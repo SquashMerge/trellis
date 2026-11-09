@@ -70,6 +70,22 @@ enum Command {
     Model(ModelArgs),
     /// Inspect existing derived indexes and the vector cache without changing them.
     Gc(GcArgs),
+    /// Read one allowlisted browser API route through the local daemon, as the Herdr mod does.
+    Api(ApiArgs),
+}
+/// `trellis api` (#817). Prints the daemon's JSON answer on stdout. Exit 0 for a 2xx answer,
+/// 1 for a daemon error answer (printed unchanged), 2 for a typed failure with no answer
+/// (`{"error":{"code","message"}}`): a refused route, a bad body or the daemon unreachable.
+#[derive(Args)]
+struct ApiArgs {
+    /// GET, or POST with --body.
+    #[arg(value_parser = ["GET", "POST"])]
+    method: String,
+    /// The route and query, for example /api/checkouts.
+    target: String,
+    /// The POST body: JSON, at most 64 KiB, or `-` to read it from stdin.
+    #[arg(long, allow_hyphen_values = true)]
+    body: Option<String>,
 }
 #[cfg(feature = "test-support")]
 #[derive(Args)]
@@ -463,6 +479,7 @@ async fn main() -> Result<()> {
             })?;
         }
         Command::Model(args) => model_command(args).await?,
+        Command::Api(args) => std::process::exit(api_command(&args)),
         Command::Gc(_) => {
             let request = daemon_request("gc_report", serde_json::json!({}));
             print_json(&send_daemon(&request, true)?)?;
@@ -689,6 +706,88 @@ mod trusted_toolchain_probe_tests {
     }
 }
 
+/// `trellis api`: refuses before reaching the daemon, so a refused route starts nothing.
+fn api_command(args: &ApiArgs) -> i32 {
+    use std::io::{Read, Write};
+    let outcome = (|| -> Result<(u16, serde_json::Value)> {
+        let body = match args.body.as_deref() {
+            None => None,
+            Some(text) if text != "-" => {
+                let limit = trellis::http::CLI_API_BODY_LIMIT;
+                ensure!(
+                    text.len() <= limit,
+                    "body_too_large: the request body exceeds {limit} bytes"
+                );
+                Some(text.to_owned())
+            }
+            Some(_) => {
+                let limit = trellis::http::CLI_API_BODY_LIMIT;
+                let mut bytes = Vec::new();
+                std::io::stdin()
+                    .lock()
+                    .take(limit as u64 + 1)
+                    .read_to_end(&mut bytes)
+                    .context("invalid_request: cannot read the body from stdin")?;
+                ensure!(
+                    bytes.len() <= limit,
+                    "body_too_large: the request body exceeds {limit} bytes"
+                );
+                Some(String::from_utf8(bytes).context("invalid_request: the body is not UTF-8")?)
+            }
+        };
+        trellis::http::cli_api_route(&args.method, &args.target, body.is_some())?;
+        let reply = send_daemon(
+            &daemon_request(
+                "api",
+                serde_json::json!({"method": args.method, "target": args.target, "body": body}),
+            ),
+            true,
+        )
+        .map_err(|error| {
+            // A daemon started before `api` existed reads it as a checkout operation.
+            if error.to_string() == "missing workspace" {
+                anyhow::anyhow!(
+                    "daemon_outdated: the running daemon predates trellis api; restart it (trellis daemon stop, then trellis serve)"
+                )
+            } else {
+                error
+            }
+        })?;
+        let status = reply["status"]
+            .as_u64()
+            .filter(|status| (100..600).contains(status))
+            .context("invalid_response: the daemon's answer has no status")?;
+        Ok((status as u16, reply["body"].clone()))
+    })();
+    let (value, code) = match outcome {
+        Ok((status, body)) => (body, i32::from(!(200..300).contains(&status))),
+        Err(error) => {
+            let text = format!("{error:#}");
+            let (code, message) = match text.split_once(": ") {
+                Some((code, message))
+                    if !code.is_empty()
+                        && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') =>
+                {
+                    (code.to_owned(), message.to_owned())
+                }
+                _ if text.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') => {
+                    (text.clone(), format!("The daemon call failed ({text})."))
+                }
+                _ => ("api_failed".to_owned(), text),
+            };
+            (
+                serde_json::json!({"error": {"code": code, "message": message}}),
+                2,
+            )
+        }
+    };
+    let mut stdout = std::io::stdout().lock();
+    let _ = serde_json::to_writer(&mut stdout, &value);
+    let _ = stdout.write_all(b"\n");
+    let _ = stdout.flush();
+    code
+}
+
 fn socket_path() -> Result<PathBuf> {
     Ok(daemon::SocketPaths::new(&TopologyRoots::production()?.data).socket)
 }
@@ -753,6 +852,10 @@ fn checked_reply(reply: protocol::Reply) -> Result<serde_json::Value> {
 /// (#179). Like every CLI read bound it limits inactivity per socket read, not
 /// the whole reply: a liveness backstop, not a deadline.
 const INDEX_REPLY_BOUND: Duration = Duration::from_secs(10 * 60);
+
+/// How long `trellis api` waits on a silent daemon, per socket read: below the 30 s a Herdr
+/// `exec` waits by default, so a slow answer is the CLI's typed failure, not a killed command.
+const CLI_API_REPLY_BOUND: Duration = Duration::from_secs(25);
 
 /// How long other non-metrics CLI calls wait on a silent daemon, per socket
 /// read. Daemon stop waits for ownership release without this completion bound.
@@ -838,6 +941,8 @@ fn send_daemon(request: &protocol::Request, read_only: bool) -> Result<serde_jso
         "index" | "semantic_import" | "producer_pickup"
     ) {
         index_bound
+    } else if request.operation == "api" {
+        cli_bound.min(CLI_API_REPLY_BOUND)
     } else {
         cli_bound
     };
@@ -2196,6 +2301,34 @@ fn dispatch_connection(
         };
         runtime.block_on(async { registry.lock().await.disconnect(session) });
         return served;
+    }
+    if request.operation == "api" {
+        // `trellis api` (#817): one allowlisted browser route, answered by its own handler.
+        let result = (|| -> Result<serde_json::Value> {
+            let field = |name: &str| {
+                request
+                    .payload
+                    .get(name)
+                    .and_then(serde_json::Value::as_str)
+            };
+            let method = field("method").context("invalid_request: missing method")?;
+            let target = field("target").context("invalid_request: missing target")?;
+            let (status, body) = runtime.block_on(trellis::http::cli_api(
+                registry.clone(),
+                method,
+                target,
+                field("body"),
+            ))?;
+            Ok(serde_json::json!({"status": status, "body": body}))
+        })();
+        let reply = protocol::Reply {
+            id: request.id,
+            payload: match result {
+                Ok(value) => serde_json::json!({"result": value}),
+                Err(error) => serde_json::json!({"error": format!("{error:#}")}),
+            },
+        };
+        return write_daemon_reply(&mut stream, &reply);
     }
     if request.operation == "gc_report" {
         let result = search.gc_report();

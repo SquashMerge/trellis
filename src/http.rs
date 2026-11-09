@@ -35,9 +35,11 @@ use std::{
 use subtle::ConstantTimeEq;
 
 pub(crate) mod architecture;
+mod cli_api;
 mod config;
 mod worker;
 pub use architecture::ArchitectureBuilding;
+pub use cli_api::{CLI_API_BODY_LIMIT, CLI_API_RESPONSE_LIMIT, cli_api, cli_api_route};
 pub use config::BrowserConfig;
 pub use worker::{AdmissionLease, RetireOutcome, RuntimePhase};
 use worker::{RuntimeState, STARTUP_BACKOFF_FIRST};
@@ -3643,7 +3645,24 @@ impl ProvisionedBrowser {
         anyhow::ensure!(valid_token(&token), "invalid bearer token");
         let hosts = vec![address.to_string(), format!("localhost:{}", address.port())];
         let origins = hosts.iter().map(|host| format!("http://{host}")).collect();
-        Ok(Self {
+        Ok(Self::with_guard(registry, token, hosts, origins))
+    }
+
+    /// The same checkout routes for `trellis api` (#817), called directly and never served:
+    /// the private daemon socket is the caller's authentication, so it has no token or hosts.
+    fn for_socket(
+        registry: Arc<tokio::sync::Mutex<crate::daemon::registry::CheckoutRegistry>>,
+    ) -> Self {
+        Self::with_guard(registry, String::new(), Vec::new(), Vec::new())
+    }
+
+    fn with_guard(
+        registry: Arc<tokio::sync::Mutex<crate::daemon::registry::CheckoutRegistry>>,
+        token: String,
+        hosts: Vec<String>,
+        origins: Vec<String>,
+    ) -> Self {
+        Self {
             registry,
             token,
             hosts,
@@ -3655,7 +3674,7 @@ impl ProvisionedBrowser {
             metrics_clock_skew_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "test-support")]
             metrics_clock: Arc::new(Mutex::new(None)),
-        })
+        }
     }
 
     #[doc(hidden)]
@@ -3969,23 +3988,7 @@ impl ProvisionedBrowser {
                 "/healthz",
                 get(|| async { Json(json!({"ok":true,"version":env!("CARGO_PKG_VERSION")})) }),
             )
-            .route(
-                "/api/checkouts",
-                get(|State(state): State<Arc<Self>>| async move {
-                    let probe = state.registry.lock().await.browser_checkouts_probe();
-                    let mut checkouts = tokio::task::spawn_blocking(move || probe.check())
-                        .await
-                        .map_err(|_| {
-                            ApiError(
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                "internal_error",
-                                "Operation failed",
-                            )
-                        })?;
-                    enrich_checkout_git(&mut checkouts).await;
-                    checkout_list_response(checkouts)
-                }),
-            )
+            .route("/api/checkouts", get(provisioned_checkouts))
             .route(
                 "/api/daemon/status",
                 get(|State(state): State<Arc<Self>>| async move {
@@ -4006,6 +4009,23 @@ impl ProvisionedBrowser {
             ))
             .with_state(state)
     }
+}
+
+async fn provisioned_checkouts(
+    State(state): State<Arc<ProvisionedBrowser>>,
+) -> Result<Response, ApiError> {
+    let probe = state.registry.lock().await.browser_checkouts_probe();
+    let mut checkouts = tokio::task::spawn_blocking(move || probe.check())
+        .await
+        .map_err(|_| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "Operation failed",
+            )
+        })?;
+    enrich_checkout_git(&mut checkouts).await;
+    checkout_list_response(checkouts)
 }
 
 async fn provision_guard(

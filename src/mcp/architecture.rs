@@ -456,6 +456,17 @@ fn page_bases(data: &mut Value, bases: &[Value]) {
         .collect();
 }
 
+/// Where a check instance's status puts it in its array (#714): `deviates`, then
+/// `unknown`, then `conforms`. Excepted instances keep their status and its place.
+fn status_rank(instance: &Value) -> u8 {
+    match instance["status"].as_str() {
+        Some("deviates") => 0,
+        Some("unknown") => 1,
+        Some("conforms") => 2,
+        _ => 3,
+    }
+}
+
 /// Fit one page of a successful result into the page target. The paged arrays
 /// form one ordered sequence; this page holds the items from `offset` that fit,
 /// and `page.nextOffset` continues it. Counts always describe the whole result.
@@ -463,7 +474,8 @@ fn page_bases(data: &mut Value, bases: &[Value]) {
 /// #725: for check and explain, each distinct semantic basis of the page's evidence
 /// appears once in `data.semanticBases`. For check, `status` keeps only the instances
 /// with those statuses before the sequence is formed, `limit` bounds the rule instances
-/// on one page, and `page.status` reports the filter.
+/// on one page, and `page.status` reports the filter. #714: check orders each instance
+/// array by status ([`status_rank`]) before the sequence is formed.
 fn paged(id: &Value, name: &str, mut envelope: Value, paging: Paging, modern: bool) -> Value {
     let Paging {
         offset,
@@ -482,11 +494,16 @@ fn paged(id: &Value, name: &str, mut envelope: Value, paging: Paging, modern: bo
     let fields = paged_fields(name);
     let mut items = Vec::new();
     for field in fields {
-        for item in envelope["data"][*field]
+        let mut rows = envelope["data"][*field]
             .as_array_mut()
             .map(std::mem::take)
-            .unwrap_or_default()
-        {
+            .unwrap_or_default();
+        if name == "trellis_rules_check" && is_instance_field(field) {
+            // #714: deviations first, then unknowns, then conformances. The sort is
+            // stable, so evaluation order still holds within each status.
+            rows.sort_by_key(status_rank);
+        }
+        for item in rows {
             if !rules || keep(field, &item) {
                 items.push((*field, item));
             }
@@ -1647,8 +1664,9 @@ mod tests {
                 tests.extend(data["testOnly"].as_array().unwrap().iter().cloned());
                 unassigned.extend(data["unassigned"].as_array().unwrap().iter().cloned());
             }
-            assert_eq!(shown, keep(&instances));
-            assert_eq!(tests, keep(&test_only));
+            // #714: the kept rows in status order.
+            assert_eq!(shown, by_status(&keep(&instances)));
+            assert_eq!(tests, by_status(&keep(&test_only)));
             assert_eq!(unassigned, vec![json!({"path":"loose.rs"})]);
             // The same arguments and offset give the same page.
             for data in &pages {
@@ -1715,6 +1733,116 @@ mod tests {
             json!({"schemaVersion":1,"limit":5}),
         );
         assert_eq!(pages[0]["instances"].as_array().unwrap().len(), 45);
+    }
+
+    /// `rows` in the #714 check order: a stable sort by status rank.
+    fn by_status(rows: &[Value]) -> Vec<Value> {
+        let mut rows = rows.to_vec();
+        rows.sort_by_key(status_rank);
+        rows
+    }
+
+    /// #714: the instances an agent asked to page, as the dogfood saw them: many unknowns
+    /// that evaluate first (by rule, target, destination), then the deviations, then
+    /// conformances. Test-only rows interleave all three.
+    fn buried_deviations() -> (Vec<Value>, Vec<Value>) {
+        let mut instances: Vec<_> = (0..30)
+            .map(|i| rule_instance(i, "unknown", vec![rule_evidence(i, None)]))
+            .collect();
+        instances
+            .extend((30..34).map(|i| rule_instance(i, "deviates", vec![rule_evidence(i, None)])));
+        instances
+            .extend((34..40).map(|i| rule_instance(i, "conforms", vec![rule_evidence(i, None)])));
+        let statuses = ["conforms", "unknown", "deviates"];
+        let test_only = (40..49)
+            .map(|i| rule_instance(i, statuses[i % 3], vec![rule_evidence(i, None)]))
+            .collect();
+        (instances, test_only)
+    }
+
+    /// #714: with no `status` filter, a check's first page leads with the deviations,
+    /// then the unknowns, each status in evaluation order. Negative controls: the
+    /// fixture does bury every deviation past page 1 in evaluation order, and explain,
+    /// which #714 does not reorder, still pages in evaluation order.
+    #[test]
+    fn rules_check_page_one_lists_deviations_before_unknowns() {
+        let (instances, test_only) = buried_deviations();
+        let deviates = |rows: &[Value]| {
+            rows.iter()
+                .filter(|row| row["status"] == "deviates")
+                .count()
+        };
+        // Control: unordered, the default page of 20 would hold no deviation.
+        assert_eq!(deviates(&instances[..CHECK_DEFAULT_INSTANCES]), 0);
+        let whole = rules_envelope(instances.clone(), test_only);
+        let pages = rules_pages("trellis_rules_check", &whole, json!({"schemaVersion":1}));
+        let first = pages[0]["instances"].as_array().unwrap();
+        assert_eq!(first.len(), CHECK_DEFAULT_INSTANCES);
+        let statuses: Vec<_> = first
+            .iter()
+            .map(|row| row["status"].as_str().unwrap())
+            .collect();
+        assert_eq!(statuses[..4], ["deviates"; 4]);
+        assert!(
+            statuses[4..].iter().all(|status| *status == "unknown"),
+            "{statuses:?}"
+        );
+        // Within a status, evaluation order holds.
+        assert_eq!(first[..4], instances[30..34]);
+        assert_eq!(first[4..], instances[..16]);
+        // Control: explain keeps evaluation order.
+        let explain = rules_pages("trellis_rules_explain", &whole, json!({"schemaVersion":1}));
+        assert_eq!(
+            explain[0]["instances"].as_array().unwrap()[..],
+            instances[..]
+        );
+    }
+
+    /// #714: pages of the status-ordered check concatenate to every instance and
+    /// test-only instance exactly once, `limit` counts the instances of both arrays on
+    /// each page, and the whole-result counts and total are identical on every page.
+    #[test]
+    fn rules_check_status_order_pages_concatenate_stably() {
+        let (instances, test_only) = buried_deviations();
+        let whole = rules_envelope(instances.clone(), test_only.clone());
+        let arguments = json!({"schemaVersion":1,"limit":7});
+        let pages = rules_pages("trellis_rules_check", &whole, arguments.clone());
+        let (mut shown, mut tests, mut sizes) = (Vec::new(), Vec::new(), Vec::new());
+        for data in &pages {
+            assert_eq!(data["counts"], whole["data"]["counts"]);
+            assert_eq!(data["testCounts"], whole["data"]["testCounts"]);
+            assert_eq!(data["page"]["total"], 40 + 9 + 1);
+            let page = data["instances"].as_array().unwrap();
+            let page_tests = data["testOnly"].as_array().unwrap();
+            sizes.push(page.len() + page_tests.len());
+            shown.extend(page.iter().cloned());
+            tests.extend(page_tests.iter().cloned());
+            // The same arguments and offset give the same page.
+            let mut again = arguments.clone();
+            again["offset"] = data["page"]["offset"].clone();
+            let repeat = capped(
+                &json!(7),
+                "trellis_rules_check",
+                whole.clone(),
+                Some(Paging::from_arguments("trellis_rules_check", Some(&again))),
+                true,
+            );
+            assert_eq!(&repeat["structuredContent"]["data"], data);
+        }
+        // 49 instances in pages of 7; the unassigned module follows on the last page.
+        assert_eq!(sizes, [7; 7]);
+        assert_eq!(pages[6]["unassigned"].as_array().unwrap().len(), 1);
+        assert_eq!(shown, by_status(&instances));
+        assert_eq!(tests, by_status(&test_only));
+        // Each row exactly once: the targets of the concatenation are distinct.
+        let mut targets: Vec<_> = shown
+            .iter()
+            .chain(&tests)
+            .map(|row| row["target"].to_string())
+            .collect();
+        targets.sort();
+        targets.dedup();
+        assert_eq!(targets.len(), 49);
     }
 
     /// A lone first item is admitted exactly when its complete line plus LF fits
