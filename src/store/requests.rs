@@ -1402,16 +1402,12 @@ impl Store {
         let Some((_guard, db)) = self.existing_request_connection()? else {
             return Ok(Vec::new());
         };
+        // By inode only (#813): the producer state sweep may run before startup settlement
+        // adopts a pending row's drifted `st_dev`, and must still keep its inputs.
         let mut statement = db.prepare(&format!(
-            "SELECT {COLUMNS} FROM requests WHERE state IN ('queued','running') AND request_kind='semanticImport' AND root_device=?1 AND root_inode=?2 ORDER BY seq"
+            "SELECT {COLUMNS} FROM requests WHERE state IN ('queued','running') AND request_kind='semanticImport' AND root_inode=?1 ORDER BY seq"
         ))?;
-        let rows = statement.query_map(
-            params![
-                self.identity.device.to_string(),
-                self.identity.inode.to_string()
-            ],
-            read,
-        )?;
+        let rows = statement.query_map(params![self.identity.inode.to_string()], read)?;
         let mut pending = Vec::new();
         for row in rows {
             if let Ok(SemanticImportJob::Generated(options)) = row?.semantic_job() {
@@ -1614,8 +1610,10 @@ impl Store {
                     return Ok(None);
                 };
                 let row = super::storage_result(db.query_row(
-                    &format!("SELECT {COLUMNS} FROM requests WHERE root_device=?1 AND root_inode=?2 ORDER BY seq DESC LIMIT 1"),
-                    params![self.identity.device.to_string(), self.identity.inode.to_string()],
+                    // By inode only (#813): a terminal row written before a reboot keeps its
+                    // old `st_dev` and stays this root's latest job.
+                    &format!("SELECT {COLUMNS} FROM requests WHERE root_inode=?1 ORDER BY seq DESC LIMIT 1"),
+                    params![self.identity.inode.to_string()],
                     read,
                 ).optional())?;
                 self.verify_request_root(&row)?;

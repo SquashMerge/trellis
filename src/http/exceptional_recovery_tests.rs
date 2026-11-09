@@ -146,6 +146,76 @@ fn changed_root_inode_recreates_the_index_and_completes_the_queued_request() {
     startup_queue_fixture(false, StoredRoot::OtherInode);
 }
 
+/// A terminal request written before a reboot stays this checkout's latest job (#813): settlement
+/// leaves terminal rows untouched, so the current-job lookup must not filter on `st_dev`.
+#[test]
+fn a_terminal_request_before_a_device_only_drift_stays_the_current_job() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("workspace");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+    let state_root = tmp.path().join("state");
+    let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let addr: std::net::SocketAddr = "127.0.0.1:7331".parse().unwrap();
+    let options = IndexOptions::new(root.clone());
+    let old = crate::testing::retry_admission(|| Store::open_for_tests(&state_root, &root));
+    let accepted = old.enqueue_request(&options, None).unwrap();
+    let before = new(old.clone(), options.clone(), token.into(), addr).unwrap();
+    before.worker_started.store(true, Ordering::Release);
+    before.worker_step().unwrap();
+    let done = old.request_by_id(&accepted.id).unwrap().unwrap();
+    assert_eq!(done.state, "done");
+    let queue_path = old.request_db_path();
+    let index_path = queue_path.with_file_name("index.db");
+    let other_device = (WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .device
+        ^ 1)
+    .to_string();
+    drop(before);
+    drop(old);
+    for (path, sql) in [
+        (&index_path, "UPDATE index_metadata SET root_device=?1"),
+        (&queue_path, "UPDATE requests SET root_device=?1"),
+    ] {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute(sql, [&other_device])
+            .unwrap();
+    }
+
+    let store = crate::testing::retry_admission(|| Store::open_for_tests(&state_root, &root));
+    let state = new(store.clone(), options, token.into(), addr).unwrap();
+    state.worker_started.store(true, Ordering::Release);
+    state.worker_step().unwrap();
+    let terminal = store.request_by_id(&accepted.id).unwrap().unwrap();
+    assert_eq!(
+        (terminal.state.as_str(), terminal.revision),
+        ("done", done.revision)
+    );
+    assert_eq!(
+        terminal.root_device, other_device,
+        "terminal rows stay immutable"
+    );
+    assert_eq!(
+        store.current_request().unwrap().map(|row| row.id),
+        Some(accepted.id.clone())
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let Json(job) = runtime
+        .block_on(current_job(State(state.clone())))
+        .map_err(|error| error.1)
+        .unwrap();
+    let job = job.expect("GET /api/jobs/current reports the latest job");
+    assert_eq!(
+        (job.id.as_str(), job.state.as_str()),
+        (accepted.id.as_str(), "done")
+    );
+}
+
 pub(super) fn fixture() -> (
     tempfile::TempDir,
     Store,
