@@ -676,6 +676,10 @@ fn details(code: &str) -> (&'static str, bool) {
         ),
         "bounded_work" => ("Architecture projection work bound exceeded", false),
         "response_too_large" => ("Architecture result is too large", false),
+        "building" => (
+            "Architecture is being computed for this revision; retry shortly",
+            true,
+        ),
         _ => ("Store is unavailable", false),
     }
 }

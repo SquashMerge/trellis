@@ -561,11 +561,27 @@ changes, only the order of rows within two arrays. This section wins over the #7
   the browser.
 - **Not in this amendment:** grouping or skipping `layer_unassigned` unknowns.
 
+## Amendment (#798): a typed `building` answer from the architecture tools
+
+**Status: proposed (owner ruling 2026-11-08 on #798, Options 1 and 2a; needs ratification of this text).** `toolVersion` is **16** (previously 15, #785). This section wins over the #129 text and the [One computation per revision](architecture-view.md#one-computation-per-revision-556) table where they differ.
+
+- **The answer.** While the checkout's Architecture owner is still computing the read's revision, `trellis_references`, `trellis_rules_check` and `trellis_rules_explain` fail with the new code `building` instead of `deadline_exceeded`. Its resolved failure has the ordinary fields, with `retryable:true` always, plus the required `progress` and `retryAfterMs`:
+
+  `{schemaVersion:1,requestId,workspace,catchingUp,error:{code:"building",message,retryable:true,currentBasis:Basis,currentContentHash:null,progress:{phase:"reading"|"resolving"|"evaluating"|"measuring",completed:UInt,total:UInt}|null,retryAfterMs:UInt}}`
+
+  `progress` is null when the build has not reported yet. The message names the phase and count, for example `Architecture is being computed for this revision (measuring 120 of 670); retry shortly`. `retryAfterMs` is 250, the browser's `202 building` value. It is never a partial answer. The `trellis_propose_layers` prompt returns the same error object as its JSON-RPC `-32603` error `data`.
+- **When.** A read waits on the owner's signal until one second before its 5 s deadline, then answers `building` if the core is still not published. A read whose revision the owner has passed (the head moved) waits again for the new head while time remains.
+- **No duplicate compute.** A read with `paths` waits like one without, and answers `building` while the owner builds its revision. It no longer starts its own whole-revision read beside the build. It still computes its own scope when the revision fails `bounded_work`.
+- **Progress.** `measuring` advances per measured document, as `reading` already did, so a retried read sees the count move.
+- **Eager build.** The owner builds every active runtime's new head after each publication and at activation, with or without `.trellis/rules.toml`, so most first calls after a restart are hits. A worker step hints the owner only when the head or the rules file differs from the last step's, so an unchanged step takes no extra read lease.
+- **Catalog.** Each of the three tools' output schemas gains a `BuildingFailure` `$defs` entry and a `oneOf` branch for it. `building` is not in `ResolvedFailureCode`, so the plain `Failure` branch never matches it. The compact catalog grows from 230,217 to 233,139 bytes, under the 245,760-byte named headroom limit.
+- **Clients.** `tools/mcp-smoke` reads a `building` tool call or prompt again after `retryAfterMs`, for at most 60 s per call, and reports the count as `buildingRetries`.
+
 ## Amendment (#818): `trellis_show` takes the user's viewers to a target
 
-**Status: proposed, for ratification under the 2026-11-08 owner delegation on #818.** `toolVersion` is **18** (previously 15; #821 and run 803 hold 16 and 17, so the number is renumbered at merge time if they land in another order). The 2026-11-08 owner rulings on #818 set the scope: views `sequence`, `class` and `source`; every open viewer of the checkout follows; following is on by default and a pin opts out; validation as the #787 deep links validate; typed answers, never partial.
+**Status: proposed, for ratification under the 2026-11-08 owner delegation on #818.** `toolVersion` is **18** (previously 17 (run 803), which follows 16 for #798). If run 803 has not landed when this merges, the gap at 17 is intentional: 17 stays reserved for it. The 2026-11-08 owner rulings on #818 set the scope: views `sequence`, `class` and `source`; every open viewer of the checkout follows; following is on by default and a pin opts out; validation as the #787 deep links validate; typed answers, never partial.
 
-- **One new tool.** `trellis_show` is entry 12 of the catalog, after `trellis_rules_explain` ([catalog entry](#trellis_show-818)). The eleven earlier tools, their schemas and their answers are unchanged. The complete catalog is 230,215 compact bytes before and 238,346 after; the modern `tools/list` frame is 238,703 bytes against the 245,760-byte named headroom limit.
+- **One new tool.** `trellis_show` is entry 12 of the catalog, after `trellis_rules_explain` ([catalog entry](#trellis_show-818)). The eleven earlier tools, their schemas and their answers are unchanged. With #798's catalog it is 233,137 compact bytes before and 241,268 after; the modern `tools/list` frame is 241,625 bytes against the 245,760-byte named headroom limit.
 - **What it changes.** Only what open viewers of the checkout display. It never writes the index, the rules, `requests.db` or any saved state, and it never moves terminal or window focus. Its `readOnlyHint` is true; `idempotentHint` is false, because each call is a new request that an open viewer follows again.
 - **One latest request per checkout.** A shown target is recorded in the daemon's memory for its checkout, under a `generation` that is strictly increasing across the daemon process and starts at the process's start time in milliseconds, so a restarted daemon's requests are newer than an earlier one's. A newer request replaces the older one; there is no queue. A checkout runtime that is released forgets its request.
 - **Viewers.** A viewer is a browser tab or Herdr pane that read the checkout's `status` or `status/head` in the last 90 seconds; each such read also marks the viewer as open. Both routes gain `viewRequest`: `null`, or `{generation,view,symbolId,revision}` for `sequence` and `class`, or `{generation,view:"source",path,line,revision}`. `revision` is the snapshot the target was checked at. The `status/head` digest, and so its `ETag`, includes it. These are browser routes ([daemon-v1](daemon-v1.md)), not MCP output.
@@ -997,7 +1013,8 @@ cites a `semanticBinding` or `typeRelationship`, counted before evidence samplin
 this is not top-level verdict truncation or proof of semantic completeness.
 
 Only these new output schemas add nonretryable codes `invalid_rules`,
-`rules_not_found`, `bounded_work` and `response_too_large`. A file with a syntax error is a
+`rules_not_found`, `bounded_work` and `response_too_large`. They also add the retryable
+`building`, with its own failure branch ([#798](#amendment-798-a-typed-building-answer-from-the-architecture-tools)). A file with a syntax error is a
 `partialFiles` row, not a failure (owner ruling 2026-10-31, #563).
 A located `invalid_rules` failure has the ordinary resolved error fields **plus**
 required `diagnostic:{code,kind,path,range,line,column,attribution,message}` as

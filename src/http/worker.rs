@@ -1241,6 +1241,9 @@ mod missing_index_tests {
         for enqueue in [false, true] {
             let (_tmp, store, state, roots, identity) = fixture();
             state.worker_step().unwrap();
+            // The head's Architecture build reads it under a lease (#798), which fences the
+            // close below until it ends: let it end first.
+            state.await_architecture_idle_for_tests();
             let index_dir = roots.index_dir(&identity);
             let removed = index_dir.clone();
             store.set_after_queue_root_verify_hook_for_tests(move || {
@@ -1334,6 +1337,8 @@ mod missing_index_tests {
     fn missing_index_waits_for_an_enqueue_already_in_flight() {
         let (_tmp, store, state, roots, identity) = fixture();
         state.worker_step().unwrap();
+        // The head's Architecture build reads it under a lease (#798); let it end first.
+        state.await_architecture_idle_for_tests();
         let enqueue = store.enqueue_in_flight();
         let index_dir = roots.index_dir(&identity);
         std::fs::remove_dir_all(&index_dir).unwrap();
@@ -1355,6 +1360,8 @@ mod missing_index_tests {
         for remove_root in [false, true] {
             let (_tmp, _store, state, roots, identity) = fixture();
             state.worker_step().unwrap();
+            // The head's Architecture build reads it under a lease (#798); let it end first.
+            state.await_architecture_idle_for_tests();
             let index_dir = roots.index_dir(&identity);
             std::fs::remove_dir_all(&index_dir).unwrap();
             if remove_root {
@@ -1368,10 +1375,50 @@ mod missing_index_tests {
         }
     }
 
+    /// #798: the head's eager Architecture build reads it under a lease, like any admitted
+    /// read, so a missing index closes the runtime only once that read ends. This is the
+    /// ordering macOS CI hit in `purge_between_worker_probe_and_existing_queue_open_…`.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn an_architecture_build_read_defers_a_missing_index_close_until_it_ends() {
+        let (_tmp, _store, state, roots, identity) = fixture();
+        let (entered, reached) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let held = std::sync::Mutex::new(held);
+        let once = std::sync::atomic::AtomicBool::new(true);
+        state.set_architecture_hook_for_tests(std::sync::Arc::new(move |point| {
+            if point == "reading" && once.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                let _ = entered.send(());
+                let _ = held
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(crate::testing::HANG_BACKSTOP);
+            }
+        }));
+        // The publication hints the owner, whose build is held inside its read.
+        state.worker_step().unwrap();
+        reached.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap();
+        let index_dir = roots.index_dir(&identity);
+        std::fs::remove_dir_all(&index_dir).unwrap();
+        let _ = state.worker_step();
+        state.publish_fifo_pending();
+        assert!(!state.retired(), "the build's read fences the close");
+        assert!(!index_dir.exists());
+        drop(release);
+        state.await_architecture_idle_for_tests();
+        state.worker_step().unwrap();
+        state.publish_fifo_pending();
+        assert!(state.retired());
+        assert!(!index_dir.exists());
+    }
+
     #[test]
     fn missing_index_directory_defers_close_until_the_admitted_read_finishes() {
         let (_tmp, _store, state, roots, identity) = fixture();
         state.worker_step().unwrap();
+        // The head's Architecture build takes a lease to read it (#798): only this test's
+        // lease fences the close below.
+        state.await_architecture_idle_for_tests();
         let lease = state.admission_lease().unwrap();
         let index_dir = roots.index_dir(&identity);
         std::fs::remove_dir_all(&index_dir).unwrap();

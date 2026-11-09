@@ -10260,6 +10260,12 @@ async fn mcp_source_post_validation_invalid_bytes_only_selected_range_fails() {
     })
     .await
     .expect("runtime did not finish valid startup before source mutation");
+    // The head's eager Architecture build (#798) reads every document: it has finished before
+    // the bytes are damaged, so only the reads below see them.
+    runtime
+        .settled_for_tests(None)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
     let writer = store.publication_for_tests().unwrap();
     let malformed = [0x61, 0x0a, 0xff, 0x0a];
     store
@@ -11293,10 +11299,11 @@ async fn references_filtered_closure_fits_large_snapshot_and_selected_overflow_i
     session.join().unwrap().unwrap();
 }
 
-/// During an Architecture build a scoped read computes its own answer, and an unscoped one
-/// stays typed and retryable inside its deadline.
+/// #798: during an Architecture build a read with or without `paths` waits for the owner, then
+/// answers the typed retryable `building` with the build's progress, inside its deadline. The
+/// scoped read does not compute its own answer beside the build.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_read_during_an_architecture_build_is_answered_or_retryable() {
+async fn a_read_during_an_architecture_build_answers_building() {
     use trellis::daemon::registry::CheckoutRegistry;
     let temp = tempfile::tempdir().unwrap();
     let (identity, topology) = published_inactive_checkout(
@@ -11341,8 +11348,6 @@ async fn a_read_during_an_architecture_build_is_answered_or_retryable() {
     reached
         .recv_timeout(trellis::testing::HANG_BACKSTOP)
         .unwrap();
-    // The scoped read spends its whole deadline computing, not waiting for this held build.
-    scheduler.set_architecture_browser_wait_for_tests(Duration::ZERO);
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
     let (mut client, mut reader, session) =
         socket_session(&identity, &registry, 556, Some(Duration::from_secs(3)));
@@ -11359,19 +11364,33 @@ async fn a_read_during_an_architecture_build_is_answered_or_retryable() {
         .unwrap();
         next_reply(&mut reader)
     };
-    let scoped = ask(1, json!({"schemaVersion":1,"paths":["a.js"]}));
-    tool(&scoped, None, true);
-    let whole = ask(2, json!({"schemaVersion":1}));
-    tool(&whole, Some("deadline_exceeded"), true);
-    let error = &whole["result"]["structuredContent"]["error"];
-    assert_eq!(error["retryable"], true, "{whole}");
-    assert!(
-        error["message"]
-            .as_str()
-            .unwrap()
-            .contains("being computed"),
-        "{whole}"
-    );
+    let builds = scheduler.architecture_builds_for_tests();
+    let mut answers = Vec::new();
+    for (id, arguments) in [
+        (1, json!({"schemaVersion":1,"paths":["a.js"]})),
+        (2, json!({"schemaVersion":1})),
+    ] {
+        let reply = ask(id, arguments);
+        tool(&reply, Some("building"), true);
+        let error = &reply["result"]["structuredContent"]["error"];
+        assert_eq!(error["retryable"], true, "{reply}");
+        assert_eq!(error["retryAfterMs"], 250, "{reply}");
+        assert_eq!(
+            error["progress"],
+            json!({"phase":"resolving","completed":0,"total":2}),
+            "{reply}"
+        );
+        assert_eq!(
+            error["message"],
+            "Architecture is being computed for this revision (resolving 0 of 2); retry shortly"
+        );
+        assert!(error["currentBasis"].is_object(), "{reply}");
+        answers.push(json!({"name":"trellis_rules_check",
+            "structuredContent":reply["result"]["structuredContent"]}));
+    }
+    validate_structured_content(&answers);
+    // Neither read started another build; the scoped one answered without computing.
+    assert_eq!(scheduler.architecture_builds_for_tests(), builds);
     drop(release);
     drop(ask);
     drop(reader);

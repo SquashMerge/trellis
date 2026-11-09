@@ -258,3 +258,36 @@ test("trellis_show input admits one target per view, and its outcomes are closed
   assert.ok(!output(envelope({ outcome: "stale", generation: 7 })), "only shown has a generation");
   assert.ok(!output(envelope({ outcome: "partial", generation: null })));
 });
+
+// #798: the BuildingFailure branch of each architecture tool takes exactly the ratified shape,
+// with the admitted basis and a null content hash.
+test("architecture building failures require a basis and a null content hash", () => {
+  const basis = { indexGeneration: "123e4567-e89b-42d3-a456-426614174000", indexRevision: 7 };
+  const valid = {
+    schemaVersion: 1, requestId: 1, workspace: "/w", catchingUp: false,
+    error: {
+      code: "building", message: "Architecture is being computed for this revision; retry shortly",
+      retryable: true, currentBasis: basis, currentContentHash: null,
+      progress: { phase: "measuring", completed: 1, total: 3 }, retryAfterMs: 250,
+    },
+  };
+  const variant = (change) => {
+    const copy = structuredClone(valid);
+    change(copy.error);
+    return copy;
+  };
+  for (const name of ["trellis_references", "trellis_rules_check", "trellis_rules_explain"]) {
+    const validate = ajv.compile(tools.find((tool) => tool.name === name).outputSchema);
+    assert.ok(validate(valid), `${name}: ${JSON.stringify(validate.errors)}`);
+    assert.ok(validate(variant((error) => { error.progress = null; })), name);
+    for (const [label, change] of [
+      ["null basis", (error) => { error.currentBasis = null; }],
+      ["content hash", (error) => { error.currentContentHash = "a".repeat(64); }],
+      ["null basis and content hash", (error) => { error.currentBasis = null; error.currentContentHash = "a".repeat(64); }],
+      ["not retryable", (error) => { error.retryable = false; }],
+      ["no retryAfterMs", (error) => { delete error.retryAfterMs; }],
+    ]) {
+      assert.equal(validate(variant(change)), false, `${name} accepted ${label}`);
+    }
+  }
+});

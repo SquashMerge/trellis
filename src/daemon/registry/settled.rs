@@ -26,6 +26,8 @@ pub enum SettleBusy {
     Fifo,
     /// Semantic catch-up (S) still has a pending target.
     Semantic,
+    /// The Architecture owner has a turn running or due (#798).
+    Architecture,
     /// The selected read was refused, for example `index_not_ready` or contention.
     Read(String),
     /// `catchingUp` was set while every component above was idle.
@@ -47,6 +49,7 @@ impl std::fmt::Display for SettleBusy {
             SettleBusy::Watcher => write!(f, "watcher pending"),
             SettleBusy::Fifo => write!(f, "FIFO pending"),
             SettleBusy::Semantic => write!(f, "semantic catch-up pending target"),
+            SettleBusy::Architecture => write!(f, "architecture owner busy"),
             SettleBusy::Read(error) => write!(f, "selected read refused: {error}"),
             SettleBusy::CatchingUp => write!(f, "catchingUp with every component idle"),
             SettleBusy::Changing => write!(f, "state changed during every idle sample"),
@@ -102,7 +105,7 @@ enum Sample {
 
 impl CheckoutRuntime {
     /// Wait until this checkout's startup reconciliation has committed and its
-    /// watcher, FIFO and semantic catch-up (S) are idle, then return the published
+    /// watcher, FIFO, semantic catch-up (S) and Architecture owner are idle, then return the published
     /// head. With `at`, that head must be `at`; an idle checkout at another head
     /// is an error at once, not a wait.
     ///
@@ -218,6 +221,12 @@ impl CheckoutRuntime {
             return busy;
         }
         match resources.store.index_baseline() {
+            // The owner builds each new head with no read asking (#798), and owes that build
+            // until the worker has submitted this head and the owner's turn has ended.
+            Ok(head) if head == pin && resources.scheduler.architecture_owes(pin) => Sample::Busy {
+                busy: SettleBusy::Architecture,
+                contended: false,
+            },
             Ok(head) if head == pin => Sample::Idle(pin),
             Ok(_) => Sample::Busy {
                 busy: SettleBusy::Changing,
@@ -255,10 +264,11 @@ impl CheckoutRuntime {
             return busy(SettleBusy::Fifo);
         }
         match resources.store.pending_semantic_target() {
-            Ok(None) => None,
-            Ok(Some(_)) => busy(SettleBusy::Semantic),
-            Err(error) => Some(read_refused(error)),
+            Ok(None) => {}
+            Ok(Some(_)) => return busy(SettleBusy::Semantic),
+            Err(error) => return Some(read_refused(error)),
         }
+        None
     }
 }
 

@@ -3408,6 +3408,8 @@ fn metrics_cli_parser_and_serialization_timeouts_are_atomic() {
             .arg("--workspace")
             .arg(&root)
             .env("TRELLIS_TEST_METRICS_WORK_DEADLINE_MS", "1500")
+            // The metrics read below does its own work, without a core built eagerly (#798).
+            .env("TRELLIS_TEST_ARCHITECTURE_ON_DEMAND", "1")
             .env(delay_key, "2000")
             .env(marker_key, &hit)
             .env("TRELLIS_TEST_METRICS_SERIALIZE_DELAY_AT_BYTES", "0")
@@ -3503,6 +3505,8 @@ fn metrics_peer_closes_at_parser_hook_without_poisoning_daemon() {
         .arg("--workspace")
         .arg(&root)
         .env("TRELLIS_TEST_METRICS_PARSE_DELAY_MS", "400")
+        // The metrics read below parses itself, without a core built eagerly (#798).
+        .env("TRELLIS_TEST_ARCHITECTURE_ON_DEMAND", "1")
         .env("TRELLIS_TEST_METRICS_PARSE_HIT_FILE", &hit)
         .output()
         .unwrap();
