@@ -34,7 +34,9 @@
   });
 
   const model = (() => {
-    const kindOf = evidence => evidence.caller != null || evidence.relationKind === "call" ? "call" : evidence.relationKind;
+    // The tag is the classified relation kind (#785), the same key Calls only and the kind counts use. A require or
+    // dynamic import keeps its `import` tag even when it carries a caller (#816).
+    const kindOf = evidence => evidence.relationKind;
     const destinationKey = destination => JSON.stringify([destination.sourceSetId, destination.language, destination.path ?? destination.package]);
     const lineKey = (instance, evidence) => JSON.stringify([instance.target.sourceSetId, instance.target.path, destinationKey(instance.destination),
       evidence.range.start, evidence.range.end, evidence.relationKind, evidence.callId]);
@@ -69,10 +71,10 @@
         for (const kind of KINDS) file.kinds[kind] += i.kindCounts[kind];
         let listedCalls = 0;
         for (const evidence of i.evidence) {
-          file.listed[evidence.relationKind]++;
-          if (evidence.relationKind === "call") listedCalls++;
           const kind = kindOf(evidence);
-          if (callsOnly && evidence.relationKind !== "call") continue;
+          file.listed[kind]++;
+          if (kind === "call") listedCalls++;
+          if (callsOnly && kind !== "call") continue;
           const id = evidence.owner ? evidence.owner.syntaxId : MODULE;
           if (!file.functions.has(id)) file.functions.set(id, {key:id, id:JSON.stringify(["fn", key, id]), label:labelOf(evidence.owner, i), lines:[]});
           file.functions.get(id).lines.push({key:lineKey(i, evidence), evidence, instance:i, kind, fn:labelOf(evidence.owner, i), direction:direction(i.sourceLayer, i.destinationLayer),
@@ -86,7 +88,7 @@
         for (const kind of KINDS) unlisted[kind] = Math.max(0, file.kinds[kind] - file.listed[kind]);
         const functions = [...file.functions.values()].map(fn => {
           sortBy(fn.lines, line => line.start, line => line.evidence.range.start);
-          const calls = fn.lines.filter(line => line.evidence.relationKind === "call").length;
+          const calls = fn.lines.filter(line => line.kind === "call").length;
           return {...fn, calls, references:fn.lines.length, callsExact:file.callsExact, refsExact:file.refsExact};
         }).filter(fn => !callsOnly || fn.calls > 0);
         sortBy(functions, fn => fn.calls > 0 ? 0 : 1, fn => -fn.references, fn => fn.label);
@@ -341,11 +343,11 @@
     function renderChips() {
       const s = state(), chips = model.chips(deps.view(), deps.edgeText), buttons = [];
       const chip = (key, label, glyph, entry) => {
-        const count = `${entry.bound ? "≥" : ""}${num(entry.count)}`, noun = key === null ? "" : ` ${entry.count === 1 ? "deviation" : "deviations"}`;
-        const button = make("button", `${glyph ? `${glyph} ` : ""}${label} · ${count}${noun}`, "deviations-chip"); button.type = "button";
+        const count = `${entry.bound ? "≥" : ""}${num(entry.count)}`, noun = entry.count === 1 ? "reference" : "references";
+        const button = make("button", `${glyph ? `${glyph} ` : ""}${label} · ${count} ${noun}`, "deviations-chip"); button.type = "button";
         button.dataset.key = key ?? ""; button.setAttribute("aria-pressed", String(s.chip === key));
         if (s.chip === key) button.className += " selected";
-        button.setAttribute("aria-label", `${glyph === "↑" ? "Upward: " : ""}${label}, ${entry.bound ? `at least ${num(entry.count)} deviations (lower bound)` : plural(entry.count, "deviation")}`);
+        button.setAttribute("aria-label", `${glyph === "↑" ? "Upward: " : ""}${label}, ${entry.bound ? `at least ${num(entry.count)} references (lower bound)` : plural(entry.count, "reference")}`);
         button.addEventListener("click", () => changeFilter({chip:key}, () => Array.from(chrome.edges.children).find(item => item.dataset.key === (key ?? ""))?.focus()));
         buttons.push(button);
       };
@@ -447,13 +449,13 @@
         name.append(caret(item), cell(f.path, "deviation-path"));
         for (const edge of f.edges) {
           const n = s.callsOnly ? edge.calls : edge.count;
-          reach.append(cell(`${edge.direction === "up" ? "↑" : "⇄"} ${edge.destinationLayer} · ${plural(n, "deviation")}`, "architecture-chip deviation-edge", "error"));
+          reach.append(cell(`${edge.direction === "up" ? "↑" : "⇄"} ${edge.destinationLayer} · ${plural(n, s.callsOnly ? "call" : "reference")}`, "architecture-chip deviation-edge", "error"));
         }
         calls = countCell(f.calls, false, "deviation-calls"); refs = countCell(f.shown, false, "deviation-refs");
-        const part = edge => `${edge.destinationLayer} ${s.callsOnly ? edge.calls : edge.count}`;
+        const part = edge => `${edge.destinationLayer} ${s.callsOnly ? plural(edge.calls, "call") : plural(edge.count, "reference")}`;
         const up = f.edges.filter(edge => edge.direction === "up").map(part), cross = f.edges.filter(edge => edge.direction !== "up").map(part);
         el.setAttribute("aria-label", [`${f.path}`, plural(f.calls, "call"), plural(f.shown, "reference"),
-          up.length ? `upward deviations: ${up.join(", ")}` : null, cross.length ? `deviations: ${cross.join(", ")}` : null].filter(Boolean).join(", "));
+          up.length ? `upward: ${up.join(", ")}` : null, cross.length ? `peer or shared: ${cross.join(", ")}` : null].filter(Boolean).join(", "));
       } else if (item.kind === "function") {
         const fn = item.fn;
         el.setAttribute("aria-expanded", String(item.expanded));
@@ -582,7 +584,7 @@
       row("File pair", `${i.target.path} → ${i.destination.path}`);
       let evidence = e.kind === "semanticBinding" || t ? "Semantic binding" : "Structural · syntax evidence";
       if (e.caller) evidence += ` · run by ${e.caller.name}`;
-      else if (line.kind === "call" && e.relationKind === "call") evidence += ` · no measured caller: ${e.callerReason ?? "unavailable"}`;
+      else if (line.kind === "call") evidence += ` · no measured caller: ${e.callerReason ?? "unavailable"}`;
       row("Evidence", evidence);
       target.append(list);
       const items = actions(line, active), exception = items.find(item => item.id === "exception");

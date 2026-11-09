@@ -386,13 +386,24 @@ Status: proposed (owner-delegated, run 802).
 The deviations chip replaces the diagram with a tree of every production deviation, found
 without choosing an edge first. It reads `kind=instances`, `rule=$layers`, `status=deviates`,
 `role=production`, `excepted=false` at the view's pin and rules hash, page by page, and
-shows nothing if any page fails. Files are grouped under the edge they reach up or across
-to, then functions, then lines, sorted by references. A line's function reads "(module
-level)" for file-level code and "(anonymous)" when no name was captured.
+shows nothing if any page fails. The tree is a flat list of files, each with its functions
+and then its lines, sorted by references. A file row carries one badge for each edge it
+reaches up or across, and the edge chips filter the list; files are not nested under edges.
+A line's function reads "(module level)" for file-level code and "(anonymous)" when no name
+was captured.
 
+- **Naming (#816).** A *deviation* is a rule instance, as on the review chip (**23
+  deviations**). The tree's chips and file badges count *references* (reference sites), for
+  example `↑ low → top · 25 references` and `↑ top · 3 references`; under Calls only a file
+  badge counts calls. Modules read `from → to`; "target" is used only for **Go to definition**,
+  the resolved declaration.
 - **Filters.** The chips are **All deviations** and one per edge, `↑` upward and `⇄` peer or
-  shared. A chip reads `≥N` when the edge count is a lower bound. **Calls only** keeps lines
-  tagged `call`; type uses, imports and other references are hidden.
+  shared. A chip reads `≥N` when the edge count is a lower bound. A line's tag is its
+  classified relation kind (`relationKind`): `call`, `type use`, `import` or `reference`.
+  **Calls only** keeps exactly the lines tagged `call`; type uses, imports and other
+  references are hidden. A JavaScript or TypeScript `require(...)` or `import(...)` stays an
+  `import` even when it carries a caller, so it is tagged `import` and hidden under Calls
+  only; it can still offer **Open in Sequence**.
 - **Counts.** Only a file's `referenceCount` and `kindCounts` are exact. Lines are sampled per
   file pair, calls first, so a function count reads `≥N` when any instance of its file was
   truncated, and the footer says so.
@@ -413,11 +424,14 @@ level)" for file-level code and "(anonymous)" when no name was captured.
   the chip, Calls only, the expanded rows, the selected line and focus. **Back** reopens the
   tree and reselects and focuses that line. If the line is gone it says "The selected line is
   no longer listed." and selects nothing.
-- **Refresh and conflicts.** A moved revision reads "The index moved to a newer revision.
-  Reload deviations."; changed rules read "Rules changed since these deviations were loaded.
-  Reload deviations."; a building index reads "Architecture is still building for this
-  revision." **Reload deviations** re-reads and reopens the tree with the same chip and Calls
-  only and no selection. Applying an exception does the same. A reset for any other reason,
+- **Refresh and conflicts.** A moved revision (`revision_conflict`, `pin_expired` or
+  `root_changed`) is handled like any stale Architecture read: the app reads "Architecture
+  snapshot changed. Refresh status before reopening Architecture.", refreshes status and
+  resets the Architecture view, which closes the tree; open it again from the deviations
+  chip. Changed rules read "Rules changed since these deviations were loaded. Reload
+  deviations."; a building index reads "Architecture is still building for this revision."
+  **Reload deviations** re-reads and reopens the tree with the same chip and Calls only and
+  no selection. Applying an exception does the same. A reset for any other reason,
   such as leaving the tab, drops that request.
 
 ## One computation per revision (#556)

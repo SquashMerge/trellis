@@ -1276,8 +1276,11 @@ the counts of the sites it aggregates. Declaration instances have `referenceCoun
   1. A structural `import` stays `import`, including JavaScript and TypeScript `require(...)`
      and `import(...)` call sites.
   2. Semantic-only sites keep `call` or `type`.
-  3. A structural `reference` becomes `call` when a stored measured call encloses the site, or
-     when the semantic binding that maps it is a call binding.
+  3. A structural `reference` becomes `call` when it is the callee of a stored measured call,
+     or when the semantic binding that maps it is a call binding. The site is that call's
+     callee when its range is the whole invocation, lies within the callee spelling, or runs
+     from the start of the invocation to the end of the callee (a qualified callee path). A
+     site that is merely inside the call, such as an argument, is not promoted.
   4. A structural `reference` mapped by a type-role semantic reference becomes `type`.
   5. Anything else is `reference`.
 - **R2, owner.** `owner` is null if and only if `ownerSyntaxId` is null. `owner.name` is null
