@@ -670,6 +670,8 @@ fn evidence_read(
 
 struct DescribedSnapshot {
     data: Option<(crate::model::IndexStatus, projection::LanguageCounts)>,
+    /// The failed and partial semantic documents, when the call asked for them (#780).
+    coverage_documents: Option<Vec<crate::store::CoverageDocument>>,
     /// Head retrieval coverage from the same selected snapshot (#777).
     search_head: Option<crate::search_model::SearchHeadCoverage>,
     catching_up: bool,
@@ -696,6 +698,7 @@ const SEARCH_LEXICAL_RESERVE: std::time::Duration = std::time::Duration::from_mi
 fn read_describe(
     runtime: &crate::daemon::registry::CheckoutRuntime,
     selected: Option<&crate::daemon::registry::SelectedCheckout>,
+    coverage_documents: Option<Option<&str>>,
     deadline: std::time::Instant,
     cancel: &std::sync::atomic::AtomicBool,
     admitted: &dyn Fn(bool),
@@ -717,14 +720,18 @@ fn read_describe(
                     runtime.run_mcp_admitted_gate_for_tests();
                     let read = response
                         .map(|response| {
-                            let data: (crate::model::IndexStatus, projection::LanguageCounts) =
-                                (|| {
-                                    let status = response.status()?;
-                                    let counts = response.mcp_language_counts()?;
-                                    let tiers = response.mcp_language_tiers()?;
-                                    Ok((status, (counts, tiers)))
-                                })()
-                                .map_err(|error| response.report_index_failure(error))?;
+                            let (data, documents) = (|| {
+                                let status = response.status()?;
+                                let counts = response.mcp_language_counts()?;
+                                let tiers = response.mcp_language_tiers()?;
+                                let documents = coverage_documents
+                                    .map(|language| {
+                                        response.mcp_coverage_documents(&tiers, language)
+                                    })
+                                    .transpose()?;
+                                Ok(((status, (counts, tiers)), documents))
+                            })()
+                            .map_err(|error| response.report_index_failure(error))?;
                             let search_head = runtime.search_head_coverage(
                                 &response,
                                 data.0.revision,
@@ -739,15 +746,18 @@ fn read_describe(
                                     Ok(())
                                 },
                             )?;
-                            response.finish((data, search_head))
+                            response.finish((data, documents, search_head))
                         })
                         .transpose()?;
-                    let (data, search_head) = match read {
-                        Some((data, search_head)) => (Some(data), search_head),
-                        None => (None, None),
+                    let (data, documents, search_head) = match read {
+                        Some((data, documents, search_head)) => {
+                            (Some(data), documents, search_head)
+                        }
+                        None => (None, None, None),
                     };
                     Ok(DescribedSnapshot {
                         data,
+                        coverage_documents: documents,
                         search_head,
                         catching_up,
                         state,
@@ -1082,9 +1092,15 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
             let mut tool = tools::prepare(&name, arguments.as_ref(), &id, modern, answering);
             let mut sampled_catching_up = catching_up;
             let mut envelope = tool.response["structuredContent"].clone();
+            let mut pending_coverage = None;
             if name == "trellis_workspace_describe"
+                && tool.valid_arguments
                 && let Some((registry, _)) = &registry
             {
+                // #780: the failed and partial document page the call asked for.
+                let coverage_request = arguments
+                    .as_ref()
+                    .and_then(|arguments| arguments.get("coverageDocuments"));
                 let answering_root = answering.root().to_owned();
                 let publish = |catching_up: bool| {
                     *resolved.lock().unwrap() = Some((answering_root.clone(), catching_up));
@@ -1092,7 +1108,11 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                 match describe(
                     registry,
                     key,
-                    selected.as_ref(),
+                    DescribeTarget {
+                        selected: selected.as_ref(),
+                        coverage_documents: coverage_request
+                            .map(|request| request["language"].as_str()),
+                    },
                     daemon_handle.as_ref(),
                     deadline,
                     &cancel,
@@ -1107,6 +1127,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                         match read {
                             Ok(DescribedSnapshot {
                                 data: Some((status, counts)),
+                                coverage_documents,
                                 search_head: head,
                                 catching_up: sampled,
                                 state,
@@ -1126,9 +1147,16 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                     })),
                                     false,
                                 );
+                                // Paged last, against the final answer (#780).
+                                if let (Some(request), Some(documents)) =
+                                    (coverage_request, coverage_documents)
+                                {
+                                    pending_coverage = Some((documents, request));
+                                }
                             }
                             Ok(DescribedSnapshot {
                                 data: None,
+                                coverage_documents: _,
                                 search_head: _,
                                 catching_up: sampled,
                                 state,
@@ -1933,6 +1961,11 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
             *resolved.lock().unwrap() = Some((answering.root().to_owned(), sampled_catching_up));
             envelope["workspace"] = serde_json::json!(answering.root());
             envelope["catchingUp"] = serde_json::json!(sampled_catching_up);
+            if let Some((documents, request)) = pending_coverage
+                && envelope.get("data").is_some()
+            {
+                envelope = projection::coverage_documents(id, envelope, documents, request, modern);
+            }
             tool.response = if architecture::is_tool(&name) || name == architecture::PROMPT_NAME {
                 // Tools page their arrays into the response cap; the prompt never pages.
                 let paging = architecture::is_tool(&name)
@@ -2023,10 +2056,17 @@ struct DescribeResult {
     search_availability: crate::search_model::SearchAvailability,
 }
 
+/// What one describe call reads: the selected worktree, if any, and the coverage document
+/// language filter when the call asked for documents (#780).
+struct DescribeTarget<'a> {
+    selected: Option<&'a crate::daemon::registry::SelectedCheckout>,
+    coverage_documents: Option<Option<&'a str>>,
+}
+
 fn describe(
     registry: &std::sync::Arc<tokio::sync::Mutex<crate::daemon::registry::CheckoutRegistry>>,
     key: &str,
-    selected: Option<&crate::daemon::registry::SelectedCheckout>,
+    target: DescribeTarget<'_>,
     daemon_handle: Option<&tokio::runtime::Handle>,
     deadline: std::time::Instant,
     cancel: &std::sync::atomic::AtomicBool,
@@ -2040,7 +2080,14 @@ fn describe(
             None => anyhow::bail!("index_not_ready: checkout not activated"),
         },
     };
-    let read = read_describe(&runtime, selected, deadline, cancel, admitted);
+    let read = read_describe(
+        &runtime,
+        target.selected,
+        target.coverage_documents,
+        deadline,
+        cancel,
+        admitted,
+    );
     Ok(DescribeResult {
         read,
         degraded: runtime.mcp_watcher_degraded(),
