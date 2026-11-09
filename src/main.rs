@@ -432,6 +432,30 @@ fn print_json(value: &impl Serialize) -> Result<()> {
 const CLI_READ_WAIT: Duration = Duration::from_secs(5);
 /// A rules check or references read can wait for the revision's architecture core (#556).
 const CLI_ARCHITECTURE_WAIT: Duration = Duration::from_secs(30);
+/// How long a CLI read on a checkout with no admitted head waits for the first
+/// validated head its activation started (#842, owner ruling 2026-11-09). Below
+/// the two minutes an agent's shell command commonly gets. On expiry the read
+/// fails `index_not_ready` and indexing continues in the daemon.
+const CLI_FIRST_INDEX_WAIT: Duration = Duration::from_secs(90);
+/// How often that wait reports progress. Also keeps the client's per-read
+/// inactivity bound (`CLI_REPLY_BOUND`) from expiring while it waits.
+const CLI_FIRST_INDEX_PROGRESS: Duration = Duration::from_secs(10);
+
+fn cli_first_index_wait() -> Duration {
+    #[cfg(feature = "test-support")]
+    if let Some(wait) = metrics_test_duration("TRELLIS_TEST_CLI_FIRST_INDEX_WAIT_MS") {
+        return wait;
+    }
+    CLI_FIRST_INDEX_WAIT
+}
+
+/// The read commands that activate their checkout and wait for its first head (#842).
+fn awaits_first_head(operation: &str) -> bool {
+    matches!(
+        operation,
+        "status" | "symbols" | "query" | "metrics" | "rules_check" | "references"
+    )
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -908,6 +932,8 @@ fn send_daemon(request: &protocol::Request, read_only: bool) -> Result<serde_jso
         };
         #[cfg(feature = "test-support")]
         let work = metrics_test_duration("TRELLIS_TEST_METRICS_CLIENT_WORK_MS").unwrap_or(work);
+        // The daemon may first wait for the checkout's first head (#842).
+        let work = work + cli_first_index_wait();
         let error_window = Duration::from_millis(500);
         #[cfg(feature = "test-support")]
         let error_window =
@@ -2408,17 +2434,32 @@ fn dispatch_connection(
         metrics_work
     };
     let architecture = matches!(request.operation.as_str(), "rules_check" | "references");
-    let request_deadline = Instant::now()
-        + if metrics {
-            metrics_work
-        } else if architecture {
-            CLI_ARCHITECTURE_WAIT
-        } else if request.operation == "settled_for_tests" {
-            // Only activation contention shares this; the wait has its own bound.
-            trellis::testing::HANG_BACKSTOP
-        } else {
-            CLI_READ_WAIT
-        };
+    let read_budget = if metrics {
+        metrics_work
+    } else if architecture {
+        CLI_ARCHITECTURE_WAIT
+    } else if request.operation == "settled_for_tests" {
+        // Only activation contention shares this; the wait has its own bound.
+        trellis::testing::HANG_BACKSTOP
+    } else {
+        CLI_READ_WAIT
+    };
+    // The read's deadline, as `run` finally set it: a wait for the first head
+    // (#842) starts a fresh read budget after it.
+    let answered_deadline = std::cell::Cell::new(Instant::now() + read_budget);
+    // Progress of that wait goes to the client as frames before its reply.
+    let mut progress_stream = stream.try_clone().ok();
+    let mut progress = |message: String| {
+        if let Some(progress) = progress_stream.as_mut() {
+            let _ = protocol::write_frame(
+                progress,
+                &protocol::Reply {
+                    id: request.id,
+                    payload: serde_json::json!({ "progress": message }),
+                },
+            );
+        }
+    };
     let read_scope = matches!(
         request.operation.as_str(),
         "status"
@@ -2430,7 +2471,8 @@ fn dispatch_connection(
             | "producer_plan"
             | "producer_status"
     );
-    let run = || -> Result<serde_json::Value> {
+    let mut run = || -> Result<serde_json::Value> {
+        let request_deadline = answered_deadline.get();
         let root: PathBuf = serde_json::from_value(
             request
                 .payload
@@ -2506,9 +2548,11 @@ fn dispatch_connection(
         } else {
             None
         };
+        // A status read activates its checkout like every other read (#842), so
+        // it publishes the workspace marker that activation needs.
         let identity = if matches!(
             request.operation.as_str(),
-            "status" | "producer_plan" | "producer_status" | "settled_for_tests"
+            "producer_plan" | "producer_status" | "settled_for_tests"
         ) {
             identity.attach_existing_marker_readonly()?
         } else {
@@ -2518,25 +2562,38 @@ fn dispatch_connection(
         // reader before any request ID has been accepted. Retry only that
         // typed pre-acceptance admission; never replay an enqueue after COMMIT.
         let activation_deadline = request_deadline;
-        let checkout = loop {
-            let activated = runtime.block_on(async {
-                let mut checked = registry.lock().await;
-                checked
-                    .attach_launch(session, &identity)
-                    .map_err(|e| anyhow::anyhow!("{}", e.reason()))?;
-                checked.activate(&identity.root_key)
-            });
-            match activated {
-                Ok(checkout) => break checkout,
-                Err(error) if trellis::store::cli_read_retryable_contention(&error) => {
-                    if Instant::now() >= activation_deadline {
-                        return Err(trellis::store::cli_read_busy_expired());
+        let checkout = in_read_scope(read_scope, activation_deadline, || {
+            loop {
+                let activated = runtime.block_on(async {
+                    let mut checked = registry.lock().await;
+                    checked
+                        .attach_launch(session, &identity)
+                        .map_err(|e| anyhow::anyhow!("{}", e.reason()))?;
+                    checked.activate(&identity.root_key)
+                });
+                match activated {
+                    Ok(checkout) => break Ok(checkout),
+                    Err(error) if trellis::store::cli_read_retryable_contention(&error) => {
+                        if Instant::now() >= activation_deadline {
+                            break Err(trellis::store::cli_read_busy_expired());
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
                     }
-                    std::thread::sleep(Duration::from_millis(20));
+                    Err(error) => break Err(error),
                 }
-                Err(error) => return Err(error),
             }
+        })?;
+        // The activation above is the one MCP and serve use: it starts startup
+        // reconciliation, the first index and the watcher. A read with no head
+        // to answer from waits for that first head, then gets its own budget.
+        let request_deadline = if awaits_first_head(&request.operation)
+            && await_first_head(&checkout, CLI_READ_WAIT, &mut progress)?
+        {
+            Instant::now() + read_budget
+        } else {
+            request_deadline
         };
+        answered_deadline.set(request_deadline);
         let args = request.payload.get("args").context("missing args")?;
         let deadline = request_deadline;
         let replayable_read = !matches!(
@@ -2563,318 +2620,327 @@ fn dispatch_connection(
                 .read_exact(&mut [0])
                 .expect("release CLI read contention fixture");
         }
-        loop {
-            // Recorded before the read: a state change between the read and
-            // the wait below is never missed.
-            let state_version = checkout.state_version();
-            let selected = match request.operation.as_str() {
-                "status" => checkout.cli_status(),
-                #[cfg(feature = "test-support")]
-                "settled_for_tests" => (|| {
-                    let at: Option<trellis::model::IndexPin> =
-                        serde_json::from_value(args["at"].clone())
-                            .context("invalid_argument: at is not a revision")?;
-                    let pin = checkout.await_settled_for_tests(at)?;
-                    Ok(serde_json::json!({ "revision": pin }))
-                })(),
-                "producer_plan" => checkout.cli_producer_plan(args),
-                "producer_status" => checkout.cli_producer_status(args),
-                "producer_pickup" => checkout.cli_producer_pickup(args),
-                "producer_run" => checkout.cli_producer_run(args),
-                "producer_cancel" => checkout.cli_producer_cancel(args),
-                "symbols" => checkout.cli_symbols(
-                    args["search"].as_str().context("missing search")?,
-                    args["limit"].as_u64().context("missing limit")? as usize,
-                ),
-                "query" => checkout.cli_query(&ViewQuery {
-                    seed: args["seed"].as_str().context("missing seed")?.into(),
-                    depth: args["depth"].as_u64().context("missing depth")? as usize,
-                    max_nodes: args["maxNodes"].as_u64().context("missing maxNodes")? as usize,
-                    max_calls: args["maxCalls"].as_u64().context("missing maxCalls")? as usize,
-                    include_callbacks: args["includeCallbacks"]
-                        .as_bool()
-                        .context("missing includeCallbacks")?,
-                    exclude_paths: serde_json::from_value(args["excludePaths"].clone())?,
-                    semantic_producer_id: serde_json::from_value(
-                        args.get("semanticProducerId").cloned().unwrap_or_default(),
-                    )
-                    .context("invalid_argument: semanticProducerId must be a string")?,
-                }),
-                "rules_check" | "references" => (|| {
-                    let kind = if request.operation == "references" {
-                        "references"
-                    } else {
-                        "check"
-                    };
-                    let mut check = || {
-                        ensure!(Instant::now() < request_deadline, "deadline_exceeded");
-                        Ok(())
-                    };
-                    // The owner finishes the first read after a publication; leave time to
-                    // answer. The wait comes before read admission, and again if the head
-                    // moved meanwhile.
-                    let (response, catching_up, result) = loop {
-                        let wait = request_deadline
-                            .saturating_duration_since(Instant::now())
-                            .saturating_sub(Duration::from_secs(1));
-                        checkout.await_architecture_tool(kind, args, wait, &mut check);
-                        let (response, catching_up) = checkout.evidence_response()?;
-                        let result = checkout.architecture_tool(&response, kind, args, &mut check);
-                        let building = result.as_ref().err().is_some_and(|error| {
-                            error
-                                .downcast_ref::<trellis::http::ArchitectureBuilding>()
-                                .is_some()
-                        });
-                        if !building || wait.is_zero() {
-                            break (response, catching_up, result);
-                        }
-                        drop(response);
-                        std::thread::sleep(Duration::from_millis(1));
-                    };
-                    match result {
-                        Ok(payload) => {
-                            check()?;
-                            let value =
-                                serde_json::json!({"catchingUp":catching_up,"payload":payload});
-                            ensure!(
-                                serde_json::to_vec(&value)?.len() <= 64 * 1024 * 1024,
-                                "response_too_large"
-                            );
-                            check()?;
-                            response.finish(value)
-                        }
-                        Err(error) => {
-                            if let Some(diagnostic) = trellis::rules::diagnostic(&error) {
-                                response.finish(serde_json::json!({"catchingUp":catching_up,"error":diagnostic}))
-                            } else {
-                                Err(error)
-                            }
-                        }
-                    }
-                })(),
-                "metrics" => {
-                    let options = metrics_options.as_ref().expect("metrics options validated");
-                    let mut before_work = || {
-                        #[cfg(feature = "test-support")]
-                        metrics_test_phase(b"W");
-                        #[cfg(feature = "test-support")]
-                        if let Ok(gate) = std::env::var("TRELLIS_TEST_METRICS_WORK_GATE") {
-                            use std::io::Write;
-                            let gate = PathBuf::from(gate);
-                            if let Ok(mut started) = std::fs::OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open(gate.join("started"))
-                            {
-                                let _ = started.write_all(b"x");
-                            }
-                            while !gate.join("release").exists()
-                                && Instant::now() < request_deadline
-                            {
-                                std::thread::sleep(Duration::from_millis(20));
-                            }
-                        }
-                        #[cfg(feature = "test-support")]
-                        if let Ok(delay) = std::env::var("TRELLIS_TEST_METRICS_WORK_DELAY_MS")
-                            && let Ok(milliseconds) = delay.parse::<u64>()
-                        {
-                            std::thread::sleep(Duration::from_millis(milliseconds).min(
-                                request_deadline.saturating_duration_since(Instant::now())
-                                    + Duration::from_millis(100),
-                            ));
-                        }
-                    };
+        in_read_scope(read_scope, request_deadline, || {
+            loop {
+                // Recorded before the read: a state change between the read and
+                // the wait below is never missed.
+                let state_version = checkout.state_version();
+                let selected = match request.operation.as_str() {
+                    "status" => checkout.cli_status(),
                     #[cfg(feature = "test-support")]
-                    let mut delayed_parse = false;
-                    let mut on_progress = || {
-                        #[cfg(feature = "test-support")]
-                        if !delayed_parse
-                            && trellis::metrics::in_parser_progress_for_tests()
-                            && let Ok(delay) = std::env::var("TRELLIS_TEST_METRICS_PARSE_DELAY_MS")
-                            && let Ok(milliseconds) = delay.parse::<u64>()
-                        {
-                            delayed_parse = true;
-                            if let Ok(path) = std::env::var("TRELLIS_TEST_METRICS_PARSE_HIT_FILE") {
-                                let _ = std::fs::write(path, b"parse");
+                    "settled_for_tests" => (|| {
+                        let at: Option<trellis::model::IndexPin> =
+                            serde_json::from_value(args["at"].clone())
+                                .context("invalid_argument: at is not a revision")?;
+                        let pin = checkout.await_settled_for_tests(at)?;
+                        Ok(serde_json::json!({ "revision": pin }))
+                    })(),
+                    "producer_plan" => checkout.cli_producer_plan(args),
+                    "producer_status" => checkout.cli_producer_status(args),
+                    "producer_pickup" => checkout.cli_producer_pickup(args),
+                    "producer_run" => checkout.cli_producer_run(args),
+                    "producer_cancel" => checkout.cli_producer_cancel(args),
+                    "symbols" => checkout.cli_symbols(
+                        args["search"].as_str().context("missing search")?,
+                        args["limit"].as_u64().context("missing limit")? as usize,
+                    ),
+                    "query" => checkout.cli_query(&ViewQuery {
+                        seed: args["seed"].as_str().context("missing seed")?.into(),
+                        depth: args["depth"].as_u64().context("missing depth")? as usize,
+                        max_nodes: args["maxNodes"].as_u64().context("missing maxNodes")? as usize,
+                        max_calls: args["maxCalls"].as_u64().context("missing maxCalls")? as usize,
+                        include_callbacks: args["includeCallbacks"]
+                            .as_bool()
+                            .context("missing includeCallbacks")?,
+                        exclude_paths: serde_json::from_value(args["excludePaths"].clone())?,
+                        semantic_producer_id: serde_json::from_value(
+                            args.get("semanticProducerId").cloned().unwrap_or_default(),
+                        )
+                        .context("invalid_argument: semanticProducerId must be a string")?,
+                    }),
+                    "rules_check" | "references" => (|| {
+                        let kind = if request.operation == "references" {
+                            "references"
+                        } else {
+                            "check"
+                        };
+                        let mut check = || {
+                            ensure!(Instant::now() < request_deadline, "deadline_exceeded");
+                            Ok(())
+                        };
+                        // The owner finishes the first read after a publication; leave time to
+                        // answer. The wait comes before read admission, and again if the head
+                        // moved meanwhile.
+                        let (response, catching_up, result) = loop {
+                            let wait = request_deadline
+                                .saturating_duration_since(Instant::now())
+                                .saturating_sub(Duration::from_secs(1));
+                            checkout.await_architecture_tool(kind, args, wait, &mut check);
+                            let (response, catching_up) = checkout.evidence_response()?;
+                            let result =
+                                checkout.architecture_tool(&response, kind, args, &mut check);
+                            let building = result.as_ref().err().is_some_and(|error| {
+                                error
+                                    .downcast_ref::<trellis::http::ArchitectureBuilding>()
+                                    .is_some()
+                            });
+                            if !building || wait.is_zero() {
+                                break (response, catching_up, result);
                             }
-                            std::thread::sleep(Duration::from_millis(milliseconds).min(
-                                request_deadline.saturating_duration_since(Instant::now())
-                                    + Duration::from_millis(100),
-                            ));
+                            drop(response);
+                            std::thread::sleep(Duration::from_millis(1));
+                        };
+                        match result {
+                            Ok(payload) => {
+                                check()?;
+                                let value =
+                                    serde_json::json!({"catchingUp":catching_up,"payload":payload});
+                                ensure!(
+                                    serde_json::to_vec(&value)?.len() <= 64 * 1024 * 1024,
+                                    "response_too_large"
+                                );
+                                check()?;
+                                response.finish(value)
+                            }
+                            Err(error) => {
+                                if let Some(diagnostic) = trellis::rules::diagnostic(&error) {
+                                    response.finish(serde_json::json!({"catchingUp":catching_up,"error":diagnostic}))
+                                } else {
+                                    Err(error)
+                                }
+                            }
                         }
-                    };
-                    #[cfg(feature = "test-support")]
-                    let serialize_threshold =
-                        std::env::var("TRELLIS_TEST_METRICS_SERIALIZE_DELAY_AT_BYTES")
-                            .ok()
-                            .or_else(|| {
-                                std::env::var("TRELLIS_TEST_METRICS_SERIALIZE_DELAY_AT_BYTES_FILE")
+                    })(),
+                    "metrics" => {
+                        let options = metrics_options.as_ref().expect("metrics options validated");
+                        let mut before_work = || {
+                            #[cfg(feature = "test-support")]
+                            metrics_test_phase(b"W");
+                            #[cfg(feature = "test-support")]
+                            if let Ok(gate) = std::env::var("TRELLIS_TEST_METRICS_WORK_GATE") {
+                                use std::io::Write;
+                                let gate = PathBuf::from(gate);
+                                if let Ok(mut started) = std::fs::OpenOptions::new()
+                                    .create(true)
+                                    .append(true)
+                                    .open(gate.join("started"))
+                                {
+                                    let _ = started.write_all(b"x");
+                                }
+                                while !gate.join("release").exists()
+                                    && Instant::now() < request_deadline
+                                {
+                                    std::thread::sleep(Duration::from_millis(20));
+                                }
+                            }
+                            #[cfg(feature = "test-support")]
+                            if let Ok(delay) = std::env::var("TRELLIS_TEST_METRICS_WORK_DELAY_MS")
+                                && let Ok(milliseconds) = delay.parse::<u64>()
+                            {
+                                std::thread::sleep(Duration::from_millis(milliseconds).min(
+                                    request_deadline.saturating_duration_since(Instant::now())
+                                        + Duration::from_millis(100),
+                                ));
+                            }
+                        };
+                        #[cfg(feature = "test-support")]
+                        let mut delayed_parse = false;
+                        let mut on_progress = || {
+                            #[cfg(feature = "test-support")]
+                            if !delayed_parse
+                                && trellis::metrics::in_parser_progress_for_tests()
+                                && let Ok(delay) =
+                                    std::env::var("TRELLIS_TEST_METRICS_PARSE_DELAY_MS")
+                                && let Ok(milliseconds) = delay.parse::<u64>()
+                            {
+                                delayed_parse = true;
+                                if let Ok(path) =
+                                    std::env::var("TRELLIS_TEST_METRICS_PARSE_HIT_FILE")
+                                {
+                                    let _ = std::fs::write(path, b"parse");
+                                }
+                                std::thread::sleep(Duration::from_millis(milliseconds).min(
+                                    request_deadline.saturating_duration_since(Instant::now())
+                                        + Duration::from_millis(100),
+                                ));
+                            }
+                        };
+                        #[cfg(feature = "test-support")]
+                        let serialize_threshold =
+                            std::env::var("TRELLIS_TEST_METRICS_SERIALIZE_DELAY_AT_BYTES")
+                                .ok()
+                                .or_else(|| {
+                                    std::env::var(
+                                        "TRELLIS_TEST_METRICS_SERIALIZE_DELAY_AT_BYTES_FILE",
+                                    )
                                     .ok()
                                     .and_then(|path| std::fs::read_to_string(path).ok())
-                            })
-                            .and_then(|value| value.trim().parse::<usize>().ok());
-                    #[cfg(feature = "test-support")]
-                    let serialize_delay = std::env::var("TRELLIS_TEST_METRICS_SERIALIZE_DELAY_MS")
-                        .ok()
-                        .and_then(|value| value.parse::<u64>().ok());
-                    #[cfg(feature = "test-support")]
-                    let mut delayed_serialize = false;
-                    let mut on_write = |written: usize| {
+                                })
+                                .and_then(|value| value.trim().parse::<usize>().ok());
                         #[cfg(feature = "test-support")]
-                        if !delayed_serialize
-                            && serialize_threshold.is_some_and(|threshold| written >= threshold)
-                            && let Some(milliseconds) = serialize_delay
-                        {
-                            delayed_serialize = true;
-                            if let Ok(path) =
-                                std::env::var("TRELLIS_TEST_METRICS_SERIALIZE_HIT_FILE")
+                        let serialize_delay =
+                            std::env::var("TRELLIS_TEST_METRICS_SERIALIZE_DELAY_MS")
+                                .ok()
+                                .and_then(|value| value.parse::<u64>().ok());
+                        #[cfg(feature = "test-support")]
+                        let mut delayed_serialize = false;
+                        let mut on_write = |written: usize| {
+                            #[cfg(feature = "test-support")]
+                            if !delayed_serialize
+                                && serialize_threshold.is_some_and(|threshold| written >= threshold)
+                                && let Some(milliseconds) = serialize_delay
                             {
-                                let _ = std::fs::write(path, b"serialize");
-                            }
-                            std::thread::sleep(Duration::from_millis(milliseconds).min(
-                                request_deadline.saturating_duration_since(Instant::now())
-                                    + Duration::from_millis(100),
-                            ));
-                        }
-                        let _ = written;
-                    };
-                    #[cfg(feature = "test-support")]
-                    let limit = std::env::var("TRELLIS_TEST_METRICS_LIMIT_FILE")
-                        .ok()
-                        .and_then(|path| std::fs::read_to_string(path).ok())
-                        .and_then(|value| value.trim().parse::<usize>().ok())
-                        .unwrap_or(64 * 1024 * 1024)
-                        .min(64 * 1024 * 1024);
-                    #[cfg(not(feature = "test-support"))]
-                    let limit = 64 * 1024 * 1024;
-                    // Errors become `selected`, so typed contention reaches the
-                    // shared bounded retry below instead of returning (#687).
-                    (|| {
-                        let (body, _) = checkout.metrics_response(
-                            options,
-                            &mut || {
-                                if Instant::now() >= request_deadline {
-                                    anyhow::bail!("deadline_exceeded");
+                                delayed_serialize = true;
+                                if let Ok(path) =
+                                    std::env::var("TRELLIS_TEST_METRICS_SERIALIZE_HIT_FILE")
+                                {
+                                    let _ = std::fs::write(path, b"serialize");
                                 }
-                                Ok(())
-                            },
-                            registry::MetricsResponseHooks {
-                                before_work: &mut before_work,
-                                before_finish: &mut || {},
-                                after_finish: &mut || {},
-                                on_write: &mut on_write,
-                                on_progress: &mut on_progress,
-                            },
-                            limit,
-                        )?;
-                        let value = serde_json::from_slice(&body)?;
-                        if Instant::now() >= request_deadline {
-                            anyhow::bail!("deadline_exceeded");
+                                std::thread::sleep(Duration::from_millis(milliseconds).min(
+                                    request_deadline.saturating_duration_since(Instant::now())
+                                        + Duration::from_millis(100),
+                                ));
+                            }
+                            let _ = written;
+                        };
+                        #[cfg(feature = "test-support")]
+                        let limit = std::env::var("TRELLIS_TEST_METRICS_LIMIT_FILE")
+                            .ok()
+                            .and_then(|path| std::fs::read_to_string(path).ok())
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .unwrap_or(64 * 1024 * 1024)
+                            .min(64 * 1024 * 1024);
+                        #[cfg(not(feature = "test-support"))]
+                        let limit = 64 * 1024 * 1024;
+                        // Errors become `selected`, so typed contention reaches the
+                        // shared bounded retry below instead of returning (#687).
+                        (|| {
+                            let (body, _) = checkout.metrics_response(
+                                options,
+                                &mut || {
+                                    if Instant::now() >= request_deadline {
+                                        anyhow::bail!("deadline_exceeded");
+                                    }
+                                    Ok(())
+                                },
+                                registry::MetricsResponseHooks {
+                                    before_work: &mut before_work,
+                                    before_finish: &mut || {},
+                                    after_finish: &mut || {},
+                                    on_write: &mut on_write,
+                                    on_progress: &mut on_progress,
+                                },
+                                limit,
+                            )?;
+                            let value = serde_json::from_slice(&body)?;
+                            if Instant::now() >= request_deadline {
+                                anyhow::bail!("deadline_exceeded");
+                            }
+                            Ok(value)
+                        })()
+                    }
+                    "index" => {
+                        ensure!(
+                            args.as_object().is_some_and(|values| values
+                                .keys()
+                                .all(|key| matches!(key.as_str(), "workspace" | "maxFileBytes"))),
+                            "invalid_request: unknown index option"
+                        );
+                        let mut options = IndexOptions::new(identity.root.clone());
+                        if let Some(value) = args.get("maxFileBytes") {
+                            options.max_file_bytes =
+                                value.as_u64().context("invalid maxFileBytes")?;
                         }
-                        Ok(value)
-                    })()
-                }
-                "index" => {
-                    ensure!(
-                        args.as_object().is_some_and(|values| values
-                            .keys()
-                            .all(|key| matches!(key.as_str(), "workspace" | "maxFileBytes"))),
-                        "invalid_request: unknown index option"
-                    );
-                    let mut options = IndexOptions::new(identity.root.clone());
-                    if let Some(value) = args.get("maxFileBytes") {
-                        options.max_file_bytes = value.as_u64().context("invalid maxFileBytes")?;
+                        ensure!(
+                            (1..=16_777_216).contains(&options.max_file_bytes),
+                            "max-file-bytes must be 1..16777216"
+                        );
+                        #[cfg(feature = "test-support")]
+                        if let Some(path) =
+                            std::env::var_os("TRELLIS_TEST_DAEMON_INDEX_CLAIM_SOCKET")
+                        {
+                            checkout.set_after_claim_hook_for_tests(move || {
+                                use std::io::{Read, Write};
+                                let mut hook = std::os::unix::net::UnixStream::connect(path)
+                                    .expect("connect accepted index fixture");
+                                hook.set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+                                    .unwrap();
+                                hook.write_all(b"C").unwrap();
+                                hook.read_exact(&mut [0]).unwrap();
+                            });
+                        }
+                        checkout.cli_index(&options)
                     }
-                    ensure!(
-                        (1..=16_777_216).contains(&options.max_file_bytes),
-                        "max-file-bytes must be 1..16777216"
-                    );
-                    #[cfg(feature = "test-support")]
-                    if let Some(path) = std::env::var_os("TRELLIS_TEST_DAEMON_INDEX_CLAIM_SOCKET") {
-                        checkout.set_after_claim_hook_for_tests(move || {
-                            use std::io::{Read, Write};
-                            let mut hook = std::os::unix::net::UnixStream::connect(path)
-                                .expect("connect accepted index fixture");
-                            hook.set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
-                                .unwrap();
-                            hook.write_all(b"C").unwrap();
-                            hook.read_exact(&mut [0]).unwrap();
-                        });
+                    "semantic_import" => {
+                        let options: trellis::store::requests::SemanticImportOptions =
+                            serde_json::from_value(args.clone()).map_err(|_| {
+                                anyhow::anyhow!("invalid_request: semantic import options")
+                            })?;
+                        checkout.cli_semantic_import(&options)
                     }
-                    checkout.cli_index(&options)
+                    _ => anyhow::bail!("unknown daemon operation"),
+                };
+                // A peer's exclusive index-use lock (a restarted daemon's startup
+                // probe or recovery stage, or another process) refuses the read
+                // with typed contention (#687). It publishes no in-process signal,
+                // so wait out this bounded external contention like activation
+                // above, then report typed expiry. Only read-only calls repeat.
+                if replayable_read
+                    && selected
+                        .as_ref()
+                        .err()
+                        .is_some_and(trellis::store::cli_read_retryable_contention)
+                {
+                    if Instant::now() >= deadline {
+                        break Err(trellis::store::cli_read_busy_expired());
+                    }
+                    #[cfg(all(feature = "test-support", unix))]
+                    if let Some(path) = contention_fixture.take() {
+                        use std::io::Write;
+                        let mut signal = std::os::unix::net::UnixStream::connect(path)
+                            .expect("connect CLI read contention fixture");
+                        signal
+                            .write_all(b"B")
+                            .expect("report CLI read contention wait");
+                    }
+                    std::thread::sleep(
+                        Duration::from_millis(20)
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    );
+                    continue;
                 }
-                "semantic_import" => {
-                    let options: trellis::store::requests::SemanticImportOptions =
-                        serde_json::from_value(args.clone()).map_err(|_| {
-                            anyhow::anyhow!("invalid_request: semantic import options")
-                        })?;
-                    checkout.cli_semantic_import(&options)
+                // Mandatory startup reconciliation may be running when a CLI read first attaches.
+                // This only repeats read-only calls; index is never replayed.
+                if replayable_read
+                    && selected
+                        .as_ref()
+                        .err()
+                        .is_some_and(|error| error.to_string().starts_with("index_not_ready:"))
+                    && Instant::now() < deadline
+                {
+                    #[cfg(all(feature = "test-support", unix))]
+                    if let Ok(path) = std::env::var("TRELLIS_TEST_CLI_READ_WAIT_SOCKET") {
+                        use std::io::Write;
+                        let mut signal = std::os::unix::net::UnixStream::connect(path)
+                            .expect("connect CLI startup read fixture");
+                        signal
+                            .write_all(b"W")
+                            .expect("report CLI startup read wait");
+                    }
+                    // Wait for startup reconciliation to progress, not a poll (#138
+                    // item 16).
+                    checkout.wait_state_change(
+                        state_version,
+                        deadline.saturating_duration_since(Instant::now()),
+                    );
+                    continue;
                 }
-                _ => anyhow::bail!("unknown daemon operation"),
-            };
-            // A peer's exclusive index-use lock (a restarted daemon's startup
-            // probe or recovery stage, or another process) refuses the read
-            // with typed contention (#687). It publishes no in-process signal,
-            // so wait out this bounded external contention like activation
-            // above, then report typed expiry. Only read-only calls repeat.
-            if replayable_read
-                && selected
-                    .as_ref()
-                    .err()
-                    .is_some_and(trellis::store::cli_read_retryable_contention)
-            {
-                if Instant::now() >= deadline {
-                    break Err(trellis::store::cli_read_busy_expired());
-                }
-                #[cfg(all(feature = "test-support", unix))]
-                if let Some(path) = contention_fixture.take() {
-                    use std::io::Write;
-                    let mut signal = std::os::unix::net::UnixStream::connect(path)
-                        .expect("connect CLI read contention fixture");
-                    signal
-                        .write_all(b"B")
-                        .expect("report CLI read contention wait");
-                }
-                std::thread::sleep(
-                    Duration::from_millis(20)
-                        .min(deadline.saturating_duration_since(Instant::now())),
-                );
-                continue;
+                break selected;
             }
-            // Mandatory startup reconciliation may be running when a CLI read first attaches.
-            // This only repeats read-only calls; index is never replayed.
-            if replayable_read
-                && selected
-                    .as_ref()
-                    .err()
-                    .is_some_and(|error| error.to_string().starts_with("index_not_ready:"))
-                && Instant::now() < deadline
-            {
-                #[cfg(all(feature = "test-support", unix))]
-                if let Ok(path) = std::env::var("TRELLIS_TEST_CLI_READ_WAIT_SOCKET") {
-                    use std::io::Write;
-                    let mut signal = std::os::unix::net::UnixStream::connect(path)
-                        .expect("connect CLI startup read fixture");
-                    signal
-                        .write_all(b"W")
-                        .expect("report CLI startup read wait");
-                }
-                // Wait for startup reconciliation to progress, not a poll (#138
-                // item 16).
-                checkout.wait_state_change(
-                    state_version,
-                    deadline.saturating_duration_since(Instant::now()),
-                );
-                continue;
-            }
-            break selected;
-        }
+        })
     };
-    let result = if read_scope {
-        trellis::store::with_read_deadline(request_deadline, run)
-    } else {
-        run()
-    };
+    let result = run();
+    let request_deadline = answered_deadline.get();
     if !serve {
         runtime.block_on(async { registry.lock().await.disconnect(session) });
     }
@@ -2923,6 +2989,91 @@ fn dispatch_connection(
         wait_for_serve_disconnect(stream, browser_shutdown.subscribe(), &runtime)?;
     }
     Ok(())
+}
+
+/// Run `read` under one read deadline (#142) when `scoped`.
+fn in_read_scope<T>(scoped: bool, deadline: Instant, read: impl FnOnce() -> T) -> T {
+    if scoped {
+        trellis::store::with_read_deadline(deadline, read)
+    } else {
+        read()
+    }
+}
+
+/// A CLI read of a just-activated checkout with no admitted head waits for the
+/// first validated head, on the runtime's state signal, up to
+/// `cli_first_index_wait` (#842, owner ruling 2026-11-09). It reports progress
+/// to the client meanwhile. A prior valid head answers at once, as MCP does,
+/// and any failure other than `index_not_ready` is left to the read to report.
+/// With no head, a blocked startup recovery ends the wait with its
+/// `recovery_blocked` cause.
+/// Returns whether it waited. On expiry, fails `index_not_ready`; the daemon
+/// keeps indexing.
+fn await_first_head(
+    checkout: &registry::CheckoutRuntime,
+    probe_budget: Duration,
+    progress: &mut dyn FnMut(String),
+) -> Result<bool> {
+    let started = Instant::now();
+    let deadline = started + cli_first_index_wait();
+    let mut reported: Option<Instant> = None;
+    loop {
+        // Recorded before the probe, so a publication after it is never missed.
+        let seen = checkout.state_version();
+        // An eligible head answers first, whatever startup recovery says
+        // (T03, Decision 0009 "Reconciling").
+        let probe = trellis::store::with_read_deadline(Instant::now() + probe_budget, || {
+            checkout.evidence_response().map(drop)
+        });
+        if !probe
+            .as_ref()
+            .is_err_and(|error| error.to_string().starts_with("index_not_ready:"))
+        {
+            return Ok(reported.is_some());
+        }
+        // With no head, a blocked startup recovery will publish none: end the
+        // wait with its typed cause, the one `status` reports (#768). Checked
+        // on every wake.
+        if let Some(blocker) = checkout.recovery_blocker() {
+            anyhow::bail!("{blocker}");
+        }
+        #[cfg(all(feature = "test-support", unix))]
+        if reported.is_none()
+            && let Ok(path) = std::env::var("TRELLIS_TEST_CLI_READ_WAIT_SOCKET")
+        {
+            use std::io::Write;
+            let mut signal = std::os::unix::net::UnixStream::connect(path)
+                .expect("connect CLI startup read fixture");
+            signal
+                .write_all(b"W")
+                .expect("report CLI startup read wait");
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            anyhow::bail!(
+                "index_not_ready: the first index of this checkout is still running; \
+                 indexing continues in the daemon, retry shortly"
+            );
+        }
+        let last = match reported {
+            Some(at) if now.duration_since(at) < CLI_FIRST_INDEX_PROGRESS => at,
+            _ => {
+                progress(format!(
+                    "trellis: indexing this checkout ({}s elapsed, waiting up to {}s)",
+                    now.duration_since(started).as_secs(),
+                    deadline.duration_since(started).as_secs()
+                ));
+                reported = Some(now);
+                now
+            }
+        };
+        checkout.wait_state_change(
+            seen,
+            deadline
+                .min(last + CLI_FIRST_INDEX_PROGRESS)
+                .saturating_duration_since(now),
+        );
+    }
 }
 
 /// Reads one request from an accepted connection, and whether it was

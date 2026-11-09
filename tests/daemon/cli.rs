@@ -179,13 +179,13 @@ fn connected_peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
 }
 
 /// Test-scope guard for only the daemon elected under this disposable HOME.
-struct FixtureDaemon(std::path::PathBuf, std::cell::Cell<bool>);
+pub(crate) struct FixtureDaemon(std::path::PathBuf, std::cell::Cell<bool>);
 impl FixtureDaemon {
-    fn new(home: &std::path::Path) -> Self {
+    pub(crate) fn new(home: &std::path::Path) -> Self {
         Self(home.to_path_buf(), std::cell::Cell::new(false))
     }
 
-    fn stop_attested(&self) -> Result<(), &'static str> {
+    pub(crate) fn stop_attested(&self) -> Result<(), &'static str> {
         // Explicit calls may retire a restarted fixture. Drop must not discover one.
         self.1.set(true);
         let marker = self.0.join("auto-daemon.pid");
@@ -251,7 +251,7 @@ impl Drop for FixtureDaemon {
     }
 }
 
-fn isolated_command(home: &std::path::Path) -> Command {
+pub(crate) fn isolated_command(home: &std::path::Path) -> Command {
     let mut cmd = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")));
     // ProjectDirs uses inherited XDG roots before HOME on Linux.
     cmd.env("HOME", home)
@@ -260,7 +260,7 @@ fn isolated_command(home: &std::path::Path) -> Command {
     cmd
 }
 
-fn command(root: &std::path::Path, state: &std::path::Path, sub: &str) -> Command {
+pub(crate) fn command(root: &std::path::Path, state: &std::path::Path, sub: &str) -> Command {
     let mut c = isolated_command(state);
     // Selected graph oracles must first stop the daemon they would otherwise
     // compete with; record its test-scoped identity for an attested stop.
@@ -1851,7 +1851,7 @@ fn selected_graph(root: &std::path::Path, home: &std::path::Path) -> Value {
 }
 
 // Read the normalized publication, including every native row, from the real daemon's database.
-fn real_index_db(home: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn real_index_db(home: &std::path::Path) -> std::path::PathBuf {
     fn find(dir: &std::path::Path) -> Option<std::path::PathBuf> {
         for entry in fs::read_dir(dir).ok()?.flatten() {
             let path = entry.path();

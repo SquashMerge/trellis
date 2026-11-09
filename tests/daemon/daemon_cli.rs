@@ -853,9 +853,11 @@ fn status_when_ready(
             output.stdout.is_empty(),
             "failed status emitted partial output"
         );
-        assert_eq!(
-            stderr.trim(),
-            "Error: index_not_ready: reindex required",
+        // The daemon's first-head wait (#842) is zero here, so a cold
+        // status fails at once with its typed expiry.
+        assert!(
+            stderr.trim().starts_with("Error: index_not_ready: ")
+                && stderr.contains("indexing continues in the daemon, retry"),
             "unexpected status failure on attempt {attempts}: {stderr}",
         );
         if let Some(release) = on_first_not_ready.take() {
@@ -1022,7 +1024,8 @@ fn daemon_keeps_private_socket_after_transient_accept_errors() {
         command
             .arg("daemon")
             .env("TRELLIS_TEST_DAEMON_ACCEPT_ERROR_ONCE", fault)
-            .env("TRELLIS_TEST_DAEMON_STARTUP_SOCKET", &startup_path);
+            .env("TRELLIS_TEST_DAEMON_STARTUP_SOCKET", &startup_path)
+            .env("TRELLIS_TEST_CLI_FIRST_INDEX_WAIT_MS", "0");
         let mut owner = detached(command);
         let socket = fixture_socket_paths(&home).socket;
         let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
