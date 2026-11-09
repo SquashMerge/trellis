@@ -120,3 +120,15 @@ test("AC26: a long label wraps to at most twelve lines, keeps its full accessibl
   assert.ok(store.display[11].endsWith("…"));assert.ok(store.full.startsWith(long));
   assert.ok([...p.nodes.values()].some(n=>n.kind==="B"&&n.full==="web · ordered layers"));
 });
+test("AC26: a label within the twelve-line cap wraps whole, with nothing dropped and the full accessible name",()=>{
+  const {adapter}=setup(), view=fixture(), label="src/web_app/layer_name-with.separators/".repeat(4).slice(0,120);
+  assert.equal(label.length,120);
+  const display={layers:new Set(view.layers.map(l=>l.name)),expanded:()=>false,edge:()=>true,unassigned:null,entries:()=>[]};
+  const p=adapter.project(view,{display,measureText:text=>Array.from(text).length*7,layerLabel:layer=>layer.name==="Store"?`${label}\nOrder 1`:`${layer.name}\nOrder ${layer.order}`});
+  const store=[...p.nodes.values()].find(n=>n.kind==="L"&&n.record.name==="Store");
+  const lines=store.display.slice(0,-1);
+  assert.ok(lines.length>1&&lines.length<=12);
+  assert.ok(lines.every(line=>!line.includes("…")));
+  assert.equal(lines.join(""),label);
+  assert.equal(store.full,`${label}\nOrder 1`);
+});
