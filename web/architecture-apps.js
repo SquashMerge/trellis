@@ -66,6 +66,94 @@
     }
     return found;
   }
+
+  // ---- All apps (#790): pure layout, card text and overlay routing. The controller draws and measures. ----
+  const COLUMN_MIN = 352, GUTTER = 176, ARROW = 8, LANE_TOP = 8, LANE_STEP = 6;
+  const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+  // Columns sit side by side when they all fit at their least width with a gutter between each; else they stack.
+  // `natural` is each drawing's own measured width: a column never narrows below it, and whatever then
+  // overflows the pane scrolls.
+  function layout({width, count, natural = []}) {
+    const n = Number.isSafeInteger(count) && count > 0 ? count : 1, wide = Number.isFinite(width) ? width : 0;
+    const sideBySide = n > 1 && wide >= n * COLUMN_MIN + (n - 1) * GUTTER;
+    const base = sideBySide ? Math.floor((wide - (n - 1) * GUTTER) / n) : Math.max(COLUMN_MIN, Math.floor(wide));
+    const widths = Array.from({length:n}, (_, index) => Math.max(base, Number.isFinite(natural[index]) ? natural[index] : 0));
+    if (!sideBySide) { const all = Math.max(...widths); return {sideBySide, gutter:GUTTER, count:n, widths:widths.map(() => all), columns:widths.map(() => ({x:0, width:all})), width:all}; }
+    let x = 0;
+    const columns = widths.map(each => { const column = {x, width:each}; x += each + GUTTER; return column; });
+    return {sideBySide, gutter:GUTTER, count:n, widths, columns, width:x - GUTTER};
+  }
+  // Non-zero evidence counts of the call sites, as the DTO reports them.
+  function confidenceText(counts) {
+    const confidence = record(counts?.confidence) ? counts.confidence : {};
+    return [["exact", "exact"], ["template", "template"], ["wrapperInferred", "wrapper-inferred"], ["unresolved", "unresolved"]]
+      .filter(([key]) => count(confidence[key]) > 0).map(([key, word]) => `${count(confidence[key])} ${word}`).join(" · ");
+  }
+  const layerNames = (entry, key) => {
+    const names = unique((Array.isArray(entry?.ends) ? entry.ends : []).filter(record).map(end => typeof end[key] === "string" ? end[key] : "no layer"));
+    return names.length ? names.join(", ") : "no layer";
+  };
+  // The card's visible lines: every number is the DTO's, never recounted from sites.
+  function cardText(entry) {
+    const counts = record(entry?.counts) ? entry.counts : {}, lines = [{text:`HTTP · ${plural(count(counts.matchedRoutes), "route")}`, strong:true},
+      {text:plural(count(counts.callSites), "call site")}];
+    const confidence = confidenceText(counts);
+    if (confidence) lines.push({text:confidence});
+    if (count(counts.serverOnly)) lines.push({text:`◆ ${count(counts.serverOnly)} server-only`, tone:"warning"});
+    if (count(counts.clientOnly)) lines.push({text:`◆ ${count(counts.clientOnly)} client-only`, tone:"warning"});
+    return lines;
+  }
+  // The card's full accessible name, a sentence that ends in Selected while it is selected.
+  function cardName(entry, selected = false) {
+    const counts = record(entry?.counts) ? entry.counts : {}, confidence = confidenceText(counts);
+    return `HTTP interface from ${entry.client} layer ${layerNames(entry, "clientLayer")} to ${entry.server} layer ${layerNames(entry, "serverLayer")}: ` +
+      `${plural(count(counts.matchedRoutes), "matched route")}, ${plural(count(counts.callSites), "client call site")}, ` +
+      `${plural(count(counts.serverOnly), "server-only route")}, ${plural(count(counts.clientOnly), "client-only call")}` +
+      `${confidence ? `; evidence ${confidence}` : ""}${selected ? ". Selected" : ""}`;
+  }
+  // One line per end for the ends no line can show: both apps and layers, in words.
+  const endsText = (entry, ends = endsOf(entry)) => ends.map(end =>
+    `${entry.client} · ${typeof end.clientLayer === "string" ? end.clientLayer : "no layer"} → ${entry.server} · ${typeof end.serverLayer === "string" ? end.serverLayer : "no layer"}`);
+  // A column header's two lines. `layered` false: the app has no ordered layer, so it says so.
+  function header(item, {max, metric, layered}) {
+    const deviates = count(item.counts?.deviates), parts = [item.languages.join(", ") || "no languages", item.roots.map(root => root || "./").join(", ") || "no roots", plural(item.fileCount, "file")];
+    if (!layered) return {name:item.name, detail:"no layers yet", deviations:null, manifests:item.duplicate ? manifestList(item) : null};
+    if (max) parts.push(`${max} (${metric})`);
+    return {name:item.name, detail:parts.join(" · "), deviations:`${plural(deviates, "deviation")}`, manifests:item.duplicate ? manifestList(item) : null};
+  }
+  // Orthogonal lines for the ends that run between adjacent side-by-side columns. `columns` maps an app name to its
+  // column index and its bands' frames, already in the grid's coordinates. Each end has its own lane in its
+  // gutter; an end whose layer is not a drawn band gets no line and is left to the card's words.
+  function routes(view, plan, columns, edgeWidth) {
+    const placed = [], lanes = new Map();
+    const entries = (Array.isArray(view?.interfaces) ? view.interfaces : []).filter(record);
+    if (!plan.sideBySide) return {lines:[], undrawn:new Map(entries.map(entry => [entry, endsOf(entry)]))};
+    const undrawn = new Map();
+    for (const entry of entries) {
+      const client = columns.get(entry.client), server = columns.get(entry.server), gone = [];
+      for (const end of endsOf(entry)) {
+        const from = client?.bands.get(end.clientLayer), to = server?.bands.get(end.serverLayer);
+        if (!client || !server || Math.abs(client.index - server.index) !== 1 || !from || !to) { gone.push(end); continue; }
+        const gutter = Math.min(client.index, server.index);
+        placed.push({entry, end, from, to, gutter, rightward:client.index < server.index});
+        lanes.set(gutter, (lanes.get(gutter) || 0) + 1);
+      }
+      undrawn.set(entry, gone);
+    }
+    const used = new Map(), lines = placed.map(item => {
+      const slot = used.get(item.gutter) || 0; used.set(item.gutter, slot + 1);
+      const left = plan.columns[item.gutter].x + plan.columns[item.gutter].width, laneX = left + Math.round(plan.gutter * (slot + 1) / (lanes.get(item.gutter) + 1));
+      const y0 = Math.min(item.from.y + item.from.h - 4, item.from.y + LANE_TOP + LANE_STEP * slot);
+      const y1 = Math.min(item.to.y + item.to.h - 4, item.to.y + LANE_TOP + LANE_STEP * slot);
+      const x0 = item.rightward ? item.from.x + item.from.w : item.from.x, x1 = item.rightward ? item.to.x : item.to.x + item.to.w, d = item.rightward ? 1 : -1;
+      return {entry:item.entry, gutter:item.gutter, laneX, width:edgeWidth(count(item.end.callSites)),
+        path:`M${x0},${y0} L${laneX},${y0} L${laneX},${y1} L${x1 - d * ARROW},${y1}`,
+        arrow:`${x1},${y1} ${x1 - d * ARROW},${y1 - ARROW / 2} ${x1 - d * ARROW},${y1 + ARROW / 2}`, y:(y0 + y1) / 2};
+    });
+    return {lines, undrawn};
+  }
+  const endsOf = entry => (Array.isArray(entry?.ends) ? entry.ends : []).filter(record);
+  const key = entry => JSON.stringify(["interface", entry.client, entry.server]);
   const label = item => item.languages.length ? `${item.name} · ${item.languages.join(", ")}` : item.name;
   const manifestList = item => item.manifests.join(", ");
   const rootList = item => item.roots.map(root => root || "./").join(", ");
@@ -76,5 +164,6 @@
   }
   const duplicateNotice = item =>
     `${item.apps.length} detected apps share the name ${item.name} (${manifestList(item)}). A layer cannot name them; rules.md Amendment (#783).`;
-  window.TrellisArchitectureApps = {groups, group, scoped, link, stubs, sumCounts, label, sourceLine, duplicateNotice};
+  window.TrellisArchitectureApps = {groups, group, scoped, link, stubs, sumCounts, label, sourceLine, duplicateNotice,
+    layout, confidenceText, cardText, cardName, endsText, header, routes, key};
 })();

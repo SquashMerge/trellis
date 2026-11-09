@@ -120,3 +120,33 @@
 .architecture-mono { font-family: var(--mono); overflow-wrap: anywhere; }
 .architecture-endpoints { overflow-wrap: anywhere; }
 .architecture-open-endpoints { min-height: 44px; background: var(--primary); color: var(--sm-ink); }
+
+/* #790: All apps. One column per app, the interface cards in the 176px gutters, an overlay of lines behind them.
+   Text wraps and never clips; whatever does not fit scrolls the diagram. */
+.architecture-apps-grid { position: relative; display: grid; align-items: start; row-gap: var(--sp-3); }
+.architecture-app-column { min-width: 0; }
+.architecture-app-header, .architecture-interface-card, .architecture-aside-box {
+  display: flex; flex-direction: column; align-items: flex-start; gap: var(--sp-1); box-sizing: border-box; width: 100%; text-align: left;
+  white-space: normal; overflow-wrap: anywhere; font: var(--type-label) var(--sans); border-radius: var(--radius-card); background: var(--surface);
+}
+.architecture-app-name { font-weight: 600; }
+.architecture-app-line, .architecture-card-ends { font: var(--type-caption) var(--sans); color: var(--secondary); }
+.architecture-aside-box[data-tone="warning"], .architecture-card-line[data-tone="warning"] { color: var(--warning); }
+.architecture-app-line [data-tone="error"] { color: var(--error); }
+.architecture-card-line[data-strong="true"] { font-weight: 600; }
+.architecture-app-stack { margin-top: var(--sp-2); min-width: 0; }
+.architecture-interface-card { z-index: 1; margin: 0; }
+.architecture-interface-card[data-gutter="true"] { position: absolute; }
+.architecture-app-header:focus-visible, .architecture-interface-card:focus-visible, .architecture-aside-box:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
+.architecture-app-header .architecture-selected-tag, .architecture-interface-card .architecture-selected-tag { display: none; padding: 0 var(--sp-2); border: 1px solid currentColor; border-radius: var(--radius-detail); font: var(--type-caption) var(--sans); }
+.architecture-app-header[aria-pressed="true"] .architecture-selected-tag, .architecture-interface-card[aria-pressed="true"] .architecture-selected-tag { display: inline-block; }
+.architecture-apps-overlay { position: absolute; top: 0; left: 0; z-index: 0; pointer-events: none; overflow: visible; }
+.architecture-apps-line { fill: none; stroke: var(--line-strong); }
+.architecture-apps-arrow { fill: var(--line-strong); stroke: none; }
+.architecture-apps-line[data-selected="true"] { stroke: var(--link); }
+.architecture-apps-arrow[data-selected="true"] { fill: var(--link); }
+.architecture-apps-aside, .architecture-apps-cards { display: flex; flex-wrap: wrap; gap: var(--sp-3); margin-top: var(--sp-3); }
+.architecture-aside-box { width: auto; max-width: 100%; }
+.architecture-aside-box[data-kind="hidden"] { border: 1px dashed var(--line-strong); }
+.architecture-aside-box[data-kind="unassigned"] { border: 1px solid var(--warning); }
+.architecture-apps-cards .architecture-interface-card { width: 176px; }

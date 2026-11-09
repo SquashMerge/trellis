@@ -68,7 +68,8 @@ function harness() {
   function node(tagName) {
     return {tagName,textContent:"",children:[],dataset:{},attrs:{},listeners:{},hidden:false,value:"",checked:false,
       append(...items) {this.children.push(...items);},replaceChildren(...items) {this.children = [...items];this.textContent="";},
-      setAttribute(key,value) {this.attrs[key]=String(value);},focus() {},
+      setAttribute(key,value) {this.attrs[key]=String(value);},focus() {},style:{},
+      after(...items) {this.following = [...(this.following || []), ...items];},
       addEventListener(name,fn) {(this.listeners[name] ||= []).push(fn);},
       async fire(name) {for (const fn of this.listeners[name] || []) await fn({target:this});}};
   }
@@ -1491,7 +1492,7 @@ test("AC8 the app switcher appears only with two or more apps, as a labelled gro
   assert.deepEqual(appButtons(h), ["All apps", "web · javascript", "daemon · rust", "scripts · javascript"], "no tooling chip");
   assert.deepEqual(pressedApps(h), ["All apps"]);
   assert.match(text(h.get("architecture-source-line")).trim(), /^3 apps · hidden layers and unassigned files grouped below$/);
-  assert.equal(h.renders.at(-1).options.title, undefined, "All apps keeps the existing stack title");
+  assert.deepEqual(h.renders.map(render => render.options.title), ["web · ordered layers", "daemon · ordered layers"], "All apps draws one column per app that has layers");
 });
 
 test("AC9/AC11 choosing an app draws only its slice of the held snapshot and never reads", async () => {
@@ -1509,8 +1510,9 @@ test("AC9/AC11 choosing an app draws only its slice of the held snapshot and nev
   assert.match(h.get("architecture-summary").textContent, /^2 file modules · 0 production/);
   await chooseApp(h, "daemon · rust");
   assert.deepEqual([...h.renders.at(-1).view.layers].map(layer => layer.name), ["Storage", "Common", "Only"]);
+  const before = h.renders.length;
   await chooseApp(h, "All apps");
-  assert.equal(h.renders.at(-1).options.title, undefined); assert.equal(h.renders.at(-1).view.layers.length, 4);
+  assert.deepEqual(h.renders.slice(before).map(render => render.options.title), ["web · ordered layers", "daemon · ordered layers"]);
   assert.equal(h.calls.length, 1);
 });
 
@@ -1568,7 +1570,7 @@ test("AC14 reopen redraws the held snapshot without a read; a changed basis read
   assert.equal(h.get("architecture-diagram").children.length, 0); assert.equal(first.options.isCurrent(), false, "a drawing from before the suspend is stale");
   first.options.onSelectModule(first.view.modules[0]); assert.equal(h.get("architecture-inspector").hidden, true);
   await h.controller.reopen();
-  assert.equal(h.calls.length, 1, "nothing changed: no read"); assert.equal(h.renders.length, 3);
+  assert.equal(h.calls.length, 1, "nothing changed: no read"); assert.equal(h.renders.length, 4);
   assert.equal(h.renders.at(-1).options.title, "web · ordered layers", "the scope survives the held snapshot");
   assert.equal(h.get("architecture-state").dataset.state, "ready");
   assert.equal(h.renders.at(-1).options.isCurrent(), true);
@@ -1589,7 +1591,7 @@ test("a suspend while a read is in flight discards the late answer, and a reopen
   pending.resolve({payload:appsFixture()}); await reading;
   assert.equal(h.renders.length, 0, "the late answer is stale");
   h.setResponse(async () => ({payload:appsFixture()})); await h.controller.reopen();
-  assert.equal(h.calls.length, 2); assert.equal(h.renders.length, 1);
+  assert.equal(h.calls.length, 2); assert.equal(h.renders.length, 2, "one drawing per app column");
 });
 
 test("a late scope render never paints over a newer choice", async () => {
@@ -1669,9 +1671,11 @@ const plainStats = stats => JSON.parse(JSON.stringify(stats));
 const inspectorParagraphs = h => descendants(h.get("architecture-inspector-content")).filter(item => item.tagName === "p").map(item => item.textContent);
 const treeChips = h => h.get("architecture-deviations-edges").children;
 
-test("AC15 stubs come from ends: a client end names the server, a server end the client, and only in a one-app stack", async () => {
+test("AC15 stubs come from ends: a client end names the server, a server end the client, in every column and in a one-app stack", async () => {
   const h = harness(); h.setResponse(async () => ({payload:interfacesFixture()})); await h.controller.refresh();
-  assert.deepEqual(plainStats(statsOf(h, "UI")).filter(stat => stat.key === "interface"), [], "All apps has no stubs until its columns");
+  const column = name => h.renders.find(render => render.options.title === `${name} · ordered layers`);
+  assert.equal(plainStats(statsOf(h, "UI", column("web"))).find(stat => stat.key === "interface").text, "→ daemon · 3 routes · 5 call sites", "each All apps column carries its app's stubs");
+  assert.equal(plainStats(statsOf(h, "Storage", column("daemon"))).find(stat => stat.key === "interface").text, "← web · ≥3 routes");
   await chooseApp(h, "web · javascript");
   const [stub] = plainStats(statsOf(h, "UI"));
   assert.equal(stub.text, "→ daemon · 3 routes · 5 call sites", "the end with no layer has no band, so it adds nothing");
@@ -1824,11 +1828,11 @@ test("an inspector open while the scope or the revision changes never fills with
 });
 
 test("a late Deviations read for a badge never paints after the scope changed", async () => {
-  const h = harness(), dto = interfacesFixture(); dto.edges = [edge("Storage","UI",5,"deviates")];
+  const h = harness(), dto = interfacesFixture(); dto.edges = [edge("Storage","Common",5,"deviates")];
   h.setResponse(async () => ({payload:dto})); await h.controller.refresh();
   const gate = deferred(); h.setDetailGate(gate.promise);
-  h.renders.at(-1).options.onOpenDeviation({sourceLayer:"Storage", destinationLayer:"UI"}); await flush();
-  await chooseApp(h, "daemon · rust");
+  h.renders.at(-1).options.onOpenDeviation({sourceLayer:"Storage", destinationLayer:"Common"}); await flush();
+  await chooseApp(h, "web · javascript");
   gate.resolve(); h.setDetailGate(null); await flush(); await flush();
   assert.equal(h.get("architecture-deviations").hidden, true, "the scope change closed the tree and the late pages found nobody");
   assert.equal(h.get("architecture-deviations").children.length, 0);
