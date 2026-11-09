@@ -626,3 +626,73 @@ fn the_project_override_wins() {
     assert!(error.starts_with(CONFIG_UNRESOLVED), "{error}");
     assert!(error.contains("no root tsconfig.json"), "{error}");
 }
+
+/// #822 review: an explicit `--ts-project` leaves the root config it does not use out of the
+/// worktree, so an unused one over the config input cap neither is read nor refuses the run.
+/// A config the chosen one extends, and the default choice, keep the cap refusal.
+#[test]
+fn an_override_never_materializes_an_unused_root_config() {
+    struct Source(RetainedInputs);
+    impl RetainedSource for Source {
+        fn each_document(&self, visit: &mut dyn FnMut(&str, Vec<u8>) -> Result<()>) -> Result<()> {
+            visit("index.ts", b"export const x = 1;\n".to_vec())
+        }
+        fn components(&self) -> Result<(Vec<Value>, Vec<Value>)> {
+            let entries = self
+                .0
+                .config
+                .iter()
+                .map(|input| json!({"path": input.path, "type": "present", "bytes": hex::encode(&input.bytes)}))
+                .collect();
+            Ok((entries, vec![]))
+        }
+    }
+    let placeholder = crate::skipped_config::PLACEHOLDER;
+    for files in [
+        vec![("jsconfig.json", placeholder)],
+        vec![
+            ("tsconfig.json", placeholder),
+            ("jsconfig.json", placeholder),
+        ],
+    ] {
+        let (rules, setting) = choose(&files, Some(TsProject::Generated)).unwrap();
+        assert_eq!(setting.value, "generated");
+        let source = Source(retained(&files));
+        let run = tempfile::tempdir().unwrap();
+        worktree::materialize(&source, &rules, run.path(), &AtomicBool::new(false)).unwrap();
+        let worktree = run.path().join("worktree");
+        assert!(!worktree.join("jsconfig.json").exists());
+        assert_eq!(
+            fs::read(worktree.join("tsconfig.json")).unwrap(),
+            profiles::SCIP_TYPESCRIPT_TSCONFIG
+        );
+    }
+    let materialize = |files: &[(&str, &[u8])], project| {
+        let (rules, _) = choose(files, project).unwrap();
+        let run = tempfile::tempdir().unwrap();
+        let result = worktree::materialize(
+            &Source(retained(files)),
+            &rules,
+            run.path(),
+            &AtomicBool::new(false),
+        );
+        (result.map(|_| ()), run)
+    };
+    let both: [(&str, &[u8]); 2] = [("tsconfig.json", b"{}"), ("jsconfig.json", placeholder)];
+    let (result, run) = materialize(&both, Some(TsProject::Tsconfig));
+    result.unwrap();
+    assert!(!run.path().join("worktree/jsconfig.json").exists());
+    assert_eq!(
+        fs::read(run.path().join("worktree/tsconfig.json")).unwrap(),
+        b"{}"
+    );
+    // The used config keeps the cap refusal: a tsconfig.json that extends it, or the default.
+    let extending: [(&str, &[u8]); 2] = [
+        ("tsconfig.json", br#"{"extends": "./jsconfig"}"#),
+        ("jsconfig.json", placeholder),
+    ];
+    for (files, project) in [(&extending, Some(TsProject::Tsconfig)), (&both, None)] {
+        let error = materialize(files, project).0.unwrap_err().to_string();
+        assert!(error.starts_with("capture_unavailable"), "{error}");
+    }
+}

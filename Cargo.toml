@@ -39,6 +39,7 @@ tokenizers = { version = "=0.23.2", default-features = false, features = ["onig"
 tokio = { version = "1", features = ["full"] }
 toml = "1.1"
 toml_edit = "0.25"
+unicode-ident = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tree-sitter = "0.27"

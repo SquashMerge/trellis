@@ -565,6 +565,23 @@ fn conditional(value: &Exports, depth: usize, targets: &mut Vec<String>) -> Resu
     Ok(())
 }
 
+/// Whether the config `bytes` (already accepted by `resolve_root`) extends the root file `path`
+/// by a relative path, with or without its `.json`.
+fn extends_root(bytes: &[u8], path: &str) -> bool {
+    let Some(config) = parse_jsonc(bytes) else {
+        return false;
+    };
+    extends_of(&config).is_ok_and(|extends| {
+        extends
+            .iter()
+            .filter(|specifier| is_path(specifier))
+            .any(|specifier| {
+                join("", specifier)
+                    .is_some_and(|target| target == path || format!("{target}.json") == path)
+            })
+    })
+}
+
 /// The typed refusal. `extends` is the JSON text of the root's `extends` entry.
 fn unresolved(root: &str, extends: &str, reason: &str) -> anyhow::Error {
     let extends: String = extends.chars().take(200).collect();
@@ -707,12 +724,18 @@ pub fn apply(
     };
     match project {
         TsProject::Generated => {
-            if find(TSCONFIG).is_some() {
-                rules.omit.push(Omission {
-                    path: TSCONFIG,
-                    reason: "--ts-project generated: the generated tsconfig.json replaces it"
-                        .into(),
-                });
+            // The generated tsconfig extends nothing, so a root config it replaces is left out
+            // of the worktree: it is never read, and one over the config input cap cannot
+            // refuse the run (#822 review).
+            for path in [TSCONFIG, JSCONFIG] {
+                if find(path).is_some() {
+                    rules.omit.push(Omission {
+                        path,
+                        reason: format!(
+                            "--ts-project generated: the generated tsconfig.json is used instead of the root {path}"
+                        ),
+                    });
+                }
             }
             Ok(setting(
                 project,
@@ -726,7 +749,19 @@ pub fn apply(
         }
         TsProject::Tsconfig => {
             let root = find(TSCONFIG).ok_or_else(|| missing(TSCONFIG))?;
-            Ok(match resolve_root(rules, root, TSCONFIG, workspace)? {
+            let resolved = resolve_root(rules, root, TSCONFIG, workspace)?;
+            // An explicit choice leaves out the root jsconfig.json it does not use, unless the
+            // tsconfig.json extends it (#822 review).
+            if source == Source::Override
+                && find(JSCONFIG).is_some()
+                && !extends_root(&root.bytes, JSCONFIG)
+            {
+                rules.omit.push(Omission {
+                    path: JSCONFIG,
+                    reason: "--ts-project tsconfig.json: the root jsconfig.json is not used".into(),
+                });
+            }
+            Ok(match resolved {
                 Some(reason) => setting(
                     TsProject::Generated,
                     Some(root),

@@ -441,3 +441,60 @@ fn typescript_project_setting_is_listed_and_hashed() {
     assert_eq!(project["source"], "override");
     assert_ne!(generated["planSha256"], js["planSha256"]);
 }
+
+/// #822 review: Cargo accepts Unicode XID feature names (Cargo 1.99.1 checks
+/// `--features app/日本語`), so the plan derives one and passes it through to the config.
+#[test]
+fn unicode_feature_names_are_cargo_feature_names() {
+    let unicode = "[package]\nname=\"app\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[features]\n\"日本語\"=[]\n[[bin]]\nname=\"app\"\nrequired-features=[\"日本語\"]\n";
+    let (plan, rules) = rust(&[("Cargo.toml", unicode)]);
+    assert_eq!(setting(&plan, "cargo.features")["value"], json!(["日本語"]));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&rules.generated[0].bytes).unwrap(),
+        json!({"cargo": {"features": ["日本語"]}})
+    );
+    assert!(config_path(&plan).is_some());
+    // The override takes the same names.
+    assert!(
+        cargo_override(&["日本語", "dep/ñ", "_x", "1a", "a-b+c.d"])
+            .validate("rust-analyzer")
+            .is_ok()
+    );
+    // Names Cargo refuses stay refused, derived and overridden.
+    for name in [
+        "-x", "+x", ".x", "a b", "a,b", "a\u{7}", "🦀", "a/b/c", "dep:x", "a=b",
+    ] {
+        assert!(!settings::valid_feature(name), "{name:?}");
+        let error = cargo_override(&[name])
+            .validate("rust-analyzer")
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("invalid_request"), "{name:?}: {error}");
+    }
+    let rejected = "[package]\nname=\"p\"\n[features]\n\"🦀\"=[]\n[[bin]]\nname=\"b\"\nrequired-features=[\"🦀\"]\n";
+    let error = refusal(&[("Cargo.toml", rejected)]);
+    assert!(
+        error.contains("which is not a Cargo feature name"),
+        "{error}"
+    );
+}
+
+/// #822 review: an optional dependency has an implicit feature only while no `[features]`
+/// value names it with `dep:`, as in Cargo 1.99.1 ("does not have feature `dep`").
+#[test]
+fn a_dep_colon_reference_suppresses_the_implicit_feature() {
+    let manifest = |features: &str| {
+        format!(
+            "[package]\nname=\"app\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[dependencies]\ndep={{path=\"../actual\",package=\"actual\",optional=true}}\n[features]\n{features}\n[[bin]]\nname=\"app\"\nrequired-features=[\"dep\"]\n"
+        )
+    };
+    let implicit = manifest("other=[\"dep/x\"]");
+    let (plan, _) = rust(&[("Cargo.toml", &implicit)]);
+    assert_eq!(setting(&plan, "cargo.features")["value"], json!(["dep"]));
+    let suppressed = manifest("explicit=[\"dep:dep\"]");
+    let error = refusal(&[("Cargo.toml", &suppressed)]);
+    assert!(
+        error.contains("requires feature \"dep\", which [features] does not declare"),
+        "{error}"
+    );
+}

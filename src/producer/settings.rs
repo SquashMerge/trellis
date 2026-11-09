@@ -121,14 +121,18 @@ fn unresolved(reason: impl std::fmt::Display) -> anyhow::Error {
     anyhow!("{CONFIG_UNRESOLVED}: {reason}")
 }
 
-/// A Cargo feature name, optionally `dep/feature` or `dep?/feature`. Nothing a cargo
-/// `--features` list or a JSON config could read differently.
+/// A Cargo feature name, optionally `dep/feature` or `dep?/feature`, by Cargo's own rule
+/// (`validate_feature_name`, Cargo 1.99): the first character is a Unicode XID start
+/// character, `_` or an ASCII digit, and each other one is a Unicode XID continue character,
+/// `-`, `+` or `.`. No such name holds a control character, whitespace, `,` or `/`, so the
+/// `pkg/feature` form, a cargo `--features` list and the JSON config read it the same way.
+/// The dependency part of `dep/feature` is checked with the same rule.
 pub fn valid_feature(feature: &str) -> bool {
     let part = |part: &str| {
-        !part.is_empty()
-            && part
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'+' | b'.'))
+        let mut chars = part.chars();
+        chars.next().is_some_and(|first| {
+            unicode_ident::is_xid_start(first) || first == '_' || first.is_ascii_digit()
+        }) && chars.all(|ch| unicode_ident::is_xid_continue(ch) || matches!(ch, '-' | '+' | '.'))
     };
     feature.len() <= MAX_FEATURE_BYTES
         && match feature.split_once('/') {
@@ -253,14 +257,23 @@ fn members<'a>(
 }
 
 /// Whether `package` declares `feature`: a `[features]` key, or the implicit feature of an
-/// optional dependency.
+/// optional dependency. As in Cargo, a dependency has no implicit feature once any `[features]`
+/// value names it as `dep:<name>`.
 fn declares(package: &toml::Table, feature: &str) -> bool {
-    if package
-        .get("features")
-        .and_then(toml::Value::as_table)
-        .is_some_and(|features| features.contains_key(feature))
-    {
+    let features = package.get("features").and_then(toml::Value::as_table);
+    if features.is_some_and(|features| features.contains_key(feature)) {
         return true;
+    }
+    let explicit = format!("dep:{feature}");
+    let suppressed = features.is_some_and(|features| {
+        features.values().any(|values| {
+            values
+                .as_array()
+                .is_some_and(|values| values.iter().any(|value| value.as_str() == Some(&explicit)))
+        })
+    });
+    if suppressed {
+        return false;
     }
     let optional = |deps: Option<&toml::Value>| {
         deps.and_then(toml::Value::as_table)
@@ -270,14 +283,18 @@ fn declares(package: &toml::Table, feature: &str) -> bool {
             .and_then(toml::Value::as_bool)
             == Some(true)
     };
-    optional(package.get("dependencies"))
+    let kinds = |table: &toml::Table| {
+        optional(table.get("dependencies")) || optional(table.get("build-dependencies"))
+    };
+    kinds(package)
         || package
             .get("target")
             .and_then(toml::Value::as_table)
             .is_some_and(|targets| {
                 targets
                     .values()
-                    .any(|target| optional(target.get("dependencies")))
+                    .filter_map(toml::Value::as_table)
+                    .any(kinds)
             })
 }
 
