@@ -865,6 +865,48 @@ pub fn view_layers(config: &Config) -> Vec<Value> {
     }).collect()
 }
 
+/// The outcome of every build manifest in `snapshot`, under its own work budget.
+pub(crate) fn app_candidates(
+    snapshot: &Snapshot,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<crate::apps::Candidates> {
+    let documents: BTreeSet<&str> = snapshot
+        .documents
+        .iter()
+        .map(|document| document.key.path.as_str())
+        .collect();
+    let mut work = Work::new(work::rules_limit(snapshot.documents.len(), 0));
+    crate::apps::candidates(&snapshot.manifests, &documents, &mut work, check)
+}
+
+/// The prompt's `payload.apps` (#783): the apps detected against `config`'s bytes, so a
+/// manifest a hidden layer selects is left out. Without a config every manifest is listed.
+pub(crate) fn prompt_apps(
+    config: Option<&Config>,
+    candidates: &crate::apps::Candidates,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<Vec<Value>> {
+    let hidden = match config {
+        Some(config) => {
+            let paths: Vec<&str> = candidates
+                .manifests
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect();
+            hidden_layer_paths(config, &paths, check)?
+        }
+        None => BTreeSet::new(),
+    };
+    Ok(crate::apps::detect(candidates, &hidden)
+        .apps
+        .into_iter()
+        .map(|app| {
+            json!({"name": app.name, "kind": app.kind, "manifest": app.manifest,
+                "roots": [app.root], "entries": app.entries})
+        })
+        .collect())
+}
+
 /// Resolve authored hidden membership for the explicit workbench metrics population.
 /// Uses the same exact-match, specificity and ambiguity rules as architecture policy.
 pub(crate) fn hidden_layer_paths(
@@ -2912,7 +2954,7 @@ mod display_tests {
 #[cfg(test)]
 mod app_scope_tests {
     use super::*;
-    use crate::apps::{App, AppKind};
+    use crate::apps::{App, AppKind, Candidates, Outcome};
 
     fn app(name: &str, kind: AppKind, root: &str) -> App {
         App {
@@ -3012,5 +3054,48 @@ mod app_scope_tests {
             assert_eq!(d["kind"], "schema", "{extra}");
             assert_eq!(d["line"], line, "{extra}");
         }
+    }
+
+    fn candidate(name: &str, kind: AppKind, manifest: &str, root: &str) -> (String, Outcome) {
+        let mut app = app(name, kind, root);
+        app.manifest = manifest.into();
+        app.entries = vec!["src/main.rs".into()];
+        (manifest.into(), Outcome::App(app))
+    }
+
+    #[test]
+    fn prompt_apps_list_every_manifest_without_rules() {
+        let candidates = Candidates {
+            manifests: vec![
+                candidate("svc", AppKind::Cargo, "svc/Cargo.toml", "svc"),
+                ("tools/package.json".into(), Outcome::NotApp),
+                candidate("ui", AppKind::Npm, "ui/package.json", "ui"),
+                ("bad/package.json".into(), Outcome::Unread),
+            ],
+        };
+        let rows = prompt_apps(None, &candidates, &mut || Ok(())).unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                json!({"name":"svc","kind":"cargo","manifest":"svc/Cargo.toml","roots":["svc"],"entries":["src/main.rs"]}),
+                json!({"name":"ui","kind":"npm","manifest":"ui/package.json","roots":["ui"],"entries":["src/main.rs"]}),
+            ]
+        );
+    }
+
+    #[test]
+    fn prompt_apps_leave_out_a_manifest_a_hidden_layer_selects() {
+        let candidates = Candidates {
+            manifests: vec![
+                candidate("svc", AppKind::Cargo, "svc/Cargo.toml", "svc"),
+                candidate("fixture", AppKind::Npm, "fixtures/package.json", "fixtures"),
+            ],
+        };
+        let config =
+            parse("version=1\n[layers.fix]\norder=1\ndisplay='hidden'\npaths=['fixtures/**']\n")
+                .unwrap();
+        let rows = prompt_apps(Some(&config), &candidates, &mut || Ok(())).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["name"], "svc");
     }
 }
