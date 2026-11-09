@@ -12527,6 +12527,83 @@ async fn propose_layers_prompt_fits_the_frame_when_references_exceed_it() {
     session.join().unwrap().unwrap();
 }
 
+/// #783: `payload.apps` follows the current rules bytes. A manifest a hidden layer selects
+/// is left out; with no rules file every manifest is listed, and two apps add the per-app
+/// instructions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn propose_layers_prompt_lists_apps_against_the_current_rules() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    let temp = tempfile::tempdir().unwrap();
+    for directory in ["src", "tools"] {
+        fs::create_dir_all(temp.path().join("checkout").join(directory)).unwrap();
+    }
+    let (identity, topology) = published_inactive_checkout(
+        temp.path(),
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"svc\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("src/main.rs", "fn main() {}\n"),
+            ("tools/package.json", "{\"name\":\"tooling\"}\n"),
+            ("tools/build.js", "module.exports = 1;\n"),
+        ],
+    );
+    fs::create_dir(identity.root.join(".trellis")).unwrap();
+    let rules_path = identity.root.join(".trellis/rules.toml");
+    fs::write(
+        &rules_path,
+        "version = 1\n[layers.tools]\norder = 1\ndisplay = \"hidden\"\npaths = [\"tools/**\"]\n",
+    )
+    .unwrap();
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(783, &identity).unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    architecture_built(&registry, &identity).await;
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 783, None);
+    let mut prompt = |id: i64| {
+        writeln!(
+            client,
+            "{}",
+            modern(
+                json!(id),
+                "prompts/get",
+                json!({"name":"trellis_propose_layers"})
+            )
+        )
+        .unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let reply: Value = serde_json::from_str(&line).unwrap();
+        assert!(reply.get("error").is_none(), "{reply}");
+        let text = reply["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let context: Value =
+            serde_json::from_str(text.split("UNTRUSTED REPOSITORY DATA\n").nth(1).unwrap())
+                .unwrap();
+        (text, context["payload"]["apps"].clone())
+    };
+    let svc = json!({"name":"svc","kind":"cargo","manifest":"Cargo.toml","roots":["."],
+        "entries":["svc"]});
+    let (text, apps) = prompt(1);
+    assert_eq!(apps, json!([svc]));
+    assert!(!text.contains("PER-APP LAYERS"));
+    fs::remove_file(&rules_path).unwrap();
+    let (text, apps) = prompt(2);
+    assert_eq!(
+        apps,
+        json!([svc, {"name":"tooling","kind":"npm","manifest":"tools/package.json",
+            "roots":["tools"],"entries":[]}])
+    );
+    assert!(text.contains("PER-APP LAYERS"));
+    drop(prompt);
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn python_architecture_external_descriptors_validate_in_structured_tool_results() {
     use trellis::daemon::registry::CheckoutRegistry;
