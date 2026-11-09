@@ -298,3 +298,43 @@ fn blocked_startup_recovery_ends_the_first_head_wait_with_its_cause() {
         "symbols did not fail typed as blocked: {message}"
     );
 }
+
+/// A prior valid head stays readable after startup recovery blocks: `symbols`
+/// answers from it with `catchingUp:true`, while `status` reports the
+/// `recovery_blocked` cause as it did before #842.
+#[test]
+fn prior_head_answers_after_startup_recovery_blocks() {
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let root = fresh_checkout(temp.path());
+    let daemon = FixtureDaemon::new(&home);
+    let indexed = command(&root, &home, "index").output().unwrap();
+    crate::child::assert_cli_success(&indexed, "indexed");
+    daemon.stop_attested().unwrap();
+    let _replacement = FixtureDaemon::new(&home);
+    // The daemon the first status starts fails every startup attempt. Until
+    // the fifth failure publishes the blocker, status answers from the head.
+    let mut blocked = None;
+    trellis::testing::wait_until("startup recovery blocks", || {
+        let mut status = command(&root, &home, "status");
+        status.env("TRELLIS_TEST_DAEMON_STARTUP_FAIL", "1");
+        let output = status.output().unwrap();
+        if output.status.success() {
+            return false;
+        }
+        blocked = Some(output);
+        true
+    });
+    let blocked = blocked.unwrap();
+    let message = String::from_utf8_lossy(&blocked.stderr);
+    assert!(blocked.stdout.is_empty(), "partial output");
+    assert!(
+        message.contains("Error: recovery_blocked: "),
+        "status did not report the recovery blocker: {message}"
+    );
+    let output = symbols(&root, &home, "firstSymbol").output().unwrap();
+    let reply = crate::child::cli_json(&output, "prior-head read after the block");
+    assert_eq!(reply["catchingUp"], true, "{reply}");
+    assert_eq!(names(&reply), ["firstSymbol"], "{reply}");
+}

@@ -3005,7 +3005,8 @@ fn in_read_scope<T>(scoped: bool, deadline: Instant, read: impl FnOnce() -> T) -
 /// `cli_first_index_wait` (#842, owner ruling 2026-11-09). It reports progress
 /// to the client meanwhile. A prior valid head answers at once, as MCP does,
 /// and any failure other than `index_not_ready` is left to the read to report.
-/// A blocked startup recovery ends the wait with its `recovery_blocked` cause.
+/// With no head, a blocked startup recovery ends the wait with its
+/// `recovery_blocked` cause.
 /// Returns whether it waited. On expiry, fails `index_not_ready`; the daemon
 /// keeps indexing.
 fn await_first_head(
@@ -3019,11 +3020,8 @@ fn await_first_head(
     loop {
         // Recorded before the probe, so a publication after it is never missed.
         let seen = checkout.state_version();
-        // A blocked startup recovery publishes no head: end the wait with its
-        // typed cause, the one `status` reports (#768). Checked on every wake.
-        if let Some(blocker) = checkout.recovery_blocker() {
-            anyhow::bail!("{blocker}");
-        }
+        // An eligible head answers first, whatever startup recovery says
+        // (T03, Decision 0009 "Reconciling").
         let probe = trellis::store::with_read_deadline(Instant::now() + probe_budget, || {
             checkout.evidence_response().map(drop)
         });
@@ -3032,6 +3030,12 @@ fn await_first_head(
             .is_err_and(|error| error.to_string().starts_with("index_not_ready:"))
         {
             return Ok(reported.is_some());
+        }
+        // With no head, a blocked startup recovery will publish none: end the
+        // wait with its typed cause, the one `status` reports (#768). Checked
+        // on every wake.
+        if let Some(blocker) = checkout.recovery_blocker() {
+            anyhow::bail!("{blocker}");
         }
         #[cfg(all(feature = "test-support", unix))]
         if reported.is_none()
