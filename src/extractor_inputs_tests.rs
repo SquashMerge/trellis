@@ -43,6 +43,10 @@ const NON_EXTRACTION_ITEMS: &[(&str, &str)] = &[
         "selects nested Cargo.toml config inputs (#394), captured and compared per revision",
     ),
     (
+        "capture::nested_pyproject_manifest",
+        "selects nested pyproject.toml config inputs (#807), captured and compared per revision",
+    ),
+    (
         "capture::CaptureInputObservation",
         "persisted change classification, not extraction",
     ),

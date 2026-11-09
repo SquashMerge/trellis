@@ -52,7 +52,7 @@ switcher and the drawing are [#789](https://github.com/SquashMerge/trellis/issue
 [#784](https://github.com/SquashMerge/trellis/issues/784).
 
 - **Apps are detected, never guessed or proposed.** The summary lists the detected apps,
-  each with its name, its kind (`cargo`, `npm` or `python`; python added by owner ruling 2026-11-08), its manifest path, its roots and its
+  each with its name, its kind (`cargo`, `npm` or `python`; python added by owner ruling 2026-11-08, #807), its manifest path, its roots and its
   entries. It also gives each layer its app: `layers[].app` for an ordered layer, the served
   apps for a shared layer. #784 fixes the exact fields. The view never draws a layer or an
   app that `rules.toml` and the manifests don't define. It has no function-level layers:
@@ -87,8 +87,8 @@ for HTTP interface evidence ([#788](https://github.com/SquashMerge/trellis/issue
 drawing is #789 and #790. App detection and the counting rule are in
 [rules.md implementation notes (#784)](rules.md#implementation-notes-784); the evidence
 meaning is the [contract-v1 #788 amendment](semantic-evidence/contract-v1.md). Detected app
-kinds are `cargo`, `npm` and `python` (owner ruling 2026-11-08); Python detection arrives
-separately in [#807](https://github.com/SquashMerge/trellis/issues/807).
+kinds are `cargo`, `npm` and `python` (owner ruling 2026-11-08); `python` apps are detected
+from `pyproject.toml` ([#807](https://github.com/SquashMerge/trellis/issues/807)).
 
 **Summary fields.**
 

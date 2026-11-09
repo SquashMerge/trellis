@@ -2801,9 +2801,11 @@ impl EvidenceResponse {
                 continue;
             };
             let path = path.as_ref();
-            // Present nested manifests feed app detection (#784); other consumers ignore
-            // them, as they do every path that is not a root input.
-            let nested = path.ends_with("/package.json") || path.ends_with("/Cargo.toml");
+            // Present nested manifests feed app detection (#784, #807); other consumers
+            // ignore them, as they do every path that is not a root input.
+            let nested = path.ends_with("/package.json")
+                || path.ends_with("/Cargo.toml")
+                || path.ends_with("/pyproject.toml");
             if !nested && !matches!(path, "tsconfig.json" | "jsconfig.json") {
                 continue;
             }
@@ -11103,12 +11105,14 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
         }
         expected.insert(format!("directory:{directory}"));
     }
-    // Nested package roots of JavaScript and TypeScript sources (#443) and nested Cargo
-    // manifests of Rust sources (#394); a non-regular one is not admitted.
+    // Nested package roots of JavaScript and TypeScript sources (#443), nested Cargo
+    // manifests of Rust sources (#394) and nested Python project manifests of Python
+    // sources (#807); a non-regular one is not admitted.
     for source in &source_paths {
         let manifest = match crate::capture::language_of_path(Path::new(source)) {
             Some("javascript" | "typescript") => "package.json",
             Some("rust") => "Cargo.toml",
+            Some("python") => "pyproject.toml",
             _ => continue,
         };
         for dir in Path::new(source).ancestors().skip(1) {

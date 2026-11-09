@@ -283,3 +283,76 @@ fn failed_app_detection_fails_the_interfaces_part() {
         "{interfaces:#}"
     );
 }
+
+/// mimir's layout (#807): a root Python service and a root Vite frontend, plus a Python
+/// plugin with its own `pyproject.toml`.
+const MIMIR: &[(&str, &str)] = &[
+    (
+        "pyproject.toml",
+        "[project]\nname = \"mimir-agent\"\n[project.scripts]\nmimir = \"mimir.main:main\"\n",
+    ),
+    (
+        "package.json",
+        "{\"name\":\"mimir-frontend\",\"private\":true}\n",
+    ),
+    (
+        "plugins/cultivate/pyproject.toml",
+        "[project]\nname = \"mimir-cultivate\"\n",
+    ),
+    ("mimir/__init__.py", ""),
+    ("mimir/main.py", "def main():\n    return 1\n"),
+    (
+        "plugins/cultivate/cultivate/__init__.py",
+        "def grow():\n    return 2\n",
+    ),
+    (
+        "src/main.ts",
+        "export function start(): number { return 1; }\n",
+    ),
+    // Not above any Python source, so capture does not retain it.
+    ("docs/pyproject.toml", "[project]\nname = \"docs\"\n"),
+    ("docs/guide.md", "# guide\n"),
+];
+
+#[test]
+fn a_captured_mimir_layout_reaches_core_app_candidates_as_three_apps() {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    for (path, text) in MIMIR {
+        write(root.path(), path, text);
+    }
+    let store = publish(&state, root.path());
+    let found = core(&store).unwrap().app_candidates().unwrap().clone();
+    let outcomes: BTreeMap<&str, &Outcome> = found
+        .manifests
+        .iter()
+        .map(|(path, outcome)| (path.as_str(), outcome))
+        .collect();
+    let Outcome::App(agent) = outcomes["pyproject.toml"] else {
+        panic!("{outcomes:?}");
+    };
+    assert_eq!(
+        (agent.kind, agent.entries.as_slice()),
+        (crate::apps::AppKind::Python, &["mimir.main".to_owned()][..])
+    );
+    assert!(
+        !outcomes.contains_key("docs/pyproject.toml"),
+        "{outcomes:?}"
+    );
+    let detected = crate::apps::detect(&found, &Default::default());
+    let apps: Vec<(&str, crate::apps::AppKind, &str)> = detected
+        .apps
+        .iter()
+        .map(|app| (app.name.as_str(), app.kind, app.root.as_str()))
+        .collect();
+    use crate::apps::AppKind::{Npm, Python};
+    assert_eq!(
+        apps,
+        [
+            ("mimir-frontend", Npm, "."),
+            ("mimir-cultivate", Python, "plugins/cultivate"),
+            ("mimir-agent", Python, "."),
+        ]
+    );
+    assert_eq!(detected.unread, 0);
+}

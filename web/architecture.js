@@ -456,7 +456,7 @@
       const refocus = show && !target.hidden && !!target.contains?.(document.activeElement);
       target.hidden = line.hidden = !show; target.replaceChildren(); line.replaceChildren();
       const footnote = get("architecture-footnote"); footnote.hidden = !show;
-      if (show) footnote.textContent = `Apps are detected from build manifests (Cargo binary packages and package.json). Layer order is compared within an app. Band and arrow counts are reference sites at ${window.TrellisIndexPin.label(payload)}; deviation totals are rule instances, as trellis rules check reports them; ≥ means a lower bound. HTTP interfaces are evidence, not proof.`;
+      if (show) footnote.textContent = `Apps are detected from build manifests (Cargo binary packages, package.json and pyproject.toml). Layer order is compared within an app. Band and arrow counts are reference sites at ${window.TrellisIndexPin.label(payload)}; deviation totals are rule instances, as trellis rules check reports them; ≥ means a lower bound. HTTP interfaces are evidence, not proof.`;
       if (!show) return;
       const choose = (name, text) => {
         const button = make("button", text); button.type = "button"; button.setAttribute("aria-pressed", String(scope === name));
