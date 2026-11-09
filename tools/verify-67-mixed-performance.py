@@ -1376,6 +1376,13 @@ class SelectedView:
             cells["version_id"] = "<document-version>"
         if table == "semantic_projection_dependencies":
             cells["version_id"] = "<document-version>"
+        # A provenance row's position depends on the order its revision's rejoined IDs sort in,
+        # which differs between a copy and a FULL rejoin; its identity does not.
+        if "provenance_ordinal" in cells:
+            cells["provenance_ordinal"] = self.map(
+                "provenance", (cells["payload_id"], cells["provenance_ordinal"]), table)
+        if table == "semantic_provenance":
+            cells["ordinal"] = "<position>"
         if table == "semantic_provenance" and cells["provenance_id"] is not None:
             cells["provenance_id"] = ("literal-provenance", cells["provenance_id"])
         if table in {"graph_projections", "classes", "class_relations"}:
