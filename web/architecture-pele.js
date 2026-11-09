@@ -614,6 +614,10 @@
   async function render(container, view, options = {}) {
     const current = () => !options.isCurrent || options.isCurrent();
     if (!current()) return {status:"stale"};
+    // An optional async yield between heavy phases, for hosts that cap one synchronous run
+    // (the Herdr mod, #707). Without it nothing here awaits more than the browser did.
+    const pause = typeof options.pause === "function" ? options.pause : null;
+    const breathe = async () => { await pause(); return current(); };
     try {
       if (document.fonts?.ready) await document.fonts.ready;
       if (!current()) return {status:"stale"};
@@ -633,9 +637,12 @@
       // The side channels routing adds (#637) depend only on the arrows and their tags, never on
       // chip sizes: they are taken off the width before chip columns are chosen.
       let target = options.width;
+      if (pause && !(await breathe())) return {status:"stale"};
       if (fit) { target -= channelReserve(project(view,{...options,columns,chipWidth,measureText:measure})); columns = chipColumns(target, sharedCount); }
       for (let attempt = 0; ; attempt++) {
+        if (pause && !(await breathe())) return {status:"stale"};
         projection = project(view,{...options,columns,chipWidth,measureText:measure});
+        if (pause && !(await breathe())) return {status:"stale"};
         raw = window.pele.render(projection.source,{fontSize:14,padding:8,responsive:false,links:false,images:false}).svg;
         if (!fit) break;
         const drawnWidth = Number(/^<svg\b[^>]*?\swidth="([0-9.]+)"/.exec(raw)?.[1]), cells = columns + sharedCount;
@@ -661,11 +668,14 @@
       // Projecting charges the caller's chip budget, so the chosen layout is projected again
       // when it was not the last attempt; the same inputs give the same source and ids.
       if (best && best.projection !== projection) {
+        if (pause && !(await breathe())) return {status:"stale"};
         projection = project(view,{...options,columns:best.columns,chipWidth:best.chipWidth,measureText:measure});
         raw = best.raw;
       }
+      if (pause && !(await breathe())) return {status:"stale"};
       if (!current()) return {status:"stale"};
       const {root,controls} = validatedSvg(raw,projection);
+      if (pause && !(await breathe())) return {status:"stale"};
       root.classList.add("trellis-architecture-svg"); root.setAttribute("font-size","14"); root.setAttribute("font-family","Inter, sans-serif");
       const palette = {"var(--_bg)":"#0B0C10","var(--_fg)":"#F7F7FB","var(--_m)":"#B8BAC8","var(--_l)":"#777A8E","var(--_s)":"#14151D","var(--_a)":"#1D1E2A","var(--_b)":"#777A8E"};
       for (const node of [root,...root.querySelectorAll("*")]) for (const attr of [...node.attributes]) {
@@ -731,6 +741,7 @@
         };
         node.addEventListener("click",select); node.addEventListener("keydown",event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); select(event); } });
       }
+      if (pause && !(await breathe())) return {status:"stale"};
       if (options.display) route(root,controls,projection);
       if (!current()) return {status:"stale"};
       container.replaceChildren(root);

@@ -1,0 +1,13 @@
+{
+  "name": "trellis-herdr-mod",
+  "private": true,
+  "description": "Trellis beside the coding agents: a Herdr app mod (#707)",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "install-mod": "node build.mjs --install"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}

@@ -1,0 +1,29 @@
+--- a/main.js
++++ b/main.js
+@@ -1,7 +1,7 @@
+ // A lazy file browser for the focused pane's folder, with bounded read-only previews.
+ import { View, div, svg } from "gpui-kit";
+ import { v_flex, h_flex, Editor, EditorState } from "gpui-base";
+-import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, window } from "herdr";
++import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, window, shared, setShared } from "herdr";
+ 
+ function location() {
+   const space = spaces().find(s => s.active), f = focused();
+@@ -12,6 +12,9 @@
+ const key = () => JSON.stringify(location());
+ const LANG = { ts: "js", tsx: "js", mts: "js", cts: "js", jsx: "js", mjs: "js", toml: "yaml", jsonc: "json", svelte: "html", vue: "html" };
+ const PER_FOLDER = 500, TOTAL = 5000;
++// trellis-files: the one change from the shipped Files mod (Trellis #707). The file it shows is
++// shared as "trellis.selectedFile" = {root, path, on} (null when none) for the Trellis mod.
++const publish = (value) => { if (JSON.stringify(shared("trellis.selectedFile") ?? null) !== JSON.stringify(value)) setShared("trellis.selectedFile", value); };
+ 
+ async function directory(path, on) {
+   const windowsDirectory = async () => {
+@@ -129,6 +132,7 @@
+ 
+   show(path, cx) {
+     this.code?.release(); this.code = null; this.file = path; this.fileError = null;
++    publish(path ? { root: this.root, path, on: this.on ?? null } : null);
+     if (!path || !cx) return;
+     const context = this.context, root = this.root, on = this.on;
+     cx.spawn(async cx => {
