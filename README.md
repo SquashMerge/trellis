@@ -121,6 +121,7 @@ null reason does not prove vector availability. See the
 - Atomic full-index publication to SQLite; background refresh, progress and cancellation.
 - Snapshot-consistent source reads and bounded, cycle-safe static call queries.
 - Loopback-only API with bearer authentication, Host/Origin checks and a cached-source viewer.
+- `trellis api`: the few browser routes the Herdr mod reads, through the daemon socket, so the mod can read another machine's daemon with Herdr's `exec` ([details](docs/daemon-v1.md#trellis-api-browser-routes-through-the-cli-817)).
 - Inline file → method browsing and source-linked static sequence diagrams for all five supported languages.
 - Java/Python class diagrams with scoped candidate links, right-click related-class expansion, and source/method navigation.
 - Reversible fluent Rust chain grouping, with every measured call retained.
