@@ -146,6 +146,9 @@ async fn fixture_with_identity(
     drop(leader);
     drop(store);
     let mut registry = CheckoutRegistry::with_roots(roots);
+    // These tests time and count the metrics read's own work, which a core the owner built
+    // eagerly (#798) would answer instead: the owner builds only once a read asks.
+    registry.architecture_on_demand_for_tests();
     registry
         .register(&identity, CheckoutOptions(serde_json::json!({})))
         .unwrap();

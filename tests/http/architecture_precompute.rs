@@ -1,5 +1,7 @@
 #![cfg(feature = "test-support")]
 //! #556: one background Architecture build per revision and rules file, served to every read.
+//! The fixture's activation has already built its head's core (#798), so each test counts the
+//! builds it starts from `before`.
 use super::architecture_http::{
     RULES, fixture, fixture_with_sources, request, summary, write_rules,
 };
@@ -96,13 +98,14 @@ async fn the_first_read_after_publication_is_served_from_one_build() {
     let (base, runtime, browser, key) = fixture().await;
     write_rules(&base, RULES);
     let scheduler = runtime.browser_scheduler().unwrap();
+    let before = scheduler.architecture_builds_for_tests();
     let app = browser.clone().router();
     // The owner starts on the publication hint alone: no read asked.
     let hold = Hold::at(&scheduler, "architecture_build_finished");
     scheduler.architecture_hint();
     hold.wait_reached();
     hold.release();
-    assert_eq!(scheduler.architecture_builds_for_tests(), 1);
+    assert_eq!(scheduler.architecture_builds_for_tests() - before, 1);
     let (status, first) = request(app.clone(), &key, "?role=production").await;
     assert_eq!(status, StatusCode::OK, "{first}");
     assert_eq!(first["payload"]["state"], "ready");
@@ -114,7 +117,7 @@ async fn the_first_read_after_publication_is_served_from_one_build() {
     let (status, other) = request(app, &key, "?role=all&aggregate=mean").await;
     assert_eq!(status, StatusCode::OK, "{other}");
     assert_eq!(other["payload"]["aggregate"], "mean");
-    assert_eq!(scheduler.architecture_builds_for_tests(), 1);
+    assert_eq!(scheduler.architecture_builds_for_tests() - before, 1);
 }
 
 #[tokio::test]
@@ -122,6 +125,7 @@ async fn a_read_during_the_build_answers_building_with_progress_then_the_result(
     let (base, runtime, browser, key) = fixture().await;
     write_rules(&base, RULES);
     let scheduler = runtime.browser_scheduler().unwrap();
+    let before = scheduler.architecture_builds_for_tests();
     let app = browser.clone().router();
     let hold = Hold::at(&scheduler, "evaluating");
     scheduler.architecture_hint();
@@ -143,7 +147,7 @@ async fn a_read_during_the_build_answers_building_with_progress_then_the_result(
     let (status, ready) = request(app, &key, &head(payload)).await;
     assert_eq!(status, StatusCode::OK, "{ready}");
     assert_eq!(ready["payload"]["state"], "ready");
-    assert_eq!(scheduler.architecture_builds_for_tests(), 1);
+    assert_eq!(scheduler.architecture_builds_for_tests() - before, 1);
 }
 
 /// #706: a page's summary read samples the head, then waits on the owner. A revision
@@ -221,6 +225,7 @@ async fn a_summary_read_whose_head_moves_while_it_waits_answers_building_and_is_
 async fn concurrent_readers_wait_for_one_build() {
     let (base, runtime, browser, key) = fixture().await;
     let scheduler = runtime.browser_scheduler().unwrap();
+    let before = scheduler.architecture_builds_for_tests();
     let app = browser.clone().router();
     // The build starts only once every reader is waiting on the owner.
     let waiting = Arc::new((Mutex::new(0usize), Condvar::new()));
@@ -256,7 +261,7 @@ async fn concurrent_readers_wait_for_one_build() {
         assert_eq!(data["payload"], a.1["payload"]);
     }
     assert_eq!(*waiting.0.lock().unwrap(), 3);
-    assert_eq!(scheduler.architecture_builds_for_tests(), 1);
+    assert_eq!(scheduler.architecture_builds_for_tests() - before, 1);
     let pin = serde_json::from_value(json!({
         "indexGeneration": a.1["payload"]["indexGeneration"],
         "indexRevision": a.1["payload"]["indexRevision"]
@@ -285,6 +290,7 @@ async fn a_rules_change_is_never_served_from_the_older_core() {
     let (base, runtime, browser, key) = fixture().await;
     write_rules(&base, RULES);
     let scheduler = runtime.browser_scheduler().unwrap();
+    let before = scheduler.architecture_builds_for_tests();
     let app = browser.clone().router();
     let (status, first) = request(app.clone(), &key, "").await;
     assert_eq!(status, StatusCode::OK, "{first}");
@@ -296,7 +302,7 @@ async fn a_rules_change_is_never_served_from_the_older_core() {
         first["payload"]["rulesFile"]["contentHash"],
         changed["payload"]["rulesFile"]["contentHash"]
     );
-    assert_eq!(scheduler.architecture_builds_for_tests(), 2);
+    assert_eq!(scheduler.architecture_builds_for_tests() - before, 2);
     // A detail read at the older hash stays a conflict, and metrics did not need the rules.
     write_rules(&base, "version=[");
     let (status, invalid) = request(app, &key, "").await;
@@ -442,6 +448,7 @@ async fn a_page_on_an_older_revision_gets_it_from_the_owner() {
             .unwrap();
     write_rules(&base, RULES);
     let scheduler = runtime.browser_scheduler().unwrap();
+    let before = scheduler.architecture_builds_for_tests();
     let (status, read) = request(app.clone(), &key, &older).await;
     assert_eq!(status, StatusCode::OK, "{read}");
     assert_eq!(read["payload"]["modules"].as_array().unwrap().len(), 4);
@@ -449,7 +456,7 @@ async fn a_page_on_an_older_revision_gets_it_from_the_owner() {
         read["payload"]["indexRevision"],
         missing["payload"]["indexRevision"]
     );
-    assert_eq!(scheduler.architecture_builds_for_tests(), 2);
+    assert_eq!(scheduler.architecture_builds_for_tests() - before, 2);
     // An unchanged inventory must retain the head that the owner already built.
     let indexing = runtime.clone();
     let unchanged =
@@ -471,7 +478,7 @@ async fn a_page_on_an_older_revision_gets_it_from_the_owner() {
     );
     let (status, again) = request(app, &key, &older).await;
     assert_eq!(status, StatusCode::OK, "{again}");
-    assert_eq!(scheduler.architecture_builds_for_tests(), 2);
+    assert_eq!(scheduler.architecture_builds_for_tests() - before, 2);
 }
 
 /// A rules read with no rules file fails at once: it does not ask for or wait on a build.
@@ -479,6 +486,7 @@ async fn a_page_on_an_older_revision_gets_it_from_the_owner() {
 async fn a_rules_read_without_rules_does_not_wait_for_a_build() {
     let (_base, runtime, _browser, _key) = fixture().await;
     let scheduler = runtime.browser_scheduler().unwrap();
+    let before = scheduler.architecture_builds_for_tests();
     let tool = runtime.clone();
     let failed = tokio::task::spawn_blocking(move || {
         tool.await_architecture_tool(
@@ -494,7 +502,7 @@ async fn a_rules_read_without_rules_does_not_wait_for_a_build() {
     .await
     .unwrap();
     assert_eq!(failed.to_string(), "rules_not_found");
-    assert_eq!(scheduler.architecture_builds_for_tests(), 0);
+    assert_eq!(scheduler.architecture_builds_for_tests() - before, 0);
 }
 
 /// A running build holds no read: the head can move, and the build gives way to it.
@@ -503,6 +511,7 @@ async fn a_new_revision_supersedes_a_build_that_is_computing() {
     let (base, runtime, browser, key) = fixture().await;
     write_rules(&base, RULES);
     let scheduler = runtime.browser_scheduler().unwrap();
+    let before = scheduler.architecture_builds_for_tests();
     let superseded = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let hold = Hold::at_with(
         &scheduler,
@@ -527,7 +536,7 @@ async fn a_new_revision_supersedes_a_build_that_is_computing() {
     assert_eq!(status, StatusCode::OK, "{next}");
     assert_eq!(next["payload"]["modules"].as_array().unwrap().len(), 5);
     assert!(superseded.load(std::sync::atomic::Ordering::Acquire));
-    assert!(scheduler.architecture_builds_for_tests() >= 2);
+    assert!(scheduler.architecture_builds_for_tests() - before >= 2);
 }
 
 /// A read for a rules file newer than the running build waits for that file's build.
@@ -539,6 +548,7 @@ async fn a_rules_edit_during_a_build_is_built_next() {
     let initial_pin = initial.status().unwrap().revision;
     initial.finish(()).unwrap();
     let scheduler = runtime.browser_scheduler().unwrap();
+    let before = scheduler.architecture_builds_for_tests();
     let hold = Hold::at(&scheduler, "evaluating");
     write_rules(&base, RULES);
     scheduler.architecture_hint();
@@ -550,7 +560,7 @@ async fn a_rules_edit_during_a_build_is_built_next() {
     let (status, read) = reading.await.unwrap();
     assert_eq!(status, StatusCode::OK, "{read}");
     assert_eq!(read["payload"]["layers"][0]["name"], "other");
-    assert_eq!(scheduler.architecture_builds_for_tests(), 2);
+    assert_eq!(scheduler.architecture_builds_for_tests() - before, 2);
     let pin = serde_json::from_value(json!({
         "indexGeneration": read["payload"]["indexGeneration"],
         "indexRevision": read["payload"]["indexRevision"]
@@ -583,6 +593,7 @@ async fn a_rules_edit_during_a_build_is_built_next() {
 async fn a_panicked_build_is_reported_once_and_the_next_read_builds_again() {
     let (base, runtime, browser, key) = fixture().await;
     let scheduler = runtime.browser_scheduler().unwrap();
+    let before = scheduler.architecture_builds_for_tests();
     let panics = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let injected = panics.clone();
     scheduler.set_architecture_hook_for_tests(Arc::new(move |point| {
@@ -598,7 +609,7 @@ async fn a_panicked_build_is_reported_once_and_the_next_read_builds_again() {
     assert!(status.is_server_error(), "{status} {failed}");
     let (status, ready) = request(app, &key, "").await;
     assert_eq!(status, StatusCode::OK, "{ready}");
-    assert_eq!(scheduler.architecture_builds_for_tests(), 2);
+    assert_eq!(scheduler.architecture_builds_for_tests() - before, 2);
 }
 
 #[tokio::test]
@@ -610,48 +621,61 @@ async fn a_failure_of_the_revision_is_kept_and_answered_typed() {
         "version=1\n[layers.a]\norder=1\npaths=['**/*.js']\n[layers.b]\norder=2\npaths=['**/*.js']",
     );
     let scheduler = runtime.browser_scheduler().unwrap();
+    let before = scheduler.architecture_builds_for_tests();
     let app = browser.clone().router();
     for _ in 0..2 {
         let (status, failed) = request(app.clone(), &key, "").await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{failed}");
         assert_eq!(failed["error"]["code"], "invalid_rules");
     }
-    assert_eq!(scheduler.architecture_builds_for_tests(), 1);
+    assert_eq!(scheduler.architecture_builds_for_tests() - before, 1);
 }
 
+/// #798: while the owner builds the head, a tool read with or without `paths` answers the
+/// typed retryable `building` with the build's progress. A scoped read does not compute its own
+/// answer beside the build.
 #[tokio::test]
-async fn a_tool_read_is_served_or_typed_retryable_within_its_wait() {
+async fn a_tool_read_during_the_build_answers_building_without_computing() {
     let (base, runtime, _browser, _key) = fixture().await;
     write_rules(&base, RULES);
     let scheduler = runtime.browser_scheduler().unwrap();
-    let hold = Hold::at(&scheduler, "architecture_build_started");
+    let before = scheduler.architecture_builds_for_tests();
+    let hold = Hold::at(&scheduler, "evaluating");
     scheduler.architecture_hint();
     hold.wait_reached();
     let tool = runtime.clone();
-    let (building, scoped) = tokio::task::spawn_blocking(move || {
+    let (whole, scoped) = tokio::task::spawn_blocking(move || {
         let (response, _) = tool.evidence_response().unwrap();
         let read =
             |arguments| tool.architecture_tool(&response, "check", &arguments, &mut || Ok(()));
         (
             read(json!({})).unwrap_err(),
-            read(json!({"paths":["sample.js"]})).unwrap(),
+            read(json!({"paths":["sample.js"]})).unwrap_err(),
         )
     })
     .await
     .unwrap();
-    // A narrow read need not wait: it computes its own scope while the build runs.
-    assert_eq!(scoped["rulesVersion"], "rules:v2");
-    assert!(building.to_string().starts_with("deadline_exceeded:"));
-    let envelope = trellis::mcp::architecture::failure(&json!(1), &building);
-    assert_eq!(envelope["error"]["code"], "deadline_exceeded");
-    assert_eq!(envelope["error"]["retryable"], true);
-    assert!(
-        envelope["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("being computed"),
-        "{envelope}"
-    );
+    for building in [&whole, &scoped] {
+        assert!(
+            building
+                .downcast_ref::<trellis::http::ArchitectureBuilding>()
+                .is_some(),
+            "{building}"
+        );
+        let envelope = trellis::mcp::architecture::failure(&json!(1), building);
+        let error = &envelope["error"];
+        assert_eq!(error["code"], "building", "{envelope}");
+        assert_eq!(error["retryable"], true);
+        assert_eq!(error["retryAfterMs"], 250);
+        assert_eq!(
+            error["progress"],
+            json!({"phase":"evaluating","completed":0,"total":4})
+        );
+        assert_eq!(
+            error["message"],
+            "Architecture is being computed for this revision (evaluating 0 of 4); retry shortly"
+        );
+    }
 
     hold.release();
     let tool = runtime.clone();
@@ -669,7 +693,7 @@ async fn a_tool_read_is_served_or_typed_retryable_within_its_wait() {
     .await
     .unwrap();
     assert_eq!(whole["rulesVersion"], "rules:v2");
-    assert_eq!(scheduler.architecture_builds_for_tests(), 1);
+    assert_eq!(scheduler.architecture_builds_for_tests() - before, 1);
 }
 
 #[tokio::test]
@@ -782,6 +806,7 @@ async fn an_over_budget_revision_still_answers_a_narrow_read() {
     trellis::references::set_site_limit_for_tests(5);
     write_rules(&base, RULES);
     let scheduler = runtime.browser_scheduler().unwrap();
+    let before = scheduler.architecture_builds_for_tests();
     let (status, whole) = request(browser.clone().router(), &key, "").await;
     assert!(!status.is_success(), "{status} {whole}");
 
@@ -814,5 +839,5 @@ async fn an_over_budget_revision_still_answers_a_narrow_read() {
         "{unscoped:#}"
     );
     // The failure is kept: the narrow reads asked for no further build.
-    assert_eq!(scheduler.architecture_builds_for_tests(), 1);
+    assert_eq!(scheduler.architecture_builds_for_tests() - before, 1);
 }

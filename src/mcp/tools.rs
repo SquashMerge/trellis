@@ -621,6 +621,10 @@ fn details(code: &str) -> (&'static str, bool) {
         ),
         "bounded_work" => ("Architecture projection work bound exceeded", false),
         "response_too_large" => ("Architecture result is too large", false),
+        "building" => (
+            "Architecture is being computed for this revision; retry shortly",
+            true,
+        ),
         _ => ("Store is unavailable", false),
     }
 }
@@ -1351,7 +1355,7 @@ mod tests {
             json!(-9007199254740991_i64),
         ];
         let describe_expected = json!({"schemaVersion":1,"requestId":7,"evidenceBasis":null,"data":{
-            "workspaceLabel":"selected","indexState":"unavailable","progress":null,"watcherDegraded":false,"languages":[],"toolVersion":15,"schemaVersion":1,
+            "workspaceLabel":"selected","indexState":"unavailable","progress":null,"watcherDegraded":false,"languages":[],"toolVersion":16,"schemaVersion":1,
             "searchIndex":{"backend":null,"unavailableReason":null},
             "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,"sourceLines":200,"defaultLimit":20,"callDefaultLimit":6,"maxLimit":50,"pageBytes":24576,"calleeTextBytes":1024,"hintWorkMs":1000,"deadlineMs":5000,"concurrency":4}},
             "warnings":[],"partial":true,"truncated":false,"truncationReason":null});

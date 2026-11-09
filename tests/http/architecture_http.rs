@@ -161,6 +161,8 @@ async fn fixture_with_bytes(
         .settled_for_tests(None)
         .await
         .unwrap_or_else(|error| panic!("{error}"));
+    // Settled includes the Architecture owner, which has built the head's core with no read
+    // asking (#798): a test that holds or counts builds sees only its own.
     let browser = ProvisionedBrowser::new(
         Arc::new(tokio::sync::Mutex::new(registry)),
         TOKEN.into(),

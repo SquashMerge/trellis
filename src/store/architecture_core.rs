@@ -272,11 +272,13 @@ impl ArchitectureCore {
             .transpose()?;
         let metrics = if measure {
             report("measuring");
-            Some(match measure_documents(store, &snapshot, &regions, check) {
-                Ok(metrics) => Ok(metrics),
-                Err(error) if CoreFailure::repeats(&error) => Err(CoreFailure::of(&error)),
-                Err(error) => return Err(error),
-            })
+            Some(
+                match measure_documents(store, &snapshot, &regions, check, progress) {
+                    Ok(metrics) => Ok(metrics),
+                    Err(error) if CoreFailure::repeats(&error) => Err(CoreFailure::of(&error)),
+                    Err(error) => return Err(error),
+                },
+            )
         } else {
             None
         };
@@ -291,13 +293,17 @@ impl ArchitectureCore {
     }
 }
 
-/// Metrics of the documents already read, in parallel.
+/// Metrics of the documents already read, in parallel. Each measured document advances
+/// `report` (#798), counted and reported under one lock so the published count only grows.
 fn measure_documents(
     store: &Store,
     snapshot: &crate::references::Snapshot,
     regions: &[Vec<crate::native_evidence::ControlRegion>],
     check: &mut (impl FnMut() -> Result<()> + Send),
+    report: &(dyn Fn(ArchitectureProgress) + Sync),
 ) -> Result<ArchitectureMetrics> {
+    let total = snapshot.documents.len();
+    let measured = Mutex::new(0usize);
     let progress = MetricsReadCheck {
         check: Mutex::new(check),
         failure: Mutex::new(None),
@@ -312,14 +318,22 @@ fn measure_documents(
             let document = &snapshot.documents[index];
             let calls = std::cell::Cell::new(0);
             let expired = || progress.expired_every(&calls, METRICS_WORKER_CHECK_EVERY);
-            store.metrics_document(
+            let outcome = store.metrics_document(
                 &document.key,
                 &document.file,
                 &document.declarations,
                 &document.calls,
                 &regions[index],
                 &expired,
-            )
+            );
+            let mut measured = measured.lock().unwrap_or_else(|e| e.into_inner());
+            *measured += 1;
+            report(ArchitectureProgress {
+                phase: "measuring",
+                completed: *measured,
+                total,
+            });
+            outcome
         },
     );
     let mut documents = BTreeMap::new();
