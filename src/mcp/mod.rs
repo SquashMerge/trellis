@@ -885,6 +885,10 @@ fn start_final_check(
 struct CallOutcome {
     result: serde_json::Value,
     finals: Finals,
+    /// A `trellis_show` target its read checked (#818). The coordinator records it only at
+    /// the call's final successful send decision, so a call that answers any failure records
+    /// nothing.
+    show: Option<show::Pending>,
 }
 enum Finals {
     /// Invalid application fields or a selection failure: nothing to recheck.
@@ -1069,6 +1073,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     return Ok(CallOutcome {
                         result: tools::resolved_root_changed(&name, &id, root, catching_up, modern),
                         finals: Finals::None,
+                        show: None,
                     });
                 }
                 Ok(selected_workspace) => selected_workspace,
@@ -1177,6 +1182,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                 )>,
             > = std::sync::Mutex::new(None);
             let show_target = &show_target;
+            let mut pending_show = None;
             let tool_read: Option<EvidenceToolRead> = match (name.as_str(), args) {
                 _ if !tool.valid_arguments || envelope["error"]["code"] != "index_not_ready" => {
                     None
@@ -1888,23 +1894,17 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     Ok((found, sampled)) => {
                         envelope = found;
                         sampled_catching_up = sampled;
-                        // Only a finished read's target is shown: never a partial answer.
+                        // Only a finished read's target can be shown; the coordinator
+                        // records it when it decides to send this answer.
                         let checked = show_target.lock().unwrap().take();
                         if let Some((target, pin)) = checked
                             && envelope.get("error").is_none()
                         {
-                            let runtime = registry.blocking_lock().runtime(key);
-                            let shown = runtime.map_or(
-                                crate::daemon::view_request::Shown::NoViewer,
-                                |runtime| {
-                                    runtime.view_requests().show(
-                                        target,
-                                        pin,
-                                        std::time::Instant::now(),
-                                    )
-                                },
-                            );
-                            envelope = show::record(envelope, shown);
+                            pending_show = Some(show::Pending {
+                                runtime: registry.blocking_lock().runtime(key),
+                                target,
+                                pin,
+                            });
                         }
                     }
                     Err(error) => {
@@ -1923,6 +1923,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                     modern,
                                 ),
                                 finals: Finals::None,
+                                show: None,
                             });
                         }
                         envelope = tools::failure(id, code);
@@ -1952,6 +1953,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
             Ok(CallOutcome {
                 result: tool.response,
                 finals,
+                show: pending_show,
             })
         }
         Err(crate::daemon::registry::SelectionError::CheckoutCapacity) => {
@@ -1982,6 +1984,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                             witness,
                             catching_up,
                         },
+                        show: None,
                     })
                 }
                 Err(error) => Ok(CallOutcome {
@@ -1991,6 +1994,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                         modern,
                     ),
                     finals: Finals::None,
+                    show: None,
                 }),
             }
         }
@@ -2005,6 +2009,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     modern,
                 ),
                 finals: Finals::None,
+                show: None,
             })
         }
     }
@@ -2446,11 +2451,13 @@ fn coordinate(
                 continue;
             }
             let mut result = outcome.result;
+            let mut show = outcome.show;
             if workspace.clock_now() < call.deadline
                 && let Finals::Launch { catching_up } = &outcome.finals
             {
                 phase_hook("launch_final")?;
                 if workspace.check().is_err() {
+                    show = None;
                     result = tools::resolved_root_changed(
                         &call.name,
                         &call.id,
@@ -2464,7 +2471,7 @@ fn coordinate(
             if let Some(hook) = &workspace.hooks.send_decision {
                 hook(&call.id);
             }
-            finished.push((token, result, None));
+            finished.push((token, result, None, show));
         }
         while let Some((token, result)) = checked.pop_front() {
             let result = result?;
@@ -2508,6 +2515,7 @@ fn coordinate(
                         *catching_up,
                         call.modern,
                     );
+                    check.outcome.show = None;
                     None
                 }
             };
@@ -2515,7 +2523,7 @@ fn coordinate(
             if let Some(hook) = &workspace.hooks.send_decision {
                 hook(&call.id);
             }
-            finished.push((token, check.outcome.result, gate));
+            finished.push((token, check.outcome.result, gate, check.outcome.show));
         }
         let now = Instant::now();
         checks.retain(|token, _| {
@@ -2556,7 +2564,7 @@ fn coordinate(
             &mut completed,
             &mut checked,
         ) {
-            for (token, _, _) in &finished {
+            for (token, _, _, _) in &finished {
                 if let Some(call) = in_flight.get(token) {
                     call.cancel
                         .store(true, std::sync::atomic::Ordering::Release);
@@ -2577,17 +2585,22 @@ fn coordinate(
         // client (#131). A comparison that fails with an I/O error proving
         // nothing (`Unavailable`) leaves the call pending: its final check
         // starts again after a tick, until its deadline.
-        for (token, result, gate) in finished {
+        for (token, result, gate, show) in finished {
             let Some(call) = in_flight.remove(&token) else {
                 continue;
             };
             phase_hook("call_send")?;
+            // The show recorded with this answer, only if the answer stays this success.
+            let mut record = None;
             let result = if workspace.clock_now() >= call.deadline {
                 deadline_answer(&call)
             } else if let Some(gate) = gate {
                 phase_hook("selected_call_send")?;
                 match gate.witness.verify_at_send(&gate.dirs) {
-                    Ok(()) => result,
+                    Ok(()) => {
+                        record = show;
+                        result
+                    }
                     Err(SelectionError::Unavailable) => {
                         let (witness, catching_up) = (gate.witness, gate.catching_up);
                         let finals = if gate.capacity {
@@ -2604,7 +2617,11 @@ fn coordinate(
                         checks.insert(
                             token,
                             FinalCheck {
-                                outcome: CallOutcome { result, finals },
+                                outcome: CallOutcome {
+                                    result,
+                                    finals,
+                                    show,
+                                },
                                 running: false,
                                 retry_at: Some(Instant::now() + FINAL_RECHECK_TICK),
                             },
@@ -2621,7 +2638,16 @@ fn coordinate(
                     ),
                 }
             } else {
+                record = show;
                 result
+            };
+            // The final send decision: a pending call is committed now, so its show is
+            // recorded with it; a cancelled call answers nothing and records nothing.
+            let result = match record {
+                Some(pending) if session.pending(token).is_some() => {
+                    show::commit(pending, result, &call.name, call.modern)
+                }
+                _ => result,
             };
             let response = architecture::response(&call.id, result);
             if let Some(value) = session

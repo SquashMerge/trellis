@@ -2052,3 +2052,69 @@ test("the follow poll reads status/head every 5 s and follows the viewRequest it
   assert.equal(h.timers.has(next), false, "a checkout reset stops it");
   assert.equal(h.run("followTimer"), null);
 });
+
+// #824: an agent show owns the view only until a newer show, a user navigation or a pin.
+test("a late older show does not override a newer one", async () => {
+  const {h} = await showHarness(), old = deferred();
+  h.context.fetch = (path, options) => JSON.parse(options.body).seed === "older" ? old.promise : Promise.resolve(response(view("newer")));
+  const pending = h.run(`observeViewRequest(${JSON.stringify(shown(4, {view:"sequence", symbolId:"older"}))})`);
+  await h.run(`observeViewRequest(${JSON.stringify(shown(5, {view:"sequence", symbolId:"newer"}))})`);
+  assert.equal(h.run("selectedMethod.id"), "newer");
+  old.resolve(response(view("older"))); await pending;
+  assert.equal(h.run("selectedMethod.id"), "newer");
+  assert.match(h.get("agent-shown-label").textContent, /newer/);
+});
+test("a pending show does not override a later manual selection", async () => {
+  const {h} = await showHarness(), old = deferred();
+  h.context.fetch = () => old.promise;
+  const pending = h.run(`observeViewRequest(${JSON.stringify(shown(4))})`);
+  h.context.fetch = async () => response(view("manual"));
+  await h.run(`selectMethod(${JSON.stringify(symbol("manual"))})`);
+  old.resolve(response(view("agent"))); await pending;
+  assert.equal(h.run("selectedMethod.id"), "manual");
+  assert.equal(h.get("agent-shown").hidden, true);
+});
+test("pinning while a show's read is pending stops its navigation; control: an unpinned one navigates", async () => {
+  for (const pin of [true, false]) {
+    const {h} = await showHarness(), old = deferred();
+    h.context.fetch = () => old.promise;
+    const pending = h.run(`observeViewRequest(${JSON.stringify(shown(4))})`);
+    if (pin) h.get("follow-agent").listeners.click();
+    old.resolve(response(view("agent"))); await pending;
+    assert.equal(h.run("selectedMethod.id"), pin ? "old" : "agent", `pinned: ${pin}`);
+  }
+});
+for (const before of ["architecture", "treemap", "classes"]) test(`agent Back returns to the visible ${before} view, not a sequence held from before`, async () => {
+  const {h} = await showHarness();
+  for (const name of ["architecture", "treemap", "sequence", "classes"]) h.get("view-" + name).getAttribute = function (key) { return this.attrs[key]; };
+  h.run(`window.TrellisShell.showView('${before}')`);
+  assert.equal(h.run("currentDiagramView()"), before);
+  await h.run(`observeViewRequest(${JSON.stringify(shown(4))})`);
+  assert.equal(h.run("currentDiagramView()"), "sequence");
+  h.get("agent-shown-back").listeners.click();
+  await h.run("readNavigationLocation()");
+  assert.equal(h.run("currentDiagramView()"), before);
+});
+test("control: agent Back from a visible sequence returns to that sequence", async () => {
+  const {h} = await showHarness();
+  for (const name of ["architecture", "treemap", "sequence", "classes"]) h.get("view-" + name).getAttribute = function (key) { return this.attrs[key]; };
+  h.run("window.TrellisShell.showView('sequence')");
+  await h.run(`observeViewRequest(${JSON.stringify(shown(4))})`);
+  h.get("agent-shown-back").listeners.click();
+  await h.run("readNavigationLocation()");
+  assert.equal(h.run("currentDiagramView()"), "sequence");
+  assert.equal(h.run("selectedMethod.id"), "old");
+});
+test("agent Back returns to the class diagram that was open", async () => {
+  const {h} = await showHarness();
+  for (const name of ["architecture", "treemap", "sequence", "classes"]) h.get("view-" + name).getAttribute = function (key) { return this.attrs[key]; };
+  const opened = [];
+  h.context.recordClass = options => opened.push(options.seed);
+  h.run("window.TrellisClasses = {reset() {}, open(options) { recordClass(options); }}");
+  await h.run("openClasses({seed:'Type'})");
+  await h.run(`observeViewRequest(${JSON.stringify(shown(4))})`);
+  h.get("agent-shown-back").listeners.click();
+  await h.run("readNavigationLocation()");
+  assert.deepEqual(opened, ["Type", "Type"]);
+  assert.equal(h.run("currentDiagramView()"), "classes");
+});

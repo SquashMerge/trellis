@@ -189,6 +189,9 @@ export default class Trellis extends View {
   }
 
   setPinned(pinned, cx) {
+    // Pinning while an agent's Sequence is still being read stops that show: the pane goes
+    // back to what it showed before (#824).
+    if (pinned && this.shown?.back && this.seq?.agent && this.seq.loading) this.backFromShow(cx);
     this.pinned = pinned; this.pinnedSeq = this.events;
     try { localStorage.setItem("trellis.pinned", String(pinned)); } catch { /* a convenience only */ }
     // Unpinning follows the agent focused now, as if it had just been focused.
@@ -258,7 +261,7 @@ export default class Trellis extends View {
     const prev = this.seq;
     this.tab = "sequence";
     // The Files selection's method list stays; only the shown method changes.
-    this.seq = { file: prev.file, methods: prev.methods, methodsError: prev.methodsError, history: [], expanded: new Set() };
+    this.seq = { file: prev.file, methods: prev.methods, methodsError: prev.methodsError, history: [], expanded: new Set(), agent: true };
     this.loadSequence({ id: request.symbolId, name: null, path: null }, false, cx);
     this.shown = { text: "Shown by agent · Sequence", back: before };
   }
@@ -272,6 +275,9 @@ export default class Trellis extends View {
       // The earlier drawing's file was replaced, so it is drawn again.
       if (this.seq) this.seq.drawn = null;
       this.seqTried = null;
+      // Never an older revision's payload under this header: read it again at this pin.
+      const data = this.seq?.data;
+      if (this.seq?.seed && !this.seq.loading && (!data || !samePin(data.revision, this.status?.pin))) this.reloadSequence(cx);
     }
     cx.notify();
   }
@@ -418,8 +424,15 @@ export default class Trellis extends View {
     this.loadMethods(cx);
   }
 
+  // A new revision reloads what the pane shows and, during an agent show, what Back returns to:
+  // a sequence is never shown under another revision's header (#824).
   reloadSequence(cx) {
-    if (!this.seq?.file) return;
+    const back = this.shown?.back?.seq;
+    if (back?.seed && back !== this.seq) this.loadSequence(back.seed, false, cx, back);
+    if (!this.seq?.file) {
+      if (this.seq?.seed) this.loadSequence(this.seq.seed, false, cx);
+      return;
+    }
     const keep = this.seq.seed;
     this.seq = { ...this.seq, methods: null, methodsError: null, data: null, error: null, drawn: null, drawError: null, keep };
     this.seqTried = null;
@@ -447,12 +460,13 @@ export default class Trellis extends View {
   }
 
   // Opens one method's sequence; `push` keeps the current one for Back (a re-center).
-  loadSequence(symbol, push, cx) {
-    const { rootKey, serial, client } = this, pin = this.status?.pin, seq = this.seq, run = {};
+  // `seq` is the shown sequence, or the one an agent show's Back returns to.
+  loadSequence(symbol, push, cx, seq = this.seq) {
+    const { rootKey, serial, client } = this, pin = this.status?.pin, run = {};
     if (push && seq.seed) seq.history = [...seq.history, seq.seed].slice(-MAX_HISTORY);
-    Object.assign(seq, { seed: { id: symbol.id, name: symbol.name, path: symbol.path }, data: null, error: null, selected: null, expanded: new Set(), loading: true, run });
+    Object.assign(seq, { seed: { id: symbol.id, name: symbol.name, path: symbol.path }, data: null, drawn: null, error: null, selected: null, expanded: new Set(), loading: true, run });
     // Only the newest sequence request of this view may set data, an error or loading.
-    const live = () => serial === this.serial && seq === this.seq && run === seq.run;
+    const live = () => serial === this.serial && (seq === this.seq || seq === this.shown?.back?.seq) && run === seq.run;
     cx.spawn(async (cx) => {
       try {
         const data = await client.sequence(rootKey, pin, symbol.id);

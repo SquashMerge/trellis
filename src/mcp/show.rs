@@ -8,6 +8,7 @@
 use crate::daemon::registry::CheckoutEvidence;
 use crate::daemon::view_request::{Shown, ViewTarget};
 use crate::model::{IndexPin, SymbolKind};
+use crate::store::mcp_read::SourceRangeRejected;
 use serde_json::{Map, Value, json};
 
 pub const NAME: &str = "trellis_show";
@@ -102,22 +103,27 @@ pub fn check(
                     line: *line,
                 },
                 Ok(None) => return answer("not_found", "No indexed file at that path."),
-                Err(error)
-                    if error
-                        .to_string()
-                        .starts_with("range_too_large: source line") =>
-                {
-                    let message = if error.to_string().contains("absent") {
-                        "The line is past the end of the indexed file."
-                    } else {
-                        "The line is too long to show."
-                    };
-                    return answer("invalid", message);
-                }
-                Err(error) if error.to_string().starts_with("unsupported_encoding:") => {
-                    return answer("invalid", "The indexed file is not UTF-8 text.");
-                }
-                Err(error) => return Err(error),
+                // Every typed reason the cached line cannot be read is a target that
+                // cannot be shown (#818), never a failure.
+                Err(error) => match error.downcast_ref::<SourceRangeRejected>() {
+                    Some(reason) => {
+                        return answer(
+                            "invalid",
+                            match reason {
+                                SourceRangeRejected::LineAbsent => {
+                                    "The line is past the end of the indexed file."
+                                }
+                                SourceRangeRejected::ByteCap | SourceRangeRejected::LineCap => {
+                                    "The line is longer than 16 KiB, so it cannot be shown."
+                                }
+                                SourceRangeRejected::NotUtf8 => {
+                                    "The indexed line is not UTF-8 text."
+                                }
+                            },
+                        );
+                    }
+                    None => return Err(error),
+                },
             }
         }
         Request::Symbol {
@@ -191,7 +197,29 @@ pub fn check(
     ))
 }
 
-/// Records a checked target after its read finished, and completes its answer.
+/// A checked target waiting for its call's final successful send decision.
+pub struct Pending {
+    pub runtime: Option<std::sync::Arc<crate::daemon::registry::CheckoutRuntime>>,
+    pub target: ViewTarget,
+    pub pin: IndexPin,
+}
+
+/// Records `pending` at its call's send decision and completes the tool result answered with
+/// it. Without a runtime or an open viewer, the answer is `no_viewer` and nothing is recorded.
+pub fn commit(pending: Pending, result: Value, name: &str, modern: bool) -> Value {
+    let shown = pending.runtime.map_or(Shown::NoViewer, |runtime| {
+        runtime
+            .view_requests()
+            .show(pending.target, pending.pin, std::time::Instant::now())
+    });
+    super::tools::result(
+        name,
+        record(result["structuredContent"].clone(), shown),
+        modern,
+    )
+}
+
+/// Completes a checked target's answer with what recording it did.
 pub fn record(mut envelope: Value, shown: Shown) -> Value {
     let data = &mut envelope["data"];
     match shown {
