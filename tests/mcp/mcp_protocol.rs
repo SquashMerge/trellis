@@ -12403,6 +12403,11 @@ async fn architecture_tools_and_prompt_share_pinned_evidence_and_current_rules()
                 .unwrap()
                 .contains("\"rulesText\":null")
         );
+        let absent_text = absent["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(absent_text.contains("\"apps\":[]"), "{absent_text}");
+        assert!(!absent_text.contains("PER-APP LAYERS"));
         let missing = ask(
             8,
             "tools/call",

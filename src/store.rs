@@ -1911,6 +1911,15 @@ impl EvidenceResponse {
         check: &mut (impl FnMut() -> Result<()> + Send),
     ) -> Result<serde_json::Value> {
         let references = core.references(&parsed.paths, parsed.sample_limit, check)?;
+        let apps = if kind == "prompt" {
+            Some(crate::rules::prompt_apps(
+                config,
+                core.app_candidates()?,
+                check,
+            )?)
+        } else {
+            None
+        };
         let mut evaluate =
             |config: &crate::rules::Config,
              references: &crate::references::Projection,
@@ -1925,7 +1934,7 @@ impl EvidenceResponse {
                 )?
                 .data)
             };
-        Self::architecture_payload(
+        let mut payload = Self::architecture_payload(
             kind,
             arguments,
             config,
@@ -1933,7 +1942,11 @@ impl EvidenceResponse {
             core.pin,
             &mut evaluate,
             check,
-        )
+        )?;
+        if let Some(apps) = apps {
+            payload["apps"] = serde_json::Value::Array(apps);
+        }
+        Ok(payload)
     }
 
     /// One path-scoped operation computed from its own scope, under the budgets of that
@@ -1951,6 +1964,12 @@ impl EvidenceResponse {
             .map_err(|error| self.store.report_index_failure(error))?;
         let references =
             crate::references::project(&snapshot, &parsed.paths, parsed.sample_limit, check)?;
+        let apps = if kind == "prompt" {
+            let candidates = crate::rules::app_candidates(&snapshot, check)?;
+            Some(crate::rules::prompt_apps(config, &candidates, check)?)
+        } else {
+            None
+        };
         let mut evaluate =
             |config: &crate::rules::Config,
              references: &crate::references::Projection,
@@ -1958,7 +1977,7 @@ impl EvidenceResponse {
                 let mut check = || check();
                 crate::rules::evaluate(config, &snapshot, references, &parsed.paths, &mut check)
             };
-        Self::architecture_payload(
+        let mut payload = Self::architecture_payload(
             kind,
             arguments,
             config,
@@ -1966,7 +1985,11 @@ impl EvidenceResponse {
             snapshot.pin,
             &mut evaluate,
             check,
-        )
+        )?;
+        if let Some(apps) = apps {
+            payload["apps"] = serde_json::Value::Array(apps);
+        }
+        Ok(payload)
     }
 
     /// One operation's answer from its references and its way of evaluating the rules.

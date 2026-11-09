@@ -164,7 +164,6 @@ impl ArchitectureCore {
             None => anyhow::bail!("store_unavailable: architecture metrics part"),
         }
     }
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn app_candidates(&self) -> Result<&crate::apps::Candidates> {
         self.app_candidates.as_ref().map_err(CoreFailure::error)
     }
