@@ -244,7 +244,9 @@ This adds a row to the direction table:
 `cross_app` joins `layer_unassigned` in the instance's `unresolved` reasons. Such a pair is
 never counted as a deviation and never fails `trellis rules check`. It stays `unknown` until
 [#686](https://github.com/SquashMerge/trellis/issues/686) measures interfaces between apps.
-A later amendment then decides how a matched interface reports.
+A later amendment then decides how a matched interface reports. The
+[implementation notes (#784)](#implementation-notes-784) give the per-app counts that
+`trellis rules check` prints.
 
 The `rules:v2` instance shape is unchanged. Production and test rows, exact counts,
 evidence and sampling are unchanged.
@@ -364,6 +366,112 @@ What the example shows:
   belong to `trellis-web`. `tests/mcp/**` stays in `tests` (`trellis`).
 - A reference between a `trellis-web` layer and a `trellis` layer (both non-shared) is
   `unknown`/`cross_app`: interface evidence for #686, not a deviation.
+
+## Implementation notes (#784)
+
+**Status: proposed (owner-delegated, run 803).** This section records how
+[#784](https://github.com/SquashMerge/trellis/issues/784) implements
+[Amendment (#783)](#amendment-783-apps-and-per-app-layers). It adds no rule beyond the
+amendment. Where the two differ in detail, this section is the exact behaviour.
+
+**App kinds.** An app's `kind` is `cargo`, `npm` or `python`. `python` is a ratified app kind
+(owner ruling 2026-11-08). Python detection from `pyproject.toml` arrives separately in
+[#807](https://github.com/SquashMerge/trellis/issues/807); until it lands, detection yields
+only `cargo` and `npm` apps.
+
+**Captured manifests.** Detection reads only manifest bytes the indexer captured with the
+code snapshot, and never the live files. The snapshot retains every present `package.json`
+and `Cargo.toml` at any depth, outside `node_modules/`, under the existing byte bounds. The
+per-manifest size bound applies to the root manifests only; a nested manifest counts toward
+the total bound. A manifest that is absent from the snapshot is not an app and is not unread.
+
+**Outcome table.** Every captured manifest gets exactly one outcome:
+
+| Manifest | Outcome |
+| --- | --- |
+| Any path with a `node_modules` component | not listed |
+| Absent (no captured bytes) | no app |
+| Root `Cargo.toml`: invalid TOML or over the size bound | unread |
+| Root `Cargo.toml` with `[workspace]` and no `[package]` | no app; its members are still detected |
+| `Cargo.toml` with `[package]` but no string `package.name`, or a `[[bin]]` without a string `name` | unread |
+| `Cargo.toml` with `[package]` and no binary entries (library only) | no app |
+| `Cargo.toml` with `[package]` and at least one binary entry | app (`cargo`) |
+| Workspace member `Cargo.toml`: invalid TOML or over the size bound | unread |
+| Workspace member `Cargo.toml` without `[package]` | no app |
+| Nested `Cargo.toml` that is not a workspace member | no app; never parsed for identity |
+| `package.json` that is not a JSON object, or is over the size bound | unread |
+| `package.json` that is a JSON object | app (`npm`) |
+
+An unread manifest detects no app. A manifest that a hidden layer selects (see
+[Amendment (#783)](#amendment-783-apps-and-per-app-layers)) is neither an app nor unread.
+
+**Defaults.**
+
+- **Workspace members** come from the root manifest's `[workspace].members` and `exclude`,
+  matched as globs whose `*` does not cross `/`, against the directories of the captured
+  nested `Cargo.toml` files. `exclude` wins. A member is parsed only when it is captured.
+- **Cargo entries** are the explicit `[[bin]].name` values. Unless `package.autobins` is
+  `false`, they also include `package.name` when `<root>/src/main.rs` is a snapshot
+  document, and the file stem of each `<root>/src/bin/*.rs` that no `[[bin]].path` names.
+  Entries are sorted and deduplicated.
+- **npm** name is `name` when it is a nonblank string, otherwise the manifest's directory
+  (`.` at the checkout root). Its entries are empty.
+- **Roots** are the manifest's directory. `.` contains every path, and a path belongs to
+  the app with the most specific containing root.
+
+**Unread manifests.** When `n` manifests are unread, the check output adds the limitation
+"`n` build manifest(s) could not be read for app detection (malformed or over the size
+bound); they detect no app." Over the work bound, detection fails `bounded_work`.
+
+**`apps` and `noApp` in check output.** `trellis rules check --format json` and the MCP
+`trellis_rules_check` payload gain:
+
+```text
+apps:[{name,manifest,counts:Counts}]   # one entry per detected manifest, in manifest-path order
+noApp:{counts:Counts}
+```
+
+Both count production instances only. `trellis_rules_explain` carries neither field. With no
+detected app, `apps` is empty and every instance is under `noApp`.
+
+**The `bucket` rule.** Each production instance is given to at most one app:
+
+- A `$layers` instance with both a source and a destination layer goes to the single app
+  those two layers have in common. It goes to no app when they share none (`cross_app`) or
+  share more than one.
+- Any other instance (a `$layers` instance with an unassigned end, `$external`, or a
+  declaration rule) is attributed by its own file. The file's layer decides when that layer
+  names exactly one app; otherwise the app whose root most specifically contains the file
+  decides. For these instances the layer is the source layer when it is set, otherwise the
+  target file's assigned layer.
+
+A file in a single-app layer counts under that app even when it lies outside that app's
+root. Instances in no app are exactly the `cross_app` instances, instances between layers
+that share more than one app, instances attributed by a file that is in no single-app layer
+and outside every app root, and every instance when no app is detected.
+
+A deviation that involves a shared layer has exactly one common app, because only shared to
+ordered can deviate. So `Σ apps[].counts + noApp.counts = counts`, field by field. A
+`cross_app` instance stays in `counts.unknown` and in `noApp.counts.unknown`; it is dropped
+from the Architecture summary's layer edges.
+
+**Single-app output.** With exactly one detected app, `apps[0].counts` equals `counts` only
+when no row's own file is unassigned and outside the app's root. Such rows count under
+`noApp`. So a single-app checkout whose app root is a subdirectory, and which has unassigned
+files outside that root, reports part of its CLI and MCP per-app output under `noApp`.
+
+**Validation order.** Layers are validated in name order and the first error wins:
+
+- With no detected app, any `app` or `apps` key is a `reference` error.
+- With one app, a name that is not that app is a `reference` error.
+- With two or more apps, an ordered layer without `app` is a `schema` error at the layer's
+  table header. A name matching no app is a `reference` error. A name matching two or more
+  apps is an `ambiguity` error that names both manifests.
+
+**Limitation.** App detection reads manifests only. A checkout that one manifest cannot
+split, such as a Node backend and a JavaScript frontend in a single `package.json`, is one
+app until an authored override exists. Trellis's own `web/package.json` makes its web files a
+second app.
 
 ## External package policy
 
