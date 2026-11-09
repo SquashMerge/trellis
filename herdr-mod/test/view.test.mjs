@@ -39,7 +39,7 @@ const architecture = () => {
     semanticComplete: false, rulesFile: { contentHash: "abc" }, references: { coverage: [] } };
 };
 
-function fakeDaemon({ ready = false } = {}) {
+function fakeDaemon({ ready = false, checkouts = [{ key: KEY, root: ROOT }] } = {}) {
   const seen = [];
   const server = createServer((req, res) => {
     let body = "";
@@ -48,9 +48,12 @@ function fakeDaemon({ ready = false } = {}) {
       seen.push({ method: req.method, url: req.url, auth: req.headers.authorization, body });
       const send = (status, value) => { res.writeHead(status, { "Content-Type": "application/json" }); res.end(JSON.stringify(value)); };
       if (req.headers.authorization !== `Bearer ${TOKEN}`) return send(401, { error: { code: "unauthorized", message: "Bearer authentication required" } });
-      const path = req.url.split("?")[0], base = `/api/checkouts/${KEY}/`;
-      if (path === "/api/checkouts") return send(200, { checkouts: [{ rootKey: KEY, state: "available", workspaceRoot: ROOT, revision: pin, catchingUp: false }] });
-      if (path === `${base}status`) return send(200, { workspaceRoot: ROOT, revision: pin, catchingUp: false });
+      const path = req.url.split("?")[0];
+      if (path === "/api/checkouts") return send(200, { checkouts: checkouts.map((c) => ({ rootKey: c.key, state: "available", workspaceRoot: c.root, revision: pin, catchingUp: false })) });
+      const listed = checkouts.find((c) => path.startsWith(`/api/checkouts/${c.key}/`));
+      if (!listed) return send(404, { error: { code: "not_found", message: "Not found" } });
+      const base = `/api/checkouts/${listed.key}/`;
+      if (path === `${base}status`) return send(200, { workspaceRoot: listed.root, revision: pin, catchingUp: false });
       if (path === `${base}architecture` && ready) return send(200, { payload: architecture() });
       if (path === `${base}architecture`) return send(200, { payload: { ...pin, state: "missing_rules", aggregate: "max", role: "production", workbench: true,
         metricsVersion: "metrics:v1", evidenceTier: "syntax", semanticComplete: false, layers: [], modules: [], edges: [] } });
@@ -168,4 +171,92 @@ test("a drawing the runtime ends is a typed timeout, not Drawing… for ever, in
     assert.equal(view.seqDrawing, false);
     await view.close();
   } finally { server.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+// #809: the pane follows the focused agent's checkout; a mod pane's focus (cwd null) keeps it;
+// the pin stops it; a later Files selection wins; a folder in no listed checkout is a note.
+const KEY_B = "c".repeat(64), ROOT_B = "/work/other";
+const agentIn = (pane, cwd) => ({ space: "s1", tab: "t1", pane, terminal: `term-${pane}`, shown: null, agent: "claude", cwd });
+const modPane = (pane) => ({ space: "s1", tab: "t1", pane, terminal: null, shown: null, agent: null, cwd: null });
+
+async function following(fn) {
+  const { server, seen, port } = await fakeDaemon({ checkouts: [{ key: KEY, root: ROOT }, { key: KEY_B, root: ROOT_B }] });
+  const dir = mkdtempSync(join(tmpdir(), "trellis-view-")), tokenFile = join(dir, "token");
+  writeFileSync(tokenFile, `${TOKEN}\n`);
+  Object.assign(state, { appHome: dir, focused: agentIn("p1", `${ROOT}/src`), shared: {}, spaces: [] });
+  try {
+    const pane = mount({ url: `http://127.0.0.1:${port}`, tokenFile, transport: "exec" });
+    await pane.settle();
+    await fn({ ...pane, seen, statusReads: (key) => seen.filter((r) => r.url === `/api/checkouts/${key}/status`).length });
+    await pane.view.close();
+  } finally { server.close(); rmSync(dir, { recursive: true, force: true }); }
+}
+
+test("the pane follows the focused agent from one checkout to another, and reads only those", async () => {
+  await following(async ({ view, settle, statusReads }) => {
+    assert.equal(view.rootKey, KEY, "agent A's folder is inside the first checkout");
+    assert.equal(statusReads(KEY_B), 0, "a checkout nobody points at is never read");
+    state.focused = agentIn("p2", ROOT_B);
+    const root = await settle();
+    assert.equal(view.rootKey, KEY_B);
+    assert.match(root.find("checkout-label").text(), /other/);
+    assert.equal(root.find("checkout-button"), null, "no checkout dropdown");
+    assert.ok(statusReads(KEY_B) > 0);
+  });
+});
+
+test("focusing a mod pane, this one included, keeps the last agent's checkout", async () => {
+  await following(async ({ view, settle }) => {
+    state.focused = agentIn("p2", `${ROOT_B}/deep/folder`);
+    await settle();
+    assert.equal(view.rootKey, KEY_B);
+    state.focused = modPane("trellis-pane");
+    await settle();
+    assert.equal(view.rootKey, KEY_B);
+    state.focused = modPane("files-pane");
+    await settle();
+    assert.equal(view.rootKey, KEY_B);
+  });
+});
+
+test("pinned, the pane stays on its checkout; unpinned, it follows the focused agent again", async () => {
+  await following(async ({ view, cx, settle }) => {
+    let root = await settle();
+    root.find("pin").props.click({}, cx);
+    state.focused = agentIn("p2", ROOT_B);
+    root = await settle();
+    assert.equal(view.rootKey, KEY, "pinned: no follow");
+    assert.match(root.find("pin").text(), /Pinned/);
+    root.find("pin").props.click({}, cx);
+    root = await settle();
+    assert.equal(view.rootKey, KEY_B, "unpinned: follows the agent focused now");
+    assert.match(root.find("pin").text(), /Following/);
+  });
+});
+
+test("a Files selection after an agent focus wins, and a later focus wins back", async () => {
+  await following(async ({ view, settle }) => {
+    assert.equal(view.rootKey, KEY);
+    state.shared["trellis.selectedFile"] = { root: ROOT_B, path: "lib.rs", on: null };
+    await settle();
+    assert.equal(view.rootKey, KEY_B, "the more recent event is the selection");
+    state.focused = modPane("files-pane");
+    await settle();
+    assert.equal(view.rootKey, KEY_B, "the Files pane's own focus changes nothing");
+    state.focused = agentIn("p1", `${ROOT}/src`);
+    await settle();
+    assert.equal(view.rootKey, KEY, "focusing the agent again is now the more recent event");
+  });
+});
+
+test("a folder in no checkout the daemon lists is a note naming it, with no guess", async () => {
+  await following(async ({ view, settle, seen }) => {
+    const reads = seen.length;
+    state.focused = agentIn("p3", "/Users/me/fresh-clone");
+    const root = await settle();
+    assert.equal(view.rootKey, null);
+    assert.match(root.text(), /\/Users\/me\/fresh-clone isn't in a checkout this daemon lists/);
+    assert.match(root.find("checkout-label").text(), /fresh-clone/);
+    assert.ok(seen.slice(reads).every((r) => !r.url.includes("/status")), "nothing is read for an unknown folder");
+  });
 });

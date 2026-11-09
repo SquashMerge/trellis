@@ -1,6 +1,6 @@
 # Trellis for Herdr: design notes (#707 foundation)
 
-This cut is the shell plus two views, Architecture and Sequence. The daemon can be on another Herdr machine (round 2, 2026-11-08). Live agent-follow is deferred to #809. Owner decisions of 2026-11-08 set the scope:
+This cut is the shell plus two views, Architecture and Sequence. The daemon can be on another Herdr machine (round 2, 2026-11-08). The pane follows the focused agent's checkout (#809 item 1, 2026-11-08); agents per checkout and symbol follow (#809 items 2 and 3) are not built. Owner decisions of 2026-11-08 set the scope:
 
 - the mod mirrors the web app, but has no file list of its own, because files come from a `trellis-files` clone of Herdr's Files panel;
 - the first view is Architecture's layer stack;
@@ -11,7 +11,8 @@ This cut is the shell plus two views, Architecture and Sequence. The daemon can 
 | Piece | State | How it was checked |
 |---|---|---|
 | Build | esbuild bundles `src/main.js`, the browser scripts, Pele and the mod's code into one `main.js`. | `node build.mjs --install`, then `herdr-app check` passes and `herdr-app status` shows no errors. |
-| Shell | Checkout selector (the daemon's `/api/checkouts`, with each row's index state), index status (revision, Fresh or Catching up), polling (status every 5 s, list every 30 s, `building` retried at the daemon's `retryAfterMs`). | `test/harness.mjs` runs the real `src/main.js` against a live daemon. |
+| Follow | The pane shows the checkout the focused agent or terminal works in, or the Files selection's, whichever is more recent. A pin stops agent follow. See [Which checkout is shown](#which-checkout-is-shown). | `view.test.mjs`: agent A then B, a mod-pane focus, pinned, a later Files selection, an unknown folder. Harness with `--cwd`. |
+| Shell | The followed checkout's label and pin (the daemon's `/api/checkouts`, with each row's index state), index status (revision, Fresh or Catching up), polling (status every 5 s, list every 30 s, `building` retried at the daemon's `retryAfterMs`). | `test/harness.mjs` runs the real `src/main.js` against a live daemon. |
 | Typed errors | Every failure is a code and a message, and the data from that read is dropped. Codes come from the daemon (`index_not_ready`, `unauthorized`, `revision_conflict` and so on) or the mod (`token_missing`, `token_unreadable`, `token_invalid`, `daemon_unreachable`, `invalid_url`, `invalid_response`, and the adapter's `unsupported`). A drawing is shown only for the payload it was made from. | Harness against a stopped port, a non-loopback URL, a missing token and the owner's daemon. Unit tests. |
 | Architecture | Fetches the summary with the browser's parameters (`aggregate=max&role=production&workbench=true`, pinned to the status revision) and validates it as the browser's `payloadOf` does. Draws with the browser's own adapter and Pele. Lists the layers natively: order, files, max cognitive, and outgoing counts (↑ ⇄ ↓ →shared and so on, with deviations in the error colour), plus hidden, test, unassigned and coverage lines. | Harness. Unit tests, which use the browser's own Architecture fixture. |
 | Transport | A space on this computer uses `fetch`. A space on another Herdr machine runs `curl` there through `exec`, with the token read there. See [Transport](#transport). | `view.test.mjs` drives the real pane through `exec` and `curl` against a fake daemon, and checks a missing token, a rejected token and a stopped daemon. The harness ran it against the isolated daemon. |
@@ -151,9 +152,19 @@ Mods run in the app that draws them. When the owner views the mini from the lapt
 
 **Reading a checkout's status starts indexing it.** So the mod never picks a checkout by itself. It opens one only if:
 
-- it was chosen before, or named in props;
-- it holds the focused terminal's folder;
-- it holds the file selected in `trellis-files`.
+- it holds the focused agent's or terminal's folder;
+- it holds the file selected in `trellis-files`;
+- it was shown last time, or named in props, and nothing is focused or selected yet.
+
+## Which checkout is shown
+
+The owner's request (#809 item 1, 2026-11-08): the pane goes with the current agent, not a dropdown.
+
+- **Two events.** Each render reads `focused()` and shared `trellis.selectedFile`. A change of the focused pane or its `cwd` with a `cwd` (an agent or terminal) is an agent event; a new Files value is a selection event. Each gets the next sequence number, and the more recent one decides.
+- **Mod panes.** A mod pane's `cwd` is null. Focusing one, this pane included, changes the focus key but records no agent event, so the last agent-or-terminal folder stays.
+- **Mapping.** The folder maps to the deepest checkout in the daemon's list whose `workspaceRoot` is it or holds it, so a worktree inside another checkout wins. A folder in none is a note naming it, and nothing is read. A listed checkout that isn't `available` is a note too.
+- **Pin.** Pinned ignores agent events. Only a selection made after pinning switches. Unpinning counts the current focus as a new event, so the pane catches up at once. The pin and the last checkout are kept in `localStorage`, a per-viewer convenience.
+- **The list refreshes** every 30 s, and each refresh re-runs the mapping, so a fresh clone appears once the daemon lists it.
 
 ## The `trellis-files` clone
 

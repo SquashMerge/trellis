@@ -7,7 +7,7 @@ A [Herdr app](https://herdr.dev) mod that shows Trellis in a pane beside the cod
 
 Both views follow the file selected in the `trellis-files` panel. The pane talks to the Trellis daemon on the machine the shown space lives on.
 
-- `src/main.js` is the pane: a checkout selector, index status, typed error states, the diagram and the layer list.
+- `src/main.js` is the pane: the followed checkout with a pin, index status, typed error states, the diagram and the layer list.
 - `src/client.js` is the daemon client: token, routes and typed errors.
 - `src/diagram.js` draws Architecture. It uses the browser's own `web/architecture-pele.js`, `web/metric-heat.js`, `web/architecture.js` helpers and the vendored Pele, bundled unchanged.
 - `src/sequence.js` draws Sequence. It uses `web/sequence-pele.js` and the helpers in `web/sequence.js`, bundled unchanged.
@@ -92,7 +92,7 @@ Optional `props`:
 |---|---|---|
 | `url` | `http://127.0.0.1:8877` | The daemon. Only loopback (`127.0.0.1`, `localhost`, `[::1]`) is accepted. |
 | `tokenFile` | `~/.config/trellis/serve.token` | The serve token file. |
-| `checkout` | none | A root key to open. |
+| `checkout` | none | A root key to open while nothing is focused or selected yet. |
 | `machine` | the shown space's machine | Herdr machine whose daemon to show; `""` means this computer. |
 | `transport` | `fetch` here, `exec` elsewhere | `"exec"` forces the curl path on this computer too. |
 
@@ -103,11 +103,16 @@ For example, `{"direction":"right","mod":"trellis","props":{"url":"http://127.0.
 - For a space on this computer, the pane fetches from `url` here.
 - For a space on another Herdr machine, the pane runs `curl` *on that machine*, against `127.0.0.1:<port of url>`, with that machine's token file (`~` is that machine's home). The token never leaves that machine. That machine needs `sh` and `curl`.
 
-Opening the pane doesn't choose a checkout by itself, because reading a checkout's status starts indexing it. It opens:
+**Which checkout the pane shows (#809).** The pane follows the focused agent. There is no checkout dropdown; the header names the checkout, and a **Following / Pinned** toggle stops and restarts the follow.
 
-- the checkout chosen last time;
-- otherwise the checkout that holds the focused terminal's folder;
-- otherwise, nothing, until you choose a checkout in the header or select a file in `trellis-files`.
+- **Focus an agent or terminal:** the pane switches to the deepest checkout the daemon lists that holds its folder (`focused().cwd`).
+- **Focus a mod pane,** this one or Files included: the pane keeps the last agent-or-terminal checkout.
+- **Select a file in `trellis-files`:** the pane switches to that file's checkout. Whichever happened last, the focus or the selection, wins.
+- **Pinned:** agent focus is ignored. A Files selection made after pinning still switches the pane, because it is an explicit choice.
+- **A folder in no listed checkout,** such as a fresh clone the daemon hasn't seen: the pane shows a note naming the folder and opens nothing. It never guesses a nearby checkout.
+- **At start,** with nothing focused or selected, it opens the checkout shown last time (or `checkout` from props), if the daemon still lists it.
+
+Reading a checkout's status starts indexing it, so only checkouts an agent, the Files panel or that last choice point at are ever read.
 
 ## Update
 

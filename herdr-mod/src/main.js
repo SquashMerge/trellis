@@ -1,8 +1,9 @@
 // Trellis beside the coding agents (#707): the daemon's Architecture and Sequence views as a
 // Herdr pane.
 //
-// Shell: a checkout selector (the daemon's checkout list), index status (revision, fresh or
-// catching up) and a typed error state that never shows partial data. The daemon is the one on
+// Shell: the checkout the focused agent works in (or the Files selection's, whichever is more
+// recent), with a pin that stops following; index status (revision, fresh or catching up) and
+// a typed error state that never shows partial data. The daemon is the one on
 // the machine the shown space lives on (src/client.js). Views, drawn by the browser's own
 // adapters and Pele into SVGs under this mod's `.render/` folder and shown with image():
 // - Architecture: the layer stack, with the layer list and counts as native rows;
@@ -49,13 +50,17 @@ export default class Trellis extends View {
     this.copy = Math.random().toString(36).slice(2, 10);
     this.open = new Map();
     this.width = 0;
-    this.listOpen = false;
     this.props = p;
+    // Follow (#809): the last agent-or-terminal focus and the last Files selection, each with a
+    // sequence number, so the more recent one picks the checkout. Pinned stops agent follow.
+    this.events = 0; this.agent = null; this.selection = null; this.focusKey = null; this.fileKey = null;
+    this.pinned = (() => { try { return localStorage.getItem("trellis.pinned") === "true"; } catch { return false; } })();
     this.files = {};
     this.tab = (() => { try { return localStorage.getItem("trellis.tab") === "sequence" ? "sequence" : "architecture"; } catch { return "architecture"; } })();
-    this.wanted = validRootKey(p.checkout) ? p.checkout : (() => { try { return localStorage.getItem("trellis.checkout"); } catch { return null; } })();
     // The layout's trellis-files is reached only through the tab bar's Files button.
     try { ensureFilesPanel({ shared, setShared, layout }); } catch { /* the pane works without it */ }
+    this.observe();
+    this.pinnedSeq = this.events; // a pin kept from last time outranks what was there at start
     this.useMachine(this.shownMachine(), cx);
     cx.timer.every(STATUS_MS, (cx) => { if (this.client?.transport === "fetch" || ++this.ticks % 2 === 0) this.refreshStatus(cx); });
     cx.timer.every(LIST_MS, (cx) => this.loadCheckouts(cx));
@@ -73,7 +78,7 @@ export default class Trellis extends View {
 
   useMachine(machine, cx) {
     this.machine = machine; this.ticks = 0;
-    this.checkouts = null; this.listError = null; this.fatal = null;
+    this.checkouts = null; this.listError = null; this.fatal = null; this.unknown = null;
     this.rootKey = undefined; this.select(null, cx);
     try { this.client = createClient({ url: this.props.url, tokenFile: this.props.tokenFile, machine, transport: this.props.transport }); }
     catch (error) { this.fatal = fail(error); this.client = null; return; }
@@ -105,18 +110,7 @@ export default class Trellis extends View {
         if (!Array.isArray(data?.checkouts)) throw new TrellisError("invalid_response", "Checkout list is invalid.");
         this.checkouts = data.checkouts.filter((row) => row && validRootKey(row.rootKey) && typeof row.state === "string");
         this.listError = null;
-        const usable = (row) => row?.state === "available" && typeof row.workspaceRoot === "string";
-        const current = this.checkouts.find((row) => row.rootKey === this.rootKey);
-        if (!this.rootKey || !usable(current)) {
-          // Reading a checkout's status starts indexing it, so never pick one the person hasn't
-          // pointed at: the one chosen before (or in props), else the one the focused terminal
-          // is in. Otherwise wait for a choice (or a Files selection).
-          const here = focused()?.cwd || spaces().find((s) => s.active)?.folder || "";
-          const inside = this.checkouts.filter((row) => usable(row) && (here === row.workspaceRoot || here.startsWith(`${row.workspaceRoot}/`)))
-            .sort((a, b) => b.workspaceRoot.length - a.workspaceRoot.length)[0];
-          const pick = usable(this.checkouts.find((row) => row.rootKey === this.wanted)) ? this.wanted : inside?.rootKey ?? null;
-          this.select(pick, cx);
-        }
+        this.follow(cx);
       } catch (error) {
         if (client !== this.client) return;
         this.listError = fail(error); this.checkouts = null;
@@ -134,6 +128,63 @@ export default class Trellis extends View {
     this.serial = (this.serial || 0) + 1;
     if (rootKey) { try { localStorage.setItem("trellis.checkout", rootKey); } catch { /* a convenience only */ } }
     if (rootKey) this.refreshStatus(cx);
+  }
+
+  // --- following the agent and the Files selection (#809) ---
+
+  // Records a new focus or Files selection as an event. A focused mod pane (this one included)
+  // has no cwd, so it leaves the last agent-or-terminal focus in place.
+  // At start the focus is recorded after the selection, so it wins over an older selection.
+  observe() {
+    const value = shared(SELECTED_FILE);
+    const fileKey = value && typeof value === "object" ? JSON.stringify([value.root, value.path, value.on ?? null]) : null;
+    if (fileKey !== this.fileKey) {
+      this.fileKey = fileKey;
+      if (fileKey) this.selection = { seq: ++this.events };
+    }
+    const f = focused();
+    const key = f ? `${f.space}|${f.pane}|${f.terminal}|${f.cwd}` : null;
+    if (key !== this.focusKey) {
+      this.focusKey = key;
+      if (typeof f?.cwd === "string" && f.cwd.startsWith("/")) this.agent = { cwd: f.cwd.replace(/\/+$/, "") || "/", seq: ++this.events };
+    }
+  }
+
+  // The checkout the more recent event points at: the deepest daemon checkout that holds the
+  // agent's folder, or the one that holds the Files selection. Reading a checkout's status starts
+  // indexing it, so nothing else is ever opened, and a folder in no listed checkout is a note.
+  follow(cx) {
+    if (!this.checkouts || this.fatal) return;
+    // Pinned: agent focus is ignored, and only a selection made after pinning switches.
+    const agent = this.pinned ? null : this.agent;
+    const floor = this.pinned ? this.pinnedSeq : agent?.seq ?? 0;
+    const file = this.selection && this.selection.seq > floor ? this.followed() : null;
+    let target, unknown = null;
+    if (file) {
+      if (!file.checkout) return; // the file card says it isn't in a served checkout
+      target = file.checkout;
+    } else if (agent) {
+      target = containing(this.checkouts, agent.cwd);
+      if (!target) unknown = { folder: agent.cwd };
+    } else if (!this.rootKey) {
+      // Nothing focused or selected yet: the checkout named in props or shown last time.
+      const saved = validRootKey(this.props.checkout) ? this.props.checkout : (() => { try { return localStorage.getItem("trellis.checkout"); } catch { return null; } })();
+      target = this.checkouts.find((row) => row.rootKey === saved) || null;
+      if (!target) return;
+    } else return;
+    if (target && target.state !== "available") unknown = { folder: target.workspaceRoot, state: target.state };
+    this.unknown = unknown;
+    const key = unknown ? null : target.rootKey;
+    if (key !== this.rootKey) this.select(key, cx);
+  }
+
+  setPinned(pinned, cx) {
+    this.pinned = pinned; this.pinnedSeq = this.events;
+    try { localStorage.setItem("trellis.pinned", String(pinned)); } catch { /* a convenience only */ }
+    // Unpinning follows the agent focused now, as if it had just been focused.
+    if (!pinned && this.agent) this.agent = { ...this.agent, seq: ++this.events };
+    this.follow(cx);
+    cx.notify();
   }
 
   refreshStatus(cx) {
@@ -469,12 +520,9 @@ export default class Trellis extends View {
     const t = theme();
     const machine = this.shownMachine();
     if (machine !== this.machine) this.useMachine(machine, cx);
+    this.observe();
+    this.follow(cx);
     const file = this.followed();
-    if (file?.checkout && file.checkout.rootKey !== this.rootKey && file.checkout.state === "available" && file.checkout.rootKey !== this.followedSwitch) {
-      // Follow the Files panel into the checkout that holds its file, once per checkout change.
-      this.followedSwitch = file.checkout.rootKey;
-      this.select(file.checkout.rootKey, cx);
-    }
     const place = file?.checkout?.rootKey === this.rootKey ? this.placement(file) : null;
     const highlight = place?.group && place.layer ? [place.layer.name, place.group.name] : place?.group && !place.layer ? [null, place.group.name] : null;
     if (this.tab === "architecture") this.scheduleDraw(cx, highlight);
@@ -499,29 +547,17 @@ export default class Trellis extends View {
           .on_click((_e, cx) => { this.tab = tab; try { localStorage.setItem("trellis.tab", tab); } catch { /* a convenience only */ } cx.notify(); })
           .child(tab === "architecture" ? "Architecture" : "Sequence")))
         .child(div().flex_1())
-        .child(h_flex().id("checkout-button").gap(6).items_center().px(8).h(26).rounded(6).border_1().border_color(t.input || t.border)
-          .cursor_pointer().hover((s) => s.bg(t.hover))
-          .on_click((_e, cx) => { this.listOpen = !this.listOpen; cx.notify(); })
-          .child(div().max_w(220).truncate().child(row ? basename(row.workspaceRoot || row.rootKey) : this.checkouts ? "Choose a checkout" : "Checkouts…"))
-          .child(div().text_color(t.dim).child(this.listOpen ? "▴" : "▾"))))
+        // The checkout is followed, not chosen: a label, and a pin that stops agent follow.
+        .child(div().id("checkout-label").max_w(220).truncate().text_color(row ? t.foreground : t.dim)
+          .child(row ? basename(row.workspaceRoot || row.rootKey) : this.unknown ? basename(this.unknown.folder) : this.checkouts ? "No checkout" : "Checkouts…"))
+        .child(div().id("pin").px(8).h(24).flex().items_center().rounded(6).border_1().cursor_pointer().text_size(12)
+          .border_color(this.pinned ? t.accent : t.input || t.border).text_color(this.pinned ? t.accent : t.dim).hover((s) => s.bg(t.hover))
+          .on_click((_e, cx) => this.setPinned(!this.pinned, cx))
+          .child(this.pinned ? "Pinned" : "Following")))
       .when(Boolean(label), (el) => el.child(h_flex().px(PAD).pb(8).gap(6).items_center().text_size(12)
         .child(div().text_color(tone).child(label.shape))
         .child(div().text_color(tone).child(label.text))
-        .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(`${row?.workspaceRoot || ""}${this.machine ? ` · on ${this.machine}` : ""}`))))
-      .when(this.listOpen, (el) => el.child(this.checkoutList(t)));
-  }
-
-  checkoutList(t) {
-    if (!this.checkouts?.length) return div().px(PAD).pb(8).text_size(12).text_color(t.dim).child(this.listError ? "Checkout list unavailable." : "No checkouts registered with this daemon.");
-    return v_flex().px(6).pb(6).gap(1).children(this.checkouts.map((row) => {
-      const label = indexLabel(row), usable = row.state === "available";
-      return h_flex().id(`checkout-${row.rootKey}`).h(28).px(8).gap(8).items_center().rounded(6)
-        .when(usable, (el) => el.cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => { this.listOpen = false; this.wanted = row.rootKey; this.select(row.rootKey, cx); cx.notify(); }))
-        .when(row.rootKey === this.rootKey, (el) => el.bg(t.selected))
-        .child(div().w(14).text_color(usable ? t.muted : t.dim).child(label.shape))
-        .child(div().flex_none().text_color(usable ? t.foreground : t.dim).child(basename(row.workspaceRoot || row.rootKey)))
-        .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.dim).child(`${label.text} · ${row.workspaceRoot || ""}`));
-    }));
+        .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(`${row?.workspaceRoot || ""}${this.machine ? ` · on ${this.machine}` : ""}`))));
   }
 
   // A typed failure: its code and message, and nothing else from that read.
@@ -540,8 +576,10 @@ export default class Trellis extends View {
     if (layout === "unavailable") return [this.problem(t, new TrellisError("machine_unavailable", `Herdr can't reach ${this.machine} right now.`), "Machine")];
     if (this.listError) return [this.problem(t, this.listError, "Daemon")];
     if (!this.checkouts) return [this.note(t, "Reading the daemon's checkouts…")];
+    if (!this.rootKey && this.unknown?.state) return [this.note(t, `${this.unknown.folder} is a checkout the daemon lists as ${this.unknown.state}, so it isn't shown.`)];
+    if (!this.rootKey && this.unknown) return [this.note(t, `${this.unknown.folder} isn't in a checkout this daemon lists${this.machine ? ` on ${this.machine}` : ""}. A checkout is listed once the browser, CLI or MCP has used it.`)];
     if (!this.rootKey) return [this.note(t, !this.checkouts.length ? "No checkouts registered with this daemon."
-      : this.checkouts.some((row) => row.state === "available") ? "Choose a checkout above, or select a file in Files." : "No available checkout. Choose one above when it is ready.")];
+      : this.pinned ? "Pinned with no checkout. Select a file in Files, or unpin to follow the focused agent." : "Focus an agent or terminal in a checkout, or select a file in Files.")];
     if (this.statusError?.code === "index_not_ready") return [this.note(t, `Index not ready (index_not_ready: ${this.statusError.message}). Indexing starts when the browser, CLI or MCP first uses this checkout.`)];
     if (this.statusError) return [this.problem(t, this.statusError, "Index status")];
     if (!this.status) return [this.note(t, "Reading index status…")];
@@ -652,6 +690,12 @@ export default class Trellis extends View {
       .child(div().pt(6).text_size(12).text_color(t.dim).child(
         `${mapped.toLocaleString("en-US")} of ${sites.toLocaleString("en-US")} reference sites mapped to a module${(view.references?.coverage || []).some((r) => r.unresolvedSites > 0) ? " · ≥ counts are lower bounds" : ""} · heat: cognitive, max per callable, fixed bands`));
   }
+}
+
+// The deepest listed checkout that holds `folder`.
+function containing(checkouts, folder) {
+  return checkouts.filter((row) => typeof row.workspaceRoot === "string" && (folder === row.workspaceRoot || folder.startsWith(`${row.workspaceRoot.replace(/\/+$/, "")}/`)))
+    .sort((a, b) => b.workspaceRoot.length - a.workspaceRoot.length)[0] || null;
 }
 
 function settingsMono() { return "JetBrains Mono"; }
