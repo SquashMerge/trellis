@@ -36,7 +36,21 @@ The #669 rule that a completed S equals a from-scratch FULL is unchanged and rem
 
 ## Baseline measurement
 
-Slice 1 of #680 confirms the note's baseline on main `a3a729e9` with the 2026-11-05 dogfood method, on a scratch copy and an owned daemon, never the live daemon. The method, raw outputs and numbers are in the owner's evidence archive at `trellis-evidence/680-660-design/measure/RESULTS.md`; the PR that ratifies this decision quotes them.
+Slice 1 of #680 confirmed the note's baseline on main `a3a729e9` (2026-11-09) with the 2026-11-05 dogfood harness, on a scratch copy and an owned daemon, never the live daemon. The method and raw outputs are in the owner's evidence archive, `trellis-evidence/680-660-design/measure/RESULTS.md`. The load average was about 5, lower than on 2026-11-05.
+
+| Quantity | Value |
+|---|---|
+| S catch-up, first edit after start (median of 3) | 25.4 s |
+| S catch-up, later body and comment edits (medians) | 5.8–7.1 s |
+| S catch-up, `Cargo.toml` FULL (1 run) | 103.2 s |
+| S commit segment (#669 copy, write and commit), later edits | 5.4–6.7 s, about 80–90 % of S |
+| Semantic tuple rows written per one-line edit | ≈0.91 M rows, every one of 651 tuples (T2 baseline) |
+| Coverage rows with facts against distinct `(producer, document version)`, after five edits | 1,996 / 537 = 3.72× across 7 retained revisions |
+| Semantic tuple bytes, after imports and after five edits | 1.52 GB and 2.92 GB |
+
+The commit segment's share is well above the note's 40 % re-scope threshold, so slice 1 proceeds as designed.
+
+The measurement also found that an edit's S revision holds about 32 % of the provenance rows of the import or FULL revision for the same 651 tuples (280 k against 864 k). This must be explained against the S-equals-FULL oracle before slice 1 relies on that oracle.
 
 ## Consequences
 
