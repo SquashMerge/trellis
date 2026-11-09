@@ -10259,6 +10259,12 @@ async fn mcp_source_post_validation_invalid_bytes_only_selected_range_fails() {
     })
     .await
     .expect("runtime did not finish valid startup before source mutation");
+    // The head's eager Architecture build (#798) reads every document: it has finished before
+    // the bytes are damaged, so only the reads below see them.
+    runtime
+        .settled_for_tests(None)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
     let writer = store.publication_for_tests().unwrap();
     let malformed = [0x61, 0x0a, 0xff, 0x0a];
     store
