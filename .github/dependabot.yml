@@ -39,7 +39,10 @@ updates:
         patterns: ["*"]
 
   - package-ecosystem: github-actions
-    directory: /
+    # The workflows, and the local composite actions they call.
+    directories:
+      - /
+      - /.github/actions/*
     schedule:
       interval: weekly
     groups:

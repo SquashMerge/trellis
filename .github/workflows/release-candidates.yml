@@ -10,6 +10,7 @@ on:
       - 'tools/release-smoke.py'
       - 'tools/release-linux.Dockerfile'
       - 'src/build_info.rs'
+      - '.github/actions/install-nextest/**'
       - 'tests/daemon/build_identity.rs'
 permissions:
   contents: read
@@ -74,9 +75,8 @@ jobs:
           python-version: '3.12'
       - name: Install repository-pinned Rust toolchain
         run: rustup show active-toolchain
-      - uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
-        with:
-          tool: cargo-nextest@0.9.150
+      # Cached or installed with retries; fails the job if it cannot be had.
+      - uses: ./.github/actions/install-nextest
       - name: Confirm native target and read pinned inputs
         shell: bash
         run: |

@@ -22,14 +22,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.99.1
-      - uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
-        with:
-          mold-version: 2.42.1
-      - name: Link with mold
-        run: echo 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold' >> "$GITHUB_ENV"
-      - uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
-        with:
-          tool: cargo-nextest@0.9.150
+      - uses: ./.github/actions/setup-mold
+      - uses: ./.github/actions/install-nextest
       - name: Run curated properties
         run: >-
           cargo nextest run --profile nightly --locked --features test-support --no-fail-fast --test index --test semantic --test http --test scip_decoding_properties
