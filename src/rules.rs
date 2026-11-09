@@ -1024,6 +1024,12 @@ impl<'a> AppScope<'a> {
         }
     }
 
+    /// The name of the app at `index`, as returned by [`AppScope::file`].
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn name(&self, index: usize) -> Option<&str> {
+        self.apps.get(index).map(|app| app.name.as_str())
+    }
+
     /// Whether layers `a` and `b` can be compared: always with fewer than two apps.
     pub(crate) fn share(&self, a: &str, b: &str) -> bool {
         self.apps.len() < 2 || !self.layer(a).is_disjoint(&self.layer(b))
@@ -1960,6 +1966,13 @@ pub(crate) struct RulesBase {
     unread_manifests: usize,
 }
 
+impl RulesBase {
+    /// The apps detected for this snapshot, in manifest-path order.
+    pub(crate) fn apps(&self) -> &[crate::apps::App] {
+        &self.apps
+    }
+}
+
 /// Evaluate every document's declaration rules once; `evaluate_prepared` selects from them.
 pub(crate) fn prepare(
     config: &Config,
@@ -2099,7 +2112,7 @@ pub(crate) fn evaluate_prepared<'a>(
         work.charge(modules.len().saturating_mul(layer_patterns)),
         "bounded_work: layer assignment pattern budget"
     );
-    let scope = AppScope::new(config, &base.apps);
+    let scope = AppScope::new(config, base.apps());
     let mut matcher = LayerMatcher::new(config);
     let mut unassigned = Vec::new();
     let mut unassigned_files = 0usize;
@@ -2802,6 +2815,18 @@ mod display_tests {
     }
 
     #[test]
+    fn view_layers_carry_the_authored_app_and_apps_or_null() {
+        let config = parse("version=1\n[layers.a]\napp='svc'\norder=1\npaths=['a/**']\n[layers.b]\napps=['svc','ui']\nshared=true\npaths=['b/**']\n[layers.c]\norder=2\npaths=['c/**']\n").unwrap();
+        let layers = view_layers(&config);
+        let field = |key: &str| -> Vec<Value> { layers.iter().map(|l| l[key].clone()).collect() };
+        assert_eq!(field("app"), [json!("svc"), Value::Null, Value::Null]);
+        assert_eq!(
+            field("apps"),
+            [Value::Null, json!(["svc", "ui"]), Value::Null]
+        );
+    }
+
+    #[test]
     fn layer_display_hint_leaves_assignment_inputs_unchanged() {
         let plain = parse("version=1\n[layers.a]\norder=1\npaths=['a/**']\n").unwrap();
         let hinted =
@@ -2886,13 +2911,54 @@ mod app_scope_tests {
     }
 
     #[test]
+    fn a_repeated_app_is_located_at_the_repeat() {
+        let text = "version=1\n[layers.s]\nshared=true\napps=[\n'x',\n'x'\n]\npaths=['a']\n";
+        let d = diagnostic(&parse(text).err().unwrap()).unwrap();
+        assert_eq!(d["kind"], "schema");
+        assert_eq!(d["line"], 6);
+    }
+
+    #[test]
+    fn too_many_apps_are_too_large_at_the_extra_entry() {
+        let entries: String = (0..=COLLECTION_LIMIT)
+            .map(|i| format!("'a{i}',\n"))
+            .collect();
+        let text = format!("version=1\n[layers.s]\nshared=true\napps=[\n{entries}]\npaths=['a']\n");
+        let d = diagnostic(&parse(&text).err().unwrap()).unwrap();
+        assert_eq!(d["kind"], "too_large");
+        assert_eq!(d["line"], 5 + COLLECTION_LIMIT);
+    }
+
+    #[test]
+    fn the_first_bad_layer_in_name_order_wins() {
+        let text = "version=1\n[layers.zeta]\napp='nope'\norder=1\npaths=['z']\n[layers.alpha]\napp='nada'\norder=2\npaths=['a']\n";
+        let config = parse(text).unwrap();
+        let apps = [app("svc", AppKind::Cargo, "svc")];
+        let d = diagnostic(&validate_apps(&config, &apps).unwrap_err()).unwrap();
+        assert_eq!(d["kind"], "reference");
+        assert_eq!(d["line"], 7);
+    }
+
+    #[test]
+    fn scope_names_the_app_of_a_file_index() {
+        let config = parse(TWO_APPS).unwrap();
+        let apps = [
+            app("svc", AppKind::Cargo, "svc"),
+            app("ui", AppKind::Npm, "ui"),
+        ];
+        let scope = AppScope::new(&config, &apps);
+        let index = scope.file("ui/x.js", None).unwrap();
+        assert_eq!(scope.name(index), Some("ui"));
+        assert_eq!(scope.name(2), None);
+    }
+
+    #[test]
     fn app_keys_are_checked_syntactically() {
         for (extra, line) in [
             ("[layers.s]\nshared=true\napp='x'\npaths=['a']\n", 4),
             ("[layers.s]\norder=1\napps=['x']\npaths=['a']\n", 4),
             ("[layers.s]\norder=1\napp=' '\npaths=['a']\n", 4),
             ("[layers.s]\nshared=true\napps=[]\npaths=['a']\n", 4),
-            ("[layers.s]\nshared=true\napps=['x','x']\npaths=['a']\n", 4),
         ] {
             let error = parse(&format!("version=1\n{extra}")).err().unwrap();
             let d = diagnostic(&error).unwrap();

@@ -187,6 +187,7 @@ fn one_app_accepts_layers_without_an_app_and_rejects_a_wrong_name() {
     let named = plain.replace("order = 2", "app = \"beta\"\norder = 2");
     let diagnostic = invalid(&with(&named, &[A_PACKAGE, A_SOURCE, B_SOURCE]));
     assert_eq!(diagnostic["kind"], "reference");
+    assert_eq!(diagnostic["line"], 6);
 }
 
 #[test]
@@ -311,4 +312,15 @@ fn a_nested_manifest_over_the_source_cap_still_reads() {
         ],
     ));
     assert!(data.is_ok(), "{:?}", data.err());
+}
+
+#[test]
+fn the_first_bad_layer_in_name_order_wins() {
+    let rules_file = "version = 1\n[layers.zeta]\napp = \"nope\"\norder = 1\npaths = [\"b/**\"]\n[layers.alpha]\napp = \"nada\"\norder = 2\npaths = [\"a/**\"]\n";
+    let diagnostic = invalid(&with(
+        rules_file,
+        &[A_PACKAGE, B_PACKAGE, A_SOURCE, B_SOURCE],
+    ));
+    assert_eq!(diagnostic["kind"], "reference");
+    assert_eq!(diagnostic["line"], 7);
 }
