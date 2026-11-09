@@ -1,6 +1,6 @@
 //! App detection from build manifests (#784, #807): which `Cargo.toml`, `package.json` and
-//! `pyproject.toml` files name a runnable application. Pure: it reads manifest bytes and the snapshot's document
-//! paths, and does no I/O.
+//! `pyproject.toml` files name a runnable application. Pure: it reads manifest bytes and the
+//! snapshot's document paths, and does no I/O.
 
 use crate::references::external::ManifestInput;
 use crate::references::work::Work;
