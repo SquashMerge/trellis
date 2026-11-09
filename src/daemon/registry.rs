@@ -482,6 +482,8 @@ pub struct CheckoutRegistry {
     test_next_dependency_hook: Option<Arc<dyn Fn(&'static str) + Send + Sync>>,
     #[cfg(feature = "test-support")]
     test_native_watcher: bool,
+    #[cfg(feature = "test-support")]
+    test_architecture_on_demand: bool,
 }
 
 impl Default for CheckoutRegistry {
@@ -516,6 +518,8 @@ impl CheckoutRegistry {
             test_next_dependency_hook: None,
             #[cfg(feature = "test-support")]
             test_native_watcher: false,
+            #[cfg(feature = "test-support")]
+            test_architecture_on_demand: false,
         }
     }
 
@@ -542,6 +546,15 @@ impl CheckoutRegistry {
     #[doc(hidden)]
     pub fn hold_next_startup_backoff_for_tests(&mut self) {
         self.test_hold_next_startup_backoff = true;
+    }
+
+    /// Every later activation's Architecture owner builds only once a read asks, as before
+    /// #798, so a metrics test can time a read that computes its own rows. Installed before its
+    /// worker starts.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn architecture_on_demand_for_tests(&mut self) {
+        self.test_architecture_on_demand = true;
     }
 
     /// Observe or pause the next activation's dependency catalog builds,
@@ -721,6 +734,10 @@ impl CheckoutRegistry {
         #[cfg(feature = "test-support")]
         if self.test_native_watcher {
             scheduler.enable_native_watcher_for_tests();
+        }
+        #[cfg(feature = "test-support")]
+        if self.test_architecture_on_demand {
+            scheduler.set_architecture_on_demand_for_tests();
         }
         if let Some(search_fill) = &self.search_fill {
             scheduler.set_search_fill(search_fill.register(&scheduler));
@@ -2954,13 +2971,7 @@ impl CheckoutRuntime {
             } else {
                 ArchitectureRules::Unused
             };
-            // A scoped read can compute its answer, so it gives the owner only a page's wait.
-            let wait = match self.resources() {
-                Ok(resources) if parsed.scoped() => {
-                    wait.min(resources.scheduler.architecture_browser_wait())
-                }
-                _ => wait,
-            };
+            // A scoped read waits like any other: it does not repeat the owner's build (#798).
             self.await_architecture(parsed.pin(), rules, false, wait, check);
         }
     }
@@ -3028,15 +3039,10 @@ impl CheckoutRuntime {
                 )
             });
         match answer {
-            // The revision is over a whole-revision budget or still building, and a narrow
-            // read need not be: it computes its own scope within its deadline.
-            Err(error)
-                if parsed.scoped()
-                    && (error.to_string().starts_with("bounded_work")
-                        || error
-                            .downcast_ref::<crate::http::architecture::ArchitectureBuilding>()
-                            .is_some()) =>
-            {
+            // The revision is over a whole-revision budget, and a narrow read need not be: it
+            // computes its own scope within its deadline. A read that finds the owner still
+            // building answers `building` instead of repeating the build's work (#798).
+            Err(error) if parsed.scoped() && error.to_string().starts_with("bounded_work") => {
                 response.architecture_response_scoped(
                     kind,
                     arguments,

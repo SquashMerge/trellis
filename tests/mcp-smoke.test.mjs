@@ -6,7 +6,7 @@ import {join} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {spawnSync} from 'node:child_process';
 import {createRequire} from 'node:module';
-import {exercise, parseArgs} from '../tools/mcp-smoke.mjs';
+import {dependencies, exercise, parseArgs} from '../tools/mcp-smoke.mjs';
 
 const require = createRequire(new URL('./mcp/package.json', import.meta.url));
 const tools = JSON.parse(readFileSync(new URL('./fixtures/mcp/catalog.json', import.meta.url)));
@@ -317,4 +317,45 @@ test('the proposal prompt fails on a protocol error, an oversized frame or a mis
       [[promptName, 'prompt', reason, code]], mode);
     assert.ok(!JSON.stringify(report).includes('SECRET'));
   }
+});
+
+// #798: a typed `building` answer is read again after `retryAfterMs`, then passes.
+function building(name) {
+  return {isError: true, content: [{type: 'text', text: 'SECRET'}], structuredContent: {
+    schemaVersion: 1, requestId: 1, workspace: '/fixture', catchingUp: false,
+    error: {code: 'building', message: 'SECRET', retryable: true, currentBasis: basis, currentContentHash: null,
+      progress: {phase: 'measuring', completed: 3, total: 9}, retryAfterMs: 7},
+  }};
+}
+const architectureTools = ['trellis_references', 'trellis_rules_check', 'trellis_rules_explain'];
+
+test('architecture tools and the prompt that answer building are retried until they answer', async () => {
+  const left = new Map([...architectureTools, promptName].map(name => [name, 2]));
+  const take = name => left.get(name) > 0 && left.set(name, left.get(name) - 1);
+  const client = clientFor((name, result) => take(name) ? building(name) : result, result => {
+    if (take(promptName)) throw Object.assign(Error('SECRET'), {code: -32603, data: building(promptName).structuredContent.error});
+    return result;
+  });
+  const slept = [];
+  const report = await exercise(client, liveTools, '/fixture', 'main', {...dependencies(), sleep: async ms => { slept.push(ms); }});
+  assert.equal(report.ok, true, JSON.stringify(report));
+  for (const name of [...architectureTools, promptName]) {
+    assert.equal(report.results.find(row => row.tool === name).buildingRetries, 2, name);
+    assert.equal(client.calls.filter(call => call.name === name).length, 3, name);
+  }
+  assert.deepEqual(slept, Array(8).fill(7));
+  assert.ok(!JSON.stringify(report).includes('SECRET'));
+});
+
+test('a building answer that outlasts the retry budget stays a typed failure', async () => {
+  const client = clientFor((name, result) => name === 'trellis_rules_check' ? building(name) : result);
+  // The checked-in schema for the tool that answers building, so its envelope is validated too.
+  const mixed = liveTools.map(tool => tool.name === 'trellis_rules_check'
+    ? tools.find(entry => entry.name === tool.name) : tool);
+  const report = await exercise(client, mixed, '/fixture', 'main', {...dependencies(), sleep: async () => {}, buildingBudgetMs: 0});
+  assert.equal(report.ok, false);
+  const failed = report.results.filter(row => row.status === 'fail');
+  assert.deepEqual(failed.map(row => [row.tool, row.reason, row.code]),
+    [['trellis_rules_check', 'tool_error', 'building'], ['trellis_rules_explain', 'missing_rule_instance', undefined]]);
+  assert.equal(client.calls.filter(call => call.name === 'trellis_rules_check').length, 1);
 });

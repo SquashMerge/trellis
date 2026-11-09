@@ -249,8 +249,9 @@ level)" for file-level code and "(anonymous)" when no name was captured.
 The daemon computes what Architecture needs once per published revision and rules file, in the
 background, on one per-checkout owner thread. Each worker step hints the owner, which compares
 the head and the rules file's hash with what it last published and starts a build when they
-differ; a newer head stops a build that is under way. The owner starts for a checkout with a
-rules file, or once any read asks. Reads never compute the head: any number of them wait for
+differ; a newer head stops a build that is under way. The owner builds every active runtime's
+new head, with or without a rules file, so the first read after an activation or a publication
+usually finds its result published (#798). Reads never compute the head: any number of them wait for
 the same build, and each rechecks the pin and rules hash, so a new revision or an edited rules
 file is never served from an older result. A daemon restart or an idle checkout's retirement
 drops the result, and the next activation builds it again.
@@ -269,18 +270,21 @@ existing budgets; layer-edge and exception work is charged per read, on the refe
 read selects. A revision over those budgets fails `bounded_work` for the summary, details and
 unscoped reads. A path-scoped MCP or CLI read then computes on the request: it reads the
 revision itself, resolves references and evaluates rules only for its own paths, and answers
-under the budgets of that scope and its usual deadline. It does the same when a build is still
-running after a 1 s wait, so an agent's narrow read after an edit usually needs no retry. That
-read holds a read transaction while it computes, and repeats the document read the build is
-doing. If it cannot finish in time it fails `deadline_exceeded`, which is retryable.
+under the budgets of that scope and its usual deadline. That read holds a read transaction
+while it computes. If it cannot finish in time it fails `deadline_exceeded`, which is retryable.
+A scoped read does not compute while the owner is still building its revision: it waits like
+an unscoped read and then answers `building`, so it never repeats the build's work (#798).
+
+A build reports its progress as `{phase,completed,total}`. The phases are `reading`,
+`resolving`, `evaluating` and `measuring`; `reading` and `measuring` advance per document.
 
 
 | Read | While the build runs |
 | --- | --- |
 | `GET architecture` | Waits 1 s for the owner, then answers **202** with `{"state":"building","progress":{"phase","completed","total"},"retryAfterMs"}`. The view shows `Building Architecture for this revision: reading indexed files 120 of 604…` and asks again; the daemon answers as soon as the build is done. |
 | `GET architecture/details` | Waits 1 s, then answers **503** `architecture_building`. |
-| MCP `trellis_rules_check`, `trellis_rules_explain`, `trellis_references`, the layer prompt | A read without `paths` waits until one second before the 5 s call deadline, then returns the existing retryable `deadline_exceeded` with a message that says the build is running. A read with `paths` computes its own scope, below. |
-| CLI `trellis rules check`, `trellis references` | A read without paths waits up to 30 s, then fails `deadline_exceeded`. A read with paths computes its own scope, below. |
+| MCP `trellis_rules_check`, `trellis_rules_explain`, `trellis_references`, the layer prompt | A read, with or without `paths`, waits until one second before the 5 s call deadline, then fails with the typed retryable `building`: `{code:"building",retryable:true,message,progress:{phase,completed,total}\|null,retryAfterMs}` (#798). The message names the phase and count. The prompt carries the same error as its JSON-RPC error `data`. |
+| CLI `trellis rules check`, `trellis references` | A read, with or without paths, waits up to 30 s, then fails `deadline_exceeded` with a message that says the build is running. |
 | `metrics` (revision or directory scope) | Waits up to 5 s for a running build, then computes its own rows. It uses a published build's rows at once, and never asks for a build. |
 
 The periods above are bounds on one read's wait: a waiter wakes on the owner's signal, and

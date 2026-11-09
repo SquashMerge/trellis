@@ -1503,6 +1503,11 @@ async fn run_daemon() -> Result<()> {
         search_fill.queue_startup(TopologyRoots::production()?);
     }
     let mut checkouts = registry::CheckoutRegistry::new();
+    // A metrics test that times the metrics read's own work needs no published core.
+    #[cfg(feature = "test-support")]
+    if std::env::var_os("TRELLIS_TEST_ARCHITECTURE_ON_DEMAND").is_some() {
+        checkouts.architecture_on_demand_for_tests();
+    }
     checkouts.set_search_fill(search_fill);
     checkouts.set_search_service(search.clone());
     let registry = Arc::new(tokio::sync::Mutex::new(checkouts));

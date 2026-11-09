@@ -536,6 +536,22 @@ The added schema bytes are paid for without changing what any schema accepts: ea
 - **Catalog.** Each architecture tool's output `$defs` drops every definition its output root does not reach. Tool 8 drops `ConfigDescriptor`, `ConstraintResult`, `RuleCounts`, `RuleDiagnostic`, `RuleEvidence` and `RuleInstance`; tools 9 and 10 drop `Edge`, `Module`, `SemanticBasis`, `Site` and `UnresolvedReference`. No response shape used them, so what any schema accepts is unchanged. The complete catalog is 241,831 compact bytes before and 230,217 after; the `tools/list` frame is 230,574 bytes against the 245,760-byte named headroom limit. A test now checks that every output definition is reachable and every `$ref` resolves.
 - **Frame.** An answer that does not fit one frame fails with `response_too_large`; ask for a smaller `limit`.
 
+## Amendment (#798): a typed `building` answer from the architecture tools
+
+**Status: proposed (owner ruling 2026-11-08 on #798, Options 1 and 2a; needs ratification of this text).** `toolVersion` is **16** (previously 15, #785). This section wins over the #129 text and the [One computation per revision](architecture-view.md#one-computation-per-revision-556) table where they differ.
+
+- **The answer.** While the checkout's Architecture owner is still computing the read's revision, `trellis_references`, `trellis_rules_check` and `trellis_rules_explain` fail with the new code `building` instead of `deadline_exceeded`. Its resolved failure has the ordinary fields, with `retryable:true` always, plus the required `progress` and `retryAfterMs`:
+
+  `{schemaVersion:1,requestId,workspace,catchingUp,error:{code:"building",message,retryable:true,currentBasis:Basis,currentContentHash:null,progress:{phase:"reading"|"resolving"|"evaluating"|"measuring",completed:UInt,total:UInt}|null,retryAfterMs:UInt}}`
+
+  `progress` is null when the build has not reported yet. The message names the phase and count, for example `Architecture is being computed for this revision (measuring 120 of 670); retry shortly`. `retryAfterMs` is 250, the browser's `202 building` value. It is never a partial answer. The `trellis_propose_layers` prompt returns the same error object as its JSON-RPC `-32603` error `data`.
+- **When.** A read waits on the owner's signal until one second before its 5 s deadline, then answers `building` if the core is still not published. A read whose revision the owner has passed (the head moved) waits again for the new head while time remains.
+- **No duplicate compute.** A read with `paths` waits like one without, and answers `building` while the owner builds its revision. It no longer starts its own whole-revision read beside the build. It still computes its own scope when the revision fails `bounded_work`.
+- **Progress.** `measuring` advances per measured document, as `reading` already did, so a retried read sees the count move.
+- **Eager build.** The owner builds every active runtime's new head after each publication and at activation, with or without `.trellis/rules.toml`, so most first calls after a restart are hits.
+- **Catalog.** Each of the three tools' output schemas gains a `BuildingFailure` `$defs` entry and a `oneOf` branch for it. `building` is not in `ResolvedFailureCode`, so the plain `Failure` branch never matches it. The compact catalog grows from 230,217 to 233,334 bytes, under the 245,760-byte named headroom limit.
+- **Clients.** `tools/mcp-smoke` reads a `building` tool call or prompt again after `retryAfterMs`, for at most 60 s per call, and reports the count as `buildingRetries`.
+
 ## Tool catalog
 
 ### `trellis_workspace_describe` (W1)
@@ -961,7 +977,8 @@ cites a `semanticBinding` or `typeRelationship`, counted before evidence samplin
 this is not top-level verdict truncation or proof of semantic completeness.
 
 Only these new output schemas add nonretryable codes `invalid_rules`,
-`rules_not_found`, `bounded_work` and `response_too_large`. A file with a syntax error is a
+`rules_not_found`, `bounded_work` and `response_too_large`. They also add the retryable
+`building`, with its own failure branch ([#798](#amendment-798-a-typed-building-answer-from-the-architecture-tools)). A file with a syntax error is a
 `partialFiles` row, not a failure (owner ruling 2026-10-31, #563).
 A located `invalid_rules` failure has the ordinary resolved error fields **plus**
 required `diagnostic:{code,kind,path,range,line,column,attribution,message}` as

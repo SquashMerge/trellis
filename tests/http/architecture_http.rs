@@ -161,6 +161,12 @@ async fn fixture_with_bytes(
         .settled_for_tests(None)
         .await
         .unwrap_or_else(|error| panic!("{error}"));
+    // Activation builds the head's core with no read asking (#798). Let it finish, so a test
+    // that holds or counts builds sees only its own.
+    let settled = runtime.clone();
+    tokio::task::spawn_blocking(move || settled.await_architecture_for_tests())
+        .await
+        .unwrap();
     let browser = ProvisionedBrowser::new(
         Arc::new(tokio::sync::Mutex::new(registry)),
         TOKEN.into(),
