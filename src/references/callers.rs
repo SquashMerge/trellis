@@ -22,15 +22,11 @@ impl<'a> Callers<'a> {
         let keys = if doc.calls.is_empty() {
             BTreeMap::new()
         } else {
-            // A partial Rust impl parse cannot supply a stable written key.
-            crate::symbol_lookup::keys_from_source(
-                &doc.key.path,
-                &doc.key.language,
-                &doc.file.text,
-                &doc.declarations,
-            )
-            .unwrap_or_default()
+            lookup_keys(doc)
         };
+        Self::with_keys(doc, &keys)
+    }
+    pub(crate) fn with_keys(doc: &'a DocumentInput, keys: &BTreeMap<String, String>) -> Self {
         let owners = doc
             .declarations
             .iter()
@@ -55,6 +51,17 @@ impl<'a> Callers<'a> {
                 .collect(),
             owners,
         }
+    }
+    /// The call exists and the range is its invocation or callee spelling, whether or not
+    /// its owner has a stable lookup key.
+    pub(crate) fn measured(
+        &self,
+        call_id: Option<&str>,
+        range: &crate::native_evidence::Range,
+    ) -> bool {
+        call_id
+            .and_then(|id| self.calls.get(id))
+            .is_some_and(|call| matches_site(call, range))
     }
     pub(crate) fn get(
         &self,
@@ -86,6 +93,18 @@ impl<'a> Callers<'a> {
         evidence["caller"] = serde_json::to_value(caller).expect("caller serialization");
         evidence["callerReason"] = serde_json::to_value(reason).expect("reason serialization");
     }
+}
+
+/// Stable lookup keys of the document's declarations by syntax ID.
+pub(crate) fn lookup_keys(doc: &DocumentInput) -> BTreeMap<String, String> {
+    // A partial Rust impl parse cannot supply a stable written key.
+    crate::symbol_lookup::keys_from_source(
+        &doc.key.path,
+        &doc.key.language,
+        &doc.file.text,
+        &doc.declarations,
+    )
+    .unwrap_or_default()
 }
 
 pub(super) fn matches_site(

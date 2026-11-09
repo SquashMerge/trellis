@@ -190,6 +190,102 @@ fn plan_lists_every_inspectable_field() {
     assert!(trusted["inputs"]["omitted"].as_array().unwrap().is_empty());
 }
 
+/// #799: a root `tsconfig.json` whose `extends` names an npm package. The plan supplies the
+/// package's config from the checkout's `node_modules`, falls back to the generated tsconfig
+/// when the package is absent, and refuses with a typed error naming the `extends` otherwise,
+/// for both `plan` and `run`.
+#[test]
+fn tsconfig_package_extends_is_supplied_replaced_or_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ts = fake_npm_install(
+        &tmp.path().join("ts"),
+        "scip-typescript",
+        &pinned_version("scip-typescript"),
+    );
+    let checkout = start_checkout(
+        |root| {
+            sources(root);
+            fs::write(
+                root.join("tsconfig.json"),
+                "{\n  // JSONC\n  \"extends\": \"@acme/tsconfig\",\n  \"include\": [\"src\"],\n}\n",
+            )
+            .unwrap();
+        },
+        &[],
+    );
+    let paths = |plan: &Value, key: &str| -> Vec<String> {
+        plan["inputs"][key]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| file["path"].as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    // Absent: the generated tsconfig replaces the repo's, and the plan says so.
+    let fallback = json_out(&plan(&checkout, &[&ts], "scip-typescript", "restricted"));
+    assert_eq!(
+        paths(&fallback, "generatedConfig"),
+        ["worktree/tsconfig.json"]
+    );
+    let omitted = &fallback["inputs"]["omitted"][0];
+    assert_eq!(omitted["path"], "tsconfig.json");
+    let reason = omitted["reason"].as_str().unwrap();
+    assert!(reason.contains("@acme/tsconfig"), "{reason}");
+    assert!(
+        reason.contains("generated tsconfig.json replaces it"),
+        "{reason}"
+    );
+    assert!(!paths(&fallback, "config").contains(&"tsconfig.json".to_owned()));
+
+    // Present: the package's config is supplied and the root's `extends` rewritten.
+    let package = checkout.root.join("node_modules/@acme/tsconfig");
+    fs::create_dir_all(&package).unwrap();
+    fs::write(
+        package.join("tsconfig.json"),
+        "{\"compilerOptions\":{\"strict\":true}}",
+    )
+    .unwrap();
+    let supplied = json_out(&plan(&checkout, &[&ts], "scip-typescript", "restricted"));
+    assert_eq!(
+        paths(&supplied, "generatedConfig"),
+        [
+            "worktree/tsconfig.json",
+            "worktree/node_modules/@acme/tsconfig/tsconfig.json"
+        ]
+    );
+    assert_eq!(supplied["inputs"]["omitted"][0]["path"], "tsconfig.json");
+    assert_ne!(supplied["planSha256"], fallback["planSha256"]);
+
+    // A supplied file's change changes the plan.
+    fs::write(package.join("tsconfig.json"), "{\"compilerOptions\":{}}").unwrap();
+    let changed = json_out(&plan(&checkout, &[&ts], "scip-typescript", "restricted"));
+    assert_ne!(changed["planSha256"], supplied["planSha256"]);
+
+    // Present but unusable: a typed refusal naming the `extends`, never `producer_failed`.
+    fs::write(package.join("tsconfig.json"), "{ not json").unwrap();
+    let refused = stderr(&plan(&checkout, &[&ts], "scip-typescript", "restricted"));
+    assert!(refused.contains("producer_config_unresolved"), "{refused}");
+    assert!(refused.contains("extends \"@acme/tsconfig\""), "{refused}");
+    let hash = changed["planSha256"].as_str().unwrap();
+    let run = stderr(&with_path(
+        &checkout,
+        &[&ts],
+        &[
+            "producer",
+            "run",
+            "--producer",
+            "scip-typescript",
+            "--trust",
+            "restricted",
+            "--plan-sha256",
+            hash,
+        ],
+    ));
+    assert!(run.contains("producer_config_unresolved"), "{run}");
+    assert!(!run.contains("producer_failed"), "{run}");
+}
+
 #[test]
 fn plan_and_status_execute_nothing() {
     let tmp = tempfile::tempdir().unwrap();
@@ -373,17 +469,19 @@ fn trusted_java_and_rust_plans_declare_downloads_and_caches() {
     };
     let planned = |producer: ProducerName, resolution: Resolution| {
         let pin = trellis::scip_admission::pinned_producer_by_id(producer.as_str()).unwrap();
+        let row = Row {
+            target: Target::Real(producer),
+            trust: TrustProfile::Trusted,
+        };
         build(&Parts {
             workspace: "/w",
-            row: Row {
-                target: Target::Real(producer),
-                trust: TrustProfile::Trusted,
-            },
+            row,
             pin: &pin,
             resolution: &resolution,
             declared: &declared,
             stub: None,
             basis: &basis,
+            rules: &trellis::producer::profiles::rules(&row),
             limits: LimitsRequest {
                 timeout_secs: 60,
                 memory_mib: 1024,
