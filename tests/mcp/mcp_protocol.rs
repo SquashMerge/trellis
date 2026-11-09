@@ -2867,7 +2867,7 @@ fn per_call_linked_worktree_selection_and_closed_failures() {
         json!({
         "inputField":"workspace","maxUtf8Bytes":4096,"attemptedValueBytes":256,
         "resolvedFields":["workspace","catchingUp"],
-        "reasons":["not_absolute","not_checkout","different_repository","identity_changed","unavailable"]})
+        "reasons":["not_absolute","not_checkout","identity_changed","unavailable"]})
     );
     fn git(cwd: &Path, args: &[&str]) {
         let output = Command::new("git")
@@ -2906,12 +2906,8 @@ fn per_call_linked_worktree_selection_and_closed_failures() {
             "HEAD",
         ],
     );
-    let foreign = temp.path().join("foreign");
-    git(temp.path(), &["init", "--quiet", foreign.to_str().unwrap()]);
     let main = main.canonicalize().unwrap();
     let linked = linked.canonicalize().unwrap();
-    let foreign = foreign.canonicalize().unwrap();
-    let foreign_marker = foreign.join(".git/trellis/workspace-id");
     let git_pointer = fs::read_to_string(linked.join(".git")).unwrap();
     let linked_git =
         fs::canonicalize(linked.join(git_pointer.trim().strip_prefix("gitdir: ").unwrap()))
@@ -2994,23 +2990,19 @@ fn per_call_linked_worktree_selection_and_closed_failures() {
             launch["result"]["structuredContent"]["data"]["workspaceLabel"],
             "main"
         );
-        for (id, value, reason) in [
-            (12, json!("relative"), "not_absolute"),
-            (13, json!(foreign), "different_repository"),
-        ] {
-            let answer = describe(&mut peer, id, json!({"schemaVersion":1,"workspace":value}));
-            tool(&answer, Some("workspace_selection_failed"), !legacy);
-            let envelope = &answer["result"]["structuredContent"];
-            assert!(envelope.get("workspace").is_none());
-            assert!(envelope.get("catchingUp").is_none());
-            assert_eq!(envelope["error"]["reason"], reason);
-            assert_eq!(envelope["error"]["attemptedWorkspace"]["value"], value);
-            assert_eq!(envelope["error"]["currentBasis"], Value::Null);
-        }
-        assert!(
-            !foreign_marker.exists(),
-            "foreign selection cannot create a marker"
+        let relative = json!("relative");
+        let answer = describe(
+            &mut peer,
+            12,
+            json!({"schemaVersion":1,"workspace":relative}),
         );
+        tool(&answer, Some("workspace_selection_failed"), !legacy);
+        let envelope = &answer["result"]["structuredContent"];
+        assert!(envelope.get("workspace").is_none());
+        assert!(envelope.get("catchingUp").is_none());
+        assert_eq!(envelope["error"]["reason"], "not_absolute");
+        assert_eq!(envelope["error"]["attemptedWorkspace"]["value"], relative);
+        assert_eq!(envelope["error"]["currentBasis"], Value::Null);
         let symlink = temp.path().join("link-to-linked");
         if !symlink.exists() {
             std::os::unix::fs::symlink(&linked, &symlink).unwrap();
@@ -3068,6 +3060,124 @@ fn per_call_linked_worktree_selection_and_closed_failures() {
         );
         peer.assert_success("trellis mcp");
     }
+}
+
+/// #839: a client launched in checkout A may select any verified local Git
+/// checkout B, sharing no Git common directory with A: a separate `git init`
+/// repository and a `git clone --local` copy. Each answer is B's evidence and
+/// names B as its top-level `workspace`.
+#[test]
+fn per_call_selection_admits_unrelated_checkouts() {
+    let temp = tempfile::tempdir().unwrap();
+    let launch = temp.path().join("launch");
+    git_selection(temp.path(), &["init", "--quiet", launch.to_str().unwrap()]);
+    fs::write(
+        launch.join("launch.py"),
+        "def only_in_launch():\n    pass\n",
+    )
+    .unwrap();
+    git_selection(&launch, &["add", "."]);
+    git_selection(&launch, &["commit", "--quiet", "-m", "launch"]);
+    let unrelated = temp.path().join("unrelated");
+    git_selection(
+        temp.path(),
+        &["init", "--quiet", unrelated.to_str().unwrap()],
+    );
+    fs::write(
+        unrelated.join("unrelated.py"),
+        "def only_in_unrelated():\n    pass\n",
+    )
+    .unwrap();
+    git_selection(&unrelated, &["add", "."]);
+    git_selection(&unrelated, &["commit", "--quiet", "-m", "unrelated"]);
+    let clone = temp.path().join("clone");
+    git_selection(
+        temp.path(),
+        &[
+            "clone",
+            "--quiet",
+            "--local",
+            launch.to_str().unwrap(),
+            clone.to_str().unwrap(),
+        ],
+    );
+    // The clone has its own Git directory; an uncommitted edit is its own work.
+    fs::write(clone.join("edit.py"), "def only_in_clone():\n    pass\n").unwrap();
+    let launch = launch.canonicalize().unwrap();
+    let unrelated = unrelated.canonicalize().unwrap();
+    let clone = clone.canonicalize().unwrap();
+    let mut peer = Peer::start(Some(&launch));
+    let mut id = 10;
+    for (selected, label, only, absent, file) in [
+        (
+            &unrelated,
+            "unrelated",
+            "only_in_unrelated",
+            "only_in_launch",
+            "unrelated.py",
+        ),
+        (
+            &clone,
+            "clone",
+            "only_in_clone",
+            "only_in_unrelated",
+            "edit.py",
+        ),
+    ] {
+        let mut ask = |name: &str, mut arguments: Value| {
+            id += 1;
+            arguments["workspace"] = json!(selected);
+            let answer = peer.ask(call(false, json!(id), name, arguments));
+            tool(&answer, None, true);
+            let envelope = answer["result"]["structuredContent"].clone();
+            assert_eq!(envelope["workspace"], json!(selected), "{answer}");
+            envelope
+        };
+        let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
+        loop {
+            let status = ask("trellis_workspace_describe", json!({"schemaVersion":1}));
+            assert_eq!(status["data"]["workspaceLabel"], label);
+            if status["data"]["indexState"] == "ready" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{label} checkout head was not admitted"
+            );
+            std::thread::yield_now();
+        }
+        let found = ask(
+            "trellis_find_symbols",
+            json!({"schemaVersion":1,"query":only}),
+        );
+        let symbols = found["data"]["symbols"].as_array().unwrap();
+        assert!(
+            symbols.iter().any(|symbol| symbol["name"] == only),
+            "{found}"
+        );
+        let missing = ask(
+            "trellis_find_symbols",
+            json!({"schemaVersion":1,"query":absent}),
+        );
+        assert_eq!(missing["data"]["symbols"], json!([]), "{missing}");
+        let source = ask(
+            "trellis_read_source",
+            json!({"schemaVersion":1,"path":file,"startLine":1,"endLine":1}),
+        );
+        assert!(source.to_string().contains(only), "{source}");
+    }
+    let back = peer.ask(call(
+        false,
+        json!(99),
+        "trellis_workspace_describe",
+        json!({"schemaVersion":1}),
+    ));
+    tool(&back, None, true);
+    assert_eq!(
+        back["result"]["structuredContent"]["workspace"],
+        json!(launch)
+    );
+    peer.assert_success("trellis mcp");
 }
 
 #[test]

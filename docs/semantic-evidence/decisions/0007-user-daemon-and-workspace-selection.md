@@ -27,8 +27,8 @@ Agent clients start a stdio MCP server per session, and subagents share their pa
 ### 2. Per-call workspace selection (amends #24)
 
 - A call without a selection is answered for the client's **launch workspace**: `--workspace`, or the nearest Git checkout from the client's launch directory, as today.
-- An evidence tool call may **explicitly** select another workspace, but only a **worktree of the same repository** as the launch workspace (the same git common directory).
-- **Verification:** the daemon verifies the selected path's root identity under the #23 rules before answering. It never falls back to another worktree. A path outside the repository, or one it can't verify, is refused with a typed error.
+- An evidence tool call may **explicitly** select another workspace: any verified local Git checkout. (Amended by owner ruling 2026-11-09, #839. This originally allowed only a worktree of the same repository as the launch workspace, with the same git common directory.)
+- **Verification:** the daemon verifies the selected path's root identity under the #23 rules before answering. It never falls back to another worktree. A path that is not a checkout root, or one it can't verify, is refused with a typed error.
 - **Attribution:** every result reports which workspace answered.
 - **Attachment:** the first explicit selection of a worktree attaches it to the client's session, and it stays attached while that client is connected. A session may have several worktrees attached.
 - **Contract change:** this replaces #24's rule that "no tool argument selects another workspace". Evidence from two worktrees still never mixes in one result, and nothing is selected implicitly. #107 adds the optional workspace field to the tools' closed input schemas, and the matching result field, with tests. #17's criteria are updated to match.
@@ -57,7 +57,7 @@ release only their own registration.
 ## Consequences
 
 - **Fewer processes:** N agent sessions cost one daemon plus N small clients instead of N full servers.
-- **Correct worktree evidence:** a subagent can get evidence for its own worktree by selecting it explicitly.
+- **Correct worktree evidence:** a subagent can get evidence for its own worktree or clone by selecting it explicitly.
 - **More concurrency inside one process, not more processes.** #16's per-checkout correctness rules apply unchanged inside the daemon.
 - **Single point of failure:** a daemon crash affects every session until clients reconnect. Accepted requests survive in each checkout's queue.
 
