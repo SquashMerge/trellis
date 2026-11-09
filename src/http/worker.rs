@@ -1378,6 +1378,7 @@ mod missing_index_tests {
     /// #798: the head's eager Architecture build reads it under a lease, like any admitted
     /// read, so a missing index closes the runtime only once that read ends. This is the
     /// ordering macOS CI hit in `purge_between_worker_probe_and_existing_queue_open_…`.
+    #[cfg(feature = "test-support")]
     #[test]
     fn an_architecture_build_read_defers_a_missing_index_close_until_it_ends() {
         let (_tmp, _store, state, roots, identity) = fixture();
