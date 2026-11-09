@@ -225,11 +225,17 @@ pub fn command(
                 launcher,
                 "index".into(),
                 "--project-name".into(),
-                "trellis-workspace".into(),
+                rules
+                    .arg("--project-name")
+                    .unwrap_or(super::settings::PYTHON_PROJECT_NAME)
+                    .to_owned(),
                 // Without it scip-python runs `git`, which is not on the child's PATH, and
                 // then fails on the undefined version.
                 "--project-version".into(),
-                "0".into(),
+                rules
+                    .arg("--project-version")
+                    .unwrap_or(super::settings::PYTHON_PROJECT_VERSION)
+                    .to_owned(),
                 "--output".into(),
                 out,
             ];
@@ -257,7 +263,12 @@ pub fn command(
             argv = v;
         }
         (Target::Real(ProducerName::ScipJava), trust) => {
-            argv = vec![launcher, "index".into(), "--output".into(), out];
+            let mut v = vec![launcher, "index".into(), "--output".into(), out];
+            // The build tool the project's files select (#717), in the trusted profile.
+            if let Some(tool) = rules.arg("--build-tool") {
+                v.extend(["--build-tool".into(), tool.to_owned()]);
+            }
+            argv = v;
             let java_dir = resolution.java.as_ref().map(|java| java.dir.as_path());
             path = path_with(&java_dir.into_iter().collect::<Vec<_>>());
             if let Some(home) = &resolution.java_home {
@@ -345,6 +356,18 @@ pub struct Omission {
 pub struct Rules {
     pub omit: Vec<Omission>,
     pub generated: Vec<Generated>,
+    /// Producer flags and their values that the project's settings set (#717).
+    pub args: Vec<(&'static str, String)>,
+}
+
+impl Rules {
+    /// The value the settings give `flag`, if any.
+    pub fn arg(&self, flag: &str) -> Option<&str> {
+        self.args
+            .iter()
+            .find(|(name, _)| *name == flag)
+            .map(|(_, value)| value.as_str())
+    }
 }
 
 pub fn rules(row: &Row) -> Rules {
@@ -361,6 +384,7 @@ pub fn rules(row: &Row) -> Rules {
                 bytes: br#"{"dependencies":[]}"#.to_vec(),
                 default_only: false,
             }],
+            args: Vec::new(),
         },
         (Target::Real(ProducerName::ScipPython), TrustProfile::Restricted) => Rules {
             omit: vec![Omission {
@@ -373,6 +397,7 @@ pub fn rules(row: &Row) -> Rules {
                 bytes: b"[]".to_vec(),
                 default_only: false,
             }],
+            args: Vec::new(),
         },
         (Target::Real(ProducerName::ScipTypescript), _) => Rules {
             omit: Vec::new(),
@@ -381,6 +406,7 @@ pub fn rules(row: &Row) -> Rules {
                 bytes: SCIP_TYPESCRIPT_TSCONFIG.to_vec(),
                 default_only: true,
             }],
+            args: Vec::new(),
         },
         _ => Rules::default(),
     }

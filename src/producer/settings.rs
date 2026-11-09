@@ -8,7 +8,15 @@
 //! member's `[[bin]]`, `[[test]]`, `[[bench]]` and `[[example]]` targets, so the code they gate
 //! is analyzed. Nothing else is turned on: never all features, so a platform feature such as
 //! `metal` stays off. The workspace members are recorded with it.
+//!
+//! scip-python: `--project-name` and `--project-version` from the root `pyproject.toml` the
+//! way scip-python 0.6.6 infers them itself (`[project]`, then `[tool.poetry]` for a key
+//! `[project]` lacks), in the trusted profile, whose worktree holds that file.
+//!
+//! scip-java: the build tool scip-java 0.12.3 detects from the retained root build files, in
+//! the trusted profile; Maven and Gradle together are contradictory.
 
+use super::TrustProfile;
 use super::profiles::{Generated, Rules};
 use super::tsconfig::CONFIG_UNRESOLVED;
 use super::worktree::{RetainedInputs, RootInput};
@@ -24,6 +32,43 @@ pub const MAX_FEATURES: usize = 256;
 const MAX_FEATURE_BYTES: usize = 128;
 const ROOT_MANIFEST: &str = "Cargo.toml";
 const TARGET_TABLES: [&str; 4] = ["bin", "test", "bench", "example"];
+/// scip-python's `--project-name` when nothing else sets it.
+pub const PYTHON_PROJECT_NAME: &str = "trellis-workspace";
+/// scip-python's `--project-version` when nothing else sets it; without one scip-python runs
+/// `git`, which is not on the child's `PATH`.
+pub const PYTHON_PROJECT_VERSION: &str = "0";
+const PYPROJECT: &str = "pyproject.toml";
+const MAX_PYTHON_VALUE_BYTES: usize = 256;
+/// The root files by which scip-java 0.12.3 detects Maven. It detects Gradle by
+/// `build.gradle`, `build.gradle.kts` or `settings.gradle`; neither `settings.gradle.kts` nor
+/// `gradle.properties` alone selects Gradle (probed against the pinned launcher).
+const MAVEN_FILES: [&str; 1] = ["pom.xml"];
+const GRADLE_FILES: [&str; 3] = ["build.gradle", "build.gradle.kts", "settings.gradle"];
+
+/// A build tool scip-java runs in the trusted profile, by the name its `--build-tool` takes.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum JavaBuildTool {
+    Maven,
+    Gradle,
+}
+
+impl JavaBuildTool {
+    /// scip-java's own name for the tool.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Maven => "Maven",
+            Self::Gradle => "Gradle",
+        }
+    }
+
+    fn files(self) -> &'static [&'static str] {
+        match self {
+            Self::Maven => &MAVEN_FILES,
+            Self::Gradle => &GRADLE_FILES,
+        }
+    }
+}
 
 /// The scip-typescript project config a run uses.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -53,11 +98,15 @@ impl TsProject {
 pub struct Overrides {
     pub cargo_features: Option<Vec<String>>,
     pub typescript_project: Option<TsProject>,
+    pub python_project_name: Option<String>,
+    pub python_project_version: Option<String>,
+    pub java_build_tool: Option<JavaBuildTool>,
 }
 
 impl Overrides {
-    /// Each override is bounded and applies to one producer only.
-    pub fn validate(&self, producer: &str) -> Result<()> {
+    /// Each override is bounded and applies to one producer only; the build tool applies to
+    /// the trusted profile only, since the restricted one omits the build files.
+    pub fn validate(&self, producer: &str, trust: TrustProfile) -> Result<()> {
         if let Some(features) = &self.cargo_features {
             ensure!(
                 producer == super::ProducerName::RustAnalyzer.as_str(),
@@ -72,6 +121,37 @@ impl Overrides {
             ensure!(
                 producer == super::ProducerName::ScipTypescript.as_str(),
                 "invalid_request: typescriptProject applies to scip-typescript only"
+            );
+        }
+        let python = producer == super::ProducerName::ScipPython.as_str();
+        if let Some(name) = &self.python_project_name {
+            ensure!(
+                python,
+                "invalid_request: pythonProjectName applies to scip-python only"
+            );
+            ensure!(
+                valid_python_name(name),
+                "invalid_request: pythonProjectName"
+            );
+        }
+        if let Some(version) = &self.python_project_version {
+            ensure!(
+                python,
+                "invalid_request: pythonProjectVersion applies to scip-python only"
+            );
+            ensure!(
+                valid_python_version(version),
+                "invalid_request: pythonProjectVersion"
+            );
+        }
+        if self.java_build_tool.is_some() {
+            ensure!(
+                producer == super::ProducerName::ScipJava.as_str(),
+                "invalid_request: javaBuildTool applies to scip-java only"
+            );
+            ensure!(
+                trust == TrustProfile::Trusted,
+                "invalid_request: javaBuildTool applies to the trusted profile only"
             );
         }
         Ok(())
@@ -149,7 +229,7 @@ fn manifest_dir(path: &str) -> Option<&str> {
     }
 }
 
-fn parse_manifest(input: &RootInput) -> Result<toml::Table> {
+fn parse_toml(input: &RootInput) -> Result<toml::Table> {
     let path = &input.path;
     if input.bytes == crate::skipped_config::PLACEHOLDER {
         return Err(unresolved(format!(
@@ -370,7 +450,7 @@ pub fn rust(
     let mut settings = Vec::new();
     let mut derived: Option<(Vec<String>, Vec<Origin>, String)> = None;
     if let Some(root) = manifests.get("").copied() {
-        let root_table = parse_manifest(root)?;
+        let root_table = parse_toml(root)?;
         let (dirs, members_detail) = members(&root_table, &manifests)?;
         let mut packages = Vec::new();
         for dir in &dirs {
@@ -378,7 +458,7 @@ pub fn rust(
             let manifest = if dir.is_empty() {
                 root_table.clone()
             } else {
-                parse_manifest(input)?
+                parse_toml(input)?
             };
             packages.push((input, manifest));
         }
@@ -468,4 +548,361 @@ pub fn rust(
     }
     settings.insert(0, features);
     Ok(settings)
+}
+
+/// A Python project name by the core metadata rule (PEP 508): ASCII letters, digits, `.`, `_`
+/// and `-`, starting and ending with a letter or digit, at most 256 bytes.
+pub fn valid_python_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    let edge = |byte: Option<&u8>| byte.is_some_and(u8::is_ascii_alphanumeric);
+    name.len() <= MAX_PYTHON_VALUE_BYTES
+        && edge(bytes.first())
+        && edge(bytes.last())
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+/// One part of a PEP 440 version: every offset it can end at when it starts at `at`.
+type VersionPart = fn(&[u8], usize) -> Vec<usize>;
+
+fn digits(bytes: &[u8], at: usize) -> Option<usize> {
+    let end = at
+        + bytes[at..]
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+    (end > at).then_some(end)
+}
+
+fn separator(bytes: &[u8], at: usize) -> Vec<usize> {
+    let mut ends = vec![at];
+    if matches!(bytes.get(at), Some(b'-' | b'_' | b'.')) {
+        ends.push(at + 1);
+    }
+    ends
+}
+
+/// `[-_.]? label [-_.]? digits?` for any of `labels`, or nothing.
+fn labelled(bytes: &[u8], at: usize, labels: &[&str]) -> Vec<usize> {
+    let mut ends = vec![at];
+    for start in separator(bytes, at) {
+        for label in labels {
+            if bytes[start..].starts_with(label.as_bytes()) {
+                for number in separator(bytes, start + label.len()) {
+                    ends.push(number);
+                    ends.extend(digits(bytes, number));
+                }
+            }
+        }
+    }
+    ends
+}
+
+const VERSION_PARTS: [VersionPart; 7] = [
+    // `v?`
+    |bytes, at| {
+        let mut ends = vec![at];
+        if bytes.get(at) == Some(&b'v') {
+            ends.push(at + 1);
+        }
+        ends
+    },
+    // `([0-9]+!)?`
+    |bytes, at| {
+        let mut ends = vec![at];
+        if let Some(end) = digits(bytes, at).filter(|end| bytes.get(*end) == Some(&b'!')) {
+            ends.push(end + 1);
+        }
+        ends
+    },
+    // `[0-9]+(\.[0-9]+)*`
+    |bytes, at| {
+        let mut ends = Vec::new();
+        let mut next = digits(bytes, at);
+        while let Some(end) = next {
+            ends.push(end);
+            next = (bytes.get(end) == Some(&b'.'))
+                .then(|| digits(bytes, end + 1))
+                .flatten();
+        }
+        ends
+    },
+    |bytes, at| {
+        labelled(
+            bytes,
+            at,
+            &["alpha", "a", "beta", "b", "preview", "pre", "c", "rc"],
+        )
+    },
+    // `-[0-9]+` or `[-_.]? (post|rev|r) [-_.]? [0-9]*`
+    |bytes, at| {
+        let mut ends = labelled(bytes, at, &["post", "rev", "r"]);
+        if bytes.get(at) == Some(&b'-') {
+            ends.extend(digits(bytes, at + 1));
+        }
+        ends
+    },
+    |bytes, at| labelled(bytes, at, &["dev"]),
+    // `(\+[a-z0-9]+([-_.][a-z0-9]+)*)?`
+    |bytes, at| {
+        let mut ends = vec![at];
+        if bytes.get(at) != Some(&b'+') {
+            return ends;
+        }
+        let segment = |at: usize| {
+            let end = at
+                + bytes[at..]
+                    .iter()
+                    .take_while(|b| b.is_ascii_alphanumeric())
+                    .count();
+            (end > at).then_some(end)
+        };
+        let mut next = segment(at + 1);
+        while let Some(end) = next {
+            ends.push(end);
+            next = matches!(bytes.get(end), Some(b'-' | b'_' | b'.'))
+                .then(|| segment(end + 1))
+                .flatten();
+        }
+        ends
+    },
+];
+
+/// A PEP 440 version, as `packaging`'s `VERSION_PATTERN` matches it (case-insensitively),
+/// without the surrounding whitespace that pattern allows, at most 256 bytes.
+pub fn valid_python_version(version: &str) -> bool {
+    fn matches(bytes: &[u8], at: usize, parts: &[VersionPart]) -> bool {
+        match parts.split_first() {
+            None => at == bytes.len(),
+            Some((part, rest)) => part(bytes, at)
+                .into_iter()
+                .any(|end| matches(bytes, end, rest)),
+        }
+    }
+    version.len() <= MAX_PYTHON_VALUE_BYTES
+        && version.is_ascii()
+        && matches(version.to_ascii_lowercase().as_bytes(), 0, &VERSION_PARTS)
+}
+
+/// `key` of the root `pyproject.toml` as scip-python 0.6.6 infers it: `[project]`'s, else
+/// `[tool.poetry]`'s when `[project]` has no such key, with the section it came from. Where
+/// scip-python silently drops a value that is not a string, this refuses it.
+fn pyproject_value(
+    manifest: &toml::Table,
+    key: &str,
+    valid: fn(&str) -> bool,
+    what: &str,
+) -> Result<Option<(String, &'static str)>> {
+    for (label, path) in [
+        ("[project]", &["project"][..]),
+        ("[tool.poetry]", &["tool", "poetry"][..]),
+    ] {
+        let mut section = Some(manifest);
+        for part in path {
+            section = match section {
+                Some(parent) => table(parent, part, PYPROJECT)?,
+                None => None,
+            };
+        }
+        match section.and_then(|section| section.get(key)) {
+            None => {}
+            Some(toml::Value::String(value)) if valid(value) => {
+                return Ok(Some((value.clone(), label)));
+            }
+            Some(toml::Value::String(value)) => {
+                return Err(unresolved(format!(
+                    "{PYPROJECT}: {label} {key} {:?} is not {what}",
+                    value.chars().take(64).collect::<String>()
+                )));
+            }
+            Some(_) => {
+                return Err(unresolved(format!(
+                    "{PYPROJECT}: {label} {key} is not a string"
+                )));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// scip-python's settings: `python.projectName` and `python.projectVersion`, passed as
+/// `--project-name` and `--project-version`. Only the trusted worktree holds the root
+/// `pyproject.toml`; the restricted profile omits it, so there it is not read and the
+/// defaults apply unless overridden.
+pub fn python(
+    rules: &mut Rules,
+    inputs: &RetainedInputs,
+    trust: TrustProfile,
+    overrides: &Overrides,
+) -> Result<Vec<Setting>> {
+    let pyproject = inputs.config.iter().find(|input| input.path == PYPROJECT);
+    let needed =
+        overrides.python_project_name.is_none() || overrides.python_project_version.is_none();
+    let manifest = match pyproject {
+        Some(input) if needed && trust == TrustProfile::Trusted => {
+            Some((input, parse_toml(input)?))
+        }
+        _ => None,
+    };
+    type Valid = fn(&str) -> bool;
+    let keys: [(
+        &str,
+        &'static str,
+        &'static str,
+        Option<&String>,
+        &str,
+        Valid,
+        &str,
+    ); 2] = [
+        (
+            "name",
+            "--project-name",
+            "python.projectName",
+            overrides.python_project_name.as_ref(),
+            PYTHON_PROJECT_NAME,
+            valid_python_name,
+            "a Python project name",
+        ),
+        (
+            "version",
+            "--project-version",
+            "python.projectVersion",
+            overrides.python_project_version.as_ref(),
+            PYTHON_PROJECT_VERSION,
+            valid_python_version,
+            "a PEP 440 version",
+        ),
+    ];
+    let mut settings = Vec::new();
+    for (key, flag, name, overridden, default, valid, what) in keys {
+        let derived = match (overridden, &manifest) {
+            (None, Some((input, manifest))) => pyproject_value(manifest, key, valid, what)?
+                .map(|(value, section)| (value, section, *input)),
+            _ => None,
+        };
+        let fallback = || match (trust, pyproject) {
+            (TrustProfile::Restricted, Some(_)) => {
+                "the restricted profile omits pyproject.toml, so it is not read".to_owned()
+            }
+            (_, None) => "no root pyproject.toml".to_owned(),
+            (_, Some(_)) => format!("pyproject.toml sets no [project] or [tool.poetry] {key}"),
+        };
+        let setting = match (overridden, derived) {
+            (Some(value), _) => Setting {
+                name,
+                value: json!(value),
+                source: Source::Override,
+                from: Vec::new(),
+                detail: format!("given with --python-project-{key}; it replaces the derived {key}"),
+            },
+            (None, Some((value, section, input))) => Setting {
+                name,
+                value: json!(value),
+                source: Source::Project,
+                from: vec![Origin::of(input)],
+                detail: format!("{section} {key} of pyproject.toml"),
+            },
+            (None, None) => Setting {
+                name,
+                value: json!(default),
+                source: Source::Default,
+                from: Vec::new(),
+                detail: fallback(),
+            },
+        };
+        let value = setting.value.as_str().unwrap_or(default).to_owned();
+        rules.args.push((flag, value));
+        settings.push(setting);
+    }
+    Ok(settings)
+}
+
+/// scip-java's `java.buildTool`. The trusted profile passes it as `--build-tool`; the
+/// restricted profile omits the build files, so scip-java reads the Trellis-written
+/// `lsif-java.json` and nothing is passed.
+pub fn java(
+    rules: &mut Rules,
+    inputs: &RetainedInputs,
+    trust: TrustProfile,
+    overridden: Option<JavaBuildTool>,
+) -> Result<Vec<Setting>> {
+    let name = "java.buildTool";
+    if trust == TrustProfile::Restricted {
+        return Ok(vec![Setting {
+            name,
+            value: json!("SCIP"),
+            source: Source::Default,
+            from: Vec::new(),
+            detail: "the restricted profile omits the build files, so scip-java reads the Trellis-written lsif-java.json".into(),
+        }]);
+    }
+    let present = |tool: JavaBuildTool| -> Vec<&RootInput> {
+        inputs
+            .config
+            .iter()
+            .filter(|input| tool.files().contains(&input.path.as_str()))
+            .collect()
+    };
+    let detected: Vec<(JavaBuildTool, Vec<&RootInput>)> =
+        [JavaBuildTool::Maven, JavaBuildTool::Gradle]
+            .into_iter()
+            .map(|tool| (tool, present(tool)))
+            .filter(|(_, files)| !files.is_empty())
+            .collect();
+    let paths = |files: &[&RootInput]| {
+        files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let setting = match (overridden, detected.as_slice()) {
+        (Some(tool), _) => {
+            if present(tool).is_empty() {
+                return Err(unresolved(format!(
+                    "--java-build-tool {}, but the checkout has no root {}",
+                    tool.as_str().to_ascii_lowercase(),
+                    tool.files().join(" or ")
+                )));
+            }
+            Setting {
+                name,
+                value: json!(tool.as_str()),
+                source: Source::Override,
+                from: Vec::new(),
+                detail: "given with --java-build-tool; it replaces the detected build tool".into(),
+            }
+        }
+        (None, []) => {
+            return Ok(vec![Setting {
+                name,
+                value: Value::Null,
+                source: Source::Default,
+                from: Vec::new(),
+                detail: "no root pom.xml, build.gradle, build.gradle.kts or settings.gradle, so scip-java detects no build tool".into(),
+            }]);
+        }
+        (None, [(tool, files)]) => Setting {
+            name,
+            value: json!(tool.as_str()),
+            source: Source::Project,
+            from: files.iter().map(|file| Origin::of(file)).collect(),
+            detail: format!("{} selects {}", paths(files), tool.as_str()),
+        },
+        (None, detected) => {
+            let all: Vec<&RootInput> = detected
+                .iter()
+                .flat_map(|(_, files)| files.iter().copied())
+                .collect();
+            return Err(unresolved(format!(
+                "{} select both Maven and Gradle, and scip-java will not choose; pass --java-build-tool maven or gradle",
+                paths(&all)
+            )));
+        }
+    };
+    if let Some(tool) = setting.value.as_str() {
+        rules.args.push(("--build-tool", tool.to_owned()));
+    }
+    Ok(vec![setting])
 }
