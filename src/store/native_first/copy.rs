@@ -82,7 +82,8 @@ impl CopyDestination {
 
 /// The basis pin key and tuple of `document` when S copies it for `producer`: the
 /// older-basis projection serves it at the pending target (not pending), the basis pin
-/// published a tuple for it, and that tuple omitted no association.
+/// published a tuple for it, and that tuple omitted no association and is no unavailable S's
+/// failure.
 pub(crate) fn copy_source(
     db: &Connection,
     target: &PendingSemanticTarget,
@@ -91,10 +92,12 @@ pub(crate) fn copy_source(
 ) -> Result<Option<(String, i64)>> {
     // A basis tuple that omitted rows for an absent target is not copied: the target can
     // return without the document changing, and only the raw claims can tell (the witness's
-    // own rule for omitted original associations).
+    // own rule for omitted original associations). Nor is a tuple an unavailable S published
+    // (#826): it is no producer evidence, and the retained selection can still be re-joined.
     let row: Option<(bool, String, Option<i64>)> = db
         .prepare_cached(
-            "SELECT d.pending OR EXISTS(SELECT 1 FROM semantic_coverage_reasons r WHERE r.tuple_id=c.tuple_id AND r.omitted=1),\
+            "SELECT d.pending OR EXISTS(SELECT 1 FROM semantic_coverage_reasons r WHERE r.tuple_id=c.tuple_id AND r.omitted=1) \
+             OR COALESCE(c.state='failed' AND substr(c.diagnostic,1,length(?5)+1)=?5||':',0),\
              o.basis_pin,c.tuple_id FROM semantic_projection_documents d \
              JOIN semantic_projection_origins o ON o.revision_id=d.revision_id AND o.producer_id=d.producer_id \
              LEFT JOIN semantic_coverage c ON c.revision_id=o.basis_pin AND c.producer_id=o.producer_id \
@@ -106,7 +109,8 @@ pub(crate) fn copy_source(
                 semantic_pin_key(target.pin),
                 producer,
                 document.language,
-                document.path
+                document.path,
+                UNAVAILABLE_DIAGNOSTIC
             ],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )

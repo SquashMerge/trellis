@@ -8584,6 +8584,8 @@ fn sorted_publication_rows(
 #[cfg(feature = "test-support")]
 thread_local! {
     static TEST_REJOIN_ORACLE_MISMATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Makes every S step on this thread fail with a content error, so S ends unavailable.
+    static TEST_SEMANTIC_CONTENT_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn rejoin_storage_failure(error: &anyhow::Error) -> bool {
@@ -15535,6 +15537,24 @@ impl Store {
             }
         }
         let _restore = Restore(TEST_REJOIN_ORACLE_MISMATCH.replace(true));
+        run()
+    }
+
+    /// Run `run` with every S step on this thread failing with a content error (#826), so
+    /// each producer S rejoins ends unavailable, as a corrupt retained selection would.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn with_semantic_content_fault_for_tests<T>(
+        &self,
+        run: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                TEST_SEMANTIC_CONTENT_FAULT.set(self.0);
+            }
+        }
+        let _restore = Restore(TEST_SEMANTIC_CONTENT_FAULT.replace(true));
         run()
     }
 
