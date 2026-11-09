@@ -15,6 +15,7 @@ use std::collections::BTreeSet;
 pub(crate) enum AppKind {
     Cargo,
     Npm,
+    Python,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
