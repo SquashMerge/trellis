@@ -307,3 +307,117 @@ test("a folder in no checkout the daemon lists is a note naming it, with no gues
     assert.ok(seen.slice(reads).every((r) => !r.url.includes("/status")), "nothing is read for an unknown folder");
   });
 });
+
+// #819 review: stale completions. Each async read owns its request; a result, rejection or
+// `finally` of a request that is no longer current changes nothing. Deferred promises, no timing.
+const deferred = () => { let resolve, reject; const promise = new Promise((a, b) => { resolve = a; reject = b; }); return { promise, resolve, reject }; };
+function bare() {
+  const jobs = [];
+  const cx = { spawn(fn) { jobs.push(fn(cx)); return { cancel() {} }; }, notify() {}, timer: { after() { return { cancel() {} }; }, every() { return { cancel() {} }; } } };
+  const view = new Trellis();
+  view.props = {}; view.events = 0;
+  return { view, cx, jobs, last: () => jobs.at(-1) };
+}
+const KEY_A = "a".repeat(64), KEY_C = "c".repeat(64);
+const pin2 = { ...pin, indexRevision: 8 };
+const rulesless = (p) => ({ payload: { ...p, state: "missing_rules", aggregate: "max", role: "production", workbench: true, metricsVersion: "metrics:v1",
+  evidenceTier: "syntax", semanticComplete: false, layers: [], modules: [], edges: [] } });
+
+test("P2-1: a status read obsoleted by a checkout switch frees nothing of B's, and B issues and shows its own", async () => {
+  const { view, cx, last } = bare();
+  const reads = { [KEY_A]: deferred(), [KEY_C]: deferred() }, calls = [];
+  view.client = { status: (key) => { calls.push(key); return reads[key].promise; }, architecture: () => new Promise(() => {}) };
+  view.select(KEY_A, cx); const jobA = last();
+  view.select(KEY_C, cx); const jobC = last();
+  assert.deepEqual(calls, [KEY_A, KEY_C], "B's refresh sent its own request");
+  reads[KEY_A].resolve({ revision: pin, workspaceRoot: "/a" }); await jobA;
+  assert.equal(view.status, null, "A's answer is dropped");
+  assert.equal(view.statusBusy, true, "B's read is still the one in flight");
+  reads[KEY_C].resolve({ revision: pin2, workspaceRoot: "/c" }); await jobC;
+  assert.deepEqual(view.status.pin, pin2);
+  assert.equal(view.statusBusy, false);
+  view.refreshStatus(cx);
+  assert.equal(calls.at(-1), KEY_C, "later polls still read B");
+});
+
+test("P2-1b: a status rejection obsoleted by a switch sets no error on B", async () => {
+  const { view, cx, last } = bare();
+  const a = deferred();
+  view.client = { status: (key) => key === KEY_A ? a.promise : Promise.resolve({ revision: pin2 }), architecture: () => new Promise(() => {}) };
+  view.select(KEY_A, cx); const jobA = last();
+  view.select(KEY_C, cx); await last();
+  a.reject(new TrellisErrorLike("daemon_unreachable")); await jobA;
+  assert.equal(view.statusError, null);
+  assert.deepEqual(view.status.pin, pin2);
+});
+
+test("P2-2: sequence B resolves, then the obsolete A rejects: B stays shown with no error", async () => {
+  const { view, cx, jobs } = bare();
+  view.rootKey = KEY_A; view.serial = 1; view.status = { pin }; view.seq = { history: [], expanded: new Set() };
+  const a = deferred(), b = deferred();
+  view.client = { sequence: (_k, _p, id) => (id === "A" ? a.promise : b.promise) };
+  view.loadSequence({ id: "A", name: "alpha" }, false, cx); const jobA = jobs.at(-1);
+  view.loadSequence({ id: "B", name: "beta" }, false, cx); const jobB = jobs.at(-1);
+  b.resolve({ revision: pin, seed: { id: "B", name: "beta" }, steps: [], participants: [] }); await jobB;
+  a.reject(new Error("old A request failed")); await jobA;
+  assert.equal(view.seq.data.seed.id, "B");
+  assert.equal(view.seq.error, null);
+  assert.equal(view.seq.loading, false);
+});
+
+test("P2-2b: an obsolete sequence that resolves first neither shows its data nor ends the successor's loading", async () => {
+  const { view, cx, jobs } = bare();
+  view.rootKey = KEY_A; view.serial = 1; view.status = { pin }; view.seq = { history: [], expanded: new Set() };
+  const a = deferred(), b = deferred();
+  view.client = { sequence: (_k, _p, id) => (id === "A" ? a.promise : b.promise) };
+  view.loadSequence({ id: "A", name: "alpha" }, false, cx); const jobA = jobs.at(-1);
+  view.loadSequence({ id: "B", name: "beta" }, false, cx);
+  a.resolve({ revision: pin, seed: { id: "A", name: "alpha" }, steps: [], participants: [] }); await jobA;
+  assert.equal(view.seq.data, null);
+  assert.equal(view.seq.loading, true, "B is still loading");
+  // A, then B, then A again: the first A's answer is not the current A request's.
+  view.loadSequence({ id: "A", name: "alpha" }, false, cx);
+  assert.equal(view.seq.data, null);
+});
+
+test("P2-3: an obsolete Architecture read for rev 7 rejecting after rev 8 succeeded keeps rev 8's view", async () => {
+  const { view, cx, jobs } = bare();
+  view.rootKey = KEY_A; view.serial = 1; view.status = { pin };
+  const old = deferred(), current = deferred();
+  view.client = { architecture: (_k, p) => (p.indexRevision === 7 ? old.promise : current.promise), status: () => Promise.resolve({ revision: pin2 }) };
+  view.loadArchitecture(cx); const jobOld = jobs.at(-1);
+  view.status = { pin: pin2 }; view.loadArchitecture(cx); const jobCurrent = jobs.at(-1);
+  current.resolve(rulesless(pin2)); await jobCurrent;
+  old.reject(new Error("old revision architecture failed")); await jobOld;
+  assert.equal(view.view.state, "missing_rules");
+  assert.equal(view.viewError, null);
+  assert.equal(view.loading, false);
+});
+
+test("an obsolete checkout list that answers last is dropped", async () => {
+  const { view, cx, jobs } = bare();
+  const first = deferred(), second = deferred(); let n = 0;
+  view.client = { checkouts: () => (n++ === 0 ? first.promise : second.promise) };
+  view.loadCheckouts(cx); const jobFirst = jobs.at(-1);
+  view.loadCheckouts(cx); const jobSecond = jobs.at(-1);
+  second.resolve({ checkouts: [{ rootKey: KEY_C, state: "available", workspaceRoot: "/c" }] }); await jobSecond;
+  first.reject(new Error("old list failed")); await jobFirst;
+  assert.equal(view.listError, null);
+  assert.equal(view.checkouts[0].rootKey, KEY_C);
+});
+
+test("an obsolete method list's rejection sets no error on the reloaded file", async () => {
+  const { view, cx, jobs } = bare();
+  view.rootKey = KEY_A; view.serial = 1; view.status = { pin }; view.seq = { file: "f.rs", history: [], expanded: new Set() };
+  const old = deferred(), current = deferred();
+  let n = 0;
+  view.client = { methods: () => (n++ === 0 ? old.promise : current.promise), sequence: () => new Promise(() => {}) };
+  view.loadMethods(cx); const jobOld = jobs.at(-1);
+  view.reloadSequence(cx); const jobCurrent = jobs.at(-1);
+  current.resolve({ items: [{ consequential: true, symbol: { id: "s", name: "run" } }] }); await jobCurrent;
+  old.reject(new Error("old methods failed")); await jobOld;
+  assert.equal(view.seq.methodsError, null);
+  assert.equal(view.seq.methods[0].id, "s");
+});
+
+function TrellisErrorLike(code) { const e = new Error(code); e.code = code; return e; }

@@ -100,19 +100,23 @@ export default class Trellis extends View {
 
   // --- data ---
 
+  // Every async read below owns a token for its one request: a result or rejection that is no
+  // longer the current request is dropped whole, and touches no successor's state or flags.
   loadCheckouts(cx) {
-    const client = this.client;
+    const client = this.client, run = {};
     if (!client) return;
+    this.listRun = run;
+    const live = () => client === this.client && run === this.listRun;
     cx.spawn(async (cx) => {
       try {
         const data = await client.checkouts();
-        if (client !== this.client) return;
+        if (!live()) return;
         if (!Array.isArray(data?.checkouts)) throw new TrellisError("invalid_response", "Checkout list is invalid.");
         this.checkouts = data.checkouts.filter((row) => row && validRootKey(row.rootKey) && typeof row.state === "string");
         this.listError = null;
         this.follow(cx);
       } catch (error) {
-        if (client !== this.client) return;
+        if (!live()) return;
         this.listError = fail(error); this.checkouts = null;
         this.select(null, cx);
       }
@@ -126,6 +130,8 @@ export default class Trellis extends View {
     this.open = new Map(); this.tried = null; this.drawError = null; this.picked = null;
     this.seq = { history: [], expanded: new Set() };
     this.serial = (this.serial || 0) + 1;
+    // A read still in flight for the old checkout is obsolete: the new one issues its own.
+    this.statusRun = null; this.archRun = null; this.loading = false;
     if (rootKey) { try { localStorage.setItem("trellis.checkout", rootKey); } catch { /* a convenience only */ } }
     if (rootKey) this.refreshStatus(cx);
   }
@@ -187,14 +193,18 @@ export default class Trellis extends View {
     cx.notify();
   }
 
+  // One status read at a time per checkout; `statusBusy` is whether the current one is in flight.
+  get statusBusy() { return Boolean(this.statusRun); }
+
   refreshStatus(cx) {
-    const rootKey = this.rootKey, serial = this.serial;
-    if (!rootKey || this.statusBusy) return;
-    this.statusBusy = true;
+    const rootKey = this.rootKey, serial = this.serial, client = this.client, run = {};
+    if (!rootKey || this.statusRun) return;
+    this.statusRun = run;
+    const live = () => run === this.statusRun && serial === this.serial;
     cx.spawn(async (cx) => {
       try {
-        const data = await this.client.status(rootKey);
-        if (serial !== this.serial) return;
+        const data = await client.status(rootKey);
+        if (!live()) return;
         const pin = data?.revision == null ? null : pinOf(data.revision);
         const changed = !samePin(pin, this.status?.pin);
         this.status = { pin, catchingUp: data?.catchingUp ?? null, workspaceRoot: data?.workspaceRoot ?? null };
@@ -202,25 +212,29 @@ export default class Trellis extends View {
         if (changed || (!this.view && !this.viewError && !this.loading)) this.loadArchitecture(cx);
         if (changed) this.reloadSequence(cx);
       } catch (error) {
-        if (serial !== this.serial) return;
+        if (!live()) return;
         // Never keep data from a checkout whose status can't be read.
-        this.status = null; this.statusError = fail(error); this.view = null; this.viewError = null;
+        this.status = null; this.statusError = fail(error); this.view = null; this.viewError = null; this.archRun = null; this.loading = false;
       } finally {
-        if (serial === this.serial) this.statusBusy = false;
+        if (run === this.statusRun) this.statusRun = null;
         cx.notify();
       }
     });
   }
 
   loadArchitecture(cx) {
-    const rootKey = this.rootKey, serial = this.serial, pin = this.status?.pin;
-    if (!pin) { this.view = null; this.viewError = null; return; }
+    const rootKey = this.rootKey, serial = this.serial, pin = this.status?.pin, client = this.client, run = {};
+    if (!pin) { this.view = null; this.viewError = null; this.archRun = null; this.loading = false; return; }
+    this.archRun = run;
     this.loading = true; this.view = null; this.viewError = null; this.building = null;
     const started = Date.now();
+    // The building retries belong to this request too.
+    const live = () => run === this.archRun && serial === this.serial && samePin(pin, this.status?.pin);
     const attempt = (cx) => cx.spawn(async (cx) => {
+      if (!live()) return;
       try {
-        const data = await this.client.architecture(rootKey, pin);
-        if (serial !== this.serial || !samePin(pin, this.status?.pin)) return;
+        const data = await client.architecture(rootKey, pin);
+        if (!live()) return;
         const payload = architecturePayload(data, pin);
         if (payload.state === "building") {
           this.building = payload.progress || {};
@@ -228,10 +242,10 @@ export default class Trellis extends View {
           cx.timer.after(Math.min(wait * (Date.now() - started > 30000 ? 4 : 1), MAX_BUILDING_MS), (cx) => attempt(cx));
           return;
         }
-        this.view = payload; this.building = null; this.loading = false;
+        this.view = payload; this.building = null; this.loading = false; this.archRun = null;
       } catch (error) {
-        if (serial !== this.serial) return;
-        this.view = null; this.viewError = fail(error); this.loading = false;
+        if (!live()) return;
+        this.view = null; this.viewError = fail(error); this.loading = false; this.archRun = null;
         if (this.viewError.code === "revision_conflict") this.refreshStatus(cx);
       } finally { cx.notify(); }
     });
@@ -350,18 +364,20 @@ export default class Trellis extends View {
   }
 
   loadMethods(cx) {
-    const { rootKey, serial } = this, pin = this.status?.pin, seq = this.seq;
+    const { rootKey, serial, client } = this, pin = this.status?.pin, seq = this.seq, run = {};
+    seq.methodsRun = run;
+    const live = () => serial === this.serial && seq === this.seq && run === seq.methodsRun;
     cx.spawn(async (cx) => {
       try {
-        const data = await this.client.methods(rootKey, pin, seq.file);
-        if (serial !== this.serial || seq !== this.seq) return;
+        const data = await client.methods(rootKey, pin, seq.file);
+        if (!live()) return;
         if (!Array.isArray(data?.items)) throw new TrellisError("invalid_response", "Invalid method list. Nothing displayed.");
         seq.methods = data.items.map((item) => item?.symbol).filter((symbol) => typeof symbol?.id === "string" && typeof symbol.name === "string");
         const named = seq.methods.filter((m) => !m.name.startsWith("<"));
         const first = seq.methods.find((m) => m.id === seq.keep?.id) || named.find((m) => data.items.find((i) => i.symbol === m)?.consequential) || named[0] || seq.methods[0];
         if (first) this.loadSequence(first, false, cx);
       } catch (error) {
-        if (serial !== this.serial || seq !== this.seq) return;
+        if (!live()) return;
         seq.methodsError = fail(error);
       } finally { cx.notify(); }
     });
@@ -369,22 +385,24 @@ export default class Trellis extends View {
 
   // Opens one method's sequence; `push` keeps the current one for Back (a re-center).
   loadSequence(symbol, push, cx) {
-    const { rootKey, serial } = this, pin = this.status?.pin, seq = this.seq;
+    const { rootKey, serial, client } = this, pin = this.status?.pin, seq = this.seq, run = {};
     if (push && seq.seed) seq.history = [...seq.history, seq.seed].slice(-MAX_HISTORY);
-    Object.assign(seq, { seed: { id: symbol.id, name: symbol.name, path: symbol.path }, data: null, error: null, selected: null, expanded: new Set(), loading: true });
+    Object.assign(seq, { seed: { id: symbol.id, name: symbol.name, path: symbol.path }, data: null, error: null, selected: null, expanded: new Set(), loading: true, run });
+    // Only the newest sequence request of this view may set data, an error or loading.
+    const live = () => serial === this.serial && seq === this.seq && run === seq.run;
     cx.spawn(async (cx) => {
       try {
-        const data = await this.client.sequence(rootKey, pin, symbol.id);
-        if (serial !== this.serial || seq !== this.seq || seq.seed.id !== symbol.id) return;
+        const data = await client.sequence(rootKey, pin, symbol.id);
+        if (!live()) return;
         // As the browser checks it: the answer is for this revision and this seed, whole.
         if (!samePin(data?.revision, pin) || data?.seed?.id !== symbol.id || !Array.isArray(data.steps) || !Array.isArray(data.participants)) {
           throw new TrellisError("revision_conflict", "Sequence provenance mismatch. Nothing displayed.");
         }
         seq.data = data; seq.seed = { id: data.seed.id, name: data.seed.name, path: data.seed.path };
       } catch (error) {
-        if (serial !== this.serial || seq !== this.seq) return;
+        if (!live()) return;
         seq.error = fail(error);
-      } finally { if (seq === this.seq) seq.loading = false; cx.notify(); }
+      } finally { if (live()) seq.loading = false; cx.notify(); }
     });
   }
 
