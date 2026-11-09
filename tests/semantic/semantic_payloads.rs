@@ -26,24 +26,27 @@ fn small(name: &str) -> DocSpec {
         .symbol(&format!("pkg {name}."), 17, &[])
 }
 
+/// The checkout every payload test starts from.
+fn payload_files(root: &std::path::Path) {
+    let small_text = |name: &str| format!("function {name}(){{ }}\n");
+    write_files(
+        root,
+        &[
+            ("src/A.js", DEFINITIONS_A),
+            ("src/B.js", DEFINITIONS_B),
+            ("src/C.js", &small_text("c")),
+            ("src/D.js", &small_text("d")),
+            ("src/E.js", &small_text("e")),
+            ("src/F.js", &small_text("f")),
+            ("src/G.js", &small_text("g")),
+        ],
+    );
+}
+
 /// Six fact-bearing documents (`A` calls `B`) and `G`, which the batch excludes as
 /// `notRequested`. The batch is imported; the oracle and work counts are on.
 fn payload_world() -> (World, IndexPin, PathBuf) {
-    let world = world(|root| {
-        let small_text = |name: &str| format!("function {name}(){{ }}\n");
-        write_files(
-            root,
-            &[
-                ("src/A.js", DEFINITIONS_A),
-                ("src/B.js", DEFINITIONS_B),
-                ("src/C.js", &small_text("c")),
-                ("src/D.js", &small_text("d")),
-                ("src/E.js", &small_text("e")),
-                ("src/F.js", &small_text("f")),
-                ("src/G.js", &small_text("g")),
-            ],
-        )
-    });
+    let world = world(payload_files);
     let counts = world._state.path().join("work-counts.json");
     // SAFETY: each test runs in its own process under nextest, and no other thread reads these.
     unsafe {
@@ -51,6 +54,13 @@ fn payload_world() -> (World, IndexPin, PathBuf) {
         std::env::set_var("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1");
     }
     world.store.set_retention_clock_for_tests(1_000, 0);
+    let descriptor = payload_batch(&world);
+    let (import, _, _) = world.publish(&descriptor).unwrap();
+    (world, import, counts)
+}
+
+/// The batch over `payload_files`: every document but `G`, which it excludes as `notRequested`.
+fn payload_batch(world: &World) -> (PathBuf, String) {
     let (a, b) = crate::semantic_batch_store::definitions_docs();
     let mut fixture = world.fixture().reference("scip-typescript");
     fixture.artifact(
@@ -58,9 +68,7 @@ fn payload_world() -> (World, IndexPin, PathBuf) {
         vec![a, b, small("c"), small("d"), small("e"), small("f")],
     );
     fixture.exclude("javascript", EXCLUDED, "notRequested");
-    let descriptor = world.write(&fixture);
-    let (import, _, _) = world.publish(&descriptor).unwrap();
-    (world, import, counts)
+    world.write(&fixture)
 }
 
 fn edit_b(world: &World, counts: &std::path::Path, body: &str) -> IndexPin {
@@ -188,18 +196,20 @@ fn s_commit_writes_changed_and_dependent_rows_only() {
     );
     // Every payload-keyed table grows by exactly the two new payloads' rows.
     for table in TABLES {
-        if matches!(
-            table,
-            "semantic_coverage"
-                | "semantic_coverage_freshness"
-                | "semantic_coverage_roles"
-                | "semantic_coverage_reasons"
-        ) {
+        if matches!(table, "semantic_coverage" | "semantic_coverage_freshness") {
             continue;
         }
+        // Roles and reasons also carry the exclusion's manifest-owned rows, counted below.
+        let manifest_owned = match table {
+            "semantic_coverage_roles" | "semantic_coverage_reasons" => world.count(&format!(
+                "SELECT COUNT(*) FROM {table} r JOIN semantic_coverage c ON c.tuple_id=r.tuple_id WHERE c.revision_id='{}'",
+                key(head)
+            )),
+            _ => 0,
+        };
         assert_eq!(
             after[table] - before[table],
-            payload_rows(&world, table, &new_payloads),
+            payload_rows(&world, table, &new_payloads) + manifest_owned,
             "{table}"
         );
     }
@@ -385,19 +395,25 @@ fn restored_noncaptured_version_hits_retained_payload() {
         world.count("SELECT COUNT(*) FROM semantic_payloads"),
         payloads
     );
-    let freshness = |pin: IndexPin| -> (i64, String) {
+    let freshness = |pin: IndexPin, path: &str| -> (i64, String) {
         world
             .db()
             .query_row(
-                "SELECT f.tuple_id,f.freshness FROM semantic_coverage_freshness f JOIN semantic_coverage c ON c.revision_id=f.revision_id AND c.tuple_id=f.tuple_id WHERE c.revision_id=?1 AND c.path='src/A.js'",
-                [key(pin)],
+                "SELECT f.tuple_id,f.freshness FROM semantic_coverage_freshness f JOIN semantic_coverage c ON c.revision_id=f.revision_id AND c.tuple_id=f.tuple_id WHERE c.revision_id=?1 AND c.path=?2",
+                rusqlite::params![key(pin), path],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap()
     };
-    // The same payload, a freshness row of each revision's own.
-    assert_ne!(freshness(v3).0, freshness(v1).0);
-    assert_eq!(freshness(v3).1, freshness(v1).1);
+    // The same payload, a freshness row of each revision's own. `A`'s bytes are unchanged but
+    // its target `B` is not the captured one, so its basis is `possiblyStale`; `B`, which the
+    // producer fails once edited, has no basis and so no freshness row.
+    let (a3, a1) = (freshness(v3, "src/A.js"), freshness(v1, "src/A.js"));
+    assert_ne!(a3.0, a1.0);
+    assert_eq!(
+        (a3.1.as_str(), a1.1.as_str()),
+        ("possiblyStale", "possiblyStale")
+    );
 }
 
 /// AC4: a document whose bytes changed has another version, so another key, and writes a
@@ -619,4 +635,165 @@ fn missing_freshness_row_is_typed_corruption() {
         format!("{error:#}").contains("incompatible_index: semantic freshness missing"),
         "{error:#}"
     );
+}
+
+/// AC4, owner ruling 2026-11-09: the join-inputs digest is part of the key. A payload another
+/// build of the join code wrote is not named by this build's writer, even for the same bytes.
+#[test]
+fn payload_written_under_another_join_digest_is_not_reused() {
+    let (world, import, counts) = payload_world();
+    edit_b(&world, &counts, "return 1;");
+    let payloads = world.count("SELECT COUNT(*) FROM semantic_payloads");
+    world
+        .store
+        .set_payload_join_inputs_for_tests(Some("another build of the join"));
+    local_edit(&world, "src/B.js", DEFINITIONS_B, &counts);
+    let head = world.store.index_baseline().unwrap();
+    for path in ["src/A.js", "src/B.js"] {
+        assert_ne!(
+            payload_of(&world, head, path),
+            payload_of(&world, import, path),
+            "{path}"
+        );
+    }
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM semantic_payloads"),
+        payloads + PATHS.len() as i64,
+        "every document wrote a payload of its own, the unchanged ones included"
+    );
+    // Back on this build's digest the same restore names the payloads it wrote.
+    world.store.set_payload_join_inputs_for_tests(None);
+    edit_b(&world, &counts, "return 1;");
+    local_edit(&world, "src/B.js", DEFINITIONS_B, &counts);
+    let head = world.store.index_baseline().unwrap();
+    assert_eq!(
+        payload_of(&world, head, "src/B.js"),
+        payload_of(&world, import, "src/B.js")
+    );
+}
+
+/// Owner ruling 2026-11-09: a build that changes join output rotates every payload, copies
+/// included. An S under another join-inputs digest names no payload the import wrote, even for
+/// unchanged documents, and still equals FULL (the oracle is on); under the real digest again
+/// the import's payloads are reused and copies resume.
+#[test]
+fn copy_does_not_name_a_payload_another_join_digest_wrote() {
+    let (world, import, counts) = payload_world();
+    let unchanged = &PATHS[2..];
+    let max_before = world.count("SELECT MAX(payload_id) FROM semantic_payloads");
+    world
+        .store
+        .set_payload_join_inputs_for_tests(Some("another build of the join"));
+    let other = edit_b(&world, &counts, "return 1;");
+    for path in PATHS {
+        let payload = payload_of(&world, other, path).unwrap();
+        assert!(
+            payload > max_before,
+            "{path} names the import's payload {payload}"
+        );
+    }
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM semantic_payloads"),
+        max_before + PATHS.len() as i64,
+        "every document, changed or not, wrote a payload"
+    );
+    // The real digest again: the documents key as they did at the import and hit its payloads.
+    world.store.set_payload_join_inputs_for_tests(None);
+    let rotated = edit_b(&world, &counts, "return 2;");
+    for path in unchanged {
+        assert_eq!(
+            payload_of(&world, rotated, path),
+            payload_of(&world, import, path),
+            "{path}"
+        );
+    }
+    // And the next S copies them: no payload of theirs is written.
+    let payloads = world.count("SELECT COUNT(*) FROM semantic_payloads");
+    let copied = edit_b(&world, &counts, "return 3;");
+    for path in unchanged {
+        assert_eq!(
+            payload_of(&world, copied, path),
+            payload_of(&world, import, path),
+            "{path}"
+        );
+    }
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM semantic_payloads"),
+        payloads + 2,
+        "only A and B wrote payloads"
+    );
+}
+
+/// With `value` set in the environment for one catch-up, as the forced-FULL reference runs it.
+fn full_edit(world: &World, path: &str, text: &str, counts: &std::path::Path) {
+    // SAFETY: each test runs in its own process under nextest, and no other thread reads it.
+    unsafe { std::env::set_var("TRELLIS_TEST_FORCE_FULL_REJOIN", "1") };
+    local_edit(world, path, text, counts);
+    // SAFETY: as above.
+    unsafe { std::env::remove_var("TRELLIS_TEST_FORCE_FULL_REJOIN") };
+}
+
+/// The call-graph view of `run` at the head, with the index pin (which differs per store)
+/// removed.
+fn call_graph(world: &World, seed: &str) -> serde_json::Value {
+    let view = world
+        .store
+        .evidence_response()
+        .unwrap()
+        .query_view(&crate::semantic_batch_store::view_query(seed, None))
+        .unwrap()
+        .unwrap();
+    let mut view = serde_json::to_value(view).unwrap();
+    view["revision"] = serde_json::Value::Null;
+    view
+}
+
+/// AC2, F4: a history run with copies and writer hits publishes exactly what an independent
+/// index that can reuse nothing does. Store `reference` is a fresh index over the same
+/// checkout whose writers key no payload and whose every S is a forced FULL rejoin.
+#[test]
+fn s_reuse_snapshot_equals_full_snapshot() {
+    let (reuse, _import, counts) = payload_world();
+    let reference = crate::semantic_batch_store::reference_world(&reuse);
+    reference.store.set_payload_reuse_for_tests(false);
+    let descriptor = payload_batch(&reuse);
+    reference.publish(&descriptor).unwrap();
+    let same = |step: &str| {
+        let a = reuse
+            .store
+            .semantic_at(reuse.store.index_baseline().unwrap());
+        let b = reference
+            .store
+            .semantic_at(reference.store.index_baseline().unwrap());
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert_eq!(
+            serde_json::to_vec(&a).unwrap(),
+            serde_json::to_vec(&b).unwrap(),
+            "{step}: reuse store and FULL reference differ"
+        );
+        assert!(!a.provenance.is_empty(), "{step}");
+    };
+    same("import");
+    let history = [
+        ("src/B.js", "function target(){ return 1; }\n"),
+        ("src/B.js", "function target(){ return 2; }\n"),
+        // The captured version again: both its documents hit retained payloads.
+        ("src/B.js", DEFINITIONS_B),
+        ("src/C.js", "function c(){ }\n// edited\n"),
+        ("src/B.js", "function target(){ return 1; }\n"),
+    ];
+    for (step, (path, text)) in history.iter().enumerate() {
+        local_edit(&reuse, path, text, &counts);
+        full_edit(&reference, path, text, &counts);
+        same(&format!("step {step}: {path}"));
+    }
+    assert!(
+        reuse.count("SELECT COUNT(*) FROM semantic_payloads")
+            < reference.count("SELECT COUNT(*) FROM semantic_payloads"),
+        "the reference wrote a payload per document and revision, the reuse store shared them"
+    );
+    let seed = crate::semantic_batch_store::declaration_ids(&reuse)["run"].clone();
+    let (graph, expected) = (call_graph(&reuse, &seed), call_graph(&reference, &seed));
+    assert!(!graph["calls"].as_array().unwrap().is_empty(), "{graph}");
+    assert_eq!(graph, expected);
 }

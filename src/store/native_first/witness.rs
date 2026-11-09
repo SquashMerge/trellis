@@ -13,6 +13,7 @@ pub(crate) type Reserve<'a> = dyn FnMut(u64) -> Result<()> + 'a;
 
 pub(crate) struct SourceAuthority {
     pub batch_id: i64,
+    pub join_inputs: String,
     pub capture_id: i64,
     pub artifact_hash: String,
     pub captured_pin: IndexPin,
@@ -1581,6 +1582,7 @@ pub(crate) fn source_authority(
     target: &PendingSemanticTarget,
     selection: &PendingSemanticSelection,
     cursor: &mut OriginalAdmissionCursor,
+    join_inputs: &str,
     limits: &BatchLimits,
     cancel: &CancelFlag,
 ) -> Result<AuthorityStep> {
@@ -1697,6 +1699,7 @@ pub(crate) fn source_authority(
         cursor.manifest = Some(SourceManifestHasher::new(&descriptor.source_set.id));
         cursor.authority = Some(SourceAuthority {
             batch_id: selection.batch_id,
+            join_inputs: join_inputs.to_owned(),
             capture_id,
             artifact_hash: entry.sha256.clone(),
             captured_pin: selection.captured_pin,

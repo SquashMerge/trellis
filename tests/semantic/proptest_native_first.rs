@@ -1611,9 +1611,10 @@ impl<'w> Harness<'w> {
         eligible
     }
 
-    /// #669 H1: corruption in a basis row S reads while copying is a typed integrity
-    /// failure that schedules a re-index. A corrupt shared payload S copies without reading
-    /// its raw proofs (`write`) is published, and every read of it fails typed instead.
+    /// #669 H1, #680: S copies a document by naming its basis payload without reading the
+    /// payload's rows, so corruption in them (`write` damages the raw proof binding, otherwise
+    /// a symbol's enum) is published, and every read of the shared payload fails typed and
+    /// schedules a re-index.
     fn corrupt_copy(&mut self, label: &str, pick: usize, write: bool) -> Result<(), String> {
         let world = self.world;
         if self.model.outstanding.is_none()
@@ -1697,7 +1698,7 @@ impl<'w> Harness<'w> {
                 let copied = work_counts(s)?
                     .map(|w| copied_paths(&w))
                     .unwrap_or_default();
-                if write && copied.contains(&path) {
+                if copied.contains(&path) {
                     let text = match world.store.semantic_at(s) {
                         Ok(_) => {
                             return Err(format!(
@@ -1706,7 +1707,12 @@ impl<'w> Harness<'w> {
                         }
                         Err(error) => format!("{error:#}"),
                     };
-                    if !text.contains("incompatible_index") {
+                    let typed = if write {
+                        "incompatible_index"
+                    } else {
+                        "invalid semantic"
+                    };
+                    if !text.contains(typed) {
                         return Err(format!(
                             "{label}: corrupt shared payload of {path} failed untyped: {text}"
                         ));
@@ -1718,11 +1724,6 @@ impl<'w> Harness<'w> {
                     }
                     self.stats.corruptions_typed += 1;
                     return Ok(());
-                }
-                if copied.contains(&path) {
-                    return Err(format!(
-                        "{label}: S published from corrupt basis rows of {path}"
-                    ));
                 }
                 self.stats.corruptions_unreached += 1;
                 Ok(())

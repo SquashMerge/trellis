@@ -89,8 +89,60 @@ pub(in crate::store) fn projection_dependencies(
     out
 }
 
-/// The input key (B): equal keys name equal payloads.
+/// What a payload key hashes besides the document's own identity: the join-inputs digest
+/// (the build's join and settle code plus its join limits; owner ruling 2026-11-09) and
+/// whether a stored payload may be named at all.
+#[derive(Clone)]
+pub(in crate::store) struct KeyInputs {
+    join_inputs: String,
+    reuse: bool,
+}
+
+impl KeyInputs {
+    /// The digest a keyed payload records, so a copy can tell which build wrote it.
+    pub(in crate::store) fn join_inputs(&self) -> &str {
+        &self.join_inputs
+    }
+
+    /// The running build's digest: the hash of its join modules (`build/semantic_join_inputs.rs`)
+    /// and of the join limits this operation applies.
+    pub(in crate::store) fn current() -> Self {
+        #[cfg(feature = "test-support")]
+        let limits = crate::semantic_batch::BatchLimits::effective()
+            .unwrap_or(crate::semantic_batch::BatchLimits::PRODUCTION);
+        #[cfg(not(feature = "test-support"))]
+        let limits = crate::semantic_batch::BatchLimits::PRODUCTION;
+        Self {
+            join_inputs: crate::native_ids::digest(
+                b"trellis.semantic-join-inputs.v1\0",
+                &crate::native_ids::canonical(&serde_json::json!({
+                    "build": env!("TRELLIS_SEMANTIC_JOIN_INPUTS_HASH"),
+                    "limits": format!("{limits:?}"),
+                })),
+            ),
+            reuse: true,
+        }
+    }
+
+    /// Test seam: a different digest, as another build of the join code would have.
+    #[cfg(feature = "test-support")]
+    pub(in crate::store) fn with_join_inputs(mut self, digest: &str) -> Self {
+        self.join_inputs = digest.to_owned();
+        self
+    }
+
+    /// Test seam: no payload is keyed, so none can be named by a later write.
+    #[cfg(feature = "test-support")]
+    pub(in crate::store) fn without_reuse(mut self) -> Self {
+        self.reuse = false;
+        self
+    }
+}
+
+/// The input key (B): equal keys name equal payloads. `None` when the inputs disable reuse.
+#[allow(clippy::too_many_arguments)]
 pub(in crate::store) fn payload_key(
+    inputs: &KeyInputs,
     producer: &sem::Producer,
     descriptor_sha256: &str,
     captured_revision: &str,
@@ -98,16 +150,20 @@ pub(in crate::store) fn payload_key(
     path: &str,
     version: &str,
     dependencies: &[(String, String, String)],
-) -> String {
-    crate::native_ids::digest(
+) -> Option<String> {
+    if !inputs.reuse {
+        return None;
+    }
+    Some(crate::native_ids::digest(
         b"trellis.semantic-payload.v1\0",
         &crate::native_ids::canonical(&serde_json::json!({
+            "joinInputs": inputs.join_inputs,
             "producer": {"id": producer.id, "version": producer.version, "executableHash": producer.executable_hash},
             "batch": {"descriptorSha256": descriptor_sha256, "capturedRevision": captured_revision},
             "document": {"language": language, "path": path, "version": version},
             "dependencies": dependencies.iter().map(|(l, p, v)| serde_json::json!({"language": l, "path": p, "version": v})).collect::<Vec<_>>(),
         })),
-    )
+    ))
 }
 
 /// Where a projection takes provenance freshness from.
@@ -115,7 +171,6 @@ pub(in crate::store) enum FreshnessSource<'a> {
     /// The freshness rows stored for the reading revision.
     Stored,
     /// Freshness a publication supplies before its rows are stored.
-    #[allow(dead_code)]
     Publication(&'a BTreeMap<i64, sem::Freshness>),
 }
 
@@ -182,6 +237,12 @@ pub(in crate::store) fn project_payload<'a>(
 }
 
 impl PayloadProjection<'_> {
+    /// Reads the payload as evidence of the revision whose native revision is `native`.
+    pub(in crate::store) fn at_native(mut self, native: &str) -> Self {
+        self.native = native.to_owned();
+        self
+    }
+
     pub(in crate::store) fn scope(&self) -> TargetScope<'_> {
         TargetScope {
             source_set: &self.source_set,
@@ -387,6 +448,29 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn keys_differing_only_in_the_join_inputs_digest_differ() {
+        let producer = sem::Producer {
+            id: "producer".into(),
+            version: "1".into(),
+            executable_hash: "a".repeat(64),
+            kind: sem::SemanticKind::Semantic,
+            languages: vec![sem::Language::Javascript],
+            position_encoding: sem::PositionEncoding::Utf8,
+        };
+        let key = |inputs: &KeyInputs| {
+            payload_key(inputs, &producer, "d", "c", "javascript", "a.js", "v", &[])
+        };
+        let current = KeyInputs::current();
+        assert_eq!(key(&current), key(&KeyInputs::current()));
+        assert_ne!(
+            key(&current),
+            key(&current.clone().with_join_inputs("other"))
+        );
+        assert_eq!(key(&current.without_reuse()), None);
+    }
+
     /// A publication whose one document names a different document through every kind of
     /// endpoint the projection depends on.
     fn every_endpoint() -> (sem::Coverage, sem::SemanticPublication) {
@@ -543,7 +627,8 @@ mod tests {
         // The document itself is in the revision; its dependencies are not.
         db.execute("INSERT INTO document_versions(vid,id,language,path,content_hash,extraction_context,producer_id,producer_version,byte_length,source_bytes,native_witness) VALUES(1,'v','javascript','main.js',?1,?1,'p','1',0,x'',?1)", ["b".repeat(64)]).unwrap();
         db.execute("INSERT INTO revision_documents VALUES('key','javascript','main.js',1,1,NULL,NULL,1,1,'complete',NULL,0,1)", []).unwrap();
-        let error = write_import_coverage(&db, "key", &publication, None).unwrap_err();
+        let error = write_import_coverage(&db, "key", &publication, None, &KeyInputs::current())
+            .unwrap_err();
         assert!(
             error.is::<SelectedIntegrity>()
                 && format!("{error:#}").contains("semantic dependency endpoint missing"),

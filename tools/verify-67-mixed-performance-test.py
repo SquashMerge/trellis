@@ -289,7 +289,7 @@ class SchemaParity(unittest.TestCase):
             db.execute("INSERT INTO semantic_revision_raw_selections VALUES(?,'scip-typescript',1,?)",
                        (pins[name], pins["r1"]))
         payload_id = tuple_id
-        db.execute("INSERT INTO semantic_payloads VALUES(?,?,'scip-typescript','1','javascript','js/a.js','version-a',1)",
+        db.execute("INSERT INTO semantic_payloads VALUES(?,?,'scip-typescript','1','javascript','js/a.js','version-a',1,NULL)",
                    (payload_id, HEX))
         db.execute("INSERT INTO semantic_coverage VALUES(?,?,'scip-typescript','1','javascript','js/a.js',1,1,'complete',NULL,?)",
                    (tuple_id, pins["r2"], payload_id))
@@ -305,7 +305,7 @@ class SchemaParity(unittest.TestCase):
         db.execute("INSERT INTO semantic_projection_dependencies VALUES(?,'javascript','js/b.js','version-b')", (payload_id,))
         db.execute("INSERT INTO semantic_projection_contexts VALUES(?)", (payload_id,))
         db.execute("INSERT INTO semantic_projection_lookup_dependencies VALUES(?,'lookup')", (payload_id,))
-        db.execute("INSERT INTO semantic_payloads VALUES(?,NULL,'scip-typescript','1','javascript','js/a.js','version-old',1)",
+        db.execute("INSERT INTO semantic_payloads VALUES(?,NULL,'scip-typescript','1','javascript','js/a.js','version-old',1,NULL)",
                    (payload_id + 1,))
         db.execute("INSERT INTO semantic_coverage VALUES(?,?,'scip-typescript','1','javascript','js/a.js',1,1,'complete',NULL,?)",
                    (tuple_id + 1, pins["r1"], payload_id + 1))

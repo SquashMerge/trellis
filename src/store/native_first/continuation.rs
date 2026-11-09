@@ -465,6 +465,7 @@ impl Store {
                             &target,
                             &selection,
                             &mut current.authority_cursor,
+                            self.payload_key_inputs().join_inputs(),
                             &limits,
                             cancel,
                         )? {
@@ -553,6 +554,8 @@ impl Store {
                                 target: target.clone(),
                                 captured_pin: selection.captured_pin,
                                 producer: selection.producer_id.clone(),
+                                batch_id: selection.batch_id,
+                                join_inputs: self.payload_key_inputs().join_inputs().to_owned(),
                             })
                         });
                         return Ok(None);

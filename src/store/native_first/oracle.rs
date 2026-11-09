@@ -48,9 +48,15 @@ pub(super) fn check(
         if !copied.is_empty() {
             let destination = super::copy::CopyDestination::read(store, db, target)?;
             for document in &copied {
-                let (basis, tuple) = super::copy::copy_source(db, target, &producer.id, document)?
-                    .context("FULL oracle copied document has no basis")?;
-                let copy = super::copy::copied_document(db, &basis, tuple, producer, &destination)?;
+                let copy = super::copy::copied_document(
+                    db,
+                    target,
+                    selection,
+                    producer,
+                    &destination,
+                    store.payload_key_inputs().join_inputs(),
+                    document,
+                )?;
                 actual.coverage.extend(copy.coverage);
                 actual.provenance.extend(copy.provenance);
                 actual.symbols.extend(copy.symbols);
@@ -186,8 +192,17 @@ pub(in crate::store) fn check_hit(
         [key],
         |r| r.get(0),
     )?;
-    let read =
-        read_semantic_tuple_with_reasons(db, key, Some(tuple), None, true, None, true, source_set)?;
+    let read = read_semantic_tuple_with_reasons(
+        db,
+        key,
+        Some(tuple),
+        None,
+        true,
+        None,
+        true,
+        source_set,
+        None,
+    )?;
     let actual = sem::SemanticPublication {
         producers: vec![],
         coverage: read.coverage,
