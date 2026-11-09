@@ -71,7 +71,7 @@ fn selected_worktree_is_attributed_and_retained_until_disconnect() {
 }
 
 #[test]
-fn selection_does_not_follow_symlinks_or_admit_other_repositories() {
+fn selection_does_not_follow_symlinks_but_admits_other_repositories() {
     let temp = tempfile::tempdir().unwrap();
     let base = fs::canonicalize(temp.path()).unwrap();
     let launch = base.join("launch");
@@ -88,10 +88,6 @@ fn selection_does_not_follow_symlinks_or_admit_other_repositories() {
             .unwrap_err(),
         SelectionError::NotAbsolute
     );
-    assert_eq!(
-        registry.select(1, &launch_id, &other).unwrap_err(),
-        SelectionError::DifferentRepository
-    );
     let alias = base.join("alias");
     symlink(&other, &alias).unwrap();
     assert_eq!(
@@ -99,16 +95,21 @@ fn selection_does_not_follow_symlinks_or_admit_other_repositories() {
         SelectionError::NotCheckout
     );
     assert_eq!(registry.active_count(), 0);
-    // A failed selection does not attach the rejected worktree or consume a slot.
+    // A failed selection does not attach the rejected path or consume a slot.
     registry.attach_launch(1, &launch_id).unwrap();
     assert_eq!(
-        registry.select(1, &launch_id, &other).unwrap_err(),
-        SelectionError::DifferentRepository
+        registry.select(1, &launch_id, &alias).unwrap_err(),
+        SelectionError::NotCheckout
     );
     assert_eq!(registry.active_count(), 1);
     assert_eq!(registry.known_roots().len(), 1);
+    // An unrelated repository is a valid selection (#839).
+    let chosen = registry.select(1, &launch_id, &other).unwrap();
+    assert_eq!(chosen.root, other);
+    chosen.before_answer().unwrap();
+    assert_eq!(registry.active_count(), 2);
     registry.disconnect(1);
-    assert_eq!(registry.active_count(), 1); // release is a separate decision
+    assert_eq!(registry.active_count(), 2); // release is a separate decision
 }
 
 #[test]
