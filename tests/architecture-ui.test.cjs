@@ -22,7 +22,7 @@ function fixture(aggregate = "max", hash = "rules-one", role = "production") {
       {identity:b,layer:"Storage",physicalLines:8,declarationCount:0,roleCounts:{production:0,test:2},metrics:{cognitive:null,cyclomatic:null},revisionId:"revision-b",contentHash:"hash-b",provenanceId:"native"}],
     edges:[{sourceLayer:"UI",destinationLayer:"Storage",role:"production",count:7,status:"conforms",excepted:false,exceptionReason:null,pairs:[pair]},
       {sourceLayer:"Storage",destinationLayer:"UI",role:"test",count:2,status:"deviates",excepted:false,exceptionReason:null,pairs:[]}],
-    references:{production:[pair],tests:[],unresolved:[],counts:{mappedSites:9,unresolvedSites:0},coverage:[{layer:"UI",role:"production",sites:7,mappedSites:7,unresolvedSites:0},{layer:"Storage",role:"test",sites:2,mappedSites:2,unresolvedSites:0}],limitations:["Structural mapping is not binding."]},rules:{instances:[],testOnly:[],counts:{comparable:0,conforms:0,deviates:0,unknown:0,excepted:0},unassignedCount:0},exceptionCount:0};
+    references:{production:[pair],tests:[],unresolved:[],counts:{mappedSites:9,unresolvedSites:0},coverage:[{layer:"UI",role:"production",sites:7,mappedSites:7,unresolvedSites:0},{layer:"Storage",role:"test",sites:2,mappedSites:2,unresolvedSites:0}],limitations:["Structural mapping is not binding."]},rules:{instances:[],testOnly:[],counts:{comparable:0,conforms:0,deviates:0,unknown:0,excepted:0},unassignedCount:0},exceptionCount:0,apps:[],noApp:null,interfaces:[]};
 }
 // The daemon's paged detail route (#448), answered from the last full fixture. The
 // controller receives only the summary (the harness strips the detail arrays).
@@ -76,7 +76,7 @@ function harness() {
     clearArchitectureInspector:() => {get("architecture-inspector").hidden=true;get("architecture-inspector-content").replaceChildren();},
     showArchitectureInspector:() => {get("architecture-inspector").hidden=false;},
   }};
-  vm.runInNewContext(pinSource + "\n" + fs.readFileSync(path.join(__dirname, "../web/metric-heat.js"), "utf8") + "\n" + fs.readFileSync(path.join(__dirname, "../web/architecture-deviations.js"), "utf8") + "\n" + source, {window,document,URLSearchParams,console,setTimeout:(run,delay) => {timers.push({run,delay}); return timers.length;},clearTimeout:id => {if (id) timers[id-1].run = null;}});
+  vm.runInNewContext(pinSource + "\n" + fs.readFileSync(path.join(__dirname, "../web/metric-heat.js"), "utf8") + "\n" + fs.readFileSync(path.join(__dirname, "../web/architecture-apps.js"), "utf8") + "\n" + fs.readFileSync(path.join(__dirname, "../web/architecture-deviations.js"), "utf8") + "\n" + source, {window,document,URLSearchParams,console,setTimeout:(run,delay) => {timers.push({run,delay}); return timers.length;},clearTimeout:id => {if (id) timers[id-1].run = null;}});
   const controller = window.TrellisArchitecture.create({request:async (url,current,options) => {
     if (url.startsWith("/api/architecture/details?")) { detailCalls.push({url,current}); if (detailError) throw detailError; return emulateDetails(full, url); }
     calls.push({url,current,options}); const data = await response(url,options);
@@ -1453,4 +1453,157 @@ test("deviations snapshot and restore round trip; a missing line selects nothing
   await stale.dev.restore(saved, () => false);
   assert.equal(stale.dev.isOpen(), false);
   assert.equal(stale.calls.details.length, 0);
+});
+
+// One app (#789): the switcher, the scoped slice, scoped counts, the no-layers help and the held snapshot.
+function appsFixture(hash = "rules-one") {
+  const dto = fixture("max", hash), web = identity("web/app.js"), tool = identity("tools/build.js"), extra = identity("src/extra.rs"), script = identity("scripts/a.sh");
+  const unassigned = (id, app) => ({identity:id,layer:null,app,physicalLines:1,declarationCount:1,roleCounts:{production:1,test:0},metrics:{cognitive:1}});
+  dto.layers = [{name:"UI",order:1,shared:false,app:"web",apps:null}, {name:"Storage",order:1,shared:false,app:"daemon",apps:null},
+    {name:"Common",shared:true,app:null,apps:null}, {name:"Only",shared:true,app:null,apps:["daemon"]}];
+  dto.modules[0].app = "web"; dto.modules[1].app = "daemon";
+  dto.modules.push(unassigned(web, "web"), unassigned(extra, "daemon"), unassigned(tool, "scripts"), unassigned(script, "scripts"));
+  const counts = (comparable, deviates, unknown) => ({comparable, conforms:comparable - deviates - unknown, deviates, unknown, excepted:0});
+  const app = (name, kind, manifest, root, languages, fileCount, unassignedFileCount, appCounts) =>
+    ({name, kind, manifest, roots:[root], entries:[], languages, fileCount, source:"manifest", counts:appCounts, unassignedFileCount});
+  dto.apps = [app("web", "npm", "web/package.json", "web", ["javascript"], 2, 1, counts(10, 3, 2)),
+    app("daemon", "cargo", "Cargo.toml", "src", ["rust"], 3, 1, counts(6, 1, 1)),
+    app("scripts", "npm", "tools/package.json", "tools", ["javascript"], 2, 2, counts(0, 0, 0))];
+  dto.noApp = {counts:counts(0, 0, 0), unassignedFileCount:0};
+  dto.rules.counts = counts(16, 4, 3);
+  dto.rules.unassignedCount = 4;
+  return dto;
+}
+const appButtons = h => h.get("architecture-apps").children.map(item => item.textContent);
+const pressedApps = h => h.get("architecture-apps").children.filter(item => item.attrs["aria-pressed"] === "true").map(item => item.textContent);
+const chooseApp = async (h, label) => { await h.get("architecture-apps").children.find(item => item.textContent === label).fire("click"); await flush(); };
+
+test("AC8 the app switcher appears only with two or more apps, as a labelled group of pressed buttons", async () => {
+  const none = harness(); await none.controller.refresh();
+  assert.equal(none.get("architecture-apps").hidden, true); assert.equal(none.get("architecture-source-line").hidden, true);
+  const one = harness(), single = appsFixture(); single.apps = single.apps.slice(0, 1);
+  one.setResponse(async () => ({payload:single})); await one.controller.refresh();
+  assert.equal(one.get("architecture-apps").hidden, true, "one app is today's single stack");
+  const h = harness(); h.setResponse(async () => ({payload:appsFixture()})); await h.controller.refresh();
+  assert.equal(h.get("architecture-apps").hidden, false);
+  assert.deepEqual(appButtons(h), ["All apps", "web · javascript", "daemon · rust", "scripts · javascript"], "no tooling chip");
+  assert.deepEqual(pressedApps(h), ["All apps"]);
+  assert.match(text(h.get("architecture-source-line")).trim(), /^3 apps · hidden layers and unassigned files grouped below$/);
+  assert.equal(h.renders.at(-1).options.title, undefined, "All apps keeps the existing stack title");
+});
+
+test("AC9/AC11 choosing an app draws only its slice of the held snapshot and never reads", async () => {
+  const h = harness(); h.setResponse(async () => ({payload:appsFixture()})); await h.controller.refresh();
+  await chooseApp(h, "web · javascript");
+  assert.equal(h.calls.length, 1, "the switcher re-draws and never reads");
+  const {view, options} = h.renders.at(-1);
+  assert.equal(options.title, "web · ordered layers");
+  assert.deepEqual([...view.layers].map(layer => layer.name), ["UI", "Common"], "its layer plus the shared layer that serves every app; not the daemon-only one");
+  assert.deepEqual([...view.modules].map(module => module.identity.path), ["src/a.rs", "web/app.js"], "its layer's files and its unassigned files");
+  assert.equal(view.edges.length, 0, "an edge needs both layers in the set");
+  assert.deepEqual([...options.layerStats(view.layers[0])], [], "the UI band no longer counts its edge into the daemon's Storage layer");
+  assert.deepEqual(pressedApps(h), ["web · javascript"]);
+  assert.match(text(h.get("architecture-source-line")).trim(), /^web · roots web · Detected from web\/package\.json \(npm\)$/);
+  assert.match(h.get("architecture-summary").textContent, /^2 file modules · 0 production/);
+  await chooseApp(h, "daemon · rust");
+  assert.deepEqual([...h.renders.at(-1).view.layers].map(layer => layer.name), ["Storage", "Common", "Only"]);
+  await chooseApp(h, "All apps");
+  assert.equal(h.renders.at(-1).options.title, undefined); assert.equal(h.renders.at(-1).view.layers.length, 4);
+  assert.equal(h.calls.length, 1);
+});
+
+test("AC12 review_chip_scopes_to_app and unassigned_chip_scopes_to_app", async () => {
+  const h = harness(); h.setResponse(async () => ({payload:appsFixture()})); await h.controller.refresh();
+  assert.deepEqual(descendants(h.get("architecture-inspector-content")).filter(item => item.className === "architecture-chip").map(item => item.textContent),
+    ["4 deviations", "4 unassigned files", "0 exceptions"], "All apps stays checkout-wide");
+  await chooseApp(h, "web · javascript");
+  const chips = descendants(h.get("architecture-inspector-content")).filter(item => item.className === "architecture-chip");
+  assert.deepEqual(chips.map(item => item.textContent), ["3 deviations", "1 unassigned file", "0 exceptions"]);
+  await h.get("architecture-unassigned").fire("click");
+  assert.deepEqual(descendants(h.get("architecture-review-list")).filter(item => item.className === "architecture-rule-row").map(row => row.dataset.source), ["web/app.js"]);
+  assert.match(h.get("architecture-review-scope").textContent, /^Unassigned files in web/);
+  await h.get("architecture-review").fire("click"); await flush();
+  assert.ok(h.detailCalls.length > 0);
+  for (const call of h.detailCalls) assert.equal(new URL(call.url, "http://local").searchParams.get("app"), "web", "the Deviations tree lists the app's instances");
+  await chooseApp(h, "All apps");
+  h.detailCalls.length = 0; await h.get("architecture-review").fire("click"); await flush();
+  for (const call of h.detailCalls) assert.equal(new URL(call.url, "http://local").searchParams.has("app"), false);
+});
+
+test("AC12 info_counts_scope_to_app", async () => {
+  const h = harness(); h.setResponse(async () => ({payload:appsFixture()})); await h.controller.refresh();
+  const notice = () => descendants(h.get("architecture-notice-content")).filter(item => item.tagName === "p").map(item => item.textContent);
+  assert.ok(notice().includes("3 of 16 production rule instances unknown."));
+  assert.ok(notice().includes("4 unassigned native file modules remain unknown."));
+  assert.ok(notice().includes("4 unassigned identities (native files and external packages) in the rule-check catalog."));
+  await chooseApp(h, "daemon · rust");
+  assert.ok(notice().includes("1 of 6 production rule instances unknown in daemon."), "the app's summed counts");
+  assert.ok(notice().includes("1 unassigned native file modules remain unknown in daemon."), "the app's unassigned modules");
+  assert.ok(notice().includes("4 unassigned identities (native files and external packages) in the rule-check catalog (whole checkout)."));
+  assert.match(h.get("architecture-coverage").textContent, /^9 of 9 reference sites mapped/, "coverage stays the whole snapshot");
+});
+
+test("AC13 an app no ordered layer names shows the setup help and its unassigned files", async () => {
+  const h = harness(); h.setResponse(async () => ({payload:appsFixture()})); await h.controller.refresh();
+  const drawn = h.renders.length;
+  await chooseApp(h, "scripts · javascript");
+  assert.equal(h.renders.length, drawn, "nothing is drawn for an app without layers");
+  assert.equal(h.get("architecture-state").dataset.state, "empty");
+  assert.match(h.get("architecture-state").textContent, /scripts has no layers yet\. Its files are listed as unassigned below\..*trellis_propose_layers.*app = "scripts"/);
+  const files = descendants(h.get("architecture-diagram")).filter(item => item.tagName === "button").map(item => item.textContent);
+  assert.deepEqual(files, ["tools/build.js", "scripts/a.sh"]);
+  await descendants(h.get("architecture-diagram")).find(item => item.textContent === "scripts/a.sh").fire("click");
+  assert.equal(h.get("architecture-inspector-title").textContent, "scripts/a.sh");
+  await chooseApp(h, "web · javascript");
+  assert.equal(h.get("architecture-state").dataset.state, "ready"); assert.equal(h.renders.length, drawn + 1);
+});
+
+test("AC14 reopen redraws the held snapshot without a read; a changed basis reads again", async () => {
+  const h = harness(), saved = {rootKey:"checkout-one",session:1,pin,rulesEpoch:0}; h.setContext(saved);
+  h.setResponse(async () => ({payload:appsFixture()})); await h.controller.refresh();
+  const first = h.renders[0]; await chooseApp(h, "web · javascript");
+  h.controller.suspend();
+  assert.equal(h.get("architecture-diagram").children.length, 0); assert.equal(first.options.isCurrent(), false, "a drawing from before the suspend is stale");
+  first.options.onSelectModule(first.view.modules[0]); assert.equal(h.get("architecture-inspector").hidden, true);
+  await h.controller.reopen();
+  assert.equal(h.calls.length, 1, "nothing changed: no read"); assert.equal(h.renders.length, 3);
+  assert.equal(h.renders.at(-1).options.title, "web · ordered layers", "the scope survives the held snapshot");
+  assert.equal(h.get("architecture-state").dataset.state, "ready");
+  assert.equal(h.renders.at(-1).options.isCurrent(), true);
+  h.controller.suspend(); h.setContext({...saved, pin:{...pin, indexRevision:2}});
+  h.setResponse(async () => ({payload:{...appsFixture(), indexRevision:2}})); await h.controller.reopen();
+  assert.equal(h.calls.length, 2, "a moved pin reads again");
+  h.controller.suspend(); h.setContext({...saved, pin:{...pin, indexRevision:2}, rulesEpoch:1});
+  await h.controller.reopen(); assert.equal(h.calls.length, 3, "a rules epoch change reads again");
+  h.controller.suspend(); await h.controller.reopen(); assert.equal(h.calls.length, 3);
+  h.controller.suspend(); h.setContext({rootKey:"checkout-two",session:1,pin:{...pin, indexRevision:2},rulesEpoch:1});
+  await h.controller.reopen(); assert.equal(h.calls.length, 4, "another checkout reads again");
+  assert.deepEqual(pressedApps(h), ["All apps"], "the scope resets with the checkout");
+});
+
+test("a suspend while a read is in flight discards the late answer, and a reopen reads", async () => {
+  const h = harness(), pending = deferred(); h.setResponse(() => pending.promise);
+  const reading = h.controller.refresh(); h.controller.suspend();
+  pending.resolve({payload:appsFixture()}); await reading;
+  assert.equal(h.renders.length, 0, "the late answer is stale");
+  h.setResponse(async () => ({payload:appsFixture()})); await h.controller.reopen();
+  assert.equal(h.calls.length, 2); assert.equal(h.renders.length, 1);
+});
+
+test("a late scope render never paints over a newer choice", async () => {
+  const h = harness(); h.setResponse(async () => ({payload:appsFixture()})); await h.controller.refresh();
+  const gate = deferred(), draw = h.renders.length; let release = true;
+  h.setRenderer(async (_container, view, options) => { h.renders.push({view, options}); if (release) { release = false; await gate.promise; } return {status:"ready"}; });
+  const slow = h.get("architecture-apps").children[1].fire("click"); await flush();
+  await h.get("architecture-apps").children[2].fire("click"); await flush();
+  gate.resolve(); await slow; await flush();
+  assert.equal(h.renders.length, draw + 2); assert.equal(h.renders[draw].options.isCurrent(), false);
+  assert.deepEqual(pressedApps(h), ["daemon · rust"]); assert.equal(h.get("architecture-state").dataset.state, "ready");
+});
+
+test("a response without apps and interfaces arrays shows nothing", async () => {
+  for (const key of ["apps", "interfaces"]) {
+    const h = harness(), dto = fixture(); delete dto[key]; h.setResponse(async () => ({payload:dto})); await h.controller.refresh();
+    assert.equal(h.renders.length, 0); assert.equal(h.get("architecture-state").dataset.state, "error");
+  }
 });

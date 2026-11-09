@@ -309,9 +309,19 @@ the authored exceptions. Deviations are `rules.counts.deviates`, unassigned file
 are the full native module inventory with no assigned layer (including module-only files),
 and exceptions is `exceptionCount`. The evidence disclosure separately labels
 `rules.unassignedCount` as identities, including external packages. There is no refresh button: the
-view re-reads when a new revision is selected or the tab is opened again. A detail list
+view re-reads when a new revision is selected or the rules change, not every time the tab
+is opened (see the note below). A detail list
 that fails with `rules_conflict` offers **Reload Architecture**. On narrow screens the
 overview does not open the inspector drawer.
+
+**Opening the tab again (#789, proposed (owner-delegated, run 803)).** This supersedes
+"re-reads when the tab is opened again". Leaving the Architecture tab keeps the loaded
+snapshot. Opening it again draws that snapshot without a read when nothing it rests on has
+changed: the checkout, the session, the index pin, the aggregation, the metric population
+and the rules epoch (a rules edit applied here, or a `rules_conflict`, advances it). Any
+change re-reads, with the usual loading message. Choosing an app, selecting or clearing a
+selection, and returning from the Deviations tree re-draw the held snapshot and never read.
+The chosen app resets when the checkout changes.
 
 The SPEC §9 size cap applies to chips: at most 40 per band or open module and 150 in
 the whole diagram, counting every note. The rest of a list becomes one visible "N files

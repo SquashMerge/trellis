@@ -95,3 +95,15 @@
 .architecture-caller { padding:8px 0; border-bottom:1px solid var(--line); }
 .architecture-caller p { margin:4px 0; overflow-wrap:anywhere; }
 .architecture-caller-unavailable { overflow-wrap:anywhere; }
+
+/* #789: the app switcher and source line open the toolbar; one pressed button is the drawn scope. */
+.architecture-apps { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
+.architecture-apps[hidden], .architecture-source-line[hidden] { display: none; }
+.architecture-apps button { font-size: var(--type-label); white-space: normal; overflow-wrap: anywhere; text-align: left; }
+.architecture-apps button:focus-visible, .architecture-app-files button:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
+.architecture-source-line { flex-basis: 100%; min-width: 0; font-size: var(--type-caption); color: var(--secondary); overflow-wrap: anywhere; }
+.architecture-source-line > span + span { margin-left: var(--sp-3); }
+.architecture-app-notice { color: var(--warning); }
+.architecture-app-files { margin: 0; padding: 0; list-style: none; font-size: var(--type-code); }
+.architecture-app-files li { padding: var(--sp-1) 0; overflow-wrap: anywhere; }
+.architecture-app-files button { white-space: normal; overflow-wrap: anywhere; text-align: left; }
