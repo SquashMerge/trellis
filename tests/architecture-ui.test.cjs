@@ -1495,6 +1495,17 @@ test("AC8 the app switcher appears only with two or more apps, as a labelled gro
   assert.deepEqual(h.renders.map(render => render.options.title), ["web · ordered layers", "daemon · ordered layers"], "All apps draws one column per app that has layers");
 });
 
+test("the footnote names only the manifests detection reads, and All apps says when no interface was measured", async () => {
+  const h = harness(); h.setResponse(async () => ({payload:appsFixture()})); await h.controller.refresh();
+  assert.match(h.get("architecture-footnote").textContent, /^Apps are detected from build manifests \(Cargo binary packages and package\.json\)\. /);
+  assert.doesNotMatch(h.get("architecture-footnote").textContent, /Python/);
+  assert.match(text(h.get("architecture-diagram")), /No HTTP interface measured between web, daemon and scripts\. This does not prove absence\./);
+  await chooseApp(h, "web · javascript");
+  assert.doesNotMatch(text(h.get("architecture-diagram")), /No HTTP interface measured/, "a one-app view has no pair to speak of");
+  const measured = harness(); measured.setResponse(async () => ({payload:interfacesFixture()})); await measured.controller.refresh();
+  assert.doesNotMatch(text(measured.get("architecture-diagram")), /No HTTP interface measured/, "a measured interface needs no empty state");
+});
+
 test("AC9/AC11 choosing an app draws only its slice of the held snapshot and never reads", async () => {
   const h = harness(); h.setResponse(async () => ({payload:appsFixture()})); await h.controller.refresh();
   await chooseApp(h, "web · javascript");

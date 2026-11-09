@@ -3,6 +3,7 @@
 use serde_json::Value;
 use std::{
     fs,
+    path::Path,
     sync::{Arc, atomic::AtomicBool},
 };
 use trellis::{
@@ -84,55 +85,75 @@ fn with<'a>(rules_file: &'a str, files: &[(&'a str, &'a str)]) -> Vec<(&'a str, 
     all
 }
 
+/// Every build manifest the capture walk would admit in this checkout, with its real text. The
+/// walk skips hidden entries and the directories capture skips, so a manifest that main adds
+/// later is found here without editing the test.
+fn real_manifests(root: &Path) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    let walk = ignore::WalkBuilder::new(root)
+        .require_git(false)
+        .follow_links(false)
+        .hidden(true)
+        .parents(false)
+        .git_global(false)
+        .git_exclude(false)
+        .filter_entry(|entry| {
+            !matches!(
+                entry.file_name().to_str(),
+                Some(".git" | "node_modules" | ".venv" | "target" | "dist" | "build")
+            )
+        })
+        .build();
+    for entry in walk {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_str().unwrap_or_default();
+        if entry.file_type().is_some_and(|kind| kind.is_file())
+            && matches!(name, "Cargo.toml" | "package.json")
+        {
+            let relative = entry.path().strip_prefix(root).unwrap();
+            found.push((
+                relative.to_str().unwrap().to_owned(),
+                fs::read_to_string(entry.path()).unwrap(),
+            ));
+        }
+    }
+    found.sort();
+    found
+}
+
 #[test]
 fn trellis_layout_detects_daemon_and_web_apps() {
-    let manifest = env!("CARGO_MANIFEST_DIR");
-    let read = |path: &str| fs::read_to_string(format!("{manifest}/{path}")).unwrap();
-    let rules_file = read(".trellis/rules.toml");
-    let cargo = read("Cargo.toml");
-    let web = read("web/package.json");
-    let files = [
-        (".trellis/rules.toml", rules_file.as_str()),
-        ("Cargo.toml", cargo.as_str()),
-        ("web/package.json", web.as_str()),
-        ("src/main.rs", "fn main() {}\n"),
-        ("src/bin/trellis-producer-stub.rs", "fn main() {}\n"),
-        ("web/app.js", "export function app() {}\n"),
-        ("tests/browser/package.json", "{\"name\":\"browser\"}\n"),
-        ("tests/browser/a.test.cjs", "module.exports = 1;\n"),
-        ("tests/mcp/package.json", "{\"name\":\"mcp\"}\n"),
-        ("tests/mcp/a.mjs", "export const a = 1;\n"),
-        (
-            "tools/extraction/package.json",
-            "{\"name\":\"extraction\"}\n",
-        ),
-        ("tools/extraction/a.mjs", "export const a = 1;\n"),
-        (
-            "tests/fixtures/typescript-mixed/package.json",
-            "{\"name\":\"mixed\"}\n",
-        ),
-        (
-            "tests/fixtures/typescript-mixed/a.ts",
-            "export const a = 1;\n",
-        ),
-        (
-            "tools/metrics-oracle/Cargo.toml",
-            "[package]\nname = \"oracle\"\n",
-        ),
-        ("tools/metrics-oracle/src/main.rs", "fn main() {}\n"),
-        (
-            "tests/fixtures/scip-rust-analyzer-packages/workspace/Cargo.toml",
-            "[workspace]\nmembers = [\"crates/*\"]\n",
-        ),
-        (
-            "tests/fixtures/scip-rust-analyzer-packages/workspace/crates/alpha/Cargo.toml",
-            "[package]\nname = \"alpha\"\n",
-        ),
-        (
-            "tests/fixtures/scip-rust-analyzer-packages/workspace/crates/alpha/src/lib.rs",
-            "pub fn a() {}\n",
-        ),
-    ];
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let rules_file = fs::read_to_string(manifest.join(".trellis/rules.toml")).unwrap();
+    let mut owned = real_manifests(manifest);
+    assert!(
+        owned.iter().any(|(path, _)| path == "web/package.json"),
+        "the walk finds the checkout's manifests"
+    );
+    let stubs: Vec<(String, String)> = owned
+        .iter()
+        .map(|(path, text)| match path.strip_suffix("package.json") {
+            Some(dir) => (format!("{dir}index.js"), "export const a = 1;\n".to_owned()),
+            None if text.contains("[package]") => (
+                format!("{}src/main.rs", path.trim_end_matches("Cargo.toml")),
+                "fn main() {}\n".to_owned(),
+            ),
+            None => (String::new(), String::new()),
+        })
+        .filter(|(path, _)| !path.is_empty())
+        .collect();
+    owned.extend(stubs);
+    owned.push((
+        "src/bin/trellis-producer-stub.rs".into(),
+        "fn main() {}\n".into(),
+    ));
+    owned.dedup_by(|a, b| a.0 == b.0);
+    let mut files: Vec<(&str, &str)> = vec![(".trellis/rules.toml", rules_file.as_str())];
+    files.extend(
+        owned
+            .iter()
+            .map(|(path, text)| (path.as_str(), text.as_str())),
+    );
     let data = check(&files).expect("the Trellis layout validates");
     assert_eq!(limitation_count(&data), 0);
     let apps: Vec<(&str, &str)> = data["apps"]

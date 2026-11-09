@@ -80,7 +80,7 @@ paths = [
   "tools/metrics-oracle/**", "tools/metrics-bench/**", "tools/semantic-search/**",
   "tools/synthetic-cohorts/generate.mjs", "tools/synthetic-cohorts/test/**",
   "docs/semantic-evidence/check-policy.mjs", "docs/semantic-evidence/id-test-vectors/**",
-  "build.rs", "build/**", "examples/**",
+  "build.rs", "build/**", "examples/**", "herdr-mod/**",
 ]
 
 # Captured sample programs are inputs, not Trellis runtime implementations.
