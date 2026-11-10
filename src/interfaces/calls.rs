@@ -1031,6 +1031,28 @@ fn run(client: &reqwest::Client) {
         }
     }
 
+    /// #867 review (residual P2): a glob import below the top level may bind any name, so it
+    /// hides every top-level constant. A top-level glob is shadowed by the constant itself.
+    #[test]
+    fn a_glob_import_below_the_top_level_hides_every_constant() {
+        let local = r#"
+const OS: &str = "http://localhost/health";
+const KEPT: &str = "http://localhost/kept";
+fn run(client: &reqwest::Client) {
+    use std::env::consts::*;
+    client.get(OS);
+}
+fn other(client: &reqwest::Client) { client.get(KEPT); }
+"#;
+        assert_eq!(reqwest_paths(local), ["GET ?", "GET ?"]);
+        let top = r#"
+use std::env::consts::*;
+const OS: &str = "http://localhost/health";
+fn run(client: &reqwest::Client) { client.get(OS); }
+"#;
+        assert_eq!(reqwest_paths(top), ["GET /health"]);
+    }
+
     /// #867 review P2: a substitution with a format specification is not read as its value.
     #[test]
     fn a_format_specification_is_a_substitution_not_its_value() {

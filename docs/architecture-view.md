@@ -250,7 +250,9 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
   `const` or `static` string at the top level of the document, its name declared nowhere
   else in it (no other `const` or `static`, and no `use` import or alias, parameter,
   closure parameter, `let`, `match`, `if let`/`while let` or `for` pattern that binds it),
-  read from a call outside every inline `mod`; any other identifier is
+  read from a call outside every inline `mod`. A glob import (`use a::*`) anywhere below the
+  top level may bind any name, so it makes every constant of the document unreadable; a
+  top-level glob does not, since the top-level item shadows it; any other identifier is
   unreadable. Each substituted value is charged to the work bound before it is copied. The path is what follows the host of an
   `http://` or `https://` URL (`/` when there is none), or the text itself when it starts
   with `/`; a URL that starts with a substitution, or anything else, is unreadable and

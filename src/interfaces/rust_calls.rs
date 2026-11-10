@@ -41,6 +41,7 @@ pub(super) fn collect(
     // (#867 review): a local `use .. as NAME` hides the outer item.
     let mut constants: BTreeMap<String, Option<String>> = BTreeMap::new();
     let mut bound: BTreeSet<&str> = BTreeSet::new();
+    let mut local_glob = false;
     let mut modules = Vec::new();
     let mut sites = Vec::new();
     walk(root, check, &mut |node, check| {
@@ -52,9 +53,17 @@ pub(super) fn collect(
             _ => None,
         };
         if let Some(binding) = binding {
+            // A glob below the top level may bind any name. A top-level glob is shadowed by
+            // the top-level constant itself, as an item shadows a glob import.
+            let local = node.kind() == "use_declaration"
+                && node.parent().is_some_and(|parent| parent.id() != root.id());
             walk(binding, check, &mut |inner, _| {
-                if inner.kind() == "identifier" {
-                    bound.insert(document.text(inner));
+                match inner.kind() {
+                    "identifier" => {
+                        bound.insert(document.text(inner));
+                    }
+                    "use_wildcard" if local => local_glob = true,
+                    _ => {}
                 }
                 Ok(false)
             })?;
@@ -82,7 +91,7 @@ pub(super) fn collect(
     let document = Document {
         constants: constants
             .into_iter()
-            .filter(|(name, _)| !bound.contains(name.as_str()))
+            .filter(|(name, _)| !local_glob && !bound.contains(name.as_str()))
             .filter_map(|(name, value)| Some((name, value?)))
             .collect(),
         ..document
