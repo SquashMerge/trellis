@@ -107,6 +107,15 @@ Trellis accepts only one exact version of each [producer](quickstart.md#install-
 
 A producer run's worktree holds no `node_modules`. When the root `tsconfig.json` `extends` an npm package, such as `@sindresorhus/tsconfig`, Trellis reads that package's config from the checkout's own `node_modules` and supplies it to the run ([#799](https://github.com/SquashMerge/trellis/issues/799)). Dependencies must be installed for this; without them, the run uses Trellis's generated tsconfig in place of the repo's, so the repo's own compiler options don't apply. The plan lists the replacement under `omitted`. Types from other installed packages are still not visible to the run. See [producer provisioning](semantic-evidence/producer-provisioning.md#scip-typescript-project-config).
 
+### Project settings a producer plan does not read
+
+A producer plan reads each producer's settings from the project's own files ([#717](https://github.com/SquashMerge/trellis/issues/717)), but not all of them. See [Project settings](semantic-evidence/producer-provisioning.md#project-settings).
+
+- **TypeScript workspaces.** The plan doesn't pass scip-typescript's `--yarn-workspaces` or `--pnpm-workspaces`, so a monorepo's packages are indexed only through the root project and its `references`. Structural import resolution does resolve workspace packages ([#773](https://github.com/SquashMerge/trellis/issues/773)); this limit is about the producer only.
+- **Project references to other file names.** A `references` entry must name a directory holding a `tsconfig.json`, or that file. A reference to another name, such as Vite's `tsconfig.app.json`, refuses the plan. So does a referenced project whose `extends` names an npm package. `--ts-project generated` runs without them.
+- **`rust-analyzer.toml`.** `rust-analyzer scip` 1.98.1 doesn't read it (probed 2026-11-10), so the plan doesn't capture or hash it. Cargo features come from the manifests, or from `--cargo-features`.
+- **The Python environment.** The plan doesn't detect or activate a `.venv`.
+
 ## Not in 0.1
 
 - Connecting to remote machines over SSH.

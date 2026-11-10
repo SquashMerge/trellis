@@ -1,14 +1,16 @@
-//! App detection from build manifests (#784, #807): which `Cargo.toml`, `package.json` and
-//! `pyproject.toml` files name a runnable application, and how apps authored in the rules file
-//! combine with them (#794). Pure: it reads manifest bytes and the snapshot's document paths,
-//! and does no I/O.
+//! App detection from build manifests (#784, #807, #854): which `Cargo.toml`, `package.json`,
+//! `pyproject.toml`, `pom.xml` and Gradle build files name a runnable application, and how apps
+//! authored in the rules file combine with them (#794). Pure: it reads manifest bytes and the
+//! snapshot's document paths, and does no I/O.
+
+mod java;
 
 use crate::references::external::ManifestInput;
 use crate::references::work::Work;
 use anyhow::{Result, ensure};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::Serialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -16,6 +18,8 @@ pub(crate) enum AppKind {
     Cargo,
     Npm,
     Python,
+    Maven,
+    Gradle,
 }
 
 /// Where an app comes from: a build manifest, or an authored `[apps.<name>]` table (#794).
@@ -115,10 +119,18 @@ pub(crate) fn candidates(
         .iter()
         .filter(|manifest| {
             let path = manifest.path.as_str();
-            matches!(
-                file_name(path),
-                "Cargo.toml" | "package.json" | "pyproject.toml"
-            ) && !path.split('/').any(|part| part == "node_modules")
+            let java_settings = matches!(path, "settings.gradle" | "settings.gradle.kts");
+            (java_settings
+                || matches!(
+                    file_name(path),
+                    "Cargo.toml"
+                        | "package.json"
+                        | "pyproject.toml"
+                        | "pom.xml"
+                        | "build.gradle"
+                        | "build.gradle.kts"
+                ))
+                && !path.split('/').any(|part| part == "node_modules")
         })
         .collect();
     listed.sort_by(|a, b| a.path.cmp(&b.path));
@@ -133,11 +145,15 @@ pub(crate) fn candidates(
         }
         root_parsed = Some(parsed);
     }
+    let mut java = maven_outcomes(&listed, work, check)?;
+    java.extend(gradle_outcomes(&listed, work, check)?);
     let mut out = Vec::with_capacity(listed.len());
     for manifest in listed {
         check()?;
         let path = manifest.path.as_str();
-        let outcome = if file_name(path) == "package.json" {
+        let outcome = if let Some(outcome) = java.remove(path) {
+            outcome
+        } else if file_name(path) == "package.json" {
             npm_outcome(manifest, parse(manifest, work)?)
         } else if file_name(path) == "pyproject.toml" {
             python_outcome(manifest, parse(manifest, work)?)
@@ -463,6 +479,213 @@ fn normalize(path: &str) -> String {
         }
     }
     parts.join("/")
+}
+
+/// A manifest's text, charging its bytes: `Ok(None)` when it is not UTF-8.
+fn text<'a>(manifest: &'a ManifestInput, work: &mut Work) -> Result<Option<&'a str>> {
+    let bytes = manifest.bytes.as_deref().unwrap_or_default();
+    ensure!(
+        work.charge(bytes.len()),
+        "bounded_work: app manifest parsing"
+    );
+    Ok(std::str::from_utf8(bytes).ok())
+}
+
+/// `relative` joined to the checkout-relative directory `dir` (`.` at the root), with `.` and
+/// `..` resolved; `None` when it leaves the checkout or is absolute.
+fn join_dir(dir: &str, relative: &str) -> Option<String> {
+    if relative.starts_with('/') || relative.contains('\\') {
+        return None;
+    }
+    let mut parts: Vec<&str> = if dir == "." {
+        Vec::new()
+    } else {
+        dir.split('/').collect()
+    };
+    for part in relative.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            part => parts.push(part),
+        }
+    }
+    Some(if parts.is_empty() {
+        ".".to_owned()
+    } else {
+        parts.join("/")
+    })
+}
+
+/// Whether some proper ancestor directory of `dir` is in `dirs`. `.` is every other
+/// directory's ancestor.
+fn has_ancestor<T>(dir: &str, dirs: &BTreeMap<String, T>) -> bool {
+    if dir == "." {
+        return false;
+    }
+    dirs.contains_key(".")
+        || dir
+            .match_indices('/')
+            .any(|(at, _)| dirs.contains_key(&dir[..at]))
+}
+
+/// The outcome of every listed `pom.xml` (#854). A present POM with no present POM in an
+/// ancestor directory is judged alone; below one, a POM is judged only when a judged POM lists
+/// its directory in `<modules>`. A judged POM is an app (`maven`) when it is runnable: packaging
+/// `war`, or `jar` (the default) with a main class declared through `maven-jar-plugin`'s
+/// manifest `mainClass`, `spring-boot-maven-plugin` or `exec-maven-plugin`'s `mainClass`. Its
+/// name is `artifactId`, with no fallback to a parent's; its entries are the literal main
+/// classes. An aggregator (`pom`) or library jar is no app; every other POM is not judged.
+fn maven_outcomes(
+    listed: &[&ManifestInput],
+    work: &mut Work,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<BTreeMap<String, Outcome>> {
+    let mut outcomes = BTreeMap::new();
+    let mut present = BTreeMap::new();
+    for manifest in listed.iter().filter(|m| file_name(&m.path) == "pom.xml") {
+        if manifest.bytes.is_some() {
+            present.insert(directory(&manifest.path), *manifest);
+        }
+        outcomes.insert(manifest.path.clone(), Outcome::NotApp);
+    }
+    let mut queue: VecDeque<String> = present
+        .keys()
+        .filter(|dir| !has_ancestor(dir, &present))
+        .cloned()
+        .collect();
+    let mut judged: BTreeSet<String> = queue.iter().cloned().collect();
+    while let Some(dir) = queue.pop_front() {
+        check()?;
+        let manifest = present[&dir];
+        let Some(pom) = text(manifest, work)?.and_then(java::pom) else {
+            outcomes.insert(manifest.path.clone(), Outcome::Unread);
+            continue;
+        };
+        for module in &pom.modules {
+            // A module names its directory, or a POM file in it.
+            let module = module.strip_suffix("/pom.xml").unwrap_or(module);
+            if let Some(module) = join_dir(&dir, module)
+                && present.contains_key(&module)
+                && judged.insert(module.clone())
+            {
+                queue.push_back(module);
+            }
+        }
+        if pom.runnable {
+            outcomes.insert(
+                manifest.path.clone(),
+                Outcome::App(App::detected(
+                    pom.artifact_id,
+                    AppKind::Maven,
+                    &manifest.path,
+                    pom.main_classes,
+                )),
+            );
+        }
+    }
+    Ok(outcomes)
+}
+
+/// The outcome of every listed Gradle file (#854). The root `settings.gradle` and
+/// `settings.gradle.kts` are never apps; an unreadable one is unread and includes nothing. A
+/// build file (`build.gradle` or `build.gradle.kts`) is judged when it is the root project's,
+/// when its directory is a project the root settings `include` (`:lib:core` is `lib/core`), or,
+/// without root settings, when no ancestor directory holds a present build file. A judged build
+/// file is an app (`gradle`) when it applies the `application` plugin or assigns `mainClass` or
+/// `mainClassName`. Its name is Gradle's project name: the root project's literal
+/// `rootProject.name`, else `.`; an included project's last path segment; a standalone nested
+/// project's directory name. Its entries are the literal main classes.
+fn gradle_outcomes(
+    listed: &[&ManifestInput],
+    work: &mut Work,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<BTreeMap<String, Outcome>> {
+    let mut outcomes = BTreeMap::new();
+    let mut root_name = None;
+    let mut includes = Vec::new();
+    let mut settings_present = false;
+    for manifest in listed
+        .iter()
+        .filter(|m| matches!(m.path.as_str(), "settings.gradle" | "settings.gradle.kts"))
+    {
+        check()?;
+        if manifest.bytes.is_none() {
+            outcomes.insert(manifest.path.clone(), Outcome::NotApp);
+            continue;
+        }
+        settings_present = true;
+        if manifest.bytes.as_deref() == Some(crate::skipped_config::PLACEHOLDER) {
+            outcomes.insert(manifest.path.clone(), Outcome::Unread);
+            continue;
+        }
+        match text(manifest, work)?.and_then(java::gradle_settings) {
+            None => {
+                outcomes.insert(manifest.path.clone(), Outcome::Unread);
+            }
+            Some(settings) => {
+                root_name = root_name.or(settings.root_name);
+                includes.extend(settings.includes);
+                outcomes.insert(manifest.path.clone(), Outcome::NotApp);
+            }
+        }
+    }
+    let mut present: BTreeMap<String, Vec<&ManifestInput>> = BTreeMap::new();
+    for manifest in listed
+        .iter()
+        .filter(|m| matches!(file_name(&m.path), "build.gradle" | "build.gradle.kts"))
+    {
+        outcomes.insert(manifest.path.clone(), Outcome::NotApp);
+        if manifest.bytes.is_some() {
+            present
+                .entry(directory(&manifest.path))
+                .or_default()
+                .push(*manifest);
+        }
+    }
+    let mut names: BTreeMap<String, String> = BTreeMap::new();
+    if present.contains_key(".") {
+        names.insert(".".into(), root_name.unwrap_or_else(|| ".".into()));
+    }
+    for include in &includes {
+        let segments: Vec<&str> = include.split(':').filter(|s| !s.is_empty()).collect();
+        let (Some(last), Some(dir)) = (segments.last(), join_dir(".", &segments.join("/"))) else {
+            continue;
+        };
+        if dir != "." && present.contains_key(&dir) {
+            names.entry(dir).or_insert_with(|| (*last).to_owned());
+        }
+    }
+    if !settings_present {
+        for dir in present.keys() {
+            if dir != "." && !has_ancestor(dir, &present) {
+                names.insert(dir.clone(), file_name(dir).to_owned());
+            }
+        }
+    }
+    for (dir, name) in names {
+        for manifest in &present[&dir] {
+            check()?;
+            let build = if manifest.bytes.as_deref() == Some(crate::skipped_config::PLACEHOLDER) {
+                None
+            } else {
+                text(manifest, work)?.and_then(java::gradle_build)
+            };
+            let outcome = match build {
+                None => Outcome::Unread,
+                Some(build) if build.runnable => Outcome::App(App::detected(
+                    name.clone(),
+                    AppKind::Gradle,
+                    &manifest.path,
+                    build.main_classes,
+                )),
+                Some(_) => Outcome::NotApp,
+            };
+            outcomes.insert(manifest.path.clone(), outcome);
+        }
+    }
+    Ok(outcomes)
 }
 
 /// The `[workspace]` members of the root manifest, minus its excludes.
@@ -1146,5 +1369,442 @@ exclude = ["packages/skip"]
         })
         .unwrap_err();
         assert_eq!(error.to_string(), "expired");
+    }
+
+    fn pom(artifact: &str, packaging: Option<&str>, build: &str, modules: &[&str]) -> Vec<u8> {
+        let packaging = packaging.map_or(String::new(), |p| format!("<packaging>{p}</packaging>"));
+        let modules = if modules.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "<modules>{}</modules>",
+                modules
+                    .iter()
+                    .map(|m| format!("<module>{m}</module>"))
+                    .collect::<String>()
+            )
+        };
+        format!(
+            "<?xml version=\"1.0\"?>\n<project xmlns=\"http://maven.apache.org/POM/4.0.0\"><modelVersion>4.0.0</modelVersion><groupId>com.acme</groupId><artifactId>{artifact}</artifactId>{packaging}{modules}{build}</project>\n"
+        )
+        .into_bytes()
+    }
+
+    fn plugin(artifact: &str, configuration: &str) -> String {
+        format!(
+            "<build><plugins><plugin><groupId>g</groupId><artifactId>{artifact}</artifactId><configuration>{configuration}</configuration></plugin></plugins></build>"
+        )
+    }
+
+    fn kind_and_entries(found: &Candidates, path: &str) -> (String, Option<AppKind>, Vec<String>) {
+        let app = app(found, path);
+        (app.name, app.kind, app.entries)
+    }
+
+    #[test]
+    fn maven_war_and_jars_with_a_declared_main_class_are_apps() {
+        let jar_manifest = plugin(
+            "maven-jar-plugin",
+            "<archive><manifest><mainClass>com.acme.Cli</mainClass></manifest></archive>",
+        );
+        let exec = "<build><plugins><plugin><artifactId>exec-maven-plugin</artifactId><executions><execution><configuration><mainClass>${main}</mainClass></configuration></execution></executions></plugin></plugins></build><properties><main>com.acme.Exec</main></properties>";
+        let boot = plugin("spring-boot-maven-plugin", "");
+        let cases: [(&str, Vec<u8>, Vec<&str>); 5] = [
+            ("web", pom("web", Some("war"), "", &[]), vec![]),
+            (
+                "cli",
+                pom("cli", None, &jar_manifest, &[]),
+                vec!["com.acme.Cli"],
+            ),
+            (
+                "cli2",
+                pom("cli2", Some("jar"), &jar_manifest, &[]),
+                vec!["com.acme.Cli"],
+            ),
+            ("exec", pom("exec", None, exec, &[]), vec!["com.acme.Exec"]),
+            ("boot", pom("boot", None, &boot, &[]), vec![]),
+        ];
+        for (name, bytes, entries) in cases {
+            let found = run(&[manifest("pom.xml", Some(&bytes))], &[]);
+            assert_eq!(
+                kind_and_entries(&found, "pom.xml"),
+                (
+                    name.to_owned(),
+                    Some(AppKind::Maven),
+                    entries.into_iter().map(str::to_owned).collect()
+                ),
+                "{name}"
+            );
+            assert_eq!(app(&found, "pom.xml").roots, ["."]);
+        }
+    }
+
+    #[test]
+    fn maven_libraries_aggregators_and_other_packagings_are_not_apps() {
+        let managed = "<build><pluginManagement><plugins><plugin><artifactId>spring-boot-maven-plugin</artifactId></plugin></plugins></pluginManagement></build>";
+        let empty_main = plugin(
+            "maven-jar-plugin",
+            "<archive><manifest><mainClass> </mainClass></manifest></archive>",
+        );
+        for bytes in [
+            pom("lib", None, "", &[]),
+            pom(
+                "lib",
+                Some("jar"),
+                &plugin("maven-compiler-plugin", ""),
+                &[],
+            ),
+            pom("parent", Some("pom"), "", &[]),
+            pom(
+                "ear",
+                Some("ear"),
+                &plugin("spring-boot-maven-plugin", ""),
+                &[],
+            ),
+            pom("managed", None, managed, &[]),
+            pom("blank", None, &empty_main, &[]),
+        ] {
+            let found = run(&[manifest("pom.xml", Some(&bytes))], &[]);
+            assert_eq!(outcome(&found, "pom.xml"), &Outcome::NotApp);
+        }
+    }
+
+    #[test]
+    fn malformed_or_over_bound_maven_and_gradle_manifests_are_unread() {
+        for bytes in [
+            &b"<project><artifactId>x</artifactId>"[..],
+            b"<project></project>",
+            b"<project><artifactId> </artifactId></project>",
+            b"<notaproject><artifactId>x</artifactId></notaproject>",
+            b"<!DOCTYPE project><project><artifactId>x</artifactId></project>",
+            b"\xff<project/>",
+            PLACEHOLDER,
+        ] {
+            let found = run(&[manifest("pom.xml", Some(bytes))], &[]);
+            assert_eq!(outcome(&found, "pom.xml"), &Outcome::Unread, "{bytes:?}");
+        }
+        for bytes in [
+            &b"plugins { id 'application'"[..],
+            b"mainClass = 'x",
+            b"\xff",
+            PLACEHOLDER,
+        ] {
+            for path in ["build.gradle", "build.gradle.kts", "settings.gradle"] {
+                let found = run(&[manifest(path, Some(bytes))], &[]);
+                assert_eq!(outcome(&found, path), &Outcome::Unread, "{path} {bytes:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn maven_multi_module_gives_one_app_per_runnable_listed_module() {
+        let root = pom(
+            "shop",
+            Some("pom"),
+            "",
+            &["api", "./lib/", "web/pom.xml", "../outside"],
+        );
+        let api = pom("shop-api", Some("war"), "", &[]);
+        let lib = pom("shop-lib", None, "", &["nested"]);
+        let nested = pom("shop-nested", Some("war"), "", &[]);
+        let web = pom(
+            "shop-web",
+            None,
+            &plugin("spring-boot-maven-plugin", ""),
+            &[],
+        );
+        let stray = pom("stray", Some("war"), "", &[]);
+        let found = run(
+            &[
+                manifest("pom.xml", Some(&root)),
+                manifest("api/pom.xml", Some(&api)),
+                manifest("lib/pom.xml", Some(&lib)),
+                manifest("lib/nested/pom.xml", Some(&nested)),
+                manifest("web/pom.xml", Some(&web)),
+                manifest("stray/pom.xml", Some(&stray)),
+            ],
+            &[],
+        );
+        assert_eq!(outcome(&found, "pom.xml"), &Outcome::NotApp);
+        assert_eq!(app(&found, "api/pom.xml").name, "shop-api");
+        assert_eq!(app(&found, "api/pom.xml").roots, ["api"]);
+        assert_eq!(outcome(&found, "lib/pom.xml"), &Outcome::NotApp);
+        assert_eq!(app(&found, "lib/nested/pom.xml").name, "shop-nested");
+        assert_eq!(app(&found, "web/pom.xml").name, "shop-web");
+        // Below a POM that does not list it, a POM is not judged.
+        assert_eq!(outcome(&found, "stray/pom.xml"), &Outcome::NotApp);
+    }
+
+    #[test]
+    fn a_nested_pom_without_a_parent_pom_is_judged_alone() {
+        let service = pom("svc", Some("war"), "", &[]);
+        let unread = b"<project>";
+        let found = run(
+            &[
+                manifest("pom.xml", None),
+                manifest("backend/svc/pom.xml", Some(&service)),
+                manifest("other/pom.xml", Some(unread)),
+                manifest("other/child/pom.xml", Some(&service)),
+            ],
+            &[],
+        );
+        assert_eq!(outcome(&found, "pom.xml"), &Outcome::NotApp);
+        assert_eq!(app(&found, "backend/svc/pom.xml").roots, ["backend/svc"]);
+        // An unread parent lists nothing, so its children are not judged.
+        assert_eq!(outcome(&found, "other/pom.xml"), &Outcome::Unread);
+        assert_eq!(outcome(&found, "other/child/pom.xml"), &Outcome::NotApp);
+    }
+
+    #[test]
+    fn gradle_application_plugin_or_main_class_makes_an_app() {
+        let runnable: [(&str, &str, Vec<&str>); 8] = [
+            (
+                "build.gradle",
+                "plugins {\n    id 'java'\n    id 'application'\n}\n",
+                vec![],
+            ),
+            (
+                "build.gradle.kts",
+                "plugins {\n    application\n}\n",
+                vec![],
+            ),
+            (
+                "build.gradle.kts",
+                "plugins { id(\"application\") }\napplication { mainClass.set(\"com.acme.App\") }\n",
+                vec!["com.acme.App"],
+            ),
+            (
+                "build.gradle",
+                "apply plugin: 'application'\nmainClassName = 'com.acme.Old'\n",
+                vec!["com.acme.Old"],
+            ),
+            (
+                "build.gradle.kts",
+                "apply(plugin = \"application\")\n",
+                vec![],
+            ),
+            (
+                "build.gradle",
+                "application {\n  mainClass = \"com.acme.Main\" // run\n}\n",
+                vec!["com.acme.Main"],
+            ),
+            (
+                "build.gradle",
+                "springBoot { mainClass = \"com.acme.${name}\" }\n",
+                vec![],
+            ),
+            (
+                "build.gradle",
+                "/* plugins { id 'application' } */ jar { }\nmainClassName = 'a.B'\n",
+                vec!["a.B"],
+            ),
+        ];
+        for (path, script, entries) in runnable {
+            let found = run(&[manifest(path, Some(script.as_bytes()))], &[]);
+            assert_eq!(
+                kind_and_entries(&found, path),
+                (
+                    ".".to_owned(),
+                    Some(AppKind::Gradle),
+                    entries.into_iter().map(str::to_owned).collect()
+                ),
+                "{script}"
+            );
+        }
+        for script in [
+            "plugins { id 'java-library' }\n",
+            "plugins { id 'java' }\n// id 'application'\n",
+            "def s = \"id 'application'\"\n",
+            "dependencies { implementation project(':application') }\n",
+            "tasks.jar { manifest { attributes 'Main-Class': 'a.B' } }\n",
+            "println(project.mainClassName)\n",
+        ] {
+            let found = run(&[manifest("build.gradle", Some(script.as_bytes()))], &[]);
+            assert_eq!(
+                outcome(&found, "build.gradle"),
+                &Outcome::NotApp,
+                "{script}"
+            );
+        }
+    }
+
+    #[test]
+    fn gradle_multi_module_gives_one_app_per_runnable_included_project() {
+        let settings = b"rootProject.name = 'shop'\ninclude 'app', ':lib:core'\ninclude(':tool')\n";
+        let app_build = b"plugins { id 'application' }\napplication { mainClass = 'shop.Main' }\n";
+        let found = run(
+            &[
+                manifest("settings.gradle", Some(settings)),
+                manifest("build.gradle", Some(b"plugins { id 'application' }\n")),
+                manifest("app/build.gradle", Some(app_build)),
+                manifest(
+                    "lib/core/build.gradle.kts",
+                    Some(b"plugins { `java-library` }\n"),
+                ),
+                manifest("tool/build.gradle.kts", Some(b"plugins { application }\n")),
+                manifest(
+                    "stray/build.gradle",
+                    Some(b"plugins { id 'application' }\n"),
+                ),
+            ],
+            &[],
+        );
+        assert_eq!(outcome(&found, "settings.gradle"), &Outcome::NotApp);
+        assert_eq!(app(&found, "build.gradle").name, "shop");
+        let app_module = app(&found, "app/build.gradle");
+        assert_eq!(
+            (
+                app_module.name.as_str(),
+                app_module.roots,
+                app_module.entries
+            ),
+            ("app", vec!["app".to_owned()], vec!["shop.Main".to_owned()])
+        );
+        assert_eq!(
+            outcome(&found, "lib/core/build.gradle.kts"),
+            &Outcome::NotApp
+        );
+        assert_eq!(app(&found, "tool/build.gradle.kts").name, "tool");
+        // Not included by the root settings: not judged.
+        assert_eq!(outcome(&found, "stray/build.gradle"), &Outcome::NotApp);
+    }
+
+    #[test]
+    fn gradle_without_root_settings_judges_topmost_build_files_alone() {
+        let found = run(
+            &[
+                manifest("settings.gradle", None),
+                manifest(
+                    "android/build.gradle",
+                    Some(b"apply plugin: 'application'\n"),
+                ),
+                manifest(
+                    "android/app/build.gradle",
+                    Some(b"apply plugin: 'application'\n"),
+                ),
+            ],
+            &[],
+        );
+        assert_eq!(app(&found, "android/build.gradle").name, "android");
+        assert_eq!(
+            outcome(&found, "android/app/build.gradle"),
+            &Outcome::NotApp
+        );
+        let unread = run(
+            &[
+                manifest("settings.gradle", Some(b"include 'app")),
+                manifest("app/build.gradle", Some(b"apply plugin: 'application'\n")),
+            ],
+            &[],
+        );
+        assert_eq!(outcome(&unread, "settings.gradle"), &Outcome::Unread);
+        assert_eq!(outcome(&unread, "app/build.gradle"), &Outcome::NotApp);
+    }
+
+    #[test]
+    fn hidden_maven_and_gradle_manifests_are_neither_apps_nor_unread() {
+        let found = run(
+            &[
+                manifest(
+                    "tests/fixtures/pom.xml",
+                    Some(&pom("fx", Some("war"), "", &[])),
+                ),
+                manifest("tests/bad/pom.xml", Some(b"<project>")),
+                manifest("svc/build.gradle", Some(b"apply plugin: 'application'\n")),
+            ],
+            &[],
+        );
+        let hidden: BTreeSet<String> = ["tests/fixtures/pom.xml", "tests/bad/pom.xml"]
+            .map(str::to_owned)
+            .into();
+        let detected = detect(&found, &hidden);
+        assert_eq!(names(&detected.apps), ["svc"]);
+        assert_eq!(detected.unread, 0);
+        assert_eq!(detect(&found, &BTreeSet::new()).unread, 1);
+    }
+
+    #[test]
+    fn maven_and_gradle_kinds_serialize_lowercase() {
+        assert_eq!(
+            serde_json::to_value(AppKind::Maven).unwrap(),
+            serde_json::json!("maven")
+        );
+        assert_eq!(
+            serde_json::to_value(AppKind::Gradle).unwrap(),
+            serde_json::json!("gradle")
+        );
+    }
+
+    #[test]
+    fn java_parsing_is_bounded_and_checked_per_manifest() {
+        let documents = BTreeSet::new();
+        let poms = [manifest("pom.xml", Some(&pom("a", Some("war"), "", &[])))];
+        let size = poms[0].bytes.as_ref().unwrap().len();
+        let error =
+            candidates(&poms, &documents, &mut Work::new(size - 1), &mut || Ok(())).unwrap_err();
+        assert_eq!(error.to_string(), "bounded_work: app manifest parsing");
+        candidates(&poms, &documents, &mut Work::new(size), &mut || Ok(())).unwrap();
+        let gradle = [
+            manifest("settings.gradle", Some(b"include 'a'\n")),
+            manifest("a/build.gradle", Some(b"apply plugin: 'application'\n")),
+        ];
+        let error =
+            candidates(&gradle, &documents, &mut Work::new(20), &mut || Ok(())).unwrap_err();
+        assert_eq!(error.to_string(), "bounded_work: app manifest parsing");
+        let mut checks = 0;
+        candidates(&gradle, &documents, &mut Work::new(1000), &mut || {
+            checks += 1;
+            Ok(())
+        })
+        .unwrap();
+        // One per Java manifest judged, plus one per listed manifest.
+        assert_eq!(checks, 4);
+    }
+    /// PR #883 review: a literal `include` admits its project (control).
+    #[test]
+    fn review_literal_gradle_include_control_selects_its_runnable_project() {
+        let found = run(
+            &[
+                manifest(
+                    "settings.gradle",
+                    Some(b"rootProject.name = 'shop'\ninclude(\"app\")\n"),
+                ),
+                manifest("app/build.gradle", Some(b"plugins { id 'application' }\n")),
+                manifest(
+                    "app-impl/build.gradle",
+                    Some(b"plugins { id 'application' }\n"),
+                ),
+            ],
+            &[
+                "app/src/main/java/shop/App.java",
+                "app-impl/src/main/java/shop/Impl.java",
+            ],
+        );
+        assert_eq!(app(&found, "app/build.gradle").name, "app");
+        assert_eq!(outcome(&found, "app-impl/build.gradle"), &Outcome::NotApp);
+    }
+
+    /// PR #883 review: a computed `include` admits nothing, not its literal prefix.
+    #[test]
+    fn review_computed_gradle_include_does_not_invent_literal_prefix_member() {
+        let found = run(
+            &[
+                manifest(
+                    "settings.gradle",
+                    Some(b"rootProject.name = 'shop'\ninclude(\"app\" + \"-impl\")\n"),
+                ),
+                manifest("app/build.gradle", Some(b"plugins { id 'application' }\n")),
+                manifest(
+                    "app-impl/build.gradle",
+                    Some(b"plugins { id 'application' }\n"),
+                ),
+            ],
+            &[
+                "app/src/main/java/shop/App.java",
+                "app-impl/src/main/java/shop/Impl.java",
+            ],
+        );
+        // Literal-only scanning need not evaluate app-impl. It must not invent app.
+        assert_eq!(outcome(&found, "app/build.gradle"), &Outcome::NotApp);
     }
 }

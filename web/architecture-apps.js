@@ -195,7 +195,7 @@
     return `${item.name} · ${item.roots.length ? `roots ${rootList(item)}` : "no roots"}${from ? ` · ${from}` : ""}`;
   }
   // What every count in the All apps view means, under the inspector (`pin` is the snapshot's label).
-  const footnote = pin => `Apps are detected from build manifests (Cargo binary packages, package.json and pyproject.toml) or authored in .trellis/rules.toml. Layer order is compared within an app. Band and arrow counts are reference sites at ${pin}; deviation totals are rule instances, as trellis rules check reports them; ≥ means a lower bound. HTTP interfaces are evidence, not proof.`;
+  const footnote = pin => `Apps are detected from build manifests (Cargo binary packages, package.json, pyproject.toml, and runnable Maven and Gradle modules) or authored in .trellis/rules.toml. Layer order is compared within an app. Band and arrow counts are reference sites at ${pin}; deviation totals are rule instances, as trellis rules check reports them; ≥ means a lower bound. HTTP interfaces are evidence, not proof.`;
   const duplicateNotice = item =>
     `${item.apps.length} detected apps share the name ${item.name} (${manifestList(item)}). A layer cannot name them; rules.md Amendment (#783).`;
 

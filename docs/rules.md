@@ -177,8 +177,19 @@ app is one of:
   member, an excluded project and a project outside the workspace are each an app. Capture
   retains a nested `pyproject.toml` that sits above Python sources, as it does a nested
   `Cargo.toml` above Rust sources.
+- **A runnable Maven or Gradle module** (status: owner-ratified 2026-11-10 (#854)). A
+  `pom.xml` is a Maven app when its packaging is `war`, or `jar` (the default) with a
+  declared main class: `maven-jar-plugin`'s manifest `mainClass`, `spring-boot-maven-plugin`,
+  or `exec-maven-plugin`'s `mainClass`. A Gradle build file (`build.gradle` or
+  `build.gradle.kts`) is a Gradle app when it applies the `application` plugin or sets
+  `mainClass` or `mainClassName`. A library jar, an aggregator POM and a build without either
+  is not an app. A multi-module build gives one app per runnable module: the modules are the
+  POM `<modules>` and the root `settings.gradle` `include` list. Its root is the build file's
+  directory, and its entries are the declared main classes. Capture retains a nested
+  `pom.xml`, `build.gradle` and `build.gradle.kts` that sits above Java sources.
 
-The app kinds are `cargo`, `npm` and `python` (`python` owner-ratified 2026-11-08 (#807)).
+The app kinds are `cargo`, `npm`, `python`, `maven` and `gradle` (`python` owner-ratified
+2026-11-08 (#807); `maven` and `gradle` owner-ratified 2026-11-10 (#854)).
 
 This amendment adds no authored apps table. Authored apps, for checkouts that manifests
 can't split, such as a Node backend and a JavaScript frontend in one package, are
@@ -387,15 +398,19 @@ What the example shows:
 [Amendment (#783)](#amendment-783-apps-and-per-app-layers). It adds no rule beyond the
 amendment. Where the two differ in detail, this section is the exact behaviour.
 
-**App kinds.** An app's `kind` is `cargo`, `npm` or `python`. `python` is a ratified app kind
-(owner ruling 2026-11-08), detected from `pyproject.toml` since
-[#807](https://github.com/SquashMerge/trellis/issues/807).
+**App kinds.** An app's `kind` is `cargo`, `npm`, `python`, `maven` or `gradle`. `python` is
+a ratified app kind (owner ruling 2026-11-08), detected from `pyproject.toml` since
+[#807](https://github.com/SquashMerge/trellis/issues/807). `maven` and `gradle` are ratified
+app kinds (owner ruling 2026-11-10), detected from `pom.xml` and Gradle build files since
+[#854](https://github.com/SquashMerge/trellis/issues/854).
 
 **Captured manifests.** Detection reads only manifest bytes the indexer captured with the
 code snapshot, and never the live files. The snapshot retains every present `package.json`
 and `Cargo.toml` at any depth, outside `node_modules/`, under the existing byte bounds. It
 retains the root `pyproject.toml` and each nested `pyproject.toml` that sits above a captured
-Python source (#807), under the same bounds. The
+Python source (#807), under the same bounds. It retains the root `pom.xml`, `build.gradle`,
+`build.gradle.kts`, `settings.gradle` and `settings.gradle.kts`, and each nested `pom.xml`,
+`build.gradle` and `build.gradle.kts` that sits above a captured Java source (#854). The
 per-manifest size bound applies to the root manifests only; a nested manifest counts toward
 the total bound. A manifest that is absent from the snapshot is not an app and is not unread.
 
@@ -419,6 +434,15 @@ the total bound. A manifest that is absent from the snapshot is not an app and i
 | `pyproject.toml` with neither `[project]` nor a `[tool.poetry]` that has `name` | no app |
 | `pyproject.toml` whose `[project].name` (or, without `[project]`, `[tool.poetry].name`) is not a nonblank string | unread |
 | `pyproject.toml` with `[project]` or a named `[tool.poetry]` | app (`python`) |
+| `pom.xml` that is not well-formed XML in the reader's subset (a DOCTYPE, an unknown entity, an unclosed or mismatched element), not UTF-8, over the size bound, not a `<project>`, or without a nonblank `artifactId` | unread |
+| `pom.xml` below a present `pom.xml` whose `<modules>` chain does not list its directory | no app; never parsed |
+| `pom.xml` with packaging `pom`, a packaging other than `jar` or `war`, or `jar` with no declared main class | no app; its `<modules>` are still followed |
+| `pom.xml` with packaging `war`, or `jar` with a declared main class | app (`maven`) |
+| Root `settings.gradle` or `settings.gradle.kts` | no app; unread when not UTF-8, over the size bound, or with an unterminated string or comment or unbalanced brackets |
+| Gradle build file that the root settings do not include, below the root, when root settings exist; or below another present build file when they do not | no app; never parsed |
+| Gradle build file that is not UTF-8, over the size bound, or has an unterminated string or comment or unbalanced brackets | unread |
+| Gradle build file without the `application` plugin, `mainClass` or `mainClassName` | no app |
+| Gradle build file with the `application` plugin, `mainClass` or `mainClassName` | app (`gradle`) |
 
 An unread manifest detects no app. A manifest that a hidden layer selects (see
 [Amendment (#783)](#amendment-783-apps-and-per-app-layers)) is neither an app nor unread.
@@ -442,6 +466,26 @@ An unread manifest detects no app. A manifest that a hidden layer selects (see
   its `callable`, and one without `callable` (a file script) adds nothing. Entries are sorted
   and deduplicated, and may be empty. A uv `[tool.uv.workspace]` changes nothing: each
   `pyproject.toml` is judged alone.
+- **Maven** modules: a present `pom.xml` with no present `pom.xml` in an ancestor directory
+  is judged alone. Each judged POM's `<module>` values, resolved against its directory (a
+  trailing `/pom.xml` dropped; a path leaving the checkout ignored), name further judged POMs.
+  The POM is read only as XML text: no parent POM, profile, `pluginManagement` entry or
+  property inheritance is read. A Maven app's name is its `artifactId`, with no fallback to
+  a parent's. Its entries are the nonblank main classes the three plugins declare (in their
+  `configuration` or an execution's), with a whole-value `${name}` resolved from the POM's own
+  `<properties>`; `spring-boot-maven-plugin` alone declares a main class it finds itself, so
+  its app may have no entries.
+- **Gradle** projects: the root build file, and each build file whose directory is a project
+  that a literal `include` of the root `settings.gradle` or `settings.gradle.kts` names
+  (`:lib:core` is `lib/core`). Without root settings, each build file with no present build
+  file in an ancestor directory is judged alone. Build scripts are code: they are scanned as
+  tokens, never run, so `application` is recognised only as `id 'application'`,
+  `id("application")` or a bare `application` in `plugins {}`, or as `apply plugin:
+  'application'` / `apply(plugin = "application")`, and `mainClass`/`mainClassName` only as
+  an assignment, `.set(…)` or a Groovy call with a value. The name is Gradle's project name:
+  the root's literal `rootProject.name`, else `.`; an included project's last path segment;
+  a standalone nested project's directory name. Entries are the literal (uninterpolated)
+  main classes assigned.
 - **Roots** are the manifest's directory. `.` contains every path, and a path belongs to
   the app with the most specific containing root.
 
@@ -798,8 +842,27 @@ Supported mapping is deliberately narrow:
   proof stay distinct. A wildcard can provide positive native mappings while
   residual unknowns remain; no native or external member inventory is invented.
   Captured Cargo declarations and reviewed `std/core/alloc` roots prove package
-  targets, never semantic calls. Custom roots/`#[path]`, macro/cfg uncertainty,
-  ambiguous ownership and depth beyond four remain unknown.
+  targets, never semantic calls. An inline `crate::`/`self::`/`super::` path with no
+  `use` item resolves like an import of the same path, and a `pub(crate)` module or
+  item is visible throughout its own crate (#828); other restricted visibilities
+  (`pub(super)`, `pub(in ...)`) remain unknown. Cargo workspace member crates (#772,
+  owner-ratified 2026-11-10) are also proved roots: the members are the retained
+  nested `Cargo.toml` directories that the captured root `[workspace] members`
+  literal paths and simple globs match and `exclude` does not, plus the root package.
+  A member's library root is its `[lib] path`, else `src/lib.rs`, and its binary root
+  `src/main.rs`, which Cargo discovers unless `autobins = false`; its crate name is `[lib] name`, else the package name
+  with `-` as `_`. In a member, an otherwise unbound first path segment names another
+  member's library root when a `[dependencies]` or `[dev-dependencies]` entry (also
+  under `[target.*]`) has a `path`, or inherits a root `[workspace.dependencies]`
+  `path` with `workspace = true`, that is that member's directory: a renamed entry
+  (`package = "..."`) binds its key, any other the target's crate name, and a binary
+  binds its own package's library. Local names shadow such a crate, and only `pub`
+  items are visible through it, not `pub(crate)` ones. Two members with one package name, one root file
+  claimed twice, one name bound to two crates, a member manifest that is not valid
+  TOML and a path dependency outside the members prove nothing and remain unknown.
+  Nothing runs `cargo metadata`, and manifest parsing shares the reference work bound.
+  Custom roots/`#[path]`, macro/cfg uncertainty, ambiguous ownership and depth beyond
+  four remain unknown.
 - **JavaScript and TypeScript:** the two languages share one resolver. Static
   relative imports/reexports/side-effect imports (also `import type`,
   `export type` and `import x = require("m")`) try the extensionless candidates
@@ -815,9 +878,33 @@ Supported mapping is deliberately narrow:
   to a TypeScript target and the reverse. The root `tsconfig.json` (else
   `jsconfig.json`; JSONC, `extends` is not followed) adds `paths` (exact key,
   else the longest `prefix*suffix` pattern, targets in order, targets leaving
-  the checkout skipped), `baseUrl` and `rootDirs` for relative misses. A bare
-  specifier falls back to a package only when no local module matched; an
-  ambiguous local match stays `module_path_ambiguous`. A
+  the checkout skipped), `baseUrl` and `rootDirs` for relative misses.
+  Workspace packages (#773, owner-ratified 2026-11-10) come next for a bare
+  specifier that `paths` and `baseUrl` leave unmatched. The member directories are
+  the literal paths and simple globs (`*` within a segment, `**` across segments;
+  a `!` pattern excludes) that the captured root `package.json` names in
+  `workspaces` (an array of strings, or `{packages: [...]}`) and the captured root
+  `pnpm-workspace.yaml` names in `packages`. That file is read with a bounded YAML
+  subset: top-level `key:` mappings, a block or one-line flow sequence of plain or
+  quoted strings, and `#` comments. Absolute or traversing patterns name nothing;
+  more than 256 patterns, an unsupported shape, tabs, anchors, tags or a second
+  document make the workspace unreadable. Each retained nested `package.json`
+  (outside `node_modules`) in a member directory maps its `name` (including
+  `@scope/name`) to that directory. A bare `name` resolves to the member's entry:
+  `exports` when it is a single `./` string, else `module`, else `main`, else the
+  directory's `index` file, by the extension rules above. `name/sub/path` resolves
+  to that member-relative path, unless a single-string `exports` closes subpaths.
+  Any other `exports` keeps the member `javascript_workspace_exports_unsupported`;
+  two members with one name are `javascript_workspace_package_ambiguous`; an entry
+  or subpath leaving the member is `javascript_workspace_entry_unsupported`; one
+  naming no indexed script is `javascript_workspace_entry_not_indexed`. A
+  workspace config, or a member `package.json`, that cannot be read makes bare
+  specifiers that resolve nowhere else `javascript_workspace_unreadable`. A member
+  name never falls back to an npm or Node label; an unreadable workspace still
+  may. No `node_modules`, package manager or execution is involved, and
+  scip-typescript's `--yarn-workspaces` and `--pnpm-workspaces` producer flags
+  remain out of scope. A bare specifier falls back to a package only when no
+  local module matched; an ambiguous local match stays `module_path_ambiguous`. A
   config that cannot be read leaves relative resolution unchanged and reports
   bare specifiers that match no package as `tsconfig_unreadable`. `export = x`
   sets an unknown name set; `.cts` ends export following. `export * from`
@@ -1270,8 +1357,10 @@ shares the existing source/stored-byte and work bounds, with cancellation before
 growth and atomic typed failure on exhaustion.
 
 The first Rust slice applies root Cargo evidence only to proved conventional root
-entry/module chains. Nested/workspace members, inherited dependencies without a
-member binding, custom roots and unproved ownership remain unknown. Root
+entry/module chains. External package labels still come only from the root
+manifest: a workspace member's own registry dependencies, inherited dependencies
+without a member binding, custom roots and unproved ownership remain unknown.
+Workspace member crates themselves resolve as in-repo modules (#772, see above). Root
 bindings distinguish upstream package names from Cargo keys/renames (including
 hyphen normalization). Conflicting normalized bindings and local path dependencies
 are not guessed external packages. Sections, optional and target qualifiers do
@@ -1300,8 +1389,11 @@ block that root. Duplicate relevant sections/keys or malformed JSON make manifes
 proof unknown, never last-wins. Aliases/protocols, workspace/link/file/Git/URL
 values, non-string constraints and unproved declarations cannot supply npm targets.
 A root `workspaces` field blocks npm inference; the root package's own `name`
-never proves a dependency/self-reference. Nested/workspace manifests, import maps,
-package exports and installed node_modules are not discovered or resolved.
+never proves a dependency/self-reference. Workspace members resolve as in-repo
+modules instead (#773, owner-ratified 2026-11-10; see the JavaScript and
+TypeScript resolution rules); their manifests' dependency sections supply no npm
+labels. Import maps, package exports maps beyond a single string and installed
+node_modules are not discovered or resolved.
 
 `pkg/sub/path` proves only declared key `pkg`; `@scope/pkg/sub` proves only
 `@scope/pkg`. Empty/traversal/query/hash/backslash/scheme forms stay unknown.

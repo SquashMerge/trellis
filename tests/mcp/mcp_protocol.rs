@@ -3207,42 +3207,21 @@ fn catalog_rejects_contradictory_unresolved_and_resolved_failures() {
     assert_eq!(catalog.as_array().unwrap().len(), 13);
     for entry in catalog.as_array().unwrap() {
         let defs = &entry["outputSchema"]["$defs"];
-        // #836: the architecture tools nest their located and building errors beside the
-        // resolved one under `Failure.error.oneOf`; the resolved error is its first shape.
-        let resolved = &defs["Failure"]["properties"]["error"];
-        let resolved = resolved["oneOf"].get(0).unwrap_or(resolved);
+        // #864: one `Failure` per tool. An answering `workspace` requires `catchingUp` and
+        // excludes the unresolved `attemptedWorkspace` and `reason`; without a workspace there
+        // is no `catchingUp`.
+        let failure = &defs["Failure"];
+        assert_eq!(failure["if"], json!({"required":["workspace"]}));
+        assert_eq!(failure["then"]["required"], json!(["catchingUp"]));
+        let excluded = &failure["then"]["properties"]["error"]["properties"];
+        assert_eq!(excluded["attemptedWorkspace"], json!(false));
+        assert_eq!(excluded["reason"], json!(false));
+        assert_eq!(failure["else"], json!({"not":{"required":["catchingUp"]}}));
+        let error = &failure["properties"]["error"];
+        assert_eq!(error["additionalProperties"], false);
         assert_eq!(
-            resolved["properties"]["code"],
-            json!({"$ref":"#/$defs/ResolvedFailureCode"})
-        );
-        assert!(
-            !defs["ResolvedFailureCode"]["enum"]
-                .as_array()
-                .unwrap()
-                .contains(&json!("workspace_selection_failed"))
-        );
-        // The four failures without a workspace share `NoWorkspaceFailure`.
-        let error = &defs["NoWorkspaceFailure"]["properties"]["error"];
-        assert_eq!(error["properties"]["currentBasis"], json!({"const":null}));
-        assert_eq!(
-            error["properties"]["currentContentHash"],
-            json!({"const":null})
-        );
-        let [selection, invalid_workspace, _, _] = error["oneOf"].as_array().unwrap().as_slice()
-        else {
-            panic!("four NoWorkspaceFailure error shapes")
-        };
-        assert_eq!(
-            invalid_workspace["properties"]["retryable"],
-            json!({"const":false})
-        );
-        assert_eq!(
-            selection["then"]["properties"]["retryable"],
-            json!({"const":true})
-        );
-        assert_eq!(
-            selection["else"]["properties"]["retryable"],
-            json!({"const":false})
+            error["properties"]["attemptedWorkspace"]["additionalProperties"],
+            false
         );
     }
 }
@@ -5725,7 +5704,7 @@ async fn describe_retries_direct_sqlite_contention_on_fresh_selected_snapshot() 
     let envelope = &expired["result"]["structuredContent"];
     assert!(envelope.get("data").is_none());
     assert_eq!(envelope["error"]["retryable"], true);
-    let codes = trellis::mcp::catalog::list(true)["tools"][0]["outputSchema"]["$defs"]["ResolvedFailureCode"]["enum"].as_array().unwrap().clone();
+    let codes = trellis::mcp::catalog::list(true)["tools"][0]["outputSchema"]["$defs"]["Failure"]["properties"]["error"]["properties"]["code"]["enum"].as_array().unwrap().clone();
     assert!(codes.contains(&envelope["error"]["code"]));
     runtime.mcp_busy_reads_for_tests(0).unwrap();
     drop(client);

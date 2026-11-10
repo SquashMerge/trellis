@@ -730,6 +730,89 @@ fn the_architecture_summary_lists_a_python_app_with_its_kind_and_entries() {
     assert_eq!(svc["languages"], json!(["python"]));
 }
 
+const MAVEN_ROOT: (&str, &str) = (
+    "pom.xml",
+    "<project><artifactId>shop</artifactId><packaging>pom</packaging><modules><module>api</module></modules></project>\n",
+);
+const MAVEN_API: (&str, &str) = (
+    "api/pom.xml",
+    "<project><artifactId>shop-api</artifactId><build><plugins><plugin><artifactId>maven-jar-plugin</artifactId><configuration><archive><manifest><mainClass>shop.Api</mainClass></manifest></archive></configuration></plugin></plugins></build></project>\n",
+);
+const MAVEN_SOURCE: (&str, &str) = (
+    "api/src/main/java/shop/Api.java",
+    "package shop;\npublic class Api { public static void main(String[] a) {} }\n",
+);
+const GRADLE_SETTINGS: (&str, &str) = ("settings.gradle", "include 'cli'\n");
+const GRADLE_CLI: (&str, &str) = (
+    "cli/build.gradle",
+    "plugins { id 'application' }\napplication { mainClass = 'tools.Cli' }\n",
+);
+const GRADLE_SOURCE: (&str, &str) = (
+    "cli/src/main/java/tools/Cli.java",
+    "package tools;\npublic class Cli { public static void main(String[] a) {} }\n",
+);
+
+#[test]
+fn maven_and_gradle_modules_are_apps_that_layers_can_name() {
+    let rules_file = "version = 1\n[layers.server]\napp = \"shop-api\"\norder = 1\npaths = [\"api/**\"]\n[layers.tool]\napp = \"cli\"\norder = 1\npaths = [\"cli/**\"]\n";
+    let files = [
+        MAVEN_ROOT,
+        MAVEN_API,
+        MAVEN_SOURCE,
+        GRADLE_SETTINGS,
+        GRADLE_CLI,
+        GRADLE_SOURCE,
+    ];
+    let data = check(&with(rules_file, &files)).unwrap();
+    let apps: Vec<(&str, &str)> = data["apps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|app| {
+            (
+                app["name"].as_str().unwrap(),
+                app["manifest"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        apps,
+        [("shop-api", "api/pom.xml"), ("cli", "cli/build.gradle")]
+    );
+    assert_eq!(limitation_count(&data), 0);
+    let summary = summary(&with(rules_file, &files));
+    let api = app_named(&summary["apps"], "shop-api");
+    assert_eq!(api["kind"], "maven");
+    assert_eq!(api["roots"], json!(["api"]));
+    assert_eq!(api["entries"], json!(["shop.Api"]));
+    assert_eq!(api["languages"], json!(["java"]));
+    let cli = app_named(&summary["apps"], "cli");
+    assert_eq!(cli["kind"], "gradle");
+    assert_eq!(cli["entries"], json!(["tools.Cli"]));
+    // A library module is no app, so naming it is a reference error.
+    let diagnostic = invalid(&with(
+        "version = 1\n[layers.server]\napp = \"shop\"\norder = 1\npaths = [\"api/**\"]\n",
+        &files,
+    ));
+    assert!(diagnostic.to_string().contains("shop"), "{diagnostic}");
+}
+
+#[test]
+fn a_malformed_pom_adds_one_limitation_unless_hidden() {
+    let bad = ("bad/pom.xml", "<project><artifactId>bad</artifactId>\n");
+    let bad_source = ("bad/src/Bad.java", "class Bad {}\n");
+    // No root POM, so each module is judged alone.
+    let files = [MAVEN_API, MAVEN_SOURCE, bad, bad_source];
+    let data = check(&with("version = 1\n", &files)).unwrap();
+    assert_eq!(limitation_count(&data), 1, "{data}");
+    assert_eq!(data["apps"].as_array().unwrap().len(), 1);
+    let hidden =
+        "version = 1\n[layers.fixtures]\ndisplay = \"hidden\"\norder = 1\npaths = [\"bad/**\"]\n";
+    let data = check(&with(hidden, &files)).unwrap();
+    assert_eq!(limitation_count(&data), 0);
+    assert_eq!(data["apps"].as_array().unwrap().len(), 1);
+}
+
 fn summary(files: &[(&str, &str)]) -> Value {
     let (_state, _root, store, pin) = publish(files);
     let response = store.evidence_response().unwrap();

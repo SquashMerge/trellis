@@ -3090,7 +3090,8 @@ mod w1_error_tests {
         let code = super::mcp_read_error(&error);
         assert_eq!(code, "deadline_exceeded");
         let catalog = super::catalog::list(true);
-        let codes = catalog["tools"][0]["outputSchema"]["$defs"]["ResolvedFailureCode"]["enum"]
+        let codes = catalog["tools"][0]["outputSchema"]["$defs"]["Failure"]["properties"]["error"]
+            ["properties"]["code"]["enum"]
             .as_array()
             .unwrap();
         assert!(codes.iter().any(|item| item == code));
@@ -3109,7 +3110,8 @@ mod w1_error_tests {
         let code = super::mcp_read_error(&error);
         assert_eq!(code, "rebuild_in_progress");
         let catalog = super::catalog::list(true);
-        let codes = catalog["tools"][0]["outputSchema"]["$defs"]["ResolvedFailureCode"]["enum"]
+        let codes = catalog["tools"][0]["outputSchema"]["$defs"]["Failure"]["properties"]["error"]
+            ["properties"]["code"]["enum"]
             .as_array()
             .unwrap();
         assert!(codes.iter().any(|item| item == code));

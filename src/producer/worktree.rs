@@ -110,7 +110,7 @@ pub struct Layout {
 }
 
 fn omission<'a>(rules: &'a Rules, path: &str) -> Option<&'a Omission> {
-    rules.omit.iter().find(|omission| omission.path == path)
+    rules.omit.iter().find(|omission| omission.matches(path))
 }
 
 /// Sources, config, then dependency inputs claim a path only once.

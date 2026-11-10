@@ -284,7 +284,8 @@ claims for it, and while a source of a language is unread, a symbol the artifact
 is unresolved rather than external in that language, and an unread Rust file a Cargo target
 reaches leaves every file of the workspace without a Cargo target. It recovers when the file changes back. Config
 inputs (the root `package.json`, `package-lock.json`, `Cargo.lock` and other root build and
-lock files, and nested `package.json`, `Cargo.toml` and (#807) `pyproject.toml` manifests) are
+lock files, and nested `package.json`, `Cargo.toml`, (#807) `pyproject.toml` and (#854)
+`pom.xml`, `build.gradle` and `build.gradle.kts` manifests) are
 read for dependency, package-root and app facts, not as source, so `--max-file-bytes` doesn't apply to them: each has its
 own 16 MiB cap (#581). One over it isn't read; it is skipped with a `config-input-oversized`
 status diagnostic and the rest of the checkout indexes. Its stored bytes are a short
