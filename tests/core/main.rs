@@ -36,6 +36,7 @@ mod python_behavior;
 mod python_source_roots;
 mod rules;
 mod rust_behavior;
+mod rust_workspace_members;
 mod search_card;
 mod search_embed;
 mod search_lexical;

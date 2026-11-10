@@ -842,8 +842,27 @@ Supported mapping is deliberately narrow:
   proof stay distinct. A wildcard can provide positive native mappings while
   residual unknowns remain; no native or external member inventory is invented.
   Captured Cargo declarations and reviewed `std/core/alloc` roots prove package
-  targets, never semantic calls. Custom roots/`#[path]`, macro/cfg uncertainty,
-  ambiguous ownership and depth beyond four remain unknown.
+  targets, never semantic calls. An inline `crate::`/`self::`/`super::` path with no
+  `use` item resolves like an import of the same path, and a `pub(crate)` module or
+  item is visible throughout its own crate (#828); other restricted visibilities
+  (`pub(super)`, `pub(in ...)`) remain unknown. Cargo workspace member crates (#772,
+  owner-ratified 2026-11-10) are also proved roots: the members are the retained
+  nested `Cargo.toml` directories that the captured root `[workspace] members`
+  literal paths and simple globs match and `exclude` does not, plus the root package.
+  A member's library root is its `[lib] path`, else `src/lib.rs`, and its binary root
+  `src/main.rs`, which Cargo discovers unless `autobins = false`; its crate name is `[lib] name`, else the package name
+  with `-` as `_`. In a member, an otherwise unbound first path segment names another
+  member's library root when a `[dependencies]` or `[dev-dependencies]` entry (also
+  under `[target.*]`) has a `path`, or inherits a root `[workspace.dependencies]`
+  `path` with `workspace = true`, that is that member's directory: a renamed entry
+  (`package = "..."`) binds its key, any other the target's crate name, and a binary
+  binds its own package's library. Local names shadow such a crate, and only `pub`
+  items are visible through it, not `pub(crate)` ones. Two members with one package name, one root file
+  claimed twice, one name bound to two crates, a member manifest that is not valid
+  TOML and a path dependency outside the members prove nothing and remain unknown.
+  Nothing runs `cargo metadata`, and manifest parsing shares the reference work bound.
+  Custom roots/`#[path]`, macro/cfg uncertainty, ambiguous ownership and depth beyond
+  four remain unknown.
 - **JavaScript and TypeScript:** the two languages share one resolver. Static
   relative imports/reexports/side-effect imports (also `import type`,
   `export type` and `import x = require("m")`) try the extensionless candidates
@@ -1338,8 +1357,10 @@ shares the existing source/stored-byte and work bounds, with cancellation before
 growth and atomic typed failure on exhaustion.
 
 The first Rust slice applies root Cargo evidence only to proved conventional root
-entry/module chains. Nested/workspace members, inherited dependencies without a
-member binding, custom roots and unproved ownership remain unknown. Root
+entry/module chains. External package labels still come only from the root
+manifest: a workspace member's own registry dependencies, inherited dependencies
+without a member binding, custom roots and unproved ownership remain unknown.
+Workspace member crates themselves resolve as in-repo modules (#772, see above). Root
 bindings distinguish upstream package names from Cargo keys/renames (including
 hyphen normalization). Conflicting normalized bindings and local path dependencies
 are not guessed external packages. Sections, optional and target qualifiers do
