@@ -95,7 +95,13 @@ The embedding model is **not bundled**. Only an explicit `trellis model install`
 
 ### Producer versions
 
-Trellis accepts only one exact version of each [producer](quickstart.md#install-the-producers), and it doesn't install them. `scip-java` is checked by file hash, so a launcher built another way can be refused even at the right version.
+Trellis accepts only one exact version of each [producer](quickstart.md#install-the-producers). Producers are never bundled, and Trellis never installs one on its own: not the daemon, `producer plan`, `run` or `pickup`, or an automatic run. `trellis producer doctor` reports what is missing, and `trellis producer install <producer>` runs the one pinned install command only when you ask (#880). It does not cover:
+
+- prerequisites: Node, npm, a JDK, `coursier`, `rustup`, the pinned Rust toolchain and scip-java's own JDK in the coursier cache are yours to install; `producer install` refuses with `prerequisite_missing` without them;
+- other versions or install methods, and shims: a version-manager shim stays `unverifiable` after an install, because the shim still comes first on `PATH`;
+- where the launcher lands: npm and rustup put it where they always do, and the recorded `scip-java` command names no output path, so that launcher must be put on `PATH` by hand.
+
+`scip-java` is checked by file hash, so a launcher built another way can be refused even at the right version.
 
 ### TypeScript configs shared through npm
 

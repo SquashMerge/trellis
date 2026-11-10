@@ -46,7 +46,8 @@ enum Command {
     Index(IndexArgs),
     /// Explicitly import pinned SCIP evidence into the selected native index.
     Semantic(SemanticCommand),
-    /// Plan and inspect headless semantic producers. Planning executes nothing.
+    /// Plan, inspect and check headless semantic producers. Planning executes nothing; only
+    /// `producer install` installs, and only on request.
     Producer(ProducerCommand),
     /// Run the user-level socket service, or stop the existing daemon.
     Daemon(DaemonArgs),
@@ -257,6 +258,32 @@ enum ProducerAction {
     Status(ProducerStatusArgs),
     /// Import an owner-configured artifact without running a producer, or clear the entry.
     Pickup(ProducerPickupArgs),
+    /// Report whether each producer is ready, with the pinned install command for each that
+    /// isn't. Read-only: runs and installs nothing, and needs no daemon. Exits 0.
+    Doctor(ProducerDoctorArgs),
+    /// Run one producer's pinned install command, only on this explicit request. Prints the
+    /// command, then asks on a terminal unless --yes. Never installs prerequisites.
+    Install(ProducerInstallArgs),
+}
+#[derive(Args)]
+struct ProducerDoctorArgs {
+    #[command(flatten)]
+    workspace: WorkspaceArgs,
+    /// Print the report as JSON.
+    #[arg(long)]
+    json: bool,
+}
+#[derive(Args)]
+struct ProducerInstallArgs {
+    /// The producer to install, at its pinned version.
+    #[arg(value_parser = clap::builder::PossibleValuesParser::new(trellis::producer::ProducerName::ALL.map(trellis::producer::ProducerName::as_str)))]
+    producer: String,
+    /// Run the pinned command without asking, for scripted use.
+    #[arg(long)]
+    yes: bool,
+    /// Print the producer's doctor entry afterwards as JSON.
+    #[arg(long)]
+    json: bool,
 }
 #[derive(Args)]
 struct ProducerPickupArgs {
@@ -519,6 +546,12 @@ async fn main() -> Result<()> {
             })?;
         }
         Command::Model(args) => model_command(args).await?,
+        Command::Producer(ProducerCommand {
+            action: ProducerAction::Doctor(args),
+        }) => producer_doctor(&args)?,
+        Command::Producer(ProducerCommand {
+            action: ProducerAction::Install(args),
+        }) => producer_install(&args)?,
         Command::Api(args) => std::process::exit(api_command(&args)),
         Command::Gc(_) => {
             let request = daemon_request("gc_report", serde_json::json!({}));
@@ -535,6 +568,57 @@ async fn main() -> Result<()> {
         | Command::References(_)) => dispatch_cli(&command)?,
     }
     Ok(())
+}
+
+/// `producer doctor` (#880): runs in the CLI process against the environment the CLI would
+/// declare to `producer plan`, so it needs no daemon or index.
+fn producer_doctor(args: &ProducerDoctorArgs) -> Result<()> {
+    use trellis::producer::{detect, doctor};
+    let declared = detect::Declared::new(&detect::Environment::from_process()?)?;
+    let cwd = std::env::current_dir()?;
+    let workspace = match &args.workspace.workspace {
+        Some(explicit) => Some(WorkspaceIdentity::discover_unattached(Some(explicit), &cwd)?.root),
+        None => WorkspaceIdentity::discover_unattached(None, &cwd)
+            .ok()
+            .map(|identity| identity.root),
+    };
+    let report = doctor::report(workspace.as_deref(), &declared);
+    if args.json {
+        print_json(&report)
+    } else {
+        use std::io::Write;
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(doctor::render(&report).as_bytes())?;
+        Ok(stdout.flush()?)
+    }
+}
+
+/// `producer install` (#880): the only caller of the pinned install.
+fn producer_install(args: &ProducerInstallArgs) -> Result<()> {
+    use trellis::producer::{ProducerName, detect, doctor, install};
+    let producer = ProducerName::parse(&args.producer)
+        .ok_or_else(|| anyhow::anyhow!("invalid_request: producer"))?;
+    let declared = detect::Declared::new(&detect::Environment::from_process()?)?;
+    let confirmation = if args.yes {
+        install::Confirmation::Assumed
+    } else {
+        install::Confirmation::Ask
+    };
+    // With --json, stdout holds only the JSON entry, so progress goes to stderr.
+    let after = if args.json {
+        install::run_pinned_install(producer, &declared, confirmation, &mut std::io::stderr())?
+    } else {
+        install::run_pinned_install(producer, &declared, confirmation, &mut std::io::stdout())?
+    };
+    if args.json {
+        print_json(&after)
+    } else {
+        use std::io::Write;
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(b"Doctor:\n")?;
+        stdout.write_all(doctor::render_producer(&after).as_bytes())?;
+        Ok(stdout.flush()?)
+    }
 }
 
 async fn model_command(args: ModelArgs) -> Result<()> {

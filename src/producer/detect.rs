@@ -157,9 +157,26 @@ impl Declared {
     }
 }
 
-/// Why a producer cannot be planned: the text after `producer_unavailable: `.
+/// Why a producer cannot be planned: the text after `producer_unavailable: `, and
+/// what kind of shortfall it is, for `producer doctor` (#880).
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Unavailable(pub String);
+pub struct Unavailable(pub String, pub UnavailableKind);
+
+/// The kind of an [`Unavailable`]. The reason text stays the typed message; the kind
+/// only classifies it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UnavailableKind {
+    /// The producer's launcher or binary is not where resolution looks.
+    Missing,
+    /// A runtime or tool the producer needs (node, java, rustup, python3) is not on
+    /// the declared `PATH`.
+    PrerequisiteMissing,
+    /// The launcher's package names another version.
+    WrongVersion { found: String },
+    /// Something was found but cannot be verified against the pin: a shim, a hash
+    /// mismatch, an unreadable or non-UTF-8 path.
+    Unverifiable,
+}
 
 impl fmt::Display for Unavailable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -176,7 +193,18 @@ impl Unavailable {
 }
 
 fn unavailable<T>(reason: impl Into<String>) -> Result<T, Unavailable> {
-    Err(Unavailable(reason.into()))
+    Err(Unavailable(reason.into(), UnavailableKind::Unverifiable))
+}
+
+fn missing<T>(reason: impl Into<String>) -> Result<T, Unavailable> {
+    Err(Unavailable(reason.into(), UnavailableKind::Missing))
+}
+
+fn prerequisite<T>(reason: impl Into<String>) -> Result<T, Unavailable> {
+    Err(Unavailable(
+        reason.into(),
+        UnavailableKind::PrerequisiteMissing,
+    ))
 }
 
 /// An executable found by resolution and its content hash.
@@ -266,21 +294,30 @@ fn is_executable_file(path: &Path) -> bool {
 }
 
 /// The first declared directory holding an executable `name`.
-fn find_on_path(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+pub(super) fn find_on_path(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
     dirs.iter()
         .find(|dir| is_executable_file(&dir.join(name)))
         .cloned()
 }
 
 fn canonical(path: &Path) -> Result<PathBuf, Unavailable> {
-    let resolved = fs::canonicalize(path)
-        .map_err(|_| Unavailable(format!("cannot resolve {}", path.display())))?;
+    let resolved = fs::canonicalize(path).map_err(|_| {
+        Unavailable(
+            format!("cannot resolve {}", path.display()),
+            UnavailableKind::Unverifiable,
+        )
+    })?;
     utf8(&resolved)?;
     Ok(resolved)
 }
 
 fn sha256_file(path: &Path) -> Result<String, Unavailable> {
-    let unreadable = |_| Unavailable(format!("cannot read {}", path.display()));
+    let unreadable = |_| {
+        Unavailable(
+            format!("cannot read {}", path.display()),
+            UnavailableKind::Unverifiable,
+        )
+    };
     let mut file = File::open(path).map_err(unreadable)?;
     if !file.metadata().map_err(unreadable)?.is_file() {
         return unavailable(format!("{} is not a regular file", path.display()));
@@ -307,7 +344,7 @@ fn exe(path: PathBuf, dir: PathBuf) -> Result<Exe, Unavailable> {
 /// The first `name` on the declared `PATH`, canonicalized and hashed.
 fn runtime_on_path(name: &str, declared: &Declared) -> Result<Exe, Unavailable> {
     let Some(dir) = find_on_path(name, &declared.path_dirs) else {
-        return unavailable(format!("no {name} on the declared PATH"));
+        return prerequisite(format!("no {name} on the declared PATH"));
     };
     exe(canonical(&dir.join(name))?, dir)
 }
@@ -368,7 +405,7 @@ fn resolve_npm(
         None => {
             let name = producer.as_str();
             let Some(dir) = find_on_path(name, &declared.path_dirs) else {
-                return unavailable(format!("no {name} on the declared PATH"));
+                return missing(format!("no {name} on the declared PATH"));
             };
             (canonical(&dir.join(name))?, Some(dir))
         }
@@ -384,16 +421,22 @@ fn resolve_npm(
         return unavailable("launcher is not an npm package entry point (shim?)");
     };
     if package.version != pin.version {
-        return unavailable(format!(
-            "version {} != pinned {}",
-            package.version, pin.version
+        return Err(Unavailable(
+            format!("version {} != pinned {}", package.version, pin.version),
+            UnavailableKind::WrongVersion {
+                found: package.version,
+            },
         ));
     }
     // npm -g and mise installs keep `node` next to the launcher: prefer it.
     let node_dir = match launcher_dir {
         Some(dir) if dir.join("node").exists() => dir,
-        _ => find_on_path("node", &declared.path_dirs)
-            .ok_or_else(|| Unavailable("no node on the declared PATH".into()))?,
+        _ => find_on_path("node", &declared.path_dirs).ok_or_else(|| {
+            Unavailable(
+                "no node on the declared PATH".into(),
+                UnavailableKind::PrerequisiteMissing,
+            )
+        })?,
     };
     let node_path = canonical(&node_dir.join("node"))?;
     if !is_native_executable(&node_path) {
@@ -422,7 +465,7 @@ fn resolve_java(
         Some(path) => canonical(path)?,
         None => {
             let Some(dir) = find_on_path("scip-java", &declared.path_dirs) else {
-                return unavailable("no scip-java on the declared PATH");
+                return missing("no scip-java on the declared PATH");
             };
             canonical(&dir.join("scip-java"))?
         }
@@ -488,7 +531,7 @@ pub(super) fn resolve_rust_on(
         }
         None => {
             let Some(dir) = find_on_path("rustup", &declared.path_dirs) else {
-                return unavailable("no rustup on the declared PATH");
+                return prerequisite("no rustup on the declared PATH");
             };
             exe(dir.join("rustup"), dir)?
         }
@@ -499,7 +542,7 @@ pub(super) fn resolve_rust_on(
         .join(format!("{}-{target}", rustup_toolchain(pin)))
         .join("bin/rust-analyzer");
     if !is_executable_file(&real) {
-        return unavailable(format!("no rust-analyzer for host at {}", real.display()));
+        return missing(format!("no rust-analyzer for host at {}", real.display()));
     }
     let observed = sha256_file(&canonical(&real)?)?;
     if observed != pinned_hash {

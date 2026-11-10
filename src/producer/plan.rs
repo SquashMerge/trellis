@@ -509,7 +509,10 @@ pub fn status(store: &Store, request: &StatusRequest, stub: Option<&Stub>) -> Re
             let pin = target.pin();
             let base = match &pin {
                 Some(pin) => detect::resolve_base(target, pin, &declared, None, stub),
-                None => Err(detect::Unavailable("producer is not pinned".into())),
+                None => Err(detect::Unavailable(
+                    "producer is not pinned".into(),
+                    detect::UnavailableKind::Unverifiable,
+                )),
             };
             let trust = |trust: TrustProfile| -> Value {
                 if let Some(reason) = profiles::refusal(target, trust) {

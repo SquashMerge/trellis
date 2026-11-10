@@ -1,6 +1,31 @@
 # Producer provisioning (#21, AC7e)
 
-The real-producer end-to-end tests (`tests/producer_e2e*.rs`) run the four pinned producers through `trellis producer plan` and `trellis producer run`. **Trellis installs nothing.** Provisioning a producer is a host action by the owner. The tests only detect and verify what is already there, and they never run a package manager, `rustup component add`, `coursier bootstrap` or a download.
+The real-producer end-to-end tests (`tests/producer_e2e*.rs`) run the four pinned producers through `trellis producer plan` and `trellis producer run`. **Trellis never installs on its own.** Producers stay host-installed and are never bundled. Provisioning a producer is a host action by the owner; `trellis producer install <producer>` runs a pinned install command only on that explicit user command (owner ruling 2026-11-10, #880). The index, the daemon, `producer plan`, `run` and `pickup`, automatic runs and every read install nothing. The tests only detect and verify what is already there, and they never run a package manager, `rustup component add`, `coursier bootstrap` or a download; the `producer install` tests use fake launchers on an isolated `PATH`.
+
+## Doctor and install (#880)
+
+`trellis producer doctor [--workspace <dir>] [--json]` is read-only and runs in the CLI, with no daemon or index. It lists the languages a capture of the checkout would admit (by the index's own walk and ignore rules, reading no source), and for each producer, marked `relevant` when it covers one of them, one state:
+
+| State | Meaning |
+|---|---|
+| `ready` | Resolution and verification succeed exactly as `producer plan` does them: the same declared environment (the caller's `PATH`, `HOME`, `RUSTUP_HOME`, `CARGO_HOME`, `COURSIER_*`), the same `detect::resolve`, with no `--executable`. A `ready` producer's plan verifies. |
+| `missing` | The launcher (npm entry point, `scip-java`) or the pinned toolchain's `rust-analyzer` binary is not where resolution looks. |
+| `wrongVersion` | The launcher's npm package names another version; `found` and `pinned` give both. |
+| `unverifiable` | Something was found but cannot be verified: a shim launcher or `node`, a hash that is not the pin (`scip-java`, `rust-analyzer`), an unreadable or non-UTF-8 path. |
+| `prerequisiteMissing` | The producer is there, but a runtime it needs is not: `node`, `java`, `rustup`, or, for scip-java, its default Temurin 17.0.20.1 JDK in `COURSIER_ARCHIVE_CACHE` that restricted runs need (see [scip-java JVM prerequisite](#scip-java-jvm-prerequisite)). |
+
+The check stands for the default profile: `restricted`, or `trusted` for rust-analyzer, which has no restricted row. Each entry lists its prerequisites with `neededFor` (`run`, `install` or `restrictedRun`) and, when it is not ready, the pinned install command. The command comes from the profile row's `installMethod` (the npm producers and scip-java) or, for rust-analyzer, whose row records the toolchain in prose, `rustup component add rust-analyzer --toolchain 1.98.1`, as the table below says. The report also says what works without producers: native evidence only. Doctor always exits 0.
+
+`trellis producer install <producer> [--yes] [--json]` is the only code path that runs an install command (`src/producer/install.rs`, the one spawn site the static inventory in `tests/producer/producer_spawn_inventory.rs` allows for it; the same test proves nothing but the CLI's `producer install` reaches it). It:
+
+1. checks the producer with doctor, and runs nothing when it is already `ready`;
+2. prints the pinned command;
+3. refuses with `prerequisite_missing` and runs nothing when a prerequisite of the command is absent: `node` or `npm` for the npm producers, `coursier` for scip-java, `rustup` or the pinned toolchain for rust-analyzer. It never installs a prerequisite;
+4. asks for confirmation on a terminal, refuses with `confirmation_required` when stdin is not one, and skips the prompt with `--yes`;
+5. runs exactly that argv, with the program resolved on the declared `PATH`, and with `RUSTUP_AUTO_INSTALL=0` for rustup so adding the component cannot install the toolchain. A non-zero exit is `install_failed`;
+6. runs doctor for that producer again and reports the result.
+
+The scip-java row's recorded command names no `-o` output path, so the launcher it writes must be put on the declared `PATH` by hand before doctor sees it.
 
 Pins live in [`hardware/mac-mini-m5-pro-v1.json`](hardware/mac-mini-m5-pro-v1.json). The producer rows record `installMethod` as it was captured. The table below records what the reference host runs today.
 
