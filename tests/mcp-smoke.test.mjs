@@ -329,7 +329,7 @@ function building(name) {
 }
 const architectureTools = ['trellis_references', 'trellis_rules_check', 'trellis_rules_explain'];
 // Each architecture tool's checked-in schema plus the live success branch, so a building
-// answer is validated against the real `BuildingFailure` branch and the mock success still
+// answer is validated against the real `Failure` branch and the mock success still
 // passes.
 const buildingTools = liveTools.map(tool => {
   if (!architectureTools.includes(tool.name)) return tool;

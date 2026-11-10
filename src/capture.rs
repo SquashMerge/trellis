@@ -676,6 +676,22 @@ fn walk(root: &Path, ignore_cap: u64, cancel: &CancelFlag) -> Result<Walked> {
     Ok((inventory, sources, oversized))
 }
 
+/// The languages of the sources an index capture of `root` would admit, by the same
+/// walk and ignore rules, reading no source. For `producer doctor` (#880).
+pub fn languages_present(root: &Path) -> Result<BTreeSet<&'static str>> {
+    let root = fs::canonicalize(root)?;
+    let cancel = CancelFlag::default();
+    let (_, sources, _) = walk(
+        &root,
+        crate::skipped_config::CONFIG_INPUT_MAX_BYTES,
+        &cancel,
+    )?;
+    Ok(sources
+        .iter()
+        .filter_map(|path| language_of_path(path))
+        .collect())
+}
+
 /// The running image must be pinned before the executable pathname is replaced.
 /// The CLI calls this at startup; embedders must do the same before indexing.
 /// Library test processes also initialize lazily on their first capture.
