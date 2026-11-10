@@ -466,7 +466,7 @@ Interface evidence is never worded "A calls B", and it is never an input to `$la
 Client paths also come from:
 
 - `fetch` and axios calls, with literal, template-literal and constant paths;
-- wrappers configured in `.trellis/rules.toml` under `[[interfaces.wrappers]]` (owner ruling 2026-11-10).
+- wrappers configured in `.trellis/rules.toml` under `[[interfaces.wrappers]]`, each scoped to every file, a directory or an app (owner rulings 2026-11-10).
 
 A server route with `method` `ANY` answers every method. Such routes are express, fastify or Koa `all` routes, and pages-router API routes.
 

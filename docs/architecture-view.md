@@ -293,6 +293,7 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
     at = 1                # 1 to 8, default 1
     prefix = "/api"       # optional rooted literal the wrapper adds to every path
     root = "web"          # optional directory the wrapper applies under; default "."
+    # app = "web"         # or: the app whose files the wrapper applies to (not with root)
     ```
 
     - **`method` and `at`.** With `"options"`, the method is `method` in the object
@@ -300,13 +301,19 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
     - **`prefix`.** It has no query, fragment or pattern. A match through it is
       `wrapperInferred`.
     - **`root`.** It follows the `[apps]` root rules (#794). The wrapper applies to files under
-      that directory. A wrapper for a deeper root wins over one for a shallower root with the
-      same callee.
+      that directory.
+    - **`app`.** It names an app of the effective inventory (owner ruling 2026-11-10). The
+      wrapper applies to the files that rule evaluation assigns to that app: the one app of the
+      file's layer, else the app whose root contains it. `root` and `app` are exclusive. An
+      unknown or shared app name is a located rules error when the apps are resolved.
+    - **Precedence.** For one callee, an `app` scope wins over any root scope, including a
+      deeper one. A deeper root wins over a shallower one, and an unscoped wrapper (`.`) comes
+      last.
     - **Matching.** A configured wrapper is matched only as assembled, never through the
       built-in `/api/` rule. It replaces a built-in wrapper with the same callee.
     - **Errors.** Each invalid entry is a located `invalid_rules` error, like any other rules
-      error: an unknown key, a bad value, the same callee twice for one root, or more than 64
-      entries. `wrappers.callees` shows what took effect. A `package.json` configures no
+      error: an unknown key, a bad value, both `root` and `app`, the same callee twice for one
+      scope, or more than 64 entries. `wrappers.callees` shows what took effect. A `package.json` configures no
       wrapper.
 - **Segment matching.** Methods must be equal, or the route is `ANY`. A literal segment must equal a literal
   segment. A server `{name}` matches exactly one segment, and `{*name}` matches the rest.

@@ -8,6 +8,7 @@ use super::{
 use crate::native_evidence::{Call, Range};
 use crate::references::{DocumentInput, callers::Callers, work::Work};
 use anyhow::Result;
+use std::collections::BTreeMap;
 use tree_sitter::Node;
 
 /// The receivers of `<owner>.request(path, options)`.
@@ -66,10 +67,18 @@ pub(crate) fn built_in() -> Vec<Wrapper> {
     ]
 }
 
-/// Configured wrappers that apply under one directory.
+/// Which files configured wrappers apply to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Scope {
+    /// Files under a checkout-relative directory; empty is every file.
+    Root(String),
+    /// Files assigned to an app.
+    App(String),
+}
+
+/// Configured wrappers that apply to one scope.
 pub(crate) struct Scoped {
-    /// A checkout-relative directory; empty is the checkout root.
-    pub(crate) root: String,
+    pub(crate) scope: Scope,
     pub(crate) wrappers: Vec<Wrapper>,
 }
 
@@ -98,6 +107,7 @@ enum Path {
 pub(super) fn extract(
     world: &World<'_>,
     configured: &[Scoped],
+    apps: &BTreeMap<String, String>,
     budget: &mut Budget<'_>,
 ) -> Result<Vec<ClientCall>> {
     let mut found = Vec::new();
@@ -115,7 +125,10 @@ pub(super) fn extract(
         }
         let mut wrappers: Vec<Wrapper> = configured
             .iter()
-            .filter(|scope| under(&doc.key.path, &scope.root))
+            .filter(|scoped| match &scoped.scope {
+                Scope::Root(root) => under(&doc.key.path, root),
+                Scope::App(app) => apps.get(&doc.key.path) == Some(app),
+            })
             .flat_map(|scope| scope.wrappers.iter().cloned())
             .collect();
         for wrapper in built_in() {
@@ -775,6 +788,7 @@ mod tests {
         extract_all(
             &snapshot(files),
             &[],
+            &Default::default(),
             &mut Work::new(usize::MAX),
             &mut || Ok(()),
         )
@@ -1004,9 +1018,15 @@ async fn h() {}
             ("src/http.rs", SERVER),
             ("web/app.js", "function t(api) { api(\"/health\"); }"),
         ]);
-        let error = extract_all(&shot, &[], &mut Work::new(10), &mut || Ok(()))
-            .err()
-            .unwrap();
+        let error = extract_all(
+            &shot,
+            &[],
+            &Default::default(),
+            &mut Work::new(10),
+            &mut || Ok(()),
+        )
+        .err()
+        .unwrap();
         assert!(error.to_string().starts_with("bounded_work"), "{error:#}");
     }
 
@@ -1038,15 +1058,29 @@ function go(api, request) {
         let app = "function t(api) { api(\"/health\"); }";
         let shot = snapshot(&[("src/http.rs", SERVER), ("web/app.js", app)]);
         let mut spent = Work::new(usize::MAX);
-        let found = extract_all(&shot, &[], &mut spent, &mut || Ok(())).unwrap();
+        let found =
+            extract_all(&shot, &[], &Default::default(), &mut spent, &mut || Ok(())).unwrap();
         assert_eq!(found.calls.len(), 1);
         let whole = spent.used;
         let bounded = |error: anyhow::Error| error.to_string() == crate::interfaces::BUDGET;
-        extract_all(&shot, &[], &mut Work::new(whole), &mut || Ok(())).unwrap();
+        extract_all(
+            &shot,
+            &[],
+            &Default::default(),
+            &mut Work::new(whole),
+            &mut || Ok(()),
+        )
+        .unwrap();
         for short in [0, 1, whole / 2, whole - 1] {
-            let error = extract_all(&shot, &[], &mut Work::new(short), &mut || Ok(()))
-                .err()
-                .unwrap();
+            let error = extract_all(
+                &shot,
+                &[],
+                &Default::default(),
+                &mut Work::new(short),
+                &mut || Ok(()),
+            )
+            .err()
+            .unwrap();
             assert!(bounded(error), "{short}");
         }
         let pairs = found.calls.len() * found.routes.len();

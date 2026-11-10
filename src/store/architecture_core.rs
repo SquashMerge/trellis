@@ -331,12 +331,43 @@ impl ArchitectureCore {
                         snapshot.documents.len(),
                         crate::references::work::snapshot_bytes(&snapshot, check)?,
                     ));
-                Some(kept(crate::interfaces::extract(
-                    &snapshot,
-                    config.interface_wrappers(),
-                    &mut work,
-                    check,
-                ))?)
+                // App-scoped wrappers (#855) need each file's app, as rule evaluation assigns
+                // it; a failed rules part is this part's failure too.
+                let apps = if config
+                    .interface_wrappers()
+                    .iter()
+                    .any(|wrapper| wrapper.app.is_some())
+                {
+                    match rules.as_ref().map(|part| &part.base) {
+                        Some(Ok(base)) => kept(crate::rules::file_apps(
+                            config,
+                            base,
+                            snapshot
+                                .documents
+                                .iter()
+                                .filter(|doc| {
+                                    matches!(doc.key.language.as_str(), "javascript" | "typescript")
+                                })
+                                .map(|doc| doc.key.path.as_str()),
+                            &mut work,
+                            check,
+                        ))?,
+                        Some(Err(failure)) => Err(failure.clone()),
+                        None => Ok(Default::default()),
+                    }
+                } else {
+                    Ok(Default::default())
+                };
+                Some(match apps {
+                    Ok(apps) => kept(crate::interfaces::extract(
+                        &snapshot,
+                        config.interface_wrappers(),
+                        &apps,
+                        &mut work,
+                        check,
+                    ))?,
+                    Err(failure) => Err(failure),
+                })
             }
             (Some(_), Ok(_)) => Some(Ok(crate::interfaces::Extraction::default())),
             // Failed app detection is the part's failure too, never an empty extraction.

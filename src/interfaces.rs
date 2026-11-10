@@ -130,10 +130,12 @@ pub(crate) struct Extraction {
 }
 
 /// The routes and client calls of a snapshot, with each call matched to at most one route.
-/// `wrappers` are the rules file's `[[interfaces.wrappers]]` (#855).
+/// `wrappers` are the rules file's `[[interfaces.wrappers]]` (#855), and `apps` the app of each
+/// file, for the wrappers scoped to an app.
 pub(crate) fn extract(
     snapshot: &Snapshot,
     wrappers: &[crate::rules::InterfaceWrapper],
+    apps: &BTreeMap<String, String>,
     work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Extraction> {
@@ -160,7 +162,7 @@ pub(crate) fn extract(
             })
             .map(|f| f.route),
     );
-    let calls = calls::extract(&world, &configured, &mut budget)?;
+    let calls = calls::extract(&world, &configured, apps, &mut budget)?;
     let matched = calls::resolve(&routes, &calls, work, check)?;
     let mut callees: Vec<String> = calls::built_in().into_iter().map(|w| w.callee).collect();
     callees.extend(["fetch".to_owned(), "axios".to_owned()]);
@@ -177,15 +179,16 @@ pub(crate) fn extract(
     })
 }
 
-/// The configured wrappers grouped by root, the deepest root first, so a wrapper authored
-/// for a directory wins over one for the whole checkout.
+/// The configured wrappers grouped by scope, in precedence order: app scopes first, then
+/// roots from the deepest to `.` (every file). The first scope that covers a file and names
+/// a callee decides it, so an app-scoped wrapper wins over a root-scoped or unscoped one.
 fn scoped(wrappers: &[crate::rules::InterfaceWrapper]) -> Vec<calls::Scoped> {
     let mut scopes: Vec<calls::Scoped> = Vec::new();
     for wrapper in wrappers {
-        let root = if wrapper.root == "." {
-            String::new()
-        } else {
-            wrapper.root.clone()
+        let scope = match &wrapper.app {
+            Some((app, _)) => calls::Scope::App(app.clone()),
+            None if wrapper.root == "." => calls::Scope::Root(String::new()),
+            None => calls::Scope::Root(wrapper.root.clone()),
         };
         let method = match wrapper.method {
             crate::rules::WrapperMethod::Options(at) => calls::MethodAt::Options(at),
@@ -197,15 +200,18 @@ fn scoped(wrappers: &[crate::rules::InterfaceWrapper]) -> Vec<calls::Scoped> {
             prefix: wrapper.prefix.clone(),
             built_in: false,
         };
-        match scopes.iter_mut().find(|scope| scope.root == root) {
-            Some(scope) => scope.wrappers.push(configured),
+        match scopes.iter_mut().find(|existing| existing.scope == scope) {
+            Some(existing) => existing.wrappers.push(configured),
             None => scopes.push(calls::Scoped {
-                root,
+                scope,
                 wrappers: vec![configured],
             }),
         }
     }
-    scopes.sort_by_key(|scope| std::cmp::Reverse(scope.root.len()));
+    scopes.sort_by_key(|scoped| match &scoped.scope {
+        calls::Scope::App(_) => (0, std::cmp::Reverse(0)),
+        calls::Scope::Root(root) => (1, std::cmp::Reverse(root.len())),
+    });
     scopes
 }
 

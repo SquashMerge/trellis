@@ -113,6 +113,7 @@ struct RawWrapper {
     at: Option<Spanned<i64>>,
     prefix: Option<Spanned<String>>,
     root: Option<Spanned<String>>,
+    app: Option<Spanned<String>>,
 }
 /// An authored `[apps.<name>]` table (#794). `roots` is its only key.
 #[derive(Deserialize)]
@@ -319,7 +320,11 @@ pub(crate) struct InterfaceWrapper {
     /// A rooted literal the wrapper adds to every path.
     pub(crate) prefix: Option<String>,
     /// The checkout-relative directory whose files the wrapper applies to; `.` is every file.
+    /// It is `.` when `app` is set.
     pub(crate) root: String,
+    /// The app whose files the wrapper applies to, and where it is written. It names an app of
+    /// the effective inventory, which rule preparation checks.
+    pub(crate) app: Option<(String, std::ops::Range<usize>)>,
 }
 
 impl Config {
@@ -1024,6 +1029,23 @@ fn interface_wrappers(text: &str, raw: RawInterfaces) -> Result<Vec<InterfaceWra
                 Some(prefix)
             }
         };
+        if let (Some(_), Some(app)) = (&entry.root, &entry.app) {
+            return Err(invalid(
+                app.span(),
+                "a wrapper names either root or app, not both".into(),
+            ));
+        }
+        let app = match entry.app {
+            None => None,
+            Some(app) => {
+                let app_span = app.span();
+                let app = app.into_inner();
+                if app.trim().is_empty() {
+                    return Err(invalid(app_span, "wrapper app must not be blank".into()));
+                }
+                Some((app, app_span))
+            }
+        };
         let root = match entry.root {
             None => ".".to_owned(),
             Some(root) => {
@@ -1040,24 +1062,34 @@ fn interface_wrappers(text: &str, raw: RawInterfaces) -> Result<Vec<InterfaceWra
                 root
             }
         };
+        let scope_name = |w: &InterfaceWrapper| match &w.app {
+            Some((app, _)) => format!("app {app}"),
+            None => format!("root {}", w.root),
+        };
+        let wrapper = InterfaceWrapper {
+            callee,
+            method,
+            prefix,
+            root,
+            app,
+        };
         if wrappers
             .iter()
-            .any(|w| w.callee == callee && w.root == root)
+            .any(|w| w.callee == wrapper.callee && scope_name(w) == scope_name(&wrapper))
         {
             return Err(error(
                 text,
                 callee_span,
                 "ambiguity",
                 "token",
-                format!("wrapper {callee} is authored twice for root {root}"),
+                format!(
+                    "wrapper {} is authored twice for {}",
+                    wrapper.callee,
+                    scope_name(&wrapper)
+                ),
             ));
         }
-        wrappers.push(InterfaceWrapper {
-            callee,
-            method,
-            prefix,
-            root,
-        });
+        wrappers.push(wrapper);
     }
     Ok(wrappers)
 }
@@ -1543,8 +1575,72 @@ impl<'a> AppScope<'a> {
 }
 
 /// Check every layer's `app` and `apps` against the effective apps (#794); the first layer in
-/// name order with a problem wins.
+/// name order with a problem wins. Then each `[[interfaces.wrappers]]` `app`, in written
+/// order (#855).
 fn validate_apps(config: &Config, apps: &[crate::apps::App]) -> Result<()> {
+    validate_layer_apps(config, apps)?;
+    for wrapper in &config.wrappers {
+        let Some((name, span)) = &wrapper.app else {
+            continue;
+        };
+        let matching = apps.iter().filter(|app| app.name == *name).count();
+        if matching == 1 {
+            continue;
+        }
+        let known = apps
+            .iter()
+            .map(|app| app.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(error(
+            &config.text,
+            span.clone(),
+            if matching == 0 {
+                "reference"
+            } else {
+                "ambiguity"
+            },
+            "token",
+            if matching == 0 {
+                format!(
+                    "wrapper {} names app {name}, which is not detected or authored (apps: {known})",
+                    wrapper.callee
+                )
+            } else {
+                format!(
+                    "wrapper {} names app {name}, which {matching} apps share",
+                    wrapper.callee
+                )
+            },
+        ));
+    }
+    Ok(())
+}
+
+/// The app of each path, as rule evaluation assigns it: the one app of the path's layer,
+/// otherwise the app whose root contains it (#784). Used for app-scoped interface wrappers
+/// (#855).
+pub(crate) fn file_apps<'p>(
+    config: &Config,
+    base: &RulesBase,
+    paths: impl IntoIterator<Item = &'p str>,
+    work: &mut Work,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<BTreeMap<String, String>> {
+    let scope = AppScope::new(config, base.apps());
+    let mut matcher = LayerMatcher::new(config);
+    let mut assigned = BTreeMap::new();
+    for path in paths {
+        check()?;
+        let layer = matcher.select(path, work, check)?;
+        if let Some(app) = scope.file(path, layer).and_then(|at| scope.name(at)) {
+            assigned.insert(path.to_owned(), app.to_owned());
+        }
+    }
+    Ok(assigned)
+}
+
+fn validate_layer_apps(config: &Config, apps: &[crate::apps::App]) -> Result<()> {
     for (layer_name, layer) in &config.layers {
         let named: Vec<&(String, std::ops::Range<usize>)> = layer
             .app
@@ -3443,6 +3539,85 @@ mod app_scope_tests {
         assert_eq!(d["line"], 5 + COLLECTION_LIMIT);
     }
 
+    /// #855: a wrapper's `app` names an effective app. A known app validates; an unknown or
+    /// shared name is a located error at the `app` value, checked where apps are resolved.
+    #[test]
+    fn a_wrapper_app_names_an_effective_app() {
+        let apps = [
+            app("svc", AppKind::Cargo, "svc"),
+            app("ui", AppKind::Npm, "ui"),
+        ];
+        let known = parse(&format!(
+            "{TWO_APPS}[[interfaces.wrappers]]\ncallee='api2'\napp='ui'\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            known.interface_wrappers()[0]
+                .app
+                .as_ref()
+                .map(|(name, _)| name.as_str()),
+            Some("ui")
+        );
+        assert_eq!(known.interface_wrappers()[0].root, ".");
+        validate_apps(&known, &apps).unwrap();
+        let unknown = parse(&format!(
+            "{TWO_APPS}[[interfaces.wrappers]]\ncallee='api2'\napp='admin'\n"
+        ))
+        .unwrap();
+        let d = diagnostic(&validate_apps(&unknown, &apps).unwrap_err()).unwrap();
+        assert_eq!(d["kind"], "reference");
+        assert_eq!(d["line"], 16, "{d}");
+        assert!(
+            d["message"]
+                .as_str()
+                .unwrap()
+                .contains("names app admin, which is not detected or authored (apps: svc, ui)"),
+            "{d}"
+        );
+        let twins = [
+            app("ui", AppKind::Npm, "ui"),
+            app("ui", AppKind::Npm, "other"),
+            app("svc", AppKind::Cargo, "svc"),
+        ];
+        let d = diagnostic(&validate_apps(&known, &twins).unwrap_err()).unwrap();
+        assert_eq!(d["kind"], "ambiguity", "{d}");
+    }
+
+    /// #855: `root` and `app` are exclusive, a blank app is invalid, and a callee is authored
+    /// once per app.
+    #[test]
+    fn a_wrapper_scope_is_root_or_app() {
+        for (body, kind, line, needle) in [
+            (
+                "[[interfaces.wrappers]]\ncallee='a'\nroot='web'\napp='web'\n",
+                "schema",
+                5,
+                "either root or app",
+            ),
+            (
+                "[[interfaces.wrappers]]\ncallee='a'\napp=' '\n",
+                "schema",
+                4,
+                "blank",
+            ),
+            (
+                "[[interfaces.wrappers]]\ncallee='a'\napp='web'\n[[interfaces.wrappers]]\ncallee='a'\napp='web'\n",
+                "ambiguity",
+                6,
+                "twice for app web",
+            ),
+        ] {
+            let d = located(&format!("version=1\n{body}"));
+            assert_eq!(d["kind"], kind, "{body}: {d}");
+            assert_eq!(d["line"], line, "{body}: {d}");
+            assert!(
+                d["message"].as_str().unwrap().contains(needle),
+                "{body}: {d}"
+            );
+        }
+        parse("version=1\n[[interfaces.wrappers]]\ncallee='a'\napp='web'\n[[interfaces.wrappers]]\ncallee='a'\nroot='web'\n[[interfaces.wrappers]]\ncallee='a'\n").unwrap();
+    }
+
     #[test]
     fn the_first_bad_layer_in_name_order_wins() {
         let text = "version=1\n[layers.zeta]\napp='nope'\norder=1\npaths=['z']\n[layers.alpha]\napp='nada'\norder=2\npaths=['a']\n";
@@ -3502,12 +3677,14 @@ mod app_scope_tests {
                     method: WrapperMethod::Options(1),
                     prefix: Some("/api".into()),
                     root: "web".into(),
+                    app: None,
                 },
                 InterfaceWrapper {
                     callee: "client.send".into(),
                     method: WrapperMethod::Argument(2),
                     prefix: None,
                     root: ".".into(),
+                    app: None,
                 },
             ]
         );

@@ -82,11 +82,25 @@ fn run(files: &[(&str, &str)]) -> (Snapshot, Extraction) {
 
 /// The extraction with the `[[interfaces.wrappers]]` of a rules file's text (#855).
 fn run_with(rules: &str, files: &[(&str, &str)]) -> (Snapshot, Extraction) {
+    run_with_apps(rules, &[], files)
+}
+
+/// As [`run_with`], with each listed file assigned to an app.
+fn run_with_apps(
+    rules: &str,
+    apps: &[(&str, &str)],
+    files: &[(&str, &str)],
+) -> (Snapshot, Extraction) {
     let config = crate::rules::parse(&format!("version = 1\n{rules}")).unwrap();
+    let apps = apps
+        .iter()
+        .map(|(path, app)| ((*path).to_owned(), (*app).to_owned()))
+        .collect();
     let shot = snapshot(files);
     let found = extract(
         &shot,
         config.interface_wrappers(),
+        &apps,
         &mut Work::new(usize::MAX),
         &mut || Ok(()),
     )
@@ -570,14 +584,27 @@ fn javascript_extraction_over_its_budget_is_a_typed_bounded_work_error() {
         ("web/client.js", "fetch(\"/api\");\n"),
     ]);
     let mut spent = Work::new(usize::MAX);
-    extract(&shot, &[], &mut spent, &mut || Ok(())).unwrap();
+    extract(&shot, &[], &Default::default(), &mut spent, &mut || Ok(())).unwrap();
     for short in [0, spent.used / 3, spent.used / 2, spent.used - 1] {
-        let error = extract(&shot, &[], &mut Work::new(short), &mut || Ok(()))
-            .err()
-            .unwrap();
+        let error = extract(
+            &shot,
+            &[],
+            &Default::default(),
+            &mut Work::new(short),
+            &mut || Ok(()),
+        )
+        .err()
+        .unwrap();
         assert_eq!(error.to_string(), super::BUDGET, "{short}");
     }
-    extract(&shot, &[], &mut Work::new(spent.used), &mut || Ok(())).unwrap();
+    extract(
+        &shot,
+        &[],
+        &Default::default(),
+        &mut Work::new(spent.used),
+        &mut || Ok(()),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -705,4 +732,79 @@ fn an_imported_callable_axios_instance_is_read_by_its_binding() {
             "{client}"
         );
     }
+}
+
+/// #855 (owner ruling 2026-11-10): an app-scoped wrapper applies to the files assigned to its
+/// app. For one callee, an app scope wins over a root scope and over an unscoped wrapper,
+/// and a deeper root wins over `.`. A file in another app falls back to the unscoped one.
+#[test]
+fn an_app_scoped_wrapper_wins_over_root_and_unscoped_wrappers() {
+    let rules = r#"
+[[interfaces.wrappers]]
+callee = "send"
+prefix = "/unscoped"
+
+[[interfaces.wrappers]]
+callee = "send"
+prefix = "/root"
+root = "web/sub"
+
+[[interfaces.wrappers]]
+callee = "send"
+prefix = "/app"
+app = "web"
+"#;
+    let server = r#"
+const express = require("express");
+const app = express();
+app.get("/unscoped/x", h);
+app.get("/root/x", h);
+app.get("/app/x", h);
+function h() {}
+"#;
+    let call = "export const go = () => send(\"/x\");\n";
+    let files = [
+        ("srv/app.js", server),
+        ("web/a.js", call),
+        ("web/sub/b.js", call),
+        ("tools/sub/c.js", call),
+        ("admin/d.js", call),
+    ];
+    let apps = [
+        ("web/a.js", "web"),
+        ("web/sub/b.js", "web"),
+        ("admin/d.js", "admin"),
+    ];
+    let (_, found) = run_with_apps(rules, &apps, &files);
+    let assembled: Vec<(&str, &str)> = found
+        .calls
+        .iter()
+        .map(|call| {
+            (
+                call.document.path.as_str(),
+                call.path_template.as_deref().unwrap_or("?"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        assembled,
+        [
+            ("admin/d.js", "/unscoped/x"),
+            ("tools/sub/c.js", "/unscoped/x"),
+            ("web/a.js", "/app/x"),
+            ("web/sub/b.js", "/app/x"),
+        ]
+    );
+    assert!(found.matched.iter().all(Option::is_some));
+    // Control: without the app assignment, the root and unscoped wrappers decide.
+    let (_, found) = run_with_apps(rules, &[], &files);
+    let unassigned: Vec<&str> = found
+        .calls
+        .iter()
+        .map(|call| call.path_template.as_deref().unwrap_or("?"))
+        .collect();
+    assert_eq!(
+        unassigned,
+        ["/unscoped/x", "/unscoped/x", "/unscoped/x", "/root/x"]
+    );
 }

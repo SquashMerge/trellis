@@ -828,38 +828,41 @@ fn trellis_whole_web_client_still_has_one_interface() {
     );
 }
 
-/// #855 (owner ruling 2026-11-10): a wrapper authored in `.trellis/rules.toml` reaches the
-/// published interfaces and is listed in `wrappers.callees`; an invalid one is a rules error.
+/// #855 (owner rulings 2026-11-10): a wrapper authored in `.trellis/rules.toml`, scoped to a
+/// root or to an app, reaches the published interfaces and is listed in `wrappers.callees`; an
+/// invalid one is a rules error.
 #[test]
 fn a_rules_file_wrapper_reaches_the_published_interfaces() {
     let layers = "version = 1\n\
         [layers.api]\napp = 'api'\norder = 1\npaths = ['api/**']\n\
         [layers.web]\napp = 'web'\norder = 1\npaths = ['web/**']\n";
-    let rules = format!(
-        "{layers}[[interfaces.wrappers]]\ncallee = \"apiFetch\"\nprefix = \"/api\"\nroot = \"web\"\n"
-    );
-    let published = publish(&[
-        (".trellis/rules.toml", rules.as_str()),
-        (
-            "api/package.json",
-            "{\"name\":\"api\",\"dependencies\":{\"express\":\"4.21.0\"}}\n",
-        ),
-        ("api/server.js", JS_API),
-        ("web/package.json", "{\"name\":\"web\"}\n"),
-        (
-            "web/client.js",
-            "export const go = () => apiFetch(\"/users\");\n",
-        ),
-    ]);
-    let interfaces = published.summary["interfaces"].as_array().unwrap();
-    assert_eq!(interfaces.len(), 1, "{interfaces:#?}");
-    assert_eq!(interfaces[0]["counts"]["confidence"]["wrapperInferred"], 1);
-    assert!(
-        interfaces[0]["wrappers"]["callees"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("apiFetch"))
-    );
+    for scope in ["root = \"web\"", "app = \"web\""] {
+        let rules = format!(
+            "{layers}[[interfaces.wrappers]]\ncallee = \"apiFetch\"\nprefix = \"/api\"\n{scope}\n"
+        );
+        let published = publish(&[
+            (".trellis/rules.toml", rules.as_str()),
+            (
+                "api/package.json",
+                "{\"name\":\"api\",\"dependencies\":{\"express\":\"4.21.0\"}}\n",
+            ),
+            ("api/server.js", JS_API),
+            ("web/package.json", "{\"name\":\"web\"}\n"),
+            (
+                "web/client.js",
+                "export const go = () => apiFetch(\"/users\");\n",
+            ),
+        ]);
+        let interfaces = published.summary["interfaces"].as_array().unwrap();
+        assert_eq!(interfaces.len(), 1, "{interfaces:#?}");
+        assert_eq!(interfaces[0]["counts"]["confidence"]["wrapperInferred"], 1);
+        assert!(
+            interfaces[0]["wrappers"]["callees"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("apiFetch"))
+        );
+    }
     let error = trellis::rules::parse(&format!(
         "{JS_RULES}[[interfaces.wrappers]]\ncallee = \"a.b.c\"\n"
     ))
