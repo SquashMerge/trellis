@@ -3,6 +3,7 @@
 //! rebuild whose hash is unchanged keeps the selected head's validated facts;
 //! any change to a listed module or crate forces full re-extraction.
 include!("build/extractor_inputs.rs");
+include!("build/semantic_join_inputs.rs");
 
 fn main() {
     build_identity();
@@ -24,6 +25,32 @@ fn main() {
     println!(
         "cargo:rustc-env=TRELLIS_EXTRACTOR_HASH={}",
         extractor_hash(&modules, &lock, test_support)
+    );
+    semantic_join_inputs();
+}
+
+/// Hashes the semantic join's inputs into `TRELLIS_SEMANTIC_JOIN_INPUTS_HASH` (Decision 0021
+/// D4, owner ruling 2026-11-09), which keys every stored semantic payload.
+fn semantic_join_inputs() {
+    let files: Vec<(String, Vec<u8>)> = join_modules(std::path::Path::new("."))
+        .into_iter()
+        .map(|path| {
+            println!("cargo:rerun-if-changed={path}");
+            let bytes = std::fs::read(&path).unwrap_or_else(|error| panic!("read {path}: {error}"));
+            (path, bytes)
+        })
+        .collect();
+    let modules: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(path, bytes)| (path.as_str(), bytes.as_slice()))
+        .collect();
+    for dir in JOIN_MODULES.iter().filter_map(|e| e.strip_suffix("/**")) {
+        println!("cargo:rerun-if-changed={dir}");
+    }
+    println!("cargo:rerun-if-changed=build/semantic_join_inputs.rs");
+    println!(
+        "cargo:rustc-env=TRELLIS_SEMANTIC_JOIN_INPUTS_HASH={}",
+        join_inputs_hash(&modules)
     );
 }
 

@@ -9,7 +9,10 @@
 //!
 //! 1. N is readable before S, and pinned reads never mix revisions.
 //! 2. Changed documents and their actual dependents are `catchingUp`/`needsReimport`,
-//!    never a negative semantic conclusion.
+//!    never a negative semantic conclusion. A dependent is actual only when a changed
+//!    dependency's term differs (Decision 0021 D4): the dependency is gone, or a syntax ID
+//!    the dependent targets is no longer declared in it. A comment or body edit that leaves
+//!    those declarations alone keeps the dependent older-basis.
 //! 3. Unchanged documents keep P evidence as `olderBasis` (never effective `fresh`),
 //!    and no traversal follows an edge into a pending document as current.
 //! 4. After S the published result equals FULL (the in-S oracle) and every retained
@@ -274,6 +277,8 @@ struct Model {
     basis_files: BTreeMap<String, String>,
     /// `owner path -> internal endpoint paths` of P's published rows.
     basis_endpoints: BTreeMap<String, BTreeSet<String>>,
+    /// `owner path -> (dependency path, targeted syntax ID)` of P's published rows.
+    basis_targets: BTreeMap<String, BTreeSet<(String, String)>>,
     basis_snapshot: SemanticSnapshot,
     basis_native: String,
     producer: String,
@@ -341,6 +346,52 @@ fn endpoints(snapshot: &SemanticSnapshot) -> BTreeMap<String, BTreeSet<String>> 
     out
 }
 
+/// Independently derive, per document, the `(dependency path, syntax ID)` pairs P's rows
+/// target in other documents: the declarations a dependency term reads.
+fn targeted_ids(snapshot: &SemanticSnapshot) -> BTreeMap<String, BTreeSet<(String, String)>> {
+    let owner: BTreeMap<&str, &str> = snapshot
+        .provenance
+        .iter()
+        .map(|p| (p.id.as_str(), p.document.path.as_str()))
+        .collect();
+    let mut out: BTreeMap<String, BTreeSet<(String, String)>> = BTreeMap::new();
+    let mut add = |proof: &str, targets: Vec<&Target>| {
+        let Some(doc) = owner.get(proof) else {
+            return;
+        };
+        for target in targets {
+            if let Target::Internal {
+                document,
+                syntax_id,
+                ..
+            } = target
+            {
+                out.entry((*doc).to_owned())
+                    .or_default()
+                    .insert((document.path.clone(), syntax_id.clone()));
+            }
+        }
+    };
+    for s in &snapshot.symbols {
+        add(&s.provenance_id, s.declarations.iter().collect());
+    }
+    for r in &snapshot.references {
+        let mut t: Vec<&Target> = r.candidates.iter().collect();
+        t.extend(r.declared_target.as_ref());
+        add(&r.provenance_id, t);
+    }
+    for c in &snapshot.call_bindings {
+        let mut t: Vec<&Target> = c.candidates.iter().collect();
+        t.extend(c.possible_dispatch.iter());
+        t.extend(c.declared_target.as_ref());
+        add(&c.provenance_id, t);
+    }
+    for r in &snapshot.type_relationships {
+        add(&r.provenance_id, vec![&r.source, &r.target]);
+    }
+    out
+}
+
 impl Model {
     fn at(world: &World, basis: IndexPin) -> Result<Self, String> {
         let snapshot = world
@@ -357,8 +408,9 @@ impl Model {
             .store
             .with_index_read_for_tests(|db| {
                 let mut statement = db.prepare(
-                    "SELECT c.path, COALESCE(r.omitted,0) FROM semantic_coverage c \
-                     LEFT JOIN semantic_coverage_reasons r ON r.tuple_id=c.tuple_id \
+                    "SELECT c.path, COALESCE(rp.omitted,rt.omitted,0) FROM semantic_coverage c \
+                     LEFT JOIN semantic_coverage_reasons rp ON rp.payload_id=c.payload_id \
+                     LEFT JOIN semantic_coverage_reasons rt ON rt.tuple_id=c.tuple_id \
                      WHERE c.revision_id=?1 AND c.producer_id=?2",
                 )?;
                 let rows = statement
@@ -379,6 +431,7 @@ impl Model {
             basis,
             basis_files: world.files(),
             basis_endpoints: endpoints(&snapshot),
+            basis_targets: targeted_ids(&snapshot),
             basis_native: native_id(world, basis)?,
             basis_snapshot: snapshot,
             producer,
@@ -398,20 +451,41 @@ impl Model {
         changed
     }
 
-    /// Changed documents plus documents whose P evidence has an endpoint in one.
-    fn pending(&self, files: &BTreeMap<String, String>) -> BTreeSet<String> {
+    /// Changed documents plus documents with a changed dependency whose term differs at
+    /// `n`: the dependency is gone, or a syntax ID the document's P rows target in it is not
+    /// declared in it at `n`. (The fixtures declare plain named functions, so a declaration's
+    /// read status is its presence; a dependency's comment or body edit keeps its IDs.)
+    fn pending(
+        &self,
+        world: &World,
+        n: IndexPin,
+        files: &BTreeMap<String, String>,
+    ) -> Result<BTreeSet<String>, String> {
         let changed = self.changed(files);
-        files
+        let declared = declarations(world, n)?;
+        let term_differs = |owner: &str, dependency: &str| {
+            !files.contains_key(dependency)
+                || self.basis_targets.get(owner).is_some_and(|targets| {
+                    targets
+                        .iter()
+                        .filter(|(path, _)| path == dependency)
+                        .any(|(_, sid)| {
+                            declared.get(sid).is_none_or(|(path, _)| path != dependency)
+                        })
+                })
+        };
+        Ok(files
             .keys()
             .filter(|path| {
                 changed.contains(*path)
-                    || self
-                        .basis_endpoints
-                        .get(*path)
-                        .is_some_and(|ends| ends.iter().any(|end| changed.contains(end)))
+                    || self.basis_endpoints.get(*path).is_some_and(|ends| {
+                        ends.iter().any(|end| {
+                            end != *path && changed.contains(end) && term_differs(path, end)
+                        })
+                    })
             })
             .cloned()
-            .collect()
+            .collect())
     }
 
     /// P's rows for `path` as a per-document answer projection serves them.
@@ -948,8 +1022,15 @@ fn arb_op() -> impl Strategy<Value = Op> {
     ]
 }
 
+/// The longest generated history.
+const MAX_HISTORY: usize = 12;
+
 fn arb_history() -> impl Strategy<Value = Vec<Op>> {
-    prop::collection::vec(arb_op(), 1..=12)
+    history_of(1..=MAX_HISTORY)
+}
+
+fn history_of(lengths: std::ops::RangeInclusive<usize>) -> impl Strategy<Value = Vec<Op>> {
+    prop::collection::vec(arb_op(), lengths)
 }
 
 #[derive(Debug, Default)]
@@ -1011,6 +1092,7 @@ impl<'w> Harness<'w> {
                 basis: world.store.index_baseline().unwrap(),
                 basis_files: BTreeMap::new(),
                 basis_endpoints: BTreeMap::new(),
+                basis_targets: BTreeMap::new(),
                 basis_snapshot: world
                     .store
                     .semantic_at(world.store.index_baseline().unwrap())
@@ -1303,7 +1385,7 @@ impl<'w> Harness<'w> {
         files: &BTreeMap<String, String>,
         actual: &Projections,
     ) -> Result<(), String> {
-        let pending = self.model.pending(files);
+        let pending = self.model.pending(self.world, n, files)?;
         let changed = self.model.changed(files);
         for (path, projection) in actual {
             let projection = projection
@@ -1499,7 +1581,7 @@ impl<'w> Harness<'w> {
             return Ok(());
         };
         let world = self.world;
-        let eligible = self.copy_eligible();
+        let eligible = self.copy_eligible()?;
         let n_native = native_id(world, n)?;
         clear_work_counts();
         let completed = world
@@ -1592,9 +1674,10 @@ impl<'w> Harness<'w> {
 
     /// The model's copy eligibility at the outstanding N: not pending, P published a tuple
     /// that omitted nothing, and captured bytes equal current bytes.
-    fn copy_eligible(&mut self) -> BTreeSet<String> {
+    fn copy_eligible(&mut self) -> Result<BTreeSet<String>, String> {
         let files = self.world.files();
-        let pending = self.model.pending(&files);
+        let n = self.model.outstanding.ok_or("no outstanding N")?;
+        let pending = self.model.pending(self.world, n, &files)?;
         let mut eligible = BTreeSet::new();
         for (path, content) in &files {
             if pending.contains(path) || !self.model.basis_tuples.contains(path) {
@@ -1608,11 +1691,13 @@ impl<'w> Harness<'w> {
                 eligible.insert(path.clone());
             }
         }
-        eligible
+        Ok(eligible)
     }
 
-    /// #669 H1: corruption in a basis row S reads while copying is a typed integrity
-    /// failure that schedules a re-index; S publishes nothing.
+    /// #669 H1, #680: S copies a document by naming its basis payload without reading the
+    /// payload's rows, so corruption in them (`write` damages the raw proof binding, otherwise
+    /// a symbol's enum) is published, and every read of the shared payload fails typed and
+    /// schedules a re-index.
     fn corrupt_copy(&mut self, label: &str, pick: usize, write: bool) -> Result<(), String> {
         let world = self.world;
         if self.model.outstanding.is_none()
@@ -1624,7 +1709,7 @@ impl<'w> Harness<'w> {
         let Some(n) = self.model.outstanding else {
             return Ok(());
         };
-        let eligible: Vec<String> = self.copy_eligible().into_iter().collect();
+        let eligible: Vec<String> = self.copy_eligible()?.into_iter().collect();
         if eligible.is_empty() {
             return Ok(());
         }
@@ -1637,15 +1722,15 @@ impl<'w> Harness<'w> {
                     // No raw capture has this artifact hash: the publisher's capture lookup
                     // for the copied rows is where the corruption is found (#679 re-review).
                     return Ok(db.execute(
-                        "UPDATE semantic_basis SET artifact_hash=?3 WHERE tuple_id IN \
-                         (SELECT tuple_id FROM semantic_coverage WHERE revision_id=?1 AND path=?2)",
+                        "UPDATE semantic_basis SET artifact_hash=?3 WHERE payload_id IN \
+                         (SELECT payload_id FROM semantic_coverage WHERE revision_id=?1 AND path=?2)",
                         rusqlite::params![key, path, "0".repeat(64)],
                     )?);
                 }
                 db.execute_batch("PRAGMA ignore_check_constraints=ON")?;
                 let changed = db.execute(
-                    "UPDATE semantic_symbols SET key_scope='bogus' WHERE tuple_id IN \
-                     (SELECT tuple_id FROM semantic_coverage WHERE revision_id=?1 AND path=?2)",
+                    "UPDATE semantic_symbols SET key_scope='bogus' WHERE payload_id IN \
+                     (SELECT payload_id FROM semantic_coverage WHERE revision_id=?1 AND path=?2)",
                     rusqlite::params![key, path],
                 )?;
                 db.execute_batch("PRAGMA ignore_check_constraints=OFF")?;
@@ -1697,9 +1782,31 @@ impl<'w> Harness<'w> {
                     .map(|w| copied_paths(&w))
                     .unwrap_or_default();
                 if copied.contains(&path) {
-                    return Err(format!(
-                        "{label}: S published from corrupt basis rows of {path}"
-                    ));
+                    let text = match world.store.semantic_at(s) {
+                        Ok(_) => {
+                            return Err(format!(
+                                "{label}: read of the corrupt shared payload of {path} succeeded"
+                            ));
+                        }
+                        Err(error) => format!("{error:#}"),
+                    };
+                    let typed = if write {
+                        "incompatible_index"
+                    } else {
+                        "invalid semantic"
+                    };
+                    if !text.contains(typed) {
+                        return Err(format!(
+                            "{label}: corrupt shared payload of {path} failed untyped: {text}"
+                        ));
+                    }
+                    if !world.store.recovery_pending_for_tests() {
+                        return Err(format!(
+                            "{label}: corrupt shared payload of {path} did not schedule a re-index: {text}"
+                        ));
+                    }
+                    self.stats.corruptions_typed += 1;
+                    return Ok(());
                 }
                 self.stats.corruptions_unreached += 1;
                 Ok(())
@@ -1917,10 +2024,10 @@ fn native_first_control_history() {
         return;
     }
     let stats = run_history(&[
-        // B (target) changes: A (run calls target) is a dependent; C (helper calls run) is not.
-        Op::Edit {
+        // B (target) goes away: A (run calls target) is a dependent; C (helper calls run) is
+        // not.
+        Op::Remove {
             path: 1,
-            choice: 1,
             defer: true,
         },
         Op::FailS,
@@ -1949,6 +2056,42 @@ fn native_first_control_history() {
         "{stats:?}"
     );
     assert!(stats.failed_s > 0 && stats.catch_ups > 0, "{stats:?}");
+}
+
+/// Decision 0021 D4: a comment edit and a body edit of the dependency `B` leave the targeted
+/// declaration alone, so `A` stays older-basis (no dependent is pending) and S copies it; a
+/// rename of the declaration makes `A` a dependent.
+#[test]
+fn native_first_dependency_term_control() {
+    if !isolated("proptest_native_first::native_first_dependency_term_control") {
+        return;
+    }
+    let comment_and_body = run_history(&[
+        // CONTENTS[8]: `// note` before `target`, then CONTENTS[4]: a body edit.
+        Op::Edit {
+            path: 1,
+            choice: 3,
+            defer: false,
+        },
+        Op::Edit {
+            path: 1,
+            choice: 1,
+            defer: false,
+        },
+    ])
+    .unwrap();
+    eprintln!("term control stats: {comment_and_body:?}");
+    assert_eq!(comment_and_body.dependent_only, 0, "{comment_and_body:?}");
+    assert!(
+        comment_and_body.older_basis_docs > 0,
+        "{comment_and_body:?}"
+    );
+    let removed = run_history(&[Op::Remove {
+        path: 1,
+        defer: true,
+    }])
+    .unwrap();
+    assert!(removed.dependent_only > 0, "{removed:?}");
 }
 
 /// #669 H1 controls: a below-head import that lost B omits A's association to `target`,
@@ -2166,19 +2309,18 @@ const REDUCED_LIMITS: &str = r#"{"unit_expansion_bytes":163840}"#;
 
 /// #826: under a live budget FULL fits but the witness does not, every S still ends caught
 /// up and equal to FULL (the in-S oracle is on) with no unavailable coverage, because the
-/// witnessed attempt falls back to FULL. The deterministic history first proves the
-/// fallback is reached; generated histories then explore the rest under the same limit.
+/// witnessed attempt falls back to FULL. This deterministic history proves the fallback is
+/// reached; the generated bands below explore the rest under the same limit.
 #[test]
-fn native_first_reduced_limit_histories() {
-    let name = "proptest_native_first::native_first_reduced_limit_histories";
+fn native_first_reduced_limit_control() {
+    let name = "proptest_native_first::native_first_reduced_limit_control";
     if !isolated_with(name, &[("TRELLIS_TEST_SEMANTIC_LIMITS", REDUCED_LIMITS)]) {
         return;
     }
-    // B (target) changes, so A (run calls target) is a pending dependent the witness settles.
+    // B (target) goes away, so A (run calls target) is a pending dependent the witness settles.
     let control = run_history(&[
-        Op::Edit {
+        Op::Remove {
             path: 1,
-            choice: 1,
             defer: false,
         },
         Op::Edit {
@@ -2193,8 +2335,21 @@ fn native_first_reduced_limit_histories() {
         control.limit_fallbacks > 0 && control.catch_ups > 0,
         "{control:?}"
     );
+}
+
+/// #838: the generated reduced-limit histories (#826), split by history length so each band
+/// finishes well inside the nightly hang backstop with the in-S oracle on. The bands
+/// partition `arb_history`'s lengths, and each band runs the share of `cases()` that the
+/// undivided strategy (uniform over `1..=MAX_HISTORY`) gave its lengths, rounded up, so the
+/// bands together run at least as many histories of every length as one test did.
+fn reduced_limit_band(name: &'static str, lengths: std::ops::RangeInclusive<usize>) {
+    if !isolated_with(name, &[("TRELLIS_TEST_SEMANTIC_LIMITS", REDUCED_LIMITS)]) {
+        return;
+    }
+    let share = (lengths.end() - lengths.start() + 1) as u32;
+    let band_cases = (cases() * share).div_ceil(MAX_HISTORY as u32);
     let config = ProptestConfig {
-        cases: cases(),
+        cases: band_cases,
         source_file: Some(file!()),
         test_name: Some(name),
         failure_persistence: Some(Box::new(
@@ -2204,7 +2359,7 @@ fn native_first_reduced_limit_histories() {
     };
     let fallbacks = std::cell::Cell::new(0);
     proptest::test_runner::TestRunner::new(config)
-        .run(&arb_history(), |history| {
+        .run(&history_of(lengths.clone()), |history| {
             match run_history(&history) {
                 Ok(stats) => fallbacks.set(fallbacks.get() + stats.limit_fallbacks),
                 Err(error) => prop_assert!(false, "{error}"),
@@ -2213,8 +2368,45 @@ fn native_first_reduced_limit_histories() {
         })
         .unwrap();
     eprintln!(
-        "reduced-limit histories over {} cases: {} limit fallbacks",
-        cases(),
+        "reduced-limit histories of length {lengths:?} over {band_cases} cases: {} limit fallbacks",
         fallbacks.get()
     );
+}
+
+/// One test per band of [`reduced_limit_band`]. A history's cost grows with its length, so
+/// the short lengths share bands and each long length has its own; at the nightly case
+/// count the longest band takes about a fifth of the undivided run (#838).
+macro_rules! reduced_limit_bands {
+    ($($test:ident => $lengths:expr),* $(,)?) => {$(
+        #[test]
+        fn $test() {
+            reduced_limit_band(concat!("proptest_native_first::", stringify!($test)), $lengths);
+        }
+    )*
+        const REDUCED_LIMIT_BANDS: &[std::ops::RangeInclusive<usize>] = &[$($lengths),*];
+    };
+}
+
+reduced_limit_bands! {
+    native_first_reduced_limit_histories_1_to_4 => 1..=4,
+    native_first_reduced_limit_histories_5_to_6 => 5..=6,
+    native_first_reduced_limit_histories_7 => 7..=7,
+    native_first_reduced_limit_histories_8 => 8..=8,
+    native_first_reduced_limit_histories_9 => 9..=9,
+    native_first_reduced_limit_histories_10 => 10..=10,
+    native_first_reduced_limit_histories_11 => 11..=11,
+    native_first_reduced_limit_histories_12 => 12..=MAX_HISTORY,
+}
+
+/// The bands cover every generated history length exactly once, so together they explore
+/// the same history space as the undivided strategy.
+#[test]
+fn reduced_limit_bands_partition_history_lengths() {
+    let mut next = 1;
+    for band in REDUCED_LIMIT_BANDS {
+        assert_eq!(*band.start(), next, "{REDUCED_LIMIT_BANDS:?}");
+        assert!(band.start() <= band.end(), "{REDUCED_LIMIT_BANDS:?}");
+        next = band.end() + 1;
+    }
+    assert_eq!(next, MAX_HISTORY + 1, "{REDUCED_LIMIT_BANDS:?}");
 }

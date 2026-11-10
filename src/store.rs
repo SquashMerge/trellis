@@ -16,6 +16,7 @@ pub mod requests;
 mod search;
 mod search_startup;
 mod semantic_display;
+mod semantic_payload;
 mod semantic_retention;
 pub(crate) use search::SEARCH_CARD_BATCH_SIZE;
 pub use search::{
@@ -508,6 +509,13 @@ pub struct Store {
     #[cfg(feature = "test-support")]
     #[cfg(feature = "test-support")]
     semantic_publication_observer: Arc<Mutex<Option<SemanticPublicationObserver>>>,
+    /// Test seam: whether writers may key payloads for reuse. Per store, so one process can
+    /// hold a reusing store and a non-reusing reference.
+    #[cfg(feature = "test-support")]
+    payload_reuse_disabled: Arc<std::sync::atomic::AtomicBool>,
+    /// Test seam: the join-inputs digest payload keys carry instead of the build's.
+    #[cfg(feature = "test-support")]
+    payload_join_inputs: Arc<Mutex<Option<String>>>,
     #[cfg(test)]
     test_stream_before_preflight_hook: Arc<Mutex<Option<TestStreamPreflightHook>>>,
     /// The publication page cache in KiB; only tests lower it.
@@ -821,11 +829,11 @@ SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+(
 UNION ALL
 SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+COALESCE(length(CAST(x.id AS BLOB)),0)+39+(CASE WHEN x.target IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes,1 AS class FROM class_relations x WHERE x.cid=?2
 )"#;
-const DATABASE_SCHEMA_VERSION: u32 = 41;
+const DATABASE_SCHEMA_VERSION: u32 = 42;
 const EXTRACTOR_VERSION: &str = "native-v6-delta-v1";
 const EVIDENCE_FORMAT: &str = "terminal-native-graph-v1";
-const CACHE_SCHEMA_V41: &str = r#"
-CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=41), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
+const CACHE_SCHEMA_V42: &str = r#"
+CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=42), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
 CREATE TABLE native_producers(id TEXT NOT NULL,version TEXT NOT NULL,executable_hash TEXT NOT NULL CHECK(length(executable_hash)=64),kind TEXT NOT NULL CHECK(kind='native'),position_encoding TEXT NOT NULL CHECK(position_encoding='utf8'),PRIMARY KEY(id,version));
 CREATE TABLE native_producer_languages(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,inventory_authenticated INTEGER NOT NULL CHECK(inventory_authenticated IN (0,1)),ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language),UNIQUE(producer_id,producer_version,ordinal),FOREIGN KEY(producer_id,producer_version) REFERENCES native_producers(id,version) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE native_producer_inputs(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,component_name TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language,component_name),UNIQUE(producer_id,producer_version,language,ordinal),FOREIGN KEY(producer_id,producer_version,language) REFERENCES native_producer_languages(producer_id,producer_version,language) DEFERRABLE INITIALLY DEFERRED);
@@ -898,11 +906,20 @@ CREATE TABLE semantic_producer_languages(id TEXT NOT NULL,version TEXT NOT NULL,
 CREATE TABLE semantic_revision_producers(revision_id TEXT NOT NULL REFERENCES native_revisions(id),id TEXT NOT NULL,version TEXT NOT NULL,context_mode TEXT NOT NULL CHECK(context_mode IN ('fullCaptured','controlledProfile')),context_trust TEXT,context_input_hash TEXT,CHECK((context_mode='fullCaptured' AND context_trust IS NULL AND context_input_hash IS NULL) OR (context_mode='controlledProfile' AND context_trust IS NOT NULL AND context_trust IN ('restricted','trusted') AND context_input_hash IS NOT NULL AND length(context_input_hash)=64)),PRIMARY KEY(revision_id,id),UNIQUE(revision_id,id,version),FOREIGN KEY(id,version) REFERENCES semantic_producers(id,version));
 CREATE TABLE semantic_requested_producers(revision_id TEXT NOT NULL REFERENCES native_revisions(id),id TEXT NOT NULL,version TEXT NOT NULL,executable_hash TEXT NOT NULL CHECK(length(executable_hash)=64),PRIMARY KEY(revision_id,id));
 CREATE TABLE semantic_requested_producer_languages(revision_id TEXT NOT NULL,id TEXT NOT NULL,language TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal BETWEEN 0 AND 9007199254740991),PRIMARY KEY(revision_id,id,language),UNIQUE(revision_id,id,ordinal),FOREIGN KEY(revision_id,id) REFERENCES semantic_requested_producers(revision_id,id));
-CREATE TABLE semantic_coverage(tuple_id INTEGER PRIMARY KEY,revision_id TEXT NOT NULL,producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,path TEXT NOT NULL,requested INTEGER NOT NULL CHECK(requested IN (0,1)),selected INTEGER NOT NULL CHECK(selected IN (0,1)),state TEXT NOT NULL CHECK(state IN ('notRequested','omitted','unsupported','failed','partial','complete')),diagnostic TEXT,UNIQUE(revision_id,producer_id,language,path),UNIQUE(tuple_id,revision_id),FOREIGN KEY(revision_id) REFERENCES native_revisions(id),FOREIGN KEY(producer_id,producer_version,language) REFERENCES semantic_producer_languages(id,version,language),FOREIGN KEY(revision_id,producer_id,producer_version) REFERENCES semantic_revision_producers(revision_id,id,version),FOREIGN KEY(revision_id,language,path) REFERENCES revision_documents(revision_id,language,path));
+CREATE TABLE semantic_payloads(payload_id INTEGER PRIMARY KEY,payload_key TEXT UNIQUE CHECK(payload_key IS NULL OR length(payload_key)=64),producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,path TEXT NOT NULL,version_id TEXT NOT NULL,batch_id INTEGER REFERENCES semantic_raw_batches(batch_id),join_inputs TEXT,CHECK(payload_key IS NULL OR batch_id IS NOT NULL),FOREIGN KEY(producer_id,producer_version,language) REFERENCES semantic_producer_languages(id,version,language));
+CREATE INDEX semantic_payloads_reuse ON semantic_payloads(batch_id,language,path,version_id);
+CREATE TABLE semantic_coverage(tuple_id INTEGER PRIMARY KEY,revision_id TEXT NOT NULL,producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,path TEXT NOT NULL,requested INTEGER NOT NULL CHECK(requested IN (0,1)),selected INTEGER NOT NULL CHECK(selected IN (0,1)),state TEXT NOT NULL CHECK(state IN ('notRequested','omitted','unsupported','failed','partial','complete')),diagnostic TEXT,payload_id INTEGER REFERENCES semantic_payloads(payload_id),UNIQUE(revision_id,producer_id,language,path),UNIQUE(tuple_id,revision_id),FOREIGN KEY(revision_id) REFERENCES native_revisions(id),FOREIGN KEY(producer_id,producer_version,language) REFERENCES semantic_producer_languages(id,version,language),FOREIGN KEY(revision_id,producer_id,producer_version) REFERENCES semantic_revision_producers(revision_id,id,version),FOREIGN KEY(revision_id,language,path) REFERENCES revision_documents(revision_id,language,path));
 CREATE INDEX semantic_coverage_history ON semantic_coverage(producer_id,language,path,revision_id);
-CREATE TABLE semantic_coverage_roles(tuple_id INTEGER NOT NULL REFERENCES semantic_coverage(tuple_id),kind TEXT NOT NULL CHECK(kind IN ('supported','observed')),ordinal INTEGER NOT NULL CHECK(ordinal BETWEEN 0 AND 9007199254740991),role TEXT NOT NULL CHECK(role IN ('definition','read','write','call','type','import','alias')),PRIMARY KEY(tuple_id,kind,ordinal),UNIQUE(tuple_id,kind,role));
-CREATE TABLE semantic_coverage_reasons(tuple_id INTEGER PRIMARY KEY REFERENCES semantic_coverage(tuple_id),macro_invocation INTEGER NOT NULL CHECK(macro_invocation BETWEEN 0 AND 9007199254740991),attribute_item INTEGER NOT NULL CHECK(attribute_item BETWEEN 0 AND 9007199254740991),macro_definition INTEGER NOT NULL CHECK(macro_definition BETWEEN 0 AND 9007199254740991),other INTEGER NOT NULL CHECK(other BETWEEN 0 AND 9007199254740991),capped INTEGER NOT NULL CHECK(capped IN (0,1)),omitted INTEGER NOT NULL CHECK(omitted IN (0,1)),captured_diagnostics INTEGER NOT NULL CHECK(captured_diagnostics IN (0,1)));
-CREATE TABLE semantic_basis(basis_id INTEGER PRIMARY KEY,tuple_id INTEGER NOT NULL REFERENCES semantic_coverage(tuple_id),producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,producer_hash TEXT NOT NULL,artifact_hash TEXT NOT NULL,language TEXT NOT NULL,source_set_id TEXT NOT NULL,captured_native_revision_id TEXT NOT NULL,source_manifest_hash TEXT NOT NULL,toolchain_hash TEXT NOT NULL,config_hash TEXT NOT NULL,dependency_hash TEXT NOT NULL,UNIQUE(tuple_id,basis_id));
+CREATE INDEX semantic_coverage_payload ON semantic_coverage(payload_id,revision_id);
+CREATE TABLE semantic_coverage_roles(payload_id INTEGER REFERENCES semantic_payloads(payload_id),tuple_id INTEGER REFERENCES semantic_coverage(tuple_id),kind TEXT NOT NULL CHECK(kind IN ('supported','observed')),ordinal INTEGER NOT NULL CHECK(ordinal BETWEEN 0 AND 9007199254740991),role TEXT NOT NULL CHECK(role IN ('definition','read','write','call','type','import','alias')),CHECK((payload_id IS NULL)<>(tuple_id IS NULL)),CHECK(tuple_id IS NULL OR kind='supported'));
+CREATE UNIQUE INDEX semantic_coverage_roles_payload ON semantic_coverage_roles(payload_id,kind,ordinal) WHERE payload_id IS NOT NULL;
+CREATE UNIQUE INDEX semantic_coverage_roles_payload_role ON semantic_coverage_roles(payload_id,kind,role) WHERE payload_id IS NOT NULL;
+CREATE UNIQUE INDEX semantic_coverage_roles_tuple ON semantic_coverage_roles(tuple_id,kind,ordinal) WHERE tuple_id IS NOT NULL;
+CREATE UNIQUE INDEX semantic_coverage_roles_tuple_role ON semantic_coverage_roles(tuple_id,kind,role) WHERE tuple_id IS NOT NULL;
+CREATE TABLE semantic_coverage_reasons(payload_id INTEGER UNIQUE REFERENCES semantic_payloads(payload_id),tuple_id INTEGER UNIQUE REFERENCES semantic_coverage(tuple_id),macro_invocation INTEGER NOT NULL CHECK(macro_invocation BETWEEN 0 AND 9007199254740991),attribute_item INTEGER NOT NULL CHECK(attribute_item BETWEEN 0 AND 9007199254740991),macro_definition INTEGER NOT NULL CHECK(macro_definition BETWEEN 0 AND 9007199254740991),other INTEGER NOT NULL CHECK(other BETWEEN 0 AND 9007199254740991),capped INTEGER NOT NULL CHECK(capped IN (0,1)),omitted INTEGER NOT NULL CHECK(omitted IN (0,1)),captured_diagnostics INTEGER NOT NULL CHECK(captured_diagnostics IN (0,1)),CHECK((payload_id IS NULL)<>(tuple_id IS NULL)));
+CREATE TABLE semantic_coverage_freshness(revision_id TEXT NOT NULL,tuple_id INTEGER NOT NULL,basis_id INTEGER NOT NULL REFERENCES semantic_basis(basis_id),freshness TEXT NOT NULL CHECK(freshness IN ('fresh','possiblyStale','stale')),PRIMARY KEY(revision_id,tuple_id,basis_id),FOREIGN KEY(tuple_id,revision_id) REFERENCES semantic_coverage(tuple_id,revision_id));
+CREATE INDEX semantic_coverage_freshness_basis ON semantic_coverage_freshness(basis_id);
+CREATE TABLE semantic_basis(basis_id INTEGER PRIMARY KEY,payload_id INTEGER NOT NULL REFERENCES semantic_payloads(payload_id),producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,producer_hash TEXT NOT NULL,artifact_hash TEXT NOT NULL,language TEXT NOT NULL,source_set_id TEXT NOT NULL,captured_native_revision_id TEXT NOT NULL,source_manifest_hash TEXT NOT NULL,toolchain_hash TEXT NOT NULL,config_hash TEXT NOT NULL,dependency_hash TEXT NOT NULL,UNIQUE(payload_id,basis_id));
 CREATE TABLE semantic_basis_lookup_dependencies(basis_id INTEGER NOT NULL REFERENCES semantic_basis(basis_id),ordinal INTEGER NOT NULL CHECK(ordinal BETWEEN 0 AND 9007199254740991),lookup_key TEXT NOT NULL,PRIMARY KEY(basis_id,ordinal),UNIQUE(basis_id,lookup_key));
 CREATE TABLE semantic_raw_batches(batch_id INTEGER PRIMARY KEY,producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,profile_id TEXT NOT NULL,source_set_id TEXT NOT NULL,captured_revision TEXT NOT NULL,source_manifest_hash TEXT NOT NULL CHECK(length(source_manifest_hash)=64),descriptor_sha256 TEXT NOT NULL CHECK(length(descriptor_sha256)=64),descriptor_bytes BLOB NOT NULL,decoder_version TEXT NOT NULL,UNIQUE(producer_id,descriptor_sha256,captured_revision));
 CREATE TABLE semantic_raw_captures(capture_id INTEGER PRIMARY KEY,batch_id INTEGER NOT NULL REFERENCES semantic_raw_batches(batch_id),ordinal INTEGER NOT NULL,languages TEXT NOT NULL CHECK(json_valid(languages)),producer_id TEXT NOT NULL,artifact_hash TEXT NOT NULL CHECK(length(artifact_hash)=64),source_set_id TEXT NOT NULL,captured_revision TEXT NOT NULL,binary_bytes BLOB NOT NULL,decoder_version TEXT NOT NULL,UNIQUE(batch_id,ordinal),UNIQUE(producer_id,artifact_hash,source_set_id,captured_revision));
@@ -917,37 +934,39 @@ CREATE TABLE semantic_raw_proofs(capture_id INTEGER NOT NULL REFERENCES semantic
 CREATE TABLE semantic_raw_documents(capture_id INTEGER NOT NULL REFERENCES semantic_raw_captures(capture_id) ON DELETE CASCADE,language TEXT NOT NULL,path TEXT NOT NULL,source_hash TEXT NOT NULL CHECK(length(source_hash)=64),wire_digest TEXT NOT NULL CHECK(length(wire_digest)=64),capped INTEGER NOT NULL CHECK(capped IN (0,1,2,3)),PRIMARY KEY(capture_id,language,path));
 CREATE TABLE semantic_reimport(revision_id TEXT NOT NULL REFERENCES native_revisions(id) ON DELETE CASCADE,producer TEXT NOT NULL,language TEXT NOT NULL,reason TEXT NOT NULL,PRIMARY KEY(revision_id,producer,language));
 CREATE TABLE semantic_import_reports(revision_id TEXT NOT NULL REFERENCES native_revisions(id),producer_id TEXT NOT NULL,report_json TEXT NOT NULL CHECK(json_valid(report_json)),PRIMARY KEY(revision_id,producer_id));
-CREATE TABLE semantic_provenance(tuple_id INTEGER NOT NULL,provenance_id TEXT NOT NULL,content_hash TEXT NOT NULL,evidence_kind TEXT NOT NULL CHECK(evidence_kind IN ('measuredSyntax','declarationBinding','semanticReference','typeRelationship')),freshness TEXT NOT NULL CHECK(freshness IN ('fresh','possiblyStale','stale')),basis_id INTEGER NOT NULL,capture_id INTEGER,derived_from_provenance_id TEXT,derived_from_record_kind TEXT CHECK(derived_from_record_kind IN ('occurrence','symbolInformation','relationship')),derived_from_fact_digest TEXT CHECK(length(derived_from_fact_digest)=64),CHECK((capture_id IS NULL AND derived_from_provenance_id IS NULL AND derived_from_record_kind IS NULL AND derived_from_fact_digest IS NULL) OR (capture_id IS NOT NULL AND derived_from_provenance_id IS NOT NULL AND derived_from_record_kind IS NOT NULL AND derived_from_fact_digest IS NOT NULL)),PRIMARY KEY(tuple_id,provenance_id),FOREIGN KEY(tuple_id) REFERENCES semantic_coverage(tuple_id),FOREIGN KEY(tuple_id,basis_id) REFERENCES semantic_basis(tuple_id,basis_id),FOREIGN KEY(capture_id,derived_from_provenance_id) REFERENCES semantic_raw_proofs(capture_id,proof_id));
+CREATE TABLE semantic_provenance(payload_id INTEGER NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal BETWEEN 0 AND 9007199254740991),provenance_id TEXT,content_hash TEXT NOT NULL,evidence_kind TEXT NOT NULL CHECK(evidence_kind IN ('measuredSyntax','declarationBinding','semanticReference','typeRelationship')),basis_id INTEGER NOT NULL,capture_id INTEGER,derived_from_provenance_id TEXT,derived_from_record_kind TEXT CHECK(derived_from_record_kind IN ('occurrence','symbolInformation','relationship')),derived_from_fact_digest TEXT CHECK(length(derived_from_fact_digest)=64),CHECK((capture_id IS NULL AND derived_from_provenance_id IS NULL AND derived_from_record_kind IS NULL AND derived_from_fact_digest IS NULL) OR (capture_id IS NOT NULL AND derived_from_provenance_id IS NOT NULL AND derived_from_record_kind IS NOT NULL AND derived_from_fact_digest IS NOT NULL)),CHECK((capture_id IS NULL)=(provenance_id IS NOT NULL)),PRIMARY KEY(payload_id,ordinal),UNIQUE(payload_id,provenance_id),UNIQUE(payload_id,derived_from_provenance_id,evidence_kind),FOREIGN KEY(payload_id) REFERENCES semantic_payloads(payload_id),FOREIGN KEY(payload_id,basis_id) REFERENCES semantic_basis(payload_id,basis_id),FOREIGN KEY(capture_id,derived_from_provenance_id) REFERENCES semantic_raw_proofs(capture_id,proof_id));
 CREATE INDEX semantic_provenance_derived ON semantic_provenance(capture_id,derived_from_provenance_id) WHERE capture_id IS NOT NULL;
-CREATE TABLE semantic_symbols(symbol_id INTEGER PRIMARY KEY,tuple_id INTEGER NOT NULL,ordinal INTEGER NOT NULL,key_scheme TEXT NOT NULL,key_symbol TEXT NOT NULL,key_scope TEXT NOT NULL CHECK(key_scope IN ('global','document','target')),key_document_language TEXT,key_document_path TEXT,display_name TEXT,provenance_id TEXT NOT NULL,UNIQUE(tuple_id,ordinal),FOREIGN KEY(tuple_id,provenance_id) REFERENCES semantic_provenance(tuple_id,provenance_id));
-CREATE UNIQUE INDEX semantic_symbols_key ON semantic_symbols(tuple_id,key_scheme,key_symbol,key_scope,COALESCE(key_document_language,''),COALESCE(key_document_path,''));
-CREATE TABLE semantic_symbol_targets(symbol_id INTEGER NOT NULL REFERENCES semantic_symbols(symbol_id),ordinal INTEGER NOT NULL,kind TEXT NOT NULL CHECK(kind IN ('internal','external')),internal_syntax_id BLOB,internal_language TEXT,internal_path TEXT,internal_native_revision_id TEXT,external_scheme TEXT,external_symbol TEXT,external_scope TEXT,external_language TEXT,external_path TEXT,CHECK((kind='internal' AND length(internal_syntax_id)=16 AND internal_language IS NOT NULL AND internal_path IS NOT NULL AND internal_native_revision_id IS NOT NULL AND external_scheme IS NULL AND external_symbol IS NULL AND external_scope IS NULL AND external_language IS NULL AND external_path IS NULL) OR (kind='external' AND internal_syntax_id IS NULL AND internal_language IS NULL AND internal_path IS NULL AND internal_native_revision_id IS NULL AND external_scheme IS NOT NULL AND external_symbol IS NOT NULL AND external_scope IN ('global','document') AND ((external_scope='global' AND external_language IS NULL AND external_path IS NULL) OR (external_scope='document' AND external_language IS NOT NULL AND external_path IS NOT NULL)))),PRIMARY KEY(symbol_id,ordinal));
+CREATE TABLE semantic_symbols(symbol_id INTEGER PRIMARY KEY,payload_id INTEGER NOT NULL,ordinal INTEGER NOT NULL,key_scheme TEXT NOT NULL,key_symbol TEXT NOT NULL,key_scope TEXT NOT NULL CHECK(key_scope IN ('global','document','target')),key_document_language TEXT,key_document_path TEXT,display_name TEXT,provenance_ordinal INTEGER NOT NULL,UNIQUE(payload_id,ordinal),FOREIGN KEY(payload_id,provenance_ordinal) REFERENCES semantic_provenance(payload_id,ordinal));
+CREATE UNIQUE INDEX semantic_symbols_key ON semantic_symbols(payload_id,key_scheme,key_symbol,key_scope,COALESCE(key_document_language,''),COALESCE(key_document_path,''));
+CREATE TABLE semantic_symbol_targets(symbol_id INTEGER NOT NULL REFERENCES semantic_symbols(symbol_id),ordinal INTEGER NOT NULL,kind TEXT NOT NULL CHECK(kind IN ('internal','external')),internal_syntax_id BLOB,internal_language TEXT,internal_path TEXT,internal_native_revision_id TEXT,external_scheme TEXT,external_symbol TEXT,external_scope TEXT,external_language TEXT,external_path TEXT,CHECK((kind='internal' AND length(internal_syntax_id)=16 AND internal_language IS NOT NULL AND internal_path IS NOT NULL AND external_scheme IS NULL AND external_symbol IS NULL AND external_scope IS NULL AND external_language IS NULL AND external_path IS NULL) OR (kind='external' AND internal_syntax_id IS NULL AND internal_language IS NULL AND internal_path IS NULL AND internal_native_revision_id IS NULL AND external_scheme IS NOT NULL AND external_symbol IS NOT NULL AND external_scope IN ('global','document') AND ((external_scope='global' AND external_language IS NULL AND external_path IS NULL) OR (external_scope='document' AND external_language IS NOT NULL AND external_path IS NOT NULL)))),PRIMARY KEY(symbol_id,ordinal));
 CREATE INDEX semantic_symbol_targets_internal_syntax ON semantic_symbol_targets(internal_syntax_id,internal_language,internal_path,symbol_id) WHERE kind='internal';
-CREATE TABLE semantic_declaration_bindings(binding_id INTEGER PRIMARY KEY,tuple_id INTEGER NOT NULL,ordinal INTEGER NOT NULL,syntax_id BLOB CHECK(syntax_id IS NULL OR length(syntax_id)=16),provenance_id TEXT NOT NULL,join_document_language TEXT NOT NULL,join_document_path TEXT NOT NULL,join_native_revision_id TEXT NOT NULL,join_content_hash TEXT NOT NULL,join_start INTEGER NOT NULL,join_end INTEGER NOT NULL,join_kind TEXT NOT NULL CHECK(join_kind='declarationName'),join_status TEXT NOT NULL CHECK(join_status IN ('exact','ambiguous','unmatched','unsupported')),join_diagnostic TEXT,UNIQUE(tuple_id,ordinal),FOREIGN KEY(tuple_id,provenance_id) REFERENCES semantic_provenance(tuple_id,provenance_id));
-CREATE INDEX semantic_declaration_bindings_syntax ON semantic_declaration_bindings(tuple_id,syntax_id);
+CREATE TABLE semantic_declaration_bindings(binding_id INTEGER PRIMARY KEY,payload_id INTEGER NOT NULL,ordinal INTEGER NOT NULL,syntax_id BLOB CHECK(syntax_id IS NULL OR length(syntax_id)=16),provenance_ordinal INTEGER NOT NULL,join_document_language TEXT NOT NULL,join_document_path TEXT NOT NULL,join_native_revision_id TEXT,join_content_hash TEXT NOT NULL,join_start INTEGER NOT NULL,join_end INTEGER NOT NULL,join_kind TEXT NOT NULL CHECK(join_kind='declarationName'),join_status TEXT NOT NULL CHECK(join_status IN ('exact','ambiguous','unmatched','unsupported')),join_diagnostic TEXT,UNIQUE(payload_id,ordinal),FOREIGN KEY(payload_id,provenance_ordinal) REFERENCES semantic_provenance(payload_id,ordinal));
+CREATE INDEX semantic_declaration_bindings_syntax ON semantic_declaration_bindings(payload_id,syntax_id);
 CREATE TABLE semantic_declaration_binding_symbols(binding_id INTEGER NOT NULL REFERENCES semantic_declaration_bindings(binding_id),ordinal INTEGER NOT NULL,scheme TEXT NOT NULL,symbol TEXT NOT NULL,scope TEXT NOT NULL,document_language TEXT,document_path TEXT,PRIMARY KEY(binding_id,ordinal));
 CREATE TABLE semantic_declaration_join_candidates(binding_id INTEGER NOT NULL REFERENCES semantic_declaration_bindings(binding_id),ordinal INTEGER NOT NULL,candidate_id BLOB NOT NULL CHECK(length(candidate_id)=16),PRIMARY KEY(binding_id,ordinal),UNIQUE(binding_id,candidate_id));
-CREATE TABLE semantic_references(tuple_id INTEGER NOT NULL,reference_id BLOB NOT NULL CHECK(length(reference_id)=16),ordinal INTEGER NOT NULL,owner_id BLOB NOT NULL CHECK(length(owner_id)=16),start_byte INTEGER NOT NULL,end_byte INTEGER NOT NULL,spelling TEXT NOT NULL,lookup_key TEXT NOT NULL,site TEXT NOT NULL CHECK(site IN ('declaration','use')),resolution TEXT NOT NULL CHECK(resolution IN ('resolved','external','ambiguous','unresolved')),declared_kind TEXT CHECK(declared_kind IS NULL OR declared_kind IN ('internal','external')),declared_internal_syntax_id BLOB,declared_internal_language TEXT,declared_internal_path TEXT,declared_internal_native_revision_id TEXT,declared_external_scheme TEXT,declared_external_symbol TEXT,declared_external_scope TEXT,declared_external_language TEXT,declared_external_path TEXT,provenance_id TEXT NOT NULL,CHECK((declared_kind IS NULL AND declared_internal_syntax_id IS NULL AND declared_internal_language IS NULL AND declared_internal_path IS NULL AND declared_internal_native_revision_id IS NULL AND declared_external_scheme IS NULL AND declared_external_symbol IS NULL AND declared_external_scope IS NULL AND declared_external_language IS NULL AND declared_external_path IS NULL) OR (declared_kind IS NOT NULL AND declared_kind='internal' AND length(declared_internal_syntax_id)=16 AND declared_internal_language IS NOT NULL AND declared_internal_path IS NOT NULL AND declared_internal_native_revision_id IS NOT NULL AND declared_external_scheme IS NULL AND declared_external_symbol IS NULL AND declared_external_scope IS NULL AND declared_external_language IS NULL AND declared_external_path IS NULL) OR (declared_kind IS NOT NULL AND declared_kind='external' AND declared_internal_syntax_id IS NULL AND declared_internal_language IS NULL AND declared_internal_path IS NULL AND declared_internal_native_revision_id IS NULL AND declared_external_scheme IS NOT NULL AND declared_external_symbol IS NOT NULL AND declared_external_scope IN ('global','document') AND ((declared_external_scope='global' AND declared_external_language IS NULL AND declared_external_path IS NULL) OR (declared_external_scope='document' AND declared_external_language IS NOT NULL AND declared_external_path IS NOT NULL)))),PRIMARY KEY(tuple_id,reference_id),FOREIGN KEY(tuple_id,provenance_id) REFERENCES semantic_provenance(tuple_id,provenance_id));
-CREATE INDEX semantic_references_owner ON semantic_references(tuple_id,owner_id);
-CREATE TABLE semantic_reference_roles(tuple_id INTEGER NOT NULL,reference_id BLOB NOT NULL,ordinal INTEGER NOT NULL,role TEXT NOT NULL,PRIMARY KEY(tuple_id,reference_id,ordinal),UNIQUE(tuple_id,reference_id,role),FOREIGN KEY(tuple_id,reference_id) REFERENCES semantic_references(tuple_id,reference_id));
-CREATE TABLE semantic_reference_candidates(tuple_id INTEGER NOT NULL,reference_id BLOB NOT NULL,ordinal INTEGER NOT NULL,kind TEXT NOT NULL CHECK(kind IN ('internal','external')),internal_syntax_id BLOB,internal_language TEXT,internal_path TEXT,internal_native_revision_id TEXT,external_scheme TEXT,external_symbol TEXT,external_scope TEXT,external_language TEXT,external_path TEXT,CHECK((kind='internal' AND length(internal_syntax_id)=16 AND internal_language IS NOT NULL AND internal_path IS NOT NULL AND internal_native_revision_id IS NOT NULL AND external_scheme IS NULL AND external_symbol IS NULL AND external_scope IS NULL AND external_language IS NULL AND external_path IS NULL) OR (kind='external' AND internal_syntax_id IS NULL AND internal_language IS NULL AND internal_path IS NULL AND internal_native_revision_id IS NULL AND external_scheme IS NOT NULL AND external_symbol IS NOT NULL AND external_scope IN ('global','document') AND ((external_scope='global' AND external_language IS NULL AND external_path IS NULL) OR (external_scope='document' AND external_language IS NOT NULL AND external_path IS NOT NULL)))),PRIMARY KEY(tuple_id,reference_id,ordinal),FOREIGN KEY(tuple_id,reference_id) REFERENCES semantic_references(tuple_id,reference_id));
-CREATE TABLE semantic_call_bindings(binding_id INTEGER PRIMARY KEY,tuple_id INTEGER NOT NULL,ordinal INTEGER NOT NULL,call_id BLOB CHECK(call_id IS NULL OR length(call_id)=16),join_document_language TEXT NOT NULL,join_document_path TEXT NOT NULL,join_native_revision_id TEXT NOT NULL,join_content_hash TEXT NOT NULL,join_start INTEGER NOT NULL,join_end INTEGER NOT NULL,join_kind TEXT NOT NULL CHECK(join_kind IN ('callee','invocation')),join_status TEXT NOT NULL,join_diagnostic TEXT,resolution TEXT NOT NULL,declared_kind TEXT CHECK(declared_kind IS NULL OR declared_kind IN ('internal','external')),declared_internal_syntax_id BLOB,declared_internal_language TEXT,declared_internal_path TEXT,declared_internal_native_revision_id TEXT,declared_external_scheme TEXT,declared_external_symbol TEXT,declared_external_scope TEXT,declared_external_language TEXT,declared_external_path TEXT,dispatch TEXT NOT NULL,possible_dispatch_complete INTEGER NOT NULL CHECK(possible_dispatch_complete=0),stale_target INTEGER CHECK(stale_target IS NULL OR stale_target=0),provenance_id TEXT NOT NULL,CHECK((declared_kind IS NULL AND declared_internal_syntax_id IS NULL AND declared_internal_language IS NULL AND declared_internal_path IS NULL AND declared_internal_native_revision_id IS NULL AND declared_external_scheme IS NULL AND declared_external_symbol IS NULL AND declared_external_scope IS NULL AND declared_external_language IS NULL AND declared_external_path IS NULL) OR (declared_kind IS NOT NULL AND declared_kind='internal' AND length(declared_internal_syntax_id)=16 AND declared_internal_language IS NOT NULL AND declared_internal_path IS NOT NULL AND declared_internal_native_revision_id IS NOT NULL AND declared_external_scheme IS NULL AND declared_external_symbol IS NULL AND declared_external_scope IS NULL AND declared_external_language IS NULL AND declared_external_path IS NULL) OR (declared_kind IS NOT NULL AND declared_kind='external' AND declared_internal_syntax_id IS NULL AND declared_internal_language IS NULL AND declared_internal_path IS NULL AND declared_internal_native_revision_id IS NULL AND declared_external_scheme IS NOT NULL AND declared_external_symbol IS NOT NULL AND declared_external_scope IN ('global','document') AND ((declared_external_scope='global' AND declared_external_language IS NULL AND declared_external_path IS NULL) OR (declared_external_scope='document' AND declared_external_language IS NOT NULL AND declared_external_path IS NOT NULL)))),UNIQUE(tuple_id,ordinal),FOREIGN KEY(tuple_id,provenance_id) REFERENCES semantic_provenance(tuple_id,provenance_id));
-CREATE INDEX semantic_call_bindings_call ON semantic_call_bindings(tuple_id,call_id);
-CREATE TABLE semantic_call_candidates(binding_id INTEGER NOT NULL REFERENCES semantic_call_bindings(binding_id),ordinal INTEGER NOT NULL,kind TEXT NOT NULL CHECK(kind IN ('internal','external')),internal_syntax_id BLOB,internal_language TEXT,internal_path TEXT,internal_native_revision_id TEXT,external_scheme TEXT,external_symbol TEXT,external_scope TEXT,external_language TEXT,external_path TEXT,CHECK((kind='internal' AND length(internal_syntax_id)=16 AND internal_language IS NOT NULL AND internal_path IS NOT NULL AND internal_native_revision_id IS NOT NULL AND external_scheme IS NULL AND external_symbol IS NULL AND external_scope IS NULL AND external_language IS NULL AND external_path IS NULL) OR (kind='external' AND internal_syntax_id IS NULL AND internal_language IS NULL AND internal_path IS NULL AND internal_native_revision_id IS NULL AND external_scheme IS NOT NULL AND external_symbol IS NOT NULL AND external_scope IN ('global','document') AND ((external_scope='global' AND external_language IS NULL AND external_path IS NULL) OR (external_scope='document' AND external_language IS NOT NULL AND external_path IS NOT NULL)))),PRIMARY KEY(binding_id,ordinal));
-CREATE TABLE semantic_call_possible_dispatch(binding_id INTEGER NOT NULL REFERENCES semantic_call_bindings(binding_id),ordinal INTEGER NOT NULL,kind TEXT NOT NULL CHECK(kind IN ('internal','external')),internal_syntax_id BLOB,internal_language TEXT,internal_path TEXT,internal_native_revision_id TEXT,external_scheme TEXT,external_symbol TEXT,external_scope TEXT,external_language TEXT,external_path TEXT,CHECK((kind='internal' AND length(internal_syntax_id)=16 AND internal_language IS NOT NULL AND internal_path IS NOT NULL AND internal_native_revision_id IS NOT NULL AND external_scheme IS NULL AND external_symbol IS NULL AND external_scope IS NULL AND external_language IS NULL AND external_path IS NULL) OR (kind='external' AND internal_syntax_id IS NULL AND internal_language IS NULL AND internal_path IS NULL AND internal_native_revision_id IS NULL AND external_scheme IS NOT NULL AND external_symbol IS NOT NULL AND external_scope IN ('global','document') AND ((external_scope='global' AND external_language IS NULL AND external_path IS NULL) OR (external_scope='document' AND external_language IS NOT NULL AND external_path IS NOT NULL)))),PRIMARY KEY(binding_id,ordinal));
+CREATE TABLE semantic_references(payload_id INTEGER NOT NULL,reference_id BLOB NOT NULL CHECK(length(reference_id)=16),ordinal INTEGER NOT NULL,owner_id BLOB NOT NULL CHECK(length(owner_id)=16),start_byte INTEGER NOT NULL,end_byte INTEGER NOT NULL,spelling TEXT NOT NULL,lookup_key TEXT NOT NULL,site TEXT NOT NULL CHECK(site IN ('declaration','use')),resolution TEXT NOT NULL CHECK(resolution IN ('resolved','external','ambiguous','unresolved')),declared_kind TEXT CHECK(declared_kind IS NULL OR declared_kind IN ('internal','external')),declared_internal_syntax_id BLOB,declared_internal_language TEXT,declared_internal_path TEXT,declared_internal_native_revision_id TEXT,declared_external_scheme TEXT,declared_external_symbol TEXT,declared_external_scope TEXT,declared_external_language TEXT,declared_external_path TEXT,provenance_ordinal INTEGER NOT NULL,CHECK((declared_kind IS NULL AND declared_internal_syntax_id IS NULL AND declared_internal_language IS NULL AND declared_internal_path IS NULL AND declared_internal_native_revision_id IS NULL AND declared_external_scheme IS NULL AND declared_external_symbol IS NULL AND declared_external_scope IS NULL AND declared_external_language IS NULL AND declared_external_path IS NULL) OR (declared_kind IS NOT NULL AND declared_kind='internal' AND length(declared_internal_syntax_id)=16 AND declared_internal_language IS NOT NULL AND declared_internal_path IS NOT NULL AND declared_external_scheme IS NULL AND declared_external_symbol IS NULL AND declared_external_scope IS NULL AND declared_external_language IS NULL AND declared_external_path IS NULL) OR (declared_kind IS NOT NULL AND declared_kind='external' AND declared_internal_syntax_id IS NULL AND declared_internal_language IS NULL AND declared_internal_path IS NULL AND declared_internal_native_revision_id IS NULL AND declared_external_scheme IS NOT NULL AND declared_external_symbol IS NOT NULL AND declared_external_scope IN ('global','document') AND ((declared_external_scope='global' AND declared_external_language IS NULL AND declared_external_path IS NULL) OR (declared_external_scope='document' AND declared_external_language IS NOT NULL AND declared_external_path IS NOT NULL)))),PRIMARY KEY(payload_id,reference_id),FOREIGN KEY(payload_id,provenance_ordinal) REFERENCES semantic_provenance(payload_id,ordinal));
+CREATE INDEX semantic_references_owner ON semantic_references(payload_id,owner_id);
+CREATE TABLE semantic_reference_roles(payload_id INTEGER NOT NULL,reference_id BLOB NOT NULL,ordinal INTEGER NOT NULL,role TEXT NOT NULL,PRIMARY KEY(payload_id,reference_id,ordinal),UNIQUE(payload_id,reference_id,role),FOREIGN KEY(payload_id,reference_id) REFERENCES semantic_references(payload_id,reference_id));
+CREATE TABLE semantic_reference_candidates(payload_id INTEGER NOT NULL,reference_id BLOB NOT NULL,ordinal INTEGER NOT NULL,kind TEXT NOT NULL CHECK(kind IN ('internal','external')),internal_syntax_id BLOB,internal_language TEXT,internal_path TEXT,internal_native_revision_id TEXT,external_scheme TEXT,external_symbol TEXT,external_scope TEXT,external_language TEXT,external_path TEXT,CHECK((kind='internal' AND length(internal_syntax_id)=16 AND internal_language IS NOT NULL AND internal_path IS NOT NULL AND external_scheme IS NULL AND external_symbol IS NULL AND external_scope IS NULL AND external_language IS NULL AND external_path IS NULL) OR (kind='external' AND internal_syntax_id IS NULL AND internal_language IS NULL AND internal_path IS NULL AND internal_native_revision_id IS NULL AND external_scheme IS NOT NULL AND external_symbol IS NOT NULL AND external_scope IN ('global','document') AND ((external_scope='global' AND external_language IS NULL AND external_path IS NULL) OR (external_scope='document' AND external_language IS NOT NULL AND external_path IS NOT NULL)))),PRIMARY KEY(payload_id,reference_id,ordinal),FOREIGN KEY(payload_id,reference_id) REFERENCES semantic_references(payload_id,reference_id));
+CREATE TABLE semantic_call_bindings(binding_id INTEGER PRIMARY KEY,payload_id INTEGER NOT NULL,ordinal INTEGER NOT NULL,call_id BLOB CHECK(call_id IS NULL OR length(call_id)=16),join_document_language TEXT NOT NULL,join_document_path TEXT NOT NULL,join_native_revision_id TEXT,join_content_hash TEXT NOT NULL,join_start INTEGER NOT NULL,join_end INTEGER NOT NULL,join_kind TEXT NOT NULL CHECK(join_kind IN ('callee','invocation')),join_status TEXT NOT NULL,join_diagnostic TEXT,resolution TEXT NOT NULL,declared_kind TEXT CHECK(declared_kind IS NULL OR declared_kind IN ('internal','external')),declared_internal_syntax_id BLOB,declared_internal_language TEXT,declared_internal_path TEXT,declared_internal_native_revision_id TEXT,declared_external_scheme TEXT,declared_external_symbol TEXT,declared_external_scope TEXT,declared_external_language TEXT,declared_external_path TEXT,dispatch TEXT NOT NULL,possible_dispatch_complete INTEGER NOT NULL CHECK(possible_dispatch_complete=0),stale_target INTEGER CHECK(stale_target IS NULL OR stale_target=0),provenance_ordinal INTEGER NOT NULL,CHECK((declared_kind IS NULL AND declared_internal_syntax_id IS NULL AND declared_internal_language IS NULL AND declared_internal_path IS NULL AND declared_internal_native_revision_id IS NULL AND declared_external_scheme IS NULL AND declared_external_symbol IS NULL AND declared_external_scope IS NULL AND declared_external_language IS NULL AND declared_external_path IS NULL) OR (declared_kind IS NOT NULL AND declared_kind='internal' AND length(declared_internal_syntax_id)=16 AND declared_internal_language IS NOT NULL AND declared_internal_path IS NOT NULL AND declared_external_scheme IS NULL AND declared_external_symbol IS NULL AND declared_external_scope IS NULL AND declared_external_language IS NULL AND declared_external_path IS NULL) OR (declared_kind IS NOT NULL AND declared_kind='external' AND declared_internal_syntax_id IS NULL AND declared_internal_language IS NULL AND declared_internal_path IS NULL AND declared_internal_native_revision_id IS NULL AND declared_external_scheme IS NOT NULL AND declared_external_symbol IS NOT NULL AND declared_external_scope IN ('global','document') AND ((declared_external_scope='global' AND declared_external_language IS NULL AND declared_external_path IS NULL) OR (declared_external_scope='document' AND declared_external_language IS NOT NULL AND declared_external_path IS NOT NULL)))),UNIQUE(payload_id,ordinal),FOREIGN KEY(payload_id,provenance_ordinal) REFERENCES semantic_provenance(payload_id,ordinal));
+CREATE INDEX semantic_call_bindings_call ON semantic_call_bindings(payload_id,call_id);
+CREATE TABLE semantic_call_candidates(binding_id INTEGER NOT NULL REFERENCES semantic_call_bindings(binding_id),ordinal INTEGER NOT NULL,kind TEXT NOT NULL CHECK(kind IN ('internal','external')),internal_syntax_id BLOB,internal_language TEXT,internal_path TEXT,internal_native_revision_id TEXT,external_scheme TEXT,external_symbol TEXT,external_scope TEXT,external_language TEXT,external_path TEXT,CHECK((kind='internal' AND length(internal_syntax_id)=16 AND internal_language IS NOT NULL AND internal_path IS NOT NULL AND external_scheme IS NULL AND external_symbol IS NULL AND external_scope IS NULL AND external_language IS NULL AND external_path IS NULL) OR (kind='external' AND internal_syntax_id IS NULL AND internal_language IS NULL AND internal_path IS NULL AND internal_native_revision_id IS NULL AND external_scheme IS NOT NULL AND external_symbol IS NOT NULL AND external_scope IN ('global','document') AND ((external_scope='global' AND external_language IS NULL AND external_path IS NULL) OR (external_scope='document' AND external_language IS NOT NULL AND external_path IS NOT NULL)))),PRIMARY KEY(binding_id,ordinal));
+CREATE TABLE semantic_call_possible_dispatch(binding_id INTEGER NOT NULL REFERENCES semantic_call_bindings(binding_id),ordinal INTEGER NOT NULL,kind TEXT NOT NULL CHECK(kind IN ('internal','external')),internal_syntax_id BLOB,internal_language TEXT,internal_path TEXT,internal_native_revision_id TEXT,external_scheme TEXT,external_symbol TEXT,external_scope TEXT,external_language TEXT,external_path TEXT,CHECK((kind='internal' AND length(internal_syntax_id)=16 AND internal_language IS NOT NULL AND internal_path IS NOT NULL AND external_scheme IS NULL AND external_symbol IS NULL AND external_scope IS NULL AND external_language IS NULL AND external_path IS NULL) OR (kind='external' AND internal_syntax_id IS NULL AND internal_language IS NULL AND internal_path IS NULL AND internal_native_revision_id IS NULL AND external_scheme IS NOT NULL AND external_symbol IS NOT NULL AND external_scope IN ('global','document') AND ((external_scope='global' AND external_language IS NULL AND external_path IS NULL) OR (external_scope='document' AND external_language IS NOT NULL AND external_path IS NOT NULL)))),PRIMARY KEY(binding_id,ordinal));
 CREATE TABLE semantic_call_join_candidates(binding_id INTEGER NOT NULL REFERENCES semantic_call_bindings(binding_id),ordinal INTEGER NOT NULL,candidate_id BLOB NOT NULL CHECK(length(candidate_id)=16),PRIMARY KEY(binding_id,ordinal),UNIQUE(binding_id,candidate_id));
-CREATE TABLE semantic_type_relationships(relationship_id INTEGER PRIMARY KEY,tuple_id INTEGER NOT NULL,ordinal INTEGER NOT NULL,kind TEXT NOT NULL CHECK(kind IN ('extends','implements','overrides')),source_kind TEXT NOT NULL CHECK(source_kind IN ('internal','external')),source_internal_syntax_id BLOB,source_internal_language TEXT,source_internal_path TEXT,source_internal_native_revision_id TEXT,source_external_scheme TEXT,source_external_symbol TEXT,source_external_scope TEXT,source_external_language TEXT,source_external_path TEXT,target_kind TEXT NOT NULL CHECK(target_kind IN ('internal','external')),target_internal_syntax_id BLOB,target_internal_language TEXT,target_internal_path TEXT,target_internal_native_revision_id TEXT,target_external_scheme TEXT,target_external_symbol TEXT,target_external_scope TEXT,target_external_language TEXT,target_external_path TEXT,provenance_id TEXT NOT NULL,CHECK((source_kind='internal' AND length(source_internal_syntax_id)=16 AND source_internal_language IS NOT NULL AND source_internal_path IS NOT NULL AND source_internal_native_revision_id IS NOT NULL AND source_external_scheme IS NULL AND source_external_symbol IS NULL AND source_external_scope IS NULL AND source_external_language IS NULL AND source_external_path IS NULL) OR (source_kind='external' AND source_internal_syntax_id IS NULL AND source_internal_language IS NULL AND source_internal_path IS NULL AND source_internal_native_revision_id IS NULL AND source_external_scheme IS NOT NULL AND source_external_symbol IS NOT NULL AND source_external_scope IN ('global','document') AND ((source_external_scope='global' AND source_external_language IS NULL AND source_external_path IS NULL) OR (source_external_scope='document' AND source_external_language IS NOT NULL AND source_external_path IS NOT NULL)))),CHECK((target_kind='internal' AND length(target_internal_syntax_id)=16 AND target_internal_language IS NOT NULL AND target_internal_path IS NOT NULL AND target_internal_native_revision_id IS NOT NULL AND target_external_scheme IS NULL AND target_external_symbol IS NULL AND target_external_scope IS NULL AND target_external_language IS NULL AND target_external_path IS NULL) OR (target_kind='external' AND target_internal_syntax_id IS NULL AND target_internal_language IS NULL AND target_internal_path IS NULL AND target_internal_native_revision_id IS NULL AND target_external_scheme IS NOT NULL AND target_external_symbol IS NOT NULL AND target_external_scope IN ('global','document') AND ((target_external_scope='global' AND target_external_language IS NULL AND target_external_path IS NULL) OR (target_external_scope='document' AND target_external_language IS NOT NULL AND target_external_path IS NOT NULL)))),UNIQUE(tuple_id,ordinal),FOREIGN KEY(tuple_id,provenance_id) REFERENCES semantic_provenance(tuple_id,provenance_id));
-CREATE INDEX semantic_type_relationships_source ON semantic_type_relationships(tuple_id,source_internal_syntax_id);
+CREATE TABLE semantic_type_relationships(relationship_id INTEGER PRIMARY KEY,payload_id INTEGER NOT NULL,ordinal INTEGER NOT NULL,kind TEXT NOT NULL CHECK(kind IN ('extends','implements','overrides')),source_kind TEXT NOT NULL CHECK(source_kind IN ('internal','external')),source_internal_syntax_id BLOB,source_internal_language TEXT,source_internal_path TEXT,source_internal_native_revision_id TEXT,source_external_scheme TEXT,source_external_symbol TEXT,source_external_scope TEXT,source_external_language TEXT,source_external_path TEXT,target_kind TEXT NOT NULL CHECK(target_kind IN ('internal','external')),target_internal_syntax_id BLOB,target_internal_language TEXT,target_internal_path TEXT,target_internal_native_revision_id TEXT,target_external_scheme TEXT,target_external_symbol TEXT,target_external_scope TEXT,target_external_language TEXT,target_external_path TEXT,provenance_ordinal INTEGER NOT NULL,CHECK((source_kind='internal' AND length(source_internal_syntax_id)=16 AND source_internal_language IS NOT NULL AND source_internal_path IS NOT NULL AND source_external_scheme IS NULL AND source_external_symbol IS NULL AND source_external_scope IS NULL AND source_external_language IS NULL AND source_external_path IS NULL) OR (source_kind='external' AND source_internal_syntax_id IS NULL AND source_internal_language IS NULL AND source_internal_path IS NULL AND source_internal_native_revision_id IS NULL AND source_external_scheme IS NOT NULL AND source_external_symbol IS NOT NULL AND source_external_scope IN ('global','document') AND ((source_external_scope='global' AND source_external_language IS NULL AND source_external_path IS NULL) OR (source_external_scope='document' AND source_external_language IS NOT NULL AND source_external_path IS NOT NULL)))),CHECK((target_kind='internal' AND length(target_internal_syntax_id)=16 AND target_internal_language IS NOT NULL AND target_internal_path IS NOT NULL AND target_external_scheme IS NULL AND target_external_symbol IS NULL AND target_external_scope IS NULL AND target_external_language IS NULL AND target_external_path IS NULL) OR (target_kind='external' AND target_internal_syntax_id IS NULL AND target_internal_language IS NULL AND target_internal_path IS NULL AND target_internal_native_revision_id IS NULL AND target_external_scheme IS NOT NULL AND target_external_symbol IS NOT NULL AND target_external_scope IN ('global','document') AND ((target_external_scope='global' AND target_external_language IS NULL AND target_external_path IS NULL) OR (target_external_scope='document' AND target_external_language IS NOT NULL AND target_external_path IS NOT NULL)))),UNIQUE(payload_id,ordinal),FOREIGN KEY(payload_id,provenance_ordinal) REFERENCES semantic_provenance(payload_id,ordinal));
+CREATE INDEX semantic_type_relationships_source ON semantic_type_relationships(payload_id,source_internal_syntax_id);
 CREATE TABLE semantic_projection_origins(revision_id TEXT NOT NULL REFERENCES native_revisions(id),producer_id TEXT NOT NULL,basis_pin TEXT NOT NULL REFERENCES native_revisions(id),PRIMARY KEY(revision_id,producer_id));
 CREATE INDEX semantic_projection_basis ON semantic_projection_origins(basis_pin,revision_id);
 CREATE TABLE semantic_projection_documents(revision_id TEXT NOT NULL,producer_id TEXT NOT NULL,language TEXT NOT NULL,path TEXT NOT NULL,pending INTEGER NOT NULL CHECK(pending IN (0,1)),PRIMARY KEY(revision_id,producer_id,language,path),FOREIGN KEY(revision_id,producer_id) REFERENCES semantic_projection_origins(revision_id,producer_id));
 CREATE TABLE semantic_pending_target(singleton INTEGER PRIMARY KEY CHECK(singleton=1),revision_id TEXT NOT NULL REFERENCES native_revisions(id),native_revision_id TEXT NOT NULL,root_id TEXT NOT NULL);
 CREATE TABLE semantic_pending_selections(revision_id TEXT NOT NULL REFERENCES native_revisions(id),producer_id TEXT NOT NULL,batch_id INTEGER NOT NULL REFERENCES semantic_raw_batches(batch_id),captured_pin TEXT NOT NULL REFERENCES native_revisions(id),basis_pin TEXT NOT NULL REFERENCES native_revisions(id),PRIMARY KEY(revision_id,producer_id));
 CREATE TABLE semantic_catchup_commits(revision_id TEXT PRIMARY KEY REFERENCES native_revisions(id),target_revision_id TEXT NOT NULL REFERENCES native_revisions(id));
-CREATE TABLE semantic_projection_dependencies(tuple_id INTEGER NOT NULL REFERENCES semantic_coverage(tuple_id) ON DELETE CASCADE,language TEXT NOT NULL,path TEXT NOT NULL,PRIMARY KEY(tuple_id,language,path));
-CREATE INDEX semantic_projection_reverse ON semantic_projection_dependencies(language,path,tuple_id);
-CREATE TABLE semantic_projection_contexts(tuple_id INTEGER PRIMARY KEY REFERENCES semantic_coverage(tuple_id) ON DELETE CASCADE);
-CREATE TABLE semantic_projection_lookup_dependencies(tuple_id INTEGER NOT NULL REFERENCES semantic_coverage(tuple_id) ON DELETE CASCADE,lookup_key TEXT NOT NULL,PRIMARY KEY(tuple_id,lookup_key));
+CREATE TABLE semantic_projection_dependencies(payload_id INTEGER NOT NULL REFERENCES semantic_payloads(payload_id),language TEXT NOT NULL,path TEXT NOT NULL,term TEXT,PRIMARY KEY(payload_id,language,path));
+CREATE INDEX semantic_projection_reverse ON semantic_projection_dependencies(language,path,payload_id);
+CREATE TABLE semantic_projection_dependency_targets(payload_id INTEGER NOT NULL REFERENCES semantic_payloads(payload_id),language TEXT NOT NULL,path TEXT NOT NULL,syntax_id BLOB NOT NULL,call INTEGER NOT NULL CHECK(call IN (0,1)),PRIMARY KEY(payload_id,language,path,syntax_id));
+CREATE TABLE semantic_projection_contexts(payload_id INTEGER PRIMARY KEY REFERENCES semantic_payloads(payload_id));
+CREATE TABLE semantic_projection_lookup_dependencies(payload_id INTEGER NOT NULL REFERENCES semantic_payloads(payload_id),lookup_key TEXT NOT NULL,PRIMARY KEY(payload_id,lookup_key));
+CREATE TABLE semantic_release_candidate_payloads(revision_id TEXT NOT NULL REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,payload_id INTEGER NOT NULL REFERENCES semantic_payloads(payload_id) DEFERRABLE INITIALLY DEFERRED,PRIMARY KEY(revision_id,payload_id));
 
 "#;
 /// A normal connection keeps the verified index use lock until SQLite closes.
@@ -4801,7 +4820,7 @@ fn expected_cache_objects() -> Result<&'static Vec<CacheObject>> {
     #[cfg(test)]
     EXPECTED_CACHE_SHAPE_BUILDS.with(|count| count.set(count.get() + 1));
     let expected = Connection::open_in_memory()?;
-    expected.execute_batch(CACHE_SCHEMA_V41)?;
+    expected.execute_batch(CACHE_SCHEMA_V42)?;
     let built = cache_objects(&expected)?;
     Ok(EXPECTED.get_or_init(|| built))
 }
@@ -4825,7 +4844,7 @@ mod cache_shape_once_tests {
 
     fn current_schema_db() -> Connection {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(CACHE_SCHEMA_V41).unwrap();
+        db.execute_batch(CACHE_SCHEMA_V42).unwrap();
         db.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
             .unwrap();
         db
@@ -6925,8 +6944,11 @@ fn semantic_variant<T: Serialize>(value: &T) -> Result<String> {
         .to_owned())
 }
 
+/// The stored columns of a target. An internal target at the writing revision stores NULL,
+/// which reads as the reading revision's native revision (D1).
 fn semantic_target_values(
     target: &crate::semantic_evidence::Target,
+    writing: &str,
 ) -> Result<Vec<rusqlite::types::Value>> {
     use crate::semantic_evidence::Target;
     use rusqlite::types::Value;
@@ -6944,7 +6966,11 @@ fn semantic_target_values(
             ),
             Value::Text(document.language.clone()),
             Value::Text(document.path.clone()),
-            Value::Text(revision_id.clone()),
+            if revision_id == writing {
+                Value::Null
+            } else {
+                Value::Text(revision_id.clone())
+            },
             Value::Null,
             Value::Null,
             Value::Null,
@@ -6999,9 +7025,10 @@ fn insert_semantic_target(
     table: &str,
     parent: &[rusqlite::types::Value],
     target: &crate::semantic_evidence::Target,
+    writing: &str,
 ) -> Result<()> {
     let mut values = parent.to_vec();
-    values.extend(semantic_target_values(target)?);
+    values.extend(semantic_target_values(target, writing)?);
     let placeholders = (1..=values.len())
         .map(|index| format!("?{index}"))
         .collect::<Vec<_>>()
@@ -7426,154 +7453,48 @@ fn semantic_pin_key(pin: IndexPin) -> String {
     format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision)
 }
 
-type SemanticCoverageRow = (
-    i64,
-    String,
-    String,
-    String,
-    String,
-    bool,
-    bool,
-    String,
-    Option<String>,
-);
-
-fn copy_semantic_rows(db: &Connection, prior: &str, next: &str, exact: bool) -> Result<()> {
-    copy_semantic_rows_filtered(db, prior, next, exact, None)
-}
-fn copy_semantic_rows_except(
-    db: &Connection,
-    prior: &str,
-    next: &str,
-    producer: &str,
-) -> Result<()> {
-    copy_semantic_rows_filtered(db, prior, next, true, Some(producer))
-}
-fn copy_semantic_rows_filtered(
+/// Publishes `prior`'s manifest at `next` (D2). An exact copy names the same payloads and
+/// copies freshness verbatim; a non-exact copy keeps only the supported roles and names no
+/// payload. `except` is a producer the caller replaces.
+fn copy_semantic_manifest(
     db: &Connection,
     prior: &str,
     next: &str,
     exact: bool,
     except: Option<&str>,
 ) -> Result<()> {
-    let mut statement = db.prepare("SELECT tuple_id,producer_id,producer_version,language,path,requested,selected,state,diagnostic FROM semantic_coverage WHERE revision_id=?1 ORDER BY tuple_id")?;
-    let tuples = statement.query_map([prior], |row| {
-        Ok((
-            row.get(0)?,
-            row.get(1)?,
-            row.get(2)?,
-            row.get(3)?,
-            row.get(4)?,
-            row.get(5)?,
-            row.get(6)?,
-            row.get(7)?,
-            row.get(8)?,
-        ))
-    })?;
-    for tuple in tuples {
-        let (old, producer, version, language, path, requested, selected, state, diagnostic): SemanticCoverageRow = tuple?;
-        if except == Some(producer.as_str()) {
-            continue;
+    const CARRIED: &str = "JOIN semantic_coverage n ON n.revision_id=?2 AND n.producer_id=o.producer_id AND n.language=o.language AND n.path=o.path WHERE o.revision_id=?1 AND (?3 IS NULL OR o.producer_id<>?3)";
+    if exact {
+        match except {
+            Some(except) => native_first::context::validate_except(db, prior, except)?,
+            None => native_first::context::validate(db, prior)?,
         }
-        let applicable: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM revision_documents WHERE revision_id=?1 AND language=?2 AND path=?3)",params![next,language,path],|row|row.get(0))?;
-        if !applicable {
-            continue;
-        }
-        db.execute("INSERT INTO semantic_coverage(revision_id,producer_id,producer_version,language,path,requested,selected,state,diagnostic) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![next,producer,version,language,path,requested,if exact { selected } else { false },if exact {state.as_str()} else if requested {"omitted"} else {"notRequested"},if exact {diagnostic.as_deref()} else if requested {Some("semantic producer not run for this revision")} else {None}])?;
-        let tuple = db.last_insert_rowid();
-        copy_semantic_table(db, "semantic_coverage_roles", "tuple_id", old, tuple)?;
-        if !exact {
+        db.execute(
+            "INSERT INTO semantic_coverage(revision_id,producer_id,producer_version,language,path,requested,selected,state,diagnostic,payload_id) SELECT ?2,c.producer_id,c.producer_version,c.language,c.path,c.requested,c.selected,c.state,c.diagnostic,c.payload_id FROM semantic_coverage c JOIN revision_documents d ON d.revision_id=?2 AND d.language=c.language AND d.path=c.path WHERE c.revision_id=?1 AND (?3 IS NULL OR c.producer_id<>?3) ORDER BY c.tuple_id",
+            params![prior, next, except],
+        )?;
+        db.execute(
+            "INSERT INTO semantic_coverage_freshness SELECT ?2,n.tuple_id,f.basis_id,f.freshness FROM semantic_coverage_freshness f JOIN semantic_coverage o ON o.tuple_id=f.tuple_id AND o.revision_id=f.revision_id JOIN semantic_coverage n ON n.revision_id=?2 AND n.producer_id=o.producer_id AND n.language=o.language AND n.path=o.path WHERE f.revision_id=?1 AND (?3 IS NULL OR o.producer_id<>?3)",
+            params![prior, next, except],
+        )?;
+        db.execute(
+            &format!("INSERT INTO semantic_coverage_roles(payload_id,tuple_id,kind,ordinal,role) SELECT NULL,n.tuple_id,r.kind,r.ordinal,r.role FROM semantic_coverage_roles r JOIN semantic_coverage o ON o.tuple_id=r.tuple_id {CARRIED}"),
+            params![prior, next, except],
+        )?;
+        db.execute(
+            &format!("INSERT INTO semantic_coverage_reasons(payload_id,tuple_id,macro_invocation,attribute_item,macro_definition,other,capped,omitted,captured_diagnostics) SELECT NULL,n.tuple_id,r.macro_invocation,r.attribute_item,r.macro_definition,r.other,r.capped,r.omitted,r.captured_diagnostics FROM semantic_coverage_reasons r JOIN semantic_coverage o ON o.tuple_id=r.tuple_id {CARRIED}"),
+            params![prior, next, except],
+        )?;
+    } else {
+        db.execute(
+            "INSERT INTO semantic_coverage(revision_id,producer_id,producer_version,language,path,requested,selected,state,diagnostic,payload_id) SELECT ?2,c.producer_id,c.producer_version,c.language,c.path,c.requested,0,CASE WHEN c.requested THEN 'omitted' ELSE 'notRequested' END,CASE WHEN c.requested THEN 'semantic producer not run for this revision' END,NULL FROM semantic_coverage c JOIN revision_documents d ON d.revision_id=?2 AND d.language=c.language AND d.path=c.path WHERE c.revision_id=?1 AND (?3 IS NULL OR c.producer_id<>?3) ORDER BY c.tuple_id",
+            params![prior, next, except],
+        )?;
+        for owner in ["o.payload_id=r.payload_id", "o.tuple_id=r.tuple_id"] {
             db.execute(
-                "DELETE FROM semantic_coverage_roles WHERE tuple_id=?1 AND kind='observed'",
-                [tuple],
+                &format!("INSERT INTO semantic_coverage_roles(payload_id,tuple_id,kind,ordinal,role) SELECT NULL,n.tuple_id,'supported',r.ordinal,r.role FROM semantic_coverage_roles r JOIN semantic_coverage o ON {owner} JOIN semantic_coverage n ON n.revision_id=?2 AND n.producer_id=o.producer_id AND n.language=o.language AND n.path=o.path WHERE o.revision_id=?1 AND (?3 IS NULL OR o.producer_id<>?3) AND r.kind='supported'"),
+                params![prior, next, except],
             )?;
-            continue;
-        }
-        native_first::context::validate_tuple(db, prior, &producer, old)?;
-        // An exact copy keeps its partial state, so it keeps the reasons recorded for it.
-        copy_semantic_table(db, "semantic_coverage_reasons", "tuple_id", old, tuple)?;
-        let mut basis_ids = BTreeMap::new();
-        for basis in semantic_table_ids(db, "semantic_basis", "tuple_id", old)? {
-            let new = copy_semantic_surrogate(
-                db,
-                "semantic_basis",
-                "basis_id",
-                "tuple_id",
-                basis,
-                tuple,
-            )?;
-            basis_ids.insert(basis, new);
-            copy_semantic_table(
-                db,
-                "semantic_basis_lookup_dependencies",
-                "basis_id",
-                basis,
-                new,
-            )?;
-        }
-        let mut proofs =
-            db.prepare("SELECT provenance_id,basis_id FROM semantic_provenance WHERE tuple_id=?1 ORDER BY rowid")?;
-        let proofs = proofs
-            .query_map([old], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (proof, basis) in proofs {
-            let new_basis = basis_ids
-                .get(&basis)
-                .context("missing copied semantic basis")?;
-            db.execute("INSERT INTO semantic_provenance SELECT ?1,provenance_id,content_hash,evidence_kind,freshness,?2,capture_id,derived_from_provenance_id,derived_from_record_kind,derived_from_fact_digest FROM semantic_provenance WHERE tuple_id=?3 AND provenance_id=?4",params![tuple,new_basis,old,proof])?;
-        }
-        for (table, id, children) in [
-            (
-                "semantic_symbols",
-                "symbol_id",
-                &["semantic_symbol_targets"][..],
-            ),
-            (
-                "semantic_declaration_bindings",
-                "binding_id",
-                &[
-                    "semantic_declaration_binding_symbols",
-                    "semantic_declaration_join_candidates",
-                ][..],
-            ),
-            (
-                "semantic_call_bindings",
-                "binding_id",
-                &[
-                    "semantic_call_candidates",
-                    "semantic_call_possible_dispatch",
-                    "semantic_call_join_candidates",
-                ][..],
-            ),
-            ("semantic_type_relationships", "relationship_id", &[][..]),
-        ] {
-            for old_id in semantic_table_ids(db, table, "tuple_id", old)? {
-                let new_id = copy_semantic_surrogate(db, table, id, "tuple_id", old_id, tuple)?;
-                for child in children {
-                    copy_semantic_table(db, child, id, old_id, new_id)?;
-                }
-            }
-        }
-        let refs = semantic_table_blobs(db, "semantic_references", "reference_id", old)?;
-        for id in refs {
-            db.execute("INSERT INTO semantic_references SELECT ?1,reference_id,ordinal,owner_id,start_byte,end_byte,spelling,lookup_key,site,resolution,declared_kind,declared_internal_syntax_id,declared_internal_language,declared_internal_path,declared_internal_native_revision_id,declared_external_scheme,declared_external_symbol,declared_external_scope,declared_external_language,declared_external_path,provenance_id FROM semantic_references WHERE tuple_id=?2 AND reference_id=?3",params![tuple,old,id])?;
-            for child in ["semantic_reference_roles", "semantic_reference_candidates"] {
-                let columns = semantic_columns(db, child)?;
-                let fields = columns
-                    .iter()
-                    .map(|c| {
-                        if c == "tuple_id" {
-                            "?1".to_string()
-                        } else {
-                            c.clone()
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",");
-                db.execute(&format!("INSERT INTO {child} SELECT {fields} FROM {child} WHERE tuple_id=?2 AND reference_id=?3"),params![tuple,old,id])?;
-            }
         }
     }
     if except.is_none() {
@@ -7617,113 +7538,6 @@ fn fill_semantic_coverage(db: &Connection, prior: &str, next: &str) -> Result<()
     }
     Ok(())
 }
-fn semantic_columns(db: &Connection, table: &str) -> Result<Vec<String>> {
-    Ok(db
-        .prepare(&format!("PRAGMA table_info({table})"))?
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<_>>()?)
-}
-fn semantic_table_ids(db: &Connection, table: &str, column: &str, id: i64) -> Result<Vec<i64>> {
-    Ok(db
-        .prepare(&format!(
-            "SELECT {} FROM {table} WHERE {column}=?1 ORDER BY {}",
-            if column == "tuple_id" {
-                if table == "semantic_basis" {
-                    "basis_id"
-                } else if table == "semantic_symbols" {
-                    "symbol_id"
-                } else if table == "semantic_declaration_bindings"
-                    || table == "semantic_call_bindings"
-                {
-                    "binding_id"
-                } else {
-                    "relationship_id"
-                }
-            } else {
-                column
-            },
-            if column == "tuple_id" {
-                "rowid"
-            } else {
-                column
-            }
-        ))?
-        .query_map([id], |row| row.get(0))?
-        .collect::<rusqlite::Result<_>>()?)
-}
-fn semantic_table_blobs(
-    db: &Connection,
-    table: &str,
-    column: &str,
-    id: i64,
-) -> Result<Vec<Vec<u8>>> {
-    Ok(db
-        .prepare(&format!(
-            "SELECT {column} FROM {table} WHERE tuple_id=?1 ORDER BY rowid"
-        ))?
-        .query_map([id], |row| row.get(0))?
-        .collect::<rusqlite::Result<_>>()?)
-}
-fn copy_semantic_table(
-    db: &Connection,
-    table: &str,
-    column: &str,
-    old: i64,
-    new: i64,
-) -> Result<()> {
-    let columns = semantic_columns(db, table)?;
-    let fields = columns
-        .iter()
-        .map(|c| {
-            if c == column {
-                "?1".to_string()
-            } else {
-                c.clone()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    db.execute(
-        &format!("INSERT INTO {table} SELECT {fields} FROM {table} WHERE {column}=?2"),
-        params![new, old],
-    )?;
-    Ok(())
-}
-fn copy_semantic_surrogate(
-    db: &Connection,
-    table: &str,
-    id: &str,
-    parent: &str,
-    old: i64,
-    new: i64,
-) -> Result<i64> {
-    let columns = semantic_columns(db, table)?;
-    let fields = columns
-        .iter()
-        .filter(|c| c.as_str() != id)
-        .map(|c| {
-            if c == parent {
-                "?1".to_string()
-            } else {
-                c.clone()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    let count = columns.len() - 1;
-    let names = columns
-        .into_iter()
-        .filter(|c| c != id)
-        .collect::<Vec<_>>()
-        .join(",");
-    ensure!(count > 0, "invalid semantic row");
-    db.execute(
-        &format!("INSERT INTO {table}({names}) SELECT {fields} FROM {table} WHERE {id}=?2"),
-        params![new, old],
-    )?;
-    Ok(db.last_insert_rowid())
-}
-
 fn semantic_enum<T: serde::de::DeserializeOwned>(value: String) -> Result<T> {
     serde_json::from_value(serde_json::Value::String(value)).map_err(|error| {
         SelectedIntegrity(format!(
@@ -7735,8 +7549,9 @@ fn semantic_enum<T: serde::de::DeserializeOwned>(value: String) -> Result<T> {
 fn semantic_target_read(
     row: &rusqlite::Row<'_>,
     start: usize,
-    source_set: &str,
+    scope: &semantic_payload::TargetScope<'_>,
 ) -> Result<Option<crate::semantic_evidence::Target>> {
+    let source_set = scope.source_set;
     use crate::semantic_evidence as sem;
     let kind: Option<String> = row.get(start)?;
     Ok(match kind.as_deref() {
@@ -7761,7 +7576,9 @@ fn semantic_target_read(
                     language: row.get(start + 2)?,
                     path: row.get(start + 3)?,
                 },
-                revision_id: row.get(start + 4)?,
+                revision_id: row
+                    .get::<_, Option<String>>(start + 4)?
+                    .unwrap_or_else(|| scope.native.to_owned()),
             })
         }
         Some("external") => {
@@ -7806,11 +7623,11 @@ fn semantic_targets(
     stmt: &mut rusqlite::Statement<'_>,
     start: usize,
     values: &[&dyn rusqlite::ToSql],
-    source_set: &str,
+    scope: &semantic_payload::TargetScope<'_>,
 ) -> Result<Vec<crate::semantic_evidence::Target>> {
     let rows = stmt
         .query_map(values, |row| {
-            let target = semantic_target_read(row, start, source_set).map_err(|e| {
+            let target = semantic_target_read(row, start, scope).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
                     start,
                     rusqlite::types::Type::Text,
@@ -7965,14 +7782,15 @@ fn semantic_candidate_ids(
 /// The import-time partial reasons stored for one coverage tuple (#520).
 fn read_coverage_reasons(
     db: &Connection,
+    payload: Option<i64>,
     tuple: i64,
 ) -> Result<Option<crate::semantic_evidence::CoverageReasons>> {
     let row: Option<([i64; 4], [bool; 3])> = db
         .prepare_cached(
             "SELECT macro_invocation,attribute_item,macro_definition,other,capped,omitted,captured_diagnostics
-             FROM semantic_coverage_reasons WHERE tuple_id=?1",
+             FROM semantic_coverage_reasons WHERE payload_id=?1 OR tuple_id=?2",
         )?
-        .query_row([tuple], |r| {
+        .query_row(params![payload, tuple], |r| {
             Ok((
                 [r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?],
                 [r.get(4)?, r.get(5)?, r.get(6)?],
@@ -8025,13 +7843,46 @@ fn read_semantic_tuple_for_call(
     trusted_admitted_raw: bool,
     call_id: Option<&[u8]>,
 ) -> Result<crate::semantic_evidence::SemanticSnapshot> {
+    let source_set: String = db.query_row(
+        "SELECT source_set_id FROM native_revisions WHERE id=?1",
+        [key],
+        |r| r.get(0),
+    )?;
+    read_semantic_tuple_with_reasons(
+        db,
+        key,
+        selected_tuple,
+        history_syntax,
+        trusted_admitted_raw,
+        call_id,
+        selected_tuple.is_none(),
+        source_set,
+        None,
+    )
+}
+
+/// A tuple of one revision read as evidence of another (#680 T1): the other revision's native
+/// revision, and the freshness its manifest row will carry.
+#[cfg_attr(not(feature = "test-support"), allow(dead_code))]
+struct ReadAs<'a> {
+    native: &'a str,
+    freshness: &'a BTreeMap<i64, crate::semantic_evidence::Freshness>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_semantic_tuple_with_reasons(
+    db: &Connection,
+    key: &str,
+    selected_tuple: Option<i64>,
+    history_syntax: Option<&str>,
+    trusted_admitted_raw: bool,
+    call_id: Option<&[u8]>,
+    with_reasons: bool,
+    source_set: String,
+    read_as: Option<ReadAs<'_>>,
+) -> Result<crate::semantic_evidence::SemanticSnapshot> {
     use crate::native_evidence::DocumentKey;
     use crate::semantic_evidence as sem;
-    let (source_set, native_id): (String, String) = db.query_row(
-        "SELECT source_set_id,native_revision_id FROM native_revisions WHERE id=?1",
-        [key],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
     let mut result = sem::SemanticSnapshot {
         producers: vec![],
         coverage: vec![],
@@ -8058,27 +7909,52 @@ fn read_semantic_tuple_for_call(
             position_encoding: semantic_enum(encoding)?,
         });
     }
-    let tuples=db.prepare("SELECT tuple_id,producer_id,producer_version,language,path,requested,selected,state,diagnostic FROM semantic_coverage WHERE revision_id=?1 AND (?2 IS NULL OR tuple_id=?2) ORDER BY tuple_id")?.query_map(params![key, selected_tuple],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,bool>(5)?,r.get::<_,bool>(6)?,r.get::<_,String>(7)?,r.get::<_,Option<String>>(8)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-    for (tuple, producer_id, _version, language, path, requested, selected, state, diagnostic) in
-        tuples
+    let tuples=db.prepare("SELECT tuple_id,producer_id,producer_version,language,path,requested,selected,state,diagnostic,payload_id FROM semantic_coverage WHERE revision_id=?1 AND (?2 IS NULL OR tuple_id=?2) ORDER BY tuple_id")?.query_map(params![key, selected_tuple],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,bool>(5)?,r.get::<_,bool>(6)?,r.get::<_,String>(7)?,r.get::<_,Option<String>>(8)?,r.get::<_,Option<i64>>(9)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    for (
+        tuple,
+        producer_id,
+        _version,
+        language,
+        path,
+        requested,
+        selected,
+        state,
+        diagnostic,
+        payload,
+    ) in tuples
     {
-        native_first::context::validate_tuple(db, key, &producer_id, tuple)?;
+        native_first::context::validate_tuple(db, key, &producer_id, payload)?;
+        let projection = match &read_as {
+            Some(read_as) => semantic_payload::project_payload(
+                db,
+                key,
+                tuple,
+                semantic_payload::FreshnessSource::Publication(read_as.freshness),
+            )?
+            .at_native(read_as.native),
+            None => semantic_payload::project_payload(
+                db,
+                key,
+                tuple,
+                semantic_payload::FreshnessSource::Stored,
+            )?,
+        };
         let supported_roles = semantic_ordered(
             db,
-            "SELECT ordinal,role FROM semantic_coverage_roles WHERE tuple_id=?1 AND kind='supported' ORDER BY ordinal",
-            &[&tuple],
+            "SELECT ordinal,role FROM semantic_coverage_roles WHERE kind='supported' AND (payload_id=?1 OR tuple_id=?2) ORDER BY ordinal",
+            &[&payload, &tuple],
         )?;
         let observed_roles = semantic_ordered(
             db,
-            "SELECT ordinal,role FROM semantic_coverage_roles WHERE tuple_id=?1 AND kind='observed' ORDER BY ordinal",
-            &[&tuple],
+            "SELECT ordinal,role FROM semantic_coverage_roles WHERE kind='observed' AND (payload_id=?1 OR tuple_id=?2) ORDER BY ordinal",
+            &[&payload, &tuple],
         )?;
         result.coverage.push(sem::Coverage {
             producer_id: producer_id.clone(),
             language: semantic_enum(language.clone())?,
             source_set_id: source_set.clone(),
             document_path: path.clone(),
-            revision_id: native_id.clone(),
+            revision_id: projection.native().to_owned(),
             requested,
             selected,
             state: semantic_enum(state)?,
@@ -8087,8 +7963,8 @@ fn read_semantic_tuple_for_call(
             diagnostic,
             // Import-time reasons belong to whole-revision snapshots, not answer projections.
             // The witnessed rejoin explicitly reads its required tuple metadata.
-            reasons: if selected_tuple.is_none() {
-                read_coverage_reasons(db, tuple)?
+            reasons: if with_reasons {
+                read_coverage_reasons(db, payload, tuple)?
             } else {
                 None
             },
@@ -8098,17 +7974,16 @@ fn read_semantic_tuple_for_call(
             language: language.clone(),
             path: path.clone(),
         };
-        let rows=db.prepare("SELECT p.provenance_id,p.content_hash,p.evidence_kind,p.freshness,p.derived_from_provenance_id,b.producer_id,b.producer_version,b.producer_hash,b.artifact_hash,b.language,b.source_set_id,b.captured_native_revision_id,b.source_manifest_hash,b.toolchain_hash,b.config_hash,b.dependency_hash,b.basis_id,p.capture_id,p.derived_from_record_kind,p.derived_from_fact_digest FROM semantic_provenance p JOIN semantic_basis b ON b.tuple_id=p.tuple_id AND b.basis_id=p.basis_id WHERE p.tuple_id=?1 AND (?5 IS NULL OR p.provenance_id IN (SELECT provenance_id FROM semantic_call_bindings WHERE tuple_id=?1 AND call_id=?5)) AND (?2 IS NULL OR p.provenance_id IN (SELECT provenance_id FROM semantic_declaration_bindings WHERE tuple_id=?1 AND syntax_id=?2 UNION SELECT s.provenance_id FROM semantic_symbols s JOIN semantic_symbol_targets t ON t.symbol_id=s.symbol_id WHERE s.tuple_id=?1 AND t.kind='internal' AND t.internal_syntax_id=?2 AND t.internal_language=?3 AND t.internal_path=?4 UNION SELECT provenance_id FROM semantic_type_relationships WHERE tuple_id=?1 AND source_kind='internal' AND source_internal_syntax_id=?2 AND source_internal_language=?3 AND source_internal_path=?4)) ORDER BY p.rowid")?.query_map(params![tuple, history_syntax.and_then(id_codec::encode_sid), language, path, call_id],|r|{
-            Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,String>(8)?,r.get::<_,String>(9)?,r.get::<_,String>(10)?,r.get::<_,String>(11)?,r.get::<_,String>(12)?,r.get::<_,String>(13)?,r.get::<_,String>(14)?,r.get::<_,String>(15)?,r.get::<_,i64>(16)?,r.get::<_,Option<i64>>(17)?,r.get::<_,Option<String>>(18)?,r.get::<_,Option<String>>(19)?))
+        let rows=db.prepare("SELECT p.ordinal,p.content_hash,p.evidence_kind,p.derived_from_provenance_id,b.producer_id,b.producer_version,b.producer_hash,b.artifact_hash,b.language,b.source_set_id,b.captured_native_revision_id,b.source_manifest_hash,b.toolchain_hash,b.config_hash,b.dependency_hash,b.basis_id,p.capture_id,p.derived_from_record_kind,p.derived_from_fact_digest FROM semantic_provenance p JOIN semantic_basis b ON b.payload_id=p.payload_id AND b.basis_id=p.basis_id WHERE p.payload_id=?1 AND (?5 IS NULL OR p.ordinal IN (SELECT provenance_ordinal FROM semantic_call_bindings WHERE payload_id=?1 AND call_id=?5)) AND (?2 IS NULL OR p.ordinal IN (SELECT provenance_ordinal FROM semantic_declaration_bindings WHERE payload_id=?1 AND syntax_id=?2 UNION SELECT s.provenance_ordinal FROM semantic_symbols s JOIN semantic_symbol_targets t ON t.symbol_id=s.symbol_id WHERE s.payload_id=?1 AND t.kind='internal' AND t.internal_syntax_id=?2 AND t.internal_language=?3 AND t.internal_path=?4 UNION SELECT provenance_ordinal FROM semantic_type_relationships WHERE payload_id=?1 AND source_kind='internal' AND source_internal_syntax_id=?2 AND source_internal_language=?3 AND source_internal_path=?4)) ORDER BY p.ordinal")?.query_map(params![payload, history_syntax.and_then(id_codec::encode_sid), language, path, call_id],|r|{
+            Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,String>(8)?,r.get::<_,String>(9)?,r.get::<_,String>(10)?,r.get::<_,String>(11)?,r.get::<_,String>(12)?,r.get::<_,String>(13)?,r.get::<_,String>(14)?,r.get::<_,i64>(15)?,r.get::<_,Option<i64>>(16)?,r.get::<_,Option<String>>(17)?,r.get::<_,Option<String>>(18)?))
         })?.collect::<rusqlite::Result<Vec<_>>>()?;
         let mut lookup_dependencies_stmt = db.prepare_cached(
             "SELECT ordinal,lookup_key FROM semantic_basis_lookup_dependencies WHERE basis_id=?1 ORDER BY ordinal",
         )?;
         for (
-            id,
+            ordinal,
             content_hash,
             evidence_kind,
-            freshness,
             derived,
             producer,
             version,
@@ -8214,10 +8089,10 @@ fn read_semantic_tuple_for_call(
             let lookup_dependencies =
                 semantic_ordered_rows::<String>(&mut lookup_dependencies_stmt, &[&basis_id])?;
             result.provenance.push(sem::Provenance {
-                id,
+                id: projection.provenance_id(ordinal)?,
                 producer_id: producer_id.clone(),
                 document: document.clone(),
-                revision_id: native_id.clone(),
+                revision_id: projection.native().to_owned(),
                 content_hash,
                 evidence_kind: semantic_enum(evidence_kind)?,
                 basis: Some(sem::SemanticBasis {
@@ -8234,12 +8109,12 @@ fn read_semantic_tuple_for_call(
                     dependency_hash,
                     lookup_dependencies,
                 }),
-                freshness: semantic_enum(freshness)?,
+                freshness: projection.freshness(basis_id)?,
                 derived_from,
             });
         }
         if history_syntax.is_none() {
-            read_semantic_facts(db, tuple, &document, &native_id, &mut result, call_id)?;
+            read_semantic_facts(db, &projection, &document, &mut result, call_id)?;
         }
     }
     Ok(result)
@@ -8338,7 +8213,7 @@ fn read_semantic_history(
         .producers
         .first()
         .map(|p| (&p.version, &p.executable_hash));
-    let historical_bases = db.prepare("SELECT producer_version,producer_hash,source_set_id,captured_native_revision_id,source_manifest_hash,toolchain_hash,config_hash,dependency_hash FROM semantic_basis WHERE tuple_id=?1")?
+    let historical_bases = db.prepare("SELECT producer_version,producer_hash,source_set_id,captured_native_revision_id,source_manifest_hash,toolchain_hash,config_hash,dependency_hash FROM semantic_basis WHERE payload_id=(SELECT payload_id FROM semantic_coverage WHERE tuple_id=?1)")?
         .query_map([tuple], |r| Ok((r.get::<_, String>(0)?,r.get::<_, String>(1)?,r.get::<_, String>(2)?,r.get::<_, String>(3)?,r.get::<_, String>(4)?,r.get::<_, String>(5)?,r.get::<_, String>(6)?,r.get::<_, String>(7)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let rows = db.prepare("SELECT d.ordinal,d.language,d.path,v.content_hash FROM revision_documents d JOIN document_versions v ON v.vid=d.vid WHERE d.revision_id=?1 ORDER BY d.ordinal")?
@@ -8395,18 +8270,20 @@ fn read_semantic_history(
 
 fn read_semantic_facts(
     db: &Connection,
-    tuple: i64,
+    projection: &semantic_payload::PayloadProjection<'_>,
     document: &crate::native_evidence::DocumentKey,
-    native_id: &str,
     result: &mut crate::semantic_evidence::SemanticSnapshot,
     selected_call: Option<&[u8]>,
 ) -> Result<()> {
     use crate::semantic_evidence as sem;
     let source_set = &document.source_set_id;
+    let Some(tuple) = projection.payload_id else {
+        return Ok(());
+    };
     if selected_call.is_some() {
-        return read_semantic_call_facts(db, tuple, document, result, selected_call);
+        return read_semantic_call_facts(db, projection, document, result, selected_call);
     }
-    let symbol_rows=db.prepare("SELECT symbol_id,ordinal,key_scheme,key_symbol,key_scope,key_document_language,key_document_path,display_name,provenance_id FROM semantic_symbols WHERE tuple_id=?1 ORDER BY ordinal")?.query_map([tuple],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,Option<String>>(6)?,r.get::<_,Option<String>>(7)?,r.get::<_,String>(8)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let symbol_rows=db.prepare("SELECT symbol_id,ordinal,key_scheme,key_symbol,key_scope,key_document_language,key_document_path,display_name,provenance_ordinal FROM semantic_symbols WHERE payload_id=?1 ORDER BY ordinal")?.query_map([tuple],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,Option<String>>(6)?,r.get::<_,Option<String>>(7)?,r.get::<_,i64>(8)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
     // Keep child statements alive across their fact loops: cache return clears bindings.
     let mut symbol_targets = db.prepare_cached(
         "SELECT * FROM semantic_symbol_targets WHERE symbol_id=?1 ORDER BY ordinal",
@@ -8423,11 +8300,11 @@ fn read_semantic_facts(
         result.symbols.push(sem::Symbol {
             key: semantic_symbol_key_read(scheme, symbol, scope, language, path, source_set)?,
             display_name,
-            declarations: semantic_targets(&mut symbol_targets, 2, &[&id], source_set)?,
-            provenance_id,
+            declarations: semantic_targets(&mut symbol_targets, 2, &[&id], &projection.scope())?,
+            provenance_id: projection.provenance_id(provenance_id)?,
         });
     }
-    let binding_rows=db.prepare("SELECT binding_id,ordinal,syntax_id,provenance_id,join_document_language,join_document_path,join_native_revision_id,join_content_hash,join_start,join_end,join_kind,join_status,join_diagnostic FROM semantic_declaration_bindings WHERE tuple_id=?1 ORDER BY ordinal")?.query_map([tuple],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,Option<Vec<u8>>>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,i64>(8)?,r.get::<_,i64>(9)?,r.get::<_,String>(10)?,r.get::<_,String>(11)?,r.get::<_,Option<String>>(12)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let binding_rows=db.prepare("SELECT binding_id,ordinal,syntax_id,provenance_ordinal,join_document_language,join_document_path,join_native_revision_id,join_content_hash,join_start,join_end,join_kind,join_status,join_diagnostic FROM semantic_declaration_bindings WHERE payload_id=?1 ORDER BY ordinal")?.query_map([tuple],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,Option<Vec<u8>>>(2)?,r.get::<_,i64>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,Option<String>>(6)?,r.get::<_,String>(7)?,r.get::<_,i64>(8)?,r.get::<_,i64>(9)?,r.get::<_,String>(10)?,r.get::<_,String>(11)?,r.get::<_,Option<String>>(12)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
     let mut declaration_symbols = db.prepare_cached(
         "SELECT ordinal,scheme,symbol,scope,document_language,document_path FROM semantic_declaration_binding_symbols WHERE binding_id=?1 ORDER BY ordinal",
     )?;
@@ -8473,7 +8350,7 @@ fn read_semantic_facts(
                         language,
                         path,
                     },
-                    revision_id,
+                    revision_id: projection.revision(revision_id),
                     content_hash,
                     range: crate::native_evidence::Range {
                         start: start.try_into().context(SelectedIntegrity(
@@ -8493,13 +8370,13 @@ fn read_semantic_facts(
                 )?,
                 diagnostic,
             },
-            provenance_id,
+            provenance_id: projection.provenance_id(provenance_id)?,
         });
     }
     let reference_rows = db
-        .prepare("SELECT * FROM semantic_references WHERE tuple_id=?1 ORDER BY rowid")?
+        .prepare("SELECT * FROM semantic_references WHERE payload_id=?1 ORDER BY rowid")?
         .query_map([tuple], |r| {
-            let target = semantic_target_read(r, 10, source_set).map_err(|e| {
+            let target = semantic_target_read(r, 10, &projection.scope()).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
                     10,
                     rusqlite::types::Type::Text,
@@ -8517,15 +8394,15 @@ fn read_semantic_facts(
                 r.get::<_, String>(8)?,
                 r.get::<_, String>(9)?,
                 target,
-                r.get::<_, String>(20)?,
+                r.get::<_, i64>(20)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut reference_roles = db.prepare_cached(
-        "SELECT ordinal,role FROM semantic_reference_roles WHERE tuple_id=?1 AND reference_id=?2 ORDER BY ordinal",
+        "SELECT ordinal,role FROM semantic_reference_roles WHERE payload_id=?1 AND reference_id=?2 ORDER BY ordinal",
     )?;
     let mut reference_candidates = db.prepare_cached(
-        "SELECT * FROM semantic_reference_candidates WHERE tuple_id=?1 AND reference_id=?2 ORDER BY ordinal",
+        "SELECT * FROM semantic_reference_candidates WHERE payload_id=?1 AND reference_id=?2 ORDER BY ordinal",
     )?;
     for (
         id,
@@ -8542,8 +8419,12 @@ fn read_semantic_facts(
     ) in reference_rows
     {
         let roles = semantic_ordered_rows(&mut reference_roles, &[&tuple, &id])?;
-        let candidates =
-            semantic_targets(&mut reference_candidates, 3, &[&tuple, &id], source_set)?;
+        let candidates = semantic_targets(
+            &mut reference_candidates,
+            3,
+            &[&tuple, &id],
+            &projection.scope(),
+        )?;
         result.references.push(sem::Reference {
             id: id_codec::decode_occ(&id).context(SelectedIntegrity(
                 "incompatible_index: corrupt semantic reference ID".into(),
@@ -8555,7 +8436,7 @@ fn read_semantic_facts(
                 "incompatible_index: invalid semantic ordinal".into(),
             ))?,
             document: document.clone(),
-            revision_id: native_id.into(),
+            revision_id: projection.native().to_owned(),
             range: crate::native_evidence::Range {
                 start: start.try_into().context(SelectedIntegrity(
                     "incompatible_index: invalid semantic start".into(),
@@ -8571,21 +8452,21 @@ fn read_semantic_facts(
             resolution: semantic_enum(resolution)?,
             declared_target,
             candidates,
-            provenance_id,
+            provenance_id: projection.provenance_id(provenance_id)?,
         });
     }
-    read_semantic_call_facts(db, tuple, document, result, None)?;
+    read_semantic_call_facts(db, projection, document, result, None)?;
     let relationship_rows = db
-        .prepare("SELECT * FROM semantic_type_relationships WHERE tuple_id=?1 ORDER BY ordinal")?
+        .prepare("SELECT * FROM semantic_type_relationships WHERE payload_id=?1 ORDER BY ordinal")?
         .query_map([tuple], |r| {
-            let source = semantic_target_read(r, 4, source_set).map_err(|e| {
+            let source = semantic_target_read(r, 4, &projection.scope()).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
                     4,
                     rusqlite::types::Type::Text,
                     Box::new(std::io::Error::other(e.to_string())),
                 )
             })?;
-            let target = semantic_target_read(r, 14, source_set).map_err(|e| {
+            let target = semantic_target_read(r, 14, &projection.scope()).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
                     14,
                     rusqlite::types::Type::Text,
@@ -8597,7 +8478,7 @@ fn read_semantic_facts(
                 r.get::<_, String>(3)?,
                 source,
                 target,
-                r.get::<_, String>(24)?,
+                r.get::<_, i64>(24)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -8616,7 +8497,7 @@ fn read_semantic_facts(
             target: target.context(SelectedIntegrity(
                 "incompatible_index: missing semantic target".into(),
             ))?,
-            provenance_id,
+            provenance_id: projection.provenance_id(provenance_id)?,
         });
     }
     Ok(())
@@ -8624,17 +8505,20 @@ fn read_semantic_facts(
 
 fn read_semantic_call_facts(
     db: &Connection,
-    tuple: i64,
+    projection: &semantic_payload::PayloadProjection<'_>,
     document: &crate::native_evidence::DocumentKey,
     result: &mut crate::semantic_evidence::SemanticSnapshot,
     selected_call: Option<&[u8]>,
 ) -> Result<()> {
     use crate::semantic_evidence as sem;
     let source_set = &document.source_set_id;
+    let Some(tuple) = projection.payload_id else {
+        return Ok(());
+    };
     let call_rows = db
-        .prepare("SELECT * FROM semantic_call_bindings WHERE tuple_id=?1 AND (?2 IS NULL OR call_id=?2) ORDER BY ordinal")?
+        .prepare("SELECT * FROM semantic_call_bindings WHERE payload_id=?1 AND (?2 IS NULL OR call_id=?2) ORDER BY ordinal")?
         .query_map(params![tuple, selected_call], |r| {
-            let target = semantic_target_read(r, 14, source_set).map_err(|e| {
+            let target = semantic_target_read(r, 14, &projection.scope()).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
                     14,
                     rusqlite::types::Type::Text,
@@ -8647,7 +8531,7 @@ fn read_semantic_call_facts(
                 r.get::<_, Option<Vec<u8>>>(3)?,
                 r.get::<_, String>(4)?,
                 r.get::<_, String>(5)?,
-                r.get::<_, String>(6)?,
+                r.get::<_, Option<String>>(6)?,
                 r.get::<_, String>(7)?,
                 r.get::<_, i64>(8)?,
                 r.get::<_, i64>(9)?,
@@ -8659,7 +8543,7 @@ fn read_semantic_call_facts(
                 r.get::<_, String>(24)?,
                 r.get::<_, bool>(25)?,
                 r.get::<_, Option<bool>>(26)?,
-                r.get::<_, String>(27)?,
+                r.get::<_, i64>(27)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -8715,7 +8599,7 @@ fn read_semantic_call_facts(
                         language,
                         path,
                     },
-                    revision_id,
+                    revision_id: projection.revision(revision_id),
                     content_hash,
                     range: crate::native_evidence::Range {
                         start: start.try_into().context(SelectedIntegrity(
@@ -8733,12 +8617,17 @@ fn read_semantic_call_facts(
             },
             resolution: semantic_enum(resolution)?,
             declared_target,
-            candidates: semantic_targets(&mut call_candidates, 2, &[&id], source_set)?,
+            candidates: semantic_targets(&mut call_candidates, 2, &[&id], &projection.scope())?,
             dispatch: semantic_enum(dispatch)?,
-            possible_dispatch: semantic_targets(&mut possible_dispatch, 2, &[&id], source_set)?,
+            possible_dispatch: semantic_targets(
+                &mut possible_dispatch,
+                2,
+                &[&id],
+                &projection.scope(),
+            )?,
             possible_dispatch_complete,
             stale_target,
-            provenance_id,
+            provenance_id: projection.provenance_id(provenance_id)?,
         });
     }
     Ok(())
@@ -8754,47 +8643,292 @@ fn producer_identity_kind(producer_id: &str) -> &'static str {
         .as_str()
 }
 
-/// Writes every coverage tuple of `publication` with its owned semantic rows.
+/// The `document_versions.id` of a document at `key`.
+fn document_version_id(
+    db: &Connection,
+    key: &str,
+    language: &str,
+    path: &str,
+) -> Result<Option<String>> {
+    Ok(db
+        .prepare_cached("SELECT v.id FROM revision_documents d JOIN document_versions v ON v.vid=d.vid WHERE d.revision_id=?1 AND d.language=?2 AND d.path=?3")?
+        .query_row(params![key, language, path], |r| r.get(0))
+        .optional()?)
+}
+
+fn insert_coverage_reasons(
+    db: &Connection,
+    payload: Option<i64>,
+    tuple: Option<i64>,
+    reasons: &crate::semantic_evidence::CoverageReasons,
+) -> Result<()> {
+    let gaps = reasons.gaps();
+    execute_cached(
+        db,
+        "INSERT INTO semantic_coverage_reasons(payload_id,tuple_id,macro_invocation,attribute_item,macro_definition,other,capped,omitted,captured_diagnostics) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        params![
+            payload,
+            tuple,
+            i64::try_from(gaps[0])?,
+            i64::try_from(gaps[1])?,
+            i64::try_from(gaps[2])?,
+            i64::try_from(gaps[3])?,
+            reasons.capped,
+            reasons.omitted,
+            reasons.captured_diagnostics
+        ],
+    )?;
+    Ok(())
+}
+
+/// The columns that identify a basis, plus its lookup dependencies.
+fn basis_identity(basis: &crate::semantic_evidence::SemanticBasis) -> Result<Vec<String>> {
+    let mut identity = vec![
+        basis.producer_id.clone(),
+        basis.producer_version.clone(),
+        basis.producer_hash.clone(),
+        basis.artifact_hash.clone(),
+        semantic_variant(&basis.language)?,
+        basis.source_set_id.clone(),
+        basis.revision_id.clone(),
+        basis.source_manifest_hash.clone(),
+        basis.toolchain_hash.clone(),
+        basis.config_hash.clone(),
+        basis.dependency_hash.clone(),
+    ];
+    identity.extend(basis.lookup_dependencies.iter().cloned());
+    Ok(identity)
+}
+
+/// Writes every coverage tuple of `publication`: a manifest row per document that names a
+/// payload, unless the row is unrequested or omitted with no facts (D1). `batch` is the raw
+/// batch the publication was joined from and the revision it captured; only a batch-written
+/// payload can be reused.
 fn write_import_coverage(
     db: &Connection,
     key: &str,
     publication: &crate::semantic_evidence::SemanticPublication,
+    batch: Option<(i64, &str)>,
+    inputs: &semantic_payload::KeyInputs,
 ) -> Result<()> {
+    use crate::semantic_evidence as sem;
+    let native: String = query_row_cached(
+        db,
+        "SELECT native_revision_id FROM native_revisions WHERE id=?1",
+        [key],
+        |r| r.get(0),
+    )?;
     for coverage in &publication.coverage {
         let producer = publication
             .producers
             .iter()
             .find(|p| p.id == coverage.producer_id)
             .context("missing semantic producer")?;
-        execute_cached(
-            db,
-            "INSERT INTO semantic_coverage(revision_id,producer_id,producer_version,language,path,requested,selected,state,diagnostic) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-            params![
-                key,
-                coverage.producer_id,
-                producer.version,
-                semantic_variant(&coverage.language)?,
-                coverage.document_path,
-                coverage.requested,
-                coverage.selected,
-                semantic_variant(&coverage.state)?,
-                coverage.diagnostic
-            ],
-        )?;
-        let tuple = db.last_insert_rowid();
-        for (kind, roles) in [
-            ("supported", &coverage.supported_roles),
-            ("observed", &coverage.observed_roles),
-        ] {
-            for (ordinal, role) in roles.iter().enumerate() {
+        let language = semantic_variant(&coverage.language)?;
+        let owns = semantic_payload::owned_provenance(coverage, publication);
+        let insert_manifest = |payload: Option<i64>| -> Result<i64> {
+            execute_cached(
+                db,
+                "INSERT INTO semantic_coverage(revision_id,producer_id,producer_version,language,path,requested,selected,state,diagnostic,payload_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                params![
+                    key,
+                    coverage.producer_id,
+                    producer.version,
+                    language,
+                    coverage.document_path,
+                    coverage.requested,
+                    coverage.selected,
+                    semantic_variant(&coverage.state)?,
+                    coverage.diagnostic,
+                    payload
+                ],
+            )?;
+            Ok(db.last_insert_rowid())
+        };
+        if matches!(
+            coverage.state,
+            sem::CoverageState::NotRequested | sem::CoverageState::Omitted
+        ) && owns.is_empty()
+        {
+            let tuple = insert_manifest(None)?;
+            ensure!(
+                coverage.observed_roles.is_empty(),
+                "payload-less coverage observed roles"
+            );
+            for (ordinal, role) in coverage.supported_roles.iter().enumerate() {
                 execute_cached(
                     db,
-                    "INSERT INTO semantic_coverage_roles VALUES(?1,?2,?3,?4)",
-                    params![tuple, kind, ordinal as i64, semantic_variant(role)?],
+                    "INSERT INTO semantic_coverage_roles(payload_id,tuple_id,kind,ordinal,role) VALUES(NULL,?1,'supported',?2,?3)",
+                    params![tuple, ordinal as i64, semantic_variant(role)?],
                 )?;
             }
+            if let Some(reasons) = &coverage.reasons {
+                insert_coverage_reasons(db, None, Some(tuple), reasons)?;
+            }
+            continue;
         }
-        write_semantic_tuple(db, tuple, coverage, publication)?;
+        let mut bases: BTreeMap<String, (&sem::SemanticBasis, sem::Freshness)> = BTreeMap::new();
+        for proof in publication
+            .provenance
+            .iter()
+            .filter(|p| owns.contains(p.id.as_str()) && p.producer_id == coverage.producer_id)
+        {
+            let basis = proof
+                .basis
+                .as_ref()
+                .context("missing captured semantic basis")?;
+            let known = bases
+                .entry(serde_json::to_string(basis)?)
+                .or_insert((basis, proof.freshness));
+            ensure!(
+                known.1 == proof.freshness,
+                "semantic freshness differs within a basis"
+            );
+        }
+        let own_version = document_version_id(db, key, &language, &coverage.document_path)?
+            .context("semantic document missing from its revision")?;
+        let keyed = batch.filter(|_| !coverage.reasons.as_ref().is_some_and(|r| r.omitted));
+        let mut dependencies = Vec::new();
+        for ((dep_language, dep_path), targets) in
+            semantic_payload::projection_dependencies(&owns, publication)
+        {
+            selected_ensure!(
+                document_version_id(db, key, &dep_language, &dep_path)?.is_some(),
+                "incompatible_index: semantic dependency endpoint missing"
+            );
+            let own = dep_language == language && dep_path == coverage.document_path;
+            let targets = targets
+                .into_iter()
+                .map(|(syntax_id, call)| {
+                    Ok((
+                        id_codec::encode_sid(&syntax_id)
+                            .context("invalid semantic dependency syntax ID")?,
+                        call,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let term = match keyed {
+                Some((_, captured_pin)) if !own => Some(semantic_payload::dependency_term(
+                    db,
+                    key,
+                    captured_pin,
+                    &dep_language,
+                    &dep_path,
+                    &targets,
+                )?),
+                _ => None,
+            };
+            dependencies.push(semantic_payload::DependencyRecord {
+                language: dep_language,
+                path: dep_path,
+                term,
+                targets,
+            });
+        }
+        let terms: Vec<(String, String, String)> = dependencies
+            .iter()
+            .filter_map(|d| Some((d.language.clone(), d.path.clone(), d.term.clone()?)))
+            .collect();
+        let payload_key = match keyed {
+            Some((batch, _)) => {
+                let (descriptor, captured): (String, String) = query_row_cached(
+                    db,
+                    "SELECT descriptor_sha256,captured_revision FROM semantic_raw_batches WHERE batch_id=?1",
+                    [batch],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                semantic_payload::payload_key(
+                    inputs,
+                    producer,
+                    &descriptor,
+                    &captured,
+                    &language,
+                    &coverage.document_path,
+                    &own_version,
+                    &terms,
+                )
+            }
+            None => None,
+        };
+        let hit: Option<i64> = match &payload_key {
+            Some(payload_key) => query_row_cached(
+                db,
+                "SELECT payload_id FROM semantic_payloads WHERE payload_key=?1",
+                [payload_key],
+                |r| r.get(0),
+            )
+            .optional()?,
+            None => None,
+        };
+        let (payload, basis_ids) = if let Some(payload) = hit {
+            let mut stored: Vec<(i64, Vec<String>)> = Vec::new();
+            let mut rows = db.prepare_cached("SELECT basis_id,producer_id,producer_version,producer_hash,artifact_hash,language,source_set_id,captured_native_revision_id,source_manifest_hash,toolchain_hash,config_hash,dependency_hash FROM semantic_basis WHERE payload_id=?1 ORDER BY basis_id")?;
+            let mut rows = rows.query([payload])?;
+            while let Some(row) = rows.next()? {
+                let mut identity = Vec::with_capacity(11);
+                for column in 1..12 {
+                    identity.push(row.get::<_, String>(column)?);
+                }
+                let id: i64 = row.get(0)?;
+                let mut lookups = db.prepare_cached("SELECT lookup_key FROM semantic_basis_lookup_dependencies WHERE basis_id=?1 ORDER BY ordinal")?;
+                identity.extend(
+                    lookups
+                        .query_map([id], |r| r.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?,
+                );
+                stored.push((id, identity));
+            }
+            let mut ids = BTreeMap::new();
+            for (encoded, (basis, _)) in &bases {
+                let identity = basis_identity(basis)?;
+                let found = stored.iter().find(|(_, other)| *other == identity);
+                selected_ensure!(
+                    found.is_some(),
+                    "incompatible_index: reused payload basis differs"
+                );
+                ids.insert(encoded.clone(), found.map_or(0, |(id, _)| *id));
+            }
+            (payload, ids)
+        } else {
+            execute_cached(
+                db,
+                "INSERT INTO semantic_payloads(payload_key,producer_id,producer_version,language,path,version_id,batch_id,join_inputs) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![
+                    payload_key,
+                    coverage.producer_id,
+                    producer.version,
+                    language,
+                    coverage.document_path,
+                    own_version,
+                    batch.map(|(batch, _)| batch),
+                    payload_key.as_ref().map(|_| inputs.join_inputs())
+                ],
+            )?;
+            let payload = db.last_insert_rowid();
+            let ids = write_semantic_tuple(
+                db,
+                payload,
+                &native,
+                coverage,
+                publication,
+                &owns,
+                &dependencies,
+            )?;
+            (payload, ids)
+        };
+        let tuple = insert_manifest(Some(payload))?;
+        for (encoded, (_, freshness)) in &bases {
+            let basis_id = basis_ids.get(encoded).context("missing payload basis")?;
+            execute_cached(
+                db,
+                "INSERT INTO semantic_coverage_freshness VALUES(?1,?2,?3,?4)",
+                params![key, tuple, basis_id, semantic_variant(freshness)?],
+            )?;
+        }
+        #[cfg(feature = "test-support")]
+        if hit.is_some() && native_first::oracle::enabled() {
+            native_first::oracle::check_hit(db, key, tuple, coverage, publication)?;
+        }
     }
     Ok(())
 }
@@ -9012,13 +9146,16 @@ fn write_staged_semantic(
     db: &Connection,
     key: &str,
     producer: &crate::semantic_evidence::Producer,
+    batch: i64,
+    captured_pin: &str,
+    inputs: &semantic_payload::KeyInputs,
     gate: &dyn Fn() -> Result<()>,
 ) -> Result<()> {
     // The tuple writers' statements, each target table's included, stay prepared.
     db.set_prepared_statement_cache_capacity(64);
     let mut index = 0u64;
     crate::semantic_import::read_staged_documents(db, "stage.", producer, &mut |publication| {
-        write_import_coverage(db, key, &publication)?;
+        write_import_coverage(db, key, &publication, Some((batch, captured_pin)), inputs)?;
         if index % 1000 == 999 {
             gate()?;
         }
@@ -9271,30 +9408,13 @@ fn write_semantic(
                 )?;
             }
         }
-        for coverage in &publication.coverage {
-            let producer = publication
-                .producers
-                .iter()
-                .find(|p| p.id == coverage.producer_id)
-                .context("missing semantic producer")?;
-            db.execute("INSERT INTO semantic_coverage(revision_id,producer_id,producer_version,language,path,requested,selected,state,diagnostic) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![
-                key,coverage.producer_id,producer.version,semantic_variant(&coverage.language)?,coverage.document_path,
-                coverage.requested,coverage.selected,semantic_variant(&coverage.state)?,coverage.diagnostic,
-            ])?;
-            let tuple = db.last_insert_rowid();
-            for (kind, roles) in [
-                ("supported", &coverage.supported_roles),
-                ("observed", &coverage.observed_roles),
-            ] {
-                for (ordinal, role) in roles.iter().enumerate() {
-                    db.execute(
-                        "INSERT INTO semantic_coverage_roles VALUES(?1,?2,?3,?4)",
-                        params![tuple, kind, ordinal as i64, semantic_variant(role)?],
-                    )?;
-                }
-            }
-            write_semantic_tuple(db, tuple, coverage, publication)?;
-        }
+        write_import_coverage(
+            db,
+            &key,
+            publication,
+            None,
+            &semantic_payload::KeyInputs::current(),
+        )?;
     }
     if let Some(previous) = prior_key {
         db.execute(
@@ -9310,7 +9430,7 @@ fn write_semantic(
                 "INSERT INTO semantic_requested_producer_languages SELECT ?1,id,language,ordinal FROM semantic_requested_producer_languages WHERE revision_id=?2",
                 params![key, previous],
             )?;
-            copy_semantic_rows(db, &previous, &key, same_native)?;
+            copy_semantic_manifest(db, &previous, &key, same_native, None)?;
         } else {
             fill_semantic_coverage(db, &previous, &key)?;
         }
@@ -9318,38 +9438,65 @@ fn write_semantic(
     Ok(())
 }
 
+/// Writes the payload rows of one new payload. Returns the payload's basis IDs by encoded basis.
 fn write_semantic_tuple(
     db: &Connection,
-    tuple: i64,
+    payload: i64,
+    native: &str,
     coverage: &crate::semantic_evidence::Coverage,
     publication: &crate::semantic_evidence::SemanticPublication,
-) -> Result<()> {
-    use crate::semantic_evidence as sem;
+    owns: &BTreeSet<&str>,
+    dependencies: &[semantic_payload::DependencyRecord],
+) -> Result<BTreeMap<String, i64>> {
+    for (kind, roles) in [
+        ("supported", &coverage.supported_roles),
+        ("observed", &coverage.observed_roles),
+    ] {
+        for (ordinal, role) in roles.iter().enumerate() {
+            execute_cached(
+                db,
+                "INSERT INTO semantic_coverage_roles(payload_id,tuple_id,kind,ordinal,role) VALUES(?1,NULL,?2,?3,?4)",
+                params![payload, kind, ordinal as i64, semantic_variant(role)?],
+            )?;
+        }
+    }
     if let Some(reasons) = &coverage.reasons {
-        let gaps = reasons.gaps();
+        insert_coverage_reasons(db, Some(payload), None, reasons)?;
+    }
+    for dependency in dependencies {
         execute_cached(
             db,
-            "INSERT INTO semantic_coverage_reasons VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            "INSERT INTO semantic_projection_dependencies VALUES(?1,?2,?3,?4)",
             params![
-                tuple,
-                i64::try_from(gaps[0])?,
-                i64::try_from(gaps[1])?,
-                i64::try_from(gaps[2])?,
-                i64::try_from(gaps[3])?,
-                reasons.capped,
-                reasons.omitted,
-                reasons.captured_diagnostics
+                payload,
+                dependency.language,
+                dependency.path,
+                dependency.term
             ],
         )?;
+        for (syntax_id, call) in &dependency.targets {
+            if dependency.term.is_some() {
+                execute_cached(
+                    db,
+                    "INSERT INTO semantic_projection_dependency_targets VALUES(?1,?2,?3,?4,?5)",
+                    params![
+                        payload,
+                        dependency.language,
+                        dependency.path,
+                        syntax_id,
+                        call
+                    ],
+                )?;
+            }
+        }
     }
-    let matches = |p: &sem::Provenance| {
-        p.producer_id == coverage.producer_id
-            && p.document.language == semantic_variant(&coverage.language).unwrap_or_default()
-            && p.document.path == coverage.document_path
-    };
     let mut basis_ids = BTreeMap::new();
-    let mut provenance = BTreeSet::new();
-    for proof in publication.provenance.iter().filter(|p| matches(p)) {
+    let mut provenance: BTreeMap<&str, i64> = BTreeMap::new();
+    for proof in publication
+        .provenance
+        .iter()
+        .filter(|p| owns.contains(p.id.as_str()) && p.producer_id == coverage.producer_id)
+    {
         let basis = proof
             .basis
             .as_ref()
@@ -9360,9 +9507,9 @@ fn write_semantic_tuple(
         } else {
             execute_cached(
                 db,
-                "INSERT INTO semantic_basis(tuple_id,producer_id,producer_version,producer_hash,artifact_hash,language,source_set_id,captured_native_revision_id,source_manifest_hash,toolchain_hash,config_hash,dependency_hash) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                "INSERT INTO semantic_basis(payload_id,producer_id,producer_version,producer_hash,artifact_hash,language,source_set_id,captured_native_revision_id,source_manifest_hash,toolchain_hash,config_hash,dependency_hash) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
                 params![
-                    tuple,
+                    payload,
                     basis.producer_id,
                     basis.producer_version,
                     basis.producer_hash,
@@ -9382,6 +9529,11 @@ fn write_semantic_tuple(
                     db,
                     "INSERT INTO semantic_basis_lookup_dependencies VALUES(?1,?2,?3)",
                     params![id, ordinal as i64, lookup],
+                )?;
+                execute_cached(
+                    db,
+                    "INSERT OR IGNORE INTO semantic_projection_lookup_dependencies VALUES(?1,?2)",
+                    params![payload, lookup],
                 )?;
             }
             basis_ids.insert(encoded, id);
@@ -9403,15 +9555,27 @@ fn write_semantic_tuple(
         } else {
             None
         };
+        if let Some(derived) = derived {
+            ensure!(
+                proof.id
+                    == crate::semantic_import::rejoin_provenance_id(
+                        &derived.provenance_id,
+                        native,
+                        proof.evidence_kind
+                    ),
+                "derived provenance ID differs from its rejoin"
+            );
+        }
+        let ordinal = provenance.len() as i64;
         execute_cached(
             db,
-            "INSERT INTO semantic_provenance(tuple_id,provenance_id,content_hash,evidence_kind,freshness,basis_id,capture_id,derived_from_provenance_id,derived_from_record_kind,derived_from_fact_digest) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            "INSERT INTO semantic_provenance(payload_id,ordinal,provenance_id,content_hash,evidence_kind,basis_id,capture_id,derived_from_provenance_id,derived_from_record_kind,derived_from_fact_digest) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![
-                tuple,
-                proof.id,
+                payload,
+                ordinal,
+                derived.is_none().then_some(&proof.id),
                 proof.content_hash,
                 semantic_variant(&proof.evidence_kind)?,
-                semantic_variant(&proof.freshness)?,
                 basis_id,
                 capture_id,
                 derived.map(|d| &d.provenance_id),
@@ -9421,20 +9585,32 @@ fn write_semantic_tuple(
                 derived.map(|d| &d.fact_digest),
             ],
         )?;
-        provenance.insert(proof.id.as_str());
+        provenance.insert(proof.id.as_str(), ordinal);
     }
-    let owns = |proof: &str| provenance.contains(proof);
+    if !basis_ids.is_empty() {
+        execute_cached(
+            db,
+            "INSERT INTO semantic_projection_contexts VALUES(?1)",
+            [payload],
+        )?;
+    }
+    let ordinal_of = |proof: &str| -> Result<i64> {
+        provenance
+            .get(proof)
+            .copied()
+            .context("semantic fact names provenance outside its tuple")
+    };
     for (ordinal, symbol) in publication
         .symbols
         .iter()
-        .filter(|s| owns(&s.provenance_id))
+        .filter(|s| provenance.contains_key(s.provenance_id.as_str()))
         .enumerate()
     {
         execute_cached(
             db,
-            "INSERT INTO semantic_symbols(tuple_id,ordinal,key_scheme,key_symbol,key_scope,key_document_language,key_document_path,display_name,provenance_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            "INSERT INTO semantic_symbols(payload_id,ordinal,key_scheme,key_symbol,key_scope,key_document_language,key_document_path,display_name,provenance_ordinal) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![
-                tuple,
+                payload,
                 ordinal as i64,
                 semantic_variant(&symbol.key.scheme)?,
                 symbol.key.symbol,
@@ -9442,7 +9618,7 @@ fn write_semantic_tuple(
                 symbol.key.document.as_ref().map(|d| d.language.as_str()),
                 symbol.key.document.as_ref().map(|d| d.path.as_str()),
                 symbol.display_name,
-                symbol.provenance_id,
+                ordinal_of(&symbol.provenance_id)?,
             ],
         )?;
         let id = db.last_insert_rowid();
@@ -9452,21 +9628,22 @@ fn write_semantic_tuple(
                 "semantic_symbol_targets",
                 &[id.into(), (ordinal as i64).into()],
                 target,
+                native,
             )?;
         }
     }
     for (ordinal, binding) in publication
         .declaration_bindings
         .iter()
-        .filter(|b| owns(&b.provenance_id))
+        .filter(|b| provenance.contains_key(b.provenance_id.as_str()))
         .enumerate()
     {
         let anchor = &binding.join.anchor;
         execute_cached(
             db,
-            "INSERT INTO semantic_declaration_bindings(tuple_id,ordinal,syntax_id,provenance_id,join_document_language,join_document_path,join_native_revision_id,join_content_hash,join_start,join_end,join_kind,join_status,join_diagnostic) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            "INSERT INTO semantic_declaration_bindings(payload_id,ordinal,syntax_id,provenance_ordinal,join_document_language,join_document_path,join_native_revision_id,join_content_hash,join_start,join_end,join_kind,join_status,join_diagnostic) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![
-                tuple,
+                payload,
                 ordinal as i64,
                 binding
                     .syntax_id
@@ -9475,10 +9652,10 @@ fn write_semantic_tuple(
                         .context("invalid semantic syntax ID")
                         .map(|b| b.to_vec()))
                     .transpose()?,
-                binding.provenance_id,
+                ordinal_of(&binding.provenance_id)?,
                 anchor.document.language,
                 anchor.document.path,
-                anchor.revision_id,
+                (anchor.revision_id != native).then_some(&anchor.revision_id),
                 anchor.content_hash,
                 anchor.range.start as i64,
                 anchor.range.end as i64,
@@ -9520,7 +9697,7 @@ fn write_semantic_tuple(
     for reference in publication
         .references
         .iter()
-        .filter(|r| owns(&r.provenance_id))
+        .filter(|r| provenance.contains_key(r.provenance_id.as_str()))
     {
         let id = id_codec::encode_occ(&reference.id)
             .context("invalid semantic reference ID")?
@@ -9529,7 +9706,7 @@ fn write_semantic_tuple(
             .context("invalid semantic owner ID")?
             .to_vec();
         let mut values: Vec<rusqlite::types::Value> = vec![
-            tuple.into(),
+            payload.into(),
             id.clone().into(),
             (reference.ordinal as i64).into(),
             owner.into(),
@@ -9541,11 +9718,11 @@ fn write_semantic_tuple(
             semantic_variant(&reference.resolution)?.into(),
         ];
         values.extend(if let Some(target) = &reference.declared_target {
-            semantic_target_values(target)?
+            semantic_target_values(target, native)?
         } else {
             vec![rusqlite::types::Value::Null; 10]
         });
-        values.push(reference.provenance_id.clone().into());
+        values.push(ordinal_of(&reference.provenance_id)?.into());
         execute_cached(
             db,
             &format!(
@@ -9561,27 +9738,28 @@ fn write_semantic_tuple(
             execute_cached(
                 db,
                 "INSERT INTO semantic_reference_roles VALUES(?1,?2,?3,?4)",
-                params![tuple, id, ordinal as i64, semantic_variant(role)?],
+                params![payload, id, ordinal as i64, semantic_variant(role)?],
             )?;
         }
         for (ordinal, target) in reference.candidates.iter().enumerate() {
             insert_semantic_target(
                 db,
                 "semantic_reference_candidates",
-                &[tuple.into(), id.clone().into(), (ordinal as i64).into()],
+                &[payload.into(), id.clone().into(), (ordinal as i64).into()],
                 target,
+                native,
             )?;
         }
     }
     for (ordinal, binding) in publication
         .call_bindings
         .iter()
-        .filter(|b| owns(&b.provenance_id))
+        .filter(|b| provenance.contains_key(b.provenance_id.as_str()))
         .enumerate()
     {
         let anchor = &binding.join.anchor;
         let mut values: Vec<rusqlite::types::Value> = vec![
-            tuple.into(),
+            payload.into(),
             (ordinal as i64).into(),
             binding
                 .call_id
@@ -9595,7 +9773,9 @@ fn write_semantic_tuple(
                 .unwrap_or(rusqlite::types::Value::Null),
             anchor.document.language.clone().into(),
             anchor.document.path.clone().into(),
-            anchor.revision_id.clone().into(),
+            (anchor.revision_id != native)
+                .then(|| anchor.revision_id.clone())
+                .into(),
             anchor.content_hash.clone().into(),
             (anchor.range.start as i64).into(),
             (anchor.range.end as i64).into(),
@@ -9605,7 +9785,7 @@ fn write_semantic_tuple(
             semantic_variant(&binding.resolution)?.into(),
         ];
         values.extend(if let Some(target) = &binding.declared_target {
-            semantic_target_values(target)?
+            semantic_target_values(target, native)?
         } else {
             vec![rusqlite::types::Value::Null; 10]
         });
@@ -9613,12 +9793,12 @@ fn write_semantic_tuple(
             semantic_variant(&binding.dispatch)?.into(),
             (binding.possible_dispatch_complete as i64).into(),
             binding.stale_target.map(|value| value as i64).into(),
-            binding.provenance_id.clone().into(),
+            ordinal_of(&binding.provenance_id)?.into(),
         ]);
         execute_cached(
             db,
             &format!(
-                "INSERT INTO semantic_call_bindings(tuple_id,ordinal,call_id,join_document_language,join_document_path,join_native_revision_id,join_content_hash,join_start,join_end,join_kind,join_status,join_diagnostic,resolution,declared_kind,declared_internal_syntax_id,declared_internal_language,declared_internal_path,declared_internal_native_revision_id,declared_external_scheme,declared_external_symbol,declared_external_scope,declared_external_language,declared_external_path,dispatch,possible_dispatch_complete,stale_target,provenance_id) VALUES({})",
+                "INSERT INTO semantic_call_bindings(payload_id,ordinal,call_id,join_document_language,join_document_path,join_native_revision_id,join_content_hash,join_start,join_end,join_kind,join_status,join_diagnostic,resolution,declared_kind,declared_internal_syntax_id,declared_internal_language,declared_internal_path,declared_internal_native_revision_id,declared_external_scheme,declared_external_symbol,declared_external_scope,declared_external_language,declared_external_path,dispatch,possible_dispatch_complete,stale_target,provenance_ordinal) VALUES({})",
                 (1..=values.len())
                     .map(|i| format!("?{i}"))
                     .collect::<Vec<_>>()
@@ -9635,7 +9815,13 @@ fn write_semantic_tuple(
             ),
         ] {
             for (ordinal, target) in targets.iter().enumerate() {
-                insert_semantic_target(db, table, &[id.into(), (ordinal as i64).into()], target)?;
+                insert_semantic_target(
+                    db,
+                    table,
+                    &[id.into(), (ordinal as i64).into()],
+                    target,
+                    native,
+                )?;
             }
         }
         for (ordinal, candidate) in binding.join.candidate_ids.iter().enumerate() {
@@ -9655,17 +9841,17 @@ fn write_semantic_tuple(
     for (ordinal, relationship) in publication
         .type_relationships
         .iter()
-        .filter(|r| owns(&r.provenance_id))
+        .filter(|r| provenance.contains_key(r.provenance_id.as_str()))
         .enumerate()
     {
         let mut values: Vec<rusqlite::types::Value> = vec![
-            tuple.into(),
+            payload.into(),
             (ordinal as i64).into(),
             semantic_variant(&relationship.kind)?.into(),
         ];
-        values.extend(semantic_target_values(&relationship.source)?);
-        values.extend(semantic_target_values(&relationship.target)?);
-        values.push(relationship.provenance_id.clone().into());
+        values.extend(semantic_target_values(&relationship.source, native)?);
+        values.extend(semantic_target_values(&relationship.target, native)?);
+        values.push(ordinal_of(&relationship.provenance_id)?.into());
         execute_cached(
             db,
             &format!(
@@ -9678,7 +9864,7 @@ fn write_semantic_tuple(
             rusqlite::params_from_iter(values),
         )?;
     }
-    Ok(())
+    Ok(basis_ids)
 }
 
 fn release_semantic_tuple(db: &Connection, revision: &str) -> Result<bool> {
@@ -9701,112 +9887,84 @@ fn release_semantic_tuple(db: &Connection, revision: &str) -> Result<bool> {
             return Ok(true);
         }
     }
-    let tuple: Option<i64> = db
-        .query_row(
-            "SELECT tuple_id FROM semantic_coverage WHERE revision_id=?1 ORDER BY tuple_id LIMIT 1",
-            [revision],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let Some(tuple) = tuple else {
-        for table in [
-            "semantic_import_reports",
-            "semantic_revision_raw_selections",
-            "semantic_requested_producer_languages",
-            "semantic_requested_producers",
-            "semantic_revision_producers",
-        ] {
-            let removed = db.execute(
+    // The manifest goes first, journaling the payloads it names: a payload is collected only
+    // after no manifest row of any revision names it.
+    let manifest: Vec<(i64, Option<i64>)> = db
+        .prepare_cached("SELECT tuple_id,payload_id FROM semantic_coverage WHERE revision_id=?1 ORDER BY tuple_id LIMIT 64")?
+        .query_map([revision], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    if !manifest.is_empty() {
+        for (tuple, payload) in manifest {
+            if let Some(payload) = payload {
+                db.execute(
+                    "INSERT OR IGNORE INTO semantic_release_candidate_payloads VALUES(?1,?2)",
+                    params![revision, payload],
+                )?;
+            }
+            db.execute(
+                "DELETE FROM semantic_coverage_freshness WHERE revision_id=?1 AND tuple_id=?2",
+                params![revision, tuple],
+            )?;
+            db.execute(
+                "DELETE FROM semantic_coverage_roles WHERE tuple_id=?1",
+                [tuple],
+            )?;
+            db.execute(
+                "DELETE FROM semantic_coverage_reasons WHERE tuple_id=?1",
+                [tuple],
+            )?;
+            db.execute("DELETE FROM semantic_coverage WHERE tuple_id=?1", [tuple])?;
+        }
+        return Ok(true);
+    }
+    if semantic_payload::cleanup_payload_candidates(db, revision)? {
+        return Ok(true);
+    }
+    for table in [
+        "semantic_import_reports",
+        "semantic_revision_raw_selections",
+        "semantic_requested_producer_languages",
+        "semantic_requested_producers",
+        "semantic_revision_producers",
+    ] {
+        let removed = db.execute(
                 &format!("DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} WHERE revision_id=?1 LIMIT 64)"),
                 [revision],
             )?;
-            if removed > 0 {
-                return Ok(true);
-            }
+        if removed > 0 {
+            return Ok(true);
         }
-        db.execute(
+    }
+    db.execute(
             "DELETE FROM semantic_batch_witnesses WHERE batch_id IN (
                 SELECT d.batch_id FROM semantic_batch_witness_documents d
                 WHERE NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s WHERE s.batch_id=d.batch_id)
                 ORDER BY d.rowid LIMIT 64)", [],
         )?;
-        let witnesses = db.execute(
+    let witnesses = db.execute(
             "DELETE FROM semantic_batch_witness_documents WHERE rowid IN (
                 SELECT d.rowid FROM semantic_batch_witness_documents d
                 WHERE NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s WHERE s.batch_id=d.batch_id)
                 ORDER BY d.rowid LIMIT 64)", [],
         )?;
-        if witnesses > 0 {
-            return Ok(true);
-        }
-        let witness_headers = db.execute(
+    if witnesses > 0 {
+        return Ok(true);
+    }
+    let witness_headers = db.execute(
             "DELETE FROM semantic_batch_witnesses WHERE batch_id IN (
                 SELECT w.batch_id FROM semantic_batch_witnesses w
                 WHERE NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s WHERE s.batch_id=w.batch_id)
                 AND NOT EXISTS(SELECT 1 FROM semantic_batch_witness_documents d WHERE d.batch_id=w.batch_id)
                 LIMIT 64)", [],
         )?;
-        let proofs = db.execute(
-            &format!("DELETE FROM semantic_raw_proofs WHERE rowid IN ({RAW_PROOF_RELEASE_SQL})"),
-            [],
-        )?;
-        let captures = db.execute("DELETE FROM semantic_raw_captures WHERE capture_id IN (SELECT c.capture_id FROM semantic_raw_captures c WHERE NOT EXISTS(SELECT 1 FROM semantic_raw_proofs p WHERE p.capture_id=c.capture_id) AND NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s WHERE s.batch_id=c.batch_id) LIMIT 64)",[])?;
-        let exclusions = db.execute("DELETE FROM semantic_raw_exclusions WHERE rowid IN (SELECT e.rowid FROM semantic_raw_exclusions e WHERE NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s WHERE s.batch_id=e.batch_id) LIMIT 64)",[])?;
-        let batches = db.execute("DELETE FROM semantic_raw_batches WHERE batch_id IN (SELECT b.batch_id FROM semantic_raw_batches b WHERE NOT EXISTS(SELECT 1 FROM semantic_raw_captures c WHERE c.batch_id=b.batch_id) AND NOT EXISTS(SELECT 1 FROM semantic_raw_exclusions e WHERE e.batch_id=b.batch_id) AND NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s WHERE s.batch_id=b.batch_id) AND NOT EXISTS(SELECT 1 FROM semantic_batch_witnesses w WHERE w.batch_id=b.batch_id) AND NOT EXISTS(SELECT 1 FROM semantic_batch_witness_documents d WHERE d.batch_id=b.batch_id) LIMIT 64)",[])?;
-        return Ok(witness_headers > 0
-            || proofs > 0
-            || captures > 0
-            || exclusions > 0
-            || batches > 0);
-    };
-    for (table, scope) in [
-        ("semantic_reference_roles", "tuple_id=?1"),
-        ("semantic_reference_candidates", "tuple_id=?1"),
-        ("semantic_references", "tuple_id=?1"),
-        (
-            "semantic_symbol_targets",
-            "symbol_id IN (SELECT symbol_id FROM semantic_symbols WHERE tuple_id=?1)",
-        ),
-        (
-            "semantic_declaration_binding_symbols",
-            "binding_id IN (SELECT binding_id FROM semantic_declaration_bindings WHERE tuple_id=?1)",
-        ),
-        (
-            "semantic_declaration_join_candidates",
-            "binding_id IN (SELECT binding_id FROM semantic_declaration_bindings WHERE tuple_id=?1)",
-        ),
-        (
-            "semantic_call_candidates",
-            "binding_id IN (SELECT binding_id FROM semantic_call_bindings WHERE tuple_id=?1)",
-        ),
-        (
-            "semantic_call_possible_dispatch",
-            "binding_id IN (SELECT binding_id FROM semantic_call_bindings WHERE tuple_id=?1)",
-        ),
-        (
-            "semantic_call_join_candidates",
-            "binding_id IN (SELECT binding_id FROM semantic_call_bindings WHERE tuple_id=?1)",
-        ),
-        ("semantic_type_relationships", "tuple_id=?1"),
-        ("semantic_symbols", "tuple_id=?1"),
-        ("semantic_declaration_bindings", "tuple_id=?1"),
-        ("semantic_call_bindings", "tuple_id=?1"),
-        ("semantic_provenance", "tuple_id=?1"),
-        (
-            "semantic_basis_lookup_dependencies",
-            "basis_id IN (SELECT basis_id FROM semantic_basis WHERE tuple_id=?1)",
-        ),
-        ("semantic_basis", "tuple_id=?1"),
-        ("semantic_coverage_roles", "tuple_id=?1"),
-        ("semantic_coverage_reasons", "tuple_id=?1"),
-    ] {
-        let removed = db.execute(&format!("DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} WHERE {scope} LIMIT 64)"),[tuple])?;
-        if removed > 0 {
-            return Ok(true);
-        }
-    }
-    db.execute("DELETE FROM semantic_coverage WHERE tuple_id=?1", [tuple])?;
-    Ok(true)
+    let proofs = db.execute(
+        &format!("DELETE FROM semantic_raw_proofs WHERE rowid IN ({RAW_PROOF_RELEASE_SQL})"),
+        [],
+    )?;
+    let captures = db.execute("DELETE FROM semantic_raw_captures WHERE capture_id IN (SELECT c.capture_id FROM semantic_raw_captures c WHERE NOT EXISTS(SELECT 1 FROM semantic_raw_proofs p WHERE p.capture_id=c.capture_id) AND NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s WHERE s.batch_id=c.batch_id) LIMIT 64)",[])?;
+    let exclusions = db.execute("DELETE FROM semantic_raw_exclusions WHERE rowid IN (SELECT e.rowid FROM semantic_raw_exclusions e WHERE NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s WHERE s.batch_id=e.batch_id) LIMIT 64)",[])?;
+    let batches = db.execute("DELETE FROM semantic_raw_batches WHERE batch_id IN (SELECT b.batch_id FROM semantic_raw_batches b WHERE NOT EXISTS(SELECT 1 FROM semantic_raw_captures c WHERE c.batch_id=b.batch_id) AND NOT EXISTS(SELECT 1 FROM semantic_raw_exclusions e WHERE e.batch_id=b.batch_id) AND NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s WHERE s.batch_id=b.batch_id) AND NOT EXISTS(SELECT 1 FROM semantic_batch_witnesses w WHERE w.batch_id=b.batch_id) AND NOT EXISTS(SELECT 1 FROM semantic_batch_witness_documents d WHERE d.batch_id=b.batch_id) AND NOT EXISTS(SELECT 1 FROM semantic_payloads p WHERE p.batch_id=b.batch_id) LIMIT 64)",[])?;
+    Ok(witness_headers > 0 || proofs > 0 || captures > 0 || exclusions > 0 || batches > 0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10461,7 +10619,7 @@ fn validate_v8_bootstrap(db: &Connection) -> Result<()> {
         indexed_at.is_empty() && options.is_none(),
         "incompatible_index: invalid v8 bootstrap metadata"
     );
-    // Fixed identifiers from CACHE_SCHEMA_V41 only. Do not read table names from
+    // Fixed identifiers from CACHE_SCHEMA_V42 only. Do not read table names from
     // sqlite_master or treat a partial publication as a valid empty bootstrap.
     for name in [
         "class_projections",
@@ -10502,9 +10660,11 @@ fn validate_v8_bootstrap(db: &Connection) -> Result<()> {
         "semantic_revision_producers",
         "semantic_requested_producers",
         "semantic_requested_producer_languages",
+        "semantic_payloads",
         "semantic_coverage",
         "semantic_coverage_roles",
         "semantic_coverage_reasons",
+        "semantic_coverage_freshness",
         "semantic_basis",
         "semantic_basis_lookup_dependencies",
         "semantic_provenance",
@@ -10524,8 +10684,10 @@ fn validate_v8_bootstrap(db: &Connection) -> Result<()> {
         "semantic_projection_origins",
         "semantic_projection_documents",
         "semantic_projection_dependencies",
+        "semantic_projection_dependency_targets",
         "semantic_projection_lookup_dependencies",
         "semantic_projection_contexts",
+        "semantic_release_candidate_payloads",
         "semantic_pending_target",
         "semantic_pending_selections",
         "semantic_catchup_commits",
@@ -12823,6 +12985,10 @@ impl Store {
             #[cfg(feature = "test-support")]
             #[cfg(feature = "test-support")]
             semantic_publication_observer: Arc::default(),
+            #[cfg(feature = "test-support")]
+            payload_reuse_disabled: Arc::default(),
+            #[cfg(feature = "test-support")]
+            payload_join_inputs: Arc::default(),
             #[cfg(test)]
             test_stream_before_preflight_hook: Arc::new(Mutex::new(None)),
             publication_cache_kib: Arc::new(std::sync::atomic::AtomicI64::new(
@@ -13193,7 +13359,7 @@ impl Store {
             db.pragma_update(None, "synchronous", "FULL")?;
             db.execute_batch("BEGIN IMMEDIATE")?;
             let result = (|| -> Result<()> {
-                db.execute_batch(CACHE_SCHEMA_V41)?;
+                db.execute_batch(CACHE_SCHEMA_V42)?;
                 let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
                 ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
                 db.execute(
@@ -15173,7 +15339,7 @@ impl Store {
         tx.execute("INSERT INTO semantic_requested_producers SELECT ?1,id,version,executable_hash FROM semantic_requested_producers WHERE revision_id=?2 AND id<>?3",params![next_key,old_key,producer.id])?;
         tx.execute("INSERT INTO semantic_requested_producer_languages SELECT ?1,id,language,ordinal FROM semantic_requested_producer_languages WHERE revision_id=?2 AND id<>?3",params![next_key,old_key,producer.id])?;
         tx.execute("INSERT INTO semantic_revision_raw_selections SELECT ?1,producer_id,batch_id,captured_pin FROM semantic_revision_raw_selections WHERE revision_id=?2 AND producer_id<>?3",params![next_key,old_key,producer.id])?;
-        copy_semantic_rows_except(&tx, &old_key, &next_key, &producer.id)?;
+        copy_semantic_manifest(&tx, &old_key, &next_key, true, Some(&producer.id))?;
         write_producer_descriptor(&tx, &next_key, &producer)?;
         tx.execute(
             "INSERT INTO semantic_requested_producers VALUES(?1,?2,?3,?4)",
@@ -15205,7 +15371,15 @@ impl Store {
             &gate,
         )?;
         gate()?;
-        write_staged_semantic(&tx, &next_key, &producer, &gate)?;
+        write_staged_semantic(
+            &tx,
+            &next_key,
+            &producer,
+            batch_id,
+            &captured_key,
+            &self.payload_key_inputs(),
+            &gate,
+        )?;
         tx.execute(
             "INSERT INTO semantic_revision_raw_selections VALUES(?1,?2,?3,?4)",
             params![next_key, producer.id, batch_id, captured_key],
@@ -15214,7 +15388,7 @@ impl Store {
         tx.execute("INSERT INTO semantic_import_reports SELECT ?1,producer_id,report_json FROM semantic_import_reports WHERE revision_id=?2 AND producer_id<>?3",params![next_key,old_key,producer.id])?;
         native_first::copy_projection_except(&tx, &old_key, &next_key, &producer.id)?;
         native_first::context::publish(self, &tx, &next_key, &producer.id, &descriptor, cancel)?;
-        native_first::index_dependencies(&tx, &next_key)?;
+        native_first::context::validate(&tx, &next_key)?;
         semantic_retention::copy(&tx, &old_key, &next_key, Some(&producer.id))?;
         for language in &descriptor.producer.languages {
             tx.execute("DELETE FROM semantic_reimport WHERE revision_id=?1 AND producer='' AND language=?2",params![next_key,language])?;
@@ -17055,7 +17229,7 @@ impl Store {
             "INSERT INTO semantic_requested_producer_languages SELECT ?1,id,language,ordinal FROM semantic_requested_producer_languages WHERE revision_id=?2",
             params![revision_key, selected.key],
         )?;
-        copy_semantic_rows(&tx, &selected.key, &revision_key, false)?;
+        copy_semantic_manifest(&tx, &selected.key, &revision_key, false, None)?;
         semantic_retention::copy(&tx, &selected.key, &revision_key, None)?;
         semantic_retention::discarded(&tx, &selected.key, &revision_key, retained_state.is_some())?;
         self.materialize_reimport(
@@ -18458,7 +18632,7 @@ impl Store {
                 // An incompatible/corrupt generation is explicitly replaced, never served.
                 // Only compatible same-generation publication appends history.
                 native_first::clear(&tx)?;
-                tx.execute_batch("DELETE FROM semantic_reference_roles; DELETE FROM semantic_reference_candidates; DELETE FROM semantic_symbol_targets; DELETE FROM semantic_declaration_binding_symbols; DELETE FROM semantic_declaration_join_candidates; DELETE FROM semantic_call_candidates; DELETE FROM semantic_call_possible_dispatch; DELETE FROM semantic_call_join_candidates; DELETE FROM semantic_type_relationships; DELETE FROM semantic_references; DELETE FROM semantic_symbols; DELETE FROM semantic_declaration_bindings; DELETE FROM semantic_call_bindings; DELETE FROM semantic_provenance; DELETE FROM semantic_revision_raw_selections; DELETE FROM semantic_batch_witness_documents; DELETE FROM semantic_batch_witnesses; DELETE FROM semantic_raw_proofs; DELETE FROM semantic_raw_captures; DELETE FROM semantic_raw_exclusions; DELETE FROM semantic_raw_batches; DELETE FROM semantic_import_reports; DELETE FROM semantic_basis_lookup_dependencies; DELETE FROM semantic_basis; DELETE FROM semantic_coverage_roles; DELETE FROM semantic_coverage_reasons; DELETE FROM semantic_coverage; DELETE FROM semantic_requested_producer_languages; DELETE FROM semantic_requested_producers; DELETE FROM semantic_revision_producers; DELETE FROM semantic_producer_languages; DELETE FROM semantic_producers; DELETE FROM revision_documents; DELETE FROM revision_capture_inputs;
+                tx.execute_batch("DELETE FROM semantic_release_candidate_payloads; DELETE FROM semantic_reference_roles; DELETE FROM semantic_reference_candidates; DELETE FROM semantic_symbol_targets; DELETE FROM semantic_declaration_binding_symbols; DELETE FROM semantic_declaration_join_candidates; DELETE FROM semantic_call_candidates; DELETE FROM semantic_call_possible_dispatch; DELETE FROM semantic_call_join_candidates; DELETE FROM semantic_type_relationships; DELETE FROM semantic_references; DELETE FROM semantic_symbols; DELETE FROM semantic_declaration_bindings; DELETE FROM semantic_call_bindings; DELETE FROM semantic_provenance; DELETE FROM semantic_coverage_freshness; DELETE FROM semantic_basis_lookup_dependencies; DELETE FROM semantic_basis; DELETE FROM semantic_coverage_roles; DELETE FROM semantic_coverage_reasons; DELETE FROM semantic_coverage; DELETE FROM semantic_payloads; DELETE FROM semantic_revision_raw_selections; DELETE FROM semantic_batch_witness_documents; DELETE FROM semantic_batch_witnesses; DELETE FROM semantic_raw_proofs; DELETE FROM semantic_raw_captures; DELETE FROM semantic_raw_exclusions; DELETE FROM semantic_raw_batches; DELETE FROM semantic_import_reports; DELETE FROM semantic_requested_producer_languages; DELETE FROM semantic_requested_producers; DELETE FROM semantic_revision_producers; DELETE FROM semantic_producer_languages; DELETE FROM semantic_producers; DELETE FROM revision_documents; DELETE FROM revision_capture_inputs;
                 DELETE FROM native_version_references; DELETE FROM native_version_capability_gaps; DELETE FROM native_version_macro_expansions;
                 DELETE FROM native_version_capability_families;
                 DELETE FROM native_version_call_regions; DELETE FROM native_version_calls;
@@ -18764,7 +18938,7 @@ impl Store {
                 )?;
             } else {
                 write_semantic(&tx, native, prior, revision, semantic)?;
-                native_first::index_dependencies(&tx, &revision_key)?;
+                native_first::context::validate(&tx, &revision_key)?;
             }
             if let Some(prior) = old_pin.filter(|pin| !rebaseline && pin.index_revision > 0) {
                 semantic_retention::copy(&tx, &semantic_pin_key(prior), &revision_key, None)?;
@@ -19547,6 +19721,44 @@ impl Store {
         self.publication_gate.test_before_spill_wait.set(hook);
     }
 
+    /// With `false`, this store's writers key no payload, so no later write can name a stored
+    /// one: an independent reference for the shared-payload path.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_payload_reuse_for_tests(&self, enabled: bool) {
+        self.payload_reuse_disabled
+            .store(!enabled, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Replaces the join-inputs digest this store's payload keys carry, as a build of
+    /// different join code would; `None` restores this build's.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_payload_join_inputs_for_tests(&self, digest: Option<&str>) {
+        *self.payload_join_inputs.lock().unwrap() = digest.map(str::to_owned);
+    }
+
+    /// What this store's payload keys hash besides the document (owner ruling 2026-11-09).
+    fn payload_key_inputs(&self) -> semantic_payload::KeyInputs {
+        let inputs = semantic_payload::KeyInputs::current();
+        #[cfg(feature = "test-support")]
+        {
+            let inputs = match self.payload_join_inputs.lock().unwrap().as_deref() {
+                Some(digest) => inputs.with_join_inputs(digest),
+                None => inputs,
+            };
+            if self
+                .payload_reuse_disabled
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return inputs.without_reuse();
+            }
+            inputs
+        }
+        #[cfg(not(feature = "test-support"))]
+        inputs
+    }
+
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn set_semantic_publication_observer_for_tests(
@@ -19643,7 +19855,8 @@ impl Store {
             "SELECT EXISTS(SELECT 1 FROM semantic_coverage WHERE revision_id=?1)
                 OR EXISTS(SELECT 1 FROM semantic_revision_producers WHERE revision_id=?1)
                 OR EXISTS(SELECT 1 FROM semantic_requested_producers WHERE revision_id=?1)
-                OR EXISTS(SELECT 1 FROM semantic_revision_raw_selections WHERE revision_id=?1)",
+                OR EXISTS(SELECT 1 FROM semantic_revision_raw_selections WHERE revision_id=?1)
+                OR EXISTS(SELECT 1 FROM semantic_release_candidate_payloads WHERE revision_id=?1)",
             [selected],
             |row| row.get(0),
         )?;
@@ -22345,7 +22558,7 @@ impl Store {
 #[test]
 fn selected_ancillary_budget_matches_main_text_key_bytes() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V41).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V42).unwrap();
     // The aggregate needs only synthetic child rows; FK behavior is covered by
     // publication/retention tests, not this isolated budget-SQL fixture.
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
@@ -22484,7 +22697,7 @@ fn selected_ancillary_budget_matches_main_text_key_bytes() {
 #[test]
 fn immutable_reference_slot_rejects_changed_payload() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V41).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V42).unwrap();
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
     let owner = [0x11u8; 16];
     let original = [0x22u8; 16];

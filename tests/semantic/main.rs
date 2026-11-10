@@ -25,6 +25,7 @@ mod semantic_import;
 mod semantic_import_queue;
 mod semantic_import_typed_errors;
 mod semantic_native_publication;
+mod semantic_payloads;
 mod semantic_publication_paths;
 mod semantic_rejoin;
 mod semantic_store;

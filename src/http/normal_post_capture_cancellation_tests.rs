@@ -38,8 +38,8 @@ fn pair_snapshot(index: &std::path::Path) -> PairSnapshot {
             .unwrap();
     assert_eq!(
         tables.len(),
-        87,
-        "compare exact schema-41 derived evidence inventory"
+        91,
+        "compare exact schema-42 derived evidence inventory"
     );
     let expected = vec![
         "class_projections",
@@ -97,18 +97,21 @@ fn pair_snapshot(index: &std::path::Path) -> PairSnapshot {
         "semantic_call_possible_dispatch",
         "semantic_catchup_commits",
         "semantic_coverage",
+        "semantic_coverage_freshness",
         "semantic_coverage_reasons",
         "semantic_coverage_roles",
         "semantic_declaration_binding_symbols",
         "semantic_declaration_bindings",
         "semantic_declaration_join_candidates",
         "semantic_import_reports",
+        "semantic_payloads",
         "semantic_pending_selections",
         "semantic_pending_target",
         "semantic_producer_languages",
         "semantic_producers",
         "semantic_projection_contexts",
         "semantic_projection_dependencies",
+        "semantic_projection_dependency_targets",
         "semantic_projection_documents",
         "semantic_projection_lookup_dependencies",
         "semantic_projection_origins",
@@ -122,6 +125,7 @@ fn pair_snapshot(index: &std::path::Path) -> PairSnapshot {
         "semantic_reference_roles",
         "semantic_references",
         "semantic_reimport",
+        "semantic_release_candidate_payloads",
         "semantic_requested_producer_languages",
         "semantic_requested_producers",
         "semantic_revision_producers",
@@ -133,7 +137,7 @@ fn pair_snapshot(index: &std::path::Path) -> PairSnapshot {
     assert_eq!(
         tables.iter().map(String::as_str).collect::<Vec<_>>(),
         expected,
-        "exact schema-41 table names: complete paired native, semantic and search evidence"
+        "exact schema-42 table names: complete paired native, semantic and search evidence"
     );
     for required in [
         "document_versions",
