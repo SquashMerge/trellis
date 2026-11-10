@@ -355,11 +355,15 @@ impl Sources<'_> {
     }
 
     fn selects(&self, globs: &globset::GlobSet, path: &str) -> bool {
-        (self.paths.is_empty() || globs.is_match(path))
-            && self.prefix.is_none_or(|prefix| {
-                path.strip_prefix(prefix)
-                    .is_some_and(|rest| rest.starts_with('/'))
-            })
+        (self.paths.is_empty() || globs.is_match(path)) && self.under(path)
+    }
+
+    /// Whether `path` lies under the prefix (always, without one).
+    fn under(&self, path: &str) -> bool {
+        self.prefix.is_none_or(|prefix| {
+            path.strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('/'))
+        })
     }
 }
 
@@ -1008,8 +1012,15 @@ impl ReferenceBase {
             "Python expands proved checkout-root and declared pyproject source-root modules and package exports with bounded import forwarding and literal-list __all__; dynamic namespaces, ambiguous bindings and unproved package layouts remain uncertain. The pinned CPython 3.12 stdlib catalog labels roots only; third-party distribution mappings remain unknown.",
             "Java expands captured public top-level types from declared packages, with explicit and lexical shadowing; static/member types and unproved third-party prefixes remain unresolved. Java labels identify package families only; javax requires an exact package in the pinned OpenJDK 25 catalog, not proof of members or installed-JDK availability.",
         ];
-        let bounds_limitation = syntax_bounds::limitation(self.partial_files.len());
-        if !self.partial_files.is_empty() {
+        // #837: a prefix scopes the partly read files too, as it does every source. Without
+        // one they stay checkout-wide.
+        let partial_files: Vec<_> = self
+            .partial_files
+            .iter()
+            .filter(|file| sources.under(&file.path))
+            .collect();
+        let bounds_limitation = syntax_bounds::limitation(partial_files.len());
+        if !partial_files.is_empty() {
             limitations.push(&bounds_limitation);
         }
         if self.producers.is_empty() {
@@ -1032,7 +1043,7 @@ impl ReferenceBase {
                 "partial":!self.semantic_documents.is_empty(),
                 "modules":emitted_modules,"externalPackages":external_packages.into_values().collect::<Vec<_>>(),"production":production,"tests":tests,"unresolved":unresolved,
                 "counts":{"scannedDocuments":scanned,"mappedSites":mapped,"unresolvedSites":unresolved.len(),"semanticSites":semantic_sites},
-                "partialFiles":self.partial_files,
+                "partialFiles":partial_files,
                 "limitations":limitations
             }),
             modules: self.modules.clone(),
