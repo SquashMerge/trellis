@@ -248,7 +248,9 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
   format specification (`{x}`, `{}`, `{0}`), and are `{}` otherwise: a fill, width,
   precision or mode such as `{x:0>3}` or `{:?}` is always `{}`. A visible constant is a
   `const` or `static` string at the top level of the document, its name declared nowhere
-  else in it, read from a call outside every inline `mod`; any other identifier is
+  else in it (no other `const` or `static`, and no `use` import or alias, parameter,
+  closure parameter, `let`, `match`, `if let`/`while let` or `for` pattern that binds it),
+  read from a call outside every inline `mod`; any other identifier is
   unreadable. Each substituted value is charged to the work bound before it is copied. The path is what follows the host of an
   `http://` or `https://` URL (`/` when there is none), or the text itself when it starts
   with `/`; a URL that starts with a substitution, or anything else, is unreadable and

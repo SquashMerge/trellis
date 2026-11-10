@@ -1002,6 +1002,35 @@ mod inner {
         );
     }
 
+    /// #867 review (residual P2): any other binding of the name anywhere in the document, an
+    /// import or a pattern, makes the top-level constant unreadable.
+    #[test]
+    fn a_name_also_bound_by_an_import_or_a_pattern_is_unresolved() {
+        let aliased = r#"
+const URL: &str = "http://localhost/health";
+mod config { pub const OTHER: &str = "http://localhost/actual"; }
+fn run(client: &reqwest::Client) {
+    use crate::config::OTHER as URL;
+    client.get(URL);
+}
+"#;
+        assert_eq!(reqwest_paths(aliased), ["GET ?"]);
+        for binding in [
+            "use crate::config::URL;",
+            "let URL = 1;",
+            "let (a, URL) = (1, 2);",
+            "for URL in [1] {}",
+            "if let Some(URL) = None::<u8> {}",
+            "match 1 { URL => {} }",
+            "let f = |URL: u8| URL;",
+        ] {
+            let client = format!(
+                "const URL: &str = \"http://localhost/health\";\nconst KEPT: &str = \"http://localhost/kept\";\nfn other() {{ {binding} }}\nfn run(client: &reqwest::Client) {{ client.get(URL); client.get(KEPT); }}\n"
+            );
+            assert_eq!(reqwest_paths(&client), ["GET ?", "GET /kept"], "{binding}");
+        }
+    }
+
     /// #867 review P2: a substitution with a format specification is not read as its value.
     #[test]
     fn a_format_specification_is_a_substitution_not_its_value() {

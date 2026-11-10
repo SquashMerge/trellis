@@ -8,7 +8,7 @@ use crate::native_evidence::Range;
 use crate::references::{DocumentInput, callers::Callers, walk, work::Work};
 use anyhow::Result;
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::Node;
 
 /// The request builders of a `reqwest` client that take only the URL.
@@ -36,11 +36,29 @@ pub(super) fn collect(
         constants: BTreeMap::new(),
     };
     // A name declared more than once anywhere may be shadowed, so it is never read. Only a
-    // top-level declaration is read, and only from outside every inline module.
+    // top-level declaration is read, and only from outside every inline module. Every
+    // identifier under an import or a binding pattern counts as another declaration
+    // (#867 review): a local `use .. as NAME` hides the outer item.
     let mut constants: BTreeMap<String, Option<String>> = BTreeMap::new();
+    let mut bound: BTreeSet<&str> = BTreeSet::new();
     let mut modules = Vec::new();
     let mut sites = Vec::new();
-    walk(root, check, &mut |node, _| {
+    walk(root, check, &mut |node, check| {
+        let binding = match node.kind() {
+            "use_declaration" | "closure_parameters" => Some(node),
+            "parameter" | "let_declaration" | "match_arm" | "for_expression" | "let_condition" => {
+                node.child_by_field_name("pattern")
+            }
+            _ => None,
+        };
+        if let Some(binding) = binding {
+            walk(binding, check, &mut |inner, _| {
+                if inner.kind() == "identifier" {
+                    bound.insert(document.text(inner));
+                }
+                Ok(false)
+            })?;
+        }
         match node.kind() {
             "mod_item" => modules.push(node.byte_range()),
             "const_item" | "static_item" => {
@@ -64,6 +82,7 @@ pub(super) fn collect(
     let document = Document {
         constants: constants
             .into_iter()
+            .filter(|(name, _)| !bound.contains(name.as_str()))
             .filter_map(|(name, value)| Some((name, value?)))
             .collect(),
         ..document
