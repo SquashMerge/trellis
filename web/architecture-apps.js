@@ -152,6 +152,31 @@
     });
     return {lines, undrawn};
   }
+  // Which side of each side-by-side column its Shared bands take (#850; owner decision 2026-11-09).
+  // Columns keep manifest order (`names`). Only an end between adjacent columns draws a line, and it
+  // leaves its band toward the partner column: an end on an ordered band crosses the Shared bands
+  // when they sit on that side, and an end on a Shared band crosses the ordered stack when they sit
+  // on the other. Each column takes the side with fewer such crossings; a tie, including a column with
+  // no drawn line, keeps the right, as in the one-app view. So with two apps whose interface runs
+  // between ordered layers, the left app's Shared band goes left and the right app's goes right.
+  // `band(name, layer)` says whether `layer` is a drawn Shared band (true), a drawn ordered band (false)
+  // or no band (null) of app `name`. Stacked columns draw no lines and keep the right.
+  function sharedSides(view, names, band, sideBySide = true) {
+    const at = new Map(names.map((name, index) => [name, index])), cost = names.map(() => ({left:0, right:0}));
+    for (const entry of sideBySide && Array.isArray(view?.interfaces) ? view.interfaces.filter(record) : []) {
+      const client = at.get(entry.client), server = at.get(entry.server);
+      if (client === undefined || server === undefined || Math.abs(client - server) !== 1) continue;
+      for (const end of endsOf(entry)) {
+        for (const [index, other, layer] of [[client, server, end.clientLayer], [server, client, end.serverLayer]]) {
+          const shared = typeof layer === "string" ? band(names[index], layer) : null;
+          if (shared === null) continue;
+          const toward = other < index ? "left" : "right";
+          cost[index][shared === (toward === "left") ? "right" : "left"]++;
+        }
+      }
+    }
+    return new Map(names.map((name, index) => [name, cost[index].left < cost[index].right ? "left" : "right"]));
+  }
   const endsOf = entry => (Array.isArray(entry?.ends) ? entry.ends : []).filter(record);
   const key = entry => JSON.stringify(["interface", entry.client, entry.server]);
   const label = item => item.languages.length ? `${item.name} · ${item.languages.join(", ")}` : item.name;
@@ -168,5 +193,5 @@
   const duplicateNotice = item =>
     `${item.apps.length} detected apps share the name ${item.name} (${manifestList(item)}). A layer cannot name them; rules.md Amendment (#783).`;
   window.TrellisArchitectureApps = {groups, group, scoped, link, stubs, sumCounts, label, origin, sourceLine, duplicateNotice,
-    layout, confidenceText, cardText, cardName, endsText, header, routes, key};
+    layout, confidenceText, cardText, cardName, endsText, header, routes, sharedSides, key};
 })();

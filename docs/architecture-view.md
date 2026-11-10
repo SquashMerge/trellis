@@ -259,6 +259,29 @@ band border. Arrow **width** grows with the arrow's reference-site count on a lo
 rest; colour keeps its meaning, the tag and the inspector keep the exact count, and the arrow
 key under the drawing shows the width at 1, 10, 100 and ≥1000 sites. The channels count
 toward the fitted width. This is layout only: records, counts and identities are unchanged.
+
+All apps layout (#790, #850; owner decision 2026-11-09). With two or more apps, All apps draws
+one column per app, side by side in **manifest order** when they fit (each at least 352px,
+with a 176px gutter between columns), else stacked. Each column is the same Pele drawing as
+the one-app view, fitted to its column width (#860's stack span included), with its own
+gutters and side channels. An interface end between **adjacent** side-by-side columns draws
+one overlay line in its own lane of the gutter, from its band's side straight across to the
+partner band; any other end is named in words on its card. A column's **Shared** boxes sit on
+the side away from its interface partners, so a line between ordered bands never crosses
+them. The rule counts, per column, the lines each side would cross: an end on an ordered band
+crosses the Shared boxes when they are on the partner's side, and an end on a Shared box
+crosses the ordered stack when the boxes are on the other side. The column takes the side
+with fewer crossings; a tie, including a column with no drawn line or a stacked layout, keeps
+the right, as in the one-app view. With two apps whose interface runs between ordered layers,
+the left app's Shared boxes are on its left and the right app's on its right. A middle app with
+partners on both sides takes the side with fewer lines; one with as many lines each way keeps
+the right, and its lines on that side then cross the Shared boxes. On the left, the nearest
+Shared box sits beside the stack, the long-upward channel runs between them, arrows to the
+nearest box run left along a gutter to its side, a farther box is still reached through the
+right channel and the strip under the drawing, and the `→`/`←` tags of shared arrows are
+mirrored so a tag points the way its arrow runs. Band headers, the Shared header included,
+wrap whole at separators and keep their size (AC26); no overlay line runs through a Shared
+header when the boxes are away from the partner. The one-app view is unchanged.
 When the panel width changes (window resize, inspector shown or hidden), the drawing
 is laid out again after a short quiet period (150 ms), from the same response with no new
 read, keeping the size cap, the inspector, the selected node and keyboard focus. The hidden-layer note

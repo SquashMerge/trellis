@@ -7,7 +7,7 @@ const {createInterface} = require("node:readline");
 const {dirname, join} = require("node:path");
 const {chromium} = require("playwright");
 const H = require("./sequence-harness.cjs");
-const {arrowGeometry} = require("./architecture-geometry.cjs");
+const {arrowGeometry, classicScrollbars, quiet} = require("./architecture-geometry.cjs");
 
 const hostileLayer = '<img src=x onerror="globalThis.architectureExecuted=true">';
 const lowSource = `pub fn low() { crate::top::target(); external::unknown(); }
@@ -1345,15 +1345,6 @@ async function laidOutAt(page, width) {
   if (Math.abs(after - before) >= 8) await page.waitForFunction(() => { const svg = document.querySelector("#architecture-diagram svg"); return svg && !svg.__old; });
   await quiet(page);
 }
-// The panel can settle in more than one step (the inspector column follows the window).
-// The canvas publishes a pending re-layout and the width it last drew for; the drawing is
-// final once nothing is pending and that width is within the re-layout slack of the canvas.
-async function quiet(page) {
-  await page.waitForFunction(() => {
-    const canvas = document.querySelector("#architecture-diagram");
-    return canvas.dataset.layout !== "pending" && Math.abs(Number(canvas.dataset.layoutWidth) - canvas.clientWidth) < 8;
-  });
-}
 function assertLayout(bounds, label) {
   // #637: no arrow segment enters a band or module box; tags sit clear of bands and each other.
   assert.deepEqual(bounds.arrows.crossings, [], `${label}: no arrow crosses a band or a module box`);
@@ -1415,19 +1406,6 @@ test("Architecture lays out tags, titles and chips without collisions or truncat
   await capture(page, "architecture-layout-900");
 }, layoutFiles));
 
-// CI draws classic 15px scrollbars (Linux, and CI Macs without a trackpad); local Macs use overlay
-// scrollbars. A classic scrollbar in the canvas's stable gutter makes every host measure as CI does
-// (#860: at 1200px the canvas is 721px wide with a 697px inner width). The rule goes in through the
-// CSSOM of the page's own stylesheet, which the strict CSP allows.
-async function classicScrollbars(page) {
-  await page.evaluate(() => {
-    const sheet = [...document.styleSheets].find(item => item.href?.endsWith("/architecture.css"));
-    sheet.insertRule("#architecture-diagram::-webkit-scrollbar { width: 15px; height: 15px; }", sheet.cssRules.length);
-  });
-  const gutter = await page.evaluate(() => { const canvas = document.querySelector("#architecture-diagram"); return canvas.offsetWidth - canvas.clientWidth; });
-  assert.equal(gutter, 15, "the canvas reserves a classic 15px scrollbar gutter, as on CI");
-  await quiet(page);
-}
 test("Architecture re-lays out on a panel width change, keeping the selection and the inspector", {timeout:240000}, async () => published(layoutRules, async selected => {
   const {page} = selected;
   await ready(page);

@@ -347,3 +347,47 @@ test("a column's shared-layer chips sum that app's own edges, as the one-app vie
   assert.notDeepEqual(columns.get("web"), columns.get("api"), "each column counts only its own edges");
   assert.ok(columns.get("web").some(text => /2/.test(text)) && !columns.get("web").some(text => /5/.test(text)));
 });
+
+// #850: the side each column's Shared bands take. `band` is the drawn bands of each app: true for
+// a Shared band, false for an ordered one, and anything else is no band.
+function sides({interfaces, names = ["web", "api"], bands = {web:{UI:false, Common:true}, api:{Api:false, Store:false, Common:true}}, sideBySide = true}) {
+  const apps = appsModule(), end = ([clientLayer, serverLayer]) => ({clientLayer, serverLayer, routes:1, callSites:1});
+  const view = {interfaces:interfaces.map(([client, server, ends]) => ({client, server, ends:ends.map(end)}))};
+  return Object.fromEntries(apps.sharedSides(view, names, (name, layer) => bands[name]?.[layer] ?? null, sideBySide));
+}
+test("#850 shared_side_two_apps: an interface on the ordered layers puts each Shared band away from the partner", () => {
+  assert.deepEqual(sides({interfaces:[["web", "api", [["UI", "Api"]]]]}), {web:"left", api:"right"});
+  assert.deepEqual(sides({interfaces:[["api", "web", [["Api", "UI"], ["Store", "UI"]]]], names:["api", "web"]}), {api:"left", web:"right"},
+    "manifest order decides the columns, whichever app is the client");
+});
+test("#850 shared_side_fallbacks: ties keep the right; a Shared end, both-side partners and hidden or far ends count by crossings", () => {
+  // No interface, or only undrawn, far or stacked ends: no line, so the right, as in the one-app view.
+  assert.deepEqual(sides({interfaces:[]}), {web:"right", api:"right"});
+  assert.deepEqual(sides({interfaces:[["web", "api", [["Hidden", "Api"]]]]}), {web:"right", api:"right"}, "an end on no drawn band draws no line");
+  assert.deepEqual(sides({interfaces:[["web", "api", [["UI", "Api"]]]], sideBySide:false}), {web:"right", api:"right"}, "stacked columns draw no lines");
+  assert.deepEqual(sides({interfaces:[["web", "db", [["UI", "Data"]]]], names:["web", "api", "db"], bands:{web:{UI:false}, db:{Data:false}}}),
+    {web:"right", api:"right", db:"right"}, "columns that are not adjacent draw no line");
+  // The Shared band is itself the end: on the partner's side it crosses nothing, so it stays right of the left app.
+  assert.deepEqual(sides({interfaces:[["web", "api", [["Common", "Api"]]]]}), {web:"right", api:"right"});
+  assert.deepEqual(sides({interfaces:[["web", "api", [["UI", "Common"]]]]}), {web:"left", api:"left"}, "a Shared server end pulls the right app's band toward its partner");
+  // One ordered and one Shared end toward the same partner: one crossing either way, a tie, so the right.
+  assert.deepEqual(sides({interfaces:[["web", "api", [["UI", "Api"], ["Common", "Api"]]]]}), {web:"right", api:"right"});
+  // A middle app with partners on both sides takes the side with fewer crossings, and the right on a tie.
+  const three = {names:["web", "api", "db"], bands:{web:{UI:false}, api:{Api:false, Common:true}, db:{Data:false}}};
+  assert.equal(sides({...three, interfaces:[["web", "api", [["UI", "Api"]]], ["api", "db", [["Api", "Data"]]]]}).api, "right", "one line each side: a tie");
+  assert.equal(sides({...three, interfaces:[["web", "api", [["UI", "Api"]]], ["api", "db", [["Api", "Data"], ["Api", "Data"]]]]}).api, "left", "two lines right, one left");
+  assert.equal(sides({...three, interfaces:[["web", "api", [["UI", "Api"], ["UI", "Api"]]], ["api", "db", [["Api", "Data"]]]]}).api, "right", "two lines left, one right");
+});
+test("#850 each column's drawing is asked for its Shared side; the one-app view never is", async () => {
+  const dto = threeApps();
+  dto.apps = dto.apps.slice(0, 2); dto.layers = dto.layers.filter(layer => layer.app !== "db"); dto.modules = dto.modules.filter(module => module.app !== "db");
+  dto.interfaces = dto.interfaces.filter(entry => entry.client !== "db" && entry.server !== "db");
+  dto.layers.push({name:"Common", shared:true, app:null, apps:null});
+  dto.modules.push({identity:identity("common/a.js"), layer:"Common", app:null, physicalLines:1, declarationCount:1, metrics:{cognitive:1}});
+  const h = controller(dto); await h.architecture.refresh();
+  assert.deepEqual(h.renders.map(render => [render.options.title.split(" ")[0], render.options.sharedSide]), [["web", "left"], ["api", "right"]]);
+  await h.get("architecture-apps").children.find(item => item.textContent.startsWith("web")).fire("click"); await flush();
+  assert.equal(h.renders.at(-1).options.sharedSide, undefined, "one app: unchanged");
+  const narrow = controller(dto, {width:700}); await narrow.architecture.refresh();
+  assert.deepEqual(narrow.renders.map(render => render.options.sharedSide), ["right", "right"], "stacked columns keep the right");
+});

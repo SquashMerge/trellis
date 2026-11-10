@@ -1,4 +1,5 @@
 "use strict";
+const assert = require("node:assert/strict");
 // #637: real-geometry checks of a drawn Architecture summary, run in the page with
 // `page.evaluate(arrowGeometry, selector)`. Everything is measured in page pixels from the
 // rendered SVG: band and chip boxes from their bounding rectangles, arrow segments from each
@@ -84,4 +85,27 @@ function arrowGeometry(selector) {
   });
   return {bands:bands.length, chips:chips.length, arrows:widths.length, crossings, tagHits, upward, widths, detached};
 }
-module.exports = {arrowGeometry};
+// Node-side layout helpers the Architecture suites share.
+// The panel can settle in more than one step (the inspector column follows the window).
+// The canvas publishes a pending re-layout and the width it last drew for; the drawing is
+// final once nothing is pending and that width is within the re-layout slack of the canvas.
+async function quiet(page) {
+  await page.waitForFunction(() => {
+    const canvas = document.querySelector("#architecture-diagram");
+    return canvas.dataset.layout !== "pending" && Math.abs(Number(canvas.dataset.layoutWidth) - canvas.clientWidth) < 8;
+  });
+}
+// CI draws classic 15px scrollbars (Linux, and CI Macs without a trackpad); local Macs use overlay
+// scrollbars. A classic scrollbar in the canvas's stable gutter makes every host measure as CI does
+// (#860: at 1200px the canvas is 721px wide with a 697px inner width). The rule goes in through the
+// CSSOM of the page's own stylesheet, which the strict CSP allows.
+async function classicScrollbars(page) {
+  await page.evaluate(() => {
+    const sheet = [...document.styleSheets].find(item => item.href?.endsWith("/architecture.css"));
+    sheet.insertRule("#architecture-diagram::-webkit-scrollbar { width: 15px; height: 15px; }", sheet.cssRules.length);
+  });
+  const gutter = await page.evaluate(() => { const canvas = document.querySelector("#architecture-diagram"); return canvas.offsetWidth - canvas.clientWidth; });
+  assert.equal(gutter, 15, "the canvas reserves a classic 15px scrollbar gutter, as on CI");
+  await quiet(page);
+}
+module.exports = {arrowGeometry, classicScrollbars, quiet};
