@@ -633,7 +633,8 @@ fn paged(id: &Value, name: &str, mut envelope: Value, paging: Paging, modern: bo
 }
 
 /// The `package` group of a native module in no app (#837). An app's group is its manifest
-/// path, which always ends in `Cargo.toml` or `package.json`, so the two never collide.
+/// path, which always ends in a manifest file name (`Cargo.toml`, `package.json`,
+/// `pyproject.toml`), so the two never collide.
 const NO_APP: &str = "noApp";
 
 /// One endpoint's group (#775): an external destination is its own package identity; a
