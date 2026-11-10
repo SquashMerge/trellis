@@ -1,4 +1,7 @@
-//! Server routes: axum literal registrations and the dispatch tables behind a catch-all.
+//! Server routes: axum literal registrations and the dispatch tables behind a catch-all, and
+//! actix-web routes (#858).
+mod actix;
+
 use super::{
     Handler, HandlerKind, LineIndex, Route, charge, comment, named_callable, parse, segments,
     test_file, test_span, under_test_support,
@@ -23,7 +26,7 @@ fn router_verb(name: &str) -> Option<&'static str> {
 }
 
 /// The HTTP method a `Method::GET` path names.
-fn path_verb(path: &str) -> Option<&'static str> {
+pub(super) fn path_verb(path: &str) -> Option<&'static str> {
     let mut parts = path.rsplit("::");
     let last = parts.next()?;
     let verb = VERBS.iter().copied().find(|verb| *verb == last)?;
@@ -43,20 +46,30 @@ pub(super) fn extract(
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Vec<Route>> {
     let mut found = Vec::new();
+    let mut actix = actix::Collected::default();
     for doc in &snapshot.documents {
         check()?;
         let text = &doc.file.text;
+        let axum = text.contains(".route(") || text.contains("Method::");
+        let actix_web = actix::candidate(text);
         if doc.key.language != "rust"
             || snapshot.evidence_gaps.contains_key(&doc.key)
-            || !(text.contains(".route(") || text.contains("Method::"))
+            || !(axum || actix_web)
             || test_file(doc)
         {
             continue;
         }
         charge(work, text.len())?;
         let tree = parse(doc, &tree_sitter_rust::LANGUAGE.into(), check)?;
-        Document::new(doc, tree.root_node()).collect(&mut found, check)?;
+        let document = Document::new(doc, tree.root_node());
+        if axum {
+            document.collect(&mut found, check)?;
+        }
+        if actix_web {
+            actix::collect(&document, &mut actix, &mut found, check)?;
+        }
     }
+    actix.finish(&mut found, work)?;
     found.sort_by(|a, b| (&a.path, a.start).cmp(&(&b.path, b.start)));
     let mut seen = BTreeSet::new();
     Ok(found
@@ -1328,6 +1341,176 @@ fn router() -> Router {
         for source in [deep, nested, chain, broken.to_owned()] {
             let _ = routes(&[("src/http.rs", &source)]);
         }
+    }
+
+    const ACTIX_ATTRIBUTES: &str = r#"
+use actix_web::{get, post, route, web, App, HttpResponse};
+#[get("/health")]
+async fn health() -> HttpResponse { HttpResponse::Ok().finish() }
+#[actix_web::post(r"/users/{id:\d+}")]
+async fn update(path: web::Path<u32>) -> HttpResponse { todo() }
+/// Documented.
+#[route("/both", method = "GET", method = "PUT")]
+async fn both() -> HttpResponse { todo() }
+#[get("/files/{tail:.*}")]
+#[delete("/files/{tail:.*}")]
+async fn files() -> HttpResponse { todo() }
+#[other("/not-a-route")]
+async fn other() {}
+#[get("/page")]
+async fn page() -> &'static str { include_str!("index.html") }
+#[cfg(test)]
+mod tests {
+    #[get("/in-test")]
+    async fn fixture() {}
+}
+"#;
+
+    #[test]
+    fn actix_route_attributes_are_routes_of_their_function() {
+        let shot = snapshot(&[("src/main.rs", ACTIX_ATTRIBUTES)]);
+        let found = run(&shot);
+        assert_eq!(
+            table(&found),
+            [
+                "GET /health",
+                "POST /users/{id}",
+                "GET /both",
+                "PUT /both",
+                "GET /files/{*tail}",
+                "DELETE /files/{*tail}",
+            ]
+        );
+        let health = &find(&found, "GET", "/health").handler;
+        assert_eq!(health.kind, HandlerKind::Declaration);
+        assert_eq!(
+            health.syntax_id.as_deref(),
+            Some(declaration(&shot, "health").syntax_id.as_str())
+        );
+        assert_eq!(
+            health.stable_lookup_key.as_deref(),
+            Some("src/main.rs::health")
+        );
+        assert_eq!(
+            find(&found, "GET", "/files/{*tail}").segments,
+            [Seg::Literal("files".into()), Seg::Rest]
+        );
+    }
+
+    const ACTIX_BUILDERS: &str = r#"
+use actix_web::{web, App, HttpServer, http::Method};
+async fn index() {}
+async fn create() {}
+async fn show() {}
+async fn remove() {}
+async fn version() {}
+async fn status() {}
+async fn guarded() {}
+#[actix_web::get("/me")]
+async fn me() {}
+#[actix_web::get("/{id}")]
+async fn item() {}
+fn app() -> App {
+    App::new()
+        .route("/", web::get().to(index))
+        .route("/items", web::post().to(create))
+        .route("/inline", web::get().to(|| async { "x" }))
+        .route("/method", web::method(Method::PATCH).to(index))
+        .route("/any", web::route().method(Method::DELETE).guard(g).to(guarded))
+        .route("/all-methods", web::route().to(index))
+        .service(web::resource("/items/{id}").route(web::get().to(show)).route(web::delete().to(remove)))
+        .service(
+            web::scope("/api")
+                .route("/version", web::get().to(version))
+                .service(me)
+                .service(
+                    web::scope("/v1/")
+                        .service(web::resource("status").route(web::get().to(status)))
+                        .service(handlers::item),
+                ),
+        )
+        .service(web::scope(PREFIX).route("/lost", web::get().to(index)))
+}
+"#;
+
+    #[test]
+    fn actix_builders_and_nested_scopes_are_routes() {
+        let shot = snapshot(&[("src/main.rs", ACTIX_BUILDERS)]);
+        let found = run(&shot);
+        assert_eq!(
+            table(&found),
+            [
+                "GET /api/me",
+                "GET /api/v1/{id}",
+                "GET /",
+                "POST /items",
+                "GET /inline",
+                "PATCH /method",
+                "DELETE /any",
+                "GET /items/{id}",
+                "DELETE /items/{id}",
+                "GET /api/version",
+                "GET /api/v1/status",
+            ]
+        );
+        let show = &find(&found, "GET", "/items/{id}").handler;
+        assert_eq!(show.kind, HandlerKind::Declaration);
+        assert_eq!(
+            show.syntax_id.as_deref(),
+            Some(declaration(&shot, "show").syntax_id.as_str())
+        );
+        let inline = &find(&found, "GET", "/inline").handler;
+        assert_eq!(inline.kind, HandlerKind::Closure);
+        assert_eq!(slice(&shot, inline), "|| async { \"x\" }");
+        assert_eq!(
+            find(&found, "GET", "/api/me").handler.syntax_id.as_deref(),
+            Some(declaration(&shot, "me").syntax_id.as_str())
+        );
+    }
+
+    #[test]
+    fn an_actix_service_in_another_document_scopes_the_attribute_route() {
+        let handlers = "use actix_web::get;\n#[get(\"/{id}\")]\npub async fn item() {}\n#[get(\"/free\")]\npub async fn free() {}\n";
+        let main = "use actix_web::{web, App};\nfn app() -> App {\n    App::new().service(web::scope(\"/a\").service(handlers::item)).service(web::scope(\"/b\").service(item))\n}\n";
+        let found = routes(&[("src/handlers.rs", handlers), ("src/main.rs", main)]);
+        assert_eq!(table(&found), ["GET /a/{id}", "GET /b/{id}", "GET /free"]);
+        assert!(
+            found
+                .iter()
+                .all(|route| route.handler.document.path == "src/handlers.rs")
+        );
+    }
+
+    #[test]
+    fn actix_test_code_and_documents_without_actix_are_not_routes() {
+        let source = "use actix_web::{web, App};\nasync fn h() {}\nfn app() -> App { App::new().route(\"/prod\", web::get().to(h)) }\n#[cfg(feature = \"test-support\")]\nfn fixture() -> App { App::new().route(\"/support\", web::get().to(h)) }\n";
+        let unrelated = "#[get(\"/rocket\")]\nfn rocket() {}\nfn f(map: Map) { map.route(\"/x\", other().to(h)); }\n";
+        assert_eq!(
+            table(&routes(&[
+                ("src/main.rs", source),
+                ("tests/api.rs", source),
+                ("src/rocket.rs", unrelated),
+            ])),
+            ["GET /prod"]
+        );
+    }
+
+    #[test]
+    fn an_actix_document_is_charged_and_an_exhausted_budget_is_typed() {
+        let shot = snapshot(&[("src/main.rs", ACTIX_ATTRIBUTES)]);
+        let error = extract(
+            &shot,
+            &mut Work::new(ACTIX_ATTRIBUTES.len() - 1),
+            &mut || Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), crate::interfaces::BUDGET);
+        // Six attributed routes and no `.service` registration are charged after the parse.
+        let exact = ACTIX_ATTRIBUTES.len() + 6;
+        assert_eq!(run(&shot).len(), 6);
+        extract(&shot, &mut Work::new(exact), &mut || Ok(())).unwrap();
+        let error = extract(&shot, &mut Work::new(exact - 1), &mut || Ok(())).unwrap_err();
+        assert_eq!(error.to_string(), crate::interfaces::BUDGET);
     }
 
     #[test]

@@ -3,6 +3,7 @@
 //! about apps, and runs at read time; nothing here is stored.
 mod calls;
 mod routes;
+mod rust_calls;
 
 use crate::native_evidence::{Declaration, DeclarationRole, DocumentKey, Range};
 use crate::references::{DocumentInput, Snapshot, callers::Caller, work::Work};
@@ -74,9 +75,12 @@ pub(crate) struct Route {
     pub(crate) handler: Handler,
 }
 
-/// One call a client makes to a server route through a request wrapper.
+/// One call a client makes to a server route: through a request wrapper, or a Rust `reqwest`
+/// call (#858).
 #[derive(Clone)]
 pub(crate) struct ClientCall {
+    /// Through a request wrapper, whose prefix rule may assemble the path.
+    pub(crate) wrapper: bool,
     /// `None` when the method cannot be read.
     pub(crate) method: Option<String>,
     /// `None` when the path cannot be read. A client substitution is written `{}`.

@@ -1,5 +1,5 @@
-//! Client calls: JavaScript and TypeScript calls to a request wrapper, and the matching of
-//! each to the server route it reaches.
+//! Client calls: JavaScript and TypeScript calls to a request wrapper, Rust `reqwest` calls
+//! (#858), and the matching of each to the server route it reaches.
 use super::{
     ClientCall, Confidence, LineIndex, Match, Route, Seg, charge, comment, parse, test_file,
     test_span,
@@ -44,6 +44,17 @@ pub(super) fn extract(
         let language = match doc.key.language.as_str() {
             "javascript" => tree_sitter_javascript::LANGUAGE.into(),
             "typescript" => crate::indexer_ts::grammar(&doc.key.path),
+            "rust" => {
+                if super::rust_calls::candidate(doc)
+                    && !snapshot.evidence_gaps.contains_key(&doc.key)
+                    && !test_file(doc)
+                {
+                    charge(work, doc.file.text.len())?;
+                    let tree = parse(doc, &tree_sitter_rust::LANGUAGE.into(), check)?;
+                    super::rust_calls::collect(doc, tree.root_node(), &mut found, check)?;
+                }
+                continue;
+            }
             _ => continue,
         };
         if snapshot.evidence_gaps.contains_key(&doc.key)
@@ -125,6 +136,7 @@ impl<'a> Document<'a> {
                 }
             };
             found.push(ClientCall {
+                wrapper: true,
                 method: self.method(wrapper, &arguments).map(str::to_owned),
                 path_template: template,
                 segments,
@@ -291,14 +303,14 @@ impl<'a> Document<'a> {
     }
 }
 
-fn verb(text: &str) -> Option<&'static str> {
+pub(super) fn verb(text: &str) -> Option<&'static str> {
     let upper = text.to_ascii_uppercase();
     VERBS.iter().copied().find(|verb| *verb == upper)
 }
 
 /// A client path as segments. A segment with a substitution is a `Param`. Only the one
 /// leading `/` is structural: `//health` keeps its empty first segment.
-fn client_segments(template: &str) -> Vec<Seg> {
+pub(super) fn client_segments(template: &str) -> Vec<Seg> {
     let mut parts: Vec<&str> = template
         .strip_prefix('/')
         .unwrap_or(template)
@@ -319,7 +331,8 @@ fn client_segments(template: &str) -> Vec<Seg> {
         .collect()
 }
 
-/// The route each call reached: as written, else through the `/api/` wrapper prefix.
+/// The route each call reached: as written, else, for a wrapper call, through the `/api/`
+/// wrapper prefix.
 pub(super) fn resolve(
     routes: &[Route],
     calls: &[ClientCall],
@@ -357,6 +370,9 @@ fn best(routes: &[Route], call: &ClientCall) -> Option<Match> {
                 Confidence::Exact
             },
         });
+    }
+    if !call.wrapper {
+        return None;
     }
     let prefixed = prefixed(segments)?;
     let route = most_literal(&candidates(routes, method, &prefixed))?;
@@ -785,6 +801,139 @@ function go(api, request) {
                 .unwrap();
             assert!(bounded(error), "{short}");
         }
+    }
+
+    const ACTIX_SERVER: &str = r#"
+use actix_web::{get, web, App};
+#[get("/health")]
+async fn health() {}
+async fn create() {}
+async fn show() {}
+async fn status() {}
+async fn unused() {}
+fn app() -> App {
+    App::new()
+        .service(health)
+        .service(
+            web::scope("/api")
+                .route("/users", web::post().to(create))
+                .service(web::resource("/users/{id}").route(web::get().to(show)))
+                .route("/checkouts/{root}/status", web::get().to(status))
+                .route("/unused", web::delete().to(unused)),
+        )
+}
+"#;
+
+    const REQWEST_CLIENT: &str = r#"
+use reqwest::{Client, Method};
+const BASE: &str = "http://localhost:8080";
+const HEALTH: &str = "http://localhost:8080/health";
+async fn calls(client: &Client, http_client: Client, id: u32, host: &str, url: String) {
+    client.get("http://localhost:8080/health").send().await;
+    reqwest::get(HEALTH).await;
+    reqwest::blocking::get("/health");
+    http_client.post(format!("{BASE}/api/users")).send().await;
+    client.get(format!("{}/api/users/{}", BASE, id)).send().await;
+    client.get(&format!("{base}/api/users/{id}?full=1", base = BASE)).send().await;
+    client.request(Method::GET, format!("http://{host}/api/users/{id}")).send().await;
+    client.request(reqwest::Method::DELETE, format!("{BASE}/api/unused"));
+    Client::new().get("https://example.test/api/missing").send().await;
+    self.client.get(format!("{}/api/users", host)).send().await;
+    client.get(url).send().await;
+    client.request(verb, "/health");
+    client.get("/api/status");
+}
+"#;
+
+    #[test]
+    fn reqwest_calls_match_actix_routes() {
+        let found = run(&[
+            ("server/src/main.rs", ACTIX_SERVER),
+            ("client/src/lib.rs", REQWEST_CLIENT),
+        ]);
+        let outcomes: Vec<String> = found
+            .calls
+            .iter()
+            .zip(&found.matched)
+            .map(|(call, matched)| {
+                let call_text = format!(
+                    "{} {}",
+                    call.method.as_deref().unwrap_or("?"),
+                    call.path_template.as_deref().unwrap_or("?")
+                );
+                match matched {
+                    Some(m) => format!(
+                        "{call_text} -> {} {:?}",
+                        found.routes[m.route].path_template, m.confidence
+                    ),
+                    None => format!("{call_text} -> unresolved"),
+                }
+            })
+            .collect();
+        assert_eq!(
+            outcomes,
+            [
+                "GET /health -> /health Exact",
+                "GET /health -> /health Exact",
+                "GET /health -> /health Exact",
+                "POST /api/users -> /api/users Exact",
+                "GET /api/users/{} -> /api/users/{id} Template",
+                "GET /api/users/{} -> /api/users/{id} Template",
+                "GET /api/users/{} -> /api/users/{id} Template",
+                "DELETE /api/unused -> /api/unused Exact",
+                "GET /api/missing -> unresolved",
+                "GET ? -> unresolved",
+                "GET ? -> unresolved",
+                "? /health -> unresolved",
+                "GET /api/status -> unresolved",
+            ]
+        );
+        assert!(found.calls.iter().all(|call| !call.wrapper));
+        let first = &found.calls[0];
+        assert_eq!(first.lines.start, 6);
+        assert!(first.call_id.is_some());
+        let caller = serde_json::to_value(first.caller.as_ref().unwrap()).unwrap();
+        assert_eq!(caller["name"], "calls");
+    }
+
+    #[test]
+    fn rust_code_that_is_not_a_reqwest_call_is_not_a_client_call() {
+        let lookalikes = r#"
+use reqwest::Client;
+fn f(map: HashMap<String, String>, cache: Cache, client: Client) {
+    map.get("/health");
+    cache.post("/health");
+    client.send("/health");
+    client.get("/health", extra);
+    other::get("/health");
+}
+#[cfg(feature = "test-support")]
+fn support(client: Client) { client.get("/health"); }
+#[cfg(test)]
+mod tests {
+    fn t(client: Client) { client.get("/health"); }
+}
+"#;
+        let no_reqwest = "fn g(client: Http) { client.get(\"/health\"); }";
+        let in_tests = "use reqwest::Client;\nfn t(client: Client) { client.get(\"/health\"); }";
+        let found = run(&[
+            ("server/src/main.rs", ACTIX_SERVER),
+            ("client/src/lib.rs", lookalikes),
+            ("client/src/plain.rs", no_reqwest),
+            ("client/tests/api.rs", in_tests),
+        ]);
+        assert!(found.calls.is_empty(), "{}", found.calls.len());
+        assert!(!found.routes.is_empty());
+    }
+
+    #[test]
+    fn an_exhausted_budget_while_reading_reqwest_calls_is_typed() {
+        let shot = snapshot(&[("client/src/lib.rs", REQWEST_CLIENT)]);
+        let mut work = Work::new(REQWEST_CLIENT.len() - 1);
+        let error = extract(&shot, &mut work, &mut || Ok(())).err().unwrap();
+        assert_eq!(error.to_string(), crate::interfaces::BUDGET);
+        let mut work = Work::new(REQWEST_CLIENT.len());
+        assert_eq!(extract(&shot, &mut work, &mut || Ok(())).unwrap().len(), 13);
     }
 
     #[test]

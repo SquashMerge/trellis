@@ -454,6 +454,12 @@ Each match carries a `confidence`, and so does each `clientOnly` item, which is 
 
 Interface evidence is never worded "A calls B", and it is never an input to `$layers` verdicts.
 
+### Amendment: actix-web routes and reqwest clients (#858)
+
+**Status: owner-ratified 2026-11-09 under the owner's decision that the endpoints of the other platforms ship in 0.2 ([#686](https://github.com/SquashMerge/trellis/issues/686), [#858](https://github.com/SquashMerge/trellis/issues/858)), with evidence wording amendments approved.** This wins over [Matching](#matching) where they differ. The evidence kind, its fields and the four confidence values and their order are unchanged.
+
+Server templates also come from Rust actix-web route attributes and route builders, with their `web::scope` prefixes. Client paths also come from Rust `reqwest` calls whose URL is statically readable. The prefix rule belongs to the configured wrappers only, so a `reqwest` match is never `wrapperInferred`. A `reqwest` call whose URL or method cannot be read is `unresolved`. As before, a missing match proves nothing.
+
 ## Owner-ratified native-v9 correction: Java varargs
 
 **Status: owner-ratified 2026-10-24 (#279).** This narrow Java measurement ruling is approved independently; the #279 capability and reference amendments above are also ratified by the owner, 2026-10-24.
