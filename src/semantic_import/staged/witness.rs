@@ -220,12 +220,14 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
             "original association event ordinal gap"
         );
         expected += 1;
-        let body: String = row.get(1)?;
-        let bound = event_bound(body.len())?;
-        let scratch = join.ctx.live.reserve(bound)?;
-        let event: OriginalRow = serde_json::from_str(&body)?;
-        drop(body);
-        reservation.grow(retained_bytes(&event, document_bytes, &captured_id, bound)?)?;
+        // SQLite's borrowed text: the event is admitted before anything of it is allocated.
+        let (scratch, event) = admit_event(&join.ctx.live, row.get_ref(1)?.as_str()?)?;
+        reservation.grow(retained_bytes(
+            &event,
+            document_bytes,
+            &captured_id,
+            scratch.bytes(),
+        )?)?;
         drop(scratch);
         match event {
             OriginalRow::Coverage(row) => {
@@ -245,7 +247,7 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
                 } else {
                     &mut row.supported_roles
                 };
-                append(roles, ordinal, role)?;
+                append(&mut reservation, roles, ordinal, role)?;
             }
             OriginalRow::Basis(row) => {
                 let id = row.basis_id;
@@ -273,6 +275,7 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
                 ordinal,
                 key,
             } => append(
+                &mut reservation,
                 &mut bases
                     .get_mut(&basis_id)
                     .context("missing original basis")?
@@ -287,7 +290,7 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
                 );
             }
             OriginalRow::Symbol(row) => {
-                append(&mut symbol_order, row.ordinal, row.row_id)?;
+                append(&mut reservation, &mut symbol_order, row.ordinal, row.row_id)?;
                 anyhow::ensure!(
                     symbols
                         .insert(
@@ -308,6 +311,7 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
                 ordinal,
                 target,
             } => append(
+                &mut reservation,
                 &mut symbols
                     .get_mut(&row_id)
                     .context("missing original symbol")?
@@ -316,7 +320,12 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
                 target,
             )?,
             OriginalRow::DeclarationBinding(row) => {
-                append(&mut declaration_order, row.ordinal, row.row_id)?;
+                append(
+                    &mut reservation,
+                    &mut declaration_order,
+                    row.ordinal,
+                    row.row_id,
+                )?;
                 anyhow::ensure!(
                     declarations
                         .insert(
@@ -337,6 +346,7 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
                 ordinal,
                 key,
             } => append(
+                &mut reservation,
                 &mut declarations
                     .get_mut(&row_id)
                     .context("missing original binding")?
@@ -349,6 +359,7 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
                 ordinal,
                 id,
             } => append(
+                &mut reservation,
                 &mut declarations
                     .get_mut(&row_id)
                     .context("missing original binding")?
@@ -389,6 +400,7 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
                 ordinal,
                 role,
             } => append(
+                &mut reservation,
                 &mut references
                     .get_mut(&reference_id)
                     .context("missing original reference")?
@@ -401,6 +413,7 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
                 ordinal,
                 target,
             } => append(
+                &mut reservation,
                 &mut references
                     .get_mut(&reference_id)
                     .context("missing original reference")?
@@ -409,7 +422,7 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
                 target,
             )?,
             OriginalRow::CallBinding(row) => {
-                append(&mut call_order, row.ordinal, row.row_id)?;
+                append(&mut reservation, &mut call_order, row.ordinal, row.row_id)?;
                 anyhow::ensure!(
                     calls
                         .insert(
@@ -436,6 +449,7 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
                 ordinal,
                 id,
             } => append(
+                &mut reservation,
                 &mut calls
                     .get_mut(&row_id)
                     .context("missing original call")?
@@ -449,6 +463,7 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
                 ordinal,
                 target,
             } => append(
+                &mut reservation,
                 &mut calls
                     .get_mut(&row_id)
                     .context("missing original call")?
@@ -461,6 +476,7 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
                 ordinal,
                 target,
             } => append(
+                &mut reservation,
                 &mut calls
                     .get_mut(&row_id)
                     .context("missing original call")?
@@ -469,7 +485,7 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
                 target,
             )?,
             OriginalRow::TypeRelationship { ordinal, row } => {
-                append(&mut relationships, ordinal, row)?
+                append(&mut reservation, &mut relationships, ordinal, row)?
             }
         }
     }
@@ -527,7 +543,8 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
         Ok(derived.provenance_id.clone())
     };
     let mut facts = super::super::JoinedFacts::default();
-    // The ordered rows move out of their decoded maps into these vectors.
+    // The ordered rows move out of their decoded maps into these vectors, allocated once at
+    // their exact final capacity after it is admitted: no push below reallocates.
     reservation.grow(sizes::sum(&[
         sizes::slots::<semantic::Symbol>(symbol_order.len())?,
         sizes::slots::<semantic::DeclarationBinding>(declaration_order.len())?,
@@ -535,6 +552,13 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
         sizes::slots::<semantic::CallBinding>(call_order.len())?,
         sizes::slots::<semantic::TypeRelationship>(relationships.len())?,
     ])?)?;
+    facts.symbols.reserve_exact(symbol_order.len());
+    facts
+        .declaration_bindings
+        .reserve_exact(declaration_order.len());
+    facts.references.reserve_exact(references.len());
+    facts.call_bindings.reserve_exact(call_order.len());
+    facts.type_relationships.reserve_exact(relationships.len());
     for id in symbol_order {
         let mut row = symbols.remove(&id).context("missing ordered symbol")?;
         row.provenance_id = raw_for(&row.provenance_id, &mut reservation)?;
@@ -697,10 +721,20 @@ fn event_bound(body: usize) -> Result<u64> {
         .ok_or_else(|| ScipCaptureError::LimitExceeded("unit expansion".into()).into())
 }
 
+/// Admits one original event at its decode bound, then decodes it from `body`, which the
+/// caller borrows from SQLite: nothing is allocated before the admission (#394). The returned
+/// guard holds the bound until the caller has charged what the event keeps.
+fn admit_event(live: &Rc<LiveBudget>, body: &str) -> Result<(Reservation, OriginalRow)> {
+    let scratch = live.reserve(event_bound(body.len())?)?;
+    let event = serde_json::from_str(body)?;
+    Ok((scratch, event))
+}
+
 /// The owned bytes one decoded original event keeps once `prepare` has placed it, counted as
 /// FULL's `sizes` visitors count the row it becomes: its value, its map entry or child slot,
 /// a parent's order slot, and the document and captured revision a reference gains. The few
-/// coverage and basis events of a document keep their decode `bound`.
+/// coverage and basis events of a document keep their decode `bound`. The slots of the vector
+/// an event is appended to are charged again, at real capacity, by `append`: conservative.
 fn retained_bytes(event: &OriginalRow, document: u64, revision: &str, bound: u64) -> Result<u64> {
     use crate::store::native_first::witness::OriginalJoin;
     let join = |row: &OriginalJoin| -> Result<u64> {
@@ -809,26 +843,101 @@ fn reused_source(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Result<boo
     )
 }
 
-fn append<T>(values: &mut Vec<T>, ordinal: i64, value: T) -> Result<()> {
+/// Appends the child or order entry at `ordinal`. A growth charges the doubled buffer to
+/// `retained` before it is allocated, while the old one is still live, and releases the old
+/// buffer's charge after (FULL's `append_reserved_with`, #865): what `prepare` keeps is charged
+/// at its real capacity. The entry's own payload is charged by `retained_bytes`.
+fn append<T>(
+    retained: &mut Reservation,
+    values: &mut Vec<T>,
+    ordinal: i64,
+    value: T,
+) -> Result<()> {
     anyhow::ensure!(
         usize::try_from(ordinal)? == values.len(),
         "original child ordinal gap"
     );
-    values.push(value);
-    Ok(())
+    super::streaming::append_reserved_with(values, 0, retained, || value)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// #865, #394: an original event is admitted at its decode bound before anything of it is
+    /// allocated. A budget below the bound refuses it typed, at the same allocation peak as the
+    /// budget's own refusal; a budget at the bound decodes it.
+    #[test]
+    fn original_event_is_admitted_before_it_is_decoded() {
+        let body = serde_json::to_string(&OriginalRow::DeclarationCandidate {
+            row_id: 1,
+            ordinal: 0,
+            id: "sid:v1:".repeat(64),
+        })
+        .unwrap();
+        let bound = event_bound(body.len()).unwrap();
+        assert!(bound > body.len() as u64);
+        let denied = LiveBudget::new(bound - 1);
+        let (refused, _, refusal_peak) =
+            crate::test_alloc::measure_peak(|| admit_event(&denied, &body).err());
+        let (_, _, reserve_peak) = crate::test_alloc::measure_peak(|| denied.reserve(bound).err());
+        assert_eq!(
+            refusal_peak, reserve_peak,
+            "nothing allocated before the refusal"
+        );
+        assert!(matches!(
+            refused.unwrap().downcast_ref::<ScipCaptureError>(),
+            Some(ScipCaptureError::LimitExceeded(name)) if name == "unit expansion"
+        ));
+        assert_eq!(denied.high_water(), 0);
+        let allowed = LiveBudget::new(bound);
+        let (scratch, event) = admit_event(&allowed, &body).unwrap();
+        assert_eq!(scratch.bytes(), bound);
+        assert!(matches!(event, OriginalRow::DeclarationCandidate { .. }));
+    }
+
     #[test]
     fn original_children_require_contiguous_ordinals() {
+        let budget = LiveBudget::new(1 << 20);
+        let mut retained = budget.reserve(0).unwrap();
         let mut values = Vec::new();
-        append(&mut values, 0, "first").unwrap();
-        assert!(append(&mut values, 2, "gap").is_err());
-        assert!(append(&mut values, 0, "duplicate").is_err());
-        append(&mut values, 1, "second").unwrap();
+        append(&mut retained, &mut values, 0, "first").unwrap();
+        assert!(append(&mut retained, &mut values, 2, "gap").is_err());
+        assert!(append(&mut retained, &mut values, 0, "duplicate").is_err());
+        append(&mut retained, &mut values, 1, "second").unwrap();
         assert_eq!(values, ["first", "second"]);
+    }
+
+    /// #865: a child or order vector is charged at its real capacity, and a growth admits the
+    /// doubled buffer while the old one is still live. A budget that holds the vector's logical
+    /// length after the fifth append, but not that growth peak, refuses it typed and leaves the
+    /// vector as it was.
+    #[test]
+    fn original_child_growth_is_admitted_at_capacity_and_peak() {
+        let slot = std::mem::size_of::<u64>() as u64;
+        let fill = |limit: u64| {
+            let budget = LiveBudget::new(limit);
+            let mut retained = budget.reserve(0).unwrap();
+            let mut values: Vec<u64> = Vec::new();
+            for ordinal in 0..4 {
+                append(&mut retained, &mut values, ordinal, 0).unwrap();
+            }
+            assert_eq!(values.capacity(), 4);
+            assert_eq!(retained.bytes(), 4 * slot, "charged at capacity 4");
+            let result = append(&mut retained, &mut values, 4, 0);
+            (result, values, retained.bytes(), budget.high_water())
+        };
+        // Five logical slots fit, but the growth needs the old 4 and the new 8 at once.
+        let (refused, values, bytes, _) = fill(5 * slot);
+        assert!(matches!(
+            refused.unwrap_err().downcast_ref::<ScipCaptureError>(),
+            Some(ScipCaptureError::LimitExceeded(name)) if name == "unit expansion"
+        ));
+        assert_eq!((values.len(), values.capacity(), bytes), (4, 4, 4 * slot));
+        // Twelve slots admit the peak; the old buffer's charge is released after the growth.
+        let (grown, values, bytes, peak) = fill(12 * slot);
+        grown.unwrap();
+        assert_eq!((values.len(), values.capacity()), (5, 8));
+        assert_eq!((bytes, peak), (8 * slot, 12 * slot));
     }
 }
