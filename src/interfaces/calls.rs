@@ -1,6 +1,6 @@
 //! Client calls: JavaScript and TypeScript request wrappers, `fetch` and axios (#788, #855),
 //! and the matching of each call to the server route it reaches.
-use super::js::{Base, Budget, Value, World, arguments, spread, unwrap, verb};
+use super::js::{Base, Budget, Prop, Value, World, arguments, unwrap, verb};
 use super::{
     ANY, ClientCall, ClientPrefix, Confidence, LineIndex, Match, Route, Seg, charge, test_file,
     test_span,
@@ -123,10 +123,7 @@ pub(super) fn extract(
                 wrappers.push(wrapper);
             }
         }
-        let axios = Axios {
-            here: doc.file.text.contains("axios"),
-            anywhere: axios_anywhere,
-        };
+        let axios = axios_anywhere;
         if !doc
             .calls
             .iter()
@@ -166,23 +163,18 @@ fn callee_text<'d>(doc: &'d DocumentInput, call: &'d Call) -> &'d str {
         .unwrap_or("")
 }
 
-/// Whether axios is mentioned in this document, and in any document.
-#[derive(Clone, Copy)]
-struct Axios {
-    here: bool,
-    anywhere: bool,
-}
-
 /// Whether a native call may be a client call, by the last name of its callee.
-fn candidate(doc: &DocumentInput, call: &Call, wrappers: &[Wrapper], axios: Axios) -> bool {
+/// `axios` is whether any document mentions axios: only then can an identifier or an
+/// axios method name be an axios client, whatever the calling file itself says.
+fn candidate(doc: &DocumentInput, call: &Call, wrappers: &[Wrapper], axios: bool) -> bool {
     let text = callee_text(doc, call);
     let last = text
         .rsplit(['.', ' ', '\n', '\t', '\r'])
         .next()
         .unwrap_or(text);
     last == "fetch"
-        || (axios.here && !text.contains('.'))
-        || (axios.anywhere && AXIOS_METHODS.iter().any(|(name, _)| *name == last))
+        || (axios && !text.contains('.'))
+        || (axios && AXIOS_METHODS.iter().any(|(name, _)| *name == last))
         || wrappers
             .iter()
             .any(|w| w.callee.rsplit('.').next() == Some(last))
@@ -194,7 +186,7 @@ struct Document<'w, 's> {
     doc: &'s DocumentInput,
     root: Node<'w>,
     wrappers: &'w [Wrapper],
-    axios: Axios,
+    axios: bool,
 }
 
 impl<'w> Document<'w, '_> {
@@ -331,7 +323,7 @@ impl<'w> Document<'w, '_> {
             "member_expression" => function
                 .child_by_field_name("property")
                 .map(|property| self.text(property)),
-            "identifier" if self.axios.here => None,
+            "identifier" if self.axios => None,
             _ => return Ok(None),
         };
         if property.is_some_and(|p| !AXIOS_METHODS.iter().any(|(name, _)| *name == p)) {
@@ -466,9 +458,9 @@ impl<'w> Document<'w, '_> {
                 None => None,
             },
             (None, Some((doc, object))) => match self.world.property(doc, object, "url") {
-                Some(url) => Some(self.world.eval(doc, url, budget)?),
-                None if spread(object) => Some(Value::Unknown),
-                None => None,
+                Prop::Found(url) => Some(self.world.eval(doc, url, budget)?),
+                Prop::Unknown => Some(Value::Unknown),
+                Prop::Absent => None,
             },
             (None, None) => None,
         };
@@ -477,11 +469,12 @@ impl<'w> Document<'w, '_> {
         };
         let base = match object {
             Some((doc, object)) => match self.world.property(doc, object, "baseURL") {
-                Some(value) => match self.world.eval(doc, value, budget)? {
+                Prop::Found(value) => match self.world.eval(doc, value, budget)? {
                     Value::Str(text) => Base::Known(text),
                     _ => Base::Unreadable,
                 },
-                None => base.clone(),
+                Prop::Unknown => Base::Unreadable,
+                Prop::Absent => base.clone(),
             },
             None => base.clone(),
         };
@@ -512,8 +505,8 @@ impl<'w> Document<'w, '_> {
         })
     }
 
-    /// The `method` of an options object. An absent object, or one without a method and
-    /// without a spread, is `GET`.
+    /// The `method` of an options object. An absent object, or one where no member can set
+    /// a method, is `GET`.
     fn options(
         &self,
         options: Option<Node<'w>>,
@@ -530,44 +523,13 @@ impl<'w> Document<'w, '_> {
             },
             _ => return Ok(None),
         };
-        let mut method = None;
-        let mut spread = false;
-        for member in super::js::children(options) {
-            match member.kind() {
-                "pair" => {
-                    let Some(key) = member.child_by_field_name("key") else {
-                        return Ok(None);
-                    };
-                    if self.world.key_name(doc, key).as_deref() == Some("method") {
-                        let Some(value) = member.child_by_field_name("value") else {
-                            return Ok(None);
-                        };
-                        method = Some(match self.world.eval(doc, value, budget)? {
-                            Value::Str(text) => verb(&text),
-                            _ => None,
-                        });
-                    }
-                }
-                "shorthand_property_identifier" if self.world.text(doc, member) == "method" => {
-                    method = Some(None);
-                }
-                // An accessor or method named `method` is present but not a literal.
-                "method_definition" => {
-                    let Some(name) = member.child_by_field_name("name") else {
-                        return Ok(None);
-                    };
-                    if self.world.key_name(doc, name).as_deref() == Some("method") {
-                        method = Some(None);
-                    }
-                }
-                "spread_element" => spread = true,
-                _ => {}
-            }
-        }
-        Ok(match method {
-            Some(method) => method,
-            None if spread => None,
-            None => Some("GET"),
+        Ok(match self.world.property(doc, options, "method") {
+            Prop::Absent => Some("GET"),
+            Prop::Unknown => None,
+            Prop::Found(value) => match self.world.eval(doc, value, budget)? {
+                Value::Str(text) => verb(&text),
+                _ => None,
+            },
         })
     }
 }

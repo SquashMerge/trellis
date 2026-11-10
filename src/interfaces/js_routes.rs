@@ -1,8 +1,8 @@
 //! JavaScript and TypeScript server routes (#855): express, fastify and Koa registrations
 //! reached from an app object through its mounts, and Next.js file routes.
 use super::js::{
-    Binding, BindingId, Budget, Factory, Value, World, arguments, children, function_like,
-    readable_path, spread, verb,
+    Binding, BindingId, Budget, Factory, Prop, Value, World, arguments, children, function_like,
+    readable_path, verb,
 };
 use super::{
     ANY, Handler, HandlerKind, LineIndex, Route, named_callable, segments, test_file, test_span,
@@ -335,16 +335,10 @@ impl<'w> Extractor<'w, '_> {
         let (path, rest) = match self.world.eval(doc, *first, budget)? {
             Value::Str(path) if readable_path(&path) => (path, &arguments[1..]),
             Value::Str(_) => return Ok(()),
-            // A name or member with no readable value may be a path: nothing after it is
-            // mounted anywhere this extraction can say.
-            Value::Unknown
-                if matches!(
-                    super::js::unwrap(*first).kind(),
-                    "identifier" | "member_expression" | "subscript_expression"
-                ) =>
-            {
-                return Ok(());
-            }
+            // A first argument with no readable value, such as a call, a conditional or an
+            // unbound name, may be a path: nothing after it is mounted anywhere this
+            // extraction can say.
+            Value::Unknown => return Ok(()),
             _ => (String::new(), arguments),
         };
         let prefix = join(prefix, &path);
@@ -394,13 +388,18 @@ impl<'w> Extractor<'w, '_> {
         let Some(plugin) = arguments.first() else {
             return Ok(());
         };
-        let path = match arguments.get(1) {
-            None => String::new(),
-            Some(options) => match self.world.eval(doc, *options, budget)? {
+        // A `fastify-plugin` plugin shares this scope, so `prefix` does not apply to it.
+        let (plugin, shared) = match self.world.eval(doc, *plugin, budget)? {
+            Value::Shared(inner) => (*inner, true),
+            plugin => (plugin, false),
+        };
+        let path = match (shared, arguments.get(1)) {
+            (true, _) | (false, None) => String::new(),
+            (false, Some(options)) => match self.world.eval(doc, *options, budget)? {
                 Value::Object(at, object) => match self.world.property(at, object, "prefix") {
-                    None if spread(object) => return Ok(()),
-                    None => String::new(),
-                    Some(path) => match self.world.eval(at, path, budget)? {
+                    Prop::Unknown => return Ok(()),
+                    Prop::Absent => String::new(),
+                    Prop::Found(path) => match self.world.eval(at, path, budget)? {
                         Value::Str(path) if readable_path(&path) => path,
                         _ => return Ok(()),
                     },
@@ -410,7 +409,7 @@ impl<'w> Extractor<'w, '_> {
         };
         if let Value::Function {
             doc: target, node, ..
-        } = self.world.eval(doc, *plugin, budget)?
+        } = plugin
             && let Some(binding) = self.world.parameter(target, node, 0)
         {
             self.process(
@@ -478,11 +477,13 @@ impl<'w> Extractor<'w, '_> {
         else {
             return Ok(());
         };
-        let (Some(method), Some(url), Some(handler)) = (
+        let url = match self.world.property(at, object, "url") {
+            Prop::Absent => self.world.property(at, object, "path"),
+            url => url,
+        };
+        let (Prop::Found(method), Prop::Found(url), Prop::Found(handler)) = (
             self.world.property(at, object, "method"),
-            self.world
-                .property(at, object, "url")
-                .or_else(|| self.world.property(at, object, "path")),
+            url,
             self.world.property(at, object, "handler"),
         ) else {
             return Ok(());
@@ -526,7 +527,7 @@ impl<'w> Extractor<'w, '_> {
         // A fastify handler can be the `handler` of an options object.
         let mut handler = *handler;
         if handler.kind() == "object"
-            && let Some(inner) = self.world.property(doc, handler, "handler")
+            && let Prop::Found(inner) = self.world.property(doc, handler, "handler")
         {
             handler = inner;
         }

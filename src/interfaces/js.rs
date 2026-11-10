@@ -92,6 +92,8 @@ pub(super) enum Value<'w> {
     Routes(Box<Value<'w>>),
     /// A method of an axios client.
     AxiosMethod(Base, String),
+    /// A `fastify-plugin` plugin, which shares its parent's scope.
+    Shared(Box<Value<'w>>),
 }
 
 /// A binding: its identity, its name, and the node whose span is its scope.
@@ -803,35 +805,47 @@ impl<'s> World<'s> {
                 ..
             } => Value::AxiosMethod(base, property.to_owned()),
             Value::Object(doc, object) => match self.property(doc, object, property) {
-                Some(value) => self.eval_at(doc, value, budget, depth)?,
-                None => Value::Unknown,
+                Prop::Found(value) => self.eval_at(doc, value, budget, depth)?,
+                Prop::Absent | Prop::Unknown => Value::Unknown,
             },
             _ => Value::Unknown,
         })
     }
 
-    /// The value node of an object literal's `key`, the last one written.
-    pub(super) fn property<'w>(
-        &'w self,
-        doc: usize,
-        object: Node<'w>,
-        key: &str,
-    ) -> Option<Node<'w>> {
-        let mut found = None;
+    /// What an object literal says about `key`, in write order: the last member that may set
+    /// it decides. A spread, a computed key, or an accessor or method of that name may set it
+    /// to anything, so it is `Unknown` until a later explicit `key` member.
+    pub(super) fn property<'w>(&'w self, doc: usize, object: Node<'w>, key: &str) -> Prop<'w> {
+        let mut found = Prop::Absent;
         for member in children(object) {
             match member.kind() {
-                "pair" => {
-                    if let (Some(name), Some(value)) = (
-                        member.child_by_field_name("key"),
-                        member.child_by_field_name("value"),
-                    ) && self.key_name(doc, name).as_deref() == Some(key)
-                    {
-                        found = Some(value);
+                "pair" => match (
+                    member.child_by_field_name("key"),
+                    member.child_by_field_name("value"),
+                ) {
+                    (Some(name), _) if name.kind() == "computed_property_name" => {
+                        found = Prop::Unknown;
                     }
-                }
+                    (Some(name), Some(value))
+                        if self.key_name(doc, name).as_deref() == Some(key) =>
+                    {
+                        found = Prop::Found(value);
+                    }
+                    _ => {}
+                },
                 "shorthand_property_identifier" if self.text(doc, member) == key => {
-                    found = Some(member);
+                    found = Prop::Found(member);
                 }
+                "spread_element" => found = Prop::Unknown,
+                "method_definition" => match member.child_by_field_name("name") {
+                    Some(name)
+                        if name.kind() == "computed_property_name"
+                            || self.key_name(doc, name).as_deref() == Some(key) =>
+                    {
+                        found = Prop::Unknown;
+                    }
+                    _ => {}
+                },
                 _ => {}
             }
         }
@@ -891,14 +905,51 @@ impl<'s> World<'s> {
                         budget,
                         depth,
                     )?)),
-                    ("fastify-plugin", []) => match arguments.first() {
-                        Some(plugin) => self.eval_at(doc, *plugin, budget, depth)?,
-                        None => Value::Unknown,
-                    },
+                    ("fastify-plugin", []) => {
+                        self.fastify_plugin(doc, &arguments, budget, depth)?
+                    }
                     _ => Value::Unknown,
                 }
             }
             _ => Value::Unknown,
+        })
+    }
+
+    /// `fp(plugin, options)` from `fastify-plugin`. Such a plugin is not encapsulated: it
+    /// shares its parent's scope, so `register`'s `prefix` does not apply to its routes. The
+    /// Fastify reference says so under "Route Prefixing and fastify-plugin":
+    /// <https://fastify.dev/docs/latest/Reference/Routes/>. With `encapsulate: true` it is an
+    /// ordinary plugin. Options that cannot be read decide nothing, so the value is unknown.
+    fn fastify_plugin<'w>(
+        &'w self,
+        doc: usize,
+        arguments: &[Node<'w>],
+        budget: &mut Budget<'_>,
+        depth: usize,
+    ) -> Result<Value<'w>> {
+        let Some(plugin) = arguments.first() else {
+            return Ok(Value::Unknown);
+        };
+        let encapsulated = match arguments.get(1) {
+            None => false,
+            Some(options) => match self.eval_at(doc, *options, budget, depth)? {
+                Value::Object(at, object) => match self.property(at, object, "encapsulate") {
+                    Prop::Absent => false,
+                    Prop::Found(value) => match unwrap(value).kind() {
+                        "true" => true,
+                        "false" => false,
+                        _ => return Ok(Value::Unknown),
+                    },
+                    Prop::Unknown => return Ok(Value::Unknown),
+                },
+                _ => return Ok(Value::Unknown),
+            },
+        };
+        let plugin = self.eval_at(doc, *plugin, budget, depth)?;
+        Ok(if encapsulated {
+            plugin
+        } else {
+            Value::Shared(Box::new(plugin))
         })
     }
 
@@ -918,11 +969,14 @@ impl<'s> World<'s> {
                     None => Some(String::new()),
                     Some(options) => match self.eval_at(doc, *options, budget, depth)? {
                         Value::Object(doc, object) => match self.property(doc, object, "prefix") {
-                            None => Some(String::new()),
-                            Some(prefix) => match self.eval_at(doc, prefix, budget, depth)? {
-                                Value::Str(prefix) if readable_path(&prefix) => Some(prefix),
-                                _ => None,
-                            },
+                            Prop::Absent => Some(String::new()),
+                            Prop::Unknown => None,
+                            Prop::Found(prefix) => {
+                                match self.eval_at(doc, prefix, budget, depth)? {
+                                    Value::Str(prefix) if readable_path(&prefix) => Some(prefix),
+                                    _ => None,
+                                }
+                            }
                         },
                         _ => None,
                     },
@@ -946,9 +1000,9 @@ impl<'s> World<'s> {
         };
         Ok(match self.eval_at(doc, config, budget, depth)? {
             Value::Object(doc, object) => match self.property(doc, object, "baseURL") {
-                None if spread(object) => Base::Unreadable,
-                None => Base::None,
-                Some(value) => match self.eval_at(doc, value, budget, depth)? {
+                Prop::Unknown => Base::Unreadable,
+                Prop::Absent => Base::None,
+                Prop::Found(value) => match self.eval_at(doc, value, budget, depth)? {
                     Value::Str(base) => Base::Known(base),
                     _ => Base::Unreadable,
                 },
@@ -1139,11 +1193,15 @@ fn made<'w>(factory: Factory) -> Value<'w> {
     }
 }
 
-/// Whether an object literal has a top-level spread.
-pub(super) fn spread(object: Node<'_>) -> bool {
-    children(object)
-        .iter()
-        .any(|member| member.kind() == "spread_element")
+/// What an object literal says about one key.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Prop<'w> {
+    /// No member can set it.
+    Absent,
+    /// The last member that sets it, with this value.
+    Found(Node<'w>),
+    /// A spread, computed key, accessor or method may set it to anything.
+    Unknown,
 }
 
 /// Whether a server path or prefix is a rooted literal this extraction can read: no

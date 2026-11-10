@@ -259,7 +259,7 @@ module.exports = async function (instance) {
 "#;
 
 #[test]
-fn fastify_routes_route_options_and_registered_plugin_prefixes() {
+fn fastify_routes_route_options_and_registered_plugins() {
     assert_eq!(
         routes(&[
             ("api/server.ts", FASTIFY_SERVER),
@@ -267,8 +267,8 @@ fn fastify_routes_route_options_and_registered_plugin_prefixes() {
             ("api/plain.js", FASTIFY_PLAIN),
         ]),
         [
-            "GET /v1/items <- api/items.ts:list",
-            "PUT /v1/items/{id} <- api/items.ts:update",
+            "GET /items <- api/items.ts:list",
+            "PUT /items/{id} <- api/items.ts:update",
             "DELETE /plain <- api/plain.js:closure",
             "GET /ping <- api/server.ts:closure",
             "GET /forms/{id} <- api/server.ts:submit",
@@ -559,4 +559,114 @@ app.use("/a", a);
     let found = routes(&[("srv/app.js", app)]);
     assert!(found.contains(&"GET /a/x <- srv/app.js:closure".to_owned()));
     assert!(found.len() <= 20, "{found:?}");
+}
+
+// #866 review (Prime2): unknown spreads, fastify-plugin encapsulation and unknown prefixes.
+
+/// A spread or unknown member that could set `url`, `baseURL` or `method` makes that part
+/// unreadable: never a local exact or inferred match. A known key written after the spread
+/// is read again.
+#[test]
+fn an_unknown_spread_never_invents_a_local_match() {
+    let client = r#"
+import axios from "axios";
+const opts = makeOptions();
+const shared = { ...opts };
+const http = axios.create({ baseURL: "/api/v2", ...opts });
+const fixed = axios.create({ ...opts, baseURL: "/api/v2" });
+const computed = axios.create({ [key]: "/x" });
+export async function go() {
+  await axios.get("/health", { ...opts });
+  await axios.get("/health", shared);
+  await http.get("/items");
+  await fixed.get("/items");
+  await computed.get("/health");
+  await fetch("/health", { method: "GET", ...opts });
+  await fetch("/health", { ...opts, method: "GET" });
+}
+"#;
+    assert_eq!(
+        calls(&[("srv/app.js", SERVER), ("web/client.js", client)]),
+        [
+            "GET ? -> unresolved",
+            "GET ? -> unresolved",
+            "GET ? -> unresolved",
+            "GET /api/v2/items -> GET /api/v2/items WrapperInferred",
+            "GET ? -> unresolved",
+            "? /health -> unresolved",
+            "GET /health -> GET /health Exact",
+        ]
+    );
+}
+
+/// Fastify: a plugin wrapped in `fastify-plugin` is not encapsulated, so `register`'s
+/// `prefix` does not apply to its routes (https://fastify.dev/docs/latest/Reference/Routes/,
+/// "Route Prefixing and fastify-plugin"). A plain plugin keeps the prefix, and so does a
+/// wrapped plugin with `encapsulate: true`.
+#[test]
+fn a_fastify_plugin_wrapped_plugin_ignores_the_register_prefix() {
+    let server = r#"
+import Fastify from "fastify";
+import fp from "fastify-plugin";
+const fastify = Fastify();
+async function wrapped(app) { app.get("/wrapped", h); }
+async function plain(app) { app.get("/plain", h); }
+async function sealed(app) { app.get("/sealed", h); }
+async function unsure(app) { app.get("/unsure", h); }
+function h() {}
+fastify.register(fp(wrapped), { prefix: "/v1" });
+fastify.register(plain, { prefix: "/v1" });
+fastify.register(fp(sealed, { encapsulate: true }), { prefix: "/v1" });
+fastify.register(fp(unsure, { ...options }), { prefix: "/v1" });
+"#;
+    assert_eq!(
+        routes(&[("api/server.js", server)]),
+        [
+            "GET /wrapped <- api/server.js:h",
+            "GET /v1/plain <- api/server.js:h",
+            "GET /v1/sealed <- api/server.js:h",
+        ]
+    );
+}
+
+/// A mount whose first argument has no readable value, such as a call or a conditional,
+/// mounts nothing; a `const` prefix still mounts.
+#[test]
+fn an_unknown_mount_prefix_registers_nothing() {
+    let app = r#"
+const express = require("express");
+const app = express();
+const router = express.Router();
+const other = express.Router();
+const PREFIX = "/v1";
+router.get("/x", (req, res) => {});
+other.get("/y", (req, res) => {});
+app.use(getPrefix(), router);
+app.use(flag ? "/a" : "/b", router);
+app.use(PREFIX, other);
+"#;
+    assert_eq!(
+        routes(&[("srv/app.js", app)]),
+        ["GET /v1/y <- srv/app.js:closure"]
+    );
+}
+
+/// An axios instance imported from another file and called directly is read by its binding,
+/// not by whether the calling file mentions axios: an unrelated comment changes nothing.
+#[test]
+fn an_imported_callable_axios_instance_is_read_by_its_binding() {
+    let http = "import axios from \"axios\";\nexport const http = axios.create({ baseURL: \"/api/v2\" });\n";
+    let client = "import { http } from \"./http\";\nexport const go = () => http(\"/items\");\n";
+    let mentioned = format!("// axios\n{client}");
+    for client in [client, mentioned.as_str()] {
+        assert_eq!(
+            calls(&[
+                ("srv/app.js", SERVER),
+                ("web/http.js", http),
+                ("web/client.js", client),
+            ]),
+            ["GET /api/v2/items -> GET /api/v2/items WrapperInferred"],
+            "{client}"
+        );
+    }
 }

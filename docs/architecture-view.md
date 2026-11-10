@@ -233,14 +233,20 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
     `handler` of a fastify options object. `all` registers the method `ANY`.
   - **Mounts.** express `use([path,] ...routers)`. Koa `use([path,] router.routes())`, a
     router's `prefix` option, and `router.prefix(path)`. fastify
-    `register(plugin, {prefix})`, where the plugin's first parameter is the child object and
-    `fastify-plugin` is looked through. Passing an app or router to a function, such as
+    `register(plugin, {prefix})`, where the plugin's first parameter is the child object. A
+    plugin wrapped in `fastify-plugin` shares its parent's scope, so `prefix` does not apply to
+    it (Fastify Routes reference, "Route Prefixing and fastify-plugin"), unless it is wrapped
+    with `encapsulate: true`. Wrapper options that cannot be read register nothing. Passing an app or router to a function, such as
     `routes(app)` or `require('./routes')(app)`, makes that parameter the same object. Mounts
     are followed across relative imports and `require`, through `module.exports`,
     `exports.name` and ESM exports, at most 16 deep.
   - **Unreadable paths and patterns.** A path or prefix that cannot be read, or that uses
     pattern syntax (`?`, `+`, `(`, `[`, `{`), registers nothing under it. A `use` whose first
-    argument is a name or member with no readable value mounts nothing.
+    argument has no readable value (an unbound name, a call, a conditional) mounts nothing.
+  - **Object members.** An options object is read in write order. A spread, a computed key,
+    or an accessor or method of the key's name may set that key to anything, so the key is
+    unreadable until a later explicit member sets it. This applies to `prefix`, `url`,
+    `path`, `method`, `handler`, `baseURL` and `encapsulate`.
   - **Normalisation.** `:name` is read as `{name}`, `*name` as `{*name}` and a bare `*` as
     `{*}`. The mount prefix and the path are joined with one `/` and no trailing `/`.
   - **Handlers.** A handler that names a function declaration, or a variable bound to a
@@ -269,7 +275,10 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
     call's own, or the config's `method`, or `GET`. A `baseURL` in the call's config or the
     instance's config is joined before the URL. A joined match is `wrapperInferred`. An
     absolute URL or `baseURL` is not a client call, and an unreadable `baseURL` makes the path
-    unreadable.
+    unreadable, as does a config member that may set it (see Object members). A verb method's
+    own method wins over the config's. When any document mentions axios, an identifier call or
+    an axios method name is read through its binding, across imports, whatever the calling
+    file says.
   - **Constants.** Paths read `const` bindings, imported constants, template literals and
     `+`, with `{}` for any part that cannot be read.
   - **The wrapper's own call.** A `fetch` or axios call inside a named callable that has a
