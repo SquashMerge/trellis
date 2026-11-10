@@ -3076,7 +3076,10 @@ impl EvidenceResponse {
                 "package.json" => "package.json",
                 "pyproject.toml" => "pyproject",
                 "pnpm-workspace.yaml" => "pnpm workspace",
-                "pom.xml" | "build.gradle" | "build.gradle.kts" | "settings.gradle"
+                "pom.xml"
+                | "build.gradle"
+                | "build.gradle.kts"
+                | "settings.gradle"
                 | "settings.gradle.kts" => "Java build",
                 _ => continue,
             };

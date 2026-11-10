@@ -377,12 +377,12 @@ pub(crate) fn settings_for(
 ) -> Result<Vec<Setting>> {
     use super::ProducerName::{RustAnalyzer, ScipJava, ScipPython, ScipTypescript};
     match row.target {
-        Target::Real(ScipTypescript) => Ok(vec![super::tsconfig::apply(
-            rules,
-            inputs,
-            workspace,
-            overrides.typescript_project,
-        )?]),
+        Target::Real(ScipTypescript) => {
+            let project =
+                super::tsconfig::apply(rules, inputs, workspace, overrides.typescript_project)?;
+            let references = super::tsconfig::references(inputs, &project)?;
+            Ok(vec![project, references])
+        }
         Target::Real(RustAnalyzer) => {
             super::settings::rust(rules, inputs, overrides.cargo_features.as_deref())
         }

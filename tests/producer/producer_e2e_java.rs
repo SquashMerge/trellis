@@ -111,7 +111,10 @@ fn build_tool_detection(availability: Availability) -> Option<String> {
             ([], Ok(settings)) => assert!(settings[0].value.is_null(), "{files:?}"),
             ([tool], Ok(settings)) => assert_eq!(settings[0].value, *tool, "{files:?}"),
             ([_, _, ..], Err(error)) => {
-                assert!(error.to_string().contains("select both"), "{error}")
+                assert!(
+                    error.to_string().contains("select Maven and Gradle"),
+                    "{error}"
+                )
             }
             (detected, derived) => {
                 panic!("{files:?}: scip-java detected {detected:?}, the plan derived {derived:?}")

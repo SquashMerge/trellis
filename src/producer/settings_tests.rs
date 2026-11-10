@@ -632,7 +632,7 @@ fn restricted_python_does_not_read_the_omitted_pyproject() {
         assert_eq!(name["source"], "default");
         assert_eq!(
             name["detail"],
-            "the restricted profile omits pyproject.toml, so it is not read"
+            "the restricted profile omits pyproject.toml and reads neither it nor setup.cfg"
         );
         assert_eq!(arg(&plan, "--project-name"), Some("trellis-workspace"));
     }
@@ -892,7 +892,7 @@ fn java_maven_and_gradle_together_refuse_unless_overridden() {
         .to_string();
     assert!(error.starts_with(CONFIG_UNRESOLVED), "{error}");
     assert!(
-        error.contains("pom.xml, build.gradle.kts select both Maven and Gradle"),
+        error.contains("pom.xml, build.gradle.kts select Maven and Gradle"),
         "{error}"
     );
     let plan = java(TrustProfile::Trusted, &both, Some(JavaBuildTool::Gradle));
@@ -1001,4 +1001,469 @@ fn python_and_java_overrides_are_validated() {
     let parsed: Overrides = serde_json::from_value(json!({"javaBuildTool": "gradle"})).unwrap();
     assert_eq!(parsed.java_build_tool, Some(JavaBuildTool::Gradle));
     assert!(serde_json::from_value::<Overrides>(json!({"javaBuildTool": "Gradle"})).is_err());
+}
+
+// The rest of #717: TypeScript project references, setup.cfg and lsif-java.json.
+
+fn typescript(files: &[(&str, &str)], project: Option<TsProject>) -> anyhow::Result<Value> {
+    Ok(planned(
+        ProducerName::ScipTypescript,
+        files,
+        &Overrides {
+            typescript_project: project,
+            ..Overrides::default()
+        },
+    )?
+    .0)
+}
+
+#[track_caller]
+fn typescript_refusal(files: &[(&str, &str)]) -> String {
+    let error = typescript(files, None).unwrap_err().to_string();
+    assert!(error.starts_with(CONFIG_UNRESOLVED), "{error}");
+    error
+}
+
+const REFERENCING_ROOT: &str = r#"{
+  // JSONC, as TypeScript reads it.
+  "files": [],
+  "references": [{"path": "./packages/a"}, {"path": "packages/b/tsconfig.json"}]
+}"#;
+
+#[test]
+fn typescript_project_references_are_followed_listed_and_hashed() {
+    let files = [
+        ("tsconfig.json", REFERENCING_ROOT),
+        (
+            "packages/a/tsconfig.json",
+            r#"{"extends": "../../tsconfig.base.json", "references": [{"path": "../b"}, {"path": "../c"}]}"#,
+        ),
+        ("packages/b/tsconfig.json", "{}"),
+        (
+            "packages/c/tsconfig.json",
+            r#"{"references": [{"path": "../.."}]}"#,
+        ),
+    ];
+    let plan = typescript(&files, None).unwrap();
+    let references = setting(&plan, "typescript.projectReferences");
+    assert_eq!(
+        references["value"],
+        json!([
+            "packages/a/tsconfig.json",
+            "packages/b/tsconfig.json",
+            "packages/c/tsconfig.json"
+        ])
+    );
+    assert_eq!(references["source"], "project");
+    let from: Vec<&str> = references["from"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|origin| origin["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        from,
+        [
+            "tsconfig.json",
+            "packages/a/tsconfig.json",
+            "packages/b/tsconfig.json",
+            "packages/c/tsconfig.json"
+        ]
+    );
+    // A referenced config is in the worktree and the plan: editing it changes the hash.
+    let mut edited = files;
+    edited[2].1 = r#"{"compilerOptions": {"strict": true}}"#;
+    let changed = typescript(&edited, None).unwrap();
+    assert_ne!(plan["planSha256"], changed["planSha256"]);
+    assert!(
+        plan["inputs"]["config"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file["path"] == "packages/b/tsconfig.json"),
+        "{}",
+        plan["inputs"]
+    );
+}
+
+#[test]
+fn typescript_without_references_or_a_root_tsconfig_follows_none() {
+    for (files, detail) in [
+        (
+            &[("tsconfig.json", "{}"), ("packages/a/tsconfig.json", "{}")][..],
+            "the root tsconfig.json has no references",
+        ),
+        (&[][..], "the generated tsconfig.json has no references"),
+        (
+            &[("jsconfig.json", r#"{"references": [{"path": "./x"}]}"#)][..],
+            "references are not inherited through extends",
+        ),
+    ] {
+        let plan = typescript(files, None).unwrap();
+        let references = setting(&plan, "typescript.projectReferences");
+        assert_eq!(references["value"], json!([]), "{files:?}");
+        assert_eq!(references["source"], "default");
+        assert!(
+            references["detail"].as_str().unwrap().contains(detail),
+            "{references}"
+        );
+    }
+}
+
+/// `--ts-project generated` replaces the root config, and with it every reference: a broken
+/// reference no longer refuses.
+#[test]
+fn the_ts_project_override_replaces_the_references() {
+    let files = [(
+        "tsconfig.json",
+        r#"{"references": [{"path": "./missing"}]}"#,
+    )];
+    typescript_refusal(&files);
+    let plan = typescript(&files, Some(TsProject::Generated)).unwrap();
+    let references = setting(&plan, "typescript.projectReferences");
+    assert_eq!(references["value"], json!([]));
+    assert_eq!(references["source"], "default");
+}
+
+#[test]
+fn unfollowable_project_references_are_typed_refusals() {
+    let root = |references: &str| format!(r#"{{"references": {references}}}"#);
+    for (files, expected) in [
+        (
+            vec![(
+                "tsconfig.json".to_owned(),
+                root(r#"[{"path": "./packages/a"}]"#),
+            )],
+            "capture retained no packages/a/tsconfig.json",
+        ),
+        (
+            vec![(
+                "tsconfig.json".to_owned(),
+                root(r#"[{"path": "../outside"}]"#),
+            )],
+            "outside the checkout",
+        ),
+        (
+            vec![("tsconfig.json".to_owned(), root(r#"[{"path": "/abs/a"}]"#))],
+            "outside the checkout",
+        ),
+        (
+            vec![
+                (
+                    "tsconfig.json".to_owned(),
+                    root(r#"[{"path": "./tsconfig.app.json"}]"#),
+                ),
+                ("tsconfig.app.json".to_owned(), "{}".to_owned()),
+            ],
+            "a config not named tsconfig.json",
+        ),
+        (
+            vec![("tsconfig.json".to_owned(), root(r#""./a""#))],
+            "references is not an array",
+        ),
+        (
+            vec![("tsconfig.json".to_owned(), root(r#"[{"path": 3}]"#))],
+            "references is not an array",
+        ),
+        (
+            vec![
+                ("tsconfig.json".to_owned(), root(r#"[{"path": "a"}]"#)),
+                ("a/tsconfig.json".to_owned(), "[1]".to_owned()),
+            ],
+            "a/tsconfig.json is not a JSON object",
+        ),
+        (
+            vec![
+                ("tsconfig.json".to_owned(), root(r#"[{"path": "a"}]"#)),
+                ("a/tsconfig.json".to_owned(), "{".to_owned()),
+            ],
+            "a/tsconfig.json is not a JSON object",
+        ),
+        (
+            vec![
+                ("tsconfig.json".to_owned(), root(r#"[{"path": "a"}]"#)),
+                (
+                    "a/tsconfig.json".to_owned(),
+                    r#"{"extends": "@tsconfig/node20/tsconfig.json"}"#.to_owned(),
+                ),
+            ],
+            "extends names a package",
+        ),
+        (
+            vec![
+                ("tsconfig.json".to_owned(), root(r#"[{"path": "a"}]"#)),
+                (
+                    "a/tsconfig.json".to_owned(),
+                    String::from_utf8(crate::skipped_config::PLACEHOLDER.to_vec()).unwrap(),
+                ),
+            ],
+            "over the config input cap",
+        ),
+    ] {
+        let files: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(path, text)| (path.as_str(), text.as_str()))
+            .collect();
+        let error = typescript_refusal(&files);
+        assert!(error.contains(expected), "{expected}: {error}");
+    }
+}
+
+#[test]
+fn project_references_are_bounded() {
+    let count = super::tsconfig::MAX_REFERENCES + 1;
+    let references: Vec<Value> = (0..count)
+        .map(|i| json!({"path": format!("p{i}")}))
+        .collect();
+    let root = json!({ "references": references }).to_string();
+    let mut files = vec![("tsconfig.json".to_owned(), root)];
+    files.extend((0..count).map(|i| (format!("p{i}/tsconfig.json"), "{}".to_owned())));
+    let files: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, text)| (path.as_str(), text.as_str()))
+        .collect();
+    assert!(typescript_refusal(&files).contains("more than 64 configs"));
+    // At the bound, it is followed.
+    let at_bound = &files[..files.len() - 1];
+    let mut kept: Vec<(&str, String)> = at_bound
+        .iter()
+        .map(|(p, t)| (*p, (*t).to_owned()))
+        .collect();
+    let references: Vec<Value> = (0..count - 1)
+        .map(|i| json!({"path": format!("p{i}")}))
+        .collect();
+    kept[0].1 = json!({ "references": references }).to_string();
+    let kept: Vec<(&str, &str)> = kept.iter().map(|(p, t)| (*p, t.as_str())).collect();
+    let plan = typescript(&kept, None).unwrap();
+    assert_eq!(
+        setting(&plan, "typescript.projectReferences")["value"]
+            .as_array()
+            .unwrap()
+            .len(),
+        count - 1
+    );
+}
+
+const SETUP_CFG: &str = "# comment\n[metadata]\nname = fixture-cfg\nversion: 2.0\nclassifiers =\n    Programming Language :: Python\n\n[options]\npackages = find:\n";
+
+#[test]
+fn python_project_name_and_version_fall_back_to_setup_cfg() {
+    let plan = python(
+        TrustProfile::Trusted,
+        &[("setup.cfg", SETUP_CFG)],
+        &Overrides::default(),
+    );
+    for (name, value, flag) in [
+        ("python.projectName", "fixture-cfg", "--project-name"),
+        ("python.projectVersion", "2.0", "--project-version"),
+    ] {
+        let setting = setting(&plan, name);
+        assert_eq!(setting["value"], value);
+        assert_eq!(setting["source"], "project");
+        assert_eq!(setting["from"][0]["path"], "setup.cfg");
+        assert!(setting["detail"].as_str().unwrap().contains("of setup.cfg"));
+        assert_eq!(arg(&plan, flag), Some(value));
+    }
+    // pyproject.toml wins key by key; setup.cfg fills the key it lacks.
+    let both = python(
+        TrustProfile::Trusted,
+        &[
+            ("pyproject.toml", "[project]\nname = \"from-pyproject\"\n"),
+            ("setup.cfg", SETUP_CFG),
+        ],
+        &Overrides::default(),
+    );
+    assert_eq!(
+        setting(&both, "python.projectName")["value"],
+        "from-pyproject"
+    );
+    assert_eq!(
+        setting(&both, "python.projectName")["from"][0]["path"],
+        "pyproject.toml"
+    );
+    assert_eq!(setting(&both, "python.projectVersion")["value"], "2.0");
+    assert_eq!(
+        setting(&both, "python.projectVersion")["from"][0]["path"],
+        "setup.cfg"
+    );
+    let none = python(TrustProfile::Trusted, &[], &Overrides::default());
+    assert_ne!(plan["planSha256"], none["planSha256"]);
+}
+
+#[test]
+fn setup_cfg_directives_and_the_restricted_profile_derive_nothing() {
+    let directive = python(
+        TrustProfile::Trusted,
+        &[(
+            "setup.cfg",
+            "[metadata]\nname = cfg\nversion = attr: cfg.__version__\n",
+        )],
+        &Overrides::default(),
+    );
+    let version = setting(&directive, "python.projectVersion");
+    assert_eq!(version["value"], "0");
+    assert_eq!(version["source"], "default");
+    assert_eq!(setting(&directive, "python.projectName")["value"], "cfg");
+    // The restricted profile reads neither file: a malformed setup.cfg does not refuse.
+    let restricted = python(
+        TrustProfile::Restricted,
+        &[("setup.cfg", "not ini")],
+        &Overrides::default(),
+    );
+    let name = setting(&restricted, "python.projectName");
+    assert_eq!(name["source"], "default");
+    assert!(name["detail"].as_str().unwrap().contains("restricted"));
+}
+
+#[test]
+fn python_overrides_replace_setup_cfg() {
+    let plan = python(
+        TrustProfile::Trusted,
+        &[("setup.cfg", "not ini")],
+        &Overrides {
+            python_project_name: Some("given".into()),
+            python_project_version: Some("9".into()),
+            ..Overrides::default()
+        },
+    );
+    assert_eq!(setting(&plan, "python.projectName")["source"], "override");
+    assert_eq!(arg(&plan, "--project-name"), Some("given"));
+}
+
+#[test]
+fn malformed_setup_cfg_is_a_typed_refusal() {
+    for (text, expected) in [
+        (
+            "[metadata]\nname fixture\n",
+            "line 2 is not a section, key or comment",
+        ),
+        (
+            "name = x\n[metadata]\n",
+            "line 1 is a key before any section",
+        ),
+        (
+            "[metadata]\nname = a\n[metadata]\n",
+            "[metadata] appears twice",
+        ),
+        (
+            "[metadata]\nname = a\nName = b\n",
+            "[metadata] name appears twice",
+        ),
+        ("[metadata]\n = a\n", "empty key"),
+        (
+            "[metadata]\nname = not a name\n",
+            "is not a Python project name",
+        ),
+        (
+            "[metadata]\nname = a\nversion = one\n",
+            "is not a PEP 440 version",
+        ),
+        (
+            "[metadata]\nname =\n  two\n  lines\n",
+            "is not a Python project name",
+        ),
+    ] {
+        let error = python_refusal(&[("setup.cfg", text)]);
+        assert!(error.contains(expected), "{text:?}: {error}");
+    }
+    let error = planned_as(
+        ProducerName::ScipPython,
+        TrustProfile::Trusted,
+        &[],
+        &Overrides::default(),
+    );
+    assert!(error.is_ok());
+    let row = profiles::row(
+        Target::Real(ProducerName::ScipPython),
+        TrustProfile::Trusted,
+    )
+    .unwrap();
+    let mut rules = profiles::rules(&row);
+    let not_utf8 = RetainedInputs {
+        config: vec![RootInput {
+            path: "setup.cfg".into(),
+            bytes: vec![b'[', 0xff, b']'],
+        }],
+        dependencies: vec![],
+    };
+    let error = settings::python(
+        &mut rules,
+        &not_utf8,
+        TrustProfile::Trusted,
+        &Overrides::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("setup.cfg is not UTF-8"), "{error}");
+}
+
+#[test]
+fn lsif_java_json_selects_scip_java_s_own_build_tool() {
+    let plan = java(TrustProfile::Trusted, &[("lsif-java.json", "{}")], None);
+    let setting = setting(&plan, "java.buildTool");
+    assert_eq!(setting["value"], "SCIP");
+    assert_eq!(setting["source"], "project");
+    assert_eq!(setting["from"][0]["path"], "lsif-java.json");
+    assert_eq!(arg(&plan, "--build-tool"), Some("SCIP"));
+    // With a Maven or Gradle file it is contradictory, as scip-java says; an override picks.
+    for (file, tool) in [("pom.xml", "Maven"), ("build.gradle", "Gradle")] {
+        let both = [("lsif-java.json", "{}"), (file, "x")];
+        let error = java_result(TrustProfile::Trusted, &both, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with(CONFIG_UNRESOLVED), "{error}");
+        assert!(
+            error.contains(&format!("select SCIP and {tool}")),
+            "{error}"
+        );
+        let scip = java(TrustProfile::Trusted, &both, Some(JavaBuildTool::Scip));
+        assert_eq!(arg(&scip, "--build-tool"), Some("SCIP"));
+    }
+    let error = java_result(
+        TrustProfile::Trusted,
+        &[("pom.xml", "x")],
+        Some(JavaBuildTool::Scip),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("has no root lsif-java.json"), "{error}");
+}
+
+/// The restricted profile writes its own `lsif-java.json` and leaves the checkout's out, with
+/// the nested module build files, and scip-python leaves `pyrightconfig.json` out.
+#[test]
+fn restricted_profiles_omit_the_new_inputs() {
+    let omitted = |plan: &Value| -> Vec<String> {
+        plan["inputs"]["omitted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["path"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let restricted_java = java(
+        TrustProfile::Restricted,
+        &[
+            ("lsif-java.json", "{}"),
+            ("app/pom.xml", "<project/>"),
+            ("lib/build.gradle.kts", ""),
+        ],
+        None,
+    );
+    assert_eq!(
+        omitted(&restricted_java),
+        ["app/pom.xml", "lib/build.gradle.kts", "lsif-java.json"]
+    );
+    let restricted_python = python(
+        TrustProfile::Restricted,
+        &[("pyrightconfig.json", "{}"), ("setup.cfg", SETUP_CFG)],
+        &Overrides::default(),
+    );
+    assert_eq!(omitted(&restricted_python), ["pyrightconfig.json"]);
+    let trusted = python(
+        TrustProfile::Trusted,
+        &[("pyrightconfig.json", "{}")],
+        &Overrides::default(),
+    );
+    assert!(omitted(&trusted).is_empty());
 }

@@ -1226,7 +1226,8 @@ impl Capture {
                     roles.push(format!("ignore:{relative}"));
                 } else if is_root_toolchain_input(relative.as_str()) {
                     roles.push(format!("toolchain:{relative}"));
-                } else if is_root_input(relative.as_str()) || nested_config_input(&self.root, path) {
+                } else if is_root_input(relative.as_str()) || nested_config_input(&self.root, path)
+                {
                     roles.push(format!("config:{relative}"));
                 }
             }

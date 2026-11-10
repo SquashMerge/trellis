@@ -13,8 +13,8 @@
 //! way scip-python 0.6.6 infers them itself (`[project]`, then `[tool.poetry]` for a key
 //! `[project]` lacks), in the trusted profile, whose worktree holds that file.
 //!
-//! scip-java: the build tool scip-java 0.12.3 detects from the retained root build files, in
-//! the trusted profile; Maven and Gradle together are contradictory.
+//! scip-java: the build tool scip-java 0.12.3 detects from the retained root build files and
+//! `lsif-java.json`, in the trusted profile; two build tools together are contradictory.
 
 use super::TrustProfile;
 use super::profiles::{Generated, Rules};
@@ -38,12 +38,16 @@ pub const PYTHON_PROJECT_NAME: &str = "trellis-workspace";
 /// `git`, which is not on the child's `PATH`.
 pub const PYTHON_PROJECT_VERSION: &str = "0";
 const PYPROJECT: &str = "pyproject.toml";
+const SETUP_CFG: &str = "setup.cfg";
 const MAX_PYTHON_VALUE_BYTES: usize = 256;
 /// The root files by which scip-java 0.12.3 detects Maven. It detects Gradle by
 /// `build.gradle`, `build.gradle.kts` or `settings.gradle`; neither `settings.gradle.kts` nor
 /// `gradle.properties` alone selects Gradle (probed against the pinned launcher).
 const MAVEN_FILES: [&str; 1] = ["pom.xml"];
 const GRADLE_FILES: [&str; 3] = ["build.gradle", "build.gradle.kts", "settings.gradle"];
+/// scip-java 0.12.3 detects its SCIP build tool by a root `lsif-java.json`, beside any other
+/// build tool it detects (probed with `--build-tool trellis-probe`, #717).
+const SCIP_FILES: [&str; 1] = ["lsif-java.json"];
 
 /// A build tool scip-java runs in the trusted profile, by the name its `--build-tool` takes.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -51,6 +55,8 @@ const GRADLE_FILES: [&str; 3] = ["build.gradle", "build.gradle.kts", "settings.g
 pub enum JavaBuildTool {
     Maven,
     Gradle,
+    /// scip-java's own build tool, configured by `lsif-java.json`.
+    Scip,
 }
 
 impl JavaBuildTool {
@@ -59,6 +65,7 @@ impl JavaBuildTool {
         match self {
             Self::Maven => "Maven",
             Self::Gradle => "Gradle",
+            Self::Scip => "SCIP",
         }
     }
 
@@ -66,6 +73,7 @@ impl JavaBuildTool {
         match self {
             Self::Maven => &MAVEN_FILES,
             Self::Gradle => &GRADLE_FILES,
+            Self::Scip => &SCIP_FILES,
         }
     }
 }
@@ -726,7 +734,114 @@ fn pyproject_value(
     Ok(None)
 }
 
-/// One scip-python setting read from `pyproject.toml`.
+/// The `[metadata]` keys of a `setup.cfg` as setuptools' `configparser` reads them: `=` or `:`
+/// delimits a key, keys are lower-cased, full-line `#` and `;` comments are skipped, and a
+/// line indented deeper than its key continues the value. A line that is neither, a key
+/// before any section, and (as `configparser`'s strict mode refuses them) a repeated section
+/// or `[metadata]` key are the typed refusal.
+fn setup_cfg_metadata(input: &RootInput) -> Result<BTreeMap<String, String>> {
+    if input.bytes == crate::skipped_config::PLACEHOLDER {
+        return Err(unresolved(format!(
+            "{SETUP_CFG} is over the config input cap and was not read"
+        )));
+    }
+    let text = std::str::from_utf8(&input.bytes)
+        .map_err(|_| unresolved(format!("{SETUP_CFG} is not UTF-8")))?;
+    let mut sections = BTreeSet::new();
+    let mut section: Option<&str> = None;
+    let mut metadata: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+    // The `[metadata]` key a deeper-indented line continues, with its line's indent.
+    let mut open: Option<(String, usize)> = None;
+    for (number, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        let indent = line.len() - line.trim_start().len();
+        if trimmed.starts_with('#') || trimmed.starts_with(';') {
+            continue;
+        }
+        if trimmed.is_empty() {
+            if let Some((key, _)) = &open {
+                metadata.entry(key.clone()).or_default().push("");
+            }
+            continue;
+        }
+        if let Some((key, key_indent)) = &open
+            && indent > *key_indent
+        {
+            metadata.entry(key.clone()).or_default().push(trimmed);
+            continue;
+        }
+        open = None;
+        if let Some(name) = trimmed
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            if !sections.insert(name) {
+                return Err(unresolved(format!(
+                    "{SETUP_CFG}: [{}] appears twice",
+                    name.chars().take(64).collect::<String>()
+                )));
+            }
+            section = Some(name);
+            continue;
+        }
+        let Some(at) = trimmed.find(['=', ':']) else {
+            return Err(unresolved(format!(
+                "{SETUP_CFG}: line {} is not a section, key or comment",
+                number + 1
+            )));
+        };
+        let key = trimmed[..at].trim().to_lowercase();
+        let Some(section) = section else {
+            return Err(unresolved(format!(
+                "{SETUP_CFG}: line {} is a key before any section",
+                number + 1
+            )));
+        };
+        if key.is_empty() {
+            return Err(unresolved(format!(
+                "{SETUP_CFG}: line {} has an empty key",
+                number + 1
+            )));
+        }
+        if section != "metadata" {
+            continue;
+        }
+        if metadata.contains_key(&key) {
+            return Err(unresolved(format!(
+                "{SETUP_CFG}: [metadata] {} appears twice",
+                key.chars().take(64).collect::<String>()
+            )));
+        }
+        metadata.insert(key.clone(), vec![trimmed[at + 1..].trim()]);
+        open = Some((key, indent));
+    }
+    Ok(metadata
+        .into_iter()
+        .map(|(key, lines)| (key, lines.join("\n").trim().to_owned()))
+        .collect())
+}
+
+/// `key` of `setup.cfg`'s `[metadata]`, when it is a literal value. A setuptools `attr:` or
+/// `file:` directive is not evaluated, so it sets nothing; a literal that is not `what` is the
+/// typed refusal.
+fn setup_cfg_value(
+    metadata: &BTreeMap<String, String>,
+    key: &str,
+    valid: fn(&str) -> bool,
+    what: &str,
+) -> Result<Option<String>> {
+    match metadata.get(key) {
+        None => Ok(None),
+        Some(value) if value.starts_with("attr:") || value.starts_with("file:") => Ok(None),
+        Some(value) if valid(value) => Ok(Some(value.clone())),
+        Some(value) => Err(unresolved(format!(
+            "{SETUP_CFG}: [metadata] {key} {:?} is not {what}",
+            value.chars().take(64).collect::<String>()
+        ))),
+    }
+}
+
+/// One scip-python setting read from `pyproject.toml`, else `setup.cfg`.
 struct PythonKey<'a> {
     key: &'static str,
     flag: &'static str,
@@ -738,8 +853,9 @@ struct PythonKey<'a> {
 }
 
 /// scip-python's settings: `python.projectName` and `python.projectVersion`, passed as
-/// `--project-name` and `--project-version`. Only the trusted worktree holds the root
-/// `pyproject.toml`; the restricted profile omits it, so there it is not read and the
+/// `--project-name` and `--project-version`, from the root `pyproject.toml` as scip-python
+/// reads it, else the root `setup.cfg` `[metadata]` (#717). Only the trusted worktree holds
+/// `pyproject.toml`; the restricted profile omits it, so there neither file is read and the
 /// defaults apply unless overridden.
 pub fn python(
     rules: &mut Rules,
@@ -756,6 +872,8 @@ pub fn python(
         }
         _ => None,
     };
+    let setup_cfg = inputs.config.iter().find(|input| input.path == SETUP_CFG);
+    let mut metadata: Option<BTreeMap<String, String>> = None;
     let keys = [
         PythonKey {
             key: "name",
@@ -787,17 +905,43 @@ pub fn python(
         what,
     } in keys
     {
-        let derived = match (overridden, &manifest) {
-            (None, Some((input, manifest))) => pyproject_value(manifest, key, valid, what)?
-                .map(|(value, section)| (value, section, *input)),
+        let mut derived = match (overridden, &manifest) {
+            (None, Some((input, manifest))) => {
+                pyproject_value(manifest, key, valid, what)?.map(|(value, section)| {
+                    (value, format!("{section} {key} of pyproject.toml"), *input)
+                })
+            }
             _ => None,
         };
-        let fallback = || match (trust, pyproject) {
-            (TrustProfile::Restricted, Some(_)) => {
-                "the restricted profile omits pyproject.toml, so it is not read".to_owned()
+        if let (None, None, Some(input), TrustProfile::Trusted) =
+            (overridden, &derived, setup_cfg, trust)
+        {
+            if metadata.is_none() {
+                metadata = Some(setup_cfg_metadata(input)?);
             }
-            (_, None) => "no root pyproject.toml".to_owned(),
-            (_, Some(_)) => format!("pyproject.toml sets no [project] or [tool.poetry] {key}"),
+            derived = setup_cfg_value(
+                metadata.as_ref().unwrap_or(&BTreeMap::new()),
+                key,
+                valid,
+                what,
+            )?
+            .map(|value| (value, format!("[metadata] {key} of setup.cfg"), input));
+        }
+        let fallback = || match (trust, pyproject, setup_cfg) {
+            (TrustProfile::Restricted, Some(_), _) | (TrustProfile::Restricted, _, Some(_)) => {
+                "the restricted profile omits pyproject.toml and reads neither it nor setup.cfg"
+                    .to_owned()
+            }
+            (_, None, None) => "no root pyproject.toml or setup.cfg".to_owned(),
+            (_, Some(_), None) => {
+                format!("pyproject.toml sets no [project] or [tool.poetry] {key}")
+            }
+            (_, None, Some(_)) => {
+                format!("setup.cfg sets no literal [metadata] {key}")
+            }
+            (_, Some(_), Some(_)) => format!(
+                "pyproject.toml sets no [project] or [tool.poetry] {key}, and setup.cfg no literal [metadata] {key}"
+            ),
         };
         let setting = match (overridden, derived) {
             (Some(value), _) => Setting {
@@ -807,12 +951,12 @@ pub fn python(
                 from: Vec::new(),
                 detail: format!("given with --python-project-{key}; it replaces the derived {key}"),
             },
-            (None, Some((value, section, input))) => Setting {
+            (None, Some((value, detail, input))) => Setting {
                 name,
                 value: json!(value),
                 source: Source::Project,
                 from: vec![Origin::of(input)],
-                detail: format!("{section} {key} of pyproject.toml"),
+                detail,
             },
             (None, None) => Setting {
                 name,
@@ -855,12 +999,15 @@ pub fn java(
             .filter(|input| tool.files().contains(&input.path.as_str()))
             .collect()
     };
-    let detected: Vec<(JavaBuildTool, Vec<&RootInput>)> =
-        [JavaBuildTool::Maven, JavaBuildTool::Gradle]
-            .into_iter()
-            .map(|tool| (tool, present(tool)))
-            .filter(|(_, files)| !files.is_empty())
-            .collect();
+    let detected: Vec<(JavaBuildTool, Vec<&RootInput>)> = [
+        JavaBuildTool::Scip,
+        JavaBuildTool::Maven,
+        JavaBuildTool::Gradle,
+    ]
+    .into_iter()
+    .map(|tool| (tool, present(tool)))
+    .filter(|(_, files)| !files.is_empty())
+    .collect();
     let paths = |files: &[&RootInput]| {
         files
             .iter()
@@ -891,7 +1038,7 @@ pub fn java(
                 value: Value::Null,
                 source: Source::Default,
                 from: Vec::new(),
-                detail: "no root pom.xml, build.gradle, build.gradle.kts or settings.gradle, so scip-java detects no build tool".into(),
+                detail: "no root pom.xml, build.gradle, build.gradle.kts, settings.gradle or lsif-java.json, so scip-java detects no build tool".into(),
             }]);
         }
         (None, [(tool, files)]) => Setting {
@@ -906,9 +1053,16 @@ pub fn java(
                 .iter()
                 .flat_map(|(_, files)| files.iter().copied())
                 .collect();
+            let tools: Vec<&str> = detected.iter().map(|(tool, _)| tool.as_str()).collect();
             return Err(unresolved(format!(
-                "{} select both Maven and Gradle, and scip-java will not choose; pass --java-build-tool maven or gradle",
-                paths(&all)
+                "{} select {}, and scip-java will not choose; pass --java-build-tool {}",
+                paths(&all),
+                tools.join(" and "),
+                detected
+                    .iter()
+                    .map(|(tool, _)| tool.as_str().to_ascii_lowercase())
+                    .collect::<Vec<_>>()
+                    .join(" or ")
             )));
         }
     };
