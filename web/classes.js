@@ -362,10 +362,14 @@
       if (path) params.set("path", path);
       // A name search lists the chosen app's classes only (#852); a file's own classes are always listed.
       const choice = path ? null : api.appFilter?.() || null;
+      // The search is recorded before it reads, so a choice made while it is pending lists again
+      // and supersedes it; every page is admitted only while the choice is still this one.
+      const record = lastLookup = {path, q, choice, ticket, done:false};
+      const chosen = () => path || sameChoice(choice, api.appFilter?.() || null);
       let data, items = [], outside = 0, pages = 0;
       for (;;) {
         data = await api.request(`/api/classes?${params}`);
-        if (ticket !== searchSerial || !valid(c)) return;
+        if (ticket !== searchSerial || !valid(c) || !chosen()) return;
         if (!window.TrellisIndexPin.equal(data.revision, c.revision)) {
           reset(); api.onStale?.("Workspace revision changed. Search again.");
           state("Workspace revision changed. Search again.", "stale"); return;
@@ -376,8 +380,7 @@
         if (items.length || data.nextOffset == null || pages >= APP_PAGES || !(data.nextOffset > Number(params.get("offset")))) break;
         params.set("offset", String(data.nextOffset));
       }
-      lastLookup = {path, q, choice:choice?.name ?? null};
-      serial++; closeContextMenu(false); closeChooser(); ui.results.hidden = false;
+      serial++; closeContextMenu(false); closeChooser(); ui.results.hidden = false; record.done = true;
       controls.hidden = true;
       if (!offset) {
         showAll = false; memberChoices.clear(); expanded = [];
@@ -404,7 +407,7 @@
       state(`${unindexed ? "Index workspace to populate class declarations." : items.length ? "Choose a class to show its declared relationships." : choice ? `No matching classes in ${choice.name}${data.nextOffset != null ? " on these pages · More classes reads on" : ""}. Try another name or All apps.` : "No matching classes. Try another name or index supported source files."}${appNote}${data.truncated ? " Results are partial." : ""}`, unindexed ? "unindexed" : data.truncated ? "partial" : items.length ? "ready" : "empty");
       if (autoOpen && items.length) await loadDiagram(items[0].symbol.id, [], true);
     } catch (error) {
-      if (ticket === searchSerial && valid(c) && error.name !== "AbortError") {
+      if (ticket === searchSerial && valid(c) && error.name !== "AbortError" && (path || sameChoice(lastLookup?.choice, api.appFilter?.() || null))) {
         const conflict = window.TrellisIndexPin.isConflict(error);
         if (conflict) { reset(); api.onStale?.("Workspace revision changed. Search again."); }
         state(error.message || "Class lookup failed. Try Search again.", conflict ? "stale" : "error");
@@ -677,11 +680,15 @@
     }
     ui.diagram.append(ledger);
   }
+  // Two app choices are the same when they name the same app under the same assignment.
+  const sameChoice = (a, b) => (a?.name ?? null) === (b?.name ?? null) && a?.assigned === b?.assigned;
   // The app choice changed (#852): a listed name search lists again under it. A drawn diagram, or a
   // file's own classes, stay as they are.
   function scopeChanged() {
-    if (!api || !ui || !lastLookup || lastLookup.path || diagram) return;
-    if ((api.appFilter?.()?.name ?? null) === lastLookup.choice) return;
+    if (!api || !ui || !lastLookup || lastLookup.path) return;
+    // A drawn diagram stays; a search still pending over it is replaced.
+    if (diagram && (lastLookup.done || lastLookup.ticket !== searchSerial)) return;
+    if (sameChoice(lastLookup.choice, api.appFilter?.() || null)) return;
     return lookup({q:lastLookup.q});
   }
   window.TrellisClasses = Object.freeze({init, open, reset, showContextMenu, closeContextMenu, scopeChanged});

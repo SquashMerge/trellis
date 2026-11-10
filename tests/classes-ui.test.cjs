@@ -610,3 +610,53 @@ test("app_choice_classes_bounds: the pass over other apps stops after ten pages 
  assert.deepEqual(listed,["sample.Own"],"a file's own classes are listed under any choice");
  assert.equal(new URL(h.calls.at(-2).url,"http://local").searchParams.get("path"),"src/Own.java");
 });
+
+// #852 review (Prime, PR #875): a search pending across a change of the app choice never publishes
+// the old choice's list; the new choice lists again.
+const appRevision={indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1};
+const appClasses=()=>[definition("Server"),{...definition("Widget"),symbol:{...definition("Widget").symbol,path:"web/widget.js"}}];
+const appListed=h=>descendants(h.get("classes-results")).filter(n=>n.className==="classes-result").map(n=>n.children[0].textContent);
+const srvChoice=(assigned="one")=>({name:"srv",holds:p=>p.startsWith("src/"),assigned});
+const webChoice=(assigned="one")=>({name:"web",holds:p=>p.startsWith("web/"),assigned});
+test("app_choice_pending_first_search: switching app while the first search is pending lists the new app only",async()=>{
+ let choice=srvChoice();
+ const h=harness({appFilter:()=>choice}), gate=deferred();
+ h.setRequest(async()=>{await gate.promise;return {revision:appRevision,items:appClasses(),nextOffset:null,warnings:[],truncated:false};});
+ const pending=h.get("classes-search").fire("click");
+ choice=webChoice(); const again=h.controller.scopeChanged();
+ gate.resolve(); await pending; await again;
+ assert.deepEqual(appListed(h),["sample.Widget"]);
+ assert.equal(h.calls.length,2,"the new choice read again");
+});
+test("app_choice_pending_round_trip: web, All apps, web while a re-list is pending ends on web's list",async()=>{
+ let choice=webChoice();
+ const h=harness({appFilter:()=>choice}), gate=deferred(), data={revision:appRevision,items:appClasses(),nextOffset:null,warnings:[],truncated:false};
+ h.setRequest(async()=>data); await h.get("classes-search").fire("click");
+ assert.deepEqual(appListed(h),["sample.Widget"]);
+ h.setRequest(async()=>{await gate.promise;return data;});
+ choice=null; const toAll=h.controller.scopeChanged();
+ choice=webChoice(); const back=h.controller.scopeChanged();
+ gate.resolve(); await toAll; await back;
+ assert.deepEqual(appListed(h),["sample.Widget"],"the All apps list never lands");
+});
+test("app_choice_new_assignment: the same app under a new assignment lists again; the same assignment does not",async()=>{
+ let choice=webChoice("one");
+ const h=harness({appFilter:()=>choice});
+ h.setRequest(async()=>({revision:appRevision,items:appClasses(),nextOffset:null,warnings:[],truncated:false}));
+ await h.get("classes-search").fire("click");
+ const reads=h.calls.length;
+ choice=webChoice("one"); await h.controller.scopeChanged();
+ assert.equal(h.calls.length,reads,"control: the same choice and assignment do not read");
+ choice={name:"web",holds:p=>p.startsWith("src/"),assigned:"two"}; await h.controller.scopeChanged();
+ assert.equal(h.calls.length,reads+1);
+ assert.deepEqual(appListed(h),["sample.Server"],"the new assignment decides the list");
+});
+test("app_choice_pending_control: an unchanged choice while a search is pending publishes it as is",async()=>{
+ const choice=webChoice();
+ const h=harness({appFilter:()=>choice}), gate=deferred();
+ h.setRequest(async()=>{await gate.promise;return {revision:appRevision,items:appClasses(),nextOffset:null,warnings:[],truncated:false};});
+ const pending=h.get("classes-search").fire("click");
+ await h.controller.scopeChanged();
+ gate.resolve(); await pending;
+ assert.deepEqual(appListed(h),["sample.Widget"]); assert.equal(h.calls.length,1);
+});

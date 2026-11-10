@@ -225,3 +225,32 @@ test("negative control: one app or no rules file draws no switcher and lists eve
     assert.equal(h.options.treemap.appFilter(), null);
   }
 });
+
+// #852 review (Prime, PR #875): an Architecture summary under new rules at the same pin (here the
+// uncached sum aggregation) drops the shared assignment, so Files, Treemap and Classes follow it.
+test("rules_change_seen_in_a_summary: a summary with a new rules hash rereads the shared assignment", async () => {
+  const h = harness();
+  const moved = modules.map(item => item.identity.path === "web/app.js" ? {...item, app:"srv"} : item);
+  let rules = "rules";
+  h.network(url => {
+    if (!url.startsWith("/api/architecture?")) throw new Error(url);
+    const aggregate = new URLSearchParams(url.split("?")[1]).get("aggregate");
+    return response(summary(pin, {aggregate, rulesFile:{contentHash:rules}, ...(rules === "rules" ? {} : {modules:moved})}));
+  });
+  await h.run("refreshAppInventory()"); await flush();
+  await h.click("files-apps", "web");
+  assert.equal(h.run("appFileFilter()('web/app.js')"), true);
+  const sum = `/api/architecture?aggregate=sum&role=production&workbench=true&indexGeneration=${pin.indexGeneration}&indexRevision=1`;
+  // Control: a summary under the same rules leaves the assignment and reads nothing more.
+  await h.run(`architectureRequest(${JSON.stringify(sum)}, () => true)`); await flush();
+  const reads = h.requests.filter(url => url.includes("/architecture?")).length;
+  assert.equal(reads, 2); assert.equal(h.run("appFileFilter()('web/app.js')"), true);
+  // The rules change: Architecture reads the sum summary under them.
+  rules = "new-rules";
+  await h.run(`architectureRequest(${JSON.stringify(sum.replace("sum", "mean"))}, () => true)`); await flush();
+  assert.equal(h.run("Apps.appOf(appAssignment(), 'web/app.js')"), "srv", "the shared assignment is the new rules'");
+  assert.equal(h.run("appFileFilter()('web/app.js')"), false, "the Files web filter drops the moved file");
+  assert.equal(h.options.treemap.appFilter().holds("web/app.js"), false, "and so does Treemap's");
+  assert.deepEqual(h.pressed("files-apps"), ["web · javascript"], "the choice stays");
+  assert.ok(h.requests.filter(url => url.includes("/architecture?")).at(-1).includes("aggregate=max"), "the assignment was read again under the new rules");
+});

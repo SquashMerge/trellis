@@ -2125,8 +2125,13 @@ async function architectureRequest(path, current, options = {}) {
   try {
     const data = method === "GET" ? await revisionRead(path, current) : await api(path, method, options.body, current);
     const hash = data?.payload?.rulesFile?.contentHash;
-    if (route === "/api/architecture" && hash) architectureRulesHash = hash;
-    else if (route === "/api/architecture/rules" && hash && architectureRulesHash && hash !== architectureRulesHash) clearRevisionReads();
+    if (route === "/api/architecture" && hash) {
+      // A summary under other rules than the last one seen: the rules changed at this pin, so the
+      // cached reads and the shared app assignment are dropped and read again (#852).
+      const changed = !!architectureRulesHash && hash !== architectureRulesHash;
+      if (changed) clearRevisionReads();
+      architectureRulesHash = hash;
+    } else if (route === "/api/architecture/rules" && hash && architectureRulesHash && hash !== architectureRulesHash) clearRevisionReads();
     return data;
   } catch (error) {
     if (error?.code === "rules_conflict") clearRevisionReads();
@@ -2149,10 +2154,11 @@ function appFileFilter() {
   const assigned = appAssignment(), name = chosenApp();
   return name === null ? null : path => Apps.holdsFile(assigned, name, path);
 }
-// The choice as a view holds it: null for All apps, else its name and file test.
+// The choice as a view holds it: null for All apps, else its name, file test and the assignment
+// it tests against (so a view can tell a new assignment of the same name from the one it listed).
 function appChoice() {
   const holds = appFileFilter();
-  return holds && {name:chosenApp(), holds};
+  return holds && {name:chosenApp(), holds, assigned:appAssignment()};
 }
 // Show an indexed path: its own app, or All apps when it is in none.
 function showAppOf(path) {
