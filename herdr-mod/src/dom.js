@@ -80,6 +80,15 @@ export class Element {
     }
   }
   appendChild(node) { this.append(node); return node; }
+  // Inserts nodes right after this one in its parent (the adapter's stat-chip controls).
+  after(...nodes) {
+    const parent = this.parentNode;
+    if (!parent) return;
+    const children = nodes.map((node) => (typeof node === "string" ? new Text(node) : node));
+    for (const child of children) if (child.parentNode) child.parentNode.childNodes = child.parentNode.childNodes.filter((n) => n !== child);
+    parent.childNodes.splice(parent.childNodes.indexOf(this) + 1, 0, ...children);
+    for (const child of children) child.parentNode = parent;
+  }
   replaceChildren(...nodes) {
     for (const node of this.childNodes) node.parentNode = null;
     this.childNodes = [];

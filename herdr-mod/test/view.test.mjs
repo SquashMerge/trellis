@@ -38,10 +38,13 @@ const architecture = () => {
   const v = make();
   for (const m of v.modules) m.declarationCount = 1;
   return { ...v, ...pin, aggregate: "max", role: "production", workbench: true, metricsVersion: "metrics:v1", evidenceTier: "syntax",
-    semanticComplete: false, rulesFile: { contentHash: "abc" }, references: { coverage: [] } };
+    semanticComplete: false, rulesFile: { contentHash: "abc" }, references: { coverage: [] }, apps: [], interfaces: [] };
 };
 
-function fakeDaemon({ ready = false, checkouts = [{ key: KEY, root: ROOT }] } = {}) {
+// `payload` stands in for the ready Architecture answer (at its own pin), `job` for the current
+// index job, and `details` for the Deviations tree's detail pages.
+function fakeDaemon({ ready = false, checkouts = [{ key: KEY, root: ROOT }], payload = null, job = null, details = null } = {}) {
+  const at = payload ? { indexGeneration: payload.indexGeneration, indexRevision: payload.indexRevision } : pin;
   const seen = [];
   const server = createServer((req, res) => {
     let body = "";
@@ -51,14 +54,18 @@ function fakeDaemon({ ready = false, checkouts = [{ key: KEY, root: ROOT }] } = 
       const send = (status, value) => { res.writeHead(status, { "Content-Type": "application/json" }); res.end(JSON.stringify(value)); };
       if (req.headers.authorization !== `Bearer ${TOKEN}`) return send(401, { error: { code: "unauthorized", message: "Bearer authentication required" } });
       const path = req.url.split("?")[0];
-      if (path === "/api/checkouts") return send(200, { checkouts: checkouts.map((c) => ({ rootKey: c.key, state: "available", workspaceRoot: c.root, revision: pin, catchingUp: false })) });
+      if (path === "/api/checkouts") return send(200, { checkouts: checkouts.map((c) => ({ rootKey: c.key, state: "available", workspaceRoot: c.root, revision: at, catchingUp: false })) });
       const listed = checkouts.find((c) => path.startsWith(`/api/checkouts/${c.key}/`));
       if (!listed) return send(404, { error: { code: "not_found", message: "Not found" } });
       const base = `/api/checkouts/${listed.key}/`;
-      if (path === `${base}status`) return send(200, { workspaceRoot: listed.root, revision: pin, catchingUp: false });
+      const query = new URL(req.url, "http://x").searchParams;
+      if (path === `${base}status`) return send(200, { workspaceRoot: listed.root, revision: at, catchingUp: false });
+      if (path === `${base}jobs/current`) return send(200, job);
+      if (path === `${base}architecture/details` && details) return send(200, details(query));
+      if (path === `${base}architecture` && payload) return send(200, { payload: { ...payload, aggregate: query.get("aggregate") } });
       if (path === `${base}architecture` && ready) return send(200, { payload: architecture() });
       if (path === `${base}architecture`) return send(200, { payload: { ...pin, state: "missing_rules", aggregate: "max", role: "production", workbench: true,
-        metricsVersion: "metrics:v1", evidenceTier: "syntax", semanticComplete: false, layers: [], modules: [], edges: [] } });
+        metricsVersion: "metrics:v1", evidenceTier: "syntax", semanticComplete: false, layers: [], modules: [], edges: [], apps: [], interfaces: [] } });
       if (path === `${base}methods`) return send(200, { items: [{ consequential: true, symbol: { id: "fixture-seed", name: "run", kind: "function", path: "fixture.rs" } }] });
       if (path === `${base}sequence` && req.method === "POST") {
         const { seed, expectedRevision } = JSON.parse(body);
@@ -321,7 +328,7 @@ function bare() {
 const KEY_A = "a".repeat(64), KEY_C = "c".repeat(64);
 const pin2 = { ...pin, indexRevision: 8 };
 const rulesless = (p) => ({ payload: { ...p, state: "missing_rules", aggregate: "max", role: "production", workbench: true, metricsVersion: "metrics:v1",
-  evidenceTier: "syntax", semanticComplete: false, layers: [], modules: [], edges: [] } });
+  evidenceTier: "syntax", semanticComplete: false, layers: [], modules: [], edges: [], apps: [], interfaces: [] } });
 
 test("P2-1: a status read obsoleted by a checkout switch frees nothing of B's, and B issues and shows its own", async () => {
   const { view, cx, last } = bare();

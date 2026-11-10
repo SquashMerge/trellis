@@ -19,8 +19,9 @@ import { View, div, image } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { appHome, focused, layout, machines, props, setShared, shared, spaces, theme } from "herdr";
 import * as fs from "fs/promises";
-import { TrellisError, architecturePayload, createClient, indexLabel, pinLabel, pinOf, samePin, validRootKey } from "./client.js";
-import { draw, heat, hit, plural, display } from "./diagram.js";
+import { TrellisError, architecturePayload, createClient, detailPage, indexLabel, jobCause, pinLabel, pinOf, samePin, validRootKey } from "./client.js";
+import { CONTROLS, DEFAULT_AGGREGATE, DEFAULT_METRIC, ERROR, HEAT_INK, apps, deviationModel, draw, heat, heatFill, hit, plural, display } from "./diagram.js";
+import * as ui from "./architecture-ui.js";
 import { drawSequence, helpers as sequenceHelpers, targetOf } from "./sequence.js";
 import { ensureFilesPanel } from "./panels.js";
 
@@ -34,6 +35,11 @@ const DRAW_TIMEOUT_MS = 15000;
 const WIDTH_SLACK = 8, PAD = 12;
 const SELECTED_FILE = "trellis.selectedFile";
 const HEAT_NAMES = ["low", "moderate", "high", "very high"];
+// The Deviations tree's read (web/architecture-deviations.js PARAMS), and its page bound.
+const DEVIATION_PARAMS = { kind: "instances", rule: "$layers", status: "deviates", role: "production", excepted: "false", limit: "500" };
+const MAX_DEVIATION_PAGES = 40;
+// The brand mark the web app's header shows, copied beside main.js by build.mjs.
+const LOGO = "mods/trellis/trellis-mark.png";
 
 const yieldTo = (cx) => () => cx.sleep(0);
 const drawTimeout = (what) => new TrellisError("draw_timeout", `The ${what} drawing didn't finish within ${DRAW_TIMEOUT_MS / 1000} s, so the Herdr runtime may have ended it. It is tried again when the data, width or theme changes.`);
@@ -51,6 +57,8 @@ export default class Trellis extends View {
     const p = props() || {};
     this.copy = Math.random().toString(36).slice(2, 10);
     this.open = new Map();
+    // The web toolbar's choices (#886): Color by and Aggregation keep across checkouts, as in the browser.
+    this.metric = DEFAULT_METRIC; this.aggregate = DEFAULT_AGGREGATE; this.menu = null;
     this.width = 0;
     this.props = p;
     // Follow (#809): the last agent-or-terminal focus and the last Files selection, each with a
@@ -131,7 +139,9 @@ export default class Trellis extends View {
     this.rootKey = rootKey; this.status = null; this.statusError = null; this.view = null; this.viewError = null; this.building = null;
     // A new checkout starts a new baseline of agent shows (#818).
     this.showSeen = null; this.shown = null;
-    this.open = new Map(); this.tried = null; this.drawError = null; this.picked = null;
+    this.open = new Map(); this.tried = null; this.drawError = null;
+    // A new checkout starts at All apps, with nothing inspected and no Deviations tree (#789, #886).
+    this.scope = null; this.drilled = new Set(); this.unassignedOpen = false; this.inspect = null; this.devs = null; this.job = null;
     this.seq = { history: [], expanded: new Set() };
     this.serial = (this.serial || 0) + 1;
     // A read still in flight for the old checkout is obsolete: the new one issues its own.
@@ -219,6 +229,10 @@ export default class Trellis extends View {
         if (changed || (!this.view && !this.viewError && !this.loading)) this.loadArchitecture(cx);
         if (changed) this.reloadSequence(cx);
         this.observeShow(data?.viewRequest, cx);
+        // The status line's "Last re-index failed" note (web/app.js renderIndexStatus). Best effort:
+        // a daemon or `trellis api` without the route leaves the note out.
+        try { const job = await client.job(rootKey); if (live()) this.job = job && typeof job === "object" ? job : null; }
+        catch { if (live()) this.job = null; }
       } catch (error) {
         if (!live()) return;
         // Never keep data from a checkout whose status can't be read.
@@ -292,19 +306,20 @@ export default class Trellis extends View {
   }
 
   loadArchitecture(cx) {
-    const rootKey = this.rootKey, serial = this.serial, pin = this.status?.pin, client = this.client, run = {};
+    const rootKey = this.rootKey, serial = this.serial, pin = this.status?.pin, client = this.client, aggregate = this.aggregate, run = {};
     if (!pin) { this.view = null; this.viewError = null; this.archRun = null; this.loading = false; return; }
+    this.devs = null;
     this.archRun = run;
     this.loading = true; this.view = null; this.viewError = null; this.building = null;
     const started = Date.now();
     // The building retries belong to this request too.
-    const live = () => run === this.archRun && serial === this.serial && samePin(pin, this.status?.pin);
+    const live = () => run === this.archRun && serial === this.serial && samePin(pin, this.status?.pin) && aggregate === this.aggregate;
     const attempt = (cx) => cx.spawn(async (cx) => {
       if (!live()) return;
       try {
-        const data = await client.architecture(rootKey, pin);
+        const data = await client.architecture(rootKey, pin, aggregate);
         if (!live()) return;
-        const payload = architecturePayload(data, pin);
+        const payload = architecturePayload(data, pin, aggregate);
         if (payload.state === "building") {
           this.building = payload.progress || {};
           const wait = Number.isSafeInteger(payload.retryAfterMs) && payload.retryAfterMs > 0 ? payload.retryAfterMs : BUILDING_MS;
@@ -329,8 +344,10 @@ export default class Trellis extends View {
     if (!this.view || this.view.state !== "ready" || this.width <= 0) return;
     const t = theme();
     const width = Math.max(320, Math.floor(this.width - 2 * PAD));
-    const themeKey = ["background", "foreground", "muted", "input", "surface", "raised", "border", "accent", "ansi0", "ansi1", "ansi3", "ansi9", "ansi11"].map((k) => t[k]).join();
-    const key = JSON.stringify([this.view.indexGeneration, this.view.indexRevision, this.view.rulesFile?.contentHash, [...this.open], themeKey, highlight]);
+    const themeKey = ["background", "foreground", "muted", "input", "surface", "raised", "border", "accent"].map((k) => t[k]).join();
+    const choice = this.choice();
+    const key = JSON.stringify([this.view.indexGeneration, this.view.indexRevision, this.view.rulesFile?.contentHash, this.view.aggregate, [...this.open], [...this.drilled],
+      this.unassignedOpen, choice.metric, choice.scope, themeKey, highlight]);
     // The last attempt's inputs, drawn or failed: a failure is not retried for the same inputs.
     const tried = this.tried && this.tried.key === key && Math.abs(this.tried.width - width) <= WIDTH_SLACK;
     if (tried || this.drawing) return;
@@ -351,11 +368,16 @@ export default class Trellis extends View {
         const pause = yieldTo(cx);
         await pause();
         if (!live()) return;
-        const out = await draw(view, { width, open: this.open, theme: t, highlight, pause });
+        const out = await draw(view, { width, theme: t, highlight, pause, choice });
         if (!live()) return;
-        const asset = await this.saveDrawing("architecture", out.svg);
+        // One file per image (All apps stacked draws one per app); the extra files of an earlier drawing go.
+        const assets = [];
+        for (const [index, one] of out.images.entries()) assets.push(one ? await this.saveDrawing(`architecture-${index}`, one.svg) : null);
+        for (const kind of Object.keys(this.files)) if (kind.startsWith("architecture-") && Number(kind.slice(13)) >= out.images.length) {
+          const file = this.files[kind]; delete this.files[kind]; await fs.unlink(file).catch(() => {});
+        }
         if (!live()) return;
-        this.drawn = { ...out, view, asset };
+        this.drawn = { ...out, view, assets, choice };
         this.drawError = null;
       } catch (error) {
         if (!live()) return;
@@ -366,6 +388,67 @@ export default class Trellis extends View {
         cx.notify();
       }
     });
+  }
+
+  // The display choices one drawing is made for.
+  choice() {
+    return { open: this.open, drilled: this.drilled, unassigned: this.unassignedOpen, metric: this.metric, aggregate: this.aggregate, scope: this.scope };
+  }
+
+  // Color by redraws the held payload; Aggregation reads the payload again, as the browser does.
+  choose(kind, value, cx) {
+    const options = kind === "metric" ? CONTROLS.metrics : CONTROLS.aggregates;
+    this.menu = null;
+    if (!options.some((option) => option.value === value)) return cx.notify();
+    if (kind === "metric") this.metric = value;
+    else if (value !== this.aggregate) { this.aggregate = value; this.view = null; this.loadArchitecture(cx); }
+    cx.notify();
+  }
+
+  // The app switcher: redraws the held snapshot and never reads (#789).
+  setScope(name, cx) {
+    if (name !== null && !apps.group(this.view, name)) return;
+    this.scope = name; this.inspect = null; this.devs = null;
+    cx.notify();
+  }
+
+  pinText() { return this.view ? pinLabel({ indexGeneration: this.view.indexGeneration, indexRevision: this.view.indexRevision }) : "no index"; }
+
+  // The Deviations tree sees the chosen app's slice and that app's counts (web/architecture.js deviationsView).
+  deviationView() {
+    const view = this.view, group = this.scope === null || !(view?.apps?.length >= 2) ? null : apps.group(view, this.scope);
+    return group ? { ...apps.scoped(view, group.name), rules: { ...view.rules, counts: group.counts } } : view;
+  }
+
+  // Opens the Deviations tree, on one edge ("source→destination") or all of them, reading every
+  // page of production `$layers` deviations at the summary's pin and rules hash.
+  openDeviations(edge, cx) {
+    const view = this.view, pin = this.status?.pin, rootKey = this.rootKey, serial = this.serial, client = this.client;
+    if (!view || view.state !== "ready" || !pin) return;
+    const group = this.scope === null || !(view.apps?.length >= 2) ? null : apps.group(view, this.scope);
+    const params = group ? { ...DEVIATION_PARAMS, app: group.name } : { ...DEVIATION_PARAMS };
+    const devs = { edge, expanded: new Set(), base: null, tree: null, error: null, progress: "" };
+    this.devs = devs;
+    const live = () => this.devs === devs && serial === this.serial && view === this.view;
+    cx.spawn(async (cx) => {
+      try {
+        const rows = [];
+        for (let offset = 0, pages = 0; offset !== null; pages++) {
+          if (pages >= MAX_DEVIATION_PAGES) throw new TrellisError("too_many_deviations", "Too many deviation pages to list here. Open the Deviations tree in the browser.");
+          const page = detailPage(await client.details(rootKey, pin, view.rulesFile.contentHash, params, offset), pin, view.rulesFile.contentHash, params.kind, offset);
+          if (!live()) return;
+          rows.push(...page.items); offset = page.nextOffset;
+          if (offset !== null) { devs.progress = `Reading deviations… ${rows.length.toLocaleString("en-US")} of ${page.total.toLocaleString("en-US")} instances`; cx.notify(); }
+        }
+        if (!rows.every(deviationModel.valid)) throw new TrellisError("invalid_response", "Invalid Architecture detail response. Nothing displayed.");
+        devs.base = deviationModel.build(rows, view.layers, null);
+        devs.tree = deviationModel.filter(devs.base, { edge, callsOnly: false });
+      } catch (error) {
+        if (!live()) return;
+        devs.error = fail(error);
+      } finally { cx.notify(); }
+    });
+    cx.notify();
   }
 
   // --- the followed file ---
@@ -390,23 +473,29 @@ export default class Trellis extends View {
     const members = view.modules.filter((m) => m.layer === module.layer);
     const groups = summary.moduleGroups(members);
     const group = groups.find((g) => g.files.includes(module)) || null;
+    // In All apps a band's stat chips count its own app's slice.
+    const part = summary.plan.parts.find((p) => p.slice.modules.includes(module)) ?? summary.plan.parts[0];
     return { module, layer, group, rank: group ? groups.indexOf(group) : -1, groups: groups.length, members: members.length,
-      hidden: layer ? !summary.layers.has(layer.name) : false, stats: layer ? summary.layerStats(layer) : [] };
+      hidden: layer ? !summary.layers.has(layer.name) : false, stats: layer ? summary.layerStats(layer, part.group?.name, part.slice) : [] };
   }
 
-  // A press on the diagram: a band (its header, or anywhere in it) opens or folds; an arrow's
-  // count, a module or a note shows its full accessible label above the drawing.
-  press(event, cx) {
+  // A press on the diagram (image `index`): a band opens or folds, as its header does in the
+  // browser; a directory module opens one level; the unassigned row opens; an upward ↑ chip or a
+  // deviating arrow opens the Deviations tree on its edge; an interface stub inspects the
+  // interface; anything else is inspected by its full accessible label.
+  press(event, index, cx) {
     const drawn = this.current(), at = event?.local_position;
-    if (!drawn || !at) return;
-    const box = hit(drawn.boxes, at.x, at.y);
+    if (!drawn || !at || !drawn.images[index]) return;
+    const box = hit(drawn.images[index].boxes, at.x, at.y);
     if (!box) return;
-    if (box.kind === "L") {
-      const layer = box.record, summary = drawn.summary;
-      this.open.set(layer.name, !summary.expanded(layer)); this.picked = null;
-    } else {
-      this.picked = { kind: { E: "Arrow", M: "File", D: "Module", N: "Note", U: "Unassigned" }[box.kind] || "Selected", text: box.label };
-    }
+    const summary = drawn.summary, record = box.record;
+    if (box.kind === "L") this.open.set(record.name, !summary.expanded(record));
+    else if (box.kind === "D" && typeof record?.key === "string") { if (this.drilled.has(record.key)) this.drilled.delete(record.key); else this.drilled.add(record.key); }
+    else if (box.kind === "U") this.unassignedOpen = !this.unassignedOpen;
+    else if (box.kind === "A" && box.action[0] === "up") return this.openDeviations(`${box.action[1]}→${box.action[2]}`, cx);
+    else if (box.kind === "A" && box.action[0] === "interface") this.inspect = { kind: "interface", key: apps.key({ client: box.action[1], server: box.action[2] }), client: box.action[1], server: box.action[2] };
+    else if (box.kind === "E" && record?.role === "production" && record.status === "deviates" && !record.excepted) return this.openDeviations(`${record.sourceLayer}→${record.destinationLayer}`, cx);
+    else this.inspect = { kind: "label", title: { E: "Arrow", M: "File", D: "Module", C: "Module", N: "Note", A: "Selected" }[box.kind] || "Selected", text: box.label || "" };
     cx.notify();
   }
 
@@ -619,7 +708,7 @@ export default class Trellis extends View {
     this.follow(cx);
     const file = this.followed();
     const place = file?.checkout?.rootKey === this.rootKey ? this.placement(file) : null;
-    const highlight = place?.group && place.layer ? [place.layer.name, place.group.name] : place?.group && !place.layer ? [null, place.group.name] : null;
+    const highlight = place?.group ? [place.layer?.name ?? null, place.group.name, place.module.app ?? null] : null;
     if (this.tab === "architecture") this.scheduleDraw(cx, highlight);
     else { this.followSequence(file, cx); this.scheduleSequenceDraw(cx); }
 
@@ -630,13 +719,22 @@ export default class Trellis extends View {
         .children([...this.shownBar(t), ...this.body(t, file, place, cx)]));
   }
 
+  // The web app's header: the Trellis by SquashMerge mark, the views, the followed checkout and
+  // its pin; then the status line (web/app.js renderIndexStatus): the index state, and a failed
+  // later re-index as a secondary note.
   header(t, cx) {
     const row = this.checkouts?.find((r) => r.rootKey === this.rootKey);
     const label = row ? indexLabel({ ...row, revision: this.status?.pin ?? row.revision, catchingUp: this.status?.catchingUp ?? row.catchingUp }) : null;
-    const tone = label?.state === "fresh" ? t.ansi2 : label?.state === "catching-up" ? t.ansi3 : label?.state === "failed" ? t.ansi1 : t.muted;
+    const job = this.job, failed = job?.state === "failed";
+    const state = failed && !this.status?.pin ? { text: `Index failed · ${jobCause(job)}`, state: "failed", shape: "□" } : label;
+    const note = failed && this.status?.pin ? `Last re-index failed · ${jobCause(job)}` : "";
+    const tone = state?.state === "fresh" ? t.ansi2 : state?.state === "catching-up" ? t.ansi3 : state?.state === "failed" ? ERROR : t.muted;
     return v_flex().flex_none().border_b(1).border_color(t.border)
       .child(h_flex().h(40).px(PAD).gap(10).items_center()
-        .child(div().font_semibold().text_size(14).child("Trellis"))
+        .child(h_flex().id("brand").flex_none().gap(6).items_center()
+          .child(image(LOGO).w(16).h(20))
+          .child(div().font_semibold().text_size(14).child("Trellis"))
+          .child(div().text_size(12).text_color(t.dim).child("by SquashMerge")))
         .children(["architecture", "sequence"].map((tab) => div().id(`tab-${tab}`).px(8).h(24).flex().items_center().rounded(6).cursor_pointer()
           .text_color(this.tab === tab ? t.foreground : t.dim).when(this.tab === tab, (el) => el.bg(t.selected)).hover((s) => s.bg(t.hover))
           .on_click((_e, cx) => { this.tab = tab; try { localStorage.setItem("trellis.tab", tab); } catch { /* a convenience only */ } cx.notify(); })
@@ -649,21 +747,22 @@ export default class Trellis extends View {
           .border_color(this.pinned ? t.accent : t.input || t.border).text_color(this.pinned ? t.accent : t.dim).hover((s) => s.bg(t.hover))
           .on_click((_e, cx) => this.setPinned(!this.pinned, cx))
           .child(this.pinned ? "Pinned" : "Following")))
-      .when(Boolean(label), (el) => el.child(h_flex().px(PAD).pb(8).gap(6).items_center().text_size(12)
-        .child(div().text_color(tone).child(label.shape))
-        .child(div().text_color(tone).child(label.text))
+      .when(Boolean(state), (el) => el.child(h_flex().id("status-line").px(PAD).pb(8).gap(6).items_center().text_size(12)
+        .child(div().text_color(tone).child(state.shape))
+        .child(div().flex_none().text_color(tone).child(state.text))
+        .when(Boolean(note), (el) => el.child(div().id("status-note").flex_none().text_color(ERROR).child(`· ${note}`)))
         .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(`${row?.workspaceRoot || ""}${this.machine ? ` · on ${this.machine}` : ""}`))));
   }
 
   // A typed failure: its code and message, and nothing else from that read.
   problem(t, error, what) {
-    return v_flex().gap(4).p(10).rounded(8).border_1().border_color(t.ansi1).bg(t.surface)
-      .child(h_flex().gap(6).child(div().text_color(t.ansi1).child("⚠")).child(div().font_semibold().child(what)))
+    return v_flex().gap(4).p(10).rounded(8).border_1().border_color(ERROR).bg(t.surface)
+      .child(h_flex().gap(6).child(div().text_color(ERROR).child("⚠")).child(div().font_semibold().child(what)))
       .child(div().text_size(12).text_color(t.muted).font_family(settingsMono()).child(error.code))
       .child(div().text_color(t.foreground).child(error.message));
   }
 
-  note(t, text) { return div().text_color(t.muted).child(text); }
+  note(t, text) { return div().text_color(t.muted).whitespace_normal().child(text); }
 
   body(t, file, place) {
     if (this.fatal) return [this.problem(t, this.fatal, "Configuration")];
@@ -680,32 +779,28 @@ export default class Trellis extends View {
     if (!this.status) return [this.note(t, "Reading index status…")];
     if (!this.status.pin) return [this.note(t, this.status.catchingUp ? "Indexing this checkout. The diagram appears when the first revision is published." : "This checkout has no index yet.")];
     if (this.tab === "sequence") return this.sequenceBody(t, file);
-    if (this.viewError) return [this.problem(t, this.viewError, "Architecture")];
+    const controls = ui.controls(this, t);
+    if (this.viewError) return [...controls, this.problem(t, this.viewError, "Architecture")];
     if (this.building) {
       const phase = { reading: "reading indexed files", resolving: "resolving references", evaluating: "evaluating rules", measuring: "measuring code" }[this.building.phase] || "preparing";
       const count = this.building.completed > 0 && this.building.total > 0 ? ` ${this.building.completed} of ${this.building.total}` : "";
-      return [this.note(t, `Building Architecture for this revision: ${phase}${count}…`)];
+      return [...controls, this.note(t, `Building Architecture for this revision: ${phase}${count}…`)];
     }
     const view = this.view;
-    if (!view) return [this.note(t, "Reading indexed architecture and reviewed rules…")];
+    if (!view) return [...controls, this.note(t, "Reading indexed architecture and reviewed rules…")];
     if (view.state === "missing_rules") return [this.note(t, "No reviewed rules file. Create or review .trellis/rules.toml to configure layers.")];
     if (view.state === "no_layers") return [this.note(t, "No authored layers are configured. Review .trellis/rules.toml to configure layers.")];
-    const out = [];
-    if (file) out.push(this.fileCard(t, file, place));
     const drawn = this.current();
+    // The switcher and controls come from the drawing's summary, so they always match what is drawn.
+    const out = [...controls];
+    if (drawn) out.push(...ui.switcher(this, t, drawn.summary, view));
+    if (drawn && this.devs) return [...out, ...ui.deviations(this, t, drawn.summary, view)];
+    if (file) out.push(this.fileCard(t, file, place));
     if (this.drawError) out.push(this.problem(t, this.drawError, "Diagram"));
-    else if (drawn) {
-      if (this.picked) out.push(h_flex().flex_none().gap(8).items_start().p(8).rounded(6).bg(t.surface).border_1().border_color(t.border)
-        .child(div().text_color(t.dim).child(this.picked.kind))
-        .child(div().flex_1().min_w(0).whitespace_normal().child(this.picked.text.replace(/\n/g, " · ")))
-        .child(div().id("picked-close").text_color(t.dim).cursor_pointer().child("×").on_click((_e, cx) => { this.picked = null; cx.notify(); })));
-      // The image is drawn at 1:1, so a press's element-relative position is in SVG units.
-      out.push(div().id("diagram").flex_none().w(drawn.width).h(drawn.height).cursor_pointer()
-        .on_mouse_down("left", (event, cx) => this.press(event, cx))
-        .child(image(drawn.asset).w(drawn.width).h(drawn.height)));
-    }
+    else if (drawn?.summary.noLayers) out.push(...ui.noLayers(t, drawn.summary, view));
+    else if (drawn) out.push(...ui.drawing(this, t, drawn));
     else out.push(this.note(t, "Drawing the layer stack…"));
-    if (drawn) out.push(this.layerList(t, place));
+    if (drawn) out.push(...ui.legend(t, drawn.summary, view), ...ui.inspector(this, t, drawn.summary, view), this.layerList(t, place));
     return out;
   }
 
@@ -718,72 +813,74 @@ export default class Trellis extends View {
     if (file.checkout.rootKey !== this.rootKey) return card.child(this.note(t, `In ${basename(file.checkout.workspaceRoot)}, which is not available.`));
     if (!place) return card.child(this.note(t, "Waiting for the diagram…"));
     if (place.missing) return card.child(this.note(t, "Not an indexed source file at this revision."));
-    const { module, layer, group } = place;
-    const metric = heat.metricValue(module.metrics, "cognitive");
-    const band = this.drawn.summary.scale.band(metric);
+    const { module, layer, group } = place, summary = this.drawn.summary, metric = summary.metric;
+    const value = metric === "layer" ? undefined : heat.metricValue(module.metrics, metric);
+    const band = value === undefined ? null : summary.scale.band(value);
     card.child(h_flex().gap(6).items_center().flex_wrap()
       .child(div().text_color(t.dim).child("Layer"))
       .child(div().font_semibold().child(layer ? `${layer.shared ? "Shared" : layer.order} · ${layer.name}` : "Unassigned / unknown"))
-      .when(place.hidden, (el) => el.child(div().text_size(12).text_color(t.dim).child(this.drawn.summary.tests.has(layer.name) ? "(tests/fixtures layer, not drawn)" : "(hidden layer, not drawn)")))
+      .when(Boolean(module.app), (el) => el.child(div().text_size(12).text_color(t.dim).child(`app ${module.app}`)))
+      .when(place.hidden, (el) => el.child(div().text_size(12).text_color(t.dim).child(summary.tests.has(layer.name) ? "(tests/fixtures layer, not drawn)" : "(hidden layer, not drawn)")))
       .children(place.stats.map((stat) => this.stat(t, stat))));
     if (group) {
-      const drawnChip = place.rank >= 0 && this.drawn.projection && [...this.drawn.projection.nodes.values()].some((n) => n.kind === "C" && n.record.group === group.name && n.record.layerKey === (layer?.name ?? null));
+      const drawnChip = place.rank >= 0 && this.drawn.images.some((one) => one && [...(one.projection?.nodes.values() ?? [])].some((n) => n.kind === "C" && n.record.group === group.name && n.record.layerKey === (layer?.name ?? null)));
       card.child(h_flex().gap(6).items_center().flex_wrap()
         .child(div().text_color(t.dim).child("Module"))
-        .child(this.chip(t, group.name, this.drawn.summary.scale.band(group.value)))
-        .child(div().text_color(t.muted).child(`${plural(group.files.length, "file")} · max cognitive ${display(group.value)} · #${place.rank + 1} of ${place.groups} in the layer`))
+        .child(this.chip(t, group.name, group.value === undefined ? null : summary.scale.band(group.value)))
+        .child(div().text_color(t.muted).child(`${plural(group.files.length, "file")}${group.value === undefined ? "" : ` · ${metric === "maintainabilityIndex" ? "min" : "max"} ${metric} ${display(group.value)}`} · #${place.rank + 1} of ${place.groups} in the layer`))
         .child(div().text_size(12).text_color(t.dim).child(drawnChip ? "outlined in the diagram" : "in the band's “more” chip")));
     }
     card.child(h_flex().gap(6).items_center().flex_wrap()
       .child(div().text_color(t.dim).child("File"))
       .child(div().text_color(t.muted).child(module.declarationCount > 0
-        ? `cognitive ${display(metric)}${band === null ? "" : ` (${HEAT_NAMES[band]})`} · ${plural(module.declarationCount, "measured callable")}`
+        ? `${metric === "layer" ? "layer membership" : `${metric} ${display(value)}`}${band === null ? "" : ` (${HEAT_NAMES[band]})`} · ${plural(module.declarationCount, "measured callable")}`
         : `no measured callables${module.excludedReason ? ` · ${module.excludedReason}` : ""}`)));
     return card;
   }
 
+  // A heat chip in the web app's colours (web/style.css --heat-0..3), with ink text on heat.
   chip(t, text, band) {
-    const fill = band === null || band === undefined || band === 0 ? t.raised : [null, t.ansi11 || t.ansi3, t.ansi3, t.ansi9 || t.ansi1][band];
-    return div().px(6).py(1).rounded(4).bg(fill).text_color(band > 0 ? t.ansi0 || t.background : t.foreground).child(text);
+    return div().px(6).py(1).rounded(4).bg(band > 0 ? heatFill(t, band) : t.raised).text_color(band > 0 ? HEAT_INK : t.foreground).child(text);
   }
 
   stat(t, stat) {
-    const color = stat.tone === "error" ? t.ansi1 : t.muted;
+    const color = stat.tone === "error" ? ERROR : t.muted;
     return div().px(5).rounded(3).border_1().border_color(color).text_size(12).text_color(color).child(stat.text);
   }
 
-  // The layer stack as rows: order, name, files, max cognitive, outgoing counts. A row opens or
-  // folds its band in the diagram, as clicking a band header does in the browser.
+  // The layer stack as rows, per app in All apps: order, name, files, max, outgoing counts. A row
+  // opens or folds its band in the diagram, as clicking a band header does in the browser.
   layerList(t, place) {
-    const view = this.view, summary = this.drawn.summary;
-    const ordered = view.layers.filter((l) => !l.shared).sort((a, b) => a.order - b.order || a.name.localeCompare(b.name));
-    const shared = view.layers.filter((l) => l.shared).sort((a, b) => a.name.localeCompare(b.name));
-    const unassigned = view.modules.filter((m) => m.layer === null).length;
-    const rows = [...ordered, ...shared].map((layer) => {
-      const members = view.modules.filter((m) => m.layer === layer.name);
-      const drawnLayer = summary.layers.has(layer.name), open = drawnLayer && summary.expanded(layer);
-      const current = place?.layer?.name === layer.name;
-      return h_flex().id(`layer-${layer.name}`).min_h(30).px(8).py(4).gap(8).items_center().rounded(6).flex_wrap()
-        .when(current, (el) => el.bg(t.selected))
-        .when(drawnLayer, (el) => el.cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => { this.open.set(layer.name, !open); cx.notify(); }))
-        .child(div().w(14).text_color(t.dim).child(drawnLayer ? (open ? "▾" : "▸") : "·"))
-        .child(div().w(52).text_color(t.dim).child(layer.shared ? "Shared" : `Order ${layer.order}`))
-        .child(div().font_semibold().text_color(drawnLayer ? t.foreground : t.dim).child(layer.name))
-        .child(div().text_color(t.muted).child(`${plural(members.length, "file")} · max ${display(summary.worst(members))}`))
-        .when(!drawnLayer, (el) => el.child(div().text_size(12).text_color(t.dim).child(summary.tests.has(layer.name) ? "tests/fixtures · not drawn" : "hidden · not drawn")))
-        .children(summary.layerStats(layer).map((stat) => this.stat(t, stat)));
-    });
-    const sites = (view.references?.coverage || []).reduce((s, r) => s + r.sites, 0), mapped = (view.references?.coverage || []).reduce((s, r) => s + r.mappedSites, 0);
-    return v_flex().flex_none().gap(2)
+    const view = this.view, summary = this.drawn.summary, out = [];
+    for (const part of summary.plan.parts) {
+      const slice = part.slice, name = part.group?.name;
+      const ordered = slice.layers.filter((l) => !l.shared).sort((a, b) => a.order - b.order || a.name.localeCompare(b.name));
+      const shared = slice.layers.filter((l) => l.shared).sort((a, b) => a.name.localeCompare(b.name));
+      if (name) out.push(div().pt(4).font_semibold().text_size(13).child(name));
+      out.push(...[...ordered, ...shared].map((layer) => {
+        const members = slice.modules.filter((m) => m.layer === layer.name);
+        const drawnLayer = part.layout.layers.has(layer.name), open = drawnLayer && summary.expanded(layer);
+        const current = place?.layer?.name === layer.name, worst = summary.worst(members);
+        return h_flex().id(`layer-${name ? `${name}-` : ""}${layer.name}`).min_h(30).px(8).py(4).gap(8).items_center().rounded(6).flex_wrap()
+          .when(current, (el) => el.bg(t.selected))
+          .when(drawnLayer, (el) => el.cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => { this.open.set(layer.name, !open); cx.notify(); }))
+          .child(div().w(14).text_color(t.dim).child(drawnLayer ? (open ? "▾" : "▸") : "·"))
+          .child(div().w(52).text_color(t.dim).child(layer.shared ? "Shared" : `Order ${layer.order}`))
+          .child(div().font_semibold().text_color(drawnLayer ? t.foreground : t.dim).child(layer.name))
+          .child(div().text_color(t.muted).child(`${plural(members.length, "file")}${worst === undefined ? "" : ` · ${summary.metric === "maintainabilityIndex" ? "min" : "max"} ${display(worst)}`}`))
+          .when(!drawnLayer, (el) => el.child(div().text_size(12).text_color(t.dim).child(part.layout.tests.has(layer.name) ? "tests/fixtures · not drawn" : "hidden · not drawn")))
+          .children(summary.layerStats(layer, name, slice).map((stat) => this.stat(t, stat)));
+      }));
+    }
+    const unassigned = summary.plan.payload.modules.filter((m) => m.layer === null).length;
+    return v_flex().id("layers").flex_none().gap(2)
       .child(h_flex().gap(8).items_center().pb(4)
         .child(div().font_semibold().text_size(14).child("Layers"))
-        .child(div().text_size(12).text_color(t.dim).child(`${plural(view.modules.length, "file module")} · rules ${String(view.rulesFile?.contentHash || "").slice(0, 12)}`)))
-      .children(rows)
+        .child(div().text_size(12).text_color(t.dim).child(`${plural(summary.plan.payload.modules.length, "file module")} · rules ${String(view.rulesFile?.contentHash || "").slice(0, 12)}`)))
+      .children(out)
       .child(h_flex().min_h(30).px(8).gap(8).items_center()
         .child(div().w(14)).child(div().w(52).text_color(t.dim).child("—"))
-        .child(div().font_semibold().child("Unassigned")).child(div().text_color(t.muted).child(`${plural(unassigned, "file")} · no layer`)))
-      .child(div().pt(6).text_size(12).text_color(t.dim).child(
-        `${mapped.toLocaleString("en-US")} of ${sites.toLocaleString("en-US")} reference sites mapped to a module${(view.references?.coverage || []).some((r) => r.unresolvedSites > 0) ? " · ≥ counts are lower bounds" : ""} · heat: cognitive, max per callable, fixed bands`));
+        .child(div().font_semibold().child("Unassigned")).child(div().text_color(t.muted).child(`${plural(unassigned, "file")} · no layer`)));
   }
 }
 

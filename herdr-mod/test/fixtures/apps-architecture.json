@@ -1,0 +1,670 @@
+{
+ "aggregate": "max",
+ "apps": [
+  {
+   "counts": {
+    "comparable": 4,
+    "conforms": 1,
+    "deviates": 2,
+    "excepted": 0,
+    "unknown": 1
+   },
+   "entries": [
+    "srv"
+   ],
+   "fileCount": 3,
+   "kind": "cargo",
+   "languages": [
+    "rust"
+   ],
+   "manifest": "Cargo.toml",
+   "name": "srv",
+   "roots": [
+    "."
+   ],
+   "source": "manifest",
+   "unassignedFileCount": 0
+  },
+  {
+   "counts": {
+    "comparable": 0,
+    "conforms": 0,
+    "deviates": 0,
+    "excepted": 0,
+    "unknown": 0
+   },
+   "entries": [],
+   "fileCount": 1,
+   "kind": "npm",
+   "languages": [
+    "javascript"
+   ],
+   "manifest": "web/package.json",
+   "name": "webapp",
+   "roots": [
+    "web"
+   ],
+   "source": "manifest",
+   "unassignedFileCount": 0
+  }
+ ],
+ "edges": [
+  {
+   "count": 3,
+   "coverage": {
+    "complete": true,
+    "mappedSites": 3,
+    "semanticSites": 0,
+    "sites": 3,
+    "unresolvedSites": 0
+   },
+   "destinationLayer": "server",
+   "evidenceTier": "syntax",
+   "excepted": false,
+   "exceptionReason": null,
+   "pairs": [
+    {
+     "count": 2,
+     "evidenceTier": "syntax",
+     "kindCounts": {
+      "call": 2,
+      "import": 0,
+      "reference": 0,
+      "type": 0
+     },
+     "omittedSites": 0,
+     "semanticSites": 0,
+     "sites": [
+      {
+       "callId": "occ:v2:267f787b156127fd4c42c402fff8687e",
+       "caller": {
+        "document": {
+         "language": "rust",
+         "path": "src/util.rs",
+         "sourceSetId": "source-set:v1:ec2ff8ac-1173-4345-a428-207094c239ab"
+        },
+        "name": "shared",
+        "stableLookupKey": "src/util.rs::shared",
+        "syntaxId": "sid:v1:f0f918a5d0e11e7f3ed4125ae69c4db0"
+       },
+       "callerReason": null,
+       "lines": {
+        "end": 2,
+        "start": 2
+       },
+       "mapping": "structural",
+       "owner": {
+        "name": "shared",
+        "stableLookupKey": "src/util.rs::shared",
+        "syntaxId": "sid:v1:f0f918a5d0e11e7f3ed4125ae69c4db0"
+       },
+       "ownerSyntaxId": "sid:v1:f0f918a5d0e11e7f3ed4125ae69c4db0",
+       "provenanceId": null,
+       "range": {
+        "end": 53,
+        "start": 41
+       },
+       "relationKind": "call",
+       "role": "production",
+       "spelling": "api::handler",
+       "target": null,
+       "targetReason": "structural_only"
+      },
+      {
+       "callId": "occ:v2:22bf83fa553f3463afeab7ca904aa030",
+       "caller": {
+        "document": {
+         "language": "rust",
+         "path": "src/util.rs",
+         "sourceSetId": "source-set:v1:ec2ff8ac-1173-4345-a428-207094c239ab"
+        },
+        "name": "shared",
+        "stableLookupKey": "src/util.rs::shared",
+        "syntaxId": "sid:v1:f0f918a5d0e11e7f3ed4125ae69c4db0"
+       },
+       "callerReason": null,
+       "lines": {
+        "end": 2,
+        "start": 2
+       },
+       "mapping": "structural",
+       "owner": {
+        "name": "shared",
+        "stableLookupKey": "src/util.rs::shared",
+        "syntaxId": "sid:v1:f0f918a5d0e11e7f3ed4125ae69c4db0"
+       },
+       "ownerSyntaxId": "sid:v1:f0f918a5d0e11e7f3ed4125ae69c4db0",
+       "provenanceId": null,
+       "range": {
+        "end": 70,
+        "start": 58
+       },
+       "relationKind": "call",
+       "role": "production",
+       "spelling": "api::handler",
+       "target": null,
+       "targetReason": "structural_only"
+      }
+     ],
+     "source": {
+      "language": "rust",
+      "path": "src/util.rs",
+      "sid": "sid:v1:233444db365c7bcc275d42cda206aff1",
+      "sourceSetId": "source-set:v1:ec2ff8ac-1173-4345-a428-207094c239ab"
+     },
+     "target": {
+      "language": "rust",
+      "path": "src/api.rs",
+      "sid": "sid:v1:0ab4b609bbe5f7880b5e181fda0af833",
+      "sourceSetId": "source-set:v1:ec2ff8ac-1173-4345-a428-207094c239ab"
+     }
+    },
+    {
+     "count": 1,
+     "evidenceTier": "syntax",
+     "kindCounts": {
+      "call": 0,
+      "import": 1,
+      "reference": 0,
+      "type": 0
+     },
+     "omittedSites": 0,
+     "semanticSites": 0,
+     "sites": [
+      {
+       "callId": null,
+       "caller": null,
+       "callerReason": "syntax_only",
+       "lines": {
+        "end": 1,
+        "start": 1
+       },
+       "mapping": "structural",
+       "owner": {
+        "name": null,
+        "stableLookupKey": null,
+        "syntaxId": "sid:v1:233444db365c7bcc275d42cda206aff1"
+       },
+       "ownerSyntaxId": "sid:v1:233444db365c7bcc275d42cda206aff1",
+       "provenanceId": null,
+       "range": {
+        "end": 14,
+        "start": 4
+       },
+       "relationKind": "import",
+       "role": "production",
+       "spelling": "crate::api",
+       "target": null,
+       "targetReason": "structural_only"
+      }
+     ],
+     "source": {
+      "language": "rust",
+      "path": "src/util.rs",
+      "sid": "sid:v1:233444db365c7bcc275d42cda206aff1",
+      "sourceSetId": "source-set:v1:ec2ff8ac-1173-4345-a428-207094c239ab"
+     },
+     "target": {
+      "language": "rust",
+      "path": "src/main.rs",
+      "sid": "sid:v1:682904ae740535f748fab4a48859757c",
+      "sourceSetId": "source-set:v1:ec2ff8ac-1173-4345-a428-207094c239ab"
+     }
+    }
+   ],
+   "role": "production",
+   "semanticSites": 0,
+   "sourceLayer": "core",
+   "status": "deviates"
+  },
+  {
+   "count": 1,
+   "coverage": {
+    "complete": false,
+    "mappedSites": 1,
+    "semanticSites": 0,
+    "sites": 2,
+    "unresolvedSites": 1
+   },
+   "destinationLayer": "core",
+   "evidenceTier": "syntax",
+   "excepted": false,
+   "exceptionReason": null,
+   "pairs": [
+    {
+     "count": 1,
+     "evidenceTier": "syntax",
+     "kindCounts": {
+      "call": 1,
+      "import": 0,
+      "reference": 0,
+      "type": 0
+     },
+     "omittedSites": 0,
+     "semanticSites": 0,
+     "sites": [
+      {
+       "callId": "occ:v2:55cdf8a1e88502b8c870cfb77884c12f",
+       "caller": {
+        "document": {
+         "language": "rust",
+         "path": "src/main.rs",
+         "sourceSetId": "source-set:v1:ec2ff8ac-1173-4345-a428-207094c239ab"
+        },
+        "name": "main",
+        "stableLookupKey": "src/main.rs::main",
+        "syntaxId": "sid:v1:c164eca0333cfbcc9f989143c4fac74f"
+       },
+       "callerReason": null,
+       "lines": {
+        "end": 8,
+        "start": 8
+       },
+       "mapping": "structural",
+       "owner": {
+        "name": "main",
+        "stableLookupKey": "src/main.rs::main",
+        "syntaxId": "sid:v1:c164eca0333cfbcc9f989143c4fac74f"
+       },
+       "ownerSyntaxId": "sid:v1:c164eca0333cfbcc9f989143c4fac74f",
+       "provenanceId": null,
+       "range": {
+        "end": 199,
+        "start": 187
+       },
+       "relationKind": "call",
+       "role": "production",
+       "spelling": "util::shared",
+       "target": null,
+       "targetReason": "structural_only"
+      }
+     ],
+     "source": {
+      "language": "rust",
+      "path": "src/main.rs",
+      "sid": "sid:v1:682904ae740535f748fab4a48859757c",
+      "sourceSetId": "source-set:v1:ec2ff8ac-1173-4345-a428-207094c239ab"
+     },
+     "target": {
+      "language": "rust",
+      "path": "src/util.rs",
+      "sid": "sid:v1:233444db365c7bcc275d42cda206aff1",
+      "sourceSetId": "source-set:v1:ec2ff8ac-1173-4345-a428-207094c239ab"
+     }
+    }
+   ],
+   "role": "production",
+   "semanticSites": 0,
+   "sourceLayer": "server",
+   "status": "conforms"
+  }
+ ],
+ "evidenceTier": "syntax",
+ "exceptionCount": 0,
+ "indexGeneration": "96741e4f-f822-44aa-a675-e2524063b4b8",
+ "indexRevision": 1,
+ "interfaces": [
+  {
+   "client": "webapp",
+   "counts": {
+    "callSites": 1,
+    "clientOnly": 1,
+    "confidence": {
+     "exact": 1,
+     "template": 0,
+     "unresolved": 1,
+     "wrapperInferred": 0
+    },
+    "matchedRoutes": 1,
+    "serverOnly": 1
+   },
+   "ends": [
+    {
+     "callSites": 1,
+     "clientLayer": "client",
+     "routes": 1,
+     "serverLayer": "server"
+    }
+   ],
+   "kind": "http",
+   "server": "srv",
+   "wrappers": {
+    "callees": [
+     "api",
+     "request",
+     "api.request",
+     "owner.request",
+     "fetch",
+     "axios"
+    ],
+    "prefix": {
+     "client": "/api/",
+     "server": "/api/checkouts/{root}/"
+    }
+   }
+  }
+ ],
+ "layers": [
+  {
+   "app": "webapp",
+   "apps": null,
+   "display": null,
+   "name": "client",
+   "order": 1,
+   "shared": false
+  },
+  {
+   "app": "srv",
+   "apps": null,
+   "display": null,
+   "name": "core",
+   "order": 2,
+   "shared": false
+  },
+  {
+   "app": "srv",
+   "apps": null,
+   "display": null,
+   "name": "server",
+   "order": 1,
+   "shared": false
+  }
+ ],
+ "metricsVersion": "metrics:v1",
+ "modules": [
+  {
+   "app": "webapp",
+   "contentHash": "d052fdb39c70b3956c28669d48376e8a7317da032974c9c81bf37abaafe702bf",
+   "declarationCount": 2,
+   "identity": {
+    "language": "javascript",
+    "path": "web/app.js",
+    "sid": "sid:v1:b31287a06940f355637125be8a2601ca",
+    "sourceSetId": "source-set:v1:ec2ff8ac-1173-4345-a428-207094c239ab"
+   },
+   "layer": "client",
+   "metrics": {
+    "cognitive": 10,
+    "commentLines": 0,
+    "cyclomatic": 5,
+    "exits": {
+     "returns": 2,
+     "throws": 0
+    },
+    "fanIn": {
+     "unavailable": "call resolution not yet produced (#40/#68)",
+     "value": null
+    },
+    "fanOut": 2,
+    "halstead": {
+     "N1": 9,
+     "N2": 8,
+     "difficulty": 6,
+     "effort": 338.836666,
+     "estimatedBugs": 0.018824,
+     "length": 17,
+     "n1": 6,
+     "n2": 4,
+     "vocabulary": 10,
+     "volume": 56.472778
+    },
+    "loc": 4,
+    "maintainabilityIndex": 87.061085,
+    "maxNesting": 4,
+    "parameters": 1,
+    "sloc": 4
+   },
+   "physicalLines": 5,
+   "provenanceId": "native-proof:v1:32f6db82fd036ede61f6a60adee02505320314e8cf126e796cf04127c53de115",
+   "revisionId": "revision:v2:d672bf6920fc4e1bbe844cf5d849cae30ab94e175e50c7f87360bf5e6b45125b",
+   "roleCounts": {
+    "production": 2,
+    "test": 0
+   }
+  },
+  {
+   "app": "srv",
+   "contentHash": "b147e363a965ee0177c5ad8a11c85bce9049d17837fead7a4c5f8763257324fd",
+   "declarationCount": 1,
+   "identity": {
+    "language": "rust",
+    "path": "src/api.rs",
+    "sid": "sid:v1:0ab4b609bbe5f7880b5e181fda0af833",
+    "sourceSetId": "source-set:v1:ec2ff8ac-1173-4345-a428-207094c239ab"
+   },
+   "layer": "server",
+   "metrics": {
+    "cognitive": 0,
+    "commentLines": 0,
+    "cyclomatic": 1,
+    "exits": {
+     "returns": 0,
+     "throws": 0
+    },
+    "fanIn": {
+     "unavailable": "call resolution not yet produced (#40/#68)",
+     "value": null
+    },
+    "fanOut": 0,
+    "halstead": {
+     "N1": 0,
+     "N2": 1,
+     "difficulty": 0,
+     "effort": 0,
+     "estimatedBugs": 0,
+     "length": 1,
+     "n1": 0,
+     "n2": 1,
+     "vocabulary": 1,
+     "volume": 0
+    },
+    "loc": 1,
+    "maintainabilityIndex": 99.865497,
+    "maxNesting": 0,
+    "parameters": 0,
+    "sloc": 1
+   },
+   "physicalLines": 1,
+   "provenanceId": "native-proof:v1:1c591420ec8381563b5ec1ea75acfd5174fb28e64efca499310e8fbdf0ba102e",
+   "revisionId": "revision:v2:d672bf6920fc4e1bbe844cf5d849cae30ab94e175e50c7f87360bf5e6b45125b",
+   "roleCounts": {
+    "production": 1,
+    "test": 0
+   }
+  },
+  {
+   "app": "srv",
+   "contentHash": "2b7be384b530a1732c20e709c8620440a43ba4400ffe0b89826f61d20d88aecb",
+   "declarationCount": 5,
+   "identity": {
+    "language": "rust",
+    "path": "src/main.rs",
+    "sid": "sid:v1:682904ae740535f748fab4a48859757c",
+    "sourceSetId": "source-set:v1:ec2ff8ac-1173-4345-a428-207094c239ab"
+   },
+   "layer": "server",
+   "metrics": {
+    "cognitive": 10,
+    "commentLines": 0,
+    "cyclomatic": 5,
+    "exits": {
+     "returns": 0,
+     "throws": 0
+    },
+    "fanIn": {
+     "unavailable": "call resolution not yet produced (#40/#68)",
+     "value": null
+    },
+    "fanOut": 5,
+    "halstead": {
+     "N1": 7,
+     "N2": 10,
+     "difficulty": 3.125,
+     "effort": 118.872188,
+     "estimatedBugs": 0.014395,
+     "length": 13,
+     "n1": 5,
+     "n2": 8,
+     "vocabulary": 10,
+     "volume": 43.185065
+    },
+    "loc": 3,
+    "maintainabilityIndex": 99.865497,
+    "maxNesting": 4,
+    "parameters": 0,
+    "sloc": 3
+   },
+   "physicalLines": 9,
+   "provenanceId": "native-proof:v1:87f9e6f5b6f7c56e0274f4e49ffe94bc6f65f91955cd4577c55e22fba647d1df",
+   "revisionId": "revision:v2:d672bf6920fc4e1bbe844cf5d849cae30ab94e175e50c7f87360bf5e6b45125b",
+   "roleCounts": {
+    "production": 5,
+    "test": 0
+   }
+  },
+  {
+   "app": "srv",
+   "contentHash": "5191d2f4980a827dbaad4218f3eef864a6801953c78089c80e869ad69eb2fa2b",
+   "declarationCount": 1,
+   "identity": {
+    "language": "rust",
+    "path": "src/util.rs",
+    "sid": "sid:v1:233444db365c7bcc275d42cda206aff1",
+    "sourceSetId": "source-set:v1:ec2ff8ac-1173-4345-a428-207094c239ab"
+   },
+   "layer": "core",
+   "metrics": {
+    "cognitive": 0,
+    "commentLines": 0,
+    "cyclomatic": 1,
+    "exits": {
+     "returns": 0,
+     "throws": 0
+    },
+    "fanIn": {
+     "unavailable": "call resolution not yet produced (#40/#68)",
+     "value": null
+    },
+    "fanOut": 2,
+    "halstead": {
+     "N1": 3,
+     "N2": 4,
+     "difficulty": 2,
+     "effort": 28,
+     "estimatedBugs": 0.004667,
+     "length": 7,
+     "n1": 2,
+     "n2": 2,
+     "vocabulary": 4,
+     "volume": 14
+    },
+    "loc": 1,
+    "maintainabilityIndex": 91.840294,
+    "maxNesting": 0,
+    "parameters": 0,
+    "sloc": 1
+   },
+   "physicalLines": 2,
+   "provenanceId": "native-proof:v1:4e0ef299054bce342d9292f1226e81e7dbab5bc461dd237be5bc00ba3b36cd26",
+   "revisionId": "revision:v2:d672bf6920fc4e1bbe844cf5d849cae30ab94e175e50c7f87360bf5e6b45125b",
+   "roleCounts": {
+    "production": 1,
+    "test": 0
+   }
+  }
+ ],
+ "noApp": {
+  "counts": {
+   "comparable": 0,
+   "conforms": 0,
+   "deviates": 0,
+   "excepted": 0,
+   "unknown": 0
+  },
+  "unassignedFileCount": 0
+ },
+ "partialFiles": [],
+ "references": {
+  "counts": {
+   "mappedSites": 4,
+   "scannedDocuments": 4,
+   "semanticSites": 0,
+   "unresolvedSites": 1
+  },
+  "coverage": [
+   {
+    "layer": "core",
+    "mappedSites": 3,
+    "role": "production",
+    "semanticSites": 0,
+    "sites": 3,
+    "unresolvedSites": 0
+   },
+   {
+    "layer": "server",
+    "mappedSites": 1,
+    "role": "production",
+    "semanticSites": 0,
+    "sites": 2,
+    "unresolvedSites": 1
+   }
+  ],
+  "evidenceTier": "syntax",
+  "externalPackages": [],
+  "indexGeneration": "96741e4f-f822-44aa-a675-e2524063b4b8",
+  "indexRevision": 1,
+  "limitations": [
+   "Structural file conventions are not compiler, package, type or call resolution; missing sites do not prove absence.",
+   "Rust expands captured public names through proved lexical modules and bounded import/reexport chains; cfg, macros, unproved ownership and unknown in-repo names remain uncertain. Declared external roots identify packages only.",
+   "JavaScript expands captured named ESM exports through bounded relative forwarding; stars exclude default. Ambiguous names, dynamic namespaces and unproved bindings remain uncertain. Static sources retain module evidence; declared npm roots and the partial pinned Node catalog identify packages only.",
+   "Python expands proved checkout-root and declared pyproject source-root modules and package exports with bounded import forwarding and literal-list __all__; dynamic namespaces, ambiguous bindings and unproved package layouts remain uncertain. The pinned CPython 3.12 stdlib catalog labels roots only; third-party distribution mappings remain unknown.",
+   "Java expands captured public top-level types from declared packages, with explicit and lexical shadowing; static/member types and unproved third-party prefixes remain unresolved. Java labels identify package families only; javax requires an exact package in the pinned OpenJDK 25 catalog, not proof of members or installed-JDK availability.",
+   "No selected semantic producer has fresh bindings for these documents; every site is structural syntax evidence."
+  ],
+  "partialFiles": [],
+  "referencesVersion": "references:v2",
+  "semanticComplete": false,
+  "semanticProducers": []
+ },
+ "role": "production",
+ "rules": {
+  "counts": {
+   "comparable": 4,
+   "conforms": 1,
+   "deviates": 2,
+   "excepted": 0,
+   "unknown": 1
+  },
+  "indexGeneration": "96741e4f-f822-44aa-a675-e2524063b4b8",
+  "indexRevision": 1,
+  "limitations": [
+   "Layer results describe observed mapped references, not absence of dependencies.",
+   "Calls and type relationships have no admitted bindings and remain unknown.",
+   "testOnly policy statuses are hypothetical and never production violations.",
+   "Structural reference provenance attests captured source bytes, not a semantic target association; semantic sites carry their binding's provenance."
+  ],
+  "partialFiles": [],
+  "rulesFile": {
+   "contentHash": "1f72640eaacfda9252a72a567fd3975fbfaca5c7836f3da8eb0201f7a2b1af4a",
+   "path": ".trellis/rules.toml",
+   "source": "checkout-config"
+  },
+  "rulesVersion": "rules:v2",
+  "testCounts": {
+   "comparable": 0,
+   "conforms": 0,
+   "deviates": 0,
+   "excepted": 0,
+   "unknown": 0
+  },
+  "unassignedCount": 0
+ },
+ "rulesFile": {
+  "contentHash": "1f72640eaacfda9252a72a567fd3975fbfaca5c7836f3da8eb0201f7a2b1af4a",
+  "path": ".trellis/rules.toml",
+  "source": "checkout-config"
+ },
+ "semanticComplete": false,
+ "state": "ready",
+ "workbench": true
+}

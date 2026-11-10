@@ -1,0 +1,199 @@
+{
+ "catchingUp": false,
+ "payload": {
+  "indexGeneration": "96741e4f-f822-44aa-a675-e2524063b4b8",
+  "indexRevision": 1,
+  "items": [
+   {
+    "instance": {
+     "constraints": [],
+     "destination": {
+      "language": "rust",
+      "path": "src/api.rs",
+      "sid": "sid:v1:0ab4b609bbe5f7880b5e181fda0af833",
+      "sourceSetId": "source-set:v1:ec2ff8ac-1173-4345-a428-207094c239ab"
+     },
+     "destinationLayer": "server",
+     "evidence": [
+      {
+       "callId": "occ:v2:267f787b156127fd4c42c402fff8687e",
+       "caller": {
+        "document": {
+         "language": "rust",
+         "path": "src/util.rs",
+         "sourceSetId": "source-set:v1:ec2ff8ac-1173-4345-a428-207094c239ab"
+        },
+        "name": "shared",
+        "stableLookupKey": "src/util.rs::shared",
+        "syntaxId": "sid:v1:f0f918a5d0e11e7f3ed4125ae69c4db0"
+       },
+       "callerReason": null,
+       "document": {
+        "language": "rust",
+        "path": "src/util.rs",
+        "sourceSetId": "source-set:v1:ec2ff8ac-1173-4345-a428-207094c239ab"
+       },
+       "kind": "structuralReference",
+       "lines": {
+        "end": 2,
+        "start": 2
+       },
+       "owner": {
+        "name": "shared",
+        "stableLookupKey": "src/util.rs::shared",
+        "syntaxId": "sid:v1:f0f918a5d0e11e7f3ed4125ae69c4db0"
+       },
+       "provenanceId": "native-proof:v1:4e0ef299054bce342d9292f1226e81e7dbab5bc461dd237be5bc00ba3b36cd26",
+       "range": {
+        "end": 53,
+        "start": 41
+       },
+       "relationKind": "call",
+       "revisionId": "revision:v2:d672bf6920fc4e1bbe844cf5d849cae30ab94e175e50c7f87360bf5e6b45125b",
+       "spelling": "api::handler",
+       "syntaxId": "sid:v1:f0f918a5d0e11e7f3ed4125ae69c4db0",
+       "target": null,
+       "targetReason": "structural_only"
+      },
+      {
+       "callId": "occ:v2:22bf83fa553f3463afeab7ca904aa030",
+       "caller": {
+        "document": {
+         "language": "rust",
+         "path": "src/util.rs",
+         "sourceSetId": "source-set:v1:ec2ff8ac-1173-4345-a428-207094c239ab"
+        },
+        "name": "shared",
+        "stableLookupKey": "src/util.rs::shared",
+        "syntaxId": "sid:v1:f0f918a5d0e11e7f3ed4125ae69c4db0"
+       },
+       "callerReason": null,
+       "document": {
+        "language": "rust",
+        "path": "src/util.rs",
+        "sourceSetId": "source-set:v1:ec2ff8ac-1173-4345-a428-207094c239ab"
+       },
+       "kind": "structuralReference",
+       "lines": {
+        "end": 2,
+        "start": 2
+       },
+       "owner": {
+        "name": "shared",
+        "stableLookupKey": "src/util.rs::shared",
+        "syntaxId": "sid:v1:f0f918a5d0e11e7f3ed4125ae69c4db0"
+       },
+       "provenanceId": "native-proof:v1:4e0ef299054bce342d9292f1226e81e7dbab5bc461dd237be5bc00ba3b36cd26",
+       "range": {
+        "end": 70,
+        "start": 58
+       },
+       "relationKind": "call",
+       "revisionId": "revision:v2:d672bf6920fc4e1bbe844cf5d849cae30ab94e175e50c7f87360bf5e6b45125b",
+       "spelling": "api::handler",
+       "syntaxId": "sid:v1:f0f918a5d0e11e7f3ed4125ae69c4db0",
+       "target": null,
+       "targetReason": "structural_only"
+      }
+     ],
+     "excepted": false,
+     "exceptionReason": null,
+     "kindCounts": {
+      "call": 2,
+      "import": 0,
+      "reference": 0,
+      "type": 0
+     },
+     "projection": null,
+     "referenceCount": 2,
+     "rule": "$layers",
+     "sourceLayer": "core",
+     "status": "deviates",
+     "target": {
+      "language": "rust",
+      "path": "src/util.rs",
+      "sid": "sid:v1:233444db365c7bcc275d42cda206aff1",
+      "sourceSetId": "source-set:v1:ec2ff8ac-1173-4345-a428-207094c239ab"
+     },
+     "unresolved": []
+    },
+    "role": "production"
+   },
+   {
+    "instance": {
+     "constraints": [],
+     "destination": {
+      "language": "rust",
+      "path": "src/main.rs",
+      "sid": "sid:v1:682904ae740535f748fab4a48859757c",
+      "sourceSetId": "source-set:v1:ec2ff8ac-1173-4345-a428-207094c239ab"
+     },
+     "destinationLayer": "server",
+     "evidence": [
+      {
+       "callId": null,
+       "caller": null,
+       "callerReason": "syntax_only",
+       "document": {
+        "language": "rust",
+        "path": "src/util.rs",
+        "sourceSetId": "source-set:v1:ec2ff8ac-1173-4345-a428-207094c239ab"
+       },
+       "kind": "structuralReference",
+       "lines": {
+        "end": 1,
+        "start": 1
+       },
+       "owner": {
+        "name": null,
+        "stableLookupKey": null,
+        "syntaxId": "sid:v1:233444db365c7bcc275d42cda206aff1"
+       },
+       "provenanceId": "native-proof:v1:4e0ef299054bce342d9292f1226e81e7dbab5bc461dd237be5bc00ba3b36cd26",
+       "range": {
+        "end": 14,
+        "start": 4
+       },
+       "relationKind": "import",
+       "revisionId": "revision:v2:d672bf6920fc4e1bbe844cf5d849cae30ab94e175e50c7f87360bf5e6b45125b",
+       "spelling": "crate::api",
+       "syntaxId": "sid:v1:233444db365c7bcc275d42cda206aff1",
+       "target": null,
+       "targetReason": "structural_only"
+      }
+     ],
+     "excepted": false,
+     "exceptionReason": null,
+     "kindCounts": {
+      "call": 0,
+      "import": 1,
+      "reference": 0,
+      "type": 0
+     },
+     "projection": null,
+     "referenceCount": 1,
+     "rule": "$layers",
+     "sourceLayer": "core",
+     "status": "deviates",
+     "target": {
+      "language": "rust",
+      "path": "src/util.rs",
+      "sid": "sid:v1:233444db365c7bcc275d42cda206aff1",
+      "sourceSetId": "source-set:v1:ec2ff8ac-1173-4345-a428-207094c239ab"
+     },
+     "unresolved": []
+    },
+    "role": "production"
+   }
+  ],
+  "kind": "instances",
+  "nextOffset": null,
+  "offset": 0,
+  "rulesFile": {
+   "contentHash": "1f72640eaacfda9252a72a567fd3975fbfaca5c7836f3da8eb0201f7a2b1af4a",
+   "path": ".trellis/rules.toml",
+   "source": "checkout-config"
+  },
+  "total": 2
+ }
+}
