@@ -1107,6 +1107,53 @@ fn effective_apps(
     Ok(apps)
 }
 
+/// The private payload field that carries [`path_apps`] to the MCP aggregation (#837). The
+/// MCP layer removes it before it answers.
+pub(crate) const PATH_APPS: &str = "_pathApps";
+
+/// The app of every module that `references` emits, for `trellis_references`
+/// `groupBy:"package"` (#837): `{path: manifest|null}`, null for a file in no app. It is the
+/// rules check's and the Architecture summary's file assignment. With a rules file, `apps`
+/// are the rules base's apps (a manifest a hidden layer selects is no app) and `layers` is
+/// the whole checkout's layer assignment from the same evaluation check runs, so `package`
+/// fails exactly when check does; a file's app is [`AppScope::file`] through its own layer.
+/// Without one, `apps` are every detected manifest and a file's app is the one whose root
+/// most specifically contains it.
+pub(crate) fn path_apps(
+    config: Option<&Config>,
+    apps: &[crate::apps::App],
+    layers: &BTreeMap<&str, Option<&str>>,
+    references: &Projection,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<Value> {
+    let mut out = serde_json::Map::new();
+    for module in references.data["modules"]
+        .as_array()
+        .context("store_unavailable: reference modules absent")?
+    {
+        check()?;
+        let path = module["identity"]["path"]
+            .as_str()
+            .context("store_unavailable: module path absent")?;
+        let app = match config {
+            Some(config) => {
+                AppScope::new(config, apps).file(path, layers.get(path).copied().flatten())
+            }
+            None => crate::apps::containing(apps, path),
+        };
+        out.insert(
+            path.to_owned(),
+            json!(app.map(|index| crate::apps::group_text(&apps[index]))),
+        );
+    }
+    Ok(Value::Object(out))
+}
+
+/// The apps detected without a rules file: every manifest that detects one (#837).
+pub(crate) fn unruled_apps(candidates: &crate::apps::Candidates) -> Vec<crate::apps::App> {
+    crate::apps::detect(candidates, &BTreeSet::new()).apps
+}
+
 /// Resolve authored hidden membership for the explicit workbench metrics population.
 /// Uses the same exact-match, specificity and ambiguity rules as architecture policy.
 pub(crate) fn hidden_layer_paths(

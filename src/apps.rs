@@ -70,6 +70,17 @@ impl App {
     }
 }
 
+/// The text of an app's `trellis_references` `groupBy:"package"` group (#837): a detected
+/// app's manifest path, or `[apps.<name>]` for an authored app, which has none. A manifest
+/// path ends in its manifest file name and an authored group in `]`, and neither is the
+/// `noApp` group, so no two kinds of group collide.
+pub(crate) fn group_text(app: &App) -> String {
+    match &app.manifest {
+        Some(manifest) => manifest.clone(),
+        None => format!("[apps.{}]", app.name),
+    }
+}
+
 /// What one manifest detects.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Outcome {

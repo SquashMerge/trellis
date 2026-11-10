@@ -6441,6 +6441,49 @@ fn a_path_filter_still_reports_a_broken_file_that_feeds_resolution() {
     assert_eq!(projection.data["partialFiles"][0]["path"], "broken.js");
 }
 
+/// #837 (Prime2 review of #861): a `prefix` scopes `partialFiles` and their limitation to
+/// files under it, on the scoped projection and on the resolved base alike; a prefix with no
+/// source under it reports none. Without a prefix the list stays checkout-wide.
+#[test]
+fn a_prefix_scopes_partial_files_to_its_directory() {
+    let input = snapshot(&[
+        ("web/a.js", "import './c.js';\n"),
+        ("web/c.js", "export const c = 1;\n"),
+        ("admin/b.js", "("),
+    ]);
+    let base = references::resolve_all(&input, &mut || Ok(())).unwrap();
+    for (prefix, scanned) in [("web", 2), ("nowhere", 0)] {
+        let scoped = references::project_under(&input, &[], Some(prefix), 5, &mut || Ok(()))
+            .unwrap()
+            .data;
+        let selected = base
+            .select_under(&[], Some(prefix), 5, &mut || Ok(()))
+            .unwrap()
+            .data;
+        for data in [&scoped, &selected] {
+            assert_eq!(
+                data["partialFiles"],
+                serde_json::json!([]),
+                "{prefix}: {data}"
+            );
+            assert!(
+                !data["limitations"].to_string().contains("syntax errors"),
+                "{prefix}: {data}"
+            );
+            assert_eq!(data["counts"]["scannedDocuments"], scanned, "{prefix}");
+        }
+        assert_eq!(scoped, selected, "{prefix}");
+    }
+    let admin = references::project_under(&input, &[], Some("admin"), 5, &mut || Ok(()))
+        .unwrap()
+        .data;
+    assert_eq!(admin["partialFiles"][0]["path"], "admin/b.js");
+    let whole = references::project(&input, &[], 5, &mut || Ok(()))
+        .unwrap()
+        .data;
+    assert_eq!(whole["partialFiles"][0]["path"], "admin/b.js");
+}
+
 #[test]
 fn a_whole_file_of_garbage_is_partial() {
     for (path, source) in [

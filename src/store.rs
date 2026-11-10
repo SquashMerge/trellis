@@ -1859,9 +1859,26 @@ impl EvidenceResponse {
             })
             .transpose()?
             .unwrap_or(5);
+        // #837: a references read may keep only the sources under a directory, and group
+        // by app, which needs each file's app.
+        let references = kind == "references";
+        let prefix = match arguments.get("prefix").filter(|_| references) {
+            None => None,
+            Some(value) => Some(
+                value
+                    .as_str()
+                    .and_then(crate::references::directory_prefix)
+                    .context("invalid_request: prefix")?
+                    .to_owned(),
+            ),
+        };
+        let apps =
+            references && arguments.get("groupBy").and_then(|by| by.as_str()) == Some("package");
         Ok(ArchitectureArguments {
             pin,
             paths,
+            prefix,
+            apps,
             sample_limit,
         })
     }
@@ -1875,7 +1892,7 @@ impl EvidenceResponse {
     ) -> Result<serde_json::Value> {
         let parsed = Self::architecture_arguments(kind, arguments)?;
         check()?;
-        let config = self.architecture_config(kind)?;
+        let config = self.architecture_config(kind, &parsed)?;
         let selected = self.selected(parsed.pin)?;
         let core = self.architecture_core_at(
             selected.pin,
@@ -1887,9 +1904,14 @@ impl EvidenceResponse {
         self.architecture_response_at(kind, arguments, &parsed, config.as_ref(), &core, check)
     }
 
-    /// The rules this operation reads; a check or explanation fails without them.
-    pub(crate) fn architecture_config(&self, kind: &str) -> Result<Option<crate::rules::Config>> {
-        let config = if kind == "references" {
+    /// The rules this operation reads; a check or explanation fails without them. References
+    /// read them only to group by app (#837), and work without them.
+    pub(crate) fn architecture_config(
+        &self,
+        kind: &str,
+        parsed: &ArchitectureArguments,
+    ) -> Result<Option<crate::rules::Config>> {
+        let config = if kind == "references" && !parsed.apps {
             None
         } else {
             crate::rules::load(Path::new(self.store.workspace_root()))?
@@ -1910,7 +1932,7 @@ impl EvidenceResponse {
         core: &ArchitectureCore,
         check: &mut (impl FnMut() -> Result<()> + Send),
     ) -> Result<serde_json::Value> {
-        let references = core.references(&parsed.paths, parsed.sample_limit, check)?;
+        let references = core.references_for(parsed, check)?;
         let apps = if kind == "prompt" {
             Some(crate::rules::prompt_apps(
                 config,
@@ -1919,6 +1941,30 @@ impl EvidenceResponse {
             )?)
         } else {
             None
+        };
+        // #837: app groups follow the whole checkout's evaluation, so they fail exactly when
+        // an unfiltered `trellis_rules_check` does, whatever sources the read selects.
+        let path_apps = match (parsed.apps, config) {
+            (false, _) => None,
+            (true, Some(config)) => {
+                let base = core.rules(config)?;
+                let whole = core.references(&[], 5, check)?;
+                let evaluated = crate::rules::evaluate_prepared(config, base, &whole, &[], check)?;
+                Some(crate::rules::path_apps(
+                    Some(config),
+                    base.apps(),
+                    &evaluated.layers,
+                    &references,
+                    check,
+                )?)
+            }
+            (true, None) => Some(crate::rules::path_apps(
+                None,
+                &crate::rules::unruled_apps(core.app_candidates()?),
+                &Default::default(),
+                &references,
+                check,
+            )?),
         };
         let mut evaluate =
             |config: &crate::rules::Config,
@@ -1946,6 +1992,9 @@ impl EvidenceResponse {
         if let Some(apps) = apps {
             payload["apps"] = serde_json::Value::Array(apps);
         }
+        if let Some(path_apps) = path_apps {
+            payload[crate::rules::PATH_APPS] = path_apps;
+        }
         Ok(payload)
     }
 
@@ -1962,13 +2011,45 @@ impl EvidenceResponse {
         let snapshot = self
             .architecture_snapshot(parsed.pin, check)
             .map_err(|error| self.store.report_index_failure(error))?;
-        let references =
-            crate::references::project(&snapshot, &parsed.paths, parsed.sample_limit, check)?;
+        let references = crate::references::project_under(
+            &snapshot,
+            &parsed.paths,
+            parsed.prefix.as_deref(),
+            parsed.sample_limit,
+            check,
+        )?;
         let apps = if kind == "prompt" {
             let candidates = crate::rules::app_candidates(&snapshot, check)?;
             Some(crate::rules::prompt_apps(config, &candidates, check)?)
         } else {
             None
+        };
+        // #837: as in `architecture_response_at`, check's whole-checkout validity. Layer
+        // assignment covers every module of the projection, whatever its sources.
+        let path_apps = match (parsed.apps, config) {
+            (false, _) => None,
+            (true, Some(config)) => {
+                let base = crate::rules::prepare(config, &snapshot, &mut *check)?;
+                let evaluated =
+                    crate::rules::evaluate_prepared(config, &base, &references, &[], check)?;
+                Some(crate::rules::path_apps(
+                    Some(config),
+                    base.apps(),
+                    &evaluated.layers,
+                    &references,
+                    check,
+                )?)
+            }
+            (true, None) => {
+                let candidates = crate::rules::app_candidates(&snapshot, check)?;
+                Some(crate::rules::path_apps(
+                    None,
+                    &crate::rules::unruled_apps(&candidates),
+                    &Default::default(),
+                    &references,
+                    check,
+                )?)
+            }
         };
         let mut evaluate =
             |config: &crate::rules::Config,
@@ -1988,6 +2069,9 @@ impl EvidenceResponse {
         )?;
         if let Some(apps) = apps {
             payload["apps"] = serde_json::Value::Array(apps);
+        }
+        if let Some(path_apps) = path_apps {
+            payload[crate::rules::PATH_APPS] = path_apps;
         }
         Ok(payload)
     }

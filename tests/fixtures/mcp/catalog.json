@@ -910,7 +910,7 @@
                   "const": 1
                 },
                 "toolVersion": {
-                  "const": 22
+                  "const": 23
                 },
                 "watcherDegraded": {
                   "type": "boolean"
@@ -12247,6 +12247,11 @@
           "type": "integer",
           "minimum": 1,
           "maximum": 32
+        },
+        "prefix": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
         }
       },
       "required": [
@@ -14508,7 +14513,7 @@
       ],
       "type": "object"
     },
-    "description": "Read pinned native-module and external-package references: structural syntax sites, plus fresh semantic call and type bindings where a producer is selected. Production and test sites are separate. Results page at about 24 KiB: repeat the call with `offset: page.nextOffset` until it is null. `groupBy:\"directory\"` (optional `depth`) or `\"package\"` instead pages `groups` rows of summed sites per source and target group, largest first; `limit` then caps rows per page."
+    "description": "Read pinned native-module and external-package references: structural syntax sites, plus fresh semantic call and type bindings where a producer is selected. Production and test sites are separate. Results page at about 24 KiB: repeat the call with `offset: page.nextOffset` until it is null. `groupBy:\"directory\"` (optional `depth`) or `\"package\"` (by app manifest, `noApp` outside every app) instead pages `groups` rows of summed sites per source and target group, largest first; `limit` then caps rows per page. `prefix` keeps only sources under a directory, and `depth` counts segments below it."
   },
   {
     "annotations": {

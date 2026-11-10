@@ -139,6 +139,7 @@ fn fields(name: &str) -> (&'static [&'static str], &'static [&'static str]) {
                 "offset",
                 "groupBy",
                 "depth",
+                "prefix",
             ],
             &["schemaVersion"],
         ),
@@ -345,6 +346,10 @@ fn field_message(name: &str, field: &str) -> &'static str {
             "`groupBy` must be \"file\", \"directory\" or \"package\"; `depth` (1 to 32) \
              goes only with \"directory\""
         }
+        (_, "prefix") => {
+            "`prefix` must be a checkout-relative directory such as \"src/store/\": `/` \
+             separators, no `.` or `..` segment, at most 4096 bytes"
+        }
         (_, "includeExternal") => "`includeExternal` must be true or false",
         (_, "includeTests") => "`includeTests` must be true or false",
         (_, "depth") => "`depth` must be an integer from 0 to 5",
@@ -452,6 +457,15 @@ pub fn check(name: &str, args: Option<&Value>) -> Result<(), Rejection> {
         }
         "trellis_references" | "trellis_rules_check" => {
             group_by(o).map_err(coded("groupBy"))?;
+            // #837: a checkout-relative directory, normalized but for one trailing `/`.
+            if !o.get("prefix").is_none_or(|prefix| {
+                prefix
+                    .as_str()
+                    .and_then(crate::references::directory_prefix)
+                    .is_some()
+            }) {
+                return Err(bad("prefix"));
+            }
             if !o.get("paths").is_none_or(|value| {
                 value.as_array().is_some_and(|paths| {
                     paths.iter().all(|path| {
@@ -1468,7 +1482,7 @@ mod tests {
             json!(-9007199254740991_i64),
         ];
         let describe_expected = json!({"schemaVersion":1,"requestId":7,"evidenceBasis":null,"data":{
-            "workspaceLabel":"selected","indexState":"unavailable","progress":null,"watcherDegraded":false,"languages":[],"toolVersion":22,"schemaVersion":1,
+            "workspaceLabel":"selected","indexState":"unavailable","progress":null,"watcherDegraded":false,"languages":[],"toolVersion":23,"schemaVersion":1,
             "searchIndex":{"backend":null,"unavailableReason":null},
             "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,"sourceLines":200,"defaultLimit":20,"callDefaultLimit":6,"maxLimit":50,"pageBytes":24576,"calleeTextBytes":1024,"hintWorkMs":1000,"deadlineMs":5000,"concurrency":4}},
             "warnings":[],"partial":true,"truncated":false,"truncationReason":null});
@@ -2138,6 +2152,63 @@ mod tests {
             validate(
                 "trellis_rules_check",
                 Some(&json!({"schemaVersion":1,"groupBy":"directory"}))
+            ),
+            Err("invalid_request")
+        );
+    }
+
+    /// #837: references `prefix` is a checkout-relative directory with every `groupBy`;
+    /// anything else is a typed `invalid_request` that names it. Check takes no prefix.
+    #[test]
+    fn references_prefix_is_a_relative_directory() {
+        let n = "trellis_references";
+        let with = |extra: Value| {
+            let mut arguments = json!({"schemaVersion":1});
+            for (key, value) in extra.as_object().unwrap() {
+                arguments[key] = value.clone();
+            }
+            arguments
+        };
+        let longest = "a/".repeat(2047) + "b";
+        assert_eq!(longest.len(), 4095);
+        for ok in [
+            json!({"prefix":"src"}),
+            json!({"prefix":"src/store/"}),
+            json!({"prefix":"src/store","groupBy":"file"}),
+            json!({"prefix":"src/","groupBy":"directory","depth":2}),
+            json!({"prefix":"src/store","groupBy":"package","paths":["src/**"]}),
+            json!({"prefix":"a b/$x.y"}),
+            json!({"prefix":longest.clone() + "/"}),
+        ] {
+            assert_eq!(validate(n, Some(&with(ok.clone()))), Ok(()), "{ok}");
+        }
+        for bad in [
+            json!(""),
+            json!("/"),
+            json!("/src"),
+            json!("src//store"),
+            json!("src/../etc"),
+            json!(".."),
+            json!("./src"),
+            json!("."),
+            json!("src\\store"),
+            json!("c:/src"),
+            json!("src\u{0}"),
+            json!("src//"),
+            json!(longest.clone() + "cc"),
+            json!(null),
+            json!(1),
+            json!(["src"]),
+        ] {
+            let rejection =
+                super::check(n, Some(&with(json!({"prefix":bad.clone()})))).unwrap_err();
+            assert_eq!(rejection.code, "invalid_request", "{bad}");
+            assert!(rejection.message.unwrap().contains("`prefix`"), "{bad}");
+        }
+        assert_eq!(
+            validate(
+                "trellis_rules_check",
+                Some(&json!({"schemaVersion":1,"prefix":"src"}))
             ),
             Err("invalid_request")
         );

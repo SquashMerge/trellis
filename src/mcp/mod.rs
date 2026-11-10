@@ -1266,7 +1266,17 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                             Err(error) if crate::store::cli_read_retryable_contention(&error) => {
                                 Err(error)
                             }
-                            Err(error) => Ok(architecture::failure(id, &error)),
+                            Err(error) => {
+                                let mut failure = architecture::failure(id, &error);
+                                // #837: references read rules only to group by app. A bad
+                                // rules file is `invalid_rules` there, located by check.
+                                if kind == "references"
+                                    && let Some(error) = failure["error"].as_object_mut()
+                                {
+                                    error.remove("diagnostic");
+                                }
+                                Ok(failure)
+                            }
                         }
                     }))
                 }
