@@ -72,7 +72,7 @@ Automatic producer re-runs ([quickstart](quickstart.md#automatic-re-runs-optiona
 - **Manifest-only changes don't trigger.** A change that touches only a manifest, with no indexed source document added, changed or removed in a language the producer covers, doesn't make a run due.
 - **Manual overrides aren't used.** Automatic runs re-derive settings from your project's files; options such as `--cargo-features` that you passed to a manual run are not stored in the approval.
 - **The rate limit and the failure back-off survive a restart.** They are restored from the producer's newest automatic run record, and lapse only if count retention has pruned it.
-- **Some failures are remembered only while the daemon runs.** A failure that happens before a run record is written (a refused plan preparation, an error before the run starts, a thread that could not start) is not saved. Each time the checkout is reactivated, Trellis tries it once more at an unchanged head; the attempt is cheap and starts no producer.
+- **Some failures are remembered only for the checkout runtime's lifetime.** A failure that happens before a run record is written (a refused plan preparation, an error before the run starts, a thread that could not start) is not saved. Each time the checkout is reactivated, Trellis tries it once more at an unchanged head; the attempt is cheap and starts no producer.
 - **Browser views show committed labels only.** The web app doesn't show the scheduled or running **catching up** label; `trellis status`, `producer status` and MCP do.
 
 ### Sequence diagrams are not traces

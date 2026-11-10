@@ -283,7 +283,7 @@ Published status remains catching up while semantic work remains. Per-document r
 
 ## Amendment: automatic producer re-runs (#660)
 
-[Accepted by the owner 2026-11-08 (#660, D1–D11)](https://github.com/SquashMerge/trellis/issues/660). The checkout's `AutoRunOwner` ([local topology T09](../../local-topology.md#automatic-producer-re-runs-660)) is a consumer of the worker's published state, not a worker authority:
+[Accepted by the owner 2026-11-08 (#660, D1–D11)](https://github.com/SquashMerge/trellis/issues/660); the details are owner-delegated decisions following the accepted design (approved 2026-11-10 at Gate 2 under the owner's delegation for #660). The checkout's `AutoRunOwner` ([local topology T09](../../local-topology.md#automatic-producer-re-runs-660)) is a consumer of the worker's published state, not a worker authority:
 - **Not a worker class.** It is not a lane, a priority class or a second publisher, and it claims no FIFO row. The worker-authority rules of §1 are unchanged.
 - **Decides on every wake, from published state.** It decides on every state-signal wake from the published head, phase and pending-intent state (§3), never from a sampled lock, and rechecks at the owning transition: immediately before every start it re-reads the live head.
 - **At most one launch in flight.** It has at most one launch in flight, and starts through the existing producer owner and slot.
