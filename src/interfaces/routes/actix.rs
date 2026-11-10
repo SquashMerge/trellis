@@ -495,7 +495,7 @@ impl<'a> Walker<'_, 'a> {
 }
 
 /// `prefix` then `path`, with one `/` between them and a leading `/`.
-fn join(prefix: &str, path: &str) -> String {
+pub(in crate::interfaces) fn join(prefix: &str, path: &str) -> String {
     let path = path.strip_prefix('/').unwrap_or(path);
     let prefix = prefix.strip_suffix('/').unwrap_or(prefix);
     match (prefix.is_empty(), path.is_empty()) {

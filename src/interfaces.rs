@@ -1,8 +1,13 @@
-//! HTTP interface evidence (#788, #855, #858, #856): the server routes a checkout registers
-//! and the client calls it makes. Extraction reads parsed source, the stored declaration roles
-//! and the captured `package.json` manifests, knows nothing about apps, and runs at read time;
-//! nothing here is stored.
+//! HTTP interface evidence (#788, #855, #858, #856, #857): the server routes a checkout
+//! registers and the client calls it makes. Extraction reads parsed source, the stored
+//! declaration roles and the captured `package.json` manifests, knows nothing about apps, and
+//! runs at read time; nothing here is stored.
 mod calls;
+mod java;
+mod java_calls;
+mod java_routes;
+#[cfg(test)]
+mod java_tests;
 mod js;
 mod js_routes;
 #[cfg(test)]
@@ -101,8 +106,10 @@ pub(crate) enum ClientPrefix {
 }
 
 /// One call a client makes to a server route: a request wrapper, `fetch`, axios, a Rust
-/// `reqwest` call (#858), which is always [`ClientPrefix::Written`], or a Python `requests`
-/// or `httpx` call (#856), which is [`ClientPrefix::Joined`] only through an httpx base URL.
+/// `reqwest` call (#858), which is always [`ClientPrefix::Written`], a Python `requests`
+/// or `httpx` call (#856), which is [`ClientPrefix::Joined`] only through an httpx base URL,
+/// or a Java client call (#857), which is [`ClientPrefix::Joined`] only under a base URL it
+/// reads.
 #[derive(Clone)]
 pub(crate) struct ClientCall {
     /// `None` when the method cannot be read.
@@ -176,6 +183,9 @@ pub(crate) fn extract(
     let python = python::Python::new(snapshot, &sources, work, check)?;
     routes.extend(python_routes::extract(&python, work, check)?);
     calls.extend(python_calls::extract(&python, work, check)?);
+    let (java_routes, java_calls) = java::extract(snapshot, work, check)?;
+    routes.extend(java_routes);
+    calls.extend(java_calls);
     let matched = calls::resolve(&routes, &calls, work, check)?;
     let mut callees: Vec<String> = calls::built_in().into_iter().map(|w| w.callee).collect();
     callees.extend(["fetch".to_owned(), "axios".to_owned()]);
