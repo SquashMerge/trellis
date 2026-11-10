@@ -398,6 +398,54 @@ fn producer_failure(id: &serde_json::Value) -> serde_json::Value {
     envelope
 }
 
+/// The files of the apps a find, search or call graph `app` argument names (#851), or the
+/// typed failure that answers instead: `not_found` for an unknown app, and the rules check's
+/// `invalid_rules` and `bounded_work`. Contention and a building core return as errors, so
+/// the read waits for the owner and is admitted again.
+fn app_files(
+    runtime: &crate::daemon::registry::CheckoutRuntime,
+    response: &crate::daemon::registry::CheckoutEvidence,
+    id: &serde_json::Value,
+    app: Option<&str>,
+    check: &mut (impl FnMut() -> anyhow::Result<()> + Send),
+) -> anyhow::Result<AppFiles> {
+    let Some(app) = app else {
+        return Ok(Ok(None));
+    };
+    match runtime.mcp_app_files(response, app, check) {
+        Ok(files) => Ok(Ok(Some(std::sync::Arc::new(files)))),
+        Err(error)
+            if crate::store::cli_read_retryable_contention(&error)
+                || error
+                    .downcast_ref::<crate::http::architecture::ArchitectureBuilding>()
+                    .is_some() =>
+        {
+            Err(error)
+        }
+        Err(error) => {
+            let message = error.to_string();
+            let code = if crate::rules::diagnostic(&error).is_some() {
+                "invalid_rules"
+            } else if message.starts_with("not_found:") {
+                "not_found"
+            } else if message.starts_with("bounded_work") {
+                "bounded_work"
+            } else {
+                evidence_failure_code(&error)
+            };
+            let mut envelope = tools::failure(id, code);
+            if code == "not_found" {
+                envelope["error"]["message"] = serde_json::json!(crate::rules::UNKNOWN_APP);
+            }
+            Ok(Err(envelope))
+        }
+    }
+}
+
+/// An `app` filter's files (`None` without one), or the failure that answers the call.
+type AppFiles =
+    Result<Option<std::sync::Arc<std::collections::BTreeSet<String>>>, serde_json::Value>;
+
 /// A failed evidence read's wire code.
 fn evidence_failure_code(error: &anyhow::Error) -> &'static str {
     let message = error.to_string();
@@ -677,6 +725,8 @@ struct DescribedSnapshot {
     catching_up: bool,
     state: &'static str,
     progress: Option<serde_json::Value>,
+    /// #851: the head's apps, from its architecture core when the owner has it.
+    apps: Option<serde_json::Value>,
 }
 
 /// Every tool call is answered within this deadline; describe reports it as
@@ -732,28 +782,30 @@ fn read_describe(
                                 Ok(((status, (counts, tiers)), documents))
                             })()
                             .map_err(|error| response.report_index_failure(error))?;
+                            let mut check = || {
+                                if cancel.load(std::sync::atomic::Ordering::Acquire)
+                                    || runtime.mcp_clock_now() >= deadline
+                                {
+                                    anyhow::bail!(
+                                        "deadline_exceeded: MCP call reached its deadline"
+                                    );
+                                }
+                                Ok(())
+                            };
                             let search_head = runtime.search_head_coverage(
                                 &response,
                                 data.0.revision,
-                                &mut || {
-                                    if cancel.load(std::sync::atomic::Ordering::Acquire)
-                                        || runtime.mcp_clock_now() >= deadline
-                                    {
-                                        anyhow::bail!(
-                                            "deadline_exceeded: MCP call reached its deadline"
-                                        );
-                                    }
-                                    Ok(())
-                                },
+                                &mut check,
                             )?;
-                            response.finish((data, documents, search_head))
+                            let apps = runtime.mcp_describe_apps(&response, &mut check)?;
+                            response.finish((data, documents, search_head, apps))
                         })
                         .transpose()?;
-                    let (data, documents, search_head) = match read {
-                        Some((data, documents, search_head)) => {
-                            (Some(data), documents, search_head)
+                    let (data, documents, search_head, apps) = match read {
+                        Some((data, documents, search_head, apps)) => {
+                            (Some(data), documents, search_head, Some(apps))
                         }
-                        None => (None, None, None),
+                        None => (None, None, None, None),
                     };
                     Ok(DescribedSnapshot {
                         data,
@@ -762,6 +814,7 @@ fn read_describe(
                         catching_up,
                         state,
                         progress,
+                        apps,
                     })
                 });
         match attempt {
@@ -1132,6 +1185,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                 catching_up: sampled,
                                 state,
                                 progress,
+                                apps,
                             }) => {
                                 search_head = head;
                                 sampled_catching_up = sampled;
@@ -1147,6 +1201,9 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                     })),
                                     false,
                                 );
+                                if let Some(apps) = apps {
+                                    envelope["data"]["apps"] = apps;
+                                }
                                 // Paged last, against the final answer (#780).
                                 if let (Some(request), Some(documents)) =
                                     (coverage_request, coverage_documents)
@@ -1161,6 +1218,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                 catching_up: sampled,
                                 state,
                                 progress,
+                                apps: _,
                             }) => {
                                 sampled_catching_up = sampled;
                                 envelope = projection::describe(
@@ -1270,7 +1328,8 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                 let mut failure = architecture::failure(id, &error);
                                 // #837: references read rules only to group by app. A bad
                                 // rules file is `invalid_rules` there, located by check.
-                                if kind == "references"
+                                // #851: so do endpoints, whose failure schema is references'.
+                                if matches!(kind, "references" | "endpoints")
                                     && let Some(error) = failure["error"].as_object_mut()
                                 {
                                     error.remove("diagnostic");
@@ -1293,6 +1352,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                             });
                     let compact = args.get("compact").and_then(|v| v.as_bool()) == Some(true);
                     let expected = validated_expected_basis(args);
+                    let app = args.get("app").and_then(|value| value.as_str());
                     Some(Box::new(move |runtime, response, sampled, prepared| {
                         let prepared = prepared.expect("search query prepared before admission");
                         let mut check = || {
@@ -1308,6 +1368,15 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                             expected.is_none_or(|expected| expected == pin),
                             "revision conflict: expected basis differs from admitted head"
                         );
+                        // #851: the ranked hits in the app's files, before the limit.
+                        let in_app = match app_files(runtime, response, id, app, &mut check)? {
+                            Ok(Some(files)) => {
+                                let paths = response.mcp_vid_paths(pin)?;
+                                Some((files, paths))
+                            }
+                            Ok(None) => None,
+                            Err(envelope) => return Ok(envelope),
+                        };
                         let policy = response.mcp_search_policy(query, pin, role, &mut check)?;
                         let service = runtime.search_service();
                         let head = runtime.browser_scheduler()?.search_head_slot(false);
@@ -1456,7 +1525,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                     (candidates.cards.len(), ranked, candidates.lexical)
                                 }
                             };
-                        let (ranked, budget_exceeded) = match ranked {
+                        let (mut ranked, budget_exceeded) = match ranked {
                             Ok(ranked) => (ranked, false),
                             Err(error)
                                 if matches!(
@@ -1519,6 +1588,13 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                             search_index.model_name = None;
                             search_index.embedded = 0;
                         }
+                        if let Some((files, paths)) = &in_app {
+                            ranked.hits.retain(|hit| {
+                                paths
+                                    .get(&hit.key.version_id)
+                                    .is_some_and(|path| files.contains(path))
+                            });
+                        }
                         let has_more = ranked.hits.len() > limit;
                         let prefix = &ranked.hits[..ranked.hits.len().min(limit)];
                         let keys: Vec<_> = prefix.iter().map(|hit| hit.key.clone()).collect();
@@ -1566,14 +1642,36 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                         .map_or(20, |v| wire::uint(v).expect("validated limit") as usize);
                     let compact = args.get("compact").and_then(|v| v.as_bool()) == Some(true);
                     let expected = validated_expected_basis(args);
-                    Some(Box::new(move |_, response, sampled, _query| {
+                    let app = args.get("app").and_then(|value| value.as_str());
+                    Some(Box::new(move |runtime, response, sampled, _query| {
+                        let mut check = || {
+                            if cancel.load(std::sync::atomic::Ordering::Acquire)
+                                || runtime.mcp_clock_now() >= deadline
+                            {
+                                anyhow::bail!("deadline_exceeded: MCP find deadline");
+                            }
+                            Ok(())
+                        };
+                        // #851: only declarations in the app's files.
+                        let files = match app_files(runtime, response, id, app, &mut check)? {
+                            Ok(files) => files,
+                            Err(envelope) => return Ok(envelope),
+                        };
                         let found = if let Some(key) = lookup_key {
-                            response.mcp_resolve_lookup_with_lines(key, expected)?
+                            let mut found =
+                                response.mcp_resolve_lookup_with_lines(key, expected)?;
+                            if let Some(files) = &files {
+                                found.symbols.retain(|symbol| {
+                                    files.contains(&symbol.symbol.declaration.document.path)
+                                });
+                            }
+                            found
                         } else {
-                            response.mcp_find_with_lines(
+                            response.mcp_find_with_lines_in(
                                 query.expect("validated query"),
                                 limit,
                                 expected,
+                                files.as_deref(),
                             )?
                         };
                         let tiers = response.mcp_language_tiers()?;
@@ -1775,8 +1873,23 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     let compact = args.get("compact").and_then(|v| v.as_bool()) == Some(true);
                     let lookup_key = args.get("lookupKey").and_then(|value| value.as_str());
                     let expected = validated_expected_basis(args);
+                    let app = args.get("app").and_then(|value| value.as_str());
                     Some(Box::new(move |runtime, response, sampled, _query| {
                         let mut query = query.clone();
+                        // #851: calls into declarations outside the app's files are filtered.
+                        let mut app_check = || {
+                            if cancel.load(std::sync::atomic::Ordering::Acquire)
+                                || runtime.mcp_clock_now() >= deadline
+                            {
+                                anyhow::bail!("deadline_exceeded: MCP call graph deadline");
+                            }
+                            Ok(())
+                        };
+                        query.app_paths =
+                            match app_files(runtime, response, id, app, &mut app_check)? {
+                                Ok(files) => files,
+                                Err(envelope) => return Ok(envelope),
+                            };
                         if let Some(key) = lookup_key {
                             query.root_syntax_id = match lookup_root(
                                 response,
@@ -1884,6 +1997,11 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
             {
                 // An architecture read waits for the owner, leaving its deadline's last
                 // second for the answer.
+                let architecture_read =
+                    architecture::is_tool(&name) || name == architecture::PROMPT_NAME;
+                // #851: a find, search or call graph `app` filter reads the head's core too.
+                let app_filtered =
+                    !architecture_read && args.is_some_and(|args| args.contains_key("app"));
                 let await_architecture = |runtime: &crate::daemon::registry::CheckoutRuntime| {
                     let store_arguments = architecture::store_arguments(
                         &name,
@@ -1893,7 +2011,11 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                         .saturating_duration_since(runtime.mcp_clock_now())
                         .saturating_sub(ARCHITECTURE_ANSWER_TIME);
                     runtime.await_architecture_tool(
-                        architecture::operation(&name),
+                        if architecture_read {
+                            architecture::operation(&name)
+                        } else {
+                            "apps"
+                        },
                         &store_arguments,
                         wait,
                         &mut || {
@@ -1925,7 +2047,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                             .as_str()
                             .expect("validated search query")
                     }),
-                    (architecture::is_tool(&name) || name == architecture::PROMPT_NAME)
+                    (architecture_read || app_filtered)
                         .then_some(&await_architecture as &BeforeEvidenceRead<'_>),
                     &*tool_read,
                 ) {

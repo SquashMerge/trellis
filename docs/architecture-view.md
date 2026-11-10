@@ -171,7 +171,8 @@ from `pyproject.toml` ([#807](https://github.com/SquashMerge/trellis/issues/807)
 
 **Extraction (#788).** Interface evidence is structural and read from the same admitted
 snapshot as the rules. It is extracted only when two or more apps are detected (#794:
-detected and authored apps together). Documents
+detected and authored apps together), with or without a rules file (#851: without one,
+every detected manifest is an app, for MCP `trellis_endpoints`). Documents
 with an evidence gap are skipped. Work is bounded; over the bound the read fails
 `bounded_work`.
 

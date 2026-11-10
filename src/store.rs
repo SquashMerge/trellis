@@ -1817,6 +1817,11 @@ fn trace_metrics_resident(documents: usize, bytes: u64) {
     });
 }
 
+/// What every `trellis_endpoints` answer says of its rows (#851).
+const ENDPOINTS_LIMITATION: &str = "Endpoints are structural matches of registered routes and client call sites by method and path template, not proof of what runs: a route with no call site, or a call with no route, does not prove it unused or missing.";
+/// The note of a checkout whose interfaces were not extracted (#851).
+const ENDPOINTS_NOT_EXTRACTED: &str = "not extracted: fewer than two apps";
+
 impl EvidenceResponse {
     /// The checked arguments of one architecture operation.
     pub(crate) fn architecture_arguments(
@@ -1824,7 +1829,10 @@ impl EvidenceResponse {
         arguments: &serde_json::Value,
     ) -> Result<ArchitectureArguments> {
         ensure!(
-            matches!(kind, "references" | "check" | "explain" | "prompt"),
+            matches!(
+                kind,
+                "references" | "check" | "explain" | "prompt" | "endpoints" | "apps"
+            ),
             "invalid_request"
         );
         let pin = arguments
@@ -1872,13 +1880,30 @@ impl EvidenceResponse {
                     .to_owned(),
             ),
         };
-        let apps =
-            references && arguments.get("groupBy").and_then(|by| by.as_str()) == Some("package");
+        let endpoints = kind == "endpoints";
+        let apps = (references
+            && arguments.get("groupBy").and_then(|by| by.as_str()) == Some("package"))
+            || endpoints
+            || kind == "apps";
+        // #851: an app name or manifest path, and the endpoint a read keeps.
+        let text = |field: &str, kinds: &[&str]| -> Result<Option<String>> {
+            match arguments.get(field).filter(|_| kinds.contains(&kind)) {
+                None => Ok(None),
+                Some(value) => value
+                    .as_str()
+                    .filter(|text| !text.is_empty() && text.len() <= 4096)
+                    .map(|text| Some(text.to_owned()))
+                    .with_context(|| format!("invalid_request: {field}")),
+            }
+        };
         Ok(ArchitectureArguments {
             pin,
             paths,
             prefix,
             apps,
+            app: text("app", &["references", "check", "endpoints", "apps"])?,
+            method: text("method", &["endpoints"])?,
+            path_template: text("pathTemplate", &["endpoints"])?,
             sample_limit,
         })
     }
@@ -1911,7 +1936,7 @@ impl EvidenceResponse {
         kind: &str,
         parsed: &ArchitectureArguments,
     ) -> Result<Option<crate::rules::Config>> {
-        let config = if kind == "references" && !parsed.apps {
+        let config = if kind == "references" && !parsed.apps() {
             None
         } else {
             crate::rules::load(Path::new(self.store.workspace_root()))?
@@ -1932,7 +1957,25 @@ impl EvidenceResponse {
         core: &ArchitectureCore,
         check: &mut (impl FnMut() -> Result<()> + Send),
     ) -> Result<serde_json::Value> {
-        let references = core.references_for(parsed, check)?;
+        if kind == "endpoints" {
+            return Self::endpoints_at(parsed, config, core, check);
+        }
+        // #851: an `app` filter assigns files as an unfiltered check does.
+        let assigned = match &parsed.app {
+            Some(app) => {
+                let (assignment, whole) = Self::app_assignment_at(config, core, check)?;
+                let named = assignment.named(app)?;
+                Some((assignment, whole, named))
+            }
+            None => None,
+        };
+        let app_files = match (&assigned, kind) {
+            (Some((assignment, whole, named)), "references") => {
+                Some(Self::app_files(assignment, whole, named, check)?)
+            }
+            _ => None,
+        };
+        let references = core.references_in(parsed, app_files.as_ref(), check)?;
         let apps = if kind == "prompt" {
             Some(crate::rules::prompt_apps(
                 config,
@@ -1995,7 +2038,185 @@ impl EvidenceResponse {
         if let Some(path_apps) = path_apps {
             payload[crate::rules::PATH_APPS] = path_apps;
         }
+        if kind == "check"
+            && let Some((assignment, _, named)) = &assigned
+        {
+            Self::check_rows_in(&mut payload, assignment, named, check)?;
+        }
         Ok(payload)
+    }
+
+    /// #851: each file's app at a core, from the same whole-checkout evaluation an unfiltered
+    /// `trellis_rules_check` runs, and that whole projection. Without a rules file every
+    /// detected manifest is an app and files go by root.
+    pub(crate) fn app_assignment_at<'c>(
+        config: Option<&'c crate::rules::Config>,
+        core: &'c ArchitectureCore,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+    ) -> Result<(
+        crate::rules::AppAssignment<'c>,
+        crate::references::Projection,
+    )> {
+        let whole = core.references(&[], 5, check)?;
+        let assignment = match config {
+            Some(config) => {
+                let base = core.rules(config)?;
+                let evaluated = crate::rules::evaluate_prepared(config, base, &whole, &[], check)?;
+                crate::rules::AppAssignment::new(
+                    Some(config),
+                    base.apps().to_vec(),
+                    &evaluated.layers,
+                )
+            }
+            None => crate::rules::AppAssignment::new(
+                None,
+                crate::rules::unruled_apps(core.app_candidates()?),
+                &BTreeMap::new(),
+            ),
+        };
+        Ok((assignment, whole))
+    }
+
+    /// The module paths of `whole` whose app is one of `named` (#851).
+    pub(crate) fn app_files(
+        assignment: &crate::rules::AppAssignment<'_>,
+        whole: &crate::references::Projection,
+        named: &BTreeSet<usize>,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<BTreeSet<String>> {
+        let mut files = BTreeSet::new();
+        for module in &whole.modules {
+            check()?;
+            let path = module["identity"]["path"]
+                .as_str()
+                .context("store_unavailable: module path absent")?;
+            if assignment
+                .file(path)
+                .is_some_and(|app| named.contains(&app))
+            {
+                files.insert(path.to_owned());
+            }
+        }
+        Ok(files)
+    }
+
+    /// #851: the effective app inventory for `trellis_workspace_describe`, each app with its
+    /// languages and file count, and the files in no app.
+    pub(crate) fn app_inventory(
+        assignment: &crate::rules::AppAssignment<'_>,
+        whole: &crate::references::Projection,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<serde_json::Value> {
+        let apps = assignment.apps();
+        let mut files = vec![(0usize, BTreeSet::new()); apps.len()];
+        let mut no_app = 0usize;
+        for module in &whole.modules {
+            check()?;
+            let identity = &module["identity"];
+            let path = identity["path"]
+                .as_str()
+                .context("store_unavailable: module path absent")?;
+            match assignment.file(path) {
+                Some(app) => {
+                    files[app].0 += 1;
+                    files[app].1.insert(
+                        identity["language"]
+                            .as_str()
+                            .context("store_unavailable: module language")?
+                            .to_owned(),
+                    );
+                }
+                None => no_app += 1,
+            }
+        }
+        let items: Vec<_> = apps
+            .iter()
+            .zip(files)
+            .map(|(app, (count, languages))| {
+                serde_json::json!({
+                    "name": app.name, "source": app.source, "kind": app.kind,
+                    "manifest": app.manifest, "roots": app.roots, "entries": app.entries,
+                    "languages": crate::semantic_evidence::LANGUAGE_ORDER
+                        .iter()
+                        .filter(|language| languages.contains(**language))
+                        .collect::<Vec<_>>(),
+                    "fileCount": count,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({"state": "ready", "items": items, "noApp": {"fileCount": no_app}}))
+    }
+
+    /// #851: a check's rows in the `named` apps. Instances and test-only rows are kept when
+    /// they count under one of them (`apps[].counts`), unassigned native files when they lie
+    /// in one; external packages, which are in no app, leave `unassigned`. Counts stay whole.
+    fn check_rows_in(
+        payload: &mut serde_json::Value,
+        assignment: &crate::rules::AppAssignment<'_>,
+        named: &BTreeSet<usize>,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        for field in ["instances", "testOnly"] {
+            let rows = payload[field]
+                .as_array_mut()
+                .context("store_unavailable: rule instances absent")?;
+            check()?;
+            rows.retain(|row| {
+                assignment
+                    .bucket(row)
+                    .is_some_and(|app| named.contains(&app))
+            });
+        }
+        let unassigned = payload["unassigned"]
+            .as_array_mut()
+            .context("store_unavailable: unassigned catalog absent")?;
+        unassigned.retain(|identity| {
+            identity["path"]
+                .as_str()
+                .and_then(|path| assignment.file(path))
+                .is_some_and(|app| named.contains(&app))
+        });
+        check()
+    }
+
+    /// #851: one `trellis_endpoints` answer at a core, every row before paging.
+    fn endpoints_at(
+        parsed: &ArchitectureArguments,
+        config: Option<&crate::rules::Config>,
+        core: &ArchitectureCore,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+    ) -> Result<serde_json::Value> {
+        let extraction = core.interfaces()?;
+        let (assignment, _) = Self::app_assignment_at(config, core, check)?;
+        let named = parsed
+            .app
+            .as_deref()
+            .map(|app| assignment.named(app))
+            .transpose()?;
+        let extracted = architecture_core::interfaces_extracted(config, core.app_candidates()?);
+        let rows = crate::interfaces::endpoints(
+            extraction,
+            &assignment,
+            &crate::interfaces::EndpointQuery {
+                apps: named.as_ref(),
+                method: parsed.method.as_deref(),
+                path_template: parsed.path_template.as_deref(),
+            },
+            check,
+        )?;
+        let mut limitations = vec![ENDPOINTS_LIMITATION];
+        if !extracted {
+            limitations.push(ENDPOINTS_NOT_EXTRACTED);
+        }
+        check()?;
+        Ok(serde_json::json!({
+            "evidence": "structural",
+            "extracted": extracted,
+            "limitations": limitations,
+            "endpoints": rows,
+            "indexGeneration": core.pin.index_generation.to_string(),
+            "indexRevision": core.pin.index_revision,
+        }))
     }
 
     /// One path-scoped operation computed from its own scope, under the budgets of that
@@ -2011,10 +2232,53 @@ impl EvidenceResponse {
         let snapshot = self
             .architecture_snapshot(parsed.pin, check)
             .map_err(|error| self.store.report_index_failure(error))?;
-        let references = crate::references::project_under(
+        // #851: an `app` filter assigns every document of the snapshot.
+        let assigned = match &parsed.app {
+            Some(app) => {
+                let candidates = crate::rules::app_candidates(&snapshot, check)?;
+                let paths: Vec<&str> = snapshot
+                    .documents
+                    .iter()
+                    .map(|document| document.key.path.as_str())
+                    .collect();
+                let assignment = match config {
+                    Some(config) => {
+                        let base = crate::rules::prepare(config, &snapshot, &mut *check)?;
+                        crate::rules::AppAssignment::for_paths(
+                            config,
+                            base.apps().to_vec(),
+                            &paths,
+                            check,
+                        )?
+                    }
+                    None => crate::rules::AppAssignment::new(
+                        None,
+                        crate::rules::unruled_apps(&candidates),
+                        &BTreeMap::new(),
+                    ),
+                };
+                let named = assignment.named(app)?;
+                let files: BTreeSet<String> = paths
+                    .iter()
+                    .filter(|path| {
+                        assignment
+                            .file(path)
+                            .is_some_and(|app| named.contains(&app))
+                    })
+                    .map(|path| (*path).to_owned())
+                    .collect();
+                Some((assignment, named, files))
+            }
+            None => None,
+        };
+        let references = crate::references::project_where(
             &snapshot,
             &parsed.paths,
             parsed.prefix.as_deref(),
+            assigned
+                .as_ref()
+                .filter(|_| kind == "references")
+                .map(|(_, _, files)| files),
             parsed.sample_limit,
             check,
         )?;
@@ -2072,6 +2336,11 @@ impl EvidenceResponse {
         }
         if let Some(path_apps) = path_apps {
             payload[crate::rules::PATH_APPS] = path_apps;
+        }
+        if kind == "check"
+            && let Some((assignment, named, _)) = &assigned
+        {
+            Self::check_rows_in(&mut payload, assignment, named, check)?;
         }
         Ok(payload)
     }

@@ -241,16 +241,24 @@ fn one_app_has_empty_interfaces_without_extracting() {
     assert!(found.routes.is_empty() && found.calls.is_empty() && found.matched.is_empty());
 }
 
+/// #851: without a rules file every detected manifest is an app, so two of them extract the
+/// same interfaces a rules file's core does, for `trellis_endpoints`.
 #[test]
-fn a_core_without_rules_has_no_interfaces_part() {
+fn a_core_without_rules_extracts_the_interfaces_of_two_detected_apps() {
     let (_state, _root, store) = published(false);
-    let error = core(&store).unwrap().interfaces().err().unwrap();
-    assert!(
-        error
-            .to_string()
-            .contains("store_unavailable: architecture interfaces part"),
-        "{error:#}"
-    );
+    let unruled = core(&store).unwrap();
+    let ruled = core_with_rules(&store).unwrap();
+    let (found, expected) = (unruled.interfaces().unwrap(), ruled.interfaces().unwrap());
+    let routes = |found: &crate::interfaces::Extraction| -> Vec<String> {
+        found
+            .routes
+            .iter()
+            .map(|route| route.path_template.clone())
+            .collect()
+    };
+    assert_eq!(routes(found), ["/health"]);
+    assert_eq!(routes(found), routes(expected));
+    assert_eq!(found.matched, expected.matched);
 }
 
 /// App detection that exhausts its work budget fails the interfaces part with the same

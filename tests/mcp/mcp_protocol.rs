@@ -553,7 +553,7 @@ fn checkout(base: &Path) -> PathBuf {
 fn request(id: Value, method: &str, params: Value) -> Value {
     json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
 }
-fn modern(id: Value, method: &str, fields: Value) -> Value {
+pub(crate) fn modern(id: Value, method: &str, fields: Value) -> Value {
     let mut p = fields.as_object().unwrap().clone();
     p.insert("_meta".into(), fixture()["modernMeta"].clone());
     request(id, method, Value::Object(p))
@@ -563,7 +563,7 @@ fn error(v: &Value, code: i64, id: Value) {
     assert_eq!(v["id"], id);
     assert_eq!(v["error"]["code"], code, "{v}");
 }
-fn tool(v: &Value, code: Option<&str>, modern: bool) {
+pub(crate) fn tool(v: &Value, code: Option<&str>, modern: bool) {
     assert_eq!(v["jsonrpc"], "2.0");
     assert_eq!(v["result"]["resultType"].as_str().is_some(), modern);
     assert_eq!(v["result"]["isError"], code.is_some(), "{v}");
@@ -620,6 +620,12 @@ fn tool(v: &Value, code: Option<&str>, modern: bool) {
                 },
                 data["instances"].as_array().unwrap().len(),
                 "instances",
+            )
+        } else if let Some(endpoints) = data.get("endpoints") {
+            (
+                "trellis_endpoints",
+                endpoints.as_array().unwrap().len(),
+                "endpoints",
             )
         } else if data.get("declaration").is_some() {
             ("trellis_declaration", 1, "declaration")
@@ -894,6 +900,15 @@ fn exact_tool(v: &Value, code: Option<&str>, modern: bool, label: &str, home: &P
             envelope["data"]["progress"] = Value::Null;
             envelope["data"]["languages"] = actual["data"]["languages"].clone();
             envelope["partial"] = json!(partial);
+            // #851: a ready head lists its apps once the owner has its architecture.
+            assert!(
+                matches!(
+                    actual["data"]["apps"]["state"].as_str(),
+                    Some("ready" | "building")
+                ),
+                "{actual}"
+            );
+            envelope["data"]["apps"] = actual["data"]["apps"].clone();
         } else {
             assert!(actual["evidenceBasis"].is_null());
             assert_eq!(actual["data"]["languages"], json!([]));
@@ -1121,7 +1136,7 @@ fn both_modes_full_catalog_tools_and_lifecycle() {
         let response = peer.ask(list);
         let catalog: Value =
             serde_json::from_str(include_str!("../fixtures/mcp/catalog.json")).unwrap();
-        assert_eq!(catalog.as_array().unwrap().len(), 12);
+        assert_eq!(catalog.as_array().unwrap().len(), 13);
         let expected_list = |id: Value| {
             let result = if legacy {
                 json!({"tools":catalog})
@@ -1304,7 +1319,7 @@ fn framing_ids_negotiation_and_application_validation() {
     for spelling in [r#""\u00e9""#, r#""é""#, r#""\ud83d\ude00""#, r#""😀""#] {
         peer.send_raw(format!(r#"{{"jsonrpc":"2.0","id":{spelling},"method":"tools/list","params":{{"_meta":{}}}}}"#,fixture()["modernMeta"]).as_bytes());
         let v = peer.reply();
-        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 12);
+        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 13);
     }
     for n in ["1e0", "1.0", "-0", "9007199254740991", "-9007199254740991"] {
         peer.send_raw(format!(r#"{{"jsonrpc":"2.0","id":{n},"method":"server/discover","params":{{"_meta":{}}}}}"#,fixture()["modernMeta"]).as_bytes());
@@ -1409,7 +1424,7 @@ fn legacy_title_recovery_max_id_and_root_selection() {
             .as_array()
             .unwrap()
             .len(),
-        12
+        13
     );
     peer.assert_success("trellis mcp");
     // Topology overlap is refused before marker attachment.
@@ -1924,6 +1939,7 @@ async fn warm_relay_serves_both_new_tools_and_rejects_closed_inputs() {
             "trellis_rules_check".to_owned(),
             "trellis_rules_explain".to_owned(),
             "trellis_show".to_owned(),
+            "trellis_endpoints".to_owned(),
         ]);
         assert_eq!(names, expected_names);
         let found = peer.ask(call(
@@ -3188,7 +3204,7 @@ fn per_call_selection_admits_unrelated_checkouts() {
 fn catalog_rejects_contradictory_unresolved_and_resolved_failures() {
     let catalog: Value =
         serde_json::from_str(include_str!("../fixtures/mcp/catalog.json")).unwrap();
-    assert_eq!(catalog.as_array().unwrap().len(), 12);
+    assert_eq!(catalog.as_array().unwrap().len(), 13);
     for entry in catalog.as_array().unwrap() {
         let defs = &entry["outputSchema"]["$defs"];
         // #836: the architecture tools nest their located and building errors beside the
@@ -5848,7 +5864,7 @@ async fn ready_registry(
 
 /// Wait for the checkout's Architecture build, on the owner's signal: an unscoped read that
 /// beats it to the 5 s call deadline answers a retryable failure, on purpose.
-async fn architecture_built(
+pub(crate) async fn architecture_built(
     registry: &std::sync::Arc<tokio::sync::Mutex<trellis::daemon::registry::CheckoutRegistry>>,
     identity: &trellis::store::topology::WorkspaceIdentity,
 ) {
@@ -5859,7 +5875,7 @@ async fn architecture_built(
 }
 
 /// One daemon-socket MCP connection served on a thread.
-fn socket_session(
+pub(crate) fn socket_session(
     identity: &trellis::store::topology::WorkspaceIdentity,
     registry: &std::sync::Arc<tokio::sync::Mutex<trellis::daemon::registry::CheckoutRegistry>>,
     session: u64,
@@ -5914,7 +5930,7 @@ fn describe_call(id: i64) -> Value {
     )
 }
 
-fn next_reply(reader: &mut BufReader<std::os::unix::net::UnixStream>) -> Value {
+pub(crate) fn next_reply(reader: &mut BufReader<std::os::unix::net::UnixStream>) -> Value {
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();
     serde_json::from_str(&line).unwrap()
@@ -7203,7 +7219,7 @@ fn mcp_find_cold_prior_head_uses_registry_roots_without_creating_index() {
 }
 
 /// Publish an index for a fresh checkout with `files`, leaving it inactive.
-fn published_inactive_checkout(
+pub(crate) fn published_inactive_checkout(
     temp: &std::path::Path,
     files: &[(&str, &str)],
 ) -> (
@@ -12825,7 +12841,7 @@ fn object_valued_input_refs_declare_type_object() {
     assert!(checked.contains(&"trellis_rules_explain.target".to_owned()));
     assert!(checked.contains(&"trellis_rules_explain.destination".to_owned()));
     assert!(checked.contains(&"trellis_find_symbols.expectedBasis".to_owned()));
-    assert_eq!(checked.len(), 13, "{checked:?}");
+    assert_eq!(checked.len(), 14, "{checked:?}");
     // Nested: the explain destination union and each of its branches say so too.
     let explain = list["result"]["tools"]
         .as_array()

@@ -45,7 +45,7 @@ test("architecture prompt messages and catalog use SDK prompt shapes", () => {
   for (const result of [{messages}, {resultType: "complete", messages}]) {
     assert.ok(GetPromptResultSchema.safeParse(result).success);
   }
-  assert.equal(tools.length, 12);
+  assert.equal(tools.length, 13);
   assert.ok(!tools.some(tool => tool.name === "trellis_propose_rules"));
 });
 
@@ -54,15 +54,15 @@ const Ajv2020 = require("ajv/dist/2020.js").default;
 const ajv = new Ajv2020({ strict: false });
 const search = tools.find(tool => tool.name === "trellis_search_symbols");
 
-test("the twelve-tool order and unchanged schemas are explicit", () => {
+test("the thirteen-tool order and unchanged schemas are explicit", () => {
   assert.deepEqual(tools.map(tool => tool.name), [
     "trellis_workspace_describe", "trellis_find_symbols", "trellis_search_symbols",
     "trellis_declaration", "trellis_outgoing_calls", "trellis_incoming_calls",
     "trellis_read_source", "trellis_call_graph", "trellis_references", "trellis_rules_check",
-    "trellis_rules_explain", "trellis_show",
+    "trellis_rules_explain", "trellis_show", "trellis_endpoints",
   ]);
   const describe = tools[0].outputSchema.oneOf[0].properties.data.properties;
-  assert.equal(describe.toolVersion.const, 23);
+  assert.equal(describe.toolVersion.const, 24);
   assert.equal(search.inputSchema.additionalProperties, false);
   assert.equal(search.inputSchema.properties.limit.default, 10);
   assert.equal(search.inputSchema.properties.limit.maximum, 50);
@@ -355,7 +355,10 @@ test("compacted failure schemas keep every failure shape exact", () => {
     "index_not_ready", "not_found", "too_many_requests", "deadline_exceeded", "rebuild_in_progress",
     "root_changed", "store_unavailable", "checkout_capacity", "daemon_unavailable", "outcome_unknown"];
   const reasons = ["not_absolute", "not_checkout", "identity_changed", "unavailable"];
-  const architecture = ["trellis_references", "trellis_rules_check", "trellis_rules_explain"];
+  const architecture = ["trellis_references", "trellis_rules_check", "trellis_rules_explain",
+    "trellis_endpoints"];
+  // #851: an `app` filter of these fails as the rules check does.
+  const appFiltered = ["trellis_find_symbols", "trellis_search_symbols", "trellis_call_graph"];
   const keys = (object, allowed) => Object.keys(object).every((key) => allowed.includes(key));
   const common = ["code", "message", "retryable", "currentBasis", "currentContentHash"];
   const expected = (name, failure) => {
@@ -368,7 +371,8 @@ test("compacted failure schemas keep every failure shape exact", () => {
         return architecture.includes(name) && keys(error, [...common, "progress", "retryAfterMs"])
           && "progress" in error && "retryAfterMs" in error && error.retryable === true
           && error.currentBasis !== null && error.currentContentHash === null;
-      const codes = architecture.includes(name) ? [...resolved, "building", "invalid_rules"] : resolved;
+      const codes = architecture.includes(name) ? [...resolved, "building", "invalid_rules", "bounded_work"]
+        : appFiltered.includes(name) ? [...resolved, "invalid_rules", "bounded_work"] : resolved;
       return codes.includes(error.code) && error.code !== "building" && keys(error, common);
     }
     if (!keys(failure, ["schemaVersion", "requestId", "error"])) return false;
@@ -386,7 +390,7 @@ test("compacted failure schemas keep every failure shape exact", () => {
       && error.retryable === false && keys(error, common);
   };
   const failures = [];
-  for (const code of [...resolved, "workspace_selection_failed", "building", "bogus"])
+  for (const code of [...resolved, "workspace_selection_failed", "building", "invalid_rules", "bounded_work", "bogus"])
     for (const retryable of [true, false])
       for (const reason of [undefined, "unavailable", "not_checkout", "different_repository"])
         for (const attemptedWorkspace of [undefined, { kind: "invalid_type", jsonType: "array" }])
@@ -410,4 +414,91 @@ test("compacted failure schemas keep every failure shape exact", () => {
     }
   }
   assert.ok(accepted > 500, `${accepted} accepted failures`);
+});
+
+// #851: the `app` filter is one bounded string on exactly the tools that take it.
+test("the app filter is a closed string on references, check, find, search, the call graph and endpoints", () => {
+  const sid = `sid:v1:${"a".repeat(32)}`;
+  const base = {
+    trellis_references: {}, trellis_rules_check: {}, trellis_endpoints: {},
+    trellis_find_symbols: { query: "a" }, trellis_search_symbols: { query: "a" },
+    trellis_call_graph: { symbolId: sid },
+  };
+  for (const tool of tools) {
+    const input = ajv.compile(tool.inputSchema);
+    const args = base[tool.name];
+    if (!args) {
+      assert.ok(!("app" in tool.inputSchema.properties), tool.name);
+      continue;
+    }
+    for (const app of ["web", "web/package.json", "a".repeat(4096)])
+      assert.ok(input({ schemaVersion: 1, ...args, app }), `${tool.name} ${JSON.stringify(input.errors)}`);
+    for (const app of ["", "a".repeat(4097), 7, null])
+      assert.equal(input({ schemaVersion: 1, ...args, app }), false, `${tool.name} ${JSON.stringify(app)}`);
+  }
+});
+
+// #851: describe's apps are a closed inventory, required on every answer.
+test("describe apps are a closed, required inventory", () => {
+  const describe = tools[0];
+  const data = describe.outputSchema.oneOf[0].properties.data;
+  assert.ok(data.required.includes("apps"));
+  const apps = ajv.compile({ $defs: describe.outputSchema.$defs, ...data.properties.apps });
+  const app = { name: "web", source: "manifest", kind: "npm", manifest: "web/package.json", roots: ["web"],
+    entries: [], languages: ["javascript"], fileCount: 2 };
+  const authored = { ...app, name: "console", source: "override", kind: null, manifest: null, roots: ["admin"] };
+  for (const ok of [
+    { state: "ready", items: [authored, app], noApp: { fileCount: 0 } },
+    { state: "building", items: [], noApp: null },
+    { state: "invalidRules", items: [], noApp: null },
+    { state: "unavailable", items: [], noApp: null },
+  ]) assert.ok(apps(ok), JSON.stringify(apps.errors));
+  for (const bad of [
+    { state: "partial", items: [], noApp: null },
+    { state: "ready", items: [{ ...app, kind: "maven" }], noApp: null },
+    { state: "ready", items: [{ ...app, languages: ["go"] }], noApp: null },
+    { state: "ready", items: [{ ...app, extra: 1 }], noApp: null },
+    { state: "ready", items: [(({ fileCount, ...rest }) => rest)(app)], noApp: null },
+    { state: "ready", items: [] },
+  ]) assert.equal(apps(bad), false, JSON.stringify(bad));
+});
+
+// #851: `trellis_endpoints` takes bounded filters and pages closed, structural rows.
+test("trellis_endpoints input is closed and its rows are structural evidence", () => {
+  const endpoints = tools.find(tool => tool.name === "trellis_endpoints");
+  assert.deepEqual(endpoints.annotations, { destructiveHint: false, idempotentHint: true, openWorldHint: false, readOnlyHint: true });
+  assert.ok(!JSON.stringify(endpoints).includes("$schema"));
+  const input = ajv.compile(endpoints.inputSchema);
+  for (const ok of [{}, { app: "web" }, { method: "GET", pathTemplate: "/api/items/{id}" }, { limit: 50, offset: 3 },
+    { workspace: "/repo", expectedBasis: { indexGeneration: "123e4567-e89b-42d3-a456-426614174000", indexRevision: 1 } }])
+    assert.ok(input({ schemaVersion: 1, ...ok }), JSON.stringify([ok, input.errors]));
+  for (const bad of [{ method: "get" }, { method: "TRACE" }, { pathTemplate: "" }, { limit: 0 }, { limit: 51 },
+    { offset: -1 }, { list: "matched" }, { app: "" }])
+    assert.equal(input({ schemaVersion: 1, ...bad }), false, JSON.stringify(bad));
+  const output = ajv.compile(endpoints.outputSchema);
+  const site = { path: "web/app.js", lines: { start: 3, end: 3 }, confidence: "exact",
+    caller: { name: "load", stableLookupKey: "web/app.js::load" }, app: "web" };
+  const handler = { kind: "declaration", syntaxId: `sid:v1:${"a".repeat(32)}`, stableLookupKey: "src/main.rs::health",
+    path: "src/main.rs", lines: { start: 1, end: 1 }, variant: null };
+  const rows = [
+    { list: "matched", method: "GET", pathTemplate: "/health", app: "srv", handler, callSites: [site], callSiteCount: 6 },
+    { list: "serverOnly", method: "POST", pathTemplate: "/orphan", app: "srv", handler, callSites: [], callSiteCount: 0 },
+    { list: "clientOnly", method: null, pathTemplate: null, app: null, handler: null,
+      callSites: [{ ...site, confidence: "unresolved", caller: null, app: null }], callSiteCount: 1 },
+  ];
+  const envelope = (data) => ({ schemaVersion: 1, requestId: 1, workspace: "/repo", catchingUp: false,
+    evidenceBasis: { indexGeneration: "123e4567-e89b-42d3-a456-426614174000", indexRevision: 1 },
+    data: { evidence: "structural", extracted: true, limitations: ["l"], endpoints: rows,
+      indexGeneration: "123e4567-e89b-42d3-a456-426614174000", indexRevision: 1,
+      page: { offset: 0, nextOffset: null, total: 3 }, ...data },
+    warnings: [], partial: true, truncated: false, truncationReason: null });
+  assert.ok(output(envelope({})), JSON.stringify(output.errors));
+  assert.ok(output(envelope({ extracted: false, endpoints: [], limitations: ["l", "not extracted: fewer than two apps"] })));
+  for (const bad of [
+    { evidence: "semantic" },
+    { endpoints: [{ ...rows[0], list: "unknown" }] },
+    { endpoints: [{ ...rows[0], callSites: [{ ...site, confidence: "semantic" }] }] },
+    { endpoints: [{ ...rows[0], handler: { ...handler, layer: "web" } }] },
+    { endpoints: [(({ callSiteCount, ...rest }) => rest)(rows[0])] },
+  ]) assert.equal(output(envelope(bad)), false, JSON.stringify(bad));
 });

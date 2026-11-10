@@ -1345,6 +1345,15 @@ impl<'a> AppScope<'a> {
         assignments: &BTreeMap<&str, Option<&str>>,
         row: &Value,
     ) -> Option<usize> {
+        self.bucket_with(|path| assignments.get(path).copied().flatten(), row)
+    }
+
+    /// [`AppScope::bucket`] with each file's assigned layer from `layer_of`.
+    fn bucket_with<'l>(
+        &self,
+        layer_of: impl Fn(&str) -> Option<&'l str>,
+        row: &'l Value,
+    ) -> Option<usize> {
         if self.apps.is_empty() {
             return None;
         }
@@ -1360,10 +1369,112 @@ impl<'a> AppScope<'a> {
             };
         }
         let path = row["target"]["path"].as_str()?;
-        let layer = source.or_else(|| assignments.get(path).copied().flatten());
+        let layer = source.or_else(|| layer_of(path));
         self.file(path, layer)
     }
 }
+
+/// Each file's app (#851), as `trellis_rules_check`, `groupBy:"package"` and the Architecture
+/// summary assign it: through its layer with a rules file ([`AppScope::file`]), by the most
+/// specific root without one. It owns its layer map, so a read keeps it past its evaluation.
+pub(crate) struct AppAssignment<'a> {
+    config: Option<&'a Config>,
+    apps: Vec<crate::apps::App>,
+    layers: BTreeMap<String, Option<String>>,
+}
+
+impl<'a> AppAssignment<'a> {
+    /// The assignment from an evaluation's layer map. Without a config every file goes by root.
+    pub(crate) fn new(
+        config: Option<&'a Config>,
+        apps: Vec<crate::apps::App>,
+        layers: &BTreeMap<&str, Option<&str>>,
+    ) -> Self {
+        let layers = layers
+            .iter()
+            .map(|(path, layer)| ((*path).to_owned(), layer.map(str::to_owned)))
+            .collect();
+        Self {
+            config,
+            apps,
+            layers,
+        }
+    }
+
+    /// The assignment of exactly `paths`, each matched to its layer as evaluation matches it.
+    pub(crate) fn for_paths(
+        config: &'a Config,
+        apps: Vec<crate::apps::App>,
+        paths: &[&str],
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<Self> {
+        let mut work = Work::new(work::rules_limit(paths.len(), 0));
+        let patterns: usize = config
+            .layers
+            .values()
+            .map(|layer| layer.patterns.len())
+            .sum();
+        ensure!(
+            work.charge(paths.len().saturating_mul(patterns)),
+            "bounded_work: layer assignment pattern budget"
+        );
+        let mut matcher = LayerMatcher::new(config);
+        let mut layers = BTreeMap::new();
+        for path in paths {
+            check()?;
+            let layer = matcher.select(path, &mut work, check)?;
+            layers.insert((*path).to_owned(), layer.map(str::to_owned));
+        }
+        Ok(Self {
+            config: Some(config),
+            apps,
+            layers,
+        })
+    }
+
+    /// The effective app inventory, in inventory order.
+    pub(crate) fn apps(&self) -> &[crate::apps::App] {
+        &self.apps
+    }
+
+    fn layer(&self, path: &str) -> Option<&str> {
+        self.layers.get(path).and_then(|layer| layer.as_deref())
+    }
+
+    /// The index of the app `path` belongs to; `None` is no app.
+    pub(crate) fn file(&self, path: &str) -> Option<usize> {
+        match self.config {
+            Some(config) => AppScope::new(config, &self.apps).file(path, self.layer(path)),
+            None => crate::apps::containing(&self.apps, path),
+        }
+    }
+
+    /// The one app a rule row counts under (#784), as `apps[].counts` counts it.
+    pub(crate) fn bucket(&self, row: &Value) -> Option<usize> {
+        let config = self.config?;
+        AppScope::new(config, &self.apps).bucket_with(|path| self.layer(path), row)
+    }
+
+    /// The apps an `app` argument names (#851): every app whose name or manifest path is
+    /// `app`. None is `not_found`.
+    pub(crate) fn named(&self, app: &str) -> Result<BTreeSet<usize>> {
+        let named: BTreeSet<usize> = self
+            .apps
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| {
+                candidate.name == app || candidate.manifest.as_deref() == Some(app)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        ensure!(!named.is_empty(), "not_found: {UNKNOWN_APP}");
+        Ok(named)
+    }
+}
+
+/// The message of an `app` argument that names no app of the effective inventory (#851).
+pub(crate) const UNKNOWN_APP: &str =
+    "No app of this checkout has that name or manifest path; trellis_workspace_describe lists them";
 
 /// Check every layer's `app` and `apps` against the effective apps (#794); the first layer in
 /// name order with a problem wins.
