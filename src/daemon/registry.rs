@@ -3231,6 +3231,49 @@ impl CheckoutRuntime {
         Ok((config, core))
     }
 
+    /// #853: reads a Sequence view's client calls against the HTTP interfaces of the view's
+    /// revision, from the core the owner published for it under the current rules file. It
+    /// never waits for or asks the owner for a core: without one the view says `notMeasured`.
+    pub fn sequence_interfaces(
+        &self,
+        response: &CheckoutEvidence,
+        view: &mut crate::behavior::SequenceView,
+    ) -> anyhow::Result<()> {
+        let mut check = || Ok(());
+        if crate::store::sequence_call_ids(&view.steps).is_empty() {
+            return Ok(());
+        }
+        let parsed =
+            crate::store::EvidenceResponse::architecture_arguments("apps", &serde_json::json!({}))?;
+        let config = match response.architecture_config("apps", &parsed) {
+            Ok(config) => config,
+            Err(error) if crate::store::cli_read_retryable_contention(&error) => return Err(error),
+            Err(_) => {
+                return response.annotate_sequence_interfaces(
+                    view,
+                    crate::store::InterfaceEvidence::Unavailable,
+                    &mut check,
+                );
+            }
+        };
+        let rules = http::architecture::CoreRules::Exactly(
+            config.as_ref().map(|config| config.content_hash.as_str()),
+        );
+        let core = self
+            .resources()?
+            .scheduler
+            .architecture_core_if_available(view.revision, Duration::ZERO, &mut check)
+            .filter(|core| rules.admits(core.rules_hash()));
+        let evidence = match &core {
+            Some(core) => crate::store::InterfaceEvidence::Core {
+                config: config.as_ref(),
+                core,
+            },
+            None => crate::store::InterfaceEvidence::NotMeasured,
+        };
+        response.annotate_sequence_interfaces(view, evidence, &mut check)
+    }
+
     /// An MCP or CLI architecture operation in this admitted read.
     pub fn architecture_tool(
         &self,

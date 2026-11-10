@@ -596,6 +596,17 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
   different apps stays `unknown` with reason `cross_app`, and the view makes no claim that one
   app calls another. Absence of a match proves nothing.
 
+### Sequence hops across apps (#853)
+
+A Sequence stays within its seed's app except at a matched interface. A client call that this
+evidence matches to a route of another app is drawn as a labelled boundary hop into an «app»
+lane for the handler's app: `POST /api/sequence · exact · structural match, not proof`. The
+confidence always shows. An unresolved call stays a boundary, and a match within one app is
+not a hop. **Open handler sequence** continues into the handler on demand. The Sequence reads
+the interface evidence of its own revision from the owner's published core and never waits
+for it; until it exists the status line says the interfaces are not measured yet. The DTO and
+drawing are specified in [sequence-slice-contract.md](sequence-slice-contract.md#http-interface-hops-across-apps-853).
+
 ## Module chips and counts (#424)
 
 The view always draws the full stack: every ordered layer, with the shared layers beside

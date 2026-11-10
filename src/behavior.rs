@@ -26,6 +26,59 @@ pub struct SequenceView {
     /// The bounds that truncated this view (#536), when known: omitted when none did.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub truncated_by: Vec<SequenceLimit>,
+    /// Whether the view's client calls were read against HTTP interface evidence (#853).
+    /// Omitted when the view has no call to read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interfaces: Option<SequenceInterfaces>,
+}
+/// How a Sequence view's client calls were read against HTTP interface evidence (#853).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SequenceInterfaces {
+    pub state: InterfacesState,
+    /// Calls that cross to another app's handler, as a labelled boundary hop.
+    pub hops: usize,
+    /// Client calls whose path matched no route: they stay boundaries.
+    pub unresolved: usize,
+}
+/// Whether interface evidence could be read for a view's revision (#853). Anything but
+/// `ready` says nothing about the view's calls: a missing hop is never read as no request.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum InterfacesState {
+    /// Read against the revision's interface evidence.
+    Ready,
+    /// The revision's architecture evidence is not built yet, or not kept for this revision.
+    NotMeasured,
+    /// The checkout has fewer than two apps, so no interface is extracted.
+    NotExtracted,
+    /// The evidence failed or the rules file is invalid.
+    Unavailable,
+}
+/// A client call's HTTP interface (#853): structural evidence that its method and path match
+/// a route, never proof that the request is sent or reaches that handler.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct InterfaceHop {
+    /// Always `http`.
+    pub kind: String,
+    /// The route's method for a match, else the call's when readable.
+    pub method: Option<String>,
+    /// The route's template for a match, else the call's when readable.
+    pub path_template: Option<String>,
+    /// `exact`, `template`, `wrapperInferred` or `unresolved` (#788).
+    pub confidence: String,
+    pub client_app: Option<String>,
+    /// The handler's app. Absent when unresolved.
+    pub server_app: Option<String>,
+    /// The handler's anchor kind (`declaration`, `closure` or `dispatchArm`). Absent when
+    /// unresolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handler_kind: Option<String>,
+    /// The participant drawn for the handler, in a column named `app:<server app>`. Absent when
+    /// unresolved, or when the handler's declaration cannot be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub participant: Option<String>,
 }
 /// A bound that truncated a sequence view (#536).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -142,6 +195,9 @@ pub struct SequenceStep {
     /// `incidentalSteps`. Absent for a step that is not incidental.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incidental: Option<IncidentalReason>,
+    /// The HTTP interface this client call reaches (#853), when it is a read client call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface: Option<InterfaceHop>,
 }
 /// Why a step is incidental (#536, #543).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

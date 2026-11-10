@@ -353,6 +353,55 @@ Typed integrity, busy and pin failures abort the entire response, never returnin
 partially enriched view. Lanes/arrows prove static declaration targets only: no runtime
 receiver identity, timing, activations or return edges are inferred.
 
+### HTTP interface hops across apps (#853)
+
+Owner issue #853 (split from #685 and #686 with the owner's approval, 2026-11-09), under the
+owner's #686 addition of 2026-11-04. A Sequence reaches another app only at a matched HTTP
+interface: a client call that the #788 interface evidence matches to a route of another app
+is drawn as a labelled boundary hop into that route's handler. The evidence meaning is the
+[contract-v1 Sequence hop amendment](semantic-evidence/contract-v1.md#interface-evidence-amendment-sequence-hops-853).
+
+- **Read.** The browser's `/api/sequence` reads the view's client calls (each step's
+  `callId`) against the interface evidence of the view's own revision, from the
+  architecture core the owner published for it under the current rules file. The read never
+  waits for that core or asks for one, and it never fails the Sequence: `interfaces.state`
+  says how it went. `ready` was read; `notMeasured` has no core for the revision yet (the
+  owner builds every head's) or it was not kept; `notExtracted` means the checkout has fewer
+  than two apps; `unavailable` means the rules file or the evidence failed. Busy storage is
+  returned typed, like every other read. A view with no call has no `interfaces`.
+- **Hop.** A call matched to a route whose handler is in another app than the call (both
+  ends assigned to apps, as `trellis_rules_check` assigns files) carries `interface`:
+  `kind:"http"`, the route's `method` and `pathTemplate`, `confidence` (`exact`, `template`
+  or `wrapperInferred`), `clientApp`, `serverApp`, `handlerKind` and `participant`. The
+  participant is the handler's declaration, `kind:"interfaceHandler"`, drawn in the column
+  `app:<server app>` («app» lane), one lane per app. A call matched within one app, or with
+  an end in no app, is not a hop and is drawn as before.
+- **Arrow.** The hop's arrow goes from the column the call runs in to the app lane, in place
+  of the call's own target (a wrapper such as `api` keeps its expanded body, drawn on its own
+  lane). Its label is `[NNN] <method> <path template> · <confidence> · structural match, not
+  proof`, with `wrapperInferred` written "wrapper-inferred". The confidence and the caveat are
+  never cut; a long template is. In Interactions the arrow has its return and activation like
+  any cross-column call. A syntax-only (calls-first) view draws the same arrow.
+- **Shown.** A hop's call that arrived hidden as incidental (an external `fetch` or client) is
+  shown, and `hiddenSteps` and `incidentalSteps` no longer count it.
+- **Unresolved.** A client call matched to no route carries `interface` with `confidence:
+  "unresolved"`, its own `method` and `pathTemplate` when readable, and no `serverApp`,
+  `handlerKind` or `participant`. It stays a boundary: it draws exactly what it drew before and
+  no handler is guessed. The inspector says "unresolved: no route matched · a missing match
+  proves nothing".
+- **On demand.** The hop does not expand the handler's body into the view. The inspector's
+  **Open handler sequence**, and the lane header when the lane has one handler, open the
+  handler's own Sequence (in its app) at the same revision.
+- **Status line and inspector.** The status line adds "N HTTP interface hops (structural
+  matches, not proof)" and "N unresolved HTTP calls", or "HTTP interfaces not measured yet for
+  this revision" / "HTTP interfaces unavailable". The inspector names the route, the
+  confidence and the two apps, and says the match is by method and path, not proof the
+  request is sent.
+- **Bounds.** Hops add at most one participant per distinct handler of the view's calls, and
+  one lane per server app. The work, depth, participant and arrow bounds are unchanged.
+- **MCP.** No MCP tool returns a Sequence; `trellis_show` opens this browser view, which
+  draws its hops. No MCP output changes.
+
 ## Original syntax slice notes
 
 The notes below record the initial syntax-only slice; current revision and semantic DTO

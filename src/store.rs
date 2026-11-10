@@ -18,6 +18,7 @@ mod search_startup;
 mod semantic_display;
 mod semantic_payload;
 mod semantic_retention;
+mod sequence_hops;
 pub(crate) use search::SEARCH_CARD_BATCH_SIZE;
 pub use search::{
     HeadSearchCard, HeadSearchCards, McpSearchCandidates, SearchDeltaColdRebuild,
@@ -30,6 +31,7 @@ pub use semantic_display::{
     CallSemantic, CoverageDocument, LANGUAGE_NOTE, LanguageTier, McpSemantic, NO_PRODUCER_NOTE,
     ProducerNotPublished, ProducerSelection, multiple_producers_note,
 };
+pub(crate) use sequence_hops::{InterfaceEvidence, call_ids as sequence_call_ids};
 pub(crate) mod symbol_trigrams;
 pub mod topology;
 use crate::model::*;
@@ -5456,6 +5458,8 @@ mod admit_once_tests;
 mod architecture_apps_tests;
 #[cfg(test)]
 mod published_admission_tests;
+#[cfg(test)]
+mod sequence_hops_tests;
 #[cfg(test)]
 mod terminal_status_contention_tests;
 #[cfg(test)]

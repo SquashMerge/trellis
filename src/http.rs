@@ -5599,12 +5599,18 @@ async fn provisioned_core_answer(
             if q.seed.is_empty() || q.seed.len() > 8192 || q.seed.contains('\0') {
                 return Err(browse_invalid());
             }
+            let hops = runtime.clone();
             let (value, catching_up) = selected_evidence(runtime, hook, move |r| {
-                if q.interactions && !q.show_all {
-                    r.sequence_interactions_at(&q.seed, q.expected_revision)
+                let mut view = if q.interactions && !q.show_all {
+                    r.sequence_interactions_at(&q.seed, q.expected_revision)?
                 } else {
-                    r.sequence_at(&q.seed, q.expected_revision, q.show_all)
+                    r.sequence_at(&q.seed, q.expected_revision, q.show_all)?
+                };
+                // #853: client calls that cross to another app's handler.
+                if let Some(view) = view.as_mut() {
+                    hops.sequence_interfaces(r, view)?;
                 }
+                Ok(view)
             })
             .await?;
             Ok((

@@ -81,7 +81,7 @@
       const evidence = preview || step, target = targetFor(evidence), lane = target && laneFor(target, evidence);
       const message = lane && evidence.kind === "call", type = message ? "message" : "note";
       const display = message && !options.showDetails
-        ? window.TrellisSequence.arrowLabel(ordinal, target, preview ? step.children.length - 1 : 0, early)
+        ? window.TrellisSequence.arrowLabel(ordinal, target, preview ? step.children.length - 1 : 0, early, undefined, window.TrellisSequence.hop(view, evidence) && evidence.interface)
         : `${marker} ${options.showDetails ? `${step.kind} ` : ""}${displayLabel}${early}`;
       const owner = ownerOf(step);
       const row = {ordinal, marker, display, step, id:step.id, callId:step.callId, path:step.path, range:step.range, revision:view.revision, previewEntryCallId:preview?.callId, preview, evidence, target, type, owner, lane};
@@ -90,9 +90,13 @@
       return row;
     };
     // An expanded callee body runs on the callee's lane, opened by the call before it (#522).
+    // A wrapper whose call is an HTTP interface hop (#853) draws its arrow to the handler's
+    // app, so its expanded body opens the wrapper's own lane here.
     function ownerOf(step) {
-      const ownerId = step.lane == null ? null : columnOf(view.participants.find(p => p.id === step.lane)).id;
-      const owner = step.lane == null ? lanes[0] : lanes.find(item => item.id === ownerId);
+      const laneParticipant = step.lane == null ? null : view.participants.find(p => p.id === step.lane);
+      const ownerId = step.lane == null ? null : columnOf(laneParticipant).id;
+      let owner = step.lane == null ? lanes[0] : lanes.find(item => item.id === ownerId);
+      if (!owner && laneParticipant?.declaration && witness(laneParticipant.declaration)) owner = laneFor(laneParticipant, null);
       if (!owner) unsupported("Unknown sequence lane");
       return owner;
     }
@@ -286,7 +290,7 @@
         for (const actor of actors.filter(node => node.getAttribute("data-id") === lane.alias)) {
           actor.setAttribute("role", "button"); actor.setAttribute("tabindex", "0");
           actor.setAttribute("data-trellis-target-id", participant.id);
-          actor.setAttribute("aria-label", `${window.TrellisSequence.targetActionLabel(participant.declaration)}: ${participant.declaration.name}`);
+          actor.setAttribute("aria-label", `${window.TrellisSequence.targetActionLabel(participant.declaration, participant)}: ${participant.declaration.name}`);
           const open = () => {
             if (active() && window.TrellisSequence.target(view, proof) === participant) options.onOpenTarget(participant.declaration, proof);
           };
