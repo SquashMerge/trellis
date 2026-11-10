@@ -18,7 +18,7 @@ const destination = {...identity, path: 'src/core.rs'};
 const document = {ref: 7, document: {sourceSetId: 'fixture', language: 'rust', path: 'src/main.rs'}, contentHash: 'a'.repeat(64)};
 const symbol = {kind: 'function', symbolId: identity.sid, doc: 7};
 const instance = {rule: '$layers', target: identity, destination};
-const promptName = 'trellis_propose_layers';
+const promptName = 'trellis_propose_rules';
 const promptResult = {description: 'proposal', messages: [{role: 'user', content: {type: 'text', text: 'SECRET prompt text'}}]};
 function response(name) {
   if (name === promptName) return structuredClone(promptResult);

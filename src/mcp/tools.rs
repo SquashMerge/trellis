@@ -733,8 +733,8 @@ fn details(code: &str) -> (&'static str, bool) {
         "invalid_rules" => ("Invalid architecture rules", false),
         // #769: point at the prompt that drafts the missing file.
         "rules_not_found" => (
-            "No .trellis/rules.toml. Ask the user to run the `trellis_propose_layers` MCP \
-             prompt (in Claude Code: /mcp__trellis__trellis_propose_layers) to draft one \
+            "No .trellis/rules.toml. Ask the user to run the `trellis_propose_rules` MCP \
+             prompt (in Claude Code: /mcp__trellis__trellis_propose_rules) to draft one \
              for review.",
             false,
         ),
@@ -1482,7 +1482,7 @@ mod tests {
             json!(-9007199254740991_i64),
         ];
         let describe_expected = json!({"schemaVersion":1,"requestId":7,"evidenceBasis":null,"data":{
-            "workspaceLabel":"selected","indexState":"unavailable","progress":null,"watcherDegraded":false,"languages":[],"toolVersion":22,"schemaVersion":1,
+            "workspaceLabel":"selected","indexState":"unavailable","progress":null,"watcherDegraded":false,"languages":[],"toolVersion":23,"schemaVersion":1,
             "searchIndex":{"backend":null,"unavailableReason":null},
             "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,"sourceLines":200,"defaultLimit":20,"callDefaultLimit":6,"maxLimit":50,"pageBytes":24576,"calleeTextBytes":1024,"hintWorkMs":1000,"deadlineMs":5000,"concurrency":4}},
             "warnings":[],"partial":true,"truncated":false,"truncationReason":null});

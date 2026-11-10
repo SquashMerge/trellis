@@ -910,7 +910,7 @@
                   "const": 1
                 },
                 "toolVersion": {
-                  "const": 22
+                  "const": 23
                 },
                 "watcherDegraded": {
                   "type": "boolean"
@@ -16823,6 +16823,7 @@
                     "additionalProperties": false,
                     "required": [
                       "name",
+                      "source",
                       "manifest",
                       "counts"
                     ],
@@ -16830,8 +16831,21 @@
                       "name": {
                         "$ref": "#/$defs/Text"
                       },
+                      "source": {
+                        "enum": [
+                          "manifest",
+                          "override"
+                        ]
+                      },
                       "manifest": {
-                        "$ref": "#/$defs/Path"
+                        "anyOf": [
+                          {
+                            "$ref": "#/$defs/Path"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
                       },
                       "counts": {
                         "$ref": "#/$defs/RuleCounts"

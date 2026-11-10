@@ -101,6 +101,23 @@ test("duplicate_app_names_share_one_group: one button, summed totals, every mani
   assert.match(h.get("architecture-state").textContent, /web has no layers yet/);
 });
 
+test("authored_app_label (#794): an override app says it is authored in the rules file and lists every root", async () => {
+  const apps = appsModule();
+  const authored = app("web", null, "client", counts(4, 1, 0), {kind:null, source:"override", roots:["client", "shared/ui"]});
+  const dto = summary([authored, app("daemon", "Cargo.toml", ".", counts(6, 1, 1), {kind:"cargo", languages:["rust"]})],
+    [{name:"Screens", order:1, shared:false, app:"web", apps:null}, {name:"Storage", order:1, shared:false, app:"daemon", apps:null}]);
+  const [web, daemon] = apps.groups(dto);
+  assert.equal(web.authored, true); assert.equal(web.manifests.length, 0); assert.equal(web.kinds.length, 0);
+  assert.equal(apps.origin(web), "Authored in .trellis/rules.toml");
+  assert.equal(apps.sourceLine(web, 2), "web · roots client, shared/ui · Authored in .trellis/rules.toml");
+  assert.equal(daemon.authored, false); assert.equal(apps.origin(daemon), "Detected from Cargo.toml (cargo)");
+  const h = controller(dto); await h.architecture.refresh();
+  assert.deepEqual(buttons(h), ["All apps", "web · javascript", "daemon · rust"]);
+  await h.get("architecture-apps").children[1].fire("click"); await flush();
+  assert.equal(text(h.get("architecture-source-line")).trim(), "web · roots client, shared/ui · Authored in .trellis/rules.toml");
+  assert.doesNotMatch(text(h.get("architecture-source-line")), /Detected from/);
+});
+
 test("T00 markup in an app name is text: no element is created from it", async () => {
   const name = '<img src=x onerror="window.__pwned=1">';
   const dto = summary([app(name, "web/package.json", "web", counts(1, 0, 0)), app("daemon", "Cargo.toml", "src", counts(1, 0, 0))],

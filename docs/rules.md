@@ -180,10 +180,10 @@ app is one of:
 
 The app kinds are `cargo`, `npm` and `python` (`python` owner-ratified 2026-11-08 (#807)).
 
-There is no authored `[[apps]]` table, so the closed top-level keys are unchanged. An
-authored override is a planned follow-up in a separate issue, for checkouts that manifests
-can't split, such as a Node backend and a JavaScript frontend in one package. It is not part
-of this amendment.
+This amendment adds no authored apps table. Authored apps, for checkouts that manifests
+can't split, such as a Node backend and a JavaScript frontend in one package, are
+[Amendment (#794)](#amendment-794-authored-apps): `[apps.<name>]` tables that override
+detection under their roots.
 
 The following detect no app:
 
@@ -453,9 +453,13 @@ bound); they detect no app." Over the work bound, detection fails `bounded_work`
 `trellis_rules_check` payload gain:
 
 ```text
-apps:[{name,manifest,counts:Counts}]   # one entry per detected manifest, in manifest-path order
+apps:[{name,source,manifest,counts:Counts}]   # one entry per app of the inventory (#794)
 noApp:{counts:Counts}
 ```
+
+(#794: `source` is `manifest` or `override`, `manifest` is null for an authored app, and the
+inventory lists authored apps by name before the detected apps in manifest-path order. See
+[Amendment (#794)](#amendment-794-authored-apps).)
 
 Both count production instances only. `trellis_rules_explain` carries neither field. With no
 detected app, `apps` is empty and every instance is under `noApp`.
@@ -496,8 +500,129 @@ files outside that root, reports part of its CLI and MCP per-app output under `n
 
 **Limitation.** App detection reads manifests only. A checkout that one manifest cannot
 split, such as a Node backend and a JavaScript frontend in a single `package.json`, is one
-app until an authored override exists. Trellis's own `web/package.json` makes its web files a
-second app.
+detected app; [Amendment (#794)](#amendment-794-authored-apps) lets the rules file author the
+split. Trellis's own `web/package.json` makes its web files a second app.
+
+## Amendment (#794): authored apps
+
+**Status: owner-ratified 2026-11-08 ([#794](https://github.com/SquashMerge/trellis/issues/794)).**
+This section records the owner's 2026-11-08 rulings on #794: D1–D6 and D8 accepted as
+recommended ([ruling](https://github.com/SquashMerge/trellis/issues/794#issuecomment-6730859881)),
+and D7 superseded by the rename and widening of the proposal prompt
+([ruling](https://github.com/SquashMerge/trellis/issues/794#issuecomment-6730845360)). It
+adds authored apps to [Amendment (#783)](#amendment-783-apps-and-per-app-layers) and the
+[implementation notes (#784)](#implementation-notes-784). A rules file without `apps`
+behaves exactly as under those sections.
+
+**Authored apps (D1, D5).** `apps` is the eighth closed top-level key: a map of
+`[apps.<name>]` tables, like `[layers.<name>]`. The table key is the app's name: nonblank and
+case-sensitive, the name layers use in `app` and `apps`. The TOML parser rejects a repeated
+table. Each table has exactly one key:
+
+| Key | Rule |
+| --- | --- |
+| `roots` | Required. A nonempty array of distinct strings. Each is `.` (the whole checkout) or a literal checkout-relative directory: no leading or trailing `/`, no empty, `.` or `..` component, no glob character (`*`, `?`, `[`, `]`, `{`, `}`, `!`), backslash, colon or NUL. |
+
+`kind`, `language`, `entries` and every other key are unknown keys, so a located `schema`
+error. An authored app has no manifest. On the wire its `kind` and `manifest` are null and
+its `entries` empty; `languages` is measured from its files, as for any app.
+
+```toml
+# One root package.json holds a Node backend and a JavaScript front end.
+[apps.backend]
+roots = ["."]
+
+[apps.web]
+roots = ["client", "shared/ui"]
+```
+
+**Shadowing and precedence (D2, D3).** The effective inventory is computed in this order:
+
+1. every manifest's outcome, as in the [implementation notes (#784)](#implementation-notes-784);
+2. a manifest that a hidden layer selects detects no app, as before;
+3. **shadowing:** a detected app is dropped when its root equals, or lies under, any
+   authored root;
+4. **union:** the authored apps, in name order, then the surviving detected apps, in
+   manifest-path order.
+
+An authored app always wins over detection inside its roots. Detection outside every
+authored root is untouched. A file belongs, for listing and for the `bucket` rule, to the
+app whose root contains it most specifically, over every root of every app, authored or
+detected; on a tie the earlier app in the inventory wins. Authored roots may nest (`.` and
+`client`), so the most specific wins. One root in two authored apps is an error.
+
+| Intent | Expressed as | Result |
+| --- | --- | --- |
+| Split one manifest (a backend and a front end, a server and a CLI) | `[apps.backend] roots=["."]` and `[apps.web] roots=["client"]` | The root manifest's app is shadowed. Files under `client/` go to `web`, every other file to `backend`. |
+| Merge a workspace's members | `[apps.platform] roots=["crates"]` | Every member under `crates/` is shadowed; one app remains. |
+| Add an app with no manifest (a front end inside a Rust crate) | `[apps.ui] roots=["ui"]` | The crate's detected app survives; `ui/` files go to `ui`. |
+| Rename a detected app | `[apps.good-name] roots=["<the detected root>"]` | The equal root shadows it. |
+| Drop a manifest that is not an app | a hidden layer that selects the manifest | Unchanged from #783. |
+
+**Layers.** `app` and `apps` resolve against the effective inventory. The table of zero, one
+or two or more apps in [Amendment (#783)](#amendment-783-apps-and-per-app-layers) counts
+effective apps. Order is compared per app, and the direction table, `cross_app`, the
+`bucket` rule and `Σ apps[].counts + noApp.counts = counts` are unchanged. A layer's `app`
+stays authoritative over roots. A detected app that an authored root shadows can no longer
+be named.
+
+**Validation (D3, D4, D6).** Each error is a located `invalid_rules`. The file is parsed
+first; then, against the same admitted snapshot as detection, the authored apps are checked
+in name order, each app's roots before its name, and the first error wins. Layer `app` and
+`apps` are then checked against the effective inventory as in #784.
+
+| Condition | `kind` | Location |
+| --- | --- | --- |
+| Missing `roots`, a blank app name, or an unknown key | `schema` | the table, or the unknown key |
+| `roots = []`, a non-string root, an invalid root (including one outside the checkout, such as `../x` or `/x`), or a root repeated in one app | `schema` | the list or the root |
+| More than 1024 apps (`too_large`, like the other named collections) or more than 1024 roots in one app | `too_large` | the file, or the first root over the limit |
+| The same root in two authored apps | `ambiguity` | its second occurrence, in name order |
+| A root with no indexed document under it (D6) | `reference` | the root |
+| An authored name equal to the name of a detected app that survives shadowing (D4) | `ambiguity` | the authored table; the message names the manifest |
+
+Detected apps that share a name keep the #783 rule: they are an error only when a layer
+names them, and authoring an app at their roots is the fix. Because root validity reads the
+snapshot, adding or removing a directory can change which rules are valid, as manifests
+already do.
+
+**Output.** The rules check `apps[]` entry is `{name, source, manifest, counts}`, with
+`source` `manifest` or `override` and `manifest` null for an authored app. It keeps one entry
+per inventory item, in inventory order. The Architecture summary's `apps[]` carries
+`source`, `kind` (null), `manifest` (null), `roots` (as authored, possibly several) and
+`entries` (empty) for an authored app. Interfaces are extracted when detected and authored
+apps together number two or more, and their ends resolve through the effective apps, so an
+authored split of one manifest has interfaces between its apps.
+
+**Edits.** Rules edits (exception preview and apply, file assignment) keep `[apps]` tables
+byte for byte, like other authored text.
+
+**Proposal prompt (D7 superseded).** The MCP prompt is renamed `trellis_propose_rules`
+(formerly `trellis_propose_layers`) and covers the whole rules file. It lists the effective
+apps, authored first, and explains how to author `[apps.<name>]` tables, so the agent may
+draft them for review. It keeps authored tables as written unless the evidence shows they
+are wrong. See [MCP Amendment (#794)](mcp-readonly-pilot-contract.md#amendment-794-authored-apps-and-the-trellis_propose_rules-prompt).
+
+**Worked example: mimir (acceptance).** mimir has a Python service (`pyproject.toml`,
+`mimir-agent`) and a Vite front end (`package.json`, `mimir-frontend`) whose manifests both
+sit at the checkout root, and a Python plugin in `plugins/cultivate`. Detection alone gives
+two apps with root `.`, so every file outside the plugin, including the front end's, goes to
+whichever root manifest sorts first. The authored override expresses the real layout:
+
+```toml
+[apps.mimir-agent]
+roots = ["."]
+
+[apps.mimir-frontend]
+roots = ["frontend"]
+
+[apps.mimir-cultivate]
+roots = ["plugins/cultivate"]
+```
+
+The root `.` shadows every detected app, so the plugin is authored too (keeping its
+detected name is allowed, because its detected app is shadowed). Files under `frontend/` go
+to `mimir-frontend`, files under `plugins/cultivate/` to `mimir-cultivate`, and every other
+file to `mimir-agent`.
 
 ## External package policy
 
@@ -563,9 +688,10 @@ forbid = [{ calls = "repository" }]
 
 The closed top-level keys are `version`, `layer_policy`, `external_policy`, `layers`,
 `roles`, `rules` and `exceptions`. `version` is required and exactly `1`; optional collections
-start empty. (#783: no top-level `[[apps]]` key is added. An ordered layer gains `app` and a shared
-layer gains `apps`; see
-[Amendment (#783)](#amendment-783-apps-and-per-app-layers).) A selector has at least one of `paths`, `name`, `language`, `extends`
+start empty. (#783: an ordered layer gains `app` and a shared layer gains `apps`; see
+[Amendment (#783)](#amendment-783-apps-and-per-app-layers). #794: `apps` is an eighth
+top-level key, a map of authored `[apps.<name>]` tables; see
+[Amendment (#794)](#amendment-794-authored-apps).) A selector has at least one of `paths`, `name`, `language`, `extends`
 and `implements`. Keys combine with AND; entries within `paths` or `language`
 combine with OR. Languages are `java`, `rust`, `python`, `javascript`, `typescript`. Name patterns
 match the measured nullable name; null never receives an invented name.
@@ -846,7 +972,7 @@ Its descriptor is `{path:".trellis/rules.toml",source:"checkout-config",contentH
 **The code pin does not identify these rules bytes.** Editing only rules can change
 the digest and outcome at an unchanged code pin. Code evidence never falls back
 to live source. Missing config permits a proposal from scratch; check/explain fail
-`rules_not_found`, whose MCP message names the `trellis_propose_layers` prompt (#769).
+`rules_not_found`, whose MCP message names the `trellis_propose_rules` prompt (#769).
 Malformed config fails all three atomically with a located error.
 
 `trellis_rules_explain` filters the same evaluated instances by exact rule/target
@@ -1332,7 +1458,8 @@ and MCP rules samples are 5 sites per pair.
 
 ## Proposal workflow
 
-The no-argument MCP prompt `trellis_propose_layers` uses the launch checkout.
+The no-argument MCP prompt `trellis_propose_rules` (named `trellis_propose_layers` before
+[#794](#amendment-794-authored-apps)) uses the launch checkout.
 Its static list is workspace-independent; get uses the same evidence admission,
 deadline, cancellation and final-root lifecycle as tools. It supplies server task
 instructions separately from untrusted repository data: the pinned structural
@@ -1350,7 +1477,9 @@ placement justifications, exact reviewed baseline exceptions and a `rules.toml`
 never applies that diff, samples a model, invokes a provider, elicits input or
 requests indexing. Any later file edit uses the agent's ordinary authorized tools.
 (#783: the prompt lists the detected apps and asks for layers per app. See
-[MCP Amendment (#783)](mcp-readonly-pilot-contract.md#amendment-783-per-app-layers-in-the-proposal-prompt).)
+[MCP Amendment (#783)](mcp-readonly-pilot-contract.md#amendment-783-per-app-layers-in-the-proposal-prompt).
+#794: it lists the effective apps, authored first, and explains how to author `[apps]`
+tables; see [Amendment (#794)](#amendment-794-authored-apps).)
 
 MCP request and complete response bounds still apply, including prompt messages,
 errors, summary text and LF. The larger static tool-catalog allowance does not

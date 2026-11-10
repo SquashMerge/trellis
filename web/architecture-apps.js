@@ -1,6 +1,6 @@
 "use strict";
-// Detected apps in the Architecture view (#789): the groups the switcher offers and the
-// per-app slice of a summary. Pure and DOM-free; the controller draws and labels. An app is
+// Detected and authored apps in the Architecture view (#789, #794): the groups the switcher
+// offers and the per-app slice of a summary. Pure and DOM-free; the controller draws and labels. An app is
 // known to the browser by its name, so apps that share a name form one group.
 (() => {
   const record = value => value !== null && typeof value === "object" && !Array.isArray(value);
@@ -25,7 +25,7 @@
       byName.get(app.name).push(app);
     }
     return [...byName].map(([name, apps]) => ({
-      name, apps, duplicate:apps.length > 1,
+      name, apps, duplicate:apps.length > 1, authored:apps.some(app => app.source === "override"),
       manifests:strings(apps.map(app => app.manifest)), kinds:unique(strings(apps.map(app => app.kind))),
       roots:unique(apps.flatMap(app => strings(app.roots))), languages:unique(apps.flatMap(app => strings(app.languages))),
       fileCount:apps.reduce((sum, app) => sum + (Number.isSafeInteger(app.fileCount) ? app.fileCount : 0), 0),
@@ -157,13 +157,16 @@
   const label = item => item.languages.length ? `${item.name} · ${item.languages.join(", ")}` : item.name;
   const manifestList = item => item.manifests.join(", ");
   const rootList = item => item.roots.map(root => root || "./").join(", ");
+  // Where an app comes from: its manifests, or the rules file for an authored app (#794).
+  const origin = item => item.authored ? "Authored in .trellis/rules.toml"
+    : item.manifests.length ? `Detected from ${manifestList(item)}${item.kinds.length ? ` (${item.kinds.join(", ")})` : ""}` : "";
   function sourceLine(item, count) {
     if (!item) return `${count} apps · hidden layers and unassigned files grouped below`;
-    const from = item.manifests.length ? ` · Detected from ${manifestList(item)}${item.kinds.length ? ` (${item.kinds.join(", ")})` : ""}` : "";
-    return `${item.name} · ${item.roots.length ? `roots ${rootList(item)}` : "no roots"}${from}`;
+    const from = origin(item);
+    return `${item.name} · ${item.roots.length ? `roots ${rootList(item)}` : "no roots"}${from ? ` · ${from}` : ""}`;
   }
   const duplicateNotice = item =>
     `${item.apps.length} detected apps share the name ${item.name} (${manifestList(item)}). A layer cannot name them; rules.md Amendment (#783).`;
-  window.TrellisArchitectureApps = {groups, group, scoped, link, stubs, sumCounts, label, sourceLine, duplicateNotice,
+  window.TrellisArchitectureApps = {groups, group, scoped, link, stubs, sumCounts, label, origin, sourceLine, duplicateNotice,
     layout, confidenceText, cardText, cardName, endsText, header, routes, key};
 })();

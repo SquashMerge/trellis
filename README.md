@@ -173,7 +173,7 @@ and says so (`truncationReason:"response_bytes"`). The current SCIP importer set
 
 [Reviewed architecture rules](docs/rules.md) adds three read-only MCP tools
 (`trellis_references`, `trellis_rules_check`, `trellis_rules_explain`), the no-argument
-`trellis_propose_layers` proposal prompt, and CLI JSON references/rules checks.
+`trellis_propose_rules` proposal prompt, and CLI JSON references/rules checks.
 Code evidence remains pinned and cached; only the fixed `.trellis/rules.toml` is
 read as current configuration with its own digest. Proposals are diffs for human
 review, never server-applied changes.

@@ -37,7 +37,7 @@ test("find and declaration schemas require closed declaration roles", () => {
 
 
 test("architecture prompt messages and catalog use SDK prompt shapes", () => {
-  const prompts = [{name: "trellis_propose_layers", description: "Read-only layer proposal", arguments: []}];
+  const prompts = [{name: "trellis_propose_rules", description: "Read-only layer proposal", arguments: []}];
   for (const result of [{prompts}, {resultType: "complete", ttlMs: 0, cacheScope: "private", prompts}]) {
     assert.ok(ListPromptsResultSchema.safeParse(result).success);
   }
@@ -46,7 +46,7 @@ test("architecture prompt messages and catalog use SDK prompt shapes", () => {
     assert.ok(GetPromptResultSchema.safeParse(result).success);
   }
   assert.equal(tools.length, 12);
-  assert.ok(!tools.some(tool => tool.name === "trellis_propose_layers"));
+  assert.ok(!tools.some(tool => tool.name === "trellis_propose_rules"));
 });
 
 // Draft 2020-12 is the advertised wire schema, rather than an SDK-only shape check.
@@ -62,7 +62,7 @@ test("the twelve-tool order and unchanged schemas are explicit", () => {
     "trellis_rules_explain", "trellis_show",
   ]);
   const describe = tools[0].outputSchema.oneOf[0].properties.data.properties;
-  assert.equal(describe.toolVersion.const, 22);
+  assert.equal(describe.toolVersion.const, 23);
   assert.equal(search.inputSchema.additionalProperties, false);
   assert.equal(search.inputSchema.properties.limit.default, 10);
   assert.equal(search.inputSchema.properties.limit.maximum, 50);

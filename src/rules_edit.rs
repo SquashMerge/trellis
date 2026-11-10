@@ -583,6 +583,31 @@ mod tests {
             assert_eq!(rules::view_layers(&proposal.config)[1]["display"], "hidden");
         }
     }
+    /// #794: every edit keeps authored `[apps.<name>]` tables byte for byte.
+    #[test]
+    fn edits_preserve_authored_apps() {
+        let apps = "[apps.backend] # keep app\nroots = ['.']\n\n[apps.web]\nroots = [\n  'client', # keep root\n  'shared/ui',\n]\n\n";
+        let authored = CONFIG.replace("[layers.a]\n", &format!("{apps}[layers.a]\n"));
+        let config = rules::parse(&authored).unwrap();
+        assert_eq!(config.authored_app_count(), 2);
+        let request = |operations: Value| -> Request {
+            serde_json::from_value(json!({"indexGeneration":"f64aac54-3da7-4a00-8c9b-4ec2efdeff32","indexRevision":1,"baseHash":hash(&authored),"operations":operations})).unwrap()
+        };
+        for operations in [
+            json!([{"type":"editException","index":0,"reason":"new"}]),
+            json!([{"type":"removeException","index":0}]),
+            json!([{"type":"assignFile","path":"src/new.rs","layer":"b"}]),
+            json!([{"type":"addExceptions","reason":"why","pairs":[{"source":{"language":"rust","path":"src/b.rs"},"destination":{"language":"rust","path":"src/a.rs"}}]}]),
+        ] {
+            let proposal = propose(&config, &request(operations), &mut || Ok(())).unwrap();
+            assert!(
+                proposal.config.text.contains(apps),
+                "{}",
+                proposal.config.text
+            );
+            assert_eq!(proposal.config.authored_app_count(), 2);
+        }
+    }
     #[test]
     fn inline_exception_arrays_are_editable() {
         let inline = "version=1\nexceptions=[{rule='$layers',target={language='rust',path='a.rs'},destination={language='rust',path='b.rs'},reason='old'}] # keep\n[layers.a]\norder=1\npaths=['**']\n";

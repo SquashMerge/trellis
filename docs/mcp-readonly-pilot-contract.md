@@ -367,7 +367,7 @@ incoming `scopeCoverage` and the lookup alternatives other tools return keep the
 
 ## Amendment (#770): a bounded prompt reference view
 
-**Status: owner-ratified 2026-11-07 (#770).** `trellis_propose_layers`
+**Status: owner-ratified 2026-11-07 (#770).** `trellis_propose_rules`
 inlined the whole `references:v2` result, so on any non-trivial checkout the prompt
 exceeded the 65,536-byte frame and failed with `response_too_large`. This section wins
 over the [proposal prompt](#one-no-argument-proposal-prompt) and
@@ -432,8 +432,8 @@ unchanged, as are the CLI and the browser.
 
 - **Rules file hint.** The `rules_not_found` message from check and explain is the
   static text ``No .trellis/rules.toml. Ask the user to run the
-  `trellis_propose_layers` MCP prompt (in Claude Code:
-  /mcp__trellis__trellis_propose_layers) to draft one for review.`` Its code and
+  `trellis_propose_rules` MCP prompt (in Claude Code:
+  /mcp__trellis__trellis_propose_rules) to draft one for review.`` Its code and
   retryability are unchanged.
 - **Ready-made explain call.** A `trellis_rules_check` instance (in `instances` or
   `testOnly`) with `omittedEvidence > 0` adds the optional
@@ -488,7 +488,7 @@ unchanged, as are the CLI and the browser.
 
 **Status: owner-ratified 2026-11-07 (#783).** Following the
 [owner's 2026-11-07 ruling](https://github.com/SquashMerge/trellis/issues/783),
-`trellis_propose_layers` gives per-app context and asks for per-app layers, under
+`trellis_propose_rules` gives per-app context and asks for per-app layers, under
 [rules.md Amendment (#783)](rules.md#amendment-783-apps-and-per-app-layers). Everything in
 [Amendment (#770)](#amendment-770-a-bounded-prompt-reference-view) is unchanged except
 what this section adds.
@@ -569,7 +569,7 @@ changes, only the order of rows within two arrays. This section wins over the #7
 
   `{schemaVersion:1,requestId,workspace,catchingUp,error:{code:"building",message,retryable:true,currentBasis:Basis,currentContentHash:null,progress:{phase:"reading"|"resolving"|"evaluating"|"measuring",completed:UInt,total:UInt}|null,retryAfterMs:UInt}}`
 
-  `progress` is null when the build has not reported yet. The message names the phase and count, for example `Architecture is being computed for this revision (measuring 120 of 670); retry shortly`. `retryAfterMs` is 250, the browser's `202 building` value. It is never a partial answer. The `trellis_propose_layers` prompt returns the same error object as its JSON-RPC `-32603` error `data`.
+  `progress` is null when the build has not reported yet. The message names the phase and count, for example `Architecture is being computed for this revision (measuring 120 of 670); retry shortly`. `retryAfterMs` is 250, the browser's `202 building` value. It is never a partial answer. The `trellis_propose_rules` prompt returns the same error object as its JSON-RPC `-32603` error `data`.
 - **When.** A read waits on the owner's signal until one second before its 5 s deadline, then answers `building` if the core is still not published. A read whose revision the owner has passed (the head moved) waits again for the new head while time remains.
 - **No duplicate compute.** A read with `paths` waits like one without, and answers `building` while the owner builds its revision. It no longer starts its own whole-revision read beside the build. It still computes its own scope when the revision fails `bounded_work`.
 - **Progress.** `measuring` advances per measured document, as `reading` already did, so a retried read sees the count move.
@@ -632,7 +632,7 @@ changes, only the order of rows within two arrays. This section wins over the #7
 - **`trellis_rules_explain`** does not carry `apps` or `noApp`; its schema and output are unchanged.
 - **Single-app output.** With exactly one detected app, `apps[0].counts` equals `rules.counts` only when no row's own file is unassigned and outside the app's root. Such rows count under `noApp`. So a single-app checkout whose app root is a subdirectory, and which has unassigned files outside that root, reports part of its CLI and MCP per-app output under `noApp`.
 - **Limitation.** When manifests are unread, `limitations` gains the one-line unread-manifest entry described in rules.md.
-- **Unchanged:** paging, `omittedEvidence`, `nextCall`, every bound, the check input, and the `trellis_propose_layers` payload of [Amendment (#783)](#amendment-783-per-app-layers-in-the-proposal-prompt). `trellis rules check --format json` prints the same two fields and its exit rule is unchanged.
+- **Unchanged:** paging, `omittedEvidence`, `nextCall`, every bound, the check input, and the `trellis_propose_rules` payload of [Amendment (#783)](#amendment-783-per-app-layers-in-the-proposal-prompt). `trellis rules check --format json` prints the same two fields and its exit rule is unchanged.
 
 ## Amendment (#836): catalog compaction
 
@@ -659,9 +659,20 @@ changes, only the order of rows within two arrays. This section wins over the #7
 - **Checks.** Tests check that every schema is self-contained and has no `$schema`. They also check that the compacted failure schemas of all twelve tools accept exactly the failures the earlier shapes accepted, using an independent oracle over a matrix of codes, reasons, flags and fields, through the SDK's own validator. As before, real responses validate.
 - **Unchanged:** every tool, input, output, bound and description, every definition not named above, and the catalog's order.
 
+## Amendment (#794): authored apps and the `trellis_propose_rules` prompt
+
+**Status: owner-ratified 2026-11-08 ([#794](https://github.com/SquashMerge/trellis/issues/794)).** It records the owner's 2026-11-08 rulings on #794: the prompt rename and widening ([ruling](https://github.com/SquashMerge/trellis/issues/794#issuecomment-6730845360)) and D1–D6 and D8 accepted as recommended ([ruling](https://github.com/SquashMerge/trellis/issues/794#issuecomment-6730859881)). `toolVersion` is **22** (previously 21, #836), because the `trellis_rules_check` output schema changes. Authored apps are [rules.md Amendment (#794)](rules.md#amendment-794-authored-apps). This section wins over [Amendment (#783)](#amendment-783-per-app-layers-in-the-proposal-prompt), [Amendment (#784)](#amendment-784-per-app-counts-in-rules-check) and the [proposal prompt](#one-no-argument-proposal-prompt) text where they differ.
+
+- **Rename, with no alias.** The prompt `trellis_propose_layers` is now **`trellis_propose_rules`**. `prompts/list` has one entry, `{name:"trellis_propose_rules",description:"Propose reviewed rules (apps and path-glob layers) from pinned structural evidence; never writes rules.",arguments:[]}`, and `prompts/get` accepts exactly `{name:"trellis_propose_rules",arguments?:{}}`. The old name is an unknown name (`-32602`), as Trellis is pre-release. The result's `description` is "Read-only architecture rules proposal for human review". The `rules_not_found` message of the rules tools names the new prompt. Admission, bounds, the fixed and clipped parts and the failure behaviour are unchanged.
+- **`payload.apps`** lists the effective inventory: `{name, source:"manifest"|"override", kind:"cargo"|"npm"|"python"|null, manifest:Path|null, roots, entries}`. With a rules file, the authored apps come first by name, with `kind` and `manifest` null and `entries` empty, then the detected apps they do not shadow, by manifest path. Without a rules file every detected manifest is listed, as before. The prompt does not check authored roots against the snapshot (that is `trellis_rules_check`'s `reference` and `ambiguity` errors), so a prompt still helps fix such a file. A malformed file still fails the prompt atomically. `apps` stays in the fixed, never-clipped part.
+- **Instructions.** An `APPS` section is always present, whatever the number of apps. It says what `payload.apps` lists and its two sources; when to propose authored apps (a backend and a front end in one `package.json`, a server and a CLI in one package, a front end with no manifest, two manifests at one root); the `[apps.<name>]` schema with an example (`roots` only, its normalisation, an indexed document under each root); shadowing, nesting and the most-specific root; that an authored name must not equal a kept detected name and that renaming is authoring at the detected root; to keep authored tables as written unless the evidence shows they are wrong; and that a hidden layer selecting a manifest still removes that detected app. The closed grammar line lists `apps` among the top-level keys. The `PER-APP LAYERS` section, for two or more apps, is unchanged apart from its first sentence, which moved to `APPS`. This supersedes D7: the prompt may now draft `[apps]` entries for review.
+- **`trellis_rules_check`** `apps[]` entries are `{name:Text, source:"manifest"|"override", manifest:Path|null, counts:RuleCounts}`, one per inventory item in inventory order. `source` is required. `trellis_rules_explain` is unchanged.
+- **Catalog.** Only the `trellis_rules_check` `apps` item schema and the `toolVersion` constant change. The prompt list is not part of the tool catalog.
+- **Unchanged:** every other tool, field and bound, `noApp`, the counting rule, paging, `omittedEvidence`, `nextCall`, and the overview table.
+
 ## Amendment (#837): references group by app, and a directory prefix
 
-**Status: owner-ratified 2026-11-09 under the owner's delegation for the #836/#837 MCP work.** The owner approved the scope on [#837](https://github.com/SquashMerge/trellis/issues/837) on 2026-11-08 (“Yes we can group by app. Can't we also group by path? Programs are usually stored in a hierarchical file structure no matter the language.”) and said to start it on 2026-11-09. `toolVersion` is **22** (previously 21, #836). This section wins over [Amendment (#775)](#amendment-775-references-group-by-directory-or-package) where they differ; check, explain, the prompt, the CLI and the browser are unchanged.
+**Status: owner-ratified 2026-11-09 under the owner's delegation for the #836/#837 MCP work.** The owner approved the scope on [#837](https://github.com/SquashMerge/trellis/issues/837) on 2026-11-08 (“Yes we can group by app. Can't we also group by path? Programs are usually stored in a hierarchical file structure no matter the language.”) and said to start it on 2026-11-09. `toolVersion` is **23** (previously 22, #794). This section wins over [Amendment (#775)](#amendment-775-references-group-by-directory-or-package) where they differ; check, explain, the prompt, the CLI and the browser are unchanged.
 
 - **`package` is the app.** With `groupBy:"package"` a native module's group is its [#784](https://github.com/SquashMerge/trellis/issues/784) app, named by the app's manifest path (for example `web/package.json`), because two apps can share a name. A module in no app is in the group `noApp`; a manifest path always ends in its manifest file name (`Cargo.toml`, `package.json` or, with [#807](https://github.com/SquashMerge/trellis/issues/807), `pyproject.toml`), so the two never collide. External destinations keep their `ExternalIdentity` group, and unresolved sites stay `target:null`. Rows, sums, order and paging are as #775 describes.
 - **The same assignment as check.** A file's app is the one the rules check and the Architecture summary give it ([rules.md, #784](rules.md#implementation-notes-784)). Apps are detected against the checkout's `.trellis/rules.toml`, so a manifest that a hidden layer selects is no app. A file in a layer that serves exactly one app (an ordered or hidden layer's `app`, the only app, or a shared layer's single `apps` entry) is in that app, even outside its root. Any other file (unassigned, or in a shared layer serving several apps) is in the app whose root most specifically contains it, or in `noApp`. Without a rules file every detected manifest is an app and every file goes by root. With no detected app every module is in `noApp`. Only `package` reads the rules file. When check would reject it, `package` fails `invalid_rules` with no `diagnostic` (the references failure schema has none; `trellis_rules_check` reports the location), and `file` and `directory` are unaffected.
@@ -1119,10 +1130,10 @@ workspace-independent and has no cursor/pagination. Modern params contain only
 required protocol `_meta`; the modern result is
 `{resultType:"complete",ttlMs:0,cacheScope:"private",prompts:[Prompt]}`.
 Legacy list accepts absent/empty params and returns `{prompts:[Prompt]}`.
-There is one entry, with `name:"trellis_propose_layers"`, a description and
+There is one entry, with `name:"trellis_propose_rules"`, a description and
 `arguments:[]`.
 
-`prompts/get` accepts exactly `{name:"trellis_propose_layers",arguments?:{}}`
+`prompts/get` accepts exactly `{name:"trellis_propose_rules",arguments?:{}}`
 plus modern required protocol `_meta`. It accepts no workspace/pin/path arguments
 and always uses the launch checkout, not a previously selected worktree. Unknown
 name, argument, cursor, extra field, wrong type or missing modern metadata fails
@@ -1146,7 +1157,9 @@ supplies current exact rules bytes and the separate checkout-config descriptor,
 or explicit absence. Missing rules permits a new proposal; malformed rules fails
 atomically, just as check/explain do. The index pin does not identify current
 configuration bytes. (#783: the prompt also lists detected apps and asks for
-layers per app; see [Amendment (#783)](#amendment-783-per-app-layers-in-the-proposal-prompt).)
+layers per app; see [Amendment (#783)](#amendment-783-per-app-layers-in-the-proposal-prompt).
+#794: the prompt is `trellis_propose_rules`, lists authored apps too and explains how to
+author them; see [Amendment (#794)](#amendment-794-authored-apps-and-the-trellis_propose_rules-prompt).)
 Output asks for explicit integer orders, reviewed peer/shared
 choices, justified placements, exact positively witnessed baseline exceptions and
 a `rules.toml` diff **for human review**. Ambiguities go to normal chat. Trellis

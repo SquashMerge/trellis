@@ -137,7 +137,8 @@ pub(crate) struct ArchitectureCore {
     metrics: Option<Result<ArchitectureMetrics, CoreFailure>>,
     /// Every build manifest's app-detection outcome, before any rules file hides some.
     app_candidates: Result<crate::apps::Candidates, CoreFailure>,
-    /// Server routes and client calls, computed only for a checkout with two or more apps.
+    /// Server routes and client calls, computed only when detected plus authored apps number
+    /// two or more.
     /// `None` when this core was computed without a rules file.
     interfaces: Option<Result<crate::interfaces::Extraction, CoreFailure>>,
     /// Finished summaries; one per valid role, aggregate and workbench choice.
@@ -316,7 +317,11 @@ impl ArchitectureCore {
         let app_candidates = kept(crate::rules::app_candidates(&snapshot, check))?;
         let interfaces = match (config, &app_candidates) {
             (None, _) => None,
-            (Some(_), Ok(candidates)) if detected_apps(candidates) >= 2 => {
+            // Authored apps can split one manifest's checkout (#794), so they count too: an
+            // upper bound of the effective inventory.
+            (Some(config), Ok(candidates))
+                if detected_apps(candidates) + config.authored_app_count() >= 2 =>
+            {
                 let mut work =
                     crate::references::work::Work::new(crate::references::work::rules_limit(
                         snapshot.documents.len(),
