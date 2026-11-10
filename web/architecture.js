@@ -55,14 +55,14 @@
   }
   const BUILD_PHASES = {reading:"reading indexed files", resolving:"resolving references", evaluating:"evaluating rules", measuring:"measuring code"};
   function create({request, context, readSource, openTreemap, openSequence, libraryButton = () => null, onConflict = () => {}, onInspect = () => {}, onRulesChanged = () => {}}) {
-    let serial = 0, renderSerial = 0, selectionSerial = 0, reviewSerial = 0, view = null, basis = null, buildingTimer = null, buildingWake = null;
+    let serial = 0, renderSerial = 0, selectionSerial = 0, view = null, basis = null, buildingTimer = null, buildingWake = null;
     let metric = "cognitive", aggregate = "max", role = "production", relative = false, showTests = false;
     // The app whose stack is drawn: null for all apps, else an app name (never compared with a literal). Memory only; a new checkout starts at "all".
     // `drawn` is the view the last render laid out (the scoped slice, or `view` itself).
     let scope = null, scopeRoot = null, drawn = null;
     // The band that holds the selected stub's end, so its label can say `client end` / `server end` (AC25).
     let endMark = null;
-    let reviewScope = null, reviewMode = "rules", selected = new Map(), draft = null, preview = null, editSerial = 0, editBusy = false, busyOwner = 0;
+    let reviewMode = "unassigned", draft = null, preview = null, editSerial = 0, editBusy = false, busyOwner = 0;
     const callables = () => role === "all" ? "indexed callables" : "production callables";
     const population = () => role === "all" ? "all indexed callables" : callables();
     // The hidden-layer note moves into the canvas after each drawing, so keep its nodes.
@@ -72,9 +72,19 @@
     const apps = window.TrellisArchitectureApps;
     const deviations = window.TrellisDeviations.create({details:(params, active, offset) => details(appFilter(params), active, offset), current:() => usable(),
       basis:() => basis, view:() => deviationsView(), targetLabel, eligible, portable, beginDraft:(operation, scope) => beginDraft(operation, scope), reviewChips,
-      edgeText, inspectLine:(record, render) => inspectLine(record, render), overview:() => overview(), openReview:(mode, verdict) => openReview(mode, verdict),
+      edgeText, inspectLine:(record, render) => inspectLine(record, render), overview:() => overview(), inspectUnknown:() => { if (usable()) inspect("unknown", null); },
+      backLabel:() => scopeGroup() ? `← ${scopeGroup().name}` : "← Architecture",
       onConflict:() => onConflict(), refresh:() => refresh(), readSource:(site, pin, active) => readSource(site, pin, active),
-      openSequence:(...args) => openSequence(...args), snapshot:() => snapshot()});
+      openSequence:(...args) => openSequence(...args), snapshot:() => snapshot(),
+      // One page of the Files outline at the view's pin; it names a closure's enclosing callable (#845).
+      outline:async (path, offset, active) => {
+        const c = basis, query = new URLSearchParams({indexGeneration:c.pin.indexGeneration, indexRevision:String(c.pin.indexRevision), path, offset:String(offset), limit:"200"});
+        const data = await request(`/api/symbols?${query}`, active);
+        if (!window.TrellisIndexPin.equal(data?.revision, c.pin) || !Array.isArray(data?.items) || !(data.nextOffset === null || (Number.isSafeInteger(data.nextOffset) && data.nextOffset > offset))) {
+          throw new Error("Invalid outline response.");
+        }
+        return data;
+      }});
     const state = (message, kind = "ready") => { get("architecture-state").textContent = message; get("architecture-state").dataset.state = kind; };
     function capture() {
       const c = context();
@@ -110,7 +120,7 @@
     }
     function reset(message = "Open Architecture to read the indexed snapshot and reviewed rules.", keepDraft = false, keepReopen = false) {
       drawn = null; get("architecture-apps").hidden = true; get("architecture-source-line").hidden = true; get("architecture-key-interface").hidden = true; get("architecture-footnote").hidden = true;
-      editSerial++; preview = null; selected.clear();
+      editSerial++; preview = null;
       if (!keepDraft) setBusy(false);
       if (!keepDraft) { draft = null; get("architecture-review-panel").hidden = true; get("architecture-editor").hidden = true; }
       get("architecture-preview-result").hidden = true;
@@ -207,11 +217,6 @@
     }
     const pairItems = active => (list, items) => pairs(list, items.map(item => item.pair), active, false);
     const instanceItems = active => (list, items) => renderInstances(list, items, active, false);
-    // The exact $layers filter of one summary edge (its verdict and exception group).
-    function edgeFilters(edge) {
-      return {rule:"$layers", role:edge.role, sourceLayer:edge.sourceLayer, destinationLayer:edge.destinationLayer, status:edge.status,
-        excepted:String(!!edge.excepted), ...(edge.exceptionReason ? {exceptionReason:edge.exceptionReason} : {})};
-    }
     function layerLabel(layer) {
       const modules = model().modules.filter(module => module.layer === layer.name);
       const values = modules.map(module => metricValue(module.metrics, metric)).filter(finite);
@@ -250,8 +255,9 @@
       const counts = layerCounts(layer, source), bound = lowerBound(layer.name, "production") ? "≥" : "";
       const stats = STATS.filter(([key]) => key !== "up" && counts[key] > 0).map(([key, glyph, words, error]) =>
         ({key, count:counts[key], text:`${glyph}${bound}${counts[key]}`, label:`${bound ? "at least " : ""}${counts[key]} outgoing production reference sites · ${words}`, tone:error ? "error" : "neutral"}));
-      const up = [...counts.upTo].map(([destination, count]) => ({key:"up", count, text:`↑${bound}${count} deviation · ${destination}`, tone:"error",
-        label:`${bound ? "at least " : ""}${count} upward production reference sites from ${layer.name} to ${destination} · deviation · open in Deviations`,
+      // The count is reference sites, the tree's unit after #846: `↑12 references · entry` (owner ruling 2026-11-09).
+      const up = [...counts.upTo].map(([destination, count]) => ({key:"up", count, text:`↑${bound}${count} ${count === 1 ? "reference" : "references"} · ${destination}`, tone:"error",
+        label:`${bound ? "at least " : ""}${plural(count, "upward production reference")} from ${layer.name} to ${destination} · deviation · open in Deviations`,
         id:JSON.stringify(["up", layer.name, destination]), action:{sourceLayer:layer.name, destinationLayer:destination}}));
       return [...up, ...stats, ...interfaceStats(layer, appName)];
     }
@@ -469,15 +475,18 @@
       line.append(make("span", apps.sourceLine(group, payload.apps.length)));
       if (group?.duplicate) line.append(make("span", apps.duplicateNotice(group), "architecture-app-notice"));
     }
-    // A `↑` badge opens 802's Deviations tree on its edge, unselected and with Calls only off (AC10).
-    function openDeviations(action) {
+    // A `↑` badge or a deviating arrow opens 802's Deviations tree on its edge, unselected and with
+    // Calls only off (AC10, #845). Back returns focus to the control that opened it.
+    function openDeviations(action, trigger = null) {
       if (!usable() || view.state !== "ready" || editBusy) return;
-      return deviations.openEdge(action.sourceLayer, action.destinationLayer);
+      return deviations.openEdge(action.sourceLayer, action.destinationLayer, trigger);
     }
+    // The arrows the tree lists: production deviations that no exception covers.
+    const treeEdge = edge => edge?.role === "production" && edge.status === "deviates" && !edge.excepted;
     function setScope(next) {
       if (!usable() || view.state !== "ready" || editBusy || next === scope) return;
       if (next !== null && !apps.group(view, next)) return;
-      scope = next; reviewScope = null; deviations.reset(); coverage();
+      scope = next; deviations.reset(); coverage();
       if (!get("architecture-review-panel").hidden) renderReview();
       return render();
     }
@@ -576,7 +585,7 @@
             unassigned:{label:`Unassigned / unknown\n${plural(unassigned, "file")} · no layer`, get expanded() { return shown.unassigned && budget.left > 0; }}},
           onOpenDeviation:action => {
             const named = name => slice.layers.some(layer => layer.name === name);
-            if (active() && named(action?.sourceLayer) && named(action?.destinationLayer)) return openDeviations(action);
+            if (active() && named(action?.sourceLayer) && named(action?.destinationLayer)) return openDeviations(action, document.activeElement);
           },
           onSelectInterface:action => {
             const entry = apps.link(slice, action?.interface?.client, action?.interface?.server);
@@ -588,7 +597,11 @@
             endMark = {layer:action.layer, side:action.side}; void render({keepSelection:true});
           },
           onSelectModule:module => { if (active() && slice.modules.includes(module)) { inspect("module", module); pressed = nodeKey(pressedNode()); } },
-          onSelectEdge:edge => { if (active() && slice.edges.includes(edge)) { inspect("edge", edge); pressed = nodeKey(pressedNode()); } },
+          onSelectEdge:edge => {
+            if (!active() || !slice.edges.includes(edge)) return;
+            if (treeEdge(edge)) { const node = pressedNode(); node?.setAttribute("aria-pressed", "false"); return openDeviations(edge, node); }
+            inspect("edge", edge); pressed = nodeKey(pressedNode());
+          },
           onSelectLayer:layer => { if (active() && slice.layers.includes(layer)) inspect("layer", layer); },
           onToggleLayer:layer => {
             if (!active() || !slice.layers.includes(layer)) return;
@@ -914,12 +927,9 @@
       }
       visit(metrics, ""); target.append(list);
     }
-    function openReview(mode, verdict = "deviates") {
+    function openReview(mode) {
       if (!usable()) return;
-      reviewScope = null; reviewMode = mode;
-      // Deviations: production rows only, the ones the chip counts. Unknown is the Deviations tree's "Inspect" list.
-      if (mode === "rules") { get("architecture-review-role").value = "production"; get("architecture-review-state").value = verdict; }
-      get("architecture-review-panel").hidden = false; renderReview();
+      reviewMode = mode; get("architecture-review-panel").hidden = false; renderReview();
     }
     // Counted review chips head every Architecture inspection (#449); each opens its list.
     // File assignments count native modules; the rule-check catalog also includes external identities.
@@ -1075,8 +1085,6 @@
       } else if (kind === "edge") {
         title.textContent = `${record.sourceLayer} → ${record.destinationLayer}`;
         paragraph(target, `${record.count} exact ${record.role} ${edgeSites(record)} · ${record.status}${record.excepted ? ` · excepted: ${record.exceptionReason}` : " · not excepted"}${record.role === "test" ? " · hypothetical policy only; never a production violation" : ""}.`);
-        reviewScope = record; reviewMode = "rules"; get("architecture-review-state").value = "all"; get("architecture-review-panel").hidden = false; renderReview();
-        detailList(target, appFilter({kind:"instances", ...edgeFilters(record)}), active, instanceItems(active), "No rule instances match this review scope.");
         pairs(target, record.pairs, active);
       } else if (kind === "layer") {
         title.textContent = record.name; paragraph(target, layerLabel(record));
@@ -1113,18 +1121,7 @@
       }
       for (const limitation of references.limitations || []) paragraph(target, limitation, "detail");
     }
-    // Review filters as one exact detail scope; null when the role/verdict selects
-    // contradict the chosen edge, so nothing can match.
-    function reviewFilters(roleFilter, verdict) {
-      const params = {kind:"instances", ...(reviewScope ? edgeFilters(reviewScope) : appFilter({kind:"instances"}))};
-      const set = (key, value) => { if (key in params && params[key] !== value) return false; params[key] = value; return true; };
-      if (roleFilter !== "all" && !set("role", roleFilter)) return null;
-      if (verdict === "excepted" && !set("excepted", "true")) return null;
-      if (!["all", "excepted"].includes(verdict) && !(set("status", verdict) && set("excepted", "false"))) return null;
-      return params;
-    }
     function portable(identity) { return {language:identity.language, path:identity.path}; }
-    function pairKey(row) { return JSON.stringify([portable(row.target), portable(row.destination)]); }
     function eligible({instance:r, role:rowRole}) {
       return rowRole === "production" && r.rule === "$layers" && r.status === "deviates" && !r.excepted &&
         !!r.target?.path && !!r.destination?.path && !external(r.target) && !external(r.destination) && r.referenceCount > 0;
@@ -1138,14 +1135,6 @@
         const r = row.instance, entry = make("div", undefined, "architecture-rule-row");
         entry.dataset.rule = r.rule; entry.dataset.source = r.target?.path || ""; entry.dataset.destination = r.destination?.path || "";
         const label = `${targetLabel(r.target)} → ${r.destination ? targetLabel(r.destination) : "Unknown destination"}`;
-        {
-          const choose = make("input"); choose.type = "checkbox"; choose.disabled = !eligible(row); choose.checked = eligible(row) && selected.has(pairKey(r));
-          choose.setAttribute("aria-label", `Select ${label}`);
-          choose.addEventListener("change", () => { if (!active() || editBusy || !eligible(row)) return;
-            if (choose.checked) selected.set(pairKey(r), {source:portable(r.target), destination:portable(r.destination)}); else selected.delete(pairKey(r));
-            get("architecture-add-selected").textContent = `Add selected exceptions (${selected.size})`;
-          }); entry.append(choose);
-        }
         action(entry, `${r.rule} · ${label}`, () => inspectRule(row), active);
         paragraph(entry, `${row.role} · ${r.sourceLayer ?? "Unassigned"} → ${r.destinationLayer ?? "Unknown"} · ${r.status} · ${r.excepted ? `excepted: ${r.exceptionReason}` : "not excepted"} · ${r.referenceCount ?? 0} exact reference sites`);
         if (!eligible(row)) paragraph(entry, r.excepted ? "Already excepted. Edit or remove the authored entry." :
@@ -1186,10 +1175,9 @@
       const target = get("architecture-review-list"); target.replaceChildren();
       const inApp = scopeGroup() ? ` in ${scopeGroup().name}` : "";
       get("architecture-review-scope").textContent = reviewMode === "unassigned" ? `Unassigned files${inApp} (including files without edges)` :
-        reviewMode === "authored" ? "Authored exceptions" : reviewScope ? `${reviewScope.sourceLayer} → ${reviewScope.destinationLayer} · ${reviewScope.role}` : `All rule instances${inApp}`;
+        "Authored exceptions";
       get("architecture-exceptions").hidden = reviewMode !== "authored";
-      const c = basis, ticket = ++reviewSerial, active = () => usable() && current(c);
-      const listed = () => active() && ticket === reviewSerial;
+      const c = basis, active = () => usable() && current(c);
       if (reviewMode === "unassigned" && view.state === "no_layers") {
         paragraph(target, "No layers configured. File assignment inventory is unavailable until layers are configured; authored exceptions remain editable.");
       } else if (reviewMode === "unassigned") {
@@ -1203,15 +1191,7 @@
           action(row, "Assign file", () => beginDraft({type:"assignFile", path:module.identity.path, layer:select.value || view.layers[0]?.name}), active).disabled = !view.layers.length; target.append(row);
         }
         if (!target.children.length) paragraph(target, "All indexed native files have an assignment.");
-      } else if (reviewMode === "rules") {
-        const roleFilter = get("architecture-review-role").value, verdict = get("architecture-review-state").value;
-        const params = reviewFilters(roleFilter, verdict), empty = "No rule instances match this review scope.";
-        if (params) detailList(target, params, listed, instanceItems(active), empty); else paragraph(target, empty);
       }
-      const select = get("architecture-destination-layer"), value = select.value; select.replaceChildren();
-      const all = make("option", "All layers"); all.value = ""; select.append(all);
-      for (const layer of view.layers) { const option = make("option", layer.name); option.value = layer.name; select.append(option); } select.value = value;
-      get("architecture-add-selected").textContent = `Add selected exceptions (${selected.size})`;
     }
     function editState(message, kind = "ready") { const node = get("architecture-edit-state"); node.textContent = message; node.dataset.state = kind; }
     function setBusy(value, owner) {
@@ -1240,7 +1220,7 @@
     }
     async function showAuthored() {
       if (!usable()) return;
-      reviewMode = "authored"; reviewScope = null; get("architecture-review-panel").hidden = false; renderReview();
+      reviewMode = "authored"; get("architecture-review-panel").hidden = false; renderReview();
       const target = get("architecture-exceptions"); target.replaceChildren(); paragraph(target, "Reading authored exceptions…");
       const c = basis;
       try {
@@ -1277,8 +1257,7 @@
     }
     function snapshot() {
       return usable() && inspection ? {inspection, pressed:nodeKey(pressedNode()), rulesHash:basis.rulesHash,
-        aggregate, role, scope, reviewMode, reviewScope, reviewOpen:!get("architecture-review-panel").hidden,
-        reviewRole:get("architecture-review-role").value, reviewState:get("architecture-review-state").value, deviations:deviations.snapshot()} : null;
+        aggregate, role, scope, reviewMode, reviewOpen:!get("architecture-review-panel").hidden, deviations:deviations.snapshot()} : null;
     }
     async function restore(saved, active) {
       aggregate = saved.aggregate; role = saved.role;
@@ -1290,13 +1269,9 @@
       settleScope(view);
       if (basis.rulesHash !== saved.rulesHash) throw new Error("Architecture rules changed. Select the boundary again.");
       if (saved.reviewOpen) {
-        if (saved.reviewMode === "authored") await showAuthored();
-        else {
-          reviewMode = saved.reviewMode; reviewScope = saved.reviewScope;
-          get("architecture-review-panel").hidden = false;
-          get("architecture-review-role").value = saved.reviewRole; get("architecture-review-state").value = saved.reviewState;
-          renderReview();
-        }
+        // The authored list reads on its own guard; the inspection does not wait for it.
+        if (saved.reviewMode === "authored") void showAuthored();
+        else if (saved.reviewMode === "unassigned") openReview("unassigned");
       }
       if (!active() || !usable()) return;
       const {kind, record} = saved.inspection;
@@ -1393,69 +1368,7 @@
       } catch (error) { editError(error); }
       finally { setBusy(false, busy); }
     }
-    function selectScope() {
-      if (!usable() || editBusy) return;
-      const glob = get("architecture-source-glob").value || "**", layer = get("architecture-destination-layer").value;
-      // Selection only: the same whole-component **, * and ? grammar; never persisted.
-      const components = glob.split("/");
-      if (components.some(part => !part || part.includes("**") && part !== "**" || /[\[\]{}\\]/.test(part))) {
-        get("architecture-review-selection-state").textContent = "Use literal path components, * or ?, and whole-component ** only."; return;
-      }
-      function componentMatches(pattern, text) {
-        let reachable = new Set([0]);
-        for (const char of pattern) {
-          const next = new Set();
-          if (char === "*" && reachable.size) {
-            const first = Math.min(...reachable);
-            for (let end = first; end <= text.length; end++) next.add(end);
-          } else for (const index of reachable) {
-            if (index < text.length && (char === "?" || char === text[index])) next.add(index + 1);
-          }
-          reachable = next;
-        }
-        return reachable.has(text.length);
-      }
-      function matches(path) {
-        const parts = path.split("/"); let reachable = new Set([0]);
-        for (const component of components) {
-          const next = new Set();
-          if (component === "**" && reachable.size) {
-            const first = Math.min(...reachable);
-            for (let end = first; end <= parts.length; end++) next.add(end);
-          } else for (const index of reachable) {
-            if (index < parts.length && componentMatches(component, parts[index])) next.add(index + 1);
-          }
-          reachable = next;
-        }
-        return reachable.has(parts.length);
-      }
-      // Only unexcepted production $layers deviations are eligible; read exactly those pages.
-      const c = basis, owner = setBusy(true), active = () => usable() && current(c);
-      const state = get("architecture-review-selection-state"); state.textContent = "Reading witnessed deviations…";
-      return (async () => {
-        try {
-          const rows = [];
-          for (let offset = 0; offset !== null;) {
-            const page = await details({kind:"instances", role:"production", rule:"$layers", status:"deviates", excepted:"false", limit:"500"}, active, offset);
-            if (!active()) return;
-            rows.push(...page.items); offset = page.nextOffset;
-          }
-          selected.clear();
-          for (const row of rows) if (eligible(row) && matches(row.instance.target.path) && (!layer || row.instance.destinationLayer === layer)) {
-            const r = row.instance; selected.set(pairKey(r), {source:portable(r.target),destination:portable(r.destination)});
-          }
-          state.textContent = `${selected.size} finite witnessed pairs selected. No wildcard exception will be written.`;
-          renderReview();
-        } catch (error) {
-          if (active() && error.name !== "AbortError") state.textContent = error.message || "Selection failed. Nothing was selected.";
-        } finally { setBusy(false, owner); }
-      })();
-    }
-    get("architecture-review-role").value = "all"; get("architecture-review-state").value = "deviates";
     get("architecture-review-close").addEventListener("click", () => { get("architecture-review-panel").hidden = true; });
-    for (const id of ["architecture-review-role","architecture-review-state"]) get(id).addEventListener("change", renderReview);
-    get("architecture-select-scope").addEventListener("click", selectScope);
-    get("architecture-add-selected").addEventListener("click", () => { if (selected.size) beginDraft({type:"addExceptions",pairs:[...selected.values()],reason:""}); });
     get("architecture-reason").addEventListener("input", invalidatePreview);
     get("architecture-preview").addEventListener("click", previewDraft);
     get("architecture-confirm").addEventListener("click", applyDraft);

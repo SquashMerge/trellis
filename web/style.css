@@ -567,12 +567,13 @@ button:is(.selected, [aria-pressed="true"]) .badge { background: var(--clear); c
 #sequence-diagram [data-boundary-highlight=true] text { fill:var(--sm-amber); }
 
 /* Deviations tree (#786): production $layers deviations by file, function and line. */
-#architecture-deviations { display: flex; flex-direction: column; gap: var(--sp-2); padding: var(--sp-2) 0; overflow: auto; overscroll-behavior: contain; font: 13px/1.5 var(--sans); }
+#architecture-deviations { display: flex; flex-direction: column; gap: var(--sp-2); padding: var(--sp-2) 18px; overflow: auto; overscroll-behavior: contain; font: 13px/1.5 var(--sans); }
 #architecture-deviations :is(p, span, label, button) { overflow-wrap: anywhere; }
 #architecture-deviations p { margin: 0; }
 #architecture-deviations .deviations-header { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--sp-1) var(--sp-3); }
 #architecture-deviations .deviations-header .detail { flex-basis: 100%; }
-#architecture-deviations .deviations-header #architecture-deviations-review { margin-left: auto; }
+#architecture-deviations .deviations-header h2 { margin: 0; flex-basis: 100%; }
+#architecture-deviations .deviations-coverage[hidden] { display: none; }
 #architecture-deviations .deviations-back { background: none; border: 0; padding: 0; min-height: 0; color: var(--link); text-decoration: underline; text-underline-offset: 3px; }
 #architecture-deviations .deviations-filters { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2) var(--sp-3); }
 #architecture-deviations .deviations-filters > .detail { margin-left: auto; }
@@ -583,7 +584,7 @@ button:is(.selected, [aria-pressed="true"]) .badge { background: var(--clear); c
 #architecture-deviations .deviations-card { max-height: 70vh; overflow: auto; overscroll-behavior: contain; border: 1px solid var(--line); border-radius: var(--radius-card); background: var(--surface); }
 #architecture-deviations .deviations-card > .detail { padding: var(--sp-2) var(--sp-3); }
 #architecture-deviations .deviations-head, #architecture-deviations .deviation-row {
-  display: grid; grid-template-columns: minmax(0, 1fr) minmax(120px, 200px) 56px 72px 32px; gap: var(--sp-2); align-items: start; padding: var(--sp-1) var(--sp-3);
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(160px, 280px) 56px 72px 32px; gap: var(--sp-2); align-items: start; padding: var(--sp-1) var(--sp-3);
 }
 #architecture-deviations .deviations-head { color: var(--secondary); font-size: 12px; border-bottom: 1px solid var(--line); }
 #architecture-deviations .deviations-head span:nth-child(3), #architecture-deviations .deviations-head span:nth-child(4),
@@ -601,10 +602,10 @@ button:is(.selected, [aria-pressed="true"]) .badge { background: var(--clear); c
 #architecture-deviations .deviation-line { font: 13px/1.5 var(--mono); }
 #architecture-deviations .deviation-path { overflow-wrap: anywhere; }
 #architecture-deviations .deviation-row[data-level="1"] .deviation-path { font-weight: 600; }
-#architecture-deviations .deviation-reach { display: flex; flex-direction: column; align-items: flex-start; gap: var(--sp-1); min-width: 0; }
-#architecture-deviations .deviation-reason { font-size: 12px; }
+#architecture-deviations .deviation-reach { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 var(--sp-2); min-width: 0; }
+#architecture-deviations .deviation-target { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; overflow-wrap: normal; }
 #architecture-deviations .deviation-muted { color: var(--secondary); }
-#architecture-deviations .deviation-edge { border: 1px solid var(--error); border-radius: 999px; padding: 1px var(--sp-2); font: 12px/1.4 var(--mono); color: var(--error); }
+#architecture-deviations .deviation-edge { white-space: nowrap; overflow-wrap: normal; font: 12px/1.5 var(--mono); color: var(--error); }
 #architecture-deviations .deviation-calls[data-tone="error"] { color: var(--error); }
 #architecture-deviations .deviation-kind { font-size: 12px; border-radius: var(--radius-detail); margin: 0; background: none; border: 1px solid var(--line-strong); color: var(--secondary); }
 #architecture-deviations .deviation-kind[data-kind="call"] { border-color: var(--error); color: var(--error); }

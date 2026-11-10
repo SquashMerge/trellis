@@ -54,6 +54,15 @@ shared = true
 paths = ["src/no-match.rs"]
 `;
 
+// An authored exception keeps the low → top arrow in the inspector: only unexcepted production
+// deviations open the Deviations tree (#845).
+const lowTopException = (target = "src/low.rs", destination = "src/top.rs") => `
+[[exceptions]]
+rule = "$layers"
+target = { language = "rust", path = "${target}" }
+destination = { language = "rust", path = "${destination}" }
+reason = "Reviewed so the arrow keeps its evidence inspector"
+`;
 async function capture(page, name) {
   const directory = process.env.TRELLIS_BROWSER_SCREENSHOTS;
   if (!directory) return;
@@ -134,57 +143,41 @@ async function architecture(selected, aggregate = "max", role = "production") {
   }
 }
 
-// #646: the same pinned boundary sites drive caller navigation, never a name search.
-test("Architecture boundary callers open their Sequence and Back restores the arrow", {timeout:240000}, async () => published(rules, async selected => {
+// #845: a deviating arrow opens the Deviations tree on its edge; Back returns to the arrow.
+test("Architecture deviating arrows open the Deviations tree on their edge, and Back returns to the arrow", {timeout:240000}, async () => published(rules, async selected => {
   const {page, requests} = selected;
   await ready(page);
-  const edge = page.locator("#architecture-diagram").getByRole("button", {name:/^2 production sites · upward\s+deviation(?: · .*)?$/});
-  await edge.focus(); await page.keyboard.press("Enter"); await settled(page);
-  const pair = page.locator("#architecture-inspector-content > details").filter({has:page.locator("summary", {hasText:/src\/low\.rs → src\/top\.rs/})}).first();
-  await pair.locator(":scope > summary").click();
-  const callers = page.locator("#architecture-inspector-content .architecture-caller");
-  assert.equal(await callers.count(), 2, "both exact measured calling methods get a separate group");
-  const caller = callers.filter({hasText:/\blow\b/}).first();
-  assert.match(await caller.textContent(), /1 (?:sampled )?boundary site/);
-  const open = caller.getByRole("button", {name:"Open sequence", exact:true});
-  await open.click();
-  await page.waitForFunction(() => document.querySelector("#sequence-diagram [data-boundary-highlight='true']") || document.querySelector("#sequence-boundary-status")?.textContent.includes("Show all steps"));
-  assert.equal(await page.locator("#view-sequence").getAttribute("aria-selected"), "true");
-  const sequenceRequest = requests.filter(row => row.url.pathname.endsWith("/sequence") && row.method === "POST").at(-1);
-  assert.ok(sequenceRequest, "opening the caller reads a real published sequence");
-  const response = await H.api(selected.server.base, selected.paths.token, "POST", H.scoped(selected.server.rootKey, "sequence"), sequenceRequest.body);
-  assert.equal(response.status, 200, JSON.stringify(response.data));
-  assert.equal(response.data.seed.name, "low", "the exact enclosing method, not the current explorer method");
-  const status = page.locator("#sequence-boundary-status");
-  if (await status.getByRole("button", {name:"Show all steps", exact:true}).count()) {
-    assert.match(await status.textContent(), /hidden|not (?:shown|visible)/i);
-    await status.getByRole("button", {name:"Show all steps", exact:true}).click();
+  const arrows = [
+    [page.locator("#architecture-diagram").getByRole("button", {name:/^2 production sites · upward\s+deviation(?: · .*)?$/}), /^low → top · \d+$/, "upward"],
+    [page.locator("#architecture-diagram").getByRole("button", {name:/production sites · (?:peer|cross)[^·]*deviation/}).first(), /^⇄ mid → peer · \d+$/, "peer"],
+  ];
+  for (const [arrow, chip, kind] of arrows) {
+    assert.equal(await arrow.count(), 1, `the ${kind} arrow is drawn`);
+    await arrow.focus(); await page.keyboard.press("Enter");
+    await page.locator("#architecture-deviations-tree .deviation-row").first().waitFor({state:"visible"});
+    assert.equal(await page.locator("#architecture-diagram").isHidden(), true);
+    const pressed = await page.locator("#architecture-deviations-edges button[aria-pressed=true]").allTextContents();
+    assert.equal(pressed.length, 1, `one chip is pressed for the ${kind} arrow`); assert.match(pressed[0], chip);
+    assert.equal(await page.locator("#architecture-deviations-calls").isChecked(), false);
+    assert.equal(await page.locator("#architecture-deviations-tree .deviation-row[aria-selected=true]").count(), 0, "no line is selected");
+    assert.equal(await page.locator("#architecture-review-panel").isVisible(), false, "no rule-instance review list");
+    assert.equal(await page.locator("#architecture-panel .architecture-toolbar").isVisible(), false, "the tree replaces the toolbar");
+    if (kind === "upward") await capture(page, "architecture-arrow-opens-deviations");
+    await page.locator("#architecture-deviations-back").click();
+    await page.locator("#architecture-diagram").waitFor({state:"visible"});
+    assert.equal(await arrow.evaluate(node => node === document.activeElement), true, `Back returns focus to the ${kind} arrow`);
+    assert.equal(await page.locator("#architecture-inspector-title").textContent(), "Architecture review");
   }
-  const highlighted = page.locator("#sequence-diagram [data-boundary-highlight='true']").first();
-  await highlighted.waitFor({state:"visible"});
-  assert.equal(await highlighted.evaluate(node => {
-    const box = node.getBoundingClientRect(), canvas = document.querySelector("#sequence-diagram").getBoundingClientRect();
-    return box.bottom > canvas.top && box.top < canvas.bottom && box.right > canvas.left && box.left < canvas.right;
-  }), true, "the boundary call is scrolled into the diagram viewport");
-  await capture(page, "architecture-boundary-deviation-sequence");
-  await page.goBack();
-  await page.locator("#architecture-panel").waitFor({state:"visible"});
-  assert.equal(await page.locator("#architecture-inspector-title").textContent(), "low → top");
-  await page.locator("#architecture-inspector-content .architecture-caller").first().waitFor({state:"visible"});
-  assert.equal(await edge.getAttribute("aria-pressed"), "true", "Back restores the original Architecture arrow");
+  assert.equal(requests.some(row => row.url.pathname.endsWith("/architecture/details") && row.url.searchParams.has("sourceLayer")), false, "no per-edge instance list is read");
 }));
-
 
 test("Architecture authored exceptions reach the same caller and preserve the exception on Back", {timeout:240000}, async () => published(rules, async selected => {
   const {page} = selected;
   await ready(page);
-  await openRuleReview(page);
-  await page.locator("#architecture-review-role").selectOption("production");
-  await page.locator("#architecture-review-state").selectOption("deviates"); await settled(page);
-  await reviewPair(page, "src/low.rs", "src/top.rs").getByRole("checkbox").check();
-  await page.locator("#architecture-add-selected").click();
+  await addLineException(page, "low → top", "src/low.rs", 1);
   await page.locator("#architecture-reason").fill("Reviewed boundary for sequence navigation");
   await confirmChange(selected, await previewChange(selected));
+  await page.locator("#architecture-deviations-back").click();
   await page.locator("#architecture-authored").click();
   const entry = page.locator("#architecture-exceptions [data-exception-index='0']");
   await entry.getByRole("button", {name:"Inspect boundary calls", exact:true}).click();
@@ -219,9 +212,9 @@ test("Architecture does not invent a caller for syntax-only non-call boundary si
   const withTypes = new Map(sources);
   withTypes.set("src/top.rs", `${withTypes.get("src/top.rs")}pub struct Marker;\n`);
   withTypes.set("src/low.rs", `${lowSource}pub fn takes_type(value: crate::top::Marker) {}\n`);
-  await published(rules, async ({page}) => {
+  await published(rules + lowTopException(), async ({page}) => {
     await ready(page);
-    const edge = page.locator("#architecture-diagram").getByRole("button", {name:/production sites · upward\s+deviation/}).first();
+    const edge = page.locator("#architecture-diagram").getByRole("button", {name:/production sites · upward\s+deviation · exception/}).first();
     await edge.focus(); await page.keyboard.press("Enter"); await settled(page);
     const pair = page.locator("#architecture-inspector-content > details").filter({has:page.locator("summary", {hasText:/src\/low\.rs → src\/top\.rs/})}).first();
     await pair.locator(":scope > summary").click();
@@ -240,7 +233,7 @@ test("Architecture keeps distinct measured callers with colliding stable lookup 
     ["src/low.rs", "pub struct Store; pub trait First { fn same(); } pub trait Second { fn same(); } impl First for Store { fn same() { crate::top::target(); } } impl Second for Store { fn same() { crate::top::target(); } }\n"],
     ["src/top.rs", "pub fn target() {}\n"],
   ]);
-  const config = 'version=1\n[layers.low]\norder=2\npaths=["src/low.rs"]\n[layers.top]\norder=1\npaths=["src/top.rs"]\n';
+  const config = 'version=1\n[layers.low]\norder=2\npaths=["src/low.rs"]\n[layers.top]\norder=1\npaths=["src/top.rs"]\n' + lowTopException();
   await published(config, async ({page}) => {
     await ready(page);
     const edge = page.locator("#architecture-diagram").getByRole("button", {name:/^2 production sites · upward\s+deviation/});
@@ -273,7 +266,7 @@ test("Architecture opens the measured inner boundary call inside an argument", {
     ["src/low.rs", "pub fn nested() { consume(crate::top::target()); } fn consume(_: ()) {}\n"],
     ["src/top.rs", "pub fn target() {}\n"],
   ]);
-  const config = 'version=1\n[layers.low]\norder=2\npaths=["src/low.rs"]\n[layers.top]\norder=1\npaths=["src/top.rs"]\n';
+  const config = 'version=1\n[layers.low]\norder=2\npaths=["src/low.rs"]\n[layers.top]\norder=1\npaths=["src/top.rs"]\n' + lowTopException();
   await published(config, async ({page}) => {
     await ready(page);
     const edge = page.locator("#architecture-diagram").getByRole("button", {name:/^1 production sites · upward\s+deviation/});
@@ -299,10 +292,24 @@ async function ready(page) {
   await page.locator("#architecture-state[data-state=ready]").waitFor({state:"attached"});
   await page.locator("#architecture-diagram svg").first().waitFor({state:"attached"});
 }
-// The deviations chip opens the tree; the review panel's rule list is one click further.
-async function openRuleReview(page) {
-  await page.locator("#architecture-review").click();
-  await page.locator("#architecture-deviations-review").click();
+// #845: an exception is added from one line of the Deviations tree, for that line's file pair.
+async function addLineException(page, chip, file, line) {
+  if (!await page.locator("#architecture-deviations-tree .deviation-row").first().isVisible().catch(() => false)) {
+    await page.locator("#architecture-review").click();
+    await page.locator("#architecture-deviations-tree .deviation-row").first().waitFor({state:"visible"});
+  }
+  await page.locator("#architecture-deviations-edges button").filter({hasText:chip}).click();
+  for (let round = 0; round < 30; round++) {
+    const next = page.locator('#architecture-deviations-tree .deviation-row[aria-expanded="false"]').first();
+    if (!await next.count()) break;
+    await next.click();
+  }
+  const row = page.locator('#architecture-deviations-tree .deviation-row[data-level="3"]').filter({has:page.locator(".deviation-line", {hasText:new RegExp(`^L${line}$`)})})
+    .filter({has:page.locator(`.deviation-actions[aria-label$="in ${file}"]`)}).first();
+  await row.click();
+  await row.locator(".deviation-actions").click();
+  await page.locator('[role=menu][aria-label="Line actions"]').getByRole("menuitem", {name:/^Add exception for this file pair/}).click();
+  await page.locator("#architecture-editor").waitFor({state:"visible"});
 }
 // Inspector and review details load on demand (#448); wait until every list has its page.
 async function settled(page) {
@@ -545,17 +552,13 @@ test("Architecture uses real pinned structural sites, authored native-file layer
   await page.waitForFunction(() => ![...document.querySelectorAll('#architecture-diagram [role=button]')].some(node => node.getAttribute("aria-label")?.includes("test sites")));
   const edge = page.locator("#architecture-diagram").getByRole("button", {name:/^2 production sites · upward\s+deviation(?: · .*)?$/});
   await edge.click();
-  const edgeDetail = await page.locator("#architecture-inspector-content").textContent();
-  assert.match(edgeDetail, /2 exact production structural reference sites.*deviates/is);
-  assert.match(edgeDetail, /src\/low\.rs.*src\/top\.rs/is);
-  assert.match(edgeDetail, /2 sampled sites.*0 omitted sites/is);
-  const pair = page.locator("#architecture-inspector-content > details").first();
-  await pair.locator(":scope > summary").click();
-  const sample = pair.locator(":scope > details").filter({has:page.locator('summary', {hasText:/production · call/})}).first();
-  await sample.locator(":scope > summary").click();
-  await sample.getByRole("button", {name:"Read indexed reference source"}).click();
-  await page.waitForFunction(() => document.querySelector("#source .source-line.highlight"));
-  assert.equal(await page.locator("#source .source-line.highlight .line-number").first().textContent(), String(reverse.sites[0].lines.start));
+  // #845: the production deviation arrow opens the Deviations tree on its edge, listing the same pair.
+  await page.locator("#architecture-deviations-tree .deviation-row").first().waitFor({state:"visible"});
+  assert.match((await page.locator("#architecture-deviations-edges button[aria-pressed=true]").allTextContents()).join(), /^low → top · \d+$/);
+  assert.match(await page.locator("#architecture-deviations-tree").textContent(), /src\/low\.rs/);
+  assert.equal(reverse.sites[0].lines.start > 0, true);
+  await page.locator("#architecture-deviations-back").click();
+  await ready(page);
   assert.equal(await page.getByRole("button", {name:"Open in Treemap", exact:true}).count(), 0, "An edge/source selection is not a module identity");
   await page.locator("#architecture-color").selectOption("layer");
   await page.waitForFunction(() => document.querySelector("#architecture-legend")?.textContent.includes("neutral chips"));
@@ -689,7 +692,7 @@ function expectedChips(check, layers) {
     counts.set(key, (counts.get(key) || 0) + row.referenceCount); totals.set(row.sourceLayer, counts);
   }
   const order = ["⇄", "↓", "→shared", "allowed", "excepted", "unknown"];
-  const text = (key, count) => key.startsWith("↑ ") ? `↑${count} deviation · ${key.slice(2)}` : `${key}${/^[⇄↓]$/.test(key) ? "" : " "}${count}`;
+  const text = (key, count) => key.startsWith("↑ ") ? `↑${count} ${/^≥?1$/.test(String(count)) ? "reference" : "references"} · ${key.slice(2)}` : `${key}${/^[⇄↓]$/.test(key) ? "" : " "}${count}`;
   // Upward deviations are one chip per destination, each a control that follows its band.
   return new Map([...totals].map(([layer, counts]) => [layer, [...[...counts.keys()].filter(key => key.startsWith("↑ ")).sort(), ...order.filter(key => counts.get(key))].map(key => text(key, counts.get(key)))]));
 }
@@ -735,7 +738,7 @@ test("Architecture draws the full stack, module chips per band, lower-bound coun
   const share = `${Math.round(lowCoverage.mappedSites / lowCoverage.sites * 100)}%`;
   const bound = layer => (dto.references.coverage.find(row => row.layer === layer && row.role === "production")?.unresolvedSites ?? 1) > 0;
   const chips = expectedChips(check, dto.layers);
-  assert.deepEqual(chips.get("low"), ["↑2 deviation · top"], "the fixture's low layer has a 2-site upward deviation, named by its destination");
+  assert.deepEqual(chips.get("low"), ["↑2 references · top"], "the fixture's low layer has a 2-site upward deviation, named by its destination");
   for (const layer of ["low", "mid", "peer", "shared", "top"]) {
     const drawn = await chipTexts(page, layer);
     const expected = (chips.get(layer) || []).map(text => bound(layer) ? text.replace(/^(\D*)(\d+)/, "$1≥$2") : text).sort();
@@ -762,9 +765,12 @@ test("Architecture draws the full stack, module chips per band, lower-bound coun
   assert.equal(await page.locator("#architecture-inspector-title").textContent(), "Architecture review");
   assert.deepEqual(await page.locator("#architecture-inspector-content .architecture-chip").allTextContents(),
     [`${check.counts.deviates} deviation${check.counts.deviates === 1 ? "" : "s"}`, `${check.unassignedFileCount} unassigned file${check.unassignedFileCount === 1 ? "" : "s"}`, "0 exceptions"]);
-  await openRuleReview(page); await settled(page);
-  assert.equal(await page.locator("#architecture-review-list [data-rule]").count(), check.counts.deviates, "the deviations chip lists exactly what it counts");
-  await page.locator("#architecture-review-close").click();
+  const read = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/architecture/details"));
+  await page.locator("#architecture-review").click();
+  assert.equal((await (await read).json()).payload.total, check.counts.deviates, "the deviations chip opens the tree on exactly what it counts");
+  await page.locator("#architecture-deviations-tree .deviation-row").first().waitFor({state:"visible"});
+  await page.locator("#architecture-deviations-back").click();
+  await ready(page);
   await capture(page, "architecture-modules-default");
 
   await page.locator(low).focus();
@@ -789,7 +795,7 @@ test("Architecture draws the full stack, module chips per band, lower-bound coun
   await page.locator(low).focus();
   await rerendered(page, () => page.keyboard.press("Enter"));
   assert.equal(await page.locator(low).getAttribute("aria-expanded"), "false");
-  assert.deepEqual((await chipTexts(page, "low")).map(([text]) => text), ["↑≥2 deviation · top"], "a folded band keeps its count chips");
+  assert.deepEqual((await chipTexts(page, "low")).map(([text]) => text), ["↑≥2 references · top"], "a folded band keeps its count chips");
   await rerendered(page, () => page.keyboard.press("Enter"));
   assert.equal(await page.locator(low).getAttribute("aria-expanded"), "true");
   const stored = await displayStore(selected);
@@ -883,21 +889,17 @@ async function confirmChange(selected, preview) {
   assert.equal(refreshed.data.payload.rulesFile.contentHash, preview.proposedHash);
   return refreshed.data.payload;
 }
-const reviewPair = (page, source, destination) => page.locator("#architecture-review-list [data-rule]")
-  .filter({has:page.getByRole("checkbox", {name:`Select ${source} → ${destination}`, exact:true})});
-
-test("Architecture review keeps exact evidence, independent filters and all unassigned files", {timeout:240000}, async () => published(rules, async selected => {
+test("Architecture arrow inspector keeps exact evidence for an excepted arrow, and lists all unassigned files", {timeout:240000}, async () => published(rules + lowTopException(), async selected => {
   const {page} = selected;
   await ready(page);
   const dto = (await architecture(selected)).data.payload;
-  const edge = page.locator("#architecture-diagram").getByRole("button", {name:/^2 production sites · upward\s+deviation(?: · .*)?$/});
+  const edge = page.locator("#architecture-diagram").getByRole("button", {name:/^2 production sites · upward\s+deviation · exception/});
   // In the summary a skip-level count can sit under a peer count; select it by keyboard.
-  await edge.focus(); await page.keyboard.press("Enter");
-  await page.locator("#architecture-review-panel").waitFor({state:"visible"}); await settled(page);
-  const row = reviewPair(page, "src/low.rs", "src/top.rs");
-  assert.equal(await row.count(), 1);
-  assert.match(await row.textContent(), /\$layers.*src\/low\.rs.*src\/top\.rs.*deviates/is);
-  assert.match(await row.textContent(), /2/);
+  await edge.focus(); await page.keyboard.press("Enter"); await settled(page);
+  assert.equal(await page.locator("#architecture-deviations").isVisible(), false, "an excepted arrow is not a deviation: it keeps the inspector");
+  assert.equal(await page.locator("#architecture-review-panel").isVisible(), false, "and opens no review list");
+  assert.equal(await page.locator("#architecture-inspector-content input[type=checkbox]").count(), 0);
+  assert.match(await page.locator("#architecture-inspector-content").textContent(), /2 exact production structural reference sites · deviates · excepted/);
   const pair = page.locator("#architecture-inspector-content > details").filter({has:page.locator("summary", {hasText:/src\/low\.rs → src\/top\.rs/})}).first();
   await pair.locator(":scope > summary").click();
   assert.match(await pair.textContent(), /2 sampled sites.*0 omitted sites/is);
@@ -912,22 +914,6 @@ test("Architecture review keeps exact evidence, independent filters and all unas
   const reference = dto.edges.filter(edge => edge.role === "production").flatMap(edge => edge.pairs).find(value => value.source.path === "src/low.rs" && value.target.path === "src/top.rs");
   assert.equal(await page.locator("#source .source-line.highlight .line-number").first().textContent(), String(reference.sites[0].lines.start));
 
-  await openRuleReview(page);
-  await page.locator("#architecture-review-role").selectOption("production");
-  await page.locator("#architecture-review-state").selectOption("deviates"); await settled(page);
-  const production = await page.locator("#architecture-review-list").textContent();
-  assert.match(production, /src\/low\.rs.*src\/top\.rs/is);
-  assert.match(production, /src\/mid\.rs.*src\/peer\.rs/is);
-  await page.locator("#architecture-review-role").selectOption("test"); await settled(page);
-  const tests = await page.locator("#architecture-review-list").textContent();
-  assert.match(tests, /src\/low\.rs.*src\/top\.rs/is);
-  assert.doesNotMatch(tests, /src\/mid\.rs.*src\/peer\.rs/is);
-  assert.equal(await page.locator("#architecture-metric-tests").isChecked(), false, "review role never changes the heat population");
-  assert.equal(await page.locator("#architecture-tests").isChecked(), false, "review role never changes the reference overlay");
-  await page.locator("#architecture-review-role").selectOption("all");
-  await page.locator("#architecture-review-state").selectOption("unknown"); await settled(page);
-  assert.match(await page.locator("#architecture-review-list").textContent(), /unknown/i);
-  assert.equal(await page.locator("#architecture-review-list input[type=checkbox]:enabled").count(), 0, "unknown destinations cannot be waived");
   await page.locator("#architecture-unassigned").click();
   const unassigned = await page.locator("#architecture-review-list").textContent();
   assert.ok(dto.modules.filter(module => module.layer === null).every(module => unassigned.includes(module.identity.path)));
@@ -937,63 +923,57 @@ test("Architecture review keeps exact evidence, independent filters and all unas
   await noOverflow(page);
 }));
 
-test("Architecture groups two witnessed pairs in one reason, previews once and adds/edits/removes exact bytes", {timeout:240000}, async () => published(`# preserved rules header\n${rules}`, async selected => {
+test("Architecture adds file-pair exceptions from tree lines, then edits and removes one with exact bytes", {timeout:240000}, async () => published(`# preserved rules header\n${rules}`, async selected => {
   const {page} = selected;
   await ready(page);
-  await openRuleReview(page);
-  await page.locator("#architecture-review-role").selectOption("production");
-  await page.locator("#architecture-review-state").selectOption("deviates"); await settled(page);
-  for (const [source, destination] of [["src/low.rs", "src/top.rs"], ["src/mid.rs", "src/peer.rs"]]) {
-    await reviewPair(page, source, destination).getByRole("checkbox").check();
-  }
-  await page.locator("#architecture-add-selected").click();
+  await addLineException(page, "low → top", "src/low.rs", 1);
   await page.locator("#architecture-reason").fill("   ");
   await page.locator("#architecture-preview").click();
   assert.equal(rulesPosts(selected, "preview").length, 0, "blank reason is rejected before any preview request");
-  const reason = '<img src=x onerror="globalThis.ruleReasonExecuted=true"> reviewed two concrete pairs';
+  const reason = '<img src=x onerror="globalThis.ruleReasonExecuted=true"> reviewed a concrete pair';
   await page.locator("#architecture-reason").fill(reason);
   const preview = await previewChange(selected);
-  assert.equal(preview.pairs.length, 2);
-  assert.equal(rulesPosts(selected, "preview").length, 1);
+  assert.equal(preview.pairs.length, 1);
   const body = rulesPosts(selected, "preview")[0].body;
   assert.equal(body.operations.length, 1);
   assert.equal(body.operations[0].type, "addExceptions");
   assert.equal(body.operations[0].reason, reason);
-  assert.deepEqual(body.operations[0].pairs.map(pair => [pair.source.path, pair.destination.path]).sort(), [["src/low.rs", "src/top.rs"], ["src/mid.rs", "src/peer.rs"]].sort());
+  assert.deepEqual(body.operations[0].pairs.map(pair => [pair.source.path, pair.destination.path]), [["src/low.rs", "src/top.rs"]], "exactly the line's file pair");
   assert.ok(preview.text.startsWith("# preserved rules header\n"), "unrelated authored text is preserved");
   await page.locator("#architecture-editor").scrollIntoViewIfNeeded();
-  await capture(page, "architecture-grouped-preview-desktop");
+  await capture(page, "architecture-line-exception-preview-desktop");
   await page.setViewportSize({width:390, height:844});
   await page.locator("#architecture-preview-result").scrollIntoViewIfNeeded();
-  await capture(page, "architecture-grouped-preview-mobile");
+  await capture(page, "architecture-line-exception-preview-mobile");
   await page.setViewportSize({width:1440, height:1000});
-  const dto = await confirmChange(selected, preview);
-  assert.equal(rulesPosts(selected, "apply").length, 1, "grouped authoring is one apply, never one save per pair");
+  await confirmChange(selected, preview);
   const applied = rulesPosts(selected, "apply")[0].body;
   assert.deepEqual(applied.operations, body.operations);
   assert.equal(applied.baseHash, body.baseHash);
   assert.equal(applied.proposedHash, preview.proposedHash);
-  for (const [source, destination] of [["src/low.rs", "src/top.rs"], ["src/mid.rs", "src/peer.rs"]]) {
+  await addLineException(page, "mid → peer", "src/mid.rs", 1);
+  await page.locator("#architecture-reason").fill("Reviewed peer pair");
+  await confirmChange(selected, await previewChange(selected));
+  for (const [source, destination, why] of [["src/low.rs", "src/top.rs", reason], ["src/mid.rs", "src/peer.rs", "Reviewed peer pair"]]) {
     const instance = rulesCheck(selected).instances.find(row => row.rule === "$layers" && row.target.path === source && row.destination?.path === destination);
     assert.equal(instance.excepted, true);
     assert.equal(instance.status, "deviates", "excepted keeps the underlying verdict");
-    assert.equal(instance.exceptionReason, reason);
+    assert.equal(instance.exceptionReason, why);
   }
   assert.equal(await page.evaluate(() => globalThis.ruleReasonExecuted), undefined);
   assert.equal(await page.locator("#architecture-review-panel img, #architecture-editor img").count(), 0);
 
-  await openRuleReview(page);
-  await page.locator("#architecture-review-state").selectOption("excepted"); await settled(page);
-  assert.ok((await page.locator("#architecture-review-list").textContent()).includes(reason));
   await page.locator("#architecture-authored").click();
+  await page.locator("#architecture-exceptions [data-exception-index]").first().waitFor({state:"visible"});
+  assert.ok((await page.locator("#architecture-exceptions").textContent()).includes(reason));
   const exception = page.locator("#architecture-exceptions").getByRole("button", {name:"Edit reason", exact:true}).first();
   await exception.click();
   await page.locator("#architecture-reason").fill("Updated reviewed reason");
   const edited = await previewChange(selected);
   await confirmChange(selected, edited);
   assert.ok(rulesCheck(selected).instances.some(row => row.excepted && row.exceptionReason === "Updated reviewed reason"));
-  await openRuleReview(page);
   await page.locator("#architecture-authored").click();
+  await page.locator("#architecture-exceptions [data-exception-index]").first().waitFor({state:"visible"});
   await page.locator("#architecture-exceptions").getByRole("button", {name:"Remove", exact:true}).first().click();
   const removed = await previewChange(selected);
   await confirmChange(selected, removed);
@@ -1005,10 +985,7 @@ test("Architecture groups two witnessed pairs in one reason, previews once and a
 test("Architecture preserves a conflicted draft, reloads explicitly and requires a new preview", {timeout:240000}, async () => published(rules, async selected => {
   const {page, paths} = selected;
   await ready(page);
-  await openRuleReview(page);
-  await page.locator("#architecture-review-role").selectOption("production"); await settled(page);
-  await reviewPair(page, "src/low.rs", "src/top.rs").getByRole("checkbox").check();
-  await page.locator("#architecture-add-selected").click();
+  await addLineException(page, "low → top", "src/low.rs", 1);
   const reason = "Keep this draft through an ordinary editor conflict";
   await page.locator("#architecture-reason").fill(reason);
   const initial = await previewChange(selected);
@@ -1438,10 +1415,25 @@ test("Architecture lays out tags, titles and chips without collisions or truncat
   await capture(page, "architecture-layout-900");
 }, layoutFiles));
 
+// CI draws classic 15px scrollbars (Linux, and CI Macs without a trackpad); local Macs use overlay
+// scrollbars. A classic scrollbar in the canvas's stable gutter makes every host measure as CI does
+// (#860: at 1200px the canvas is 721px wide with a 697px inner width). The rule goes in through the
+// CSSOM of the page's own stylesheet, which the strict CSP allows.
+async function classicScrollbars(page) {
+  await page.evaluate(() => {
+    const sheet = [...document.styleSheets].find(item => item.href?.endsWith("/architecture.css"));
+    sheet.insertRule("#architecture-diagram::-webkit-scrollbar { width: 15px; height: 15px; }", sheet.cssRules.length);
+  });
+  const gutter = await page.evaluate(() => { const canvas = document.querySelector("#architecture-diagram"); return canvas.offsetWidth - canvas.clientWidth; });
+  assert.equal(gutter, 15, "the canvas reserves a classic 15px scrollbar gutter, as on CI");
+  await quiet(page);
+}
 test("Architecture re-lays out on a panel width change, keeping the selection and the inspector", {timeout:240000}, async () => published(layoutRules, async selected => {
   const {page} = selected;
   await ready(page);
-  const tag = page.locator("#architecture-diagram [data-trellis-edge-tone=deviation]").first();
+  await classicScrollbars(page);
+  // An allowed arrow keeps the edge inspector; a deviating one opens the Deviations tree (#845).
+  const tag = page.locator("#architecture-diagram [data-trellis-edge-tone=allowed]").first();
   const edgeId = await tag.getAttribute("data-trellis-edge-id");
   await tag.click(); await settled(page);
   const title = await page.locator("#architecture-inspector-title").textContent();
@@ -1632,9 +1624,13 @@ test("Deviations tree classifies lines and opens one menu three ways", {timeout:
     assert.equal(await page.locator("#architecture-diagram").isHidden(), true, "the diagram is hidden, not destroyed");
     assert.match(await page.locator("#architecture-deviations-summary").textContent(), /^\d+ files? · \d+ deviating references? · \d+ calls?$/);
     const badges = await page.locator("#architecture-deviations-tree .deviation-edge").allTextContents();
-    assert.ok(badges.length > 0 && badges.every(text => / · [\d,]+ references?$/.test(text)), `every badge counts references: ${JSON.stringify(badges)}`);
-    const chips = await page.locator("#architecture-deviations-edges button").allTextContents();
-    assert.ok(chips.length > 1 && chips.every(text => / · ≥?[\d,]+ references?$/.test(text)), `every chip counts references, not deviations (#816): ${JSON.stringify(chips)}`);
+    assert.ok(badges.length > 0 && badges.every(text => /^[▲⇄] \S+ \d[\d,]*$/.test(text)), `every reach reads "▲ <layer> N": ${JSON.stringify(badges)}`);
+    const chips = page.locator("#architecture-deviations-edges button");
+    assert.ok(await chips.count() > 1, "edge chips are listed");
+    for (const chip of await chips.all()) {
+      assert.match(await chip.textContent(), /^(?:⇄ )?.+ · [\d,]+$/, "a chip reads 'from → to · N' (#845)");
+      assert.match(await chip.getAttribute("aria-label"), /, [\d,]+ references?$/, "and counts references, not deviations (#816)");
+    }
     assert.equal(await page.evaluate(() => globalThis.architectureExecuted), undefined, "a hostile layer name is text");
     assert.equal(await page.locator("#architecture-deviations-edges button").filter({hasText:hostileLayer}).count(), 1, "the hostile layer name renders literally in its chip");
     assert.equal(await page.locator("#architecture-deviations img").count(), 0);
@@ -1929,7 +1925,7 @@ test("Deviations exception flow previews, confirms and removes the pair from the
   }, new Map(), base);
 });
 
-test("Deviations notice counts unknown instances and opens them in the review panel", {timeout:240000}, async () => {
+test("Deviations notice counts unknown instances and links to the same-layer and unassigned references", {timeout:240000}, async () => {
   const {config, base} = deviationsFixture();
   await published(config, async selected => {
     const {page} = selected;
@@ -1937,9 +1933,10 @@ test("Deviations notice counts unknown instances and opens them in the review pa
     await openDeviations(page);
     const notice = page.locator("#architecture-deviations-notices");
     assert.match(await notice.textContent(), /^.*\d+ unknown rule instances? (?:is|are) not deviations\./s);
-    await page.locator("#architecture-deviations-notices").getByRole("button", {name:"Inspect unknown instances"}).click();
-    await page.locator("#architecture-review-panel").waitFor({state:"visible"});
-    assert.equal(await page.locator("#architecture-review-state").inputValue(), "unknown");
+    await page.locator("#architecture-deviations-notices").getByRole("button", {name:"Inspect same-layer and unassigned references"}).click();
+    await page.locator("#architecture-diagram").waitFor({state:"visible"});
+    assert.equal(await page.locator("#architecture-inspector-title").textContent(), "Same-layer and unassigned references");
+    assert.equal(await page.locator("#architecture-review-panel").isVisible(), false);
   }, new Map(), base);
 });
 
@@ -2040,15 +2037,73 @@ test("a stub selects its interface with a visible Selected word, opens the inspe
 
 test("a ↑ badge opens the Deviations tree on its edge with the chip pressed and nothing selected", {timeout:240000}, async () => published(rules, async ({page}) => {
   await ready(page);
-  const badge = page.getByRole("button", {name:/^2 upward production reference sites from low to top · deviation · open in Deviations$|^at least 2 upward production reference sites from low to top/});
-  assert.equal(await badge.locator("text.trellis-architecture-stat").textContent(), "↑≥2 deviation · top");
+  const badge = page.getByRole("button", {name:/^(?:at least )?2 upward production references from low to top · deviation · open in Deviations$/});
+  assert.equal(await badge.locator("text.trellis-architecture-stat").textContent(), "↑≥2 references · top");
   assert.equal(await badge.evaluate(node => node.previousElementSibling?.getAttribute("data-trellis-layer-id")), "low", "the badge follows its band");
   await badge.focus(); await page.keyboard.press("Enter");
   await page.locator("#architecture-deviations-tree .deviation-row").first().waitFor({state:"visible"});
   const pressed = await page.locator("#architecture-deviations-edges button[aria-pressed=true]").allTextContents();
-  assert.equal(pressed.length, 1); assert.match(pressed[0], /^↑ low → top/);
+  assert.equal(pressed.length, 1); assert.match(pressed[0], /^low → top · \d+$/, "the design's chip: edge and reference count");
   assert.equal(await page.locator("#architecture-deviations-calls").isChecked(), false);
   assert.equal(await page.locator("#architecture-deviations-tree .deviation-row[aria-selected=true]").count(), 0, "no line is selected");
+}));
+
+// #845 stale results: a tree read still pending when the user opens another edge, or when the
+// index moves on, never paints over what is current.
+const detailsPattern = "**/api/checkouts/*/architecture/details?*";
+function holdDetails() {
+  let release, entered;
+  const gate = new Promise(resolve => { release = resolve; }), seen = new Promise(resolve => { entered = resolve; });
+  return {gate, seen, release:() => release(), entered:() => entered()};
+}
+test("Deviations: an edge opened while another edge's read is pending shows only the latest edge", {timeout:240000}, async () => published(rules, async ({page}) => {
+  await ready(page);
+  const hold = holdDetails();
+  const handler = async route => { hold.entered(); await hold.gate; await route.continue(); };
+  await page.route(detailsPattern, handler);
+  try {
+    const up = page.locator("#architecture-diagram").getByRole("button", {name:/^2 production sites · upward\s+deviation(?: · .*)?$/});
+    await up.focus(); await page.keyboard.press("Enter");
+    await hold.seen;
+    assert.match(await page.locator("#architecture-deviations-state").textContent(), /^Reading deviations/);
+    await page.locator("#architecture-deviations-back").click();
+    const peer = page.locator("#architecture-diagram").getByRole("button", {name:/production sites · (?:peer|cross)[^·]*deviation/}).first();
+    await peer.focus(); await page.keyboard.press("Enter");
+    hold.release();
+    await page.locator("#architecture-deviations-tree .deviation-row").first().waitFor({state:"visible"});
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    const pressed = await page.locator("#architecture-deviations-edges button[aria-pressed=true]").allTextContents();
+    assert.equal(pressed.length, 1); assert.match(pressed[0], /^⇄ mid → peer · \d+$/, "the later edge wins");
+    const files = await page.locator('#architecture-deviations-tree .deviation-row[data-level="1"] .deviation-path').allTextContents();
+    assert.deepEqual(files, ["src/mid.rs"], "only the later edge's files are listed");
+  } finally { hold.release(); await page.unroute(detailsPattern, handler); }
+}));
+
+test("Deviations: a tree read that answers after the index moved paints nothing", {timeout:240000}, async () => published(rules, async ({page, paths, pin, server, requests}) => {
+  await ready(page);
+  const hold = holdDetails();
+  const handler = async route => {
+    hold.entered(); await hold.gate;
+    await route.fulfill({status:409, contentType:"application/json", body:JSON.stringify({error:{code:"revision_conflict", message:"The index revision changed."}})});
+  };
+  await page.route(detailsPattern, handler);
+  try {
+    const up = page.locator("#architecture-diagram").getByRole("button", {name:/^2 production sites · upward\s+deviation(?: · .*)?$/});
+    await up.focus(); await page.keyboard.press("Enter");
+    await hold.seen;
+    const changed = `${sources.get("src/peer.rs")}pub fn added() {}\n`;
+    writeFileSync(join(paths.workspace, "src/peer.rs"), changed);
+    const head = await H.indexThroughApi(server, paths.token, pin, "src/peer.rs", changed);
+    assert.ok(head.indexRevision > pin.indexRevision);
+    hold.release();
+    await page.waitForFunction(() => !document.querySelector("#architecture-deviations-state")?.textContent.startsWith("Reading deviations"));
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    assert.equal(await page.locator("#architecture-deviations-tree .deviation-row").count(), 0, "no rows from a read of the old revision");
+    await page.waitForFunction(revision => document.querySelector("#status")?.textContent?.includes(`:${revision}`), head.indexRevision);
+  } finally { hold.release(); await page.unroute(detailsPattern, handler); }
+  // The conflict moved the view to the new head on purpose; the suite-wide check that every
+  // Architecture read uses the fixture's first pin applies to the reads before the move.
+  for (let i = requests.length - 1; i >= 0; i--) if (requests[i].url.searchParams.get("indexRevision") && requests[i].url.searchParams.get("indexRevision") !== String(pin.indexRevision)) requests.splice(i, 1);
 }));
 
 test("returning from the Deviations tree leaves no stub marked Selected", {timeout:240000}, async () => published(httpRules, async ({page}) => {
