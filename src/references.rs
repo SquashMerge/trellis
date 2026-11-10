@@ -13,6 +13,7 @@ pub(crate) mod callers;
 pub mod external;
 mod java;
 mod javascript;
+mod js_workspace;
 pub(crate) mod parallel_check;
 mod python;
 mod rust;
@@ -631,12 +632,15 @@ fn resolve(
                         &mut work,
                         &mut check,
                     )?;
+                    let workspaces =
+                        js_workspace::Workspaces::new(&snapshot.manifests, &mut work, &mut check)?;
                     Some(javascript::Catalog::new(
                         &docs,
                         &trees,
                         &document_map,
                         &selected,
                         &packages,
+                        &workspaces,
                         snapshot.root_tsconfig.as_ref(),
                         &mut work,
                         request,

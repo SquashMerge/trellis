@@ -26,6 +26,7 @@ mod file_tree;
 mod files_view_store;
 mod interfaces;
 mod java_behavior;
+mod js_workspaces;
 mod metrics;
 mod metrics_oracle;
 mod metrics_store;
