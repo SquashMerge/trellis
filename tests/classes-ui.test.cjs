@@ -660,3 +660,31 @@ test("app_choice_pending_control: an unchanged choice while a search is pending 
  gate.resolve(); await pending;
  assert.deepEqual(appListed(h),["sample.Widget"]); assert.equal(h.calls.length,1);
 });
+
+// #852 review (Prime, 680899d2): a search that failed is settled, so a later app change keeps the
+// drawn diagram; a search still pending over it follows the new app.
+test("app_choice_failed_search_settles: after a storage_busy search, an app change keeps the drawn diagram",async()=>{
+ let choice=webChoice();
+ const h=harness({appFilter:()=>choice});
+ await h.controller.open({seed:"A"}); const card=h.card("A");
+ const failure=deferred(); h.setRequest(()=>failure.promise);
+ const lookup=h.get("classes-search").fire("click");
+ failure.reject(Object.assign(new Error("Storage is busy"),{status:409,code:"storage_busy"})); await lookup;
+ assert.equal(h.card("A"),card); assert.equal(h.get("classes-state").dataset.state,"error");
+ await h.button(card,"execute()").fire("click"); assert.equal(h.methods.length,1);
+ const reads=h.calls.length;
+ h.setRequest(async()=>({revision:appRevision,items:appClasses(),nextOffset:null,warnings:[],truncated:false}));
+ choice=srvChoice(); await h.controller.scopeChanged();
+ assert.equal(h.card("A"),card,"the drawn diagram stays"); assert.equal(h.calls.length,reads,"no search was pending, so none is sent");
+});
+test("app_choice_pending_over_diagram: a search still pending over a drawn diagram follows the new app",async()=>{
+ let choice=webChoice();
+ const h=harness({appFilter:()=>choice});
+ await h.controller.open({seed:"A"});
+ const gate=deferred(); h.setRequest(()=>gate.promise);
+ const lookup=h.get("classes-search").fire("click");
+ h.setRequest(async()=>({revision:appRevision,items:appClasses(),nextOffset:null,warnings:[],truncated:false}));
+ choice=srvChoice(); await h.controller.scopeChanged();
+ gate.resolve({revision:appRevision,items:appClasses(),nextOffset:null,warnings:[],truncated:false}); await lookup;
+ assert.deepEqual(appListed(h),["sample.Server"],"the new app's list, not the old");
+});

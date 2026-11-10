@@ -357,6 +357,9 @@
     // Keep the current diagram and its callbacks usable while lookup is pending.
     // A failed non-revision request must not discard the only loaded view.
     state("Looking for indexed classes…", "loading");
+    // This search's record, once it is made. It settles however the search ends (listed, failed or
+    // superseded), but only while it is still the latest record, never a successor's.
+    let record = null;
     try {
       const params = new URLSearchParams({q, offset: String(offset), limit: "100", indexGeneration: c.revision.indexGeneration, indexRevision: String(c.revision.indexRevision)});
       if (path) params.set("path", path);
@@ -364,7 +367,7 @@
       const choice = path ? null : api.appFilter?.() || null;
       // The search is recorded before it reads, so a choice made while it is pending lists again
       // and supersedes it; every page is admitted only while the choice is still this one.
-      const record = lastLookup = {path, q, choice, ticket, done:false};
+      record = lastLookup = {path, q, choice, ticket, done:false};
       const chosen = () => path || sameChoice(choice, api.appFilter?.() || null);
       let data, items = [], outside = 0, pages = 0;
       for (;;) {
@@ -380,7 +383,7 @@
         if (items.length || data.nextOffset == null || pages >= APP_PAGES || !(data.nextOffset > Number(params.get("offset")))) break;
         params.set("offset", String(data.nextOffset));
       }
-      serial++; closeContextMenu(false); closeChooser(); ui.results.hidden = false; record.done = true;
+      serial++; closeContextMenu(false); closeChooser(); ui.results.hidden = false;
       controls.hidden = true;
       if (!offset) {
         showAll = false; memberChoices.clear(); expanded = [];
@@ -412,6 +415,8 @@
         if (conflict) { reset(); api.onStale?.("Workspace revision changed. Search again."); }
         state(error.message || "Class lookup failed. Try Search again.", conflict ? "stale" : "error");
       }
+    } finally {
+      if (record && lastLookup === record) record.done = true;
     }
   }
   async function loadDiagram(nextSeed, nextExpanded, fresh = false, focusId = null) {
