@@ -18,6 +18,7 @@ mod semantic_batch_support;
 #[path = "../support/producer.rs"]
 mod support;
 
+mod producer_doctor;
 mod producer_e2e;
 mod producer_e2e_java;
 mod producer_e2e_rust;

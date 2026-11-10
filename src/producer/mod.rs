@@ -1,13 +1,16 @@
 //! Explicit, owner-requested semantic producer runs (#21). Nothing in the
 //! watcher, the MCP server or daemon launch starts a producer; this module is
-//! reached only from the producer commands.
+//! reached only from the producer commands. `install` runs a pinned install
+//! command only from the explicit `producer install` CLI command (#880).
 
 use serde::{Deserialize, Serialize};
 
 pub mod batch;
 pub mod detect;
+pub mod doctor;
 pub mod exec;
 pub mod import;
+pub mod install;
 pub mod pickup;
 pub mod pickup_watch;
 pub mod plan;

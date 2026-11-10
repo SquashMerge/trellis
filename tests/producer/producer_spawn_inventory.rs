@@ -404,6 +404,8 @@ fn spawn_sites_are_closed_inventory() {
         (("src/main.rs", "&compiler"), 1),
         (("src/main.rs", "std::env::current_exe()?"), 1),
         (("src/producer/exec.rs", "&spec.argv[0]"), 1),
+        // The pinned install command, run only by the explicit `producer install` (#880).
+        (("src/producer/install.rs", "&program"), 1),
         (("src/store/topology.rs", "executable"), 1),
     ]);
     let mut actual: BTreeMap<(String, String), usize> = BTreeMap::new();
@@ -620,6 +622,119 @@ fn producer_spawn_reachable_only_from_run() {
         ["src/daemon/registry.rs", "src/producer/run.rs"],
         "start_run is called from the run owner and the registry's run handler only"
     );
+}
+
+/// The body of the first `fn name(` item in `text`, braces included.
+fn fn_body<'a>(text: &'a str, name: &str) -> &'a str {
+    let start = text
+        .find(&format!("fn {name}("))
+        .unwrap_or_else(|| panic!("fn {name}"));
+    let open = start + text[start..].find('{').unwrap();
+    let mut depth = 0_usize;
+    for (offset, c) in text[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &text[start..=open + offset];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unbalanced fn {name}")
+}
+
+#[test]
+fn pinned_install_is_reachable_only_from_the_explicit_cli_command() {
+    let module_list = production(|f| f == "src/producer/mod.rs", false);
+    let siblings: Vec<String> = module_list[0]
+        .1
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let rest = line
+                .strip_prefix("pub mod ")
+                .or_else(|| line.strip_prefix("mod "))?;
+            Some(rest.trim_end_matches(';').trim().to_owned())
+        })
+        .collect();
+    assert!(siblings.iter().any(|s| s == "install") && siblings.iter().any(|s| s == "doctor"));
+    let reaches_install = |text: &str| {
+        sibling_references(text, &siblings).contains(&"install".to_owned())
+            || whole_words(text, "run_pinned_install") > 0
+    };
+    // No daemon, read, plan, run, pickup, auto-run, MCP or browser path names the installer:
+    // only the CLI binary and the module itself.
+    let mut reached: Vec<String> = production(|_| true, false)
+        .into_iter()
+        .filter(|(_, text)| reaches_install(text))
+        .map(|(file, _)| file)
+        .collect();
+    reached.sort();
+    assert_eq!(
+        reached,
+        ["src/main.rs", "src/producer/install.rs"],
+        "the pinned install is reached only from the CLI"
+    );
+    // Inside the CLI, only `producer_install` names it, and only `main`'s own
+    // `producer install` arm calls that, outside the daemon dispatch.
+    let main = &production(|f| f == "src/main.rs", false)[0].1;
+    let handler = fn_body(main, "producer_install");
+    assert!(reaches_install(handler));
+    let rest = main.replace(handler, "");
+    assert!(
+        !reaches_install(&rest),
+        "main.rs names the installer elsewhere"
+    );
+    assert_eq!(whole_words(&rest, "producer_install"), 1, "one call site");
+    let entry = fn_body(main, "main");
+    assert!(entry.contains("ProducerAction::Install(args),"));
+    assert!(entry.contains("=> producer_install(&args)?"));
+    for function in ["dispatch_cli", "run_daemon"] {
+        assert_eq!(
+            whole_words(fn_body(main, function), "producer_install"),
+            0,
+            "{function} reaches the installer"
+        );
+    }
+    // The installer reaches only doctor and detection; doctor itself executes nothing.
+    let producer_files = production(|f| f.starts_with("src/producer/"), false);
+    let text_of = |name: &str| {
+        &producer_files
+            .iter()
+            .find(|(file, _)| file == &format!("src/producer/{name}.rs"))
+            .unwrap()
+            .1
+    };
+    let install = sibling_references(text_of("install"), &siblings);
+    assert!(
+        install
+            .iter()
+            .all(|m| matches!(m.as_str(), "detect" | "doctor")),
+        "install.rs reaches {install:?}"
+    );
+    let doctor = sibling_references(text_of("doctor"), &siblings);
+    assert!(
+        doctor
+            .iter()
+            .all(|m| matches!(m.as_str(), "detect" | "profiles")),
+        "doctor.rs reaches {doctor:?}"
+    );
+    for word in [
+        "spawn_producer",
+        "start_run",
+        "Command::new",
+        "ProducerOwner",
+        "PickupOwner",
+    ] {
+        assert_eq!(
+            whole_words(text_of("doctor"), word),
+            0,
+            "doctor names {word}"
+        );
+    }
 }
 
 /// The leading identifier of `text`.

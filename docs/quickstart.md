@@ -201,18 +201,35 @@ Out of the box, Trellis knows what your code *says*: which functions exist and w
 
 For that, run a language's own indexer, called a *producer*, and import the result. That gives you **semantic evidence**: resolved call targets, better Sequence diagrams, and more accurate Architecture references. Producers are optional, and you add them per language.
 
+**Semantic evidence (optional).** Everything above works without producers, on native evidence only. To see which producers your checkout would use and what each one needs, run this from inside the repository:
+
+```sh
+trellis producer doctor          # add --json for a machine-readable report
+```
+
+It is read-only and needs no daemon. For each producer that matches a language in the checkout it reports `ready`, `missing`, `wrongVersion` (with the version found and the pinned one), `unverifiable` (for example a version-manager shim or a hash mismatch) or `prerequisiteMissing` (for example no Node, no JDK, or no pinned Rust toolchain), and the exact pinned install command for each one that isn't ready. `ready` means `producer plan` will verify it. It always exits 0.
+
+To run one pinned install command, ask for it explicitly:
+
+```sh
+trellis producer install scip-typescript   # prints the command, then asks; --yes skips the prompt
+```
+
+It runs exactly the command `doctor` printed and nothing else, then checks the producer again. It never installs a prerequisite: with no Node, `rustup`, `coursier` or pinned Rust toolchain it refuses with `prerequisite_missing` and runs nothing. Without a terminal it refuses with `confirmation_required` unless you pass `--yes`. Trellis never installs a producer on its own: not the daemon, not `producer plan`, `run` or `pickup`, and not an automatic run.
+
 ### Install the producers
 
-Trellis accepts only the exact versions below, and never installs them for you.
+Trellis accepts only the exact versions below. It never installs them on its own; `trellis producer install <producer>` runs the pinned command only when you ask.
 
 | Language | Producer | Version | Install |
 | --- | --- | --- | --- |
 | JavaScript, TypeScript | `scip-typescript` | 0.4.0 | `npm install -g @sourcegraph/scip-typescript@0.4.0` |
 | Python | `scip-python` | 0.6.6 | `npm install -g @sourcegraph/scip-python@0.6.6` |
 | Java | `scip-java` | 0.12.3 | `coursier bootstrap --standalone com.sourcegraph:scip-java_2.13:0.12.3 -o ~/.local/bin/scip-java` |
-| Rust | `rust-analyzer` | 1.98.1 | `rustup toolchain install 1.98.1 --component rust-analyzer` |
+| Rust | `rust-analyzer` | 1.98.1 | `rustup toolchain install 1.98.1 --component rust-analyzer`, or with the toolchain already installed, `rustup component add rust-analyzer --toolchain 1.98.1` (what `producer install` runs) |
 
 - The npm producers need Node.
+- `trellis producer install scip-java` runs the command in the table, with `~` expanded to your home folder, and creates `~/.local/bin` first if it doesn't exist. Make sure `~/.local/bin` is on your `PATH`; `producer doctor` tells you if it isn't.
 - `scip-java` needs a JDK on your `PATH`. It also needs its own JDK in the Coursier cache, because Trellis runs it offline by default. To fetch that once (about 500 MB), run it by hand in an empty folder:
 
   ```sh
@@ -227,10 +244,10 @@ Trellis accepts only the exact versions below, and never installs them for you.
 Check what Trellis can see, from inside your repository:
 
 ```sh
-trellis producer status | jq '.producers[] | {name, detection}'
+trellis producer doctor
 ```
 
-Each producer should show `"result": "available"`. Otherwise `reason` says what's wrong, for example `version 0.4.1 != pinned 0.4.0`.
+Each producer you need should show `ready`. Otherwise the reason says what's wrong, for example `wrongVersion (found 0.4.1, pinned 0.4.0)`. `trellis producer status` reports the same detection per trust profile, through the daemon.
 
 ### Run a producer
 
