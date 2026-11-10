@@ -30,6 +30,7 @@ pub use semantic_display::{
     CallSemantic, CoverageDocument, LANGUAGE_NOTE, LanguagePending, LanguageTier, McpSemantic,
     NO_PRODUCER_NOTE, ProducerNotPublished, ProducerSelection, multiple_producers_note,
 };
+pub use semantic_retention::AutoRunHead;
 pub(crate) mod symbol_trigrams;
 pub mod topology;
 use crate::model::*;
