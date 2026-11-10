@@ -910,7 +910,7 @@
                   "const": 1
                 },
                 "toolVersion": {
-                  "const": 25
+                  "const": 26
                 },
                 "watcherDegraded": {
                   "type": "boolean"
@@ -5250,6 +5250,32 @@
             },
             "catchingUp": {
               "type": "boolean"
+            },
+            "semanticStatus": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "language": {
+                    "$ref": "#/$defs/Language"
+                  },
+                  "state": {
+                    "enum": [
+                      "catchingUp",
+                      "needsReimport"
+                    ]
+                  },
+                  "reason": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "language",
+                  "state",
+                  "reason"
+                ],
+                "additionalProperties": false
+              }
             }
           },
           "required": [
@@ -5262,7 +5288,8 @@
             "truncated",
             "truncationReason",
             "workspace",
-            "catchingUp"
+            "catchingUp",
+            "semanticStatus"
           ],
           "type": "object"
         },
@@ -7202,6 +7229,32 @@
             },
             "catchingUp": {
               "type": "boolean"
+            },
+            "semanticStatus": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "language": {
+                    "$ref": "#/$defs/Language"
+                  },
+                  "state": {
+                    "enum": [
+                      "catchingUp",
+                      "needsReimport"
+                    ]
+                  },
+                  "reason": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "language",
+                  "state",
+                  "reason"
+                ],
+                "additionalProperties": false
+              }
             }
           },
           "required": [
@@ -7214,7 +7267,8 @@
             "truncated",
             "truncationReason",
             "workspace",
-            "catchingUp"
+            "catchingUp",
+            "semanticStatus"
           ],
           "type": "object"
         },
@@ -9143,6 +9197,32 @@
             },
             "catchingUp": {
               "type": "boolean"
+            },
+            "semanticStatus": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "language": {
+                    "$ref": "#/$defs/Language"
+                  },
+                  "state": {
+                    "enum": [
+                      "catchingUp",
+                      "needsReimport"
+                    ]
+                  },
+                  "reason": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "language",
+                  "state",
+                  "reason"
+                ],
+                "additionalProperties": false
+              }
             }
           },
           "required": [
@@ -9155,7 +9235,8 @@
             "truncated",
             "truncationReason",
             "workspace",
-            "catchingUp"
+            "catchingUp",
+            "semanticStatus"
           ],
           "type": "object"
         },
@@ -12182,6 +12263,32 @@
             },
             "catchingUp": {
               "type": "boolean"
+            },
+            "semanticStatus": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "language": {
+                    "$ref": "#/$defs/Language"
+                  },
+                  "state": {
+                    "enum": [
+                      "catchingUp",
+                      "needsReimport"
+                    ]
+                  },
+                  "reason": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "language",
+                  "state",
+                  "reason"
+                ],
+                "additionalProperties": false
+              }
             }
           },
           "required": [
@@ -12194,7 +12301,8 @@
             "truncated",
             "truncationReason",
             "workspace",
-            "catchingUp"
+            "catchingUp",
+            "semanticStatus"
           ],
           "type": "object"
         },

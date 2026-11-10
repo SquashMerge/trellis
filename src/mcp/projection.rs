@@ -118,6 +118,30 @@ fn syntax_only<'a>(tiers: &Tiers, languages: impl IntoIterator<Item = &'a str>) 
     })
 }
 
+/// `semanticStatus` (#660): each of the answer's languages whose evidence is still catching
+/// up or needs re-import, in #22 order, from the same committed per-language state describe
+/// reports. `[]` when none is pending.
+fn semantic_status<'a>(tiers: &Tiers, languages: impl IntoIterator<Item = &'a str>) -> Value {
+    use crate::model::SemanticStatus;
+    let languages: std::collections::BTreeSet<&str> = languages.into_iter().collect();
+    Value::Array(
+        LANGUAGES
+            .into_iter()
+            .zip(tiers)
+            .filter(|(language, _)| languages.contains(language))
+            .filter_map(|(language, tier)| {
+                let pending = tier.pending.as_ref()?;
+                let state = match pending.status {
+                    SemanticStatus::NeedsReimport => "needsReimport",
+                    SemanticStatus::CatchingUp => "catchingUp",
+                    SemanticStatus::OlderBasis => return None,
+                };
+                Some(json!({"language":language,"state":state,"reason":pending.reason}))
+            })
+            .collect(),
+    )
+}
+
 pub fn describe(
     id: &Value,
     label: &str,
@@ -143,7 +167,7 @@ pub fn describe(
     let deadline_ms = u64::try_from(super::CALL_DEADLINE.as_millis()).unwrap_or(u64::MAX);
     json!({"schemaVersion":1,"requestId":id,"evidenceBasis":basis,
       "data":{"workspaceLabel":label,"indexState":state,"progress":progress,
-      "watcherDegraded":degraded,"languages":languages,"toolVersion":25,"schemaVersion":1,
+      "watcherDegraded":degraded,"languages":languages,"toolVersion":26,"schemaVersion":1,
       "searchIndex":crate::search_model::SearchAvailability::default(),
       // #851: the head's apps, when its architecture is read; the call fills them in.
       "apps":{"state":"unavailable","items":[],"noApp":null},
@@ -223,6 +247,53 @@ pub const COVERAGE_DOCUMENTS_DEFAULT: usize = 20;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tiers whose listed languages (by name) are pending with the given status and reason.
+    pub(super) fn pending_tiers(entries: &[(&str, crate::model::SemanticStatus, &str)]) -> Tiers {
+        let mut tiers = Tiers::default();
+        for (name, status, reason) in entries {
+            let at = LANGUAGES
+                .iter()
+                .position(|language| language == name)
+                .unwrap();
+            tiers[at].pending = Some(crate::store::LanguagePending {
+                status: *status,
+                reason: (*reason).into(),
+            });
+        }
+        tiers
+    }
+
+    /// #660: only the answer's pending languages are listed, in #22 order, and `[]` when none.
+    #[test]
+    fn semantic_status_lists_the_answers_pending_languages_in_order() {
+        use crate::model::SemanticStatus::{CatchingUp, NeedsReimport};
+        let tiers = pending_tiers(&[
+            ("typescript", CatchingUp, "re-import pending"),
+            ("java", NeedsReimport, "re-import required"),
+            ("rust", NeedsReimport, "producer profile pin changed"),
+        ]);
+        assert_eq!(
+            semantic_status(&tiers, ["typescript", "rust", "java", "rust"]),
+            json!([
+                {"language":"java","state":"needsReimport","reason":"re-import required"},
+                {"language":"rust","state":"needsReimport","reason":"producer profile pin changed"},
+                {"language":"typescript","state":"catchingUp","reason":"re-import pending"},
+            ])
+        );
+        assert_eq!(
+            semantic_status(&tiers, ["rust", "python"]),
+            json!([{"language":"rust","state":"needsReimport","reason":"producer profile pin changed"}])
+        );
+        assert_eq!(semantic_status(&tiers, ["python"]), json!([]));
+        assert_eq!(semantic_status(&tiers, Vec::<&str>::new()), json!([]));
+        assert_eq!(semantic_status(&Tiers::default(), ["rust"]), json!([]));
+        assert!(
+            crate::mcp::tools::failure(&json!(1), "not_found")
+                .get("semanticStatus")
+                .is_none()
+        );
+    }
     #[test]
     fn compact_keeps_projection_and_historical_freshness() {
         let projection = json!({
@@ -297,7 +368,7 @@ mod tests {
         );
         assert_eq!(ready["evidenceBasis"], basis);
         assert_eq!(ready["data"]["watcherDegraded"], true);
-        assert_eq!(ready["data"]["toolVersion"], 25);
+        assert_eq!(ready["data"]["toolVersion"], 26);
         assert_eq!(
             ready["data"]["languages"][1]["coverage"],
             json!({
@@ -652,7 +723,8 @@ pub fn declaration(
         "data":{"stableLookupKey":source.stable_lookup_key,"displayKey":crate::references::display_key(&result.declaration),"declaration":compact,"doc":doc,"lines":source.lines.map(|lines| json!({"start":lines.start,"end":lines.end})),"documents":documents,
             "evidence":{"evidenceTier":"syntax","semanticBasis":null,"freshness":"fresh","staleBecause":[]},
             "coverage":result.coverage,"provenance":result.provenance},
-        "warnings":warnings,"partial":incomplete,"truncated":false,"truncationReason":null});
+        "warnings":warnings,"partial":incomplete,"truncated":false,"truncationReason":null,
+        "semanticStatus":semantic_status(tiers, [result.declaration.document.language.as_str()])});
     let frame = json!({"jsonrpc":"2.0","id":id,
         "result":super::tools::result("trellis_declaration", envelope.clone(), modern)});
     (serde_json::to_vec(&frame).ok()?.len() < super::wire::RESPONSE_BYTES).then_some(envelope)
@@ -2665,10 +2737,12 @@ fn call_warnings<'a>(
 }
 
 /// Calls have priority over optional hints in the complete structured-plus-summary wire budget.
+#[allow(clippy::too_many_arguments)]
 pub fn outgoing(
     id: &Value,
     result: crate::store::mcp_read::McpOutgoingWithLines,
     semantic: &crate::store::McpSemantic,
+    tiers: &Tiers,
     compact: bool,
     root: &std::path::Path,
     catching_up: bool,
@@ -2692,6 +2766,15 @@ pub fn outgoing(
                     .chain(item.candidate_documents[..shown[index]].iter())
             });
         let (documents, refs) = document_table(versions)?;
+        let languages: Vec<&str> =
+            std::iter::once(result.owner.selected.declaration.document.language.as_str())
+                .chain(
+                    documents
+                        .iter()
+                        .filter_map(|document| document["document"]["language"].as_str()),
+                )
+                .collect();
+        let semantic_status = semantic_status(tiers, languages);
         let mut coverage = BTreeMap::new();
         let mut provenance = BTreeMap::new();
         for row in &result.owner.selected.coverage {
@@ -2845,7 +2928,7 @@ pub fn outgoing(
             json!({"schemaVersion":1,"requestId":id,"workspace":root,"catchingUp":catching_up,
             "evidenceBasis":basis,"data":data,
             "warnings":warnings,"partial":incomplete || truncated || boundary,
-            "truncated":truncated,"truncationReason":reason}),
+            "truncated":truncated,"truncationReason":reason,"semanticStatus":semantic_status}),
         )
     };
     let mut count = 0;
@@ -2904,6 +2987,7 @@ pub fn call_graph(
     answer: &mut crate::graph_query::GraphAnswer,
     stable_lookup_key: Option<&str>,
     node_keys: &std::collections::BTreeMap<String, String>,
+    tiers: &Tiers,
     compact: bool,
     root: &std::path::Path,
     catching_up: bool,
@@ -2960,11 +3044,18 @@ pub fn call_graph(
             if compact {
                 compact_graph(&mut data, node_keys);
             }
+            let semantic_status = semantic_status(
+                tiers,
+                result
+                    .nodes
+                    .iter()
+                    .map(|node| node.declaration.document.language.as_str()),
+            );
             Ok(
                 json!({"schemaVersion":1,"requestId":id,"workspace":root,"catchingUp":catching_up,
             "evidenceBasis":basis,"data":data,
             "warnings":result.warnings,"partial":result.partial,"truncated":result.truncated,
-            "truncationReason":reason}),
+            "truncationReason":reason,"semanticStatus":semantic_status}),
             )
         };
     let fits = |envelope: &Value| -> bool {
@@ -3233,6 +3324,14 @@ pub fn incoming(
                 .any(|status| status.projection.semantic_status.is_pending());
         let (bases, mut provenance) = intern_bases(&mut callers, provenance.into_values())?;
         label_projected_proofs(&mut provenance, semantic, count)?;
+        let semantic_status = semantic_status(
+            tiers,
+            std::iter::once(owner.declaration.document.language.as_str()).chain(
+                documents
+                    .iter()
+                    .filter_map(|document| document["document"]["language"].as_str()),
+            ),
+        );
         let mut data = json!({
             "symbolId":owner.declaration.syntax_id,"displayKey":crate::references::display_key(&owner.declaration),
             "stableLookupKey":result.selected.source.stable_lookup_key,
@@ -3254,7 +3353,7 @@ pub fn incoming(
             json!({"schemaVersion":1,"requestId":id,"workspace":root,"catchingUp":catching_up,
             "evidenceBasis":basis,"data":data,
             "warnings":warnings,"partial":incomplete || truncated || boundary,
-            "truncated":truncated,"truncationReason":reason}),
+            "truncated":truncated,"truncationReason":reason,"semanticStatus":semantic_status}),
         )
     };
     let fits = |envelope: &Value| {
@@ -3278,6 +3377,46 @@ pub fn incoming(
 #[cfg(test)]
 mod outgoing_tests {
     use super::*;
+
+    /// #660: `trellis_outgoing_calls` and `trellis_declaration` name the owner document's
+    /// language when it is pending, and omit pending languages outside the answer.
+    #[test]
+    fn outgoing_and_declaration_carry_semantic_status() {
+        use crate::model::SemanticStatus::{CatchingUp, NeedsReimport};
+        let root = std::path::Path::new("/workspace");
+        let result = || {
+            with_lines(McpOutgoing {
+                owner: owner(),
+                calls: vec![],
+                has_more: false,
+            })
+        };
+        let none = Tiers::default();
+        let pending = super::tests::pending_tiers(&[
+            ("javascript", CatchingUp, "re-import pending"),
+            ("rust", NeedsReimport, "re-import required"),
+        ]);
+        let expected =
+            json!([{"language":"javascript","state":"catchingUp","reason":"re-import pending"}]);
+        for (tiers, status) in [(&none, json!([])), (&pending, expected)] {
+            let outgoing = outgoing(
+                &json!(1),
+                result(),
+                &syntax_only(),
+                tiers,
+                false,
+                root,
+                false,
+                true,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(outgoing["semanticStatus"], status);
+            let declaration =
+                declaration(&json!(1), result().owner, tiers, root, false, true).unwrap();
+            assert_eq!(declaration["semanticStatus"], status);
+        }
+    }
     use crate::native_evidence::{Coverage, Declaration, DocumentKey, Provenance};
     use crate::store::mcp_read::{
         McpDeclaration, McpDeclarationWithLines, McpDocumentVersion, McpItemSource, McpLines,
@@ -3343,6 +3482,7 @@ mod outgoing_tests {
             id,
             with_lines(result),
             &syntax_only(),
+            &Default::default(),
             false,
             root,
             catching_up,
@@ -3489,6 +3629,7 @@ mod outgoing_tests {
             &json!(1),
             make_result(),
             &syntax_only(),
+            &Default::default(),
             false,
             root,
             false,
@@ -3509,8 +3650,17 @@ mod outgoing_tests {
         // The owner proof is real and present in the response, but it is not
         // the independent target declaration's proof.
         wrong.calls[0].candidate_documents[0].provenance_id = owner().provenance[0].id.clone();
-        let failure =
-            outgoing(&json!(1), wrong, &syntax_only(), false, root, false, true).unwrap_err();
+        let failure = outgoing(
+            &json!(1),
+            wrong,
+            &syntax_only(),
+            &Default::default(),
+            false,
+            root,
+            false,
+            true,
+        )
+        .unwrap_err();
         assert!(failure.starts_with("store_unavailable"));
     }
 
@@ -3824,6 +3974,37 @@ mod incoming_tests {
     use super::*;
     use crate::store::mcp_read::{McpIncomingCallWithLines, McpIncomingWithLines};
 
+    /// #660: the owner and callers' languages are the answer's; others are omitted.
+    #[test]
+    fn incoming_carries_semantic_status_for_the_answers_languages() {
+        use crate::model::SemanticStatus::{CatchingUp, NeedsReimport};
+        let mut pending = super::tests::pending_tiers(&[
+            ("javascript", NeedsReimport, "re-import required"),
+            ("python", CatchingUp, "re-import pending"),
+        ]);
+        let incoming = |tiers: &Tiers| {
+            incoming(
+                &json!(1),
+                fixture(1, false, 0),
+                &crate::store::McpSemantic::syntax_only(crate::store::NO_PRODUCER_NOTE, 0),
+                tiers,
+                false,
+                std::path::Path::new("/workspace"),
+                false,
+                true,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        assert_eq!(incoming(&Default::default())["semanticStatus"], json!([]));
+        assert_eq!(
+            incoming(&pending)["semanticStatus"],
+            json!([{"language":"javascript","state":"needsReimport","reason":"re-import required"}])
+        );
+        pending[3].pending = None;
+        assert_eq!(incoming(&pending)["semanticStatus"], json!([]));
+    }
+
     fn fixture(calls: usize, has_more: bool, diagnostic: usize) -> McpIncomingWithLines {
         let outgoing = with_lines(crate::store::mcp_read::McpOutgoing {
             owner: owner(),
@@ -4116,6 +4297,39 @@ mod call_graph_tests {
     const SS: &str = "source-set:v1:s";
     const REV: &str = "revision:v2:r";
 
+    /// #660: the call graph names its nodes' languages when pending, including under
+    /// `compact`, and omits pending languages outside the graph.
+    #[test]
+    fn call_graph_carries_semantic_status_for_node_languages() {
+        use crate::model::SemanticStatus::{CatchingUp, NeedsReimport};
+        let tiers = super::tests::pending_tiers(&[
+            ("rust", CatchingUp, "re-import pending"),
+            ("java", NeedsReimport, "re-import required"),
+        ]);
+        for compact in [false, true] {
+            let graph = |tiers: &Tiers| {
+                call_graph(
+                    &json!("graph"),
+                    &mut answer(1, 1),
+                    None,
+                    &Default::default(),
+                    tiers,
+                    compact,
+                    std::path::Path::new("/w"),
+                    false,
+                    true,
+                )
+                .unwrap()
+                .unwrap()
+            };
+            assert_eq!(graph(&Default::default())["semanticStatus"], json!([]));
+            assert_eq!(
+                graph(&tiers)["semanticStatus"],
+                json!([{"language":"rust","state":"catchingUp","reason":"re-import pending"}])
+            );
+        }
+    }
+
     fn sid(n: u64) -> String {
         format!("sid:v1:{n:032x}")
     }
@@ -4246,6 +4460,7 @@ mod call_graph_tests {
             &json!("graph"),
             answer,
             None,
+            &Default::default(),
             &Default::default(),
             false,
             std::path::Path::new("/w"),
@@ -5076,6 +5291,7 @@ mod size_tests {
             answer,
             Some("src/daemon/state.rs::DaemonState::enqueue_index"),
             node_keys,
+            &Default::default(),
             compact,
             std::path::Path::new("/Users/someone/projects/trellis"),
             false,

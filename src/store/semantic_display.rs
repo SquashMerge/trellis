@@ -972,6 +972,42 @@ impl McpSemantic {
     }
 }
 
+/// Why a language's answers wait on semantic evidence (#660): the status an agent should
+/// show and the reason behind it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LanguagePending {
+    pub status: crate::model::SemanticStatus,
+    pub reason: String,
+}
+
+/// The pending state of one language: its re-import reason, else `re-import required`
+/// when a document needs re-import, else `re-import pending` when one is catching up.
+fn language_pending(tier: &LanguageTier) -> Option<LanguagePending> {
+    use crate::model::{SemanticReimport, SemanticStatus};
+    let (status, reason) = if let Some(SemanticReimport::NeedsReimport { reason }) = &tier.reimport
+    {
+        (SemanticStatus::NeedsReimport, reason.clone())
+    } else if tier
+        .documents
+        .iter()
+        .any(|d| d.projection.semantic_status == SemanticStatus::NeedsReimport)
+    {
+        (
+            SemanticStatus::NeedsReimport,
+            "re-import required".to_owned(),
+        )
+    } else if tier
+        .documents
+        .iter()
+        .any(|d| d.projection.semantic_status == SemanticStatus::CatchingUp)
+    {
+        (SemanticStatus::CatchingUp, "re-import pending".to_owned())
+    } else {
+        return None;
+    };
+    Some(LanguagePending { status, reason })
+}
+
 /// One language's selected imported evidence at the admitted head (#528): its default
 /// producer (#483), that producer's coverage tuple counts and its worst proof freshness.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -988,6 +1024,8 @@ pub struct LanguageTier {
     pub freshness: &'static str,
     /// Why the producer's partial tuples are partial (#520), when any is.
     pub partial_reasons: Option<crate::model::SemanticCoverageSummary>,
+    /// Set when the language has pending semantic evidence, from committed data only.
+    pub pending: Option<LanguagePending>,
 }
 
 impl LanguageTier {
@@ -1198,6 +1236,9 @@ impl EvidenceResponse {
                 }
                 tiers[at].documents.push(document);
             }
+        }
+        for tier in &mut tiers {
+            tier.pending = language_pending(tier);
         }
         Ok(tiers)
     }
@@ -1977,6 +2018,7 @@ mod reimport_tests {
         assert_eq!(status.stats.semantic_state, SemanticState::Unavailable);
         for tier in response.mcp_language_tiers().unwrap() {
             assert!(tier.reimport.is_none());
+            assert!(tier.pending.is_none());
             assert!(!tier.semantic());
             assert_eq!(tier.freshness, "unavailable");
         }
@@ -2041,6 +2083,66 @@ mod reimport_tests {
         assert_eq!(tiers[1].freshness, "unavailable");
         assert_eq!(tiers[1].counts, [0; 5]);
         assert!(tiers[3].reimport.is_none());
+        let Some(crate::model::SemanticReimport::NeedsReimport { reason }) = expected else {
+            unreachable!()
+        };
+        assert_eq!(
+            tiers[1].pending,
+            Some(LanguagePending {
+                status: crate::model::SemanticStatus::NeedsReimport,
+                reason
+            })
+        );
+        assert!(tiers[3].pending.is_none());
+    }
+
+    fn document(status: crate::model::SemanticStatus) -> crate::model::DocumentSemanticStatus {
+        let pin = crate::model::IndexPin {
+            index_generation: uuid::Uuid::nil(),
+            index_revision: 1,
+        };
+        crate::model::DocumentSemanticStatus {
+            producer_id: "p".into(),
+            language: "rust".into(),
+            path: "src/lib.rs".into(),
+            projection: crate::model::SemanticProjection {
+                current_pin: pin,
+                semantic_basis_pin: pin,
+                basis_native_revision_id: "r".into(),
+                semantic_status: status,
+            },
+        }
+    }
+
+    /// #660: a re-import reason wins, then a document that needs re-import, then one that
+    /// is catching up; an older basis alone is not pending.
+    #[test]
+    fn language_pending_follows_reimport_then_required_then_pending() {
+        use crate::model::SemanticStatus::{CatchingUp, NeedsReimport, OlderBasis};
+        let mut tier = LanguageTier::default();
+        assert_eq!(language_pending(&tier), None);
+        tier.documents = vec![document(OlderBasis)];
+        assert_eq!(language_pending(&tier), None);
+        tier.documents.push(document(CatchingUp));
+        let pending = language_pending(&tier).unwrap();
+        assert_eq!(
+            (pending.status, pending.reason.as_str()),
+            (CatchingUp, "re-import pending")
+        );
+        tier.documents.push(document(NeedsReimport));
+        let required = language_pending(&tier).unwrap();
+        assert_eq!(
+            (required.status, required.reason.as_str()),
+            (NeedsReimport, "re-import required")
+        );
+        tier.reimport = Some(crate::model::SemanticReimport::NeedsReimport {
+            reason: "producer profile pin changed".into(),
+        });
+        let reimport = language_pending(&tier).unwrap();
+        assert_eq!(
+            (reimport.status, reimport.reason.as_str()),
+            (NeedsReimport, "producer profile pin changed")
+        );
     }
 }
 
