@@ -1022,8 +1022,15 @@ fn arb_op() -> impl Strategy<Value = Op> {
     ]
 }
 
+/// The longest generated history.
+const MAX_HISTORY: usize = 12;
+
 fn arb_history() -> impl Strategy<Value = Vec<Op>> {
-    prop::collection::vec(arb_op(), 1..=12)
+    history_of(1..=MAX_HISTORY)
+}
+
+fn history_of(lengths: std::ops::RangeInclusive<usize>) -> impl Strategy<Value = Vec<Op>> {
+    prop::collection::vec(arb_op(), lengths)
 }
 
 #[derive(Debug, Default)]
@@ -2301,11 +2308,11 @@ const REDUCED_LIMITS: &str = r#"{"unit_expansion_bytes":163840}"#;
 
 /// #826: under a live budget FULL fits but the witness does not, every S still ends caught
 /// up and equal to FULL (the in-S oracle is on) with no unavailable coverage, because the
-/// witnessed attempt falls back to FULL. The deterministic history first proves the
-/// fallback is reached; generated histories then explore the rest under the same limit.
+/// witnessed attempt falls back to FULL. This deterministic history proves the fallback is
+/// reached; the generated bands below explore the rest under the same limit.
 #[test]
-fn native_first_reduced_limit_histories() {
-    let name = "proptest_native_first::native_first_reduced_limit_histories";
+fn native_first_reduced_limit_control() {
+    let name = "proptest_native_first::native_first_reduced_limit_control";
     if !isolated_with(name, &[("TRELLIS_TEST_SEMANTIC_LIMITS", REDUCED_LIMITS)]) {
         return;
     }
@@ -2327,8 +2334,21 @@ fn native_first_reduced_limit_histories() {
         control.limit_fallbacks > 0 && control.catch_ups > 0,
         "{control:?}"
     );
+}
+
+/// #838: the generated reduced-limit histories (#826), split by history length so each band
+/// finishes well inside the nightly hang backstop with the in-S oracle on. The bands
+/// partition `arb_history`'s lengths, and each band runs the share of `cases()` that the
+/// undivided strategy (uniform over `1..=MAX_HISTORY`) gave its lengths, rounded up, so the
+/// bands together run at least as many histories of every length as one test did.
+fn reduced_limit_band(name: &'static str, lengths: std::ops::RangeInclusive<usize>) {
+    if !isolated_with(name, &[("TRELLIS_TEST_SEMANTIC_LIMITS", REDUCED_LIMITS)]) {
+        return;
+    }
+    let share = (lengths.end() - lengths.start() + 1) as u32;
+    let band_cases = (cases() * share).div_ceil(MAX_HISTORY as u32);
     let config = ProptestConfig {
-        cases: cases(),
+        cases: band_cases,
         source_file: Some(file!()),
         test_name: Some(name),
         failure_persistence: Some(Box::new(
@@ -2338,7 +2358,7 @@ fn native_first_reduced_limit_histories() {
     };
     let fallbacks = std::cell::Cell::new(0);
     proptest::test_runner::TestRunner::new(config)
-        .run(&arb_history(), |history| {
+        .run(&history_of(lengths.clone()), |history| {
             match run_history(&history) {
                 Ok(stats) => fallbacks.set(fallbacks.get() + stats.limit_fallbacks),
                 Err(error) => prop_assert!(false, "{error}"),
@@ -2347,8 +2367,45 @@ fn native_first_reduced_limit_histories() {
         })
         .unwrap();
     eprintln!(
-        "reduced-limit histories over {} cases: {} limit fallbacks",
-        cases(),
+        "reduced-limit histories of length {lengths:?} over {band_cases} cases: {} limit fallbacks",
         fallbacks.get()
     );
+}
+
+/// One test per band of [`reduced_limit_band`]. A history's cost grows with its length, so
+/// the short lengths share bands and each long length has its own; at the nightly case
+/// count the longest band takes about a fifth of the undivided run (#838).
+macro_rules! reduced_limit_bands {
+    ($($test:ident => $lengths:expr),* $(,)?) => {$(
+        #[test]
+        fn $test() {
+            reduced_limit_band(concat!("proptest_native_first::", stringify!($test)), $lengths);
+        }
+    )*
+        const REDUCED_LIMIT_BANDS: &[std::ops::RangeInclusive<usize>] = &[$($lengths),*];
+    };
+}
+
+reduced_limit_bands! {
+    native_first_reduced_limit_histories_1_to_4 => 1..=4,
+    native_first_reduced_limit_histories_5_to_6 => 5..=6,
+    native_first_reduced_limit_histories_7 => 7..=7,
+    native_first_reduced_limit_histories_8 => 8..=8,
+    native_first_reduced_limit_histories_9 => 9..=9,
+    native_first_reduced_limit_histories_10 => 10..=10,
+    native_first_reduced_limit_histories_11 => 11..=11,
+    native_first_reduced_limit_histories_12 => 12..=MAX_HISTORY,
+}
+
+/// The bands cover every generated history length exactly once, so together they explore
+/// the same history space as the undivided strategy.
+#[test]
+fn reduced_limit_bands_partition_history_lengths() {
+    let mut next = 1;
+    for band in REDUCED_LIMIT_BANDS {
+        assert_eq!(*band.start(), next, "{REDUCED_LIMIT_BANDS:?}");
+        assert!(band.start() <= band.end(), "{REDUCED_LIMIT_BANDS:?}");
+        next = band.end() + 1;
+    }
+    assert_eq!(next, MAX_HISTORY + 1, "{REDUCED_LIMIT_BANDS:?}");
 }
