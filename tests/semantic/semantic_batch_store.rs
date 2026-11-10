@@ -97,28 +97,50 @@ struct MemoryAdmission {
     merged: trellis::scip_raw::CapturedScipInventory,
 }
 
-struct World {
-    _state: tempfile::TempDir,
-    _root: tempfile::TempDir,
-    root: PathBuf,
-    store: Store,
-    index_dir: PathBuf,
-    index_db: PathBuf,
-    cancel: Arc<AtomicBool>,
-    batches: std::cell::Cell<usize>,
+pub(crate) struct World {
+    pub(crate) _state: tempfile::TempDir,
+    pub(crate) _root: tempfile::TempDir,
+    pub(crate) root: PathBuf,
+    pub(crate) store: Store,
+    pub(crate) index_dir: PathBuf,
+    pub(crate) index_db: PathBuf,
+    pub(crate) cancel: Arc<AtomicBool>,
+    pub(crate) batches: std::cell::Cell<usize>,
 }
 
-fn world(populate: impl FnOnce(&Path)) -> World {
+pub(crate) fn world(populate: impl FnOnce(&Path)) -> World {
     world_with(populate, false)
 }
 
 /// `mcp` stages the virgin request queue before the first publication, as a daemon
 /// would, so an MCP session can be served over this index.
-fn world_with(populate: impl FnOnce(&Path), mcp: bool) -> World {
+pub(crate) fn world_with(populate: impl FnOnce(&Path), mcp: bool) -> World {
     let state = tempfile::tempdir().unwrap();
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
     populate(&root);
+    world_over(state, temp, root, mcp)
+}
+
+/// A fresh index in a state directory of its own over the same checkout: the independent
+/// reference for a history `world` ran. Its native revisions equal `world`'s while the
+/// checkout is unchanged.
+pub(crate) fn reference_world(world: &World) -> World {
+    world_over(
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        world.root.clone(),
+        false,
+    )
+}
+
+/// `_root` only keeps its directory alive; `root` is where the checkout lives.
+fn world_over(
+    state: tempfile::TempDir,
+    temp: tempfile::TempDir,
+    root: PathBuf,
+    mcp: bool,
+) -> World {
     let store = trellis::testing::retry_admission(|| Store::open_for_tests(state.path(), &root));
     if mcp {
         store.mcp_prepare_virgin_queue_for_tests().unwrap();
@@ -159,21 +181,21 @@ fn world_with(populate: impl FnOnce(&Path), mcp: bool) -> World {
 }
 
 impl World {
-    fn fixture(&self) -> BatchFixture {
+    pub(crate) fn fixture(&self) -> BatchFixture {
         BatchFixture::from_published(&self.index_db, &self.root).synthetic()
     }
 
-    fn batch_dir(&self) -> PathBuf {
+    pub(crate) fn batch_dir(&self) -> PathBuf {
         let number = self.batches.get();
         self.batches.set(number + 1);
         self.root.join(format!(".trellis-semantic-batch-{number}"))
     }
 
-    fn write(&self, fixture: &BatchFixture) -> (PathBuf, String) {
+    pub(crate) fn write(&self, fixture: &BatchFixture) -> (PathBuf, String) {
         fixture.write(&self.batch_dir())
     }
 
-    fn stage(
+    pub(crate) fn stage(
         &self,
         descriptor: &(PathBuf, String),
         limits: &BatchLimits,
@@ -194,7 +216,7 @@ impl World {
         )
     }
 
-    fn admit(&self, descriptor: &(PathBuf, String)) -> anyhow::Result<AdmittedBatch> {
+    pub(crate) fn admit(&self, descriptor: &(PathBuf, String)) -> anyhow::Result<AdmittedBatch> {
         self.stage(
             descriptor,
             &BatchLimits::PRODUCTION,
@@ -202,7 +224,7 @@ impl World {
         )
     }
 
-    fn stage_dirs(&self) -> Vec<String> {
+    pub(crate) fn stage_dirs(&self) -> Vec<String> {
         fs::read_dir(&self.index_dir)
             .unwrap()
             .flatten()
@@ -729,7 +751,7 @@ fn cache_budget_fits_sixty_four_mebibytes() {
 }
 
 impl World {
-    fn republish(&self) {
+    pub(crate) fn republish(&self) {
         let (graph, native, capture) = index_workspace_bundle(
             &IndexOptions::new(self.root.clone()),
             self.store.root_id(),
@@ -755,7 +777,7 @@ impl World {
             .unwrap();
     }
 
-    fn join_with(
+    pub(crate) fn join_with(
         &self,
         descriptor: &(PathBuf, String),
         limits: &BatchLimits,
@@ -779,7 +801,7 @@ impl World {
     /// The whole-publication validator the memory path runs, over `publication`: it recomputes
     /// freshness independently and runs the three cross-row checks the staged join's closure
     /// queries do not repeat (contradictory resolved call targets, coverage observed roles).
-    fn full_validation(
+    pub(crate) fn full_validation(
         &self,
         descriptor: &(PathBuf, String),
         mutations: DestinationMutations,
@@ -924,7 +946,7 @@ impl World {
     }
 
     /// The publication the in-memory join builds from the same batch bytes.
-    fn memory_publication(
+    pub(crate) fn memory_publication(
         &self,
         descriptor: &(PathBuf, String),
         mutations: DestinationMutations,
@@ -932,7 +954,7 @@ impl World {
         self.try_memory_publication(descriptor, mutations).unwrap()
     }
 
-    fn try_memory_publication(
+    pub(crate) fn try_memory_publication(
         &self,
         descriptor: &(PathBuf, String),
         mutations: DestinationMutations,
@@ -941,7 +963,7 @@ impl World {
             .map(|result| result.publication)
     }
 
-    fn memory_rejoin(
+    pub(crate) fn memory_rejoin(
         &self,
         descriptor: &(PathBuf, String),
         mutations: DestinationMutations,
@@ -949,7 +971,7 @@ impl World {
         self.memory_rejoin_with(descriptor, mutations, &BatchLimits::PRODUCTION)
     }
 
-    fn memory_rejoin_with(
+    pub(crate) fn memory_rejoin_with(
         &self,
         descriptor: &(PathBuf, String),
         mutations: DestinationMutations,
@@ -1090,11 +1112,11 @@ fn calls_doc(source: &str) -> DocSpec {
     doc
 }
 
-const DEFINITIONS_A: &str = "function run(){ target(); }\n";
-const DEFINITIONS_B: &str = "function target(){ }\n";
+pub(crate) const DEFINITIONS_A: &str = "function run(){ target(); }\n";
+pub(crate) const DEFINITIONS_B: &str = "function target(){ }\n";
 const JAVA_TYPES: &str = "class B {}\nclass A extends B {}\n";
 
-fn definitions_docs() -> (DocSpec, DocSpec) {
+pub(crate) fn definitions_docs() -> (DocSpec, DocSpec) {
     (
         DocSpec::new("src/A.js")
             .occurrence(&[0, 9, 12], &[], "pkg run.", 1)
@@ -1115,7 +1137,7 @@ fn java_doc() -> DocSpec {
         .symbol("pkg A#", 7, &["pkg B#"])
 }
 
-fn write_files(root: &Path, files: &[(&str, &str)]) {
+pub(crate) fn write_files(root: &Path, files: &[(&str, &str)]) {
     for (path, text) in files {
         let file = root.join(path);
         fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -1131,7 +1153,7 @@ fn one_artifact_per_language(world: &World, docs: Vec<(&str, Vec<DocSpec>)>) -> 
     world.write(&fixture)
 }
 
-fn definitions_world() -> World {
+pub(crate) fn definitions_world() -> World {
     world(|root| {
         write_files(
             root,
@@ -2919,7 +2941,7 @@ fn join_cursor_plans_use_no_temp_btree() {
 }
 
 impl World {
-    fn db(&self) -> rusqlite::Connection {
+    pub(crate) fn db(&self) -> rusqlite::Connection {
         rusqlite::Connection::open_with_flags(
             &self.index_db,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -2927,12 +2949,12 @@ impl World {
         .unwrap()
     }
 
-    fn count(&self, sql: &str) -> i64 {
+    pub(crate) fn count(&self, sql: &str) -> i64 {
         self.db().query_row(sql, [], |row| row.get(0)).unwrap()
     }
 
     /// Joins `descriptor` against the head and publishes it, returning the join for inspection.
-    fn publish(
+    pub(crate) fn publish(
         &self,
         descriptor: &(PathBuf, String),
     ) -> anyhow::Result<(
@@ -4590,7 +4612,7 @@ fn synthetic_producer_row_records_generator_source_identity_kind() {
 impl World {
     /// Publishes the current workspace as a native recovery publication, which rejoins every
     /// selected batch over the new revision.
-    fn republish_with_rejoin(&self) {
+    pub(crate) fn republish_with_rejoin(&self) {
         let (graph, native, capture) = index_workspace_bundle(
             &IndexOptions::new(self.root.clone()),
             self.store.root_id(),
@@ -4609,15 +4631,15 @@ impl World {
             .unwrap();
     }
 
-    fn head_key(&self) -> String {
+    pub(crate) fn head_key(&self) -> String {
         let pin = self.store.index_baseline().unwrap();
         format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision)
     }
 
     /// `(document path, artifact hash)` of every stored basis at the head.
-    fn basis_artifacts(&self) -> Vec<(String, String)> {
+    pub(crate) fn basis_artifacts(&self) -> Vec<(String, String)> {
         self.db()
-            .prepare("SELECT DISTINCT c.path,b.artifact_hash FROM semantic_basis b JOIN semantic_coverage c ON c.tuple_id=b.tuple_id WHERE c.revision_id=?1 ORDER BY c.path")
+            .prepare("SELECT DISTINCT c.path,b.artifact_hash FROM semantic_basis b JOIN semantic_coverage c ON c.payload_id=b.payload_id WHERE c.revision_id=?1 ORDER BY c.path")
             .unwrap()
             .query_map([self.head_key()], |row| Ok((row.get(0)?, row.get(1)?)))
             .unwrap()
@@ -4625,7 +4647,7 @@ impl World {
             .collect()
     }
 
-    fn rejoin_failures(&self) -> i64 {
+    pub(crate) fn rejoin_failures(&self) -> i64 {
         self.db()
             .query_row(
                 "SELECT COUNT(*) FROM semantic_coverage WHERE revision_id=?1 AND diagnostic LIKE 'selected raw capture unavailable%'",
@@ -4944,7 +4966,7 @@ fn replaced_batch_world() -> (World, IndexPin, IndexPin) {
 }
 
 /// One LOCAL publication of `text` at `path`; returns its work counts.
-fn local_edit(world: &World, path: &str, text: &str, counts: &Path) -> Value {
+pub(crate) fn local_edit(world: &World, path: &str, text: &str, counts: &Path) -> Value {
     let _ = fs::remove_file(counts);
     write_files(&world.root, &[(path, text)]);
     let options = IndexOptions::new(world.root.clone());
@@ -5143,10 +5165,11 @@ fn below_head_import_recovers_dependent_rows_when_target_returns() {
     assert_delayed_import_matches_full(&world, &descriptor);
 }
 
-/// #669 H1: S copies an unchanged document's published rows. Corruption read while copying
-/// fails typed and schedules a re-index, as a read of those rows would.
+/// #669 H1, #680: S copies an unchanged document by naming its basis payload, without reading
+/// the payload's rows, so a corrupt row publishes. Every read of it then fails typed and
+/// schedules a re-index.
 #[test]
-fn corruption_read_while_copying_schedules_a_rebuild() {
+fn corrupt_copied_symbol_publishes_then_fails_typed_on_read() {
     let world = definitions_world();
     let (a, b) = definitions_docs();
     let mut fixture = world.fixture().reference("scip-typescript");
@@ -5159,8 +5182,8 @@ fn corruption_read_while_copying_schedules_a_rebuild() {
         .unwrap();
     let corrupted = db
         .execute(
-            "UPDATE semantic_symbols SET key_scope='bogus' WHERE tuple_id IN \
-             (SELECT tuple_id FROM semantic_coverage WHERE revision_id=?1 AND path='src/A.js')",
+            "UPDATE semantic_symbols SET key_scope='bogus' WHERE payload_id IN \
+             (SELECT payload_id FROM semantic_coverage WHERE revision_id=?1 AND path='src/A.js')",
             [&import],
         )
         .unwrap();
@@ -5175,10 +5198,14 @@ fn corruption_read_while_copying_schedules_a_rebuild() {
         .publish_local_for_tests(&options, &capture, &leader, &world.cancel)
         .unwrap();
     drop(leader);
-    let error = world
+    let native = world.store.index_baseline().unwrap();
+    world
         .store
         .catch_up_semantic_for_tests(&world.cancel)
-        .unwrap_err();
+        .unwrap();
+    let head = world.store.index_baseline().unwrap();
+    assert_ne!(head, native, "the catch-up publication advanced the head");
+    let error = world.store.semantic_at(head).unwrap_err();
     assert!(
         format!("{error:#}").contains("invalid semantic enum"),
         "{error:#}"
@@ -5186,9 +5213,10 @@ fn corruption_read_while_copying_schedules_a_rebuild() {
     assert!(world.store.recovery_pending_for_tests());
 }
 
-/// A corrupt copied basis is first consumed by the publisher's capture lookup.
+/// A copied document names the basis payload without reading its raw proofs, so a corrupt
+/// capture binding publishes; every revision that names the payload then fails typed on read.
 #[test]
-fn corruption_found_while_writing_copied_rows_schedules_a_rebuild() {
+fn corrupt_copied_basis_publishes_then_fails_typed_on_read() {
     let world = definitions_world();
     let (a, b) = definitions_docs();
     let mut fixture = world.fixture().reference("scip-typescript");
@@ -5196,6 +5224,7 @@ fn corruption_found_while_writing_copied_rows_schedules_a_rebuild() {
     let descriptor = world.write(&fixture);
     world.publish(&descriptor).unwrap();
     let import = world.head_key();
+    let import_pin = world.store.index_baseline().unwrap();
     write_files(&world.root, &[("src/C.js", "function other(){ }\n")]);
     let options = IndexOptions::new(world.root.clone());
     let capture = trellis::capture::Capture::admit(&options, &world.cancel, &|_| {}).unwrap();
@@ -5209,8 +5238,8 @@ fn corruption_found_while_writing_copied_rows_schedules_a_rebuild() {
     let db = rusqlite::Connection::open(&world.index_db).unwrap();
     let corrupted = db
         .execute(
-            "UPDATE semantic_basis SET artifact_hash=?2 WHERE tuple_id IN \
-             (SELECT tuple_id FROM semantic_coverage WHERE revision_id=?1 AND path='src/A.js')",
+            "UPDATE semantic_basis SET artifact_hash=?2 WHERE payload_id IN \
+             (SELECT payload_id FROM semantic_coverage WHERE revision_id=?1 AND path='src/A.js')",
             rusqlite::params![import, "0".repeat(64)],
         )
         .unwrap();
@@ -5220,19 +5249,25 @@ fn corruption_found_while_writing_copied_rows_schedules_a_rebuild() {
         world.count("SELECT COUNT(*) FROM semantic_raw_captures WHERE artifact_hash='0000000000000000000000000000000000000000000000000000000000000000'"),
         0
     );
-    let error = world
+    world
         .store
         .catch_up_semantic_for_tests(&world.cancel)
-        .unwrap_err();
+        .unwrap();
+    let head = world.store.index_baseline().unwrap();
+    assert_ne!(head, native, "the catch-up publication advanced the head");
+    let error = world.store.semantic_at(head).unwrap_err();
     assert!(
-        matches!(
-            error.downcast_ref::<rusqlite::Error>(),
-            Some(rusqlite::Error::QueryReturnedNoRows)
-        ),
+        format!("{error:#}").contains("incompatible_index: corrupt raw proof binding"),
         "{error:#}"
     );
-    assert_eq!(world.store.index_baseline().unwrap(), native);
-    assert!(world.store.recovery_pending_for_tests(), "{error:#}");
+    // The first failure latches the index as invalid, so the import revision, which names the
+    // same payload, now reports the typed reconciliation failure.
+    let error = world.store.semantic_at(import_pin).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("incompatible_index:"),
+        "{error:#}"
+    );
+    assert!(world.store.recovery_pending_for_tests());
 }
 
 /// Runs the due revision maintenance until nothing is left to do.
@@ -5905,7 +5940,7 @@ fn gc_keeps_proofs_referenced_by_retained_provenance() {
         .store
         .with_index_sql_for_tests(|db| {
             let changed = db.execute(
-                "UPDATE semantic_provenance SET capture_id=?1,derived_from_provenance_id=?2,derived_from_record_kind=(SELECT record_kind FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id=?2),derived_from_fact_digest=(SELECT fact_digest FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id=?2) WHERE rowid=(SELECT v.rowid FROM semantic_provenance v JOIN semantic_coverage c ON c.tuple_id=v.tuple_id WHERE c.revision_id=?3 AND v.capture_id IS NOT NULL LIMIT 1)",
+                "UPDATE semantic_provenance SET capture_id=?1,derived_from_provenance_id=?2,derived_from_record_kind=(SELECT record_kind FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id=?2),derived_from_fact_digest=(SELECT fact_digest FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id=?2) WHERE rowid=(SELECT v.rowid FROM semantic_provenance v JOIN semantic_coverage c ON c.payload_id=v.payload_id WHERE c.revision_id=?3 AND v.capture_id IS NOT NULL LIMIT 1)",
                 rusqlite::params![capture_id, proof_id, format!("pin:v1:{}:{}", head.index_generation, head.index_revision)],
             )?;
             assert_eq!(changed, 1);
@@ -7001,7 +7036,7 @@ fn publish_real_fixture(world: &World, fixture: &str, files: &[&str]) -> (IndexP
     (pin, producer)
 }
 
-fn declaration_ids(world: &World) -> std::collections::BTreeMap<String, String> {
+pub(crate) fn declaration_ids(world: &World) -> std::collections::BTreeMap<String, String> {
     let (_, native, _) = index_workspace_bundle(
         &IndexOptions::new(world.root.clone()),
         world.store.root_id(),
@@ -7017,7 +7052,7 @@ fn declaration_ids(world: &World) -> std::collections::BTreeMap<String, String> 
 }
 
 /// The query the CLI daemon builds for `trellis query --seed ... [--semantic-producer-id ...]`.
-fn view_query(seed: &str, producer: Option<&str>) -> trellis::model::ViewQuery {
+pub(crate) fn view_query(seed: &str, producer: Option<&str>) -> trellis::model::ViewQuery {
     let mut query = json!({"seed": seed});
     if let Some(producer) = producer {
         query["semanticProducerId"] = json!(producer);
@@ -9392,6 +9427,10 @@ fn a_later_producer_fallback_keeps_earlier_producer_copies() {
             DocSpec::new("src/c.rs"),
         ],
     );
+    // The import runs under the same limits as S: a payload keyed under other limits is not
+    // copied (owner ruling 2026-11-09).
+    let counts = world._state.path().join("work-counts.json");
+    issue_826_env(&counts, Some(ISSUE_826_LIMITS));
     let rust = world.write(&rust);
     drop(world.publish(&rust).unwrap());
     let (a, b) = definitions_docs();
@@ -9399,17 +9438,11 @@ fn a_later_producer_fallback_keeps_earlier_producer_copies() {
     js.artifact("javascript", vec![a, b]);
     let js = world.write(&js);
     drop(world.publish(&js).unwrap());
-    let counts = world._state.path().join("work-counts.json");
-    issue_826_env(&counts, Some(ISSUE_826_LIMITS));
-    // One native publication: C changes (Rust A and B are copied); JavaScript B changes, so
-    // JavaScript A is a pending dependent the witness settles, over the limit.
+    // One native publication: C changes (Rust A and B are copied); JavaScript B's `target`
+    // is renamed, so JavaScript A is a pending dependent (its targeted declaration is gone)
+    // the witness settles, over the limit.
     write_files(&world.root, &[("src/c.rs", "fn other() { let _ = 1; }\n")]);
-    let work = local_edit(
-        &world,
-        "src/B.js",
-        "function target(){ }\n// edited\n",
-        &counts,
-    );
+    let work = local_edit(&world, "src/B.js", "function other(){ }\n", &counts);
     assert_eq!(
         work["producerIds"],
         json!(["rust-analyzer", "scip-typescript"]),
@@ -9476,7 +9509,7 @@ fn full_limit_stays_unavailable_under_the_oracle() {
     assert_eq!(world.rejoin_failures(), 3);
     assert_eq!(
         world.count(&format!(
-            "SELECT COUNT(*) FROM semantic_provenance p JOIN semantic_coverage c ON c.tuple_id=p.tuple_id WHERE c.revision_id='{}'",
+            "SELECT COUNT(*) FROM semantic_provenance p JOIN semantic_coverage c ON c.payload_id=p.payload_id WHERE c.revision_id='{}'",
             world.head_key()
         )),
         0
@@ -10608,40 +10641,43 @@ fn gaps_doc() -> DocSpec {
 #[test]
 fn partial_document_records_a_native_gap_and_the_cap_together() {
     use trellis::semantic_evidence::{CoverageReasons, CoverageState};
-    let world = world(|root| {
-        write_files(
-            root,
-            &[
-                (
-                    "Cargo.toml",
-                    "[package]\nname = \"gaps\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-                ),
-                ("src/lib.rs", GAPS_RS),
-            ],
-        )
-    });
-    let mut fixture = world.fixture();
-    fixture.artifact("rust", vec![gaps_doc()]);
-    let descriptor = world.write(&fixture);
     let capped_limits = BatchLimits {
         document_occurrences: 5,
         ..BatchLimits::PRODUCTION
     };
     let cases = [
         (
-            BatchLimits::PRODUCTION,
-            "uncapped",
-            CoverageReasons::new([2, 1, 0, 0], false, false, false),
-            "partial: 1 · native macro/attribute gaps only",
-        ),
-        (
             capped_limits,
             "capped",
             CoverageReasons::new([1, 0, 0, 0], true, false, false),
             "partial: 1 · native gaps 1, document cap 1",
         ),
+        (
+            BatchLimits::PRODUCTION,
+            "uncapped",
+            CoverageReasons::new([2, 1, 0, 0], false, false, false),
+            "partial: 1 · native macro/attribute gaps only",
+        ),
     ];
+    let mut last_world = None;
     for (limits, case, expected, summary) in cases {
+        // The same descriptor settles differently under other limits, which only a test can
+        // vary, so each case has a store of its own and shares no payload with another.
+        let world = world(|root| {
+            write_files(
+                root,
+                &[
+                    (
+                        "Cargo.toml",
+                        "[package]\nname = \"gaps\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                    ),
+                    ("src/lib.rs", GAPS_RS),
+                ],
+            )
+        });
+        let mut fixture = world.fixture();
+        fixture.artifact("rust", vec![gaps_doc()]);
+        let descriptor = world.write(&fixture);
         let (mut admitted, joined, _) = world
             .join_with(&descriptor, &limits, DestinationMutations::default())
             .unwrap();
@@ -10724,7 +10760,9 @@ fn partial_document_records_a_native_gap_and_the_cap_together() {
             expected.macro_invocation,
             "{case}"
         );
+        last_world = Some(world);
     }
+    let world = last_world.unwrap();
     // A later native revision rejoins the selected batch, under production limits, and records
     // the rejoined tuple's reasons again.
     write_files(&world.root, &[("src/other.rs", "pub fn other() {}\n")]);

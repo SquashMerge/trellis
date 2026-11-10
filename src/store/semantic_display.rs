@@ -372,7 +372,7 @@ impl<'a> SemanticCalls<'a> {
         };
         let (usable, stale): (bool, bool) = self.db.query_row(
             "SELECT c.selected=1 AND c.state IN ('complete','partial'),
-                    EXISTS(SELECT 1 FROM semantic_provenance p WHERE p.tuple_id=c.tuple_id AND p.freshness<>'fresh')
+                    EXISTS(SELECT 1 FROM semantic_coverage_freshness f WHERE f.revision_id=c.revision_id AND f.tuple_id=c.tuple_id AND f.freshness<>'fresh')
              FROM semantic_coverage c WHERE c.tuple_id=?1",
             [tuple],
             |row| Ok((row.get(0)?, row.get(1)?)),
@@ -523,7 +523,7 @@ pub(super) fn status_semantics(
                     language.semantic_state = SemanticState::Stale;
                 }
                 let counts: (i64,i64,i64) = db.query_row(
-                    "SELECT count(DISTINCT CASE WHEN b.resolution='resolved' THEN b.call_id END),count(DISTINCT CASE WHEN b.resolution='external' THEN b.call_id END),count(DISTINCT CASE WHEN b.resolution='ambiguous' THEN b.call_id END) FROM semantic_coverage c JOIN semantic_call_bindings b ON b.tuple_id=c.tuple_id WHERE c.revision_id=?1 AND c.producer_id=?2 AND c.language=?3 AND c.path=?4 AND c.selected=1 AND c.state IN ('complete','partial')",
+                    "SELECT count(DISTINCT CASE WHEN b.resolution='resolved' THEN b.call_id END),count(DISTINCT CASE WHEN b.resolution='external' THEN b.call_id END),count(DISTINCT CASE WHEN b.resolution='ambiguous' THEN b.call_id END) FROM semantic_coverage c JOIN semantic_call_bindings b ON b.payload_id=c.payload_id WHERE c.revision_id=?1 AND c.producer_id=?2 AND c.language=?3 AND c.path=?4 AND c.selected=1 AND c.state IN ('complete','partial')",
                     params![basis, document.producer_id, document.language, document.path],
                     |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
                 )?;
@@ -602,7 +602,7 @@ fn language_counts(
                      WHEN b.resolution='external' OR b.declared_kind='external' THEN 1
                      WHEN b.resolution='ambiguous' THEN 2 ELSE 3 END AS kind,
                 count(DISTINCT b.call_id)
-         FROM semantic_coverage c JOIN semantic_call_bindings b ON b.tuple_id=c.tuple_id
+         FROM semantic_coverage c JOIN semantic_call_bindings b ON b.payload_id=c.payload_id
          WHERE c.revision_id=?1 AND c.producer_id=?2 AND c.language=?3 AND c.selected=1
            AND c.state IN ('complete','partial') AND b.call_id IS NOT NULL
          GROUP BY kind",
@@ -616,9 +616,9 @@ fn language_counts(
     }
     let (usable, stale): (bool, bool) = db.query_row(
         "SELECT EXISTS(SELECT 1 FROM semantic_coverage WHERE revision_id=?1 AND producer_id=?2 AND language=?3 AND selected=1 AND state IN ('complete','partial')),
-                EXISTS(SELECT 1 FROM semantic_coverage c JOIN semantic_provenance p ON p.tuple_id=c.tuple_id
+                EXISTS(SELECT 1 FROM semantic_coverage c JOIN semantic_coverage_freshness f ON f.revision_id=c.revision_id AND f.tuple_id=c.tuple_id
                        WHERE c.revision_id=?1 AND c.producer_id=?2 AND c.language=?3 AND c.selected=1
-                         AND c.state IN ('complete','partial') AND p.freshness<>'fresh')",
+                         AND c.state IN ('complete','partial') AND f.freshness<>'fresh')",
         params![key, producer, row.language],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
@@ -646,18 +646,19 @@ pub(super) fn coverage_summary(
     use crate::model::{GapOccurrences, PartialReasons, SemanticCoverageSummary};
     let mut summary = SemanticCoverageSummary::default();
     let mut statement = db.prepare_cached(
-        "SELECT c.state, count(*), count(r.tuple_id),
-                coalesce(sum(r.macro_invocation+r.attribute_item+r.macro_definition+r.other>0),0),
-                coalesce(sum(r.macro_invocation+r.attribute_item+r.macro_definition+r.other>0
-                             AND r.capped=0 AND r.omitted=0 AND r.captured_diagnostics=0),0),
-                coalesce(sum(r.capped),0), coalesce(sum(r.omitted),0),
-                coalesce(sum(r.captured_diagnostics),0),
-                coalesce(sum(r.macro_invocation),0), coalesce(sum(r.attribute_item),0),
-                coalesce(sum(r.macro_definition),0), coalesce(sum(r.other),0),
+        "SELECT c.state, count(*), count(COALESCE(rp.rowid,rt.rowid)),
+                coalesce(sum(COALESCE(rp.macro_invocation,rt.macro_invocation)+COALESCE(rp.attribute_item,rt.attribute_item)+COALESCE(rp.macro_definition,rt.macro_definition)+COALESCE(rp.other,rt.other)>0),0),
+                coalesce(sum(COALESCE(rp.macro_invocation,rt.macro_invocation)+COALESCE(rp.attribute_item,rt.attribute_item)+COALESCE(rp.macro_definition,rt.macro_definition)+COALESCE(rp.other,rt.other)>0
+                             AND COALESCE(rp.capped,rt.capped)=0 AND COALESCE(rp.omitted,rt.omitted)=0 AND COALESCE(rp.captured_diagnostics,rt.captured_diagnostics)=0),0),
+                coalesce(sum(COALESCE(rp.capped,rt.capped)),0), coalesce(sum(COALESCE(rp.omitted,rt.omitted)),0),
+                coalesce(sum(COALESCE(rp.captured_diagnostics,rt.captured_diagnostics)),0),
+                coalesce(sum(COALESCE(rp.macro_invocation,rt.macro_invocation)),0), coalesce(sum(COALESCE(rp.attribute_item,rt.attribute_item)),0),
+                coalesce(sum(COALESCE(rp.macro_definition,rt.macro_definition)),0), coalesce(sum(COALESCE(rp.other,rt.other)),0),
                 coalesce(sum(c.diagnostic='excluded_failed_by_producer'),0),
                 coalesce(sum(c.diagnostic='unmeasurable_source_anchor'),0),
                 coalesce(sum(c.diagnostic LIKE 'selected raw capture unavailable:%'),0)
-         FROM semantic_coverage c LEFT JOIN semantic_coverage_reasons r ON r.tuple_id=c.tuple_id
+         FROM semantic_coverage c LEFT JOIN semantic_coverage_reasons rp ON rp.payload_id=c.payload_id
+         LEFT JOIN semantic_coverage_reasons rt ON rt.tuple_id=c.tuple_id
          WHERE c.revision_id=?1 AND c.producer_id=?2 AND c.language=?3
          GROUP BY c.state",
     )?;
@@ -1137,10 +1138,14 @@ impl EvidenceResponse {
             // captured basis only, so every proof of one tuple shares it: one proof per
             // tuple is exact for what Trellis published (#261), and avoids scanning the
             // hundreds of thousands of proofs a language can hold on every read. A tuple
-            // without proofs (an empty fact set) is valid and adds nothing.
+            // without proofs (an empty fact set) is valid and adds nothing; a proof without
+            // its required freshness row is corruption.
             let mut statement = self.db.prepare_cached(
-                "SELECT (SELECT p.freshness FROM semantic_provenance p
-                         WHERE p.tuple_id=c.tuple_id LIMIT 1)
+                "SELECT (SELECT COALESCE(f.freshness,'missing') FROM semantic_provenance p
+                         LEFT JOIN semantic_coverage_freshness f
+                           ON f.revision_id=c.revision_id AND f.tuple_id=c.tuple_id AND f.basis_id=p.basis_id
+                         WHERE p.payload_id=c.payload_id
+                         ORDER BY p.ordinal LIMIT 1)
                  FROM semantic_coverage c
                  WHERE c.revision_id=?1 AND c.producer_id=?2 AND c.language=?3 AND c.selected=1
                    AND c.state IN ('complete','partial')",
@@ -1218,9 +1223,10 @@ impl EvidenceResponse {
             };
             let mut statement = self.db.prepare_cached(
                 "SELECT c.path,c.state,c.diagnostic,
-                        r.macro_invocation+r.attribute_item+r.macro_definition+r.other>0,
-                        r.capped,r.omitted,r.captured_diagnostics
-                 FROM semantic_coverage c LEFT JOIN semantic_coverage_reasons r ON r.tuple_id=c.tuple_id
+                        COALESCE(rp.macro_invocation,rt.macro_invocation)+COALESCE(rp.attribute_item,rt.attribute_item)+COALESCE(rp.macro_definition,rt.macro_definition)+COALESCE(rp.other,rt.other)>0,
+                        COALESCE(rp.capped,rt.capped),COALESCE(rp.omitted,rt.omitted),COALESCE(rp.captured_diagnostics,rt.captured_diagnostics)
+                 FROM semantic_coverage c LEFT JOIN semantic_coverage_reasons rp ON rp.payload_id=c.payload_id
+                 LEFT JOIN semantic_coverage_reasons rt ON rt.tuple_id=c.tuple_id
                  WHERE c.revision_id=?1 AND c.producer_id=?2 AND c.language=?3 AND c.selected=1
                    AND c.state IN ('failed','partial') AND (?4 IS NULL OR c.path=?4)",
             )?;
@@ -1508,20 +1514,20 @@ pub(super) fn architecture_semantic(
     // Only selected rows are loaded. Proof identities and basis metadata are keyed by
     // tuple/provenance; raw proof bytes and full semantic snapshots are never scanned.
     let mut proof = db.prepare_cached(
-        "SELECT p.freshness,p.content_hash,p.evidence_kind,p.capture_id,
+        "SELECT p.ordinal,p.content_hash,p.evidence_kind,p.capture_id,
                 p.derived_from_provenance_id,p.derived_from_record_kind,p.derived_from_fact_digest,
                 b.producer_id,b.producer_version,b.producer_hash,b.artifact_hash,b.language,
                 b.source_set_id,b.captured_native_revision_id,b.source_manifest_hash,
                 b.toolchain_hash,b.config_hash,b.dependency_hash,b.basis_id
-         FROM semantic_provenance p JOIN semantic_basis b ON b.tuple_id=p.tuple_id AND b.basis_id=p.basis_id
-         WHERE p.tuple_id=?1 AND p.provenance_id=?2",
+         FROM semantic_provenance p JOIN semantic_basis b ON b.payload_id=p.payload_id AND b.basis_id=p.basis_id
+         WHERE p.payload_id=?1 AND p.ordinal=?2",
     )?;
     let mut lookup_dependencies = db.prepare_cached(
         "SELECT lookup_key FROM semantic_basis_lookup_dependencies WHERE basis_id=?1 ORDER BY ordinal",
     )?;
     let mut metadata_rows = 0usize;
-    let mut metadata = |tuple: i64,
-                        provenance: &str,
+    let mut metadata = |pp: &super::semantic_payload::PayloadProjection<'_>,
+                        ordinal: i64,
                         projection: Option<&crate::model::SemanticProjection>|
      -> Result<BTreeMap<String, serde_json::Value>> {
         metadata_rows += 1;
@@ -1529,11 +1535,11 @@ pub(super) fn architecture_semantic(
             metadata_rows <= ARCHITECTURE_SEMANTIC_ROWS,
             "bounded_work: architecture proof metadata"
         );
-        let mut values = proof.query_row(params![tuple, provenance], |row| {
-            let historical: String = row.get(0)?;
+        let payload = pp.payload_id.context(SelectedIntegrity(
+            "incompatible_index: architecture tuple names no payload".into(),
+        ))?;
+        let mut values = proof.query_row(params![payload, ordinal], |row| {
             let mut value = BTreeMap::new();
-            value.insert("historicalFreshness".into(), json!(historical));
-            value.insert("freshness".into(), json!(if projection.is_some() && historical != "stale" { "possiblyStale" } else { &historical }));
             value.insert("historicalContentHash".into(), json!(row.get::<_, String>(1)?));
             value.insert("evidenceKind".into(), json!(row.get::<_, String>(2)?));
             let derivation = (
@@ -1546,6 +1552,18 @@ pub(super) fn architecture_semantic(
             Ok((value, row.get::<_, i64>(18)?, derivation))
         })?;
         let (capture, proof, kind, digest) = values.2;
+        let historical = semantic_variant(&pp.freshness(values.1)?)?;
+        values
+            .0
+            .insert("historicalFreshness".into(), json!(historical));
+        values.0.insert(
+            "freshness".into(),
+            json!(if projection.is_some() && historical != "stale" {
+                "possiblyStale"
+            } else {
+                &historical
+            }),
+        );
         values.0.insert(
             "derivedFrom".into(),
             serde_json::to_value(architecture_derived_from(capture, proof, kind, digest)?)?,
@@ -1579,42 +1597,45 @@ pub(super) fn architecture_semantic(
     let mut calls = db.prepare_cached(
         "SELECT b.call_id,b.join_start,b.join_end,b.resolution,b.declared_kind,
                 b.declared_internal_syntax_id,b.declared_internal_language,b.declared_internal_path,
-                b.dispatch,b.stale_target,b.provenance_id,b.binding_id,b.join_status,b.join_kind,b.join_document_language,b.join_document_path,b.join_native_revision_id
+                b.dispatch,b.stale_target,b.provenance_ordinal,b.binding_id,b.join_status,b.join_kind,b.join_document_language,b.join_document_path,COALESCE(b.join_native_revision_id,?6),p.basis_id
          FROM semantic_call_bindings b
-         JOIN semantic_provenance p ON p.tuple_id=b.tuple_id AND p.provenance_id=b.provenance_id
-         WHERE b.tuple_id=?1 AND b.call_id IS NOT NULL AND (?4 OR p.freshness='fresh')
+         JOIN semantic_provenance p ON p.payload_id=b.payload_id AND p.ordinal=b.provenance_ordinal
+         LEFT JOIN semantic_coverage_freshness f ON f.revision_id=?5 AND f.tuple_id=?7 AND f.basis_id=p.basis_id
+         WHERE b.payload_id=?1 AND b.call_id IS NOT NULL AND (?4 OR f.basis_id IS NULL OR f.freshness='fresh')
            AND b.join_document_language=?2 AND b.join_document_path=?3",
     )?;
     let mut references = db.prepare_cached(
         "SELECT r.start_byte,r.end_byte,r.resolution,r.declared_internal_syntax_id,
-                r.declared_internal_language,r.declared_internal_path,r.provenance_id,
+                r.declared_internal_language,r.declared_internal_path,r.provenance_ordinal,
                 EXISTS(SELECT 1 FROM semantic_reference_roles o
-                       WHERE o.tuple_id=r.tuple_id AND o.reference_id=r.reference_id AND o.role='type'),r.reference_id
+                       WHERE o.payload_id=r.payload_id AND o.reference_id=r.reference_id AND o.role='type'),r.reference_id,p.basis_id
          FROM semantic_references r
-         JOIN semantic_provenance p ON p.tuple_id=r.tuple_id AND p.provenance_id=r.provenance_id
-         WHERE r.tuple_id=?1 AND r.site='use' AND (?2 OR p.freshness='fresh')
+         JOIN semantic_provenance p ON p.payload_id=r.payload_id AND p.ordinal=r.provenance_ordinal
+         LEFT JOIN semantic_coverage_freshness f ON f.revision_id=?3 AND f.tuple_id=?4 AND f.basis_id=p.basis_id
+         WHERE r.payload_id=?1 AND r.site='use' AND (?2 OR f.basis_id IS NULL OR f.freshness='fresh')
            AND (?2 OR (r.resolution='resolved' AND r.declared_kind='internal') OR r.resolution='external')",
     )?;
     let mut relationships = db.prepare_cached(
         "SELECT t.kind,t.source_internal_syntax_id,t.target_kind,t.target_internal_syntax_id,
-                t.target_internal_language,t.target_internal_path,t.provenance_id,
-                t.source_internal_language,t.source_internal_path,t.source_internal_native_revision_id,
-                t.target_internal_native_revision_id,t.target_external_scheme,t.target_external_symbol,
-                t.target_external_scope,t.target_external_language,t.target_external_path
+                t.target_internal_language,t.target_internal_path,t.provenance_ordinal,
+                t.source_internal_language,t.source_internal_path,COALESCE(t.source_internal_native_revision_id,?5),
+                CASE WHEN t.target_kind='internal' THEN COALESCE(t.target_internal_native_revision_id,?5) END,t.target_external_scheme,t.target_external_symbol,
+                t.target_external_scope,t.target_external_language,t.target_external_path,p.basis_id
          FROM semantic_type_relationships t
-         JOIN semantic_provenance p ON p.tuple_id=t.tuple_id AND p.provenance_id=t.provenance_id
-         WHERE t.tuple_id=?1 AND (?2 OR p.freshness='fresh') AND t.source_kind='internal'
+         JOIN semantic_provenance p ON p.payload_id=t.payload_id AND p.ordinal=t.provenance_ordinal
+         LEFT JOIN semantic_coverage_freshness f ON f.revision_id=?3 AND f.tuple_id=?4 AND f.basis_id=p.basis_id
+         WHERE t.payload_id=?1 AND (?2 OR f.basis_id IS NULL OR f.freshness='fresh') AND t.source_kind='internal'
            AND t.kind IN ('extends','implements')
          ORDER BY t.ordinal",
     )?;
     let mut call_endpoints = db.prepare_cached(
-        "SELECT declared_kind,declared_internal_language,declared_internal_path,declared_internal_syntax_id,declared_internal_native_revision_id,declared_external_scheme,declared_external_symbol,declared_external_scope,declared_external_language,declared_external_path,'declared' FROM semantic_call_bindings WHERE binding_id=?1
-         UNION ALL SELECT kind,internal_language,internal_path,internal_syntax_id,internal_native_revision_id,external_scheme,external_symbol,external_scope,external_language,external_path,'candidate' FROM semantic_call_candidates WHERE binding_id=?1
-         UNION ALL SELECT kind,internal_language,internal_path,internal_syntax_id,internal_native_revision_id,external_scheme,external_symbol,external_scope,external_language,external_path,'dispatch' FROM semantic_call_possible_dispatch WHERE binding_id=?1",
+        "SELECT declared_kind,declared_internal_language,declared_internal_path,declared_internal_syntax_id,CASE WHEN declared_kind='internal' THEN COALESCE(declared_internal_native_revision_id,?2) END,declared_external_scheme,declared_external_symbol,declared_external_scope,declared_external_language,declared_external_path,'declared' FROM semantic_call_bindings WHERE binding_id=?1
+         UNION ALL SELECT kind,internal_language,internal_path,internal_syntax_id,CASE WHEN kind='internal' THEN COALESCE(internal_native_revision_id,?2) END,external_scheme,external_symbol,external_scope,external_language,external_path,'candidate' FROM semantic_call_candidates WHERE binding_id=?1
+         UNION ALL SELECT kind,internal_language,internal_path,internal_syntax_id,CASE WHEN kind='internal' THEN COALESCE(internal_native_revision_id,?2) END,external_scheme,external_symbol,external_scope,external_language,external_path,'dispatch' FROM semantic_call_possible_dispatch WHERE binding_id=?1",
     )?;
     let mut reference_endpoints = db.prepare_cached(
-        "SELECT declared_kind,declared_internal_language,declared_internal_path,declared_internal_syntax_id,declared_internal_native_revision_id,declared_external_scheme,declared_external_symbol,declared_external_scope,declared_external_language,declared_external_path,'declared' FROM semantic_references WHERE tuple_id=?1 AND reference_id=?2
-         UNION ALL SELECT kind,internal_language,internal_path,internal_syntax_id,internal_native_revision_id,external_scheme,external_symbol,external_scope,external_language,external_path,'candidate' FROM semantic_reference_candidates WHERE tuple_id=?1 AND reference_id=?2",
+        "SELECT declared_kind,declared_internal_language,declared_internal_path,declared_internal_syntax_id,CASE WHEN declared_kind='internal' THEN COALESCE(declared_internal_native_revision_id,?3) END,declared_external_scheme,declared_external_symbol,declared_external_scope,declared_external_language,declared_external_path,'declared' FROM semantic_references WHERE payload_id=?1 AND reference_id=?2
+         UNION ALL SELECT kind,internal_language,internal_path,internal_syntax_id,CASE WHEN kind='internal' THEN COALESCE(internal_native_revision_id,?3) END,external_scheme,external_symbol,external_scope,external_language,external_path,'candidate' FROM semantic_reference_candidates WHERE payload_id=?1 AND reference_id=?2",
     )?;
     for (tuple, i, producer, complete, projection) in tuples {
         let historical = projection.is_some();
@@ -1640,6 +1661,20 @@ pub(super) fn architecture_semantic(
             Ok(Some(target))
         };
         check()?;
+        let key = projection.as_ref().map_or_else(
+            || revision_key.to_owned(),
+            |projection| semantic_pin_key(projection.semantic_basis_pin),
+        );
+        let pp = super::semantic_payload::project_payload(
+            db,
+            &key,
+            tuple,
+            super::semantic_payload::FreshnessSource::Stored,
+        )?;
+        let payload = pp.payload_id.context(SelectedIntegrity(
+            "incompatible_index: architecture tuple names no payload".into(),
+        ))?;
+        let native = pp.native().to_owned();
         let (language, path) = (
             documents[i].key.language.clone(),
             documents[i].key.path.clone(),
@@ -1648,12 +1683,17 @@ pub(super) fn architecture_semantic(
         // The lowest provenance represents a call, as in the call graph; an unusable one
         // (stale, or outside this snapshot) leaves the call without a binding.
         let mut by_call: BTreeMap<String, (String, Option<SemanticAnchor>)> = BTreeMap::new();
-        let mut cursor = calls.query(params![tuple, language, path, historical])?;
+        let mut cursor = calls.query(params![
+            payload, language, path, historical, key, native, tuple
+        ])?;
         while let Some(row) = cursor.next()? {
             admit()?;
+            // A missing required freshness row is corruption, never a filtered fact.
+            pp.freshness(row.get(17)?)?;
             let call_id = id_codec::decode_occ(row.get_ref(0)?.as_blob()?)
                 .map_err(|_| SelectedIntegrity("invalid semantic call ID".into()))?;
-            let provenance_id: String = row.get(10)?;
+            let ordinal: i64 = row.get(10)?;
+            let provenance_id = pp.provenance_id(ordinal)?;
             // Every row's offsets and dispatch decode strictly, used or not.
             let anchor_range = range(row.get(1)?, row.get(2)?)?;
             let is_direct = direct(row.get_ref(8)?.as_str()?)?;
@@ -1663,7 +1703,7 @@ pub(super) fn architecture_semantic(
             {
                 continue;
             }
-            let mut binding_metadata = metadata(tuple, &provenance_id, projection.as_ref())?;
+            let mut binding_metadata = metadata(&pp, ordinal, projection.as_ref())?;
             if historical {
                 binding_metadata.insert(
                     "historicalResolution".into(),
@@ -1677,7 +1717,8 @@ pub(super) fn architecture_semantic(
             if historical {
                 let mut targets = Vec::new();
                 let mut external_targets = Vec::new();
-                let mut alternatives = call_endpoints.query([row.get::<_, i64>(11)?])?;
+                let mut alternatives =
+                    call_endpoints.query(params![row.get::<_, i64>(11)?, native])?;
                 while let Some(target) = alternatives.next()? {
                     admit()?;
                     if target.get_ref(0)?.as_str_or_null()? == Some("internal") {
@@ -1745,9 +1786,10 @@ pub(super) fn architecture_semantic(
             .filter_map(|(_, anchor)| anchor)
             .collect();
         // Resolved and external use-site references: the names a site spells.
-        let mut cursor = references.query(params![tuple, historical])?;
+        let mut cursor = references.query(params![payload, historical, key, tuple])?;
         while let Some(row) = cursor.next()? {
             admit()?;
+            pp.freshness(row.get(9)?)?;
             let outcome = match (
                 row.get_ref(2)?.as_str()?,
                 sid(row.get_ref(3)?.as_blob_or_null()?)?,
@@ -1765,8 +1807,8 @@ pub(super) fn architecture_semantic(
                 ("external", _) => SemanticOutcome::External,
                 _ => return Err(SelectedIntegrity("corrupt semantic reference".into()).into()),
             };
-            let mut reference_metadata =
-                metadata(tuple, row.get_ref(6)?.as_str()?, projection.as_ref())?;
+            let reference_ordinal: i64 = row.get(6)?;
+            let mut reference_metadata = metadata(&pp, reference_ordinal, projection.as_ref())?;
             if historical {
                 reference_metadata.insert(
                     "historicalResolution".into(),
@@ -1777,8 +1819,11 @@ pub(super) fn architecture_semantic(
             if historical {
                 let mut targets = Vec::new();
                 let mut external_targets = Vec::new();
-                let mut alternatives =
-                    reference_endpoints.query(params![tuple, row.get_ref(8)?.as_blob()?])?;
+                let mut alternatives = reference_endpoints.query(params![
+                    payload,
+                    row.get_ref(8)?.as_blob()?,
+                    native
+                ])?;
                 while let Some(target) = alternatives.next()? {
                     admit()?;
                     if target.get_ref(0)?.as_str_or_null()? == Some("internal") {
@@ -1806,7 +1851,7 @@ pub(super) fn architecture_semantic(
                 } else {
                     SemanticOutcome::Boundary
                 },
-                provenance_id: row.get(6)?,
+                provenance_id: pp.provenance_id(reference_ordinal)?,
                 metadata: reference_metadata,
             });
         }
@@ -1820,9 +1865,10 @@ pub(super) fn architecture_semantic(
             ))
         });
         let mut found = Vec::new();
-        let mut cursor = relationships.query(params![tuple, historical])?;
+        let mut cursor = relationships.query(params![payload, historical, key, tuple, native])?;
         while let Some(row) = cursor.next()? {
             admit()?;
+            pp.freshness(row.get(16)?)?;
             let source = sid(row.get_ref(1)?.as_blob_or_null()?)?.context(SelectedIntegrity(
                 "corrupt semantic type relationship".into(),
             ))?;
@@ -1837,8 +1883,9 @@ pub(super) fn architecture_semantic(
                 .map(|target_doc| (target_doc, target)),
                 _ => None,
             };
+            let relationship_ordinal: i64 = row.get(6)?;
             let mut relationship_metadata =
-                metadata(tuple, row.get_ref(6)?.as_str()?, projection.as_ref())?;
+                metadata(&pp, relationship_ordinal, projection.as_ref())?;
             let source_eligible = !historical
                 || endpoint(
                     row.get_ref(7)?.as_str_or_null()?,
@@ -1865,7 +1912,7 @@ pub(super) fn architecture_semantic(
                 kind: row.get(0)?,
                 source_syntax_id: source,
                 target: if source_eligible { target } else { None },
-                provenance_id: row.get(6)?,
+                provenance_id: pp.provenance_id(relationship_ordinal)?,
                 metadata: relationship_metadata,
             });
         }

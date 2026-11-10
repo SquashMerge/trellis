@@ -5,7 +5,7 @@ mod continuation;
 pub(crate) mod copy;
 mod local_targets;
 #[cfg(feature = "test-support")]
-mod oracle;
+pub(in crate::store) mod oracle;
 #[cfg(test)]
 mod tests;
 pub(crate) mod witness;
@@ -37,6 +37,9 @@ pub(crate) struct PreparedSemantic {
     pub output: PreparedOutput,
     /// A below-capture batch whose staged capture witness this S publishes.
     pub capture_witness: Option<i64>,
+    /// The FULL rejoin the pre-commit oracle computed, kept for the post-commit head oracle.
+    #[cfg(feature = "test-support")]
+    pub oracle_full: Option<crate::semantic_evidence::SemanticPublication>,
 }
 
 pub(crate) enum PreparedOutput {
@@ -77,38 +80,7 @@ fn parse_pin(key: &str) -> Result<IndexPin> {
 }
 
 pub(super) fn clear(db: &Connection) -> Result<()> {
-    db.execute_batch("DELETE FROM semantic_pending_target; DELETE FROM semantic_pending_selections; DELETE FROM semantic_catchup_commits; DELETE FROM semantic_projection_documents; DELETE FROM semantic_projection_origins; DELETE FROM semantic_projection_dependencies; DELETE FROM semantic_projection_lookup_dependencies; DELETE FROM semantic_projection_contexts;")?;
-    Ok(())
-}
-
-/// Build reverse associations only from validated, published endpoints. Opaque lookup keys
-/// remain historical dependencies; they are not a namespace for inventing N resolutions.
-pub(super) fn index_dependencies(db: &Connection, key: &str) -> Result<()> {
-    db.execute("INSERT OR IGNORE INTO semantic_projection_contexts SELECT DISTINCT b.tuple_id FROM semantic_basis b JOIN semantic_coverage c ON c.tuple_id=b.tuple_id WHERE c.revision_id=?1",[key])?;
-    context::validate(db, key)?;
-    let endpoints = [
-        "SELECT s.tuple_id,t.internal_language,t.internal_path FROM semantic_symbols s JOIN semantic_symbol_targets t ON t.symbol_id=s.symbol_id WHERE t.kind='internal'",
-        "SELECT b.tuple_id,b.join_document_language,b.join_document_path FROM semantic_declaration_bindings b",
-        "SELECT b.tuple_id,b.join_document_language,b.join_document_path FROM semantic_declaration_bindings b JOIN semantic_declaration_join_candidates j ON j.binding_id=b.binding_id",
-        "SELECT r.tuple_id,r.declared_internal_language,r.declared_internal_path FROM semantic_references r WHERE r.declared_kind='internal'",
-        "SELECT r.tuple_id,r.internal_language,r.internal_path FROM semantic_reference_candidates r WHERE r.kind='internal'",
-        "SELECT b.tuple_id,b.declared_internal_language,b.declared_internal_path FROM semantic_call_bindings b WHERE b.declared_kind='internal'",
-        "SELECT b.tuple_id,t.internal_language,t.internal_path FROM semantic_call_bindings b JOIN semantic_call_candidates t ON t.binding_id=b.binding_id WHERE t.kind='internal'",
-        "SELECT b.tuple_id,t.internal_language,t.internal_path FROM semantic_call_bindings b JOIN semantic_call_possible_dispatch t ON t.binding_id=b.binding_id WHERE t.kind='internal'",
-        "SELECT b.tuple_id,b.join_document_language,b.join_document_path FROM semantic_call_bindings b",
-        "SELECT b.tuple_id,b.join_document_language,b.join_document_path FROM semantic_call_bindings b JOIN semantic_call_join_candidates j ON j.binding_id=b.binding_id",
-        "SELECT r.tuple_id,r.source_internal_language,r.source_internal_path FROM semantic_type_relationships r WHERE r.source_kind='internal'",
-        "SELECT r.tuple_id,r.target_internal_language,r.target_internal_path FROM semantic_type_relationships r WHERE r.target_kind='internal'",
-    ];
-    for endpoint in endpoints {
-        db.execute(&format!("INSERT OR IGNORE INTO semantic_projection_dependencies SELECT e.* FROM ({endpoint}) e JOIN semantic_coverage c ON c.tuple_id=e.tuple_id WHERE c.revision_id=?1"), [key])?;
-    }
-    let missing: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM semantic_projection_dependencies e JOIN semantic_coverage c ON c.tuple_id=e.tuple_id LEFT JOIN revision_documents d ON d.revision_id=c.revision_id AND d.language=e.language AND d.path=e.path WHERE c.revision_id=?1 AND d.vid IS NULL)", [key], |row|row.get(0))?;
-    selected_ensure!(
-        !missing,
-        "incompatible_index: semantic dependency endpoint missing"
-    );
-    db.execute("INSERT OR IGNORE INTO semantic_projection_lookup_dependencies SELECT c.tuple_id,d.lookup_key FROM semantic_coverage c JOIN semantic_basis b ON b.tuple_id=c.tuple_id JOIN semantic_basis_lookup_dependencies d ON d.basis_id=b.basis_id WHERE c.revision_id=?1", [key])?;
+    db.execute_batch("DELETE FROM semantic_pending_target; DELETE FROM semantic_pending_selections; DELETE FROM semantic_catchup_commits; DELETE FROM semantic_projection_documents; DELETE FROM semantic_projection_origins; DELETE FROM semantic_projection_dependencies; DELETE FROM semantic_projection_dependency_targets; DELETE FROM semantic_projection_lookup_dependencies; DELETE FROM semantic_projection_contexts;")?;
     Ok(())
 }
 
@@ -121,6 +93,30 @@ pub(super) fn write_pending(
     config: &[serde_json::Value],
     dependencies: &[serde_json::Value],
     cancel: &CancelFlag,
+) -> Result<()> {
+    write_pending_within(
+        db,
+        prior,
+        pin,
+        root_id,
+        config,
+        dependencies,
+        cancel,
+        semantic_payload::TERM_LOOKUP_BOUND,
+    )
+}
+
+/// [`write_pending`] with its dependency-term lookup bound given.
+#[allow(clippy::too_many_arguments)]
+fn write_pending_within(
+    db: &Connection,
+    prior: IndexPin,
+    pin: IndexPin,
+    root_id: &str,
+    config: &[serde_json::Value],
+    dependencies: &[serde_json::Value],
+    cancel: &CancelFlag,
+    lookup_bound: usize,
 ) -> Result<()> {
     let old = semantic_pin_key(prior);
     let key = semantic_pin_key(pin);
@@ -152,9 +148,9 @@ pub(super) fn write_pending(
     if same_native {
         context::validate(db, &old)?;
         // Same-native copies retain exact destination authority, including #657.
-        copy_semantic_rows(db, &old, &key, true)?;
+        copy_semantic_manifest(db, &old, &key, true, None)?;
         copy_projection_except(db, &old, &key, "")?;
-        index_dependencies(db, &key)?;
+        context::validate(db, &key)?;
         return Ok(());
     }
     db.execute("INSERT INTO semantic_projection_origins SELECT ?1,p.id,COALESCE(o.basis_pin,?2) FROM semantic_revision_producers p LEFT JOIN semantic_projection_origins o ON o.revision_id=p.revision_id AND o.producer_id=p.id WHERE p.revision_id=?2", params![key, old])?;
@@ -183,11 +179,53 @@ pub(super) fn write_pending(
         JOIN revision_documents p ON p.revision_id=o.basis_pin
         LEFT JOIN revision_documents n ON n.revision_id=?1 AND n.language=p.language AND n.path=p.path
         WHERE o.revision_id=?1 AND (n.vid IS NULL OR n.vid<>p.vid)", [&key])?;
-    db.execute("UPDATE semantic_projection_documents SET pending=1 WHERE revision_id=?1 AND (producer_id,language,path) IN (
-        SELECT c.producer_id,c.language,c.path FROM native_first_changed x
+    // A changed dependency makes a dependent pending only when its dependency term differs at
+    // the new revision from the one the basis payload recorded, or when the check is over its
+    // bound (Decision 0021 D4); a NULL term is pending on any change.
+    let mut dependents = db.prepare("SELECT c.producer_id,c.language,c.path,e.payload_id,e.language,e.path,e.term,s.captured_pin
+        FROM native_first_changed x
         CROSS JOIN semantic_projection_dependencies e INDEXED BY semantic_projection_reverse ON e.language=x.language AND e.path=x.path
-        JOIN semantic_coverage c ON c.tuple_id=e.tuple_id AND c.revision_id=x.basis_pin
-        JOIN semantic_projection_origins o ON o.revision_id=?1 AND o.producer_id=c.producer_id AND o.basis_pin=x.basis_pin)", [&key])?;
+        JOIN semantic_coverage c ON c.payload_id=e.payload_id AND c.revision_id=x.basis_pin
+        JOIN semantic_projection_origins o ON o.revision_id=?1 AND o.producer_id=c.producer_id AND o.basis_pin=x.basis_pin
+        LEFT JOIN semantic_revision_raw_selections s ON s.revision_id=?1 AND s.producer_id=c.producer_id")?;
+    let mut targets = db.prepare("SELECT syntax_id,call FROM semantic_projection_dependency_targets WHERE payload_id=?1 AND language=?2 AND path=?3")?;
+    let mut mark = db.prepare("UPDATE semantic_projection_documents SET pending=1 WHERE revision_id=?1 AND producer_id=?2 AND language=?3 AND path=?4")?;
+    let mut marked = BTreeSet::new();
+    let mut budget = lookup_bound;
+    let mut rows = dependents.query([&key])?;
+    while let Some(row) = rows.next()? {
+        let tuple: (String, String, String) = (row.get(0)?, row.get(1)?, row.get(2)?);
+        if marked.contains(&tuple) {
+            continue;
+        }
+        let (payload, language, path): (i64, String, String) =
+            (row.get(3)?, row.get(4)?, row.get(5)?);
+        let (stored, captured): (Option<String>, Option<String>) = (row.get(6)?, row.get(7)?);
+        let pending = match (stored, captured) {
+            (Some(stored), Some(captured)) => {
+                let targets: Vec<(Vec<u8>, bool)> = targets
+                    .query_map(params![payload, language, path], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })?
+                    .collect::<rusqlite::Result<_>>()?;
+                if targets.len() >= budget {
+                    budget = 0;
+                    true
+                } else {
+                    budget -= targets.len() + 1;
+                    semantic_payload::dependency_term(
+                        db, &key, &captured, &language, &path, &targets,
+                    )? != stored
+                }
+            }
+            _ => true,
+        };
+        if pending {
+            mark.execute(params![key, tuple.0, tuple.1, tuple.2])?;
+            marked.insert(tuple);
+        }
+    }
+    drop(rows);
     db.execute_batch("DELETE FROM native_first_changed")?;
     context::mark_pending(db, &key, config, dependencies, cancel)?;
     db.execute("INSERT INTO semantic_pending_selections SELECT s.revision_id,s.producer_id,s.batch_id,s.captured_pin,o.basis_pin FROM semantic_revision_raw_selections s JOIN semantic_projection_origins o ON o.revision_id=s.revision_id AND o.producer_id=s.producer_id WHERE s.revision_id=?1", [&key])?;
@@ -281,11 +319,11 @@ pub(crate) fn semantic_projection_for(
         |r| r.get(0),
     )?;
     row.map(|(basis, native, pending)| {
-        let tuple: Option<i64> = db.query_row(
-            "SELECT tuple_id FROM semantic_coverage WHERE revision_id=?1 AND producer_id=?2 AND language=?3 AND path=?4",
+        let payload: Option<Option<i64>> = db.query_row(
+            "SELECT payload_id FROM semantic_coverage WHERE revision_id=?1 AND producer_id=?2 AND language=?3 AND path=?4",
             params![basis,producer,language,path], |r|r.get(0)).optional()?;
-        if let Some(tuple) = tuple {
-            context::validate_tuple(db, &basis, producer, tuple)?;
+        if let Some(payload) = payload {
+            context::validate_tuple(db, &basis, producer, payload)?;
         }
         Ok(SemanticProjection {
             current_pin: pin,
@@ -603,7 +641,7 @@ impl Store {
         ] {
             tx.execute(sql, params![key, old])?;
         }
-        copy_semantic_rows(&tx, &old, &key, true)?;
+        copy_semantic_manifest(&tx, &old, &key, true, None)?;
         blocked.check(&tx);
         #[cfg(feature = "test-support")]
         let mut observer = self.semantic_publication_observer.lock().unwrap().take();
@@ -631,37 +669,65 @@ impl Store {
                         destination = Some(copy::CopyDestination::read(self, &tx, target)?);
                     }
                     let producer = &output.producer;
+                    let selection = target
+                        .selections
+                        .iter()
+                        .find(|selection| selection.producer_id == producer.id)
+                        .context("selected semantic batch missing")?;
+                    let inputs = self.payload_key_inputs();
+                    let captured_key = semantic_pin_key(selection.captured_pin);
                     // Copied and staged documents are written in canonical key order, as one
-                    // settlement of every document would have written them.
-                    let mut write = |document: &crate::semantic_evidence::SemanticPublication| {
+                    // settlement of every document would have written them. Corruption read or
+                    // written while publishing is reported, so it schedules a re-index as a
+                    // read would; the publication transaction is not committed.
+                    let mut write = |next: CommitDocument<'_>| {
                         check_cancel(cancel)?;
-                        write_import_coverage(&tx, &key, document)?;
+                        match next {
+                            CommitDocument::Staged(document) => write_import_coverage(
+                                &tx,
+                                &key,
+                                document,
+                                Some((selection.batch_id, &captured_key)),
+                                &inputs,
+                            )?,
+                            // A copied document names its basis row's payload: its manifest
+                            // row and freshness are all S writes for it, and the payload's
+                            // rows are never read or written.
+                            CommitDocument::Copied(document) => {
+                                let (_, basis_tuple) = copy::copy_source(
+                                    &tx,
+                                    target,
+                                    &producer.id,
+                                    selection.batch_id,
+                                    inputs.join_inputs(),
+                                    document,
+                                )?
+                                .context(SelectedIntegrity(
+                                    "incompatible_index: copied document lost its basis".into(),
+                                ))?;
+                                let payload: Option<i64> = tx.query_row(
+                                    "SELECT payload_id FROM semantic_coverage WHERE tuple_id=?1",
+                                    [basis_tuple],
+                                    |row| row.get(0),
+                                )?;
+                                let freshness = match payload {
+                                    Some(payload) => copy::reuse_freshness(
+                                        &tx,
+                                        payload,
+                                        producer,
+                                        destination.as_ref().context("copy destination")?,
+                                    )?,
+                                    None => BTreeMap::new(),
+                                };
+                                copy::publish_copy(&tx, &key, basis_tuple, &freshness)?;
+                            }
+                        }
                         blocked.check(&tx);
                         #[cfg(feature = "test-support")]
                         if let Some(observer) = observer.as_mut() {
                             observer(crate::store::SemanticPublicationStage::AfterDocument, &tx);
                         }
                         anyhow::Ok(())
-                    };
-                    // Corruption read or written while copying is reported, so it schedules a
-                    // re-index as a read would; the publication transaction is not committed.
-                    let copy_one = |document: &crate::native_evidence::DocumentKey| {
-                        (|| {
-                            let (basis, tuple) =
-                                copy::copy_source(&tx, target, &producer.id, document)?.context(
-                                    SelectedIntegrity(
-                                        "incompatible_index: copied document lost its basis".into(),
-                                    ),
-                                )?;
-                            copy::copied_document(
-                                &tx,
-                                &basis,
-                                tuple,
-                                producer,
-                                destination.as_ref().context("copy destination")?,
-                            )
-                        })()
-                        .map_err(|error| self.report_index_failure(error))
                     };
                     crate::semantic_import::read_staged_documents(
                         parts.conn,
@@ -678,16 +744,16 @@ impl Store {
                                         < (staged.0.as_str(), staged.1.as_str())
                                 }) {
                                     let doc = copied.pop_front().expect("front checked");
-                                    // Writing a copied row can be where its corruption is found.
-                                    write(&copy_one(&doc)?)
+                                    write(CommitDocument::Copied(&doc))
                                         .map_err(|error| self.report_index_failure(error))?;
                                 }
                             }
-                            write(&document)
+                            write(CommitDocument::Staged(&document))
+                                .map_err(|error| self.report_index_failure(error))
                         },
                     )?;
                     while let Some(doc) = copied.pop_front() {
-                        write(&copy_one(&doc)?)
+                        write(CommitDocument::Copied(&doc))
                             .map_err(|error| self.report_index_failure(error))?;
                     }
                     context::publish(
@@ -711,7 +777,7 @@ impl Store {
         // Producers without retained raw input keep their explicit P view, not missing tuples.
         tx.execute("INSERT INTO semantic_projection_origins SELECT ?1,o.producer_id,o.basis_pin FROM semantic_projection_origins o WHERE o.revision_id=?2 AND NOT EXISTS(SELECT 1 FROM semantic_pending_selections s WHERE s.revision_id=?2 AND s.producer_id=o.producer_id)",params![key,old])?;
         tx.execute("INSERT INTO semantic_projection_documents SELECT ?1,d.producer_id,d.language,d.path,d.pending FROM semantic_projection_documents d JOIN semantic_projection_origins o ON o.revision_id=?1 AND o.producer_id=d.producer_id WHERE d.revision_id=?2",params![key,old])?;
-        index_dependencies(&tx, &key)?;
+        context::validate(&tx, &key)?;
         semantic_retention::copy(&tx, &old, &key, None)?;
         // A producer S re-admitted no longer needs a re-import.
         for output in prepared.iter() {
@@ -753,6 +819,12 @@ impl Store {
             }
         }
     }
+}
+
+/// A document S publishes at commit: settled and staged, or copied from its basis row.
+enum CommitDocument<'a> {
+    Staged(&'a crate::semantic_evidence::SemanticPublication),
+    Copied(&'a crate::native_evidence::DocumentKey),
 }
 
 /// A bounded one-document overlay read. The tuple and every target retain P authority.

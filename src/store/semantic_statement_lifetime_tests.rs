@@ -4,12 +4,16 @@ use super::*;
 fn semantic_fact_children_reuse_statement_without_reprepare_per_symbol() {
     let db = Connection::open_in_memory().unwrap();
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
-    db.execute_batch(CACHE_SCHEMA_V41).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V42).unwrap();
+    db.execute("INSERT INTO native_revisions VALUES('key','source-set',?1,?1,?1,'native','[]','[]','{}','[]','[]',NULL,'[]',0,'{}','[]',1)", ["a".repeat(64)]).unwrap();
+    db.execute("INSERT INTO semantic_coverage VALUES(1,'key','producer','1','rust','main.rs',1,1,'complete',NULL,1)", []).unwrap();
+    db.execute("INSERT INTO semantic_provenance(payload_id,ordinal,provenance_id,content_hash,evidence_kind,basis_id) VALUES(1,0,'proof','hash','measuredSyntax',1)", []).unwrap();
     for id in 10_i64..14 {
         db.execute(
-            "INSERT INTO semantic_symbols VALUES(?1,1,?2,'scip',?3,'global',NULL,NULL,NULL,'proof')",
+            "INSERT INTO semantic_symbols VALUES(?1,1,?2,'scip',?3,'global',NULL,NULL,NULL,0)",
             params![id, id - 10, format!("symbol-{id}")],
-        ).unwrap();
+        )
+        .unwrap();
         db.execute(
             "INSERT INTO semantic_symbol_targets VALUES(?1,0,'external',NULL,NULL,NULL,NULL,'scip',?2,'global',NULL,NULL)",
             params![id, format!("target-{id}")],
@@ -31,7 +35,10 @@ fn semantic_fact_children_reuse_statement_without_reprepare_per_symbol() {
         type_relationships: vec![],
     };
     SEMANTIC_CHILD_REPREPARES.with(|count| count.set(0));
-    read_semantic_facts(&db, 1, &document, "native", &mut result, None).unwrap();
+    let projection =
+        semantic_payload::project_payload(&db, "key", 1, semantic_payload::FreshnessSource::Stored)
+            .unwrap();
+    read_semantic_facts(&db, &projection, &document, &mut result, None).unwrap();
     assert_eq!(result.symbols.len(), 4);
     for (offset, symbol) in result.symbols.iter().enumerate() {
         let expected = format!("target-{}", offset + 10);

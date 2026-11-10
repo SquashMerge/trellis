@@ -4,7 +4,7 @@
 use super::*;
 use crate::{native_ids, semantic_batch::AdmittedBatch, semantic_evidence as sem};
 
-pub(super) fn enabled() -> bool {
+pub(in crate::store) fn enabled() -> bool {
     std::env::var_os("TRELLIS_TEST_LOCAL_FULL_ORACLE").is_some()
         || TEST_REJOIN_ORACLE_MISMATCH.get()
 }
@@ -17,9 +17,9 @@ pub(super) fn check(
     producer: &sem::Producer,
     admitted: &mut AdmittedBatch,
     cancel: &CancelFlag,
-) -> Result<()> {
+) -> Result<sem::SemanticPublication> {
     let work_checkpoint = crate::semantic_import::publication_work_checkpoint();
-    let result = (|| -> Result<()> {
+    let result = (|| -> Result<sem::SemanticPublication> {
         check_cancel(cancel)?;
         let mut actual = crate::semantic_import::empty_publication(producer);
         crate::semantic_import::read_staged_documents(
@@ -48,9 +48,15 @@ pub(super) fn check(
         if !copied.is_empty() {
             let destination = super::copy::CopyDestination::read(store, db, target)?;
             for document in &copied {
-                let (basis, tuple) = super::copy::copy_source(db, target, &producer.id, document)?
-                    .context("FULL oracle copied document has no basis")?;
-                let copy = super::copy::copied_document(db, &basis, tuple, producer, &destination)?;
+                let copy = super::copy::copied_document(
+                    db,
+                    target,
+                    selection,
+                    producer,
+                    &destination,
+                    store.payload_key_inputs().join_inputs(),
+                    document,
+                )?;
                 actual.coverage.extend(copy.coverage);
                 actual.provenance.extend(copy.provenance);
                 actual.symbols.extend(copy.symbols);
@@ -69,10 +75,148 @@ pub(super) fn check(
         {
             return Err(RejoinOracleMismatch.into());
         }
-        Ok(())
+        Ok(full)
     })();
     crate::semantic_import::restore_publication_work(work_checkpoint);
     result
+}
+
+/// F2. The committed head's reader-visible rows for `producer` against the independent FULL
+/// rejoin: a wrong writer hit, copy, projection or freshness row shows here.
+pub(in crate::store) fn check_published(
+    db: &Connection,
+    published: IndexPin,
+    producer: &sem::Producer,
+    full: &sem::SemanticPublication,
+) -> Result<()> {
+    let snapshot = read_semantic_tuple(db, &semantic_pin_key(published), None, None, false)?;
+    let provenance: Vec<_> = snapshot
+        .provenance
+        .into_iter()
+        .filter(|p| p.producer_id == producer.id)
+        .collect();
+    let owned: BTreeSet<&str> = provenance.iter().map(|p| p.id.as_str()).collect();
+    let actual = sem::SemanticPublication {
+        producers: vec![],
+        coverage: snapshot
+            .coverage
+            .into_iter()
+            .filter(|c| c.producer_id == producer.id)
+            .collect(),
+        symbols: snapshot
+            .symbols
+            .into_iter()
+            .filter(|f| owned.contains(f.provenance_id.as_str()))
+            .collect(),
+        declaration_bindings: snapshot
+            .declaration_bindings
+            .into_iter()
+            .filter(|f| owned.contains(f.provenance_id.as_str()))
+            .collect(),
+        references: snapshot
+            .references
+            .into_iter()
+            .filter(|f| owned.contains(f.provenance_id.as_str()))
+            .collect(),
+        call_bindings: snapshot
+            .call_bindings
+            .into_iter()
+            .filter(|f| owned.contains(f.provenance_id.as_str()))
+            .collect(),
+        type_relationships: snapshot
+            .type_relationships
+            .into_iter()
+            .filter(|f| owned.contains(f.provenance_id.as_str()))
+            .collect(),
+        provenance: provenance.clone(),
+    };
+    if sorted_publication_rows(&actual)?[1..] != sorted_publication_rows(full)?[1..] {
+        return Err(RejoinOracleMismatch.into());
+    }
+    Ok(())
+}
+
+/// F3. A writer hit names a stored payload instead of writing rows; the rows the manifest
+/// row now reads must equal the settled document it replaced.
+pub(in crate::store) fn check_hit(
+    db: &Connection,
+    key: &str,
+    tuple: i64,
+    coverage: &sem::Coverage,
+    publication: &sem::SemanticPublication,
+) -> Result<()> {
+    let owns = semantic_payload::owned_provenance(coverage, publication);
+    let mine = |id: &str| owns.contains(id);
+    let settled = sem::SemanticPublication {
+        producers: vec![],
+        coverage: vec![coverage.clone()],
+        provenance: publication
+            .provenance
+            .iter()
+            .filter(|p| mine(&p.id) && p.producer_id == coverage.producer_id)
+            .cloned()
+            .collect(),
+        symbols: publication
+            .symbols
+            .iter()
+            .filter(|f| mine(&f.provenance_id))
+            .cloned()
+            .collect(),
+        declaration_bindings: publication
+            .declaration_bindings
+            .iter()
+            .filter(|f| mine(&f.provenance_id))
+            .cloned()
+            .collect(),
+        references: publication
+            .references
+            .iter()
+            .filter(|f| mine(&f.provenance_id))
+            .cloned()
+            .collect(),
+        call_bindings: publication
+            .call_bindings
+            .iter()
+            .filter(|f| mine(&f.provenance_id))
+            .cloned()
+            .collect(),
+        type_relationships: publication
+            .type_relationships
+            .iter()
+            .filter(|f| mine(&f.provenance_id))
+            .cloned()
+            .collect(),
+    };
+    let source_set: String = db.query_row(
+        "SELECT source_set_id FROM native_revisions WHERE id=?1",
+        [key],
+        |r| r.get(0),
+    )?;
+    let read = read_semantic_tuple_with_reasons(
+        db,
+        key,
+        Some(tuple),
+        None,
+        true,
+        None,
+        true,
+        source_set,
+        None,
+    )?;
+    let actual = sem::SemanticPublication {
+        producers: vec![],
+        coverage: read.coverage,
+        provenance: read.provenance,
+        symbols: read.symbols,
+        declaration_bindings: read.declaration_bindings,
+        references: read.references,
+        call_bindings: read.call_bindings,
+        type_relationships: read.type_relationships,
+    };
+    if sorted_publication_rows(&actual)? != sorted_publication_rows(&settled)? {
+        return Err(RejoinOracleMismatch.into());
+    }
+    Ok(())
 }
 
 /// An S that ended unavailable for `producer` is a mismatch whenever the independent FULL

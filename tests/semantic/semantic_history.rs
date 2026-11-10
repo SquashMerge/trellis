@@ -548,7 +548,7 @@ fn populated_history_partitions_documents_and_producers() {
             .join("index.db"),
     )
     .unwrap();
-    let plan = db.prepare("EXPLAIN QUERY PLAN SELECT s.provenance_id FROM semantic_symbols s JOIN semantic_symbol_targets t ON t.symbol_id=s.symbol_id WHERE s.tuple_id=?1 AND t.kind='internal' AND t.internal_syntax_id=?2 AND t.internal_language=?3 AND t.internal_path=?4").unwrap()
+    let plan = db.prepare("EXPLAIN QUERY PLAN SELECT s.provenance_ordinal FROM semantic_symbols s JOIN semantic_symbol_targets t ON t.symbol_id=s.symbol_id WHERE s.payload_id=?1 AND t.kind='internal' AND t.internal_syntax_id=?2 AND t.internal_language=?3 AND t.internal_path=?4").unwrap()
         .query_map(rusqlite::params![1, vec![0_u8; 16], "rust", "hello.rs"], |row| row.get::<_, String>(3)).unwrap()
         .collect::<rusqlite::Result<Vec<_>>>().unwrap();
     assert!(
@@ -980,7 +980,7 @@ fn corrupted_retained_tuple_fails_typed_without_partial_history() {
             .join("index.db"),
     )
     .unwrap();
-    db.execute("UPDATE semantic_basis SET language='invalid' WHERE tuple_id=(SELECT tuple_id FROM semantic_coverage WHERE revision_id=?1)", [format!("pin:v1:{}:{}", first.index_generation, first.index_revision)]).unwrap();
+    db.execute("UPDATE semantic_basis SET language='invalid' WHERE payload_id=(SELECT payload_id FROM semantic_coverage WHERE revision_id=?1)", [format!("pin:v1:{}:{}", first.index_generation, first.index_revision)]).unwrap();
     let error = store
         .semantic_history_for(second, producer, doc, syntax)
         .unwrap_err();

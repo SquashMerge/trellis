@@ -1601,7 +1601,7 @@ fn bounded_semantic_children_release_preserves_same_native_id_survivors() {
     )
     .unwrap();
     let count = |db: &Connection, pin: trellis::model::IndexPin| -> i64 {
-        db.query_row("SELECT count(*) FROM semantic_basis_lookup_dependencies WHERE basis_id IN (SELECT basis_id FROM semantic_basis WHERE tuple_id IN (SELECT tuple_id FROM semantic_coverage WHERE revision_id=?1))",[format!("pin:v1:{}:{}",pin.index_generation,pin.index_revision)],|r|r.get(0)).unwrap()
+        db.query_row("SELECT count(*) FROM semantic_basis_lookup_dependencies WHERE basis_id IN (SELECT basis_id FROM semantic_basis WHERE payload_id IN (SELECT payload_id FROM semantic_coverage WHERE revision_id=?1))",[format!("pin:v1:{}:{}",pin.index_generation,pin.index_revision)],|r|r.get(0)).unwrap()
     };
     assert!(count(&db, first) > 64);
     let survivor_count = count(&db, second);
@@ -1634,8 +1634,8 @@ fn bounded_semantic_children_release_preserves_same_native_id_survivors() {
     assert_eq!(count(&db, first), 0);
     assert_eq!(count(&db, second), survivor_count);
     let released_children: i64 = db.query_row(
-        "SELECT count(*) FROM semantic_provenance WHERE tuple_id IN (SELECT tuple_id FROM semantic_coverage WHERE revision_id=?1)",
-        [&pin_key], |r| r.get(0),
+        "SELECT count(*) FROM semantic_provenance p WHERE NOT EXISTS(SELECT 1 FROM semantic_coverage c WHERE c.payload_id=p.payload_id)",
+        [], |r| r.get(0),
     ).unwrap();
     assert_eq!(released_children, 0);
     let released = reopened.semantic_at(first).unwrap_err();
@@ -1912,7 +1912,7 @@ fn native_only_selective_recovery_replaces_semantics_after_private_stage() {
         .unwrap_err();
     assert!(error.to_string().contains("cancelled"), "{error:#}");
     let db = rusqlite::Connection::open(&path).unwrap();
-    let old:i64=db.query_row("SELECT count(*) FROM semantic_provenance WHERE tuple_id IN (SELECT tuple_id FROM semantic_coverage WHERE revision_id=?1)",
+    let old:i64=db.query_row("SELECT count(*) FROM semantic_provenance p JOIN semantic_coverage c ON c.payload_id=p.payload_id WHERE c.revision_id=?1",
         [format!("pin:v1:{}:{}",prior.index_generation,prior.index_revision)],|r|r.get(0)).unwrap();
     assert_eq!(
         old,
