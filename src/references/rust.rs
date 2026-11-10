@@ -1925,6 +1925,15 @@ pub(super) fn extract(
     Ok(result)
 }
 
+/// The path of module `name` in module directory `directory` (`""` is the checkout's).
+fn child_path(directory: &str, name: &str) -> String {
+    if directory.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{directory}/{name}")
+    }
+}
+
 #[cfg(test)]
 mod cache_tests {
     use super::*;
@@ -2257,14 +2266,5 @@ mod cache_tests {
             index.enclosing(101, 102, &mut work, &mut check).unwrap(),
             None
         );
-    }
-}
-
-/// The path of module `name` in module directory `directory` (`""` is the checkout's).
-fn child_path(directory: &str, name: &str) -> String {
-    if directory.is_empty() {
-        name.to_owned()
-    } else {
-        format!("{directory}/{name}")
     }
 }
