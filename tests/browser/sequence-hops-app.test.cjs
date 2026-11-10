@@ -94,7 +94,7 @@ test("a web app Sequence hops into the daemon at matched routes and opens the ha
     const inspector = await page.locator("#call-inspector").innerText();
     assert.match(inspector, /HTTP interface hop · POST \/api\/sequence · exact · web-app → alpha · structural match by method and path, not proof the request is sent/);
     assert.match(inspector, /HTTP interface handler · sequence in alpha/);
-    const open = page.getByRole("button", {name:"Open handler sequence"});
+    const open = page.getByRole("button", {name:"Open handler sequence", exact:true});
     await open.click();
     await page.waitForFunction(id => new URLSearchParams(location.hash.slice("#sequence?".length)).get("sid") === id, handler.declaration.id);
     await page.waitForFunction(() => /^sequence · src\/main\.rs/.test(document.querySelector("#sequence-state")?.textContent || ""));

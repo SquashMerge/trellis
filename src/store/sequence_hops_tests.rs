@@ -113,7 +113,7 @@ fn client_calls_cross_to_the_daemon_with_their_confidence_or_stay_boundaries() {
         )
         .unwrap();
     let found = hops(&view);
-    let summary: Vec<(usize, &str, Option<&str>, Option<&str>, Option<&str>)> = found
+    let summary: Vec<_> = found
         .iter()
         .map(|(line, hop)| {
             (
