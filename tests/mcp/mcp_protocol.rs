@@ -11830,6 +11830,187 @@ async fn references_group_by_app_and_select_sources_under_a_prefix() {
     session.join().unwrap().unwrap();
 }
 
+/// #837 (Prime2 review of #861): `package` rejects the rules exactly when an unfiltered
+/// `trellis_rules_check` does. An ambiguity only in a file that the read's `prefix` or
+/// `paths` excludes, which nothing references, still fails `package` as `invalid_rules`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn package_groups_reject_rules_that_check_rejects_outside_the_selection() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, topology) = published_inactive_checkout(
+        temp.path(),
+        &[
+            ("web/a.js", "export const a = 1;\n"),
+            ("admin/b.js", "export const b = 2;\n"),
+        ],
+    );
+    fs::create_dir(identity.root.join(".trellis")).unwrap();
+    fs::write(
+        identity.root.join(".trellis/rules.toml"),
+        "version = 1\n[layers.one]\nshared = true\npaths = [\"admin/b.js\"]\n\
+         [layers.two]\nshared = true\npaths = [\"admin/b.js\"]\n",
+    )
+    .unwrap();
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(8371, &identity).unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    architecture_built(&registry, &identity).await;
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 8371, None);
+    let mut structured = Vec::new();
+    let mut ask = |id: i32, name: &str, arguments: Value, code: Option<&str>| {
+        writeln!(
+            client,
+            "{}",
+            modern(
+                json!(id),
+                "tools/call",
+                json!({"name":name,"arguments":arguments})
+            )
+        )
+        .unwrap();
+        let reply = next_reply(&mut reader);
+        tool(&reply, code, true);
+        let envelope = reply["result"]["structuredContent"].clone();
+        structured.push(json!({"name":name,"structuredContent":envelope}));
+        envelope
+    };
+    ask(
+        1,
+        "trellis_rules_check",
+        json!({"schemaVersion":1}),
+        Some("invalid_rules"),
+    );
+    for (id, arguments) in [
+        (
+            2,
+            json!({"schemaVersion":1,"groupBy":"package","prefix":"web"}),
+        ),
+        (
+            3,
+            json!({"schemaVersion":1,"groupBy":"package","paths":["web/**"]}),
+        ),
+        (
+            4,
+            json!({"schemaVersion":1,"groupBy":"package","prefix":"nowhere"}),
+        ),
+        (5, json!({"schemaVersion":1,"groupBy":"package"})),
+    ] {
+        let failed = ask(id, "trellis_references", arguments, Some("invalid_rules"));
+        assert!(failed["error"].get("diagnostic").is_none());
+    }
+    // The groupings that never read the rules still answer.
+    ask(
+        6,
+        "trellis_references",
+        json!({"schemaVersion":1,"groupBy":"directory","prefix":"web"}),
+        None,
+    );
+    drop(ask);
+    validate_structured_content(&structured);
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+/// #837 with #794: `package` groups use the rules check's effective app list, so an authored
+/// `[apps.<name>]` app (no manifest) is the group `[apps.<name>]` for the files under its
+/// roots, beside detected manifest apps, and check counts the same inventory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn package_groups_use_authored_apps() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, topology) = published_inactive_checkout(
+        temp.path(),
+        &[
+            ("web/package.json", "{\"name\":\"web\"}\n"),
+            ("web/src/view.js", "export const v = 1;\n"),
+            (
+                "console/main.js",
+                "import '../web/src/view.js'; import './panel.js';\n",
+            ),
+            ("console/panel.js", "export const p = 1;\n"),
+            ("lib/util.js", "import '../console/panel.js';\n"),
+        ],
+    );
+    fs::create_dir(identity.root.join(".trellis")).unwrap();
+    fs::write(
+        identity.root.join(".trellis/rules.toml"),
+        "version = 1\n[apps.console]\nroots = [\"console\"]\n",
+    )
+    .unwrap();
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(8372, &identity).unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    architecture_built(&registry, &identity).await;
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 8372, None);
+    let mut structured = Vec::new();
+    let mut ask = |id: i32, name: &str, arguments: Value| {
+        writeln!(
+            client,
+            "{}",
+            modern(
+                json!(id),
+                "tools/call",
+                json!({"name":name,"arguments":arguments})
+            )
+        )
+        .unwrap();
+        let reply = next_reply(&mut reader);
+        tool(&reply, None, true);
+        let envelope = reply["result"]["structuredContent"].clone();
+        structured.push(json!({"name":name,"structuredContent":envelope}));
+        envelope
+    };
+    let row = |source: &str, target: &str, sites: u64| json!({"source":source,"target":target,"sites":sites,"production":sites,"test":0});
+    let package = ask(
+        1,
+        "trellis_references",
+        json!({"schemaVersion":1,"groupBy":"package"}),
+    );
+    assert_eq!(
+        package["data"]["groups"],
+        json!([
+            row("[apps.console]", "[apps.console]", 1),
+            row("[apps.console]", "web/package.json", 1),
+            row("noApp", "[apps.console]", 1),
+        ])
+    );
+    let scoped = ask(
+        2,
+        "trellis_references",
+        json!({"schemaVersion":1,"groupBy":"package","prefix":"lib"}),
+    );
+    assert_eq!(
+        scoped["data"]["groups"],
+        json!([row("noApp", "[apps.console]", 1)])
+    );
+    let check = ask(3, "trellis_rules_check", json!({"schemaVersion":1}));
+    let inventory: Vec<_> = check["data"]["apps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|app| {
+            (
+                app["name"].clone(),
+                app["source"].clone(),
+                app["manifest"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        inventory,
+        [
+            (json!("console"), json!("override"), Value::Null),
+            (json!("web"), json!("manifest"), json!("web/package.json")),
+        ]
+    );
+    drop(ask);
+    validate_structured_content(&structured);
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
 /// #798: during an Architecture build a read with or without `paths` waits for the owner, then
 /// answers the typed retryable `building` with the build's progress, inside its deadline. The
 /// scoped read does not compute its own answer beside the build.

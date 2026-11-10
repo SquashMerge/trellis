@@ -3066,7 +3066,7 @@ impl CheckoutRuntime {
     ) {
         if let Ok(parsed) = crate::store::EvidenceResponse::architecture_arguments(kind, arguments)
         {
-            let rules = if matches!(kind, "check" | "explain") {
+            let rules = if matches!(kind, "check" | "explain") || parsed.apps() {
                 ArchitectureRules::Evaluated
             } else {
                 ArchitectureRules::Unused
@@ -3122,7 +3122,8 @@ impl CheckoutRuntime {
         let config = response.architecture_config(kind, &parsed)?;
         let pin = response.selected_pin(parsed.pin())?;
         let needs = CoreNeeds {
-            rules: matches!(kind, "check" | "explain"),
+            // #837: app groups evaluate the rules as check does.
+            rules: matches!(kind, "check" | "explain") || parsed.apps(),
             metrics: false,
             compute_older_pin: true,
         };

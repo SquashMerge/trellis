@@ -1942,15 +1942,29 @@ impl EvidenceResponse {
         } else {
             None
         };
-        let path_apps = if parsed.apps {
-            Some(crate::rules::path_apps(
-                config,
-                core.app_candidates()?,
+        // #837: app groups follow the whole checkout's evaluation, so they fail exactly when
+        // an unfiltered `trellis_rules_check` does, whatever sources the read selects.
+        let path_apps = match (parsed.apps, config) {
+            (false, _) => None,
+            (true, Some(config)) => {
+                let base = core.rules(config)?;
+                let whole = core.references(&[], 5, check)?;
+                let evaluated = crate::rules::evaluate_prepared(config, base, &whole, &[], check)?;
+                Some(crate::rules::path_apps(
+                    Some(config),
+                    base.apps(),
+                    &evaluated.layers,
+                    &references,
+                    check,
+                )?)
+            }
+            (true, None) => Some(crate::rules::path_apps(
+                None,
+                &crate::rules::unruled_apps(core.app_candidates()?),
+                &Default::default(),
                 &references,
                 check,
-            )?)
-        } else {
-            None
+            )?),
         };
         let mut evaluate =
             |config: &crate::rules::Config,
@@ -2010,16 +2024,32 @@ impl EvidenceResponse {
         } else {
             None
         };
-        let path_apps = if parsed.apps {
-            let candidates = crate::rules::app_candidates(&snapshot, check)?;
-            Some(crate::rules::path_apps(
-                config,
-                &candidates,
-                &references,
-                check,
-            )?)
-        } else {
-            None
+        // #837: as in `architecture_response_at`, check's whole-checkout validity. Layer
+        // assignment covers every module of the projection, whatever its sources.
+        let path_apps = match (parsed.apps, config) {
+            (false, _) => None,
+            (true, Some(config)) => {
+                let base = crate::rules::prepare(config, &snapshot, &mut *check)?;
+                let evaluated =
+                    crate::rules::evaluate_prepared(config, &base, &references, &[], check)?;
+                Some(crate::rules::path_apps(
+                    Some(config),
+                    base.apps(),
+                    &evaluated.layers,
+                    &references,
+                    check,
+                )?)
+            }
+            (true, None) => {
+                let candidates = crate::rules::app_candidates(&snapshot, check)?;
+                Some(crate::rules::path_apps(
+                    None,
+                    &crate::rules::unruled_apps(&candidates),
+                    &Default::default(),
+                    &references,
+                    check,
+                )?)
+            }
         };
         let mut evaluate =
             |config: &crate::rules::Config,

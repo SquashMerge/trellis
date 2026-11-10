@@ -33,6 +33,10 @@ impl ArchitectureArguments {
     pub(crate) fn pin(&self) -> Option<IndexPin> {
         self.pin
     }
+    /// References only (#837): app groups, which evaluate the rules.
+    pub(crate) fn apps(&self) -> bool {
+        self.apps
+    }
     pub(crate) fn scoped(&self) -> bool {
         !self.paths.is_empty() || self.prefix.is_some()
     }
