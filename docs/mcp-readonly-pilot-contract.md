@@ -1335,4 +1335,4 @@ An independently returned projected proof wrapper is `{evidence:T,projection:Sem
 - **Reason vocabulary.** The #632 re-import reasons, `re-import pending`, `re-import required`, `producer re-run scheduled` and `automatic re-run failed: <code>`.
 - **Failure envelopes** never carry it, and it takes part in each answer's frame-fit computation like any other top-level field.
 - It is informative only: it changes no evidence, coverage, freshness, completeness, `partial` or boundary meaning, and MCP still never runs a producer or initiates an import. MCP smoke treats it as informative.
-- **Catalog.** Only the four output schemas and the `toolVersion` constant change (25 to 26). The compacted-frame limit is 235,520 bytes; the measured sizes at `toolVersion` 26 are: modern `tools/list` frame TBD-MEASURED bytes and legacy TBD-MEASURED bytes (slice `s2-mcp-semantic-status` records them).
+- **Catalog.** Only the four output schemas and the `toolVersion` constant change (25 to 26). The compacted-frame limit is 235,520 bytes; the measured sizes at `toolVersion` 26 are: modern `tools/list` frame 234,676 bytes and legacy 234,619 bytes, against the 235,520-byte limit.
