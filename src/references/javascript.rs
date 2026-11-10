@@ -81,6 +81,8 @@ struct Resolver<'a> {
     hazards: BTreeMap<usize, Hazards>,
     memo: BTreeMap<(usize, usize, Route), Arc<Names>>,
     named_memo: BTreeMap<(usize, String, usize, Route), Arc<Bucket>>,
+    /// Workspace packages (#773).
+    workspaces: &'a js_workspace::Workspaces,
     /// The root config and the source set it belongs to; `Err` is its typed reason.
     tsconfig: Option<(
         String,
@@ -95,6 +97,7 @@ impl Catalog {
         documents: &BTreeMap<DocumentKey, usize>,
         selected: &[usize],
         packages: &external::JavascriptPackages,
+        workspaces: &js_workspace::Workspaces,
         root_tsconfig: Option<&tsconfig::RootTsconfigInput>,
         work: &mut Work,
         request: &parallel_check::RequestCheck<'_>,
@@ -122,6 +125,7 @@ impl Catalog {
             hazards: BTreeMap::new(),
             memo: BTreeMap::new(),
             named_memo: BTreeMap::new(),
+            workspaces,
             tsconfig,
         };
         for (document, doc) in docs.iter().enumerate() {
@@ -261,7 +265,7 @@ impl Catalog {
                     && !relative(specifier)
                     && resolver
                         .target(document, Some(specifier), work, check)?
-                        .is_err_and(|reason| reason != "module_path_ambiguous")
+                        .is_err_and(package_fallback)
                 {
                     let key = &docs[document].key;
                     charge(
@@ -370,8 +374,9 @@ impl Resolver<'_> {
         }
         Ok(outcome(&found))
     }
-    /// A non-relative specifier: `paths`, then `baseUrl`, of a readable root config.
-    /// Packages and the standard library are the caller's, after this falls through.
+    /// A non-relative specifier: `paths`, then `baseUrl`, of a readable root config, then a
+    /// workspace package (#773). Packages and the standard library are the caller's, after
+    /// this falls through.
     fn bare_target(
         &self,
         document: usize,
@@ -379,10 +384,41 @@ impl Resolver<'_> {
         work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<std::result::Result<usize, &'static str>> {
-        const UNRESOLVED: &str = "absolute_or_bare_import";
         if specifier.starts_with('/') {
-            return Ok(Err(UNRESOLVED));
+            return Ok(Err(BARE_UNRESOLVED));
         }
+        let configured = self.config_target(document, specifier, work, check)?;
+        if !configured.is_err_and(|reason| reason != "module_path_ambiguous") {
+            return Ok(configured);
+        }
+        Ok(
+            match self.workspaces.lookup(
+                &self.docs[document].key.source_set_id,
+                specifier,
+                work,
+                check,
+            )? {
+                None => configured,
+                Some(js_workspace::Lookup::Unknown(reason)) => Err(reason),
+                Some(js_workspace::Lookup::Path(path, directory)) => {
+                    let found = self.lookup(document, &path, directory, work, check)?;
+                    match outcome(&found) {
+                        Err("module_path_not_indexed") => Err(js_workspace::NOT_INDEXED),
+                        other => other,
+                    }
+                }
+            },
+        )
+    }
+    /// `paths`, then `baseUrl`, of a readable root config.
+    fn config_target(
+        &self,
+        document: usize,
+        specifier: &str,
+        work: &mut Work,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<std::result::Result<usize, &'static str>> {
+        const UNRESOLVED: &str = BARE_UNRESOLVED;
         let config = match self.config(document) {
             None => return Ok(Err(UNRESOLVED)),
             Some(Err(reason)) => return Ok(Err(reason)),
@@ -981,6 +1017,13 @@ fn add_bucket(
         result.proof.extend(candidate.proof.iter().copied());
     }
     Ok(())
+}
+const BARE_UNRESOLVED: &str = "absolute_or_bare_import";
+/// Whether a bare specifier's failure lets an npm or Node label stand in: not when a local
+/// mapping was ambiguous, nor when a workspace member claims the name (#773).
+fn package_fallback(reason: &str) -> bool {
+    reason != "module_path_ambiguous"
+        && (!reason.starts_with("javascript_workspace_") || reason == js_workspace::UNREADABLE)
 }
 fn relative(specifier: &str) -> bool {
     specifier.starts_with("./") || specifier.starts_with("../")
@@ -1932,6 +1975,7 @@ mod tests {
             hazards: BTreeMap::new(),
             memo: BTreeMap::new(),
             named_memo: BTreeMap::new(),
+            workspaces: &js_workspace::Workspaces::default(),
             tsconfig: None,
         };
         let mut work = Work::new(work::reference_limit(docs.len(), 0));
@@ -2164,6 +2208,7 @@ mod tests {
             hazards: BTreeMap::new(),
             memo: BTreeMap::new(),
             named_memo: BTreeMap::new(),
+            workspaces: &js_workspace::Workspaces::default(),
             tsconfig: config.map(|text| (source_set, tsconfig::parse(text.as_bytes()))),
         };
         let mut work = Work::new(work::reference_limit(docs.len(), 0));

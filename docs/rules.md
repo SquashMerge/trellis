@@ -815,9 +815,33 @@ Supported mapping is deliberately narrow:
   to a TypeScript target and the reverse. The root `tsconfig.json` (else
   `jsconfig.json`; JSONC, `extends` is not followed) adds `paths` (exact key,
   else the longest `prefix*suffix` pattern, targets in order, targets leaving
-  the checkout skipped), `baseUrl` and `rootDirs` for relative misses. A bare
-  specifier falls back to a package only when no local module matched; an
-  ambiguous local match stays `module_path_ambiguous`. A
+  the checkout skipped), `baseUrl` and `rootDirs` for relative misses.
+  Workspace packages (#773, owner-ratified 2026-11-10) come next for a bare
+  specifier that `paths` and `baseUrl` leave unmatched. The member directories are
+  the literal paths and simple globs (`*` within a segment, `**` across segments;
+  a `!` pattern excludes) that the captured root `package.json` names in
+  `workspaces` (an array of strings, or `{packages: [...]}`) and the captured root
+  `pnpm-workspace.yaml` names in `packages`. That file is read with a bounded YAML
+  subset: top-level `key:` mappings, a block or one-line flow sequence of plain or
+  quoted strings, and `#` comments. Absolute or traversing patterns name nothing;
+  more than 256 patterns, an unsupported shape, tabs, anchors, tags or a second
+  document make the workspace unreadable. Each retained nested `package.json`
+  (outside `node_modules`) in a member directory maps its `name` (including
+  `@scope/name`) to that directory. A bare `name` resolves to the member's entry:
+  `exports` when it is a single `./` string, else `module`, else `main`, else the
+  directory's `index` file, by the extension rules above. `name/sub/path` resolves
+  to that member-relative path, unless a single-string `exports` closes subpaths.
+  Any other `exports` keeps the member `javascript_workspace_exports_unsupported`;
+  two members with one name are `javascript_workspace_package_ambiguous`; an entry
+  or subpath leaving the member is `javascript_workspace_entry_unsupported`; one
+  naming no indexed script is `javascript_workspace_entry_not_indexed`. A
+  workspace config, or a member `package.json`, that cannot be read makes bare
+  specifiers that resolve nowhere else `javascript_workspace_unreadable`. A member
+  name never falls back to an npm or Node label; an unreadable workspace still
+  may. No `node_modules`, package manager or execution is involved, and
+  scip-typescript's `--yarn-workspaces` and `--pnpm-workspaces` producer flags
+  remain out of scope. A bare specifier falls back to a package only when no
+  local module matched; an ambiguous local match stays `module_path_ambiguous`. A
   config that cannot be read leaves relative resolution unchanged and reports
   bare specifiers that match no package as `tsconfig_unreadable`. `export = x`
   sets an unknown name set; `.cts` ends export following. `export * from`
@@ -1300,8 +1324,11 @@ block that root. Duplicate relevant sections/keys or malformed JSON make manifes
 proof unknown, never last-wins. Aliases/protocols, workspace/link/file/Git/URL
 values, non-string constraints and unproved declarations cannot supply npm targets.
 A root `workspaces` field blocks npm inference; the root package's own `name`
-never proves a dependency/self-reference. Nested/workspace manifests, import maps,
-package exports and installed node_modules are not discovered or resolved.
+never proves a dependency/self-reference. Workspace members resolve as in-repo
+modules instead (#773, owner-ratified 2026-11-10; see the JavaScript and
+TypeScript resolution rules); their manifests' dependency sections supply no npm
+labels. Import maps, package exports maps beyond a single string and installed
+node_modules are not discovered or resolved.
 
 `pkg/sub/path` proves only declared key `pkg`; `@scope/pkg/sub` proves only
 `@scope/pkg`. Empty/traversal/query/hash/backslash/scheme forms stay unknown.
