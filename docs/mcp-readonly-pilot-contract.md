@@ -702,6 +702,13 @@ changes, only the order of rows within two arrays. This section wins over the #7
 - **Catalog.** One change: describe's `apps` and description, the five `app` inputs and description sentences, the two failure codes on three tools, the `app` hint, the `trellis_endpoints` entry and `toolVersion` 24. The schemas stay self-contained, with local `$ref`s only and no `$schema` (#836). The modern `tools/list` frame is 232,468 bytes (legacy 232,411), 11,198 bytes more than at `toolVersion` 23, against the 235,520-byte compacted-frame limit (owner ruling 2026-11-09, #851) and the unchanged 245,760-byte named headroom limit. `trellis_endpoints` is 9,363 compact bytes.
 - **Choices beyond the issue text.** The name-or-manifest `app` value naming every same-named app; check filtering rows only, with whole counts; the 500-name find scan; the call graph not checking its root; the `building`/`invalidRules` describe states instead of waiting; the per-row call-site samples (5, or 50 in the single-endpoint form); exact `method` and `pathTemplate` matching; and extraction without a rules file.
 
+## Amendment (#855): the proposal prompt's closed grammar accepts `interfaces`
+
+**Status: owner-ratified 2026-11-10 ([#855](https://github.com/SquashMerge/trellis/issues/855)).** The owner ruled that JavaScript and TypeScript request wrappers are configured in `.trellis/rules.toml` rather than in each client's `package.json`. `toolVersion` is **25** (previously 24, #851). The bump records the prompt text change below.
+
+- **Prompt.** The proposal prompt's closed TOML grammar lists `interfaces` among the accepted top-level keys. One sentence says that optional `[[interfaces.wrappers]]` entries `{callee,method,at,prefix,root|app}` name request wrappers for HTTP interface evidence only and never change verdicts. The table's rules are in [architecture-view.md](architecture-view.md#apps-and-http-interfaces-data-and-extraction-784-788).
+- **Catalog.** Only the `toolVersion` constant changes, from 24 to 25, which has the same width. The prompt text is not part of the tool catalog, so the `tools/list` frame size is unchanged from #851's: 232,468 bytes modern and 232,411 legacy, against the 235,520-byte compacted-frame limit.
+
 ## Tool catalog
 
 ### `trellis_workspace_describe` (W1)

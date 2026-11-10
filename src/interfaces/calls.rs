@@ -1,133 +1,253 @@
-//! Client calls: JavaScript and TypeScript calls to a request wrapper, and the matching of
-//! each to the server route it reaches.
+//! Client calls: JavaScript and TypeScript request wrappers, `fetch` and axios (#788, #855),
+//! and the matching of each call to the server route it reaches.
+use super::js::{Base, Budget, Prop, Value, World, arguments, unwrap, verb};
 use super::{
-    ClientCall, Confidence, LineIndex, Match, Route, Seg, charge, comment, parse, test_file,
+    ANY, ClientCall, ClientPrefix, Confidence, LineIndex, Match, Route, Seg, charge, test_file,
     test_span,
 };
 use crate::native_evidence::{Call, Range};
-use crate::references::{DocumentInput, Snapshot, callers::Callers, work::Work};
+use crate::references::{DocumentInput, callers::Callers, work::Work};
 use anyhow::Result;
+use std::collections::BTreeMap;
 use tree_sitter::Node;
 
-const VERBS: [&str; 7] = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"];
 /// The receivers of `<owner>.request(path, options)`.
 const OWNERS: [&str; 2] = ["api", "owner"];
+/// The objects whose `fetch` is the global one.
+const GLOBALS: [&str; 3] = ["window", "globalThis", "self"];
+/// Axios request methods and the argument their config is at; `request` has no URL argument.
+const AXIOS_METHODS: [(&str, usize); 11] = [
+    ("request", 0),
+    ("get", 1),
+    ("delete", 1),
+    ("head", 1),
+    ("options", 1),
+    ("post", 2),
+    ("put", 2),
+    ("patch", 2),
+    ("postForm", 2),
+    ("putForm", 2),
+    ("patchForm", 2),
+];
 
-/// The built-in request wrappers. Each reads the path from argument 0.
-#[derive(Clone, Copy)]
-enum Wrapper {
-    /// `api(path, method)`: the method is a string at argument 1.
-    Api,
-    /// `request(path, body, options)`: the method is in the options object at argument 2.
-    Request,
-    /// `api.request(path, options)`: the method is in the options object at argument 1.
-    Member,
+/// Where a wrapper reads its method.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MethodAt {
+    /// A string literal at this argument; absent is `GET`.
+    Argument(usize),
+    /// `method` in the options object at this argument; absent is `GET`.
+    Options(usize),
 }
 
-/// What a wrapper's path argument reads as.
+/// A request wrapper: a callee whose argument 0 is the path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Wrapper {
+    /// An identifier, or `object.property`.
+    pub(crate) callee: String,
+    pub(crate) method: MethodAt,
+    /// A configured prefix the wrapper adds to every path, or the built-in checkout prefix
+    /// rule when `None` for a built-in.
+    pub(crate) prefix: Option<String>,
+    pub(crate) built_in: bool,
+}
+
+/// The built-in wrappers of #788.
+pub(crate) fn built_in() -> Vec<Wrapper> {
+    let wrapper = |callee: &str, method| Wrapper {
+        callee: callee.to_owned(),
+        method,
+        prefix: None,
+        built_in: true,
+    };
+    vec![
+        wrapper("api", MethodAt::Argument(1)),
+        wrapper("request", MethodAt::Options(2)),
+        wrapper("api.request", MethodAt::Options(1)),
+        wrapper("owner.request", MethodAt::Options(1)),
+    ]
+}
+
+/// Which files configured wrappers apply to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Scope {
+    /// Files under a checkout-relative directory; empty is every file.
+    Root(String),
+    /// Files assigned to an app.
+    App(String),
+}
+
+/// Configured wrappers that apply to one scope.
+pub(crate) struct Scoped {
+    pub(crate) scope: Scope,
+    pub(crate) wrappers: Vec<Wrapper>,
+}
+
+/// What a client reads its call as.
+enum Form {
+    Wrapper(Wrapper),
+    Fetch,
+    /// An axios call: its base URL, the argument its URL is at (if any) and its config's.
+    Axios {
+        base: Base,
+        url: Option<usize>,
+        config: usize,
+        method: Option<&'static str>,
+    },
+}
+
+/// What a client's path reads as.
 enum Path {
     Unreadable,
-    /// A readable path that is not rooted: not a client call.
+    /// A readable path that is not rooted, or an absolute URL: not a client call.
     Foreign,
-    Read(String),
+    Read(String, ClientPrefix),
 }
 
 /// The client calls of every production JavaScript and TypeScript document.
 pub(super) fn extract(
-    snapshot: &Snapshot,
-    work: &mut Work,
-    check: &mut impl FnMut() -> Result<()>,
+    world: &World<'_>,
+    configured: &[Scoped],
+    apps: &BTreeMap<String, String>,
+    budget: &mut Budget<'_>,
 ) -> Result<Vec<ClientCall>> {
     let mut found = Vec::new();
-    for doc in &snapshot.documents {
-        check()?;
-        let language = match doc.key.language.as_str() {
-            "javascript" => tree_sitter_javascript::LANGUAGE.into(),
-            "typescript" => crate::indexer_ts::grammar(&doc.key.path),
-            _ => continue,
-        };
-        if snapshot.evidence_gaps.contains_key(&doc.key)
-            || !doc.calls.iter().any(|call| wrapper_name(doc, call))
-            || test_file(doc)
+    // An axios client's methods are candidates only where some document can make one.
+    let mut axios_anywhere = false;
+    for doc in &world.snapshot.documents {
+        budget.step(1)?;
+        axios_anywhere |= super::js::javascript(doc) && doc.file.text.contains("axios");
+    }
+    for at in 0..world.snapshot.documents.len() {
+        budget.step(1)?;
+        let doc = world.doc(at);
+        if !world.readable(at) || test_file(doc) {
+            continue;
+        }
+        let mut wrappers: Vec<Wrapper> = configured
+            .iter()
+            .filter(|scoped| match &scoped.scope {
+                Scope::Root(root) => under(&doc.key.path, root),
+                Scope::App(app) => apps.get(&doc.key.path) == Some(app),
+            })
+            .flat_map(|scope| scope.wrappers.iter().cloned())
+            .collect();
+        for wrapper in built_in() {
+            if !wrappers.iter().any(|w| w.callee == wrapper.callee) {
+                wrappers.push(wrapper);
+            }
+        }
+        let axios = axios_anywhere;
+        if !doc
+            .calls
+            .iter()
+            .any(|call| candidate(doc, call, &wrappers, axios))
         {
             continue;
         }
-        charge(work, doc.file.text.len())?;
-        let tree = parse(doc, &language, check)?;
+        let Some(tree) = world.tree(at, budget)? else {
+            continue;
+        };
         Document {
+            world,
+            at,
             doc,
-            source: &doc.file.text,
             root: tree.root_node(),
+            wrappers: &wrappers,
+            axios,
         }
-        .collect(&mut found, check)?;
+        .collect(&mut found, budget)?;
     }
     Ok(found)
 }
 
-/// Whether the call's callee text ends in `api` or `request`.
-fn wrapper_name(doc: &DocumentInput, call: &Call) -> bool {
-    let text = call
-        .callee_range
+/// Whether a path lies under a directory.
+fn under(path: &str, root: &str) -> bool {
+    root.is_empty()
+        || path
+            .strip_prefix(root)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn callee_text<'d>(doc: &'d DocumentInput, call: &'d Call) -> &'d str {
+    call.callee_range
         .as_ref()
         .and_then(|range| doc.file.text.get(range.start..range.end))
         .or(call.spelling.as_deref())
-        .unwrap_or("");
-    text.ends_with("api") || text.ends_with("request")
+        .unwrap_or("")
 }
 
-struct Document<'a> {
-    doc: &'a DocumentInput,
-    source: &'a str,
-    root: Node<'a>,
+/// Whether a native call may be a client call, by the last name of its callee.
+/// `axios` is whether any document mentions axios: only then can an identifier or an
+/// axios method name be an axios client, whatever the calling file itself says.
+fn candidate(doc: &DocumentInput, call: &Call, wrappers: &[Wrapper], axios: bool) -> bool {
+    let text = callee_text(doc, call);
+    let last = text
+        .rsplit(['.', ' ', '\n', '\t', '\r'])
+        .next()
+        .unwrap_or(text);
+    last == "fetch"
+        || (axios && !text.contains('.'))
+        || (axios && AXIOS_METHODS.iter().any(|(name, _)| *name == last))
+        || wrappers
+            .iter()
+            .any(|w| w.callee.rsplit('.').next() == Some(last))
 }
 
-impl<'a> Document<'a> {
-    fn text(&self, node: Node<'_>) -> &'a str {
-        self.source.get(node.byte_range()).unwrap_or("")
+struct Document<'w, 's> {
+    world: &'w World<'s>,
+    at: usize,
+    doc: &'s DocumentInput,
+    root: Node<'w>,
+    wrappers: &'w [Wrapper],
+    axios: bool,
+}
+
+impl<'w> Document<'w, '_> {
+    fn text(&self, node: Node<'_>) -> &str {
+        self.world.text(self.at, node)
     }
 
-    fn collect(
-        &self,
-        found: &mut Vec<ClientCall>,
-        check: &mut impl FnMut() -> Result<()>,
-    ) -> Result<()> {
-        let lines = LineIndex::new(self.source);
+    fn collect(&self, found: &mut Vec<ClientCall>, budget: &mut Budget<'_>) -> Result<()> {
+        let lines = LineIndex::new(&self.doc.file.text);
         let callers = Callers::new(self.doc);
-        let mut sites: Vec<(&Call, Node<'a>, Wrapper)> = Vec::new();
+        let mut sites: Vec<(&Call, Node<'w>, Form)> = Vec::new();
         for call in &self.doc.calls {
-            check()?;
-            if !wrapper_name(self.doc, call) || test_span(self.doc, &call.range) {
+            budget.step(1)?;
+            if !candidate(self.doc, call, self.wrappers, self.axios)
+                || test_span(self.doc, &call.range)
+            {
                 continue;
             }
             let Some(node) = self.call_node(&call.range).filter(|node| !node.has_error()) else {
                 continue;
             };
-            let wrapper = node
-                .child_by_field_name("function")
-                .and_then(|function| self.wrapper(function));
-            if let Some(wrapper) = wrapper {
-                sites.push((call, node, wrapper));
+            let Some(function) = node.child_by_field_name("function") else {
+                continue;
+            };
+            if let Some(form) = self.form(function, budget)? {
+                if !matches!(form, Form::Wrapper(_)) && self.inside_wrapper(&call.range) {
+                    continue;
+                }
+                sites.push((call, node, form));
             }
         }
         sites.sort_by_key(|(call, ..)| (call.range.start, call.range.end));
-        for (call, node, wrapper) in sites {
-            let arguments = Self::arguments(node);
-            let path = match arguments.first() {
-                Some(argument) => self.path(*argument),
-                None => Path::Unreadable,
-            };
-            let (template, segments) = match path {
+        for (call, node, form) in sites {
+            let arguments = arguments(node);
+            let (path, method) = self.read(&form, &arguments, budget)?;
+            let (template, segments, prefix) = match path {
                 Path::Foreign => continue,
-                Path::Unreadable => (None, None),
-                Path::Read(template) => {
+                Path::Unreadable => (None, None, ClientPrefix::Written),
+                Path::Read(template, prefix) => {
                     let segments = client_segments(&template);
-                    (Some(template), Some(segments))
+                    (Some(template), Some(segments), prefix)
                 }
             };
             found.push(ClientCall {
-                method: self.method(wrapper, &arguments).map(str::to_owned),
+                method: method.map(str::to_owned),
                 path_template: template,
                 segments,
+                prefix,
                 document: self.doc.key.clone(),
                 lines: lines.lines(&call.range),
                 range: call.range.clone(),
@@ -138,9 +258,24 @@ impl<'a> Document<'a> {
         Ok(())
     }
 
+    /// Whether the span lies inside a named callable that is itself a wrapper: its own
+    /// `fetch` or axios call is the wrapper's implementation, not a call of its own.
+    fn inside_wrapper(&self, span: &Range) -> bool {
+        self.doc.declarations.iter().any(|d| {
+            crate::metrics::callable(&d.kind)
+                && d.range.start <= span.start
+                && span.end <= d.range.end
+                && d.name.as_deref().is_some_and(|name| {
+                    self.wrappers
+                        .iter()
+                        .any(|w| w.callee.rsplit('.').next() == Some(name))
+                })
+        })
+    }
+
     /// The call expression whose span is exactly `range`. A native call over an `await` spans
     /// the awaited expression, so that one reaches the call it awaits.
-    fn call_node(&self, range: &Range) -> Option<Node<'a>> {
+    fn call_node(&self, range: &Range) -> Option<Node<'w>> {
         let mut node = self
             .root
             .descendant_for_byte_range(range.start, range.end)?;
@@ -163,137 +298,282 @@ impl<'a> Document<'a> {
         }
     }
 
-    fn wrapper(&self, function: Node<'a>) -> Option<Wrapper> {
+    /// What the callee makes the call: a wrapper, `fetch`, an axios call, or none.
+    fn form(&self, function: Node<'w>, budget: &mut Budget<'_>) -> Result<Option<Form>> {
         // The TypeScript grammar reads `await api<T>(path)` as a call of `await api`.
         let function = match function.kind() {
-            "await_expression" => function.named_child(0)?,
+            "await_expression" => match function.named_child(0) {
+                Some(inner) => inner,
+                None => return Ok(None),
+            },
             _ => function,
         };
-        match function.kind() {
-            "identifier" => match self.text(function) {
-                "api" => Some(Wrapper::Api),
-                "request" => Some(Wrapper::Request),
+        let written: String = self.text(function).split_whitespace().collect();
+        let simple = match function.kind() {
+            "identifier" => true,
+            "member_expression" => function
+                .child_by_field_name("object")
+                .is_some_and(|object| object.kind() == "identifier"),
+            _ => false,
+        };
+        if simple && let Some(wrapper) = self.wrappers.iter().find(|w| w.callee == written) {
+            // A built-in `x.request` is a wrapper only for its known owners.
+            let owned = !wrapper.built_in
+                || !written.contains('.')
+                || OWNERS.contains(&written.split('.').next().unwrap_or(""));
+            if owned {
+                return Ok(Some(Form::Wrapper(wrapper.clone())));
+            }
+        }
+        if written == "fetch"
+            || written
+                .split_once('.')
+                .is_some_and(|(object, property)| GLOBALS.contains(&object) && property == "fetch")
+        {
+            return Ok(Some(Form::Fetch));
+        }
+        let property = match function.kind() {
+            "member_expression" => function
+                .child_by_field_name("property")
+                .map(|property| self.text(property)),
+            "identifier" if self.axios => None,
+            _ => return Ok(None),
+        };
+        if property.is_some_and(|p| !AXIOS_METHODS.iter().any(|(name, _)| *name == p)) {
+            return Ok(None);
+        }
+        let config_at = |name: &str| AXIOS_METHODS.iter().find(|(n, _)| *n == name).map(|m| m.1);
+        let method_of = |name: &str| match name {
+            "request" => None,
+            name => verb(name.strip_suffix("Form").unwrap_or(name)),
+        };
+        Ok(match self.world.eval(self.at, function, budget)? {
+            Value::Package(package, path) if package == "axios" => match &path[..] {
+                [] => Some(Form::Axios {
+                    base: Base::None,
+                    url: None,
+                    config: 0,
+                    method: None,
+                }),
+                [name] => config_at(name).map(|config| Form::Axios {
+                    base: Base::None,
+                    url: (config > 0).then_some(0),
+                    config,
+                    method: method_of(name),
+                }),
                 _ => None,
             },
-            "member_expression" => {
-                let object = function.child_by_field_name("object")?;
-                let property = function.child_by_field_name("property")?;
-                (object.kind() == "identifier"
-                    && OWNERS.contains(&self.text(object))
-                    && self.text(property) == "request")
-                    .then_some(Wrapper::Member)
-            }
+            Value::Made {
+                factory: super::js::Factory::Axios(base),
+                ..
+            } => Some(Form::Axios {
+                base,
+                url: None,
+                config: 0,
+                method: None,
+            }),
+            Value::AxiosMethod(base, name) => config_at(&name).map(|config| Form::Axios {
+                base,
+                url: (config > 0).then_some(0),
+                config,
+                method: method_of(&name),
+            }),
             _ => None,
-        }
+        })
     }
 
-    fn arguments(call: Node<'a>) -> Vec<Node<'a>> {
-        let Some(arguments) = call.child_by_field_name("arguments") else {
-            return Vec::new();
-        };
-        let mut cursor = arguments.walk();
-        arguments
-            .named_children(&mut cursor)
-            .filter(|argument| !comment(*argument))
-            .collect()
-    }
-
-    /// The text of a string or template literal, with `{}` for each substitution. An escape
-    /// sequence or anything unexpected makes it unreadable.
-    fn literal(&self, node: Node<'a>) -> Option<String> {
-        if !matches!(node.kind(), "string" | "template_string") {
-            return None;
-        }
-        let mut text = String::new();
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            match child.kind() {
-                "string_fragment" => text.push_str(self.text(child)),
-                "template_substitution" if node.kind() == "template_string" => text.push_str("{}"),
-                _ if comment(child) => {}
-                _ => return None,
+    /// The call's path and method.
+    fn read(
+        &self,
+        form: &Form,
+        arguments: &[Node<'w>],
+        budget: &mut Budget<'_>,
+    ) -> Result<(Path, Option<&'static str>)> {
+        match form {
+            Form::Wrapper(wrapper) => {
+                let path = match arguments.first() {
+                    Some(path) => self.path(*path, budget)?,
+                    None => Path::Unreadable,
+                };
+                let path = match (path, &wrapper.prefix, wrapper.built_in) {
+                    (Path::Read(path, _), None, true) => {
+                        Path::Read(path, ClientPrefix::CheckoutFallback)
+                    }
+                    (Path::Read(path, _), Some(prefix), _) => {
+                        Path::Read(join(prefix, &path), ClientPrefix::Joined)
+                    }
+                    (path, ..) => path,
+                };
+                let method = match wrapper.method {
+                    MethodAt::Argument(at) => match arguments.get(at) {
+                        None => Some("GET"),
+                        Some(method) => match self.world.eval(self.at, *method, budget)? {
+                            Value::Str(text) => verb(&text),
+                            _ => None,
+                        },
+                    },
+                    MethodAt::Options(at) => self.options(arguments.get(at).copied(), budget)?,
+                };
+                Ok((path, method))
             }
-        }
-        Some(text)
-    }
-
-    fn path(&self, node: Node<'a>) -> Path {
-        match self.literal(node) {
-            None => Path::Unreadable,
-            Some(text) if !text.starts_with('/') => Path::Foreign,
-            Some(text) => {
-                let end = text.find(['?', '#']).unwrap_or(text.len());
-                Path::Read(text[..end].to_owned())
+            Form::Fetch => {
+                let path = match arguments.first() {
+                    Some(path) => self.path(*path, budget)?,
+                    None => Path::Unreadable,
+                };
+                Ok((path, self.options(arguments.get(1).copied(), budget)?))
             }
+            Form::Axios {
+                base,
+                url,
+                config,
+                method,
+            } => self.axios(base, *url, *config, *method, arguments, budget),
         }
     }
 
-    /// The written method, or `None` when it cannot be read.
-    fn method(&self, wrapper: Wrapper, arguments: &[Node<'a>]) -> Option<&'static str> {
-        match wrapper {
-            Wrapper::Api => match arguments.get(1) {
-                None => Some("GET"),
-                Some(method) => verb(&self.literal(*method)?),
+    #[allow(clippy::too_many_arguments)]
+    fn axios(
+        &self,
+        base: &Base,
+        url: Option<usize>,
+        config: usize,
+        method: Option<&'static str>,
+        arguments: &[Node<'w>],
+        budget: &mut Budget<'_>,
+    ) -> Result<(Path, Option<&'static str>)> {
+        // `axios(url, config)` as well as `axios(config)`.
+        let (url, config) = match (url, arguments.first()) {
+            (None, Some(first)) if config == 0 => match self.world.eval(self.at, *first, budget)? {
+                Value::Object(..) => (None, 0),
+                _ => (Some(0), 1),
             },
-            Wrapper::Request => self.options(arguments.get(2).copied()),
-            Wrapper::Member => self.options(arguments.get(1).copied()),
-        }
-    }
-
-    /// An object member's written name: an identifier, or a string literal without escapes.
-    fn key_name(&self, key: Node<'a>) -> String {
-        match key.kind() {
-            "property_identifier" => self.text(key).to_owned(),
-            _ => self.literal(key).unwrap_or_default(),
-        }
-    }
-
-    /// The `method` of an options object literal. An absent object, or one without a method
-    /// and without a spread, is `GET`.
-    fn options(&self, options: Option<Node<'a>>) -> Option<&'static str> {
-        let Some(options) = options else {
-            return Some("GET");
+            _ => (url, config),
         };
-        if options.kind() != "object" {
-            return None;
+        let options = arguments.get(config).copied();
+        let object = match options {
+            None => None,
+            Some(options) => match self.world.eval(self.at, options, budget)? {
+                Value::Object(doc, object) => Some((doc, object)),
+                _ => {
+                    // An unreadable config can carry any URL, base and method.
+                    return Ok((Path::Unreadable, method));
+                }
+            },
+        };
+        let method = match method {
+            Some(method) => Some(method),
+            None => self.options(options, budget)?,
+        };
+        let url = match (url, object) {
+            (Some(at), _) => match arguments.get(at) {
+                Some(url) => Some(self.world.eval(self.at, *url, budget)?),
+                None => None,
+            },
+            (None, Some((doc, object))) => match self.world.property(doc, object, "url") {
+                Prop::Found(url) => Some(self.world.eval(doc, url, budget)?),
+                Prop::Unknown => Some(Value::Unknown),
+                Prop::Absent => None,
+            },
+            (None, None) => None,
+        };
+        let Some(Value::Str(url)) = url else {
+            return Ok((Path::Unreadable, method));
+        };
+        let base = match object {
+            Some((doc, object)) => match self.world.property(doc, object, "baseURL") {
+                Prop::Found(value) => match self.world.eval(doc, value, budget)? {
+                    Value::Str(text) => Base::Known(text),
+                    _ => Base::Unreadable,
+                },
+                Prop::Unknown => Base::Unreadable,
+                Prop::Absent => base.clone(),
+            },
+            None => base.clone(),
+        };
+        if absolute(&url) {
+            return Ok((Path::Foreign, method));
         }
-        let mut method = None;
-        let mut spread = false;
-        let mut cursor = options.walk();
-        for member in options.named_children(&mut cursor) {
-            match member.kind() {
-                "pair" => {
-                    let key = member.child_by_field_name("key")?;
-                    if self.key_name(key) == "method" {
-                        let value = member.child_by_field_name("value")?;
-                        method = Some(self.literal(value).and_then(|text| verb(&text)));
+        let path = match base {
+            Base::None => rooted(&url, ClientPrefix::Written),
+            Base::Unreadable => Path::Unreadable,
+            Base::Known(base) if base.starts_with('/') && !absolute(&base) => {
+                match rooted(&join(&base, &url), ClientPrefix::Joined) {
+                    Path::Read(path, prefix) if !base.trim_matches('/').is_empty() => {
+                        Path::Read(path, prefix)
                     }
+                    Path::Read(path, _) => Path::Read(path, ClientPrefix::Written),
+                    other => other,
                 }
-                "shorthand_property_identifier" if self.text(member) == "method" => {
-                    method = Some(None);
-                }
-                // An accessor or method named `method` is present but not a literal.
-                "method_definition" => {
-                    let name = member.child_by_field_name("name")?;
-                    if self.key_name(name) == "method" {
-                        method = Some(None);
-                    }
-                }
-                "spread_element" => spread = true,
-                _ => {}
             }
-        }
-        match method {
-            Some(method) => method,
-            None if spread => None,
-            None => Some("GET"),
-        }
+            Base::Known(_) => Path::Foreign,
+        };
+        Ok((path, method))
+    }
+
+    fn path(&self, node: Node<'w>, budget: &mut Budget<'_>) -> Result<Path> {
+        Ok(match self.world.eval(self.at, node, budget)? {
+            Value::Str(text) => rooted(&text, ClientPrefix::Written),
+            _ => Path::Unreadable,
+        })
+    }
+
+    /// The `method` of an options object. An absent object, or one where no member can set
+    /// a method, is `GET`.
+    fn options(
+        &self,
+        options: Option<Node<'w>>,
+        budget: &mut Budget<'_>,
+    ) -> Result<Option<&'static str>> {
+        let Some(options) = options else {
+            return Ok(Some("GET"));
+        };
+        let (doc, options) = match unwrap(options).kind() {
+            "object" => (self.at, unwrap(options)),
+            "identifier" => match self.world.eval(self.at, options, budget)? {
+                Value::Object(doc, object) => (doc, object),
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        Ok(match self.world.property(doc, options, "method") {
+            Prop::Absent => Some("GET"),
+            Prop::Unknown => None,
+            Prop::Found(value) => match self.world.eval(doc, value, budget)? {
+                Value::Str(text) => verb(&text),
+                _ => None,
+            },
+        })
     }
 }
 
-fn verb(text: &str) -> Option<&'static str> {
-    let upper = text.to_ascii_uppercase();
-    VERBS.iter().copied().find(|verb| *verb == upper)
+/// Whether a URL names a scheme or a host.
+fn absolute(url: &str) -> bool {
+    url.starts_with("//")
+        || url.split_once("://").is_some_and(|(scheme, _)| {
+            !scheme.is_empty()
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        })
+}
+
+/// A rooted path cut at its query or fragment; anything else is not a client call.
+fn rooted(text: &str, prefix: ClientPrefix) -> Path {
+    if !text.starts_with('/') {
+        return Path::Foreign;
+    }
+    let end = text.find(['?', '#']).unwrap_or(text.len());
+    Path::Read(text[..end].to_owned(), prefix)
+}
+
+/// A client prefix and a path, with one `/` between them.
+fn join(prefix: &str, path: &str) -> String {
+    format!(
+        "{}/{}",
+        prefix.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
 }
 
 /// A client path as segments. A segment with a substitution is a `Param`. Only the one
@@ -338,12 +618,20 @@ pub(super) fn resolve(
 fn best(routes: &[Route], call: &ClientCall) -> Option<Match> {
     let method = call.method.as_deref()?;
     let segments = call.segments.as_deref()?;
+    if call.prefix == ClientPrefix::Joined {
+        let route = most_literal(&candidates(routes, method, segments))?;
+        return Some(Match {
+            route,
+            confidence: Confidence::WrapperInferred,
+        });
+    }
     let written = candidates(routes, method, segments);
     if !written.is_empty() {
         let route = most_literal(&written)?;
         let template = segments.contains(&Seg::Param) || {
             let route = &routes[route];
             route.from_table
+                || route.method == ANY
                 || route
                     .segments
                     .iter()
@@ -357,6 +645,9 @@ fn best(routes: &[Route], call: &ClientCall) -> Option<Match> {
                 Confidence::Exact
             },
         });
+    }
+    if call.prefix != ClientPrefix::CheckoutFallback {
+        return None;
     }
     let prefixed = prefixed(segments)?;
     let route = most_literal(&candidates(routes, method, &prefixed))?;
@@ -382,27 +673,30 @@ fn prefixed(segments: &[Seg]) -> Option<Vec<Seg>> {
     }
 }
 
-/// The routes the client path reaches, with each one's count of literal segments.
-fn candidates(routes: &[Route], method: &str, client: &[Seg]) -> Vec<(usize, usize)> {
+/// The routes the client path reaches, ranked by their count of literal segments and then
+/// by naming the method rather than accepting any.
+fn candidates(routes: &[Route], method: &str, client: &[Seg]) -> Vec<(usize, (usize, bool))> {
     routes
         .iter()
         .enumerate()
-        .filter(|(_, route)| route.method == method && fits(&route.segments, client))
+        .filter(|(_, route)| {
+            (route.method == method || route.method == ANY) && fits(&route.segments, client)
+        })
         .map(|(index, route)| {
             let literals = route
                 .segments
                 .iter()
                 .filter(|seg| matches!(seg, Seg::Literal(_)))
                 .count();
-            (index, literals)
+            (index, (literals, route.method != ANY))
         })
         .collect()
 }
 
-/// The one candidate with the most literal segments. A tie has none.
-fn most_literal(candidates: &[(usize, usize)]) -> Option<usize> {
-    let most = candidates.iter().map(|(_, literals)| *literals).max()?;
-    let mut top = candidates.iter().filter(|(_, literals)| *literals == most);
+/// The one best-ranked candidate. A tie has none.
+fn most_literal(candidates: &[(usize, (usize, bool))]) -> Option<usize> {
+    let most = candidates.iter().map(|(_, rank)| *rank).max()?;
+    let mut top = candidates.iter().filter(|(_, rank)| *rank == most);
     match (top.next(), top.next()) {
         (Some((route, _)), None) => Some(*route),
         _ => None,
@@ -427,6 +721,7 @@ fn fits(route: &[Seg], client: &[Seg]) -> bool {
 mod tests {
     use super::*;
     use crate::interfaces::{Extraction, extract as extract_all};
+    use crate::references::{DocumentInput, Snapshot};
     use std::sync::{Arc, atomic::AtomicBool};
 
     fn snapshot(files: &[(&str, &str)]) -> Snapshot {
@@ -490,7 +785,14 @@ mod tests {
     }
 
     fn run(files: &[(&str, &str)]) -> Extraction {
-        extract_all(&snapshot(files), &mut Work::new(usize::MAX), &mut || Ok(())).unwrap()
+        extract_all(
+            &snapshot(files),
+            &[],
+            &Default::default(),
+            &mut Work::new(usize::MAX),
+            &mut || Ok(()),
+        )
+        .unwrap()
     }
 
     const SERVER: &str = r#"
@@ -716,9 +1018,15 @@ async fn h() {}
             ("src/http.rs", SERVER),
             ("web/app.js", "function t(api) { api(\"/health\"); }"),
         ]);
-        let error = extract_all(&shot, &mut Work::new(10), &mut || Ok(()))
-            .err()
-            .unwrap();
+        let error = extract_all(
+            &shot,
+            &[],
+            &Default::default(),
+            &mut Work::new(10),
+            &mut || Ok(()),
+        )
+        .err()
+        .unwrap();
         assert!(error.to_string().starts_with("bounded_work"), "{error:#}");
     }
 
@@ -746,45 +1054,50 @@ function go(api, request) {
     }
 
     #[test]
-    fn each_of_a_calls_own_charges_is_a_typed_bounded_work_error() {
+    fn every_phase_over_its_budget_is_a_typed_bounded_work_error() {
         let app = "function t(api) { api(\"/health\"); }";
         let shot = snapshot(&[("src/http.rs", SERVER), ("web/app.js", app)]);
-        let budget = |limit: usize| {
-            let mut work = Work::new(limit);
-            let routes = crate::interfaces::routes::extract(&shot, &mut work, &mut || Ok(()));
-            (work, routes)
-        };
-        let (spent, routes) = budget(usize::MAX);
-        let routes = routes.unwrap();
-        let (routes_cost, parse_cost, match_cost) = (spent.used, app.len(), routes.len());
-        assert!(routes_cost > 0 && match_cost > 1);
+        let mut spent = Work::new(usize::MAX);
+        let found =
+            extract_all(&shot, &[], &Default::default(), &mut spent, &mut || Ok(())).unwrap();
+        assert_eq!(found.calls.len(), 1);
+        let whole = spent.used;
         let bounded = |error: anyhow::Error| error.to_string() == crate::interfaces::BUDGET;
-
-        let mut work = Work::new(parse_cost - 1);
+        extract_all(
+            &shot,
+            &[],
+            &Default::default(),
+            &mut Work::new(whole),
+            &mut || Ok(()),
+        )
+        .unwrap();
+        for short in [0, 1, whole / 2, whole - 1] {
+            let error = extract_all(
+                &shot,
+                &[],
+                &Default::default(),
+                &mut Work::new(short),
+                &mut || Ok(()),
+            )
+            .err()
+            .unwrap();
+            assert!(bounded(error), "{short}");
+        }
+        let pairs = found.calls.len() * found.routes.len();
+        assert!(pairs > 1);
+        let mut work = Work::new(pairs - 1);
         assert!(bounded(
-            extract(&shot, &mut work, &mut || Ok(())).err().unwrap()
-        ));
-        let mut work = Work::new(parse_cost);
-        let calls = extract(&shot, &mut work, &mut || Ok(())).unwrap();
-        assert_eq!(calls.len(), 1);
-
-        let mut work = Work::new(calls.len() * match_cost - 1);
-        assert!(bounded(
-            resolve(&routes, &calls, &mut work, &mut || Ok(()))
+            resolve(&found.routes, &found.calls, &mut work, &mut || Ok(()))
                 .err()
                 .unwrap()
         ));
-        let mut work = Work::new(calls.len() * match_cost);
-        resolve(&routes, &calls, &mut work, &mut || Ok(())).unwrap();
-
-        let whole = routes_cost + parse_cost + calls.len() * match_cost;
-        extract_all(&shot, &mut Work::new(whole), &mut || Ok(())).unwrap();
-        for short in [whole - 1, routes_cost + parse_cost - 1] {
-            let error = extract_all(&shot, &mut Work::new(short), &mut || Ok(()))
-                .err()
-                .unwrap();
-            assert!(bounded(error), "{short}");
-        }
+        resolve(
+            &found.routes,
+            &found.calls,
+            &mut Work::new(pairs),
+            &mut || Ok(()),
+        )
+        .unwrap();
     }
 
     #[test]
