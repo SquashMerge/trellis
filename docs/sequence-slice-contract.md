@@ -366,9 +366,10 @@ is drawn as a labelled boundary hop into that route's handler. The evidence mean
   architecture core the owner published for it under the current rules file. The read never
   waits for that core or asks for one, and it never fails the Sequence: `interfaces.state`
   says how it went. `ready` was read; `notMeasured` has no core for the revision yet (the
-  owner builds every head's) or it was not kept; `notExtracted` means the checkout has fewer
-  than two apps; `unavailable` means the rules file or the evidence failed. Busy storage is
-  returned typed, like every other read. A view with no call has no `interfaces`.
+  owner builds every head's) or it was not kept; `unavailable` means the rules file or the
+  evidence failed. Busy storage is returned typed, like every other read. A view with no
+  call, or in a checkout with fewer than two apps (no interface is extracted), has no
+  `interfaces`, so its wire is unchanged.
 - **Hop.** A call matched to a route whose handler is in another app than the call (both
   ends assigned to apps, as `trellis_rules_check` assigns files) carries `interface`:
   `kind:"http"`, the route's `method` and `pathTemplate`, `confidence` (`exact`, `template`

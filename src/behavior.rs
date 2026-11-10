@@ -27,7 +27,7 @@ pub struct SequenceView {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub truncated_by: Vec<SequenceLimit>,
     /// Whether the view's client calls were read against HTTP interface evidence (#853).
-    /// Omitted when the view has no call to read.
+    /// Omitted when the view has no call to read, or the checkout has fewer than two apps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interfaces: Option<SequenceInterfaces>,
 }
@@ -50,8 +50,6 @@ pub enum InterfacesState {
     Ready,
     /// The revision's architecture evidence is not built yet, or not kept for this revision.
     NotMeasured,
-    /// The checkout has fewer than two apps, so no interface is extracted.
-    NotExtracted,
     /// The evidence failed or the rules file is invalid.
     Unavailable,
 }

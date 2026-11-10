@@ -89,8 +89,8 @@ impl EvidenceResponse {
             record(InterfacesState::Unavailable);
             return Ok(());
         };
+        // Fewer than two apps: no interface is extracted, and there is nothing to say.
         if !super::architecture_core::interfaces_extracted(config, candidates) {
-            record(InterfacesState::NotExtracted);
             return Ok(());
         }
         let Ok(extraction) = core.interfaces() else {

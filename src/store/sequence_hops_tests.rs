@@ -280,10 +280,8 @@ fn one_app_extracts_no_interface() {
         )
         .unwrap();
     assert!(hops(&view).is_empty());
-    assert_eq!(
-        view.interfaces.unwrap().state,
-        InterfacesState::NotExtracted
-    );
+    // Nothing to say: the one-app wire is unchanged.
+    assert_eq!(view.interfaces, None);
 }
 
 #[test]
