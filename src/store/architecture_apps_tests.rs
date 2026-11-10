@@ -110,7 +110,7 @@ fn nested_manifests_reach_core_app_candidates_with_their_outcomes() {
         panic!("{outcomes:?}");
     };
     assert_eq!(
-        (member.name.as_str(), member.root.as_str()),
+        (member.name.as_str(), member.roots[0].as_str()),
         ("alpha", "crates/alpha")
     );
     let Outcome::App(web) = outcomes["web/package.json"] else {
@@ -333,7 +333,10 @@ fn a_captured_mimir_layout_reaches_core_app_candidates_as_three_apps() {
     };
     assert_eq!(
         (agent.kind, agent.entries.as_slice()),
-        (crate::apps::AppKind::Python, &["mimir.main".to_owned()][..])
+        (
+            Some(crate::apps::AppKind::Python),
+            &["mimir.main".to_owned()][..]
+        )
     );
     assert!(
         !outcomes.contains_key("docs/pyproject.toml"),
@@ -343,7 +346,7 @@ fn a_captured_mimir_layout_reaches_core_app_candidates_as_three_apps() {
     let apps: Vec<(&str, crate::apps::AppKind, &str)> = detected
         .apps
         .iter()
-        .map(|app| (app.name.as_str(), app.kind, app.root.as_str()))
+        .map(|app| (app.name.as_str(), app.kind.unwrap(), app.roots[0].as_str()))
         .collect();
     use crate::apps::AppKind::{Npm, Python};
     assert_eq!(

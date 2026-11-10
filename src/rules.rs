@@ -90,6 +90,15 @@ struct Raw {
     rules: Vec<Spanned<RawRule>>,
     #[serde(default)]
     exceptions: Vec<Spanned<RawException>>,
+    /// Authored apps (#794).
+    #[serde(default)]
+    apps: BTreeMap<String, Spanned<RawApp>>,
+}
+/// An authored `[apps.<name>]` table (#794). `roots` is its only key.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawApp {
+    roots: Option<Spanned<Vec<Spanned<String>>>>,
 }
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -249,6 +258,12 @@ struct Exception {
     kind: ExceptionKind,
     reason: String,
 }
+/// An authored app (#794), located for errors.
+struct AuthoredApp {
+    name: String,
+    span: std::ops::Range<usize>,
+    roots: Vec<(String, std::ops::Range<usize>)>,
+}
 pub struct Config {
     pub text: String,
     pub content_hash: String,
@@ -259,12 +274,32 @@ pub struct Config {
     peers: Option<String>,
     shared_outbound: Option<String>,
     external_deny: BTreeSet<ExternalSelector>,
+    /// Authored `[apps.<name>]` tables in name order (#794).
+    apps: Vec<AuthoredApp>,
 }
 
 impl Config {
     /// Authored `[[exceptions]]` entries, as the rules inventory lists them.
     pub fn exception_count(&self) -> usize {
         self.exceptions.len()
+    }
+
+    /// How many `[apps.<name>]` tables the file authors (#794).
+    pub(crate) fn authored_app_count(&self) -> usize {
+        self.apps.len()
+    }
+
+    /// The authored apps in name order, as inventory entries.
+    fn authored_apps(&self) -> Vec<crate::apps::App> {
+        self.apps
+            .iter()
+            .map(|app| {
+                crate::apps::App::authored(
+                    app.name.clone(),
+                    app.roots.iter().map(|(root, _)| root.clone()).collect(),
+                )
+            })
+            .collect()
     }
 }
 
@@ -475,6 +510,7 @@ pub fn parse(text: &str) -> Result<Config> {
         raw.roles.len(),
         raw.rules.len(),
         raw.exceptions.len(),
+        raw.apps.len(),
     ]
     .into_iter()
     .any(|n| n > COLLECTION_LIMIT)
@@ -603,6 +639,7 @@ pub fn parse(text: &str) -> Result<Config> {
             },
         );
     }
+    let apps = authored_apps(text, raw.apps)?;
     let mut roles = BTreeMap::new();
     for (name, raw) in raw.roles {
         let selector = raw.get_ref();
@@ -844,7 +881,104 @@ pub fn parse(text: &str) -> Result<Config> {
         peers,
         shared_outbound,
         external_deny,
+        apps,
     })
+}
+
+/// Whether an authored root is `.` or a literal checkout-relative directory: no leading or
+/// trailing slash, no empty, `.` or `..` component, and no glob, backslash, colon or NUL.
+fn valid_root(root: &str) -> bool {
+    root == "."
+        || (!root.is_empty()
+            && crate::file_tree::valid_path(root)
+            && !root.contains(['*', '?', '[', ']', '{', '}', '!']))
+}
+
+/// The authored `[apps.<name>]` tables (#794), in name order. Checks that need no snapshot:
+/// each table has a nonblank name and a nonempty list of valid, distinct roots, and no root is
+/// authored by two apps.
+fn authored_apps(text: &str, raw: BTreeMap<String, Spanned<RawApp>>) -> Result<Vec<AuthoredApp>> {
+    let mut apps = Vec::with_capacity(raw.len());
+    let mut owners: BTreeMap<String, String> = BTreeMap::new();
+    for (name, table) in raw {
+        let span = table.span();
+        if name.trim().is_empty() {
+            return Err(error(
+                text,
+                span,
+                "schema",
+                "token",
+                "app name must not be blank",
+            ));
+        }
+        let Some(list) = table.into_inner().roots else {
+            return Err(error(
+                text,
+                span,
+                "schema",
+                "token",
+                format!("app {name} requires roots"),
+            ));
+        };
+        let list_span = list.span();
+        let list = list.into_inner();
+        if list.is_empty() {
+            return Err(error(
+                text,
+                list_span,
+                "schema",
+                "token",
+                format!("app {name} must list at least one root"),
+            ));
+        }
+        if list.len() > COLLECTION_LIMIT {
+            return Err(error(
+                text,
+                list[COLLECTION_LIMIT].span(),
+                "too_large",
+                "token",
+                "app roots collection exceeds 1024 entries",
+            ));
+        }
+        let mut roots: Vec<(String, std::ops::Range<usize>)> = Vec::with_capacity(list.len());
+        for value in list {
+            let root_span = value.span();
+            let root = value.into_inner();
+            if !valid_root(&root) {
+                return Err(error(
+                    text,
+                    root_span,
+                    "schema",
+                    "token",
+                    format!(
+                        "app root {root:?} must be \".\" or a checkout-relative directory: no leading or trailing slash, no \".\" or \"..\" component, no glob, backslash or colon"
+                    ),
+                ));
+            }
+            if roots.iter().any(|(seen, _)| *seen == root) {
+                return Err(error(
+                    text,
+                    root_span,
+                    "schema",
+                    "token",
+                    format!("app {name} lists root {root} twice"),
+                ));
+            }
+            if let Some(owner) = owners.get(&root) {
+                return Err(error(
+                    text,
+                    root_span,
+                    "ambiguity",
+                    "token",
+                    format!("root {root} is authored by apps {owner} and {name}"),
+                ));
+            }
+            owners.insert(root.clone(), name.clone());
+            roots.push((root, root_span));
+        }
+        apps.push(AuthoredApp { name, span, roots });
+    }
+    Ok(apps)
 }
 
 fn identity(d: &Declaration) -> Value {
@@ -884,8 +1018,10 @@ pub(crate) fn app_candidates(
     crate::apps::candidates(&snapshot.manifests, &documents, &mut work, check)
 }
 
-/// The prompt's `payload.apps` (#783): the apps detected against `config`'s bytes, so a
-/// manifest a hidden layer selects is left out. Without a config every manifest is listed.
+/// The prompt's `payload.apps` (#783, #794): the effective apps against `config`'s bytes, so a
+/// manifest a hidden layer selects is left out and authored apps shadow the detected apps
+/// under their roots. Without a config every manifest is listed. The authored apps are not
+/// checked against the snapshot here; `trellis_rules_check` reports those errors.
 pub(crate) fn prompt_apps(
     config: Option<&Config>,
     candidates: &crate::apps::Candidates,
@@ -902,14 +1038,73 @@ pub(crate) fn prompt_apps(
         }
         None => BTreeSet::new(),
     };
-    Ok(crate::apps::detect(candidates, &hidden)
-        .apps
+    let detected = crate::apps::detect(candidates, &hidden).apps;
+    let authored = config.map(Config::authored_apps).unwrap_or_default();
+    Ok(crate::apps::effective(authored, detected)
         .into_iter()
         .map(|app| {
-            json!({"name": app.name, "kind": app.kind, "manifest": app.manifest,
-                "roots": [app.root], "entries": app.entries})
+            json!({"name": app.name, "source": app.source, "kind": app.kind,
+                "manifest": app.manifest, "roots": app.roots, "entries": app.entries})
         })
         .collect())
+}
+
+/// The effective app inventory of a snapshot (#794): `config`'s authored apps, then the
+/// `detected` apps they do not shadow. In name order, the first authored app with a problem
+/// fails: a root with no snapshot document under it is a `reference` error at the root, and a
+/// name that a surviving detected app also has is an `ambiguity` error at the table.
+fn effective_apps(
+    config: &Config,
+    detected: Vec<crate::apps::App>,
+    documents: &BTreeSet<&str>,
+) -> Result<Vec<crate::apps::App>> {
+    let apps = crate::apps::effective(config.authored_apps(), detected);
+    for authored in &config.apps {
+        for (root, span) in &authored.roots {
+            let found = if root == "." {
+                !documents.is_empty()
+            } else {
+                let prefix = format!("{root}/");
+                documents
+                    .range::<&str, _>(prefix.as_str()..)
+                    .next()
+                    .is_some_and(|path| path.starts_with(&prefix))
+            };
+            if !found {
+                return Err(error(
+                    &config.text,
+                    span.clone(),
+                    "reference",
+                    "token",
+                    format!(
+                        "app {} names root {root}, but no indexed document lies under it",
+                        authored.name
+                    ),
+                ));
+            }
+        }
+        let manifests: Vec<&str> = apps
+            .iter()
+            .filter(|app| {
+                app.source == crate::apps::AppSource::Manifest && app.name == authored.name
+            })
+            .filter_map(|app| app.manifest.as_deref())
+            .collect();
+        if !manifests.is_empty() {
+            return Err(error(
+                &config.text,
+                authored.span.clone(),
+                "ambiguity",
+                "token",
+                format!(
+                    "app {} is authored here and also detected by {}; author it at the detected root to replace that app",
+                    authored.name,
+                    manifests.join(" and ")
+                ),
+            ));
+        }
+    }
+    Ok(apps)
 }
 
 /// Resolve authored hidden membership for the explicit workbench metrics population.
@@ -1039,7 +1234,7 @@ impl<'a> LayerMatcher<'a> {
     }
 }
 
-/// Which detected apps each layer belongs to (#784).
+/// Which apps of the effective inventory each layer belongs to (#784, #794).
 pub(crate) struct AppScope<'a> {
     config: &'a Config,
     apps: &'a [crate::apps::App],
@@ -1123,8 +1318,8 @@ impl<'a> AppScope<'a> {
     }
 }
 
-/// Check every layer's `app` and `apps` against the detected apps; the first layer in name
-/// order with a problem wins.
+/// Check every layer's `app` and `apps` against the effective apps (#794); the first layer in
+/// name order with a problem wins.
 fn validate_apps(config: &Config, apps: &[crate::apps::App]) -> Result<()> {
     for (layer_name, layer) in &config.layers {
         let named: Vec<&(String, std::ops::Range<usize>)> = layer
@@ -1155,7 +1350,9 @@ fn validate_apps(config: &Config, apps: &[crate::apps::App]) -> Result<()> {
                         span.clone(),
                         "reference",
                         "token",
-                        format!("layer {layer_name} names app {name}, but no app is detected"),
+                        format!(
+                            "layer {layer_name} names app {name}, but no app is detected or authored"
+                        ),
                     ));
                 }
                 [] => {
@@ -1170,14 +1367,14 @@ fn validate_apps(config: &Config, apps: &[crate::apps::App]) -> Result<()> {
                         "reference",
                         "token",
                         format!(
-                            "layer {layer_name} names app {name}, which is not detected (detected: {detected})"
+                            "layer {layer_name} names app {name}, which is not detected or authored (apps: {detected})"
                         ),
                     ));
                 }
                 many => {
                     let manifests = many
                         .iter()
-                        .map(|app| app.manifest.as_str())
+                        .filter_map(|app| app.manifest.as_deref())
                         .collect::<Vec<_>>()
                         .join(" and ");
                     return Err(error(
@@ -2041,7 +2238,8 @@ pub(crate) struct RulesBase {
 }
 
 impl RulesBase {
-    /// The apps detected for this snapshot, in manifest-path order.
+    /// The effective apps for this snapshot (#794): authored apps by name, then the detected
+    /// apps they do not shadow, in manifest-path order.
     pub(crate) fn apps(&self) -> &[crate::apps::App] {
         &self.apps
     }
@@ -2107,7 +2305,7 @@ fn prepare_with_workers(
         );
         documents.push(doc);
     }
-    let detected = {
+    let apps = {
         let document_paths: BTreeSet<&str> = snapshot
             .documents
             .iter()
@@ -2121,9 +2319,13 @@ fn prepare_with_workers(
             .map(|(path, _)| path.as_str())
             .collect();
         let hidden = hidden_layer_paths(config, &manifest_paths, check)?;
-        crate::apps::detect(&candidates, &hidden)
+        let detected = crate::apps::detect(&candidates, &hidden);
+        (
+            effective_apps(config, detected.apps, &document_paths)?,
+            detected.unread,
+        )
     };
-    validate_apps(config, &detected.apps)?;
+    validate_apps(config, &apps.0)?;
     let mut targets: Targets<'_> = BTreeMap::new();
     let semantic = snapshot
         .documents
@@ -2154,8 +2356,8 @@ fn prepare_with_workers(
         declarations,
         test_declarations,
         work_used: work.used,
-        apps: detected.apps,
-        unread_manifests: detected.unread,
+        apps: apps.0,
+        unread_manifests: apps.1,
     })
 }
 
@@ -2424,7 +2626,7 @@ pub(crate) fn evaluate_prepared<'a>(
             let rows = instances
                 .iter()
                 .filter(|row| scope.bucket(&assignments, row) == Some(index));
-            json!({"name":scope.name(index),"manifest":app.manifest,"counts":counts(rows)})
+            json!({"name":scope.name(index),"source":app.source,"manifest":app.manifest,"counts":counts(rows)})
         })
         .collect();
     let no_app = counts(
@@ -2962,13 +3164,7 @@ mod app_scope_tests {
     use crate::apps::{App, AppKind, Candidates, Outcome};
 
     fn app(name: &str, kind: AppKind, root: &str) -> App {
-        App {
-            name: name.into(),
-            kind,
-            manifest: format!("{root}/manifest"),
-            root: root.into(),
-            entries: vec![],
-        }
+        App::detected(name.into(), kind, &format!("{root}/manifest"), vec![])
     }
 
     const TWO_APPS: &str = "version=1\n[layers.up]\napp='svc'\norder=1\npaths=['svc/**']\n[layers.web]\napp='ui'\norder=1\npaths=['ui/**']\n[layers.base]\nshared=true\napps=['svc']\npaths=['base/**']\n";
@@ -3061,10 +3257,202 @@ mod app_scope_tests {
         }
     }
 
-    fn candidate(name: &str, kind: AppKind, manifest: &str, root: &str) -> (String, Outcome) {
-        let mut app = app(name, kind, root);
-        app.manifest = manifest.into();
-        app.entries = vec!["src/main.rs".into()];
+    fn located(text: &str) -> Value {
+        diagnostic(&parse(text).err().expect("invalid rules")).unwrap()
+    }
+
+    /// #794: `[apps.<name>]` tables parse in name order, each with its roots.
+    #[test]
+    fn authored_apps_parse_in_name_order() {
+        let config = parse(
+            "version=1\n[apps.web]\nroots=['client', 'shared/ui']\n[apps.backend]\nroots=['.']\n",
+        )
+        .unwrap();
+        assert_eq!(config.authored_app_count(), 2);
+        let apps = config.authored_apps();
+        assert_eq!(apps[0].name, "backend");
+        assert_eq!(apps[0].roots, ["."]);
+        assert_eq!(apps[1].name, "web");
+        assert_eq!(apps[1].roots, ["client", "shared/ui"]);
+        assert_eq!(apps[1].source, crate::apps::AppSource::Override);
+        assert_eq!(parse("version=1\n").unwrap().authored_app_count(), 0);
+    }
+
+    /// #794: each schema error of an authored app is located at its token.
+    #[test]
+    fn authored_app_schema_errors_are_located() {
+        for (body, line, needle) in [
+            ("[apps.api]\n", 2, "requires roots"),
+            ("[apps.api]\nroots=[]\n", 3, "at least one root"),
+            ("[apps.api]\nroots='server'\n", 3, ""),
+            ("[apps.api]\nroots=[\n1\n]\n", 4, ""),
+            ("[apps.api]\nroots=['server']\nkind='npm'\n", 4, "kind"),
+            (
+                "[apps.api]\nroots=['server']\nentries=['main']\n",
+                4,
+                "entries",
+            ),
+            ("[apps.\" \"]\nroots=['server']\n", 2, "blank"),
+            ("[apps.api]\nroots=[\n'server',\n'server'\n]\n", 5, "twice"),
+        ] {
+            let d = located(&format!("version=1\n{body}"));
+            assert_eq!(d["kind"], "schema", "{body}");
+            assert_eq!(d["line"], line, "{body}: {d}");
+            assert!(
+                d["message"].as_str().unwrap().contains(needle),
+                "{body}: {d}"
+            );
+        }
+    }
+
+    /// #794: a root must be `.` or a literal checkout-relative directory; one outside the
+    /// checkout, absolute, globbed or unnormalised is a located schema error.
+    #[test]
+    fn an_invalid_root_is_a_schema_error_at_the_root() {
+        for root in [
+            "", "/srv", "srv/", "../srv", "srv/../x", "./srv", "srv/./x", "a//b", "srv/*",
+            "srv/**", "s?v", "[s]rv", "{a,b}", "!srv", "srv\\\\x", "c:/srv", "..",
+        ] {
+            let text = format!(
+                "version=1\n[apps.api]\nroots=[\n'ok',\n{}\n]\n",
+                toml::Value::String(root.into())
+            );
+            let d = located(&text);
+            assert_eq!(d["kind"], "schema", "{root:?}");
+            assert_eq!(d["line"], 5, "{root:?}");
+            assert!(
+                d["message"].as_str().unwrap().contains("app root"),
+                "{root:?}"
+            );
+        }
+    }
+
+    /// #794 D3: the same root in two authored apps is an ambiguity at its second occurrence;
+    /// nested roots are allowed.
+    #[test]
+    fn an_identical_root_in_two_apps_is_an_ambiguity_and_nesting_is_not() {
+        let d =
+            located("version=1\n[apps.api]\nroots=['srv']\n[apps.web]\nroots=[\n'ui',\n'srv'\n]\n");
+        assert_eq!(d["kind"], "ambiguity");
+        assert_eq!(d["line"], 7);
+        assert!(
+            d["message"].as_str().unwrap().contains("api and web"),
+            "{d}"
+        );
+        parse("version=1\n[apps.api]\nroots=['.']\n[apps.web]\nroots=['ui', 'ui/inner']\n[apps.inner]\nroots=['ui/inner/x']\n").unwrap();
+    }
+
+    #[test]
+    fn too_many_authored_apps_or_roots_are_too_large() {
+        let roots: String = (0..=COLLECTION_LIMIT)
+            .map(|i| format!("'r{i}',\n"))
+            .collect();
+        let d = located(&format!("version=1\n[apps.api]\nroots=[\n{roots}]\n"));
+        assert_eq!(d["kind"], "too_large");
+        assert_eq!(d["line"], 4 + COLLECTION_LIMIT);
+        let apps: String = (0..=COLLECTION_LIMIT)
+            .map(|i| format!("[apps.a{i}]\nroots=['r{i}']\n"))
+            .collect();
+        let d = located(&format!("version=1\n{apps}"));
+        assert_eq!(d["kind"], "too_large");
+    }
+
+    fn documents<'a>(paths: &[&'a str]) -> BTreeSet<&'a str> {
+        paths.iter().copied().collect()
+    }
+
+    /// #794 D6: a root with no indexed document under it is a located reference error.
+    #[test]
+    fn an_authored_root_without_documents_is_a_reference_error() {
+        let config = parse("version=1\n[apps.api]\nroots=[\n'server',\n'gone'\n]\n").unwrap();
+        let d = diagnostic(
+            &effective_apps(&config, vec![], &documents(&["server/a.js", "gonex/b.js"]))
+                .unwrap_err(),
+        )
+        .unwrap();
+        assert_eq!(d["kind"], "reference");
+        assert_eq!(d["line"], 5);
+        assert!(d["message"].as_str().unwrap().contains("gone"), "{d}");
+        let apps =
+            effective_apps(&config, vec![], &documents(&["server/a.js", "gone/b.js"])).unwrap();
+        assert_eq!(apps.len(), 1);
+        let root = parse("version=1\n[apps.all]\nroots=['.']\n").unwrap();
+        assert!(effective_apps(&root, vec![], &documents(&[])).is_err());
+        effective_apps(&root, vec![], &documents(&["a.rs"])).unwrap();
+    }
+
+    /// #794 D4: an authored name equal to a detected app that survives is an ambiguity at the
+    /// authored table; the same name on a shadowed app is a rename.
+    #[test]
+    fn an_authored_name_clashing_with_a_surviving_detected_app_is_an_ambiguity() {
+        let detected = vec![
+            app("svc", AppKind::Cargo, "svc"),
+            app("ui", AppKind::Npm, "ui"),
+        ];
+        let docs = documents(&["svc/main.rs", "ui/a.js", "cli/a.rs"]);
+        let clash = parse("version=1\n[apps.svc]\nroots=['cli']\n").unwrap();
+        let d = diagnostic(&effective_apps(&clash, detected.clone(), &docs).unwrap_err()).unwrap();
+        assert_eq!(d["kind"], "ambiguity");
+        assert_eq!(d["line"], 2);
+        assert!(
+            d["message"].as_str().unwrap().contains("svc/manifest"),
+            "{d}"
+        );
+        let rename =
+            parse("version=1\n[apps.service]\nroots=['svc']\n[apps.ui]\nroots=['ui']\n").unwrap();
+        let apps = effective_apps(&rename, detected, &docs).unwrap();
+        let names: Vec<&str> = apps.iter().map(|app| app.name.as_str()).collect();
+        assert_eq!(names, ["service", "ui"]);
+        assert!(
+            apps.iter()
+                .all(|app| app.source == crate::apps::AppSource::Override)
+        );
+    }
+
+    /// #794: a layer names an effective app; a detected app an authored root shadows can no
+    /// longer be named.
+    #[test]
+    fn layers_name_effective_apps_only() {
+        let text = "version=1\n[apps.service]\nroots=['svc']\n[layers.up]\napp='svc'\norder=1\npaths=['svc/**']\n[layers.web]\napp='ui'\norder=1\npaths=['ui/**']\n";
+        let config = parse(text).unwrap();
+        let detected = vec![
+            app("svc", AppKind::Cargo, "svc"),
+            app("ui", AppKind::Npm, "ui"),
+        ];
+        let apps =
+            effective_apps(&config, detected, &documents(&["svc/main.rs", "ui/a.js"])).unwrap();
+        let d = diagnostic(&validate_apps(&config, &apps).unwrap_err()).unwrap();
+        assert_eq!(d["kind"], "reference");
+        assert_eq!(d["line"], 5);
+        assert!(
+            d["message"].as_str().unwrap().contains("service, ui"),
+            "{d}"
+        );
+    }
+
+    /// #794: with a rules file the prompt lists the effective inventory, unchecked against
+    /// the snapshot.
+    #[test]
+    fn prompt_apps_list_authored_apps_first_and_drop_shadowed_ones() {
+        let candidates = Candidates {
+            manifests: vec![
+                candidate("svc", AppKind::Cargo, "svc/Cargo.toml"),
+                candidate("ui", AppKind::Npm, "ui/package.json"),
+            ],
+        };
+        let config = parse("version=1\n[apps.web]\nroots=['ui', 'gone']\n").unwrap();
+        let rows = prompt_apps(Some(&config), &candidates, &mut || Ok(())).unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                json!({"name":"web","source":"override","kind":null,"manifest":null,"roots":["ui","gone"],"entries":[]}),
+                json!({"name":"svc","source":"manifest","kind":"cargo","manifest":"svc/Cargo.toml","roots":["svc"],"entries":["src/main.rs"]}),
+            ]
+        );
+    }
+
+    fn candidate(name: &str, kind: AppKind, manifest: &str) -> (String, Outcome) {
+        let app = App::detected(name.into(), kind, manifest, vec!["src/main.rs".into()]);
         (manifest.into(), Outcome::App(app))
     }
 
@@ -3072,9 +3460,9 @@ mod app_scope_tests {
     fn prompt_apps_list_every_manifest_without_rules() {
         let candidates = Candidates {
             manifests: vec![
-                candidate("svc", AppKind::Cargo, "svc/Cargo.toml", "svc"),
+                candidate("svc", AppKind::Cargo, "svc/Cargo.toml"),
                 ("tools/package.json".into(), Outcome::NotApp),
-                candidate("ui", AppKind::Npm, "ui/package.json", "ui"),
+                candidate("ui", AppKind::Npm, "ui/package.json"),
                 ("bad/package.json".into(), Outcome::Unread),
             ],
         };
@@ -3082,8 +3470,8 @@ mod app_scope_tests {
         assert_eq!(
             rows,
             vec![
-                json!({"name":"svc","kind":"cargo","manifest":"svc/Cargo.toml","roots":["svc"],"entries":["src/main.rs"]}),
-                json!({"name":"ui","kind":"npm","manifest":"ui/package.json","roots":["ui"],"entries":["src/main.rs"]}),
+                json!({"name":"svc","source":"manifest","kind":"cargo","manifest":"svc/Cargo.toml","roots":["svc"],"entries":["src/main.rs"]}),
+                json!({"name":"ui","source":"manifest","kind":"npm","manifest":"ui/package.json","roots":["ui"],"entries":["src/main.rs"]}),
             ]
         );
     }
@@ -3092,8 +3480,8 @@ mod app_scope_tests {
     fn prompt_apps_leave_out_a_manifest_a_hidden_layer_selects() {
         let candidates = Candidates {
             manifests: vec![
-                candidate("svc", AppKind::Cargo, "svc/Cargo.toml", "svc"),
-                candidate("fixture", AppKind::Npm, "fixtures/package.json", "fixtures"),
+                candidate("svc", AppKind::Cargo, "svc/Cargo.toml"),
+                candidate("fixture", AppKind::Npm, "fixtures/package.json"),
             ],
         };
         let config =

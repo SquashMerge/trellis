@@ -352,7 +352,7 @@ trellis rules check > rules-report.json
 
 Use `--path 'src/**'` to check only some source files.
 
-Agents can use `trellis_rules_check` and `trellis_rules_explain`, and the `trellis_propose_layers` MCP prompt drafts layers for you to review. See the [rules reference](rules.md) for exceptions and external package rules.
+Agents can use `trellis_rules_check` and `trellis_rules_explain`, and the `trellis_propose_rules` MCP prompt drafts apps and layers for you to review. See the [rules reference](rules.md) for exceptions and external package rules.
 
 ## 7. Read the results
 

@@ -782,7 +782,7 @@ fn rules_envelopes_accept_classified_evidence_and_kind_counts() {
             "data":{"rulesVersion":"rules:v2","indexGeneration":"g","indexRevision":1,
                 "rulesFile":{"path":".trellis/rules.toml","source":"checkout-config","contentHash":"0".repeat(64)},
                 "instances":[instance],"testOnly":[],"counts":counts,"testCounts":counts,
-                "apps":[{"name":"trellis","manifest":"Cargo.toml","counts":counts}],"noApp":{"counts":counts},
+                "apps":[{"name":"trellis","source":"manifest","manifest":"Cargo.toml","counts":counts}],"noApp":{"counts":counts},
                 "unassignedFileCount":0,"unassigned":[],"partialFiles":[],"limitations":[],
                 "externalPackages":[],"page":page,"semanticBases":[]},
             "warnings":[],"partial":false,"truncated":false,"truncationReason":null,
@@ -12196,9 +12196,9 @@ async fn rules_check_next_call_explains_an_instance_with_its_omitted_evidence() 
 }
 
 /// #769: without `.trellis/rules.toml`, check and explain fail `rules_not_found` with a
-/// static hint naming the `trellis_propose_layers` prompt that drafts one.
+/// static hint naming the `trellis_propose_rules` prompt that drafts one.
 #[tokio::test(flavor = "current_thread")]
-async fn rules_not_found_names_the_propose_layers_prompt() {
+async fn rules_not_found_names_the_propose_rules_prompt() {
     use trellis::daemon::registry::CheckoutRegistry;
     let temp = tempfile::tempdir().unwrap();
     let (identity, topology) =
@@ -12229,9 +12229,9 @@ async fn rules_not_found_names_the_propose_layers_prompt() {
         let envelope = &reply["result"]["structuredContent"];
         let message = envelope["error"]["message"].as_str().unwrap();
         assert!(message.contains(".trellis/rules.toml"), "{message}");
-        assert!(message.contains("`trellis_propose_layers`"), "{message}");
+        assert!(message.contains("`trellis_propose_rules`"), "{message}");
         assert!(
-            message.contains("/mcp__trellis__trellis_propose_layers"),
+            message.contains("/mcp__trellis__trellis_propose_rules"),
             "{message}"
         );
         assert_eq!(
@@ -12401,27 +12401,33 @@ fn architecture_catalog_prompt_and_closed_inputs_use_both_protocol_modes() {
         let list = peer.ask(frame(101, "prompts/list", json!({})));
         assert_eq!(
             list["result"]["prompts"][0]["name"],
-            "trellis_propose_layers"
+            "trellis_propose_rules"
         );
         assert_eq!(list["result"]["prompts"][0]["arguments"], json!([]));
         assert_eq!(list["result"].get("resultType").is_some(), !legacy);
         for (id, method, params) in [
             (102, "prompts/list", json!({"cursor":"next"})),
             (103, "prompts/get", json!({"name":"unknown"})),
+            // #794: the old prompt name has no alias.
+            (
+                110,
+                "prompts/get",
+                json!({"name":"trellis_propose_layers","arguments":{}}),
+            ),
             (
                 104,
                 "prompts/get",
-                json!({"name":"trellis_propose_layers","arguments":{"scope":"src"}}),
+                json!({"name":"trellis_propose_rules","arguments":{"scope":"src"}}),
             ),
             (
                 105,
                 "prompts/get",
-                json!({"name":"trellis_propose_layers","arguments":null}),
+                json!({"name":"trellis_propose_rules","arguments":null}),
             ),
             (
                 106,
                 "tools/call",
-                json!({"name":"trellis_propose_layers","arguments":{"schemaVersion":1}}),
+                json!({"name":"trellis_propose_rules","arguments":{"schemaVersion":1}}),
             ),
         ] {
             error(&peer.ask(frame(id, method, params)), -32602, json!(id));
@@ -12429,7 +12435,7 @@ fn architecture_catalog_prompt_and_closed_inputs_use_both_protocol_modes() {
         let cold = peer.ask(frame(
             107,
             "prompts/get",
-            json!({"name":"trellis_propose_layers","arguments":{}}),
+            json!({"name":"trellis_propose_rules","arguments":{}}),
         ));
         assert_eq!(cold["error"]["code"], -32603, "{cold}");
         assert_eq!(cold["error"]["data"]["code"], "index_not_ready", "{cold}");
@@ -12604,7 +12610,7 @@ async fn architecture_tools_and_prompt_share_pinned_evidence_and_current_rules()
         validate_structured_content(&[
             json!({"name":"trellis_rules_explain","structuredContent":not_found_env}),
         ]);
-        let prompt = ask(4, "prompts/get", json!({"name":"trellis_propose_layers"}));
+        let prompt = ask(4, "prompts/get", json!({"name":"trellis_propose_rules"}));
         assert!(prompt.get("error").is_none(), "{prompt}");
         let text = prompt["result"]["messages"][0]["content"]["text"]
             .as_str()
@@ -12638,14 +12644,14 @@ async fn architecture_tools_and_prompt_share_pinned_evidence_and_current_rules()
         validate_structured_content(&[
             json!({"name":"trellis_rules_check","structuredContent":invalid["result"]["structuredContent"]}),
         ]);
-        let bad_prompt = ask(6, "prompts/get", json!({"name":"trellis_propose_layers"}));
+        let bad_prompt = ask(6, "prompts/get", json!({"name":"trellis_propose_rules"}));
         assert_eq!(
             bad_prompt["error"]["data"]["code"], "invalid_rules",
             "{bad_prompt}"
         );
         assert!(bad_prompt.get("result").is_none());
         fs::remove_file(identity.root.join(".trellis/rules.toml")).unwrap();
-        let absent = ask(7, "prompts/get", json!({"name":"trellis_propose_layers"}));
+        let absent = ask(7, "prompts/get", json!({"name":"trellis_propose_rules"}));
         assert!(
             absent["result"]["messages"][0]["content"]["text"]
                 .as_str()
@@ -12683,7 +12689,7 @@ async fn architecture_tools_and_prompt_share_pinned_evidence_and_current_rules()
 /// edges and file-module pairs with exact totals and omitted counts, and the exact
 /// current rules bytes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn propose_layers_prompt_fits_the_frame_when_references_exceed_it() {
+async fn propose_rules_prompt_fits_the_frame_when_references_exceed_it() {
     use trellis::daemon::registry::CheckoutRegistry;
     let temp = tempfile::tempdir().unwrap();
     let mut files = Vec::new();
@@ -12728,12 +12734,12 @@ async fn propose_layers_prompt_fits_the_frame_when_references_exceed_it() {
     .unwrap();
     let refs_env = &refs["result"]["structuredContent"];
     assert!(refs_env.get("error").is_none(), "{refs}");
-    let first = raw(2, "prompts/get", json!({"name":"trellis_propose_layers"}));
+    let first = raw(2, "prompts/get", json!({"name":"trellis_propose_rules"}));
     // A small prompt: instructions, rules, pin, totals and a bounded overview.
     assert!(first.len() < 32 * 1024, "{} bytes", first.len());
     let prompt: Value = serde_json::from_str(&first).unwrap();
     assert!(prompt.get("error").is_none(), "{prompt}");
-    let second = raw(3, "prompts/get", json!({"name":"trellis_propose_layers"}));
+    let second = raw(3, "prompts/get", json!({"name":"trellis_propose_rules"}));
     assert_eq!(
         first.replacen("\"id\":2", "", 1),
         second.replacen("\"id\":3", "", 1),
@@ -12780,7 +12786,7 @@ async fn propose_layers_prompt_fits_the_frame_when_references_exceed_it() {
 /// is left out; with no rules file every manifest is listed, and two apps add the per-app
 /// instructions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn propose_layers_prompt_lists_apps_against_the_current_rules() {
+async fn propose_rules_prompt_lists_apps_against_the_current_rules() {
     use trellis::daemon::registry::CheckoutRegistry;
     let temp = tempfile::tempdir().unwrap();
     for directory in ["src", "tools"] {
@@ -12817,7 +12823,7 @@ async fn propose_layers_prompt_lists_apps_against_the_current_rules() {
             modern(
                 json!(id),
                 "prompts/get",
-                json!({"name":"trellis_propose_layers"})
+                json!({"name":"trellis_propose_rules"})
             )
         )
         .unwrap();
@@ -12834,8 +12840,8 @@ async fn propose_layers_prompt_lists_apps_against_the_current_rules() {
                 .unwrap();
         (text, context["payload"]["apps"].clone())
     };
-    let svc = json!({"name":"svc","kind":"cargo","manifest":"Cargo.toml","roots":["."],
-        "entries":["svc"]});
+    let svc = json!({"name":"svc","source":"manifest","kind":"cargo","manifest":"Cargo.toml",
+        "roots":["."],"entries":["svc"]});
     let (text, apps) = prompt(1);
     assert_eq!(apps, json!([svc]));
     assert!(!text.contains("PER-APP LAYERS"));
@@ -12843,10 +12849,25 @@ async fn propose_layers_prompt_lists_apps_against_the_current_rules() {
     let (text, apps) = prompt(2);
     assert_eq!(
         apps,
-        json!([svc, {"name":"tooling","kind":"npm","manifest":"tools/package.json",
-            "roots":["tools"],"entries":[]}])
+        json!([svc, {"name":"tooling","source":"manifest","kind":"npm",
+            "manifest":"tools/package.json","roots":["tools"],"entries":[]}])
     );
     assert!(text.contains("PER-APP LAYERS"));
+    // #794: an authored app shadows the detected app at its root and is listed first, and
+    // the instructions explain how to author apps.
+    fs::write(
+        &rules_path,
+        "version = 1\n[apps.build-tools]\nroots = [\"tools\"]\n",
+    )
+    .unwrap();
+    let (text, apps) = prompt(3);
+    assert_eq!(
+        apps,
+        json!([{"name":"build-tools","source":"override","kind":null,"manifest":null,
+            "roots":["tools"],"entries":[]}, svc])
+    );
+    assert!(text.contains("APPS\npayload.apps is the app inventory"));
+    assert!(text.contains("[apps.backend]\nroots = [\".\"]"));
     drop(prompt);
     drop(reader);
     drop(client);
@@ -13094,7 +13115,7 @@ async fn architecture_prompt_cancellation_deadline_and_final_root_are_not_tool_r
             writeln!(
                 client,
                 "{}",
-                frame(1, "prompts/get", json!({"name":"trellis_propose_layers"}))
+                frame(1, "prompts/get", json!({"name":"trellis_propose_rules"}))
             )
             .unwrap();
             let waiter = gate.clone();

@@ -17,7 +17,7 @@ layers stay visible. Unassigned modules are explicitly **Unassigned / unknown** 
 the stack; Trellis does not guess membership.
 
 Missing rules or a configuration without layers shows setup help for the existing
-`trellis_propose_layers` MCP prompt. The browser does not call a model. Authoring
+`trellis_propose_rules` MCP prompt. The browser does not call a model. Authoring
 requires an existing valid rules file. Editing or removing authored exceptions does not
 require layers or current matching instances; new layer-pair exceptions require
 positively witnessed production deviations.
@@ -51,7 +51,10 @@ switcher and the drawing are [#789](https://github.com/SquashMerge/trellis/issue
 [#790](https://github.com/SquashMerge/trellis/issues/790). The data is
 [#784](https://github.com/SquashMerge/trellis/issues/784).
 
-- **Apps are detected, never guessed or proposed.** The summary lists the detected apps,
+- **Apps are detected or authored, never guessed.** (#794: an app can also be authored in
+  `.trellis/rules.toml`; see [rules.md Amendment (#794)](rules.md#amendment-794-authored-apps).
+  The proposal prompt may draft authored apps for review; the browser never does.) The
+  summary lists the apps,
   each with its name, its kind (`cargo`, `npm` or `python`; python added by owner ruling 2026-11-08, #807), its manifest path, its roots and its
   entries. It also gives each layer its app: `layers[].app` for an ordered layer, the served
   apps for a shared layer. #784 fixes the exact fields. The view never draws a layer or an
@@ -62,7 +65,7 @@ switcher and the drawing are [#789](https://github.com/SquashMerge/trellis/issue
   or one app, the view is the single stack above, with the same per-destination `↑` badges
   (see the #789 badge amendment under the band headers).
 - **An app with no layers yet** lists its files as unassigned, under that app, and shows
-  the `trellis_propose_layers` setup help.
+  the `trellis_propose_rules` setup help.
 - **Tooling, test harnesses and fixtures are hidden layers of their app, not apps** (#524).
   They wait in that app's hidden-layer note and its toggle. There is no app chip for them.
 - **Unassigned files are listed per app,** by the most specific containing app root, plus
@@ -96,7 +99,12 @@ from `pyproject.toml` ([#807](https://github.com/SquashMerge/trellis/issues/807)
   `kind`, `manifest`, `roots`, `entries`, `counts` (production `$layers` and other rule
   instances given to the app, equal to the CLI's `apps[].counts`), `languages`, `fileCount`,
   `unassignedFileCount` and `source: "manifest"`. `fileCount` and `unassignedFileCount` count
-  the modules whose app is this one.
+  the modules whose app is this one. (#794: authored apps come first, by name, with
+  `source: "override"`, `kind` and `manifest` null, `entries` empty and `roots` as authored,
+  possibly several; a detected app an authored root shadows is not listed. The browser labels
+  an authored app "Authored in .trellis/rules.toml" where a detected one says "Detected from
+  <manifest> (<kind>)", and lists every root. See
+  [rules.md Amendment (#794)](rules.md#amendment-794-authored-apps).)
 - `modules[].app`: the app name of the module's file, or null.
 - `layers[].app` and `layers[].apps`: the authored values, or null.
 - `noApp`: `{counts, unassignedFileCount}`. It is null only in the summary head, before the
@@ -162,7 +170,8 @@ from `pyproject.toml` ([#807](https://github.com/SquashMerge/trellis/issues/807)
   filter value, with every manifest path listed.
 
 **Extraction (#788).** Interface evidence is structural and read from the same admitted
-snapshot as the rules. It is extracted only when two or more apps are detected. Documents
+snapshot as the rules. It is extracted only when two or more apps are detected (#794:
+detected and authored apps together). Documents
 with an evidence gap are skipped. Work is bounded; over the bound the read fails
 `bounded_work`.
 

@@ -2584,7 +2584,7 @@ mod relay_failure_tests {
             crate::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
         for modern in [false, true] {
             let mut value = json!({"jsonrpc":"2.0","id":129,"method":"prompts/get",
-                "params":{"name":"trellis_propose_layers","arguments":{}}});
+                "params":{"name":"trellis_propose_rules","arguments":{}}});
             if modern {
                 value["params"]["_meta"] = json!({
                 "io.modelcontextprotocol/protocolVersion":"2026-07-28",

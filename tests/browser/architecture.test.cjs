@@ -1160,10 +1160,10 @@ for (const [name, config, state] of [["missing", null, "missing_rules"], ["empty
     assert.equal(response.status, 200, JSON.stringify(response.data));
     assert.equal(response.data.payload.state, state);
     assert.deepEqual(response.data.payload.modules, []); assert.deepEqual(response.data.payload.edges, []);
-    await selected.page.waitForFunction(expected => document.querySelector("#architecture-state")?.textContent.includes(expected), state === "no_layers" ? "No authored layers" : "trellis_propose_layers");
+    await selected.page.waitForFunction(expected => document.querySelector("#architecture-state")?.textContent.includes(expected), state === "no_layers" ? "No authored layers" : "trellis_propose_rules");
     const message = await selected.page.locator("#architecture-panel").textContent();
     assert.match(message, /\.trellis\/rules\.toml/);
-    assert.match(message, state === "no_layers" ? /Existing authored exceptions/ : /trellis_propose_layers/);
+    assert.match(message, state === "no_layers" ? /Existing authored exceptions/ : /trellis_propose_rules/);
     assert.equal(await selected.page.locator("#architecture-diagram svg").count(), 0);
     assert.equal(selected.requests.some(row => row.url.pathname.endsWith("/source")), false, "setup does not read a source");
   }));
@@ -1970,7 +1970,7 @@ test("an app with no layers shows the setup help and its unassigned files", {tim
   const state = page.locator("#architecture-state[data-state=empty]");
   await state.waitFor({state:"visible"});
   const message = await state.textContent();
-  assert.match(message, /beta has no layers yet/); assert.match(message, /trellis_propose_layers/); assert.match(message, /app = "beta"/);
+  assert.match(message, /beta has no layers yet/); assert.match(message, /trellis_propose_rules/); assert.match(message, /app = "beta"/);
   const files = await page.locator("#architecture-diagram .architecture-app-files button").allTextContents();
   assert.deepEqual(files.sort(), ["b/extra.js", "b/lib.js"], "its unassigned files are listed, not dropped");
 }, new Map(), twoApps));
