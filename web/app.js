@@ -1083,7 +1083,7 @@ async function showCachedSource(path, range, revision, callerCurrent = () => tru
   return true;
 }
 async function refreshView() {
-  resetHeadObservation(); clearRevisionReads();
+  resetHeadObservation(); clearRevisionReads(false);
   const revision = status?.revision, session = epoch, root = selectedRootKey;
   const file = filesFile, basis = filesBasis;
   clearSource(); filesDiffSerial++; filesDiff = null; $("files-diff")?.replaceChildren();
@@ -1097,7 +1097,7 @@ async function refreshView() {
     $("checkout-state").textContent = storageWarning();
   }
   if (IndexPin.equal(revision, status?.revision)) {
-    void viewerMetrics?.refresh(); await refreshTree();
+    void viewerMetrics?.refresh(); void refreshAppInventory(); await refreshTree();
     if (section === "files" && file) {
       if (file.changeOnly) { filesFile = file; await setFilesBasis("working"); }
       else { await selectFilesFile(file); if (basis === "working") await setFilesBasis("working"); }
@@ -2090,10 +2090,11 @@ let architectureRulesHash = null;
 // Advances whenever the cached reads are dropped, so Architecture can tell a held snapshot from one
 // the rules have since moved past (#789).
 let rulesEpoch = 0;
-function clearRevisionReads() {
+function clearRevisionReads(rereadApps = true) {
   revisionReads.clear(); revisionReadsKey = null; architectureRulesHash = null; rulesEpoch++;
-  // The rules may assign files to other apps: the switchers read the new assignment.
-  void Promise.resolve().then(refreshAppInventory);
+  // The rules may assign files to other apps: the switchers read the new assignment. Refresh
+  // reads it itself, once the status says which pin it is for.
+  if (rereadApps) void Promise.resolve().then(refreshAppInventory);
 }
 async function revisionRead(path, current = () => true) {
   const route = path.split("?", 1)[0];
