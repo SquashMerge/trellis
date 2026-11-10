@@ -5,6 +5,7 @@ const {mkdirSync, writeFileSync, rmSync} = require("node:fs");
 const {dirname, join} = require("node:path");
 const {chromium} = require("playwright");
 const H = require("./sequence-harness.cjs");
+const {arrowGeometry, classicScrollbars} = require("./architecture-geometry.cjs");
 
 test.before(async () => H.setup(), {timeout:960000});
 test.after(async () => H.cleanup());
@@ -189,4 +190,86 @@ test("app_switcher_narrow: at 760px every app button of a 120-character name sta
     await page.waitForFunction(index => document.querySelectorAll("#architecture-apps button")[index]?.getAttribute("aria-pressed") === "true", at);
     assert.equal((await geometry()).panel.scrollLeft, 0, "no button was reached by scrolling the hidden overflow");
   }
+}));
+
+// #850: a Rust server `srv` (manifest first, so the left column) with a Shared layer `common`, and a
+// JavaScript client `web`. The Shared layer's call back into `server` is a deviation, so its header has a chip. The interface runs between the ordered layers, so srv's Shared band goes
+// on its left and no line crosses it. The control adds a second route whose handler is in the Shared
+// layer, registered there: one end on each side is a tie, so the band keeps the right and the ordered end's line crosses it.
+const sharedFiles = control => new Map([
+  ["Cargo.toml", '[package]\nname = "srv"\n'],
+  ["src/main.rs", `mod util;\nasync fn health() {}\nfn router() -> Router {\n    Router::new().route("/health", get(health))\n}\npub fn version() -> u32 { 2 }\nfn main() { util::helper(); }\n`],
+  ["src/util.rs", `pub fn helper() -> u32 { crate::version() }\n${control ? 'pub async fn ping() {}\nfn routes() -> Router {\n    Router::new().route("/ping", get(ping))\n}\n' : ""}`],
+  ["web/package.json", '{"name":"web"}\n'],
+  ["web/app.js", 'async function load(api) {\n  await api("/health");\n  await api("/ping");\n}\n'],
+]);
+const sharedRules = "version=1\n[layers.server]\napp='srv'\norder=1\npaths=['src/main.rs']\n[layers.common]\napps=['srv']\nshared=true\npaths=['src/util.rs']\n" +
+  "[layers.client]\napp='web'\norder=1\npaths=['web/**']\n";
+// In page pixels: the Shared band, the overlay segments that enter it, its header text lines and chips, and their overlaps.
+const sharedGeometry = page => page.evaluate(() => {
+  const band = document.querySelector('.pele-cluster[data-trellis-layer-id="common"]'), frame = band.querySelector(":scope > rect").getBoundingClientRect();
+  const stacks = [...document.querySelectorAll(".architecture-app-column")].find(column => column.getAttribute("aria-label") === "srv").querySelectorAll(".pele-cluster");
+  const stack = [...stacks].find(cluster => cluster.querySelector(":scope > text")?.textContent.replace(/\s+/g, " ").includes("ordered")).querySelector(":scope > rect");
+  const box = r => ({x:r.left, y:r.top, w:r.width, h:r.height});
+  // A segment enters a box when it passes through the box shrunk by one pixel (Liang-Barsky).
+  const enters = (a, b, r) => {
+    const x0 = r.x + 1, x1 = r.x + r.w - 1, y0 = r.y + 1, y1 = r.y + r.h - 1;
+    let t0 = 0, t1 = 1;
+    const dx = b[0] - a[0], dy = b[1] - a[1];
+    for (const [p, q] of [[-dx, a[0] - x0], [dx, x1 - a[0]], [-dy, a[1] - y0], [dy, y1 - a[1]]]) {
+      if (p === 0) { if (q < 0) return false; continue; }
+      const t = q / p;
+      if (p < 0) { if (t > t1) return false; if (t > t0) t0 = t; } else { if (t < t0) return false; if (t < t1) t1 = t; }
+    }
+    return t1 - t0 > 1e-6;
+  };
+  const crossings = [];
+  for (const path of document.querySelectorAll(".architecture-apps-line")) {
+    const m = path.getScreenCTM(), pts = [...path.getAttribute("d").matchAll(/(-?[\d.]+),(-?[\d.]+)/g)].map(([, x, y]) => [m.a * x + m.c * y + m.e, m.b * x + m.d * y + m.f]);
+    for (let i = 0; i + 1 < pts.length; i++) if (enters(pts[i], pts[i + 1], box(frame))) crossings.push(path.getAttribute("d"));
+  }
+  const lines = [...band.querySelectorAll(":scope > text tspan")].filter(span => span.textContent.trim()).map(span => ({text:span.textContent, ...box(span.getBoundingClientRect())}));
+  const chips = [...band.querySelectorAll(":scope > rect")].slice(1).map(rect => ({text:"chip", ...box(rect.getBoundingClientRect())}));
+  for (const action of document.querySelectorAll('.trellis-architecture-stat-action[data-trellis-layer-action="common"] > rect:first-child')) chips.push({text:"action", ...box(action.getBoundingClientRect())});
+  const hit = (a, b) => a.x < b.x + b.w - 0.5 && b.x < a.x + a.w - 0.5 && a.y < b.y + b.h - 0.5 && b.y < a.y + a.h - 0.5;
+  const overlaps = [], parts = [...lines, ...chips], f = box(frame);
+  parts.forEach((a, i) => { for (const b of parts.slice(i + 1)) if (hit(a, b)) overlaps.push(`${a.text} × ${b.text}`); });
+  const outside = parts.filter(part => part.x < f.x - 0.5 || part.x + part.w > f.x + f.w + 0.5).map(part => part.text);
+  return {band:f, stack:box(stack.getBoundingClientRect()), crossings, lines:lines.map(line => line.text), chips:chips.length, overlaps, outside,
+    lineCount:document.querySelectorAll(".architecture-apps-line").length};
+});
+async function sharedDrawn(page) {
+  await drawn(page);
+  await classicScrollbars(page);
+  await columnsDrawn(page);
+  await page.locator('.pele-cluster[data-trellis-layer-id="common"]').waitFor({state:"attached"});
+  await page.locator(".architecture-apps-line").first().waitFor({state:"attached"});
+  return sharedGeometry(page);
+}
+
+test("#850 shared_band_away_from_partner: srv's Shared band sits left of its stack, no interface line enters it, and its header text never overlaps", {timeout:240000}, async () => published(sharedFiles(false), sharedRules, async ({page}) => {
+  const at = await sharedDrawn(page);
+  const detail = JSON.stringify({...at, inputs:await layoutInputs(page)});
+  assert.ok(at.band.x + at.band.w <= at.stack.x + 0.5, `the Shared band is left of srv's ordered stack: ${detail}`);
+  assert.ok(at.lineCount >= 1, `the interface draws its line: ${detail}`);
+  assert.deepEqual(at.crossings, [], `no interface line enters the Shared band: ${detail}`);
+  assert.equal(at.lines[0].startsWith("Shared"), true, detail); assert.ok(at.lines.some(line => /^1 file/.test(line)), `the file count is drawn whole: ${detail}`);
+  assert.ok(at.chips >= 1, `the Shared header draws its count chip: ${detail}`);
+  assert.deepEqual(at.overlaps, [], `the Shared header's lines and chips do not overlap: ${detail}`);
+  assert.deepEqual(at.outside, [], `the Shared header stays inside its band: ${detail}`);
+  // The column's own arrows route around the moved band: the shared outbound arrow leaves the band's right side.
+  const arrows = await page.evaluate(arrowGeometry, '.architecture-app-column[aria-label="srv"] svg.trellis-architecture-svg');
+  assert.ok(arrows.arrows >= 1, `srv draws its shared arrow: ${JSON.stringify(arrows)}`);
+  assert.deepEqual([arrows.crossings, arrows.tagHits, arrows.detached], [[], [], []], `srv's arrows cross no band, chip or tag: ${JSON.stringify(arrows)}`);
+}));
+
+test("#850 negative control: a Shared end and an ordered end toward the partner tie, the band keeps the right and the check sees the crossing", {timeout:240000}, async () => published(sharedFiles(true), sharedRules, async ({page}) => {
+  const at = await sharedDrawn(page);
+  const detail = JSON.stringify(at);
+  assert.ok(at.band.x >= at.stack.x + at.stack.w - 0.5, `the tie keeps the Shared band right of the stack: ${detail}`);
+  assert.ok(at.crossings.length >= 1, `the ordered end's line crosses the Shared band, and the check reports it: ${detail}`);
+  assert.deepEqual(at.overlaps, [], `the header still never overlaps itself: ${detail}`);
+  // The overlap check sees a chip moved up onto the header's last text line.
+  await page.evaluate(() => { const chip = document.querySelectorAll('.pele-cluster[data-trellis-layer-id="common"] > rect')[1]; chip.setAttribute("y", String(Number(chip.getAttribute("y")) - 10)); });
+  assert.notDeepEqual((await sharedGeometry(page)).overlaps, [], "a chip drawn over a header line is reported");
 }));

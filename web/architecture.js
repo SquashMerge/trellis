@@ -685,6 +685,12 @@
         css(grid, {width:`${plan.width}px`, gridTemplateColumns:plan.sideBySide ? plan.widths.map(each => `${each}px`).join(" ") : `${plan.width}px`, columnGap:`${plan.gutter}px`});
       };
       place();
+      // Each column's Shared bands sit on the side away from its interface partners (#850).
+      const partOf = new Map(parts.map(part => [part.group.name, part]));
+      const sides = apps.sharedSides(full, parts.map(part => part.group.name), (name, layerName) => {
+        const part = partOf.get(name), layer = part?.slice.layers.find(item => item.name === layerName);
+        return layer && part.layout.layers.has(layerName) && part.slice.layers.some(item => !item.shared) ? layer.shared : null;
+      }, plan.sideBySide);
       for (const part of parts) {
         const group = part.group, layered = part.slice.layers.some(layer => !layer.shared);
         const column = make("div", undefined, "architecture-app-column"), box = make("div", undefined, "architecture-app-stack");
@@ -705,7 +711,7 @@
           button.type = "button"; button.dataset.tone = "warning"; button.addEventListener("click", () => { if (active()) openReview("unassigned"); });
           box.append(button); continue;
         }
-        const outcome = await window.TrellisArchitecturePele.render(box, part.slice, stack(part, {width:plan.widths[columns.length - 1], title:`${group.name} · ordered layers`}));
+        const outcome = await window.TrellisArchitecturePele.render(box, part.slice, stack(part, {width:plan.widths[columns.length - 1], title:`${group.name} · ordered layers`, sharedSide:sides.get(group.name)}));
         if (!active()) return false;
         if (outcome?.status !== "ready") throw new Error(outcome?.reason || outcome?.error?.message || "Architecture mapping failed. Nothing displayed.");
         bandsOf.set(group.name, outcome.bands);
