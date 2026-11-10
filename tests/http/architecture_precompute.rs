@@ -96,12 +96,13 @@ fn head(payload: &Value) -> String {
 #[tokio::test]
 async fn the_first_read_after_publication_is_served_from_one_build() {
     let (base, runtime, browser, key) = fixture().await;
-    write_rules(&base, RULES);
     let scheduler = runtime.browser_scheduler().unwrap();
+    // Baseline and hold before the rules, so any build they make eligible is counted and held.
     let before = scheduler.architecture_builds_for_tests();
+    let hold = Hold::at(&scheduler, "architecture_build_finished");
+    write_rules(&base, RULES);
     let app = browser.clone().router();
     // The owner starts on the publication hint alone: no read asked.
-    let hold = Hold::at(&scheduler, "architecture_build_finished");
     scheduler.architecture_hint();
     hold.wait_reached();
     hold.release();
@@ -123,11 +124,11 @@ async fn the_first_read_after_publication_is_served_from_one_build() {
 #[tokio::test]
 async fn a_read_during_the_build_answers_building_with_progress_then_the_result() {
     let (base, runtime, browser, key) = fixture().await;
-    write_rules(&base, RULES);
     let scheduler = runtime.browser_scheduler().unwrap();
     let before = scheduler.architecture_builds_for_tests();
-    let app = browser.clone().router();
     let hold = Hold::at(&scheduler, "evaluating");
+    write_rules(&base, RULES);
+    let app = browser.clone().router();
     scheduler.architecture_hint();
     hold.wait_reached();
     scheduler.set_architecture_browser_wait_for_tests(Duration::ZERO);
@@ -157,7 +158,6 @@ async fn a_read_during_the_build_answers_building_with_progress_then_the_result(
 #[tokio::test]
 async fn a_summary_read_whose_head_moves_while_it_waits_answers_building_and_is_asked_again() {
     let (base, runtime, browser, key) = fixture().await;
-    write_rules(&base, RULES);
     let scheduler = runtime.browser_scheduler().unwrap();
     let (held_tx, held_rx) = mpsc::channel();
     let (waiting_tx, waiting_rx) = mpsc::channel();
@@ -192,6 +192,8 @@ async fn a_summary_read_whose_head_moves_while_it_waits_answers_building_and_is_
         }
         _ => {}
     }));
+    // Rules after the hook, so the first ruled build is counted and held.
+    write_rules(&base, RULES);
     let signalled = |rx: mpsc::Receiver<()>| {
         tokio::task::spawn_blocking(move || {
             rx.recv_timeout(trellis::testing::HANG_BACKSTOP).unwrap();
@@ -288,9 +290,9 @@ async fn concurrent_readers_wait_for_one_build() {
 #[tokio::test]
 async fn a_rules_change_is_never_served_from_the_older_core() {
     let (base, runtime, browser, key) = fixture().await;
-    write_rules(&base, RULES);
     let scheduler = runtime.browser_scheduler().unwrap();
     let before = scheduler.architecture_builds_for_tests();
+    write_rules(&base, RULES);
     let app = browser.clone().router();
     let (status, first) = request(app.clone(), &key, "").await;
     assert_eq!(status, StatusCode::OK, "{first}");
@@ -446,9 +448,22 @@ async fn a_page_on_an_older_revision_gets_it_from_the_owner() {
             .await
             .unwrap()
             .unwrap();
-    write_rules(&base, RULES);
+    // #870: the owner builds the new head without rules on the publication's hint, and that
+    // build's next turn sees rules written after it. Wait for that build to be published, then
+    // take the baseline before the rules exist: the head's ruled build and the older one are
+    // both counted, however the owner orders its turns.
+    let published = serde_json::from_value(json!({
+        "indexGeneration": publication["publishedRevision"]["indexGeneration"],
+        "indexRevision": publication["publishedRevision"]["indexRevision"]
+    }))
+    .unwrap();
+    runtime
+        .settled_for_tests(Some(published))
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
     let scheduler = runtime.browser_scheduler().unwrap();
     let before = scheduler.architecture_builds_for_tests();
+    write_rules(&base, RULES);
     let (status, read) = request(app.clone(), &key, &older).await;
     assert_eq!(status, StatusCode::OK, "{read}");
     assert_eq!(read["payload"]["modules"].as_array().unwrap().len(), 4);
@@ -509,7 +524,6 @@ async fn a_rules_read_without_rules_does_not_wait_for_a_build() {
 #[tokio::test]
 async fn a_new_revision_supersedes_a_build_that_is_computing() {
     let (base, runtime, browser, key) = fixture().await;
-    write_rules(&base, RULES);
     let scheduler = runtime.browser_scheduler().unwrap();
     let before = scheduler.architecture_builds_for_tests();
     let superseded = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -519,6 +533,7 @@ async fn a_new_revision_supersedes_a_build_that_is_computing() {
         superseded.clone(),
         "architecture_build_superseded",
     );
+    write_rules(&base, RULES);
     scheduler.architecture_hint();
     hold.wait_reached();
     assert_eq!(scheduler.leases_for_tests(), 0);
@@ -615,13 +630,13 @@ async fn a_panicked_build_is_reported_once_and_the_next_read_builds_again() {
 #[tokio::test]
 async fn a_failure_of_the_revision_is_kept_and_answered_typed() {
     let (base, runtime, browser, key) = fixture().await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let before = scheduler.architecture_builds_for_tests();
     // Valid rules that only evaluation finds ambiguous.
     write_rules(
         &base,
         "version=1\n[layers.a]\norder=1\npaths=['**/*.js']\n[layers.b]\norder=2\npaths=['**/*.js']",
     );
-    let scheduler = runtime.browser_scheduler().unwrap();
-    let before = scheduler.architecture_builds_for_tests();
     let app = browser.clone().router();
     for _ in 0..2 {
         let (status, failed) = request(app.clone(), &key, "").await;
@@ -637,10 +652,10 @@ async fn a_failure_of_the_revision_is_kept_and_answered_typed() {
 #[tokio::test]
 async fn a_tool_read_during_the_build_answers_building_without_computing() {
     let (base, runtime, _browser, _key) = fixture().await;
-    write_rules(&base, RULES);
     let scheduler = runtime.browser_scheduler().unwrap();
     let before = scheduler.architecture_builds_for_tests();
     let hold = Hold::at(&scheduler, "evaluating");
+    write_rules(&base, RULES);
     scheduler.architecture_hint();
     hold.wait_reached();
     let tool = runtime.clone();
@@ -759,9 +774,9 @@ async fn metrics_from_a_published_core_answer_like_computed_metrics() {
 #[tokio::test]
 async fn a_waiting_read_holds_nothing_and_ends_on_cancellation() {
     let (base, runtime, _browser, _key) = fixture().await;
-    write_rules(&base, RULES);
     let scheduler = runtime.browser_scheduler().unwrap();
     let hold = Hold::at(&scheduler, "evaluating");
+    write_rules(&base, RULES);
     scheduler.architecture_hint();
     hold.wait_reached();
     let tool = runtime.clone();
@@ -804,9 +819,9 @@ async fn an_over_budget_revision_still_answers_a_narrow_read() {
     )
     .await;
     trellis::references::set_site_limit_for_tests(5);
-    write_rules(&base, RULES);
     let scheduler = runtime.browser_scheduler().unwrap();
     let before = scheduler.architecture_builds_for_tests();
+    write_rules(&base, RULES);
     let (status, whole) = request(browser.clone().router(), &key, "").await;
     assert!(!status.is_success(), "{status} {whole}");
 
