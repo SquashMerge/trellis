@@ -177,8 +177,19 @@ app is one of:
   member, an excluded project and a project outside the workspace are each an app. Capture
   retains a nested `pyproject.toml` that sits above Python sources, as it does a nested
   `Cargo.toml` above Rust sources.
+- **A runnable Maven or Gradle module** (status: owner-ratified 2026-11-10 (#854)). A
+  `pom.xml` is a Maven app when its packaging is `war`, or `jar` (the default) with a
+  declared main class: `maven-jar-plugin`'s manifest `mainClass`, `spring-boot-maven-plugin`,
+  or `exec-maven-plugin`'s `mainClass`. A Gradle build file (`build.gradle` or
+  `build.gradle.kts`) is a Gradle app when it applies the `application` plugin or sets
+  `mainClass` or `mainClassName`. A library jar, an aggregator POM and a build without either
+  is not an app. A multi-module build gives one app per runnable module: the modules are the
+  POM `<modules>` and the root `settings.gradle` `include` list. Its root is the build file's
+  directory, and its entries are the declared main classes. Capture retains a nested
+  `pom.xml`, `build.gradle` and `build.gradle.kts` that sits above Java sources.
 
-The app kinds are `cargo`, `npm` and `python` (`python` owner-ratified 2026-11-08 (#807)).
+The app kinds are `cargo`, `npm`, `python`, `maven` and `gradle` (`python` owner-ratified
+2026-11-08 (#807); `maven` and `gradle` owner-ratified 2026-11-10 (#854)).
 
 This amendment adds no authored apps table. Authored apps, for checkouts that manifests
 can't split, such as a Node backend and a JavaScript frontend in one package, are
@@ -387,15 +398,19 @@ What the example shows:
 [Amendment (#783)](#amendment-783-apps-and-per-app-layers). It adds no rule beyond the
 amendment. Where the two differ in detail, this section is the exact behaviour.
 
-**App kinds.** An app's `kind` is `cargo`, `npm` or `python`. `python` is a ratified app kind
-(owner ruling 2026-11-08), detected from `pyproject.toml` since
-[#807](https://github.com/SquashMerge/trellis/issues/807).
+**App kinds.** An app's `kind` is `cargo`, `npm`, `python`, `maven` or `gradle`. `python` is
+a ratified app kind (owner ruling 2026-11-08), detected from `pyproject.toml` since
+[#807](https://github.com/SquashMerge/trellis/issues/807). `maven` and `gradle` are ratified
+app kinds (owner ruling 2026-11-10), detected from `pom.xml` and Gradle build files since
+[#854](https://github.com/SquashMerge/trellis/issues/854).
 
 **Captured manifests.** Detection reads only manifest bytes the indexer captured with the
 code snapshot, and never the live files. The snapshot retains every present `package.json`
 and `Cargo.toml` at any depth, outside `node_modules/`, under the existing byte bounds. It
 retains the root `pyproject.toml` and each nested `pyproject.toml` that sits above a captured
-Python source (#807), under the same bounds. The
+Python source (#807), under the same bounds. It retains the root `pom.xml`, `build.gradle`,
+`build.gradle.kts`, `settings.gradle` and `settings.gradle.kts`, and each nested `pom.xml`,
+`build.gradle` and `build.gradle.kts` that sits above a captured Java source (#854). The
 per-manifest size bound applies to the root manifests only; a nested manifest counts toward
 the total bound. A manifest that is absent from the snapshot is not an app and is not unread.
 
@@ -419,6 +434,15 @@ the total bound. A manifest that is absent from the snapshot is not an app and i
 | `pyproject.toml` with neither `[project]` nor a `[tool.poetry]` that has `name` | no app |
 | `pyproject.toml` whose `[project].name` (or, without `[project]`, `[tool.poetry].name`) is not a nonblank string | unread |
 | `pyproject.toml` with `[project]` or a named `[tool.poetry]` | app (`python`) |
+| `pom.xml` that is not well-formed XML in the reader's subset (a DOCTYPE, an unknown entity, an unclosed or mismatched element), not UTF-8, over the size bound, not a `<project>`, or without a nonblank `artifactId` | unread |
+| `pom.xml` below a present `pom.xml` whose `<modules>` chain does not list its directory | no app; never parsed |
+| `pom.xml` with packaging `pom`, a packaging other than `jar` or `war`, or `jar` with no declared main class | no app; its `<modules>` are still followed |
+| `pom.xml` with packaging `war`, or `jar` with a declared main class | app (`maven`) |
+| Root `settings.gradle` or `settings.gradle.kts` | no app; unread when not UTF-8, over the size bound, or with an unterminated string or comment or unbalanced brackets |
+| Gradle build file that the root settings do not include, below the root, when root settings exist; or below another present build file when they do not | no app; never parsed |
+| Gradle build file that is not UTF-8, over the size bound, or has an unterminated string or comment or unbalanced brackets | unread |
+| Gradle build file without the `application` plugin, `mainClass` or `mainClassName` | no app |
+| Gradle build file with the `application` plugin, `mainClass` or `mainClassName` | app (`gradle`) |
 
 An unread manifest detects no app. A manifest that a hidden layer selects (see
 [Amendment (#783)](#amendment-783-apps-and-per-app-layers)) is neither an app nor unread.
@@ -442,6 +466,26 @@ An unread manifest detects no app. A manifest that a hidden layer selects (see
   its `callable`, and one without `callable` (a file script) adds nothing. Entries are sorted
   and deduplicated, and may be empty. A uv `[tool.uv.workspace]` changes nothing: each
   `pyproject.toml` is judged alone.
+- **Maven** modules: a present `pom.xml` with no present `pom.xml` in an ancestor directory
+  is judged alone. Each judged POM's `<module>` values, resolved against its directory (a
+  trailing `/pom.xml` dropped; a path leaving the checkout ignored), name further judged POMs.
+  The POM is read only as XML text: no parent POM, profile, `pluginManagement` entry or
+  property inheritance is read. A Maven app's name is its `artifactId`, with no fallback to
+  a parent's. Its entries are the nonblank main classes the three plugins declare (in their
+  `configuration` or an execution's), with a whole-value `${name}` resolved from the POM's own
+  `<properties>`; `spring-boot-maven-plugin` alone declares a main class it finds itself, so
+  its app may have no entries.
+- **Gradle** projects: the root build file, and each build file whose directory is a project
+  that a literal `include` of the root `settings.gradle` or `settings.gradle.kts` names
+  (`:lib:core` is `lib/core`). Without root settings, each build file with no present build
+  file in an ancestor directory is judged alone. Build scripts are code: they are scanned as
+  tokens, never run, so `application` is recognised only as `id 'application'`,
+  `id("application")` or a bare `application` in `plugins {}`, or as `apply plugin:
+  'application'` / `apply(plugin = "application")`, and `mainClass`/`mainClassName` only as
+  an assignment, `.set(…)` or a Groovy call with a value. The name is Gradle's project name:
+  the root's literal `rootProject.name`, else `.`; an included project's last path segment;
+  a standalone nested project's directory name. Entries are the literal (uninterpolated)
+  main classes assigned.
 - **Roots** are the manifest's directory. `.` contains every path, and a path belongs to
   the app with the most specific containing root.
 

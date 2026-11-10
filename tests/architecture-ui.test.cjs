@@ -1504,7 +1504,7 @@ test("AC8 the app switcher appears only with two or more apps, as a labelled gro
 
 test("the footnote names only the manifests detection reads, and All apps says when no interface was measured", async () => {
   const h = harness(); h.setResponse(async () => ({payload:appsFixture()})); await h.controller.refresh();
-  assert.match(h.get("architecture-footnote").textContent, /^Apps are detected from build manifests \(Cargo binary packages, package\.json and pyproject\.toml\) or authored in \.trellis\/rules\.toml\. /);
+  assert.match(h.get("architecture-footnote").textContent, /^Apps are detected from build manifests \(Cargo binary packages, package\.json, pyproject\.toml, and runnable Maven and Gradle modules\) or authored in \.trellis\/rules\.toml\. /);
   assert.doesNotMatch(h.get("architecture-footnote").textContent, /Python/);
   assert.match(text(h.get("architecture-diagram")), /No HTTP interface measured between web, daemon and scripts\. This does not prove absence\./);
   await chooseApp(h, "web · javascript");
