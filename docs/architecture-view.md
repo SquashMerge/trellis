@@ -137,8 +137,7 @@ from `pyproject.toml` ([#807](https://github.com/SquashMerge/trellis/issues/807)
   `callSites` counts call sites. `counts.confidence` counts call sites, matched and
   client-only. `serverOnly` is the number of the server's routes that no call matched, and
   `clientOnly` the number of the client's unmatched calls.
-- Summary `edges` omit `cross_app` instances. They stay in `rules.counts.unknown` and in the
-  review list.
+- Summary `edges` omit `cross_app` instances. They stay in `rules.counts.unknown`.
 - A single-app checkout whose app root is a subdirectory, and which has unassigned files
   outside that root, reports part of its per-app output under `noApp`: `apps[0].counts`
   equals `rules.counts` only when no row's own file is unassigned and outside the app's root.
@@ -173,7 +172,8 @@ from `pyproject.toml` ([#807](https://github.com/SquashMerge/trellis/issues/807)
 
 **Extraction (#788).** Interface evidence is structural and read from the same admitted
 snapshot as the rules. It is extracted only when two or more apps are detected (#794:
-detected and authored apps together). Documents
+detected and authored apps together), with or without a rules file (#851: without one,
+every detected manifest is an app, for MCP `trellis_endpoints`). Documents
 with an evidence gap are skipped. Work is bounded; over the bound the read fails
 `bounded_work`.
 
@@ -416,9 +416,8 @@ unknown`) and the longer prose live behind the ⓘ.
 
 The inspector opens on the counted review chips, **23 deviations · 156 unassigned ·
 0 exceptions**, and every Architecture inspection keeps them at its head. The deviations
-chip opens the Deviations tree below; the review list is reached through **Review all rule
-instances** there and through edge inspection. The other chips open the unassigned files and
-the authored exceptions. Deviations are `rules.counts.deviates`, unassigned files
+chip opens the Deviations tree below, the one review path for deviations (#845). The other
+chips open the unassigned files and the authored exceptions. Deviations are `rules.counts.deviates`, unassigned files
 are the full native module inventory with no assigned layer (including module-only files),
 and exceptions is `exceptionCount`. The evidence disclosure separately labels
 `rules.unassignedCount` as identities, including external packages. There is no refresh button: the
@@ -430,8 +429,9 @@ overview does not open the inspector drawer.
 **Per-destination `↑` badges and interface stubs (#789, proposed (owner-delegated, run 803)).**
 This amends the single `↑` chip above, in every stack. A band has one `↑` badge for each
 destination layer it reaches upward: production `$layers` edges with the `deviates` verdict,
-not excepted, to a layer with a smaller `order`. It reads `↑12 deviation · entry` (`↑≥12` for a
-lower bound) and sums the summary edges, so the badges of a band add up to its former `↑`
+not excepted, to a layer with a smaller `order`. It reads `↑12 references · entry` (`↑≥12` for a
+lower bound, `↑1 reference · entry` for one): the count is reference sites, the tree's unit after
+#846 (owner ruling 2026-11-09, #845). It sums the summary edges, so the badges of a band add up to its former `↑`
 chip. Each badge is its own focusable control, the next sibling of its band, and opens the
 Deviations tree with that edge's chip pressed, no line selected and Calls only off. The `↓`
 chip stays display-only.
@@ -465,15 +465,24 @@ hint stay in the hidden-layer note until **Include tests and fixtures in metrics
 
 Click a module or select it with Enter/Space to inspect its identity, layer, captured
 physical file lines, callable count, every metric, and its incident references and rule
-instances (read on demand, [below](#summary-and-detail-reads-448)). Select a
-summary edge to inspect its exact contributing module pairs, production/test counts,
-verdicts, exceptions and source-site samples. Omitted sample counts stay visible;
+instances (read on demand, [below](#summary-and-detail-reads-448)).
+
+**Arrows and badges open the Deviations tree (#845, owner ruling 2026-11-09).** Selecting an
+arrow that the tree lists, a production `$layers` edge with the `deviates` verdict and no
+exception (upward `↑` or peer and shared `⇄`), opens the Deviations tree with that edge's
+chip pressed, no line selected and Calls only off, exactly as its band's `↑` badge does. The
+tree's back link returns to the drawing and focuses the arrow or badge that opened it. Any
+other arrow (allowed, excepted, unknown or test-only) opens the edge inspector: its exact
+contributing module pairs, production/test counts, verdict, exception and source-site
+samples. The edge inspector lists no rule instances; the per-edge exception review it used
+to open (a rule-instance list with checkboxes, **Select witnessed pairs** and **Add selected
+exceptions**) is retired. Omitted sample counts stay visible;
 sampling never changes totals. Explicit source actions read cached indexed text at
 the displayed revision. They never fall back to the live file.
 
 ### Boundary calls to Sequence (#646)
 
-For deviating or excepted references, the inspector groups sampled boundary call sites by
+For excepted references (and other arrows the edge inspector shows), the inspector groups sampled boundary call sites by
 calling method. **Open sequence** opens that exact measured caller in Interactions and
 highlights its boundary calls, scrolling the first visible call into view. If Interactions
 hides a focused call, the notice offers **Show all steps**. Browser Back returns to the
@@ -499,26 +508,46 @@ The deviations chip replaces the diagram with a tree of every production deviati
 without choosing an edge first. It reads `kind=instances`, `rule=$layers`, `status=deviates`,
 `role=production`, `excepted=false` at the view's pin and rules hash, page by page, and
 shows nothing if any page fails. The tree is a flat list of files, each with its functions
-and then its lines, sorted by references. A file row carries one badge for each edge it
-reaches up or across, and the edge chips filter the list; files are not nested under edges.
-A line's function reads "(module level)" for file-level code and "(anonymous)" when no name
-was captured.
+and then its lines, sorted by references; files are not nested under edges. A file row
+carries the edges it reaches up or across, and the edge chips filter the list. The tree
+replaces the drawing and the Architecture toolbar (app switcher, metric controls, ⓘ); its
+header leads back with "← Architecture", or "← <app>" in a one-app stack.
 
 - **Naming (#816).** A *deviation* is a rule instance, as on the review chip (**23
-  deviations**). The tree's chips and file badges count *references* (reference sites), for
-  example `↑ low → top · 25 references` and `↑ top · 3 references`; under Calls only a file
-  badge counts calls. Modules read `from → to`; "target" is used only for **Go to definition**,
-  the resolved declaration.
-- **Filters.** The chips are **All deviations** and one per edge, `↑` upward and `⇄` peer or
-  shared. A chip reads `≥N` when the edge count is a lower bound. A line's tag is its
+  deviations**). The tree's chips and Reaches up column count *references* (reference
+  sites), in the design's compact form (#845): a chip reads `storage → indexing · 445` and a
+  file's Reaches up reads `▲ indexing 403`; their accessible names say "references" (or
+  "calls" under Calls only). Modules read `from → to`; "target" is used only for **Go to
+  definition**, the resolved declaration.
+- **Function names (#845).** A function row is the owner's stable lookup key without the
+  file's `path::` prefix (`EvidenceResponse::architecture_config` under `src/store.rs`). A
+  site whose smallest enclosing declaration is a closure (no name and no stable key) is
+  listed under its nearest enclosing callable, read from the Files outline (`GET symbols`) at
+  the view's pin, and its line panel says "(in a closure)". A callable is a named function,
+  method or constructor, or a binding whose whole initializer is a function
+  (`callableInitializer`); named variables, fields and types on the way are skipped (#860). A
+  method reads `Type::name` from its `impl` block. A closure with no enclosing callable up to
+  its file's root is "(module level)". At most 50 files are named per tree; a file whose
+  outline cannot be read keeps "(anonymous)", but an outline read that answers
+  `revision_conflict`, `pin_expired` or `root_changed` is the tree's conflict, handled as below,
+  and shows no tree.
+- **Filters.** The chips are **All upward** (or **All deviations** when a peer or shared
+  edge is listed) and one per edge, with `⇄` before a peer or shared edge. When a listed
+  edge's source layer has unresolved sites, the chip still shows the mapped count and one
+  line under the chips gives the reason: "Counts are references mapped to a file. Some sites
+  in <layers> stayed unresolved, so their edges may have more." A line's tag is its
   classified relation kind (`relationKind`): `call`, `type use`, `import` or `reference`.
   **Calls only** keeps exactly the lines tagged `call`; type uses, imports and other
   references are hidden. A JavaScript or TypeScript `require(...)` or `import(...)` stays an
   `import` even when it carries a caller, so it is tagged `import` and hidden under Calls
   only; it can still offer **Open in Sequence**.
-- **Counts.** Only a file's `referenceCount` and `kindCounts` are exact. Lines are sampled per
-  file pair, calls first, so a function count reads `≥N` when any instance of its file was
-  truncated, and the footer says so.
+- **Counts.** A file's `referenceCount` and `kindCounts` are exact. Lines are sampled per
+  file pair, calls first. A function's count reads `≥N` only when a file pair that feeds it
+  has more sites (or calls) than are listed; a function fed only by fully listed pairs is
+  exact. The footer says what `≥` means.
+- **Line rows** read `L<line> <symbol>` with a kind tag and, on one line, `→ <file>:<line>` for
+  the definition, or `→ <file> · file only` without a binding; the full path and the reason
+  are the tooltip and the accessible name.
 - **Line actions.** One menu with the label "Line actions" opens from the `⋯` button, a
   right-click or Shift+F10: **Open in Sequence** (only when the line has a measured caller),
   **Go to call site**, **Go to definition** (only with a target), **Copy location** and
@@ -530,8 +559,8 @@ was captured.
 - **Hidden selection.** A filter that hides the selected line clears the selection and says
   "Selected line is hidden by this filter." **Clear filter** returns to All deviations with
   Calls only off and selects nothing. A line is never selected for the user.
-- **Unknown.** "N unknown rule instances are not deviations." opens the review panel on the
-  unknown verdict.
+- **Unknown.** "N unknown rule instances are not deviations." links to the existing
+  **Inspect same-layer and unassigned references** view, and closes the tree.
 - **Open in Sequence and Back.** The browser history entry keeps whether the tree was open,
   the chip, Calls only, the expanded rows, the selected line and focus. **Back** reopens the
   tree and reselects and focuses that line. If the line is gone it says "The selected line is
@@ -667,30 +696,28 @@ The browser reads details only when an inspector or list needs them:
 
 - a module's pairs and rule instances;
 - a layer's pairs and instances;
-- an edge's instances;
 - unresolved sites;
 - same-layer and unassigned pairs;
 - `$external` results;
-- the review list;
-- the witnessed deviations a glob selection chooses from.
+- the Deviations tree's production deviations.
 
-An edge lists the `$layers` instances of its exact verdict and exception group;
 `$external` results have their own list in the notices. Each list shows one page and a **Show more** button for the next one. Repository
 text in details is inserted with `textContent`.
 
 ## Review and authoring
 
-The review list pages rule instances from `architecture/details` with source/destination files, layers, production or
-test role, underlying verdict and exception reason. Filters do not change the indexed
-metric population. Structural evidence is syntax-tier: captured source-owner identities and
+Deviations are reviewed in the Deviations tree, above. A module's or layer's inspector lists
+its rule instances from `architecture/details` with source/destination files, layers,
+production or test role, underlying verdict and exception reason. Structural evidence is syntax-tier: captured source-owner identities and
 spellings are not resolved destination-symbol bindings. Semantic sites name their
 binding's provenance, and rule evidence calls them `semanticBinding`. Site samples and omitted counts
 stay explicit. The Unassigned list includes files with no observed references.
 
-An exception needs a nonblank reason. Select one pair or several witnessed pairs and apply
-one reason in **one preview and one apply**. File-to-layer and glob controls select an
-explicit finite list of current pairs; they do not persist wildcard exceptions or waive
-future files. The portable format remains literal language/path endpoints under #365.
+An exception is per file pair. It starts from a line of the Deviations tree, **Add exception
+for this file pair…** (the line menu or the line panel), or from a rule instance in a module
+or layer inspector, and needs a nonblank reason. It goes through one preview and one apply.
+There is no bulk selection (#845): the design has none, and each pair is reviewed from the
+lines that witness it. Exceptions do not persist wildcards or waive future files. The portable format remains literal language/path endpoints under #365.
 Unknown destinations and external packages cannot become portable pair exceptions.
 Existing authored exceptions can be edited or removed even when no current pair matches.
 An unassigned file can be assigned to an existing layer by adding its exact path.

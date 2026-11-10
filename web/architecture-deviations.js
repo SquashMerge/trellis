@@ -18,11 +18,23 @@
   const PARAMS = {kind:"instances", rule:"$layers", status:"deviates", role:"production", excepted:"false", limit:"500"};
   const CONFLICTS = ["revision_conflict", "pin_expired", "root_changed"];
   const INVALID = "Invalid Architecture detail response. Nothing displayed.";
-  const HIDDEN = ["#architecture-diagram", "#architecture-legend", ".architecture-edge-legend", "#architecture-color", "label[for=architecture-color]",
-    "#architecture-aggregate", "label[for=architecture-aggregate]", "#architecture-panel .view-options"];
+  // The tree replaces the drawing and its toolbar (app switcher, metric controls, ⓘ); its own header leads back (#845).
+  const HIDDEN = ["#architecture-diagram", "#architecture-legend", ".architecture-edge-legend", "#architecture-panel .architecture-toolbar"];
   const MODULE = "(module)";
+  // Unnamed owners (closures) are named after their nearest named callable from the Files outline,
+  // read for at most this many files, and pages of 200 symbols per file, per tree (#845).
+  const CLOSURE_FILES = 50, OUTLINE_PAGES = 50;
+  const unnamed = name => typeof name !== "string" || !name || name.startsWith("<");
+  // A closure belongs to the nearest enclosing *callable*: a named function, method or constructor, or a binding
+  // whose whole initializer is a function (the outline's `callableInitializer`, #526). Variables, fields and
+  // types are lexical parents, not owners (#860).
+  const CALLABLE = new Set(["function", "method", "constructor"]);
+  const callable = item => !unnamed(item.symbol.name) && (CALLABLE.has(item.symbol.kind) || CALLABLE.has(item.nativeKind) || item.callableInitializer === true);
+  // A closure with no enclosing callable, read to the root of its file's outline, is module-level code.
+  const MODULE_LEVEL = Object.freeze({syntaxId:"(module)", moduleLevel:true});
   const num = value => value.toLocaleString("en-US");
   const plural = (value, one, many = `${one}s`) => `${num(value)} ${value === 1 ? one : many}`;
+  const basename = path => path.slice(path.lastIndexOf("/") + 1);
   const record = value => value !== null && typeof value === "object" && !Array.isArray(value);
   const counted = value => Number.isSafeInteger(value) && value >= 0;
   const zeros = () => ({call:0, type:0, import:0, reference:0});
@@ -52,16 +64,21 @@
       return (source, destination) => Number.isFinite(order.get(source)) && Number.isFinite(order.get(destination)) &&
         order.get(destination) < order.get(source) ? "up" : "cross";
     };
-    const labelOf = (owner, instance) => !owner || owner.syntaxId === instance.target.sid ? "(module level)"
-      : owner.stableLookupKey ?? owner.name ?? "(anonymous)";
-    function assemble(rows, layers, {edge = null, callsOnly = false} = {}) {
+    // A function row sits under its file row, so its label drops the `path::` prefix of the stable key.
+    const labelOf = (owner, instance) => {
+      if (!owner || owner.moduleLevel || owner.syntaxId === instance.target.sid) return "(module level)";
+      const key = owner.stableLookupKey, prefix = `${instance.target.path}::`;
+      return (typeof key === "string" && key.startsWith(prefix) ? key.slice(prefix.length) : key) ?? owner.name ?? "(anonymous)";
+    };
+    // `names` maps an unnamed owner's syntax ID to its nearest named enclosing callable (from `closureNames`).
+    function assemble(rows, layers, {edge = null, callsOnly = false} = {}, names = null) {
       const direction = directionOf(layers), files = new Map();
       for (const {instance:i} of rows) {
         const pair = edgeKey(i.sourceLayer, i.destinationLayer);
         if (edge !== null && pair !== edge) continue;
         const key = JSON.stringify([i.target.sourceSetId, i.target.language, i.target.path]);
         if (!files.has(key)) files.set(key, {key, target:i.target, path:i.target.path, edges:new Map(), references:0, calls:0, kinds:zeros(), listed:zeros(),
-          callsExact:true, refsExact:true, functions:new Map()});
+          functions:new Map()});
         const file = files.get(key);
         if (!file.edges.has(pair)) file.edges.set(pair, {key:pair, sourceLayer:i.sourceLayer, destinationLayer:i.destinationLayer,
           direction:direction(i.sourceLayer, i.destinationLayer), count:0, calls:0});
@@ -69,19 +86,23 @@
         entry.count += i.referenceCount; entry.calls += i.kindCounts.call;
         file.references += i.referenceCount; file.calls += i.kindCounts.call;
         for (const kind of KINDS) file.kinds[kind] += i.kindCounts[kind];
-        let listedCalls = 0;
+        // A sampled instance (more sites than listed) makes every function it lists lines for a lower bound;
+        // a function fed only by fully listed instances has exact counts (#845).
+        const callsExact = i.evidence.filter(evidence => kindOf(evidence) === "call").length === i.kindCounts.call;
+        const refsExact = i.evidence.length === i.referenceCount;
         for (const evidence of i.evidence) {
           const kind = kindOf(evidence);
           file.listed[kind]++;
-          if (kind === "call") listedCalls++;
           if (callsOnly && kind !== "call") continue;
-          const id = evidence.owner ? evidence.owner.syntaxId : MODULE;
-          if (!file.functions.has(id)) file.functions.set(id, {key:id, id:JSON.stringify(["fn", key, id]), label:labelOf(evidence.owner, i), lines:[]});
-          file.functions.get(id).lines.push({key:lineKey(i, evidence), evidence, instance:i, kind, fn:labelOf(evidence.owner, i), direction:direction(i.sourceLayer, i.destinationLayer),
+          const enclosing = evidence.owner && names?.get(evidence.owner.syntaxId), owner = enclosing || evidence.owner;
+          // Every module-level line of a file shares one row: no owner, the file module itself, or a closure with no callable.
+          const id = owner && !owner.moduleLevel && owner.syntaxId !== i.target.sid ? owner.syntaxId : MODULE;
+          if (!file.functions.has(id)) file.functions.set(id, {key:id, id:JSON.stringify(["fn", key, id]), label:labelOf(owner, i), lines:[], callsExact:true, refsExact:true});
+          const fn = file.functions.get(id);
+          fn.callsExact &&= callsExact; fn.refsExact &&= refsExact;
+          fn.lines.push({key:lineKey(i, evidence), evidence, instance:i, kind, fn:fn.label, closure:!!enclosing, direction:direction(i.sourceLayer, i.destinationLayer),
             start:evidence.lines?.start ?? 0});
         }
-        file.callsExact &&= listedCalls === i.kindCounts.call;
-        file.refsExact &&= i.evidence.length === i.referenceCount;
       }
       const done = [...files.values()].filter(file => !callsOnly || file.calls > 0).map(file => {
         const unlisted = zeros();
@@ -89,7 +110,7 @@
         const functions = [...file.functions.values()].map(fn => {
           sortBy(fn.lines, line => line.start, line => line.evidence.range.start);
           const calls = fn.lines.filter(line => line.kind === "call").length;
-          return {...fn, calls, references:fn.lines.length, callsExact:file.callsExact, refsExact:file.refsExact};
+          return {...fn, calls, references:fn.lines.length};
         }).filter(fn => !callsOnly || fn.calls > 0);
         sortBy(functions, fn => fn.calls > 0 ? 0 : 1, fn => -fn.references, fn => fn.label);
         const edges = sortBy([...file.edges.values()].filter(item => !callsOnly || item.calls > 0), item => -(callsOnly ? item.calls : item.count), item => item.key);
@@ -99,8 +120,45 @@
       sortBy(done, file => -file.shown, file => file.path);
       return {files:done, totals:{files:done.length, references:done.reduce((sum, file) => sum + file.references, 0), calls:done.reduce((sum, file) => sum + file.calls, 0)}};
     }
-    const build = (rows, layers) => ({...assemble(rows, layers), rows, layers});
-    const filter = (tree, options) => ({...assemble(tree.rows, tree.layers, options), rows:tree.rows, layers:tree.layers});
+    const build = (rows, layers, names = null) => ({...assemble(rows, layers, {}, names), rows, layers, names});
+    const filter = (tree, options) => ({...assemble(tree.rows, tree.layers, options, tree.names), rows:tree.rows, layers:tree.layers, names:tree.names});
+    // The unnamed owners to name, by file: an owner with neither a name nor a stable key that is not the file module.
+    function unnamedOwners(rows) {
+      const files = new Map();
+      for (const {instance:i} of rows) for (const evidence of i.evidence) {
+        const owner = evidence.owner;
+        if (!owner || owner.syntaxId === i.target.sid || owner.stableLookupKey || owner.name) continue;
+        if (!files.has(i.target.path)) files.set(i.target.path, new Set());
+        files.get(i.target.path).add(owner.syntaxId);
+      }
+      return files;
+    }
+    // Walks each unnamed owner's `parent` chain in one file's outline items to the first callable. A named
+    // owner seen elsewhere in the rows supplies its stable key, so the row joins that function's row;
+    // otherwise a method reads `Type::name` from its Rust impl block, as stable keys do. A chain that reaches
+    // the root without a callable is module level; one that breaks (a missing parent, the hop limit) stays unnamed.
+    function closureNames(rows, ids, outline, names = new Map()) {
+      const known = new Map();
+      for (const {instance:i} of rows) for (const evidence of i.evidence) if (evidence.owner && (evidence.owner.stableLookupKey || evidence.owner.name)) known.set(evidence.owner.syntaxId, evidence.owner);
+      const byId = new Map();
+      for (const item of Array.isArray(outline) ? outline : []) if (record(item?.symbol) && typeof item.symbol.id === "string") byId.set(item.symbol.id, item);
+      for (const id of ids) {
+        let item = byId.get(id), hops = 0;
+        if (!item) continue;
+        for (item = byId.get(item.symbol.parent); item && !callable(item) && hops < 64; hops++) item = byId.get(item.symbol.parent);
+        if (!item) {
+          // The walk left the outline: at the root (`parent: null`) it is module level, otherwise unknown.
+          let last = byId.get(id), steps = 0;
+          while (last && last.symbol.parent != null && byId.has(last.symbol.parent) && steps++ < 64) last = byId.get(last.symbol.parent);
+          if (last && last.symbol.parent == null) names.set(id, MODULE_LEVEL);
+          continue;
+        }
+        if (!callable(item)) continue;
+        const parent = byId.get(item.symbol.parent), type = typeof parent?.implTarget === "string" && parent.implTarget ? parent.implTarget : null;
+        names.set(id, known.get(item.symbol.id) ?? {syntaxId:item.symbol.id, name:type ? `${type}::${item.symbol.name}` : item.symbol.name, stableLookupKey:null});
+      }
+      return names;
+    }
     // One chip per layer pair, from the summary edges; `bound` is the same rule as the diagram arrows.
     function chips(view, edgeText) {
       const direction = directionOf(view.layers), groups = new Map();
@@ -139,7 +197,7 @@
       }
     };
     const canOpenSequence = evidence => !!(evidence.caller?.syntaxId && evidence.caller.stableLookupKey && evidence.callId);
-    return Object.freeze({lineKey, valid, build, filter, chips, exceptionNote, keyAction, canOpenSequence, kindOf});
+    return Object.freeze({lineKey, valid, build, filter, chips, exceptionNote, keyAction, canOpenSequence, kindOf, unnamedOwners, closureNames});
   })();
 
   function create(deps) {
@@ -174,20 +232,20 @@
     function ensureChrome() {
       if (chrome) return;
       const root = get("architecture-deviations");
-      const back = make("button", "← Architecture", "deviations-back"); back.type = "button"; back.id = "architecture-deviations-back";
+      const back = make("button", deps.backLabel?.() ?? "← Architecture", "deviations-back"); back.type = "button"; back.id = "architecture-deviations-back";
       back.addEventListener("click", () => close());
       const title = make("h2", "Deviations"); title.id = "architecture-deviations-title";
       const summary = make("p", "", "detail"); summary.id = "architecture-deviations-summary";
       const help = make("p", "Expand a file to see its functions and lines. Select a line for its actions, or open its menu with ⋯, right-click or Shift+F10.", "detail");
-      const review = make("button", "Review all rule instances"); review.type = "button"; review.id = "architecture-deviations-review";
-      review.addEventListener("click", () => { close(); deps.openReview("rules"); });
-      const header = make("div", undefined, "deviations-header"); header.append(back, title, summary, help, review);
+      const header = make("div", undefined, "deviations-header"); header.append(back, title, summary, help);
       const edges = make("div", undefined, "deviations-edges"); edges.id = "architecture-deviations-edges";
       edges.setAttribute("role", "group"); edges.setAttribute("aria-label", "Deviation edge");
       const calls = make("input"); calls.type = "checkbox"; calls.id = "architecture-deviations-calls";
       calls.addEventListener("change", () => changeFilter({callsOnly:calls.checked}, () => calls.focus()));
       const callsLabel = make("label"); callsLabel.append(calls, make("span", " Calls only"));
       const filters = make("div", undefined, "deviations-filters"); filters.append(edges, callsLabel, make("span", "Sorted by references · production only", "detail"));
+      // Why an edge total may be low: the one place the tree says so, instead of a ≥ on every chip (#845).
+      const coverage = make("p", "", "detail deviations-coverage"); coverage.id = "architecture-deviations-coverage";
       const notices = make("div", undefined, "deviations-notices"); notices.id = "architecture-deviations-notices";
       notices.setAttribute("role", "status"); notices.setAttribute("aria-live", "polite");
       const slots = {hidden:make("div"), unknown:make("div"), error:make("div"), feedback:make("div")};
@@ -199,9 +257,9 @@
       box.setAttribute("role", "tree"); box.setAttribute("aria-label", "Files with deviations");
       box.addEventListener("keydown", treeKey);
       const card = make("div", undefined, "deviations-card");
-      card.append(head, box, make("p", "Lines are sampled per file pair, calls first. File totals and kind counts are exact.", "detail"));
-      root.replaceChildren(header, filters, notices, line, card);
-      chrome = {root, back, summary, edges, calls, slots, line, box, card};
+      card.append(head, box, make("p", "Lines are listed up to a sample per file pair, calls first. File totals are exact; ≥ marks a function whose file pair has more lines than listed.", "detail"));
+      root.replaceChildren(header, filters, coverage, notices, line, card);
+      chrome = {root, back, summary, edges, calls, coverage, slots, line, box, card};
     }
 
     // Reads every page in sequence; nothing read so far survives a failure.
@@ -219,13 +277,38 @@
           if (offset !== null) { progress = `Reading deviations… ${num(read.length)} of ${num(page.total)} instances`; renderState(); }
         }
         if (!read.every(model.valid)) throw new Error(INVALID);
-        base = model.build(read, view.layers); phase = "ready";
+        const names = await nameClosures(read, active);
+        if (!active()) return;
+        base = model.build(read, view.layers, names); phase = "ready";
         refilter(); settle(restoring);
       } catch (error) {
         if (!active() || error?.name === "AbortError") return;
         base = tree = null; phase = "error"; errorInfo = describe(error); render();
         if (error?.status === 409 && CONFLICTS.includes(error.code)) deps.onConflict();
       }
+    }
+    // Best effort: a file whose outline cannot be read keeps "(anonymous)"; only a lost owner stops the load.
+    // The outline lists a parent before its children, so paging stops once every wanted owner is seen.
+    async function nameClosures(rows, active) {
+      const names = new Map();
+      if (typeof deps.outline !== "function") return names;
+      for (const [path, ids] of [...model.unnamedOwners(rows)].slice(0, CLOSURE_FILES)) {
+        progress = `Naming closures in ${path}…`; renderState();
+        const items = [], wanted = new Set(ids);
+        try {
+          for (let offset = 0, pages = 0; offset !== null && wanted.size && pages < OUTLINE_PAGES; pages++) {
+            const page = await deps.outline(path, offset, active);
+            if (!active()) return names;
+            for (const item of page.items) { items.push(item); wanted.delete(item?.symbol?.id); }
+            offset = page.nextOffset;
+          }
+        } catch (error) {
+          // A typed stale answer means the pin is gone: it is the tree's conflict, never an unnamed tree (#860).
+          if (!active() || error?.name === "AbortError" || (error?.status === 409 && CONFLICTS.includes(error.code))) throw error;
+        }
+        model.closureNames(rows, ids, items, names);
+      }
+      return names;
     }
     function describe(error) {
       if (error?.status === 409 && CONFLICTS.includes(error.code)) return "The index moved to a newer revision. Reload deviations.";
@@ -267,7 +350,8 @@
       opened = false; ticket++; showHidden();
       if (chrome) chrome.root.hidden = true;
       deps.overview();
-      const target = get("architecture-review") || (trigger?.isConnected !== false ? trigger : null) || get("architecture-diagram");
+      // Back returns to the arrow or badge that opened the tree, else to the review chip or the drawing.
+      const target = (trigger && trigger.isConnected !== false && !trigger.closest?.("[hidden]") ? trigger : null) || get("architecture-review") || get("architecture-diagram");
       target?.focus?.();
     }
     function open(next) {
@@ -340,21 +424,26 @@
       chrome.summary.textContent = !totals ? "" : s.callsOnly ? `${plural(totals.files, "file")} · ${plural(totals.calls, "deviating call")}`
         : `${plural(totals.files, "file")} · ${plural(totals.references, "deviating reference")} · ${plural(totals.calls, "call")}`;
     }
+    // Chips count reference sites, the design's unit: "storage → indexing · 445". A peer or shared edge keeps
+    // its ⇄. A count that may be low (unresolved sites in the source layer) is said once, below the chips.
     function renderChips() {
       const s = state(), chips = model.chips(deps.view(), deps.edgeText), buttons = [];
-      const chip = (key, label, glyph, entry) => {
-        const count = `${entry.bound ? "≥" : ""}${num(entry.count)}`, noun = entry.count === 1 ? "reference" : "references";
-        const button = make("button", `${glyph ? `${glyph} ` : ""}${label} · ${count} ${noun}`, "deviations-chip"); button.type = "button";
+      const upward = chips.edges.every(entry => entry.direction === "up");
+      const chip = (key, label, cross, entry) => {
+        const button = make("button", `${cross ? "⇄ " : ""}${label} · ${num(entry.count)}`, "deviations-chip"); button.type = "button";
         button.dataset.key = key ?? ""; button.setAttribute("aria-pressed", String(s.chip === key));
         if (s.chip === key) button.className += " selected";
-        button.setAttribute("aria-label", `${glyph === "↑" ? "Upward: " : ""}${label}, ${entry.bound ? `at least ${num(entry.count)} references (lower bound)` : plural(entry.count, "reference")}`);
+        button.setAttribute("aria-label", `${key === null ? "" : cross ? "Peer or shared: " : "Upward: "}${label}, ${plural(entry.count, "reference")}`);
         button.addEventListener("click", () => changeFilter({chip:key}, () => Array.from(chrome.edges.children).find(item => item.dataset.key === (key ?? ""))?.focus()));
         buttons.push(button);
       };
-      chip(null, "All deviations", "", chips.all);
-      for (const entry of chips.edges) chip(entry.key, `${entry.sourceLayer} → ${entry.destinationLayer}`, entry.direction === "up" ? "↑" : "⇄", entry);
+      chip(null, upward ? "All upward" : "All deviations", false, chips.all);
+      for (const entry of chips.edges) chip(entry.key, `${entry.sourceLayer} → ${entry.destinationLayer}`, entry.direction !== "up", entry);
       chrome.edges.replaceChildren(...buttons);
       chrome.calls.checked = s.callsOnly;
+      const low = [...new Set(chips.edges.filter(entry => entry.bound && (s.chip === null || s.chip === entry.key)).map(entry => entry.sourceLayer))];
+      chrome.coverage.textContent = low.length ? `Counts are references mapped to a file. Some sites in ${low.join(", ")} stayed unresolved, so ${low.length === 1 ? "its" : "their"} edges may have more.` : "";
+      chrome.coverage.hidden = !low.length;
     }
     function renderNotices() {
       const {slots} = chrome, unknown = deps.view()?.rules?.counts?.unknown;
@@ -365,8 +454,8 @@
         slots.hidden.append(make("span", "Selected line is hidden by this filter."), clear);
       }
       if (Number.isSafeInteger(unknown) && unknown > 0) {
-        const inspect = make("button", "Inspect unknown instances"); inspect.type = "button"; inspect.id = "architecture-deviations-inspect";
-        inspect.addEventListener("click", () => deps.openReview("rules", "unknown"));
+        const inspect = make("button", "Inspect same-layer and unassigned references"); inspect.type = "button"; inspect.id = "architecture-deviations-inspect";
+        inspect.addEventListener("click", () => { close(); deps.inspectUnknown(); });
         slots.unknown.append(make("span", unknown === 1 ? "1 unknown rule instance is not a deviation." : `${num(unknown)} unknown rule instances are not deviations.`), inspect);
       }
       if (errorInfo) {
@@ -449,7 +538,7 @@
         name.append(caret(item), cell(f.path, "deviation-path"));
         for (const edge of f.edges) {
           const n = s.callsOnly ? edge.calls : edge.count;
-          reach.append(cell(`${edge.direction === "up" ? "↑" : "⇄"} ${edge.destinationLayer} · ${plural(n, s.callsOnly ? "call" : "reference")}`, "architecture-chip deviation-edge", "error"));
+          reach.append(cell(`${edge.direction === "up" ? "▲" : "⇄"} ${edge.destinationLayer} ${num(n)}`, "deviation-edge", "error"));
         }
         calls = countCell(f.calls, false, "deviation-calls"); refs = countCell(f.shown, false, "deviation-refs");
         const part = edge => `${edge.destinationLayer} ${s.callsOnly ? plural(edge.calls, "call") : plural(edge.count, "reference")}`;
@@ -474,16 +563,20 @@
         const tag = cell(TAGS[line.kind], "badge deviation-kind"); tag.dataset.kind = line.kind;
         name.append(cell(`L${lineNo ?? "—"}`, "deviation-line deviation-muted"), cell(symbol, "deviation-symbol"), tag);
         let where;
+        // One line, as the design draws it: the file name and line; the full path is the tooltip.
+        let target;
         if (t) {
-          reach.append(cell(`→ ${t.document.path}:${t.lines.start}`, "deviation-target"));
+          target = cell(`→ ${basename(t.document.path)}:${t.lines.start}`, "deviation-target");
+          target.setAttribute("title", `${t.document.path}:${t.lines.start}`);
           where = `defined at ${t.document.path}:${t.lines.start}`;
         } else {
           const reason = REASONS[e.targetReason];
           const destination = (deps.targetLabel || (identity => identity.path))(line.instance.destination);
-          reach.append(cell(`→ ${destination} · file only`, "deviation-target"));
-          if (reason) reach.append(cell(reason, "deviation-reason deviation-muted"));
+          target = cell(`→ ${basename(destination)} · file only`, "deviation-target");
+          target.setAttribute("title", `${destination} · file only${reason ? `: ${reason}` : ""}`);
           where = `file only: ${reason ?? "no binding"}`;
         }
+        reach.append(target);
         el.setAttribute("aria-selected", String(item.key === s.selected));
         el.setAttribute("aria-label", `Line ${lineNo ?? "unknown"}, ${symbol}, ${TAGS[line.kind]}, ${where}`);
         menu = make("button", "⋯", "deviation-actions"); menu.type = "button";
@@ -575,7 +668,7 @@
       const higher = up ? "a higher layer" : "another layer";
       const labels = {call:`Call · runs code in ${up ? "a higher layer" : "another layer"}`, type:`Type use · names a type from ${higher}`,
         import:`Import · brings in a module from ${higher}`, reference:`Reference · names an item from ${higher}`};
-      target.append(make("p", labels[line.kind], "detail"), make("p", `in ${line.fn}`));
+      target.append(make("p", labels[line.kind], "detail"), make("p", `in ${line.fn}${line.closure ? " (in a closure)" : ""}`));
       const list = make("dl");
       const row = (term, value, tone) => { const dd = make("dd", value); if (tone) dd.dataset.tone = tone; list.append(make("dt", term), dd); };
       row("Refers to", t ? t.displayKey : `${e.spelling ?? ""} (spelling, not a resolved symbol)`);

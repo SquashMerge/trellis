@@ -52,7 +52,7 @@ function clientFor(transform = (_, result) => result, promptTransform = result =
   }};
 }
 
-test('all twelve live tools use discovered inputs, declaration refs and pinned rule identity', async () => {
+test('all thirteen live tools use discovered inputs, declaration refs and pinned rule identity', async () => {
   const client = clientFor();
   const report = await exercise(client, liveTools, '/fixture', 'fixtureMain');
   assert.equal(report.ok, true, JSON.stringify(report));

@@ -13,7 +13,7 @@
   // CHIP_CELL is one drawn chip column (chip, padding and grid gap) at 14px Inter; the
   // summary display fits as many columns as the canvas width holds (#449). The chip text
   // width then grows or shrinks so the drawing fills the panel width (#525).
-  const CHIP_WIDTH = 104, MIN_CHIP = 72, MAX_CHIP = 240, CHIP_CELL = 176, CHIP_COLUMNS = 5, MAX_COLUMNS = 14, SHARED_ROWS = 6, STAT_GAP = "   ";
+  const MAX_STACK_SPAN = 4, CHIP_WIDTH = 104, MIN_CHIP = 72, MAX_CHIP = 240, CHIP_CELL = 176, CHIP_COLUMNS = 5, MAX_COLUMNS = 14, SHARED_ROWS = 6, STAT_GAP = "   ";
   // Pele's drawn node padding around a label and the grid gap between siblings.
   const NODE_PAD = 32, GRID_GAP = 12;
   // A stat chip is its text plus 12 units of padding, 6 apart (see statChips).
@@ -213,8 +213,10 @@
       if (display.unassigned && unassigned.length && display.unassigned.expanded) opened.set(null, display.entries(null,unassigned));
     }
     // Pele stretches a composite's children to equal grid columns, so the stack spans
-    // several columns and each shared box one, keeping the shared boxes narrow.
-    const stackSpan = display ? COLUMNS : 4, orders = [...new Set(ordered.map(l => l.order))];
+    // several columns and each shared box one, keeping the shared boxes narrow. At one chip
+    // column the fit may ask the stack to span more grid columns than it has chip columns
+    // (`stackSpan`), so the widest band header no longer sets every shared box's width (#860).
+    const stackSpan = display ? Math.max(COLUMNS, Number.isSafeInteger(options.stackSpan) ? options.stackSpan : 0) : 4, orders = [...new Set(ordered.map(l => l.order))];
     if (display) source[1] = `columns ${stackSpan + shared.length}`; else open(outer,stackSpan + shared.length);
     open(orderedStack,width,stackSpan);
     if (!ordered.length) leaf(addNode("B",null,display ? "No ordered layers shown" : "No ordered layers"));
@@ -656,9 +658,11 @@
       // Fit the canvas width (#449, #525): start from the estimated chip columns, then size the
       // chips so Pele's natural layout fills the canvas without passing it. Once a fitting and
       // an overflowing chip width are known, bisect between them. Too wide with no fit shrinks
-      // the chips, then drops a column; the narrowest layout wins when none fits.
+      // the chips, then drops a column. At one column with the narrowest chips, a stack beside
+      // shared boxes then spans more grid columns (up to MAX_STACK_SPAN), which narrows the equal
+      // grid cells the shared boxes take; the narrowest layout wins when none fits.
       const sharedCount = options.display ? view.layers.filter(l => l.shared && options.display.layers.has(l.name)).length : 0;
-      let columns = options.display ? chipColumns(options.width, sharedCount) : undefined, chipWidth = CHIP_WIDTH;
+      let columns = options.display ? chipColumns(options.width, sharedCount) : undefined, chipWidth = CHIP_WIDTH, stackSpan = 0;
       let projection, raw, best = null, low = null, high = null;
       const fit = options.display && options.width > 0;
       // The side channels routing adds (#637) depend only on the arrows and their tags, never on
@@ -668,13 +672,13 @@
       if (fit) { target -= channelReserve(project(view,{...options,columns,chipWidth,measureText:measure})); columns = chipColumns(target, sharedCount); }
       for (let attempt = 0; ; attempt++) {
         if (pause && !(await breathe())) return {status:"stale"};
-        projection = project(view,{...options,columns,chipWidth,measureText:measure});
+        projection = project(view,{...options,columns,chipWidth,stackSpan,measureText:measure});
         if (pause && !(await breathe())) return {status:"stale"};
         raw = window.pele.render(projection.source,{fontSize:14,padding:8,responsive:false,links:false,images:false}).svg;
         if (!fit) break;
         const drawnWidth = Number(/^<svg\b[^>]*?\swidth="([0-9.]+)"/.exec(raw)?.[1]), cells = columns + sharedCount;
         const fits = drawnWidth <= target;
-        if (!best || (fits && (!best.fits || drawnWidth > best.drawnWidth)) || (!fits && !best.fits && drawnWidth < best.drawnWidth)) best = {fits,drawnWidth,projection,raw,columns,chipWidth};
+        if (!best || (fits && (!best.fits || drawnWidth > best.drawnWidth)) || (!fits && !best.fits && drawnWidth < best.drawnWidth)) best = {fits,drawnWidth,projection,raw,columns,chipWidth,stackSpan};
         if (attempt >= 12) break;
         let next;
         if (fits) {
@@ -687,6 +691,7 @@
           if (low !== null) next = Math.floor((low + high) / 2);
           else if (chipWidth > MIN_CHIP) next = Math.max(MIN_CHIP, chipWidth - Math.ceil((drawnWidth - target) / cells) - 1);
           else if (columns > 1) { columns--; high = null; next = CHIP_WIDTH; }
+          else if (sharedCount && Math.max(columns, stackSpan) < MAX_STACK_SPAN) { stackSpan = Math.max(columns, stackSpan) + 1; high = null; next = MIN_CHIP; }
           else break;
         }
         if (low !== null && high !== null && high - low <= 1) break;
@@ -696,7 +701,7 @@
       // when it was not the last attempt; the same inputs give the same source and ids.
       if (best && best.projection !== projection) {
         if (pause && !(await breathe())) return {status:"stale"};
-        projection = project(view,{...options,columns:best.columns,chipWidth:best.chipWidth,measureText:measure});
+        projection = project(view,{...options,columns:best.columns,chipWidth:best.chipWidth,stackSpan:best.stackSpan,measureText:measure});
         raw = best.raw;
       }
       if (pause && !(await breathe())) return {status:"stale"};

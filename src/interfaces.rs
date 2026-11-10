@@ -552,6 +552,138 @@ impl Projection<'_> {
     }
 }
 
+/// What one `trellis_endpoints` read selects (#851). Every filter is optional.
+pub(crate) struct EndpointQuery<'q> {
+    /// The apps an `app` argument names: a row is kept when either of its ends is in one.
+    pub(crate) apps: Option<&'q BTreeSet<usize>>,
+    pub(crate) method: Option<&'q str>,
+    /// The single-endpoint form: one exact path template, whose rows keep every call site
+    /// up to [`ENDPOINT_SITES`].
+    pub(crate) path_template: Option<&'q str>,
+}
+
+/// Call sites one list row carries; the rest are counted in `callSiteCount`.
+pub(crate) const LIST_SITES: usize = 5;
+/// Call sites one row of the single-endpoint form carries.
+pub(crate) const ENDPOINT_SITES: usize = 50;
+
+/// The `trellis_endpoints` rows (#851) over the whole extraction, every route and every call:
+/// each route with the calls matched to it (`matched`), or with none (`serverOnly`), in route
+/// order, then each call matched to no route (`clientOnly`), in call order. Each end carries
+/// the app `assignment` gives its file. Rows are structural name and path matches, never
+/// proof that a route is or is not called.
+pub(crate) fn endpoints(
+    extraction: &Extraction,
+    assignment: &crate::rules::AppAssignment<'_>,
+    query: &EndpointQuery<'_>,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<Vec<Value>> {
+    let app = |path: &str| assignment.file(path);
+    let name = |app: Option<usize>| app.map(|index| assignment.apps()[index].name.clone());
+    let kept = |apps: &[Option<usize>]| {
+        query.apps.is_none_or(|wanted| {
+            apps.iter()
+                .any(|app| app.is_some_and(|app| wanted.contains(&app)))
+        })
+    };
+    let sites = if query.path_template.is_some() {
+        ENDPOINT_SITES
+    } else {
+        LIST_SITES
+    };
+    let mut callers: Vec<Vec<usize>> = vec![Vec::new(); extraction.routes.len()];
+    for (call, found) in extraction.matched.iter().enumerate() {
+        check()?;
+        if let Some(found) = found {
+            callers[found.route].push(call);
+        }
+    }
+    let site = |call: usize, app: Option<usize>| {
+        let site = &extraction.calls[call];
+        let caller = site.caller.as_ref().map(|caller| {
+            let caller = json!(caller);
+            json!({"name": caller["name"], "stableLookupKey": caller["stableLookupKey"]})
+        });
+        json!({
+            "path": site.document.path,
+            "lines": site.lines,
+            "confidence": extraction.matched[call]
+                .map_or(Confidence::Unresolved, |found| found.confidence),
+            "caller": caller,
+            "app": name(app),
+        })
+    };
+    let wanted = |method: Option<&str>, template: Option<&str>| {
+        query.method.is_none_or(|wanted| method == Some(wanted))
+            && query
+                .path_template
+                .is_none_or(|wanted| template == Some(wanted))
+    };
+    let mut rows = Vec::new();
+    for (index, route) in extraction.routes.iter().enumerate() {
+        check()?;
+        if !wanted(Some(&route.method), Some(&route.path_template)) {
+            continue;
+        }
+        let server = app(&route.handler.document.path);
+        let calls: Vec<(usize, Option<usize>)> = callers[index]
+            .iter()
+            .map(|&call| (call, app(&extraction.calls[call].document.path)))
+            .collect();
+        let ends: Vec<Option<usize>> = std::iter::once(server)
+            .chain(calls.iter().map(|(_, app)| *app))
+            .collect();
+        if !kept(&ends) {
+            continue;
+        }
+        let handler = &route.handler;
+        rows.push(json!({
+            "list": if calls.is_empty() { "serverOnly" } else { "matched" },
+            "method": route.method,
+            "pathTemplate": route.path_template,
+            "app": name(server),
+            "handler": {
+                "kind": handler.kind,
+                "syntaxId": handler.syntax_id,
+                "stableLookupKey": handler.stable_lookup_key,
+                "path": handler.document.path,
+                "lines": handler.lines,
+                "variant": handler.variant,
+            },
+            "callSites": calls
+                .iter()
+                .take(sites)
+                .map(|&(call, app)| site(call, app))
+                .collect::<Vec<_>>(),
+            "callSiteCount": calls.len(),
+        }));
+    }
+    for (call, found) in extraction.matched.iter().enumerate() {
+        check()?;
+        if found.is_some() {
+            continue;
+        }
+        let client = &extraction.calls[call];
+        if !wanted(client.method.as_deref(), client.path_template.as_deref()) {
+            continue;
+        }
+        let client_app = app(&client.document.path);
+        if !kept(&[client_app]) {
+            continue;
+        }
+        rows.push(json!({
+            "list": "clientOnly",
+            "method": client.method,
+            "pathTemplate": client.path_template,
+            "app": name(client_app),
+            "handler": null,
+            "callSites": [site(call, client_app)],
+            "callSiteCount": 1,
+        }));
+    }
+    Ok(rows)
+}
+
 /// Splits a `/`-rooted template into segments. Only the one leading `/` is removed, so a
 /// repeated slash keeps its empty segment. A trailing empty segment is dropped.
 pub(crate) fn segments(template: &str) -> Vec<Seg> {

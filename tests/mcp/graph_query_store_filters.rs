@@ -18,6 +18,7 @@ fn query(root: &str, producer: bool, include_external: bool, include_tests: bool
         max_calls: 500,
         include_external,
         include_tests,
+        app_paths: None,
     }
 }
 
@@ -233,4 +234,51 @@ fn unit() {}
             omitted
         );
     }
+}
+
+/// #851: an `app` filter's files bound the expansion. A bound call into a declaration whose
+/// file is outside them is filtered with the `app` hint, as a test callee is filtered without
+/// `includeTests`; the same call into a file inside them expands.
+#[test]
+fn an_app_filter_stops_at_calls_into_files_outside_the_app() {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let mut spec = Spec::new(&[
+        (
+            "web/a.rs",
+            "fn root() { inside(); outside(); }\nfn inside() {}\n",
+        ),
+        ("srv/b.rs", "fn outside() {}\n"),
+    ]);
+    spec.bindings = vec![bind("root", 0, "inside"), bind("root", 1, "outside")];
+    publisher.publish(&spec);
+    let root_id = syntax_id(publisher.native(), "root");
+    let app = |paths: &[&str]| GraphQuery {
+        app_paths: Some(std::sync::Arc::new(
+            paths.iter().map(|path| (*path).to_owned()).collect(),
+        )),
+        ..query(&root_id, true, true, true)
+    };
+
+    let unfiltered = run(&publisher, &query(&root_id, true, true, true));
+    assert_eq!(unfiltered.nodes.len(), 3);
+    assert_eq!(unfiltered.omitted.filtered, 0);
+
+    let web = run(&publisher, &app(&["web/a.rs"]));
+    assert_eq!(web.nodes.len(), 2, "{:?}", web.nodes);
+    assert!(
+        web.nodes
+            .iter()
+            .all(|node| node.declaration.document.path == "web/a.rs")
+    );
+    assert_eq!(web.omitted.filtered, 1);
+    assert_eq!(web.hints, vec!["app"]);
+    assert_eq!(web.frontier[0].reason, FrontierReason::Filtered);
+
+    // Negative control: with both files in the app nothing is filtered.
+    let both = run(&publisher, &app(&["web/a.rs", "srv/b.rs"]));
+    assert_eq!(both.nodes.len(), 3);
+    assert_eq!(both.omitted.filtered, 0);
+    assert!(both.hints.is_empty());
 }

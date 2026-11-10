@@ -157,6 +157,10 @@ pub struct GraphRequest {
     pub include_external: bool,
     #[serde(default)]
     pub include_tests: bool,
+    /// #851: an MCP `app` filter's files. A call into a declaration outside them is
+    /// filtered. Never on the wire: the request echo reports the caller's other bounds.
+    #[serde(skip)]
+    pub app_paths: Option<std::sync::Arc<std::collections::BTreeSet<String>>>,
 }
 
 fn is_syntax_id(id: &str) -> bool {
@@ -283,6 +287,8 @@ pub struct GraphQuery {
     pub max_calls: u64,
     pub include_external: bool,
     pub include_tests: bool,
+    /// #851: the files of the apps an `app` argument names.
+    pub app_paths: Option<std::sync::Arc<std::collections::BTreeSet<String>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1035,9 +1041,18 @@ pub fn evaluate(
                 let test = (node_id != request.root_syntax_id
                     && node.declaration.role == native::DeclarationRole::Test)
                     || target_role == Some(native::DeclarationRole::Test);
-                if (external && !request.include_external) || (test && !request.include_tests) {
+                let outside_app = request.app_paths.as_ref().is_some_and(|files| {
+                    exact_target.is_some_and(|(_, key)| !files.contains(&key.path))
+                });
+                if (external && !request.include_external)
+                    || (test && !request.include_tests)
+                    || outside_app
+                {
                     add_omission(&mut frontier, &node_id, FrontierReason::Filtered, 1);
                     let hints = filtered_hints.entry(node_id.clone()).or_default();
+                    if outside_app {
+                        hints.insert("app".to_string());
+                    }
                     if external && !request.include_external {
                         hints.insert("includeExternal".to_string());
                     }

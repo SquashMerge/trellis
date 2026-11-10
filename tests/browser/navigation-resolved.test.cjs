@@ -106,6 +106,13 @@ paths = ["flow.rs"]
 [layers.top]
 order = 1
 paths = ["target.rs"]
+# #845: an unexcepted deviating arrow opens the Deviations tree; the excepted one keeps the
+# edge inspector and its boundary callers, which this test follows into Interactions.
+[[exceptions]]
+rule = "$layers"
+target = { language = "rust", path = "flow.rs" }
+destination = { language = "rust", path = "target.rs" }
+reason = "Reviewed so the arrow keeps its boundary callers"
 `);
   let server, browser, context;
   try {

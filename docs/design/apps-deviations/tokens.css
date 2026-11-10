@@ -1,0 +1,59 @@
+/* SquashMerge design language v1 + Brand Guide v1.1 — tokens used by the Trellis Workbench mockup.
+   Every color in the mockup is one of these. Dark theme only (Trellis ships dark). */
+:root {
+  color-scheme: dark;
+
+  /* Surfaces */
+  --sm-ink: #0B0C10;        /* page background; text on warm/purple fills */
+  --sm-surface: #14151D;    /* panels, cards */
+  --sm-raised: #1D1E2A;     /* hover, selected-but-quiet, chips */
+
+  /* Lines */
+  --sm-line: #343644;       /* decorative dividers only */
+  --sm-control: #777A8E;    /* meaningful control boundaries: buttons, inputs, selects, tab groups */
+
+  /* Text */
+  --sm-white: #F7F7FB;      /* primary text */
+  --sm-muted: #B8BAC8;      /* secondary text (never use --sm-control for text) */
+
+  /* Warm (brand gradient family) */
+  --sm-gold: #FFC20A;       /* warning / caution; heat ramp step 1 */
+  --sm-amber: #FFAA10;      /* PRIMARY ACTION fill, ink text; heat ramp step 2 */
+  --sm-orange: #FF7A00;     /* heat ramp step 3 (hottest) */
+
+  /* Cool */
+  --sm-lavender: #ABA5FF;   /* links (underlined) and focus ring */
+  --sm-purple: #7770DC;     /* selection fill, ink text */
+  --sm-deep-purple: #5D55C8;
+
+  /* Status — always pair with a word and a shape, never color alone */
+  --sm-success: #57D6A0;
+  --sm-error: #FF8E9A;
+  --sm-info: #85C7FF;
+
+  /* Diff highlighting (design handoff): added / removed / changed */
+  --diff-add: var(--sm-success);
+  --diff-remove: var(--sm-error);
+  --diff-change: var(--sm-gold);
+
+  /* Complexity heat ramp: quartiles of the visible modules. Reverse for Maintainability (higher = better). */
+  --heat-0: var(--sm-line);
+  --heat-1: var(--sm-gold);
+  --heat-2: var(--sm-amber);
+  --heat-3: var(--sm-orange);
+
+  /* Type */
+  --font-heading: 'Manrope', system-ui, sans-serif;   /* 600–800 */
+  --font-body: 'Inter', system-ui, sans-serif;        /* 400 body, 600 labels, 650 emphasis */
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace; /* 400 — code, IDs, metrics */
+  /* size/line-height */
+  --type-h1: 32px/40px;  --type-h2: 24px/32px;  --type-h3: 18px/26px;
+  --type-body: 16px/24px; --type-label: 14px/20px; --type-caption: 12px/18px; --type-code: 13px/20px;
+
+  /* Space & shape */
+  --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px; --sp-5: 24px; --sp-6: 32px; --sp-7: 48px; --sp-8: 64px;
+  --radius-detail: 4px; --radius-control: 8px; --radius-card: 12px;
+  --control-min-height: 44px; /* primary buttons */
+}
+
+:focus-visible { outline: 2px solid var(--sm-lavender); outline-offset: 3px; }

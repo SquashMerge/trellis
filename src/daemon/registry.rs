@@ -1778,6 +1778,8 @@ enum ArchitectureRules {
     Unused,
     /// It needs this file's rule rows.
     Evaluated,
+    /// It needs this file's rule rows when there is a file: each file's app (#837, #851).
+    IfPresent,
     /// A summary: it needs them only if the file has layers.
     Layers,
 }
@@ -3017,7 +3019,10 @@ impl CheckoutRuntime {
             return;
         }
         // A read of rules there are none of fails at once. So does a summary without layers.
-        if rules != ArchitectureRules::Unused && config.is_none()
+        if matches!(
+            rules,
+            ArchitectureRules::Evaluated | ArchitectureRules::Layers
+        ) && config.is_none()
             || rules == ArchitectureRules::Layers
                 && config
                     .as_ref()
@@ -3025,13 +3030,20 @@ impl CheckoutRuntime {
         {
             return;
         }
+        // A read that evaluates rules waits for a core of exactly the current file, or of no
+        // file once it is removed (#851).
         let hash = config.as_ref().map(|config| config.content_hash.as_str());
+        let rules = if rules == ArchitectureRules::Unused {
+            crate::http::architecture::CoreRules::Any
+        } else {
+            crate::http::architecture::CoreRules::Exactly(hash)
+        };
         if !current {
-            resources.scheduler.architecture_request_older(pin, hash);
+            resources.scheduler.architecture_request_older(pin, rules);
         }
         resources
             .scheduler
-            .architecture_wait(pin, hash, wait, check);
+            .architecture_wait(pin, rules, wait, check);
     }
 
     fn await_architecture_metrics(
@@ -3066,8 +3078,10 @@ impl CheckoutRuntime {
     ) {
         if let Ok(parsed) = crate::store::EvidenceResponse::architecture_arguments(kind, arguments)
         {
-            let rules = if matches!(kind, "check" | "explain") || parsed.apps() {
+            let rules = if matches!(kind, "check" | "explain") {
                 ArchitectureRules::Evaluated
+            } else if parsed.apps() {
+                ArchitectureRules::IfPresent
             } else {
                 ArchitectureRules::Unused
             };
@@ -3087,26 +3101,134 @@ impl CheckoutRuntime {
         needs: CoreNeeds,
         check: &mut (impl FnMut() -> anyhow::Result<()> + Send),
     ) -> anyhow::Result<Arc<crate::store::ArchitectureCore>> {
-        let hash = config
-            .filter(|_| needs.rules)
-            .map(|config| config.content_hash.as_str());
+        // #851: a read that needs the rules needs exactly the current file's, or a core built
+        // without one when there is none; a core built under a removed file never answers it.
+        let rules = if needs.rules {
+            crate::http::architecture::CoreRules::Exactly(
+                config.map(|config| config.content_hash.as_str()),
+            )
+        } else {
+            crate::http::architecture::CoreRules::Any
+        };
         let scheduler = self.resources()?.scheduler.clone();
         if pin == response.selected_pin(None)? {
-            return scheduler.architecture_core(pin, hash, Duration::ZERO, check);
+            return scheduler.architecture_core(pin, rules, Duration::ZERO, check);
         }
         if let Some(core) =
             scheduler.architecture_core_if_available(pin, Duration::ZERO, &mut || Ok(()))
-            && hash.is_none_or(|hash| core.rules_hash() == Some(hash))
+            && rules.admits(core.rules_hash())
         {
             return Ok(core);
         }
         if !needs.compute_older_pin {
-            scheduler.architecture_request_older(pin, hash);
-            return scheduler.architecture_core(pin, hash, Duration::ZERO, check);
+            scheduler.architecture_request_older(pin, rules);
+            return scheduler.architecture_core(pin, rules, Duration::ZERO, check);
         }
         response
             .architecture_core_at(pin, config, needs.metrics, check, &|_| {})
             .map(Arc::new)
+    }
+
+    /// #851: the files of the apps `app` names, by name or manifest path, as an unfiltered
+    /// `trellis_rules_check` assigns them, for a find, search or call graph read at the
+    /// admitted head. The head's core is the owner's; a read that finds it building fails
+    /// [`crate::http::architecture::ArchitectureBuilding`], which the caller waits out.
+    pub fn mcp_app_files(
+        &self,
+        response: &CheckoutEvidence,
+        app: &str,
+        check: &mut (impl FnMut() -> anyhow::Result<()> + Send),
+    ) -> anyhow::Result<std::collections::BTreeSet<String>> {
+        let (config, core) = self.app_core(response, false, check)?;
+        let (assignment, whole) =
+            crate::store::EvidenceResponse::app_assignment_at(config.as_ref(), &core, check)?;
+        let named = assignment.named(app)?;
+        crate::store::EvidenceResponse::app_files(&assignment, &whole, &named, check)
+    }
+
+    /// #851: `trellis_workspace_describe`'s `apps`, from the head's core if the owner has
+    /// published it, without waiting or asking for one: `ready` with the effective inventory,
+    /// `building` until the owner (which builds every head, #798) has it for the current rules
+    /// file, `invalidRules` when the rules file is rejected, and `unavailable` otherwise.
+    pub fn mcp_describe_apps(
+        &self,
+        response: &CheckoutEvidence,
+        check: &mut (impl FnMut() -> anyhow::Result<()> + Send),
+    ) -> anyhow::Result<serde_json::Value> {
+        let state = |state: &str| serde_json::json!({"state": state, "items": [], "noApp": null});
+        let answer = self
+            .app_core(response, true, check)
+            .and_then(|(config, core)| {
+                let (assignment, whole) = crate::store::EvidenceResponse::app_assignment_at(
+                    config.as_ref(),
+                    &core,
+                    check,
+                )?;
+                crate::store::EvidenceResponse::app_inventory(&assignment, &whole, check)
+            });
+        match answer {
+            Ok(apps) => Ok(apps),
+            // Its message starts `deadline_exceeded`, so it is matched first.
+            Err(error)
+                if error
+                    .downcast_ref::<crate::http::architecture::ArchitectureBuilding>()
+                    .is_some() =>
+            {
+                Ok(state("building"))
+            }
+            Err(error) if crate::store::cli_read_retryable_contention(&error) => Err(error),
+            Err(error) if error.to_string().starts_with("deadline_exceeded") => Err(error),
+            Err(error) if crate::rules::diagnostic(&error).is_some() => Ok(state("invalidRules")),
+            Err(_) => Ok(state("unavailable")),
+        }
+    }
+
+    /// The head's core and the rules file it evaluated, for each file's app (#851). A
+    /// `passive` read only takes a published core; it never asks the owner for one.
+    fn app_core(
+        &self,
+        response: &CheckoutEvidence,
+        passive: bool,
+        check: &mut (impl FnMut() -> anyhow::Result<()> + Send),
+    ) -> anyhow::Result<(
+        Option<crate::rules::Config>,
+        Arc<crate::store::ArchitectureCore>,
+    )> {
+        let parsed =
+            crate::store::EvidenceResponse::architecture_arguments("apps", &serde_json::json!({}))?;
+        let config = response.architecture_config("apps", &parsed)?;
+        let pin = response.selected_pin(None)?;
+        if passive {
+            let hash = config.as_ref().map(|config| config.content_hash.as_str());
+            let scheduler = self.resources()?.scheduler.clone();
+            return match scheduler
+                .architecture_core_if_available(pin, Duration::ZERO, &mut || Ok(()))
+            {
+                Some(core)
+                    if crate::http::architecture::CoreRules::Exactly(hash)
+                        .admits(core.rules_hash()) =>
+                {
+                    Ok((config, core))
+                }
+                _ => Err(crate::http::architecture::ArchitectureBuilding {
+                    pin,
+                    progress: None,
+                }
+                .into()),
+            };
+        }
+        let core = self.architecture_core_for_read(
+            response,
+            pin,
+            config.as_ref(),
+            CoreNeeds {
+                rules: true,
+                metrics: false,
+                compute_older_pin: false,
+            },
+            check,
+        )?;
+        Ok((config, core))
     }
 
     /// An MCP or CLI architecture operation in this admitted read.
@@ -3180,7 +3302,12 @@ impl CheckoutRuntime {
             };
             let scheduler = self.browser_scheduler().expect("active runtime");
             let wait = deadline.saturating_duration_since(Instant::now());
-            let outcome = scheduler.architecture_core(pin, hash.as_deref(), wait, &mut || Ok(()));
+            let outcome = scheduler.architecture_core(
+                pin,
+                crate::http::architecture::CoreRules::Exactly(hash.as_deref()),
+                wait,
+                &mut || Ok(()),
+            );
             let building = outcome.as_ref().err().is_some_and(|error| {
                 error
                     .downcast_ref::<crate::http::architecture::ArchitectureBuilding>()
