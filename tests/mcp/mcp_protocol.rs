@@ -10054,6 +10054,11 @@ fn mcp_outgoing_corrupt_boundary_fixture(fault: &str) -> Value {
         assert_eq!(db.execute(sql, []).unwrap(), expect, "{fault}");
     }
     let mut registry = CheckoutRegistry::with_roots(topology);
+    // The subject is this one read's handling of the corrupt rows. An eagerly built
+    // Architecture core (#798) reads the same rows at activation, reports the corruption
+    // and latches the head for rebuild; a read that lands after it is then refused as
+    // store_unavailable whatever its own optional handling (#878). Build only on demand.
+    registry.architecture_on_demand_for_tests();
     registry.attach_launch(302, &identity).unwrap();
     registry.activate(&identity.root_key).unwrap();
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
