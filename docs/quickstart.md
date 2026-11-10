@@ -229,7 +229,7 @@ Trellis accepts only the exact versions below. It never installs them on its own
 | Rust | `rust-analyzer` | 1.98.1 | `rustup toolchain install 1.98.1 --component rust-analyzer`, or with the toolchain already installed, `rustup component add rust-analyzer --toolchain 1.98.1` (what `producer install` runs) |
 
 - The npm producers need Node.
-- `trellis producer install scip-java` runs the profile's recorded command, `coursier bootstrap --standalone com.sourcegraph:scip-java_2.13:0.12.3`, which names no `-o` output path. Put the launcher it writes on your `PATH`, or run the command in the table instead.
+- `trellis producer install scip-java` runs the command in the table, with `~` expanded to your home folder, and creates `~/.local/bin` first if it doesn't exist. Make sure `~/.local/bin` is on your `PATH`; `producer doctor` tells you if it isn't.
 - `scip-java` needs a JDK on your `PATH`. It also needs its own JDK in the Coursier cache, because Trellis runs it offline by default. To fetch that once (about 500 MB), run it by hand in an empty folder:
 
   ```sh

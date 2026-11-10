@@ -289,7 +289,7 @@ fn short(hash: &str) -> &str {
     &hash[..hash.len().min(12)]
 }
 
-fn is_executable_file(path: &Path) -> bool {
+pub(super) fn is_executable_file(path: &Path) -> bool {
     fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 

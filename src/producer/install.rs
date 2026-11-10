@@ -10,6 +10,7 @@ use super::detect::Declared;
 use super::doctor::{self, ProducerReport, State};
 use anyhow::{Result, bail};
 use std::io::{BufRead, IsTerminal, Write};
+use std::path::Path;
 
 pub const PREREQUISITE_MISSING: &str = "prerequisite_missing";
 pub const CONFIRMATION_REQUIRED: &str = "confirmation_required";
@@ -25,12 +26,20 @@ pub enum Confirmation {
     Ask,
 }
 
+/// Where the install command's stdout goes. Its stderr is always the CLI's stderr.
+pub enum ChildOutput {
+    Inherit,
+    /// `--json`: the CLI's stdout carries only the JSON report.
+    Stderr,
+}
+
 /// Run `producer`'s pinned install command under `declared` and return the doctor entry
 /// afterwards. A producer that is already ready runs nothing. Progress goes to `out`.
 pub fn run_pinned_install(
     producer: ProducerName,
     declared: &Declared,
     confirmation: Confirmation,
+    child_output: ChildOutput,
     out: &mut dyn Write,
 ) -> Result<ProducerReport> {
     let before = doctor::check(producer, declared);
@@ -43,7 +52,7 @@ pub fn run_pinned_install(
         )?;
         return Ok(before);
     }
-    let Some(command) = doctor::pinned_install(producer) else {
+    let Some(command) = doctor::pinned_install(producer, &declared.home) else {
         bail!(
             "{NO_INSTALL_COMMAND}: {} has no pinned install command; nothing was run",
             producer.as_str()
@@ -51,6 +60,15 @@ pub fn run_pinned_install(
     };
     writeln!(out, "Pinned install command for {}:", producer.as_str())?;
     writeln!(out, "  {}", command.display())?;
+    // The output directory the command writes into, created first when absent.
+    let create = command
+        .output()
+        .and_then(Path::parent)
+        .filter(|dir| !dir.is_dir())
+        .map(Path::to_path_buf);
+    if let Some(dir) = &create {
+        writeln!(out, "  (creates {} first)", dir.display())?;
+    }
     let missing: Vec<String> = before
         .prerequisites
         .iter()
@@ -87,8 +105,14 @@ pub fn run_pinned_install(
         }
     }
     out.flush()?;
+    if let Some(dir) = &create {
+        std::fs::create_dir_all(dir)?;
+    }
     let mut child = std::process::Command::new(&program);
     child.args(&command.argv[1..]);
+    if let ChildOutput::Stderr = child_output {
+        child.stdout(std::io::stderr());
+    }
     if producer == ProducerName::RustAnalyzer {
         // Adding the component must never install the toolchain, a prerequisite.
         child.env("RUSTUP_AUTO_INSTALL", "0");

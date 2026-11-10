@@ -574,15 +574,29 @@ async fn main() -> Result<()> {
 /// declare to `producer plan`, so it needs no daemon or index.
 fn producer_doctor(args: &ProducerDoctorArgs) -> Result<()> {
     use trellis::producer::{detect, doctor};
-    let declared = detect::Declared::new(&detect::Environment::from_process()?)?;
-    let cwd = std::env::current_dir()?;
-    let workspace = match &args.workspace.workspace {
-        Some(explicit) => Some(WorkspaceIdentity::discover_unattached(Some(explicit), &cwd)?.root),
-        None => WorkspaceIdentity::discover_unattached(None, &cwd)
-            .ok()
-            .map(|identity| identity.root),
-    };
-    let report = doctor::report(workspace.as_deref(), &declared);
+    // Operational failures become typed fields of the report, so doctor always reports and
+    // exits 0; only invalid command-line usage (clap) fails.
+    let declared = detect::Environment::from_process()
+        .and_then(|environment| detect::Declared::new(&environment))
+        .map_err(|error| format!("{error:#}"));
+    let workspace = std::env::current_dir()
+        .map_err(anyhow::Error::from)
+        .and_then(|cwd| match &args.workspace.workspace {
+            Some(explicit) => {
+                WorkspaceIdentity::discover_unattached(Some(explicit), &cwd).map(|id| Some(id.root))
+            }
+            None => Ok(WorkspaceIdentity::discover_unattached(None, &cwd)
+                .ok()
+                .map(|identity| identity.root)),
+        })
+        .map_err(|error| format!("{error:#}"));
+    let report = doctor::report(
+        workspace
+            .as_ref()
+            .map(Option::as_deref)
+            .map_err(Clone::clone),
+        declared.as_ref().map_err(Clone::clone),
+    );
     if args.json {
         print_json(&report)
     } else {
@@ -604,11 +618,24 @@ fn producer_install(args: &ProducerInstallArgs) -> Result<()> {
     } else {
         install::Confirmation::Ask
     };
-    // With --json, stdout holds only the JSON entry, so progress goes to stderr.
+    // With --json, stdout holds only the JSON entry, so progress and the install command's
+    // own output go to stderr.
     let after = if args.json {
-        install::run_pinned_install(producer, &declared, confirmation, &mut std::io::stderr())?
+        install::run_pinned_install(
+            producer,
+            &declared,
+            confirmation,
+            install::ChildOutput::Stderr,
+            &mut std::io::stderr(),
+        )?
     } else {
-        install::run_pinned_install(producer, &declared, confirmation, &mut std::io::stdout())?
+        install::run_pinned_install(
+            producer,
+            &declared,
+            confirmation,
+            install::ChildOutput::Inherit,
+            &mut std::io::stdout(),
+        )?
     };
     if args.json {
         print_json(&after)

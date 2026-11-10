@@ -80,6 +80,9 @@ pub struct ProducerReport {
     pub reason: Option<String>,
     /// The pinned install command, for a producer that is not ready.
     pub install_command: Option<String>,
+    /// What to do next when the reason alone does not say, for example a launcher installed
+    /// outside the declared `PATH`.
+    pub hint: Option<String>,
     pub prerequisites: Vec<Prerequisite>,
 }
 
@@ -88,12 +91,28 @@ pub struct ProducerReport {
 #[serde(rename_all = "camelCase")]
 pub struct Report {
     pub workspace: Option<String>,
+    /// Why the checkout could not be resolved, for example an explicit `--workspace` that is
+    /// missing or unreadable. Doctor still reports every producer.
+    pub workspace_error: Option<Diagnostic>,
+    /// Why the declared environment is invalid, for example `HOME` unset. No producer can
+    /// be checked then, so `producers` is empty.
+    pub environment_error: Option<Diagnostic>,
     /// Languages with sources in the checkout, as an index capture would admit them.
     pub languages: Option<Vec<&'static str>>,
     pub languages_error: Option<String>,
     pub native_evidence: &'static str,
     pub producers: Vec<ProducerReport>,
 }
+
+/// A typed failure doctor reports instead of exiting non-zero.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct Diagnostic {
+    pub code: &'static str,
+    pub message: String,
+}
+
+pub const WORKSPACE_UNAVAILABLE: &str = "workspace_unavailable";
+pub const ENVIRONMENT_INVALID: &str = "environment_invalid";
 
 /// A pinned install command: the argv `producer install` runs, and nothing else.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -104,6 +123,12 @@ pub struct InstallCommand {
 impl InstallCommand {
     pub fn display(&self) -> String {
         self.argv.join(" ")
+    }
+
+    /// The file the command writes, when it names one with `-o` (scip-java).
+    pub fn output(&self) -> Option<&Path> {
+        let at = self.argv.iter().position(|arg| arg == "-o")?;
+        self.argv.get(at + 1).map(Path::new)
     }
 }
 
@@ -117,10 +142,11 @@ fn install_tool(producer: ProducerName) -> &'static str {
 }
 
 /// The pinned install command for `producer`. The npm producers and scip-java run the
-/// reference profile row's `installMethod` as captured. The rust-analyzer row records the
-/// component and toolchain in prose, so its command adds the component to the pinned
-/// toolchain, as the provisioning table says.
-pub fn pinned_install(producer: ProducerName) -> Option<InstallCommand> {
+/// reference profile row's `installMethod`, split on whitespace, with a leading `~` of an
+/// argument expanded to the declared `home` (no shell is involved). The rust-analyzer row
+/// records the component and toolchain in prose, so its command adds the component to the
+/// pinned toolchain, as the provisioning table says.
+pub fn pinned_install(producer: ProducerName, home: &Path) -> Option<InstallCommand> {
     let pin = Target::Real(producer).pin()?;
     let argv: Vec<String> = match producer {
         ProducerName::RustAnalyzer => [
@@ -135,7 +161,11 @@ pub fn pinned_install(producer: ProducerName) -> Option<InstallCommand> {
         .to_vec(),
         _ => crate::scip_admission::reference_install_method(producer.as_str())?
             .split_whitespace()
-            .map(str::to_owned)
+            .map(|arg| match arg.strip_prefix("~/") {
+                Some(rest) => home.join(rest).to_string_lossy().into_owned(),
+                None if arg == "~" => home.to_string_lossy().into_owned(),
+                None => arg.to_owned(),
+            })
             .collect(),
     };
     // A row whose method is not a command for the expected tool, or does not name the pin,
@@ -160,15 +190,23 @@ fn rust_toolchain_dir(declared: &Declared) -> Option<PathBuf> {
     )))
 }
 
+/// Whether the cache holds an unpacked scip-java JDK with its platform `java` executable:
+/// `Contents/Home/bin/java` in a macOS JDK bundle, `bin/java` on Linux. An empty or
+/// partially unpacked directory, for example after an interrupted fetch, does not count.
 fn scip_java_jdk_cached(declared: &Declared) -> bool {
     let Ok(entries) = fs::read_dir(declared.coursier_archive_cache.join(SCIP_JAVA_JDK_RELEASE))
     else {
         return false;
     };
-    entries
-        .take(MAX_CACHE_ENTRIES)
-        .flatten()
-        .any(|entry| entry.path().join(SCIP_JAVA_JDK).is_dir())
+    let java = if cfg!(target_os = "macos") {
+        "Contents/Home/bin/java"
+    } else {
+        "bin/java"
+    };
+    entries.take(MAX_CACHE_ENTRIES).flatten().any(|entry| {
+        let home = entry.path().join(SCIP_JAVA_JDK);
+        home.is_dir() && detect::is_executable_file(&home.join(java))
+    })
 }
 
 fn tool(name: &str, needed_for: Vec<&'static str>, declared: &Declared) -> Prerequisite {
@@ -290,8 +328,25 @@ pub fn check(producer: ProducerName, declared: &Declared) -> ProducerReport {
         },
     };
     let install_command = (state != State::Ready)
-        .then(|| pinned_install(producer).map(|command| command.display()))
+        .then(|| pinned_install(producer, &declared.home))
         .flatten();
+    // The launcher an install wrote, but resolution cannot see (#880).
+    let hint = install_command
+        .as_ref()
+        .and_then(InstallCommand::output)
+        .filter(|_| state == State::Missing)
+        .filter(|output| output.is_file())
+        .and_then(|output| {
+            let dir = output.parent()?;
+            (!declared.path_dirs.iter().any(|entry| entry == dir)).then(|| {
+                format!(
+                    "{} exists, but {} is not on the declared PATH; add it to PATH",
+                    output.display(),
+                    dir.display()
+                )
+            })
+        });
+    let install_command = install_command.map(|command| command.display());
     ProducerReport {
         name: producer.as_str(),
         languages: target.languages(),
@@ -302,34 +357,64 @@ pub fn check(producer: ProducerName, declared: &Declared) -> ProducerReport {
         found,
         reason,
         install_command,
+        hint,
         prerequisites,
     }
 }
 
 /// The doctor reply for `workspace` (when one was found) under `declared`.
-pub fn report(workspace: Option<&Path>, declared: &Declared) -> Report {
+/// `workspace` is the resolved checkout, `Ok(None)` when none was found, or the discovery
+/// error; `declared` is the declared environment or why it is invalid. Neither error stops
+/// the report: each becomes a typed field.
+pub fn report(
+    workspace: Result<Option<&Path>, String>,
+    declared: Result<&Declared, String>,
+) -> Report {
+    let (workspace, workspace_error) = match workspace {
+        Ok(found) => (found, None),
+        Err(message) => (
+            None,
+            Some(Diagnostic {
+                code: WORKSPACE_UNAVAILABLE,
+                message,
+            }),
+        ),
+    };
     let (languages, languages_error) = match workspace {
+        None if workspace_error.is_some() => (None, None),
         None => (None, Some("no checkout found".to_owned())),
         Some(root) => match crate::capture::languages_present(root) {
             Ok(found) => (Some(found.into_iter().collect::<Vec<_>>()), None),
             Err(error) => (None, Some(format!("{error:#}"))),
         },
     };
+    let (declared, environment_error) = match declared {
+        Ok(declared) => (Some(declared), None),
+        Err(message) => (
+            None,
+            Some(Diagnostic {
+                code: ENVIRONMENT_INVALID,
+                message,
+            }),
+        ),
+    };
     let producers = ProducerName::ALL
         .into_iter()
-        .map(|producer| {
-            let mut entry = check(producer, declared);
+        .filter_map(|producer| {
+            let mut entry = check(producer, declared?);
             entry.relevant = languages.as_ref().is_none_or(|present| {
                 entry
                     .languages
                     .iter()
                     .any(|language| present.contains(language))
             });
-            entry
+            Some(entry)
         })
         .collect();
     Report {
         workspace: workspace.map(|root| root.display().to_string()),
+        workspace_error,
+        environment_error,
         languages,
         languages_error,
         native_evidence: NATIVE_ONLY,
@@ -360,6 +445,9 @@ pub fn render_producer(entry: &ProducerReport) -> String {
     if let Some(reason) = &entry.reason {
         let _ = writeln!(out, "  reason: {reason}");
     }
+    if let Some(hint) = &entry.hint {
+        let _ = writeln!(out, "  hint: {hint}");
+    }
     if let Some(command) = &entry.install_command {
         let _ = writeln!(out, "  install: {command}");
         let _ = writeln!(out, "    or: trellis producer install {}", entry.name);
@@ -379,13 +467,23 @@ pub fn render_producer(entry: &ProducerReport) -> String {
 /// The doctor reply as text.
 pub fn render(report: &Report) -> String {
     let mut out = String::new();
-    match &report.workspace {
-        Some(root) => {
+    match (&report.workspace, &report.workspace_error) {
+        (Some(root), _) => {
             let _ = writeln!(out, "Checkout: {root}");
         }
-        None => {
+        (None, Some(error)) => {
+            let _ = writeln!(out, "Checkout: {}: {}", error.code, error.message);
+        }
+        (None, None) => {
             let _ = writeln!(out, "Checkout: none found");
         }
+    }
+    if let Some(error) = &report.environment_error {
+        let _ = writeln!(
+            out,
+            "Environment: {}: {}; no producer was checked",
+            error.code, error.message
+        );
     }
     match (&report.languages, &report.languages_error) {
         (Some(languages), _) if languages.is_empty() => {
@@ -393,6 +491,9 @@ pub fn render(report: &Report) -> String {
         }
         (Some(languages), _) => {
             let _ = writeln!(out, "Languages: {}", languages.join(", "));
+        }
+        (None, None) if report.workspace_error.is_some() => {
+            let _ = writeln!(out, "Languages: unknown; every producer is listed");
         }
         (None, error) => {
             let _ = writeln!(

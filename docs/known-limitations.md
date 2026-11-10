@@ -99,7 +99,7 @@ Trellis accepts only one exact version of each [producer](quickstart.md#install-
 
 - prerequisites: Node, npm, a JDK, `coursier`, `rustup`, the pinned Rust toolchain and scip-java's own JDK in the coursier cache are yours to install; `producer install` refuses with `prerequisite_missing` without them;
 - other versions or install methods, and shims: a version-manager shim stays `unverifiable` after an install, because the shim still comes first on `PATH`;
-- where the launcher lands: npm and rustup put it where they always do, and the recorded `scip-java` command names no output path, so that launcher must be put on `PATH` by hand.
+- your `PATH`: npm and rustup put the launcher where they always do, and `scip-java` goes to `~/.local/bin/scip-java`. If that folder isn't on your `PATH`, doctor's hint says so, and you add it yourself.
 
 `scip-java` is checked by file hash, so a launcher built another way can be refused even at the right version.
 
