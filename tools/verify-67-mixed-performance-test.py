@@ -302,8 +302,11 @@ class SchemaParity(unittest.TestCase):
                    (pins["r2"], pins["import"]))
         db.execute("INSERT INTO semantic_projection_documents VALUES(?,'scip-typescript','javascript','js/a.js',0)",
                    (pins["r2"],))
+        target_sid = b"\x01" * 16
+        db.execute("INSERT INTO native_version_declarations(vid,syntax_id,kind,role,name,lookup_key,key_signature_present,key_ordinal,start_byte,end_byte,name_start,name_end) "
+                   "VALUES(2,?,'function','production','b','b',0,0,0,10,1,2)", (target_sid,))
         db.execute("INSERT INTO semantic_projection_dependencies VALUES(?,'javascript','js/b.js','term-b')", (payload_id,))
-        db.execute("INSERT INTO semantic_projection_dependency_targets VALUES(?,'javascript','js/b.js',?,1)", (payload_id, bytes(16)))
+        db.execute("INSERT INTO semantic_projection_dependency_targets VALUES(?,'javascript','js/b.js',?,1)", (payload_id, target_sid))
         db.execute("INSERT INTO semantic_projection_contexts VALUES(?)", (payload_id,))
         db.execute("INSERT INTO semantic_projection_lookup_dependencies VALUES(?,'lookup')", (payload_id,))
         db.execute("INSERT INTO semantic_payloads VALUES(?,NULL,'scip-typescript','1','javascript','js/a.js','version-old',1,NULL)",
@@ -315,7 +318,7 @@ class SchemaParity(unittest.TestCase):
         db.execute("INSERT INTO semantic_projection_documents VALUES(?,'scip-typescript','javascript','js/a.js',0)",
                    (pins["r1"],))
         db.execute("INSERT INTO semantic_projection_dependencies VALUES(?,'javascript','js/b.js','term-old')", (payload_id + 1,))
-        db.execute("INSERT INTO semantic_projection_dependency_targets VALUES(?,'javascript','js/b.js',?,0)", (payload_id + 1, bytes(16)))
+        db.execute("INSERT INTO semantic_projection_dependency_targets VALUES(?,'javascript','js/b.js',?,0)", (payload_id + 1, target_sid))
         db.execute("INSERT INTO semantic_projection_contexts VALUES(?)", (payload_id + 1,))
         db.execute("INSERT INTO semantic_projection_lookup_dependencies VALUES(?,'old-lookup')", (payload_id + 1,))
         report = {"producerId": "scip-typescript", "identityKind": "executable",

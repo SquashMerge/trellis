@@ -741,7 +741,7 @@ fn sqlite_snapshot(
         .unwrap();
     // Check exact schema-42 names before comparing evidence and the logical
     // search corpus. FTS shadow bytes depend on publication/merge history.
-    const REQUIRED_V40_TABLES: [&str; 90] = [
+    const REQUIRED_V40_TABLES: [&str; 91] = [
         "class_projections",
         "class_relations",
         "classes",
