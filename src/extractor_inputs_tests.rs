@@ -101,6 +101,14 @@ const NON_NATIVE_SOURCE_PARSERS: &[(&str, &str)] = &[
         "src/interfaces/routes.rs",
         "read-time HTTP interface extraction",
     ),
+    (
+        "src/interfaces/routes/actix.rs",
+        "read-time HTTP interface extraction",
+    ),
+    (
+        "src/interfaces/rust_calls.rs",
+        "read-time HTTP interface extraction",
+    ),
     ("src/metrics.rs", "read-time code metrics"),
     (
         "src/semantic_import.rs",

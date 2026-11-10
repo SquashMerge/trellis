@@ -474,6 +474,12 @@ A server route with `method` `ANY` answers every method. Such routes are express
 
 **Evidence, never proof.** Two things are not extracted: a route whose mount, prefix or path cannot be read, and a client call whose base URL is an absolute URL. Their absence, like an unmatched call, proves nothing.
 
+## Interface evidence amendment: Rust actix-web and reqwest (#858)
+
+**Status: owner-ratified 2026-11-09 under the owner's decision that the endpoints of the other platforms ship in 0.2 ([#686](https://github.com/SquashMerge/trellis/issues/686), [#858](https://github.com/SquashMerge/trellis/issues/858)), with evidence wording amendments approved.** It adds matching sources to the #788 and #855 amendments; the evidence kind, the fields, the four values and their precedence are unchanged.
+
+Server templates also come from Rust actix-web route attributes and route builders, with their `web::scope` prefixes. Client paths also come from Rust `reqwest` calls whose URL is statically readable. A `reqwest` call adds no prefix of its own (no wrapper prefix, configured prefix or base URL), so its match is never `wrapperInferred`. A `reqwest` call whose URL or method cannot be read is `unresolved`. As before, a missing match proves nothing.
+
 ## Owner-ratified native-v9 correction: Java varargs
 
 **Status: owner-ratified 2026-10-24 (#279).** This narrow Java measurement ruling is approved independently; the #279 capability and reference amendments above are also ratified by the owner, 2026-10-24.

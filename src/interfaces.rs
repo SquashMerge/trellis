@@ -8,6 +8,7 @@ mod js_routes;
 #[cfg(test)]
 mod js_tests;
 mod routes;
+mod rust_calls;
 
 use crate::native_evidence::{Declaration, DeclarationRole, DocumentKey, Range};
 use crate::references::{DocumentInput, Snapshot, callers::Caller, work::Work};
@@ -94,7 +95,8 @@ pub(crate) enum ClientPrefix {
     Joined,
 }
 
-/// One call a client makes to a server route: a request wrapper, `fetch` or axios.
+/// One call a client makes to a server route: a request wrapper, `fetch`, axios, or a Rust
+/// `reqwest` call (#858), which is always [`ClientPrefix::Written`].
 #[derive(Clone)]
 pub(crate) struct ClientCall {
     /// `None` when the method cannot be read.
@@ -162,7 +164,8 @@ pub(crate) fn extract(
             })
             .map(|f| f.route),
     );
-    let calls = calls::extract(&world, &configured, apps, &mut budget)?;
+    let mut calls = calls::extract(&world, &configured, apps, &mut budget)?;
+    calls.extend(rust_calls::extract(snapshot, work, check)?);
     let matched = calls::resolve(&routes, &calls, work, check)?;
     let mut callees: Vec<String> = calls::built_in().into_iter().map(|w| w.callee).collect();
     callees.extend(["fetch".to_owned(), "axios".to_owned()]);

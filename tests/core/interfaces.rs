@@ -592,6 +592,83 @@ fn main() {}
     assert_eq!(routes, ["/api/data"], "{rows:#?}");
 }
 
+/// #858: an actix-web server and a reqwest client, each its own Cargo app. Both one-sided
+/// lists are reported against the pair, and a reqwest call never takes the wrapper prefix.
+#[test]
+fn an_actix_server_and_a_reqwest_client_are_an_interface() {
+    let rules = "version = 1\n\
+[layers.server]\napp = 'api'\norder = 1\npaths = ['server/**']\n\
+[layers.client]\napp = 'cli'\norder = 1\npaths = ['tool/**']\n";
+    let server = r#"
+use actix_web::{get, web, App};
+#[get("/health")]
+async fn health() {}
+async fn show() {}
+async fn unused() {}
+fn app() -> App {
+    App::new().service(health).service(
+        web::scope("/api")
+            .service(web::resource("/users/{id}").route(web::get().to(show)))
+            .route("/unused", web::post().to(unused)),
+    )
+}
+fn main() {}
+"#;
+    let client = r#"
+use reqwest::Client;
+const BASE: &str = "http://localhost:8080";
+pub async fn run(client: &Client, id: u32) {
+    client.get(format!("{BASE}/health")).send().await;
+    client.get(format!("{BASE}/api/users/{id}")).send().await;
+    client.get(format!("{BASE}/api/missing")).send().await;
+}
+fn main() {}
+"#;
+    let published = publish(&[
+        (".trellis/rules.toml", rules),
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"server\", \"tool\"]\n",
+        ),
+        ("server/Cargo.toml", "[package]\nname = \"api\"\n"),
+        ("server/src/main.rs", server),
+        ("tool/Cargo.toml", "[package]\nname = \"cli\"\n"),
+        ("tool/src/main.rs", client),
+    ]);
+    let interfaces = published.summary["interfaces"].as_array().unwrap();
+    assert_eq!(interfaces.len(), 1, "{interfaces:#?}");
+    assert_eq!(
+        (&interfaces[0]["client"], &interfaces[0]["server"]),
+        (&json!("cli"), &json!("api"))
+    );
+    assert_eq!(
+        interfaces[0]["counts"],
+        json!({"matchedRoutes": 2, "callSites": 2, "serverOnly": 1, "clientOnly": 1,
+            "confidence": {"exact": 1, "template": 1, "wrapperInferred": 0, "unresolved": 1}})
+    );
+    let matched = details(&published, &[("list", "matched")], 100);
+    let users = matched
+        .iter()
+        .find(|item| item["entry"]["pathTemplate"] == "/api/users/{id}")
+        .unwrap();
+    assert_eq!(users["entry"]["confidence"], "template");
+    assert_eq!(
+        users["entry"]["handler"]["stableLookupKey"],
+        "server/src/main.rs::show"
+    );
+    let site = &users["entry"]["callSites"][0];
+    assert_eq!(site["document"]["language"], "rust");
+    assert_eq!(site["caller"]["name"], "run");
+    let server_only = details(&published, &[("list", "serverOnly")], 100);
+    assert_eq!(server_only.len(), 1);
+    assert_eq!(server_only[0]["entry"]["method"], "POST");
+    assert_eq!(server_only[0]["entry"]["pathTemplate"], "/api/unused");
+    let client_only = details(&published, &[("list", "clientOnly")], 100);
+    assert_eq!(client_only.len(), 1);
+    assert_eq!(client_only[0]["entry"]["pathTemplate"], "/api/missing");
+    assert_eq!(client_only[0]["entry"]["confidence"], "unresolved");
+}
+
 // #855: JavaScript and TypeScript servers and clients.
 
 const JS_RULES: &str = "version = 1\n\

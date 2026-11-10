@@ -189,6 +189,29 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
   by the table's routes: the literal's prefix plus the arm's suffix, with the arm's method
   (kept only if the registration includes it). Such routes are marked as coming from the
   table, which makes their matches `template`.
+- **actix-web routes (#858).** Read in Rust documents that mention `actix_web` or `web::`:
+  - a route attribute on a function: `#[get("/p")]` (any method above, optionally
+    `actix_web::`-qualified) or `#[route("/p", method = "GET", method = "POST")]`; the handler
+    is the function;
+  - `<App or Scope>.route("/p", R)` and `web::resource("/p").route(R)`, where `R` is
+    `web::<method>().to(h)`, `web::method(Method::M).to(h)` or
+    `web::route().method(Method::M).to(h)`, with other links such as `.guard(..)` between.
+    An `R` without a readable method (`web::route().to(h)`, `resource.to(h)`) is not a route;
+  - prefixes: a registration inside the arguments of a call on a `web::scope("/p")` chain is
+    under `/p`, and scopes nest. A function with a route attribute is under the prefix of
+    each `.service(f)` (or `.service(path::f)`) that names it, in any document, matched by
+    name; with no such registration it is at its own path. A scope whose prefix is not a
+    literal hides the routes under it. A registration counts only on a proven chain: one that
+    starts at `App::new()` (always the root), at an inline `web::scope(..)` or at
+    `web::resource(..)`. Any other receiver, such as a variable bound to a scope, is mounted
+    at an unknown prefix, so nothing registers under it or in its arguments.
+    `.configure(..)` is not followed, and nothing in its callback registers.
+  - the expansion of attributed routes under their prefixes is charged to the work bound
+    before it is built.
+  - `{name:regex}` is read as `{name}`; a last segment `{name:.*}`, `{name:.+}` or
+    `{name}*` as `{*name}`; an unbalanced brace makes the path unreadable and the
+    registration is not a route. Handler identity, exclusions and the one route per method
+    and template rule are as for axum.
 - **Handler identity.** `handler.kind` is `declaration` when the handler names exactly one
   same-document function (the function's span), `closure` otherwise (the span of the handler
   expression), or `dispatchArm` for a table route answered by an arm that does not call
@@ -315,13 +338,33 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
       error: an unknown key, a bad value, both `root` and `app`, the same callee twice for one
       scope, or more than 64 entries. `wrappers.callees` shows what took effect. A `package.json` configures no
       wrapper.
+- **reqwest calls (#858).** Read in Rust documents that mention `reqwest`:
+  `reqwest::get(url)` and `reqwest::blocking::get(url)` (`GET`); `c.get(url)`, `.post`,
+  `.put`, `.delete`, `.patch` and `.head` (the method of the name); and
+  `c.request(Method::M, url)` (method unreadable unless `Method::M` or a path ending in
+  `Method::M`). The receiver `c` must read as a client: a name or field containing `client`
+  in any case, or a `Client::new()` or `Client::builder()` chain. The URL, looked through
+  `&`, is a string literal without escapes, a visible constant, or a `format!` whose
+  substitutions are read where they are a string literal or a visible constant with no
+  format specification (`{x}`, `{}`, `{0}`), and are `{}` otherwise: a fill, width,
+  precision or mode such as `{x:0>3}` or `{:?}` is always `{}`. A visible constant is a
+  `const` or `static` string at the top level of the document, its name declared nowhere
+  else in it (no other `const` or `static`, and no `use` import or alias, parameter,
+  closure parameter, `let`, `match`, `if let`/`while let` or `for` pattern that binds it),
+  read from a call outside every inline `mod`. A glob import (`use a::*`) anywhere below the
+  top level may bind any name, so it makes every constant of the document unreadable; a
+  top-level glob does not, since the top-level item shadows it; any other identifier is
+  unreadable. Each substituted value is charged to the work bound before it is copied. The
+  path is what follows the host of an `http://` or `https://` URL (`/` when there is none), or the text itself when it starts
+  with `/`; a URL that starts with a substitution, or anything else, is unreadable and
+  `unresolved`. The path is cut at `?` or `#` and split as above.
 - **Segment matching.** Methods must be equal, or the route is `ANY`. A literal segment must equal a literal
   segment. A server `{name}` matches exactly one segment, and `{*name}` matches the rest.
   A client substitution segment matches only a server `{name}` or `{*name}`. If nothing
   matches as written, the call is matched again as assembled by the wrapper's prefix:
   `/api/` becomes `/api/checkouts/{root}/`, with `{root}` a substitution segment. That rule
-  applies to the built-in wrappers only. Among the matches the one with the most literal
-  segments wins. Between equal counts, a route that names the method wins over an `ANY`
+  applies to the built-in wrappers only, never to a configured wrapper or a reqwest call.
+  Among the matches the one with the most literal segments wins. Between equal counts, a route that names the method wins over an `ANY`
   route. Any other tie is no match.
 - **Confidence.** `wrapperInferred` when the prefix was needed. Otherwise `template` when the
   call used a client substitution, or the route has a server `{name}` or `{*name}`, came

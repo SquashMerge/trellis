@@ -1,5 +1,6 @@
 //! Client calls: JavaScript and TypeScript request wrappers, `fetch` and axios (#788, #855),
-//! and the matching of each call to the server route it reaches.
+//! and the matching of each call to the server route it reaches. Rust `reqwest` calls (#858)
+//! are read in `rust_calls` and matched here.
 use super::js::{Base, Budget, Prop, Value, World, arguments, unwrap, verb};
 use super::{
     ANY, ClientCall, ClientPrefix, Confidence, LineIndex, Match, Route, Seg, charge, test_file,
@@ -578,7 +579,7 @@ fn join(prefix: &str, path: &str) -> String {
 
 /// A client path as segments. A segment with a substitution is a `Param`. Only the one
 /// leading `/` is structural: `//health` keeps its empty first segment.
-fn client_segments(template: &str) -> Vec<Seg> {
+pub(super) fn client_segments(template: &str) -> Vec<Seg> {
     let mut parts: Vec<&str> = template
         .strip_prefix('/')
         .unwrap_or(template)
@@ -1098,6 +1099,299 @@ function go(api, request) {
             &mut || Ok(()),
         )
         .unwrap();
+    }
+
+    const ACTIX_SERVER: &str = r#"
+use actix_web::{get, web, App};
+#[get("/health")]
+async fn health() {}
+async fn create() {}
+async fn show() {}
+async fn status() {}
+async fn unused() {}
+fn app() -> App {
+    App::new()
+        .service(health)
+        .service(
+            web::scope("/api")
+                .route("/users", web::post().to(create))
+                .service(web::resource("/users/{id}").route(web::get().to(show)))
+                .route("/checkouts/{root}/status", web::get().to(status))
+                .route("/unused", web::delete().to(unused)),
+        )
+}
+"#;
+
+    const REQWEST_CLIENT: &str = r#"
+use reqwest::{Client, Method};
+const BASE: &str = "http://localhost:8080";
+const HEALTH: &str = "http://localhost:8080/health";
+async fn calls(client: &Client, http_client: Client, id: u32, host: &str, url: String) {
+    client.get("http://localhost:8080/health").send().await;
+    reqwest::get(HEALTH).await;
+    reqwest::blocking::get("/health");
+    http_client.post(format!("{BASE}/api/users")).send().await;
+    client.get(format!("{}/api/users/{}", BASE, id)).send().await;
+    client.get(&format!("{base}/api/users/{id}?full=1", base = BASE)).send().await;
+    client.request(Method::GET, format!("http://{host}/api/users/{id}")).send().await;
+    client.request(reqwest::Method::DELETE, format!("{BASE}/api/unused"));
+    Client::new().get("https://example.test/api/missing").send().await;
+    self.client.get(format!("{}/api/users", host)).send().await;
+    client.get(url).send().await;
+    client.request(verb, "/health");
+    client.get("/api/status");
+}
+"#;
+
+    #[test]
+    fn reqwest_calls_match_actix_routes() {
+        let found = run(&[
+            ("server/src/main.rs", ACTIX_SERVER),
+            ("client/src/lib.rs", REQWEST_CLIENT),
+        ]);
+        let outcomes: Vec<String> = found
+            .calls
+            .iter()
+            .zip(&found.matched)
+            .map(|(call, matched)| {
+                let call_text = format!(
+                    "{} {}",
+                    call.method.as_deref().unwrap_or("?"),
+                    call.path_template.as_deref().unwrap_or("?")
+                );
+                match matched {
+                    Some(m) => format!(
+                        "{call_text} -> {} {:?}",
+                        found.routes[m.route].path_template, m.confidence
+                    ),
+                    None => format!("{call_text} -> unresolved"),
+                }
+            })
+            .collect();
+        assert_eq!(
+            outcomes,
+            [
+                "GET /health -> /health Exact",
+                "GET /health -> /health Exact",
+                "GET /health -> /health Exact",
+                "POST /api/users -> /api/users Exact",
+                "GET /api/users/{} -> /api/users/{id} Template",
+                "GET /api/users/{} -> /api/users/{id} Template",
+                "GET /api/users/{} -> /api/users/{id} Template",
+                "DELETE /api/unused -> /api/unused Exact",
+                "GET /api/missing -> unresolved",
+                "GET ? -> unresolved",
+                "GET ? -> unresolved",
+                "? /health -> unresolved",
+                "GET /api/status -> unresolved",
+            ]
+        );
+        assert!(
+            found
+                .calls
+                .iter()
+                .all(|call| call.prefix == ClientPrefix::Written)
+        );
+        let first = &found.calls[0];
+        assert_eq!(first.lines.start, 6);
+        assert!(first.call_id.is_some());
+        let caller = serde_json::to_value(first.caller.as_ref().unwrap()).unwrap();
+        assert_eq!(caller["name"], "calls");
+    }
+
+    #[test]
+    fn rust_code_that_is_not_a_reqwest_call_is_not_a_client_call() {
+        let lookalikes = r#"
+use reqwest::Client;
+fn f(map: HashMap<String, String>, cache: Cache, client: Client) {
+    map.get("/health");
+    cache.post("/health");
+    client.send("/health");
+    client.get("/health", extra);
+    other::get("/health");
+}
+#[cfg(feature = "test-support")]
+fn support(client: Client) { client.get("/health"); }
+#[cfg(test)]
+mod tests {
+    fn t(client: Client) { client.get("/health"); }
+}
+"#;
+        let no_reqwest = "fn g(client: Http) { client.get(\"/health\"); }";
+        let in_tests = "use reqwest::Client;\nfn t(client: Client) { client.get(\"/health\"); }";
+        let found = run(&[
+            ("server/src/main.rs", ACTIX_SERVER),
+            ("client/src/lib.rs", lookalikes),
+            ("client/src/plain.rs", no_reqwest),
+            ("client/tests/api.rs", in_tests),
+        ]);
+        assert!(found.calls.is_empty(), "{}", found.calls.len());
+        assert!(!found.routes.is_empty());
+    }
+
+    #[test]
+    fn an_exhausted_budget_while_reading_reqwest_calls_is_typed() {
+        let shot = snapshot(&[("client/src/lib.rs", REQWEST_CLIENT)]);
+        let mut work = Work::new(REQWEST_CLIENT.len() - 1);
+        let error = crate::interfaces::rust_calls::extract(&shot, &mut work, &mut || Ok(()))
+            .err()
+            .unwrap();
+        assert_eq!(error.to_string(), crate::interfaces::BUDGET);
+        // The source, then each substituted constant or literal (#867 review).
+        let substituted = "http://localhost:8080/health".len() + 4 * "http://localhost:8080".len();
+        let mut work = Work::new(REQWEST_CLIENT.len() + substituted);
+        assert_eq!(
+            crate::interfaces::rust_calls::extract(&shot, &mut work, &mut || Ok(()))
+                .unwrap()
+                .len(),
+            13
+        );
+        let mut work = Work::new(REQWEST_CLIENT.len() + substituted - 1);
+        let error = crate::interfaces::rust_calls::extract(&shot, &mut work, &mut || Ok(()))
+            .err()
+            .unwrap();
+        assert_eq!(error.to_string(), crate::interfaces::BUDGET);
+    }
+
+    /// The `(method, path)` each reqwest call of `client` reads as.
+    fn reqwest_paths(client: &str) -> Vec<String> {
+        run(&[("client/src/lib.rs", client)])
+            .calls
+            .iter()
+            .map(|call| {
+                format!(
+                    "{} {}",
+                    call.method.as_deref().unwrap_or("?"),
+                    call.path_template.as_deref().unwrap_or("?")
+                )
+            })
+            .collect()
+    }
+
+    /// #867 review P1: a `format!` that repeats a constant expands past the budget although
+    /// its source is small. The expansion is charged before it is built.
+    #[test]
+    fn a_format_expansion_over_the_budget_is_typed_bounded_work() {
+        let client = format!(
+            "use reqwest::Client;\nconst P: &str = \"{}\";\nfn f(client: Client) {{ client.get(format!(\"http://h/{}\")); }}\n",
+            "a".repeat(1000),
+            "{P}".repeat(50)
+        );
+        let shot = snapshot(&[("client/src/lib.rs", &client)]);
+        let error = crate::interfaces::rust_calls::extract(
+            &shot,
+            &mut Work::new(client.len() * 4),
+            &mut || Ok(()),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.to_string(), crate::interfaces::BUDGET);
+        let calls =
+            crate::interfaces::rust_calls::extract(&shot, &mut Work::new(usize::MAX), &mut || {
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            calls[0].path_template.as_ref().unwrap().len(),
+            1 + 50 * 1000
+        );
+    }
+
+    /// #867 review P2: a constant is read only where it is in scope at the call.
+    #[test]
+    fn a_constant_out_of_scope_at_the_call_is_unresolved() {
+        let client = r#"
+use reqwest::Client;
+const VISIBLE: &str = "http://localhost/visible";
+mod unrelated {
+    const URL: &str = "http://localhost/health";
+    const BASE: &str = "http://localhost";
+}
+fn run(client: &Client, URL: &str, BASE: &str) {
+    client.get(URL);
+    client.get(format!("{BASE}/x"));
+    client.get(VISIBLE);
+}
+mod inner {
+    fn nested(client: &reqwest::Client) { client.get(super::VISIBLE); client.get(VISIBLE); }
+}
+"#;
+        assert_eq!(
+            reqwest_paths(client),
+            ["GET ?", "GET ?", "GET /visible", "GET ?", "GET ?"]
+        );
+    }
+
+    /// #867 review (residual P2): any other binding of the name anywhere in the document, an
+    /// import or a pattern, makes the top-level constant unreadable.
+    #[test]
+    fn a_name_also_bound_by_an_import_or_a_pattern_is_unresolved() {
+        let aliased = r#"
+const URL: &str = "http://localhost/health";
+mod config { pub const OTHER: &str = "http://localhost/actual"; }
+fn run(client: &reqwest::Client) {
+    use crate::config::OTHER as URL;
+    client.get(URL);
+}
+"#;
+        assert_eq!(reqwest_paths(aliased), ["GET ?"]);
+        for binding in [
+            "use crate::config::URL;",
+            "let URL = 1;",
+            "let (a, URL) = (1, 2);",
+            "for URL in [1] {}",
+            "if let Some(URL) = None::<u8> {}",
+            "match 1 { URL => {} }",
+            "let f = |URL: u8| URL;",
+        ] {
+            let client = format!(
+                "const URL: &str = \"http://localhost/health\";\nconst KEPT: &str = \"http://localhost/kept\";\nfn other() {{ {binding} }}\nfn run(client: &reqwest::Client) {{ client.get(URL); client.get(KEPT); }}\n"
+            );
+            assert_eq!(reqwest_paths(&client), ["GET ?", "GET /kept"], "{binding}");
+        }
+    }
+
+    /// #867 review (residual P2): a glob import below the top level may bind any name, so it
+    /// hides every top-level constant. A top-level glob is shadowed by the constant itself.
+    #[test]
+    fn a_glob_import_below_the_top_level_hides_every_constant() {
+        let local = r#"
+const OS: &str = "http://localhost/health";
+const KEPT: &str = "http://localhost/kept";
+fn run(client: &reqwest::Client) {
+    use std::env::consts::*;
+    client.get(OS);
+}
+fn other(client: &reqwest::Client) { client.get(KEPT); }
+"#;
+        assert_eq!(reqwest_paths(local), ["GET ?", "GET ?"]);
+        let top = r#"
+use std::env::consts::*;
+const OS: &str = "http://localhost/health";
+fn run(client: &reqwest::Client) { client.get(OS); }
+"#;
+        assert_eq!(reqwest_paths(top), ["GET /health"]);
+    }
+
+    /// #867 review P2: a substitution with a format specification is not read as its value.
+    #[test]
+    fn a_format_specification_is_a_substitution_not_its_value() {
+        let client = r#"
+use reqwest::Client;
+const ID: &str = "7";
+const BASE: &str = "http://localhost";
+fn run(client: &Client) {
+    client.get(format!("{BASE}/n/{ID:0>3}"));
+    client.get(format!("{BASE}/n/{:?}", ID));
+    client.get(format!("{BASE}/n/{0:.1}", ID));
+    client.get(format!("{BASE:>40}/n"));
+    client.get(format!("{BASE}/n/{ID}"));
+}
+"#;
+        assert_eq!(
+            reqwest_paths(client),
+            ["GET /n/{}", "GET /n/{}", "GET /n/{}", "GET ?", "GET /n/7"]
+        );
     }
 
     #[test]
