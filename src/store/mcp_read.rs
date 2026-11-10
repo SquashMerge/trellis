@@ -540,6 +540,19 @@ impl EvidenceResponse {
         limit: usize,
         expected: Option<IndexPin>,
     ) -> Result<McpFind> {
+        self.mcp_find_in(query, limit, expected, None)
+    }
+
+    /// [`Self::mcp_find`] of only the declarations whose document path is in `files`, when
+    /// given (#851): the first [`APP_FIND_SCAN`] ranked names are filtered, so `has_more` also
+    /// holds when that scan stopped before the ranked names ran out.
+    pub fn mcp_find_in(
+        &self,
+        query: &str,
+        limit: usize,
+        expected: Option<IndexPin>,
+        files: Option<&BTreeSet<String>>,
+    ) -> Result<McpFind> {
         #[cfg(feature = "test-support")]
         if self
             .store
@@ -557,13 +570,30 @@ impl EvidenceResponse {
             "revision conflict: expected basis differs from admitted head"
         );
         let scope = self.mcp_find_scope(&selected, &mut || Ok(()))?;
+        let lookahead = if files.is_some() {
+            APP_FIND_SCAN
+        } else {
+            limit + 1
+        };
         let hits = super::symbol_trigrams::w2_hits(
             &self.db,
             &selected.key,
             query,
-            i64::try_from(limit + 1)?,
+            i64::try_from(lookahead)?,
         )?;
-        let has_more = hits.len() > limit;
+        let stopped = files.is_some() && hits.len() >= lookahead;
+        let hits: Vec<_> = hits
+            .into_iter()
+            .filter(|(version, _)| {
+                files.is_none_or(|files| {
+                    scope
+                        .scopes
+                        .get(version)
+                        .is_some_and(|document| files.contains(&document.key.path))
+                })
+            })
+            .collect();
+        let has_more = hits.len() > limit || stopped;
         self.mcp_hydrate_find(
             &selected,
             &scope,
@@ -734,10 +764,35 @@ impl EvidenceResponse {
         limit: usize,
         expected: Option<IndexPin>,
     ) -> Result<McpFindWithLines> {
-        let found = self.mcp_find(query, limit, expected)?;
+        self.mcp_find_with_lines_in(query, limit, expected, None)
+    }
+
+    /// [`Self::mcp_find_with_lines`] in only the files `files` names, when given (#851).
+    pub fn mcp_find_with_lines_in(
+        &self,
+        query: &str,
+        limit: usize,
+        expected: Option<IndexPin>,
+        files: Option<&BTreeSet<String>>,
+    ) -> Result<McpFindWithLines> {
+        let found = self.mcp_find_in(query, limit, expected, files)?;
         self.mcp_find_lines(found, &mut || Ok(()))
     }
+
+    /// Each document version's path at `pin`, by `vid` (#851): what an `app` filter of
+    /// `trellis_search_symbols` keeps its ranked hits by.
+    pub fn mcp_vid_paths(&self, pin: IndexPin) -> Result<BTreeMap<i64, String>> {
+        let selected = self.selected(Some(pin))?;
+        let mut statement = self.db.prepare(
+            "SELECT vid,path FROM revision_documents WHERE revision_id=?1 AND vid IS NOT NULL",
+        )?;
+        let rows = statement.query_map([&selected.key], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
 }
+
+/// Ranked names an `app` filter of `trellis_find_symbols` scans (#851).
+pub const APP_FIND_SCAN: usize = 500;
 
 pub(super) struct McpFindScope {
     pub counts: [[u64; 5]; 5],

@@ -401,6 +401,7 @@ mod omitted_python_context {
                     max_calls: 20,
                     include_external: true,
                     include_tests: true,
+                    app_paths: None,
                 },
                 Some(pin),
                 &mut || Ok(()),
