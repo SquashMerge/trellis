@@ -1,5 +1,5 @@
 use super::detect::{Declared, Environment, Exe, Resolution, Verification};
-use super::plan::{self, Basis, LimitsRequest, Parts, PlanRequest};
+use super::plan::{self, Basis, LimitsRequest, Parts, PlanRequest, Prepared};
 use super::profiles::{self, Target};
 use super::worktree::{RetainedInputs, RootInput};
 use super::{ProducerName, TrustProfile};
@@ -279,4 +279,154 @@ fn producer_status_survives_the_first_publication_mid_read() {
         status["head"]["indexGeneration"],
         json!(pin.index_generation.to_string())
     );
+}
+
+fn exe(dir: &str, name: &str, digit: char) -> Exe {
+    Exe {
+        path: PathBuf::from(format!("{dir}/{name}")),
+        sha256: digit.to_string().repeat(64),
+        dir: PathBuf::from(dir),
+    }
+}
+
+fn environment() -> Environment {
+    Environment {
+        path: "/r".into(),
+        home: "/h".into(),
+        ..Environment::default()
+    }
+}
+
+/// A rust-analyzer `Prepared` whose root manifest is `cargo_toml`; `edit` changes it before the
+/// plan or the template is taken.
+fn prepared(cargo_toml: &str, edit: impl FnOnce(&mut Prepared)) -> Prepared {
+    let row = profiles::row(
+        Target::Real(ProducerName::RustAnalyzer),
+        TrustProfile::Trusted,
+    )
+    .unwrap();
+    let pin = row.target.pin().unwrap();
+    let resolution = Resolution {
+        launcher: PathBuf::from("/r/rustup"),
+        verification: Verification {
+            method: "executableSha256",
+            observed: pin.version.clone(),
+        },
+        node: None,
+        java: None,
+        java_home: None,
+        rustup: Some(exe("/r", "rustup", '7')),
+        python3: None,
+    };
+    let declared = Declared::new(&environment()).unwrap();
+    let mut basis = basis("revision:v2:a");
+    basis.inputs.config = vec![RootInput {
+        path: "Cargo.toml".into(),
+        bytes: cargo_toml.as_bytes().to_vec(),
+    }];
+    let mut rules = profiles::rules(&row);
+    let settings =
+        super::settings::rust(&mut rules, &basis.inputs, None).expect("the manifest parses");
+    let mut prepared = Prepared {
+        row,
+        pin,
+        resolution,
+        declared,
+        basis,
+        rules,
+        settings,
+        limits: LimitsRequest {
+            timeout_secs: 1800,
+            memory_mib: 8192,
+        },
+    };
+    edit(&mut prepared);
+    prepared
+}
+
+const PLAIN: &str = "[package]\nname = \"a\"\nversion = \"0.1.0\"\n";
+const FEATURED: &str =
+    "[package]\nname = \"a\"\nversion = \"0.1.0\"\n[features]\ndefault = [\"x\"]\nx = []\n";
+
+fn template(prepared: &Prepared) -> String {
+    plan::template_sha256(prepared, &environment())
+}
+
+fn plan_hash(prepared: &Prepared) -> String {
+    plan::plan_sha256(&plan::build(&Parts {
+        workspace: "/w",
+        row: prepared.row,
+        pin: &prepared.pin,
+        resolution: &prepared.resolution,
+        declared: &prepared.declared,
+        stub: None,
+        basis: &prepared.basis,
+        rules: &prepared.rules,
+        settings: &prepared.settings,
+        limits: prepared.limits,
+        run_dir: "/state/runs/{runId}",
+    }))
+}
+
+/// The template follows the approved producer setup, not the checkout's contents or the run
+/// directory: two manifests change the plan hash and the settings, and leave the template.
+#[test]
+fn template_ignores_settings_and_run_paths() {
+    let (plain, featured) = (prepared(PLAIN, |_| {}), prepared(FEATURED, |_| {}));
+    assert_ne!(plain.settings, featured.settings);
+    assert_ne!(plan_hash(&plain), plan_hash(&featured));
+    assert_eq!(template(&plain), template(&featured));
+    assert_eq!(template(&plain).len(), 64);
+
+    let moved = prepared(PLAIN, |p| p.basis.source_revision = "revision:v2:b".into());
+    assert_ne!(plan_hash(&plain), plan_hash(&moved));
+    assert_eq!(template(&plain), template(&moved));
+}
+
+#[test]
+fn template_covers_producer_trust_runtime_environment_limits_generation() {
+    let base = template(&prepared(PLAIN, |_| {}));
+    let changed: Vec<(&str, String)> = vec![
+        (
+            "producer",
+            template(&prepared(PLAIN, |p| p.pin.version.push('x'))),
+        ),
+        (
+            "launcher",
+            template(&prepared(PLAIN, |p| {
+                p.resolution.launcher = PathBuf::from("/r/other")
+            })),
+        ),
+        (
+            "runtime",
+            template(&prepared(PLAIN, |p| {
+                p.resolution.rustup = Some(exe("/r", "rustup", '8'))
+            })),
+        ),
+        (
+            "limits",
+            template(&prepared(PLAIN, |p| p.limits.timeout_secs = 60)),
+        ),
+        (
+            "memory",
+            template(&prepared(PLAIN, |p| p.limits.memory_mib = 64)),
+        ),
+        (
+            "trust",
+            template(&prepared(PLAIN, |p| p.row.trust = TrustProfile::Restricted)),
+        ),
+        (
+            "environment",
+            plan::template_sha256(
+                &prepared(PLAIN, |_| {}),
+                &Environment {
+                    home: "/other".into(),
+                    ..environment()
+                },
+            ),
+        ),
+    ];
+    for (what, hash) in &changed {
+        assert_ne!(&base, hash, "{what} is part of the template");
+    }
 }
