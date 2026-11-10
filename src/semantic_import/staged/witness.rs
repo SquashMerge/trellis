@@ -1,6 +1,6 @@
 //! Bounded original-source reconstruction for the common settlement.
 use super::*;
-use crate::semantic_batch::staging::{WitnessFallback, original_rows_reservation};
+use crate::semantic_batch::staging::WitnessFallback;
 use crate::store::native_first::witness::{CoverageInput, OriginalRow, OriginalSourceWitness};
 
 pub(super) struct Prepared {
@@ -187,14 +187,14 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
         .conn()
         .prepare_cached("SELECT ord FROM sources WHERE language=?1 AND path=?2")?
         .query_row(params![doc.language, doc.path], |r| r.get(0))?;
-    // The typed event storage estimate admits decoded parents, children, indexing maps,
-    // the final claim map and the destination copy before any body is materialized.
-    let bytes = original_rows_reservation(join.conn(), source_ord)?;
-    let reservation = join.ctx.live.reserve(
-        bytes
-            .checked_mul(3)
-            .ok_or_else(|| ScipCaptureError::LimitExceeded("unit expansion".into()))?,
-    )?;
+    // Each event is admitted at the typed per-event decode bound before it is decoded, then
+    // keeps only the owned bytes of what it becomes, as FULL's `sizes` visitors count its rows
+    // (#865). The claim map and the destination copy are admitted at their measured size before
+    // they are built. A whole-document bound of three decode bounds (#826) denied a large
+    // call-sensitive dependent that FULL settles within the same live budget.
+    let mut reservation = join.ctx.live.reserve(0)?;
+    let captured_id = join.captured_id().to_owned();
+    let document_bytes = sizes::document(doc)?;
     let mut symbol_order = Vec::new();
     let mut declaration_order = Vec::new();
     let mut call_order = Vec::new();
@@ -221,7 +221,12 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
         );
         expected += 1;
         let body: String = row.get(1)?;
+        let bound = event_bound(body.len())?;
+        let scratch = join.ctx.live.reserve(bound)?;
         let event: OriginalRow = serde_json::from_str(&body)?;
+        drop(body);
+        reservation.grow(retained_bytes(&event, document_bytes, &captured_id, bound)?)?;
+        drop(scratch);
         match event {
             OriginalRow::Coverage(row) => {
                 anyhow::ensure!(
@@ -478,7 +483,7 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
         return fallback("original source tuple identity differs");
     }
     let mut claimed = BTreeSet::new();
-    let mut raw_for = |id: &str| -> Result<String> {
+    let mut raw_for = |id: &str, reservation: &mut Reservation| -> Result<String> {
         let p = provenance
             .get(id)
             .context("original fact has no provenance")?;
@@ -513,24 +518,38 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
             capture == Some(p.capture_id),
             "original proof capture differs"
         );
+        reservation.grow(sizes::sum(&[
+            sizes::text(&derived.provenance_id),
+            sizes::map_entries::<String, ()>(1)?,
+            sizes::text(id),
+        ])?)?;
         claimed.insert(id.to_owned());
         Ok(derived.provenance_id.clone())
     };
     let mut facts = super::super::JoinedFacts::default();
+    // The ordered rows move out of their decoded maps into these vectors.
+    reservation.grow(sizes::sum(&[
+        sizes::slots::<semantic::Symbol>(symbol_order.len())?,
+        sizes::slots::<semantic::DeclarationBinding>(declaration_order.len())?,
+        sizes::slots::<semantic::Reference>(references.len())?,
+        sizes::slots::<semantic::CallBinding>(call_order.len())?,
+        sizes::slots::<semantic::TypeRelationship>(relationships.len())?,
+    ])?)?;
     for id in symbol_order {
         let mut row = symbols.remove(&id).context("missing ordered symbol")?;
-        row.provenance_id = raw_for(&row.provenance_id)?;
+        row.provenance_id = raw_for(&row.provenance_id, &mut reservation)?;
         facts.symbols.push(row);
     }
     for id in declaration_order {
         let mut row = declarations
             .remove(&id)
             .context("missing ordered declaration")?;
-        row.provenance_id = raw_for(&row.provenance_id)?;
+        row.provenance_id = raw_for(&row.provenance_id, &mut reservation)?;
         facts.declaration_bindings.push(row);
     }
     for mut row in references.into_values() {
-        row.provenance_id = raw_for(&row.provenance_id)?;
+        row.provenance_id = raw_for(&row.provenance_id, &mut reservation)?;
+        reservation.grow(claim_bytes(&row)?)?;
         if facts
             .reference_claims
             .insert(row.provenance_id.clone(), row.clone())
@@ -542,7 +561,7 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
     }
     for id in call_order {
         let mut row = calls.remove(&id).context("missing ordered call")?;
-        row.provenance_id = raw_for(&row.provenance_id)?;
+        row.provenance_id = raw_for(&row.provenance_id, &mut reservation)?;
         if !facts.reference_claims.contains_key(&row.provenance_id) {
             let anchor = &row.join.anchor;
             let mut matches = facts.references.iter().filter(|reference| {
@@ -558,6 +577,12 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
             if matches.next().is_some() {
                 return fallback("ambiguous original fused call reference");
             }
+            reservation.grow(sizes::sum(&[
+                claim_bytes(reference)?,
+                sizes::map_entries::<String, ()>(2)?,
+                sizes::text(&reference.provenance_id),
+                sizes::text(&row.provenance_id),
+            ])?)?;
             let mut reference = reference.clone();
             facts.fused_calls.insert(reference.provenance_id.clone());
             facts.fused_calls.insert(row.provenance_id.clone());
@@ -569,7 +594,7 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
         facts.call_bindings.push(row);
     }
     for mut row in relationships {
-        row.provenance_id = raw_for(&row.provenance_id)?;
+        row.provenance_id = raw_for(&row.provenance_id, &mut reservation)?;
         facts.type_relationships.push(row);
     }
     for (id, p) in &provenance {
@@ -607,6 +632,10 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
             capture == Some(p.capture_id),
             "original fused proof capture differs"
         );
+        reservation.grow(sizes::sum(&[
+            sizes::map_entries::<String, ()>(1)?,
+            sizes::text(&derived.provenance_id),
+        ])?)?;
         facts.fused_proofs.insert(derived.provenance_id.clone());
     }
     if coverage
@@ -614,8 +643,24 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
         .as_ref()
         .is_some_and(|r| r.captured_diagnostics)
     {
+        reservation.grow(sizes::sum(&[
+            sizes::map_entries::<native::DocumentKey, BTreeSet<String>>(1)?,
+            document_bytes,
+        ])?)?;
         facts.diagnostics.insert(doc.clone(), BTreeSet::new());
     }
+    // The destination copy, then the destination revision ID each re-keyed row takes in place
+    // of its captured one (the captured string is not released: conservative).
+    let rekeyed = facts.declaration_bindings.len()
+        + facts.references.len()
+        + facts.reference_claims.len()
+        + facts.call_bindings.len();
+    reservation.grow(sizes::sum(&[
+        sizes::joined_facts(&facts)?,
+        (rekeyed as u64)
+            .checked_mul(sizes::text(join.destination_id()))
+            .ok_or_else(|| ScipCaptureError::LimitExceeded("unit expansion".into()))?,
+    ])?)?;
     let mut destination = facts.clone();
     for row in &mut destination.declaration_bindings {
         row.join.anchor.revision_id = join.destination_id().to_owned();
@@ -641,6 +686,105 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
         destination,
         reservation,
     })
+}
+
+/// The typed per-event decode bound (#826's per-row estimate): a decoded event and its parse
+/// scratch stay within eight times its JSON body plus 512 bytes.
+fn event_bound(body: usize) -> Result<u64> {
+    (body as u64)
+        .checked_mul(8)
+        .and_then(|bytes| bytes.checked_add(512))
+        .ok_or_else(|| ScipCaptureError::LimitExceeded("unit expansion".into()).into())
+}
+
+/// The owned bytes one decoded original event keeps once `prepare` has placed it, counted as
+/// FULL's `sizes` visitors count the row it becomes: its value, its map entry or child slot,
+/// a parent's order slot, and the document and captured revision a reference gains. The few
+/// coverage and basis events of a document keep their decode `bound`.
+fn retained_bytes(event: &OriginalRow, document: u64, revision: &str, bound: u64) -> Result<u64> {
+    use crate::store::native_first::witness::OriginalJoin;
+    let join = |row: &OriginalJoin| -> Result<u64> {
+        sizes::sum(&[
+            sizes::document(&row.document)?,
+            sizes::text(&row.revision_id),
+            sizes::text(&row.content_hash),
+            sizes::optional(&row.diagnostic),
+        ])
+    };
+    let target =
+        |target: &Option<semantic::Target>| target.as_ref().map_or(Ok(0), sizes::target_payload);
+    let string = |value: &str| sizes::sum(&[sizes::slots::<String>(1)?, sizes::text(value)]);
+    match event {
+        OriginalRow::Coverage(_) | OriginalRow::Basis(_) => Ok(bound),
+        OriginalRow::CoverageRole { .. } | OriginalRow::ReferenceRole { .. } => {
+            sizes::slots::<semantic::Role>(1)
+        }
+        OriginalRow::BasisLookupDependency { key, .. } => string(key),
+        OriginalRow::Provenance(row) => sizes::sum(&[
+            sizes::map_entries::<String, crate::store::native_first::witness::OriginalProvenance>(
+                1,
+            )?,
+            sizes::text(&row.id),
+            sizes::text(&row.id),
+            sizes::text(&row.content_hash),
+            sizes::text(&row.derived_from.provenance_id),
+            sizes::text(&row.derived_from.fact_digest),
+        ]),
+        OriginalRow::Symbol(row) => sizes::sum(&[
+            sizes::slots::<i64>(1)?,
+            sizes::map_entries::<i64, semantic::Symbol>(1)?,
+            sizes::symbol_key(&row.key)?,
+            sizes::optional(&row.display_name),
+            sizes::text(&row.provenance_id),
+        ]),
+        OriginalRow::SymbolTarget { target, .. }
+        | OriginalRow::ReferenceCandidate { target, .. }
+        | OriginalRow::CallCandidate { target, .. }
+        | OriginalRow::CallDispatch { target, .. } => sizes::target(target),
+        OriginalRow::DeclarationBinding(row) => sizes::sum(&[
+            sizes::slots::<i64>(1)?,
+            sizes::map_entries::<i64, semantic::DeclarationBinding>(1)?,
+            sizes::optional(&row.syntax_id),
+            join(&row.join)?,
+            sizes::text(&row.provenance_id),
+        ]),
+        OriginalRow::DeclarationSymbol { key, .. } => sizes::sum(&[
+            sizes::slots::<semantic::SymbolKey>(1)?,
+            sizes::symbol_key(key)?,
+        ]),
+        OriginalRow::DeclarationCandidate { id, .. }
+        | OriginalRow::CallJoinCandidate { id, .. } => string(id),
+        OriginalRow::Reference(row) => sizes::sum(&[
+            sizes::map_entries::<String, semantic::Reference>(1)?,
+            sizes::text(&row.id),
+            sizes::text(&row.id),
+            sizes::text(&row.owner_syntax_id),
+            document,
+            sizes::text(revision),
+            sizes::text(&row.spelling),
+            sizes::text(&row.lookup_key),
+            target(&row.declared_target)?,
+            sizes::text(&row.provenance_id),
+        ]),
+        OriginalRow::CallBinding(row) => sizes::sum(&[
+            sizes::slots::<i64>(1)?,
+            sizes::map_entries::<i64, semantic::CallBinding>(1)?,
+            sizes::optional(&row.call_id),
+            join(&row.join)?,
+            target(&row.declared_target)?,
+            sizes::text(&row.provenance_id),
+        ]),
+        OriginalRow::TypeRelationship { row, .. } => sizes::type_relationship(row),
+    }
+}
+
+/// The owned bytes of one reference row copied into the claim map, with its key.
+fn claim_bytes(row: &semantic::Reference) -> Result<u64> {
+    sizes::sum(&[
+        sizes::map_entries::<String, semantic::Reference>(1)?,
+        sizes::text(&row.provenance_id),
+        sizes::reference(row)? - std::mem::size_of::<semantic::Reference>() as u64,
+    ])
 }
 
 /// Whether `doc` is copied from its published basis (#669 H1): the join neither settles it
