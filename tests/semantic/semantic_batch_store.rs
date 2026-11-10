@@ -9425,15 +9425,11 @@ fn a_later_producer_fallback_keeps_earlier_producer_copies() {
     js.artifact("javascript", vec![a, b]);
     let js = world.write(&js);
     drop(world.publish(&js).unwrap());
-    // One native publication: C changes (Rust A and B are copied); JavaScript B changes, so
-    // JavaScript A is a pending dependent the witness settles, over the limit.
+    // One native publication: C changes (Rust A and B are copied); JavaScript B's `target`
+    // is renamed, so JavaScript A is a pending dependent (its targeted declaration is gone)
+    // the witness settles, over the limit.
     write_files(&world.root, &[("src/c.rs", "fn other() { let _ = 1; }\n")]);
-    let work = local_edit(
-        &world,
-        "src/B.js",
-        "function target(){ }\n// edited\n",
-        &counts,
-    );
+    let work = local_edit(&world, "src/B.js", "function other(){ }\n", &counts);
     assert_eq!(
         work["producerIds"],
         json!(["rust-analyzer", "scip-typescript"]),

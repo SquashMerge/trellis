@@ -697,6 +697,7 @@ semantic_call_possible_dispatch semantic_call_join_candidates semantic_type_rela
 semantic_raw_batches semantic_raw_captures semantic_raw_exclusions semantic_revision_raw_selections
 semantic_raw_proofs semantic_raw_documents semantic_import_reports semantic_reimport
 semantic_projection_origins semantic_projection_documents semantic_projection_dependencies
+semantic_projection_dependency_targets
 semantic_projection_contexts semantic_projection_lookup_dependencies
 semantic_pending_target semantic_pending_selections semantic_catchup_commits
 """.split())
@@ -764,8 +765,8 @@ def selected_where(table):
     elif table in {"semantic_payloads", "semantic_basis", "semantic_provenance",
                    "semantic_symbols", "semantic_declaration_bindings", "semantic_references",
                    "semantic_call_bindings", "semantic_type_relationships",
-                   "semantic_projection_dependencies", "semantic_projection_contexts",
-                   "semantic_projection_lookup_dependencies",
+                   "semantic_projection_dependencies", "semantic_projection_dependency_targets",
+                   "semantic_projection_contexts", "semantic_projection_lookup_dependencies",
                    "semantic_reference_roles", "semantic_reference_candidates"}:
         return f"payload_id IN ({payloads})"
     elif table in {"semantic_basis_lookup_dependencies"}:
@@ -1374,8 +1375,9 @@ class SelectedView:
             # The key digests root-derived document version IDs and the descriptor digest.
             cells["payload_key"] = None if cells["payload_key"] is None else "<payload-key>"
             cells["version_id"] = "<document-version>"
-        if table == "semantic_projection_dependencies":
-            cells["version_id"] = "<document-version>"
+        if table == "semantic_projection_dependencies" and cells["term"] is not None:
+            # The term digests the dependency's path and syntax IDs, which are root-derived.
+            cells["term"] = "<dependency-term>"
         # A provenance row's position depends on the order its revision's rejoined IDs sort in,
         # which differs between a copy and a FULL rejoin; its identity does not.
         if "provenance_ordinal" in cells:

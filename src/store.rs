@@ -961,8 +961,9 @@ CREATE TABLE semantic_projection_documents(revision_id TEXT NOT NULL,producer_id
 CREATE TABLE semantic_pending_target(singleton INTEGER PRIMARY KEY CHECK(singleton=1),revision_id TEXT NOT NULL REFERENCES native_revisions(id),native_revision_id TEXT NOT NULL,root_id TEXT NOT NULL);
 CREATE TABLE semantic_pending_selections(revision_id TEXT NOT NULL REFERENCES native_revisions(id),producer_id TEXT NOT NULL,batch_id INTEGER NOT NULL REFERENCES semantic_raw_batches(batch_id),captured_pin TEXT NOT NULL REFERENCES native_revisions(id),basis_pin TEXT NOT NULL REFERENCES native_revisions(id),PRIMARY KEY(revision_id,producer_id));
 CREATE TABLE semantic_catchup_commits(revision_id TEXT PRIMARY KEY REFERENCES native_revisions(id),target_revision_id TEXT NOT NULL REFERENCES native_revisions(id));
-CREATE TABLE semantic_projection_dependencies(payload_id INTEGER NOT NULL REFERENCES semantic_payloads(payload_id),language TEXT NOT NULL,path TEXT NOT NULL,version_id TEXT NOT NULL,PRIMARY KEY(payload_id,language,path));
+CREATE TABLE semantic_projection_dependencies(payload_id INTEGER NOT NULL REFERENCES semantic_payloads(payload_id),language TEXT NOT NULL,path TEXT NOT NULL,term TEXT,PRIMARY KEY(payload_id,language,path));
 CREATE INDEX semantic_projection_reverse ON semantic_projection_dependencies(language,path,payload_id);
+CREATE TABLE semantic_projection_dependency_targets(payload_id INTEGER NOT NULL REFERENCES semantic_payloads(payload_id),language TEXT NOT NULL,path TEXT NOT NULL,syntax_id BLOB NOT NULL,call INTEGER NOT NULL CHECK(call IN (0,1)),PRIMARY KEY(payload_id,language,path,syntax_id));
 CREATE TABLE semantic_projection_contexts(payload_id INTEGER PRIMARY KEY REFERENCES semantic_payloads(payload_id));
 CREATE TABLE semantic_projection_lookup_dependencies(payload_id INTEGER NOT NULL REFERENCES semantic_payloads(payload_id),lookup_key TEXT NOT NULL,PRIMARY KEY(payload_id,lookup_key));
 CREATE TABLE semantic_release_candidate_payloads(revision_id TEXT NOT NULL REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,payload_id INTEGER NOT NULL REFERENCES semantic_payloads(payload_id) DEFERRABLE INITIALLY DEFERRED,PRIMARY KEY(revision_id,payload_id));
@@ -8339,12 +8340,13 @@ fn basis_identity(basis: &crate::semantic_evidence::SemanticBasis) -> Result<Vec
 
 /// Writes every coverage tuple of `publication`: a manifest row per document that names a
 /// payload, unless the row is unrequested or omitted with no facts (D1). `batch` is the raw
-/// batch the publication was joined from; only a batch-written payload can be reused.
+/// batch the publication was joined from and the revision it captured; only a batch-written
+/// payload can be reused.
 fn write_import_coverage(
     db: &Connection,
     key: &str,
     publication: &crate::semantic_evidence::SemanticPublication,
-    batch: Option<i64>,
+    batch: Option<(i64, &str)>,
     inputs: &semantic_payload::KeyInputs,
 ) -> Result<()> {
     use crate::semantic_evidence as sem;
@@ -8421,20 +8423,52 @@ fn write_import_coverage(
                 "semantic freshness differs within a basis"
             );
         }
-        let dependencies = semantic_payload::projection_dependencies(&owns, publication);
-        let mut versions = Vec::with_capacity(dependencies.len());
-        for (dep_language, dep_path) in dependencies {
-            let version = document_version_id(db, key, &dep_language, &dep_path)?;
-            selected_ensure!(
-                version.is_some(),
-                "incompatible_index: semantic dependency endpoint missing"
-            );
-            versions.push((dep_language, dep_path, version.unwrap_or_default()));
-        }
         let own_version = document_version_id(db, key, &language, &coverage.document_path)?
             .context("semantic document missing from its revision")?;
-        let payload_key = match batch {
-            Some(batch) if !coverage.reasons.as_ref().is_some_and(|r| r.omitted) => {
+        let keyed = batch.filter(|_| !coverage.reasons.as_ref().is_some_and(|r| r.omitted));
+        let mut dependencies = Vec::new();
+        for ((dep_language, dep_path), targets) in
+            semantic_payload::projection_dependencies(&owns, publication)
+        {
+            selected_ensure!(
+                document_version_id(db, key, &dep_language, &dep_path)?.is_some(),
+                "incompatible_index: semantic dependency endpoint missing"
+            );
+            let own = dep_language == language && dep_path == coverage.document_path;
+            let targets = targets
+                .into_iter()
+                .map(|(syntax_id, call)| {
+                    Ok((
+                        id_codec::encode_sid(&syntax_id)
+                            .context("invalid semantic dependency syntax ID")?,
+                        call,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let term = match keyed {
+                Some((_, captured_pin)) if !own => Some(semantic_payload::dependency_term(
+                    db,
+                    key,
+                    captured_pin,
+                    &dep_language,
+                    &dep_path,
+                    &targets,
+                )?),
+                _ => None,
+            };
+            dependencies.push(semantic_payload::DependencyRecord {
+                language: dep_language,
+                path: dep_path,
+                term,
+                targets,
+            });
+        }
+        let terms: Vec<(String, String, String)> = dependencies
+            .iter()
+            .filter_map(|d| Some((d.language.clone(), d.path.clone(), d.term.clone()?)))
+            .collect();
+        let payload_key = match keyed {
+            Some((batch, _)) => {
                 let (descriptor, captured): (String, String) = query_row_cached(
                     db,
                     "SELECT descriptor_sha256,captured_revision FROM semantic_raw_batches WHERE batch_id=?1",
@@ -8449,10 +8483,10 @@ fn write_import_coverage(
                     &language,
                     &coverage.document_path,
                     &own_version,
-                    &versions,
+                    &terms,
                 )
             }
-            _ => None,
+            None => None,
         };
         let hit: Option<i64> = match &payload_key {
             Some(payload_key) => query_row_cached(
@@ -8504,7 +8538,7 @@ fn write_import_coverage(
                     language,
                     coverage.document_path,
                     own_version,
-                    batch,
+                    batch.map(|(batch, _)| batch),
                     payload_key.as_ref().map(|_| inputs.join_inputs())
                 ],
             )?;
@@ -8516,7 +8550,7 @@ fn write_import_coverage(
                 coverage,
                 publication,
                 &owns,
-                &versions,
+                &dependencies,
             )?;
             (payload, ids)
         };
@@ -8751,6 +8785,7 @@ fn write_staged_semantic(
     key: &str,
     producer: &crate::semantic_evidence::Producer,
     batch: i64,
+    captured_pin: &str,
     inputs: &semantic_payload::KeyInputs,
     gate: &dyn Fn() -> Result<()>,
 ) -> Result<()> {
@@ -8758,7 +8793,7 @@ fn write_staged_semantic(
     db.set_prepared_statement_cache_capacity(64);
     let mut index = 0u64;
     crate::semantic_import::read_staged_documents(db, "stage.", producer, &mut |publication| {
-        write_import_coverage(db, key, &publication, Some(batch), inputs)?;
+        write_import_coverage(db, key, &publication, Some((batch, captured_pin)), inputs)?;
         if index % 1000 == 999 {
             gate()?;
         }
@@ -9049,7 +9084,7 @@ fn write_semantic_tuple(
     coverage: &crate::semantic_evidence::Coverage,
     publication: &crate::semantic_evidence::SemanticPublication,
     owns: &BTreeSet<&str>,
-    versions: &[(String, String, String)],
+    dependencies: &[semantic_payload::DependencyRecord],
 ) -> Result<BTreeMap<String, i64>> {
     for (kind, roles) in [
         ("supported", &coverage.supported_roles),
@@ -9066,12 +9101,32 @@ fn write_semantic_tuple(
     if let Some(reasons) = &coverage.reasons {
         insert_coverage_reasons(db, Some(payload), None, reasons)?;
     }
-    for (language, path, version) in versions {
+    for dependency in dependencies {
         execute_cached(
             db,
             "INSERT INTO semantic_projection_dependencies VALUES(?1,?2,?3,?4)",
-            params![payload, language, path, version],
+            params![
+                payload,
+                dependency.language,
+                dependency.path,
+                dependency.term
+            ],
         )?;
+        for (syntax_id, call) in &dependency.targets {
+            if dependency.term.is_some() {
+                execute_cached(
+                    db,
+                    "INSERT INTO semantic_projection_dependency_targets VALUES(?1,?2,?3,?4,?5)",
+                    params![
+                        payload,
+                        dependency.language,
+                        dependency.path,
+                        syntax_id,
+                        call
+                    ],
+                )?;
+            }
+        }
     }
     let mut basis_ids = BTreeMap::new();
     let mut provenance: BTreeMap<&str, i64> = BTreeMap::new();
@@ -10267,6 +10322,7 @@ fn validate_v8_bootstrap(db: &Connection) -> Result<()> {
         "semantic_projection_origins",
         "semantic_projection_documents",
         "semantic_projection_dependencies",
+        "semantic_projection_dependency_targets",
         "semantic_projection_lookup_dependencies",
         "semantic_projection_contexts",
         "semantic_release_candidate_payloads",
@@ -14956,6 +15012,7 @@ impl Store {
             &next_key,
             &producer,
             batch_id,
+            &captured_key,
             &self.payload_key_inputs(),
             &gate,
         )?;

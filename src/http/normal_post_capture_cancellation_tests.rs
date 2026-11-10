@@ -38,7 +38,7 @@ fn pair_snapshot(index: &std::path::Path) -> PairSnapshot {
             .unwrap();
     assert_eq!(
         tables.len(),
-        90,
+        91,
         "compare exact schema-42 derived evidence inventory"
     );
     let expected = vec![
@@ -111,6 +111,7 @@ fn pair_snapshot(index: &std::path::Path) -> PairSnapshot {
         "semantic_producers",
         "semantic_projection_contexts",
         "semantic_projection_dependencies",
+        "semantic_projection_dependency_targets",
         "semantic_projection_documents",
         "semantic_projection_lookup_dependencies",
         "semantic_projection_origins",
