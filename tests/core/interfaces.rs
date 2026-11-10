@@ -190,7 +190,7 @@ fn dto_shape_and_end_layers() {
     );
     assert_eq!(
         interface["wrappers"],
-        json!({"callees": ["api", "request", "api.request", "owner.request"],
+        json!({"callees": ["api", "request", "api.request", "owner.request", "fetch", "axios"],
             "prefix": {"client": "/api/", "server": "/api/checkouts/{root}/"}})
     );
     assert_eq!(
@@ -590,4 +590,240 @@ fn main() {}
         .map(|item| item["entry"]["pathTemplate"].as_str().unwrap())
         .collect();
     assert_eq!(routes, ["/api/data"], "{rows:#?}");
+}
+
+// #855: JavaScript and TypeScript servers and clients.
+
+const JS_RULES: &str = "version = 1\n\
+[layers.api]\napp = 'api'\norder = 1\npaths = ['api/**']\n\
+[layers.web]\napp = 'web'\norder = 1\npaths = ['web/**']\n\
+[layers.site]\napp = 'site'\norder = 1\npaths = ['site/**']\n";
+
+const JS_API: &str = r#"
+const express = require("express");
+const app = express();
+const users = express.Router();
+function listUsers(req, res) {}
+function showUser(req, res) {}
+users.get("/", listUsers);
+users.get("/:id", showUser);
+app.use("/api/users", users);
+app.post("/api/audit", (req, res) => {});
+module.exports = app;
+"#;
+
+const JS_SITE_ROUTE: &str = "export async function GET(request) { return Response.json([]); }\n";
+
+const JS_WEB: &str = r#"
+import axios from "axios";
+const http = axios.create({ baseURL: "/api" });
+export async function load(id) {
+  await fetch("/api/users");
+  await http.get(`/users/${id}`);
+  await fetch("/products/7");
+  await axios.delete("/api/users/7");
+}
+"#;
+
+fn js_apps(api: &str) -> Published {
+    publish(&[
+        (".trellis/rules.toml", JS_RULES),
+        (
+            "api/package.json",
+            "{\"name\":\"api\",\"dependencies\":{\"express\":\"4.21.0\"}}\n",
+        ),
+        ("api/server.js", api),
+        (
+            "site/package.json",
+            "{\"name\":\"site\",\"dependencies\":{\"next\":\"15.0.0\"}}\n",
+        ),
+        ("site/app/products/[id]/route.js", JS_SITE_ROUTE),
+        (
+            "web/package.json",
+            "{\"name\":\"web\",\"dependencies\":{\"axios\":\"1.7.0\"}}\n",
+        ),
+        ("web/client.js", JS_WEB),
+    ])
+}
+
+/// A browser client reaches an express server and a Next.js app: one interface per pair,
+/// each with its own confidence counts, and both one-sided lists.
+#[test]
+fn a_javascript_client_reaches_express_and_next_servers() {
+    let published = js_apps(JS_API);
+    let interfaces = published.summary["interfaces"].as_array().unwrap();
+    let pairs: Vec<(&str, &str)> = interfaces
+        .iter()
+        .map(|i| (i["client"].as_str().unwrap(), i["server"].as_str().unwrap()))
+        .collect();
+    assert_eq!(pairs, [("web", "api"), ("web", "site")], "{interfaces:#?}");
+    let api = &interfaces[0];
+    assert_eq!(
+        api["counts"],
+        json!({"matchedRoutes": 2, "callSites": 2, "serverOnly": 1, "clientOnly": 1,
+            "confidence": {"exact": 1, "template": 0, "wrapperInferred": 1, "unresolved": 1}})
+    );
+    assert!(
+        api["wrappers"]["callees"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("axios"))
+    );
+    let site = &interfaces[1];
+    assert_eq!(site["counts"]["matchedRoutes"], 1);
+    assert_eq!(site["counts"]["confidence"]["template"], 1);
+
+    let matched = details(
+        &published,
+        &[("client", "web"), ("server", "api"), ("list", "matched")],
+        10,
+    );
+    let entries: Vec<(&str, &str, &str, &str)> = matched
+        .iter()
+        .map(|item| {
+            let entry = &item["entry"];
+            (
+                entry["method"].as_str().unwrap(),
+                entry["pathTemplate"].as_str().unwrap(),
+                entry["confidence"].as_str().unwrap(),
+                entry["handler"]["stableLookupKey"].as_str().unwrap_or("-"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        entries,
+        [
+            ("GET", "/api/users", "exact", "api/server.js::listUsers"),
+            (
+                "GET",
+                "/api/users/{id}",
+                "wrapperInferred",
+                "api/server.js::showUser"
+            ),
+        ]
+    );
+    // One-sided, both ways: the server's unmatched route, and the client's call with no route.
+    let server_only = details(
+        &published,
+        &[("client", "web"), ("server", "api"), ("list", "serverOnly")],
+        10,
+    );
+    assert_eq!(server_only.len(), 1);
+    assert_eq!(server_only[0]["entry"]["method"], "POST");
+    assert_eq!(server_only[0]["entry"]["pathTemplate"], "/api/audit");
+    let client_only = details(
+        &published,
+        &[("client", "web"), ("server", "api"), ("list", "clientOnly")],
+        10,
+    );
+    assert_eq!(client_only.len(), 1);
+    assert_eq!(client_only[0]["entry"]["method"], "DELETE");
+    assert_eq!(client_only[0]["entry"]["pathTemplate"], "/api/users/7");
+    assert_eq!(client_only[0]["entry"]["confidence"], "unresolved");
+    let site_matched = details(
+        &published,
+        &[("client", "web"), ("server", "site"), ("list", "matched")],
+        10,
+    );
+    assert_eq!(site_matched[0]["entry"]["pathTemplate"], "/products/{id}");
+    assert_eq!(site_matched[0]["entry"]["handler"]["kind"], "declaration");
+}
+
+/// Negative control: the same server source without the express import registers nothing, so
+/// the web app's only interface is with the Next.js app.
+#[test]
+fn a_server_without_a_framework_import_has_no_routes() {
+    let published = js_apps(&JS_API.replace("require(\"express\")", "require(\"./local\")"));
+    let interfaces = published.summary["interfaces"].as_array().unwrap();
+    let pairs: Vec<(&str, &str)> = interfaces
+        .iter()
+        .map(|i| (i["client"].as_str().unwrap(), i["server"].as_str().unwrap()))
+        .collect();
+    assert_eq!(pairs, [("web", "site")], "{interfaces:#?}");
+}
+
+/// #855 on Trellis itself: with `fetch`, axios and the JavaScript frameworks read, every
+/// JavaScript and TypeScript source under `web/` and `herdr-mod/` and every build manifest the
+/// capture walk admits still give exactly one interface, `trellis-web` to `trellis`.
+#[test]
+fn trellis_whole_web_client_still_has_one_interface() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut owned: Vec<(String, String)> = Vec::new();
+    let walk = ignore::WalkBuilder::new(root)
+        .require_git(false)
+        .follow_links(false)
+        .hidden(true)
+        .parents(false)
+        .git_global(false)
+        .git_exclude(false)
+        .filter_entry(|entry| {
+            !matches!(
+                entry.file_name().to_str(),
+                Some(".git" | "node_modules" | ".venv" | "target" | "dist" | "build")
+            )
+        })
+        .build();
+    for entry in walk {
+        let entry = entry.unwrap();
+        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let relative = entry.path().strip_prefix(root).unwrap().to_str().unwrap();
+        let name = entry.file_name().to_str().unwrap_or_default();
+        let source = (relative.starts_with("web/") || relative.starts_with("herdr-mod/"))
+            && [".js", ".mjs", ".cjs", ".ts"]
+                .iter()
+                .any(|ext| name.ends_with(ext));
+        let manifest = matches!(name, "Cargo.toml" | "package.json" | "pyproject.toml");
+        if source || manifest {
+            owned.push((
+                relative.to_owned(),
+                fs::read_to_string(entry.path()).unwrap(),
+            ));
+        }
+    }
+    let stubs: Vec<(String, String)> = owned
+        .iter()
+        .filter_map(|(path, text)| {
+            if let Some(dir) = path.strip_suffix("pyproject.toml") {
+                return Some((format!("{dir}stub.py"), "A = 1\n".to_owned()));
+            }
+            let dir = path.strip_suffix("Cargo.toml")?;
+            text.contains("[package]")
+                .then(|| (format!("{dir}src/main.rs"), "fn main() {}\n".to_owned()))
+        })
+        .collect();
+    owned.extend(stubs);
+    for path in [".trellis/rules.toml", "src/http.rs"] {
+        owned.push((
+            path.to_owned(),
+            fs::read_to_string(root.join(path)).unwrap(),
+        ));
+    }
+    owned.push((
+        "src/bin/trellis-producer-stub.rs".into(),
+        "fn main() {}\n".into(),
+    ));
+    owned.sort();
+    owned.dedup_by(|a, b| a.0 == b.0);
+    let files: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(path, text)| (path.as_str(), text.as_str()))
+        .collect();
+    let published = publish(&files);
+    let interfaces = published.summary["interfaces"].as_array().unwrap();
+    let pairs: Vec<(&str, &str)> = interfaces
+        .iter()
+        .map(|i| (i["client"].as_str().unwrap(), i["server"].as_str().unwrap()))
+        .collect();
+    assert_eq!(pairs, [("trellis-web", "trellis")], "{interfaces:#?}");
+    // The `api` wrapper's own `fetch` is its implementation, not a call of its own.
+    let client_only = details(&published, &[("list", "clientOnly")], 200);
+    assert!(!client_only.is_empty());
+    assert!(
+        client_only
+            .iter()
+            .all(|item| item["entry"]["callSite"]["caller"]["name"] != "api"),
+        "{client_only:#?}"
+    );
 }

@@ -123,12 +123,14 @@ from `pyproject.toml` ([#807](https://github.com/SquashMerge/trellis/issues/807)
   ```text
   {client,server,kind:"http",
    ends:[{clientLayer:string|null,serverLayer:string|null,routes:UInt,callSites:UInt}],
-   wrappers:{callees:["api","request","api.request","owner.request"],
+   wrappers:{callees:["api","request","api.request","owner.request","fetch","axios",...],
              prefix:{client:"/api/",server:"/api/checkouts/{root}/"}},
    counts:{matchedRoutes,callSites,serverOnly,clientOnly,
            confidence:{exact,template,wrapperInferred,unresolved}}}
   ```
 
+  `wrappers.callees` lists the built-in wrappers, then `fetch` and `axios`, then every
+  wrapper configured in a `package.json` (#855).
   `client` and `server` are app names. An end's app is the app of its file and layer under
   the `bucket` rule's file attribution. `ends[]` groups matched pairs by the layer of the call
   site and the layer of the handler (null sorts last): `routes` counts distinct routes and
@@ -198,7 +200,7 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
   contains the handler (or the named function, for `declaration`), with keys from the
   declaration lookup keys. They are null when no named callable exists.
 - **Client calls.** JavaScript and TypeScript calls to the built-in wrappers (there is no
-  rules-file key):
+  rules-file key; #855 adds `fetch`, axios and `package.json` wrappers, below):
 
   | Callee | Path | Method | Default |
   | --- | --- | --- | --- |
@@ -214,15 +216,92 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
   has a top-level spread and no `method`, or when it is not one of `GET`, `POST`, `PUT`,
   `DELETE`, `PATCH`, `HEAD` or `OPTIONS` (after uppercasing). An unreadable path or method
   never matches and is `unresolved`.
-- **Segment matching.** Methods must be equal. A literal segment must equal a literal
+- **JavaScript and TypeScript server routes (#855).** They are read from production
+  documents.
+  - **App objects.** A route is reached from an app object through its mounts. An app object
+    is a `const`, `let` or `var` binding made by `express()`, `fastify()` (or `Fastify()`) or
+    `new Koa()`, where the callee is imported or required from the `express`, `fastify` or `koa`
+    package. Routers are bindings made by `express.Router()` (or a `Router` imported from
+    `express`) or `new Router()` from `@koa/router` or `koa-router`. A router that no app object
+    reaches registers nothing.
+  - **Registrations.** On an express app or router, `x.get/post/put/delete/patch/head/options`
+    and `x.all`, and the chain `x.route(path).get(h).post(h)`. On fastify, the same methods and
+    `x.route({method, url, handler})`, where `method` is a string or an array of strings. On a
+    Koa router, the same methods, `del`, and the named form `router.get(name, path, h)`. The
+    path is argument 0. It is a string, a template literal or a `+` of them, with `const`
+    bindings and imported constants resolved. The handler is the last argument, or the
+    `handler` of a fastify options object. `all` registers the method `ANY`.
+  - **Mounts.** express `use([path,] ...routers)`. Koa `use([path,] router.routes())`, a
+    router's `prefix` option, and `router.prefix(path)`. fastify
+    `register(plugin, {prefix})`, where the plugin's first parameter is the child object and
+    `fastify-plugin` is looked through. Passing an app or router to a function, such as
+    `routes(app)` or `require('./routes')(app)`, makes that parameter the same object. Mounts
+    are followed across relative imports and `require`, through `module.exports`,
+    `exports.name` and ESM exports, at most 16 deep.
+  - **Unreadable paths and patterns.** A path or prefix that cannot be read, or that uses
+    pattern syntax (`?`, `+`, `(`, `[`, `{`), registers nothing under it. A `use` whose first
+    argument is a name or member with no readable value mounts nothing.
+  - **Normalisation.** `:name` is read as `{name}`, `*name` as `{*name}` and a bare `*` as
+    `{*}`. The mount prefix and the path are joined with one `/` and no trailing `/`.
+  - **Handlers.** A handler that names a function declaration, or a variable bound to a
+    function, is that `declaration`, even across an import. Any other handler is a
+    `closure`: its own span, inside the named callable around it.
+  - **Next.js.** A `package.json` that depends on `next` (in `dependencies`,
+    `devDependencies` or `peerDependencies`) makes its directory a Next.js root. Under it, or
+    under its `src/`, two kinds of file are routes:
+    - `pages/api/**`, whose default export answers `ANY`;
+    - `app/**/route.(js|jsx|ts|tsx|mjs|cjs)`, whose exported `GET`, `POST`, `PUT`, `PATCH`,
+      `DELETE`, `HEAD` and `OPTIONS` (declarations, `const` exports or `export { h as GET }`)
+      each answer their method.
+
+    In the path, `[id]` is `{id}` and `[...rest]` is `{*rest}`. `[[...rest]]` gives two
+    routes, one without the segment and one with `{*rest}`. Route groups `(g)` and slots
+    `@s` are dropped. A segment starting with `_` or `(.` excludes the file, and so does a
+    pages-router file named `_*`. `index` is its directory.
+  - **Duplicates.** JavaScript routes are one per method, template and registering file.
+- **JavaScript and TypeScript clients (#855).** Besides the wrappers above:
+  - `fetch(path, options)`, including `window.fetch`, `globalThis.fetch` and `self.fetch`.
+    The method is the `method` of the options object, as for `request`.
+  - axios: `axios(config)`, `axios(url, config)`, `axios.request(config)`,
+    `axios.get/delete/head/options(url, config)` and `axios.post/put/patch(url, data,
+    config)` (and the `Form` variants). The same calls work on a binding made by
+    `axios.create(config)`. The URL is the argument or the config's `url`. The method is the
+    call's own, or the config's `method`, or `GET`. A `baseURL` in the call's config or the
+    instance's config is joined before the URL. A joined match is `wrapperInferred`. An
+    absolute URL or `baseURL` is not a client call, and an unreadable `baseURL` makes the path
+    unreadable.
+  - **Constants.** Paths read `const` bindings, imported constants, template literals and
+    `+`, with `{}` for any part that cannot be read.
+  - **The wrapper's own call.** A `fetch` or axios call inside a named callable that has a
+    wrapper's name (such as `api`) is the wrapper's own implementation, not a call.
+  - **Configured wrappers.** A `package.json` may configure wrappers for the files under its
+    directory:
+
+    ```json
+    "trellis": {"wrappers": [
+      {"callee": "apiFetch", "method": "options", "at": 1, "prefix": "/api"}
+    ]}
+    ```
+
+    `callee` is an identifier or `object.property` and is required. `method` is
+    `"options"` (the default: `method` in the object literal at argument `at`) or
+    `"argument"` (a string at argument `at`). `at` is 1 to 8, with a default of 1. `prefix`
+    is an optional rooted literal that the wrapper adds to every path; a match through it is
+    `wrapperInferred`. A configured wrapper is matched only as assembled, never through the
+    built-in `/api/` rule, and it replaces a built-in wrapper with the same callee. A list
+    with more than 64 entries, or any invalid entry, configures nothing; `wrappers.callees`
+    shows what took effect.
+- **Segment matching.** Methods must be equal, or the route is `ANY`. A literal segment must equal a literal
   segment. A server `{name}` matches exactly one segment, and `{*name}` matches the rest.
   A client substitution segment matches only a server `{name}` or `{*name}`. If nothing
   matches as written, the call is matched again as assembled by the wrapper's prefix:
-  `/api/` becomes `/api/checkouts/{root}/`, with `{root}` a substitution segment. Among the
-  matches the one with the most literal segments wins, and a tie is no match.
+  `/api/` becomes `/api/checkouts/{root}/`, with `{root}` a substitution segment. That rule
+  applies to the built-in wrappers only. Among the matches the one with the most literal
+  segments wins. Between equal counts, a route that names the method wins over an `ANY`
+  route. Any other tie is no match.
 - **Confidence.** `wrapperInferred` when the prefix was needed. Otherwise `template` when the
-  call used a client substitution, or the route has a server `{name}` or `{*name}`, or came
-  from the dispatch table. Otherwise `exact`. A call with no match is `unresolved`. A route
+  call used a client substitution, or the route has a server `{name}` or `{*name}`, came
+  from the dispatch table or is `ANY`. Otherwise `exact`. A call with no match is `unresolved`. A route
   takes its best call site: `exact`, then `template`, then `wrapperInferred`. The values are
   defined in the contract-v1 amendment.
 - **Exclusions.** Documents whose file module has the `test` role, routes and calls whose
