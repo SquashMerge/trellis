@@ -1131,3 +1131,23 @@ fn an_anchored_regex_mounts_no_include() {
     let escaped = "from django.urls import include, re_path\nurlpatterns = [re_path(r\"^api\\$\", include(\"child\"))]\n";
     assert_eq!(django_urls(escaped, Some(child)), ["ANY /api$x"]);
 }
+
+/// #877 review: a numeric, hex, octal, unicode, named or unknown escape in a character class
+/// may denote `/`, so the group is unreadable. Known escapes are read.
+#[test]
+fn a_class_escape_that_may_denote_a_slash_is_unreadable() {
+    let urls = r#"
+from django.urls import re_path
+from . import views
+urlpatterns = [
+    re_path(r"^a/(?P<part>[\x2f]+)/done$", views.v),
+    re_path(r"^b/(?P<part>[\u002f]+)/done$", views.v),
+    re_path(r"^c/(?P<part>[\057]+)/done$", views.v),
+    re_path(r"^d/(?P<part>[\U0000002f]+)/done$", views.v),
+    re_path(r"^e/(?P<part>[\N{SOLIDUS}]+)/done$", views.v),
+    re_path(r"^f/(?P<part>[/]+)/done$", views.v),
+    re_path(r"^g/(?P<part>[\w-]+)/done$", views.v),
+]
+"#;
+    assert_eq!(django_urls(urls, None), ["ANY /g/{part}/done"]);
+}

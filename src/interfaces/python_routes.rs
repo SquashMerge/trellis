@@ -999,11 +999,15 @@ fn within_segment(body: &str) -> bool {
                         None => return false,
                         Some(']') => break,
                         Some('\\') => {
+                            // Only escapes whose meaning is known: a numeric, hex, octal,
+                            // unicode, named or unknown escape may denote `/` (#877 review).
                             match chars.get(end + 1) {
                                 Some('D' | 'W' | 'S') if !negated => return false,
+                                Some('d' | 'w' | 's' | 'D' | 'W' | 'S') => {}
+                                Some('n' | 't' | 'r' | 'f' | 'v') => {}
                                 Some('/') => escapes_slash = true,
-                                Some(_) => {}
-                                None => return false,
+                                Some(c) if c.is_ascii_punctuation() => {}
+                                _ => return false,
                             }
                             // An escape as a range end point is not read: such a range
                             // may span `/`.
@@ -1140,6 +1144,14 @@ mod tests {
             (r"^a/(?P<x>[!-0]+)$", None),
             (r"^a/(?P<x>[\!-0]+)$", None),
             (r"^a/(?P<x>[\W]+)$", None),
+            (r"^a/(?P<x>[\x2f]+)$", None),
+            (r"^a/(?P<x>[\u002f]+)$", None),
+            (r"^a/(?P<x>[\U0000002f]+)$", None),
+            (r"^a/(?P<x>[\057]+)$", None),
+            (r"^a/(?P<x>[\N{SOLIDUS}]+)$", None),
+            (r"^a/(?P<x>[\q]+)$", None),
+            (r"^a/(?P<x>[\w\.-]+)$", Some("/a/{x}")),
+            (r"^a/(?P<x>[^\t/]+)$", Some("/a/{x}")),
             (r"^a/(?P<x>[^/]+)$", Some("/a/{x}")),
             (r"^a/(?P<x>[a-z0-9_-]+)$", Some("/a/{x}")),
             (r"^a/(?P<x>\d{2,4})$", Some("/a/{x}")),

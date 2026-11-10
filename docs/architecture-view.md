@@ -258,7 +258,9 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
     `{name}` group body must provably never match `/`: literal characters other than `/`,
     `\d`, `\w`, `\s`, escaped punctuation other than `/`, and classes that exclude `/` (a
     positive class with no `/`, no range spanning it and no `\D`, `\W` or `\S`, or a negated
-    class that names `/`), each optionally quantified. Any other regex syntax (such as `.`
+    class that names `/`), each optionally quantified. Inside a class only `\d`, `\w`, `\s`,
+    their negations, `\n`, `\t`, `\r`, `\f`, `\v` and escaped punctuation are read; a
+    numeric, hex, octal, unicode, named or unknown escape may denote `/`. Any other regex syntax (such as `.`
     inside a body, or `[^x]+`), an optional or repeated group, a brace in a Flask or Django
     route, or an unbalanced or unnamed placeholder makes the route unreadable. A `re_path`
     whose regex ends in an unescaped `$` matches only an empty remainder, so an `include`
