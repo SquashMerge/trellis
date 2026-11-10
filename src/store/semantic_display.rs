@@ -1138,11 +1138,13 @@ impl EvidenceResponse {
             // captured basis only, so every proof of one tuple shares it: one proof per
             // tuple is exact for what Trellis published (#261), and avoids scanning the
             // hundreds of thousands of proofs a language can hold on every read. A tuple
-            // without proofs (an empty fact set) is valid and adds nothing.
+            // without proofs (an empty fact set) is valid and adds nothing; a proof without
+            // its required freshness row is corruption.
             let mut statement = self.db.prepare_cached(
-                "SELECT (SELECT f.freshness FROM semantic_coverage_freshness f
-                         JOIN semantic_provenance p ON p.payload_id=c.payload_id AND p.basis_id=f.basis_id
-                         WHERE f.revision_id=c.revision_id AND f.tuple_id=c.tuple_id
+                "SELECT (SELECT COALESCE(f.freshness,'missing') FROM semantic_provenance p
+                         LEFT JOIN semantic_coverage_freshness f
+                           ON f.revision_id=c.revision_id AND f.tuple_id=c.tuple_id AND f.basis_id=p.basis_id
+                         WHERE p.payload_id=c.payload_id
                          ORDER BY p.ordinal LIMIT 1)
                  FROM semantic_coverage c
                  WHERE c.revision_id=?1 AND c.producer_id=?2 AND c.language=?3 AND c.selected=1
@@ -1595,22 +1597,22 @@ pub(super) fn architecture_semantic(
     let mut calls = db.prepare_cached(
         "SELECT b.call_id,b.join_start,b.join_end,b.resolution,b.declared_kind,
                 b.declared_internal_syntax_id,b.declared_internal_language,b.declared_internal_path,
-                b.dispatch,b.stale_target,b.provenance_ordinal,b.binding_id,b.join_status,b.join_kind,b.join_document_language,b.join_document_path,COALESCE(b.join_native_revision_id,?6)
+                b.dispatch,b.stale_target,b.provenance_ordinal,b.binding_id,b.join_status,b.join_kind,b.join_document_language,b.join_document_path,COALESCE(b.join_native_revision_id,?6),p.basis_id
          FROM semantic_call_bindings b
          JOIN semantic_provenance p ON p.payload_id=b.payload_id AND p.ordinal=b.provenance_ordinal
-         JOIN semantic_coverage_freshness f ON f.revision_id=?5 AND f.tuple_id=?7 AND f.basis_id=p.basis_id
-         WHERE b.payload_id=?1 AND b.call_id IS NOT NULL AND (?4 OR f.freshness='fresh')
+         LEFT JOIN semantic_coverage_freshness f ON f.revision_id=?5 AND f.tuple_id=?7 AND f.basis_id=p.basis_id
+         WHERE b.payload_id=?1 AND b.call_id IS NOT NULL AND (?4 OR f.basis_id IS NULL OR f.freshness='fresh')
            AND b.join_document_language=?2 AND b.join_document_path=?3",
     )?;
     let mut references = db.prepare_cached(
         "SELECT r.start_byte,r.end_byte,r.resolution,r.declared_internal_syntax_id,
                 r.declared_internal_language,r.declared_internal_path,r.provenance_ordinal,
                 EXISTS(SELECT 1 FROM semantic_reference_roles o
-                       WHERE o.payload_id=r.payload_id AND o.reference_id=r.reference_id AND o.role='type'),r.reference_id
+                       WHERE o.payload_id=r.payload_id AND o.reference_id=r.reference_id AND o.role='type'),r.reference_id,p.basis_id
          FROM semantic_references r
          JOIN semantic_provenance p ON p.payload_id=r.payload_id AND p.ordinal=r.provenance_ordinal
-         JOIN semantic_coverage_freshness f ON f.revision_id=?3 AND f.tuple_id=?4 AND f.basis_id=p.basis_id
-         WHERE r.payload_id=?1 AND r.site='use' AND (?2 OR f.freshness='fresh')
+         LEFT JOIN semantic_coverage_freshness f ON f.revision_id=?3 AND f.tuple_id=?4 AND f.basis_id=p.basis_id
+         WHERE r.payload_id=?1 AND r.site='use' AND (?2 OR f.basis_id IS NULL OR f.freshness='fresh')
            AND (?2 OR (r.resolution='resolved' AND r.declared_kind='internal') OR r.resolution='external')",
     )?;
     let mut relationships = db.prepare_cached(
@@ -1618,11 +1620,11 @@ pub(super) fn architecture_semantic(
                 t.target_internal_language,t.target_internal_path,t.provenance_ordinal,
                 t.source_internal_language,t.source_internal_path,COALESCE(t.source_internal_native_revision_id,?5),
                 CASE WHEN t.target_kind='internal' THEN COALESCE(t.target_internal_native_revision_id,?5) END,t.target_external_scheme,t.target_external_symbol,
-                t.target_external_scope,t.target_external_language,t.target_external_path
+                t.target_external_scope,t.target_external_language,t.target_external_path,p.basis_id
          FROM semantic_type_relationships t
          JOIN semantic_provenance p ON p.payload_id=t.payload_id AND p.ordinal=t.provenance_ordinal
-         JOIN semantic_coverage_freshness f ON f.revision_id=?3 AND f.tuple_id=?4 AND f.basis_id=p.basis_id
-         WHERE t.payload_id=?1 AND (?2 OR f.freshness='fresh') AND t.source_kind='internal'
+         LEFT JOIN semantic_coverage_freshness f ON f.revision_id=?3 AND f.tuple_id=?4 AND f.basis_id=p.basis_id
+         WHERE t.payload_id=?1 AND (?2 OR f.basis_id IS NULL OR f.freshness='fresh') AND t.source_kind='internal'
            AND t.kind IN ('extends','implements')
          ORDER BY t.ordinal",
     )?;
@@ -1686,6 +1688,8 @@ pub(super) fn architecture_semantic(
         ])?;
         while let Some(row) = cursor.next()? {
             admit()?;
+            // A missing required freshness row is corruption, never a filtered fact.
+            pp.freshness(row.get(17)?)?;
             let call_id = id_codec::decode_occ(row.get_ref(0)?.as_blob()?)
                 .map_err(|_| SelectedIntegrity("invalid semantic call ID".into()))?;
             let ordinal: i64 = row.get(10)?;
@@ -1785,6 +1789,7 @@ pub(super) fn architecture_semantic(
         let mut cursor = references.query(params![payload, historical, key, tuple])?;
         while let Some(row) = cursor.next()? {
             admit()?;
+            pp.freshness(row.get(9)?)?;
             let outcome = match (
                 row.get_ref(2)?.as_str()?,
                 sid(row.get_ref(3)?.as_blob_or_null()?)?,
@@ -1863,6 +1868,7 @@ pub(super) fn architecture_semantic(
         let mut cursor = relationships.query(params![payload, historical, key, tuple, native])?;
         while let Some(row) = cursor.next()? {
             admit()?;
+            pp.freshness(row.get(16)?)?;
             let source = sid(row.get_ref(1)?.as_blob_or_null()?)?.context(SelectedIntegrity(
                 "corrupt semantic type relationship".into(),
             ))?;
