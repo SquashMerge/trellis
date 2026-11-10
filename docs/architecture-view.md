@@ -212,6 +212,54 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
     `{name}*` as `{*name}`; an unbalanced brace makes the path unreadable and the
     registration is not a route. Handler identity, exclusions and the one route per method
     and template rule are as for axum.
+- **Python server routes (#856).** Read from production Python documents. Objects, mounts
+  and views are followed only through bindings that resolve; anything else registers
+  nothing, never a route at the root.
+  - **Bindings.** A name is read only when it is bound exactly once in its document: no other
+    assignment, `+=`, import or alias, parameter, `for` or comprehension target, `with .. as`,
+    `except .. as`, walrus, `global`, `class`, `def`, `match` pattern or deletion of that name
+    anywhere in the document. A module-level `from m import *` hides every name bound before
+    it, and one inside a function or class hides every name of the document. A string
+    constant is such a name bound by a module-level assignment. An object or view imported
+    from another module must be bound in that module's own scope, not inside a function.
+  - **Objects.** A Flask app is a name bound to `Flask(..)`, a blueprint to `Blueprint(..)`
+    (with its `url_prefix`), a FastAPI app to `FastAPI(..)` and a router to `APIRouter(..)`
+    (with its `prefix`), each class imported from `flask` or `fastapi` (`from flask import
+    Flask` or `import flask`, then `flask.Flask`). Every Flask and FastAPI app is a root; a
+    blueprint or router is reached only through registrations from a root.
+  - **Routes.** On a Flask app or blueprint, `@o.route(rule, methods=[..])` (no `methods` is
+    `GET`) and `@o.get/post/put/delete/patch(rule)`. On a FastAPI app or router,
+    `@o.get/post/put/delete/patch/head/options(path)` and `@o.api_route(path, methods=[..])`.
+    The handler is the decorated function. A `methods` value that is not a list, tuple or set
+    of readable method names, or that a `**` splat may supply, registers nothing.
+  - **Mounts.** Flask `parent.register_blueprint(bp, url_prefix=..)`: the registration's
+    `url_prefix` replaces the blueprint's own, and a nested blueprint's prefix is joined to its
+    parent's with one `/`. FastAPI `parent.include_router(router, prefix=..)`: the include
+    prefix, then the router's own prefix, are prepended as written. Mounts are followed across
+    documents through `import m`, `import a.b as m` and `from m import n` bindings: a relative
+    import from the document's package, an absolute one from the one directory above the
+    document that holds the module (two or more such directories are ambiguous, and resolve
+    nothing), at most 16 deep. A prefix or object that cannot be read, or that a `**` splat may
+    supply, mounts nothing.
+  - **Django.** A module-level `ROOT_URLCONF = "pkg.urls"` in any document names a root
+    urlconf; without one no Django pattern is a route. A urlconf's `urlpatterns` is its one
+    module-level list or tuple, extended by module-level `+=` of lists. `path(route, view)` and
+    `re_path(regex, view)` from `django.urls` are routes that answer `ANY`. `include(..)` of a
+    module string, an imported module, a pattern list or an inline list mounts its patterns
+    under the route, whose text is prepended as written; an include that cannot be resolved
+    mounts nothing. The handler is the function the view resolves to, else the view's span.
+  - **Normalisation.** Flask and Django `<name>` and `<converter:name>` (Flask's
+    `<converter(args):name>` too) are `{name}`; FastAPI `{name}` and `{name:converter}` are
+    `{name}`. The `path` converter is `{*name}` as the whole last segment, else `{name}`. A
+    `re_path` regex must start with `^`; a final `$` is dropped, `(?P<name>..)` is `{name}`
+    (`{*name}` for `.*` or `.+`) and an escaped punctuation character is itself. Any other
+    regex syntax, an optional or repeated group, a group that can match `/`, a brace in a
+    Flask or Django route, or an unbalanced or unnamed placeholder makes the route unreadable.
+  - **Bounds.** Every production Python document is scanned for candidate words, and each
+    candidate is parsed and walked, all charged to the work bound. Each object's routes under
+    each prefix it is mounted at, and each Django list under each include, are charged
+    before they are built.
+  - **Duplicates.** Python routes are one per method, template and registering document.
 - **Handler identity.** `handler.kind` is `declaration` when the handler names exactly one
   same-document function (the function's span), `closure` otherwise (the span of the handler
   expression), or `dispatchArm` for a table route answered by an arm that does not call
@@ -358,12 +406,38 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
   path is what follows the host of an `http://` or `https://` URL (`/` when there is none), or the text itself when it starts
   with `/`; a URL that starts with a substitution, or anything else, is unreadable and
   `unresolved`. The path is cut at `?` or `#` and split as above.
+- **Python clients (#856).** Read in production Python documents that mention `requests` or
+  `httpx`:
+  - `requests.get/post/put/delete/patch/head/options(url)` and `requests.request(method,
+    url)`, the same functions on `httpx`, and `httpx.stream(method, url)`, called through the
+    module (`import requests`, `import httpx as h`) or a function imported from it (`from
+    requests import post`);
+  - the same methods on a client: `requests.Session()` (or `session()`), `httpx.Client(..)`
+    or `httpx.AsyncClient(..)`, written inline or bound once by an assignment or by `with`
+    (or `async with`) `.. as c`. `self.session` and other attributes are not read.
+  - **Method.** The function's own, or for `request` and `stream` a readable string argument
+    (`method` or argument 0) after uppercasing; else unreadable.
+  - **URL.** `url` or its argument position. A string literal (no escapes, no bytes), a visible
+    constant (see Bindings above), an f-string, `+` and implicit concatenation, `%` with a
+    tuple, a single value or a dictionary, and `.format(..)`, with `{}` for any part that
+    cannot be read. An f-string substitution, a `%s` or a `.format` field is read only without
+    a conversion, format specification, flag, width or `=` (`{x:03}`, `{x!r}`, `%5s` are
+    always `{}`). A `*args` or `**kwargs` may supply any argument or key not written, and a
+    dictionary splat or unreadable key hides the keys written before it. Each substituted
+    value is charged to the work bound before it is copied, and cancellation is checked for
+    each substitution.
+  - **Path.** An `http://` or `https://` URL gives its path as for reqwest. A relative URL
+    needs the client's readable absolute `base_url` (httpx), and is joined to the base's path
+    with one `/`; when the base has a path, the match is `wrapperInferred`. A relative URL
+    without a base, or with an unreadable base (including one a `**` splat may supply), is
+    unreadable and `unresolved`.
 - **Segment matching.** Methods must be equal, or the route is `ANY`. A literal segment must equal a literal
   segment. A server `{name}` matches exactly one segment, and `{*name}` matches the rest.
   A client substitution segment matches only a server `{name}` or `{*name}`. If nothing
   matches as written, the call is matched again as assembled by the wrapper's prefix:
   `/api/` becomes `/api/checkouts/{root}/`, with `{root}` a substitution segment. That rule
-  applies to the built-in wrappers only, never to a configured wrapper or a reqwest call.
+  applies to the built-in wrappers only, never to a configured wrapper or a reqwest,
+  requests or httpx call.
   Among the matches the one with the most literal segments wins. Between equal counts, a route that names the method wins over an `ANY`
   route. Any other tie is no match.
 - **Confidence.** `wrapperInferred` when the prefix was needed. Otherwise `template` when the

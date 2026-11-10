@@ -669,6 +669,87 @@ fn main() {}
     assert_eq!(client_only[0]["entry"]["confidence"], "unresolved");
 }
 
+/// #856: a Flask server and a requests/httpx client, each its own Python project. Both
+/// one-sided lists are reported against the pair, and an httpx base URL path infers.
+#[test]
+fn a_flask_server_and_a_python_client_are_an_interface() {
+    let rules = "version = 1\n\
+[layers.server]\napp = 'api'\norder = 1\npaths = ['server/**']\n\
+[layers.client]\napp = 'cli'\norder = 1\npaths = ['tool/**']\n";
+    let server = r#"
+from flask import Flask, Blueprint
+
+app = Flask(__name__)
+users = Blueprint("users", __name__, url_prefix="/api/users")
+
+@app.route("/health")
+def health():
+    return "ok"
+
+@users.route("/<int:user_id>")
+def show(user_id):
+    return ""
+
+@users.route("/<int:user_id>", methods=["DELETE"])
+def remove(user_id):
+    return ""
+
+app.register_blueprint(users)
+"#;
+    let client = r#"
+import httpx
+import requests
+
+BASE = "http://localhost:8000"
+
+def run(user_id):
+    requests.get(f"{BASE}/health")
+    with httpx.Client(base_url=f"{BASE}/api") as client:
+        client.get(f"/users/{user_id}")
+    requests.get(BASE + "/api/missing")
+"#;
+    let published = publish(&[
+        (".trellis/rules.toml", rules),
+        ("server/pyproject.toml", "[project]\nname = \"api\"\n"),
+        ("server/api/app.py", server),
+        ("tool/pyproject.toml", "[project]\nname = \"cli\"\n"),
+        ("tool/cli/main.py", client),
+    ]);
+    let interfaces = published.summary["interfaces"].as_array().unwrap();
+    assert_eq!(interfaces.len(), 1, "{interfaces:#?}");
+    assert_eq!(
+        (&interfaces[0]["client"], &interfaces[0]["server"]),
+        (&json!("cli"), &json!("api"))
+    );
+    assert_eq!(
+        interfaces[0]["counts"],
+        json!({"matchedRoutes": 2, "callSites": 2, "serverOnly": 1, "clientOnly": 1,
+            "confidence": {"exact": 1, "template": 0, "wrapperInferred": 1, "unresolved": 1}})
+    );
+    let matched = details(&published, &[("list", "matched")], 100);
+    let show = matched
+        .iter()
+        .find(|item| item["entry"]["pathTemplate"] == "/api/users/{user_id}")
+        .unwrap();
+    assert_eq!(show["entry"]["method"], "GET");
+    assert_eq!(show["entry"]["confidence"], "wrapperInferred");
+    assert_eq!(show["entry"]["handler"]["kind"], "declaration");
+    let site = &show["entry"]["callSites"][0];
+    assert_eq!(site["document"]["language"], "python");
+    assert_eq!(site["caller"]["name"], "run");
+    let server_only = details(&published, &[("list", "serverOnly")], 100);
+    assert_eq!(server_only.len(), 1);
+    assert_eq!(server_only[0]["entry"]["method"], "DELETE");
+    assert_eq!(
+        server_only[0]["entry"]["pathTemplate"],
+        "/api/users/{user_id}"
+    );
+    let client_only = details(&published, &[("list", "clientOnly")], 100);
+    assert_eq!(client_only.len(), 1);
+    assert_eq!(client_only[0]["entry"]["pathTemplate"], "/api/missing");
+    assert_eq!(client_only[0]["entry"]["confidence"], "unresolved");
+}
+
 // #855: JavaScript and TypeScript servers and clients.
 
 const JS_RULES: &str = "version = 1\n\
