@@ -51,7 +51,7 @@ pub(super) fn extract(
                 {
                     charge(work, doc.file.text.len())?;
                     let tree = parse(doc, &tree_sitter_rust::LANGUAGE.into(), check)?;
-                    super::rust_calls::collect(doc, tree.root_node(), &mut found, check)?;
+                    super::rust_calls::collect(doc, tree.root_node(), &mut found, work, check)?;
                 }
                 continue;
             }
@@ -932,8 +932,95 @@ mod tests {
         let mut work = Work::new(REQWEST_CLIENT.len() - 1);
         let error = extract(&shot, &mut work, &mut || Ok(())).err().unwrap();
         assert_eq!(error.to_string(), crate::interfaces::BUDGET);
-        let mut work = Work::new(REQWEST_CLIENT.len());
+        // The source, then each substituted constant or literal (#867 review).
+        let substituted = "http://localhost:8080/health".len() + 4 * "http://localhost:8080".len();
+        let mut work = Work::new(REQWEST_CLIENT.len() + substituted);
         assert_eq!(extract(&shot, &mut work, &mut || Ok(())).unwrap().len(), 13);
+        let mut work = Work::new(REQWEST_CLIENT.len() + substituted - 1);
+        let error = extract(&shot, &mut work, &mut || Ok(())).err().unwrap();
+        assert_eq!(error.to_string(), crate::interfaces::BUDGET);
+    }
+
+    /// The `(method, path)` each reqwest call of `client` reads as.
+    fn reqwest_paths(client: &str) -> Vec<String> {
+        run(&[("client/src/lib.rs", client)])
+            .calls
+            .iter()
+            .map(|call| {
+                format!(
+                    "{} {}",
+                    call.method.as_deref().unwrap_or("?"),
+                    call.path_template.as_deref().unwrap_or("?")
+                )
+            })
+            .collect()
+    }
+
+    /// #867 review P1: a `format!` that repeats a constant expands past the budget although
+    /// its source is small. The expansion is charged before it is built.
+    #[test]
+    fn a_format_expansion_over_the_budget_is_typed_bounded_work() {
+        let client = format!(
+            "use reqwest::Client;\nconst P: &str = \"{}\";\nfn f(client: Client) {{ client.get(format!(\"http://h/{}\")); }}\n",
+            "a".repeat(1000),
+            "{P}".repeat(50)
+        );
+        let shot = snapshot(&[("client/src/lib.rs", &client)]);
+        let error = extract(&shot, &mut Work::new(client.len() * 4), &mut || Ok(()))
+            .err()
+            .unwrap();
+        assert_eq!(error.to_string(), crate::interfaces::BUDGET);
+        let calls = extract(&shot, &mut Work::new(usize::MAX), &mut || Ok(())).unwrap();
+        assert_eq!(
+            calls[0].path_template.as_ref().unwrap().len(),
+            1 + 50 * 1000
+        );
+    }
+
+    /// #867 review P2: a constant is read only where it is in scope at the call.
+    #[test]
+    fn a_constant_out_of_scope_at_the_call_is_unresolved() {
+        let client = r#"
+use reqwest::Client;
+const VISIBLE: &str = "http://localhost/visible";
+mod unrelated {
+    const URL: &str = "http://localhost/health";
+    const BASE: &str = "http://localhost";
+}
+fn run(client: &Client, URL: &str, BASE: &str) {
+    client.get(URL);
+    client.get(format!("{BASE}/x"));
+    client.get(VISIBLE);
+}
+mod inner {
+    fn nested(client: &reqwest::Client) { client.get(super::VISIBLE); client.get(VISIBLE); }
+}
+"#;
+        assert_eq!(
+            reqwest_paths(client),
+            ["GET ?", "GET ?", "GET /visible", "GET ?", "GET ?"]
+        );
+    }
+
+    /// #867 review P2: a substitution with a format specification is not read as its value.
+    #[test]
+    fn a_format_specification_is_a_substitution_not_its_value() {
+        let client = r#"
+use reqwest::Client;
+const ID: &str = "7";
+const BASE: &str = "http://localhost";
+fn run(client: &Client) {
+    client.get(format!("{BASE}/n/{ID:0>3}"));
+    client.get(format!("{BASE}/n/{:?}", ID));
+    client.get(format!("{BASE}/n/{0:.1}", ID));
+    client.get(format!("{BASE:>40}/n"));
+    client.get(format!("{BASE}/n/{ID}"));
+}
+"#;
+        assert_eq!(
+            reqwest_paths(client),
+            ["GET /n/{}", "GET /n/{}", "GET /n/{}", "GET ?", "GET /n/7"]
+        );
     }
 
     #[test]

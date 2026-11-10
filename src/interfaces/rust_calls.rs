@@ -1,10 +1,13 @@
 //! Rust client calls (#858): `reqwest` requests whose URL is a literal, a `format!` with a
 //! readable path, or a same-document string constant. Anything else is an unreadable path.
 use super::calls::{client_segments, verb};
-use super::{ClientCall, LineIndex, comment, routes::path_verb, test_span, under_test_support};
+use super::{
+    ClientCall, LineIndex, charge, comment, routes::path_verb, test_span, under_test_support,
+};
 use crate::native_evidence::Range;
-use crate::references::{DocumentInput, callers::Callers, walk};
+use crate::references::{DocumentInput, callers::Callers, walk, work::Work};
 use anyhow::Result;
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use tree_sitter::Node;
 
@@ -25,20 +28,26 @@ pub(super) fn collect(
     doc: &DocumentInput,
     root: Node<'_>,
     found: &mut Vec<ClientCall>,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<()> {
     let document = Document {
         source: &doc.file.text,
         constants: BTreeMap::new(),
     };
+    // A name declared more than once anywhere may be shadowed, so it is never read. Only a
+    // top-level declaration is read, and only from outside every inline module.
     let mut constants: BTreeMap<String, Option<String>> = BTreeMap::new();
+    let mut modules = Vec::new();
     let mut sites = Vec::new();
     walk(root, check, &mut |node, _| {
         match node.kind() {
+            "mod_item" => modules.push(node.byte_range()),
             "const_item" | "static_item" => {
                 let name = node.child_by_field_name("name").map(|n| document.text(n));
                 let value = node
                     .child_by_field_name("value")
+                    .filter(|_| node.parent().is_some_and(|parent| parent.id() == root.id()))
                     .and_then(|value| document.literal(value));
                 if let Some(name) = name {
                     constants
@@ -74,7 +83,10 @@ pub(super) fn collect(
         let Some((method, url)) = document.request(node) else {
             continue;
         };
-        let template = document.url(url);
+        let visible = !modules
+            .iter()
+            .any(|module| module.start <= range.start && range.end <= module.end);
+        let template = document.url(url, visible, work, check)?;
         let call_id = doc
             .calls
             .iter()
@@ -182,55 +194,95 @@ impl<'a> Document<'a> {
         }
     }
 
-    /// The path template of a URL argument, with `{}` for each substitution. `None` when it
-    /// cannot be read.
-    fn url(&self, node: Node<'a>) -> Option<String> {
-        let mut node = node;
-        while node.kind() == "reference_expression" {
-            node = node.child_by_field_name("value")?;
-        }
-        let text = match node.kind() {
-            "string_literal" | "raw_string_literal" => self.literal(node)?,
-            "identifier" => self.constants.get(self.text(node))?.clone(),
-            "macro_invocation" => self.format(node)?,
-            _ => return None,
-        };
-        path(&text)
+    /// A string constant declared once at the top of the document, when the call is outside
+    /// every inline module and so sees it. Anything else is not read.
+    fn constant(&self, name: &str, visible: bool) -> Option<&str> {
+        visible
+            .then(|| self.constants.get(name))
+            .flatten()
+            .map(String::as_str)
     }
 
-    /// A `format!` call with substitutions read where they are string literals or constants,
-    /// and [`UNKNOWN`] elsewhere.
-    fn format(&self, invocation: Node<'a>) -> Option<String> {
-        let name: String = self
-            .text(invocation.child_by_field_name("macro")?)
+    /// The path template of a URL argument, with `{}` for each substitution. `None` when it
+    /// cannot be read. `visible` says whether the call sees the top-level constants. Each
+    /// substituted value is charged before it is copied.
+    fn url(
+        &self,
+        node: Node<'a>,
+        visible: bool,
+        work: &mut Work,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<Option<String>> {
+        let mut node = node;
+        while node.kind() == "reference_expression" {
+            let Some(value) = node.child_by_field_name("value") else {
+                return Ok(None);
+            };
+            node = value;
+        }
+        let text = match node.kind() {
+            "string_literal" | "raw_string_literal" => self.literal(node),
+            "identifier" => match self.constant(self.text(node), visible) {
+                Some(text) => {
+                    charge(work, text.len())?;
+                    Some(text.to_owned())
+                }
+                None => None,
+            },
+            "macro_invocation" => self.format(node, visible, work, check)?,
+            _ => None,
+        };
+        Ok(text.as_deref().and_then(path))
+    }
+
+    /// A `format!` call with substitutions read where they are string literals or visible
+    /// constants without a format specification, and [`UNKNOWN`] elsewhere.
+    fn format(
+        &self,
+        invocation: Node<'a>,
+        visible: bool,
+        work: &mut Work,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<Option<String>> {
+        let name: String = invocation
+            .child_by_field_name("macro")
+            .map(|name| self.text(name))
+            .unwrap_or("")
             .split_whitespace()
             .collect();
         if !matches!(name.as_str(), "format" | "std::format" | "alloc::format") {
-            return None;
+            return Ok(None);
         }
-        let tree = Self::named_children(invocation)
+        let Some(tree) = Self::named_children(invocation)
             .into_iter()
-            .find(|child| child.kind() == "token_tree")?;
+            .find(|child| child.kind() == "token_tree")
+        else {
+            return Ok(None);
+        };
         let mut cursor = tree.walk();
         let tokens: Vec<_> = tree
             .children(&mut cursor)
             .filter(|token| !comment(*token))
             .collect();
-        let inner = tokens.get(1..tokens.len().checked_sub(1)?)?;
-        let mut groups = inner.split(|token| token.kind() == ",");
-        let [template] = groups.next()? else {
-            return None;
+        let Some(inner) = tokens.get(1..tokens.len().saturating_sub(1)) else {
+            return Ok(None);
         };
-        let template = self.literal(*template)?;
+        let mut groups = inner.split(|token| token.kind() == ",");
+        let Some([template]) = groups.next() else {
+            return Ok(None);
+        };
+        let Some(template) = self.literal(*template) else {
+            return Ok(None);
+        };
         let mut positional = Vec::new();
         let mut named = BTreeMap::new();
         for group in groups {
             match group {
                 [] => {}
                 [name, equals, value] if name.kind() == "identifier" && equals.kind() == "=" => {
-                    named.insert(self.text(*name), self.value(&[*value]));
+                    named.insert(self.text(*name), self.value(&[*value], visible));
                 }
-                value => positional.push(self.value(value)),
+                value => positional.push(self.value(value, visible)),
             }
         }
         let mut out = String::new();
@@ -240,16 +292,19 @@ impl<'a> Document<'a> {
             match c {
                 '{' if chars.next_if_eq(&'{').is_some() => out.push('{'),
                 '}' if chars.next_if_eq(&'}').is_some() => out.push('}'),
-                '}' => return None,
+                '}' => return Ok(None),
                 '{' => {
+                    check()?;
                     let mut spec = String::new();
                     loop {
-                        match chars.next()? {
-                            '}' => break,
-                            c => spec.push(c),
+                        match chars.next() {
+                            None => return Ok(None),
+                            Some('}') => break,
+                            Some(c) => spec.push(c),
                         }
                     }
-                    let argument = spec.split(':').next().unwrap_or("").trim();
+                    let (argument, format) = spec.split_once(':').unwrap_or((&spec, ""));
+                    let argument = argument.trim();
                     let value = if argument.is_empty() {
                         next += 1;
                         positional.get(next - 1).cloned().flatten()
@@ -258,27 +313,32 @@ impl<'a> Document<'a> {
                     } else {
                         match named.get(&argument) {
                             Some(value) => value.clone(),
-                            None => self.constants.get(argument).cloned(),
+                            None => self.constant(argument, visible).map(Cow::Borrowed),
                         }
                     };
-                    match value {
-                        Some(text) => out.push_str(&text),
+                    // A fill, width, precision or other mode changes the text, so the value
+                    // is a substitution, never its raw text.
+                    match value.filter(|_| format.is_empty()) {
+                        Some(text) => {
+                            charge(work, text.len())?;
+                            out.push_str(&text);
+                        }
                         None => out.push(UNKNOWN),
                     }
                 }
                 c => out.push(c),
             }
         }
-        Some(out)
+        Ok(Some(out))
     }
 
-    /// A format argument that is one string literal or constant.
-    fn value(&self, tokens: &[Node<'a>]) -> Option<String> {
+    /// A format argument that is one string literal or visible constant.
+    fn value(&self, tokens: &[Node<'a>], visible: bool) -> Option<Cow<'_, str>> {
         match tokens {
             [token] if token.kind() == "identifier" => {
-                self.constants.get(self.text(*token)).cloned()
+                self.constant(self.text(*token), visible).map(Cow::Borrowed)
             }
-            [token] => self.literal(*token),
+            [token] => self.literal(*token).map(Cow::Owned),
             _ => None,
         }
     }

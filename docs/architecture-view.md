@@ -199,7 +199,13 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
     under `/p`, and scopes nest. A function with a route attribute is under the prefix of
     each `.service(f)` (or `.service(path::f)`) that names it, in any document, matched by
     name; with no such registration it is at its own path. A scope whose prefix is not a
-    literal hides the routes under it. `.configure(..)` is not followed.
+    literal hides the routes under it. A registration counts only on a proven chain: one that
+    starts at `App::new()` (always the root), at an inline `web::scope(..)` or at
+    `web::resource(..)`. Any other receiver, such as a variable bound to a scope, is mounted
+    at an unknown prefix, so nothing registers under it or in its arguments.
+    `.configure(..)` is not followed, and nothing in its callback registers.
+  - the expansion of attributed routes under their prefixes is charged to the work bound
+    before it is built.
   - `{name:regex}` is read as `{name}`; a last segment `{name:.*}`, `{name:.+}` or
     `{name}*` as `{*name}`; an unbalanced brace makes the path unreadable and the
     registration is not a route. Handler identity, exclusions and the one route per method
@@ -237,9 +243,13 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
   `c.request(Method::M, url)` (method unreadable unless `Method::M` or a path ending in
   `Method::M`). The receiver `c` must read as a client: a name or field containing `client`
   in any case, or a `Client::new()` or `Client::builder()` chain. The URL, looked through
-  `&`, is a string literal without escapes, a same-document `const` or `static` string
-  declared once, or a `format!` whose substitutions are read where they name such a constant
-  or are a string literal, and are `{}` otherwise. The path is what follows the host of an
+  `&`, is a string literal without escapes, a visible constant, or a `format!` whose
+  substitutions are read where they are a string literal or a visible constant with no
+  format specification (`{x}`, `{}`, `{0}`), and are `{}` otherwise: a fill, width,
+  precision or mode such as `{x:0>3}` or `{:?}` is always `{}`. A visible constant is a
+  `const` or `static` string at the top level of the document, its name declared nowhere
+  else in it, read from a call outside every inline `mod`; any other identifier is
+  unreadable. Each substituted value is charged to the work bound before it is copied. The path is what follows the host of an
   `http://` or `https://` URL (`/` when there is none), or the text itself when it starts
   with `/`; a URL that starts with a substitution, or anything else, is unreadable and
   `unresolved`. The path is cut at `?` or `#` and split as above.

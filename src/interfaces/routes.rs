@@ -69,7 +69,7 @@ pub(super) fn extract(
             actix::collect(&document, &mut actix, &mut found, check)?;
         }
     }
-    actix.finish(&mut found, work)?;
+    actix.finish(&mut found, work, check)?;
     found.sort_by(|a, b| (&a.path, a.start).cmp(&(&b.path, b.start)));
     let mut seen = BTreeSet::new();
     Ok(found
@@ -1505,11 +1505,73 @@ fn app() -> App {
         )
         .unwrap_err();
         assert_eq!(error.to_string(), crate::interfaces::BUDGET);
-        // Six attributed routes and no `.service` registration are charged after the parse.
-        let exact = ACTIX_ATTRIBUTES.len() + 6;
+        // After the parse: six attributed routes, each expanded once at its own path, charged
+        // as one unit plus its path bytes and two (#867 review).
+        let paths = [
+            "/health",
+            r"/users/{id:\d+}",
+            "/both",
+            "/both",
+            "/files/{tail:.*}",
+            "/files/{tail:.*}",
+        ];
+        let expansion: usize = paths.iter().map(|path| path.len() + 2).sum();
+        let exact = ACTIX_ATTRIBUTES.len() + 6 + expansion;
         assert_eq!(run(&shot).len(), 6);
         extract(&shot, &mut Work::new(exact), &mut || Ok(())).unwrap();
         let error = extract(&shot, &mut Work::new(exact - 1), &mut || Ok(())).unwrap_err();
+        assert_eq!(error.to_string(), crate::interfaces::BUDGET);
+    }
+
+    /// #867 review P2: a registration whose receiver is not a proven `App` or an inline scope
+    /// or resource registers nothing, and `.configure(..)` is not followed.
+    #[test]
+    fn an_actix_registration_on_an_unknown_receiver_registers_nothing() {
+        let source = r#"
+use actix_web::{get, web, App};
+async fn h() {}
+#[get("/attributed")]
+async fn attributed() {}
+fn app(prefix: &str) {
+    let scoped = web::scope(prefix);
+    let scoped = scoped.route("/lost", web::get().to(h)).service(attributed);
+    let _app = App::new().service(scoped);
+    let _configured = App::new().configure(|cfg| {
+        cfg.route("/configured", web::get().to(h));
+    });
+    let _kept = actix_web::App::new().route("/kept", web::get().to(h));
+}
+"#;
+        assert_eq!(table(&routes(&[("src/main.rs", source)])), ["GET /kept"]);
+    }
+
+    /// #867 review P2: attributed routes times the scopes that register them is charged
+    /// before it is built.
+    #[test]
+    fn the_attributed_route_and_service_fan_out_is_charged() {
+        let mut files: Vec<(String, String)> = (0..20)
+            .map(|n| {
+                (
+                    format!("src/m{n}.rs"),
+                    format!("use actix_web::get;\n#[get(\"/p{n}\")]\npub async fn item() {{}}\n"),
+                )
+            })
+            .collect();
+        let services: String = (0..20)
+            .map(|n| format!(".service(web::scope(\"/s{n}\").service(m{n}::item))"))
+            .collect();
+        files.push((
+            "src/main.rs".into(),
+            format!("use actix_web::{{web, App}};\nfn app() {{ App::new(){services}; }}\n"),
+        ));
+        let files: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(path, text)| (path.as_str(), text.as_str()))
+            .collect();
+        let shot = snapshot(&files);
+        assert_eq!(run(&shot).len(), 400);
+        let bytes: usize = shot.documents.iter().map(|d| d.file.text.len()).sum();
+        let error = extract(&shot, &mut Work::new(bytes + 40), &mut || Ok(())).unwrap_err();
         assert_eq!(error.to_string(), crate::interfaces::BUDGET);
     }
 

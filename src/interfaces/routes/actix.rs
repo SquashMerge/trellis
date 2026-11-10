@@ -5,7 +5,7 @@ use crate::interfaces::{HandlerKind, Route, charge, segments};
 use crate::references::work::Work;
 use crate::syntax_bounds::{DEPTH, VISITS};
 use anyhow::Result;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use tree_sitter::Node;
 
 /// Whether a Rust document can register actix-web routes.
@@ -34,21 +34,50 @@ pub(super) struct Collected {
 impl Collected {
     /// Each attributed function as a route under every prefix it is registered with, or as
     /// written when no `.service(name)` registers it.
-    pub(super) fn finish(self, found: &mut Vec<Found>, work: &mut Work) -> Result<()> {
-        let registrations: usize = self.services.values().map(Vec::len).sum();
-        charge(work, self.attributed.len().saturating_add(registrations))?;
+    pub(super) fn finish(
+        self,
+        found: &mut Vec<Found>,
+        work: &mut Work,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        // The expansion is every attributed route under every readable prefix that registers
+        // its name. Its size and bytes are charged before any of it is built (#867 review).
         let unregistered = vec![Some(String::new())];
-        for attributed in self.attributed {
-            let prefixes = self.services.get(&attributed.name).unwrap_or(&unregistered);
-            let mut seen = Vec::new();
-            for prefix in prefixes.iter().flatten() {
+        let prefixes = |name: &str| self.services.get(name).unwrap_or(&unregistered);
+        let mut sizes: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+        for (name, registered) in &self.services {
+            check()?;
+            charge(work, registered.len())?;
+            let readable = registered.iter().flatten();
+            sizes.insert(
+                name,
+                (
+                    readable.clone().count(),
+                    readable.map(String::len).sum::<usize>(),
+                ),
+            );
+        }
+        let mut cost = self.attributed.len();
+        for attributed in &self.attributed {
+            let (count, bytes) = sizes
+                .get(attributed.name.as_str())
+                .copied()
+                .unwrap_or((1, 0));
+            cost = cost
+                .saturating_add(count.saturating_mul(attributed.path.len().saturating_add(2)))
+                .saturating_add(bytes);
+        }
+        charge(work, cost)?;
+        for attributed in &self.attributed {
+            let mut seen = BTreeSet::new();
+            for prefix in prefixes(&attributed.name).iter().flatten() {
+                check()?;
                 let Some(template) = normalize(&join(prefix, &attributed.path)) else {
                     continue;
                 };
-                if seen.contains(&template) {
+                if !seen.insert(template.clone()) {
                     continue;
                 }
-                seen.push(template.clone());
                 let mut route = attributed.found.route.clone();
                 route.method = attributed.method.into();
                 route.segments = segments(&template);
@@ -64,12 +93,14 @@ impl Collected {
     }
 }
 
-/// The root of a builder chain: `web::scope(p)`, `web::resource(p)` or anything else.
+/// The root of a builder chain: `web::scope(p)`, `web::resource(p)`, `App::new()`, or
+/// anything else, whose mount point is unknown.
 #[derive(Clone)]
 enum Root {
     Scope(Option<String>),
     Resource(Option<String>),
-    Other,
+    App,
+    Unknown,
 }
 
 struct Walker<'d, 'a> {
@@ -170,14 +201,18 @@ impl<'a> Walker<'_, 'a> {
             return Ok(None);
         };
         let root = self.root(receiver);
+        // An `App` is always the root. A receiver that is not a proven chain, such as a
+        // variable bound to a scope or the `cfg` of a `configure` callback, is mounted at an
+        // unknown prefix, so nothing registers under it (#867 review).
         let scoped = match (&root, prefix) {
+            (Root::App, _) => Some(String::new()),
             (Root::Scope(Some(scope)), Some(prefix)) => Some(join(prefix, scope)),
-            (Root::Scope(None), _) | (_, None) => None,
-            (_, Some(prefix)) => Some(prefix.clone()),
+            (Root::Resource(_), Some(prefix)) => Some(prefix.clone()),
+            _ => None,
         };
         let arguments = Document::arguments(call);
         match (self.text(field), &arguments[..], &root) {
-            ("route", [path_node, route], Root::Scope(_) | Root::Other) => {
+            ("route", [path_node, route], Root::Scope(_) | Root::App) => {
                 if let (Some(scoped), Some(path)) = (&scoped, self.document.literal(*path_node)) {
                     let at = path_node.start_byte();
                     self.builder(call, at, &join(scoped, &path), *route, found, check)?;
@@ -202,7 +237,12 @@ impl<'a> Walker<'_, 'a> {
             }
             _ => {}
         }
-        Ok(matches!(root, Root::Scope(_)).then_some(scoped))
+        // `.configure(..)` is not followed: its callback is mounted at an unknown prefix.
+        Ok(match root {
+            _ if self.text(field) == "configure" => Some(None),
+            Root::Resource(_) => None,
+            _ => Some(scoped),
+        })
     }
 
     /// The root of the chain `node` heads, remembered per node so that a chain is read once.
@@ -218,14 +258,20 @@ impl<'a> Walker<'_, 'a> {
                 .then(|| current.child_by_field_name("function"))
                 .flatten()
             else {
-                break Root::Other;
+                break Root::Unknown;
             };
             if function.kind() == "field_expression" {
                 match function.child_by_field_name("value") {
                     Some(value) => current = value,
-                    None => break Root::Other,
+                    None => break Root::Unknown,
                 }
                 continue;
+            }
+            let path: String = self.text(function).split_whitespace().collect();
+            if matches!(path.as_str(), "App::new" | "actix_web::App::new")
+                && Document::arguments(current).is_empty()
+            {
+                break Root::App;
             }
             break match (
                 self.web_function(function),
@@ -233,7 +279,7 @@ impl<'a> Walker<'_, 'a> {
             ) {
                 (Some("scope"), [path]) => Root::Scope(self.document.literal(*path)),
                 (Some("resource"), [path]) => Root::Resource(self.document.literal(*path)),
-                _ => Root::Other,
+                _ => Root::Unknown,
             };
         };
         for id in chain {
