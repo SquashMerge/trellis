@@ -876,9 +876,7 @@ fn relevant_input(path: &Path) -> bool {
         path.file_name().and_then(|e| e.to_str()),
         Some(".gitignore" | ".ignore")
     ) || path.components().count() == 1
-        && crate::capture::ROOT_INPUTS
-            .iter()
-            .any(|name| path == Path::new(name))
+        && path.to_str().is_some_and(crate::capture::is_root_input)
 }
 #[cfg(test)]
 mod source_relevance_tests {

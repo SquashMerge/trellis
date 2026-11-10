@@ -863,7 +863,7 @@ pub(crate) fn captured_components(
     executable_hash: &str,
 ) -> Result<(Value, Vec<Value>, Vec<Value>)> {
     let root = capture.physical_root();
-    let root_inputs: Vec<_> = crate::capture::ROOT_INPUTS[..22]
+    let root_inputs: Vec<_> = crate::capture::ROOT_CONFIG_INPUTS
         .iter()
         .map(|name| root.join(name))
         .collect();
@@ -872,7 +872,7 @@ pub(crate) fn captured_components(
         .map(|p| entry(root, p, capture.bytes(p)))
         .collect::<Result<_>>()?;
     let mut config = dependencies.clone();
-    let selectors: Vec<_> = crate::capture::ROOT_INPUTS[22..]
+    let selectors: Vec<_> = crate::capture::ROOT_TOOLCHAIN_INPUTS
         .iter()
         .map(|n| root.join(n))
         .collect();
@@ -889,14 +889,11 @@ pub(crate) fn captured_components(
         {
             config.push(entry(root, p, b)?);
         }
-        // Present nested package roots bind scip-typescript module markers (#443), nested
-        // Cargo manifests scope Rust symbol keys by Cargo target (#394), and nested Python
-        // project manifests feed app detection (#807).
-        if b.is_some()
-            && (crate::capture::nested_package_manifest(root, p)
-                || crate::capture::nested_cargo_manifest(root, p)
-                || crate::capture::nested_pyproject_manifest(root, p))
-        {
+        // Present nested config inputs: package roots bind scip-typescript module markers
+        // (#443), Cargo manifests scope Rust symbol keys by Cargo target (#394), Python,
+        // Maven and Gradle manifests feed app detection (#807, #854), and TypeScript configs
+        // are the project references a producer plan follows (#717).
+        if b.is_some() && crate::capture::nested_config_input(root, p) {
             config.push(entry(root, p, b)?);
         }
     }
