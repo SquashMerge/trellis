@@ -158,7 +158,6 @@ async fn a_read_during_the_build_answers_building_with_progress_then_the_result(
 #[tokio::test]
 async fn a_summary_read_whose_head_moves_while_it_waits_answers_building_and_is_asked_again() {
     let (base, runtime, browser, key) = fixture().await;
-    write_rules(&base, RULES);
     let scheduler = runtime.browser_scheduler().unwrap();
     let (held_tx, held_rx) = mpsc::channel();
     let (waiting_tx, waiting_rx) = mpsc::channel();
@@ -193,6 +192,8 @@ async fn a_summary_read_whose_head_moves_while_it_waits_answers_building_and_is_
         }
         _ => {}
     }));
+    // Rules after the hook, so the first ruled build is counted and held.
+    write_rules(&base, RULES);
     let signalled = |rx: mpsc::Receiver<()>| {
         tokio::task::spawn_blocking(move || {
             rx.recv_timeout(trellis::testing::HANG_BACKSTOP).unwrap();
