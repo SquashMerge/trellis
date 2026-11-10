@@ -10,6 +10,7 @@ use tree_sitter::{Node, Parser, Tree};
 use work::Work;
 
 pub(crate) mod callers;
+mod cargo_workspace;
 pub mod external;
 mod java;
 mod javascript;
@@ -606,7 +607,10 @@ fn resolve(
             0 => {
                 let packages =
                     external::RustPackages::new(&snapshot.manifests, &mut work, &mut check)?;
-                let catalog = rust::Catalog::new(&docs, &trees, &document_map, work, &mut check)?;
+                let workspace =
+                    cargo_workspace::Workspace::new(&snapshot.manifests, &mut work, &mut check)?;
+                let catalog =
+                    rust::Catalog::new(&docs, &trees, &document_map, &workspace, work, &mut check)?;
                 let used = catalog.work.used;
                 return Ok((CatalogJob::Rust(Box::new((catalog, packages))), used));
             }
@@ -2163,7 +2167,14 @@ mod parallel_tests {
             if language == 0 {
                 rx.lock().unwrap().recv().unwrap();
                 let packages = external::RustPackages::new(&[], &mut work, &mut check)?;
-                let catalog = rust::Catalog::new(&docs, &trees, &documents, work, &mut check)?;
+                let catalog = rust::Catalog::new(
+                    &docs,
+                    &trees,
+                    &documents,
+                    &cargo_workspace::Workspace::default(),
+                    work,
+                    &mut check,
+                )?;
                 Ok(CatalogJob::Rust(Box::new((catalog, packages))))
             } else {
                 let catalog = java::Catalog::new(&docs, &trees, &selected, &mut work, &mut check)?;
