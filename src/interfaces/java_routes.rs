@@ -711,6 +711,9 @@ fn jaxrs_method(
     Ok(Read::Known((vec![verb], vec![path])))
 }
 
+/// A signature, its entry slot and the order position that declared it.
+type Declared = (String, usize, usize);
+
 /// The method name and parameter count of a signature `name(T1,T2)`.
 fn shape(signature: &str) -> (String, usize) {
     let (name, parameters) = signature.split_once('(').unwrap_or((signature, ""));
@@ -753,7 +756,7 @@ fn entries<'t>(
     let mut entries: Vec<Entry<'t>> = Vec::new();
     let mut by_signature: HashMap<String, usize> = HashMap::new();
     // Each (name, arity) with the signatures and the order position that declared them.
-    let mut by_shape: HashMap<(String, usize), Vec<(String, usize, usize)>> = HashMap::new();
+    let mut by_shape: HashMap<(String, usize), Vec<Declared>> = HashMap::new();
     let mut unresolved = false;
     for (position, item) in order.iter().enumerate() {
         let (index, at) = match *item {

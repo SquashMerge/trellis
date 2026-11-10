@@ -619,6 +619,9 @@ fn import<'a>(node: Node<'_>, text: &impl Fn(Node<'_>) -> &'a str) -> Import {
     }
 }
 
+/// A field that may be a readable constant: its owner's node, its value and its written type.
+type Field<'a> = (usize, Node<'a>, &'a str);
+
 /// One declaration of a variable name: a field, local, parameter or other binding.
 pub(super) struct Binding<'a> {
     pub(super) ty: Option<Node<'a>>,
@@ -671,8 +674,7 @@ impl<'a> Document<'a> {
         let mut imports = Vec::new();
         let mut types = BTreeSet::new();
         let mut bound: BTreeSet<String> = BTreeSet::new();
-        let mut fields: BTreeMap<&'a str, Vec<Option<(usize, Node<'a>, &'a str)>>> =
-            BTreeMap::new();
+        let mut fields: BTreeMap<&'a str, Vec<Option<Field<'a>>>> = BTreeMap::new();
         let mut declared: BTreeMap<&'a str, Vec<Binding<'a>>> = BTreeMap::new();
         let mut assigned: BTreeMap<&'a str, Vec<Node<'a>>> = BTreeMap::new();
         walk(root, check, &mut |node, _| {
@@ -701,7 +703,7 @@ impl<'a> Document<'a> {
                     let constant =
                         implicit || (has_modifier(node, "static") && has_modifier(node, "final"));
                     let ty = node.child_by_field_name("type");
-                    let written = ty.map(|ty| text(ty));
+                    let written = ty.map(text);
                     let mut cursor = node.walk();
                     for declarator in node.children_by_field_name("declarator", &mut cursor) {
                         let Some(name) = declarator.child_by_field_name("name") else {
