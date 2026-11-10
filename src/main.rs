@@ -330,7 +330,7 @@ struct ProducerPlanArgs {
     #[arg(long)]
     python_project_version: Option<String>,
     /// scip-java, trusted profile: the build tool to run instead of the one the plan detects.
-    #[arg(long, value_parser = ["maven", "gradle"])]
+    #[arg(long, value_parser = ["maven", "gradle", "scip"])]
     java_build_tool: Option<String>,
 }
 #[derive(Args)]

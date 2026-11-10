@@ -270,7 +270,7 @@ trellis producer run --producer rust-analyzer --trust trusted --plan-sha256 "$PL
 
 **Trust profiles:**
 
-- `--trust restricted` is the default and runs none of your repository's code. Java build files and `pyproject.toml` are left out, and Java runs offline. That means calls into third-party dependencies may stay unresolved.
+- `--trust restricted` is the default and runs none of your repository's code. Java build files, `lsif-java.json`, `pyproject.toml` and `pyrightconfig.json` are left out, and Java runs offline. That means calls into third-party dependencies may stay unresolved.
 - `--trust trusted` lets the producer run your repository's build logic, which is not sandboxed. Use it only on code you trust. `rust-analyzer` always needs it, because it can't turn off build scripts and proc macros. Trusted `scip-java` runs your Gradle or Maven build, so that tool must be reachable: the run's `PATH` holds only your JDK's folder, `/usr/bin` and `/bin`.
 
 Every run happens in a private copy of the indexed files. Your checkout isn't touched. The defaults are a 30-minute limit and 8 GiB of memory; change them with `--timeout-secs` and `--memory-mib`, on both commands.
@@ -295,9 +295,9 @@ You always need a new plan. An old hash fails with `plan_changed`. If you edit a
 `plan` reads each producer's settings from your project's own files, so you don't write producer config. Its `settings` list shows each setting, where it came from, and the hashes of those files. The settings are part of `planSha256`.
 
 - **Rust:** the Cargo features that your workspace's binaries, tests, benches and examples list in `required-features`, such as a `test-support` feature, so the code behind them is analyzed. Nothing else is turned on, never all features. The plan also lists the workspace members it read.
-- **TypeScript and JavaScript:** the root `tsconfig.json`, else the root `jsconfig.json`, else a config Trellis generates.
-- **Python, trusted:** the project name and version from `pyproject.toml` (`[project]`, else `[tool.poetry]`). The restricted profile doesn't read `pyproject.toml`, so it uses `trellis-workspace` and `0`.
-- **Java, trusted:** Maven if the root has `pom.xml`, Gradle if it has `build.gradle`, `build.gradle.kts` or `settings.gradle`. Having both is refused; pick one with `--java-build-tool`.
+- **TypeScript and JavaScript:** the root `tsconfig.json`, else the root `jsconfig.json`, else a config Trellis generates. The plan also lists the projects the root `tsconfig.json` reaches through `references`.
+- **Python, trusted:** the project name and version from `pyproject.toml` (`[project]`, else `[tool.poetry]`), else from `setup.cfg` `[metadata]`. The restricted profile reads neither file, so it uses `trellis-workspace` and `0`.
+- **Java, trusted:** Maven if the root has `pom.xml`, Gradle if it has `build.gradle`, `build.gradle.kts` or `settings.gradle`, and scip-java's own SCIP build tool if it has `lsif-java.json`. Having two is refused; pick one with `--java-build-tool`.
 
 To use other values, pass them to both `plan` and `run`. They replace what the plan read:
 
@@ -308,7 +308,7 @@ trellis producer plan --producer scip-python --python-project-name myapp --pytho
 trellis producer plan --producer scip-java --trust trusted --java-build-tool gradle
 ```
 
-`--cargo-features ''` turns on no extra features. `--ts-project` takes `tsconfig.json`, `jsconfig.json` or `generated`. `--java-build-tool` takes `maven` or `gradle`, in the trusted profile only. If your project config can't be parsed, or contradicts itself, `plan` fails with `producer_config_unresolved` and names the file. It never falls back to defaults.
+`--cargo-features ''` turns on no extra features. `--ts-project` takes `tsconfig.json`, `jsconfig.json` or `generated`. `--java-build-tool` takes `maven`, `gradle` or `scip`, in the trusted profile only. If your project config can't be parsed, or contradicts itself, `plan` fails with `producer_config_unresolved` and names the file. It never falls back to defaults.
 
 ### Upgrading Trellis
 

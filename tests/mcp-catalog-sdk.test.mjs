@@ -62,7 +62,7 @@ test("the thirteen-tool order and unchanged schemas are explicit", () => {
     "trellis_rules_explain", "trellis_show", "trellis_endpoints",
   ]);
   const describe = tools[0].outputSchema.oneOf[0].properties.data.properties;
-  assert.equal(describe.toolVersion.const, 26);
+  assert.equal(describe.toolVersion.const, 27);
   assert.equal(search.inputSchema.additionalProperties, false);
   assert.equal(search.inputSchema.properties.limit.default, 10);
   assert.equal(search.inputSchema.properties.limit.maximum, 50);
@@ -458,10 +458,12 @@ test("describe apps are a closed, required inventory", () => {
     { state: "building", items: [], noApp: null },
     { state: "invalidRules", items: [], noApp: null },
     { state: "unavailable", items: [], noApp: null },
+    // #854: runnable Maven and Gradle modules.
+    { state: "ready", items: [{ ...app, kind: "maven" }, { ...app, kind: "gradle" }], noApp: null },
   ]) assert.ok(apps(ok), JSON.stringify(apps.errors));
   for (const bad of [
     { state: "partial", items: [], noApp: null },
-    { state: "ready", items: [{ ...app, kind: "maven" }], noApp: null },
+    { state: "ready", items: [{ ...app, kind: "sbt" }], noApp: null },
     { state: "ready", items: [{ ...app, languages: ["go"] }], noApp: null },
     { state: "ready", items: [{ ...app, extra: 1 }], noApp: null },
     { state: "ready", items: [(({ fileCount, ...rest }) => rest)(app)], noApp: null },

@@ -760,7 +760,7 @@
                   "const": 1
                 },
                 "toolVersion": {
-                  "const": 26
+                  "const": 27
                 },
                 "watcherDegraded": {
                   "type": "boolean"
@@ -877,6 +877,8 @@
                               "cargo",
                               "npm",
                               "python",
+                              "maven",
+                              "gradle",
                               null
                             ]
                           },
