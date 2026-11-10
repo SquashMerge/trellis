@@ -264,11 +264,12 @@ All apps layout (#790, #850; owner decision 2026-11-09). With two or more apps, 
 one column per app, side by side in **manifest order** when they fit (each at least 352px,
 with a 176px gutter between columns), else stacked. Each column is the same Pele drawing as
 the one-app view, fitted to its column width (#860's stack span included), with its own
-gutters and side channels. An interface end between **adjacent** side-by-side columns draws
+gutters and side channels. An interface end between **adjacent** side-by-side columns, with
+both of its layers drawn as bands, draws
 one overlay line in its own lane of the gutter, from its band's side straight across to the
 partner band; any other end is named in words on its card. A column's **Shared** boxes sit on
 the side away from its interface partners, so a line between ordered bands never crosses
-them. The rule counts, per column, the lines each side would cross: an end on an ordered band
+them. The rule counts, per column, only those drawn lines, and the ones each side would cross: an end on an ordered band
 crosses the Shared boxes when they are on the partner's side, and an end on a Shared box
 crosses the ordered stack when the boxes are on the other side. The column takes the side
 with fewer crossings; a tie, including a column with no drawn line or a stacked layout, keeps

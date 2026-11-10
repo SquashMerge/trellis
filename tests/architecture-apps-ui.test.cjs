@@ -391,3 +391,27 @@ test("#850 each column's drawing is asked for its Shared side; the one-app view 
   const narrow = controller(dto, {width:700}); await narrow.architecture.refresh();
   assert.deepEqual(narrow.renders.map(render => render.options.sharedSide), ["right", "right"], "stacked columns keep the right");
 });
+test("#850 shared_side_drawn_lines_only: an end whose partner layer is null or undrawn draws no line and counts nothing", () => {
+  const bands = {web:{UI:false, Store:false, Common:true}, api:{Api:false}};
+  // Prime's probe (PR #872): one real line from web's Shared band, two distinct undrawn pairs from its ordered bands.
+  assert.deepEqual(sides({bands, interfaces:[["web", "api", [["Common", "Api"], ["UI", null], ["Store", null]]]]}), {web:"right", api:"right"},
+    "only the Shared line is drawn, and it crosses nothing with the band on the partner's side");
+  // Mirrored: web is the right column, so its one real Shared line runs left and its band goes left.
+  assert.deepEqual(sides({bands, names:["api", "web"], interfaces:[["web", "api", [["Common", "Api"], ["UI", null], ["Store", null]]]]}), {api:"left", web:"left"},
+    "api's one drawn end leaves right, so its side is left too");
+  // The null on the other end: an api end with no layer draws no line for either column.
+  assert.deepEqual(sides({bands, interfaces:[["web", "api", [["UI", "Api"]]], ["api", "web", [[null, "UI"], [null, "Store"]]]]}), {web:"left", api:"right"});
+  // Mixed: one drawn ordered line and an undrawn Shared end; only the drawn line decides.
+  assert.deepEqual(sides({bands, interfaces:[["web", "api", [["UI", "Api"], ["Common", null]]]]}), {web:"left", api:"right"});
+  // A lone ordered -> null end draws no line, so the right fallback, on both columns.
+  assert.deepEqual(sides({bands, interfaces:[["web", "api", [["UI", null]]]]}), {web:"right", api:"right"});
+  assert.deepEqual(sides({bands, interfaces:[["web", "api", [[null, "Api"]]]]}), {web:"right", api:"right"});
+});
+test("#850 routes and sharedSides agree on which ends draw a line", () => {
+  const apps = appsModule(), frame = {x:0, y:0, w:10, h:10};
+  const view = {interfaces:[{client:"web", server:"api", ends:[{clientLayer:"Common", serverLayer:"Api", callSites:1}, {clientLayer:"UI", serverLayer:null, callSites:1}, {clientLayer:"Store", serverLayer:null, callSites:1}]}]};
+  const plan = apps.layout({width:1600, count:2});
+  const places = new Map([["web", {index:0, bands:new Map([["Common", frame], ["UI", frame], ["Store", frame]])}], ["api", {index:1, bands:new Map([["Api", frame]])}]]);
+  const routed = apps.routes(view, plan, places, () => 1);
+  assert.equal(routed.lines.length, 1); assert.equal(routed.undrawn.get(view.interfaces[0]).length, 2);
+});
