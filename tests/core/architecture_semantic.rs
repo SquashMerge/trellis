@@ -609,7 +609,8 @@ fn corrupt_semantic_rows_fail_typed_after_reopen() {
         let changed = db
             .execute(
                 &format!(
-                    "UPDATE semantic_call_bindings SET {column}={value} WHERE provenance_id='call-lower-0'"
+                    "UPDATE semantic_call_bindings SET {column}={value} WHERE (payload_id,provenance_ordinal) IN \
+                     (SELECT payload_id,ordinal FROM semantic_provenance WHERE provenance_id='call-lower-0')"
                 ),
                 [],
             )
@@ -694,4 +695,224 @@ fn bound_method_call_evidence_names_caller_and_target() {
         assert_eq!(other["targetReason"], "unresolved", "{other}");
     }
     assert_eq!(evidence.len(), 3);
+}
+
+/// Deletes only the per-revision freshness association of the basis behind `provenance`.
+/// Payload, provenance, basis and manifest rows stay valid, and SQLite's foreign keys pass.
+fn delete_freshness(state: &tempfile::TempDir, provenance: &str) {
+    let index = fs::read_dir(state.path().join("cache/indexes"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap()
+        .join("index.db");
+    let db = rusqlite::Connection::open(index).unwrap();
+    db.pragma_update(None, "foreign_keys", "ON").unwrap();
+    let changed = db
+        .execute(
+            "DELETE FROM semantic_coverage_freshness WHERE basis_id IN \
+             (SELECT basis_id FROM semantic_provenance WHERE provenance_id=?1)",
+            [provenance],
+        )
+        .unwrap();
+    assert!(changed > 0, "{provenance}");
+    let violations: i64 = db
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(violations, 0, "the missing required row passes SQLite FKs");
+}
+
+/// AC10, #261: after reopening, the read fails typed instead of dropping the fact.
+fn assert_missing_freshness_fails(published: Published, kind: &str) {
+    let (state, root, store, pin) = published;
+    drop(store);
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let response = store.evidence_response().unwrap();
+    let error = response
+        .architecture_response(kind, &json!({"expectedBasis":pin}), &mut || Ok(()))
+        .unwrap_err();
+    let text = format!("{error:#}");
+    assert!(
+        text.contains("incompatible_index: semantic freshness missing"),
+        "{kind}: {text}"
+    );
+}
+
+fn semantic_sites<'a>(data: &'a Value, provenance: &str) -> Vec<&'a Value> {
+    data["production"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|edge| edge["sites"].as_array().unwrap())
+        .filter(|site| site["provenanceId"] == provenance)
+        .collect()
+}
+
+/// Control: a healthy index answers the same before and after reopening, with both calls.
+#[test]
+fn healthy_semantic_references_answer_identically_after_reopen() {
+    let (state, root, store, pin) = publish(&semantic());
+    let before = read(&store, "references", json!({"expectedBasis":pin}));
+    assert_eq!(before["counts"]["semanticSites"], 2, "{before}");
+    assert_eq!(before["partial"], false);
+    assert_eq!(semantic_sites(&before, "call-lower-0").len(), 1, "{before}");
+    drop(store);
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    assert_eq!(
+        read(&store, "references", json!({"expectedBasis":pin})),
+        before
+    );
+}
+
+/// Review of #873: a call whose basis lost its freshness row is corruption, not a dropped
+/// lower->go binding with `semanticSites: 1` and `partial: false`.
+#[test]
+fn missing_call_freshness_fails_typed_after_reopen() {
+    let published = publish(&semantic());
+    delete_freshness(&published.0, "call-lower-0");
+    assert_missing_freshness_fails(published, "references");
+}
+
+/// Shapes with `Square implements Shape` and, optionally, a semantic use of `Shape` in
+/// `src/low.rs`, which holds no calls, so the references and type-relationship reads are
+/// the ones that meet the fact.
+fn shapes(reference: bool, relationship: bool) -> Published {
+    let mut spec = Spec::new(SHAPES);
+    spec.declaration_bindings = vec!["Square".into(), "Shape".into()];
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    publisher.publish(&spec);
+    let use_site = publisher
+        .native()
+        .references
+        .iter()
+        .find(|r| r.document.path == "src/low.rs" && r.spelling.ends_with("Shape"))
+        .unwrap()
+        .clone();
+    let pin = publisher.publish_with_semantic(&spec, |semantic, _| {
+        let target = |name: &str| {
+            semantic
+                .symbols
+                .iter()
+                .find(|symbol| symbol.display_name.as_deref() == Some(name))
+                .unwrap()
+                .declarations[0]
+                .clone()
+        };
+        let (square, shape) = (target("Square"), target("Shape"));
+        let base = semantic
+            .provenance
+            .iter()
+            .find(|proof| proof.id == "decl-Square")
+            .unwrap()
+            .clone();
+        let document = base.document.clone();
+        let mut roles = vec![];
+        if relationship {
+            let mut proof = base.clone();
+            proof.id = "rel-square".into();
+            proof.evidence_kind = s::EvidenceKind::TypeRelationship;
+            semantic.provenance.push(proof);
+            semantic.type_relationships.push(s::TypeRelationship {
+                kind: s::RelationshipKind::Implements,
+                source: square,
+                target: shape.clone(),
+                provenance_id: "rel-square".into(),
+            });
+            roles.push(s::Role::Type);
+        }
+        if reference {
+            let mut proof = base.clone();
+            proof.id = "ref-shape".into();
+            proof.evidence_kind = s::EvidenceKind::SemanticReference;
+            semantic.references.push(s::Reference {
+                id: use_site.id.clone(),
+                owner_syntax_id: use_site.owner_syntax_id.clone(),
+                ordinal: use_site.ordinal,
+                document: use_site.document.clone(),
+                revision_id: proof.revision_id.clone(),
+                range: use_site.range.clone(),
+                spelling: use_site.spelling.clone(),
+                lookup_key: use_site.lookup_key.clone(),
+                site: s::ReferenceSite::Use,
+                roles: vec![s::Role::Read],
+                resolution: Resolution::Resolved,
+                declared_target: Some(shape),
+                candidates: vec![],
+                provenance_id: "ref-shape".into(),
+            });
+            semantic.provenance.push(proof);
+            roles.push(s::Role::Read);
+        }
+        semantic.provenance.sort_by(|a, b| a.id.cmp(&b.id));
+        for coverage in &mut semantic.coverage {
+            coverage.supported_roles.extend(roles.iter().copied());
+            coverage.supported_roles.sort();
+            if coverage.document_path == document.path {
+                coverage.observed_roles.extend(roles.iter().copied());
+                coverage.observed_roles.sort();
+            }
+        }
+    });
+    fs::create_dir_all(root.path().join(".trellis")).unwrap();
+    fs::write(root.path().join(".trellis/rules.toml"), SHAPE_RULES).unwrap();
+    (state, root, publisher.store, pin)
+}
+
+#[test]
+fn missing_reference_freshness_fails_typed_after_reopen() {
+    // Control: the healthy reference is a semantic site the read returns.
+    let (_state, _root, store, pin) = shapes(true, false);
+    let data = read(&store, "references", json!({"expectedBasis":pin}));
+    assert_eq!(semantic_sites(&data, "ref-shape").len(), 1, "{data}");
+
+    let published = shapes(true, false);
+    delete_freshness(&published.0, "ref-shape");
+    assert_missing_freshness_fails(published, "references");
+}
+
+#[test]
+fn missing_type_relationship_freshness_fails_typed_after_reopen() {
+    // Control: the healthy relationship settles the rule.
+    let (_state, _root, store, pin) = shapes(false, true);
+    let check = read(&store, "check", json!({"expectedBasis":pin}));
+    assert_eq!(
+        instance(&check, "squares-are-shapes", "src/low.rs", None)["status"],
+        "conforms"
+    );
+
+    let published = shapes(false, true);
+    delete_freshness(&published.0, "rel-square");
+    assert_missing_freshness_fails(published, "check");
+}
+
+/// The language tier reads one proof's freshness per tuple; a missing row there is corruption
+/// too, never a healthy `fresh`.
+#[test]
+fn missing_freshness_fails_the_language_tier_typed() {
+    let (_state, _root, store, _pin) = publish(&semantic());
+    let rust = |store: &Store| {
+        store
+            .evidence_response()
+            .unwrap()
+            .mcp_language_tiers()
+            .map(|tiers| {
+                let rust = s::LANGUAGE_ORDER.iter().position(|l| *l == "rust").unwrap();
+                tiers.into_iter().nth(rust).unwrap()
+            })
+    };
+    assert_eq!(rust(&store).unwrap().freshness, "fresh");
+
+    let (state, root, store, _pin) = publish(&semantic());
+    drop(store);
+    delete_freshness(&state, "call-lower-0");
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let text = format!("{:#}", rust(&store).unwrap_err());
+    assert!(
+        text.contains("invalid selected semantic proof freshness"),
+        "{text}"
+    );
 }

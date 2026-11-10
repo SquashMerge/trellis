@@ -190,7 +190,7 @@ fn dto_shape_and_end_layers() {
     );
     assert_eq!(
         interface["wrappers"],
-        json!({"callees": ["api", "request", "api.request", "owner.request"],
+        json!({"callees": ["api", "request", "api.request", "owner.request", "fetch", "axios"],
             "prefix": {"client": "/api/", "server": "/api/checkouts/{root}/"}})
     );
     assert_eq!(
@@ -590,4 +590,441 @@ fn main() {}
         .map(|item| item["entry"]["pathTemplate"].as_str().unwrap())
         .collect();
     assert_eq!(routes, ["/api/data"], "{rows:#?}");
+}
+
+/// #858: an actix-web server and a reqwest client, each its own Cargo app. Both one-sided
+/// lists are reported against the pair, and a reqwest call never takes the wrapper prefix.
+#[test]
+fn an_actix_server_and_a_reqwest_client_are_an_interface() {
+    let rules = "version = 1\n\
+[layers.server]\napp = 'api'\norder = 1\npaths = ['server/**']\n\
+[layers.client]\napp = 'cli'\norder = 1\npaths = ['tool/**']\n";
+    let server = r#"
+use actix_web::{get, web, App};
+#[get("/health")]
+async fn health() {}
+async fn show() {}
+async fn unused() {}
+fn app() -> App {
+    App::new().service(health).service(
+        web::scope("/api")
+            .service(web::resource("/users/{id}").route(web::get().to(show)))
+            .route("/unused", web::post().to(unused)),
+    )
+}
+fn main() {}
+"#;
+    let client = r#"
+use reqwest::Client;
+const BASE: &str = "http://localhost:8080";
+pub async fn run(client: &Client, id: u32) {
+    client.get(format!("{BASE}/health")).send().await;
+    client.get(format!("{BASE}/api/users/{id}")).send().await;
+    client.get(format!("{BASE}/api/missing")).send().await;
+}
+fn main() {}
+"#;
+    let published = publish(&[
+        (".trellis/rules.toml", rules),
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"server\", \"tool\"]\n",
+        ),
+        ("server/Cargo.toml", "[package]\nname = \"api\"\n"),
+        ("server/src/main.rs", server),
+        ("tool/Cargo.toml", "[package]\nname = \"cli\"\n"),
+        ("tool/src/main.rs", client),
+    ]);
+    let interfaces = published.summary["interfaces"].as_array().unwrap();
+    assert_eq!(interfaces.len(), 1, "{interfaces:#?}");
+    assert_eq!(
+        (&interfaces[0]["client"], &interfaces[0]["server"]),
+        (&json!("cli"), &json!("api"))
+    );
+    assert_eq!(
+        interfaces[0]["counts"],
+        json!({"matchedRoutes": 2, "callSites": 2, "serverOnly": 1, "clientOnly": 1,
+            "confidence": {"exact": 1, "template": 1, "wrapperInferred": 0, "unresolved": 1}})
+    );
+    let matched = details(&published, &[("list", "matched")], 100);
+    let users = matched
+        .iter()
+        .find(|item| item["entry"]["pathTemplate"] == "/api/users/{id}")
+        .unwrap();
+    assert_eq!(users["entry"]["confidence"], "template");
+    assert_eq!(
+        users["entry"]["handler"]["stableLookupKey"],
+        "server/src/main.rs::show"
+    );
+    let site = &users["entry"]["callSites"][0];
+    assert_eq!(site["document"]["language"], "rust");
+    assert_eq!(site["caller"]["name"], "run");
+    let server_only = details(&published, &[("list", "serverOnly")], 100);
+    assert_eq!(server_only.len(), 1);
+    assert_eq!(server_only[0]["entry"]["method"], "POST");
+    assert_eq!(server_only[0]["entry"]["pathTemplate"], "/api/unused");
+    let client_only = details(&published, &[("list", "clientOnly")], 100);
+    assert_eq!(client_only.len(), 1);
+    assert_eq!(client_only[0]["entry"]["pathTemplate"], "/api/missing");
+    assert_eq!(client_only[0]["entry"]["confidence"], "unresolved");
+}
+
+/// #856: a Flask server and a requests/httpx client, each its own Python project. Both
+/// one-sided lists are reported against the pair, and an httpx base URL path infers.
+#[test]
+fn a_flask_server_and_a_python_client_are_an_interface() {
+    let rules = "version = 1\n\
+[layers.server]\napp = 'api'\norder = 1\npaths = ['server/**']\n\
+[layers.client]\napp = 'cli'\norder = 1\npaths = ['tool/**']\n";
+    let server = r#"
+from flask import Flask, Blueprint
+
+app = Flask(__name__)
+users = Blueprint("users", __name__, url_prefix="/api/users")
+
+@app.route("/health")
+def health():
+    return "ok"
+
+@users.route("/<int:user_id>")
+def show(user_id):
+    return ""
+
+@users.route("/<int:user_id>", methods=["DELETE"])
+def remove(user_id):
+    return ""
+
+app.register_blueprint(users)
+"#;
+    let client = r#"
+import httpx
+import requests
+
+BASE = "http://localhost:8000"
+
+def run(user_id):
+    requests.get(f"{BASE}/health")
+    with httpx.Client(base_url=f"{BASE}/api") as client:
+        client.get(f"/users/{user_id}")
+    requests.get(BASE + "/api/missing")
+"#;
+    let published = publish(&[
+        (".trellis/rules.toml", rules),
+        ("server/pyproject.toml", "[project]\nname = \"api\"\n"),
+        ("server/api/app.py", server),
+        ("tool/pyproject.toml", "[project]\nname = \"cli\"\n"),
+        ("tool/cli/main.py", client),
+    ]);
+    let interfaces = published.summary["interfaces"].as_array().unwrap();
+    assert_eq!(interfaces.len(), 1, "{interfaces:#?}");
+    assert_eq!(
+        (&interfaces[0]["client"], &interfaces[0]["server"]),
+        (&json!("cli"), &json!("api"))
+    );
+    assert_eq!(
+        interfaces[0]["counts"],
+        json!({"matchedRoutes": 2, "callSites": 2, "serverOnly": 1, "clientOnly": 1,
+            "confidence": {"exact": 1, "template": 0, "wrapperInferred": 1, "unresolved": 1}})
+    );
+    let matched = details(&published, &[("list", "matched")], 100);
+    let show = matched
+        .iter()
+        .find(|item| item["entry"]["pathTemplate"] == "/api/users/{user_id}")
+        .unwrap();
+    assert_eq!(show["entry"]["method"], "GET");
+    assert_eq!(show["entry"]["confidence"], "wrapperInferred");
+    assert_eq!(show["entry"]["handler"]["kind"], "declaration");
+    let site = &show["entry"]["callSites"][0];
+    assert_eq!(site["document"]["language"], "python");
+    assert_eq!(site["caller"]["name"], "run");
+    let server_only = details(&published, &[("list", "serverOnly")], 100);
+    assert_eq!(server_only.len(), 1);
+    assert_eq!(server_only[0]["entry"]["method"], "DELETE");
+    assert_eq!(
+        server_only[0]["entry"]["pathTemplate"],
+        "/api/users/{user_id}"
+    );
+    let client_only = details(&published, &[("list", "clientOnly")], 100);
+    assert_eq!(client_only.len(), 1);
+    assert_eq!(client_only[0]["entry"]["pathTemplate"], "/api/missing");
+    assert_eq!(client_only[0]["entry"]["confidence"], "unresolved");
+}
+
+// #855: JavaScript and TypeScript servers and clients.
+
+const JS_RULES: &str = "version = 1\n\
+[layers.api]\napp = 'api'\norder = 1\npaths = ['api/**']\n\
+[layers.web]\napp = 'web'\norder = 1\npaths = ['web/**']\n\
+[layers.site]\napp = 'site'\norder = 1\npaths = ['site/**']\n";
+
+const JS_API: &str = r#"
+const express = require("express");
+const app = express();
+const users = express.Router();
+function listUsers(req, res) {}
+function showUser(req, res) {}
+users.get("/", listUsers);
+users.get("/:id", showUser);
+app.use("/api/users", users);
+app.post("/api/audit", (req, res) => {});
+module.exports = app;
+"#;
+
+const JS_SITE_ROUTE: &str = "export async function GET(request) { return Response.json([]); }\n";
+
+const JS_WEB: &str = r#"
+import axios from "axios";
+const http = axios.create({ baseURL: "/api" });
+export async function load(id) {
+  await fetch("/api/users");
+  await http.get(`/users/${id}`);
+  await fetch("/products/7");
+  await axios.delete("/api/users/7");
+}
+"#;
+
+fn js_apps(api: &str) -> Published {
+    publish(&[
+        (".trellis/rules.toml", JS_RULES),
+        (
+            "api/package.json",
+            "{\"name\":\"api\",\"dependencies\":{\"express\":\"4.21.0\"}}\n",
+        ),
+        ("api/server.js", api),
+        (
+            "site/package.json",
+            "{\"name\":\"site\",\"dependencies\":{\"next\":\"15.0.0\"}}\n",
+        ),
+        ("site/app/products/[id]/route.js", JS_SITE_ROUTE),
+        (
+            "web/package.json",
+            "{\"name\":\"web\",\"dependencies\":{\"axios\":\"1.7.0\"}}\n",
+        ),
+        ("web/client.js", JS_WEB),
+    ])
+}
+
+/// A browser client reaches an express server and a Next.js app: one interface per pair,
+/// each with its own confidence counts, and both one-sided lists.
+#[test]
+fn a_javascript_client_reaches_express_and_next_servers() {
+    let published = js_apps(JS_API);
+    let interfaces = published.summary["interfaces"].as_array().unwrap();
+    let pairs: Vec<(&str, &str)> = interfaces
+        .iter()
+        .map(|i| (i["client"].as_str().unwrap(), i["server"].as_str().unwrap()))
+        .collect();
+    assert_eq!(pairs, [("web", "api"), ("web", "site")], "{interfaces:#?}");
+    let api = &interfaces[0];
+    assert_eq!(
+        api["counts"],
+        json!({"matchedRoutes": 2, "callSites": 2, "serverOnly": 1, "clientOnly": 1,
+            "confidence": {"exact": 1, "template": 0, "wrapperInferred": 1, "unresolved": 1}})
+    );
+    assert!(
+        api["wrappers"]["callees"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("axios"))
+    );
+    let site = &interfaces[1];
+    assert_eq!(site["counts"]["matchedRoutes"], 1);
+    assert_eq!(site["counts"]["confidence"]["template"], 1);
+
+    let matched = details(
+        &published,
+        &[("client", "web"), ("server", "api"), ("list", "matched")],
+        10,
+    );
+    let entries: Vec<(&str, &str, &str, &str)> = matched
+        .iter()
+        .map(|item| {
+            let entry = &item["entry"];
+            (
+                entry["method"].as_str().unwrap(),
+                entry["pathTemplate"].as_str().unwrap(),
+                entry["confidence"].as_str().unwrap(),
+                entry["handler"]["stableLookupKey"].as_str().unwrap_or("-"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        entries,
+        [
+            ("GET", "/api/users", "exact", "api/server.js::listUsers"),
+            (
+                "GET",
+                "/api/users/{id}",
+                "wrapperInferred",
+                "api/server.js::showUser"
+            ),
+        ]
+    );
+    // One-sided, both ways: the server's unmatched route, and the client's call with no route.
+    let server_only = details(
+        &published,
+        &[("client", "web"), ("server", "api"), ("list", "serverOnly")],
+        10,
+    );
+    assert_eq!(server_only.len(), 1);
+    assert_eq!(server_only[0]["entry"]["method"], "POST");
+    assert_eq!(server_only[0]["entry"]["pathTemplate"], "/api/audit");
+    let client_only = details(
+        &published,
+        &[("client", "web"), ("server", "api"), ("list", "clientOnly")],
+        10,
+    );
+    assert_eq!(client_only.len(), 1);
+    assert_eq!(client_only[0]["entry"]["method"], "DELETE");
+    assert_eq!(client_only[0]["entry"]["pathTemplate"], "/api/users/7");
+    assert_eq!(client_only[0]["entry"]["confidence"], "unresolved");
+    let site_matched = details(
+        &published,
+        &[("client", "web"), ("server", "site"), ("list", "matched")],
+        10,
+    );
+    assert_eq!(site_matched[0]["entry"]["pathTemplate"], "/products/{id}");
+    assert_eq!(site_matched[0]["entry"]["handler"]["kind"], "declaration");
+}
+
+/// Negative control: the same server source without the express import registers nothing, so
+/// the web app's only interface is with the Next.js app.
+#[test]
+fn a_server_without_a_framework_import_has_no_routes() {
+    let published = js_apps(&JS_API.replace("require(\"express\")", "require(\"./local\")"));
+    let interfaces = published.summary["interfaces"].as_array().unwrap();
+    let pairs: Vec<(&str, &str)> = interfaces
+        .iter()
+        .map(|i| (i["client"].as_str().unwrap(), i["server"].as_str().unwrap()))
+        .collect();
+    assert_eq!(pairs, [("web", "site")], "{interfaces:#?}");
+}
+
+/// #855 on Trellis itself: with `fetch`, axios and the JavaScript frameworks read, every
+/// JavaScript and TypeScript source under `web/` and `herdr-mod/` and every build manifest the
+/// capture walk admits still give exactly one interface, `trellis-web` to `trellis`.
+#[test]
+fn trellis_whole_web_client_still_has_one_interface() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut owned: Vec<(String, String)> = Vec::new();
+    let walk = ignore::WalkBuilder::new(root)
+        .require_git(false)
+        .follow_links(false)
+        .hidden(true)
+        .parents(false)
+        .git_global(false)
+        .git_exclude(false)
+        .filter_entry(|entry| {
+            !matches!(
+                entry.file_name().to_str(),
+                Some(".git" | "node_modules" | ".venv" | "target" | "dist" | "build")
+            )
+        })
+        .build();
+    for entry in walk {
+        let entry = entry.unwrap();
+        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let relative = entry.path().strip_prefix(root).unwrap().to_str().unwrap();
+        let name = entry.file_name().to_str().unwrap_or_default();
+        let source = (relative.starts_with("web/") || relative.starts_with("herdr-mod/"))
+            && [".js", ".mjs", ".cjs", ".ts"]
+                .iter()
+                .any(|ext| name.ends_with(ext));
+        let manifest = matches!(name, "Cargo.toml" | "package.json" | "pyproject.toml");
+        if source || manifest {
+            owned.push((
+                relative.to_owned(),
+                fs::read_to_string(entry.path()).unwrap(),
+            ));
+        }
+    }
+    let stubs: Vec<(String, String)> = owned
+        .iter()
+        .filter_map(|(path, text)| {
+            if let Some(dir) = path.strip_suffix("pyproject.toml") {
+                return Some((format!("{dir}stub.py"), "A = 1\n".to_owned()));
+            }
+            let dir = path.strip_suffix("Cargo.toml")?;
+            text.contains("[package]")
+                .then(|| (format!("{dir}src/main.rs"), "fn main() {}\n".to_owned()))
+        })
+        .collect();
+    owned.extend(stubs);
+    for path in [".trellis/rules.toml", "src/http.rs"] {
+        owned.push((
+            path.to_owned(),
+            fs::read_to_string(root.join(path)).unwrap(),
+        ));
+    }
+    owned.push((
+        "src/bin/trellis-producer-stub.rs".into(),
+        "fn main() {}\n".into(),
+    ));
+    owned.sort();
+    owned.dedup_by(|a, b| a.0 == b.0);
+    let files: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(path, text)| (path.as_str(), text.as_str()))
+        .collect();
+    let published = publish(&files);
+    let interfaces = published.summary["interfaces"].as_array().unwrap();
+    let pairs: Vec<(&str, &str)> = interfaces
+        .iter()
+        .map(|i| (i["client"].as_str().unwrap(), i["server"].as_str().unwrap()))
+        .collect();
+    assert_eq!(pairs, [("trellis-web", "trellis")], "{interfaces:#?}");
+    // The `api` wrapper's own `fetch` is its implementation, not a call of its own.
+    let client_only = details(&published, &[("list", "clientOnly")], 200);
+    assert!(!client_only.is_empty());
+    assert!(
+        client_only
+            .iter()
+            .all(|item| item["entry"]["callSite"]["caller"]["name"] != "api"),
+        "{client_only:#?}"
+    );
+}
+
+/// #855 (owner rulings 2026-11-10): a wrapper authored in `.trellis/rules.toml`, scoped to a
+/// root or to an app, reaches the published interfaces and is listed in `wrappers.callees`; an
+/// invalid one is a rules error.
+#[test]
+fn a_rules_file_wrapper_reaches_the_published_interfaces() {
+    let layers = "version = 1\n\
+        [layers.api]\napp = 'api'\norder = 1\npaths = ['api/**']\n\
+        [layers.web]\napp = 'web'\norder = 1\npaths = ['web/**']\n";
+    for scope in ["root = \"web\"", "app = \"web\""] {
+        let rules = format!(
+            "{layers}[[interfaces.wrappers]]\ncallee = \"apiFetch\"\nprefix = \"/api\"\n{scope}\n"
+        );
+        let published = publish(&[
+            (".trellis/rules.toml", rules.as_str()),
+            (
+                "api/package.json",
+                "{\"name\":\"api\",\"dependencies\":{\"express\":\"4.21.0\"}}\n",
+            ),
+            ("api/server.js", JS_API),
+            ("web/package.json", "{\"name\":\"web\"}\n"),
+            (
+                "web/client.js",
+                "export const go = () => apiFetch(\"/users\");\n",
+            ),
+        ]);
+        let interfaces = published.summary["interfaces"].as_array().unwrap();
+        assert_eq!(interfaces.len(), 1, "{interfaces:#?}");
+        assert_eq!(interfaces[0]["counts"]["confidence"]["wrapperInferred"], 1);
+        assert!(
+            interfaces[0]["wrappers"]["callees"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("apiFetch"))
+        );
+    }
+    let error = trellis::rules::parse(&format!(
+        "{JS_RULES}[[interfaces.wrappers]]\ncallee = \"a.b.c\"\n"
+    ))
+    .err()
+    .unwrap();
+    assert!(format!("{error:#}").contains("wrapper callee"), "{error:#}");
 }

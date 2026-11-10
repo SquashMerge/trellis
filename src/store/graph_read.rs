@@ -361,41 +361,48 @@ impl GraphSource for SnapshotGraphSource<'_> {
 /// Bound the exact facts the shared decoder will read, without loading unrelated tuple facts.
 fn navigation_call_budget(
     db: &Connection,
+    projection: &semantic_payload::PayloadProjection<'_>,
+    revision_key: &str,
     tuple: i64,
     call: &[u8],
     reader: &mut crate::navigation::Reader<'_>,
 ) -> Result<bool> {
+    let native = projection.native();
+    let payload = projection.payload_id;
     let sql = "SELECT length(CAST(json_object('tuple_id',tuple_id,'revision_id',revision_id,'producer_id',producer_id,'producer_version',producer_version,'language',language,'path',path,'requested',requested,'selected',selected,'state',state,'diagnostic',diagnostic) AS BLOB)) FROM semantic_coverage WHERE tuple_id=?1
 UNION ALL
-SELECT length(CAST(json_object('tuple_id',tuple_id,'kind',kind,'ordinal',ordinal,'role',role) AS BLOB)) FROM semantic_coverage_roles WHERE tuple_id=?1
+SELECT length(CAST(json_object('tuple_id',?1,'kind',kind,'ordinal',ordinal,'role',role) AS BLOB)) FROM semantic_coverage_roles WHERE payload_id=?6 OR tuple_id=?1
 UNION ALL
 SELECT length(CAST(json_object('id',id,'version',version,'executable_hash',executable_hash,'kind',kind,'position_encoding',position_encoding) AS BLOB)) FROM semantic_producers WHERE (id,version) IN (SELECT producer_id,producer_version FROM semantic_coverage WHERE tuple_id=?1)
 UNION ALL
 SELECT length(CAST(json_object('id',id,'version',version,'language',language,'ordinal',ordinal) AS BLOB)) FROM semantic_producer_languages WHERE (id,version) IN (SELECT producer_id,producer_version FROM semantic_coverage WHERE tuple_id=?1)
 UNION ALL
-SELECT length(CAST(json_object('binding_id',binding_id,'tuple_id',tuple_id,'ordinal',ordinal,'call_id',hex(call_id),'join_document_language',join_document_language,'join_document_path',join_document_path,'join_native_revision_id',join_native_revision_id,'join_content_hash',join_content_hash,'join_start',join_start,'join_end',join_end,'join_kind',join_kind,'join_status',join_status,'join_diagnostic',join_diagnostic,'resolution',resolution,'declared_kind',declared_kind,'declared_internal_syntax_id',hex(declared_internal_syntax_id),'declared_internal_language',declared_internal_language,'declared_internal_path',declared_internal_path,'declared_internal_native_revision_id',declared_internal_native_revision_id,'declared_external_scheme',declared_external_scheme,'declared_external_symbol',declared_external_symbol,'declared_external_scope',declared_external_scope,'declared_external_language',declared_external_language,'declared_external_path',declared_external_path,'dispatch',dispatch,'possible_dispatch_complete',possible_dispatch_complete,'stale_target',stale_target,'provenance_id',provenance_id) AS BLOB)) FROM semantic_call_bindings WHERE tuple_id=?1 AND call_id=?2
+SELECT length(CAST(json_object('binding_id',binding_id,'tuple_id',?1,'ordinal',ordinal,'call_id',hex(call_id),'join_document_language',join_document_language,'join_document_path',join_document_path,'join_native_revision_id',COALESCE(join_native_revision_id,?4),'join_content_hash',join_content_hash,'join_start',join_start,'join_end',join_end,'join_kind',join_kind,'join_status',join_status,'join_diagnostic',join_diagnostic,'resolution',resolution,'declared_kind',declared_kind,'declared_internal_syntax_id',hex(declared_internal_syntax_id),'declared_internal_language',declared_internal_language,'declared_internal_path',declared_internal_path,'declared_internal_native_revision_id',CASE WHEN declared_kind='internal' THEN COALESCE(declared_internal_native_revision_id,?4) END,'declared_external_scheme',declared_external_scheme,'declared_external_symbol',declared_external_symbol,'declared_external_scope',declared_external_scope,'declared_external_language',declared_external_language,'declared_external_path',declared_external_path,'dispatch',dispatch,'possible_dispatch_complete',possible_dispatch_complete,'stale_target',stale_target,'provenance_id',(SELECT COALESCE(p.provenance_id,printf('%064d',0)) FROM semantic_provenance p WHERE p.payload_id=b.payload_id AND p.ordinal=b.provenance_ordinal)) AS BLOB)) FROM semantic_call_bindings b WHERE payload_id=?6 AND call_id=?2
 UNION ALL
-SELECT length(CAST(json_object('binding_id',binding_id,'ordinal',ordinal,'kind',kind,'internal_syntax_id',hex(internal_syntax_id),'internal_language',internal_language,'internal_path',internal_path,'internal_native_revision_id',internal_native_revision_id,'external_scheme',external_scheme,'external_symbol',external_symbol,'external_scope',external_scope,'external_language',external_language,'external_path',external_path) AS BLOB)) FROM semantic_call_candidates WHERE binding_id IN (SELECT binding_id FROM semantic_call_bindings WHERE tuple_id=?1 AND call_id=?2)
+SELECT length(CAST(json_object('binding_id',binding_id,'ordinal',ordinal,'kind',kind,'internal_syntax_id',hex(internal_syntax_id),'internal_language',internal_language,'internal_path',internal_path,'internal_native_revision_id',CASE WHEN kind='internal' THEN COALESCE(internal_native_revision_id,?4) END,'external_scheme',external_scheme,'external_symbol',external_symbol,'external_scope',external_scope,'external_language',external_language,'external_path',external_path) AS BLOB)) FROM semantic_call_candidates WHERE binding_id IN (SELECT binding_id FROM semantic_call_bindings WHERE payload_id=?6 AND call_id=?2)
 UNION ALL
-SELECT length(CAST(json_object('binding_id',binding_id,'ordinal',ordinal,'kind',kind,'internal_syntax_id',hex(internal_syntax_id),'internal_language',internal_language,'internal_path',internal_path,'internal_native_revision_id',internal_native_revision_id,'external_scheme',external_scheme,'external_symbol',external_symbol,'external_scope',external_scope,'external_language',external_language,'external_path',external_path) AS BLOB)) FROM semantic_call_possible_dispatch WHERE binding_id IN (SELECT binding_id FROM semantic_call_bindings WHERE tuple_id=?1 AND call_id=?2)
+SELECT length(CAST(json_object('binding_id',binding_id,'ordinal',ordinal,'kind',kind,'internal_syntax_id',hex(internal_syntax_id),'internal_language',internal_language,'internal_path',internal_path,'internal_native_revision_id',CASE WHEN kind='internal' THEN COALESCE(internal_native_revision_id,?4) END,'external_scheme',external_scheme,'external_symbol',external_symbol,'external_scope',external_scope,'external_language',external_language,'external_path',external_path) AS BLOB)) FROM semantic_call_possible_dispatch WHERE binding_id IN (SELECT binding_id FROM semantic_call_bindings WHERE payload_id=?6 AND call_id=?2)
 UNION ALL
-SELECT length(CAST(json_object('binding_id',binding_id,'ordinal',ordinal,'candidate_id',hex(candidate_id)) AS BLOB)) FROM semantic_call_join_candidates WHERE binding_id IN (SELECT binding_id FROM semantic_call_bindings WHERE tuple_id=?1 AND call_id=?2)
+SELECT length(CAST(json_object('binding_id',binding_id,'ordinal',ordinal,'candidate_id',hex(candidate_id)) AS BLOB)) FROM semantic_call_join_candidates WHERE binding_id IN (SELECT binding_id FROM semantic_call_bindings WHERE payload_id=?6 AND call_id=?2)
 UNION ALL
-SELECT length(CAST(json_object('tuple_id',tuple_id,'provenance_id',provenance_id,'content_hash',content_hash,'evidence_kind',evidence_kind,'freshness',freshness,'basis_id',basis_id,'capture_id',capture_id,'derived_from_provenance_id',derived_from_provenance_id,'derived_from_record_kind',derived_from_record_kind,'derived_from_fact_digest',derived_from_fact_digest) AS BLOB)) FROM semantic_provenance WHERE tuple_id=?1 AND provenance_id IN (SELECT provenance_id FROM semantic_call_bindings WHERE tuple_id=?1 AND call_id=?2)
+SELECT length(CAST(json_object('tuple_id',?1,'provenance_id',COALESCE(p.provenance_id,printf('%064d',0)),'content_hash',p.content_hash,'evidence_kind',p.evidence_kind,'freshness',(SELECT f.freshness FROM semantic_coverage_freshness f WHERE f.revision_id=?5 AND f.tuple_id=?1 AND f.basis_id=p.basis_id),'basis_id',p.basis_id,'capture_id',p.capture_id,'derived_from_provenance_id',p.derived_from_provenance_id,'derived_from_record_kind',p.derived_from_record_kind,'derived_from_fact_digest',p.derived_from_fact_digest) AS BLOB)) FROM semantic_provenance p WHERE p.payload_id=?6 AND p.ordinal IN (SELECT provenance_ordinal FROM semantic_call_bindings WHERE payload_id=?6 AND call_id=?2)
 UNION ALL
-SELECT length(CAST(json_object('basis_id',basis_id,'tuple_id',tuple_id,'producer_id',producer_id,'producer_version',producer_version,'producer_hash',producer_hash,'artifact_hash',artifact_hash,'language',language,'source_set_id',source_set_id,'captured_native_revision_id',captured_native_revision_id,'source_manifest_hash',source_manifest_hash,'toolchain_hash',toolchain_hash,'config_hash',config_hash,'dependency_hash',dependency_hash) AS BLOB)) FROM semantic_basis WHERE basis_id IN (SELECT basis_id FROM semantic_provenance WHERE tuple_id=?1 AND provenance_id IN (SELECT provenance_id FROM semantic_call_bindings WHERE tuple_id=?1 AND call_id=?2))
+SELECT length(CAST(json_object('basis_id',basis_id,'tuple_id',?1,'producer_id',producer_id,'producer_version',producer_version,'producer_hash',producer_hash,'artifact_hash',artifact_hash,'language',language,'source_set_id',source_set_id,'captured_native_revision_id',captured_native_revision_id,'source_manifest_hash',source_manifest_hash,'toolchain_hash',toolchain_hash,'config_hash',config_hash,'dependency_hash',dependency_hash) AS BLOB)) FROM semantic_basis WHERE basis_id IN (SELECT basis_id FROM semantic_provenance WHERE payload_id=?6 AND ordinal IN (SELECT provenance_ordinal FROM semantic_call_bindings WHERE payload_id=?6 AND call_id=?2))
 UNION ALL
-SELECT length(CAST(json_object('basis_id',basis_id,'ordinal',ordinal,'lookup_key',lookup_key) AS BLOB)) FROM semantic_basis_lookup_dependencies WHERE basis_id IN (SELECT basis_id FROM semantic_provenance WHERE tuple_id=?1 AND provenance_id IN (SELECT provenance_id FROM semantic_call_bindings WHERE tuple_id=?1 AND call_id=?2))
+SELECT length(CAST(json_object('basis_id',basis_id,'ordinal',ordinal,'lookup_key',lookup_key) AS BLOB)) FROM semantic_basis_lookup_dependencies WHERE basis_id IN (SELECT basis_id FROM semantic_provenance WHERE payload_id=?6 AND ordinal IN (SELECT provenance_ordinal FROM semantic_call_bindings WHERE payload_id=?6 AND call_id=?2))
 UNION ALL
-SELECT length(CAST(json_object('capture_id',capture_id,'proof_id',proof_id,'record_kind',record_kind,'fact_digest',fact_digest,'language',language,'path',path) AS BLOB)) FROM semantic_raw_proofs WHERE (capture_id,proof_id) IN (SELECT capture_id,derived_from_provenance_id FROM semantic_provenance WHERE tuple_id=?1 AND provenance_id IN (SELECT provenance_id FROM semantic_call_bindings WHERE tuple_id=?1 AND call_id=?2))
+SELECT length(CAST(json_object('capture_id',capture_id,'proof_id',proof_id,'record_kind',record_kind,'fact_digest',fact_digest,'language',language,'path',path) AS BLOB)) FROM semantic_raw_proofs WHERE (capture_id,proof_id) IN (SELECT capture_id,derived_from_provenance_id FROM semantic_provenance WHERE payload_id=?6 AND ordinal IN (SELECT provenance_ordinal FROM semantic_call_bindings WHERE payload_id=?6 AND call_id=?2))
 UNION ALL
-SELECT length(CAST(json_object('capture_id',capture_id,'producer_id',producer_id,'artifact_hash',artifact_hash,'source_set_id',source_set_id,'captured_revision',captured_revision,'decoder_version',decoder_version) AS BLOB)) FROM semantic_raw_captures WHERE capture_id IN (SELECT capture_id FROM semantic_provenance WHERE tuple_id=?1 AND provenance_id IN (SELECT provenance_id FROM semantic_call_bindings WHERE tuple_id=?1 AND call_id=?2))
+SELECT length(CAST(json_object('capture_id',capture_id,'producer_id',producer_id,'artifact_hash',artifact_hash,'source_set_id',source_set_id,'captured_revision',captured_revision,'decoder_version',decoder_version) AS BLOB)) FROM semantic_raw_captures WHERE capture_id IN (SELECT capture_id FROM semantic_provenance WHERE payload_id=?6 AND ordinal IN (SELECT provenance_ordinal FROM semantic_call_bindings WHERE payload_id=?6 AND call_id=?2))
 LIMIT ?3";
     let mut statement = db.prepare(sql)?;
     let mut rows = statement.query(params![
         tuple,
         call,
-        (crate::navigation::QUERY_ROWS + 1) as i64
+        (crate::navigation::QUERY_ROWS + 1) as i64,
+        native,
+        revision_key,
+        payload
     ])?;
     let mut count = 0;
     while let Some(row) = rows.next()? {
@@ -515,7 +522,13 @@ pub(super) fn navigation_calls(
         let encoded = id_codec::encode_occ(&call.id).context(SelectedIntegrity(
             "invalid selected navigation call ID".into(),
         ))?;
-        if !navigation_call_budget(db, tuple, &encoded, reader)? {
+        let payload_projection = semantic_payload::project_payload(
+            db,
+            &basis_key,
+            tuple,
+            semantic_payload::FreshnessSource::Stored,
+        )?;
+        if !navigation_call_budget(db, &payload_projection, &basis_key, tuple, &encoded, reader)? {
             break;
         }
         let facts =

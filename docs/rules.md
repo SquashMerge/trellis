@@ -624,6 +624,30 @@ detected name is allowed, because its detected app is shadowed). Files under `fr
 to `mimir-frontend`, files under `plugins/cultivate/` to `mimir-cultivate`, and every other
 file to `mimir-agent`.
 
+## Amendment (#855): interface wrappers
+
+**Status: owner-ratified 2026-11-10 ([#855](https://github.com/SquashMerge/trellis/issues/855)).**
+The owner ruled that JavaScript and TypeScript request wrappers for HTTP interface evidence are
+configured in this file. They are not configured in each client's `package.json`.
+
+`[interfaces]` is an optional top-level table, and `wrappers` is its only key. Each
+`[[interfaces.wrappers]]` entry has these keys:
+
+- `callee` (required): an identifier or `object.property`;
+- `method`: `"options"` (the default) or `"argument"`;
+- `at`: 1 to 8, with a default of 1;
+- `prefix`: a rooted literal with no query, fragment or pattern;
+- `root`: a directory, following the `[apps]` root rules, with a default of `.`;
+- `app`: the name of one app of the effective inventory, the same inventory `check` uses.
+  The wrapper applies to the files assigned to that app (owner ruling 2026-11-10).
+
+`root` and `app` are exclusive. Each of these is a located `invalid_rules` error: any other key,
+any invalid value, both `root` and `app`, the same `callee` twice for one scope, and more than 64
+entries. An `app` that names no app, or a name that several apps share, is a located
+`reference` or `ambiguity` error when the apps are resolved, like a layer's `app`. Wrappers only shape interface evidence. They
+never change a rule verdict, a count or an app. The reading rules are in
+[architecture-view.md](architecture-view.md#apps-and-http-interfaces-data-and-extraction-784-788).
+
 ## External package policy
 
 A layer needs a nonempty `paths` or `external` collection; either selects that

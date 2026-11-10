@@ -93,6 +93,27 @@ struct Raw {
     /// Authored apps (#794).
     #[serde(default)]
     apps: BTreeMap<String, Spanned<RawApp>>,
+    /// HTTP interface settings (#855).
+    #[serde(default)]
+    interfaces: RawInterfaces,
+}
+/// The `[interfaces]` table (#855). `wrappers` is its only key.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawInterfaces {
+    #[serde(default)]
+    wrappers: Vec<Spanned<RawWrapper>>,
+}
+/// One `[[interfaces.wrappers]]` entry (#855).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawWrapper {
+    callee: Option<Spanned<String>>,
+    method: Option<Spanned<String>>,
+    at: Option<Spanned<i64>>,
+    prefix: Option<Spanned<String>>,
+    root: Option<Spanned<String>>,
+    app: Option<Spanned<String>>,
 }
 /// An authored `[apps.<name>]` table (#794). `roots` is its only key.
 #[derive(Deserialize)]
@@ -276,12 +297,45 @@ pub struct Config {
     external_deny: BTreeSet<ExternalSelector>,
     /// Authored `[apps.<name>]` tables in name order (#794).
     apps: Vec<AuthoredApp>,
+    /// Authored `[[interfaces.wrappers]]` entries in written order (#855).
+    wrappers: Vec<InterfaceWrapper>,
+}
+
+/// Where a configured request wrapper reads its method (#855).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WrapperMethod {
+    /// `method` in the options object at this argument.
+    Options(usize),
+    /// A string at this argument.
+    Argument(usize),
+}
+
+/// An authored `[[interfaces.wrappers]]` entry (#855): a JavaScript or TypeScript callee whose
+/// argument 0 is a request path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct InterfaceWrapper {
+    /// An identifier, or `object.property`.
+    pub(crate) callee: String,
+    pub(crate) method: WrapperMethod,
+    /// A rooted literal the wrapper adds to every path.
+    pub(crate) prefix: Option<String>,
+    /// The checkout-relative directory whose files the wrapper applies to; `.` is every file.
+    /// It is `.` when `app` is set.
+    pub(crate) root: String,
+    /// The app whose files the wrapper applies to, and where it is written. It names an app of
+    /// the effective inventory, which rule preparation checks.
+    pub(crate) app: Option<(String, std::ops::Range<usize>)>,
 }
 
 impl Config {
     /// Authored `[[exceptions]]` entries, as the rules inventory lists them.
     pub fn exception_count(&self) -> usize {
         self.exceptions.len()
+    }
+
+    /// The authored request wrappers, in written order (#855).
+    pub(crate) fn interface_wrappers(&self) -> &[InterfaceWrapper] {
+        &self.wrappers
     }
 
     /// How many `[apps.<name>]` tables the file authors (#794).
@@ -640,6 +694,7 @@ pub fn parse(text: &str) -> Result<Config> {
         );
     }
     let apps = authored_apps(text, raw.apps)?;
+    let wrappers = interface_wrappers(text, raw.interfaces)?;
     let mut roles = BTreeMap::new();
     for (name, raw) in raw.roles {
         let selector = raw.get_ref();
@@ -882,7 +937,161 @@ pub fn parse(text: &str) -> Result<Config> {
         shared_outbound,
         external_deny,
         apps,
+        wrappers,
     })
+}
+
+/// The most wrappers `[interfaces]` may author.
+const WRAPPER_LIMIT: usize = 64;
+
+/// The authored `[[interfaces.wrappers]]` entries (#855). Each has a `callee` that is an
+/// identifier or `object.property`; `method` is `"options"` (the default) or `"argument"`;
+/// `at` is 1 to 8 (default 1); `prefix` is a rooted literal with no query, fragment or
+/// pattern; `root` is a valid app root (default `.`). A callee appears once per root.
+fn interface_wrappers(text: &str, raw: RawInterfaces) -> Result<Vec<InterfaceWrapper>> {
+    if raw.wrappers.len() > WRAPPER_LIMIT {
+        return Err(error(
+            text,
+            raw.wrappers[WRAPPER_LIMIT].span(),
+            "too_large",
+            "token",
+            "interfaces.wrappers exceeds 64 entries",
+        ));
+    }
+    let identifier = |part: &str| {
+        let mut chars = part.chars();
+        chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+    };
+    let mut wrappers: Vec<InterfaceWrapper> = Vec::with_capacity(raw.wrappers.len());
+    for entry in raw.wrappers {
+        let span = entry.span();
+        let entry = entry.into_inner();
+        let invalid = |span: std::ops::Range<usize>, message: String| {
+            error(text, span, "schema", "token", message)
+        };
+        let Some(callee) = entry.callee else {
+            return Err(invalid(
+                span,
+                "an interfaces wrapper requires callee".into(),
+            ));
+        };
+        let callee_span = callee.span();
+        let callee = callee.into_inner();
+        let parts: Vec<&str> = callee.split('.').collect();
+        if parts.len() > 2 || !parts.iter().all(|part| identifier(part)) {
+            return Err(invalid(
+                callee_span,
+                format!("wrapper callee {callee:?} must be an identifier or object.property"),
+            ));
+        }
+        let at = match entry.at {
+            None => 1,
+            Some(at) => {
+                let at_span = at.span();
+                match usize::try_from(*at.get_ref()) {
+                    Ok(at @ 1..=8) => at,
+                    _ => {
+                        return Err(invalid(at_span, "wrapper at must be 1 to 8".into()));
+                    }
+                }
+            }
+        };
+        let method = match entry
+            .method
+            .as_ref()
+            .map(|m| (m.get_ref().as_str(), m.span()))
+        {
+            None | Some(("options", _)) => WrapperMethod::Options(at),
+            Some(("argument", _)) => WrapperMethod::Argument(at),
+            Some((other, method_span)) => {
+                return Err(invalid(
+                    method_span,
+                    format!("wrapper method {other:?} must be \"options\" or \"argument\""),
+                ));
+            }
+        };
+        let prefix = match entry.prefix {
+            None => None,
+            Some(prefix) => {
+                let prefix_span = prefix.span();
+                let prefix = prefix.into_inner();
+                if !prefix.starts_with('/') || prefix.contains(['?', '#', '{', '}', '*']) {
+                    return Err(invalid(
+                        prefix_span,
+                        format!(
+                            "wrapper prefix {prefix:?} must start with / and have no query, fragment or pattern"
+                        ),
+                    ));
+                }
+                Some(prefix)
+            }
+        };
+        if let (Some(_), Some(app)) = (&entry.root, &entry.app) {
+            return Err(invalid(
+                app.span(),
+                "a wrapper names either root or app, not both".into(),
+            ));
+        }
+        let app = match entry.app {
+            None => None,
+            Some(app) => {
+                let app_span = app.span();
+                let app = app.into_inner();
+                if app.trim().is_empty() {
+                    return Err(invalid(app_span, "wrapper app must not be blank".into()));
+                }
+                Some((app, app_span))
+            }
+        };
+        let root = match entry.root {
+            None => ".".to_owned(),
+            Some(root) => {
+                let root_span = root.span();
+                let root = root.into_inner();
+                if !valid_root(&root) {
+                    return Err(invalid(
+                        root_span,
+                        format!(
+                            "wrapper root {root:?} must be \".\" or a checkout-relative directory: no leading or trailing slash, no \".\" or \"..\" component, no glob, backslash or colon"
+                        ),
+                    ));
+                }
+                root
+            }
+        };
+        let scope_name = |w: &InterfaceWrapper| match &w.app {
+            Some((app, _)) => format!("app {app}"),
+            None => format!("root {}", w.root),
+        };
+        let wrapper = InterfaceWrapper {
+            callee,
+            method,
+            prefix,
+            root,
+            app,
+        };
+        if wrappers
+            .iter()
+            .any(|w| w.callee == wrapper.callee && scope_name(w) == scope_name(&wrapper))
+        {
+            return Err(error(
+                text,
+                callee_span,
+                "ambiguity",
+                "token",
+                format!(
+                    "wrapper {} is authored twice for {}",
+                    wrapper.callee,
+                    scope_name(&wrapper)
+                ),
+            ));
+        }
+        wrappers.push(wrapper);
+    }
+    Ok(wrappers)
 }
 
 /// Whether an authored root is `.` or a literal checkout-relative directory: no leading or
@@ -1477,8 +1686,83 @@ pub(crate) const UNKNOWN_APP: &str =
     "No app of this checkout has that name or manifest path; trellis_workspace_describe lists them";
 
 /// Check every layer's `app` and `apps` against the effective apps (#794); the first layer in
-/// name order with a problem wins.
+/// name order with a problem wins. Then each `[[interfaces.wrappers]]` `app`, in written
+/// order (#855).
 fn validate_apps(config: &Config, apps: &[crate::apps::App]) -> Result<()> {
+    validate_layer_apps(config, apps)?;
+    for wrapper in &config.wrappers {
+        let Some((name, span)) = &wrapper.app else {
+            continue;
+        };
+        let matching = apps.iter().filter(|app| app.name == *name).count();
+        if matching == 1 {
+            continue;
+        }
+        let known = apps
+            .iter()
+            .map(|app| app.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(error(
+            &config.text,
+            span.clone(),
+            if matching == 0 {
+                "reference"
+            } else {
+                "ambiguity"
+            },
+            "token",
+            if matching == 0 {
+                format!(
+                    "wrapper {} names app {name}, which is not detected or authored (apps: {known})",
+                    wrapper.callee
+                )
+            } else {
+                format!(
+                    "wrapper {} names app {name}, which {matching} apps share",
+                    wrapper.callee
+                )
+            },
+        ));
+    }
+    Ok(())
+}
+
+/// The app of each path, as rule evaluation assigns it: the one app of the path's layer,
+/// otherwise the app whose root contains it (#784). Used for app-scoped interface wrappers
+/// (#855).
+pub(crate) fn file_apps<'p>(
+    config: &Config,
+    base: &RulesBase,
+    paths: impl IntoIterator<Item = &'p str>,
+    work: &mut Work,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<BTreeMap<String, String>> {
+    let scope = AppScope::new(config, base.apps());
+    let patterns: usize = config
+        .layers
+        .values()
+        .map(|layer| layer.patterns.len())
+        .sum();
+    let mut matcher = LayerMatcher::new(config);
+    let mut assigned = BTreeMap::new();
+    for path in paths {
+        check()?;
+        // `select` charges only specificity comparisons; its scan of every pattern is charged
+        // here, as the other callers precharge it.
+        ensure!(
+            work.charge(patterns),
+            "bounded_work: layer assignment pattern budget"
+        );
+        let layer = matcher.select(path, work, check)?;
+        if let Some(app) = scope.file(path, layer).and_then(|at| scope.name(at)) {
+            assigned.insert(path.to_owned(), app.to_owned());
+        }
+    }
+    Ok(assigned)
+}
+
+fn validate_layer_apps(config: &Config, apps: &[crate::apps::App]) -> Result<()> {
     for (layer_name, layer) in &config.layers {
         let named: Vec<&(String, std::ops::Range<usize>)> = layer
             .app
@@ -3377,6 +3661,121 @@ mod app_scope_tests {
         assert_eq!(d["line"], 5 + COLLECTION_LIMIT);
     }
 
+    /// #855: a wrapper's `app` names an effective app. A known app validates; an unknown or
+    /// shared name is a located error at the `app` value, checked where apps are resolved.
+    #[test]
+    fn a_wrapper_app_names_an_effective_app() {
+        let apps = [
+            app("svc", AppKind::Cargo, "svc"),
+            app("ui", AppKind::Npm, "ui"),
+        ];
+        let known = parse(&format!(
+            "{TWO_APPS}[[interfaces.wrappers]]\ncallee='api2'\napp='ui'\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            known.interface_wrappers()[0]
+                .app
+                .as_ref()
+                .map(|(name, _)| name.as_str()),
+            Some("ui")
+        );
+        assert_eq!(known.interface_wrappers()[0].root, ".");
+        validate_apps(&known, &apps).unwrap();
+        let unknown = parse(&format!(
+            "{TWO_APPS}[[interfaces.wrappers]]\ncallee='api2'\napp='admin'\n"
+        ))
+        .unwrap();
+        let d = diagnostic(&validate_apps(&unknown, &apps).unwrap_err()).unwrap();
+        assert_eq!(d["kind"], "reference");
+        assert_eq!(d["line"], 16, "{d}");
+        assert!(
+            d["message"]
+                .as_str()
+                .unwrap()
+                .contains("names app admin, which is not detected or authored (apps: svc, ui)"),
+            "{d}"
+        );
+        let twins = [
+            app("ui", AppKind::Npm, "ui"),
+            app("ui", AppKind::Npm, "other"),
+            app("svc", AppKind::Cargo, "svc"),
+        ];
+        let d = diagnostic(&validate_apps(&known, &twins).unwrap_err()).unwrap();
+        assert_eq!(d["kind"], "ambiguity", "{d}");
+    }
+
+    /// #855 review: assigning files to apps for app-scoped wrappers charges every path's scan
+    /// of the layer patterns, so a budget below paths x patterns fails typed `bounded_work`.
+    #[test]
+    fn file_apps_charges_each_path_pattern_scan() {
+        let config = parse(TWO_APPS).unwrap();
+        let base = RulesBase {
+            apps: vec![
+                app("svc", AppKind::Cargo, "svc"),
+                app("ui", AppKind::Npm, "ui"),
+            ],
+            limit: 0,
+            source_set: None,
+            semantic: false,
+            declarations: vec![],
+            test_declarations: vec![],
+            work_used: 0,
+            unread_manifests: 0,
+        };
+        let paths = ["ui/a.js", "svc/b.js", "other/c.js"];
+        let scans = paths.len() * 3;
+        for limit in [0, scans - 1] {
+            let error = file_apps(&config, &base, paths, &mut Work::new(limit), &mut || Ok(()))
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "bounded_work: layer assignment pattern budget",
+                "{limit}"
+            );
+        }
+        let mut work = Work::new(scans);
+        let assigned = file_apps(&config, &base, paths, &mut work, &mut || Ok(())).unwrap();
+        assert_eq!(assigned.get("ui/a.js").map(String::as_str), Some("ui"));
+        assert_eq!(assigned.get("svc/b.js").map(String::as_str), Some("svc"));
+        assert_eq!(work.used, scans);
+    }
+
+    /// #855: `root` and `app` are exclusive, a blank app is invalid, and a callee is authored
+    /// once per app.
+    #[test]
+    fn a_wrapper_scope_is_root_or_app() {
+        for (body, kind, line, needle) in [
+            (
+                "[[interfaces.wrappers]]\ncallee='a'\nroot='web'\napp='web'\n",
+                "schema",
+                5,
+                "either root or app",
+            ),
+            (
+                "[[interfaces.wrappers]]\ncallee='a'\napp=' '\n",
+                "schema",
+                4,
+                "blank",
+            ),
+            (
+                "[[interfaces.wrappers]]\ncallee='a'\napp='web'\n[[interfaces.wrappers]]\ncallee='a'\napp='web'\n",
+                "ambiguity",
+                6,
+                "twice for app web",
+            ),
+        ] {
+            let d = located(&format!("version=1\n{body}"));
+            assert_eq!(d["kind"], kind, "{body}: {d}");
+            assert_eq!(d["line"], line, "{body}: {d}");
+            assert!(
+                d["message"].as_str().unwrap().contains(needle),
+                "{body}: {d}"
+            );
+        }
+        parse("version=1\n[[interfaces.wrappers]]\ncallee='a'\napp='web'\n[[interfaces.wrappers]]\ncallee='a'\nroot='web'\n[[interfaces.wrappers]]\ncallee='a'\n").unwrap();
+    }
+
     #[test]
     fn the_first_bad_layer_in_name_order_wins() {
         let text = "version=1\n[layers.zeta]\napp='nope'\norder=1\npaths=['z']\n[layers.alpha]\napp='nada'\norder=2\npaths=['a']\n";
@@ -3417,6 +3816,136 @@ mod app_scope_tests {
 
     fn located(text: &str) -> Value {
         diagnostic(&parse(text).err().expect("invalid rules")).unwrap()
+    }
+
+    /// #855: `[[interfaces.wrappers]]` parse in written order, with their defaults and an
+    /// optional root.
+    #[test]
+    fn interface_wrappers_parse_with_defaults_and_roots() {
+        let config = parse(
+            "version=1\n[[interfaces.wrappers]]\ncallee='apiFetch'\nprefix='/api'\nroot='web'\n\
+             [[interfaces.wrappers]]\ncallee='client.send'\nmethod='argument'\nat=2\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.interface_wrappers(),
+            [
+                InterfaceWrapper {
+                    callee: "apiFetch".into(),
+                    method: WrapperMethod::Options(1),
+                    prefix: Some("/api".into()),
+                    root: "web".into(),
+                    app: None,
+                },
+                InterfaceWrapper {
+                    callee: "client.send".into(),
+                    method: WrapperMethod::Argument(2),
+                    prefix: None,
+                    root: ".".into(),
+                    app: None,
+                },
+            ]
+        );
+        // The same callee may be authored once per root.
+        parse("version=1\n[[interfaces.wrappers]]\ncallee='api2'\n[[interfaces.wrappers]]\ncallee='api2'\nroot='web'\n").unwrap();
+        assert!(
+            parse("version=1\n")
+                .unwrap()
+                .interface_wrappers()
+                .is_empty()
+        );
+        assert!(
+            parse("version=1\n[interfaces]\n")
+                .unwrap()
+                .interface_wrappers()
+                .is_empty()
+        );
+    }
+
+    /// #855: an invalid wrapper is a located rules error, never a silent omission.
+    #[test]
+    fn interface_wrapper_errors_are_located() {
+        for (body, kind, line, needle) in [
+            (
+                "[[interfaces.wrappers]]\nprefix='/api'\n",
+                "schema",
+                2,
+                "requires callee",
+            ),
+            (
+                "[[interfaces.wrappers]]\ncallee='a.b.c'\n",
+                "schema",
+                3,
+                "identifier",
+            ),
+            (
+                "[[interfaces.wrappers]]\ncallee='9a'\n",
+                "schema",
+                3,
+                "identifier",
+            ),
+            (
+                "[[interfaces.wrappers]]\ncallee='a'\nmethod='body'\n",
+                "schema",
+                4,
+                "options",
+            ),
+            (
+                "[[interfaces.wrappers]]\ncallee='a'\nat=0\n",
+                "schema",
+                4,
+                "1 to 8",
+            ),
+            (
+                "[[interfaces.wrappers]]\ncallee='a'\nat=9\n",
+                "schema",
+                4,
+                "1 to 8",
+            ),
+            (
+                "[[interfaces.wrappers]]\ncallee='a'\nprefix='api'\n",
+                "schema",
+                4,
+                "prefix",
+            ),
+            (
+                "[[interfaces.wrappers]]\ncallee='a'\nprefix='/a?b'\n",
+                "schema",
+                4,
+                "prefix",
+            ),
+            (
+                "[[interfaces.wrappers]]\ncallee='a'\nroot='../web'\n",
+                "schema",
+                4,
+                "wrapper root",
+            ),
+            (
+                "[[interfaces.wrappers]]\ncallee='a'\nkind='x'\n",
+                "schema",
+                4,
+                "kind",
+            ),
+            ("[interfaces]\ncallees=['a']\n", "schema", 3, "callees"),
+            (
+                "[[interfaces.wrappers]]\ncallee='a'\n[[interfaces.wrappers]]\ncallee='a'\n",
+                "ambiguity",
+                5,
+                "twice",
+            ),
+        ] {
+            let d = located(&format!("version=1\n{body}"));
+            assert_eq!(d["kind"], kind, "{body}: {d}");
+            assert_eq!(d["line"], line, "{body}: {d}");
+            assert!(
+                d["message"].as_str().unwrap().contains(needle),
+                "{body}: {d}"
+            );
+        }
+        let many: String = (0..65)
+            .map(|at| format!("[[interfaces.wrappers]]\ncallee='w{at}'\n"))
+            .collect();
+        assert_eq!(located(&format!("version=1\n{many}"))["kind"], "too_large");
     }
 
     /// #794: `[apps.<name>]` tables parse in name order, each with its roots.

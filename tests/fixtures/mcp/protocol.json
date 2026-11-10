@@ -60,7 +60,7 @@
         },
         "watcherDegraded": false,
         "languages": [],
-        "toolVersion": 24,
+        "toolVersion": 25,
         "schemaVersion": 1,
         "apps": {
           "state": "unavailable",

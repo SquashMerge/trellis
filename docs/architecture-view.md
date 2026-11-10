@@ -152,12 +152,14 @@ from `pyproject.toml` ([#807](https://github.com/SquashMerge/trellis/issues/807)
   ```text
   {client,server,kind:"http",
    ends:[{clientLayer:string|null,serverLayer:string|null,routes:UInt,callSites:UInt}],
-   wrappers:{callees:["api","request","api.request","owner.request"],
+   wrappers:{callees:["api","request","api.request","owner.request","fetch","axios",...],
              prefix:{client:"/api/",server:"/api/checkouts/{root}/"}},
    counts:{matchedRoutes,callSites,serverOnly,clientOnly,
            confidence:{exact,template,wrapperInferred,unresolved}}}
   ```
 
+  `wrappers.callees` lists the built-in wrappers, then `fetch` and `axios`, then every
+  wrapper configured in `.trellis/rules.toml` (#855).
   `client` and `server` are app names. An end's app is the app of its file and layer under
   the `bucket` rule's file attribution. `ends[]` groups matched pairs by the layer of the call
   site and the layer of the handler (null sorts last): `routes` counts distinct routes and
@@ -216,6 +218,87 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
   by the table's routes: the literal's prefix plus the arm's suffix, with the arm's method
   (kept only if the registration includes it). Such routes are marked as coming from the
   table, which makes their matches `template`.
+- **actix-web routes (#858).** Read in Rust documents that mention `actix_web` or `web::`:
+  - a route attribute on a function: `#[get("/p")]` (any method above, optionally
+    `actix_web::`-qualified) or `#[route("/p", method = "GET", method = "POST")]`; the handler
+    is the function;
+  - `<App or Scope>.route("/p", R)` and `web::resource("/p").route(R)`, where `R` is
+    `web::<method>().to(h)`, `web::method(Method::M).to(h)` or
+    `web::route().method(Method::M).to(h)`, with other links such as `.guard(..)` between.
+    An `R` without a readable method (`web::route().to(h)`, `resource.to(h)`) is not a route;
+  - prefixes: a registration inside the arguments of a call on a `web::scope("/p")` chain is
+    under `/p`, and scopes nest. A function with a route attribute is under the prefix of
+    each `.service(f)` (or `.service(path::f)`) that names it, in any document, matched by
+    name; with no such registration it is at its own path. A scope whose prefix is not a
+    literal hides the routes under it. A registration counts only on a proven chain: one that
+    starts at `App::new()` (always the root), at an inline `web::scope(..)` or at
+    `web::resource(..)`. Any other receiver, such as a variable bound to a scope, is mounted
+    at an unknown prefix, so nothing registers under it or in its arguments.
+    `.configure(..)` is not followed, and nothing in its callback registers.
+  - the expansion of attributed routes under their prefixes is charged to the work bound
+    before it is built.
+  - `{name:regex}` is read as `{name}`; a last segment `{name:.*}`, `{name:.+}` or
+    `{name}*` as `{*name}`; an unbalanced brace makes the path unreadable and the
+    registration is not a route. Handler identity, exclusions and the one route per method
+    and template rule are as for axum.
+- **Python server routes (#856).** Read from production Python documents. Objects, mounts
+  and views are followed only through bindings that resolve; anything else registers
+  nothing, never a route at the root.
+  - **Bindings.** A name is read only when it is bound exactly once in its document: no other
+    assignment, `+=`, import or alias, parameter, `for` or comprehension target, `with .. as`,
+    `except .. as`, walrus, `global`, `class`, `def`, `match` pattern or deletion of that name
+    anywhere in the document. A module-level `from m import *` hides every name bound before
+    it, and one inside a function or class hides every name of the document. A string
+    constant is such a name bound by a module-level assignment. An object or view imported
+    from another module must be bound in that module's own scope, not inside a function.
+  - **Objects.** A Flask app is a name bound to `Flask(..)`, a blueprint to `Blueprint(..)`
+    (with its `url_prefix`), a FastAPI app to `FastAPI(..)` and a router to `APIRouter(..)`
+    (with its `prefix`), each class imported from `flask` or `fastapi` (`from flask import
+    Flask` or `import flask`, then `flask.Flask`). Every Flask and FastAPI app is a root; a
+    blueprint or router is reached only through registrations from a root.
+  - **Routes.** On a Flask app or blueprint, `@o.route(rule, methods=[..])` (no `methods` is
+    `GET`) and `@o.get/post/put/delete/patch(rule)`. On a FastAPI app or router,
+    `@o.get/post/put/delete/patch/head/options(path)` and `@o.api_route(path, methods=[..])`.
+    The handler is the decorated function. A `methods` value that is not a list, tuple or set
+    of readable method names, or that a `**` splat may supply, registers nothing.
+  - **Mounts.** Flask `parent.register_blueprint(bp, url_prefix=..)`: the registration's
+    `url_prefix` replaces the blueprint's own, and a nested blueprint's prefix is joined to its
+    parent's with one `/`. FastAPI `parent.include_router(router, prefix=..)`: the include
+    prefix, then the router's own prefix, are prepended as written. Mounts are followed across
+    documents through `import m`, `import a.b as m` and `from m import n` bindings: a relative
+    import from the document's package, an absolute one from the one directory above the
+    document that holds the module (two or more such directories are ambiguous, and resolve
+    nothing), at most 16 deep. A prefix or object that cannot be read, or that a `**` splat may
+    supply, mounts nothing. Only candidate documents are read: a module that mentions no
+    framework word and is not a package `__init__.py` (such as a plain re-export module) is
+    not parsed, so a mount that passes through it is omitted, never guessed.
+  - **Django.** A module-level `ROOT_URLCONF = "pkg.urls"` in any document names a root
+    urlconf; without one no Django pattern is a route. A urlconf's `urlpatterns` is its one
+    module-level list or tuple, extended by module-level `+=` of lists. `path(route, view)` and
+    `re_path(regex, view)` from `django.urls` are routes that answer `ANY`. `include(..)` of a
+    module string, an imported module, a pattern list or an inline list mounts its patterns
+    under the route, whose text is prepended as written; an include that cannot be resolved
+    mounts nothing. The handler is the function the view resolves to, else the view's span.
+  - **Normalisation.** Flask and Django `<name>` and `<converter:name>` (Flask's
+    `<converter(args):name>` too) are `{name}`; FastAPI `{name}` and `{name:converter}` are
+    `{name}`. The `path` converter is `{*name}` as the whole last segment, else `{name}`. A
+    `re_path` regex must start with `^`; a final unescaped `$` is dropped, `(?P<name>..)` is
+    `{name}` (`{*name}` for `.*` or `.+`) and an escaped punctuation character is itself. A
+    `{name}` group body must provably never match `/`: literal characters other than `/`,
+    `\d`, `\w`, `\s`, escaped punctuation other than `/`, and classes that exclude `/` (a
+    positive class with no `/`, no range spanning it and no `\D`, `\W` or `\S`, or a negated
+    class that names `/`), each optionally quantified. Inside a class only `\d`, `\w`, `\s`,
+    their negations, `\n`, `\t`, `\r`, `\f`, `\v` and escaped punctuation are read; a
+    numeric, hex, octal, unicode, named or unknown escape may denote `/`. Any other regex syntax (such as `.`
+    inside a body, or `[^x]+`), an optional or repeated group, a brace in a Flask or Django
+    route, or an unbalanced or unnamed placeholder makes the route unreadable. A `re_path`
+    whose regex ends in an unescaped `$` matches only an empty remainder, so an `include`
+    behind it mounts nothing.
+  - **Bounds.** Every production Python document is scanned for candidate words, and each
+    candidate is parsed and walked, all charged to the work bound. Each object's routes under
+    each prefix it is mounted at, and each Django list under each include, are charged
+    before they are built.
+  - **Duplicates.** Python routes are one per method, template and registering document.
 - **Handler identity.** `handler.kind` is `declaration` when the handler names exactly one
   same-document function (the function's span), `closure` otherwise (the span of the handler
   expression), or `dispatchArm` for a table route answered by an arm that does not call
@@ -227,7 +310,7 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
   contains the handler (or the named function, for `declaration`), with keys from the
   declaration lookup keys. They are null when no named callable exists.
 - **Client calls.** JavaScript and TypeScript calls to the built-in wrappers (there is no
-  rules-file key):
+  rules-file key for these; #855 adds `fetch`, axios and `[[interfaces.wrappers]]`, below):
 
   | Callee | Path | Method | Default |
   | --- | --- | --- | --- |
@@ -243,15 +326,162 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
   has a top-level spread and no `method`, or when it is not one of `GET`, `POST`, `PUT`,
   `DELETE`, `PATCH`, `HEAD` or `OPTIONS` (after uppercasing). An unreadable path or method
   never matches and is `unresolved`.
-- **Segment matching.** Methods must be equal. A literal segment must equal a literal
+- **JavaScript and TypeScript server routes (#855).** They are read from production
+  documents.
+  - **App objects.** A route is reached from an app object through its mounts. An app object
+    is a `const`, `let` or `var` binding made by `express()`, `fastify()` (or `Fastify()`) or
+    `new Koa()`, where the callee is imported or required from the `express`, `fastify` or `koa`
+    package. Routers are bindings made by `express.Router()` (or a `Router` imported from
+    `express`) or `new Router()` from `@koa/router` or `koa-router`. A router that no app object
+    reaches registers nothing.
+  - **Registrations.** On an express app or router, `x.get/post/put/delete/patch/head/options`
+    and `x.all`, and the chain `x.route(path).get(h).post(h)`. On fastify, the same methods and
+    `x.route({method, url, handler})`, where `method` is a string or an array of strings. On a
+    Koa router, the same methods, `del`, and the named form `router.get(name, path, h)`. The
+    path is argument 0. It is a string, a template literal or a `+` of them, with `const`
+    bindings and imported constants resolved. The handler is the last argument, or the
+    `handler` of a fastify options object. `all` registers the method `ANY`.
+  - **Mounts.** express `use([path,] ...routers)`. Koa `use([path,] router.routes())`, a
+    router's `prefix` option, and `router.prefix(path)`. fastify
+    `register(plugin, {prefix})`, where the plugin's first parameter is the child object. A
+    plugin wrapped in `fastify-plugin` shares its parent's scope, so `prefix` does not apply to
+    it (Fastify Routes reference, "Route Prefixing and fastify-plugin"), unless it is wrapped
+    with `encapsulate: true`. Wrapper options that cannot be read register nothing. Passing an app or router to a function, such as
+    `routes(app)` or `require('./routes')(app)`, makes that parameter the same object. Mounts
+    are followed across relative imports and `require`, through `module.exports`,
+    `exports.name` and ESM exports, at most 16 deep.
+  - **Unreadable paths and patterns.** A path or prefix that cannot be read, or that uses
+    pattern syntax (`?`, `+`, `(`, `[`, `{`), registers nothing under it. A `use` whose first
+    argument has no readable value (an unbound name, a call, a conditional) mounts nothing.
+  - **Object members.** An options object is read in write order. A spread, a computed key,
+    or an accessor or method of the key's name may set that key to anything, so the key is
+    unreadable until a later explicit member sets it. This applies to `prefix`, `url`,
+    `path`, `method`, `handler`, `baseURL` and `encapsulate`.
+  - **Normalisation.** `:name` is read as `{name}`, `*name` as `{*name}` and a bare `*` as
+    `{*}`. The mount prefix and the path are joined with one `/` and no trailing `/`.
+  - **Handlers.** A handler that names a function declaration, or a variable bound to a
+    function, is that `declaration`, even across an import. Any other handler is a
+    `closure`: its own span, inside the named callable around it.
+  - **Next.js.** A `package.json` that depends on `next` (in `dependencies`,
+    `devDependencies` or `peerDependencies`) makes its directory a Next.js root. Under it, or
+    under its `src/`, two kinds of file are routes:
+    - `pages/api/**`, whose default export answers `ANY`;
+    - `app/**/route.(js|jsx|ts|tsx|mjs|cjs)`, whose exported `GET`, `POST`, `PUT`, `PATCH`,
+      `DELETE`, `HEAD` and `OPTIONS` (declarations, `const` exports or `export { h as GET }`)
+      each answer their method.
+
+    In the path, `[id]` is `{id}` and `[...rest]` is `{*rest}`. `[[...rest]]` gives two
+    routes, one without the segment and one with `{*rest}`. Route groups `(g)` and slots
+    `@s` are dropped. A segment starting with `_` or `(.` excludes the file, and so does a
+    pages-router file named `_*`. `index` is its directory.
+  - **Duplicates.** JavaScript routes are one per method, template and registering file.
+- **JavaScript and TypeScript clients (#855).** Besides the wrappers above:
+  - `fetch(path, options)`, including `window.fetch`, `globalThis.fetch` and `self.fetch`.
+    The method is the `method` of the options object, as for `request`.
+  - axios: `axios(config)`, `axios(url, config)`, `axios.request(config)`,
+    `axios.get/delete/head/options(url, config)` and `axios.post/put/patch(url, data,
+    config)` (and the `Form` variants). The same calls work on a binding made by
+    `axios.create(config)`. The URL is the argument or the config's `url`. The method is the
+    call's own, or the config's `method`, or `GET`. A `baseURL` in the call's config or the
+    instance's config is joined before the URL. A joined match is `wrapperInferred`. An
+    absolute URL or `baseURL` is not a client call, and an unreadable `baseURL` makes the path
+    unreadable, as does a config member that may set it (see Object members). A verb method's
+    own method wins over the config's. When any document mentions axios, an identifier call or
+    an axios method name is read through its binding, across imports, whatever the calling
+    file says.
+  - **Constants.** Paths read `const` bindings, imported constants, template literals and
+    `+`, with `{}` for any part that cannot be read.
+  - **The wrapper's own call.** A `fetch` or axios call inside a named callable that has a
+    wrapper's name (such as `api`) is the wrapper's own implementation, not a call.
+  - **Configured wrappers.** `.trellis/rules.toml` may configure wrappers (owner ruling
+    2026-11-10):
+
+    ```toml
+    [[interfaces.wrappers]]
+    callee = "apiFetch"   # required: an identifier or object.property
+    method = "options"    # "options" (default) or "argument"
+    at = 1                # 1 to 8, default 1
+    prefix = "/api"       # optional rooted literal the wrapper adds to every path
+    root = "web"          # optional directory the wrapper applies under; default "."
+    # app = "web"         # or: the app whose files the wrapper applies to (not with root)
+    ```
+
+    - **`method` and `at`.** With `"options"`, the method is `method` in the object
+      literal at argument `at`. With `"argument"`, it is a string at argument `at`.
+    - **`prefix`.** It has no query, fragment or pattern. A match through it is
+      `wrapperInferred`.
+    - **`root`.** It follows the `[apps]` root rules (#794). The wrapper applies to files under
+      that directory.
+    - **`app`.** It names an app of the effective inventory (owner ruling 2026-11-10). The
+      wrapper applies to the files that rule evaluation assigns to that app: the one app of the
+      file's layer, else the app whose root contains it. `root` and `app` are exclusive. An
+      unknown or shared app name is a located rules error when the apps are resolved.
+    - **Precedence.** For one callee, an `app` scope wins over any root scope, including a
+      deeper one. A deeper root wins over a shallower one, and an unscoped wrapper (`.`) comes
+      last.
+    - **Matching.** A configured wrapper is matched only as assembled, never through the
+      built-in `/api/` rule. It replaces a built-in wrapper with the same callee.
+    - **Errors.** Each invalid entry is a located `invalid_rules` error, like any other rules
+      error: an unknown key, a bad value, both `root` and `app`, the same callee twice for one
+      scope, or more than 64 entries. `wrappers.callees` shows what took effect. A `package.json` configures no
+      wrapper.
+- **reqwest calls (#858).** Read in Rust documents that mention `reqwest`:
+  `reqwest::get(url)` and `reqwest::blocking::get(url)` (`GET`); `c.get(url)`, `.post`,
+  `.put`, `.delete`, `.patch` and `.head` (the method of the name); and
+  `c.request(Method::M, url)` (method unreadable unless `Method::M` or a path ending in
+  `Method::M`). The receiver `c` must read as a client: a name or field containing `client`
+  in any case, or a `Client::new()` or `Client::builder()` chain. The URL, looked through
+  `&`, is a string literal without escapes, a visible constant, or a `format!` whose
+  substitutions are read where they are a string literal or a visible constant with no
+  format specification (`{x}`, `{}`, `{0}`), and are `{}` otherwise: a fill, width,
+  precision or mode such as `{x:0>3}` or `{:?}` is always `{}`. A visible constant is a
+  `const` or `static` string at the top level of the document, its name declared nowhere
+  else in it (no other `const` or `static`, and no `use` import or alias, parameter,
+  closure parameter, `let`, `match`, `if let`/`while let` or `for` pattern that binds it),
+  read from a call outside every inline `mod`. A glob import (`use a::*`) anywhere below the
+  top level may bind any name, so it makes every constant of the document unreadable; a
+  top-level glob does not, since the top-level item shadows it; any other identifier is
+  unreadable. Each substituted value is charged to the work bound before it is copied. The
+  path is what follows the host of an `http://` or `https://` URL (`/` when there is none), or the text itself when it starts
+  with `/`; a URL that starts with a substitution, or anything else, is unreadable and
+  `unresolved`. The path is cut at `?` or `#` and split as above.
+- **Python clients (#856).** Read in production Python documents that mention `requests` or
+  `httpx`:
+  - `requests.get/post/put/delete/patch/head/options(url)` and `requests.request(method,
+    url)`, the same functions on `httpx`, and `httpx.stream(method, url)`, called through the
+    module (`import requests`, `import httpx as h`) or a function imported from it (`from
+    requests import post`);
+  - the same methods on a client: `requests.Session()` (or `session()`), `httpx.Client(..)`
+    or `httpx.AsyncClient(..)`, written inline or bound once by an assignment or by `with`
+    (or `async with`) `.. as c`. `self.session` and other attributes are not read.
+  - **Method.** The function's own, or for `request` and `stream` a readable string argument
+    (`method` or argument 0) after uppercasing; else unreadable.
+  - **URL.** `url` or its argument position. A string literal (no escapes, no bytes), a visible
+    constant (see Bindings above), an f-string, `+` and implicit concatenation, `%` with a
+    tuple, a single value or a dictionary, and `.format(..)`, with `{}` for any part that
+    cannot be read. An f-string substitution, a `%s` or a `.format` field is read only without
+    a conversion, format specification, flag, width or `=` (`{x:03}`, `{x!r}`, `%5s` are
+    always `{}`). A `*args` or `**kwargs` may supply any argument or key not written, and a
+    dictionary splat or unreadable key hides the keys written before it. Each substituted
+    value is charged to the work bound before it is copied, and cancellation is checked for
+    each substitution.
+  - **Path.** An `http://` or `https://` URL gives its path as for reqwest. A relative URL
+    needs the client's absolute `base_url` (httpx), readable in full, and is joined to the
+    base's path with one `/`; when the base has a path, the match is `wrapperInferred`. A relative URL
+    without a base, or with an unreadable base (including one a `**` splat may supply), is
+    unreadable and `unresolved`.
+- **Segment matching.** Methods must be equal, or the route is `ANY`. A literal segment must equal a literal
   segment. A server `{name}` matches exactly one segment, and `{*name}` matches the rest.
   A client substitution segment matches only a server `{name}` or `{*name}`. If nothing
   matches as written, the call is matched again as assembled by the wrapper's prefix:
-  `/api/` becomes `/api/checkouts/{root}/`, with `{root}` a substitution segment. Among the
-  matches the one with the most literal segments wins, and a tie is no match.
+  `/api/` becomes `/api/checkouts/{root}/`, with `{root}` a substitution segment. That rule
+  applies to the built-in wrappers only, never to a configured wrapper or a reqwest,
+  requests or httpx call.
+  Among the matches the one with the most literal segments wins. Between equal counts, a route that names the method wins over an `ANY`
+  route. Any other tie is no match.
 - **Confidence.** `wrapperInferred` when the prefix was needed. Otherwise `template` when the
-  call used a client substitution, or the route has a server `{name}` or `{*name}`, or came
-  from the dispatch table. Otherwise `exact`. A call with no match is `unresolved`. A route
+  call used a client substitution, or the route has a server `{name}` or `{*name}`, came
+  from the dispatch table or is `ANY`. Otherwise `exact`. A call with no match is `unresolved`. A route
   takes its best call site: `exact`, then `template`, then `wrapperInferred`. The values are
   defined in the contract-v1 amendment.
 - **Exclusions.** Documents whose file module has the `test` role, routes and calls whose
