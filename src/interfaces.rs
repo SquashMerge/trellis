@@ -1,7 +1,12 @@
-//! HTTP interface evidence (#788): the server routes a checkout registers and the client calls
-//! it makes. Extraction reads parsed source and the stored declaration roles, knows nothing
-//! about apps, and runs at read time; nothing here is stored.
+//! HTTP interface evidence (#788, #855): the server routes a checkout registers and the client
+//! calls it makes. Extraction reads parsed source, the stored declaration roles and the
+//! captured `package.json` manifests, knows nothing about apps, and runs at read time; nothing
+//! here is stored.
 mod calls;
+mod js;
+mod js_routes;
+#[cfg(test)]
+mod js_tests;
 mod routes;
 mod rust_calls;
 
@@ -75,17 +80,31 @@ pub(crate) struct Route {
     pub(crate) handler: Handler,
 }
 
-/// One call a client makes to a server route: through a request wrapper, or a Rust `reqwest`
-/// call (#858).
+/// A server route method that answers every method: express `all`, fastify `all`, Koa `all`
+/// and a Next.js pages-router API route.
+pub(crate) const ANY: &str = "ANY";
+
+/// How a client call's path was assembled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClientPrefix {
+    /// As written.
+    Written,
+    /// As written, else through the built-in checkout prefix rule (#788).
+    CheckoutFallback,
+    /// With a wrapper's or client's configured prefix or base URL (#855).
+    Joined,
+}
+
+/// One call a client makes to a server route: a request wrapper, `fetch`, axios, or a Rust
+/// `reqwest` call (#858), which is always [`ClientPrefix::Written`].
 #[derive(Clone)]
 pub(crate) struct ClientCall {
-    /// Through a request wrapper, whose prefix rule may assemble the path.
-    pub(crate) wrapper: bool,
     /// `None` when the method cannot be read.
     pub(crate) method: Option<String>,
     /// `None` when the path cannot be read. A client substitution is written `{}`.
     pub(crate) path_template: Option<String>,
     pub(crate) segments: Option<Vec<Seg>>,
+    pub(crate) prefix: ClientPrefix,
     pub(crate) document: DocumentKey,
     pub(crate) range: Range,
     pub(crate) lines: Lines,
@@ -108,22 +127,130 @@ pub(crate) struct Extraction {
     pub(crate) calls: Vec<ClientCall>,
     /// One entry per call, in call order. `None` is an unresolved call.
     pub(crate) matched: Vec<Option<Match>>,
+    /// The client callees read: the built-in wrappers, `fetch`, axios and configured wrappers.
+    pub(crate) callees: Vec<String>,
 }
 
 /// The routes and client calls of a snapshot, with each call matched to at most one route.
+/// `wrappers` are the rules file's `[[interfaces.wrappers]]` (#855), and `apps` the app of each
+/// file, for the wrappers scoped to an app.
 pub(crate) fn extract(
     snapshot: &Snapshot,
+    wrappers: &[crate::rules::InterfaceWrapper],
+    apps: &BTreeMap<String, String>,
     work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Extraction> {
-    let routes = routes::extract(snapshot, work, check)?;
-    let calls = calls::extract(snapshot, work, check)?;
+    let mut routes = routes::extract(snapshot, work, check)?;
+    let next_roots = next_roots(snapshot, work, check)?;
+    let configured = scoped(wrappers);
+    let world = js::World::new(snapshot);
+    let mut budget = js::Budget {
+        work,
+        check: &mut *check,
+    };
+    let mut found = js_routes::extract(&world, &next_roots, &mut budget)?;
+    found.sort_by(|a, b| (&a.path, a.start).cmp(&(&b.path, b.start)));
+    let mut seen = BTreeSet::new();
+    routes.extend(
+        found
+            .into_iter()
+            .filter(|f| {
+                seen.insert((
+                    f.route.method.clone(),
+                    f.route.path_template.clone(),
+                    f.path.clone(),
+                ))
+            })
+            .map(|f| f.route),
+    );
+    let mut calls = calls::extract(&world, &configured, apps, &mut budget)?;
+    calls.extend(rust_calls::extract(snapshot, work, check)?);
     let matched = calls::resolve(&routes, &calls, work, check)?;
+    let mut callees: Vec<String> = calls::built_in().into_iter().map(|w| w.callee).collect();
+    callees.extend(["fetch".to_owned(), "axios".to_owned()]);
+    for wrapper in wrappers {
+        if !callees.contains(&wrapper.callee) {
+            callees.push(wrapper.callee.clone());
+        }
+    }
     Ok(Extraction {
         routes,
         calls,
         matched,
+        callees,
     })
+}
+
+/// The configured wrappers grouped by scope, in precedence order: app scopes first, then
+/// roots from the deepest to `.` (every file). The first scope that covers a file and names
+/// a callee decides it, so an app-scoped wrapper wins over a root-scoped or unscoped one.
+fn scoped(wrappers: &[crate::rules::InterfaceWrapper]) -> Vec<calls::Scoped> {
+    let mut scopes: Vec<calls::Scoped> = Vec::new();
+    for wrapper in wrappers {
+        let scope = match &wrapper.app {
+            Some((app, _)) => calls::Scope::App(app.clone()),
+            None if wrapper.root == "." => calls::Scope::Root(String::new()),
+            None => calls::Scope::Root(wrapper.root.clone()),
+        };
+        let method = match wrapper.method {
+            crate::rules::WrapperMethod::Options(at) => calls::MethodAt::Options(at),
+            crate::rules::WrapperMethod::Argument(at) => calls::MethodAt::Argument(at),
+        };
+        let configured = calls::Wrapper {
+            callee: wrapper.callee.clone(),
+            method,
+            prefix: wrapper.prefix.clone(),
+            built_in: false,
+        };
+        match scopes.iter_mut().find(|existing| existing.scope == scope) {
+            Some(existing) => existing.wrappers.push(configured),
+            None => scopes.push(calls::Scoped {
+                scope,
+                wrappers: vec![configured],
+            }),
+        }
+    }
+    scopes.sort_by_key(|scoped| match &scoped.scope {
+        calls::Scope::App(_) => (0, std::cmp::Reverse(0)),
+        calls::Scope::Root(root) => (1, std::cmp::Reverse(root.len())),
+    });
+    scopes
+}
+
+/// The directories of Next.js apps: each captured `package.json` that depends on `next`. A
+/// manifest that is not a JSON object contributes nothing.
+fn next_roots(
+    snapshot: &Snapshot,
+    work: &mut Work,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<Vec<String>> {
+    let mut roots = Vec::new();
+    for manifest in &snapshot.manifests {
+        check()?;
+        let Some(directory) = manifest
+            .path
+            .strip_suffix("package.json")
+            .filter(|rest| rest.is_empty() || rest.ends_with('/'))
+            .map(|rest| rest.trim_end_matches('/').to_owned())
+        else {
+            continue;
+        };
+        let Some(bytes) = &manifest.bytes else {
+            continue;
+        };
+        charge(work, bytes.len())?;
+        let Ok(Value::Object(fields)) = serde_json::from_slice::<Value>(bytes) else {
+            continue;
+        };
+        if ["dependencies", "devDependencies", "peerDependencies"]
+            .iter()
+            .any(|key| fields.get(*key).and_then(|deps| deps.get("next")).is_some())
+        {
+            roots.push(directory);
+        }
+    }
+    Ok(roots)
 }
 
 /// The three lists of an interface that detail pages serve.
@@ -179,8 +306,6 @@ pub(crate) struct Projection<'a> {
     call_layers: Vec<Option<String>>,
     pairs: Vec<Pair>,
 }
-
-const WRAPPER_CALLEES: [&str; 4] = ["api", "request", "api.request", "owner.request"];
 
 /// Projects the extraction onto the detected apps. `layers` maps each file to its layer.
 pub(crate) fn project<'a>(
@@ -335,7 +460,7 @@ impl Projection<'_> {
             "kind": "http",
             "ends": ends,
             "wrappers": {
-                "callees": WRAPPER_CALLEES,
+                "callees": self.extraction.callees,
                 "prefix": {"client": "/api/", "server": "/api/checkouts/{root}/"},
             },
             "counts": {
@@ -428,6 +553,138 @@ impl Projection<'_> {
         json!({"client": pair.client, "server": pair.server, "list": row.list.name(),
             "entry": entry})
     }
+}
+
+/// What one `trellis_endpoints` read selects (#851). Every filter is optional.
+pub(crate) struct EndpointQuery<'q> {
+    /// The apps an `app` argument names: a row is kept when either of its ends is in one.
+    pub(crate) apps: Option<&'q BTreeSet<usize>>,
+    pub(crate) method: Option<&'q str>,
+    /// The single-endpoint form: one exact path template, whose rows keep every call site
+    /// up to [`ENDPOINT_SITES`].
+    pub(crate) path_template: Option<&'q str>,
+}
+
+/// Call sites one list row carries; the rest are counted in `callSiteCount`.
+pub(crate) const LIST_SITES: usize = 5;
+/// Call sites one row of the single-endpoint form carries.
+pub(crate) const ENDPOINT_SITES: usize = 50;
+
+/// The `trellis_endpoints` rows (#851) over the whole extraction, every route and every call:
+/// each route with the calls matched to it (`matched`), or with none (`serverOnly`), in route
+/// order, then each call matched to no route (`clientOnly`), in call order. Each end carries
+/// the app `assignment` gives its file. Rows are structural name and path matches, never
+/// proof that a route is or is not called.
+pub(crate) fn endpoints(
+    extraction: &Extraction,
+    assignment: &crate::rules::AppAssignment<'_>,
+    query: &EndpointQuery<'_>,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<Vec<Value>> {
+    let app = |path: &str| assignment.file(path);
+    let name = |app: Option<usize>| app.map(|index| assignment.apps()[index].name.clone());
+    let kept = |apps: &[Option<usize>]| {
+        query.apps.is_none_or(|wanted| {
+            apps.iter()
+                .any(|app| app.is_some_and(|app| wanted.contains(&app)))
+        })
+    };
+    let sites = if query.path_template.is_some() {
+        ENDPOINT_SITES
+    } else {
+        LIST_SITES
+    };
+    let mut callers: Vec<Vec<usize>> = vec![Vec::new(); extraction.routes.len()];
+    for (call, found) in extraction.matched.iter().enumerate() {
+        check()?;
+        if let Some(found) = found {
+            callers[found.route].push(call);
+        }
+    }
+    let site = |call: usize, app: Option<usize>| {
+        let site = &extraction.calls[call];
+        let caller = site.caller.as_ref().map(|caller| {
+            let caller = json!(caller);
+            json!({"name": caller["name"], "stableLookupKey": caller["stableLookupKey"]})
+        });
+        json!({
+            "path": site.document.path,
+            "lines": site.lines,
+            "confidence": extraction.matched[call]
+                .map_or(Confidence::Unresolved, |found| found.confidence),
+            "caller": caller,
+            "app": name(app),
+        })
+    };
+    let wanted = |method: Option<&str>, template: Option<&str>| {
+        query.method.is_none_or(|wanted| method == Some(wanted))
+            && query
+                .path_template
+                .is_none_or(|wanted| template == Some(wanted))
+    };
+    let mut rows = Vec::new();
+    for (index, route) in extraction.routes.iter().enumerate() {
+        check()?;
+        if !wanted(Some(&route.method), Some(&route.path_template)) {
+            continue;
+        }
+        let server = app(&route.handler.document.path);
+        let calls: Vec<(usize, Option<usize>)> = callers[index]
+            .iter()
+            .map(|&call| (call, app(&extraction.calls[call].document.path)))
+            .collect();
+        let ends: Vec<Option<usize>> = std::iter::once(server)
+            .chain(calls.iter().map(|(_, app)| *app))
+            .collect();
+        if !kept(&ends) {
+            continue;
+        }
+        let handler = &route.handler;
+        rows.push(json!({
+            "list": if calls.is_empty() { "serverOnly" } else { "matched" },
+            "method": route.method,
+            "pathTemplate": route.path_template,
+            "app": name(server),
+            "handler": {
+                "kind": handler.kind,
+                "syntaxId": handler.syntax_id,
+                "stableLookupKey": handler.stable_lookup_key,
+                "path": handler.document.path,
+                "lines": handler.lines,
+                "variant": handler.variant,
+            },
+            "callSites": calls
+                .iter()
+                .take(sites)
+                .map(|&(call, app)| site(call, app))
+                .collect::<Vec<_>>(),
+            "callSiteCount": calls.len(),
+        }));
+    }
+    for (call, found) in extraction.matched.iter().enumerate() {
+        check()?;
+        if found.is_some() {
+            continue;
+        }
+        let client = &extraction.calls[call];
+        if !wanted(client.method.as_deref(), client.path_template.as_deref()) {
+            continue;
+        }
+        let client_app = app(&client.document.path);
+        if !kept(&[client_app]) {
+            continue;
+        }
+        rows.push(json!({
+            "list": "clientOnly",
+            "method": client.method,
+            "pathTemplate": client.path_template,
+            "app": name(client_app),
+            "handler": null,
+            "callSites": [site(call, client_app)],
+            "callSiteCount": 1,
+        }));
+    }
+    Ok(rows)
 }
 
 /// Splits a `/`-rooted template into segments. Only the one leading `/` is removed, so a

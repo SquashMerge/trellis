@@ -123,20 +123,21 @@ from `pyproject.toml` ([#807](https://github.com/SquashMerge/trellis/issues/807)
   ```text
   {client,server,kind:"http",
    ends:[{clientLayer:string|null,serverLayer:string|null,routes:UInt,callSites:UInt}],
-   wrappers:{callees:["api","request","api.request","owner.request"],
+   wrappers:{callees:["api","request","api.request","owner.request","fetch","axios",...],
              prefix:{client:"/api/",server:"/api/checkouts/{root}/"}},
    counts:{matchedRoutes,callSites,serverOnly,clientOnly,
            confidence:{exact,template,wrapperInferred,unresolved}}}
   ```
 
+  `wrappers.callees` lists the built-in wrappers, then `fetch` and `axios`, then every
+  wrapper configured in `.trellis/rules.toml` (#855).
   `client` and `server` are app names. An end's app is the app of its file and layer under
   the `bucket` rule's file attribution. `ends[]` groups matched pairs by the layer of the call
   site and the layer of the handler (null sorts last): `routes` counts distinct routes and
   `callSites` counts call sites. `counts.confidence` counts call sites, matched and
   client-only. `serverOnly` is the number of the server's routes that no call matched, and
   `clientOnly` the number of the client's unmatched calls.
-- Summary `edges` omit `cross_app` instances. They stay in `rules.counts.unknown` and in the
-  review list.
+- Summary `edges` omit `cross_app` instances. They stay in `rules.counts.unknown`.
 - A single-app checkout whose app root is a subdirectory, and which has unassigned files
   outside that root, reports part of its per-app output under `noApp`: `apps[0].counts`
   equals `rules.counts` only when no row's own file is unassigned and outside the app's root.
@@ -171,7 +172,8 @@ from `pyproject.toml` ([#807](https://github.com/SquashMerge/trellis/issues/807)
 
 **Extraction (#788).** Interface evidence is structural and read from the same admitted
 snapshot as the rules. It is extracted only when two or more apps are detected (#794:
-detected and authored apps together). Documents
+detected and authored apps together), with or without a rules file (#851: without one,
+every detected manifest is an app, for MCP `trellis_endpoints`). Documents
 with an evidence gap are skipped. Work is bounded; over the bound the read fails
 `bounded_work`.
 
@@ -221,7 +223,7 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
   contains the handler (or the named function, for `declaration`), with keys from the
   declaration lookup keys. They are null when no named callable exists.
 - **Client calls.** JavaScript and TypeScript calls to the built-in wrappers (there is no
-  rules-file key):
+  rules-file key for these; #855 adds `fetch`, axios and `[[interfaces.wrappers]]`, below):
 
   | Callee | Path | Method | Default |
   | --- | --- | --- | --- |
@@ -237,6 +239,105 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
   has a top-level spread and no `method`, or when it is not one of `GET`, `POST`, `PUT`,
   `DELETE`, `PATCH`, `HEAD` or `OPTIONS` (after uppercasing). An unreadable path or method
   never matches and is `unresolved`.
+- **JavaScript and TypeScript server routes (#855).** They are read from production
+  documents.
+  - **App objects.** A route is reached from an app object through its mounts. An app object
+    is a `const`, `let` or `var` binding made by `express()`, `fastify()` (or `Fastify()`) or
+    `new Koa()`, where the callee is imported or required from the `express`, `fastify` or `koa`
+    package. Routers are bindings made by `express.Router()` (or a `Router` imported from
+    `express`) or `new Router()` from `@koa/router` or `koa-router`. A router that no app object
+    reaches registers nothing.
+  - **Registrations.** On an express app or router, `x.get/post/put/delete/patch/head/options`
+    and `x.all`, and the chain `x.route(path).get(h).post(h)`. On fastify, the same methods and
+    `x.route({method, url, handler})`, where `method` is a string or an array of strings. On a
+    Koa router, the same methods, `del`, and the named form `router.get(name, path, h)`. The
+    path is argument 0. It is a string, a template literal or a `+` of them, with `const`
+    bindings and imported constants resolved. The handler is the last argument, or the
+    `handler` of a fastify options object. `all` registers the method `ANY`.
+  - **Mounts.** express `use([path,] ...routers)`. Koa `use([path,] router.routes())`, a
+    router's `prefix` option, and `router.prefix(path)`. fastify
+    `register(plugin, {prefix})`, where the plugin's first parameter is the child object. A
+    plugin wrapped in `fastify-plugin` shares its parent's scope, so `prefix` does not apply to
+    it (Fastify Routes reference, "Route Prefixing and fastify-plugin"), unless it is wrapped
+    with `encapsulate: true`. Wrapper options that cannot be read register nothing. Passing an app or router to a function, such as
+    `routes(app)` or `require('./routes')(app)`, makes that parameter the same object. Mounts
+    are followed across relative imports and `require`, through `module.exports`,
+    `exports.name` and ESM exports, at most 16 deep.
+  - **Unreadable paths and patterns.** A path or prefix that cannot be read, or that uses
+    pattern syntax (`?`, `+`, `(`, `[`, `{`), registers nothing under it. A `use` whose first
+    argument has no readable value (an unbound name, a call, a conditional) mounts nothing.
+  - **Object members.** An options object is read in write order. A spread, a computed key,
+    or an accessor or method of the key's name may set that key to anything, so the key is
+    unreadable until a later explicit member sets it. This applies to `prefix`, `url`,
+    `path`, `method`, `handler`, `baseURL` and `encapsulate`.
+  - **Normalisation.** `:name` is read as `{name}`, `*name` as `{*name}` and a bare `*` as
+    `{*}`. The mount prefix and the path are joined with one `/` and no trailing `/`.
+  - **Handlers.** A handler that names a function declaration, or a variable bound to a
+    function, is that `declaration`, even across an import. Any other handler is a
+    `closure`: its own span, inside the named callable around it.
+  - **Next.js.** A `package.json` that depends on `next` (in `dependencies`,
+    `devDependencies` or `peerDependencies`) makes its directory a Next.js root. Under it, or
+    under its `src/`, two kinds of file are routes:
+    - `pages/api/**`, whose default export answers `ANY`;
+    - `app/**/route.(js|jsx|ts|tsx|mjs|cjs)`, whose exported `GET`, `POST`, `PUT`, `PATCH`,
+      `DELETE`, `HEAD` and `OPTIONS` (declarations, `const` exports or `export { h as GET }`)
+      each answer their method.
+
+    In the path, `[id]` is `{id}` and `[...rest]` is `{*rest}`. `[[...rest]]` gives two
+    routes, one without the segment and one with `{*rest}`. Route groups `(g)` and slots
+    `@s` are dropped. A segment starting with `_` or `(.` excludes the file, and so does a
+    pages-router file named `_*`. `index` is its directory.
+  - **Duplicates.** JavaScript routes are one per method, template and registering file.
+- **JavaScript and TypeScript clients (#855).** Besides the wrappers above:
+  - `fetch(path, options)`, including `window.fetch`, `globalThis.fetch` and `self.fetch`.
+    The method is the `method` of the options object, as for `request`.
+  - axios: `axios(config)`, `axios(url, config)`, `axios.request(config)`,
+    `axios.get/delete/head/options(url, config)` and `axios.post/put/patch(url, data,
+    config)` (and the `Form` variants). The same calls work on a binding made by
+    `axios.create(config)`. The URL is the argument or the config's `url`. The method is the
+    call's own, or the config's `method`, or `GET`. A `baseURL` in the call's config or the
+    instance's config is joined before the URL. A joined match is `wrapperInferred`. An
+    absolute URL or `baseURL` is not a client call, and an unreadable `baseURL` makes the path
+    unreadable, as does a config member that may set it (see Object members). A verb method's
+    own method wins over the config's. When any document mentions axios, an identifier call or
+    an axios method name is read through its binding, across imports, whatever the calling
+    file says.
+  - **Constants.** Paths read `const` bindings, imported constants, template literals and
+    `+`, with `{}` for any part that cannot be read.
+  - **The wrapper's own call.** A `fetch` or axios call inside a named callable that has a
+    wrapper's name (such as `api`) is the wrapper's own implementation, not a call.
+  - **Configured wrappers.** `.trellis/rules.toml` may configure wrappers (owner ruling
+    2026-11-10):
+
+    ```toml
+    [[interfaces.wrappers]]
+    callee = "apiFetch"   # required: an identifier or object.property
+    method = "options"    # "options" (default) or "argument"
+    at = 1                # 1 to 8, default 1
+    prefix = "/api"       # optional rooted literal the wrapper adds to every path
+    root = "web"          # optional directory the wrapper applies under; default "."
+    # app = "web"         # or: the app whose files the wrapper applies to (not with root)
+    ```
+
+    - **`method` and `at`.** With `"options"`, the method is `method` in the object
+      literal at argument `at`. With `"argument"`, it is a string at argument `at`.
+    - **`prefix`.** It has no query, fragment or pattern. A match through it is
+      `wrapperInferred`.
+    - **`root`.** It follows the `[apps]` root rules (#794). The wrapper applies to files under
+      that directory.
+    - **`app`.** It names an app of the effective inventory (owner ruling 2026-11-10). The
+      wrapper applies to the files that rule evaluation assigns to that app: the one app of the
+      file's layer, else the app whose root contains it. `root` and `app` are exclusive. An
+      unknown or shared app name is a located rules error when the apps are resolved.
+    - **Precedence.** For one callee, an `app` scope wins over any root scope, including a
+      deeper one. A deeper root wins over a shallower one, and an unscoped wrapper (`.`) comes
+      last.
+    - **Matching.** A configured wrapper is matched only as assembled, never through the
+      built-in `/api/` rule. It replaces a built-in wrapper with the same callee.
+    - **Errors.** Each invalid entry is a located `invalid_rules` error, like any other rules
+      error: an unknown key, a bad value, both `root` and `app`, the same callee twice for one
+      scope, or more than 64 entries. `wrappers.callees` shows what took effect. A `package.json` configures no
+      wrapper.
 - **reqwest calls (#858).** Read in Rust documents that mention `reqwest`:
   `reqwest::get(url)` and `reqwest::blocking::get(url)` (`GET`); `c.get(url)`, `.post`,
   `.put`, `.delete`, `.patch` and `.head` (the method of the name); and
@@ -253,20 +354,21 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
   read from a call outside every inline `mod`. A glob import (`use a::*`) anywhere below the
   top level may bind any name, so it makes every constant of the document unreadable; a
   top-level glob does not, since the top-level item shadows it; any other identifier is
-  unreadable. Each substituted value is charged to the work bound before it is copied. The path is what follows the host of an
-  `http://` or `https://` URL (`/` when there is none), or the text itself when it starts
+  unreadable. Each substituted value is charged to the work bound before it is copied. The
+  path is what follows the host of an `http://` or `https://` URL (`/` when there is none), or the text itself when it starts
   with `/`; a URL that starts with a substitution, or anything else, is unreadable and
   `unresolved`. The path is cut at `?` or `#` and split as above.
-- **Segment matching.** Methods must be equal. A literal segment must equal a literal
+- **Segment matching.** Methods must be equal, or the route is `ANY`. A literal segment must equal a literal
   segment. A server `{name}` matches exactly one segment, and `{*name}` matches the rest.
   A client substitution segment matches only a server `{name}` or `{*name}`. If nothing
-  matches as written, a wrapper call (never a reqwest call) is matched again as assembled by
-  the wrapper's prefix:
-  `/api/` becomes `/api/checkouts/{root}/`, with `{root}` a substitution segment. Among the
-  matches the one with the most literal segments wins, and a tie is no match.
+  matches as written, the call is matched again as assembled by the wrapper's prefix:
+  `/api/` becomes `/api/checkouts/{root}/`, with `{root}` a substitution segment. That rule
+  applies to the built-in wrappers only, never to a configured wrapper or a reqwest call.
+  Among the matches the one with the most literal segments wins. Between equal counts, a route that names the method wins over an `ANY`
+  route. Any other tie is no match.
 - **Confidence.** `wrapperInferred` when the prefix was needed. Otherwise `template` when the
-  call used a client substitution, or the route has a server `{name}` or `{*name}`, or came
-  from the dispatch table. Otherwise `exact`. A call with no match is `unresolved`. A route
+  call used a client substitution, or the route has a server `{name}` or `{*name}`, came
+  from the dispatch table or is `ANY`. Otherwise `exact`. A call with no match is `unresolved`. A route
   takes its best call site: `exact`, then `template`, then `wrapperInferred`. The values are
   defined in the contract-v1 amendment.
 - **Exclusions.** Documents whose file module has the `test` role, routes and calls whose
@@ -304,6 +406,30 @@ band border. Arrow **width** grows with the arrow's reference-site count on a lo
 rest; colour keeps its meaning, the tag and the inspector keep the exact count, and the arrow
 key under the drawing shows the width at 1, 10, 100 and ≥1000 sites. The channels count
 toward the fitted width. This is layout only: records, counts and identities are unchanged.
+
+All apps layout (#790, #850; owner decision 2026-11-09). With two or more apps, All apps draws
+one column per app, side by side in **manifest order** when they fit (each at least 352px,
+with a 176px gutter between columns), else stacked. Each column is the same Pele drawing as
+the one-app view, fitted to its column width (#860's stack span included), with its own
+gutters and side channels. An interface end between **adjacent** side-by-side columns, with
+both of its layers drawn as bands, draws
+one overlay line in its own lane of the gutter, from its band's side straight across to the
+partner band; any other end is named in words on its card. A column's **Shared** boxes sit on
+the side away from its interface partners, so a line between ordered bands never crosses
+them. The rule counts, per column, only those drawn lines, and the ones each side would cross: an end on an ordered band
+crosses the Shared boxes when they are on the partner's side, and an end on a Shared box
+crosses the ordered stack when the boxes are on the other side. The column takes the side
+with fewer crossings; a tie, including a column with no drawn line or a stacked layout, keeps
+the right, as in the one-app view. With two apps whose interface runs between ordered layers,
+the left app's Shared boxes are on its left and the right app's on its right. A middle app with
+partners on both sides takes the side with fewer lines; one with as many lines each way keeps
+the right, and its lines on that side then cross the Shared boxes. On the left, the nearest
+Shared box sits beside the stack, the long-upward channel runs between them, arrows to the
+nearest box run left along a gutter to its side, a farther box is still reached through the
+right channel and the strip under the drawing, and the `→`/`←` tags of shared arrows are
+mirrored so a tag points the way its arrow runs. Band headers, the Shared header included,
+wrap whole at separators and keep their size (AC26); no overlay line runs through a Shared
+header when the boxes are away from the partner. The one-app view is unchanged.
 When the panel width changes (window resize, inspector shown or hidden), the drawing
 is laid out again after a short quiet period (150 ms), from the same response with no new
 read, keeping the size cap, the inspector, the selected node and keyboard focus. The hidden-layer note
@@ -357,9 +483,8 @@ unknown`) and the longer prose live behind the ⓘ.
 
 The inspector opens on the counted review chips, **23 deviations · 156 unassigned ·
 0 exceptions**, and every Architecture inspection keeps them at its head. The deviations
-chip opens the Deviations tree below; the review list is reached through **Review all rule
-instances** there and through edge inspection. The other chips open the unassigned files and
-the authored exceptions. Deviations are `rules.counts.deviates`, unassigned files
+chip opens the Deviations tree below, the one review path for deviations (#845). The other
+chips open the unassigned files and the authored exceptions. Deviations are `rules.counts.deviates`, unassigned files
 are the full native module inventory with no assigned layer (including module-only files),
 and exceptions is `exceptionCount`. The evidence disclosure separately labels
 `rules.unassignedCount` as identities, including external packages. There is no refresh button: the
@@ -371,8 +496,9 @@ overview does not open the inspector drawer.
 **Per-destination `↑` badges and interface stubs (#789, proposed (owner-delegated, run 803)).**
 This amends the single `↑` chip above, in every stack. A band has one `↑` badge for each
 destination layer it reaches upward: production `$layers` edges with the `deviates` verdict,
-not excepted, to a layer with a smaller `order`. It reads `↑12 deviation · entry` (`↑≥12` for a
-lower bound) and sums the summary edges, so the badges of a band add up to its former `↑`
+not excepted, to a layer with a smaller `order`. It reads `↑12 references · entry` (`↑≥12` for a
+lower bound, `↑1 reference · entry` for one): the count is reference sites, the tree's unit after
+#846 (owner ruling 2026-11-09, #845). It sums the summary edges, so the badges of a band add up to its former `↑`
 chip. Each badge is its own focusable control, the next sibling of its band, and opens the
 Deviations tree with that edge's chip pressed, no line selected and Calls only off. The `↓`
 chip stays display-only.
@@ -406,15 +532,24 @@ hint stay in the hidden-layer note until **Include tests and fixtures in metrics
 
 Click a module or select it with Enter/Space to inspect its identity, layer, captured
 physical file lines, callable count, every metric, and its incident references and rule
-instances (read on demand, [below](#summary-and-detail-reads-448)). Select a
-summary edge to inspect its exact contributing module pairs, production/test counts,
-verdicts, exceptions and source-site samples. Omitted sample counts stay visible;
+instances (read on demand, [below](#summary-and-detail-reads-448)).
+
+**Arrows and badges open the Deviations tree (#845, owner ruling 2026-11-09).** Selecting an
+arrow that the tree lists, a production `$layers` edge with the `deviates` verdict and no
+exception (upward `↑` or peer and shared `⇄`), opens the Deviations tree with that edge's
+chip pressed, no line selected and Calls only off, exactly as its band's `↑` badge does. The
+tree's back link returns to the drawing and focuses the arrow or badge that opened it. Any
+other arrow (allowed, excepted, unknown or test-only) opens the edge inspector: its exact
+contributing module pairs, production/test counts, verdict, exception and source-site
+samples. The edge inspector lists no rule instances; the per-edge exception review it used
+to open (a rule-instance list with checkboxes, **Select witnessed pairs** and **Add selected
+exceptions**) is retired. Omitted sample counts stay visible;
 sampling never changes totals. Explicit source actions read cached indexed text at
 the displayed revision. They never fall back to the live file.
 
 ### Boundary calls to Sequence (#646)
 
-For deviating or excepted references, the inspector groups sampled boundary call sites by
+For excepted references (and other arrows the edge inspector shows), the inspector groups sampled boundary call sites by
 calling method. **Open sequence** opens that exact measured caller in Interactions and
 highlights its boundary calls, scrolling the first visible call into view. If Interactions
 hides a focused call, the notice offers **Show all steps**. Browser Back returns to the
@@ -440,26 +575,46 @@ The deviations chip replaces the diagram with a tree of every production deviati
 without choosing an edge first. It reads `kind=instances`, `rule=$layers`, `status=deviates`,
 `role=production`, `excepted=false` at the view's pin and rules hash, page by page, and
 shows nothing if any page fails. The tree is a flat list of files, each with its functions
-and then its lines, sorted by references. A file row carries one badge for each edge it
-reaches up or across, and the edge chips filter the list; files are not nested under edges.
-A line's function reads "(module level)" for file-level code and "(anonymous)" when no name
-was captured.
+and then its lines, sorted by references; files are not nested under edges. A file row
+carries the edges it reaches up or across, and the edge chips filter the list. The tree
+replaces the drawing and the Architecture toolbar (app switcher, metric controls, ⓘ); its
+header leads back with "← Architecture", or "← <app>" in a one-app stack.
 
 - **Naming (#816).** A *deviation* is a rule instance, as on the review chip (**23
-  deviations**). The tree's chips and file badges count *references* (reference sites), for
-  example `↑ low → top · 25 references` and `↑ top · 3 references`; under Calls only a file
-  badge counts calls. Modules read `from → to`; "target" is used only for **Go to definition**,
-  the resolved declaration.
-- **Filters.** The chips are **All deviations** and one per edge, `↑` upward and `⇄` peer or
-  shared. A chip reads `≥N` when the edge count is a lower bound. A line's tag is its
+  deviations**). The tree's chips and Reaches up column count *references* (reference
+  sites), in the design's compact form (#845): a chip reads `storage → indexing · 445` and a
+  file's Reaches up reads `▲ indexing 403`; their accessible names say "references" (or
+  "calls" under Calls only). Modules read `from → to`; "target" is used only for **Go to
+  definition**, the resolved declaration.
+- **Function names (#845).** A function row is the owner's stable lookup key without the
+  file's `path::` prefix (`EvidenceResponse::architecture_config` under `src/store.rs`). A
+  site whose smallest enclosing declaration is a closure (no name and no stable key) is
+  listed under its nearest enclosing callable, read from the Files outline (`GET symbols`) at
+  the view's pin, and its line panel says "(in a closure)". A callable is a named function,
+  method or constructor, or a binding whose whole initializer is a function
+  (`callableInitializer`); named variables, fields and types on the way are skipped (#860). A
+  method reads `Type::name` from its `impl` block. A closure with no enclosing callable up to
+  its file's root is "(module level)". At most 50 files are named per tree; a file whose
+  outline cannot be read keeps "(anonymous)", but an outline read that answers
+  `revision_conflict`, `pin_expired` or `root_changed` is the tree's conflict, handled as below,
+  and shows no tree.
+- **Filters.** The chips are **All upward** (or **All deviations** when a peer or shared
+  edge is listed) and one per edge, with `⇄` before a peer or shared edge. When a listed
+  edge's source layer has unresolved sites, the chip still shows the mapped count and one
+  line under the chips gives the reason: "Counts are references mapped to a file. Some sites
+  in <layers> stayed unresolved, so their edges may have more." A line's tag is its
   classified relation kind (`relationKind`): `call`, `type use`, `import` or `reference`.
   **Calls only** keeps exactly the lines tagged `call`; type uses, imports and other
   references are hidden. A JavaScript or TypeScript `require(...)` or `import(...)` stays an
   `import` even when it carries a caller, so it is tagged `import` and hidden under Calls
   only; it can still offer **Open in Sequence**.
-- **Counts.** Only a file's `referenceCount` and `kindCounts` are exact. Lines are sampled per
-  file pair, calls first, so a function count reads `≥N` when any instance of its file was
-  truncated, and the footer says so.
+- **Counts.** A file's `referenceCount` and `kindCounts` are exact. Lines are sampled per
+  file pair, calls first. A function's count reads `≥N` only when a file pair that feeds it
+  has more sites (or calls) than are listed; a function fed only by fully listed pairs is
+  exact. The footer says what `≥` means.
+- **Line rows** read `L<line> <symbol>` with a kind tag and, on one line, `→ <file>:<line>` for
+  the definition, or `→ <file> · file only` without a binding; the full path and the reason
+  are the tooltip and the accessible name.
 - **Line actions.** One menu with the label "Line actions" opens from the `⋯` button, a
   right-click or Shift+F10: **Open in Sequence** (only when the line has a measured caller),
   **Go to call site**, **Go to definition** (only with a target), **Copy location** and
@@ -471,8 +626,8 @@ was captured.
 - **Hidden selection.** A filter that hides the selected line clears the selection and says
   "Selected line is hidden by this filter." **Clear filter** returns to All deviations with
   Calls only off and selects nothing. A line is never selected for the user.
-- **Unknown.** "N unknown rule instances are not deviations." opens the review panel on the
-  unknown verdict.
+- **Unknown.** "N unknown rule instances are not deviations." links to the existing
+  **Inspect same-layer and unassigned references** view, and closes the tree.
 - **Open in Sequence and Back.** The browser history entry keeps whether the tree was open,
   the chip, Calls only, the expanded rows, the selected line and focus. **Back** reopens the
   tree and reselects and focuses that line. If the line is gone it says "The selected line is
@@ -608,30 +763,28 @@ The browser reads details only when an inspector or list needs them:
 
 - a module's pairs and rule instances;
 - a layer's pairs and instances;
-- an edge's instances;
 - unresolved sites;
 - same-layer and unassigned pairs;
 - `$external` results;
-- the review list;
-- the witnessed deviations a glob selection chooses from.
+- the Deviations tree's production deviations.
 
-An edge lists the `$layers` instances of its exact verdict and exception group;
 `$external` results have their own list in the notices. Each list shows one page and a **Show more** button for the next one. Repository
 text in details is inserted with `textContent`.
 
 ## Review and authoring
 
-The review list pages rule instances from `architecture/details` with source/destination files, layers, production or
-test role, underlying verdict and exception reason. Filters do not change the indexed
-metric population. Structural evidence is syntax-tier: captured source-owner identities and
+Deviations are reviewed in the Deviations tree, above. A module's or layer's inspector lists
+its rule instances from `architecture/details` with source/destination files, layers,
+production or test role, underlying verdict and exception reason. Structural evidence is syntax-tier: captured source-owner identities and
 spellings are not resolved destination-symbol bindings. Semantic sites name their
 binding's provenance, and rule evidence calls them `semanticBinding`. Site samples and omitted counts
 stay explicit. The Unassigned list includes files with no observed references.
 
-An exception needs a nonblank reason. Select one pair or several witnessed pairs and apply
-one reason in **one preview and one apply**. File-to-layer and glob controls select an
-explicit finite list of current pairs; they do not persist wildcard exceptions or waive
-future files. The portable format remains literal language/path endpoints under #365.
+An exception is per file pair. It starts from a line of the Deviations tree, **Add exception
+for this file pair…** (the line menu or the line panel), or from a rule instance in a module
+or layer inspector, and needs a nonblank reason. It goes through one preview and one apply.
+There is no bulk selection (#845): the design has none, and each pair is reviewed from the
+lines that witness it. Exceptions do not persist wildcards or waive future files. The portable format remains literal language/path endpoints under #365.
 Unknown destinations and external packages cannot become portable pair exceptions.
 Existing authored exceptions can be edited or removed even when no current pair matches.
 An unassigned file can be assigned to an existing layer by adding its exact path.

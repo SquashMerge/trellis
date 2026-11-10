@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Architecture · deviations</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;650&amp;family=JetBrains+Mono:wght@400&amp;family=Manrope:wght@600;700;750&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#0B0C10}
+a{color:#ABA5FF}a:hover{color:#F7F7FB}
+a:focus-visible,button:focus-visible,input:focus-visible{outline:2px solid #ABA5FF;outline-offset:3px}
+</style>
+</helmet>
+<div style="min-height: 900px; background: #0B0C10; color: #F7F7FB; font-family: 'Inter', system-ui, sans-serif; font-size: 14px; display: flex; flex-direction: column">
+
+<header style="display: flex; flex-wrap: wrap; align-items: center; gap: 12px 16px; padding: 8px 16px; border-bottom: 1px solid #343644; background: #14151D">
+<span style="font-family: 'Manrope', system-ui, sans-serif; font-size: 18px; font-weight: 750">Trellis</span>
+<nav aria-label="Sections" style="display: flex; gap: 4px"><a href="Viewer.dc.html" aria-current="page" style="padding: 8px 12px; border-radius: 8px; background: #1D1E2A; color: #F7F7FB; text-decoration: none; font-size: 14px; font-weight: 600">Diagrams</a><a href="Files.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 14px">Files</a></nav>
+<span style="padding: 8px 12px; border: 1px solid #777A8E; border-radius: 8px; font-family: 'JetBrains Mono', monospace; font-size: 13px">trellis ⎇ main · rev 669eb851:43</span>
+<span style="margin-left: auto; display: flex; align-items: center; gap: 8px; font-size: 13px"><span aria-hidden="true" style="width: 8px; height: 8px; border-radius: 50%; background: #57D6A0"></span>Fresh · rev 669eb851:43</span>
+</header>
+
+<nav aria-label="Diagram views" style="display: flex; gap: 4px; padding: 8px 16px; border-bottom: 1px solid #343644">
+<a href="Apps.dc.html" aria-current="page" style="padding: 8px 12px; border-radius: 8px; background: #1D1E2A; color: #F7F7FB; text-decoration: none; font-size: 13px; font-weight: 600; box-shadow: inset 0 -2px 0 #7770DC">Architecture</a>
+<a href="Treemap.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">Treemap</a>
+<a href="Sequence.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">Sequence</a>
+<a href="Class.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">Classes</a>
+</nav>
+
+<div style="flex: 1; display: flex; min-height: 0">
+<section aria-label="Deviations by file" style="flex: 1; min-width: 0; padding: 16px; overflow: auto">
+
+<div style="display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 12px; margin-bottom: 4px">
+<a href="Apps.dc.html" style="font-size: 13px">← daemon · Rust</a>
+<h1 style="margin: 0; font-family: 'Manrope', system-ui, sans-serif; font-size: 22px; font-weight: 750">Deviations</h1>
+<span style="font-size: 13px; color: #B8BAC8">{{summary}}</span>
+</div>
+<p style="margin: 0 0 12px; font-size: 13px; color: #B8BAC8">Files that reach up a layer. Expand a file to see the functions and the exact lines. Select a line for its actions, or right-click it.</p>
+
+<div style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; margin-bottom: 12px">
+<div role="group" aria-label="Edge" style="display: flex; flex-wrap: wrap; gap: 4px; padding: 4px; border: 1px solid #777A8E; border-radius: 12px">
+<sc-for list="{{edges}}" as="e" hint-placeholder-count="3">
+<button type="button" onClick="{{e.pick}}" aria-pressed="{{e.pressed}}" style="min-height: 32px; padding: 0 12px; border-radius: 8px; border: 0; background: {{e.bg}}; color: {{e.fg}}; font: inherit; font-size: 13px; font-weight: {{e.weight}}; cursor: pointer">{{e.label}}</button>
+</sc-for>
+</div>
+<label style="display: flex; align-items: center; gap: 6px; font-size: 13px; color: #B8BAC8"><input type="checkbox" checked="{{callsOnly}}" onChange="{{toggleCalls}}"> Calls only</label>
+<span style="margin-left: auto; font-size: 12px; color: #B8BAC8">Sorted by references · production only</span>
+</div>
+
+<div role="tree" aria-label="Files with deviations" style="border: 1px solid #343644; border-radius: 12px; background: #14151D; overflow: hidden">
+<div aria-hidden="true" style="display: grid; grid-template-columns: minmax(0, 1fr) 190px 64px 84px 32px; gap: 8px; padding: 8px 16px; border-bottom: 1px solid #343644; font-size: 12px; color: #B8BAC8">
+<span>File · function · line</span><span>Reaches up</span><span style="text-align: right">Calls</span><span style="text-align: right">References</span><span></span>
+</div>
+<sc-for list="{{rows}}" as="r" hint-placeholder-count="12">
+<div role="treeitem" aria-level="{{r.level}}" aria-expanded="{{r.expanded}}" aria-selected="{{r.selected}}" onClick="{{r.click}}" onContextMenu="{{r.context}}" style="position: relative; display: grid; grid-template-columns: minmax(0, 1fr) 190px 64px 84px 32px; align-items: center; gap: 8px; min-height: {{r.h}}px; padding: 0 16px 0 {{r.indent}}px; border-bottom: 1px solid {{r.line}}; background: {{r.bg}}; color: {{r.fg}}; cursor: pointer">
+<span style="display: flex; align-items: center; gap: 8px; min-width: 0">
+<span aria-hidden="true" style="width: 12px; color: {{r.sub}}; font-size: 12px">{{r.caret}}</span>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 13px; font-weight: {{r.weight}}; overflow: hidden; text-overflow: ellipsis; white-space: nowrap">{{r.name}}</span>
+<sc-if value="{{r.kind}}" hint-placeholder-val="{{false}}"><span style="flex: none; padding: 0 6px; border-radius: 4px; border: 1px {{r.kindStyle}} {{r.kindB}}; font-size: 12px; color: {{r.kindC}}">{{r.kind}}</span></sc-if>
+<sc-if value="{{r.flag}}" hint-placeholder-val="{{false}}"><span style="flex: none; padding: 0 6px; border-radius: 4px; border: 1px dashed #FFC20A; font-size: 12px; color: {{r.flagC}}">◆ {{r.flag}}</span></sc-if>
+</span>
+<span style="font-size: 12px; color: {{r.edgeC}}; overflow: hidden; text-overflow: ellipsis; white-space: nowrap">{{r.edge}}</span>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 13px; text-align: right; color: {{r.callsC}}">{{r.calls}}</span>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 13px; text-align: right">{{r.n}}</span>
+<sc-if value="{{r.isSite}}" hint-placeholder-val="{{false}}">
+<button type="button" aria-label="{{r.menuLabel}}" aria-haspopup="menu" onClick="{{r.openMenu}}" style="width: 28px; height: 28px; border-radius: 8px; border: 1px solid {{r.btnB}}; background: transparent; color: inherit; font: inherit; cursor: pointer">⋯</button>
+</sc-if>
+<sc-if value="{{r.menuOpen}}" hint-placeholder-val="{{false}}">
+<div role="menu" aria-label="Line actions" style="position: absolute; right: 16px; top: 36px; z-index: 2; width: 240px; padding: 4px; border: 1px solid #777A8E; border-radius: 8px; background: #1D1E2A; color: #F7F7FB; box-shadow: 0 8px 24px rgba(0,0,0,.5)">
+<sc-for list="{{menu}}" as="m" hint-placeholder-count="4">
+<a role="menuitem" href="{{m.href}}" style="display: flex; justify-content: space-between; gap: 8px; padding: 8px; border-radius: 4px; color: #F7F7FB; text-decoration: none; font-size: 13px">{{m.label}}<span style="color: #B8BAC8; font-size: 12px">{{m.hint}}</span></a>
+</sc-for>
+</div>
+</sc-if>
+</div>
+</sc-for>
+<p style="margin: 0; padding: 12px 16px; font-size: 12px; color: #B8BAC8">{{more}}</p>
+</div>
+<p style="margin: 8px 0 0; font-size: 12px; color: #B8BAC8">Sample data: file, function and line names are from a scan of rev 669eb851:43; counts, code text and definition lines are illustrative. The real rows come from rules_explain, up to 50 lines per file pair, pinned to the index basis.</p>
+</section>
+
+<aside aria-label="Selected line" style="width: 380px; flex: none; padding: 16px; border-left: 1px solid #343644; background: #14151D; overflow: auto">
+<p style="margin: 0 0 4px; font-size: 12px; color: #B8BAC8">{{d.kindLabel}}</p>
+<p style="margin: 0 0 4px; font-family: 'JetBrains Mono', monospace; font-size: 15px; overflow-wrap: anywhere">{{d.loc}}</p>
+<p style="margin: 0 0 12px; font-size: 13px; color: #B8BAC8">in <span style="font-family: 'JetBrains Mono', monospace; color: #F7F7FB">{{d.fn}}</span></p>
+
+<pre style="margin: 0 0 16px; padding: 8px; border-radius: 8px; background: #0B0C10; font-family: 'JetBrains Mono', monospace; font-size: 12px; line-height: 18px; white-space: pre-wrap; overflow-wrap: anywhere"><span style="color: #B8BAC8">{{d.line}}  </span>{{d.code}}</pre>
+
+<dl style="display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; margin: 0 0 16px; font-size: 13px">
+<dt style="color: #B8BAC8">Refers to</dt><dd style="margin: 0; font-family: 'JetBrains Mono', monospace; overflow-wrap: anywhere">{{d.ref}}</dd>
+<dt style="color: #B8BAC8">Defined at</dt><dd style="margin: 0; font-family: 'JetBrains Mono', monospace">{{d.def}}</dd>
+<dt style="color: #B8BAC8">Layers</dt><dd style="margin: 0; color: #FF8E9A">▲ {{d.edge}}</dd>
+<dt style="color: #B8BAC8">File pair</dt><dd style="margin: 0; font-family: 'JetBrains Mono', monospace; overflow-wrap: anywhere">{{d.pair}}</dd>
+<dt style="color: #B8BAC8">Evidence</dt><dd style="margin: 0">{{d.evidence}}</dd>
+</dl>
+<sc-if value="{{d.flag}}" hint-placeholder-val="{{false}}"><p style="margin: 0 0 16px; padding: 8px; border: 1px dashed #FFC20A; border-radius: 8px; font-size: 12px; color: #FFC20A">◆ {{d.flag}}</p></sc-if>
+
+<div style="display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px">
+<sc-if value="{{d.isCall}}" hint-placeholder-val="{{true}}">
+<a href="Sequence.dc.html" style="display: flex; align-items: center; justify-content: space-between; min-height: 44px; padding: 0 16px; border-radius: 8px; background: #FFAA10; color: #0B0C10; font-weight: 650; text-decoration: none">Open in Sequence<span style="font-weight: 400; font-size: 12px">{{d.fnShort}}, this call marked</span></a>
+</sc-if>
+<a href="Files.dc.html" style="display: flex; align-items: center; justify-content: space-between; min-height: 44px; padding: 0 16px; border-radius: 8px; {{d.siteStyle}}; text-decoration: none">Go to call site<span style="font-weight: 400; font-size: 12px">{{d.loc}}</span></a>
+<a href="Files.dc.html" style="display: flex; align-items: center; justify-content: space-between; min-height: 44px; padding: 0 16px; border-radius: 8px; border: 1px solid #777A8E; color: #F7F7FB; text-decoration: none">Go to definition<span style="font-size: 12px; color: #B8BAC8">{{d.def}}</span></a>
+</div>
+<button type="button" style="min-height: 36px; padding: 0 12px; border-radius: 8px; border: 1px solid #777A8E; background: transparent; color: #F7F7FB; font: inherit; font-size: 13px; cursor: pointer">Add exception for this file pair…</button>
+<p style="margin: 8px 0 0; font-size: 12px; color: #B8BAC8">Exceptions are per file pair in rules.toml, so this covers {{d.pairCount}} in {{d.pair}}.</p>
+</aside>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1440,"height":900}}'>
+class Component extends DCLogic {
+  constructor(props) { super(props); this.state = { edge: 'all', callsOnly: false, open: { 'src/producer/import.rs': true, 'src/producer/import.rs#submit': true, 'src/store.rs': true, 'src/store.rs#write_staged_semantic': true, 'src/store.rs#validate': true, 'src/store/mcp_read.rs': true, 'src/store/mcp_read.rs#mcp_outgoing_excluding': true, 'src/store/graph_read.rs': true, 'src/store/graph_read.rs#navigation_call_budget': true }, sel: 'imp102', menu: null }; }
+  renderVals() {
+    const DEF = { edge: 'all', callsOnly: false, open: { 'src/producer/import.rs': true, 'src/producer/import.rs#submit': true, 'src/store.rs': true, 'src/store.rs#write_staged_semantic': true, 'src/store.rs#validate': true, 'src/store/mcp_read.rs': true, 'src/store/mcp_read.rs#mcp_outgoing_excluding': true, 'src/store/graph_read.rs': true, 'src/store/graph_read.rs#navigation_call_budget': true }, sel: 'imp102', menu: null };
+    const st = Object.assign({}, DEF, this.state || {});
+    const EDGES_OK = ['all', 'storage → indexing', 'storage → query', 'indexing → entry', 'storage → entry'];
+    const edge = EDGES_OK.includes(st.edge) ? st.edge : 'all';
+    const callsOnly = !!st.callsOnly, open = (st.open && typeof st.open === 'object') ? st.open : DEF.open, menu = st.menu || null;
+    let sel = typeof st.sel === 'string' ? st.sel : 'imp102';
+    const up = '#FF8E9A';
+    const SI = 'storage → indexing', SQ = 'storage → query', IE = 'indexing → entry', SE = 'storage → entry';
+    // site: [id, line, refers to, kind, defined at, to-file, code, edge]
+    const S = (id, line, ref, kind, def, to, code, e) => ({ id, line, ref, kind, def, to, code, edge: e });
+    const FILES = [
+      { path: 'src/store.rs', counts: { [SI]: 403, [SQ]: 134 }, more: '+ 71 more functions · 497 type uses', fns: [
+        { name: 'Store::write_staged_semantic', sites: [S('st8449', 8449, 'semantic_import::read_staged_documents()', 'call', 'semantic_import.rs:212', 'src/semantic_import.rs', 'crate::semantic_import::read_staged_documents(db, "stage.", producer, &mut |publication| {', SI)] },
+        { name: 'Store::recreate_index_exclusive_with_hook', sites: [S('st12833', 12833, 'native_evidence::spool_full_capture()', 'call', 'native_evidence.rs:3410', 'src/native_evidence.rs', 'let spool = crate::native_evidence::spool_full_capture(', SI)] },
+        { name: 'validate', count: 9, sites: [S('st1421', 1421, 'metrics::METRIC_ORDER', 'type', 'metrics.rs:41', 'src/metrics.rs', 'for metric in crate::metrics::METRIC_ORDER {', SQ), S('st1543', 1543, 'rules::Config', 'type', 'rules.rs:96', 'src/rules.rs', 'config: &crate::rules::Config,', SQ), S('st1544', 1544, 'references::Projection', 'type', 'references.rs:58', 'src/references.rs', 'projection: &crate::references::Projection,', SQ)] },
+        { name: 'publication_gate', count: 7, sites: [S('st489', 489, 'metrics::MetricsMemo', 'type', 'metrics.rs:212', 'src/metrics.rs', 'memo: &mut crate::metrics::MetricsMemo,', SQ)] },
+        { name: 'take_selected_read_counts', count: 14, sites: [S('st1040', 1040, 'native_evidence::Declaration', 'type', 'native_evidence.rs:402', 'src/native_evidence.rs', 'crate::native_evidence::Declaration {', SI), S('st1041', 1041, 'native_evidence::Call', 'type', 'native_evidence.rs:455', 'src/native_evidence.rs', 'crate::native_evidence::Call {', SI), S('st1042', 1042, 'native_evidence::ControlRegion', 'type', 'native_evidence.rs:488', 'src/native_evidence.rs', 'crate::native_evidence::ControlRegion {', SI), S('st1048', 1048, 'native_evidence::SourceSet', 'type', 'native_evidence.rs:120', 'src/native_evidence.rs', 'crate::native_evidence::SourceSet::Primary =>', SI)] },
+        { name: 'validate_reconcile_inventory', count: 13, sites: [S('st10719', 10719, 'indexer::ReconcileOptions', 'type', 'indexer.rs:88', 'src/indexer.rs', 'options: &crate::indexer::ReconcileOptions,', SI), S('st10748', 10748, 'capture::CaptureStat', 'type', 'capture.rs:61', 'src/capture.rs', 'let stat: crate::capture::CaptureStat = row.get(3)?;', SI), S('st10773', 10773, 'capture::CaptureInputObservation', 'type', 'capture.rs:74', 'src/capture.rs', 'crate::capture::CaptureInputObservation::Root {', SI)] },
+        { name: 'compare_capture_observations', count: 11, sites: [S('st10437', 10437, 'capture::CaptureStat', 'type', 'capture.rs:61', 'src/capture.rs', 'left: &crate::capture::CaptureStat,', SI), S('st10484', 10484, 'capture::CaptureInputObservation::Present', 'type', 'capture.rs:76', 'src/capture.rs', 'crate::capture::CaptureInputObservation::Present { stat, .. } =>', SI)] }
+      ] },
+      { path: 'src/store/graph_read.rs', counts: { [SQ]: 54, [SI]: 9, [SE]: 1 }, more: '+ 9 more functions · 52 type uses', fns: [
+        { name: 'navigation_call_budget', count: 6, sites: [S('gr338', 338, 'navigation::Reader', 'call', 'navigation.rs:144', 'src/navigation.rs', 'let reader = crate::navigation::Reader::new(&self.conn, pin);', SQ), S('gr370', 370, 'navigation::QUERY_ROWS', 'type', 'navigation.rs:22', 'src/navigation.rs', '.min(crate::navigation::QUERY_ROWS)', SQ), S('gr375', 375, 'navigation::QUERY_ROWS', 'type', 'navigation.rs:22', 'src/navigation.rs', 'if rows.len() > crate::navigation::QUERY_ROWS {', SQ)] },
+        { name: 'projection_endpoint', sites: [S('gr232', 232, 'graph_query::BoundaryReason', 'type', 'graph_query.rs:31', 'src/graph_query.rs', 'reason: crate::graph_query::BoundaryReason::Unbound,', SQ)] },
+        { name: 'GraphRead::check', sites: [S('gr324', 324, 'mcp::phase_hook()', 'call', 'mcp/mod.rs:2210', 'src/mcp/mod.rs', 'crate::mcp::phase_hook("graph_read.check");', SE)] }
+      ] },
+      { path: 'src/store/search.rs', counts: { [SQ]: 22 }, more: '+ 6 more functions · 18 type uses', fns: [
+        { name: 'publish_head', sites: [S('se214', 214, 'search_rank::SearchCandidate', 'type', 'search_rank.rs:77', 'src/search_rank.rs', 'let head: Vec<crate::search_rank::SearchCandidate> = ', SQ)] },
+        { name: 'search_candidate', sites: [S('se239', 239, 'search_rank::SearchCandidate', 'type', 'search_rank.rs:77', 'src/search_rank.rs', ') -> crate::search_rank::SearchCandidate {', SQ)] }
+      ] },
+      { path: 'src/store/architecture_core.rs', counts: { [SQ]: 7, [SE]: 1 }, fns: [
+        { name: '(module)', sites: [S('ac5', 5, 'http::architecture', 'type', 'http.rs:6120', 'src/http.rs', 'use crate::http::architecture::ArchitectureQuery;', SE), S('ac11', 11, 'metrics::DeclarationMetrics', 'type', 'metrics.rs:180', 'src/metrics.rs', 'use crate::metrics::DeclarationMetrics;', SQ)] },
+        { name: 'remember_summary', sites: [S('ac193', 193, 'references::Snapshot', 'type', 'references.rs:301', 'src/references.rs', 'snapshot: &crate::references::Snapshot,', SQ)] }
+      ] },
+      { path: 'src/store/mcp_read.rs', counts: { [SE]: 4, [SI]: 9 }, more: '+ 5 more functions · 9 type uses', fns: [
+        { name: 'McpRead::mcp_outgoing_excluding', sites: [S('mr1380', 1380, 'mcp::phase_hook()', 'call', 'mcp/mod.rs:2210', 'src/mcp/mod.rs', 'crate::mcp::phase_hook("outgoing.open");', SE), S('mr1391', 1391, 'mcp::phase_hook()', 'call', 'mcp/mod.rs:2210', 'src/mcp/mod.rs', 'crate::mcp::phase_hook("outgoing.rows");', SE), S('mr1411', 1411, 'mcp::phase_hook()', 'call', 'mcp/mod.rs:2210', 'src/mcp/mod.rs', 'crate::mcp::phase_hook("outgoing.page");', SE), S('mr1486', 1486, 'mcp::phase_hook()', 'call', 'mcp/mod.rs:2210', 'src/mcp/mod.rs', 'crate::mcp::phase_hook("outgoing.close");', SE)] }
+      ] },
+      { path: 'src/producer/pickup.rs', counts: { [IE]: 6 }, fns: [
+        { name: 'pickup::wait_ready', sites: [S('pk291', 291, 'DaemonState::state_version()', 'call', 'http/worker.rs:1013', 'src/http/worker.rs', 'let seen = scheduler.state_version();', IE), S('pk292', 292, 'DaemonState::runtime_phase()', 'call', 'http/worker.rs:107', 'src/http/worker.rs', 'match scheduler.runtime_phase() {', IE), S('pk304', 304, 'DaemonState::wait_state_change()', 'call', 'http/worker.rs:1018', 'src/http/worker.rs', 'scheduler.wait_state_change(seen, deadline - now);', IE)] },
+        { name: 'PickupHost::phase', sites: [S('pk772', 772, 'DaemonState::runtime_phase()', 'call', 'http/worker.rs:107', 'src/http/worker.rs', 'self.scheduler.runtime_phase()', IE)] },
+        { name: 'pickup::start_watch', sites: [S('pk243', 243, 'DaemonState', 'type', 'http.rs:174', 'src/http.rs', 'scheduler: &DaemonState,', IE)] }
+      ] },
+      { path: 'src/producer/import.rs', counts: { [IE]: 3 }, fns: [
+        { name: 'import::submit', sites: [S('imp102', 102, 'DaemonState::enqueue_generated_semantic_import()', 'call', 'http/worker.rs:729', 'src/http/worker.rs', 'let id = scheduler.enqueue_generated_semantic_import(options)?;', IE), S('imp101', 101, 'DaemonState', 'type', 'http.rs:174', 'src/http.rs', 'scheduler: &DaemonState,', IE)] },
+        { name: 'import::wait', sites: [S('imp158', 158, 'DaemonState::runtime_phase()', 'call', 'http/worker.rs:107', 'src/http/worker.rs', 'match scheduler.runtime_phase() {', IE)] }
+      ] },
+      { path: 'src/store/captured_witness.rs', counts: { [SI]: 3 }, fns: [
+        { name: 'stage_documents', sites: [S('cw22', 22, 'semantic_import::read_staged_documents()', 'call', 'semantic_import.rs:212', 'src/semantic_import.rs', 'crate::semantic_import::read_staged_documents(conn, "", producer, &mut |publication| {', SI)] }
+      ] },
+      { path: 'src/index_coordinator.rs', counts: { [IE]: 2 }, flag: 'test-support', fns: [
+        { name: 'WatcherWork::report_request_pending', sites: [S('ic907', 907, 'CausalWitness::watch_pending()', 'call', 'daemon/causal_witness.rs:138', 'src/daemon/causal_witness.rs', 'reporter.watch_pending(lineage, generation);', IE)] }
+      ] },
+      { path: 'src/producer/run.rs', counts: { [IE]: 1 }, fns: [
+        { name: 'RunContext', sites: [S('run89', 89, 'DaemonState', 'type', 'http.rs:174', 'src/http.rs', "scheduler: &'a DaemonState,", IE)] }
+      ] }
+    ];
+    if (!FILES.some(f => f.fns.some(fn => fn.sites.some(x => x.id === sel)))) sel = 'imp102';
+    const inEdge = (s) => edge === 'all' || s.edge === edge;
+    const fileN = (f) => edge === 'all' ? Object.values(f.counts).reduce((a, b) => a + b, 0) : (f.counts[edge] || 0);
+    const callsOf = (list) => list.filter(s => s.kind === 'call' && inEdge(s)).length;
+    const fileCalls = (f) => f.fns.reduce((a, fn) => a + callsOf(fn.sites), 0);
+    const shown = FILES.filter(f => fileN(f) > 0 && (!callsOnly || fileCalls(f) > 0)).sort((a, b) => fileN(b) - fileN(a));
+    const toggle = (k) => this.setState({ open: Object.assign({}, open, { [k]: !open[k] }), menu: null });
+    const plain = { kind: '', flag: '', edge: '', edgeC: '', calls: '', callsC: '', n: '', isSite: false, menuOpen: false, context: () => {}, selected: 'false', expanded: 'false' };
+    const rows = [];
+    for (const f of shown) {
+      const fo = !!open[f.path], fc = fileCalls(f);
+      const edgeText = Object.entries(f.counts).filter(([e]) => edge === 'all' || e === edge).map(([e, n]) => '▲ ' + e.split(' → ')[1] + ' ' + n).join(' · ');
+      rows.push(Object.assign({}, plain, { level: 1, expanded: fo ? 'true' : 'false', h: 44, indent: 16, caret: fo ? '▾' : '▸', name: f.path, weight: 650, flag: f.flag || '', flagC: '#FFC20A',
+        edge: edgeText, edgeC: up, calls: fc || '—', callsC: fc ? up : '#B8BAC8', n: fileN(f), bg: '#14151D', fg: '#F7F7FB', sub: '#B8BAC8', line: '#343644', click: () => toggle(f.path) }));
+      if (!fo) continue;
+      for (const fn of f.fns) {
+        const k = f.path + '#' + fn.name.split('::').pop();
+        const sites = fn.sites.filter(s => inEdge(s) && (!callsOnly || s.kind === 'call'));
+        if (!sites.length) continue;
+        const go = !!open[k], fc2 = callsOf(fn.sites);
+        rows.push(Object.assign({}, plain, { level: 2, expanded: go ? 'true' : 'false', h: 36, indent: 40, caret: go ? '▾' : '▸', name: fn.name, weight: 400,
+          calls: fc2 || '—', callsC: fc2 ? up : '#B8BAC8', n: (edge === 'all' && fn.count) || sites.length, bg: '#14151D', fg: '#F7F7FB', sub: '#B8BAC8', line: '#1D1E2A', click: () => toggle(k) }));
+        if (!go) continue;
+        for (const s of sites) {
+          const on = s.id === sel, isCall = s.kind === 'call';
+          rows.push({ level: 3, expanded: 'false', selected: on ? 'true' : 'false', h: 36, indent: 64, caret: '', name: 'L' + s.line + '  ' + s.ref, weight: on ? 650 : 400,
+            kind: isCall ? 'call' : 'type use', kindStyle: 'solid', kindB: on ? '#0B0C10' : (isCall ? up : '#777A8E'), kindC: on ? '#0B0C10' : (isCall ? up : '#B8BAC8'), flag: '',
+            edge: '→ ' + s.def, edgeC: on ? '#0B0C10' : '#B8BAC8', calls: '', callsC: '', n: '', bg: on ? '#7770DC' : '#0B0C10', fg: on ? '#0B0C10' : '#F7F7FB', sub: on ? '#0B0C10' : '#B8BAC8', line: '#1D1E2A', btnB: on ? '#0B0C10' : '#777A8E',
+            click: () => this.setState({ sel: s.id, menu: null }),
+            context: (e) => { if (e && e.preventDefault) e.preventDefault(); this.setState({ sel: s.id, menu: s.id }); },
+            openMenu: (e) => { if (e && e.stopPropagation) e.stopPropagation(); this.setState({ sel: s.id, menu: menu === s.id ? null : s.id }); },
+            menuLabel: 'Actions for line ' + s.line, isSite: true, menuOpen: menu === s.id });
+        }
+        if (edge === 'all' && !callsOnly && fn.count && fn.count > sites.length) rows.push(Object.assign({}, plain, { level: 3, h: 32, indent: 64, caret: '', name: '+ ' + (fn.count - sites.length) + ' more lines', weight: 400, bg: '#0B0C10', fg: '#B8BAC8', sub: '#B8BAC8', line: '#1D1E2A', click: () => {} }));
+      }
+      if (f.more && !callsOnly && edge === 'all') rows.push(Object.assign({}, plain, { level: 2, h: 32, indent: 40, caret: '·', name: f.more, weight: 400, bg: '#14151D', fg: '#B8BAC8', sub: '#B8BAC8', line: '#1D1E2A', click: () => {} }));
+    }
+    const TOT = { all: [746, 31], [SI]: [445, 18], [SQ]: [280, 14], [IE]: [12, 4], [SE]: [6, 3] };
+    const edgeOpts = [['all', 'All upward · 746'], [SI, SI + ' · 445'], [SQ, SQ + ' · 280'], [IE, IE + ' · 12'], [SE, SE + ' · 6']].map(([k, label]) => ({ label, pressed: edge === k ? 'true' : 'false', bg: edge === k ? '#7770DC' : 'transparent', fg: edge === k ? '#0B0C10' : '#B8BAC8', weight: edge === k ? 650 : 400, pick: () => this.setState({ edge: k, menu: null }) }));
+    const hidden = TOT[edge][1] - shown.length;
+    const more = hidden > 0 ? '+ ' + hidden + ' more files' + (edge === 'all' ? ', including indexing → query (3 references)' : '') : '';
+
+    let site = null, file = null, fnName = '';
+    const findSite = (id) => { for (const f of FILES) for (const fn of f.fns) for (const s of fn.sites) if (s.id === id) { site = s; file = f; fnName = fn.name; } };
+    findSite(sel); if (!site) { sel = 'imp102'; findSite(sel); }
+    const isCall = site.kind === 'call';
+    const pairN = file.fns.reduce((a, fn) => a + fn.sites.filter(s => s.to === site.to).length, 0);
+    const d = {
+      kindLabel: isCall ? 'Call · runs code in a higher layer' : 'Type use · names a type from a higher layer',
+      loc: file.path.replace('src/', '') + ':' + site.line, fn: fnName, fnShort: fnName.split('::').pop(), line: site.line, code: site.code,
+      ref: site.ref, def: site.def, edge: site.edge, pair: file.path.replace('src/', '') + ' → ' + site.to.replace('src/', ''),
+      evidence: 'rust-analyzer · exact binding', flag: file.flag ? 'Inside #[cfg(feature = "test-support")]. The rust-analyzer import enables that feature, so this counts as production.' : '',
+      isCall, siteStyle: isCall ? 'border: 1px solid #777A8E; color: #F7F7FB' : 'background: #FFAA10; color: #0B0C10; font-weight: 650',
+      pairCount: pairN > 1 ? pairN + ' listed lines' : 'this line and any others'
+    };
+    const menuItems = [isCall ? { label: 'Open in Sequence', hint: fnName.split('::').pop(), href: 'Sequence.dc.html' } : null,
+      { label: 'Go to call site', hint: 'L' + site.line, href: 'Files.dc.html' }, { label: 'Go to definition', hint: site.def, href: 'Files.dc.html' },
+      { label: 'Copy location', hint: '', href: '#' }, { label: 'Add exception for file pair…', hint: '', href: '#' }].filter(Boolean);
+    const shownCalls = shown.reduce((a, f) => a + fileCalls(f), 0);
+    return { edges: edgeOpts, rows, more, d, menu: menuItems, callsOnly, toggleCalls: () => this.setState({ callsOnly: !callsOnly, menu: null }),
+      summary: TOT[edge][1] + ' files · ' + TOT[edge][0] + ' upward references · ' + shownCalls + ' calls listed' };
+  }
+}
+</script>
+</body>
+</html>

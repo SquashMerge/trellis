@@ -1398,6 +1398,7 @@ impl<'w> Harness<'w> {
                 max_calls: 200,
                 include_external: true,
                 include_tests: true,
+                app_paths: None,
             };
             let response = self.world.store.evidence_response().map_err(err(label))?;
             let answer = response

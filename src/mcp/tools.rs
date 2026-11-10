@@ -3,7 +3,7 @@ use super::{IdentityError, OpenedWorkspace, wire};
 use crate::daemon::registry::SelectionError;
 use serde_json::{Value, json};
 
-const TOOLS: [&str; 12] = super::catalog::NAMES;
+const TOOLS: [&str; 13] = super::catalog::NAMES;
 #[derive(Debug)]
 pub struct PreparedTool {
     pub name: String,
@@ -140,6 +140,7 @@ fn fields(name: &str) -> (&'static [&'static str], &'static [&'static str]) {
                 "groupBy",
                 "depth",
                 "prefix",
+                "app",
             ],
             &["schemaVersion"],
         ),
@@ -152,6 +153,20 @@ fn fields(name: &str) -> (&'static [&'static str], &'static [&'static str]) {
                 "limit",
                 "offset",
                 "status",
+                "app",
+            ],
+            &["schemaVersion"],
+        ),
+        "trellis_endpoints" => (
+            &[
+                "schemaVersion",
+                "workspace",
+                "expectedBasis",
+                "app",
+                "method",
+                "pathTemplate",
+                "limit",
+                "offset",
             ],
             &["schemaVersion"],
         ),
@@ -177,6 +192,7 @@ fn fields(name: &str) -> (&'static [&'static str], &'static [&'static str]) {
                 "compact",
                 "expectedBasis",
                 "workspace",
+                "app",
             ],
             &["schemaVersion"],
         ),
@@ -189,6 +205,7 @@ fn fields(name: &str) -> (&'static [&'static str], &'static [&'static str]) {
                 "compact",
                 "expectedBasis",
                 "workspace",
+                "app",
             ],
             &["schemaVersion", "query"],
         ),
@@ -256,6 +273,7 @@ fn fields(name: &str) -> (&'static [&'static str], &'static [&'static str]) {
                 "compact",
                 "expectedBasis",
                 "workspace",
+                "app",
             ],
             &["schemaVersion"],
         ),
@@ -350,6 +368,18 @@ fn field_message(name: &str, field: &str) -> &'static str {
             "`prefix` must be a checkout-relative directory such as \"src/store/\": `/` \
              separators, no `.` or `..` segment, at most 4096 bytes"
         }
+        (_, "app") => {
+            "`app` must be an app name or manifest path of 1 to 4096 bytes, as \
+             trellis_workspace_describe lists them"
+        }
+        (_, "method") => {
+            "`method` must be one of \"GET\", \"POST\", \"PUT\", \"DELETE\", \"PATCH\", \
+             \"HEAD\", \"OPTIONS\""
+        }
+        (_, "pathTemplate") => {
+            "`pathTemplate` must be a route path template of 1 to 4096 bytes, such as \
+             \"/api/items/{id}\""
+        }
         (_, "includeExternal") => "`includeExternal` must be true or false",
         (_, "includeTests") => "`includeTests` must be true or false",
         (_, "depth") => "`depth` must be an integer from 0 to 5",
@@ -434,6 +464,10 @@ pub fn check(name: &str, args: Option<&Value>) -> Result<(), Rejection> {
     if o.get("compact").is_some_and(|value| !value.is_boolean()) {
         return Err(bad("compact"));
     }
+    // #851: `app` is one nonempty string wherever a tool accepts it.
+    if !o.get("app").is_none_or(|app| bounded_text(Some(app))) {
+        return Err(bad("app"));
+    }
     match name {
         "trellis_workspace_describe" => {
             if let Some(request) = o.get("coverageDocuments") {
@@ -479,6 +513,26 @@ pub fn check(name: &str, args: Option<&Value>) -> Result<(), Rejection> {
             }
             if !status_filter(o) {
                 return Err(bad("status"));
+            }
+            limit(o).map_err(coded("limit"))?;
+            offset(o).map_err(coded("offset"))?;
+        }
+        "trellis_endpoints" => {
+            if !o.get("method").is_none_or(|method| {
+                string(Some(method)).is_some_and(|method| {
+                    matches!(
+                        method,
+                        "GET" | "POST" | "PUT" | "DELETE" | "PATCH" | "HEAD" | "OPTIONS"
+                    )
+                })
+            }) {
+                return Err(bad("method"));
+            }
+            if !o
+                .get("pathTemplate")
+                .is_none_or(|template| bounded_text(Some(template)))
+            {
+                return Err(bad("pathTemplate"));
             }
             limit(o).map_err(coded("limit"))?;
             offset(o).map_err(coded("offset"))?;
@@ -633,6 +687,10 @@ fn selector(o: &serde_json::Map<String, Value>) -> Result<(), &'static str> {
     }
     Ok(())
 }
+/// A string of 1 to 4096 bytes (#851).
+fn bounded_text(value: Option<&Value>) -> bool {
+    string(value).is_some_and(|text| !text.is_empty() && text.len() <= 4096)
+}
 /// Whether `field` of the arguments is a JSON string.
 fn string_field(args: Option<&Value>, field: &str) -> bool {
     args.and_then(|args| args.get(field))
@@ -712,6 +770,8 @@ pub fn call_graph_query(args: &Value) -> crate::graph_query::GraphQuery {
         include_tests: args
             .get("includeTests")
             .is_some_and(|value| value.as_bool().expect("validated call graph flag")),
+        // #851: filled in from the admitted read.
+        app_paths: None,
     }
 }
 fn details(code: &str) -> (&'static str, bool) {
@@ -910,6 +970,13 @@ pub fn result(name: &str, envelope: Value, modern: bool) -> Value {
                 ),
                 // Its summary names the outcome instead (below).
                 "trellis_show" => (0, "targets"),
+                "trellis_endpoints" => (
+                    envelope["data"]["endpoints"]
+                        .as_array()
+                        .expect("endpoint rows")
+                        .len(),
+                    "endpoints",
+                ),
                 _ => unreachable!("known tool name"),
             }
         };
@@ -1065,7 +1132,9 @@ mod tests {
             "trellis_find_symbols" | "trellis_search_symbols" => {
                 json!({"schemaVersion":1,"query":"a"})
             }
-            "trellis_references" | "trellis_rules_check" => json!({"schemaVersion":1}),
+            "trellis_references" | "trellis_rules_check" | "trellis_endpoints" => {
+                json!({"schemaVersion":1})
+            }
             "trellis_rules_explain" => json!({"schemaVersion":1,"rule":"rule-a",
                 "target":{"sourceSetId":"app","language":"rust","path":"src/a.rs","sid":sid()}}),
             "trellis_declaration"
@@ -1482,8 +1551,9 @@ mod tests {
             json!(-9007199254740991_i64),
         ];
         let describe_expected = json!({"schemaVersion":1,"requestId":7,"evidenceBasis":null,"data":{
-            "workspaceLabel":"selected","indexState":"unavailable","progress":null,"watcherDegraded":false,"languages":[],"toolVersion":23,"schemaVersion":1,
+            "workspaceLabel":"selected","indexState":"unavailable","progress":null,"watcherDegraded":false,"languages":[],"toolVersion":25,"schemaVersion":1,
             "searchIndex":{"backend":null,"unavailableReason":null},
+            "apps":{"state":"unavailable","items":[],"noApp":null},
             "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,"sourceLines":200,"defaultLimit":20,"callDefaultLimit":6,"maxLimit":50,"pageBytes":24576,"calleeTextBytes":1024,"hintWorkMs":1000,"deadlineMs":5000,"concurrency":4}},
             "warnings":[],"partial":true,"truncated":false,"truncationReason":null});
         assert_eq!(describe(&json!(7), workspace.label()), describe_expected);

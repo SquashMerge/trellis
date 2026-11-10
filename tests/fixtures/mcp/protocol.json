@@ -60,8 +60,13 @@
         },
         "watcherDegraded": false,
         "languages": [],
-        "toolVersion": 23,
+        "toolVersion": 25,
         "schemaVersion": 1,
+        "apps": {
+          "state": "unavailable",
+          "items": [],
+          "noApp": null
+        },
         "limits": {
           "requestBytes": 16384,
           "responseBytes": 65536,

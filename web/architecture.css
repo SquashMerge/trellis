@@ -34,9 +34,7 @@
 .architecture-rule-row { padding: 8px 0; border-bottom: 1px solid var(--line); font-size: 12px; }
 .architecture-rule-row p { margin: 4px 0; }
 .architecture-rule-row button { text-align: left; overflow-wrap: anywhere; white-space: normal; }
-.architecture-rule-row input[type="checkbox"] { margin-right: 8px; }
 .architecture-rule-row label { margin-inline: 8px; }
-#architecture-source-glob { width: 150px; }
 #architecture-editor { padding: 0 18px 14px; font-size: 12px; }
 #architecture-edit-scope, #architecture-preview-result pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 #architecture-editor textarea { display: block; width: 100%; box-sizing: border-box; margin: 6px 0; background: var(--surface); color: var(--ink); border: 1px solid var(--sm-control); font: inherit; padding: 8px; }

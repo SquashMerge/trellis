@@ -132,8 +132,8 @@
     for (const entry of entries) {
       const client = columns.get(entry.client), server = columns.get(entry.server), gone = [];
       for (const end of endsOf(entry)) {
-        const from = client?.bands.get(end.clientLayer), to = server?.bands.get(end.serverLayer);
-        if (!client || !server || Math.abs(client.index - server.index) !== 1 || !from || !to) { gone.push(end); continue; }
+        if (!drawable(client, server, end, (place, layer) => !!place.bands.get(layer))) { gone.push(end); continue; }
+        const from = client.bands.get(end.clientLayer), to = server.bands.get(end.serverLayer);
         const gutter = Math.min(client.index, server.index);
         placed.push({entry, end, from, to, gutter, rightward:client.index < server.index});
         lanes.set(gutter, (lanes.get(gutter) || 0) + 1);
@@ -152,6 +152,35 @@
     });
     return {lines, undrawn};
   }
+  // An end draws a line only between adjacent columns, and only when both of its layers are drawn bands
+  // (`has(place, layer)`). `routes` and `sharedSides` share this test, so a side is chosen from drawn lines alone.
+  const drawable = (client, server, end, has) => !!client && !!server && Math.abs(client.index - server.index) === 1 &&
+    has(client, end.clientLayer) && has(server, end.serverLayer);
+  // Which side of each side-by-side column its Shared bands take (#850; owner decision 2026-11-09).
+  // Columns keep manifest order (`names`). Only an end between adjacent columns draws a line, and it
+  // leaves its band toward the partner column: an end on an ordered band crosses the Shared bands
+  // when they sit on that side, and an end on a Shared band crosses the ordered stack when they sit
+  // on the other. Each column takes the side with fewer such crossings; a tie, including a column with
+  // no drawn line, keeps the right, as in the one-app view. So with two apps whose interface runs
+  // between ordered layers, the left app's Shared band goes left and the right app's goes right.
+  // `band(name, layer)` says whether `layer` is a drawn Shared band (true), a drawn ordered band (false)
+  // or no band (null) of app `name`. An end draws a line only when both its bands are drawn (see `drawable`);
+  // an undrawn end counts nothing. Stacked columns draw no lines and keep the right.
+  function sharedSides(view, names, band, sideBySide = true) {
+    const at = new Map(names.map((name, index) => [name, {name, index}])), cost = names.map(() => ({left:0, right:0}));
+    const has = (place, layer) => typeof layer === "string" && typeof band(place.name, layer) === "boolean";
+    for (const entry of sideBySide && Array.isArray(view?.interfaces) ? view.interfaces.filter(record) : []) {
+      const client = at.get(entry.client), server = at.get(entry.server);
+      for (const end of endsOf(entry)) {
+        if (!drawable(client, server, end, has)) continue;
+        for (const [index, other, layer] of [[client.index, server.index, end.clientLayer], [server.index, client.index, end.serverLayer]]) {
+          const shared = band(names[index], layer), toward = other < index ? "left" : "right";
+          cost[index][shared === (toward === "left") ? "right" : "left"]++;
+        }
+      }
+    }
+    return new Map(names.map((name, index) => [name, cost[index].left < cost[index].right ? "left" : "right"]));
+  }
   const endsOf = entry => (Array.isArray(entry?.ends) ? entry.ends : []).filter(record);
   const key = entry => JSON.stringify(["interface", entry.client, entry.server]);
   const label = item => item.languages.length ? `${item.name} · ${item.languages.join(", ")}` : item.name;
@@ -168,5 +197,5 @@
   const duplicateNotice = item =>
     `${item.apps.length} detected apps share the name ${item.name} (${manifestList(item)}). A layer cannot name them; rules.md Amendment (#783).`;
   window.TrellisArchitectureApps = {groups, group, scoped, link, stubs, sumCounts, label, origin, sourceLine, duplicateNotice,
-    layout, confidenceText, cardText, cardName, endsText, header, routes, key};
+    layout, confidenceText, cardText, cardName, endsText, header, routes, sharedSides, key};
 })();

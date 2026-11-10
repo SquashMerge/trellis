@@ -90,6 +90,14 @@ const NON_NATIVE_SOURCE_PARSERS: &[(&str, &str)] = &[
         "read-time HTTP interface extraction",
     ),
     (
+        "src/interfaces/js.rs",
+        "read-time HTTP interface extraction",
+    ),
+    (
+        "src/interfaces/js_routes.rs",
+        "read-time HTTP interface extraction",
+    ),
+    (
         "src/interfaces/routes.rs",
         "read-time HTTP interface extraction",
     ),

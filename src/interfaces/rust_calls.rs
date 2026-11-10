@@ -1,6 +1,7 @@
 //! Rust client calls (#858): `reqwest` requests whose URL is a literal, a `format!` with a
 //! readable path, or a same-document string constant. Anything else is an unreadable path.
-use super::calls::{client_segments, verb};
+use super::calls::client_segments;
+use super::js::verb;
 use super::{
     ClientCall, LineIndex, charge, comment, routes::path_verb, test_span, under_test_support,
 };
@@ -18,13 +19,33 @@ const FREE: [&str; 2] = ["reqwest::get", "reqwest::blocking::get"];
 /// Stands for a substitution while a URL is assembled.
 const UNKNOWN: char = '\0';
 
+/// The `reqwest` calls of every production Rust document.
+pub(super) fn extract(
+    snapshot: &crate::references::Snapshot,
+    work: &mut Work,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<Vec<ClientCall>> {
+    let mut found = Vec::new();
+    for doc in &snapshot.documents {
+        check()?;
+        if !candidate(doc) || snapshot.evidence_gaps.contains_key(&doc.key) || super::test_file(doc)
+        {
+            continue;
+        }
+        charge(work, doc.file.text.len())?;
+        let tree = super::parse(doc, &tree_sitter_rust::LANGUAGE.into(), check)?;
+        collect(doc, tree.root_node(), &mut found, work, check)?;
+    }
+    Ok(found)
+}
+
 /// Whether a Rust document can make `reqwest` calls.
-pub(super) fn candidate(doc: &DocumentInput) -> bool {
+fn candidate(doc: &DocumentInput) -> bool {
     doc.key.language == "rust" && doc.file.text.contains("reqwest")
 }
 
 /// The `reqwest` calls of one document, in source order.
-pub(super) fn collect(
+fn collect(
     doc: &DocumentInput,
     root: Node<'_>,
     found: &mut Vec<ClientCall>,
@@ -121,7 +142,7 @@ pub(super) fn collect(
             .find(|call| call.range == range)
             .map(|call| call.id.clone());
         calls.push(ClientCall {
-            wrapper: false,
+            prefix: super::ClientPrefix::Written,
             method: method.map(str::to_owned),
             segments: template.as_deref().map(client_segments),
             path_template: template,

@@ -328,9 +328,26 @@ pub fn project_under(
     sample_limit: usize,
     check: &mut (impl FnMut() -> Result<()> + Send),
 ) -> Result<Projection> {
+    project_where(snapshot, paths, prefix, None, sample_limit, check)
+}
+
+/// [`project_under`] of only the sources whose path is in `files`, when it is given: the
+/// files of the apps an `app` argument names (#851).
+pub fn project_where(
+    snapshot: &Snapshot,
+    paths: &[String],
+    prefix: Option<&str>,
+    files: Option<&BTreeSet<String>>,
+    sample_limit: usize,
+    check: &mut (impl FnMut() -> Result<()> + Send),
+) -> Result<Projection> {
     project_configured(
         snapshot,
-        Sources { paths, prefix },
+        Sources {
+            paths,
+            prefix,
+            files,
+        },
         sample_limit,
         crate::parallel::default_workers(),
         check,
@@ -339,11 +356,13 @@ pub fn project_under(
 }
 
 /// The sources a read selects: those any `paths` glob matches (every source without one),
-/// and only under the directory `prefix` when it is given (#837).
+/// and only under the directory `prefix` when it is given (#837), and only in `files` when it
+/// is given (#851).
 #[derive(Clone, Copy)]
 struct Sources<'a> {
     paths: &'a [String],
     prefix: Option<&'a str>,
+    files: Option<&'a BTreeSet<String>>,
 }
 
 impl Sources<'_> {
@@ -351,6 +370,7 @@ impl Sources<'_> {
         Sources {
             paths: &[],
             prefix: None,
+            files: None,
         }
     }
 
@@ -358,12 +378,12 @@ impl Sources<'_> {
         (self.paths.is_empty() || globs.is_match(path)) && self.under(path)
     }
 
-    /// Whether `path` lies under the prefix (always, without one).
+    /// Whether `path` lies under the prefix and in the files (always, without them).
     fn under(&self, path: &str) -> bool {
         self.prefix.is_none_or(|prefix| {
             path.strip_prefix(prefix)
                 .is_some_and(|rest| rest.starts_with('/'))
-        })
+        }) && self.files.is_none_or(|files| files.contains(path))
     }
 }
 
@@ -380,6 +400,7 @@ pub fn project_with_workers(
         Sources {
             paths,
             prefix: None,
+            files: None,
         },
         sample_limit,
         workers,
@@ -906,7 +927,28 @@ impl ReferenceBase {
         sample_limit: usize,
         check: &mut (impl FnMut() -> Result<()> + Send),
     ) -> Result<Projection> {
-        self.select_inner(Sources { paths, prefix }, sample_limit, check)
+        self.select_where(paths, prefix, None, sample_limit, check)
+    }
+
+    /// [`Self::select_under`] of only the sources whose path is in `files`, when it is given:
+    /// what [`project_where`] returns for the same arguments (#851).
+    pub fn select_where(
+        &self,
+        paths: &[String],
+        prefix: Option<&str>,
+        files: Option<&BTreeSet<String>>,
+        sample_limit: usize,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+    ) -> Result<Projection> {
+        self.select_inner(
+            Sources {
+                paths,
+                prefix,
+                files,
+            },
+            sample_limit,
+            check,
+        )
     }
 
     fn select_inner(
@@ -2022,6 +2064,7 @@ mod parallel_tests {
                 Sources {
                     paths: &paths,
                     prefix: None,
+                    files: None,
                 },
                 1,
                 1,
@@ -2035,6 +2078,7 @@ mod parallel_tests {
                     Sources {
                         paths: &paths,
                         prefix: None,
+                        files: None,
                     },
                     1,
                     workers,

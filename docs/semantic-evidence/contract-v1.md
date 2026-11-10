@@ -454,11 +454,31 @@ Each match carries a `confidence`, and so does each `clientOnly` item, which is 
 
 Interface evidence is never worded "A calls B", and it is never an input to `$layers` verdicts.
 
-### Amendment: actix-web routes and reqwest clients (#858)
+## Interface evidence amendment: JavaScript and TypeScript (#855)
 
-**Status: owner-ratified 2026-11-09 under the owner's decision that the endpoints of the other platforms ship in 0.2 ([#686](https://github.com/SquashMerge/trellis/issues/686), [#858](https://github.com/SquashMerge/trellis/issues/858)), with evidence wording amendments approved.** This wins over [Matching](#matching) where they differ. The evidence kind, its fields and the four confidence values and their order are unchanged.
+**Status: owner-ratified 2026-11-09 ([#855](https://github.com/SquashMerge/trellis/issues/855)), under the owner's decision of that date to capture the other platforms' endpoints in 0.2. It changes only the wording of the #788 amendment's matching sources and two confidence meanings. The evidence kind, the fields, the four values and their precedence are unchanged.**
 
-Server templates also come from Rust actix-web route attributes and route builders, with their `web::scope` prefixes. Client paths also come from Rust `reqwest` calls whose URL is statically readable. The prefix rule belongs to the configured wrappers only, so a `reqwest` match is never `wrapperInferred`. A `reqwest` call whose URL or method cannot be read is `unresolved`. As before, a missing match proves nothing.
+**Matching sources.** Server templates also come from JavaScript and TypeScript route registrations:
+
+- express, fastify and Koa routes, reached from an app object through their mounts;
+- Next.js pages-router API files and app-router `route` files.
+
+Client paths also come from:
+
+- `fetch` and axios calls, with literal, template-literal and constant paths;
+- wrappers configured in `.trellis/rules.toml` under `[[interfaces.wrappers]]`, each scoped to every file, a directory or an app (owner rulings 2026-11-10).
+
+A server route with `method` `ANY` answers every method. Such routes are express, fastify or Koa `all` routes, and pages-router API routes.
+
+**Confidence wording.** `wrapperInferred` means the match needed a prefix the client adds to build the path. That prefix is a known wrapper's prefix, a configured wrapper's prefix, or an axios client's base URL. `template` also covers a match on an `ANY` route. Where a route that names the client's method and an `ANY` route have the same number of literal segments, the named-method route wins.
+
+**Evidence, never proof.** Two things are not extracted: a route whose mount, prefix or path cannot be read, and a client call whose base URL is an absolute URL. Their absence, like an unmatched call, proves nothing.
+
+## Interface evidence amendment: Rust actix-web and reqwest (#858)
+
+**Status: owner-ratified 2026-11-09 under the owner's decision that the endpoints of the other platforms ship in 0.2 ([#686](https://github.com/SquashMerge/trellis/issues/686), [#858](https://github.com/SquashMerge/trellis/issues/858)), with evidence wording amendments approved.** It adds matching sources to the #788 and #855 amendments; the evidence kind, the fields, the four values and their precedence are unchanged.
+
+Server templates also come from Rust actix-web route attributes and route builders, with their `web::scope` prefixes. Client paths also come from Rust `reqwest` calls whose URL is statically readable. A `reqwest` call adds no prefix of its own (no wrapper prefix, configured prefix or base URL), so its match is never `wrapperInferred`. A `reqwest` call whose URL or method cannot be read is `unresolved`. As before, a missing match proves nothing.
 
 ## Owner-ratified native-v9 correction: Java varargs
 

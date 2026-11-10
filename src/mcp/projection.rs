@@ -143,8 +143,10 @@ pub fn describe(
     let deadline_ms = u64::try_from(super::CALL_DEADLINE.as_millis()).unwrap_or(u64::MAX);
     json!({"schemaVersion":1,"requestId":id,"evidenceBasis":basis,
       "data":{"workspaceLabel":label,"indexState":state,"progress":progress,
-      "watcherDegraded":degraded,"languages":languages,"toolVersion":23,"schemaVersion":1,
+      "watcherDegraded":degraded,"languages":languages,"toolVersion":25,"schemaVersion":1,
       "searchIndex":crate::search_model::SearchAvailability::default(),
+      // #851: the head's apps, when its architecture is read; the call fills them in.
+      "apps":{"state":"unavailable","items":[],"noApp":null},
       "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,
         "sourceLines":200,"defaultLimit":20,"callDefaultLimit":super::CALL_DEFAULT_LIMIT,
         "maxLimit":50,"pageBytes":super::architecture::PAGE_BYTES,"calleeTextBytes":CALLEE_TEXT_BYTES,
@@ -295,7 +297,7 @@ mod tests {
         );
         assert_eq!(ready["evidenceBasis"], basis);
         assert_eq!(ready["data"]["watcherDegraded"], true);
-        assert_eq!(ready["data"]["toolVersion"], 23);
+        assert_eq!(ready["data"]["toolVersion"], 25);
         assert_eq!(
             ready["data"]["languages"][1]["coverage"],
             json!({
@@ -4219,6 +4221,7 @@ mod call_graph_tests {
             max_calls: 500,
             include_external: false,
             include_tests: false,
+            app_paths: None,
         };
         let outcome = evaluate(&requested, &mut facts).unwrap();
         GraphAnswer {
@@ -5022,6 +5025,7 @@ mod size_tests {
             max_calls,
             include_external: false,
             include_tests: false,
+            app_paths: None,
         };
         let outcome = evaluate(&requested, &mut facts).unwrap();
         crate::graph_query::GraphAnswer {
@@ -5781,7 +5785,7 @@ for (const output of outputs) {
             .unwrap()
             .len();
         let bytes = line_bytes(&id, &answer, true);
-        assert_eq!((shown, bytes), (43, 24_505));
+        assert_eq!((shown, bytes), (43, 24_560));
         assert!(bytes <= target);
         assert_eq!(
             answer["data"]["coverageDocuments"]["page"]["nextOffset"],
@@ -5794,7 +5798,7 @@ for (const output of outputs) {
             .unwrap()
             .push(json!({"language":"rust","path":documents[43].path,"state":"failed","reasons":["other"]}));
         over["data"]["coverageDocuments"]["page"]["nextOffset"] = json!(44);
-        assert_eq!(line_bytes(&id, &over, true), 24_972);
+        assert_eq!(line_bytes(&id, &over, true), 25_027);
         // Negative control: sizing before the search configuration and workspace are
         // attached, as 647751cd did, admits 44 documents and a final line over target.
         let mut bare = ready.clone();

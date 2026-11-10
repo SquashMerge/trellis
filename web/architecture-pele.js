@@ -13,7 +13,7 @@
   // CHIP_CELL is one drawn chip column (chip, padding and grid gap) at 14px Inter; the
   // summary display fits as many columns as the canvas width holds (#449). The chip text
   // width then grows or shrinks so the drawing fills the panel width (#525).
-  const CHIP_WIDTH = 104, MIN_CHIP = 72, MAX_CHIP = 240, CHIP_CELL = 176, CHIP_COLUMNS = 5, MAX_COLUMNS = 14, SHARED_ROWS = 6, STAT_GAP = "   ";
+  const MAX_STACK_SPAN = 4, CHIP_WIDTH = 104, MIN_CHIP = 72, MAX_CHIP = 240, CHIP_CELL = 176, CHIP_COLUMNS = 5, MAX_COLUMNS = 14, SHARED_ROWS = 6, STAT_GAP = "   ";
   // Pele's drawn node padding around a label and the grid gap between siblings.
   const NODE_PAD = 32, GRID_GAP = 12;
   // A stat chip is its text plus 12 units of padding, 6 apart (see statChips).
@@ -80,6 +80,7 @@
     return lines;
   }
   const ARROWS = {downward:"↓", upward:"↑", peer:"↔", "into shared":"→", "shared outbound":"←"};
+  const MIRRORED = {"into shared":"←", "shared outbound":"→"};
   function direction(source, destination) {
     if (destination.shared) return "into shared";
     if (source.shared) return "shared outbound";
@@ -213,9 +214,14 @@
       if (display.unassigned && unassigned.length && display.unassigned.expanded) opened.set(null, display.entries(null,unassigned));
     }
     // Pele stretches a composite's children to equal grid columns, so the stack spans
-    // several columns and each shared box one, keeping the shared boxes narrow.
-    const stackSpan = display ? COLUMNS : 4, orders = [...new Set(ordered.map(l => l.order))];
+    // several columns and each shared box one, keeping the shared boxes narrow. At one chip
+    // column the fit may ask the stack to span more grid columns than it has chip columns
+    // (`stackSpan`), so the widest band header no longer sets every shared box's width (#860).
+    const stackSpan = display ? Math.max(COLUMNS, Number.isSafeInteger(options.stackSpan) ? options.stackSpan : 0) : 4, orders = [...new Set(ordered.map(l => l.order))];
     if (display) source[1] = `columns ${stackSpan + shared.length}`; else open(outer,stackSpan + shared.length);
+    // All apps (#850) may put the shared boxes left of the stack, nearest box first beside it. They are
+    // still projected after the stack, so chip budgets charge in the same order; only their source moves.
+    const sharedLeft = !!display && options.sharedSide === "left" && shared.length > 0, stackAt = source.length;
     open(orderedStack,width,stackSpan);
     if (!ordered.length) leaf(addNode("B",null,display ? "No ordered layers shown" : "No ordered layers"));
     for (const order of orders) {
@@ -229,7 +235,10 @@
       if (peers.length > 1) open(addNode("B",null,`Peer layers · order ${order}`),peers.length);
       peers.forEach(layer => emitLayer(layer)); if (peers.length > 1) source.push("end");
     }
-    source.push("end"); shared.forEach(layer => emitLayer(layer)); if (!display) source.push("end");
+    source.push("end");
+    const boxes = shared.map(layer => { const at = source.length; emitLayer(layer); return source.slice(at); });
+    if (sharedLeft) { const tail = source.splice(stackAt), lines = boxes.flat().length; source.push(...boxes.reverse().flat(), ...tail.slice(0, tail.length - lines)); }
+    if (!display) source.push("end");
     let unassignedId = null;
     if (display?.unassigned && unassigned.length) {
       const item = addNode("U",display.unassigned,display.unassigned.label,false,display.unassigned.label,rowWidth(COLUMNS + shared.length)); item.expanded = opened.has(null);
@@ -258,7 +267,9 @@
       // may qualify both: a lower bound and the source layer's mapped-site coverage (#449).
       const words = options.edgeText?.(edge, way) || {};
       const full = `${edge.count} ${edge.role} sites · ${way}\n${state}${edge.excepted ? " · exception" : ""}${words.label ? ` · ${words.label}` : ""}`;
-      const shown = `${ARROWS[way]}${words.bound ? "≥" : ""}${edge.count}${edge.excepted ? " excepted" : ""}${edge.role === "test" ? " test" : ""}${words.note ? ` · ${words.note}` : ""}`;
+      // A shared box left of the stack (#850) mirrors the two shared glyphs, so a tag points the way its arrow runs.
+      const glyph = sharedLeft && MIRRORED[way] ? MIRRORED[way] : ARROWS[way];
+      const shown = `${glyph}${words.bound ? "≥" : ""}${edge.count}${edge.excepted ? " excepted" : ""}${edge.role === "test" ? " test" : ""}${words.note ? ` · ${words.note}` : ""}`;
       const item = display ? label("E",edge,full,true,shown,Math.ceil(measure(`${shown}…`)) + 2) : label("E",edge,full);
       Object.assign(item,{from,to,tone:options.edgeTone?.(edge) || null}); edges.set(item.id,item);
       // The summary display routes its own arrows (#637): Pele lays out the boxes only, so its
@@ -271,7 +282,7 @@
     // The summary display's band rows (peers share a row), shared boxes in drawing order,
     // the ordered stack and the unassigned row: what arrow routing needs (#637).
     const layout = display ? {rows:orders.map(order => ordered.filter(l => l.order === order).map(l => layers.get(l.name).id)),
-      shared:shared.map(l => layers.get(l.name).id), stack:orderedStack.id, unassigned:unassignedId} : null;
+      shared:shared.map(l => layers.get(l.name).id), stack:orderedStack.id, unassigned:unassignedId, sharedLeft} : null;
     return {source:text,nodes,edges,view,layout};
   }
   function validatedSvg(raw, projection) {
@@ -475,7 +486,10 @@
       if (rs !== undefined && rd !== undefined && Math.abs(rs - rd) > 1) { if (rd < rs) lanesLeft++; else lanesRight++; }
       else if ((rs === undefined) !== (rd === undefined) && sharedOf.get(rs === undefined ? edge.from : edge.to) > 0) lanesRight++;
     }
-    return channelWidth(lanesLeft) + Math.max(0, channelWidth(lanesRight) - (layout.shared.length ? GRID_GAP : 0));
+    // The channel between the stack and the shared boxes already has the grid gap (#850: on either side).
+    const gap = layout.shared.length ? GRID_GAP : 0;
+    return layout.sharedLeft ? Math.max(0, channelWidth(lanesLeft) - gap) + channelWidth(lanesRight)
+      : channelWidth(lanesLeft) + Math.max(0, channelWidth(lanesRight) - gap);
   }
   function route(root, controls, projection) {
     const layout = projection.layout;
@@ -525,11 +539,11 @@
           plan.top = top(rd, to, {tag, pref:span(to).lo}); plan.last = track(rd);
         }
       } else if (rs !== undefined || rd !== undefined) {
-        // An ordered band and a shared box: through the gutter under the band's row, right to the
-        // nearest shared box's side, or by the right channel and the strip to a farther one.
+        // An ordered band and a shared box: through the gutter under the band's row, across to the
+        // nearest shared box's side (right or, #850, left), or by the right channel and the strip to a farther one.
         const ordered = rs !== undefined ? from : to, box = rs !== undefined ? to : from, row = rowOf.get(ordered), k = sharedOf.get(box);
         plan.kind = k === 0 ? "shared" : "far"; plan.toShared = rs !== undefined; plan.box = box; plan.key = row;
-        plan.top = top(row, ordered, {tag, pref:span(ordered).hi}); plan.first = track(row);
+        plan.top = top(row, ordered, {tag, pref:layout.sharedLeft ? span(ordered).lo : span(ordered).hi}); plan.first = track(row);
         if (k > 0) { right.push(plan); plan.channel = right; plan.end = top("strip", box, {}); plan.last = track("strip"); }
       } else if (ks !== undefined && kd !== undefined) {
         // Two shared boxes: down into the strip under them, across, and back up.
@@ -560,8 +574,18 @@
     const extra = rows.map((_, r) => Math.max(0, (gutters.get(r)?.height ?? (r < rows.length - 1 ? MIN_GUTTER : 0)) - gap(r)));
     const below = r => extra.slice(0, r).reduce((sum, value) => sum + value, 0), total = below(rows.length);
     const LW = channelWidth(left.length), CW = channelWidth(right.length), sharedFrames = layout.shared.map(band);
-    const firstShared = sharedFrames.length ? Math.min(...sharedFrames.map(f => f.x)) : null;
-    const RW = Math.max(0, CW - (firstShared === null ? 0 : firstShared - (stack.x + stack.w)));
+    // The channel between the stack and the shared boxes widens only past the gap already there: the
+    // right one when the boxes are right of the stack, the left one when they are left of it (#850).
+    // `stackDx` moves the stack and its rows, `sharedDx` the shared boxes, `baseDx` the unassigned row.
+    let inner, stackDx, sharedDx, baseDx, grow;
+    if (layout.sharedLeft) {
+      inner = Math.max(0, LW - (stack.x - Math.max(...sharedFrames.map(f => f.x + f.w))));
+      stackDx = inner; sharedDx = 0; baseDx = 0; grow = inner + CW;
+    } else {
+      const firstShared = sharedFrames.length ? Math.min(...sharedFrames.map(f => f.x)) : null;
+      inner = Math.max(0, CW - (firstShared === null ? 0 : firstShared - (stack.x + stack.w)));
+      stackDx = LW; sharedDx = LW + inner; baseDx = LW; grow = LW + inner;
+    }
     const strip = gutters.get("strip");
     const rootBottom = Math.max(stack.y + stack.h, ...sharedFrames.map(f => f.y + f.h));
     const stripH = strip ? strip.height : 0;
@@ -570,28 +594,28 @@
     for (const control of controls.values()) {
       if (control.item.kind === "E") continue;
       const owner = control.item.host, id = control.item.id;
-      if (rowOfHost.has(owner)) shift(control.node, LW, below(rowOfHost.get(owner)));
+      if (rowOfHost.has(owner)) shift(control.node, stackDx, below(rowOfHost.get(owner)));
       else if (sharedOf.has(owner)) {
-        shift(control.node, LW + RW, 0);
+        shift(control.node, sharedDx, 0);
         // A shared box spans the whole grown stack, so every gutter's track meets its side.
         if (id === owner) { const rect = control.node.querySelector(":scope > rect"); rect.setAttribute("height", String(round(Math.max(num(rect,"height") + total, stack.y + stack.h + total - num(rect,"y"))))); }
       } else if (owner && owner === layout.unassigned) {
-        shift(control.node, LW, total + stripH);
-        if (id === owner) { const rect = control.node.querySelector(":scope > rect"); rect.setAttribute("width", String(round(num(rect,"width") + RW))); }
+        shift(control.node, baseDx, total + stripH);
+        if (id === owner) { const rect = control.node.querySelector(":scope > rect"); rect.setAttribute("width", String(round(num(rect,"width") + inner))); }
       } else {
-        shift(control.node, LW, 0);
+        shift(control.node, stackDx, 0);
         if (id === layout.stack) { const rect = control.node.querySelector(":scope > rect"); rect.setAttribute("height", String(round(num(rect,"height") + total))); }
       }
     }
-    const width = num(root,"width") + LW + RW, height = num(root,"height") + total + stripH;
+    const width = num(root,"width") + grow, height = num(root,"height") + total + stripH;
     root.setAttribute("width", String(round(width))); root.setAttribute("height", String(round(height))); root.setAttribute("viewBox", `0 0 ${round(width)} ${round(height)}`);
-    // Final coordinates: x moves with the left channel (and the right one for shared boxes).
-    const dx = id => LW + (sharedOf.has(id) ? RW : 0), f = id => { const b = band(id); return {x:b.x, y:b.y, w:b.w, h:b.h, bottom:b.y + b.h}; };
+    // Final coordinates: x moves with the channels left of each box.
+    const dx = id => sharedOf.has(id) ? sharedDx : stackDx, f = id => { const b = band(id); return {x:b.x, y:b.y, w:b.w, h:b.h, bottom:b.y + b.h}; };
     const X = entry => round(entry.x + dx(entry.id));
     const gutterTop = key => key === "strip" ? rootBottom + total : rows[key].bottom + below(key);
     const trackY = ({key, index}) => round(gutterTop(key) + GUTTER_PAD + gutters.get(key).zone + (index + 0.5) * TRACK);
     const tagAt = (entry, key) => { const g = gutters.get(key); return {cx:X(entry), cy:round(gutterTop(key) + GUTTER_PAD + entry.row * (g.tagH + TAG_GAP) + entry.tag.h / 2)}; };
-    const stackLeft = stack.x + LW, stackRight = stack.x + stack.w + LW;
+    const stackLeft = stack.x + stackDx, stackRight = stack.x + stack.w + stackDx;
     const laneX = (list, plan) => {
       const sorted = [...list].sort((a, b) => a.reach - b.reach || a.control.item.id.localeCompare(b.control.item.id)), i = sorted.indexOf(plan);
       return list === left ? round(stackLeft - CHANNEL_PAD - (i + 0.5) * LANE) : round(stackRight + CHANNEL_PAD + (i + 0.5) * LANE);
@@ -616,7 +640,7 @@
       } else if (plan.kind === "shared" || plan.kind === "far") {
         const xs = X(plan.top), y1 = trackY(plan.first), band = f(plan.top.id).bottom;
         let run;
-        if (plan.kind === "shared") run = [[xs, band], [xs, y1], [f(plan.box).x, y1]];
+        if (plan.kind === "shared") run = [[xs, band], [xs, y1], [layout.sharedLeft ? f(plan.box).x + f(plan.box).w : f(plan.box).x, y1]];
         else { const lane = laneX(right, plan), y2 = trackY(plan.last), xk = X(plan.end); run = [[xs, band], [xs, y1], [lane, y1], [lane, y2], [xk, y2], [xk, f(plan.box).bottom]]; }
         points = plan.toShared ? run : run.reverse(); tag = tagAt(plan.top, plan.key);
       } else continue;
@@ -656,9 +680,11 @@
       // Fit the canvas width (#449, #525): start from the estimated chip columns, then size the
       // chips so Pele's natural layout fills the canvas without passing it. Once a fitting and
       // an overflowing chip width are known, bisect between them. Too wide with no fit shrinks
-      // the chips, then drops a column; the narrowest layout wins when none fits.
+      // the chips, then drops a column. At one column with the narrowest chips, a stack beside
+      // shared boxes then spans more grid columns (up to MAX_STACK_SPAN), which narrows the equal
+      // grid cells the shared boxes take; the narrowest layout wins when none fits.
       const sharedCount = options.display ? view.layers.filter(l => l.shared && options.display.layers.has(l.name)).length : 0;
-      let columns = options.display ? chipColumns(options.width, sharedCount) : undefined, chipWidth = CHIP_WIDTH;
+      let columns = options.display ? chipColumns(options.width, sharedCount) : undefined, chipWidth = CHIP_WIDTH, stackSpan = 0;
       let projection, raw, best = null, low = null, high = null;
       const fit = options.display && options.width > 0;
       // The side channels routing adds (#637) depend only on the arrows and their tags, never on
@@ -668,13 +694,13 @@
       if (fit) { target -= channelReserve(project(view,{...options,columns,chipWidth,measureText:measure})); columns = chipColumns(target, sharedCount); }
       for (let attempt = 0; ; attempt++) {
         if (pause && !(await breathe())) return {status:"stale"};
-        projection = project(view,{...options,columns,chipWidth,measureText:measure});
+        projection = project(view,{...options,columns,chipWidth,stackSpan,measureText:measure});
         if (pause && !(await breathe())) return {status:"stale"};
         raw = window.pele.render(projection.source,{fontSize:14,padding:8,responsive:false,links:false,images:false}).svg;
         if (!fit) break;
         const drawnWidth = Number(/^<svg\b[^>]*?\swidth="([0-9.]+)"/.exec(raw)?.[1]), cells = columns + sharedCount;
         const fits = drawnWidth <= target;
-        if (!best || (fits && (!best.fits || drawnWidth > best.drawnWidth)) || (!fits && !best.fits && drawnWidth < best.drawnWidth)) best = {fits,drawnWidth,projection,raw,columns,chipWidth};
+        if (!best || (fits && (!best.fits || drawnWidth > best.drawnWidth)) || (!fits && !best.fits && drawnWidth < best.drawnWidth)) best = {fits,drawnWidth,projection,raw,columns,chipWidth,stackSpan};
         if (attempt >= 12) break;
         let next;
         if (fits) {
@@ -687,6 +713,7 @@
           if (low !== null) next = Math.floor((low + high) / 2);
           else if (chipWidth > MIN_CHIP) next = Math.max(MIN_CHIP, chipWidth - Math.ceil((drawnWidth - target) / cells) - 1);
           else if (columns > 1) { columns--; high = null; next = CHIP_WIDTH; }
+          else if (sharedCount && Math.max(columns, stackSpan) < MAX_STACK_SPAN) { stackSpan = Math.max(columns, stackSpan) + 1; high = null; next = MIN_CHIP; }
           else break;
         }
         if (low !== null && high !== null && high - low <= 1) break;
@@ -696,7 +723,7 @@
       // when it was not the last attempt; the same inputs give the same source and ids.
       if (best && best.projection !== projection) {
         if (pause && !(await breathe())) return {status:"stale"};
-        projection = project(view,{...options,columns:best.columns,chipWidth:best.chipWidth,measureText:measure});
+        projection = project(view,{...options,columns:best.columns,chipWidth:best.chipWidth,stackSpan:best.stackSpan,measureText:measure});
         raw = best.raw;
       }
       if (pause && !(await breathe())) return {status:"stale"};

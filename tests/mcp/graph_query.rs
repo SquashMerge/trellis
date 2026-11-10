@@ -343,6 +343,7 @@ fn request(root: u64, producer: bool) -> GraphRequest {
         max_calls: 500,
         include_external: true,
         include_tests: true,
+        app_paths: None,
     }
 }
 

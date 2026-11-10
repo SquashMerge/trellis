@@ -4190,6 +4190,7 @@ fn real_typescript_ambiguous_calls_read_as_one_edge_with_the_union() {
                 max_calls: 500,
                 include_external: true,
                 include_tests: true,
+                app_paths: None,
             },
             None,
             &mut || Ok(()),
@@ -7293,7 +7294,7 @@ async fn real_typescript_bindings_show_in_query_mcp_status_and_methods() {
     // #528: describe and scopeCoverage report the imported JavaScript evidence beside the
     // native coverage, which keeps its syntax tier; other languages have no producer.
     let describe = mcp.call("trellis_workspace_describe", json!({"schemaVersion":1}));
-    assert_eq!(describe["data"]["toolVersion"], 23);
+    assert_eq!(describe["data"]["toolVersion"], 25);
     for (scope, rows) in [
         ("describe", &describe["data"]["languages"]),
         ("incoming", &incoming["data"]["scopeCoverage"]),
@@ -7740,6 +7741,7 @@ fn real_rust_analyzer_direct_calls_expand_the_call_graph_and_sequence() {
                     max_calls: 500,
                     include_external: true,
                     include_tests: true,
+                    app_paths: None,
                 },
                 None,
                 &mut || Ok(()),
@@ -8563,6 +8565,16 @@ forbid = [{{ calls = "helper" }}]
                     );
                     assert_eq!(reply["data"]["outcome"], "not_found", "{reply}");
                 }
+                // #851: these fixtures have no app manifests, so nothing is extracted and
+                // the answer says so; an unknown app is a typed `not_found`.
+                "trellis_endpoints" => {
+                    let reply = mcp.success(name, pinned(json!({})));
+                    assert_eq!(reply["data"]["evidence"], "structural", "{reply}");
+                    assert_eq!(reply["data"]["extracted"], false, "{reply}");
+                    assert_eq!(reply["data"]["endpoints"], json!([]));
+                    let unknown = mcp.call(name, pinned(json!({"app":"absent"})));
+                    assert_eq!(unknown["error"]["code"], "not_found", "{unknown}");
+                }
                 "trellis_call_graph" => {
                     // #665: the compact graph keeps the full graph's nodes and edge
                     // identities and drops proofs; both modes validate against the catalog.
@@ -8931,6 +8943,7 @@ fn real_rust_analyzer_inherent_calls_expand_and_trait_calls_stay_boundaries() {
                     max_calls: 500,
                     include_external: true,
                     include_tests: true,
+                    app_paths: None,
                 },
                 None,
                 &mut || Ok(()),

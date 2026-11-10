@@ -26,6 +26,11 @@ pub(crate) struct ArchitectureArguments {
     pub(super) prefix: Option<String>,
     /// References only (#837): `groupBy:"package"`, which needs each file's app.
     pub(super) apps: bool,
+    /// #851: the `app` filter of references, check and endpoints, an app name or manifest path.
+    pub(super) app: Option<String>,
+    /// Endpoints only (#851): the method and exact path template a read keeps.
+    pub(super) method: Option<String>,
+    pub(super) path_template: Option<String>,
     pub(super) sample_limit: usize,
 }
 
@@ -33,9 +38,10 @@ impl ArchitectureArguments {
     pub(crate) fn pin(&self) -> Option<IndexPin> {
         self.pin
     }
-    /// References only (#837): app groups, which evaluate the rules.
+    /// App groups (#837), an `app` filter, or endpoints (#851): each file's app, which
+    /// evaluates the rules when there are any.
     pub(crate) fn apps(&self) -> bool {
-        self.apps
+        self.apps || self.app.is_some()
     }
     pub(crate) fn scoped(&self) -> bool {
         !self.paths.is_empty() || self.prefix.is_some()
@@ -142,8 +148,7 @@ pub(crate) struct ArchitectureCore {
     /// Every build manifest's app-detection outcome, before any rules file hides some.
     app_candidates: Result<crate::apps::Candidates, CoreFailure>,
     /// Server routes and client calls, computed only when detected plus authored apps number
-    /// two or more.
-    /// `None` when this core was computed without a rules file.
+    /// two or more ([`interfaces_extracted`]), with or without a rules file (#851).
     interfaces: Option<Result<crate::interfaces::Extraction, CoreFailure>>,
     /// Finished summaries; one per valid role, aggregate and workbench choice.
     summaries: Mutex<BTreeMap<SummaryKey, Arc<serde_json::Value>>>,
@@ -158,15 +163,18 @@ impl ArchitectureCore {
     ) -> Result<Projection> {
         self.references.select(paths, sample_limit, check)
     }
-    /// The references of one read's sources: its `paths` under its `prefix` (#837).
-    pub(crate) fn references_for(
+    /// The references of one read's sources: its `paths` under its `prefix` (#837), and in
+    /// `files` when given (#851).
+    pub(crate) fn references_in(
         &self,
         parsed: &ArchitectureArguments,
+        files: Option<&std::collections::BTreeSet<String>>,
         check: &mut (impl FnMut() -> Result<()> + Send),
     ) -> Result<Projection> {
-        self.references.select_under(
+        self.references.select_where(
             &parsed.paths,
             parsed.prefix.as_deref(),
+            files,
             parsed.sample_limit,
             check,
         )
@@ -320,24 +328,54 @@ impl ArchitectureCore {
         };
         let app_candidates = kept(crate::rules::app_candidates(&snapshot, check))?;
         let interfaces = match (config, &app_candidates) {
-            (None, _) => None,
             // Authored apps can split one manifest's checkout (#794), so they count too: an
-            // upper bound of the effective inventory.
-            (Some(config), Ok(candidates))
-                if detected_apps(candidates) + config.authored_app_count() >= 2 =>
-            {
+            // upper bound of the effective inventory. Without a rules file every detected
+            // manifest is an app (#851: `trellis_endpoints` reads them too).
+            (config, Ok(candidates)) if interfaces_extracted(config, candidates) => {
                 let mut work =
                     crate::references::work::Work::new(crate::references::work::rules_limit(
                         snapshot.documents.len(),
                         crate::references::work::snapshot_bytes(&snapshot, check)?,
                     ));
-                Some(kept(crate::interfaces::extract(
-                    &snapshot, &mut work, check,
-                ))?)
+                // App-scoped wrappers (#855) need each file's app, as rule evaluation assigns
+                // it; a failed rules part is this part's failure too. Without a rules file
+                // there are no configured wrappers.
+                let wrappers = config.map_or(&[][..], |config| config.interface_wrappers());
+                let apps = match config {
+                    Some(config) if wrappers.iter().any(|wrapper| wrapper.app.is_some()) => {
+                        match rules.as_ref().map(|part| &part.base) {
+                            Some(Ok(base)) => kept(crate::rules::file_apps(
+                                config,
+                                base,
+                                snapshot
+                                    .documents
+                                    .iter()
+                                    .filter(|doc| {
+                                        matches!(
+                                            doc.key.language.as_str(),
+                                            "javascript" | "typescript"
+                                        )
+                                    })
+                                    .map(|doc| doc.key.path.as_str()),
+                                &mut work,
+                                check,
+                            ))?,
+                            Some(Err(failure)) => Err(failure.clone()),
+                            None => Ok(Default::default()),
+                        }
+                    }
+                    _ => Ok(Default::default()),
+                };
+                Some(match apps {
+                    Ok(apps) => kept(crate::interfaces::extract(
+                        &snapshot, wrappers, &apps, &mut work, check,
+                    ))?,
+                    Err(failure) => Err(failure),
+                })
             }
-            (Some(_), Ok(_)) => Some(Ok(crate::interfaces::Extraction::default())),
+            (_, Ok(_)) => Some(Ok(crate::interfaces::Extraction::default())),
             // Failed app detection is the part's failure too, never an empty extraction.
-            (Some(_), Err(failure)) => Some(Err(failure.clone())),
+            (_, Err(failure)) => Some(Err(failure.clone())),
         };
         check()?;
         Ok(Self {
@@ -362,6 +400,15 @@ fn kept<T>(outcome: Result<T>) -> Result<std::result::Result<T, CoreFailure>> {
 }
 
 /// How many manifests detect an app.
+/// Whether a core extracts interfaces (#788): when its detected plus authored apps number two
+/// or more. Otherwise its extraction is empty without being read (#851).
+pub(crate) fn interfaces_extracted(
+    config: Option<&Config>,
+    candidates: &crate::apps::Candidates,
+) -> bool {
+    detected_apps(candidates) + config.map_or(0, Config::authored_app_count) >= 2
+}
+
 fn detected_apps(candidates: &crate::apps::Candidates) -> usize {
     candidates
         .manifests

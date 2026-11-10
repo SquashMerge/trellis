@@ -142,3 +142,37 @@ test("AC25: a stat with a tag always reserves room for it, so selecting an inter
   assert.deepEqual([...plain],[2],"both chips fit one header line without the tag");
   assert.deepEqual([...tagged],[1,1],"the reserved tag takes room the chips would otherwise share");
 });
+test("#850: sharedSide left draws the shared boxes left of the stack, nearest first beside it, with the same chip budget order",()=>{
+  const {adapter,pele}=setup(), drawn={};
+  for (const side of [undefined,"left"]) {
+    const view=fixture(), calls=[];
+    view.layers.push({name:"Common",shared:true});
+    const display={layers:new Set(view.layers.map(l=>l.name)),expanded:()=>false,edge:()=>true,unassigned:null,entries:()=>[],
+      summary:(key,modules)=>{calls.push(key);return modules.slice(0,1).map(()=>({type:"chip",band:null,label:"x",shown:"x"}));}};
+    const p=adapter.project(view,{display,sharedSide:side,measureText:text=>Array.from(text).length*7});
+    const raw=pele.render(p.source,{fontSize:14,padding:8,responsive:false,links:false,images:false}).svg;
+    const x=id=>Number(new RegExp(`data-id="${id}"[^>]*><rect x="([\\d.]+)"`).exec(raw)[1]);
+    const name=id=>[...p.nodes.values()].find(n=>n.id===id).record.name;
+    drawn[side||"right"]={calls,sharedLeft:p.layout.sharedLeft,stack:x(p.layout.stack),shared:p.layout.shared.map(id=>[name(id),x(id)]),
+      tags:[...p.edges.values()].filter(e=>/into shared|shared outbound/.test(e.full)).map(e=>[e.full.split("\n")[0].split(" · ")[1],e.display[0][0]])};
+  }
+  const {right,left}=drawn;
+  assert.deepEqual(right.shared.map(([n])=>n),["Common","Shared"]); assert.deepEqual(left.shared.map(([n])=>n),["Common","Shared"],"layout.shared stays nearest first");
+  assert.equal(right.sharedLeft,false); assert.equal(left.sharedLeft,true);
+  assert.ok(right.stack<right.shared[0][1]&&right.shared[0][1]<right.shared[1][1],`right: stack, Common, Shared ${JSON.stringify(right)}`);
+  assert.ok(left.shared[1][1]<left.shared[0][1]&&left.shared[0][1]<left.stack,`left: Shared, Common, stack ${JSON.stringify(left)}`);
+  assert.deepEqual(left.calls,right.calls,"chip budgets charge in the same order on either side");
+  assert.ok(right.tags.length>0,"the fixture has arrows to or from a shared box");
+  for(const [way,glyph] of right.tags) assert.equal(glyph,way==="into shared"?"→":"←");
+  for(const [way,glyph] of left.tags) assert.equal(glyph,way==="into shared"?"←":"→","a tag points the way its arrow runs");
+});
+test("#850: sharedSide is ignored without the summary display or without a shared layer",()=>{
+  const {adapter}=setup(), view=fixture();
+  assert.equal(adapter.project(view,{sharedSide:"left"}).source,adapter.project(view).source,"the full projection is unchanged");
+  const ordered=fixture(); ordered.layers=ordered.layers.filter(l=>!l.shared); ordered.modules=ordered.modules.filter(m=>ordered.layers.some(l=>l.name===m.layer)||m.layer===null);
+  ordered.edges=ordered.edges.filter(e=>ordered.layers.some(l=>l.name===e.sourceLayer)&&ordered.layers.some(l=>l.name===e.destinationLayer));
+  const display={layers:new Set(ordered.layers.map(l=>l.name)),expanded:()=>false,edge:()=>true,unassigned:null,entries:()=>[]};
+  const p=adapter.project(ordered,{display,sharedSide:"left",measureText:text=>Array.from(text).length*7});
+  assert.equal(p.layout.sharedLeft,false);
+  assert.equal(p.source,adapter.project(ordered,{display,measureText:text=>Array.from(text).length*7}).source);
+});

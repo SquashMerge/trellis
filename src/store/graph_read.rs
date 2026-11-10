@@ -796,6 +796,7 @@ pub(super) fn sequence_calls(
         max_calls: 200,
         include_external: true,
         include_tests: true,
+        app_paths: None,
     };
     for document in source.facts.documents.values() {
         if let Some(projection) = &document.projection {
@@ -1468,6 +1469,7 @@ impl EvidenceResponse {
             max_calls: query.max_calls,
             include_external: query.include_external,
             include_tests: query.include_tests,
+            app_paths: query.app_paths.clone(),
         };
         let snapshot = GraphSnapshot {
             source_set_id,

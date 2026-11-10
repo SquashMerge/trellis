@@ -2338,6 +2338,7 @@ fn selected_case(change_b: &str) {
                     max_calls: DEFAULT_MAX_CALLS,
                     include_external: true,
                     include_tests: true,
+                    app_paths: None,
                 },
                 None,
                 &mut || Ok(()),

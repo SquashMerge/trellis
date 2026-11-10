@@ -13,6 +13,7 @@ mod graph_fixtures;
 #[path = "../support/semantic_batch.rs"]
 mod semantic_batch_support;
 
+mod apps_endpoints;
 mod graph_query;
 mod graph_query_store;
 mod graph_query_store_filters;

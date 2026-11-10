@@ -32,6 +32,7 @@ fn query(root: &str, producer: bool) -> GraphQuery {
         max_calls: 500,
         include_external: true,
         include_tests: true,
+        app_paths: None,
     }
 }
 
