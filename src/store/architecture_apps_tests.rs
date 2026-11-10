@@ -368,6 +368,105 @@ fn a_captured_mimir_layout_reaches_core_app_candidates_as_three_apps() {
     assert_eq!(detected.unread, 0);
 }
 
+/// #854: a Maven multi-module build and a Gradle multi-module build in one checkout. Capture
+/// retains the nested module manifests above Java sources, and each runnable module is an app.
+const JAVA_BUILDS: &[(&str, &str)] = &[
+    (
+        "shop/pom.xml",
+        "<project><artifactId>shop</artifactId><packaging>pom</packaging><modules><module>api</module><module>core</module></modules></project>\n",
+    ),
+    (
+        "shop/api/pom.xml",
+        "<project><artifactId>shop-api</artifactId><packaging>war</packaging></project>\n",
+    ),
+    (
+        "shop/core/pom.xml",
+        "<project><artifactId>shop-core</artifactId></project>\n",
+    ),
+    (
+        "shop/api/src/main/java/shop/Api.java",
+        "package shop; public class Api {}\n",
+    ),
+    (
+        "shop/core/src/main/java/shop/Core.java",
+        "package shop; public class Core {}\n",
+    ),
+    (
+        "settings.gradle",
+        "rootProject.name = 'tools'\ninclude 'cli', 'lib'\n",
+    ),
+    (
+        "cli/build.gradle.kts",
+        "plugins { application }\napplication { mainClass.set(\"tools.Cli\") }\n",
+    ),
+    ("lib/build.gradle.kts", "plugins { `java-library` }\n"),
+    (
+        "cli/src/main/java/tools/Cli.java",
+        "package tools; public class Cli {}\n",
+    ),
+    (
+        "lib/src/main/java/tools/Lib.java",
+        "package tools; public class Lib {}\n",
+    ),
+    // Not above any Java source, so capture does not retain it.
+    (
+        "docs/pom.xml",
+        "<project><artifactId>docs</artifactId><packaging>war</packaging></project>\n",
+    ),
+    ("docs/guide.md", "# guide\n"),
+];
+
+#[test]
+fn captured_maven_and_gradle_multi_module_builds_reach_core_as_runnable_modules() {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    for (path, text) in JAVA_BUILDS {
+        write(root.path(), path, text);
+    }
+    let store = publish(&state, root.path());
+    let found = core(&store).unwrap().app_candidates().unwrap().clone();
+    let outcomes: BTreeMap<&str, &Outcome> = found
+        .manifests
+        .iter()
+        .map(|(path, outcome)| (path.as_str(), outcome))
+        .collect();
+    assert!(!outcomes.contains_key("docs/pom.xml"), "{outcomes:?}");
+    for not_app in [
+        "shop/pom.xml",
+        "shop/core/pom.xml",
+        "lib/build.gradle.kts",
+        "settings.gradle",
+    ] {
+        assert_eq!(
+            outcomes.get(not_app),
+            Some(&&Outcome::NotApp),
+            "{not_app}: {outcomes:?}"
+        );
+    }
+    let detected = crate::apps::detect(&found, &Default::default());
+    let apps: Vec<(&str, crate::apps::AppKind, &str, &[String])> = detected
+        .apps
+        .iter()
+        .map(|app| {
+            (
+                app.name.as_str(),
+                app.kind.unwrap(),
+                app.roots[0].as_str(),
+                app.entries.as_slice(),
+            )
+        })
+        .collect();
+    use crate::apps::AppKind::{Gradle, Maven};
+    assert_eq!(
+        apps,
+        [
+            ("cli", Gradle, "cli", &["tools.Cli".to_owned()][..]),
+            ("shop-api", Maven, "shop/api", &[][..]),
+        ]
+    );
+    assert_eq!(detected.unread, 0);
+}
+
 /// #851 review (Prime, PR #868): one detected app and one authored app make a ruled core
 /// extract interfaces. Once the rules file is removed, that core's extraction must not answer
 /// an endpoints read: the owner hands such a read only a core built without rules
