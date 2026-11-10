@@ -95,7 +95,8 @@
           file.listed[kind]++;
           if (callsOnly && kind !== "call") continue;
           const enclosing = evidence.owner && names?.get(evidence.owner.syntaxId), owner = enclosing || evidence.owner;
-          const id = owner && !owner.moduleLevel ? owner.syntaxId : MODULE;
+          // Every module-level line of a file shares one row: no owner, the file module itself, or a closure with no callable.
+          const id = owner && !owner.moduleLevel && owner.syntaxId !== i.target.sid ? owner.syntaxId : MODULE;
           if (!file.functions.has(id)) file.functions.set(id, {key:id, id:JSON.stringify(["fn", key, id]), label:labelOf(owner, i), lines:[], callsExact:true, refsExact:true});
           const fn = file.functions.get(id);
           fn.callsExact &&= callsExact; fn.refsExact &&= refsExact;

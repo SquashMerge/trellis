@@ -2108,3 +2108,18 @@ test("#860 a late outline answer after the context moved paints nothing", async 
   assert.equal(deviationTreeRows(h).length, 0, "the late outline found nobody to paint for");
   assert.equal(h.conflicts.length, 0);
 });
+
+test("#860 a module-level closure joins its file's module row: one (module level) row with every line", () => {
+  const {model} = deviationsHarness().sandbox.window.TrellisDeviations, rows = deviationRows();
+  // evidence[1] is owned by the file module itself (owner.syntaxId === target.sid); evidence[3] is a closure with no callable.
+  assert.equal(rows[0].instance.evidence[1].owner.syntaxId, rows[0].instance.target.sid);
+  rows[0].instance.evidence[3].owner = {syntaxId:"c1", name:null, stableLookupKey:null};
+  const names = model.closureNames(rows, ["c1"], [{symbol:{id:"c1", name:"<anonymousFunction@3>", kind:"function", parent:null}, nativeKind:"anonymousFunction"}]);
+  assert.equal(names.get("c1")?.moduleLevel, true);
+  const store = model.build(rows, deviationView().layers, names).files[0];
+  const modules = store.functions.filter(fn => fn.label === "(module level)");
+  assert.equal(modules.length, 1, "one module-level row per file");
+  const [row] = modules;
+  deq(row.lines.map(line => [line.evidence.lines.start, line.closure]), [[10, false], [30, true]], "both lines, the closure still marked");
+  deq([row.calls, row.references], [1, 2], "counts are combined");
+});
