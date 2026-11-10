@@ -1415,9 +1415,23 @@ test("Architecture lays out tags, titles and chips without collisions or truncat
   await capture(page, "architecture-layout-900");
 }, layoutFiles));
 
+// CI draws classic 15px scrollbars (Linux, and CI Macs without a trackpad); local Macs use overlay
+// scrollbars. A classic scrollbar in the canvas's stable gutter makes every host measure as CI does
+// (#860: at 1200px the canvas is 721px wide with a 697px inner width). The rule goes in through the
+// CSSOM of the page's own stylesheet, which the strict CSP allows.
+async function classicScrollbars(page) {
+  await page.evaluate(() => {
+    const sheet = [...document.styleSheets].find(item => item.href?.endsWith("/architecture.css"));
+    sheet.insertRule("#architecture-diagram::-webkit-scrollbar { width: 15px; height: 15px; }", sheet.cssRules.length);
+  });
+  const gutter = await page.evaluate(() => { const canvas = document.querySelector("#architecture-diagram"); return canvas.offsetWidth - canvas.clientWidth; });
+  assert.equal(gutter, 15, "the canvas reserves a classic 15px scrollbar gutter, as on CI");
+  await quiet(page);
+}
 test("Architecture re-lays out on a panel width change, keeping the selection and the inspector", {timeout:240000}, async () => published(layoutRules, async selected => {
   const {page} = selected;
   await ready(page);
+  await classicScrollbars(page);
   // An allowed arrow keeps the edge inspector; a deviating one opens the Deviations tree (#845).
   const tag = page.locator("#architecture-diagram [data-trellis-edge-tone=allowed]").first();
   const edgeId = await tag.getAttribute("data-trellis-edge-id");
