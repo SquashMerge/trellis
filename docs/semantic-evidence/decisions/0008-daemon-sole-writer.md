@@ -96,3 +96,7 @@ Only the daemon opens these databases, so no other supported Trellis process con
 - **The daemon is required.** Every data command needs a daemon, started automatically; if it can't start, the command fails with `daemon_unavailable`. A daemon crash briefly interrupts every session until clients restart it; accepted queue rows survive (Decision 0007 already accepts this).
 - **Tests change.** Tests that simulate two competing Trellis processes on one checkout are replaced by daemon-restart and crash-recovery tests.
 - **External tools.** Opening a live daemon index with an external tool such as the `sqlite3` CLI is **unsupported**. It may still physically succeed, so it isn't excluded. §2's gate covers Trellis-controlled openers only; external access while the daemon runs is unsupported and may observe or disturb in-progress state.
+
+## Amendment: automatic producer re-runs (#660)
+
+[Accepted by the owner 2026-11-08 (#660, D1–D11)](https://github.com/SquashMerge/trellis/issues/660). The checkout's `AutoRunOwner` is not a writer. It opens no database, holds no write lock and adds no cross-process state: its decision state is in memory and is rebuilt at every activation from the published head and the producer state directory (T09). The only thing a run adds to the sole writer's input is the generated import, which enters the FIFO exactly as a manual run's import does; nothing else enters it. The writer, the queue and the sole-writer gate are unchanged.

@@ -280,3 +280,14 @@ N and the durable pending target/selected raw IDs commit together. The worker ch
 Published status remains catching up while semantic work remains. Per-document read states distinguish older-basis evidence from actual pending documents under the [projection addendum](../native-first-delete-design.md#addendum--approved-older-basis-projection-2026-11-03). This scheduling amendment does not change retention/retirement policy, immutable pins, root checks or bounded storage-contention handling.
 
 **Unit slices.** One S unit runs bounded continuation steps inside one coherent read snapshot for at most 50 ms, and the cooperative unit rechecks priority, cancellation and the queue between steps; it then returns to worker selection. No snapshot survives a return to selection, so accepted foreground work waits at most one slice.
+
+## Amendment: automatic producer re-runs (#660)
+
+[Accepted by the owner 2026-11-08 (#660, D1–D11)](https://github.com/SquashMerge/trellis/issues/660). The checkout's `AutoRunOwner` ([local topology T09](../../local-topology.md#automatic-producer-re-runs-660)) is a consumer of the worker's published state, not a worker authority:
+- **Not a worker class.** It is not a lane, a priority class or a second publisher, and it claims no FIFO row. The worker-authority rules of §1 are unchanged.
+- **Decides on every wake, from published state.** It decides on every state-signal wake from the published head, phase and pending-intent state (§3), never from a sampled lock, and rechecks at the owning transition: immediately before every start it re-reads the live head.
+- **At most one launch in flight.** It has at most one launch in flight, and starts through the existing producer owner and slot.
+- **Lease only while a run is active.** It holds a `background_lease` only while a run is active (D9), so an idle owner never keeps a runtime alive.
+- **Schedules only in `Ready`.** `RetireRequested` drops the schedule (D9); the next activation re-evaluates.
+
+The FIFO, watcher and retirement order is unchanged. §8 gains exactly two senders of the state signal, each of which updates its durable condition first: the registry after every manual producer run returns, and the owner's run thread after it stores an outcome. Lease changes still do not bump the signal. The owner's 60 s wait is a liveness backstop only.

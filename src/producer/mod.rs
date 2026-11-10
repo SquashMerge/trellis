@@ -1,6 +1,8 @@
 //! Explicit, owner-requested semantic producer runs (#21). Nothing in the
 //! watcher, the MCP server or daemon launch starts a producer; this module is
-//! reached only from the producer commands.
+//! reached only from the producer commands and, for a workspace that opted in
+//! and a manual run approved, from the checkout's `AutoRunOwner` (`auto.rs`,
+//! #660).
 
 use serde::{Deserialize, Serialize};
 
