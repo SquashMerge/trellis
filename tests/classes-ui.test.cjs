@@ -14,7 +14,7 @@ const range = {startLine: 1, endLine: 8, startByte: 0, endByte: 120};
 function definition(id) { return {symbol: {id, name: id, path: `src/${id}.java`, range, provenance: {parser: "syntax"}}, qualifiedName: `sample.${id}`, language: "java", declarationKind: "class", fields: [{name:"other",typeHint:"B",path:`src/${id}.java`,range}], methods: [{name:"execute",symbolId:`${id}.execute`,typeHint:"void",path:`src/${id}.java`,range}], truncated:false}; }
 const node = id => ({id, label:id, kind:"class", expandable:true, class:definition(id)});
 function diagram(ids = ["A", "B"], revision = {indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}) { return {revision, seed: ids[0], nodes:ids.map(node), edges:ids.slice(1).map((id,i)=>({id:`e${i}`,owner:ids[0],target:id,typeName:id,kind:"field",matchKind:"syntaxCandidate",candidateIds:[id],path:"A.java",range})), warnings:[],truncated:false}; }
-function harness({navigation = false} = {}) {
+function harness({navigation = false, appFilter = null} = {}) {
   const elements = new Map(), calls = [], reads = [], methods = [], changes = [], navigations = [], stale = [];
   let navigate = (event, selector, scope) => { navigations.push({event, selector, scope}); };
   const docListeners = {}, winListeners = {};
@@ -52,7 +52,7 @@ function harness({navigation = false} = {}) {
   document.getElementById=id=>{if(!elements.has(id)){const item=element(id);elements.set(id,item);document.body.append(item);}return elements.get(id);};
   const window = {innerWidth:390,innerHeight:600,addEventListener(type,fn){(winListeners[type] ||= []).push(fn);}};
   vm.runInNewContext(pinSource + "\n" + source,{window,document,URLSearchParams,console,getComputedStyle:()=>({getPropertyValue:token=>token==="--mono"?"monospace":"sans-serif"})});
-  window.TrellisClasses.init({...(navigation ? {navigateMember:(...args)=>navigate(...args)} : {}),request:(url,options)=>{calls.push({url,options});return request(url,options);},readSource:(step,rev)=>reads.push({step,revision:rev}),selectMethod:symbol=>methods.push(symbol),currentRevision:()=>revision,currentSession:()=>session,onChange:()=>changes.push(true),onStale:message=>stale.push(message)});
+  window.TrellisClasses.init({...(navigation ? {navigateMember:(...args)=>navigate(...args)} : {}),...(appFilter ? {appFilter} : {}),request:(url,options)=>{calls.push({url,options});return request(url,options);},readSource:(step,rev)=>reads.push({step,revision:rev}),selectMethod:symbol=>methods.push(symbol),currentRevision:()=>revision,currentSession:()=>session,onChange:()=>changes.push(true),onStale:message=>stale.push(message)});
   return {controller:window.TrellisClasses,document,window,calls,reads,methods,changes,navigations,stale,get:document.getElementById,
     setNavigate(fn){navigate=fn;},setRequest(fn){request=fn;},setRevision(value){revision=value;},setSession(value){session=value;},
     async event(type,target){for(const fn of docListeners[type]||[]) await fn({target});},
@@ -575,4 +575,116 @@ test("stale terminal class response cannot replace a newer selected declaration"
  first.resolve(diagram(["A","B"]));await old;
  assert.ok(h.card("B"));assert.equal(h.card("A"),undefined);
  assert.equal(h.reads.length,0);
+});
+
+// #852: a name search under one app lists that app's classes, passing over other apps' pages.
+test("app_choice_classes: a name search lists the chosen app's classes, passes over bounded pages and lists again on a new choice", async()=>{
+ let choice={name:"web",holds:path=>path.startsWith("web/")};
+ const h=harness({appFilter:()=>choice}), revision={indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1};
+ const at=(id,file)=>({...definition(id),symbol:{...definition(id).symbol,path:file}});
+ const pages=[[at("Server","src/server.rs")],[at("Store","src/store.rs")],[at("Widget","web/widget.js"),at("Daemon","src/daemon.rs")],[at("Panel","web/panel.js")]];
+ h.setRequest(async url=>{const offset=Number(new URL(url,"http://local").searchParams.get("offset"));return {revision,items:pages[offset],nextOffset:offset+1<pages.length?offset+1:null,warnings:[],truncated:false};});
+ h.get("classes-query").value="";await h.get("classes-search").fire("click");
+ assert.deepEqual(h.calls.map(call=>new URL(call.url,"http://local").searchParams.get("offset")),["0","1","2"],"pages without the app's classes are passed over");
+ const listed=()=>descendants(h.get("classes-results")).filter(n=>n.className==="classes-result").map(n=>n.children[0].textContent);
+ assert.deepEqual(listed(),["sample.Widget"]);
+ assert.match(h.get("classes-state").textContent,/3 classes in other apps or no app passed over · All apps lists them/);
+ const more=descendants(h.get("classes-results")).find(n=>n.className==="classes-more");assert.ok(more,"More classes reads on");
+ await more.fire("click");assert.deepEqual(listed(),["sample.Widget","sample.Panel"]);
+ // All apps lists the first page again, everything on it.
+ choice=null;await h.controller.scopeChanged();
+ assert.deepEqual(listed(),["sample.Server"]);
+ const count=h.calls.length;await h.controller.scopeChanged();assert.equal(h.calls.length,count,"the same choice does not read");
+});
+
+test("app_choice_classes_bounds: the pass over other apps stops after ten pages and says so; a file's classes ignore the choice",async()=>{
+ const choice={name:"web",holds:path=>path.startsWith("web/")};
+ const h=harness({appFilter:()=>choice}), revision={indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1};
+ h.setRequest(async url=>{const params=new URL(url,"http://local").searchParams, offset=Number(params.get("offset"));
+  return {revision,items:[definition(params.get("path")?"Own":`S${offset}`)],nextOffset:offset+1,warnings:[],truncated:false};});
+ await h.get("classes-search").fire("click");
+ assert.equal(h.calls.length,10,"at most ten pages per search");
+ assert.match(h.get("classes-state").textContent,/No matching classes in web on these pages · More classes reads on/);
+ await h.controller.open({path:"src/Own.java"});
+ const listed=descendants(h.get("classes-results")).filter(n=>n.className==="classes-result").map(n=>n.children[0].textContent);
+ assert.deepEqual(listed,["sample.Own"],"a file's own classes are listed under any choice");
+ assert.equal(new URL(h.calls.at(-2).url,"http://local").searchParams.get("path"),"src/Own.java");
+});
+
+// #852 review (Prime, PR #875): a search pending across a change of the app choice never publishes
+// the old choice's list; the new choice lists again.
+const appRevision={indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1};
+const appClasses=()=>[definition("Server"),{...definition("Widget"),symbol:{...definition("Widget").symbol,path:"web/widget.js"}}];
+const appListed=h=>descendants(h.get("classes-results")).filter(n=>n.className==="classes-result").map(n=>n.children[0].textContent);
+const srvChoice=(assigned="one")=>({name:"srv",holds:p=>p.startsWith("src/"),assigned});
+const webChoice=(assigned="one")=>({name:"web",holds:p=>p.startsWith("web/"),assigned});
+test("app_choice_pending_first_search: switching app while the first search is pending lists the new app only",async()=>{
+ let choice=srvChoice();
+ const h=harness({appFilter:()=>choice}), gate=deferred();
+ h.setRequest(async()=>{await gate.promise;return {revision:appRevision,items:appClasses(),nextOffset:null,warnings:[],truncated:false};});
+ const pending=h.get("classes-search").fire("click");
+ choice=webChoice(); const again=h.controller.scopeChanged();
+ gate.resolve(); await pending; await again;
+ assert.deepEqual(appListed(h),["sample.Widget"]);
+ assert.equal(h.calls.length,2,"the new choice read again");
+});
+test("app_choice_pending_round_trip: web, All apps, web while a re-list is pending ends on web's list",async()=>{
+ let choice=webChoice();
+ const h=harness({appFilter:()=>choice}), gate=deferred(), data={revision:appRevision,items:appClasses(),nextOffset:null,warnings:[],truncated:false};
+ h.setRequest(async()=>data); await h.get("classes-search").fire("click");
+ assert.deepEqual(appListed(h),["sample.Widget"]);
+ h.setRequest(async()=>{await gate.promise;return data;});
+ choice=null; const toAll=h.controller.scopeChanged();
+ choice=webChoice(); const back=h.controller.scopeChanged();
+ gate.resolve(); await toAll; await back;
+ assert.deepEqual(appListed(h),["sample.Widget"],"the All apps list never lands");
+});
+test("app_choice_new_assignment: the same app under a new assignment lists again; the same assignment does not",async()=>{
+ let choice=webChoice("one");
+ const h=harness({appFilter:()=>choice});
+ h.setRequest(async()=>({revision:appRevision,items:appClasses(),nextOffset:null,warnings:[],truncated:false}));
+ await h.get("classes-search").fire("click");
+ const reads=h.calls.length;
+ choice=webChoice("one"); await h.controller.scopeChanged();
+ assert.equal(h.calls.length,reads,"control: the same choice and assignment do not read");
+ choice={name:"web",holds:p=>p.startsWith("src/"),assigned:"two"}; await h.controller.scopeChanged();
+ assert.equal(h.calls.length,reads+1);
+ assert.deepEqual(appListed(h),["sample.Server"],"the new assignment decides the list");
+});
+test("app_choice_pending_control: an unchanged choice while a search is pending publishes it as is",async()=>{
+ const choice=webChoice();
+ const h=harness({appFilter:()=>choice}), gate=deferred();
+ h.setRequest(async()=>{await gate.promise;return {revision:appRevision,items:appClasses(),nextOffset:null,warnings:[],truncated:false};});
+ const pending=h.get("classes-search").fire("click");
+ await h.controller.scopeChanged();
+ gate.resolve(); await pending;
+ assert.deepEqual(appListed(h),["sample.Widget"]); assert.equal(h.calls.length,1);
+});
+
+// #852 review (Prime, 680899d2): a search that failed is settled, so a later app change keeps the
+// drawn diagram; a search still pending over it follows the new app.
+test("app_choice_failed_search_settles: after a storage_busy search, an app change keeps the drawn diagram",async()=>{
+ let choice=webChoice();
+ const h=harness({appFilter:()=>choice});
+ await h.controller.open({seed:"A"}); const card=h.card("A");
+ const failure=deferred(); h.setRequest(()=>failure.promise);
+ const lookup=h.get("classes-search").fire("click");
+ failure.reject(Object.assign(new Error("Storage is busy"),{status:409,code:"storage_busy"})); await lookup;
+ assert.equal(h.card("A"),card); assert.equal(h.get("classes-state").dataset.state,"error");
+ await h.button(card,"execute()").fire("click"); assert.equal(h.methods.length,1);
+ const reads=h.calls.length;
+ h.setRequest(async()=>({revision:appRevision,items:appClasses(),nextOffset:null,warnings:[],truncated:false}));
+ choice=srvChoice(); await h.controller.scopeChanged();
+ assert.equal(h.card("A"),card,"the drawn diagram stays"); assert.equal(h.calls.length,reads,"no search was pending, so none is sent");
+});
+test("app_choice_pending_over_diagram: a search still pending over a drawn diagram follows the new app",async()=>{
+ let choice=webChoice();
+ const h=harness({appFilter:()=>choice});
+ await h.controller.open({seed:"A"});
+ const gate=deferred(); h.setRequest(()=>gate.promise);
+ const lookup=h.get("classes-search").fire("click");
+ h.setRequest(async()=>({revision:appRevision,items:appClasses(),nextOffset:null,warnings:[],truncated:false}));
+ choice=srvChoice(); await h.controller.scopeChanged();
+ gate.resolve({revision:appRevision,items:appClasses(),nextOffset:null,warnings:[],truncated:false}); await lookup;
+ assert.deepEqual(appListed(h),["sample.Server"],"the new app's list, not the old");
 });

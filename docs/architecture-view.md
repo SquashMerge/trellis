@@ -82,6 +82,35 @@ switcher and the drawing are [#789](https://github.com/SquashMerge/trellis/issue
 - **Exceptions are unchanged:** one file pair, previewed and applied through the existing
   routes.
 
+## The app switcher in Treemap, Classes and the Files tree (#852)
+
+[#852](https://github.com/SquashMerge/trellis/issues/852) gives Treemap, Classes and the Files
+tree the switcher Architecture has: All apps, then one choice per app name, in the same order and
+words. There is one choice for the page. Choosing in any view, Architecture included, changes it in
+all of them. It is kept in memory only, and a new checkout starts at All apps.
+
+- **One assignment.** The apps and each file's app come from the Architecture summary at the
+  shown pin and rules: each module's `app`, which is the assignment the rules check uses (through
+  the file's layer, else the most specific containing root). A path the summary has no module
+  for, such as an unindexed file or a folder, is assigned by the roots alone. The views read the
+  same cached summary as Architecture. With no ready summary that has two or more apps (no rules
+  file, rejected rules, a single app, or while it builds), there is no switcher and every view
+  shows the whole checkout. A summary for an older pin, session, checkout or rules epoch never
+  draws a switcher. As in Architecture, a summary without the chosen app ends the choice, and the
+  choice does not come back when the app does.
+- **All apps** shows each view as it was before #852.
+- **One app** filters each view to that app's files. Treemap draws them, and its summary says
+  `in this app`. A new choice starts at the whole checkout; a new assignment for the same choice
+  keeps the directory. Opening a file from Architecture into Treemap switches to the file's own
+  app, or to All apps when the file is in no app. The Files tree (the directory tree, the indexed
+  list and filter matches) lists the app's files and the folders that hold them, lie in its roots
+  or lead to them. Classes lists the app's classes for a name search, passing over at most ten
+  pages of other apps' classes per search. A file's own class list and a drawn diagram are not
+  filtered.
+- **Unassigned files are listed, never dropped.** A file with no layer belongs to its root's app,
+  so it is listed under that app. A file in no app is listed under All apps. Every filtered view
+  counts what it leaves out and says that All apps shows it.
+
 ## Apps and HTTP interfaces: data and extraction (#784, #788)
 
 **Status: proposed (owner-delegated, run 803).** This section says what the summary and
