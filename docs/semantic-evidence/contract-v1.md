@@ -480,6 +480,12 @@ A server route with `method` `ANY` answers every method. Such routes are express
 
 Server templates also come from Rust actix-web route attributes and route builders, with their `web::scope` prefixes. Client paths also come from Rust `reqwest` calls whose URL is statically readable. A `reqwest` call adds no prefix of its own (no wrapper prefix, configured prefix or base URL), so its match is never `wrapperInferred`. A `reqwest` call whose URL or method cannot be read is `unresolved`. As before, a missing match proves nothing.
 
+## Interface evidence amendment: Java (#857)
+
+**Status: owner-ratified 2026-11-09 under the owner's decision that the endpoints of the other platforms ship in 0.2 ([#686](https://github.com/SquashMerge/trellis/issues/686), [#857](https://github.com/SquashMerge/trellis/issues/857)), with evidence wording amendments approved.** It adds matching sources to the #788, #855 and #858 amendments; the evidence kind, the fields, the four values and their precedence are unchanged.
+
+Server templates also come from Java Spring MVC mapping annotations on controller classes, joined to their class-level `@RequestMapping`, and from JAX-RS resource classes under their `@Path` and the snapshot's `@ApplicationPath`. Mappings inherited from a supertype count only when that supertype resolves to one type of the snapshot. Client paths also come from `java.net.http` requests, Spring `RestTemplate` calls and Spring `WebClient` requests whose URL is statically readable. Unlike an axios base URL, the base URL of a `RestTemplate` or `WebClient` is read even when it is absolute: its path is the prefix, so a match that needed it is `wrapperInferred`. A route whose prefix, path or method cannot be read is not extracted, and a Java call whose URL, base URL or method cannot be read is `unresolved`. As before, a missing match proves nothing.
+
 ## Owner-ratified native-v9 correction: Java varargs
 
 **Status: owner-ratified 2026-10-24 (#279).** This narrow Java measurement ruling is approved independently; the #279 capability and reference amendments above are also ratified by the owner, 2026-10-24.

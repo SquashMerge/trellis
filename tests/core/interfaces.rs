@@ -669,6 +669,100 @@ fn main() {}
     assert_eq!(client_only[0]["entry"]["confidence"], "unresolved");
 }
 
+/// #857: a Spring server and a Java client, each an authored app. Both one-sided lists are
+/// reported against the pair, and a `WebClient` under a readable base URL is
+/// `wrapperInferred`.
+#[test]
+fn a_spring_server_and_a_java_client_are_an_interface() {
+    let rules = "version = 1\n\
+[apps.users]\nroots = ['api']\n\
+[apps.portal]\nroots = ['portal']\n\
+[layers.server]\napp = 'users'\norder = 1\npaths = ['api/**']\n\
+[layers.client]\napp = 'portal'\norder = 1\npaths = ['portal/**']\n";
+    let server = r#"package com.example.users;
+
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/users")
+public class UserController {
+    @GetMapping("/{id}")
+    public String show(@PathVariable long id) { return ""; }
+
+    @GetMapping("/health")
+    public String health() { return "ok"; }
+
+    @DeleteMapping("/{id}")
+    public void remove(@PathVariable long id) {}
+}
+"#;
+    let client = r#"package com.example.portal;
+
+import org.springframework.web.client.RestTemplate;
+import org.springframework.web.reactive.function.client.WebClient;
+
+public class UsersGateway {
+    private static final String HOST = "http://users:8080";
+    private final RestTemplate rest = new RestTemplate();
+    private final WebClient users = WebClient.builder().baseUrl(HOST + "/api/users").build();
+
+    public void load(long id) {
+        rest.getForObject(HOST + "/api/users/{id}", String.class, id);
+        users.get().uri("/health").retrieve();
+        rest.getForObject(HOST + "/api/orders", String.class);
+    }
+}
+"#;
+    let published = publish(&[
+        (".trellis/rules.toml", rules),
+        (
+            "api/src/main/java/com/example/users/UserController.java",
+            server,
+        ),
+        (
+            "portal/src/main/java/com/example/portal/UsersGateway.java",
+            client,
+        ),
+    ]);
+    let interfaces = published.summary["interfaces"].as_array().unwrap();
+    assert_eq!(interfaces.len(), 1, "{interfaces:#?}");
+    assert_eq!(
+        (&interfaces[0]["client"], &interfaces[0]["server"]),
+        (&json!("portal"), &json!("users"))
+    );
+    assert_eq!(
+        interfaces[0]["counts"],
+        json!({"matchedRoutes": 2, "callSites": 2, "serverOnly": 1, "clientOnly": 1,
+            "confidence": {"exact": 0, "template": 1, "wrapperInferred": 1, "unresolved": 1}})
+    );
+    let matched = details(&published, &[("list", "matched")], 100);
+    let show = matched
+        .iter()
+        .find(|item| item["entry"]["pathTemplate"] == "/api/users/{id}")
+        .unwrap();
+    assert_eq!(show["entry"]["confidence"], "template");
+    assert_eq!(
+        show["entry"]["handler"]["stableLookupKey"],
+        "api/src/main/java/com/example/users/UserController.java::UserController::show"
+    );
+    let site = &show["entry"]["callSites"][0];
+    assert_eq!(site["document"]["language"], "java");
+    assert_eq!(site["caller"]["name"], "load");
+    let health = matched
+        .iter()
+        .find(|item| item["entry"]["pathTemplate"] == "/api/users/health")
+        .unwrap();
+    assert_eq!(health["entry"]["confidence"], "wrapperInferred");
+    let server_only = details(&published, &[("list", "serverOnly")], 100);
+    assert_eq!(server_only.len(), 1);
+    assert_eq!(server_only[0]["entry"]["method"], "DELETE");
+    assert_eq!(server_only[0]["entry"]["pathTemplate"], "/api/users/{id}");
+    let client_only = details(&published, &[("list", "clientOnly")], 100);
+    assert_eq!(client_only.len(), 1);
+    assert_eq!(client_only[0]["entry"]["pathTemplate"], "/api/orders");
+    assert_eq!(client_only[0]["entry"]["confidence"], "unresolved");
+}
+
 // #855: JavaScript and TypeScript servers and clients.
 
 const JS_RULES: &str = "version = 1\n\

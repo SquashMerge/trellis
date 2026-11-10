@@ -1,6 +1,7 @@
 //! Server routes: axum literal registrations and the dispatch tables behind a catch-all, and
 //! actix-web routes (#858).
 mod actix;
+pub(super) use actix::join;
 
 use super::{
     Handler, HandlerKind, LineIndex, Route, charge, comment, named_callable, parse, segments,

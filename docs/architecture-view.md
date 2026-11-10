@@ -212,6 +212,41 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
     `{name}*` as `{*name}`; an unbalanced brace makes the path unreadable and the
     registration is not a route. Handler identity, exclusions and the one route per method
     and template rule are as for axum.
+- **Spring MVC routes (#857).** Read in production Java documents that mention `Mapping`.
+  A controller is a class, not abstract, annotated `@RestController` or `@Controller` from
+  Spring (imported singly or on demand, or written qualified); any other class or interface,
+  such as a Feign client, registers nothing. Its routes come from `@GetMapping`,
+  `@PostMapping`, `@PutMapping`, `@DeleteMapping`, `@PatchMapping` (the method of the name)
+  and `@RequestMapping` (each `RequestMethod.M` of `method`, or `ANY` when `method` is
+  absent). Each path of the unnamed value, `value` or `path` (one string or an array; none
+  is the empty path) is joined to each path of the class prefix, for every method; the
+  expansion is charged to the work bound before it is built. The class prefix is the first
+  class-level `@RequestMapping` in Spring's search order: the class, its interfaces, then
+  its superclass, each with its own supertypes. A method's mapping is the first one found
+  for its signature in the same order, and the handler is the first declaration with a
+  body. Nothing is invented: a mapping, class prefix or method that cannot be read (a
+  value that is not a string literal, a visible constant or a `+` of them; `value` and
+  `path` together; a class-level `method`; a `method` other than `RequestMethod.M`; two
+  mapping annotations), a composed or meta-annotation, or a mapping that a supertype which
+  does not resolve could decide first, registers nothing, and nothing falls back to the
+  root. A supertype resolves only to one type of the snapshot: declared once in the same
+  document, else named by a single-type import, else in the same package, in a file
+  `<package path>/<Name>.java`; an on-demand import or a nested qualified name does not
+  resolve. Patterns: `{name}` and `{name:regex}` are `{name}`, a last `{*name}` is
+  `{*name}`, and a `*`, `**` or `?` wildcard or an unbalanced brace makes the path
+  unreadable.
+- **JAX-RS routes (#857).** Read in the same documents (`javax.ws.rs` or `jakarta.ws.rs`). A
+  resource is a class, not abstract, with its own `@Path`. A resource method has exactly one
+  of `@GET`, `@POST`, `@PUT`, `@DELETE`, `@PATCH`, `@HEAD` or `@OPTIONS`, with an optional
+  `@Path`; a method with JAX-RS annotations but no single method annotation (a sub-resource
+  locator, a custom `@HttpMethod`) is not a route. A method with no JAX-RS annotation of its
+  own, nor on its parameters, inherits the first resolved superclass method, then interface
+  method, that has one, as above. The snapshot's one `@ApplicationPath` (a trailing `/*`
+  dropped) prefixes every JAX-RS route; two different ones, or one that cannot be read,
+  leave every JAX-RS mount unknown, and no JAX-RS route is registered. A last segment
+  `{name:.*}` or `{name:.+}` is `{*name}`; other patterns are as for Spring, except that `*`
+  and `?` are literal. A servlet mapping outside the source, like a Spring context path, is
+  not read. Routes are one per method, template and controller document.
 - **Handler identity.** `handler.kind` is `declaration` when the handler names exactly one
   same-document function (the function's span), `closure` otherwise (the span of the handler
   expression), or `dispatchArm` for a table route answered by an arm that does not call
@@ -358,12 +393,48 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
   path is what follows the host of an `http://` or `https://` URL (`/` when there is none), or the text itself when it starts
   with `/`; a URL that starts with a substitution, or anything else, is unreadable and
   `unresolved`. The path is cut at `?` or `#` and split as above.
+- **Java calls (#857).** Read in production Java documents that mention `java.net.http`,
+  `RestTemplate`, `RestOperations` or `WebClient`:
+  - `HttpRequest.newBuilder(..)` chains that end in `.build()`: the method is the last of
+    `GET()`, `POST(..)`, `PUT(..)`, `DELETE()`, `HEAD()` or `method("M", ..)` (`GET` when
+    none, unreadable for any other `method`); the URL is the last `.uri(..)`, else the
+    `newBuilder` argument, through `URI.create(s)` or `new URI(s)`.
+  - `RestTemplate` (or `RestOperations`) `getForObject`, `getForEntity`, `headForHeaders`,
+    `postForObject`, `postForEntity`, `postForLocation`, `put`, `patchForObject`, `delete`
+    and `optionsForAllow` (the method of the name), and `exchange` and `execute` (method
+    `HttpMethod.M` at argument 1, else unreadable); the URL is argument 0.
+  - `WebClient` `get()`, `post()`, `put()`, `delete()`, `patch()`, `head()`, `options()`
+    and `method(HttpMethod.M)`; the URL is the argument of the `.uri(..)` that follows, and
+    a call without one, or with a lambda, has an unreadable path.
+  - A receiver is a client when every declaration of its name in the document (field,
+    local, parameter, `this.name`) types it as one, by an import or a qualified name, or it
+    is built inline: `new RestTemplate(..)`, `WebClient.create(..)`, or a
+    `new RestTemplateBuilder()` or `WebClient.builder()` chain ending in `.build()`. Its base
+    URL is the last `rootUri(s)` or `baseUrl(s)` of that chain (none without one), when every
+    value the document gives the name agrees on it. A parameter, an injected field with no
+    value, an injected builder without a base link, `uriTemplateHandler(..)` or
+    `uriBuilderFactory(..)`, or values that disagree leave the base unknown.
+  - The URL text is a string literal without escapes, a visible constant, a `+` of them,
+    `String.format(..)` or `"..".formatted(..)`; anything else is a substitution. A plain
+    `%s` takes its argument; any other conversion, or a `%s` with an index, flag, width or
+    precision, is a substitution. A visible constant is a `static final String` field (or
+    an interface field) initialised with a plain literal, declared once in the document, of
+    a type whose body encloses the use with no type in between that has a supertype (an
+    anonymous class always has one), and bound by nothing else in the document: no local,
+    parameter, catch, resource, `for`, lambda or pattern variable, enum constant, other
+    field or single static import. A class's own constant is not visible in its own class
+    annotations. Each part is charged to the work bound before it is copied. For the Spring
+    clients a `{name}` URI template variable is a substitution.
+  - An `http://` or `https://` URL is its own path, as for reqwest. A rooted path is as
+    written with no base (or a base with an empty path), joined under the base URL's path
+    with `ClientPrefix` joined (so its match is `wrapperInferred`), and unreadable when the
+    base is unknown. Anything else is unreadable and `unresolved`.
 - **Segment matching.** Methods must be equal, or the route is `ANY`. A literal segment must equal a literal
   segment. A server `{name}` matches exactly one segment, and `{*name}` matches the rest.
   A client substitution segment matches only a server `{name}` or `{*name}`. If nothing
   matches as written, the call is matched again as assembled by the wrapper's prefix:
   `/api/` becomes `/api/checkouts/{root}/`, with `{root}` a substitution segment. That rule
-  applies to the built-in wrappers only, never to a configured wrapper or a reqwest call.
+  applies to the built-in wrappers only, never to a configured wrapper, a reqwest call or a Java call.
   Among the matches the one with the most literal segments wins. Between equal counts, a route that names the method wins over an `ANY`
   route. Any other tie is no match.
 - **Confidence.** `wrapperInferred` when the prefix was needed. Otherwise `template` when the
