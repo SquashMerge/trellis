@@ -240,7 +240,9 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
     import from the document's package, an absolute one from the one directory above the
     document that holds the module (two or more such directories are ambiguous, and resolve
     nothing), at most 16 deep. A prefix or object that cannot be read, or that a `**` splat may
-    supply, mounts nothing.
+    supply, mounts nothing. Only candidate documents are read: a module that mentions no
+    framework word and is not a package `__init__.py` (such as a plain re-export module) is
+    not parsed, so a mount that passes through it is omitted, never guessed.
   - **Django.** A module-level `ROOT_URLCONF = "pkg.urls"` in any document names a root
     urlconf; without one no Django pattern is a route. A urlconf's `urlpatterns` is its one
     module-level list or tuple, extended by module-level `+=` of lists. `path(route, view)` and
@@ -251,10 +253,16 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
   - **Normalisation.** Flask and Django `<name>` and `<converter:name>` (Flask's
     `<converter(args):name>` too) are `{name}`; FastAPI `{name}` and `{name:converter}` are
     `{name}`. The `path` converter is `{*name}` as the whole last segment, else `{name}`. A
-    `re_path` regex must start with `^`; a final `$` is dropped, `(?P<name>..)` is `{name}`
-    (`{*name}` for `.*` or `.+`) and an escaped punctuation character is itself. Any other
-    regex syntax, an optional or repeated group, a group that can match `/`, a brace in a
-    Flask or Django route, or an unbalanced or unnamed placeholder makes the route unreadable.
+    `re_path` regex must start with `^`; a final unescaped `$` is dropped, `(?P<name>..)` is
+    `{name}` (`{*name}` for `.*` or `.+`) and an escaped punctuation character is itself. A
+    `{name}` group body must provably never match `/`: literal characters other than `/`,
+    `\d`, `\w`, `\s`, escaped punctuation other than `/`, and classes that exclude `/` (a
+    positive class with no `/`, no range spanning it and no `\D`, `\W` or `\S`, or a negated
+    class that names `/`), each optionally quantified. Any other regex syntax (such as `.`
+    inside a body, or `[^x]+`), an optional or repeated group, a brace in a Flask or Django
+    route, or an unbalanced or unnamed placeholder makes the route unreadable. A `re_path`
+    whose regex ends in an unescaped `$` matches only an empty remainder, so an `include`
+    behind it mounts nothing.
   - **Bounds.** Every production Python document is scanned for candidate words, and each
     candidate is parsed and walked, all charged to the work bound. Each object's routes under
     each prefix it is mounted at, and each Django list under each include, are charged
@@ -427,8 +435,8 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
     value is charged to the work bound before it is copied, and cancellation is checked for
     each substitution.
   - **Path.** An `http://` or `https://` URL gives its path as for reqwest. A relative URL
-    needs the client's readable absolute `base_url` (httpx), and is joined to the base's path
-    with one `/`; when the base has a path, the match is `wrapperInferred`. A relative URL
+    needs the client's absolute `base_url` (httpx), readable in full, and is joined to the
+    base's path with one `/`; when the base has a path, the match is `wrapperInferred`. A relative URL
     without a base, or with an unreadable base (including one a `**` splat may supply), is
     unreadable and `unresolved`.
 - **Segment matching.** Methods must be equal, or the route is `ANY`. A literal segment must equal a literal

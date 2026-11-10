@@ -1041,3 +1041,93 @@ fn an_httpx_base_url_path_infers_the_match() {
         [Some(Confidence::WrapperInferred)]
     );
 }
+
+/// #877 review: an httpx base URL with any unreadable part, here its path, is unreadable
+/// whole, so a relative call through it is unresolved, never a joined `{}` prefix.
+#[test]
+fn a_partly_unreadable_httpx_base_url_is_unreadable() {
+    let server = r#"
+from fastapi import FastAPI
+app = FastAPI()
+
+@app.get("/{part}/users")
+def users(part):
+    return {}
+"#;
+    let client = r#"
+import httpx
+BASE = "http://h/api"
+def run(prefix):
+    httpx.Client(base_url=f"http://h/{prefix}").get("/users")
+    httpx.Client(base_url="http://h/api").get("/users")
+    httpx.Client(base_url=BASE).get("/users")
+    httpx.Client(base_url=f"http://h/{prefix}").get("http://h/api/users")
+"#;
+    assert_eq!(
+        calls(&[("api/main.py", server), ("cli/client.py", client)]),
+        [
+            "GET ? -> unresolved",
+            "GET /api/users -> /{part}/users WrapperInferred",
+            "GET /api/users -> /{part}/users WrapperInferred",
+            "GET /api/users -> /{part}/users Template",
+        ]
+    );
+}
+
+fn django_urls(urls: &str, child: Option<&str>) -> Vec<String> {
+    let views = "from django.http import HttpResponse\ndef v(request, part=None):\n    return HttpResponse(\"\")\n";
+    let mut files = vec![
+        ("site/settings.py", "ROOT_URLCONF = \"urls\"\n"),
+        ("site/urls.py", urls),
+        ("site/views.py", views),
+    ];
+    if let Some(child) = child {
+        files.push(("site/child.py", child));
+    }
+    routes(&files)
+        .into_iter()
+        .map(|route| route.split(" <- ").next().unwrap().to_owned())
+        .collect()
+}
+
+/// #877 review: a named group whose body may match `/` without a literal slash is
+/// unreadable, never a one-segment `{name}`. Bodies that provably stay in one segment are
+/// read.
+#[test]
+fn a_named_group_that_may_match_a_slash_is_unreadable() {
+    let urls = r#"
+from django.urls import re_path
+from . import views
+urlpatterns = [
+    re_path(r"^a/(?P<part>[^x]+)/done$", views.v),
+    re_path(r"^b/(?P<part>a.*b)/done$", views.v),
+    re_path(r"^c/(?P<part>[!-0]+)/done$", views.v),
+    re_path(r"^d/(?P<part>[^/]+)/done$", views.v),
+    re_path(r"^e/(?P<part>[0-9]+)/done$", views.v),
+    re_path(r"^f/(?P<part>[\w-]+)/done$", views.v),
+]
+"#;
+    assert_eq!(
+        django_urls(urls, None),
+        [
+            "ANY /d/{part}/done",
+            "ANY /e/{part}/done",
+            "ANY /f/{part}/done",
+        ]
+    );
+}
+
+/// #877 review: a regex that ends in `$` matches only when nothing remains, so a pattern
+/// list it includes is not reached past it. Without the anchor it is.
+#[test]
+fn an_anchored_regex_mounts_no_include() {
+    let child =
+        "from django.urls import path\nfrom . import views\nurlpatterns = [path(\"x\", views.v)]\n";
+    let anchored = "from django.urls import include, re_path\nurlpatterns = [re_path(r\"^api/$\", include(\"child\"))]\n";
+    assert!(django_urls(anchored, Some(child)).is_empty());
+    let open = "from django.urls import include, re_path\nurlpatterns = [re_path(r\"^api/\", include(\"child\"))]\n";
+    assert_eq!(django_urls(open, Some(child)), ["ANY /api/x"]);
+    // An escaped `$` is a literal, not an anchor.
+    let escaped = "from django.urls import include, re_path\nurlpatterns = [re_path(r\"^api\\$\", include(\"child\"))]\n";
+    assert_eq!(django_urls(escaped, Some(child)), ["ANY /api$x"]);
+}

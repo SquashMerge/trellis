@@ -207,7 +207,9 @@ fn client<'t>(
     let base = match args.keyword("base_url") {
         Arg::Absent => Base::None,
         Arg::Unknown => Base::Unreadable,
-        Arg::Given(base) => match reader.string(base, work, check)? {
+        // A base with any unreadable part may carry any path, so it is unreadable whole
+        // (#877 review).
+        Arg::Given(base) => match reader.exact(base, work, check)? {
             Some(base) if base.is_empty() => Base::None,
             Some(base) => Base::Known(base),
             None => Base::Unreadable,

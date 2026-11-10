@@ -673,12 +673,14 @@ impl<'t> Reading<'_, 't> {
                 let Some(route) = reader.exact(route, work, check)? else {
                     continue;
                 };
+                // A regex that ends in `$` matches only when nothing of the path remains, so
+                // nothing it includes is reachable past it (#877 review).
                 let fragment = if regex {
                     regex_template(&route)
                 } else {
-                    angles(&route)
+                    angles(&route).map(|fragment| (fragment, false))
                 };
-                let Some(fragment) = fragment else {
+                let Some((fragment, anchored)) = fragment else {
                     continue;
                 };
                 charge(
@@ -691,6 +693,7 @@ impl<'t> Reading<'_, 't> {
                 let full = format!("{prefix}{fragment}");
                 if let Some(target) = self.include(doc, view, work, check)? {
                     if let Some(target) = target
+                        && !anchored
                         && depth < MOUNT_DEPTH
                     {
                         includes.push((target, full, depth + 1));
@@ -889,12 +892,21 @@ fn braces(pattern: &str) -> Option<String> {
 }
 
 /// A Django `re_path()` regex in the #788 template form, when it is a literal path with named
-/// groups: `^` is required and a final `$` dropped, `(?P<name>..)` is `{name}` (`{*name}`
-/// for `.*` or `.+`), and an escaped punctuation character is itself. Any other regex
-/// syntax, an optional or repeated group, or a group that can span a `/`, is unreadable.
-fn regex_template(pattern: &str) -> Option<String> {
+/// groups, and whether it ends in an unescaped `$`: `^` is required and a final `$` dropped,
+/// `(?P<name>..)` is `{name}` (`{*name}` for `.*` or `.+`), and an escaped punctuation
+/// character is itself. Any other regex syntax, an optional or repeated group, or a group
+/// whose body is not provably one that cannot match `/`, is unreadable.
+fn regex_template(pattern: &str) -> Option<(String, bool)> {
     let pattern = pattern.strip_prefix('^')?;
-    let pattern = pattern.strip_suffix('$').unwrap_or(pattern);
+    let escapes = pattern
+        .strip_suffix('$')
+        .map(|rest| rest.chars().rev().take_while(|c| *c == '\\').count());
+    let anchored = escapes.is_some_and(|count| count % 2 == 0);
+    let pattern = if anchored {
+        &pattern[..pattern.len() - 1]
+    } else {
+        pattern
+    };
     let chars: Vec<char> = pattern.chars().collect();
     let mut out = String::new();
     let mut at = 0;
@@ -936,13 +948,15 @@ fn regex_template(pattern: &str) -> Option<String> {
                 }
                 let body: String = chars[body_start..end].iter().collect();
                 at = end + 1;
-                if matches!(chars.get(at), Some('?' | '*' | '+' | '{')) || body.contains('/') {
+                if matches!(chars.get(at), Some('?' | '*' | '+' | '{')) {
                     return None;
                 }
                 if matches!(body.as_str(), ".*" | ".+") {
                     out.push_str(&format!("{{*{name}}}"));
-                } else {
+                } else if within_segment(&body) {
                     out.push_str(&format!("{{{name}}}"));
+                } else {
+                    return None;
                 }
             }
             '.' | '^' | '$' | '*' | '+' | '?' | '{' | '}' | '[' | ']' | '|' | ')' => return None,
@@ -952,7 +966,97 @@ fn regex_template(pattern: &str) -> Option<String> {
             }
         }
     }
-    Some(out)
+    Some((out, anchored))
+}
+
+/// Whether a regex group body provably never matches `/`: a sequence of literal characters
+/// other than `/`, `\d`, `\w`, `\s`, escaped punctuation other than `/`, and character classes
+/// that exclude `/` (a positive class with no `/`, no range spanning it and no `\D`, `\W` or
+/// `\S`, or a negated class that names `/`), each optionally followed by `+`, `*`, `?` or
+/// `{m,n}`. Anything else, such as `.`, an alternation or a nested group, may match `/`.
+fn within_segment(body: &str) -> bool {
+    let chars: Vec<char> = body.chars().collect();
+    let mut at = 0;
+    while at < chars.len() {
+        match chars[at] {
+            '\\' => match chars.get(at + 1) {
+                Some('d' | 'w' | 's') => at += 2,
+                Some(c) if !c.is_alphanumeric() && *c != '/' => at += 2,
+                _ => return false,
+            },
+            '[' => {
+                let negated = chars.get(at + 1) == Some(&'^');
+                let mut end = at + 1 + usize::from(negated);
+                let mut members = Vec::new();
+                // A `]` first in the class is a member.
+                if chars.get(end) == Some(&']') {
+                    members.push(']');
+                    end += 1;
+                }
+                let mut escapes_slash = false;
+                loop {
+                    match chars.get(end) {
+                        None => return false,
+                        Some(']') => break,
+                        Some('\\') => {
+                            match chars.get(end + 1) {
+                                Some('D' | 'W' | 'S') if !negated => return false,
+                                Some('/') => escapes_slash = true,
+                                Some(_) => {}
+                                None => return false,
+                            }
+                            // An escape as a range end point is not read: such a range
+                            // may span `/`.
+                            members.push('\0');
+                            end += 2;
+                        }
+                        Some(c) => {
+                            members.push(*c);
+                            end += 1;
+                        }
+                    }
+                }
+                let spans_slash = members.windows(3).any(|range| {
+                    range[1] == '-'
+                        && (range[0] == '\0'
+                            || range[2] == '\0'
+                            || (range[0] <= '/' && '/' <= range[2]))
+                });
+                let names_slash = members.contains(&'/') || escapes_slash;
+                let excludes = if negated {
+                    names_slash
+                } else {
+                    !names_slash && !spans_slash
+                };
+                if !excludes {
+                    return false;
+                }
+                at = end + 1;
+            }
+            '/' | '.' | '|' | '(' | ')' | '^' | '$' | '*' | '+' | '?' | '{' | '}' | ']' => {
+                return false;
+            }
+            _ => at += 1,
+        }
+        // An optional quantifier after the atom.
+        match chars.get(at) {
+            Some('+' | '*' | '?') => at += 1,
+            Some('{') => {
+                let Some(close) = chars[at..].iter().position(|c| *c == '}') else {
+                    return false;
+                };
+                if !chars[at + 1..at + close]
+                    .iter()
+                    .all(|c| c.is_ascii_digit() || *c == ',')
+                {
+                    return false;
+                }
+                at += close + 1;
+            }
+            _ => {}
+        }
+    }
+    !chars.is_empty()
 }
 
 /// A complete template: rooted at `/`, and with a rest capture only as its whole last
@@ -1031,10 +1135,18 @@ mod tests {
             (r"^a/\d+/$", None),
             (r"^a/(?P<d>\d+/\d+)/$", None),
             (r"^a|b$", None),
+            (r"^a/(?P<x>[^x]+)$", None),
+            (r"^a/(?P<x>a.*b)$", None),
+            (r"^a/(?P<x>[!-0]+)$", None),
+            (r"^a/(?P<x>[\!-0]+)$", None),
+            (r"^a/(?P<x>[\W]+)$", None),
+            (r"^a/(?P<x>[^/]+)$", Some("/a/{x}")),
+            (r"^a/(?P<x>[a-z0-9_-]+)$", Some("/a/{x}")),
+            (r"^a/(?P<x>\d{2,4})$", Some("/a/{x}")),
         ] {
             assert_eq!(
                 regex_template(pattern)
-                    .map(|fragment| format!("/{fragment}"))
+                    .map(|(fragment, _)| format!("/{fragment}"))
                     .as_deref()
                     .and_then(finish)
                     .as_deref(),
