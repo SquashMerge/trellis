@@ -218,7 +218,7 @@ impl<'a> Reader<'_, 'a> {
             if name == Some("newBuilder")
                 && object.is_some_and(|object| {
                     self.view
-                        .resolves(&self.view.compact(object), &[HTTP], "HttpRequest")
+                        .resolves_value(&self.view.compact(object), &[HTTP], "HttpRequest")
                 })
             {
                 if uri.is_none() {
@@ -272,7 +272,7 @@ impl<'a> Reader<'_, 'a> {
                 node.child_by_field_name("name").map(|n| self.text(n)) == Some("create")
                     && node.child_by_field_name("object").is_some_and(|object| {
                         self.view
-                            .resolves(&self.view.compact(object), &[NET], "URI")
+                            .resolves_value(&self.view.compact(object), &[NET], "URI")
                     })
             }
             "object_creation_expression" => {
@@ -285,8 +285,9 @@ impl<'a> Reader<'_, 'a> {
         named.then_some(only)
     }
 
-    /// A Spring client URL: a string, or a `java.net.URI` of one. Each `{name}` URI template
-    /// variable is a substitution.
+    /// A Spring client URL: a string, whose `{name}` URI template variables are
+    /// substitutions, or a `java.net.URI` of one. A `URI` is sent as it is: the client's base
+    /// URL is not applied to it (#876 review), so a rooted `URI` under a base is unreadable.
     fn spring_url(
         &self,
         url: Node<'a>,
@@ -294,9 +295,20 @@ impl<'a> Reader<'_, 'a> {
         work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<(Option<String>, ClientPrefix)> {
-        let node = self.uri_argument(url).unwrap_or(url);
-        let text = self.view.string(node, work, check)?;
-        Ok(assemble(&variables(&text), base))
+        match self.uri_argument(url) {
+            Some(node) => {
+                let text = self.view.string(node, work, check)?;
+                let base = match base {
+                    Base::None => Base::None,
+                    _ => Base::Unknown,
+                };
+                Ok(assemble(&text, &base))
+            }
+            None => {
+                let text = self.view.string(url, work, check)?;
+                Ok(assemble(&variables(&text), base))
+            }
+        }
     }
 
     /// `HttpMethod.M`.
@@ -307,7 +319,10 @@ impl<'a> Reader<'_, 'a> {
         }
         let object = self.view.compact(node.child_by_field_name("object")?);
         let field = self.text(node.child_by_field_name("field")?);
-        if !self.view.resolves(&object, &[SPRING_HTTP], "HttpMethod") {
+        if !self
+            .view
+            .resolves_value(&object, &[SPRING_HTTP], "HttpMethod")
+        {
             return None;
         }
         VERBS.iter().copied().find(|verb| *verb == field)
@@ -452,7 +467,7 @@ impl<'a> Reader<'_, 'a> {
         let webclient = |object: Option<Node<'a>>| {
             object.is_some_and(|object| {
                 self.view
-                    .resolves(&self.view.compact(object), &[REACTIVE], "WebClient")
+                    .resolves_value(&self.view.compact(object), &[REACTIVE], "WebClient")
             })
         };
         let arguments = Document::arguments(node);
@@ -468,6 +483,16 @@ impl<'a> Reader<'_, 'a> {
         }
         // Links from the outermost in: the first base link seen is the last one set.
         let mut base: Option<Base> = None;
+        // A custom URI factory or template handler overrides any base URL, whichever order
+        // the builder is called in (#876 review).
+        let mut overridden = false;
+        let settled = |base: Option<Base>, overridden: bool, default: Base| {
+            if overridden {
+                Base::Unknown
+            } else {
+                base.unwrap_or(default)
+            }
+        };
         let mut link = node.child_by_field_name("object");
         loop {
             check()?;
@@ -489,14 +514,20 @@ impl<'a> Reader<'_, 'a> {
                     if !builder || has_body(current) {
                         return Ok(None);
                     }
-                    return Ok(Some((Kind::RestTemplate, base.unwrap_or(Base::None))));
+                    return Ok(Some((
+                        Kind::RestTemplate,
+                        settled(base, overridden, Base::None),
+                    )));
                 }
                 "method_invocation" => {
                     let arguments = Document::arguments(current);
                     let object = current.child_by_field_name("object");
                     match (name(current), &arguments[..]) {
                         (Some("builder"), []) if webclient(object) => {
-                            return Ok(Some((Kind::WebClient, base.unwrap_or(Base::None))));
+                            return Ok(Some((
+                                Kind::WebClient,
+                                settled(base, overridden, Base::None),
+                            )));
                         }
                         (Some("rootUri" | "baseUrl"), [url]) => {
                             if base.is_none() {
@@ -504,7 +535,7 @@ impl<'a> Reader<'_, 'a> {
                             }
                         }
                         (Some("uriTemplateHandler" | "uriBuilderFactory"), _) => {
-                            base.get_or_insert(Base::Unknown);
+                            overridden = true;
                         }
                         _ => {}
                     }
@@ -513,7 +544,7 @@ impl<'a> Reader<'_, 'a> {
                 "identifier" => {
                     // An injected builder may already carry a base.
                     let kind = self.builder_kind(self.text(current));
-                    return Ok(kind.map(|kind| (kind, base.unwrap_or(Base::Unknown))));
+                    return Ok(kind.map(|kind| (kind, settled(base, overridden, Base::Unknown))));
                 }
                 _ => return Ok(None),
             }

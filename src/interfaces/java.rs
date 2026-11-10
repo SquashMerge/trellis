@@ -53,7 +53,8 @@ pub(super) fn extract(
         if let Some(tree) = tree {
             check()?;
             let doc = &snapshot.documents[index];
-            views.insert(index, Document::new(doc, tree.root_node(), work, check)?);
+            let view = Document::new(&world, index, doc, tree.root_node(), work, check)?;
+            views.insert(index, view);
         }
     }
     let routes = super::java_routes::extract(&world, &views, work, check)?;
@@ -103,6 +104,10 @@ pub(super) struct Unit {
     package: String,
     imports: Vec<Import>,
     pub(super) types: Vec<TypeInfo>,
+    /// Every annotation name written in the document.
+    annotations_written: BTreeSet<String>,
+    /// What each written annotation name resolves to, once resolved.
+    annotations: BTreeMap<String, Super>,
 }
 
 #[derive(Clone)]
@@ -217,8 +222,134 @@ impl<'s> World<'s> {
                 info.superclass = superclass;
                 info.interfaces = resolved;
             }
+            // Annotation types, so that a composed annotation declared in the snapshot is
+            // known for what it carries (#876 review).
+            let written: Vec<String> = self
+                .units
+                .get(&index)
+                .map(|unit| unit.annotations_written.iter().cloned().collect())
+                .unwrap_or_default();
+            charge(work, written.len())?;
+            for name in written {
+                check()?;
+                let resolved = self.resolve(index, &name, &mut queue, work, check)?;
+                if let Some(unit) = self.units.get_mut(&index) {
+                    unit.annotations.insert(name, resolved);
+                }
+            }
         }
         Ok(())
+    }
+
+    /// The type an annotation name written in a document resolved to.
+    pub(super) fn annotation(&self, index: usize, written: &str) -> Super {
+        self.units
+            .get(&index)
+            .and_then(|unit| unit.annotations.get(written))
+            .copied()
+            .unwrap_or(Super::Unresolved)
+    }
+
+    /// Whether a file `Name.java` of the document's own package is in the snapshot: a type of
+    /// the same package that shadows an on-demand or `java.lang` name.
+    pub(super) fn same_package_file(&self, index: usize, simple: &str) -> bool {
+        let package = self
+            .units
+            .get(&index)
+            .map_or("", |unit| unit.package.as_str());
+        let file = format!("{simple}.java");
+        let tail = if package.is_empty() {
+            file.clone()
+        } else {
+            format!("{}/{file}", package.replace('.', "/"))
+        };
+        self.files
+            .get(file.as_str())
+            .into_iter()
+            .flatten()
+            .any(|&other| {
+                let path = &self.snapshot.documents[other].key.path;
+                path == &tail || path.ends_with(&format!("/{tail}"))
+            })
+    }
+
+    /// A parameter type written in a document, qualified so that two distinct types never
+    /// compare equal (#876 review): a qualified name as written, a single-type import, a
+    /// type of the same package, else `java.lang`. A type the document declares, or a
+    /// simple name an on-demand import may supply, is qualified by the document, so it
+    /// equals only itself.
+    pub(super) fn qualify(&self, index: usize, written: &str) -> String {
+        let mut base = String::new();
+        let mut depth = 0usize;
+        for c in written.chars() {
+            match c {
+                '<' => depth += 1,
+                '>' => depth = depth.saturating_sub(1),
+                c if c.is_whitespace() => {}
+                c if depth == 0 => base.push(c),
+                _ => {}
+            }
+        }
+        let (name, suffix) = match base.find('[') {
+            Some(at) => base.split_at(at),
+            None => (base.as_str(), ""),
+        };
+        const PRIMITIVES: [&str; 9] = [
+            "boolean", "byte", "char", "short", "int", "long", "float", "double", "void",
+        ];
+        let Some(unit) = self.units.get(&index) else {
+            return format!("?{index}.{name}{suffix}");
+        };
+        // `java.lang` types an on-demand import cannot also supply without ambiguity.
+        const LANG: [&str; 26] = [
+            "Boolean",
+            "Byte",
+            "Character",
+            "CharSequence",
+            "Class",
+            "Comparable",
+            "Double",
+            "Enum",
+            "Exception",
+            "Float",
+            "Integer",
+            "Iterable",
+            "Long",
+            "Number",
+            "Object",
+            "Record",
+            "Runnable",
+            "RuntimeException",
+            "Short",
+            "String",
+            "StringBuilder",
+            "Thread",
+            "Throwable",
+            "Void",
+            "Math",
+            "Error",
+        ];
+        let qualified = if PRIMITIVES.contains(&name) || name.contains('.') {
+            name.to_owned()
+        } else if unit.types.iter().any(|info| info.name == name) {
+            format!("#{index}.{name}")
+        } else if let Some(import) = unit.imports.iter().find(|import| {
+            !import.is_static && !import.wildcard && import.path.rsplit('.').next() == Some(name)
+        }) {
+            import.path.clone()
+        } else if self.same_package_file(index, name) {
+            format!("{}.{name}", unit.package)
+        } else if !LANG.contains(&name)
+            && unit
+                .imports
+                .iter()
+                .any(|import| !import.is_static && import.wildcard)
+        {
+            format!("?{index}.{name}")
+        } else {
+            format!("java.lang.{name}")
+        };
+        format!("{qualified}{suffix}")
     }
 
     /// The one type a supertype name written in `from` binds to: a type of the same document,
@@ -235,11 +366,13 @@ impl<'s> World<'s> {
         let Some(name) = type_name(written) else {
             return Ok(Super::Unresolved);
         };
-        if name == "Object" || name == "java.lang.Object" {
-            return Ok(Super::Object);
-        }
         if name.contains('.') {
-            return self.lookup(&name, queue, work, check);
+            let found = self.lookup(&name, queue, work, check)?;
+            // Only a proven `java.lang.Object` is mapping-free (#876 review).
+            return Ok(match found {
+                Super::Unresolved if name == "java.lang.Object" => Super::Object,
+                found => found,
+            });
         }
         let unit = &self.units[&from];
         let mut same = unit
@@ -263,6 +396,11 @@ impl<'s> World<'s> {
             .collect();
         let qualified = match &imported[..] {
             [only] => only.clone(),
+            [] if name == "Object" && !self.same_package_file(from, &name) => {
+                // Neither declared, imported nor in the package: `java.lang.Object`, which
+                // an on-demand import cannot also supply without ambiguity.
+                return Ok(Super::Object);
+            }
             [] if unit.package.is_empty() => name,
             [] => format!("{}.{name}", unit.package),
             _ => return Ok(Super::Unresolved),
@@ -387,7 +525,13 @@ fn unit(
         }
     }
     let mut types = Vec::new();
+    let mut annotations_written = BTreeSet::new();
     walk(root, check, &mut |node, _| {
+        if matches!(node.kind(), "annotation" | "marker_annotation")
+            && let Some(name) = node.child_by_field_name("name")
+        {
+            annotations_written.insert(text(name).split_whitespace().collect::<String>());
+        }
         let Some(kind) = TYPES.iter().copied().find(|kind| *kind == node.kind()) else {
             return Ok(false);
         };
@@ -448,6 +592,8 @@ fn unit(
         package,
         imports,
         types,
+        annotations_written,
+        annotations: BTreeMap::new(),
     })
 }
 
@@ -488,7 +634,12 @@ pub(super) struct Document<'a> {
     pub(super) root: Node<'a>,
     pub(super) lines: LineIndex,
     keys: OnceCell<BTreeMap<String, String>>,
+    world: &'a World<'a>,
+    index: usize,
     imports: Vec<Import>,
+    /// Every name a local, parameter, pattern, lambda, catch, resource, `for` variable or
+    /// single static import binds.
+    bound: BTreeSet<String>,
     /// The simple names of the types the document declares.
     types: BTreeSet<&'a str>,
     /// Readable constants by name: the declaring type's node and the value.
@@ -507,6 +658,8 @@ impl<'a> Document<'a> {
     /// resource, `for`, lambda or pattern variable, enum constant, other field, or single
     /// static import.
     fn new(
+        world: &'a World<'a>,
+        index: usize,
         doc: &'a DocumentInput,
         root: Node<'a>,
         work: &mut Work,
@@ -518,7 +671,8 @@ impl<'a> Document<'a> {
         let mut imports = Vec::new();
         let mut types = BTreeSet::new();
         let mut bound: BTreeSet<String> = BTreeSet::new();
-        let mut fields: BTreeMap<&'a str, Vec<Option<(usize, Node<'a>)>>> = BTreeMap::new();
+        let mut fields: BTreeMap<&'a str, Vec<Option<(usize, Node<'a>, &'a str)>>> =
+            BTreeMap::new();
         let mut declared: BTreeMap<&'a str, Vec<Binding<'a>>> = BTreeMap::new();
         let mut assigned: BTreeMap<&'a str, Vec<Node<'a>>> = BTreeMap::new();
         walk(root, check, &mut |node, _| {
@@ -547,19 +701,18 @@ impl<'a> Document<'a> {
                     let constant =
                         implicit || (has_modifier(node, "static") && has_modifier(node, "final"));
                     let ty = node.child_by_field_name("type");
-                    let string =
-                        ty.is_some_and(|ty| matches!(text(ty), "String" | "java.lang.String"));
+                    let written = ty.map(|ty| text(ty));
                     let mut cursor = node.walk();
                     for declarator in node.children_by_field_name("declarator", &mut cursor) {
                         let Some(name) = declarator.child_by_field_name("name") else {
                             continue;
                         };
                         let value = declarator.child_by_field_name("value");
-                        let readable = match (owner, value) {
-                            (Some(owner), Some(value))
-                                if constant && string && value.kind() == "string_literal" =>
+                        let readable = match (owner, value, written) {
+                            (Some(owner), Some(value), Some(written))
+                                if constant && value.kind() == "string_literal" =>
                             {
-                                Some((owner, value))
+                                Some((owner, value, written))
                             }
                             _ => None,
                         };
@@ -669,30 +822,71 @@ impl<'a> Document<'a> {
             }
             Ok(false)
         })?;
-        let string_shadowed = types.contains("String");
-        let mut constants = BTreeMap::new();
-        for (name, declarations) in fields {
-            if bound.contains(name) || string_shadowed {
-                continue;
-            }
-            if let [Some((owner, value))] = declarations[..]
-                && let Some(literal) = literal_text(value, source)
-            {
-                constants.insert(name, (owner, literal));
-            }
-        }
-        Ok(Self {
+        let mut view = Self {
             doc,
             source,
             root,
             lines: LineIndex::new(source),
             keys: OnceCell::new(),
+            world,
+            index,
             imports,
+            bound,
             types,
-            constants,
+            constants: BTreeMap::new(),
             declared,
             assigned,
-        })
+        };
+        let mut constants = BTreeMap::new();
+        for (name, declarations) in fields {
+            if view.bound.contains(name) {
+                continue;
+            }
+            if let [Some((owner, value, written))] = declarations[..]
+                && view.string_type(written)
+                && let Some(literal) = literal_text(value, source)
+            {
+                constants.insert(name, (owner, literal));
+            }
+        }
+        view.constants = constants;
+        Ok(view)
+    }
+
+    /// Whether a type name written simple is the `java.lang` type: declared nowhere in the
+    /// document, imported singly from nowhere else, and no file of the same package declares
+    /// it. An on-demand import cannot also supply it without ambiguity.
+    fn java_lang(&self, simple: &str) -> bool {
+        let suffix = format!(".{simple}");
+        !self.types.contains(simple)
+            && !self.imports.iter().any(|import| {
+                !import.is_static
+                    && !import.wildcard
+                    && import.path.ends_with(&suffix)
+                    && import.path != format!("java.lang{suffix}")
+            })
+            && !self.world.same_package_file(self.index, simple)
+    }
+
+    /// Whether a written type is `java.lang.String`.
+    pub(super) fn string_type(&self, written: &str) -> bool {
+        let written: String = written.split_whitespace().collect();
+        written == "java.lang.String" || (written == "String" && self.java_lang("String"))
+    }
+
+    /// Whether a name is bound as a variable anywhere in the document, so that in an
+    /// expression it may name a value rather than a type.
+    fn value_name(&self, name: &str) -> bool {
+        self.bound.contains(name) || self.declared.contains_key(name)
+    }
+
+    /// As [`Self::resolves`], for a type written as an expression's qualifier, such as the
+    /// `HttpMethod` of `HttpMethod.GET`: a variable of the first name would be read instead,
+    /// so none may be bound anywhere in the document (#876 review).
+    pub(super) fn resolves_value(&self, written: &str, packages: &[&str], simple: &str) -> bool {
+        let written: String = written.split_whitespace().collect();
+        let first = written.split('.').next().unwrap_or_default();
+        !self.value_name(first) && self.resolves(&written, packages, simple)
     }
 
     pub(super) fn text(&self, node: Node<'_>) -> &'a str {
@@ -753,19 +947,11 @@ impl<'a> Document<'a> {
                     .any(|package| import.path == format!("{package}{suffix}"))
             });
         }
-        self.imports.iter().any(|import| {
-            !import.is_static && import.wildcard && packages.contains(&import.path.as_str())
-        })
-    }
-
-    /// Whether any annotation or type name written simple is imported from one of `packages`
-    /// or written qualified in one.
-    pub(super) fn in_package(&self, written: &str, packages: &[&str]) -> bool {
-        let written: String = written.split_whitespace().collect();
-        match written.rsplit_once('.') {
-            Some((package, _)) => packages.contains(&package),
-            None => self.resolves(&written, packages, &written),
-        }
+        // A type of the document's own package shadows an on-demand import.
+        !self.world.same_package_file(self.index, simple)
+            && self.imports.iter().any(|import| {
+                !import.is_static && import.wildcard && packages.contains(&import.path.as_str())
+            })
     }
 
     /// The value of a readable constant named at `at`, when the declaring type encloses `at`
@@ -891,8 +1077,8 @@ impl<'a> Document<'a> {
         let arguments = Self::arguments(call);
         let (template, values) = match (name, object) {
             (Some("format"), Some(object))
-                if matches!(self.compact(object).as_str(), "String" | "java.lang.String")
-                    && !self.types.contains("String") =>
+                if !self.value_name(self.compact(object).split('.').next().unwrap_or_default())
+                    && self.string_type(&self.compact(object)) =>
             {
                 match arguments.split_first() {
                     Some((template, values)) => (*template, values.to_vec()),

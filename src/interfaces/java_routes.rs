@@ -21,6 +21,30 @@ const SPRING_MAPPINGS: [(&str, Option<&str>); 6] = [
     ("DeleteMapping", Some("DELETE")),
     ("PatchMapping", Some("PATCH")),
 ];
+/// The annotations of the JAX-RS package a resource method or its parameters may carry.
+const JAXRS_ANNOTATIONS: [&str; 21] = [
+    "Path",
+    "GET",
+    "POST",
+    "PUT",
+    "DELETE",
+    "PATCH",
+    "HEAD",
+    "OPTIONS",
+    "Produces",
+    "Consumes",
+    "PathParam",
+    "QueryParam",
+    "HeaderParam",
+    "CookieParam",
+    "FormParam",
+    "MatrixParam",
+    "BeanParam",
+    "DefaultValue",
+    "Encoded",
+    "HttpMethod",
+    "NameBinding",
+];
 const VERBS: [&str; 7] = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"];
 /// Supertype levels an inheritance walk follows before the rest is unresolved.
 const LEVELS: usize = 32;
@@ -273,19 +297,30 @@ fn jaxrs_order(world: &World<'_>, index: usize, at: usize) -> Vec<Item> {
 }
 
 /// The instance methods a type's body declares, with their signatures.
-fn methods<'t>(view: &Document<'t>, node: Node<'t>) -> Vec<(String, Node<'t>)> {
+fn methods<'t>(
+    world: &World<'_>,
+    index: usize,
+    view: &Document<'t>,
+    node: Node<'t>,
+) -> Vec<(String, Node<'t>)> {
     let Some(body) = node.child_by_field_name("body") else {
         return Vec::new();
     };
     Document::named_children(body)
         .into_iter()
         .filter(|child| child.kind() == "method_declaration" && !has_modifier(*child, "static"))
-        .filter_map(|method| Some((signature(view, method)?, method)))
+        .filter_map(|method| Some((signature(world, index, view, method)?, method)))
         .collect()
 }
 
-/// `name(T1,T2)`, with each parameter type's simple name and no type arguments.
-fn signature(view: &Document<'_>, method: Node<'_>) -> Option<String> {
+/// `name(T1,T2)`, each parameter type qualified as its document binds it (#876 review), so
+/// overloads on distinct types with one simple name stay distinct.
+fn signature(
+    world: &World<'_>,
+    index: usize,
+    view: &Document<'_>,
+    method: Node<'_>,
+) -> Option<String> {
     let name = view.text(method.child_by_field_name("name")?);
     let mut types = Vec::new();
     if let Some(parameters) = method.child_by_field_name("parameters") {
@@ -298,34 +333,96 @@ fn signature(view: &Document<'_>, method: Node<'_>) -> Option<String> {
                     .map(|t| view.text(t)),
                 _ => None,
             };
-            let mut simple = String::new();
-            let mut depth = 0usize;
-            for c in ty.unwrap_or("?").chars() {
-                match c {
-                    '<' => depth += 1,
-                    '>' => depth = depth.saturating_sub(1),
-                    '.' if depth == 0 => simple.clear(),
-                    c if c.is_whitespace() => {}
-                    c if depth == 0 => simple.push(c),
-                    _ => {}
-                }
-            }
+            let mut qualified = world.qualify(index, ty.unwrap_or("?"));
             if parameter.kind() == "spread_parameter" {
-                simple.push_str("[]");
+                qualified.push_str("[]");
             }
-            types.push(simple);
+            types.push(qualified);
         }
     }
     Some(format!("{name}({})", types.join(",")))
 }
 
+/// Whether an annotation written in a document is a composed or meta-annotation of the
+/// framework: an annotation type of the snapshot that carries one of the framework's
+/// mapping annotations, itself or through another such type. It decides what it is
+/// written on, though it cannot be read (#876 review).
+fn composed(
+    world: &World<'_>,
+    views: &Views<'_>,
+    index: usize,
+    written: &str,
+    framework: Framework,
+    level: usize,
+) -> bool {
+    let Super::Resolved(declared, at) = world.annotation(index, written) else {
+        return false;
+    };
+    if level > 4 {
+        return true;
+    }
+    let Some((view, node)) = world.node(views, declared, at) else {
+        return false;
+    };
+    if node.kind() != "annotation_type_declaration" {
+        return false;
+    }
+    Document::annotations(node).into_iter().any(|annotation| {
+        let name = view.annotation_name(annotation);
+        let direct = match framework {
+            Framework::Spring => SPRING_MAPPINGS
+                .iter()
+                .any(|(simple, _)| view.resolves(&name, &[SPRING], simple)),
+            Framework::Jaxrs => ["HttpMethod", "Path"]
+                .into_iter()
+                .chain(VERBS)
+                .any(|simple| view.resolves(&name, &JAXRS, simple)),
+        };
+        direct || composed(world, views, declared, &name, framework, level + 1)
+    })
+}
+
+/// Whether any annotation on a declaration is a composed mapping of the framework.
+fn carries_composed(
+    world: &World<'_>,
+    views: &Views<'_>,
+    index: usize,
+    view: &Document<'_>,
+    declaration: Node<'_>,
+    framework: Framework,
+) -> bool {
+    Document::annotations(declaration)
+        .into_iter()
+        .any(|annotation| {
+            composed(
+                world,
+                views,
+                index,
+                &view.annotation_name(annotation),
+                framework,
+                0,
+            )
+        })
+}
+
 /// The method's own Spring mapping: the methods it answers and its paths.
 fn spring_mapping(
-    view: &Document<'_>,
+    scope: Scope<'_, '_, '_>,
     declaration: Node<'_>,
     work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Read<(Vec<&'static str>, Vec<String>)>> {
+    let view = scope.view;
+    if carries_composed(
+        scope.world,
+        scope.views,
+        scope.index,
+        view,
+        declaration,
+        Framework::Spring,
+    ) {
+        return Ok(Read::Unknown);
+    }
     let mut found = Vec::new();
     for annotation in Document::annotations(declaration) {
         let name = view.annotation_name(annotation);
@@ -412,7 +509,7 @@ fn request_methods(view: &Document<'_>, annotation: Node<'_>) -> Option<Vec<&'st
         }
         let object = view.compact(element.child_by_field_name("object")?);
         let field = view.text(element.child_by_field_name("field")?);
-        if !view.resolves(&object, &[SPRING], "RequestMethod") {
+        if !view.resolves_value(&object, &[SPRING], "RequestMethod") {
             return None;
         }
         let verb = VERBS.iter().copied().find(|verb| *verb == field)?;
@@ -425,11 +522,22 @@ fn request_methods(view: &Document<'_>, annotation: Node<'_>) -> Option<Vec<&'st
 
 /// A type's own class-level `@RequestMapping` paths. One that names a method cannot be read.
 fn spring_class(
-    view: &Document<'_>,
+    scope: Scope<'_, '_, '_>,
     declaration: Node<'_>,
     work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Read<Vec<String>>> {
+    let view = scope.view;
+    if carries_composed(
+        scope.world,
+        scope.views,
+        scope.index,
+        view,
+        declaration,
+        Framework::Spring,
+    ) {
+        return Ok(Read::Unknown);
+    }
     let mappings: Vec<Node<'_>> = Document::annotations(declaration)
         .into_iter()
         .filter(|annotation| {
@@ -485,7 +593,13 @@ fn spring(
         let Some((view, node)) = world.node(views, index, at) else {
             return Ok(());
         };
-        match spring_class(view, node, work, check)? {
+        let scope = Scope {
+            world,
+            views,
+            index,
+            view,
+        };
+        match spring_class(scope, node, work, check)? {
             Read::Absent => {}
             Read::Known(paths) => {
                 prefixes = Some(paths);
@@ -496,9 +610,8 @@ fn spring(
     }
     let prefixes = prefixes.unwrap_or_else(|| vec![String::new()]);
     let entries = entries(world, views, &order, work, check, Framework::Spring)?;
-    emit(
-        views, index, at, world, &prefixes, entries, found, work, check,
-    )
+    let class = (index, at, Framework::Spring);
+    emit(views, class, world, &prefixes, entries, found, work, check)
 }
 
 /// The routes of one JAX-RS resource class: a class with its own `@Path`.
@@ -530,30 +643,37 @@ fn jaxrs(
     charge(work, order.len())?;
     let entries = entries(world, views, &order, work, check, Framework::Jaxrs)?;
     let prefix = join(application, &class_path);
-    emit(
-        views,
-        index,
-        at,
-        world,
-        &[prefix],
-        entries,
-        found,
-        work,
-        check,
-    )
+    let class = (index, at, Framework::Jaxrs);
+    emit(views, class, world, &[prefix], entries, found, work, check)
 }
 
 /// A JAX-RS method's own resource method: its HTTP method and `@Path`. `Absent` when neither
 /// the method nor a parameter carries a JAX-RS annotation, so it inherits; `Unknown` when
 /// it carries some but is not one resource method.
 fn jaxrs_method(
-    view: &Document<'_>,
+    scope: Scope<'_, '_, '_>,
     declaration: Node<'_>,
     work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Read<(Vec<&'static str>, Vec<String>)>> {
+    let view = scope.view;
+    if carries_composed(
+        scope.world,
+        scope.views,
+        scope.index,
+        view,
+        declaration,
+        Framework::Jaxrs,
+    ) {
+        return Ok(Read::Unknown);
+    }
     let annotations = Document::annotations(declaration);
-    let own = |annotation: &Node<'_>| view.in_package(&view.annotation_name(*annotation), &JAXRS);
+    let own = |annotation: &Node<'_>| {
+        let name = view.annotation_name(*annotation);
+        JAXRS_ANNOTATIONS
+            .iter()
+            .any(|simple| view.resolves(&name, &JAXRS, simple))
+    };
     let mut any = annotations.iter().any(own);
     if let Some(parameters) = declaration.child_by_field_name("parameters") {
         for parameter in Document::named_children(parameters) {
@@ -591,11 +711,32 @@ fn jaxrs_method(
     Ok(Read::Known((vec![verb], vec![path])))
 }
 
-/// Whose annotations decide a method.
-#[derive(Clone, Copy)]
-enum Framework {
+/// The method name and parameter count of a signature `name(T1,T2)`.
+fn shape(signature: &str) -> (String, usize) {
+    let (name, parameters) = signature.split_once('(').unwrap_or((signature, ""));
+    let parameters = parameters.trim_end_matches(')');
+    let arity = if parameters.is_empty() {
+        0
+    } else {
+        parameters.split(',').count()
+    };
+    (name.to_owned(), arity)
+}
+
+/// Whose annotations decide a method, and whose template rules a path follows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Framework {
     Spring,
     Jaxrs,
+}
+
+/// Where a declaration is read: its document and the snapshot around it.
+#[derive(Clone, Copy)]
+struct Scope<'w, 'v, 't> {
+    world: &'w World<'w>,
+    views: &'v Views<'t>,
+    index: usize,
+    view: &'v Document<'t>,
 }
 
 /// Each method signature of a class in its inheritance order, decided by the first
@@ -611,8 +752,10 @@ fn entries<'t>(
 ) -> Result<Vec<Entry<'t>>> {
     let mut entries: Vec<Entry<'t>> = Vec::new();
     let mut by_signature: HashMap<String, usize> = HashMap::new();
+    // Each (name, arity) with the signatures and the order position that declared them.
+    let mut by_shape: HashMap<(String, usize), Vec<(String, usize, usize)>> = HashMap::new();
     let mut unresolved = false;
-    for item in order {
+    for (position, item) in order.iter().enumerate() {
         let (index, at) = match *item {
             Item::Unresolved => {
                 unresolved = true;
@@ -625,11 +768,12 @@ fn entries<'t>(
             continue;
         };
         let class = node.kind() != "interface_declaration";
-        let declared = methods(view, node);
+        let declared = methods(world, index, view, node);
         charge(work, declared.len())?;
         for (signature, method) in declared {
             check()?;
-            let slot = *by_signature.entry(signature).or_insert_with(|| {
+            let new = !by_signature.contains_key(&signature);
+            let slot = *by_signature.entry(signature.clone()).or_insert_with(|| {
                 entries.push(Entry {
                     handler: None,
                     default_handler: None,
@@ -638,6 +782,26 @@ fn entries<'t>(
                 });
                 entries.len() - 1
             });
+            if new {
+                // A parameter type the document cannot bind may be the same type as one an
+                // overriding method names differently, so the two may be one method. Which
+                // mapping decides it is then unknown (#876 review).
+                let shape = shape(&signature);
+                let others = by_shape.entry(shape).or_default();
+                let mut ambiguous = false;
+                for (other, other_slot, other_position) in others.iter() {
+                    if *other_position != position
+                        && (other.contains('?') || signature.contains('?'))
+                    {
+                        ambiguous = true;
+                        entries[*other_slot].mapping.get_or_insert(Read::Unknown);
+                    }
+                }
+                if ambiguous {
+                    entries[slot].mapping = Some(Read::Unknown);
+                }
+                others.push((signature, slot, position));
+            }
             let entry = &mut entries[slot];
             if method.child_by_field_name("body").is_some() {
                 let handler = if class {
@@ -650,9 +814,15 @@ fn entries<'t>(
             if entry.mapping.is_some() {
                 continue;
             }
+            let scope = Scope {
+                world,
+                views,
+                index,
+                view,
+            };
             let read = match framework {
-                Framework::Spring => spring_mapping(view, method, work, check)?,
-                Framework::Jaxrs => jaxrs_method(view, method, work, check)?,
+                Framework::Spring => spring_mapping(scope, method, work, check)?,
+                Framework::Jaxrs => jaxrs_method(scope, method, work, check)?,
             };
             if matches!(read, Read::Absent) {
                 continue;
@@ -668,8 +838,7 @@ fn entries<'t>(
 #[allow(clippy::too_many_arguments)]
 fn emit(
     views: &Views<'_>,
-    index: usize,
-    at: usize,
+    (index, at, framework): (usize, usize, Framework),
     world: &World<'_>,
     prefixes: &[String],
     entries: Vec<Entry<'_>>,
@@ -719,7 +888,7 @@ fn emit(
             for prefix in prefixes {
                 for path in &paths {
                     check()?;
-                    let Some(template) = template(&join(prefix, path)) else {
+                    let Some(template) = template(&join(prefix, path), framework) else {
                         continue;
                     };
                     found.push(Found {
@@ -740,11 +909,17 @@ fn emit(
     Ok(())
 }
 
-/// A Spring or JAX-RS path in the #788 template form. `{name}` and `{name:regex}` are
-/// `{name}`. A last segment `{*name}` (Spring), or `{name:.*}` or `{name:.+}` (JAX-RS, whose
-/// pattern may span segments), is `{*name}`. A Spring `*`, `**` or `?` wildcard, or an
-/// unbalanced brace, makes the path unreadable.
-pub(super) fn template(path: &str) -> Option<String> {
+/// A Spring or JAX-RS path in the #788 template form, by each framework's own rules
+/// (#876 review). For both, `{name}` and `{name:regex}` are `{name}`, and an unbalanced brace
+/// makes the path unreadable.
+///
+/// - Spring (`PathPattern`): a `{name:regex}` matches one segment, so it stays `{name}`; only
+///   a last `{*name}` captures the rest, as `{*name}`. A `*`, `**` or `?` wildcard makes the
+///   path unreadable.
+/// - JAX-RS: a variable's pattern may span segments, so a last `{name:.*}` or `{name:.+}` is
+///   `{*name}`. `*` and `?` outside a variable are literal characters, and `{*name}` is not a
+///   variable, so it is unreadable.
+pub(super) fn template(path: &str, framework: Framework) -> Option<String> {
     let parts: Vec<&str> = path.split('/').collect();
     let mut out = Vec::with_capacity(parts.len());
     for (at, part) in parts.iter().enumerate() {
@@ -774,7 +949,7 @@ pub(super) fn template(path: &str) -> Option<String> {
                     let whole = start == 0 && end + 1 == part.len();
                     if let Some(name) = body.strip_prefix('*') {
                         let name = name.trim();
-                        if !(last && whole) || name.is_empty() {
+                        if framework != Framework::Spring || !(last && whole) || name.is_empty() {
                             return None;
                         }
                         segment.push_str(&format!("{{*{name}}}"));
@@ -785,13 +960,18 @@ pub(super) fn template(path: &str) -> Option<String> {
                     if name.is_empty() {
                         return None;
                     }
-                    if last && whole && matches!(regex.trim(), ".*" | ".+") {
+                    let rest = framework == Framework::Jaxrs
+                        && last
+                        && whole
+                        && matches!(regex.trim(), ".*" | ".+");
+                    if rest {
                         segment.push_str(&format!("{{*{name}}}"));
                     } else {
                         segment.push_str(&format!("{{{name}}}"));
                     }
                 }
-                '}' | '*' | '?' => return None,
+                '}' => return None,
+                '*' | '?' if framework == Framework::Spring => return None,
                 c => segment.push(c),
             }
         }
@@ -802,29 +982,56 @@ pub(super) fn template(path: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::template;
+    use super::{Framework, template};
 
     #[test]
-    fn paths_normalise_to_the_template_form() {
-        for (path, read) in [
-            ("/users/{id}", Some("/users/{id}")),
-            ("/users/{id:\\d+}/posts", Some("/users/{id}/posts")),
-            ("/users/{ id : [0-9]+ }", Some("/users/{id}")),
-            ("/n/{id:\\d{3}}", Some("/n/{id}")),
-            ("/files/{*path}", Some("/files/{*path}")),
-            ("/files/{path: .*}", Some("/files/{*path}")),
-            ("/files/{path:.+}", Some("/files/{*path}")),
-            ("/a/{x:.*}/b", Some("/a/{x}/b")),
-            ("/report-{id}.json", Some("/report-{id}.json")),
-            ("/files/{*path}/x", None),
-            ("/files/**", None),
-            ("/files/*.html", None),
-            ("/q?", None),
-            ("/bad/{id", None),
-            ("/bad/}", None),
-            ("/bad/{}", None),
+    fn paths_normalise_to_each_frameworks_template_form() {
+        // (path, Spring, JAX-RS)
+        for (path, spring, jaxrs) in [
+            ("/users/{id}", Some("/users/{id}"), Some("/users/{id}")),
+            (
+                "/users/{id:\\d+}/posts",
+                Some("/users/{id}/posts"),
+                Some("/users/{id}/posts"),
+            ),
+            (
+                "/users/{ id : [0-9]+ }",
+                Some("/users/{id}"),
+                Some("/users/{id}"),
+            ),
+            ("/n/{id:\\d{3}}", Some("/n/{id}"), Some("/n/{id}")),
+            ("/files/{*path}", Some("/files/{*path}"), None),
+            (
+                "/files/{path: .*}",
+                Some("/files/{path}"),
+                Some("/files/{*path}"),
+            ),
+            (
+                "/files/{path:.+}",
+                Some("/files/{path}"),
+                Some("/files/{*path}"),
+            ),
+            ("/a/{x:.*}/b", Some("/a/{x}/b"), Some("/a/{x}/b")),
+            (
+                "/report-{id}.json",
+                Some("/report-{id}.json"),
+                Some("/report-{id}.json"),
+            ),
+            ("/files/{*path}/x", None, None),
+            ("/files/**", None, Some("/files/**")),
+            ("/files/*", None, Some("/files/*")),
+            ("/files/*.html", None, Some("/files/*.html")),
+            ("/q?", None, Some("/q?")),
+            ("/bad/{id", None, None),
+            ("/bad/}", None, None),
+            ("/bad/{}", None, None),
         ] {
-            assert_eq!(template(path).as_deref(), read, "{path}");
+            assert_eq!(
+                template(path, Framework::Spring).as_deref(),
+                spring,
+                "{path}"
+            );
+            assert_eq!(template(path, Framework::Jaxrs).as_deref(), jaxrs, "{path}");
         }
     }
 }

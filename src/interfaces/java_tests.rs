@@ -1021,3 +1021,298 @@ fn deeply_nested_and_malformed_java_does_not_panic() {
         ["GET /c"]
     );
 }
+
+// #876 review: each scenario failed on 8a6a3d96, with a control that held there.
+
+/// #876 review 1: overloads on distinct types that share a simple name are distinct
+/// methods, and an override still inherits its own overload's mapping.
+#[test]
+fn overloads_on_distinct_qualified_types_stay_distinct() {
+    let overloads = r#"package a;
+import org.springframework.web.bind.annotation.*;
+@RestController
+class C {
+    @GetMapping("/a") public void run(x.Id id) {}
+    @PostMapping("/b") public void run(y.Id id) {}
+}
+"#;
+    assert_eq!(
+        route_table(&[("src/main/java/a/C.java", overloads)]),
+        ["GET /a", "POST /b"]
+    );
+    let inherited = r#"package a;
+import org.springframework.web.bind.annotation.*;
+interface Api {
+    @GetMapping("/i") void run(x.Id id);
+}
+@RestController
+class D implements Api {
+    public void run(y.Id id) {}
+    public void run(x.Id id) {}
+}
+"#;
+    let found = run(&[("src/main/java/a/D.java", inherited)]);
+    assert_eq!(routes(&found), ["GET /i"]);
+    assert_eq!(found.routes[0].handler.lines.start, 9);
+}
+
+/// #876 review 2: Spring and JAX-RS templates follow their own framework's rules.
+#[test]
+fn spring_and_jaxrs_templates_follow_their_own_rules() {
+    let spring = r#"package a;
+import org.springframework.web.bind.annotation.*;
+@RestController
+@RequestMapping("/files")
+class C {
+    @GetMapping("/{name:.+}") String file() { return ""; }
+    @GetMapping("/tail/{*rest}") String tail() { return ""; }
+    @GetMapping("/*") String star() { return ""; }
+}
+"#;
+    let client = r#"package c;
+import org.springframework.web.client.RestTemplate;
+class Client {
+    void run(RestTemplate rest) {
+        rest.getForObject("http://h/files/a/b", String.class);
+        rest.getForObject("http://h/files/a", String.class);
+    }
+}
+"#;
+    let found = run(&[
+        ("api/src/main/java/a/C.java", spring),
+        ("client/src/main/java/c/Client.java", client),
+    ]);
+    assert_eq!(
+        routes(&found),
+        ["GET /files/{name}", "GET /files/tail/{*rest}"]
+    );
+    assert_eq!(
+        outcomes(&found),
+        [
+            "GET /files/a/b -> unresolved",
+            "GET /files/a -> /files/{name} Template",
+        ]
+    );
+    let jaxrs = r#"package a;
+import javax.ws.rs.*;
+@Path("/files")
+public class R {
+    @GET @Path("{name:.+}") public String file() { return ""; }
+    @GET @Path("*") public String star() { return ""; }
+    @GET @Path("tail/{*rest}") public String tail() { return ""; }
+}
+"#;
+    assert_eq!(
+        route_table(&[("src/main/java/a/R.java", jaxrs)]),
+        ["GET /files/{*name}", "GET /files/*"]
+    );
+}
+
+/// #876 review 3: an own composed mapping or prefix decides what it is written on, so it
+/// never falls back to an ancestor's mapping or prefix.
+#[test]
+fn an_own_composed_annotation_never_inherits_an_ancestor_mapping() {
+    let method = r#"package a;
+import java.lang.annotation.*;
+import org.springframework.web.bind.annotation.*;
+@RequestMapping(path = "/own", method = RequestMethod.POST)
+@Target(ElementType.METHOD) @Retention(RetentionPolicy.RUNTIME)
+@interface OwnPost {}
+interface Base { @GetMapping("/base") String call(); }
+@RestController @RequestMapping("/r")
+class C implements Base {
+    @OwnPost public String call() { return ""; }
+}
+"#;
+    assert!(route_table(&[("src/main/java/a/C.java", method)]).is_empty());
+    let prefix = r#"package a;
+import java.lang.annotation.*;
+import org.springframework.web.bind.annotation.*;
+@RequestMapping("/own")
+@Target(ElementType.TYPE) @Retention(RetentionPolicy.RUNTIME)
+@interface OwnPrefix {}
+@RequestMapping("/base") interface Base {}
+@RestController @OwnPrefix
+class C implements Base {
+    @GetMapping("/x") public String x() { return ""; }
+}
+"#;
+    assert!(route_table(&[("src/main/java/a/C.java", prefix)]).is_empty());
+    // Declared in another file and imported.
+    let own_post = r#"package a.meta;
+import org.springframework.web.bind.annotation.*;
+@RequestMapping(path = "/own", method = RequestMethod.POST)
+public @interface OwnPost {}
+"#;
+    let imported = method
+        .replace(
+            "@RequestMapping(path = \"/own\", method = RequestMethod.POST)\n@Target(ElementType.METHOD) @Retention(RetentionPolicy.RUNTIME)\n@interface OwnPost {}\n",
+            "",
+        )
+        .replace("package a;\n", "package a;\nimport a.meta.OwnPost;\n");
+    assert!(
+        route_table(&[
+            ("src/main/java/a/meta/OwnPost.java", own_post),
+            ("src/main/java/a/C.java", &imported),
+        ])
+        .is_empty()
+    );
+    let jaxrs = r#"package a;
+import java.lang.annotation.*;
+import javax.ws.rs.*;
+@HttpMethod("PATCH")
+@Target(ElementType.METHOD) @Retention(RetentionPolicy.RUNTIME)
+@interface Patchy {}
+interface Base { @GET @Path("old") String call(); }
+@Path("/r")
+public class R implements Base {
+    @Patchy public String call() { return ""; }
+}
+"#;
+    assert!(route_table(&[("src/main/java/a/R.java", jaxrs)]).is_empty());
+    // Control: an unrelated annotation does not stop ordinary inheritance.
+    let ordinary = method.replace("@OwnPost public", "@Override @Deprecated public");
+    assert_eq!(
+        route_table(&[("src/main/java/a/C.java", &ordinary)]),
+        ["GET /r/base"]
+    );
+    let ordinary_jaxrs = jaxrs.replace("@Patchy public", "@Override public");
+    assert_eq!(
+        route_table(&[("src/main/java/a/R.java", &ordinary_jaxrs)]),
+        ["GET /r/old"]
+    );
+}
+
+/// #876 review 4: a user type named `Object` is that type, not `java.lang.Object`.
+#[test]
+fn a_user_type_named_object_is_not_java_lang_object() {
+    let same_document = r#"package a;
+import org.springframework.web.bind.annotation.*;
+@RequestMapping("/api") class Object {}
+@RestController
+class C extends Object {
+    @GetMapping("/x") public String x() { return ""; }
+}
+"#;
+    assert_eq!(
+        route_table(&[("src/main/java/a/C.java", same_document)]),
+        ["GET /api/x"]
+    );
+    let user_object = r#"package b;
+import org.springframework.web.bind.annotation.*;
+@RequestMapping("/api")
+public class Object {}
+"#;
+    let imported = r#"package a;
+import b.Object;
+import org.springframework.web.bind.annotation.*;
+@RestController
+class C extends Object {
+    @GetMapping("/x") public String x() { return ""; }
+}
+"#;
+    let both = [
+        ("src/main/java/b/Object.java", user_object),
+        ("src/main/java/a/C.java", imported),
+    ];
+    assert_eq!(route_table(&both), ["GET /api/x"]);
+    // An imported `Object` the snapshot does not hold is unknown: nothing registers.
+    assert!(route_table(&[both[1]]).is_empty());
+    // Control: `java.lang.Object` carries no mapping.
+    let plain = imported.replace("import b.Object;\n", "");
+    assert_eq!(
+        route_table(&[("src/main/java/a/C.java", &plain)]),
+        ["GET /x"]
+    );
+    let qualified = plain.replace("extends Object", "extends java.lang.Object");
+    assert_eq!(
+        route_table(&[("src/main/java/a/C.java", &qualified)]),
+        ["GET /x"]
+    );
+}
+
+/// #876 review 5: a custom URI factory or template handler overrides the base URL in either
+/// order, so a rooted path is unresolved.
+#[test]
+fn a_custom_uri_factory_overrides_the_base_url_in_either_order() {
+    let client = r#"package c;
+import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.client.RestTemplate;
+import org.springframework.boot.web.client.RestTemplateBuilder;
+class C {
+    private final WebClient before = WebClient.builder().uriBuilderFactory(factory).baseUrl("http://h/api").build();
+    private final WebClient after = WebClient.builder().baseUrl("http://h/api").uriBuilderFactory(factory).build();
+    private final WebClient base = WebClient.builder().baseUrl("http://h/api").build();
+    private final RestTemplate handled = new RestTemplateBuilder().uriTemplateHandler(handler).rootUri("http://h/api").build();
+    void run() {
+        before.get().uri("/users").retrieve();
+        after.get().uri("/users").retrieve();
+        base.get().uri("/users").retrieve();
+        handled.getForObject("/users", String.class);
+    }
+}
+"#;
+    assert_eq!(calls(client), ["GET ?", "GET ?", "GET /api/users", "GET ?"]);
+}
+
+/// #876 review 6: `String.format` is the standard formatter only when `String` is
+/// `java.lang.String` at the call.
+#[test]
+fn a_shadowed_string_format_is_not_read() {
+    let parameter = r#"package c;
+import org.springframework.web.client.RestTemplate;
+class Formatter { java.lang.String format(java.lang.String ignored) { return null; } }
+class C {
+    void run(RestTemplate rest, Formatter String) {
+        rest.getForObject(String.format("http://h/api/users"), java.lang.String.class);
+    }
+}
+"#;
+    assert_eq!(calls(parameter), ["GET ?"]);
+    let local = parameter.replace(
+        "void run(RestTemplate rest, Formatter String) {",
+        "void run(RestTemplate rest) { Formatter String = new Formatter();",
+    );
+    assert_eq!(calls(&local), ["GET ?"]);
+    let imported = r#"package c;
+import com.example.String;
+import org.springframework.web.client.RestTemplate;
+class C {
+    void run(RestTemplate rest) {
+        rest.getForObject(String.format("http://h/api/users"), Object.class);
+    }
+}
+"#;
+    assert_eq!(calls(imported), ["GET ?"]);
+    // Controls: the standard formatter, written simple or qualified.
+    let standard = r#"package c;
+import org.springframework.web.client.RestTemplate;
+class C {
+    void run(RestTemplate rest) {
+        rest.getForObject(String.format("http://h/api/%s", "users"), String.class);
+        rest.getForObject(java.lang.String.format("http://h/api/users"), String.class);
+    }
+}
+"#;
+    assert_eq!(calls(standard), ["GET /api/users", "GET /api/users"]);
+}
+
+/// #876 review (calls 3): a `java.net.URI` is sent as it is, so a client's base URL does not
+/// prefix a rooted `URI`.
+#[test]
+fn a_rooted_uri_under_a_base_url_is_unresolved() {
+    let client = r#"package c;
+import java.net.URI;
+import org.springframework.web.client.RestTemplate;
+import org.springframework.boot.web.client.RestTemplateBuilder;
+class C {
+    private final RestTemplate rooted = new RestTemplateBuilder().rootUri("http://h/api").build();
+    void run() {
+        rooted.getForObject(URI.create("/users"), String.class);
+        rooted.getForObject("/users", String.class);
+        rooted.getForObject(URI.create("http://h/api/users"), String.class);
+    }
+}
+"#;
+    assert_eq!(calls(client), ["GET ?", "GET /api/users", "GET /api/users"]);
+}
