@@ -130,7 +130,7 @@ from `pyproject.toml` ([#807](https://github.com/SquashMerge/trellis/issues/807)
   ```
 
   `wrappers.callees` lists the built-in wrappers, then `fetch` and `axios`, then every
-  wrapper configured in a `package.json` (#855).
+  wrapper configured in `.trellis/rules.toml` (#855).
   `client` and `server` are app names. An end's app is the app of its file and layer under
   the `bucket` rule's file attribution. `ends[]` groups matched pairs by the layer of the call
   site and the layer of the handler (null sorts last): `routes` counts distinct routes and
@@ -200,7 +200,7 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
   contains the handler (or the named function, for `declaration`), with keys from the
   declaration lookup keys. They are null when no named callable exists.
 - **Client calls.** JavaScript and TypeScript calls to the built-in wrappers (there is no
-  rules-file key; #855 adds `fetch`, axios and `package.json` wrappers, below):
+  rules-file key for these; #855 adds `fetch`, axios and `[[interfaces.wrappers]]`, below):
 
   | Callee | Path | Method | Default |
   | --- | --- | --- | --- |
@@ -283,23 +283,31 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
     `+`, with `{}` for any part that cannot be read.
   - **The wrapper's own call.** A `fetch` or axios call inside a named callable that has a
     wrapper's name (such as `api`) is the wrapper's own implementation, not a call.
-  - **Configured wrappers.** A `package.json` may configure wrappers for the files under its
-    directory:
+  - **Configured wrappers.** `.trellis/rules.toml` may configure wrappers (owner ruling
+    2026-11-10):
 
-    ```json
-    "trellis": {"wrappers": [
-      {"callee": "apiFetch", "method": "options", "at": 1, "prefix": "/api"}
-    ]}
+    ```toml
+    [[interfaces.wrappers]]
+    callee = "apiFetch"   # required: an identifier or object.property
+    method = "options"    # "options" (default) or "argument"
+    at = 1                # 1 to 8, default 1
+    prefix = "/api"       # optional rooted literal the wrapper adds to every path
+    root = "web"          # optional directory the wrapper applies under; default "."
     ```
 
-    `callee` is an identifier or `object.property` and is required. `method` is
-    `"options"` (the default: `method` in the object literal at argument `at`) or
-    `"argument"` (a string at argument `at`). `at` is 1 to 8, with a default of 1. `prefix`
-    is an optional rooted literal that the wrapper adds to every path; a match through it is
-    `wrapperInferred`. A configured wrapper is matched only as assembled, never through the
-    built-in `/api/` rule, and it replaces a built-in wrapper with the same callee. A list
-    with more than 64 entries, or any invalid entry, configures nothing; `wrappers.callees`
-    shows what took effect.
+    - **`method` and `at`.** With `"options"`, the method is `method` in the object
+      literal at argument `at`. With `"argument"`, it is a string at argument `at`.
+    - **`prefix`.** It has no query, fragment or pattern. A match through it is
+      `wrapperInferred`.
+    - **`root`.** It follows the `[apps]` root rules (#794). The wrapper applies to files under
+      that directory. A wrapper for a deeper root wins over one for a shallower root with the
+      same callee.
+    - **Matching.** A configured wrapper is matched only as assembled, never through the
+      built-in `/api/` rule. It replaces a built-in wrapper with the same callee.
+    - **Errors.** Each invalid entry is a located `invalid_rules` error, like any other rules
+      error: an unknown key, a bad value, the same callee twice for one root, or more than 64
+      entries. `wrappers.callees` shows what took effect. A `package.json` configures no
+      wrapper.
 - **Segment matching.** Methods must be equal, or the route is `ANY`. A literal segment must equal a literal
   segment. A server `{name}` matches exactly one segment, and `{*name}` matches the rest.
   A client substitution segment matches only a server `{name}` or `{*name}`. If nothing

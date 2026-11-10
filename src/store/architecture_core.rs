@@ -332,7 +332,10 @@ impl ArchitectureCore {
                         crate::references::work::snapshot_bytes(&snapshot, check)?,
                     ));
                 Some(kept(crate::interfaces::extract(
-                    &snapshot, &mut work, check,
+                    &snapshot,
+                    config.interface_wrappers(),
+                    &mut work,
+                    check,
                 ))?)
             }
             (Some(_), Ok(_)) => Some(Ok(crate::interfaces::Extraction::default())),

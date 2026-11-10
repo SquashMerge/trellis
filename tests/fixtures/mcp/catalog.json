@@ -910,7 +910,7 @@
                   "const": 1
                 },
                 "toolVersion": {
-                  "const": 23
+                  "const": 24
                 },
                 "watcherDegraded": {
                   "type": "boolean"

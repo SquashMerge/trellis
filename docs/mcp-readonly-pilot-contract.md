@@ -682,6 +682,13 @@ changes, only the order of rows within two arrays. This section wins over the #7
 - **Catalog.** References' input gains `prefix:{type:"string",minLength:1,maxLength:4096}` and its description names app groups, `noApp`, `prefix` and the relative `depth`. The schemas stay self-contained, with local `$ref`s only and no `$schema` (#836). The modern `tools/list` frame is 221,270 bytes (legacy 221,213), 188 bytes more than at `toolVersion` 22 (#794), against the 225,280-byte #836 compacted-frame limit and the 245,760-byte named headroom limit.
 - **Choices beyond the issue text.** The manifest path or `[apps.<name>]` as the app group's text (names can repeat) and the literal `noApp` group; `prefix` with every `groupBy` rather than only `directory`; `prefix` filtering sources only, as `paths` does; `depth` relative to the prefix; and the diagnostic-free `invalid_rules`.
 
+## Amendment (#855): the proposal prompt's closed grammar accepts `interfaces`
+
+**Status: owner-ratified 2026-11-10 ([#855](https://github.com/SquashMerge/trellis/issues/855)).** The owner ruled that JavaScript and TypeScript request wrappers are configured in `.trellis/rules.toml` rather than in each client's `package.json`. `toolVersion` is **24** (previously 23, #837). The bump records the prompt text change below; whichever of #855 and #868 merges second renumbers at merge.
+
+- **Prompt.** The proposal prompt's closed TOML grammar lists `interfaces` among the accepted top-level keys. One sentence says that optional `[[interfaces.wrappers]]` entries `{callee,method,at,prefix,root}` name request wrappers for HTTP interface evidence only and never change verdicts. The table's rules are in [architecture-view.md](architecture-view.md#apps-and-http-interfaces-data-and-extraction-784-788).
+- **Catalog.** Only the `toolVersion` constant changes, from 23 to 24, which has the same width. The prompt text is not part of the tool catalog, so the `tools/list` frame size is unchanged.
+
 ## Tool catalog
 
 ### `trellis_workspace_describe` (W1)

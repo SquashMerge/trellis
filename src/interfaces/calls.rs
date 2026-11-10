@@ -772,7 +772,13 @@ mod tests {
     }
 
     fn run(files: &[(&str, &str)]) -> Extraction {
-        extract_all(&snapshot(files), &mut Work::new(usize::MAX), &mut || Ok(())).unwrap()
+        extract_all(
+            &snapshot(files),
+            &[],
+            &mut Work::new(usize::MAX),
+            &mut || Ok(()),
+        )
+        .unwrap()
     }
 
     const SERVER: &str = r#"
@@ -998,7 +1004,7 @@ async fn h() {}
             ("src/http.rs", SERVER),
             ("web/app.js", "function t(api) { api(\"/health\"); }"),
         ]);
-        let error = extract_all(&shot, &mut Work::new(10), &mut || Ok(()))
+        let error = extract_all(&shot, &[], &mut Work::new(10), &mut || Ok(()))
             .err()
             .unwrap();
         assert!(error.to_string().starts_with("bounded_work"), "{error:#}");
@@ -1032,13 +1038,13 @@ function go(api, request) {
         let app = "function t(api) { api(\"/health\"); }";
         let shot = snapshot(&[("src/http.rs", SERVER), ("web/app.js", app)]);
         let mut spent = Work::new(usize::MAX);
-        let found = extract_all(&shot, &mut spent, &mut || Ok(())).unwrap();
+        let found = extract_all(&shot, &[], &mut spent, &mut || Ok(())).unwrap();
         assert_eq!(found.calls.len(), 1);
         let whole = spent.used;
         let bounded = |error: anyhow::Error| error.to_string() == crate::interfaces::BUDGET;
-        extract_all(&shot, &mut Work::new(whole), &mut || Ok(())).unwrap();
+        extract_all(&shot, &[], &mut Work::new(whole), &mut || Ok(())).unwrap();
         for short in [0, 1, whole / 2, whole - 1] {
-            let error = extract_all(&shot, &mut Work::new(short), &mut || Ok(()))
+            let error = extract_all(&shot, &[], &mut Work::new(short), &mut || Ok(()))
                 .err()
                 .unwrap();
             assert!(bounded(error), "{short}");

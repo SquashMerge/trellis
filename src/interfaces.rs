@@ -130,19 +130,22 @@ pub(crate) struct Extraction {
 }
 
 /// The routes and client calls of a snapshot, with each call matched to at most one route.
+/// `wrappers` are the rules file's `[[interfaces.wrappers]]` (#855).
 pub(crate) fn extract(
     snapshot: &Snapshot,
+    wrappers: &[crate::rules::InterfaceWrapper],
     work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Extraction> {
     let mut routes = routes::extract(snapshot, work, check)?;
-    let packages = packages(snapshot, work, check)?;
+    let next_roots = next_roots(snapshot, work, check)?;
+    let configured = scoped(wrappers);
     let world = js::World::new(snapshot);
     let mut budget = js::Budget {
         work,
         check: &mut *check,
     };
-    let mut found = js_routes::extract(&world, &packages.next_roots, &mut budget)?;
+    let mut found = js_routes::extract(&world, &next_roots, &mut budget)?;
     found.sort_by(|a, b| (&a.path, a.start).cmp(&(&b.path, b.start)));
     let mut seen = BTreeSet::new();
     routes.extend(
@@ -157,15 +160,13 @@ pub(crate) fn extract(
             })
             .map(|f| f.route),
     );
-    let calls = calls::extract(&world, &packages.wrappers, &mut budget)?;
+    let calls = calls::extract(&world, &configured, &mut budget)?;
     let matched = calls::resolve(&routes, &calls, work, check)?;
     let mut callees: Vec<String> = calls::built_in().into_iter().map(|w| w.callee).collect();
     callees.extend(["fetch".to_owned(), "axios".to_owned()]);
-    for scope in &packages.wrappers {
-        for wrapper in &scope.wrappers {
-            if !callees.contains(&wrapper.callee) {
-                callees.push(wrapper.callee.clone());
-            }
+    for wrapper in wrappers {
+        if !callees.contains(&wrapper.callee) {
+            callees.push(wrapper.callee.clone());
         }
     }
     Ok(Extraction {
@@ -176,27 +177,46 @@ pub(crate) fn extract(
     })
 }
 
-/// What the captured `package.json` manifests say about interfaces.
-#[derive(Default)]
-struct Packages {
-    /// The directories of Next.js apps: a manifest that depends on `next`.
-    next_roots: Vec<String>,
-    /// Wrappers configured under `trellis.wrappers`, by manifest directory.
-    wrappers: Vec<calls::Scoped>,
+/// The configured wrappers grouped by root, the deepest root first, so a wrapper authored
+/// for a directory wins over one for the whole checkout.
+fn scoped(wrappers: &[crate::rules::InterfaceWrapper]) -> Vec<calls::Scoped> {
+    let mut scopes: Vec<calls::Scoped> = Vec::new();
+    for wrapper in wrappers {
+        let root = if wrapper.root == "." {
+            String::new()
+        } else {
+            wrapper.root.clone()
+        };
+        let method = match wrapper.method {
+            crate::rules::WrapperMethod::Options(at) => calls::MethodAt::Options(at),
+            crate::rules::WrapperMethod::Argument(at) => calls::MethodAt::Argument(at),
+        };
+        let configured = calls::Wrapper {
+            callee: wrapper.callee.clone(),
+            method,
+            prefix: wrapper.prefix.clone(),
+            built_in: false,
+        };
+        match scopes.iter_mut().find(|scope| scope.root == root) {
+            Some(scope) => scope.wrappers.push(configured),
+            None => scopes.push(calls::Scoped {
+                root,
+                wrappers: vec![configured],
+            }),
+        }
+    }
+    scopes.sort_by_key(|scope| std::cmp::Reverse(scope.root.len()));
+    scopes
 }
 
-/// The most configured wrappers one manifest may list.
-const WRAPPER_LIMIT: usize = 64;
-
-/// Reads every captured `package.json`. A manifest that is not a JSON object, and a
-/// `trellis.wrappers` value that is not a valid list, contribute nothing; the summary's
-/// `wrappers.callees` lists what took effect.
-fn packages(
+/// The directories of Next.js apps: each captured `package.json` that depends on `next`. A
+/// manifest that is not a JSON object contributes nothing.
+fn next_roots(
     snapshot: &Snapshot,
     work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
-) -> Result<Packages> {
-    let mut packages = Packages::default();
+) -> Result<Vec<String>> {
+    let mut roots = Vec::new();
     for manifest in &snapshot.manifests {
         check()?;
         let Some(directory) = manifest
@@ -214,82 +234,14 @@ fn packages(
         let Ok(Value::Object(fields)) = serde_json::from_slice::<Value>(bytes) else {
             continue;
         };
-        let next = ["dependencies", "devDependencies", "peerDependencies"]
+        if ["dependencies", "devDependencies", "peerDependencies"]
             .iter()
-            .any(|key| fields.get(*key).and_then(|deps| deps.get("next")).is_some());
-        if next {
-            packages.next_roots.push(directory.clone());
-        }
-        if let Some(wrappers) = fields
-            .get("trellis")
-            .and_then(|config| config.get("wrappers"))
-            .and_then(configured_wrappers)
+            .any(|key| fields.get(*key).and_then(|deps| deps.get("next")).is_some())
         {
-            packages.wrappers.push(calls::Scoped {
-                root: directory,
-                wrappers,
-            });
+            roots.push(directory);
         }
     }
-    Ok(packages)
-}
-
-/// `[{callee, method?: "argument"|"options", at?, prefix?}]`, or `None` if any entry is
-/// invalid.
-fn configured_wrappers(value: &Value) -> Option<Vec<calls::Wrapper>> {
-    let list = value.as_array()?;
-    if list.len() > WRAPPER_LIMIT {
-        return None;
-    }
-    let identifier = |part: &str| {
-        let mut chars = part.chars();
-        chars
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
-            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
-    };
-    list.iter()
-        .map(|entry| {
-            let entry = entry.as_object()?;
-            if entry
-                .keys()
-                .any(|key| !matches!(key.as_str(), "callee" | "method" | "at" | "prefix"))
-            {
-                return None;
-            }
-            let callee = entry.get("callee")?.as_str()?;
-            let parts: Vec<&str> = callee.split('.').collect();
-            if parts.len() > 2 || !parts.iter().all(|part| identifier(part)) {
-                return None;
-            }
-            let at = match entry.get("at") {
-                None => 1,
-                Some(at) => usize::try_from(at.as_u64()?)
-                    .ok()
-                    .filter(|at| (1..=8).contains(at))?,
-            };
-            let method = match entry.get("method").map(Value::as_str) {
-                None | Some(Some("options")) => calls::MethodAt::Options(at),
-                Some(Some("argument")) => calls::MethodAt::Argument(at),
-                Some(_) => return None,
-            };
-            let prefix = match entry.get("prefix") {
-                None => None,
-                Some(prefix) => {
-                    let prefix = prefix.as_str()?;
-                    (prefix.starts_with('/') && !prefix.contains(['?', '#', '{', '}']))
-                        .then(|| prefix.to_owned())?
-                        .into()
-                }
-            };
-            Some(calls::Wrapper {
-                callee: callee.to_owned(),
-                method,
-                prefix,
-                built_in: false,
-            })
-        })
-        .collect()
+    Ok(roots)
 }
 
 /// The three lists of an interface that detail pages serve.

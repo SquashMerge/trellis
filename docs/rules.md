@@ -624,6 +624,26 @@ detected name is allowed, because its detected app is shadowed). Files under `fr
 to `mimir-frontend`, files under `plugins/cultivate/` to `mimir-cultivate`, and every other
 file to `mimir-agent`.
 
+## Amendment (#855): interface wrappers
+
+**Status: owner-ratified 2026-11-10 ([#855](https://github.com/SquashMerge/trellis/issues/855)).**
+The owner ruled that JavaScript and TypeScript request wrappers for HTTP interface evidence are
+configured in this file. They are not configured in each client's `package.json`.
+
+`[interfaces]` is an optional top-level table, and `wrappers` is its only key. Each
+`[[interfaces.wrappers]]` entry has these keys:
+
+- `callee` (required): an identifier or `object.property`;
+- `method`: `"options"` (the default) or `"argument"`;
+- `at`: 1 to 8, with a default of 1;
+- `prefix`: a rooted literal with no query, fragment or pattern;
+- `root`: a directory, following the `[apps]` root rules, with a default of `.`.
+
+Any other key, any invalid value, the same `callee` twice for one `root`, and more than 64
+entries are each a located `invalid_rules` error. Wrappers only shape interface evidence. They
+never change a rule verdict, a count or an app. The reading rules are in
+[architecture-view.md](architecture-view.md#apps-and-http-interfaces-data-and-extraction-784-788).
+
 ## External package policy
 
 A layer needs a nonempty `paths` or `external` collection; either selects that

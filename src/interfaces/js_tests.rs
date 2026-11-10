@@ -77,8 +77,20 @@ fn snapshot(files: &[(&str, &str)]) -> Snapshot {
 }
 
 fn run(files: &[(&str, &str)]) -> (Snapshot, Extraction) {
+    run_with("", files)
+}
+
+/// The extraction with the `[[interfaces.wrappers]]` of a rules file's text (#855).
+fn run_with(rules: &str, files: &[(&str, &str)]) -> (Snapshot, Extraction) {
+    let config = crate::rules::parse(&format!("version = 1\n{rules}")).unwrap();
     let shot = snapshot(files);
-    let found = extract(&shot, &mut Work::new(usize::MAX), &mut || Ok(())).unwrap();
+    let found = extract(
+        &shot,
+        config.interface_wrappers(),
+        &mut Work::new(usize::MAX),
+        &mut || Ok(()),
+    )
+    .unwrap();
     (shot, found)
 }
 
@@ -110,7 +122,11 @@ fn routes(files: &[(&str, &str)]) -> Vec<String> {
 
 /// Each client call as `METHOD path -> route confidence`.
 fn calls(files: &[(&str, &str)]) -> Vec<String> {
-    let (_, found) = run(files);
+    calls_with("", files)
+}
+
+fn calls_with(rules: &str, files: &[(&str, &str)]) -> Vec<String> {
+    let (_, found) = run_with(rules, files);
     found
         .calls
         .iter()
@@ -447,10 +463,19 @@ export async function go(id) {
 }
 
 #[test]
-fn configured_wrappers_apply_under_their_package_and_the_wrapper_body_is_not_a_call() {
-    let package = r#"{"name":"web","trellis":{"wrappers":[
-        {"callee":"apiFetch","prefix":"/api/v2"},
-        {"callee":"client.send","method":"argument","at":1}]}}"#;
+fn configured_wrappers_apply_under_their_root_and_the_wrapper_body_is_not_a_call() {
+    let rules = r#"
+[[interfaces.wrappers]]
+callee = "apiFetch"
+prefix = "/api/v2"
+root = "web"
+
+[[interfaces.wrappers]]
+callee = "client.send"
+method = "argument"
+at = 1
+root = "web"
+"#;
     let client = r#"
 async function apiFetch(path, options) {
   return fetch("/api/v2" + path, options);
@@ -462,35 +487,46 @@ export async function go(client) {
 }
 "#;
     let elsewhere = "export function go(client) { client.send(\"/users\", \"post\"); }\n";
-    let (_, found) = run(&[
+    let files = [
         ("srv/app.js", SERVER),
-        ("web/package.json", package),
         ("web/client.js", client),
         ("other/client.js", elsewhere),
-    ]);
+    ];
     assert_eq!(
-        calls(&[
-            ("srv/app.js", SERVER),
-            ("web/package.json", package),
-            ("web/client.js", client),
-            ("other/client.js", elsewhere),
-        ]),
+        calls_with(rules, &files),
         [
             "GET /api/v2/items -> GET /api/v2/items WrapperInferred",
             "DELETE /api/v2/items -> unresolved",
             "POST /users -> POST /users Exact",
         ]
     );
+    let (_, found) = run_with(rules, &files);
     assert!(found.callees.iter().any(|c| c == "apiFetch"));
     assert!(found.callees.iter().any(|c| c == "client.send"));
-    // An invalid list configures nothing.
-    let invalid =
-        r#"{"name":"web","trellis":{"wrappers":[{"callee":"apiFetch"},{"callee":"a.b.c"}]}}"#;
+    // Without a root, a wrapper applies to every file.
+    let everywhere = "[[interfaces.wrappers]]\ncallee = \"client.send\"\nmethod = \"argument\"\n";
+    assert_eq!(
+        calls_with(
+            everywhere,
+            &[("srv/app.js", SERVER), ("other/client.js", elsewhere)]
+        ),
+        ["POST /users -> POST /users Exact"]
+    );
+}
+
+/// Negative control: wrapper configuration lives only in the rules file. A `trellis` key in
+/// a `package.json` configures nothing.
+#[test]
+fn a_package_json_trellis_key_configures_no_wrapper() {
+    let package =
+        r#"{"name":"web","trellis":{"wrappers":[{"callee":"apiFetch","prefix":"/api/v2"}]}}"#;
+    let client = "export const go = () => apiFetch(\"/items\");\n";
     let (_, found) = run(&[
         ("srv/app.js", SERVER),
-        ("web/package.json", invalid),
+        ("web/package.json", package),
         ("web/client.js", client),
     ]);
+    assert!(found.calls.is_empty());
     assert!(!found.callees.iter().any(|c| c == "apiFetch"));
 }
 
@@ -534,14 +570,14 @@ fn javascript_extraction_over_its_budget_is_a_typed_bounded_work_error() {
         ("web/client.js", "fetch(\"/api\");\n"),
     ]);
     let mut spent = Work::new(usize::MAX);
-    extract(&shot, &mut spent, &mut || Ok(())).unwrap();
+    extract(&shot, &[], &mut spent, &mut || Ok(())).unwrap();
     for short in [0, spent.used / 3, spent.used / 2, spent.used - 1] {
-        let error = extract(&shot, &mut Work::new(short), &mut || Ok(()))
+        let error = extract(&shot, &[], &mut Work::new(short), &mut || Ok(()))
             .err()
             .unwrap();
         assert_eq!(error.to_string(), super::BUDGET, "{short}");
     }
-    extract(&shot, &mut Work::new(spent.used), &mut || Ok(())).unwrap();
+    extract(&shot, &[], &mut Work::new(spent.used), &mut || Ok(())).unwrap();
 }
 
 #[test]
