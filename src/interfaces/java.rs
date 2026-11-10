@@ -274,10 +274,12 @@ impl<'s> World<'s> {
     }
 
     /// A parameter type written in a document, qualified so that two distinct types never
-    /// compare equal (#876 review): a qualified name as written, a single-type import, a
-    /// type of the same package, else `java.lang`. A type the document declares, or a
-    /// simple name an on-demand import may supply, is qualified by the document, so it
-    /// equals only itself.
+    /// compare equal and one type always reads the same (#876 review): a package-qualified
+    /// name as written; a type the document declares once, by its package and enclosing
+    /// types; a single-type import; a type of the same package in its own file; a known
+    /// `java.lang` type. Anything else (a name the document declares twice, a qualified
+    /// name that starts with a type, a non-public type of another file, a type variable, a
+    /// name an on-demand import may supply) is uncertain (`?`) and equals only itself.
     pub(super) fn qualify(&self, index: usize, written: &str) -> String {
         let mut base = String::new();
         let mut depth = 0usize;
@@ -329,25 +331,50 @@ impl<'s> World<'s> {
             "Math",
             "Error",
         ];
-        let qualified = if PRIMITIVES.contains(&name) || name.contains('.') {
+        let declared: Vec<&TypeInfo> = unit.types.iter().filter(|info| info.name == name).collect();
+        let qualified = if PRIMITIVES.contains(&name) {
             name.to_owned()
-        } else if unit.types.iter().any(|info| info.name == name) {
-            format!("#{index}.{name}")
+        } else if name.contains('.') {
+            // A package-qualified name is canonical as written. One that starts with a type
+            // name (`Outer.Inner`) is not proven to be, so it is uncertain.
+            if name.starts_with(|c: char| c.is_ascii_uppercase()) {
+                format!("?{index}.{name}")
+            } else {
+                name.to_owned()
+            }
+        } else if let [info] = declared[..] {
+            // The canonical name of a type the document declares: the package, the enclosing
+            // types, then the name (#876 review), as a qualified or imported spelling of it
+            // in another document reads.
+            let mut enclosing: Vec<&TypeInfo> = unit
+                .types
+                .iter()
+                .filter(|outer| {
+                    outer.start <= info.start && info.end <= outer.end && outer.start != info.start
+                })
+                .collect();
+            enclosing.sort_by_key(|outer| outer.start);
+            let mut parts: Vec<&str> = Vec::new();
+            if !unit.package.is_empty() {
+                parts.push(&unit.package);
+            }
+            parts.extend(enclosing.iter().map(|outer| outer.name.as_str()));
+            parts.push(name);
+            parts.join(".")
+        } else if !declared.is_empty() {
+            format!("?{index}.{name}")
         } else if let Some(import) = unit.imports.iter().find(|import| {
             !import.is_static && !import.wildcard && import.path.rsplit('.').next() == Some(name)
         }) {
             import.path.clone()
         } else if self.same_package_file(index, name) {
             format!("{}.{name}", unit.package)
-        } else if !LANG.contains(&name)
-            && unit
-                .imports
-                .iter()
-                .any(|import| !import.is_static && import.wildcard)
-        {
-            format!("?{index}.{name}")
-        } else {
+        } else if LANG.contains(&name) {
             format!("java.lang.{name}")
+        } else {
+            // Not proven: a non-public type of another file, a type variable, or a type an
+            // on-demand import supplies.
+            format!("?{index}.{name}")
         };
         format!("{qualified}{suffix}")
     }
@@ -727,8 +754,10 @@ impl<'a> Document<'a> {
                     }
                 }
                 "enum_constant" => {
+                    // An enum constant is a field: it binds a value name (#876 review).
                     if let Some(name) = node.child_by_field_name("name") {
                         fields.entry(text(name)).or_default().push(None);
+                        bound.insert(text(name).to_owned());
                     }
                 }
                 "local_variable_declaration" => {
@@ -876,8 +905,10 @@ impl<'a> Document<'a> {
         written == "java.lang.String" || (written == "String" && self.java_lang("String"))
     }
 
-    /// Whether a name is bound as a variable anywhere in the document, so that in an
-    /// expression it may name a value rather than a type.
+    /// Whether a name is bound as a value anywhere in the document, so that in an
+    /// expression it may name a value rather than a type: a field or enum constant, a record
+    /// component, a local, a method, constructor, lambda or catch parameter, a pattern
+    /// variable, a `for` or try-with-resources variable, or a single static import.
     fn value_name(&self, name: &str) -> bool {
         self.bound.contains(name) || self.declared.contains_key(name)
     }

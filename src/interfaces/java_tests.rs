@@ -1316,3 +1316,185 @@ class C {
 "#;
     assert_eq!(calls(client), ["GET ?", "GET /api/users", "GET /api/users"]);
 }
+
+/// #876 review (residual): every value a document binds hides a library type of the same
+/// name used as a qualifier, an enum constant included.
+#[test]
+fn any_value_binding_hides_a_library_qualifier() {
+    const IMPORTS: &str = "package c;\nimport java.net.URI;\nimport java.net.http.HttpRequest;\nimport org.springframework.http.HttpMethod;\nimport org.springframework.web.client.RestTemplate;\nimport org.springframework.web.reactive.function.client.WebClient;\n";
+    // (qualifier, the call, what it reads as unshadowed, what it reads as shadowed)
+    let qualifiers: [(&str, &str, &[&str], &[&str]); 5] = [
+        (
+            "String",
+            "rest.getForObject(String.format(\"http://h/api/users\"), Object.class);",
+            &["GET /api/users"],
+            &["GET ?"],
+        ),
+        (
+            "HttpMethod",
+            "rest.exchange(\"http://h/api/users\", HttpMethod.POST, null, Object.class);",
+            &["POST /api/users"],
+            &["? /api/users"],
+        ),
+        (
+            "URI",
+            "rest.getForObject(URI.create(\"http://h/api/users\"), Object.class);",
+            &["GET /api/users"],
+            &["GET ?"],
+        ),
+        (
+            "HttpRequest",
+            "HttpRequest.newBuilder(java.net.URI.create(\"http://h/api/users\")).build();",
+            &["GET /api/users"],
+            &[],
+        ),
+        (
+            "WebClient",
+            "WebClient.create(\"http://h\").get().uri(\"/api/users\").retrieve();",
+            &["GET /api/users"],
+            &[],
+        ),
+    ];
+    for (name, call, unshadowed, shadowed) in qualifiers {
+        let control = format!("{IMPORTS}class C {{ void run(RestTemplate rest) {{ {call} }} }}\n");
+        assert_eq!(calls(&control), unshadowed, "{name} control");
+        let bindings = [
+            (
+                "an enum constant",
+                format!("enum C {{ {name}; void run(RestTemplate rest) {{ {call} }} }}"),
+            ),
+            (
+                "a field",
+                format!("class C {{ Object {name}; void run(RestTemplate rest) {{ {call} }} }}"),
+            ),
+            (
+                "a record component",
+                format!("record C(Object {name}) {{ void run(RestTemplate rest) {{ {call} }} }}"),
+            ),
+            (
+                "a local",
+                format!(
+                    "class C {{ void run(RestTemplate rest) {{ Object {name} = null; {call} }} }}"
+                ),
+            ),
+            (
+                "a lambda parameter",
+                format!(
+                    "class C {{ void run(RestTemplate rest) {{ java.util.function.Consumer<Object> f = {name} -> {{}}; {call} }} }}"
+                ),
+            ),
+            (
+                "a catch parameter",
+                format!(
+                    "class C {{ void run(RestTemplate rest) {{ try {{ {call} }} catch (RuntimeException {name}) {{}} }} }}"
+                ),
+            ),
+            (
+                "a pattern variable",
+                format!(
+                    "class C {{ void run(RestTemplate rest, Object o) {{ if (o instanceof Integer {name}) {{}} {call} }} }}"
+                ),
+            ),
+            (
+                "a resource",
+                format!(
+                    "class C {{ void run(RestTemplate rest) throws Exception {{ try (java.io.StringReader {name} = null) {{}} {call} }} }}"
+                ),
+            ),
+            (
+                "a local class",
+                format!("class C {{ void run(RestTemplate rest) {{ class {name} {{}} {call} }} }}"),
+            ),
+        ];
+        for (form, body) in bindings {
+            let source = format!("{IMPORTS}{body}\n");
+            assert_eq!(calls(&source), shadowed, "{name} bound by {form}");
+        }
+    }
+    // The server side: `RequestMethod` bound by an enum constant of a nested enum.
+    let route = |extra: &str| {
+        format!(
+            "package a;\nimport org.springframework.web.bind.annotation.*;\n@RestController\nclass C {{\n    {extra}\n    @RequestMapping(value = \"/x\", method = RequestMethod.GET) String x() {{ return \"\"; }}\n}}\n"
+        )
+    };
+    assert_eq!(
+        route_table(&[("src/main/java/a/C.java", &route(""))]),
+        ["GET /x"]
+    );
+    let shadowed = route("enum Kind { RequestMethod }");
+    assert!(route_table(&[("src/main/java/a/C.java", &shadowed)]).is_empty());
+}
+
+/// #876 review (residual): a parameter type reads as one canonical name however it is
+/// written, so an override of a method declared with a type of its own document matches.
+#[test]
+fn one_parameter_type_reads_the_same_however_it_is_written() {
+    let api = r#"package a;
+import org.springframework.web.bind.annotation.*;
+interface Api { @GetMapping("/x") void run(Id id); }
+class Id {}
+"#;
+    let controller = |parameter: &str, imports: &str| {
+        format!(
+            "package a;\n{imports}import org.springframework.web.bind.annotation.*;\n@RestController @RequestMapping(\"/r\")\nclass C implements Api {{\n    public void run({parameter} id) {{}}\n}}\n"
+        )
+    };
+    // A simple `Id` here names a non-public type of another file, which the snapshot does
+    // not bind by its file: the method is unknown, never anchored on the abstract `Api.run`.
+    let simple = controller("Id", "");
+    assert!(
+        route_table(&[
+            ("src/main/java/a/Api.java", api),
+            ("src/main/java/a/C.java", &simple),
+        ])
+        .is_empty()
+    );
+    // Written qualified or imported: one method, whose handler is the controller's body.
+    for (parameter, imports) in [("a.Id", ""), ("Id", "import a.Id;\n")] {
+        let source = controller(parameter, imports);
+        let found = run(&[
+            ("src/main/java/a/Api.java", api),
+            ("src/main/java/a/C.java", &source),
+        ]);
+        assert_eq!(routes(&found), ["GET /r/x"], "{parameter} {imports}");
+        assert_eq!(
+            found.routes[0].handler.document.path, "src/main/java/a/C.java",
+            "{parameter} {imports}"
+        );
+        assert_eq!(
+            found.routes[0].handler.lines.start,
+            5 + imports.lines().count()
+        );
+    }
+    // A nested type is named by its enclosing type, as a qualified spelling reads.
+    let nested = r#"package a;
+import org.springframework.web.bind.annotation.*;
+interface Api { @GetMapping("/x") void run(Api.Id id); class Id {} }
+"#;
+    let source = controller("a.Api.Id", "");
+    let found = run(&[
+        ("src/main/java/a/Api.java", nested),
+        ("src/main/java/a/C.java", &source),
+    ]);
+    // `Api.Id` starts with a type, so it is not proven to be `a.Api.Id`: the method is
+    // unknown rather than anchored on the abstract declaration.
+    assert!(
+        found
+            .routes
+            .iter()
+            .all(|route| route.handler.document.path == "src/main/java/a/C.java"),
+        "{:?}",
+        routes(&found)
+    );
+    // Control: a distinct qualified type is a distinct overload.
+    let other = controller("b.Id", "");
+    let found = run(&[
+        ("src/main/java/a/Api.java", api),
+        ("src/main/java/a/C.java", &other),
+    ]);
+    assert_eq!(routes(&found), ["GET /r/x"]);
+    assert_eq!(
+        found.routes[0].handler.document.path,
+        "src/main/java/a/Api.java"
+    );
+}

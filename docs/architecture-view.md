@@ -225,13 +225,16 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
   class-level `@RequestMapping` in Spring's search order: the class, its interfaces, then
   its superclass, each with its own supertypes. A method's mapping is the first one found
   for its signature in the same order, and the handler is the first declaration with a
-  body. A signature is the method name and each parameter type qualified as its document
-  binds it (as written when qualified, else a single-type import, a type of the same
-  package, or `java.lang`), so overloads on distinct types with one simple name stay
-  distinct. A parameter type the document cannot bind (a simple name an on-demand import
-  may supply, or a type the document declares) equals only itself; where such a signature
-  and a different one of another type in the order share a name and parameter count, the
-  method is unknown and registers nothing. Nothing is invented: a mapping, class prefix or method that cannot be read (a
+  body. A signature is the method name and each parameter type in one canonical
+  qualified form, however it is written: a package-qualified name as written; a type the
+  document declares once, by its package and enclosing types; a single-type import; a type
+  of the same package in its own file; or a known `java.lang` type. Overloads on distinct
+  types with one simple name stay distinct, and `Id`, `a.Id` and an imported `a.Id` are one
+  type. A parameter type that is not proven (declared twice in the document, qualified
+  starting with a type name, a non-public type of another file, a type variable, or a name
+  an on-demand import may supply) equals only itself; where such a signature and a
+  different one of another type in the order share a name and parameter count, the method
+  is unknown and registers nothing. Nothing is invented: a mapping, class prefix or method that cannot be read (a
   value that is not a string literal, a visible constant or a `+` of them; `value` and
   `path` together; a class-level `method`; a `method` other than `RequestMethod.M`; two
   mapping annotations), a composed or meta-annotation, or a mapping that a supertype which
@@ -437,8 +440,11 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
   - A qualifier such as `HttpRequest`, `URI`, `WebClient`, `HttpMethod`, `RequestMethod` or
     the `String` of `String.format` is the library type only when it resolves as a type
     (imported, or written qualified; `String` is `java.lang.String` only when no type of that
-    name is declared, singly imported or in the same package) and no variable of that name
-    (field, local, parameter or other binding) is declared anywhere in the document.
+    name is declared, singly imported or in the same package) and no value of that name is
+    bound anywhere in the document: a field or enum constant, a record component, a local,
+    a method, constructor, lambda or catch parameter, a pattern variable, a `for` or
+    try-with-resources variable, or a single static import. A local or nested type of that
+    name is a declared type and hides it too.
   - The URL text is a string literal without escapes, a visible constant, a `+` of them,
     `String.format(..)` or `"..".formatted(..)`; anything else is a substitution. A plain
     `%s` takes its argument; any other conversion, or a `%s` with an index, flag, width or
