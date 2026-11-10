@@ -750,8 +750,9 @@ fn setup_cfg_metadata(input: &RootInput) -> Result<BTreeMap<String, String>> {
     let mut sections = BTreeSet::new();
     let mut section: Option<&str> = None;
     let mut metadata: BTreeMap<String, Vec<&str>> = BTreeMap::new();
-    // The `[metadata]` key a deeper-indented line continues, with its line's indent.
-    let mut open: Option<(String, usize)> = None;
+    // The key a deeper-indented line continues, with its line's indent: a `[metadata]` key
+    // (`Some`), or a key of another section, whose value is skipped (`None`).
+    let mut open: Option<(Option<String>, usize)> = None;
     for (number, line) in text.lines().enumerate() {
         let trimmed = line.trim();
         let indent = line.len() - line.trim_start().len();
@@ -759,7 +760,7 @@ fn setup_cfg_metadata(input: &RootInput) -> Result<BTreeMap<String, String>> {
             continue;
         }
         if trimmed.is_empty() {
-            if let Some((key, _)) = &open {
+            if let Some((Some(key), _)) = &open {
                 metadata.entry(key.clone()).or_default().push("");
             }
             continue;
@@ -767,7 +768,9 @@ fn setup_cfg_metadata(input: &RootInput) -> Result<BTreeMap<String, String>> {
         if let Some((key, key_indent)) = &open
             && indent > *key_indent
         {
-            metadata.entry(key.clone()).or_default().push(trimmed);
+            if let Some(key) = key {
+                metadata.entry(key.clone()).or_default().push(trimmed);
+            }
             continue;
         }
         open = None;
@@ -804,6 +807,7 @@ fn setup_cfg_metadata(input: &RootInput) -> Result<BTreeMap<String, String>> {
             )));
         }
         if section != "metadata" {
+            open = Some((None, indent));
             continue;
         }
         if metadata.contains_key(&key) {
@@ -813,7 +817,7 @@ fn setup_cfg_metadata(input: &RootInput) -> Result<BTreeMap<String, String>> {
             )));
         }
         metadata.insert(key.clone(), vec![trimmed[at + 1..].trim()]);
-        open = Some((key, indent));
+        open = Some((Some(key), indent));
     }
     Ok(metadata
         .into_iter()

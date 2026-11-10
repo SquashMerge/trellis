@@ -574,23 +574,47 @@ pub(super) fn gradle_settings(text: &str) -> Option<GradleSettings> {
             settings.root_name = Some(value.trim().to_owned());
         }
         if name == "include" && !punct(before, '.') {
-            // `include 'a', 'b'` or `include("a", "b")`: literal paths up to the statement's end.
+            // `include 'a', 'b'` or `include("a", "b")`: a comma-separated list of string
+            // literals up to the statement's end. Any other argument, such as
+            // `"app" + "-impl"`, makes the whole statement computed, and it admits nothing; an
+            // interpolated string item is skipped alone.
             let mut next = index + 1;
             let parenthesized = punct(tokens.get(next), '(');
             if parenthesized {
                 next += 1;
             }
-            while let Some(token) = tokens.get(next) {
-                match token {
-                    Token::Str(Some(path)) if settings.includes.len() < MAX_LISTED => {
-                        settings.includes.push(path.clone());
+            let mut listed = Vec::new();
+            let mut literal = true;
+            let mut item = true;
+            loop {
+                match tokens.get(next) {
+                    Some(Token::Str(value)) if item => {
+                        if let Some(path) = value {
+                            listed.push(path.clone());
+                        }
+                        item = false;
                     }
-                    Token::Str(_) | Token::Punct(',') => {}
-                    Token::Punct(';') if !parenthesized => break,
-                    Token::Punct(';') => {}
-                    _ => break,
+                    Some(Token::Punct(',')) if !item => item = true,
+                    // A line break (tokenized as `;`) inside parentheses, or after a comma,
+                    // continues the list.
+                    Some(Token::Punct(';')) if parenthesized || (item && next > index + 1) => {}
+                    // Kotlin allows a trailing comma before `)`.
+                    Some(Token::Punct(')')) if parenthesized => break,
+                    Some(Token::Punct(';')) if !parenthesized && !item => break,
+                    Some(Token::Ident(_)) | None if !parenthesized && !item => break,
+                    _ => {
+                        literal = false;
+                        break;
+                    }
                 }
                 next += 1;
+            }
+            if literal {
+                for path in listed {
+                    if settings.includes.len() < MAX_LISTED {
+                        settings.includes.push(path);
+                    }
+                }
             }
         }
     }
@@ -696,5 +720,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(kotlin.includes, [":app", ":lib"]);
+        // PR #883 review: a computed argument admits nothing, not its literal prefix.
+        for computed in [
+            "include(\"app\" + \"-impl\")\n",
+            "include 'app' + '-impl'\n",
+            "include(\"a\", \"b\" + suffix)\n",
+            "include(name)\n",
+        ] {
+            assert!(
+                gradle_settings(computed).unwrap().includes.is_empty(),
+                "{computed}"
+            );
+        }
     }
 }

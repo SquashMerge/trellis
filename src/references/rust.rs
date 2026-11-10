@@ -195,7 +195,9 @@ impl Catalog {
                 return Some("src".to_owned());
             }
             workspace.crate_root(&doc.key.source_set_id, path)?;
-            path.rsplit_once('/').map(|(dir, _)| dir.to_owned())
+            // A root at the checkout's top level (`[lib] path = "lib.rs"`) has the checkout
+            // directory, `""`, as its module directory.
+            Some(path.rsplit_once('/').map_or("", |(dir, _)| dir).to_owned())
         };
         let mut declarations = BTreeMap::new();
         for (document, doc) in docs.iter().enumerate() {
@@ -270,7 +272,7 @@ impl Catalog {
             if edge.child.is_none() {
                 let scope = &result.scopes[edge.scope];
                 let doc = docs[scope.document];
-                let prefix = format!("{}/{}", scope.directory, edge.name);
+                let prefix = child_path(&scope.directory, &edge.name);
                 let candidates = find(
                     doc,
                     &[format!("{prefix}.rs"), format!("{prefix}/mod.rs")],
@@ -397,7 +399,10 @@ impl Catalog {
                 Some(_) => (BTreeSet::new(), true),
                 None => possible_module_names(&file.text),
             };
-            let below = format!("{}/", self.scopes[owner].directory);
+            let below = match self.scopes[owner].directory.as_str() {
+                "" => String::new(),
+                directory => format!("{directory}/"),
+            };
             for (&other, &child) in &self.files.clone() {
                 self.step(check)?;
                 let path = &docs[other].key.path;
@@ -658,7 +663,7 @@ impl Catalog {
                         });
                 }
                 if child.kind() == "mod_item" {
-                    let directory = format!("{}/{}", self.scopes[scope].directory, name);
+                    let directory = child_path(&self.scopes[scope].directory, &name);
                     let child_scope = if let Some(body) = child.child_by_field_name("body") {
                         let child_scope =
                             self.add_scope(document, body, Some(scope), directory, true, check)?;
@@ -886,7 +891,19 @@ impl Catalog {
                     ..Names::default()
                 }
             } else {
-                self.path(scope, &import.path, depth + 1, route, context, check)?
+                // The import's own path resolves in its defining crate; whether the caller
+                // may see the import is checked against the caller's context below.
+                self.path(
+                    scope,
+                    &import.path,
+                    depth + 1,
+                    route,
+                    ResolveContext {
+                        foreign: false,
+                        ..context
+                    },
+                    check,
+                )?
             };
             if resolved.unknown_set && (!exported || import.visible(context)) {
                 // An unproved named import has a known spelling but unproved namespace.
@@ -1160,11 +1177,21 @@ impl Catalog {
             proof.extend(next.proof.iter().copied());
             depth = depth.max(next.follow);
             current = next.module.expect("proved module");
-            if self.root(current) != Some(crate_root) {
-                return Ok(Names {
-                    unknown_set: true,
-                    ..Names::default()
-                });
+            // A proved binding (such as `use member::model as alias;`) can name a module of
+            // another workspace member: the rest of the path continues in that crate, with
+            // its foreign visibility.
+            match self.root(current) {
+                Some(root) if root == crate_root => {}
+                Some(root) => {
+                    crate_root = root;
+                    context.foreign = self.root(scope) != Some(root);
+                }
+                None => {
+                    return Ok(Names {
+                        unknown_set: true,
+                        ..Names::default()
+                    });
+                }
             }
         }
     }
@@ -1204,7 +1231,19 @@ impl Catalog {
                 ..Names::default()
             });
         }
-        let target = self.path(scope, &import.path, depth, route, context, check)?;
+        // The glob's path resolves in its defining crate; the caller's context still filters
+        // the names the target exports.
+        let target = self.path(
+            scope,
+            &import.path,
+            depth,
+            route,
+            ResolveContext {
+                foreign: false,
+                ..context
+            },
+            check,
+        )?;
         let mut modules = Vec::new();
         let mut unknown = target.unknown_set;
         for ((namespace, _), bucket) in target.names {
@@ -2218,5 +2257,14 @@ mod cache_tests {
             index.enclosing(101, 102, &mut work, &mut check).unwrap(),
             None
         );
+    }
+}
+
+/// The path of module `name` in module directory `directory` (`""` is the checkout's).
+fn child_path(directory: &str, name: &str) -> String {
+    if directory.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{directory}/{name}")
     }
 }
