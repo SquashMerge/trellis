@@ -2186,6 +2186,13 @@ impl EvidenceResponse {
         core: &ArchitectureCore,
         check: &mut (impl FnMut() -> Result<()> + Send),
     ) -> Result<serde_json::Value> {
+        // Whether a core extracts depends on its rules file's authored apps, so its extraction
+        // answers only the file it was built for, or no file (#851). The owner never hands a
+        // read another file's core; a core of another file here is refused, never projected.
+        ensure!(
+            core.rules_hash() == config.map(|config| config.content_hash.as_str()),
+            "store_unavailable: architecture core of another rules file"
+        );
         let extraction = core.interfaces()?;
         let (assignment, _) = Self::app_assignment_at(config, core, check)?;
         let named = parsed

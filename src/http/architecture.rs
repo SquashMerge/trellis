@@ -74,6 +74,33 @@ struct CoreKey {
     rules_hash: Option<String>,
 }
 
+/// Which rules file the core a read takes must have evaluated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CoreRules<'a> {
+    /// The read uses no rules part: a core of the pin under any rules file answers it.
+    Any,
+    /// Exactly this rules file, by content hash, or exactly none (#851): a core built with a
+    /// rules file never answers a read of a checkout whose file was since removed, nor a core
+    /// built without one a read of a file since added.
+    Exactly(Option<&'a str>),
+}
+impl<'a> CoreRules<'a> {
+    /// Whether a core built with the rules file `built` answers this read.
+    pub(crate) fn admits(self, built: Option<&str>) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Exactly(wanted) => built == wanted,
+        }
+    }
+    /// The rules file an older-revision request builds with.
+    fn hash(self) -> Option<&'a str> {
+        match self {
+            Self::Any => None,
+            Self::Exactly(hash) => hash,
+        }
+    }
+}
+
 struct Published {
     key: CoreKey,
     outcome: Result<Arc<ArchitectureCore>, CoreFailure>,
@@ -81,9 +108,8 @@ struct Published {
     report_once: bool,
 }
 impl Published {
-    fn answers(&self, pin: IndexPin, rules_hash: Option<&str>) -> bool {
-        self.key.pin == pin
-            && rules_hash.is_none_or(|hash| self.key.rules_hash.as_deref() == Some(hash))
+    fn answers(&self, pin: IndexPin, rules: CoreRules<'_>) -> bool {
+        self.key.pin == pin && rules.admits(self.key.rules_hash.as_deref())
     }
 }
 
@@ -121,8 +147,8 @@ struct OwnerState {
 const PUBLISHED_CORES: usize = 2;
 
 impl OwnerState {
-    fn answer(&self, pin: IndexPin, rules_hash: Option<&str>) -> Option<&Published> {
-        self.published.iter().find(|p| p.answers(pin, rules_hash))
+    fn answer(&self, pin: IndexPin, rules: CoreRules<'_>) -> Option<&Published> {
+        self.published.iter().find(|p| p.answers(pin, rules))
     }
     /// The owner has seen a newer head than `pin`, and no page asked it for `pin`.
     fn passed(&self, pin: IndexPin) -> bool {
@@ -400,28 +426,28 @@ impl DaemonState {
     pub(crate) fn architecture_core(
         self: &Arc<Self>,
         pin: IndexPin,
-        rules_hash: Option<&str>,
+        rules: CoreRules<'_>,
         wait: Duration,
         check: &mut impl FnMut() -> anyhow::Result<()>,
     ) -> anyhow::Result<Arc<ArchitectureCore>> {
-        self.architecture_outcome(pin, rules_hash, wait, check, true)
+        self.architecture_outcome(pin, rules, wait, check, true)
     }
 
     /// Wait for what `architecture_core` would answer, leaving any failure to that read.
     pub(crate) fn architecture_wait(
         self: &Arc<Self>,
         pin: IndexPin,
-        rules_hash: Option<&str>,
+        rules: CoreRules<'_>,
         wait: Duration,
         check: &mut impl FnMut() -> anyhow::Result<()>,
     ) {
-        let _ = self.architecture_outcome(pin, rules_hash, wait, check, false);
+        let _ = self.architecture_outcome(pin, rules, wait, check, false);
     }
 
     fn architecture_outcome(
         self: &Arc<Self>,
         pin: IndexPin,
-        rules_hash: Option<&str>,
+        rules: CoreRules<'_>,
         wait: Duration,
         check: &mut impl FnMut() -> anyhow::Result<()>,
         answering: bool,
@@ -436,7 +462,7 @@ impl DaemonState {
         let mut submitted = false;
         let mut waiting = false;
         loop {
-            if let Some(published) = state.answer(pin, rules_hash) {
+            if let Some(published) = state.answer(pin, rules) {
                 let result = match &published.outcome {
                     Ok(core) => Ok(core.clone()),
                     Err(failure) => Err(failure.error()),
@@ -447,8 +473,7 @@ impl DaemonState {
                 return result;
             }
             let running = state.running.as_ref().filter(|running| {
-                running.pin == pin
-                    && rules_hash.is_none_or(|hash| running.rules_hash.as_deref() == Some(hash))
+                running.pin == pin && rules.admits(running.rules_hash.as_deref())
             });
             let progress = running.and_then(|running| running.progress);
             if running.is_none() && !submitted {
@@ -477,12 +502,12 @@ impl DaemonState {
     pub(crate) fn architecture_request_older(
         self: &Arc<Self>,
         pin: IndexPin,
-        rules_hash: Option<&str>,
+        rules: CoreRules<'_>,
     ) {
         let mut state = self.architecture.0.state.lock().unwrap();
         state.older = Some(CoreKey {
             pin,
-            rules_hash: rules_hash.map(str::to_owned),
+            rules_hash: rules.hash().map(str::to_owned),
         });
     }
 
@@ -500,7 +525,7 @@ impl DaemonState {
         loop {
             if let Some(Published {
                 outcome: Ok(core), ..
-            }) = state.answer(pin, None)
+            }) = state.answer(pin, CoreRules::Any)
             {
                 return Some(core.clone());
             }
@@ -850,7 +875,7 @@ mod tests {
         assert!(core.is_some());
         assert!(
             state
-                .architecture_core(head(&state), None, Duration::ZERO, &mut || Ok(()))
+                .architecture_core(head(&state), CoreRules::Any, Duration::ZERO, &mut || Ok(()))
                 .is_ok()
         );
         assert_eq!(state.architecture_builds_for_tests(), 1);
@@ -870,7 +895,7 @@ mod tests {
         reached.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap();
         let pin = head(&state);
         let error = state
-            .architecture_core(pin, None, Duration::ZERO, &mut || Ok(()))
+            .architecture_core(pin, CoreRules::Any, Duration::ZERO, &mut || Ok(()))
             .err()
             .expect("the core is still building");
         let building = error.downcast_ref::<ArchitectureBuilding>().unwrap();
@@ -889,7 +914,12 @@ mod tests {
         drop(release);
         assert!(
             state
-                .architecture_core(pin, None, crate::testing::HANG_BACKSTOP, &mut || Ok(()))
+                .architecture_core(
+                    pin,
+                    CoreRules::Any,
+                    crate::testing::HANG_BACKSTOP,
+                    &mut || Ok(())
+                )
                 .is_ok()
         );
         assert_eq!(state.architecture_builds_for_tests(), 1);
@@ -916,6 +946,28 @@ mod owner_state_tests {
             report_once: false,
         }
     }
+    /// #851 review: a core answers a rule read only under exactly its own rules file. A core
+    /// built with a file never answers a read of the checkout once the file is removed, nor a
+    /// core built without one a read under a file; a read that uses no rules takes either.
+    #[test]
+    fn a_core_answers_only_reads_of_its_own_rules_state() {
+        let mut ruled = published(1);
+        ruled.key.rules_hash = Some("h".into());
+        let unruled = published(1);
+        for (core, built) in [(&ruled, Some("h")), (&unruled, None)] {
+            assert!(core.answers(pin(1), CoreRules::Any));
+            assert!(core.answers(pin(1), CoreRules::Exactly(built)));
+            assert!(!core.answers(pin(2), CoreRules::Exactly(built)));
+        }
+        assert!(!ruled.answers(pin(1), CoreRules::Exactly(None)));
+        assert!(!unruled.answers(pin(1), CoreRules::Exactly(Some("h"))));
+        assert!(!ruled.answers(pin(1), CoreRules::Exactly(Some("other"))));
+        let mut state = OwnerState::default();
+        state.published.push(ruled);
+        assert!(state.answer(pin(1), CoreRules::Exactly(None)).is_none());
+        assert!(state.answer(pin(1), CoreRules::Any).is_some());
+    }
+
     fn revisions(state: &OwnerState) -> Vec<u64> {
         state
             .published

@@ -637,3 +637,34 @@ async fn endpoints_with_one_app_say_they_were_not_extracted() {
     );
     session.finish();
 }
+
+/// #851 review (Prime, PR #868): one detected app and one authored app extract interfaces;
+/// once the rules file is removed, an endpoints read waits for a core built without rules
+/// instead of answering the ruled core's rows beside `extracted:false`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn endpoints_after_the_rules_file_is_removed_answer_the_unruled_core() {
+    let files = [
+        ("web/package.json", "{\"name\":\"web\"}\n"),
+        ("web/app.js", WEB),
+        ("src/lib.rs", SERVER),
+    ];
+    let checkout = Checkout::publish(
+        &files,
+        Some("version = 1\n[apps.server]\nroots = [\"src\"]\n"),
+        8516,
+    )
+    .await;
+    let mut session = checkout.session();
+    let ruled = session.ask("trellis_endpoints", json!({"schemaVersion":1}), None);
+    assert_eq!(ruled["data"]["extracted"], true, "{ruled}");
+    assert!(!ruled["data"]["endpoints"].as_array().unwrap().is_empty());
+    fs::remove_file(checkout.identity.root.join(".trellis/rules.toml")).unwrap();
+    let removed = session.ask("trellis_endpoints", json!({"schemaVersion":1}), None);
+    assert_eq!(removed["data"]["extracted"], false, "{removed}");
+    assert_eq!(removed["data"]["endpoints"], json!([]), "{removed}");
+    assert_eq!(
+        removed["data"]["limitations"][1],
+        "not extracted: fewer than two apps"
+    );
+    session.finish();
+}

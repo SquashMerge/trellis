@@ -367,3 +367,69 @@ fn a_captured_mimir_layout_reaches_core_app_candidates_as_three_apps() {
     );
     assert_eq!(detected.unread, 0);
 }
+
+/// #851 review (Prime, PR #868): one detected app and one authored app make a ruled core
+/// extract interfaces. Once the rules file is removed, that core's extraction must not answer
+/// an endpoints read: the owner hands such a read only a core built without rules
+/// (`CoreRules::Exactly(None)`), and the endpoint stage refuses a core of another rules file
+/// rather than projecting it. The fresh unruled core answers no rows.
+#[test]
+fn review_removed_rules_must_not_reuse_old_interface_extraction() {
+    let (_state, _root, store) = published_single_app();
+    let config = crate::rules::parse("version = 1\n[apps.server]\nroots = [\"src\"]\n").unwrap();
+    let response = store.evidence_response().unwrap();
+    let pin = response.selected_pin(None).unwrap();
+    let old = response
+        .architecture_core_at(pin, Some(&config), false, &mut || Ok(()), &|_| {})
+        .unwrap();
+    let fresh = response
+        .architecture_core_at(pin, None, false, &mut || Ok(()), &|_| {})
+        .unwrap();
+    let arguments = serde_json::json!({});
+    let parsed = EvidenceResponse::architecture_arguments("endpoints", &arguments).unwrap();
+    let stale = response.architecture_response_at(
+        "endpoints",
+        &arguments,
+        &parsed,
+        None,
+        &old,
+        &mut || Ok(()),
+    );
+    let fresh_answer = response
+        .architecture_response_at("endpoints", &arguments, &parsed, None, &fresh, &mut || {
+            Ok(())
+        })
+        .unwrap();
+    // Controls: the core of the file answers that file, and the fresh unruled core is empty.
+    let ruled = response
+        .architecture_response_at(
+            "endpoints",
+            &arguments,
+            &parsed,
+            Some(&config),
+            &old,
+            &mut || Ok(()),
+        )
+        .unwrap();
+    assert_eq!(ruled["extracted"], true);
+    assert_eq!(ruled["endpoints"].as_array().unwrap().len(), 2);
+    assert_eq!(fresh_answer["extracted"], false);
+    assert_eq!(fresh_answer["endpoints"], serde_json::json!([]));
+    // #851 requires no endpoints when fewer than two detected plus authored apps remain.
+    match stale {
+        Ok(stale_answer) => {
+            assert_eq!(stale_answer["extracted"], false);
+            assert_eq!(
+                stale_answer["endpoints"],
+                serde_json::json!([]),
+                "#851 requires no endpoints when fewer than two detected plus authored apps remain"
+            );
+        }
+        Err(error) => assert!(
+            error
+                .to_string()
+                .starts_with("store_unavailable: architecture core of another rules file"),
+            "{error:#}"
+        ),
+    }
+}

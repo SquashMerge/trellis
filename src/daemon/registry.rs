@@ -3030,13 +3030,20 @@ impl CheckoutRuntime {
         {
             return;
         }
+        // A read that evaluates rules waits for a core of exactly the current file, or of no
+        // file once it is removed (#851).
         let hash = config.as_ref().map(|config| config.content_hash.as_str());
+        let rules = if rules == ArchitectureRules::Unused {
+            crate::http::architecture::CoreRules::Any
+        } else {
+            crate::http::architecture::CoreRules::Exactly(hash)
+        };
         if !current {
-            resources.scheduler.architecture_request_older(pin, hash);
+            resources.scheduler.architecture_request_older(pin, rules);
         }
         resources
             .scheduler
-            .architecture_wait(pin, hash, wait, check);
+            .architecture_wait(pin, rules, wait, check);
     }
 
     fn await_architecture_metrics(
@@ -3094,22 +3101,28 @@ impl CheckoutRuntime {
         needs: CoreNeeds,
         check: &mut (impl FnMut() -> anyhow::Result<()> + Send),
     ) -> anyhow::Result<Arc<crate::store::ArchitectureCore>> {
-        let hash = config
-            .filter(|_| needs.rules)
-            .map(|config| config.content_hash.as_str());
+        // #851: a read that needs the rules needs exactly the current file's, or a core built
+        // without one when there is none; a core built under a removed file never answers it.
+        let rules = if needs.rules {
+            crate::http::architecture::CoreRules::Exactly(
+                config.map(|config| config.content_hash.as_str()),
+            )
+        } else {
+            crate::http::architecture::CoreRules::Any
+        };
         let scheduler = self.resources()?.scheduler.clone();
         if pin == response.selected_pin(None)? {
-            return scheduler.architecture_core(pin, hash, Duration::ZERO, check);
+            return scheduler.architecture_core(pin, rules, Duration::ZERO, check);
         }
         if let Some(core) =
             scheduler.architecture_core_if_available(pin, Duration::ZERO, &mut || Ok(()))
-            && hash.is_none_or(|hash| core.rules_hash() == Some(hash))
+            && rules.admits(core.rules_hash())
         {
             return Ok(core);
         }
         if !needs.compute_older_pin {
-            scheduler.architecture_request_older(pin, hash);
-            return scheduler.architecture_core(pin, hash, Duration::ZERO, check);
+            scheduler.architecture_request_older(pin, rules);
+            return scheduler.architecture_core(pin, rules, Duration::ZERO, check);
         }
         response
             .architecture_core_at(pin, config, needs.metrics, check, &|_| {})
@@ -3191,7 +3204,10 @@ impl CheckoutRuntime {
             return match scheduler
                 .architecture_core_if_available(pin, Duration::ZERO, &mut || Ok(()))
             {
-                Some(core) if hash.is_none_or(|hash| core.rules_hash() == Some(hash)) => {
+                Some(core)
+                    if crate::http::architecture::CoreRules::Exactly(hash)
+                        .admits(core.rules_hash()) =>
+                {
                     Ok((config, core))
                 }
                 _ => Err(crate::http::architecture::ArchitectureBuilding {
@@ -3286,7 +3302,12 @@ impl CheckoutRuntime {
             };
             let scheduler = self.browser_scheduler().expect("active runtime");
             let wait = deadline.saturating_duration_since(Instant::now());
-            let outcome = scheduler.architecture_core(pin, hash.as_deref(), wait, &mut || Ok(()));
+            let outcome = scheduler.architecture_core(
+                pin,
+                crate::http::architecture::CoreRules::Exactly(hash.as_deref()),
+                wait,
+                &mut || Ok(()),
+            );
             let building = outcome.as_ref().err().is_some_and(|error| {
                 error
                     .downcast_ref::<crate::http::architecture::ArchitectureBuilding>()
