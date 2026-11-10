@@ -480,6 +480,12 @@ A server route with `method` `ANY` answers every method. Such routes are express
 
 Server templates also come from Rust actix-web route attributes and route builders, with their `web::scope` prefixes. Client paths also come from Rust `reqwest` calls whose URL is statically readable. A `reqwest` call adds no prefix of its own (no wrapper prefix, configured prefix or base URL), so its match is never `wrapperInferred`. A `reqwest` call whose URL or method cannot be read is `unresolved`. As before, a missing match proves nothing.
 
+## Interface evidence amendment: Python (#856)
+
+**Status: owner-ratified 2026-11-09 under the owner's decision that the endpoints of the other platforms ship in 0.2 ([#686](https://github.com/SquashMerge/trellis/issues/686), [#856](https://github.com/SquashMerge/trellis/issues/856)), with evidence wording amendments approved.** It adds matching sources to the #788, #855 and #858 amendments; the evidence kind, the fields, the four values and their precedence are unchanged.
+
+Server templates also come from Python Flask and FastAPI route decorators, under the blueprint and router prefixes they are registered with, and from Django URL patterns reached from a `ROOT_URLCONF`. A Django pattern answers every method, as an `ANY` route. Client paths also come from Python `requests` and `httpx` calls whose URL is statically readable. An httpx client's `base_url` is an absolute URL whose path is a prefix the client adds (unlike an axios `baseURL`, which is not extracted when absolute), so a match that needed that path is `wrapperInferred`; no other Python call adds a prefix. A route whose object, mount, prefix, method or path cannot be read is not extracted, and a Python call whose URL, base URL or method cannot be read is `unresolved`. As before, a missing match proves nothing.
+
 ## Owner-ratified native-v9 correction: Java varargs
 
 **Status: owner-ratified 2026-10-24 (#279).** This narrow Java measurement ruling is approved independently; the #279 capability and reference amendments above are also ratified by the owner, 2026-10-24.

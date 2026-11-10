@@ -17,7 +17,7 @@ const BUILDERS: [&str; 6] = ["get", "post", "put", "delete", "patch", "head"];
 /// The free functions that send a `GET`.
 const FREE: [&str; 2] = ["reqwest::get", "reqwest::blocking::get"];
 /// Stands for a substitution while a URL is assembled.
-const UNKNOWN: char = '\0';
+pub(super) const UNKNOWN: char = '\0';
 
 /// The `reqwest` calls of every production Rust document.
 pub(super) fn extract(
@@ -396,7 +396,7 @@ impl<'a> Document<'a> {
 /// The path of an absolute URL or a rooted path, cut at `?` or `#`, with `{}` for each
 /// substitution. A URL that starts with a substitution is unreadable, since that may carry
 /// its own path.
-fn path(url: &str) -> Option<String> {
+pub(super) fn path(url: &str) -> Option<String> {
     let lower = url.get(..8).unwrap_or(url).to_ascii_lowercase();
     let rest = if lower.starts_with("http://") {
         &url[7..]
