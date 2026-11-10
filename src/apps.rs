@@ -1760,4 +1760,51 @@ exclude = ["packages/skip"]
         // One per Java manifest judged, plus one per listed manifest.
         assert_eq!(checks, 4);
     }
+    /// PR #883 review: a literal `include` admits its project (control).
+    #[test]
+    fn review_literal_gradle_include_control_selects_its_runnable_project() {
+        let found = run(
+            &[
+                manifest(
+                    "settings.gradle",
+                    Some(b"rootProject.name = 'shop'\ninclude(\"app\")\n"),
+                ),
+                manifest("app/build.gradle", Some(b"plugins { id 'application' }\n")),
+                manifest(
+                    "app-impl/build.gradle",
+                    Some(b"plugins { id 'application' }\n"),
+                ),
+            ],
+            &[
+                "app/src/main/java/shop/App.java",
+                "app-impl/src/main/java/shop/Impl.java",
+            ],
+        );
+        assert_eq!(app(&found, "app/build.gradle").name, "app");
+        assert_eq!(outcome(&found, "app-impl/build.gradle"), &Outcome::NotApp);
+    }
+
+    /// PR #883 review: a computed `include` admits nothing, not its literal prefix.
+    #[test]
+    fn review_computed_gradle_include_does_not_invent_literal_prefix_member() {
+        let found = run(
+            &[
+                manifest(
+                    "settings.gradle",
+                    Some(b"rootProject.name = 'shop'\ninclude(\"app\" + \"-impl\")\n"),
+                ),
+                manifest("app/build.gradle", Some(b"plugins { id 'application' }\n")),
+                manifest(
+                    "app-impl/build.gradle",
+                    Some(b"plugins { id 'application' }\n"),
+                ),
+            ],
+            &[
+                "app/src/main/java/shop/App.java",
+                "app-impl/src/main/java/shop/Impl.java",
+            ],
+        );
+        // Literal-only scanning need not evaluate app-impl. It must not invent app.
+        assert_eq!(outcome(&found, "app/build.gradle"), &Outcome::NotApp);
+    }
 }

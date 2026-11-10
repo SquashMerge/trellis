@@ -1467,3 +1467,21 @@ fn restricted_profiles_omit_the_new_inputs() {
     );
     assert!(omitted(&trusted).is_empty());
 }
+
+/// PR #883 review: a continuation under an ignored section's key is a value line, as in
+/// configparser, so the `[metadata]` fallback still applies.
+#[test]
+fn setup_cfg_multiline_options_do_not_refuse_metadata_fallback() {
+    let plan = python(
+        TrustProfile::Trusted,
+        &[(
+            "setup.cfg",
+            "[metadata]\nname = example\nversion = 1.0\n\n[options]\ninstall_requires =\n    requests\n",
+        )],
+        &Overrides::default(),
+    );
+    assert_eq!(setting(&plan, "python.projectName")["value"], "example");
+    assert_eq!(setting(&plan, "python.projectVersion")["value"], "1.0");
+    assert_eq!(arg(&plan, "--project-name"), Some("example"));
+    assert_eq!(arg(&plan, "--project-version"), Some("1.0"));
+}

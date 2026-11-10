@@ -304,3 +304,122 @@ fn inline_qualified_paths_without_a_use_item_resolve() {
         );
     }
 }
+
+/// PR #883 review: a proved alias of a member's module keeps that member as its crate.
+#[test]
+fn review_883_workspace_foreign_module_alias() {
+    let (_state, _root, store, pin) = indexed(
+        vec![
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = ['a', 'b']\nresolver = '2'\n",
+            ),
+            (
+                "a/Cargo.toml",
+                "[package]\nname = 'a'\nversion = '0.1.0'\nedition = '2021'\n[dependencies]\nb = { path = '../b' }\n",
+            ),
+            (
+                "a/src/lib.rs",
+                "use b::model as alias;\nuse alias::Model;\npub fn keep(_: Model) {}\n",
+            ),
+            (
+                "b/Cargo.toml",
+                "[package]\nname = 'b'\nversion = '0.1.0'\nedition = '2021'\n",
+            ),
+            ("b/src/lib.rs", "pub mod model;\n"),
+            ("b/src/model.rs", "pub struct Model;\n"),
+        ],
+        &[],
+    );
+    let data = read(&store, "references", pin);
+    assert!(
+        unresolved(&data, "a/src/lib.rs", "b::model as alias").is_none(),
+        "direct module import must resolve: {data}"
+    );
+    assert!(
+        unresolved(&data, "a/src/lib.rs", "alias::Model").is_none(),
+        "proved member module alias must resolve: {data}"
+    );
+    assert!(
+        has_edge(&data, "a/src/lib.rs", "b/src/model.rs"),
+        "aliased member item must produce the same edge as its direct path: {data}"
+    );
+}
+
+/// PR #883 review: `[lib] path = "lib.rs"` at the checkout top level owns its child modules.
+#[test]
+fn review_883_checkout_top_level_declared_library() {
+    let (_state, _root, store, pin) = indexed(
+        vec![
+            (
+                "Cargo.toml",
+                "[package]\nname = 'root_lib'\nversion = '0.1.0'\nedition = '2021'\n[lib]\npath = 'lib.rs'\n",
+            ),
+            (
+                "lib.rs",
+                "pub mod model;\nuse crate::model::Model;\npub fn keep(_: Model) {}\n",
+            ),
+            ("model.rs", "pub struct Model;\n"),
+        ],
+        &[],
+    );
+    let data = read(&store, "references", pin);
+    assert!(
+        unresolved(&data, "lib.rs", "crate::model::Model").is_none(),
+        "declared library root must be owned: {data}"
+    );
+    assert!(
+        has_edge(&data, "lib.rs", "model.rs"),
+        "declared top-level library must reach its child module: {data}"
+    );
+}
+
+/// Review probe: a public re-export resolves its defining-crate path internally,
+/// even when the original caller entered the crate through the extern prelude.
+#[test]
+fn review_public_reexport_through_crate_private_modules_resolves() {
+    let (_state, _root, store, pin) = fixture(&[
+        (
+            "crates/core/src/lib.rs",
+            "pub(crate) mod outer { pub(crate) mod inner { pub fn public_api() {} } }\npub use crate::outer::inner::public_api;\npub fn own_call() { crate::outer::inner::public_api(); }\n",
+        ),
+        (
+            "crates/core/src/model.rs",
+            "// No module declaration reaches this old fixture file.\n",
+        ),
+        (
+            "crates/app/src/view.rs",
+            "use acme_core::public_api;\nuse acme_core::outer::inner::public_api as forbidden;\npub fn show() { public_api(); }\n",
+        ),
+    ]);
+    let data = read(&store, "references", pin);
+    // Its own crate can follow the crate-private modules.
+    assert!(
+        unresolved(
+            &data,
+            "crates/core/src/lib.rs",
+            "crate::outer::inner::public_api"
+        )
+        .is_none(),
+        "internal path must resolve: {data}"
+    );
+    // An external consumer cannot name those modules directly.
+    assert!(
+        unresolved(
+            &data,
+            "crates/app/src/view.rs",
+            "acme_core::outer::inner::public_api as forbidden"
+        )
+        .is_some(),
+        "crate-private module path must stay unknown: {data}"
+    );
+    // But it can name the legal public root re-export.
+    assert!(
+        unresolved(&data, "crates/app/src/view.rs", "acme_core::public_api").is_none(),
+        "legal public re-export must resolve: {data}"
+    );
+    assert!(
+        has_edge(&data, "crates/app/src/view.rs", "crates/core/src/lib.rs"),
+        "public re-export must produce its structural edge: {data}"
+    );
+}
