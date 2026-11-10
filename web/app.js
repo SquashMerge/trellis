@@ -2,6 +2,9 @@
 const $ = id => document.getElementById(id);
 let token = "", epoch = 0, selectedRootKey = null, selectedWorkspaceRoot = null, selectedGit = null, gitSerial = 0, checkoutBusy = false, checkouts = [], sourceSerial = 0;
 const pendingRequests = new Set();
+// The app switcher's state (#852): the page-wide choice and the assignment of one pin and rules.
+const Apps = window.TrellisArchitectureApps, appSelection = Apps?.selection();
+let appInventory = {key:null, assigned:null};
 let status = null, statusUnavailable = false, jobUnavailable = false, jobObservation = 0, indexNotReady = false, staleMessage = "";
 let statusSerial = 0, statusRefreshDepth = 0, pairRefreshPending = false, pairRefreshObserved = null;
 let pairRefreshQueued = null, pairRefreshFollowup = false;
@@ -629,6 +632,7 @@ async function refreshStatus(followup = false) {
   if (browseChanged && nextPin) {
     updateViewAvailability();
     void viewerMetrics?.refresh();
+    void refreshAppInventory();
     if (section === "diagrams" && !$("architecture-panel").hidden) void architecture?.refresh();
     if (section === "diagrams" && !$("treemap-panel").hidden) void treemap?.refresh();
     await loadTreeRoot();
@@ -1570,6 +1574,7 @@ function clearBrowse(message = "Expand a file and select a method.") {
   browseSerial++; diagramSerial++; catalogSerial++; directoryRefreshSerial++; files = []; nextFileOffset = null; selectedMethod = null;
   clearFileFilterResults();
   directories.clear(); treeMode = false; treeRoot = null; indexedWorkspace = "";
+  drawAppSwitchers();
   $("index").textContent = "Index workspace";
   fileStates.clear(); closedDirectories.clear(); $("method-source").disabled = true;
   $("file-tree").replaceChildren(); $("sequence-diagram").replaceChildren(); $("sequence-warnings").replaceChildren(); if ($("sequence-incidental")) $("sequence-incidental").hidden = true;
@@ -1657,7 +1662,10 @@ function renderFiles() {
   const tree = $("file-tree"); tree.replaceChildren();
   // A filter shows only the server's whole-catalog matches for the current query.
   const listed = filtering ? filterResults?.query === filter ? filterResults.items : [] : files;
-  const visible = listed.filter(f => showHiddenFiles() || !dotPath(f.path));
+  // One chosen app shows its files only (#852); the others are counted, never dropped silently.
+  const inApp = appFileFilter(), shownFiles = listed.filter(f => showHiddenFiles() || !dotPath(f.path));
+  const visible = inApp ? shownFiles.filter(f => inApp(f.path)) : shownFiles, outside = shownFiles.length - visible.length;
+  const appNote = outside ? ` · ${outside} in other apps or no app · All apps shows them` : "";
   const changes = gitChangesByPath(), metricRows = [];
   const dirs = new Map([["", tree]]);
   for (const file of visible) {
@@ -1698,12 +1706,12 @@ function renderFiles() {
     const searching = filterResults?.query !== filter;
     if (!searching && !visible.length) tree.append(element("li", "No indexed files match.", "detail"));
     $("files-state").textContent = filterError || (searching ? "Searching indexed files…"
-      : `${visible.length} matching indexed ${visible.length === 1 ? "file" : "files"}${filterResults.next != null ? " · more available" : ""}`);
+      : `${visible.length} matching indexed ${visible.length === 1 ? "file" : "files"}${appNote}${filterResults.next != null ? " · more available" : ""}`);
     $("more-files").hidden = searching || filterResults.next == null;
     $("more-files").textContent = "Load more matches";
   } else {
     if (!visible.length) tree.append(element("li", files.length ? "No indexed files to show." : "No indexed files yet. Use Index workspace above, then browse the tree.", "detail"));
-    $("files-state").textContent = `${visible.length} of ${files.length} loaded files${nextFileOffset != null ? " · more available" : ""}`;
+    $("files-state").textContent = `${visible.length} of ${files.length} loaded files${appNote}${nextFileOffset != null ? " · more available" : ""}`;
     $("more-files").hidden = nextFileOffset == null;
     $("more-files").textContent = "Load more files";
   }
@@ -2082,7 +2090,11 @@ let architectureRulesHash = null;
 // Advances whenever the cached reads are dropped, so Architecture can tell a held snapshot from one
 // the rules have since moved past (#789).
 let rulesEpoch = 0;
-function clearRevisionReads() { revisionReads.clear(); revisionReadsKey = null; architectureRulesHash = null; rulesEpoch++; }
+function clearRevisionReads() {
+  revisionReads.clear(); revisionReadsKey = null; architectureRulesHash = null; rulesEpoch++;
+  // The rules may assign files to other apps: the switchers read the new assignment.
+  void Promise.resolve().then(refreshAppInventory);
+}
 async function revisionRead(path, current = () => true) {
   const route = path.split("?", 1)[0];
   if (!["/api/architecture", "/api/metrics"].includes(route) || !status?.revision) return api(path, "GET", undefined, current);
@@ -2103,6 +2115,116 @@ async function revisionRead(path, current = () => true) {
   if (hit) observePinnedResponse(path, "GET", undefined, data);
   return typeof structuredClone === "function" ? structuredClone(data) : data;
 }
+// The architecture read: the rules file is read live, so it can change at the same revision. Any
+// sign that it did drops the cached reads, so "Reload Architecture" and every recovery read the
+// current file: a rules_conflict from any read, a rules read whose hash differs from the cached
+// summary's, and any rules preview or apply.
+async function architectureRequest(path, current, options = {}) {
+  const route = path.split("?", 1)[0], method = options.method || "GET";
+  try {
+    const data = method === "GET" ? await revisionRead(path, current) : await api(path, method, options.body, current);
+    const hash = data?.payload?.rulesFile?.contentHash;
+    if (route === "/api/architecture" && hash) architectureRulesHash = hash;
+    else if (route === "/api/architecture/rules" && hash && architectureRulesHash && hash !== architectureRulesHash) clearRevisionReads();
+    return data;
+  } catch (error) {
+    if (error?.code === "rules_conflict") clearRevisionReads();
+    throw error;
+  } finally { if (method === "POST" && route.startsWith("/api/architecture/rules/")) clearRevisionReads(); }
+}
+// ---- The app switcher of Treemap, Classes and the Files tree (#852). ----
+// One page-wide choice, shared with Architecture: All apps or one app. It is memory only and a new
+// checkout starts at All apps. The apps and each file's app come from the Architecture summary at
+// the shown pin and rules (the assignment the rules check uses); its read is the cached one
+// Architecture makes. Without a ready summary of two or more apps there is no switcher and every
+// view shows the whole checkout.
+const appInventoryKey = () => token && selectedRootKey && status?.revision ? `${epoch}:${selectedRootKey}:${IndexPin.key(status.revision)}:${rulesEpoch}` : null;
+// The assignment of the shown pin and rules; null while it is read, or when there is none.
+const appAssignment = () => appInventory.key !== null && appInventory.key === appInventoryKey() ? appInventory.assigned : null;
+// The chosen app at this checkout, or null for All apps (also when the assignment no longer has it).
+const chosenApp = () => Apps ? Apps.chosen(appAssignment(), appSelection.get(selectedRootKey)) : null;
+// A view's file test: null shows every file.
+function appFileFilter() {
+  const assigned = appAssignment(), name = chosenApp();
+  return name === null ? null : path => Apps.holdsFile(assigned, name, path);
+}
+// The choice as a view holds it: null for All apps, else its name and file test.
+function appChoice() {
+  const holds = appFileFilter();
+  return holds && {name:chosenApp(), holds};
+}
+// Show an indexed path: its own app, or All apps when it is in none.
+function showAppOf(path) {
+  const assigned = appAssignment();
+  if (assigned) appSelection.set(selectedRootKey, Apps.chosen(assigned, Apps.appOf(assigned, path)));
+}
+function appFolderFilter() {
+  const assigned = appAssignment(), name = chosenApp();
+  return name === null ? null : path => Apps.holdsFolder(assigned, name, path);
+}
+const APP_SWITCHERS = ["treemap-apps", "classes-apps", "files-apps"];
+function drawAppSwitchers() {
+  const assigned = appAssignment(), name = chosenApp();
+  for (const id of APP_SWITCHERS) {
+    const target = $(id);
+    if (!target) continue;
+    const refocus = !target.hidden && !!target.contains?.(document.activeElement);
+    const choices = Apps ? Apps.choices(assigned) : [];
+    target.replaceChildren(); target.hidden = !choices.length;
+    for (const choice of choices) {
+      const pick = element("button", choice.text); pick.type = "button";
+      pick.setAttribute("aria-pressed", String(choice.name === name));
+      pick.addEventListener("click", () => chooseApp(choice.name));
+      target.append(pick);
+      if (refocus && choice.name === name) pick.focus?.();
+    }
+  }
+}
+function chooseApp(name) {
+  if (!appSelection || !appAssignment() || Apps.chosen(appAssignment(), name) !== name || name === chosenApp()) return;
+  appSelection.set(selectedRootKey, name);
+}
+// Every view follows a new choice or a new assignment: the switchers, the Files tree, Treemap,
+// Classes' list and Architecture. Only a listed class search reads, since its list is paged.
+function appScopeChanged() {
+  drawAppSwitchers();
+  if (treeMode || files.length || filesCatalogLoaded || $("file-filter").value.trim()) renderFiles();
+  treemap?.scopeChanged();
+  window.TrellisClasses?.scopeChanged?.();
+  void architecture?.scopeChanged();
+}
+appSelection?.subscribe(() => appScopeChanged());
+function appPause(delay) { return new Promise(resolve => setTimeout(resolve, delay)); }
+async function refreshAppInventory() {
+  const key = appInventoryKey();
+  if (!Apps || key === appInventory.key) return;
+  const had = appInventory.key !== null && appInventory.assigned !== null;
+  appInventory = {key, assigned:null};
+  if (had) appScopeChanged(); else drawAppSwitchers();
+  if (key === null) return;
+  const pin = IndexPin.copy(status.revision), current = () => appInventoryKey() === key && appInventory.key === key;
+  const query = new URLSearchParams({aggregate:"max", role:"production", workbench:"true", indexGeneration:pin.indexGeneration, indexRevision:String(pin.indexRevision)});
+  let assigned = null;
+  try {
+    for (;;) {
+      const payload = (await architectureRequest(`/api/architecture?${query}`, current))?.payload;
+      if (!current()) return;
+      if (!payload || !IndexPin.equal(payload, pin)) return;
+      if (payload.state !== "building") { assigned = Apps.assignment(payload); break; }
+      await appPause(Number.isSafeInteger(payload.retryAfterMs) && payload.retryAfterMs > 0 ? payload.retryAfterMs : 250);
+      if (!current()) return;
+    }
+  } catch (_) {
+    // No summary (no rules file, rejected rules, a failed read): no switcher. Architecture reports why.
+    return;
+  }
+  if (!current()) return;
+  appInventory = {key, assigned};
+  // As in Architecture, a summary that cannot show the chosen app ends the choice: it never returns with the apps.
+  const held = appSelection.get(selectedRootKey);
+  if (held !== null && Apps.chosen(assigned, held) === null) { appSelection.set(selectedRootKey, null); return; }
+  if (assigned) appScopeChanged();
+}
 const viewerMetrics = window.TrellisMetrics?.create({
   request: path => revisionRead(path),
   context: () => ({rootKey:selectedRootKey, session:epoch, pin:status?.revision, treeRoot, indexedWorkspace}),
@@ -2112,29 +2234,15 @@ const viewerMetrics = window.TrellisMetrics?.create({
 });
 const treemap = window.TrellisTreemap?.create({
   request: (path, current) => revisionRead(path, current),
+  appFilter: appChoice, showApp: showAppOf,
   context: () => ({rootKey:selectedRootKey, session:epoch, pin:status?.revision, workspaceRoot:status?.workspaceRoot}),
   readSource: (site, pin, current) => perform(() => showCachedSource(site.path, site.range, pin, current)),
   onConflict: () => unexpectedPair("Treemap snapshot changed. Refresh status before reopening Treemap."),
   onInspect: () => { viewerMetrics?.clearInspection(); architecture?.clearInspection(); clearSource(); },
 });
 const architecture = window.TrellisArchitecture?.create({
-  // The rules file is read live, so it can change at the same revision. Any sign that it did
-  // drops the cached reads, so "Reload Architecture" and every recovery read the current file:
-  // a rules_conflict from any read, a rules read whose hash differs from the cached summary's,
-  // and any rules preview or apply.
-  request: async (path, current, options = {}) => {
-    const route = path.split("?", 1)[0], method = options.method || "GET";
-    try {
-      const data = method === "GET" ? await revisionRead(path, current) : await api(path, method, options.body, current);
-      const hash = data?.payload?.rulesFile?.contentHash;
-      if (route === "/api/architecture" && hash) architectureRulesHash = hash;
-      else if (route === "/api/architecture/rules" && hash && architectureRulesHash && hash !== architectureRulesHash) clearRevisionReads();
-      return data;
-    } catch (error) {
-      if (error?.code === "rules_conflict") clearRevisionReads();
-      throw error;
-    } finally { if (method === "POST" && route.startsWith("/api/architecture/rules/")) clearRevisionReads(); }
-  },
+  request: architectureRequest,
+  appScope: appSelection && {get:() => appSelection.get(selectedRootKey), set:name => appSelection.set(selectedRootKey, name)},
   context: () => ({rootKey:selectedRootKey, session:epoch, pin:status?.revision, rulesEpoch}),
   readSource: (site, pin, current) => perform(() => showCachedSource(site.path, site.range, pin, current)),
   openSequence: (caller, sites, pin, saved, active) => perform(() => openArchitectureSequence(caller, sites, pin, saved, active)),
@@ -2301,8 +2409,19 @@ function renderDirectoryTree() {
   if ($("file-filter").value.trim()) { renderFiles(); return; }
   $("reveal-method").hidden = !selectedMethod;
   $("retry-files").hidden = true; $("more-files").hidden = true;
-  let count = 0, hidden = 0;
+  let count = 0, hidden = 0, outside = 0;
   const metricRows = [], showHidden = showHiddenFiles();
+  // One chosen app (#852) shows the folders and files in it, by their path in the index workspace.
+  // A folder above that workspace stays when the workspace lies below it.
+  const inApp = appFileFilter(), folderInApp = appFolderFilter();
+  const indexedPathOf = item => item.indexedPath ?? metricDirectorySelection(item.path)?.path ?? null;
+  const aboveWorkspace = item => !!treeRoot && !!indexedWorkspace && `${indexedWorkspace.replace(/\/$/, "")}/`.startsWith(`${treeRoot.replace(/\/$/, "")}/${item.path}/`);
+  const appHides = item => {
+    if (!inApp) return false;
+    const path = indexedPathOf(item);
+    if (path === null) return !(item.kind === "directory" && aboveWorkspace(item));
+    return item.kind === "directory" ? !folderInApp(path) : !inApp(path);
+  };
   const changes = treeRoot === selectedWorkspaceRoot ? gitChangesByPath() : new Map();
   function rows(path, list, anchorPath = path) {
     const state = directories.get(path);
@@ -2310,6 +2429,7 @@ function renderDirectoryTree() {
     const unsupported = [];
     for (const item of state.items || []) {
       if (!showHidden && hiddenTreeEntry(item)) { hidden++; continue; }
+      if (appHides(item)) { outside++; continue; }
       count++;
       if (unsupportedTreeFile(item)) { unsupported.push(item); continue; }
       const row = element("li");
@@ -2360,7 +2480,9 @@ function renderDirectoryTree() {
   }
   rows("", tree);
   viewerMetrics?.renderLegend(metricRows.filter(Boolean));
-  $("files-state").textContent = hidden ? `${hidden} hidden or unindexed ${hidden === 1 ? "entry" : "entries"} · ⋯ to show` : "";
+  const notes = [hidden ? `${hidden} hidden or unindexed ${hidden === 1 ? "entry" : "entries"} · ⋯ to show` : "",
+    outside ? `${outside} ${outside === 1 ? "entry" : "entries"} outside ${chosenApp()} · All apps shows ${outside === 1 ? "it" : "them"}` : ""];
+  $("files-state").textContent = notes.filter(Boolean).join(" · ");
 }
 
 // External libraries are candidate definitions, never workspace evidence.
@@ -2798,6 +2920,7 @@ function initClassView() {
     readSource: (item, revision) => perform(() => showSource(item, revision)),
     selectMethod: symbol => perform(() => selectMethod(symbol)),
     navigateMember: (event, selector, options) => window.TrellisNavigation?.open(event, selector, options),
+    appFilter: appChoice,
   });
 }
 initClassView();

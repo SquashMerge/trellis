@@ -98,6 +98,9 @@
 /* #789: the app switcher and source line open the toolbar; one pressed button is the drawn scope. */
 .architecture-apps { display: flex; flex-wrap: wrap; gap: var(--sp-2); min-width: 0; max-width: 100%; }
 .architecture-apps[hidden], .architecture-source-line[hidden] { display: none; }
+.files-apps { margin: var(--sp-2) 0; }
+/* Treemap and Classes give the switcher its own row, as Architecture does (#852). */
+#treemap-apps, #classes-apps { flex-basis: 100%; }
 .architecture-apps button { font-size: var(--type-label); white-space: normal; overflow-wrap: anywhere; text-align: left; }
 .architecture-apps button:focus-visible, .architecture-app-files button:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
 .architecture-source-line { flex-basis: 100%; min-width: 0; font-size: var(--type-caption); color: var(--secondary); overflow-wrap: anywhere; }

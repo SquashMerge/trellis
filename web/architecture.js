@@ -54,12 +54,20 @@
     return [...groups].sort(([a], [b]) => a.localeCompare(b));
   }
   const BUILD_PHASES = {reading:"reading indexed files", resolving:"resolving references", evaluating:"evaluating rules", measuring:"measuring code"};
-  function create({request, context, readSource, openTreemap, openSequence, libraryButton = () => null, onConflict = () => {}, onInspect = () => {}, onRulesChanged = () => {}}) {
+  // The app choice when the page shares none: memory only, per checkout.
+  function ownScope(context) {
+    let root = null, name = null;
+    return {get:() => root === context().rootKey ? name : null, set:next => { root = context().rootKey; name = next; }};
+  }
+  function create({request, context, readSource, openTreemap, openSequence, libraryButton = () => null, onConflict = () => {}, onInspect = () => {}, onRulesChanged = () => {}, appScope = null}) {
     let serial = 0, renderSerial = 0, selectionSerial = 0, view = null, basis = null, buildingTimer = null, buildingWake = null;
     let metric = "cognitive", aggregate = "max", role = "production", relative = false, showTests = false;
     // The app whose stack is drawn: null for all apps, else an app name (never compared with a literal). Memory only; a new checkout starts at "all".
+    // The choice is the page's, shared with Treemap, Classes and the Files tree (#852): `scopes.get()` reads it at the
+    // current checkout and `scopes.set` changes it for every view. `drawnScope` is the choice the last render drew.
     // `drawn` is the view the last render laid out (the scoped slice, or `view` itself).
-    let scope = null, scopeRoot = null, drawn = null;
+    const scopes = appScope || ownScope(context);
+    let drawn = null, drawnScope = null;
     // The band that holds the selected stub's end, so its label can say `client end` / `server end` (AC25).
     let endMark = null;
     let reviewMode = "unassigned", draft = null, preview = null, editSerial = 0, editBusy = false, busyOwner = 0;
@@ -98,14 +106,22 @@
     function usable() { return view && current(basis) && view.rulesFile?.contentHash === basis.rulesHash; }
     // The app group the view is scoped to; null for the whole checkout (and for a name the data no longer has).
     // With fewer than two detected apps there is no switcher, so no scope: the stack is checkout-wide.
-    const scopeGroup = (payload = view) => scope === null || payload?.state !== "ready" || !(payload.apps?.length >= 2) ? null : apps.group(payload, scope);
-    const settleScope = payload => { if (scope !== null && !scopeGroup(payload)) scope = null; };
+    const scopeGroup = (payload = view) => scopes.get() === null || payload?.state !== "ready" || !(payload.apps?.length >= 2) ? null : apps.group(payload, scopes.get());
+    const scopeName = (payload = view) => scopeGroup(payload)?.name ?? null;
+    // A snapshot that cannot show the chosen app ends the choice, for every view: it never returns
+    // with the apps. Settling draws nothing here; the caller renders.
+    let settling = false;
+    const settleScope = payload => {
+      if (scopes.get() === null || scopeGroup(payload)) return;
+      settling = true;
+      try { scopes.set(null); } finally { settling = false; }
+    };
     // The Deviations tree sees the app's slice: its layers and edges, and the group's counts.
     let treeView = null;
     function deviationsView() {
       const group = scopeGroup();
       if (!group) return view;
-      if (treeView?.of !== view || treeView.scope !== scope) treeView = {of:view, scope, value:{...apps.scoped(view, scope), rules:{...view.rules, counts:group.counts}}};
+      if (treeView?.of !== view || treeView.scope !== group.name) treeView = {of:view, scope:group.name, value:{...apps.scoped(view, group.name), rules:{...view.rules, counts:group.counts}}};
       return treeView.value;
     }
     const model = () => drawn ?? view;
@@ -465,9 +481,9 @@
       if (show) footnote.textContent = `Apps are detected from build manifests (Cargo binary packages, package.json and pyproject.toml) or authored in .trellis/rules.toml. Layer order is compared within an app. Band and arrow counts are reference sites at ${window.TrellisIndexPin.label(payload)}; deviation totals are rule instances, as trellis rules check reports them; ≥ means a lower bound. HTTP interfaces are evidence, not proof.`;
       if (!show) return;
       const choose = (name, text) => {
-        const button = make("button", text); button.type = "button"; button.setAttribute("aria-pressed", String(scope === name));
+        const button = make("button", text); button.type = "button"; button.setAttribute("aria-pressed", String(scopeName(payload) === name));
         button.addEventListener("click", () => { void setScope(name); }); target.append(button);
-        if (refocus && scope === name) button.focus?.();
+        if (refocus && scopeName(payload) === name) button.focus?.();
       };
       choose(null, "All apps");
       for (const item of groups) choose(item.name, apps.label(item));
@@ -484,11 +500,19 @@
     // The arrows the tree lists: production deviations that no exception covers.
     const treeEdge = edge => edge?.role === "production" && edge.status === "deviates" && !edge.excepted;
     function setScope(next) {
-      if (!usable() || view.state !== "ready" || editBusy || next === scope) return;
+      if (!usable() || view.state !== "ready" || editBusy || next === scopeName()) return;
       if (next !== null && !apps.group(view, next)) return;
-      scope = next; deviations.reset(); coverage();
+      scopes.set(next);
+      return scopeChanged();
+    }
+    // The page's choice changed, here or in another view: a drawn snapshot follows it at once and
+    // never reads; a hidden or busy one draws it when it next renders.
+    let following = null;
+    function scopeChanged() {
+      if (settling || !usable() || view.state !== "ready" || editBusy || scopeName() === drawnScope) return following;
+      deviations.reset(); coverage();
       if (!get("architecture-review-panel").hidden) renderReview();
-      return render();
+      return following = render();
     }
     // AC13: an app that no ordered layer names has nothing to draw. It gets the setup help and its
     // unassigned files, so none is dropped. The list is bounded like a drawing; the chip lists all.
@@ -543,9 +567,10 @@
       // With no app chosen and two or more named apps, the drawing is one column per app (#790).
       const c = basis, full = view, ticket = ++renderSerial;
       if (!keepSelection) endMark = null;
-      if (scope !== null && !scopeGroup(full)) scope = null;
+      const scope = scopeName(full);
       const columns = scope === null && full.apps.length >= 2 ? apps.groups(full) : [], allApps = columns.length >= 2;
       const payload = scope === null ? full : apps.scoped(full, scope);
+      drawnScope = scope;
       const active = () => current(c) && view === full && ticket === renderSerial && full.rulesFile.contentHash === c.rulesHash;
       drawn = payload; switcher(full);
       get("architecture-key-interface").hidden = !allApps;
@@ -812,7 +837,6 @@
       reset(undefined, options.keepDraft === true, true);
       const c = capture();
       if (!c.rootKey || !c.pin) { state("Choose an indexed checkout, then open Architecture.", "empty"); return; }
-      if (c.rootKey !== scopeRoot) { scope = null; scopeRoot = c.rootKey; }
       loadDisplay(c.rootKey);
       state("Reading indexed architecture and reviewed rules…", "loading"); get("architecture-diagram").setAttribute("aria-busy", "true");
       return read(c, options);
@@ -1263,13 +1287,13 @@
     }
     function snapshot() {
       return usable() && inspection ? {inspection, pressed:nodeKey(pressedNode()), rulesHash:basis.rulesHash,
-        aggregate, role, scope, reviewMode, reviewOpen:!get("architecture-review-panel").hidden, deviations:deviations.snapshot()} : null;
+        aggregate, role, scope:scopeName(), reviewMode, reviewOpen:!get("architecture-review-panel").hidden, deviations:deviations.snapshot()} : null;
     }
     async function restore(saved, active) {
       aggregate = saved.aggregate; role = saved.role;
       get("architecture-aggregate").value = aggregate;
-      // The saved scope applies to this checkout; refresh keeps it because the root key matches.
-      scope = saved.scope ?? null; scopeRoot = context().rootKey;
+      // The saved scope applies to this checkout, and so to every view that shares the choice.
+      scopes.set(saved.scope ?? null);
       await refresh();
       if (!active() || !usable()) return;
       settleScope(view);
@@ -1416,7 +1440,7 @@
       if (!["max", "sum", "mean"].includes(event.target.value) || event.target.value === aggregate) return;
       aggregate = event.target.value; return refresh();
     });
-    return {refresh, reset, clearInspection, restore, reopen, suspend};
+    return {refresh, reset, clearInspection, restore, reopen, suspend, scopeChanged};
   }
   window.TrellisArchitecture = {create, moduleKey, quartiles, band, metricValue, commonDirectory, groupModules};
 })();

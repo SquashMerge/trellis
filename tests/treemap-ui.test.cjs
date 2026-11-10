@@ -23,7 +23,7 @@ function fixture(aggregate = "max", role = "production") {
   if (role === "all") for (const row of files) { row.declarationCount += row.roleCounts.test; if (row.declarationCount) row.metrics.cognitive = 7; }
   return {...pin, aggregate, role, workbench:true,metricsVersion:"metrics:v1", scope:"revision", files, directories:[]};
 }
-function harness(globals = {}) {
+function harness(globals = {}, options = {}) {
   const elements = new Map(), calls = [], renders = [], reads = [], conflicts = [];
   let context = {rootKey:"checkout-one", session:1, pin}, response = async () => ({payload:fixture()});
   function node(tagName) {
@@ -52,7 +52,7 @@ function harness(globals = {}) {
   }};
   vm.runInNewContext(pinSource + "\n" + fs.readFileSync(path.join(__dirname, "../web/metric-heat.js"), "utf8") + "\n" + source, {window, document, URLSearchParams, console, ...globals});
   const controller = window.TrellisTreemap.create({request:(url, current) => { calls.push({url, current}); return response(url); }, context:() => context,
-    readSource:(site, revision, current) => reads.push({site, revision, current}), onConflict:error => conflicts.push(error)});
+    readSource:(site, revision, current) => reads.push({site, revision, current}), onConflict:error => conflicts.push(error), ...options});
   const button = label => { const result = descendants(get("treemap-inspector-content")).find(item => item.tagName === "button" && item.textContent === label); assert.ok(result, `Missing ${label}`); return result; };
   return {window, controller, calls, renders, reads, conflicts, get, button, setContext:value => {context = value;}, setResponse:fn => {response = fn;}, setRenderer:fn => {renderer = fn;}};
 }
@@ -392,4 +392,64 @@ test("the layout signal is pending while the current render, a resize or its rel
   assert.equal(layout(), "settled", "the newest render published while the superseded paint is still held");
   r.held[2].resolve(); await r.settle();
   assert.equal(layout(), "settled"); assert.equal(r.painted.at(-1).files.every(file => file.path.includes("src/")), true);
+});
+
+// #852: the page's app choice filters the drawn files; a new choice starts at the whole checkout.
+test("app_choice_filters_treemap: one app draws its files only, a new choice drops the directory, the same choice keeps it", async () => {
+  let choice = null;
+  const shown = [];
+  const h = harness({}, {appFilter:() => choice, showApp:path => shown.push(path)});
+  await h.controller.refresh();
+  assert.equal(h.renders.at(-1).files.length, 5, "All apps draws every visible file");
+  choice = {name:"server", holds:path => path.startsWith("src/")};
+  await h.controller.scopeChanged();
+  assert.deepEqual(h.renders.at(-1).files.map(file => file.path), ["src/main.rs", "src/main.rs", "src/no-callables.rs"], "only the app's files are drawn");
+  assert.match(h.get("treemap-summary").textContent, /^3 of 7 indexed files in this app/);
+  const before = h.renders.length;
+  await h.renders.at(-1).options.onSelectDirectory({sourceSetId:"workspace", path:"src"});
+  assert.equal(h.renders.length, before + 1);
+  assert.ok(h.get("treemap-breadcrumbs").children.length > 0, "inside a directory");
+  // A new assignment of the same choice keeps the directory.
+  choice = {name:"server", holds:path => path.startsWith("src/")};
+  await h.controller.scopeChanged();
+  assert.equal(h.get("treemap-breadcrumbs").hidden, false, "the same choice keeps the directory");
+  choice = {name:"other", holds:path => path === "lib.py"};
+  await h.controller.scopeChanged();
+  assert.equal(h.get("treemap-breadcrumbs").hidden, true, "a new choice starts at the whole checkout");
+  assert.deepEqual(h.renders.at(-1).files.map(file => file.path), ["lib.py"]);
+  // All apps again draws everything; a second All apps is a no-op.
+  choice = null; await h.controller.scopeChanged();
+  assert.equal(h.renders.at(-1).files.length, 5);
+  const settled = h.renders.length; await h.controller.scopeChanged();
+  assert.equal(h.renders.length, settled, "nothing changed, nothing drawn");
+  assert.deepEqual(shown, []);
+  assert.equal(h.calls.length, 1, "following a choice never reads");
+});
+
+test("app_choice_open_file: opening a file outside the chosen app asks for its app first", async () => {
+  let choice = {name:"other", holds:path => path === "lib.py"};
+  const shown = [];
+  const h = harness({}, {appFilter:() => choice, showApp:path => { shown.push(path); choice = {name:"server", holds:item => item.startsWith("src/")}; }});
+  assert.equal(await h.controller.openFile({sourceSetId:"workspace", language:"rust", path:"src/main.rs"}, pin), true);
+  assert.deepEqual(shown, ["src/main.rs"]);
+  assert.ok(h.renders.at(-1).files.some(file => file.path === "src/main.rs"), "the file is drawn under its app");
+  shown.length = 0;
+  assert.equal(await h.controller.openFile({sourceSetId:"workspace", language:"rust", path:"src/no-callables.rs"}, pin), true);
+  assert.deepEqual(shown, [], "a file in the chosen app keeps the choice");
+});
+
+test("app_choice_stale: a choice made while the metrics read is pending applies to that read's drawing", async () => {
+  let choice = null;
+  const gate = deferred(), h = harness({}, {appFilter:() => choice});
+  h.setResponse(async () => { await gate.promise; return {payload:fixture()}; });
+  const pending = h.controller.refresh();
+  choice = {name:"server", holds:path => path.startsWith("src/")};
+  await h.controller.scopeChanged();
+  assert.equal(h.renders.length, 0, "nothing to draw before the read");
+  gate.resolve(); await pending;
+  assert.ok(h.renders.at(-1).files.every(file => file.path.startsWith("src/")));
+  // A drawing from an old checkout never answers a choice.
+  h.setContext({rootKey:"checkout-two", session:1, pin});
+  const count = h.renders.length; await h.controller.scopeChanged();
+  assert.equal(h.renders.length, count);
 });
