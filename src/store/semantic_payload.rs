@@ -26,9 +26,18 @@ pub(in crate::store) fn owned_provenance<'a>(
         .collect()
 }
 
-/// The syntax IDs of one other document that a payload's rows target, each with whether a call
-/// binding's declared target is it.
-pub(in crate::store) type DependencyTargets = BTreeMap<String, bool>;
+/// A targeted syntax ID's flags: a call binding's declared target is it ([`TARGET_CALL`]), and
+/// an own symbol row declares in it ([`TARGET_DECLARATION`]).
+pub(in crate::store) type TargetFlags = u8;
+/// A call binding's declared target.
+pub(in crate::store) const TARGET_CALL: TargetFlags = 1;
+/// An own symbol row's declaration. Such a declaration in another document comes from the
+/// destination row's discovery, which keeps it only while that document is unchanged since the
+/// capture (#863).
+pub(in crate::store) const TARGET_DECLARATION: TargetFlags = 2;
+
+/// The syntax IDs of one other document that a payload's rows target, each with its flags.
+pub(in crate::store) type DependencyTargets = BTreeMap<String, TargetFlags>;
 
 /// The documents the tuple's rows name: the union of every internal endpoint, join anchor,
 /// candidate and dispatch document, with the syntax IDs targeted in each. A change to any of
@@ -38,7 +47,7 @@ pub(in crate::store) fn projection_dependencies(
     publication: &sem::SemanticPublication,
 ) -> BTreeMap<(String, String), DependencyTargets> {
     let mut out: BTreeMap<(String, String), DependencyTargets> = BTreeMap::new();
-    let mut target = |t: &sem::Target, call: bool| {
+    let mut target = |t: &sem::Target, flags: TargetFlags| {
         if let sem::Target::Internal {
             document,
             syntax_id,
@@ -48,7 +57,7 @@ pub(in crate::store) fn projection_dependencies(
             *out.entry((document.language.clone(), document.path.clone()))
                 .or_default()
                 .entry(syntax_id.clone())
-                .or_default() |= call;
+                .or_default() |= flags;
         }
     };
     for symbol in publication
@@ -56,7 +65,10 @@ pub(in crate::store) fn projection_dependencies(
         .iter()
         .filter(|s| owns.contains(s.provenance_id.as_str()))
     {
-        symbol.declarations.iter().for_each(|t| target(t, false));
+        symbol
+            .declarations
+            .iter()
+            .for_each(|t| target(t, TARGET_DECLARATION));
     }
     let mut anchors = Vec::new();
     for binding in publication
@@ -74,20 +86,19 @@ pub(in crate::store) fn projection_dependencies(
         .iter()
         .filter(|r| owns.contains(r.provenance_id.as_str()))
     {
-        reference
-            .declared_target
-            .iter()
-            .for_each(|t| target(t, false));
-        reference.candidates.iter().for_each(|t| target(t, false));
+        reference.declared_target.iter().for_each(|t| target(t, 0));
+        reference.candidates.iter().for_each(|t| target(t, 0));
     }
     for call in publication
         .call_bindings
         .iter()
         .filter(|b| owns.contains(b.provenance_id.as_str()))
     {
-        call.declared_target.iter().for_each(|t| target(t, true));
-        call.candidates.iter().for_each(|t| target(t, false));
-        call.possible_dispatch.iter().for_each(|t| target(t, false));
+        call.declared_target
+            .iter()
+            .for_each(|t| target(t, TARGET_CALL));
+        call.candidates.iter().for_each(|t| target(t, 0));
+        call.possible_dispatch.iter().for_each(|t| target(t, 0));
         anchors.push((
             call.join.anchor.document.language.clone(),
             call.join.anchor.document.path.clone(),
@@ -98,8 +109,8 @@ pub(in crate::store) fn projection_dependencies(
         .iter()
         .filter(|r| owns.contains(r.provenance_id.as_str()))
     {
-        target(&relationship.source, false);
-        target(&relationship.target, false);
+        target(&relationship.source, 0);
+        target(&relationship.target, 0);
     }
     for anchor in anchors {
         out.entry(anchor).or_default();
@@ -114,7 +125,7 @@ pub(in crate::store) struct DependencyRecord {
     /// `None` for the payload's own document and for a payload with no reuse key: a change to
     /// that document then always invalidates the payload.
     pub term: Option<String>,
-    pub targets: Vec<(Vec<u8>, bool)>,
+    pub targets: Vec<(Vec<u8>, TargetFlags)>,
 }
 
 /// How many targeted syntax IDs one pending decision may look up; beyond it every remaining
@@ -122,7 +133,7 @@ pub(in crate::store) struct DependencyRecord {
 pub(in crate::store) const TERM_LOOKUP_BOUND: usize = 200_000;
 
 /// The dependency term of document `language`/`path` for a payload that targets `targets`
-/// (syntax ID BLOB, call-bound), read at `revision` with `captured_pin` as the capture
+/// (syntax ID BLOB, [`TargetFlags`]), read at `revision` with `captured_pin` as the capture
 /// (owner ruling 2026-11-09, Decision 0021 D4). Equal terms mean the payload's settled tuple is
 /// equal, because the term holds everything the settlement reads of another document D:
 ///
@@ -135,7 +146,12 @@ pub(in crate::store) const TERM_LOOKUP_BOUND: usize = 200_000;
 ///   changed D (`staged/witness.rs` `reused_source`, FULL's `StagedSide::unchanged`), and only
 ///   `rejoined_dispatch` reads it, turning a captured `Direct` call on a method into `Unknown`.
 ///   It compares content hashes, not versions: a config-only change keeps the bytes and the
-///   dispatch.
+///   dispatch;
+/// - the same bit when an own symbol row declares in D (#863). An own symbol with no captured
+///   exact definition in its document takes the destination row's declarations, which FULL
+///   discovers only over documents unchanged since the capture (`definitions_sql`). Such a
+///   declaration needs D's own symbol information in another artifact (#473; symbol keys are
+///   unique per artifact), and a multi-artifact batch always settles through FULL.
 ///
 /// No byte offset, range or anchor of D is read or stored: anchors are own-document, targets
 /// are `(syntax_id, document)` and syntax IDs survive comment and body edits. A future
@@ -147,7 +163,7 @@ pub(in crate::store) fn dependency_term(
     captured_pin: &str,
     language: &str,
     path: &str,
-    targets: &[(Vec<u8>, bool)],
+    targets: &[(Vec<u8>, TargetFlags)],
 ) -> Result<String> {
     let document = |revision: &str| -> Result<Option<(i64, String)>> {
         Ok(db
@@ -156,9 +172,9 @@ pub(in crate::store) fn dependency_term(
             .optional()?)
     };
     let current = document(revision)?;
-    let mut call_method = false;
+    let mut sensitive = false;
     let mut statuses = Vec::with_capacity(targets.len());
-    for (syntax_id, call) in targets {
+    for (syntax_id, flags) in targets {
         let status: Option<(bool, bool, bool)> = match &current {
             Some((vid, _)) => db
                 .prepare_cached("SELECT name_start IS NOT NULL,name_start IS NOT NULL AND name IS NOT NULL,kind='method' FROM native_version_declarations WHERE vid=?1 AND syntax_id=?2")?
@@ -166,13 +182,14 @@ pub(in crate::store) fn dependency_term(
                 .optional()?,
             None => None,
         };
-        call_method |= *call && status.is_some_and(|(_, _, method)| method);
+        sensitive |= flags & TARGET_DECLARATION != 0
+            || (flags & TARGET_CALL != 0 && status.is_some_and(|(_, _, method)| method));
         statuses.push(serde_json::json!([
             super::id_codec::decode_sid(syntax_id)?,
             status
         ]));
     }
-    let unchanged = match (&current, call_method) {
+    let unchanged = match (&current, sensitive) {
         (Some((_, hash)), true) => Some(
             revision == captured_pin
                 || document(captured_pin)?.is_some_and(|(_, captured)| captured == *hash),
@@ -717,7 +734,7 @@ mod tests {
     #[test]
     fn writer_rejects_dependency_endpoint_missing_from_revision() {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(CACHE_SCHEMA_V42).unwrap();
+        db.execute_batch(CACHE_SCHEMA_V43).unwrap();
         db.pragma_update(None, "foreign_keys", "OFF").unwrap();
         db.execute("INSERT INTO native_revisions VALUES('key','set',?1,?1,?1,'native','[]','[]','{}','[]','[]',NULL,'[]',0,'{}','[]',1)", ["a".repeat(64)]).unwrap();
         let (_, mut publication) = every_endpoint();
@@ -746,7 +763,7 @@ mod tests {
     #[test]
     fn unbatched_payload_records_null_terms_and_no_targets() {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(CACHE_SCHEMA_V42).unwrap();
+        db.execute_batch(CACHE_SCHEMA_V43).unwrap();
         db.pragma_update(None, "foreign_keys", "OFF").unwrap();
         db.execute("INSERT INTO native_revisions VALUES('key','set',?1,?1,?1,'native','[]','[]','{}','[]','[]',NULL,'[]',0,'{}','[]',1)", ["a".repeat(64)]).unwrap();
         let (_, mut publication) = every_endpoint();
@@ -784,7 +801,7 @@ mod tests {
     }
 
     fn payload_with_children(db: &Connection, key: Option<&str>, symbols: usize) {
-        db.execute_batch(CACHE_SCHEMA_V42).unwrap();
+        db.execute_batch(CACHE_SCHEMA_V43).unwrap();
         db.pragma_update(None, "foreign_keys", "OFF").unwrap();
         db.execute(
             "INSERT INTO semantic_payloads(payload_id,payload_key,producer_id,producer_version,language,path,version_id,batch_id) VALUES(1,?1,'p','1','javascript','a.js','v',1)",

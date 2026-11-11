@@ -9619,6 +9619,149 @@ fn first_edit_after_capture_witnesses_many_call_sensitive_dependents() {
     assert_head_matches_full(&world, &descriptor);
 }
 
+const ISSUE_863_B: &str = "fn g() { }\n";
+
+/// #863: `src/a.rs` carries the symbol information of `g`, whose only definition is in
+/// `src/b.rs`. With `cross_artifact`, B and its own symbol information of `g` are a second
+/// artifact of the batch (symbol keys are unique per artifact, so both may carry `g`); without
+/// it, B has no symbol information. Returns the world, its descriptor, the work-counts file and
+/// `g`'s declaration counts per symbol row at the head.
+#[allow(clippy::type_complexity)]
+fn issue_863_world(
+    cross_artifact: bool,
+) -> (
+    World,
+    (PathBuf, String),
+    PathBuf,
+    impl Fn(&World) -> Vec<usize>,
+) {
+    let world = world(|root| {
+        write_files(
+            root,
+            &[
+                ("src/a.rs", "fn r() { g(); }\n"),
+                ("src/b.rs", ISSUE_863_B),
+                ("src/c.rs", "fn other() { }\n"),
+            ],
+        )
+    });
+    let counts = world._state.path().join("work-counts.json");
+    issue_826_env(&counts, None);
+    let symbol = |name: &str| format!("rust-analyzer cargo c 0.1.0 {name}");
+    let (r, g) = (symbol("r()."), symbol("g()."));
+    let a = DocSpec::new("src/a.rs")
+        .occurrence(&[0, 3, 4], &[], &r, 1)
+        .occurrence(&[0, 9, 10], &[], &g, 0)
+        .symbol(&r, 17, &[])
+        .symbol(&g, 17, &[]);
+    let b = DocSpec::new("src/b.rs").occurrence(&[0, 3, 4], &[], &g, 1);
+    let c = DocSpec::new("src/c.rs");
+    let mut fixture = world.fixture().reference("rust-analyzer");
+    if cross_artifact {
+        fixture.artifact("rust", vec![a, c]);
+        fixture.artifact("rust", vec![b.symbol(&g, 17, &[])]);
+    } else {
+        fixture.artifact("rust", vec![a, b, c]);
+    }
+    let descriptor = world.write(&fixture);
+    drop(world.publish(&descriptor).unwrap());
+    let declarations = move |world: &World| {
+        let head = world.store.index_baseline().unwrap();
+        let facts = world.store.semantic_at(head).unwrap();
+        facts
+            .symbols
+            .iter()
+            .filter(|row| row.key.symbol == g)
+            .map(|row| row.declarations.len())
+            .collect::<Vec<_>>()
+    };
+    (world, descriptor, counts, declarations)
+}
+
+/// Whether the S of `work` copied `path`'s payload.
+fn copied(work: &Value, path: &str) -> bool {
+    work["copiedDocuments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|doc| doc["path"] == path)
+}
+
+/// #863 control: in one artifact, B cannot carry `g`'s symbol information too ("duplicate
+/// semantic symbol key"), and without it B's definition is not Common-compatible (#473), so
+/// A's row of `g` has no declaration on either path. With the in-S oracle on, the head equals
+/// FULL after comment edits to B and the revert, and A's payload is copied throughout.
+#[test]
+fn symbol_without_a_compatible_definition_in_a_changed_dependency_matches_full() {
+    let (world, descriptor, counts, declarations) = issue_863_world(false);
+    assert_eq!(declarations(&world), vec![0], "not Common-compatible");
+    for edit in [
+        format!("{ISSUE_863_B}// edited\n"),
+        format!("{ISSUE_863_B}// edited twice\n"),
+        ISSUE_863_B.to_owned(),
+    ] {
+        let work = local_edit(&world, "src/b.rs", &edit, &counts);
+        assert_eq!(work["fullFallbacks"], 0, "{work}");
+        assert!(copied(&work, "src/a.rs"), "{work}");
+        assert_head_matches_full(&world, &descriptor);
+    }
+    assert_eq!(declarations(&world), vec![0]);
+}
+
+/// #863: A's own row of `g` has no captured exact definition in A, so settlement gives it the
+/// destination row's declarations: B's, which FULL discovers only while B is unchanged since
+/// the capture. A comment edit to B leaves B's declaration status alone, so A's dependency term
+/// on B must carry B's "unchanged" bit (Decision 0021 D4). The first edit rotates A's payload
+/// and drops the declaration, the second reuses A's new payload, and the revert (D5) reuses
+/// the captured one. A multi-artifact batch settles through FULL; the in-S oracle checks that
+/// the head, reused payloads included, equals an independent FULL after each edit.
+#[test]
+fn symbol_declared_only_in_a_changed_dependency_matches_full() {
+    let (world, _, counts, declarations) = issue_863_world(true);
+    let payload = |world: &World| {
+        world.count(&format!(
+            "SELECT payload_id FROM semantic_coverage WHERE revision_id='{}' AND path='src/a.rs'",
+            world.head_key()
+        ))
+    };
+    // A's row and B's own row of `g` each carry B's declaration.
+    assert_eq!(declarations(&world), vec![1, 1], "captured");
+    let captured = payload(&world);
+    let work = local_edit(
+        &world,
+        "src/b.rs",
+        &format!("{ISSUE_863_B}// edited\n"),
+        &counts,
+    );
+    assert_eq!(
+        work["fallbackReasons"],
+        json!(["multi_artifact_batch"]),
+        "{work}"
+    );
+    assert_eq!(world.rejoin_failures(), 0);
+    let edited = payload(&world);
+    assert_ne!(edited, captured, "B's changed content rotates A");
+    assert_eq!(
+        declarations(&world),
+        vec![0],
+        "only A's row remains, without B's"
+    );
+    local_edit(
+        &world,
+        "src/b.rs",
+        &format!("{ISSUE_863_B}// edited twice\n"),
+        &counts,
+    );
+    assert_eq!(payload(&world), edited, "an equal term reuses A");
+    local_edit(&world, "src/b.rs", ISSUE_863_B, &counts);
+    assert_eq!(
+        payload(&world),
+        captured,
+        "the revert reuses the captured payload"
+    );
+    assert_eq!(declarations(&world), vec![1, 1], "reverted");
+}
+
 /// #826 control for the oracle: FULL's own resource bound is a typed unavailable outcome the
 /// unbounded oracle does not flag, so S still publishes it (`failed`, never partial rows).
 #[test]
