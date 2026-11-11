@@ -85,16 +85,6 @@ impl BatchLimits {
         document_cache_bytes: 8 * MIB,
         cache_bytes: 64 * MIB,
     };
-
-    /// Production limits with the `TRELLIS_TEST_SEMANTIC_LIMITS` JSON object applied. The
-    /// caller reads this once per operation; an unparsable object or unknown key is an error.
-    pub fn effective() -> Result<BatchLimits, String> {
-        #[cfg(feature = "test-support")]
-        if let Ok(text) = std::env::var("TRELLIS_TEST_SEMANTIC_LIMITS") {
-            return serde_json::from_str(&text).map_err(|_| "test limits".to_string());
-        }
-        Ok(BatchLimits::PRODUCTION)
-    }
 }
 
 impl Default for BatchLimits {

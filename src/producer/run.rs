@@ -17,8 +17,7 @@ use super::{
 use crate::{
     http::DaemonState,
     semantic_batch::{
-        BatchCounters, BatchLimits, StageInput, StageOwner, descriptor::GenerationOrigin,
-        stage_batch,
+        BatchCounters, StageInput, StageOwner, descriptor::GenerationOrigin, stage_batch,
     },
     store::Store,
 };
@@ -434,7 +433,9 @@ impl Run<'_> {
             &self.active.run_id,
             &self.dir,
         )?;
-        let limits = BatchLimits::effective().map_err(|error| anyhow::anyhow!("{error}"))?;
+        let limits = store
+            .batch_limits()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
         stage_batch(
             store,
             &input,

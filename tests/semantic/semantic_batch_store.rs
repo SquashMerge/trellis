@@ -181,6 +181,19 @@ fn world_over(
 }
 
 impl World {
+    /// S writes its work counts to `counts` (test support, on this store only).
+    pub(crate) fn work_counts(&self, counts: &Path) {
+        self.store.update_semantic_test_hooks_for_tests(|hooks| {
+            hooks.work_counts_file = Some(counts.to_owned())
+        });
+    }
+
+    /// Turns this store's in-S FULL oracle on or off.
+    pub(crate) fn full_oracle(&self, on: bool) {
+        self.store
+            .update_semantic_test_hooks_for_tests(|hooks| hooks.full_oracle = on);
+    }
+
     pub(crate) fn fixture(&self) -> BatchFixture {
         BatchFixture::from_published(&self.index_db, &self.root).synthetic()
     }
@@ -4914,8 +4927,7 @@ fn multi_artifact_reference_batch_records_multi_artifact_fallback() {
     let descriptor = world.write(&fixture);
     world.publish(&descriptor).unwrap();
     let counts = world._state.path().join("work-counts.json");
-    // SAFETY: each test runs in its own process under nextest, and no other thread reads this.
-    unsafe { std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts) };
+    world.work_counts(&counts);
     write_files(&world.root, &[("src/C.js", "function other(){ }\n")]);
     let options = IndexOptions::new(world.root.clone());
     let capture = trellis::capture::Capture::admit(&options, &world.cancel, &|_| {}).unwrap();
@@ -5057,11 +5069,8 @@ fn assert_delayed_import_witnessed(work: &Value) {
 fn below_head_import_witnesses_successive_local_edits() {
     let (world, descriptor, _) = delayed_import_world(false);
     let counts = world._state.path().join("work-counts.json");
-    // SAFETY: each test runs in its own process under nextest, and no other thread reads these.
-    unsafe {
-        std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts);
-        std::env::set_var("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1");
-    }
+    world.work_counts(&counts);
+    world.full_oracle(true);
     for value in 3..=5 {
         let work = local_edit(
             &world,
@@ -5119,11 +5128,8 @@ fn below_head_import_recovers_dependent_rows_when_target_returns() {
     };
     let captured_version = version(captured);
     let counts = world._state.path().join("work-counts.json");
-    // SAFETY: each test runs in its own process under nextest, and no other thread reads these.
-    unsafe {
-        std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts);
-        std::env::set_var("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1");
-    }
+    world.work_counts(&counts);
+    world.full_oracle(true);
     // Prime any lazy witness while B is still absent; this destination is lossy as well.
     local_edit(
         &world,
@@ -5296,8 +5302,7 @@ fn the_import_revision_outlasts_the_grace_while_its_batch_is_selected() {
     let admitted = tuples(&world);
     assert!(admitted > 0);
     let counts = world._state.path().join("work-counts.json");
-    // SAFETY: each test runs in its own process under nextest, and no other thread reads this.
-    unsafe { std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts) };
+    world.work_counts(&counts);
     world.store.set_retention_clock_for_tests(1_001, 1);
     local_edit(&world, "src/C.js", "function other(){ }\n", &counts);
     world.store.set_retention_clock_for_tests(1_902, 902);
@@ -5374,8 +5379,7 @@ fn unreleased_revisions(world: &World) -> i64 {
 fn sequential_imports_leave_no_chain_of_held_revisions() {
     let world = definitions_world();
     let counts = world._state.path().join("work-counts.json");
-    // SAFETY: each test runs in its own process under nextest, and no other thread reads these.
-    unsafe { std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts) };
+    world.work_counts(&counts);
     world.store.set_retention_clock_for_tests(1_000, 0);
     write_files(&world.root, &[("src/C.js", "function other(){ }\n")]);
     world.republish();
@@ -5401,7 +5405,7 @@ fn sequential_imports_leave_no_chain_of_held_revisions() {
     assert_eq!(bounds[4], bounds[2], "{bounds:?}");
     assert_eq!(bounds[4], bounds[3], "{bounds:?}");
     assert!(bounds[4].0 <= 3 && bounds[4].1 <= 2, "{bounds:?}");
-    unsafe { std::env::set_var("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1") };
+    world.full_oracle(true);
     let work = local_edit(
         &world,
         "src/C.js",
@@ -5418,8 +5422,7 @@ fn sequential_imports_leave_no_chain_of_held_revisions() {
 fn a_revision_in_its_grace_reads_after_its_capture_is_released() {
     let world = definitions_world();
     let counts = world._state.path().join("work-counts.json");
-    // SAFETY: each test runs in its own process under nextest, and no other thread reads this.
-    unsafe { std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts) };
+    world.work_counts(&counts);
     world.store.set_retention_clock_for_tests(1_000, 0);
     let capture = world.store.index_baseline().unwrap();
     let (a, b) = definitions_docs();
@@ -5499,11 +5502,8 @@ fn each_head_selected_batch_keeps_its_capture_and_import_past_the_grace() {
         )
     });
     let counts = world._state.path().join("work-counts.json");
-    // SAFETY: each test runs in its own process under nextest, and no other thread reads these.
-    unsafe {
-        std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts);
-        std::env::set_var("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1");
-    }
+    world.work_counts(&counts);
+    world.full_oracle(true);
     world.store.set_retention_clock_for_tests(1_000, 0);
     let (a, b) = definitions_docs();
     let mut fixture = world.fixture().reference("scip-typescript");
@@ -5550,8 +5550,7 @@ fn each_head_selected_batch_keeps_its_capture_and_import_past_the_grace() {
 fn an_interrupted_release_resumes_without_touching_what_the_head_holds() {
     let world = definitions_world();
     let counts = world._state.path().join("work-counts.json");
-    // SAFETY: each test runs in its own process under nextest, and no other thread reads this.
-    unsafe { std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts) };
+    world.work_counts(&counts);
     world.store.set_retention_clock_for_tests(1_000, 0);
     write_files(&world.root, &[("src/C.js", "function other(){ }\n")]);
     world.republish();
@@ -5619,8 +5618,7 @@ fn a_reselected_batch_brings_its_pending_import_revision_back() {
     let import = world.publish(&first).unwrap().0;
     world.store.set_retention_clock_for_tests(1_001, 1);
     let counts = world._state.path().join("work-counts.json");
-    // SAFETY: each test runs in its own process under nextest, and no other thread reads these.
-    unsafe { std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts) };
+    world.work_counts(&counts);
     local_edit(&world, "src/C.js", "function unrelated(){}\n", &counts);
     let (a, b) = definitions_docs();
     let a = a.occurrence(&[0, 0, 1], &[], "pkg extra.", 0);
@@ -5650,7 +5648,7 @@ fn a_reselected_batch_brings_its_pending_import_revision_back() {
     run_maintenance(&world);
     assert_eq!(revision_state(&world, import), "retained");
     assert_eq!(world.store.semantic_at(head).unwrap(), semantic);
-    unsafe { std::env::set_var("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1") };
+    world.full_oracle(true);
     let work = local_edit(
         &world,
         "src/C.js",
@@ -5687,8 +5685,7 @@ fn a_partly_released_import_revision_is_not_brought_back() {
     let import = world.publish(&first).unwrap().0;
     world.store.set_retention_clock_for_tests(1_001, 1);
     let counts = world._state.path().join("work-counts.json");
-    // SAFETY: each test runs in its own process under nextest, and no other thread reads this.
-    unsafe { std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts) };
+    world.work_counts(&counts);
     local_edit(&world, "src/C.js", "function unrelated(){}\n", &counts);
     let (a, b) = definitions_docs();
     let a = a.occurrence(&[0, 0, 1], &[], "pkg extra.", 0);
@@ -5785,12 +5782,8 @@ fn a_fused_definition_stays_on_the_fast_path_and_matches_full() {
         let descriptor = world.write(&fixture);
         world.publish(&descriptor).unwrap();
         let counts = world._state.path().join("work-counts.json");
-        // SAFETY: each test runs in its own process under nextest, and no other thread reads
-        // these.
-        unsafe {
-            std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts);
-            std::env::set_var("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1");
-        }
+        world.work_counts(&counts);
+        world.full_oracle(true);
         let work = local_edit(&world, "src/C.js", "function other(){ }\n", &counts);
         assert_eq!(work["witnessedRejoins"], 1, "{spelling}: {work}");
         assert_eq!(work["fullFallbacks"], 0, "{spelling}: {work}");
@@ -5823,12 +5816,8 @@ fn a_lost_target_takes_full(shape: fn(DocSpec, &str) -> DocSpec) {
         let descriptor = world.write(&fixture);
         world.publish(&descriptor).unwrap();
         let counts = world._state.path().join("work-counts.json");
-        // SAFETY: each test runs in its own process under nextest, and no other thread reads
-        // these.
-        unsafe {
-            std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts);
-            std::env::set_var("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1");
-        }
+        world.work_counts(&counts);
+        world.full_oracle(true);
         fs::remove_file(world.root.join("src/B.js")).unwrap();
         let options = IndexOptions::new(world.root.clone());
         let capture = trellis::capture::Capture::admit(&options, &world.cancel, &|_| {}).unwrap();
@@ -6300,8 +6289,7 @@ fn whole_publication_validator_runs_over_every_original_of_a_batch() {
     let descriptor = mixed_language_batch(&world);
     world.publish(&descriptor).unwrap();
     let counts = world._state.path().join("work-counts.json");
-    // SAFETY: each test runs in its own process under nextest, and no other thread reads this.
-    unsafe { std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts) };
+    world.work_counts(&counts);
     write_files(&world.root, &[("src/C.js", "function other(){ }\n")]);
     world.republish_with_rejoin();
     let work: Value = serde_json::from_slice(&fs::read(&counts).unwrap()).unwrap();
@@ -8140,11 +8128,8 @@ fn witnessed_local_rejoin_preserves_real_partial_import_metadata() {
         .reasons
         .clone();
     let counts = world._state.path().join("work-counts.json");
-    // SAFETY: nextest runs each test in its own process; the hook reads these during publication.
-    unsafe {
-        std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts);
-        std::env::set_var("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1");
-    }
+    world.work_counts(&counts);
+    world.full_oracle(true);
     let work = local_edit(&world, "src/other.rs", "pub fn unrelated() {}\n", &counts);
     assert_eq!(work["witnessedRejoins"], 1, "{work}");
     let after = world
@@ -9171,8 +9156,7 @@ fn witnessed_local_rejoin_does_not_keep_a_method_direct_in_an_edited_document() 
     assert_eq!(calls(&world), [call("f", "Direct"), call("g", "Direct")]);
 
     let counts = world._state.path().join("work-counts.json");
-    // SAFETY: each test runs in its own process under nextest, and no other thread reads this.
-    unsafe { std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts) };
+    world.work_counts(&counts);
     write_files(
         &world.root,
         &[(
@@ -9237,11 +9221,8 @@ fn witnessed_local_rejoin_keeps_a_method_direct_in_an_unchanged_document() {
     let descriptor = world.write(&fixture);
     drop(world.publish(&descriptor).unwrap());
     let counts = world._state.path().join("work-counts.json");
-    // SAFETY: each test runs in its own process under nextest, and no other thread reads these.
-    unsafe {
-        std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts);
-        std::env::set_var("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1");
-    }
+    world.work_counts(&counts);
+    world.full_oracle(true);
     let work = local_edit(&world, "src/c.rs", "fn other() { let _ = 1; }\n", &counts);
     assert_eq!(work["witnessedRejoins"], 1, "{work}");
     let head = world.store.index_baseline().unwrap();
@@ -9301,23 +9282,22 @@ fn issue_826_world() -> (World, (PathBuf, String)) {
 /// this one lowers the witnessed settlement's alone, below what A's settlement needs.
 const ISSUE_826_WITNESS_LIMITS: &str = r#"{"unit_expansion_bytes":24576}"#;
 
-fn issue_826_env(counts: &Path, limits: Option<&str>) {
-    // SAFETY: each test runs in its own process under nextest, and no other thread reads these.
-    unsafe {
-        std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", counts);
-        std::env::set_var("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1");
-        std::env::remove_var("TRELLIS_TEST_WITNESS_JOIN_LIMITS");
-        match limits {
-            Some(limits) => std::env::set_var("TRELLIS_TEST_SEMANTIC_LIMITS", limits),
-            None => std::env::remove_var("TRELLIS_TEST_SEMANTIC_LIMITS"),
-        }
-    }
+/// Turns on `world`'s work counts at `counts` and its in-S oracle, with `limits` (or
+/// production limits) for every operation and no separate witnessed settlement limit.
+fn issue_826_env(world: &World, counts: &Path, limits: Option<&str>) {
+    world.store.update_semantic_test_hooks_for_tests(|hooks| {
+        hooks.work_counts_file = Some(counts.to_owned());
+        hooks.full_oracle = true;
+        hooks.witness_join_limits = None;
+        hooks.semantic_limits = limits.map(str::to_owned);
+    });
 }
 
-/// Lowers the witnessed settlement's live budget alone (`ISSUE_826_WITNESS_LIMITS`).
-fn issue_826_witness_limit() {
-    // SAFETY: as in `issue_826_env`.
-    unsafe { std::env::set_var("TRELLIS_TEST_WITNESS_JOIN_LIMITS", ISSUE_826_WITNESS_LIMITS) };
+/// Lowers `world`'s witnessed settlement live budget alone (`ISSUE_826_WITNESS_LIMITS`).
+fn issue_826_witness_limit(world: &World) {
+    world.store.update_semantic_test_hooks_for_tests(|hooks| {
+        hooks.witness_join_limits = Some(ISSUE_826_WITNESS_LIMITS.to_owned())
+    });
 }
 
 fn assert_head_matches_full(world: &World, descriptor: &(PathBuf, String)) {
@@ -9334,9 +9314,9 @@ fn witness_limit_falls_back_to_full() {
     for reduced in [false, true] {
         let (world, descriptor) = issue_826_world();
         let counts = world._state.path().join("work-counts.json");
-        issue_826_env(&counts, None);
+        issue_826_env(&world, &counts, None);
         if reduced {
-            issue_826_witness_limit();
+            issue_826_witness_limit(&world);
         }
         let work = local_edit(&world, "src/b.rs", edit, &counts);
         if reduced {
@@ -9362,9 +9342,9 @@ fn witness_limit_falls_back_to_full() {
 fn unavailable_basis_is_rejoined_not_copied() {
     let (world, descriptor) = issue_826_world();
     let counts = world._state.path().join("work-counts.json");
-    issue_826_env(&counts, None);
-    // SAFETY: as above; the oracle would (rightly) refuse the injected unavailable S.
-    unsafe { std::env::remove_var("TRELLIS_TEST_LOCAL_FULL_ORACLE") };
+    issue_826_env(&world, &counts, None);
+    // The oracle would (rightly) refuse the injected unavailable S.
+    world.full_oracle(false);
     world
         .store
         .with_semantic_content_fault_for_tests(|| {
@@ -9384,7 +9364,7 @@ fn unavailable_basis_is_rejoined_not_copied() {
         )),
         1
     );
-    issue_826_env(&counts, None);
+    issue_826_env(&world, &counts, None);
     let work = local_edit(&world, "src/c.rs", "fn other() { let _ = 1; }\n", &counts);
     assert_eq!(work["copiedDocuments"], json!([]), "{work}");
     assert_eq!(
@@ -9440,7 +9420,7 @@ fn a_later_producer_fallback_keeps_earlier_producer_copies() {
         ],
     );
     let counts = world._state.path().join("work-counts.json");
-    issue_826_env(&counts, None);
+    issue_826_env(&world, &counts, None);
     let rust = world.write(&rust);
     drop(world.publish(&rust).unwrap());
     let (a, b) = definitions_docs();
@@ -9452,7 +9432,7 @@ fn a_later_producer_fallback_keeps_earlier_producer_copies() {
     // is renamed, so JavaScript A is a pending dependent (its targeted declaration is gone)
     // the witness settles, over the limit.
     write_files(&world.root, &[("src/c.rs", "fn other() { let _ = 1; }\n")]);
-    issue_826_witness_limit();
+    issue_826_witness_limit(&world);
     let work = local_edit(&world, "src/B.js", "function other(){ }\n", &counts);
     assert_eq!(
         work["producerIds"],
@@ -9484,7 +9464,7 @@ fn a_later_producer_fallback_keeps_earlier_producer_copies() {
 fn oracle_catches_unavailable_when_full_succeeds() {
     let (world, _) = issue_826_world();
     let counts = world._state.path().join("work-counts.json");
-    issue_826_env(&counts, None);
+    issue_826_env(&world, &counts, None);
     write_files(&world.root, &[("src/c.rs", "fn other() { let _ = 1; }\n")]);
     let options = IndexOptions::new(world.root.clone());
     let capture = trellis::capture::Capture::admit(&options, &world.cancel, &|_| {}).unwrap();
@@ -9527,7 +9507,7 @@ fn issue_865_world(limits: Option<&str>) -> (World, (PathBuf, String), PathBuf) 
         }
     });
     let counts = world._state.path().join("work-counts.json");
-    issue_826_env(&counts, limits);
+    issue_826_env(&world, &counts, limits);
     let symbol = |name: &str| format!("rust-analyzer cargo c 0.1.0 {name}");
     let f = symbol("impl#[S]f().");
     let mut docs = vec![
@@ -9646,7 +9626,7 @@ fn issue_863_world(
         )
     });
     let counts = world._state.path().join("work-counts.json");
-    issue_826_env(&counts, None);
+    issue_826_env(&world, &counts, None);
     let symbol = |name: &str| format!("rust-analyzer cargo c 0.1.0 {name}");
     let (r, g) = (symbol("r()."), symbol("g()."));
     let a = DocSpec::new("src/a.rs")
@@ -9768,7 +9748,7 @@ fn symbol_declared_only_in_a_changed_dependency_matches_full() {
 fn full_limit_stays_unavailable_under_the_oracle() {
     let (world, _) = issue_826_world();
     let counts = world._state.path().join("work-counts.json");
-    issue_826_env(&counts, Some(r#"{"unit_expansion_bytes":4096}"#));
+    issue_826_env(&world, &counts, Some(r#"{"unit_expansion_bytes":4096}"#));
     local_edit(&world, "src/c.rs", "fn other() { let _ = 1; }\n", &counts);
     assert_eq!(world.rejoin_failures(), 3);
     assert_eq!(
@@ -9820,10 +9800,7 @@ fn witnessed_semantic_spill_marks_readers_before_commit() {
     );
     drop(world.publish(&world.write(&fixture)).unwrap());
     let counts = world._state.path().join("spill-work-counts.json");
-    // SAFETY: nextest runs each test in its own process.
-    unsafe {
-        std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts);
-    }
+    world.work_counts(&counts);
     let spill_count = |db: &rusqlite::Connection| {
         let (mut current, mut highwater) = (0, 0);
         // SAFETY: live writer connection and valid local out-pointers.
@@ -12429,11 +12406,8 @@ fn rust_below_head_rejoin_is_local_unless_cargo_context_differs_from_capture() {
     world.republish();
     world.publish(&descriptor).unwrap();
     let counts = world._state.path().join("rust-owner-counts.json");
-    // SAFETY: nextest isolates each test process; this test owns both hooks.
-    unsafe {
-        std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts);
-        std::env::set_var("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1");
-    }
+    world.work_counts(&counts);
+    world.full_oracle(true);
     for value in 1..=2 {
         let work = local_edit(
             &world,

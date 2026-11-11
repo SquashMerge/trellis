@@ -469,6 +469,43 @@ pub struct SemanticHistory {
     pub presentation_freshness: crate::semantic_evidence::Freshness,
 }
 
+/// Test-support switches for one store's semantic publication (#893): the file S writes its
+/// work counts to, the in-S FULL oracle, forced FULL re-join, and lowered batch and witnessed
+/// settlement limits (each a `BatchLimits` JSON object; an unparsable one fails the operation
+/// that applies it). A store opens with them from the `TRELLIS_TEST_*` environment, which
+/// subprocess fixtures set. An in-process test sets them on its own store instead
+/// ([`Store::update_semantic_test_hooks_for_tests`]), so tests sharing one test binary never
+/// see each other's.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+#[derive(Clone, Debug, Default)]
+pub struct SemanticTestHooks {
+    /// `TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE`.
+    pub work_counts_file: Option<std::path::PathBuf>,
+    /// `TRELLIS_TEST_LOCAL_FULL_ORACLE`.
+    pub full_oracle: bool,
+    /// `TRELLIS_TEST_FORCE_FULL_REJOIN`: S takes the bounded FULL path without a witness.
+    pub force_full_rejoin: bool,
+    /// `TRELLIS_TEST_SEMANTIC_LIMITS`.
+    pub semantic_limits: Option<String>,
+    /// `TRELLIS_TEST_WITNESS_JOIN_LIMITS`: the witnessed settlement's limits alone.
+    pub witness_join_limits: Option<String>,
+}
+
+#[cfg(feature = "test-support")]
+impl SemanticTestHooks {
+    fn from_env() -> Self {
+        Self {
+            work_counts_file: std::env::var_os("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE")
+                .map(std::path::PathBuf::from),
+            full_oracle: std::env::var_os("TRELLIS_TEST_LOCAL_FULL_ORACLE").is_some(),
+            force_full_rejoin: std::env::var_os("TRELLIS_TEST_FORCE_FULL_REJOIN").is_some(),
+            semantic_limits: std::env::var("TRELLIS_TEST_SEMANTIC_LIMITS").ok(),
+            witness_join_limits: std::env::var("TRELLIS_TEST_WITNESS_JOIN_LIMITS").ok(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Store {
     roots: topology::TopologyRoots,
@@ -518,6 +555,9 @@ pub struct Store {
     /// Test seam: the join-inputs digest payload keys carry instead of the build's.
     #[cfg(feature = "test-support")]
     payload_join_inputs: Arc<Mutex<Option<String>>>,
+    /// Test seam: this store's semantic publication switches (#893).
+    #[cfg(feature = "test-support")]
+    semantic_test_hooks: Arc<Mutex<SemanticTestHooks>>,
     #[cfg(test)]
     test_stream_before_preflight_hook: Arc<Mutex<Option<TestStreamPreflightHook>>>,
     /// The publication page cache in KiB; only tests lower it.
@@ -7122,6 +7162,7 @@ fn authenticate_stored_batch(
     r1: &crate::native_evidence::Artifact,
     sources: &BTreeMap<crate::native_evidence::DocumentKey, Vec<u8>>,
     identity: &topology::WorkspaceIdentity,
+    limits: &crate::semantic_batch::BatchLimits,
     cancel: &CancelFlag,
 ) -> Result<AttestedProfileProducer> {
     use crate::native_ids::digest;
@@ -7129,7 +7170,7 @@ fn authenticate_stored_batch(
         self, AuthenticatedArtifact, AuthenticatedScipDocument, DocumentSource, VecSink,
     };
     use crate::semantic_batch::{
-        BatchCounters, BatchLimits,
+        BatchCounters,
         descriptor::{FORMAT_VERSION, SourceManifestHasher},
     };
     let descriptor = &raw.descriptor;
@@ -7191,7 +7232,6 @@ fn authenticate_stored_batch(
     }
     let cargo_targets = cargo_targets.finish();
     // The limits admission ran under, so a document capped there is capped here.
-    let limits = BatchLimits::effective().map_err(anyhow::Error::msg)?;
     let mut claims = Vec::new();
     let mut capped = scip_raw::CappedDocuments::new();
     for capture in &raw.captures {
@@ -7286,7 +7326,7 @@ fn authenticate_stored_batch(
             &artifact,
             &mut resolve,
             &mut BatchCounters::default(),
-            &limits,
+            limits,
             &mut sink,
             cancel,
         )
@@ -8948,7 +8988,7 @@ fn write_import_coverage(
             )?;
         }
         #[cfg(feature = "test-support")]
-        if hit.is_some() && native_first::oracle::enabled() {
+        if hit.is_some() && inputs.check_hits() {
             native_first::oracle::check_hit(db, key, tuple, coverage, publication)?;
         }
     }
@@ -8988,19 +9028,6 @@ enum CommitLoss {
     Before,
     BusyBefore,
     DiskFullBefore,
-}
-
-/// Limits the publication measures disk growth against.
-fn batch_publication_limits() -> crate::semantic_batch::BatchLimits {
-    #[cfg(feature = "test-support")]
-    {
-        crate::semantic_batch::BatchLimits::effective()
-            .unwrap_or(crate::semantic_batch::BatchLimits::PRODUCTION)
-    }
-    #[cfg(not(feature = "test-support"))]
-    {
-        crate::semantic_batch::BatchLimits::PRODUCTION
-    }
 }
 
 /// `file:` URI that attaches `stage.db` read-only.
@@ -9379,6 +9406,7 @@ fn write_semantic(
         &crate::semantic_evidence::SemanticPublication,
         &crate::semantic_evidence::CapturedComponents,
     )>,
+    inputs: &semantic_payload::KeyInputs,
 ) -> Result<()> {
     let key = semantic_pin_key(pin);
     let prior_key = prior
@@ -9430,13 +9458,7 @@ fn write_semantic(
                 )?;
             }
         }
-        write_import_coverage(
-            db,
-            &key,
-            publication,
-            None,
-            &semantic_payload::KeyInputs::current(),
-        )?;
+        write_import_coverage(db, &key, publication, None, inputs)?;
     }
     if let Some(previous) = prior_key {
         db.execute(
@@ -13009,6 +13031,8 @@ impl Store {
             payload_reuse_disabled: Arc::default(),
             #[cfg(feature = "test-support")]
             payload_join_inputs: Arc::default(),
+            #[cfg(feature = "test-support")]
+            semantic_test_hooks: Arc::new(Mutex::new(SemanticTestHooks::from_env())),
             #[cfg(test)]
             test_stream_before_preflight_hook: Arc::new(Mutex::new(None)),
             publication_cache_kib: Arc::new(std::sync::atomic::AtomicI64::new(
@@ -15268,7 +15292,7 @@ impl Store {
             report_json.len() <= 1024 * 1024,
             "semantic import report exceeds response bound"
         );
-        let batch_limits = batch_publication_limits();
+        let batch_limits = self.batch_publication_limits();
         // No handle on stage.db may exist while the writer has it attached.
         stage.release_connection();
         let stage_uri = stage_attach_uri(&stage.db_path());
@@ -18252,7 +18276,7 @@ impl Store {
     ) -> Result<IndexPin> {
         let PublicationPlan { expected, target } = plan;
         #[cfg(feature = "test-support")]
-        if std::env::var_os("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE").is_some() {
+        if self.semantic_test_hooks().work_counts_file.is_some() {
             crate::semantic_import::reset_publication_work(&bundle.2.revision.id, BTreeSet::new());
         }
         if let PublicationTarget::Live = target {
@@ -18957,7 +18981,14 @@ impl Store {
                     cancel,
                 )?;
             } else {
-                write_semantic(&tx, native, prior, revision, semantic)?;
+                write_semantic(
+                    &tx,
+                    native,
+                    prior,
+                    revision,
+                    semantic,
+                    &self.import_key_inputs(),
+                )?;
                 native_first::context::validate(&tx, &revision_key)?;
             }
             if let Some(prior) = old_pin.filter(|pin| !rebaseline && pin.index_revision > 0) {
@@ -19758,9 +19789,69 @@ impl Store {
         *self.payload_join_inputs.lock().unwrap() = digest.map(str::to_owned);
     }
 
+    /// Replaces this store's semantic test switches with `update`'s changes (#893).
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn update_semantic_test_hooks_for_tests(
+        &self,
+        update: impl FnOnce(&mut SemanticTestHooks),
+    ) {
+        update(
+            &mut self
+                .semantic_test_hooks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+    }
+
+    /// This store's semantic test switches.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn semantic_test_hooks_for_tests(&self) -> SemanticTestHooks {
+        self.semantic_test_hooks()
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn semantic_test_hooks(&self) -> SemanticTestHooks {
+        self.semantic_test_hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// The batch limits this store's operations apply: production, or under test support the
+    /// store's lowered ones. The caller reads this once per operation; an unparsable object or
+    /// unknown key is an error.
+    pub(crate) fn batch_limits(
+        &self,
+    ) -> std::result::Result<crate::semantic_batch::BatchLimits, String> {
+        #[cfg(feature = "test-support")]
+        if let Some(text) = self.semantic_test_hooks().semantic_limits {
+            return serde_json::from_str(&text).map_err(|_| "test limits".to_string());
+        }
+        Ok(crate::semantic_batch::BatchLimits::PRODUCTION)
+    }
+
+    /// Limits the publication measures disk growth against.
+    fn batch_publication_limits(&self) -> crate::semantic_batch::BatchLimits {
+        self.batch_limits()
+            .unwrap_or(crate::semantic_batch::BatchLimits::PRODUCTION)
+    }
+
+    /// The build's key inputs under this store's limits, without the payload-reuse seams.
+    fn import_key_inputs(&self) -> semantic_payload::KeyInputs {
+        let inputs = semantic_payload::KeyInputs::current(&self.batch_publication_limits());
+        #[cfg(feature = "test-support")]
+        {
+            inputs.checking_hits(native_first::oracle::enabled(self))
+        }
+        #[cfg(not(feature = "test-support"))]
+        inputs
+    }
+
     /// What this store's payload keys hash besides the document (owner ruling 2026-11-09).
     fn payload_key_inputs(&self) -> semantic_payload::KeyInputs {
-        let inputs = semantic_payload::KeyInputs::current();
+        let inputs = self.import_key_inputs();
         #[cfg(feature = "test-support")]
         {
             let inputs = match self.payload_join_inputs.lock().unwrap().as_deref() {
