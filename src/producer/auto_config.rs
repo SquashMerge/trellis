@@ -32,6 +32,10 @@ pub(crate) struct AutoConfig {
     pub quiet: Duration,
     /// The least time between two automatic starts.
     pub min_interval: Duration,
+    /// Defer a start while the host runs on battery.
+    pub battery_gate: bool,
+    /// Defer a start while the host's load is saturated.
+    pub load_gate: bool,
 }
 
 impl Default for AutoConfig {
@@ -40,6 +44,8 @@ impl Default for AutoConfig {
             enabled: false,
             quiet: Duration::from_secs(DEFAULT_QUIET_SECS),
             min_interval: Duration::from_secs(DEFAULT_MIN_INTERVAL_SECS),
+            battery_gate: true,
+            load_gate: true,
         }
     }
 }
@@ -68,6 +74,8 @@ struct RawAuto {
     enabled: Option<bool>,
     quiet_secs: Option<u64>,
     min_interval_secs: Option<u64>,
+    battery_gate: Option<bool>,
+    load_gate: Option<bool>,
 }
 
 /// Read and validate the file of the checkout at `root`. `known` says whether a producer name
@@ -116,6 +124,8 @@ fn parse(
                 enabled: auto.enabled.unwrap_or(false),
                 quiet: Duration::from_secs(quiet),
                 min_interval: Duration::from_secs(interval),
+                battery_gate: auto.battery_gate.unwrap_or(true),
+                load_gate: auto.load_gate.unwrap_or(true),
             },
         );
     }

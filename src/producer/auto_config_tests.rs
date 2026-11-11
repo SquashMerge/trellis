@@ -33,6 +33,31 @@ fn defaults_apply_to_an_empty_table() {
     assert!(!config.enabled);
     assert_eq!(config.quiet, Duration::from_secs(60));
     assert_eq!(config.min_interval, Duration::from_secs(600));
+    assert!(config.battery_gate && config.load_gate);
+}
+
+#[test]
+fn gate_switches_are_read_independently() {
+    let ConfigState::Valid(tables) = load_text(
+        "[auto.rust-analyzer]\nbatteryGate = false\n\
+         [auto.scip-python]\nloadGate = false\n",
+    ) else {
+        panic!("valid");
+    };
+    assert!(!tables["rust-analyzer"].battery_gate);
+    assert!(tables["rust-analyzer"].load_gate);
+    assert!(tables["scip-python"].battery_gate);
+    assert!(!tables["scip-python"].load_gate);
+}
+
+#[test]
+fn a_non_boolean_gate_switch_is_a_schema_error() {
+    for text in [
+        "[auto.rust-analyzer]\nbatteryGate = \"off\"\n",
+        "[auto.rust-analyzer]\nloadGate = 0\n",
+    ] {
+        assert_eq!(invalid(text), auto_config::SCHEMA, "{text}");
+    }
 }
 
 #[test]
@@ -49,6 +74,8 @@ fn explicit_values_are_read() {
             enabled: true,
             quiet: Duration::from_secs(3600),
             min_interval: Duration::from_secs(86_400),
+            battery_gate: true,
+            load_gate: true,
         }
     );
     assert_eq!(tables["scip-python"].quiet, Duration::from_secs(1));
@@ -112,7 +139,7 @@ fn deep_nesting_is_a_syntax_error_without_a_panic() {
 fn unknown_keys_are_schema_errors() {
     for text in [
         "[auto.rust-analyzer]\nenabled = true\ntrustProfile = \"trusted\"\n",
-        "[auto.rust-analyzer]\nbatteryGate = false\n",
+        "[auto.rust-analyzer]\nbatterySaver = false\n",
         "[other]\nx = 1\n",
         "version = 1\n",
         "[auto.rust-analyzer]\nenabled = \"yes\"\n",

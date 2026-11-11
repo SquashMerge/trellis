@@ -10,6 +10,7 @@
 
 use super::approval::{self, Approval, ApprovalRead};
 use super::auto_config::{self, AutoConfig, ConfigState};
+use super::auto_gate::{self, Gate, Probes};
 use super::profiles::{Stub, Target};
 use super::run::{AutoCancel, SupersedeToken, test_hook};
 use super::state::{RunOrigin, RunRecord, StateDir, now_millis};
@@ -136,8 +137,7 @@ pub(crate) struct Intervals {
     pub quiet: Option<Duration>,
     /// Test-support replacement for every producer's minimum interval.
     pub min_interval: Option<Duration>,
-    /// How long a gated candidate stays deferred (used by the gates).
-    #[allow(dead_code)]
+    /// How long a gated candidate stays deferred.
     pub gate_backstop: Duration,
     pub backstop: Duration,
 }
@@ -184,6 +184,7 @@ pub(crate) enum AutoState {
     Off,
     Idle,
     Scheduled,
+    Deferred,
     Running,
     Failed,
     NeedsApproval,
@@ -196,6 +197,7 @@ impl AutoState {
             Self::Off => "off",
             Self::Idle => "idle",
             Self::Scheduled => "scheduled",
+            Self::Deferred => "deferred",
             Self::Running => "running",
             Self::Failed => "failed",
             Self::NeedsApproval => "needsApproval",
@@ -296,6 +298,8 @@ pub(crate) struct OwnerState {
     last_run_id: BTreeMap<String, String>,
     active: Option<Active>,
     hold: Option<Hold>,
+    /// A producer a gate held back, and until when (`now` plus the gate backstop).
+    deferred: BTreeMap<String, (Gate, Instant)>,
 }
 
 impl OwnerState {
@@ -315,6 +319,7 @@ impl OwnerState {
             last_run_id: BTreeMap::new(),
             active: None,
             hold: None,
+            deferred: BTreeMap::new(),
         };
         for (producer, seed) in seed {
             // A clock stepped back must not push the next start into the future.
@@ -393,6 +398,13 @@ impl OwnerState {
         });
     }
 
+    /// Remember the producers the pass deferred, so they publish `deferred` until their time.
+    fn apply_deferrals(&mut self, deferrals: &[(String, Gate, Instant)]) {
+        for (producer, gate, until) in deferrals {
+            self.deferred.insert(producer.clone(), (*gate, *until));
+        }
+    }
+
     /// Take a launch's end. Only the outcome of the launch in flight counts.
     fn apply(&mut self, done: Tagged, seen: u64, now: Instant) -> bool {
         let matches = self.active.as_ref().is_some_and(|active| {
@@ -450,6 +462,12 @@ impl OwnerState {
     /// Record the dates the pass just published: set on entry, and cleared with the schedule,
     /// including for a producer the pass no longer evaluates (its table or the whole file went).
     fn sync_due_since(&mut self, statuses: &BTreeMap<String, AutoRunStatus>) {
+        let kept = |producer: &String| {
+            statuses
+                .get(producer)
+                .is_some_and(|status| status.due_since.is_some())
+        };
+        self.deferred.retain(|producer, _| kept(producer));
         self.due_since.retain(|producer, _| {
             statuses
                 .get(producer)
@@ -483,6 +501,8 @@ pub(crate) struct Decision {
     pub statuses: BTreeMap<String, AutoRunStatus>,
     pub fallback: AutoRunStatus,
     pub action: Action,
+    /// Gate deferrals made in this pass: (producer, gate, deferred_until).
+    pub deferrals: Vec<(String, Gate, Instant)>,
     /// The soonest future, time-gated instant that changes the decision.
     pub next_deadline: Option<Instant>,
 }
@@ -500,8 +520,22 @@ fn instant_of(ms: u64, now: Instant, now_ms: u64) -> Instant {
     now + Duration::from_millis(ms.saturating_sub(now_ms))
 }
 
+/// The epoch millisecond of the future instant `at`.
+fn epoch_of(at: Instant, now: Instant, now_ms: u64) -> u64 {
+    now_ms.saturating_add(at.saturating_duration_since(now).as_millis() as u64)
+}
+
 /// What the owner should do now, from published state only. Runs on every wake.
-pub(crate) fn decide(s: &OwnerState, live: &Live, now: Instant, now_ms: u64) -> Decision {
+///
+/// `gate` names the gate that holds a producer back, if any. It is asked only of a candidate
+/// that could start now, in `(dueSince, producer)` order.
+pub(crate) fn decide(
+    s: &OwnerState,
+    live: &Live,
+    now: Instant,
+    now_ms: u64,
+    gate: &mut dyn FnMut(&str) -> Option<Gate>,
+) -> Decision {
     let fallback = match &s.config {
         ConfigState::Invalid(reason) => {
             AutoRunStatus::bare(false, AutoState::InvalidConfig, Some((*reason).to_owned()))
@@ -514,7 +548,7 @@ pub(crate) fn decide(s: &OwnerState, live: &Live, now: Instant, now_ms: u64) -> 
     }
     names.extend(s.active.iter().map(|active| active.producer.as_str()));
 
-    let mut statuses = BTreeMap::new();
+    let mut statuses: BTreeMap<String, AutoRunStatus> = BTreeMap::new();
     let mut waiting = Vec::new();
     for name in names {
         let status = evaluate(s, name, live, now, now_ms, &mut waiting);
@@ -555,7 +589,38 @@ pub(crate) fn decide(s: &OwnerState, live: &Live, now: Instant, now_ms: u64) -> 
         && live.slot.is_none()
         && !live.intent_pending
         && !hold_active;
-    let action = if can_start && let Some(first) = ready.into_iter().next() {
+    let mut deferrals = Vec::new();
+    let mut start = None;
+    if can_start {
+        for producer in ready {
+            match gate(&producer) {
+                Some(gated) => {
+                    deferrals.push((producer, gated, now + s.intervals.gate_backstop));
+                }
+                None => {
+                    start = Some(producer);
+                    break;
+                }
+            }
+        }
+    }
+    for (producer, gated, until) in &deferrals {
+        if let Some(status) = statuses.get_mut(producer) {
+            status.state = AutoState::Deferred;
+            status.reason = Some(gated.reason().to_owned());
+            status.next_earliest_start = Some(epoch_of(*until, now, now_ms));
+        }
+        soonest(*until);
+    }
+    for (producer, (_, until)) in &s.deferred {
+        if statuses
+            .get(producer)
+            .is_some_and(|status| status.state == AutoState::Deferred)
+        {
+            soonest(*until);
+        }
+    }
+    let action = if let Some(first) = start {
         Action::Start(first)
     } else if let (Some(active), Some(head)) = (&s.active, &s.head)
         && !active.supersede_requested
@@ -569,6 +634,7 @@ pub(crate) fn decide(s: &OwnerState, live: &Live, now: Instant, now_ms: u64) -> 
         statuses,
         fallback,
         action,
+        deferrals,
         next_deadline,
     }
 }
@@ -650,6 +716,15 @@ fn evaluate(
                 AutoState::Failed,
                 Some(format!("automatic re-run failed: {}", failure.code)),
             )
+        };
+    }
+    if let Some((gate, until)) = s.deferred.get(producer)
+        && *until > now
+    {
+        return AutoRunStatus {
+            due_since,
+            next_earliest_start: Some(epoch_of(*until, now, now_ms)),
+            ..status(AutoState::Deferred, Some(gate.reason().to_owned()))
         };
     }
     let quiet_at = head.seen_at + config.quiet;
@@ -802,6 +877,7 @@ pub(crate) struct Deps {
     pub runtime: Arc<dyn AutoRunRuntime>,
     pub sources: Arc<dyn AutoRunSources>,
     pub clock: Arc<dyn Clock>,
+    pub probes: Arc<dyn Probes>,
     pub intervals: Intervals,
     pub spawn: Spawner,
     pub closed: Arc<AtomicBool>,
@@ -824,6 +900,7 @@ impl AutoRunOwner {
             runtime,
             sources,
             clock: Arc::new(SystemClock),
+            probes: auto_gate::current(),
             intervals: Intervals::current(),
             spawn: thread_spawner(),
             closed: self.closed.clone(),
@@ -917,12 +994,28 @@ fn publish(deps: &Deps, s: &mut OwnerState, decision: &Decision) {
     }
 }
 
+/// `decide` with the host's gates, and the deferrals it made remembered.
+fn decide_gated(
+    s: &mut OwnerState,
+    probes: &Arc<dyn Probes>,
+    live: &Live,
+    now: Instant,
+    now_ms: u64,
+) -> Decision {
+    let decision = decide(s, live, now, now_ms, &mut |producer| {
+        auto_gate::check(&s.cfg(producer)?, &**probes)
+    });
+    s.apply_deferrals(&decision.deferrals);
+    decision
+}
+
 /// The decider (§6.5). No lock is held across a runtime or source call.
 pub(crate) fn run_loop(deps: Deps) {
     let Deps {
         runtime,
         sources,
         clock,
+        probes,
         intervals,
         ..
     } = &deps;
@@ -969,14 +1062,14 @@ pub(crate) fn run_loop(deps: Deps) {
             }
         }
 
-        let mut decision = decide(&s, &live, now, now_ms);
+        let mut decision = decide_gated(&mut s, probes, &live, now, now_ms);
         publish(&deps, &mut s, &decision);
         match decision.action.clone() {
             Action::Start(producer) => {
                 // The owning transition: config and approval are re-read, and what that decides
                 // replaces the first decision.
                 s.reload(&**sources);
-                let recheck = decide(&s, &live, now, now_ms);
+                let recheck = decide_gated(&mut s, probes, &live, now, now_ms);
                 publish(&deps, &mut s, &recheck);
                 if recheck.action != Action::Start(producer.clone()) {
                     continue;
@@ -984,7 +1077,7 @@ pub(crate) fn run_loop(deps: Deps) {
                 if !spawn_run(&deps, &mut s, &cell, &producer, now_ms) {
                     continue;
                 }
-                decision = decide(&s, &live, now, now_ms);
+                decision = decide_gated(&mut s, probes, &live, now, now_ms);
                 publish(&deps, &mut s, &decision);
             }
             Action::Supersede => {
@@ -1034,6 +1127,7 @@ fn spawn_run(
         token: token.clone(),
     };
     let prev_start = s.last_start.insert(producer.to_owned(), now_ms);
+    s.deferred.remove(producer);
     s.active = Some(Active {
         producer: producer.to_owned(),
         basis: basis.clone(),

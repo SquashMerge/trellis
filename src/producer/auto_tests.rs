@@ -55,6 +55,8 @@ fn config(names: &[&str], quiet: u64, min_interval: u64) -> ConfigState {
                         enabled: true,
                         quiet: secs(quiet),
                         min_interval: secs(min_interval),
+                        battery_gate: true,
+                        load_gate: true,
                     },
                 )
             })
@@ -98,9 +100,34 @@ fn live() -> Live {
 
 /// Decide `after` seconds past `base`, publishing like the loop does.
 fn at(s: &mut OwnerState, live: &Live, base: Instant, after: u64) -> Decision {
-    let decision = decide(s, live, base + secs(after), NOW_MS + after * 1000);
+    at_gated(s, live, base, after, &mut |_| None)
+}
+
+/// Like `at`, with `gate` deciding which producers a gate holds back.
+fn at_gated(
+    s: &mut OwnerState,
+    live: &Live,
+    base: Instant,
+    after: u64,
+    gate: &mut dyn FnMut(&str) -> Option<Gate>,
+) -> Decision {
+    let decision = decide(s, live, base + secs(after), NOW_MS + after * 1000, gate);
+    s.apply_deferrals(&decision.deferrals);
     s.sync_due_since(&decision.statuses);
     decision
+}
+
+/// Probes that read nothing: no gate ever holds a run back.
+struct NoProbes;
+
+impl Probes for NoProbes {
+    fn on_battery(&self) -> Option<bool> {
+        None
+    }
+
+    fn load_saturated(&self) -> Option<bool> {
+        None
+    }
 }
 
 /// Make `producer` the launch in flight, as `spawn_run` does.
@@ -231,6 +258,89 @@ fn oldest_due_first_one_at_a_time() {
     assert_eq!(next.action, Action::None);
     assert_eq!(next.statuses[BETA].state, AutoState::Running);
     assert_eq!(next.statuses[ALPHA].state, AutoState::Scheduled);
+}
+
+#[test]
+fn gated_candidate_defers_and_rechecks_at_backstop() {
+    let base = Instant::now();
+    let mut s = ready(&[ALPHA], base);
+    let mut asked = 0;
+    let held = at_gated(&mut s, &live(), base, 20, &mut |_| {
+        asked += 1;
+        Some(Gate::Load)
+    });
+    assert_eq!(held.action, Action::None);
+    assert_eq!(asked, 1);
+    // Inside the backstop the gate is not asked again, and the producer stays deferred.
+    let waiting = at_gated(&mut s, &live(), base, 50, &mut |_| {
+        asked += 1;
+        None
+    });
+    assert_eq!(waiting.action, Action::None);
+    assert_eq!(waiting.statuses[ALPHA].state, AutoState::Deferred);
+    assert_eq!(asked, 1);
+    // At the backstop it is a candidate again, and a gate that still holds defers it afresh.
+    let again = at_gated(&mut s, &live(), base, 80, &mut |_| {
+        asked += 1;
+        Some(Gate::Battery)
+    });
+    assert_eq!(asked, 2);
+    assert_eq!(again.statuses[ALPHA].state, AutoState::Deferred);
+    assert_eq!(
+        again.statuses[ALPHA].reason.as_deref(),
+        Some("deferred: battery")
+    );
+    let cleared = at_gated(&mut s, &live(), base, 140, &mut |_| None);
+    assert_eq!(cleared.action, Action::Start(ALPHA.into()));
+}
+
+#[test]
+fn ungated_second_candidate_starts() {
+    let base = Instant::now();
+    let mut s = ready(&[ALPHA, BETA], base);
+    s.due_since.insert(ALPHA.into(), 100);
+    s.due_since.insert(BETA.into(), 200);
+    let mut asked = Vec::new();
+    let decision = at_gated(&mut s, &live(), base, 20, &mut |producer| {
+        asked.push(producer.to_owned());
+        (producer == ALPHA).then_some(Gate::Battery)
+    });
+    assert_eq!(asked, [ALPHA, BETA]);
+    assert_eq!(decision.action, Action::Start(BETA.into()));
+    assert_eq!(decision.deferrals.len(), 1);
+    assert_eq!(decision.statuses[ALPHA].state, AutoState::Deferred);
+    assert_eq!(decision.statuses[BETA].state, AutoState::Scheduled);
+}
+
+#[test]
+fn new_deferral_publishes_deferred_with_deadline_same_pass() {
+    let base = Instant::now();
+    let mut s = ready(&[ALPHA], base);
+    let decision = at_gated(&mut s, &live(), base, 20, &mut |_| Some(Gate::Battery));
+    let status = &decision.statuses[ALPHA];
+    assert_eq!(status.state, AutoState::Deferred);
+    assert_eq!(status.reason.as_deref(), Some("deferred: battery"));
+    assert_eq!(status.next_earliest_start, Some(NOW_MS + 80_000));
+    assert!(status.due_since.is_some());
+    assert_eq!(decision.next_deadline, Some(base + secs(80)));
+    assert_eq!(
+        decision.deferrals,
+        [(ALPHA.to_owned(), Gate::Battery, base + secs(80))]
+    );
+}
+
+#[test]
+fn a_blocked_start_asks_no_gate() {
+    let base = Instant::now();
+    let mut s = ready(&[ALPHA], base);
+    let manual = Live {
+        slot: Some(RunOrigin::Manual),
+        ..live()
+    };
+    let decision = at_gated(&mut s, &manual, base, 20, &mut |_| {
+        panic!("a producer that cannot start is not gated")
+    });
+    assert!(decision.deferrals.is_empty());
 }
 
 #[test]
@@ -1157,6 +1267,7 @@ impl Harness {
             runtime: rt.clone(),
             sources: src.clone(),
             clock: clock.clone(),
+            probes: Arc::new(NoProbes),
             intervals,
             spawn,
             closed: closed.clone(),
