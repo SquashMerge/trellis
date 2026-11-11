@@ -3238,6 +3238,7 @@ impl CheckoutRuntime {
         &self,
         response: &CheckoutEvidence,
         view: &mut crate::behavior::SequenceView,
+        visible_bound: bool,
     ) -> anyhow::Result<()> {
         let mut check = || Ok(());
         if crate::store::sequence_call_ids(&view.steps).is_empty() {
@@ -3252,6 +3253,7 @@ impl CheckoutRuntime {
                 return response.annotate_sequence_interfaces(
                     view,
                     crate::store::InterfaceEvidence::Unavailable,
+                    visible_bound,
                     &mut check,
                 );
             }
@@ -3271,7 +3273,7 @@ impl CheckoutRuntime {
             },
             None => crate::store::InterfaceEvidence::NotMeasured,
         };
-        response.annotate_sequence_interfaces(view, evidence, &mut check)
+        response.annotate_sequence_interfaces(view, evidence, visible_bound, &mut check)
     }
 
     /// An MCP or CLI architecture operation in this admitted read.

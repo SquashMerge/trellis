@@ -40,6 +40,9 @@ function sequenceInterfaceText(step, view) {
   const route = [hop.method, hop.pathTemplate].filter(item => typeof item === "string").join(" ") || "path not readable";
   if (sequenceHop(view, step)) return `HTTP interface hop · ${route} · ${SEQUENCE_HOP_CONFIDENCE[hop.confidence]} · ${hop.clientApp || "client"} → ${hop.serverApp} · structural match by method and path, not proof the request is sent`;
   if (hop.confidence === "unresolved") return `HTTP client call · ${route} · unresolved: no route matched · a missing match proves nothing`;
+  // A match whose app column did not fit the participant limit is told, never drawn.
+  if (typeof hop.serverApp === "string" && hop.serverApp && Object.hasOwn(SEQUENCE_HOP_CONFIDENCE, hop.confidence))
+    return `HTTP interface · ${route} · ${SEQUENCE_HOP_CONFIDENCE[hop.confidence]} · ${hop.clientApp || "client"} → ${hop.serverApp} · not drawn: sequence participant limit · structural match, not proof`;
   return "";
 }
 // The view's interface reading (#853), for the status line. Absence is never no request.
@@ -71,7 +74,8 @@ function sequenceTarget(view, step) {
 }
 function sequenceEvidenceLabel(step, view) {
   if (!["call", "boundary"].includes(step?.kind) || !step.callId) return "Measured source syntax";
-  if (view && sequenceHop(view, step)) return `HTTP interface hop · ${SEQUENCE_HOP_CONFIDENCE[step.interface.confidence]} · structural match, not proof`;
+  // The matched route travels with the confidence wherever the hop is drawn, Show all included.
+  if (view && sequenceHop(view, step)) return `HTTP interface hop · ${sequenceHopLabel(step.interface)}`;
   const evidence = step.callEvidence;
   if (!evidence) return "measured syntax; target unverified";
   if (evidence.projection?.semanticStatus === "catchingUp") return "Semantic catching up - native syntax only";
@@ -449,6 +453,9 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
     }
     const target = sequenceTarget(view, step);
     if (target) { visibleTargets.add(target.id); targetProofs.set(target.id, step); }
+    // A shown step's own lane is drawn even when the call that opened it is drawn elsewhere: a
+    // wrapper whose call is an HTTP interface hop (#853) keeps its expanded body's lane.
+    if (step.lane != null && participantById.get(step.lane)?.declaration) visibleTargets.add(step.lane);
     pending.push(...nestedPending(step, depth + 1));
   }
   // Hidden chain members and replaced candidate hints must not leave ghost lanes.
@@ -546,7 +553,7 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
     // text is treated as equivalent, merged, or removed.
     const isControl = ["branch", "loop", "try"].includes(display.kind);
     let label = display.label || display.kind;
-    if (["call", "boundary"].includes(evidence.kind) && evidence.callEvidence) label = `${sequenceEvidenceLabel(evidence, view)} · ${label}`;
+    if (["call", "boundary"].includes(evidence.kind) && (evidence.callEvidence || sequenceHop(view, evidence))) label = `${sequenceEvidenceLabel(evidence, view)} · ${label}`;
     if (options.showDetails) {
       if (!operator && display.kind !== "group" && display.kind !== "call chain" && display.kind !== "call") label = `${display.kind} · ${label}`;
     } else {

@@ -57,10 +57,17 @@ impl EvidenceResponse {
     /// between two apps changes the drawing: it targets its handler's participant, and an
     /// incidental one is shown. Contention is returned; any other failure of the evidence is
     /// `unavailable`, never a failed Sequence.
+    ///
+    /// The view's bounds are unchanged (Prime2 review on #885): a handler that would need a
+    /// column past [`crate::behavior::MAX_COLUMNS`] is not drawn and the view is truncated by
+    /// `participants`; and when `visible_bound` holds (every view but the Interactions
+    /// candidates, #663), revealed calls are kept within [`crate::behavior::MAX_STEPS`] shown
+    /// steps by the same cap, truncated by `visibleSteps`. Counts describe the retained view.
     pub(crate) fn annotate_sequence_interfaces(
         &self,
         view: &mut SequenceView,
         evidence: InterfaceEvidence<'_>,
+        visible_bound: bool,
         check: &mut (impl FnMut() -> Result<()> + Send),
     ) -> Result<()> {
         let ids = call_ids(&view.steps);
@@ -127,6 +134,7 @@ impl EvidenceResponse {
         let app = |index: usize| assignment.apps().get(index).map(|app| app.name.clone());
         // One participant per handler, in its app's column.
         let mut handlers: BTreeMap<String, Option<String>> = BTreeMap::new();
+        let mut column_limited = false;
         let mut found: BTreeMap<String, InterfaceHop> = BTreeMap::new();
         for (id, hop) in hops {
             check()?;
@@ -144,9 +152,20 @@ impl EvidenceResponse {
                             match handlers.get(&key) {
                                 Some(known) => known.clone(),
                                 None => {
-                                    let symbol = self
-                                        .symbol_at(syntax_id, Some(view.revision))?
-                                        .map(|(_, symbol)| symbol);
+                                    let column = SequenceColumn {
+                                        id: format!("app:{server}"),
+                                        label: server.clone(),
+                                    };
+                                    // The app's column is admitted like any target's (#558).
+                                    let fits =
+                                        crate::behavior_columns::fits(&view.participants, &column);
+                                    column_limited |= !fits;
+                                    let symbol = if fits {
+                                        self.symbol_at(syntax_id, Some(view.revision))?
+                                            .map(|(_, symbol)| symbol)
+                                    } else {
+                                        None
+                                    };
                                     let drawn = symbol.map(|symbol| {
                                         view.participants.push(Participant {
                                             id: key.clone(),
@@ -154,10 +173,7 @@ impl EvidenceResponse {
                                             kind: HANDLER_KIND.into(),
                                             identification: HANDLER_IDENTIFICATION.into(),
                                             declaration: Some(symbol),
-                                            column: Some(SequenceColumn {
-                                                id: format!("app:{server}"),
-                                                label: server.clone(),
-                                            }),
+                                            column: Some(column),
                                         });
                                         key.clone()
                                     });
@@ -193,32 +209,57 @@ impl EvidenceResponse {
             };
             found.insert(id, annotation);
         }
-        let mut summary = SequenceInterfaces {
-            state: InterfacesState::Ready,
-            hops: 0,
-            unresolved: 0,
-        };
-        let mut shown = 0;
+        let mut revealed = false;
         let mut pending: Vec<&mut SequenceStep> = view.steps.iter_mut().collect();
         while let Some(step) = pending.pop() {
             if let Some(hop) = step.call_id.as_deref().and_then(|id| found.get(id)) {
-                if hop.participant.is_some() {
-                    summary.hops += 1;
-                    // An incidental call (`fetch`, an external client) is hidden by default;
-                    // its hop is the interaction, so it is shown.
-                    if step.hidden && step.incidental.take().is_some() {
-                        step.hidden = false;
-                        shown += 1;
-                    }
-                } else if hop.server_app.is_none() {
-                    summary.unresolved += 1;
+                // An incidental call (`fetch`, an external client) is hidden by default; its
+                // hop is the interaction, so it is shown.
+                if hop.participant.is_some() && step.hidden && step.incidental.take().is_some() {
+                    step.hidden = false;
+                    revealed = true;
                 }
                 step.interface = Some(hop.clone());
             }
             pending.extend(step.children.iter_mut().chain(step.alternate.iter_mut()));
         }
-        view.hidden_steps = view.hidden_steps.saturating_sub(shown);
-        view.incidental_steps = view.incidental_steps.saturating_sub(shown);
+        if column_limited {
+            view.limit(crate::behavior::SequenceLimit::Participants);
+            const WARNING: &str =
+                "Sequence participant limit reached; additional targets are not shown.";
+            if !view.warnings.iter().any(|warning| warning == WARNING) {
+                view.warnings.push(WARNING.into());
+            }
+        }
+        if revealed && visible_bound {
+            // The same typed cap as the read's own; it recounts hidden and incidental steps.
+            crate::behavior::cap_visible(view, crate::behavior::MAX_STEPS);
+        } else {
+            view.hidden_steps = crate::behavior::hidden_count(&view.steps);
+            view.incidental_steps = crate::behavior::incidental_count(&view.steps);
+        }
+        // Counts and handler participants describe the steps the view kept.
+        let mut summary = SequenceInterfaces {
+            state: InterfacesState::Ready,
+            hops: 0,
+            unresolved: 0,
+        };
+        let mut drawn = BTreeSet::new();
+        let mut pending: Vec<&SequenceStep> = view.steps.iter().collect();
+        while let Some(step) = pending.pop() {
+            if let Some(hop) = &step.interface {
+                if let Some(participant) = &hop.participant {
+                    summary.hops += 1;
+                    drawn.insert(participant.clone());
+                } else if hop.server_app.is_none() {
+                    summary.unresolved += 1;
+                }
+            }
+            pending.extend(step.children.iter().chain(&step.alternate));
+        }
+        view.participants.retain(|participant| {
+            participant.kind != HANDLER_KIND || drawn.contains(&participant.id)
+        });
         view.interfaces = Some(summary);
         Ok(())
     }

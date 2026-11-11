@@ -137,7 +137,7 @@ test("the handler lane and the inspector continue into the handler's own Sequenc
     const step = window.picks[0], target = TrellisSequence.target(window.view, step);
     return {id:step.id, target:target.id, action:TrellisSequence.targetActionLabel(target.declaration, target), evidence:TrellisSequence.evidenceLabel(step, window.view), text:TrellisSequence.interfaceText(step, window.view)};
   });
-  assert.deepEqual(picked, {id:"c-exact", target:"interface:daemon:sequence", action:"Open handler sequence", evidence:"HTTP interface hop · exact · structural match, not proof",
+  assert.deepEqual(picked, {id:"c-exact", target:"interface:daemon:sequence", action:"Open handler sequence", evidence:"HTTP interface hop · POST /api/sequence · exact · structural match, not proof",
     text:"HTTP interface hop · POST /api/sequence · exact · web → daemon · structural match by method and path, not proof the request is sent"});
   // One hop: the lane names one handler, so its header opens that handler's Sequence.
   const single = hopView();
@@ -149,6 +149,11 @@ test("the handler lane and the inspector continue into the handler's own Sequenc
   assert.deepEqual(await page.evaluate(() => window.opened), [["syntax:sequence", "c-exact"]]);
   const unresolved = await page.evaluate(view => TrellisSequence.interfaceText(view.steps[4], view), view);
   assert.equal(unresolved, "HTTP client call · GET /api/nowhere · unresolved: no route matched · a missing match proves nothing");
+  // A match the participant limit left undrawn is told in the inspector, never drawn.
+  const limited = hopView();
+  delete limited.steps[0].interface.participant;
+  assert.equal(await page.evaluate(view => [TrellisSequence.hop(view, view.steps[0]), TrellisSequence.interfaceText(view.steps[0], view)], limited).then(([hop, text]) => hop === null && text),
+    "HTTP interface · POST /api/sequence · exact · web → daemon · not drawn: sequence participant limit · structural match, not proof");
 });
 
 test("negative control: without interface evidence the same calls draw exactly as before", async () => {
@@ -192,4 +197,65 @@ test("calls-first (a syntax-only view) draws the same hops as arrows and keeps u
   assert.equal((await render(view, {})).status, "rendered");
   assert.deepEqual(await page.locator("#sequence-diagram .pele-edge-label").allTextContents(), LABELS);
   for (const id of ["c-dynamic", "c-nowhere"]) assert.equal(await page.locator(`#sequence-diagram .pele-note[data-trellis-call-id="callid:${id}"]`).count(), 1);
+});
+
+// Prime2 review on #885: Show all steps keeps the matched route on the hop, in both renderers.
+test("Show all keeps the matched method and path template on every hop, in both renderers", async () => {
+  const view = hopView();
+  view.semantic = {tier:"syntax", reason:"no producer"};
+  for (const step of view.steps) { delete step.callEvidence; delete step.target; }
+  view.participants = view.participants.filter(participant => participant.id !== "api");
+  const routes = Object.values(HOPS).map(([method, path]) => `${method} ${path}`);
+  assert.equal((await render(view, {showDetails:true})).status, "rendered");
+  const pele = await page.locator("#sequence-diagram .pele-edge-label").allTextContents();
+  assert.equal(pele.length, 3, JSON.stringify(pele));
+  pele.forEach((text, at) => assert.ok(text.includes(routes[at]) && /structural match, not proof/.test(text), text));
+  await legacy(view, {showDetails:true});
+  const rows = await page.locator("#sequence-diagram .sequence-source[data-trellis-call-id]").evaluateAll(nodes => nodes.map(node => [node.getAttribute("data-trellis-call-id"), node.querySelector("text").textContent]));
+  for (const [at, id] of Object.keys(HOPS).entries()) {
+    const row = rows.find(([callId]) => callId === `callid:${id}`);
+    assert.ok(row && row[1].includes(routes[at]), JSON.stringify(rows));
+  }
+});
+
+// Prime2 review on #885: a wrapper in its own column keeps its lane when its call hops, so its
+// expanded body's arrows start from the wrapper, in both renderers.
+function wrapperView() {
+  const view = hopView();
+  view.steps = view.steps.filter(step => step.id === "c-exact");
+  const api = view.participants.find(participant => participant.id === "api");
+  api.column = {id:"module:client", label:"client"};
+  const trace = {...structuredClone(api), id:"trace", label:"trace", column:{id:"module:trace", label:"trace"}, declaration:{...structuredClone(api.declaration), id:"trace", name:"trace", path:"web/trace.js"}};
+  view.participants.push(trace);
+  const outer = view.steps[0];
+  outer.children = [{...structuredClone(outer), id:"c-exact>trace", label:"trace()", callId:"callid:c-exact>trace", target:"trace", lane:"api", interface:undefined, children:[],
+    callEvidence:{...outer.callEvidence, provenanceId:"proof:trace"}}];
+  delete outer.children[0].interface;
+  view.interfaces = {state:"ready", hops:1, unresolved:0};
+  return view;
+}
+test("an expanded wrapper in its own column keeps its lane: its body's arrow starts there, in both renderers", async () => {
+  const view = wrapperView();
+  assert.equal((await render(view)).status, "rendered");
+  const peleHeaders = await headers("#sequence-diagram .pele-actor:not(.pele-actor-footer)");
+  assert.ok(peleHeaders.includes("«module» client"), JSON.stringify(peleHeaders));
+  const client = await box(page.locator("#sequence-diagram .pele-actor:not(.pele-actor-footer)").filter({hasText:/client$/}));
+  const peleChild = await box(page.locator('#sequence-diagram .pele-message[data-trellis-step-id="c-exact>trace"]:not([data-trellis-return-step-id]) path').first());
+  // The child runs between the wrapper's and trace's lanes, never from the seed's.
+  const seedX = (await box(page.locator('#sequence-diagram .pele-lifeline[data-id="S"]'))).x;
+  const trace = await box(page.locator("#sequence-diagram .pele-actor:not(.pele-actor-footer)").filter({hasText:/trace$/}));
+  const ends = [peleChild.left, peleChild.right].sort((a, b) => Math.abs(a - client.x) - Math.abs(b - client.x));
+  assert.ok(Math.abs(ends[0] - client.x) <= 13 && Math.abs(ends[1] - trace.x) <= 13 && Math.abs(peleChild.left - seedX) > 20, `Pele child client → trace: ${JSON.stringify({peleChild, client, trace, seedX})}`);
+  await legacy(view);
+  const legacyHeaders = await headers("#sequence-diagram .sequence-participant-label");
+  assert.ok(legacyHeaders.includes("«module» client"), JSON.stringify(legacyHeaders));
+  const geometry = await page.evaluate(() => {
+    const label = [...document.querySelectorAll("#sequence-diagram .sequence-participant-label")].find(node => node.textContent.includes("client"));
+    const arrow = document.querySelector('#sequence-diagram .sequence-arrow[data-trellis-call-id="callid:c-exact>trace"]');
+    const back = document.querySelector('#sequence-diagram .sequence-return[data-trellis-return-step-id="c-exact>trace"]');
+    const start = d => Number(/^M ([\d.]+)/.exec(d)[1]);
+    return {client:Number(label.getAttribute("x")), from:start(arrow.getAttribute("d")), backTo:back ? Number(/H ([\d.]+)/.exec(back.getAttribute("d"))[1]) : null};
+  });
+  assert.equal(geometry.from, geometry.client, JSON.stringify(geometry));
+  assert.equal(geometry.backTo, geometry.client, JSON.stringify(geometry));
 });

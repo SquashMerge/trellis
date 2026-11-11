@@ -5607,8 +5607,13 @@ async fn provisioned_core_answer(
                     r.sequence_at(&q.seed, q.expected_revision, q.show_all)?
                 };
                 // #853: client calls that cross to another app's handler.
+                // The Interactions candidates (#663) of an enriched view are not bound by shown
+                // steps; every other view keeps that bound when a hop reveals a call.
                 if let Some(view) = view.as_mut() {
-                    hops.sequence_interfaces(r, view)?;
+                    let candidates = q.interactions
+                        && !q.show_all
+                        && view.semantic.tier == crate::behavior::EvidenceTier::Semantic;
+                    hops.sequence_interfaces(r, view, !candidates)?;
                 }
                 Ok(view)
             })

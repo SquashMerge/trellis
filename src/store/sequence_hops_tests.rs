@@ -109,6 +109,7 @@ fn client_calls_cross_to_the_daemon_with_their_confidence_or_stay_boundaries() {
                 config: None,
                 core: &core,
             },
+            true,
             &mut || Ok(()),
         )
         .unwrap();
@@ -216,6 +217,7 @@ fn a_view_with_no_client_call_is_unchanged_but_says_it_was_read() {
                 config: None,
                 core: &core,
             },
+            true,
             &mut || Ok(()),
         )
         .unwrap();
@@ -236,7 +238,9 @@ fn without_a_core_of_the_revision_the_calls_are_not_measured_not_unmatched() {
     let mut view = sequence(&response, "load");
     let original = view.clone();
     response
-        .annotate_sequence_interfaces(&mut view, InterfaceEvidence::NotMeasured, &mut || Ok(()))
+        .annotate_sequence_interfaces(&mut view, InterfaceEvidence::NotMeasured, true, &mut || {
+            Ok(())
+        })
         .unwrap();
     assert_eq!(view.steps, original.steps);
     assert_eq!(view.interfaces.unwrap().state, InterfacesState::NotMeasured);
@@ -251,6 +255,7 @@ fn without_a_core_of_the_revision_the_calls_are_not_measured_not_unmatched() {
                 config: None,
                 core: &core,
             },
+            true,
             &mut || Ok(()),
         )
         .unwrap();
@@ -276,6 +281,7 @@ fn one_app_extracts_no_interface() {
                 config: None,
                 core: &core,
             },
+            true,
             &mut || Ok(()),
         )
         .unwrap();
@@ -308,6 +314,7 @@ fn a_hidden_incidental_client_call_with_a_hop_is_shown() {
                 config: None,
                 core: &core,
             },
+            true,
             &mut || Ok(()),
         )
         .unwrap();
@@ -336,6 +343,7 @@ fn the_hop_fields_serialize_as_the_browser_reads_them() {
                 config: None,
                 core: &core,
             },
+            true,
             &mut || Ok(()),
         )
         .unwrap();
@@ -375,4 +383,175 @@ fn the_hop_fields_serialize_as_the_browser_reads_them() {
             .unwrap()
             .starts_with("interface:alpha:")
     );
+}
+
+fn annotate(response: &EvidenceResponse, core: &ArchitectureCore, view: &mut SequenceView) {
+    response
+        .annotate_sequence_interfaces(
+            view,
+            InterfaceEvidence::Core { config: None, core },
+            true,
+            &mut || Ok(()),
+        )
+        .unwrap();
+}
+
+fn shown(steps: &[SequenceStep]) -> usize {
+    steps
+        .iter()
+        .map(|step| usize::from(!step.hidden) + shown(&step.children) + shown(&step.alternate))
+        .sum()
+}
+
+#[test]
+fn a_hop_never_adds_a_twenty_first_column() {
+    // Prime2 review on #885: twenty drawn columns leave no room for the server app's column.
+    let (_state, _root, store) = two_apps();
+    let response = store.evidence_response().unwrap();
+    let core = core(&response);
+    let mut view = sequence(&response, "load");
+    let filler = view.participants[0].clone();
+    for at in 0..crate::behavior::MAX_COLUMNS {
+        let mut participant = filler.clone();
+        participant.id = format!("filler:{at}");
+        participant.column = Some(crate::behavior::SequenceColumn {
+            id: format!("module:filler{at}"),
+            label: format!("filler{at}"),
+        });
+        view.participants.push(participant);
+    }
+    let before = view.participants.clone();
+    annotate(&response, &core, &mut view);
+    assert_eq!(
+        view.participants, before,
+        "no handler participant, no new column"
+    );
+    assert!(
+        view.truncated
+            && view
+                .truncated_by
+                .contains(&crate::behavior::SequenceLimit::Participants)
+    );
+    assert!(
+        view.warnings
+            .iter()
+            .any(|w| w.contains("participant limit"))
+    );
+    let found = hops(&view);
+    // The matches are still told, but none is drawn: no participant.
+    assert!(found.values().all(|hop| hop.participant.is_none()));
+    assert_eq!(
+        found
+            .values()
+            .filter(|hop| hop.server_app.is_some())
+            .count(),
+        3
+    );
+    let read = view.interfaces.unwrap();
+    assert_eq!((read.hops, read.unresolved), (0, 2));
+}
+
+#[test]
+fn a_revealed_hop_stays_within_the_shown_step_bound() {
+    // Prime2 review on #885: a hidden client call at shown step 201 is not revealed past the cap.
+    let (_state, _root, store) = two_apps();
+    let response = store.evidence_response().unwrap();
+    let core = core(&response);
+    let mut view = sequence(&response, "load");
+    let template = view
+        .steps
+        .iter()
+        .find(|step| step.call_id.is_none())
+        .cloned()
+        .unwrap_or_else(|| view.steps[0].clone());
+    for step in &mut view.steps {
+        if step.call_id.is_some() {
+            step.hidden = true;
+            step.incidental = Some(crate::behavior::IncidentalReason::External);
+        }
+    }
+    let mut filler = Vec::new();
+    for at in 0..crate::behavior::MAX_STEPS - shown(&view.steps) {
+        let mut step = template.clone();
+        step.id = format!("filler:{at}");
+        step.kind = "effect".into();
+        step.call_id = None;
+        step.hidden = false;
+        step.incidental = None;
+        step.children.clear();
+        step.alternate.clear();
+        filler.push(step);
+    }
+    filler.append(&mut view.steps);
+    view.steps = filler;
+    view.hidden_steps = crate::behavior::hidden_count(&view.steps);
+    view.incidental_steps = crate::behavior::incidental_count(&view.steps);
+    assert_eq!(shown(&view.steps), crate::behavior::MAX_STEPS);
+    annotate(&response, &core, &mut view);
+    assert!(shown(&view.steps) <= crate::behavior::MAX_STEPS);
+    assert!(
+        view.truncated_by
+            .contains(&crate::behavior::SequenceLimit::VisibleSteps)
+    );
+    assert_eq!(
+        view.hidden_steps,
+        crate::behavior::hidden_count(&view.steps)
+    );
+    assert_eq!(
+        view.incidental_steps,
+        crate::behavior::incidental_count(&view.steps)
+    );
+    // Counts and handler participants describe the retained view only.
+    let found = hops(&view);
+    let read = view.interfaces.as_ref().unwrap();
+    assert_eq!(
+        read.hops,
+        found
+            .values()
+            .filter(|hop| hop.participant.is_some())
+            .count()
+    );
+    let drawn: Vec<&str> = found
+        .values()
+        .filter_map(|hop| hop.participant.as_deref())
+        .collect();
+    assert!(
+        view.participants
+            .iter()
+            .filter(|participant| participant.kind == crate::store::sequence_hops::HANDLER_KIND)
+            .all(|participant| drawn.contains(&participant.id.as_str()))
+    );
+}
+
+#[test]
+fn the_interactions_candidates_keep_their_unbounded_shown_steps() {
+    // Interactions bound arrows in the browser (#663): without the visible bound, a hop is
+    // revealed wherever it is.
+    let (_state, _root, store) = two_apps();
+    let response = store.evidence_response().unwrap();
+    let core = core(&response);
+    let mut view = sequence(&response, "load");
+    for step in &mut view.steps {
+        if step.call_id.is_some() {
+            step.hidden = true;
+            step.incidental = Some(crate::behavior::IncidentalReason::External);
+        }
+    }
+    response
+        .annotate_sequence_interfaces(
+            &mut view,
+            InterfaceEvidence::Core {
+                config: None,
+                core: &core,
+            },
+            false,
+            &mut || Ok(()),
+        )
+        .unwrap();
+    assert!(
+        !view
+            .truncated_by
+            .contains(&crate::behavior::SequenceLimit::VisibleSteps)
+    );
+    assert_eq!(view.interfaces.unwrap().hops, 3);
 }

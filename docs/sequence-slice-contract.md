@@ -399,7 +399,19 @@ is drawn as a labelled boundary hop into that route's handler. The evidence mean
   confidence and the two apps, and says the match is by method and path, not proof the
   request is sent.
 - **Bounds.** Hops add at most one participant per distinct handler of the view's calls, and
-  one lane per server app. The work, depth, participant and arrow bounds are unchanged.
+  one lane per server app, within the unchanged bounds (Prime2 review on #885). A server app's
+  column is admitted like any target's: when 20 columns are drawn already, the handler gets no
+  participant, the call keeps its `interface` without one (the inspector says it was not
+  drawn) and the view is truncated by `participants` with the usual warning. A revealed
+  incidental call counts toward the 200 shown steps in every view the visible bound applies
+  to (all but the Interactions candidates, #663): the same cap runs again and truncates by
+  `visibleSteps`. `hiddenSteps`, `incidentalSteps`, `interfaces` counts and the handler
+  participants describe only the steps kept. The work, depth and arrow bounds are unchanged.
+- **Show all.** Show all steps keeps the source text and adds the hop's route: its evidence
+  label is `HTTP interface hop · <method> <path template> · <confidence> · structural match,
+  not proof` in both renderers.
+- **Wrapper lane.** A wrapper whose call is a hop keeps its own lane for its expanded body in
+  both renderers, so the body's arrows start from the wrapper's column.
 - **MCP.** No MCP tool returns a Sequence; `trellis_show` opens this browser view, which
   draws its hops. No MCP output changes.
 
