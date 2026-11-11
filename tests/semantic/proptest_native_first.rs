@@ -2001,6 +2001,7 @@ fn isolated_with(test: &str, env: &[(&str, &str)]) -> bool {
         )
         .env_remove("TRELLIS_TEST_FORCE_FULL_REJOIN")
         .env_remove("TRELLIS_TEST_SEMANTIC_LIMITS")
+        .env_remove("TRELLIS_TEST_WITNESS_JOIN_LIMITS")
         .envs(env.iter().copied())
         .output()
         .unwrap();
@@ -2303,9 +2304,18 @@ fn native_first_generated_histories() {
 }
 
 /// #826: the live budget (`unit_expansion_bytes`) of the reduced-limit histories, 160 KiB.
-/// Every FULL (import or S) of this corpus fits in 128 KiB (not in 64 KiB); the witnessed
-/// settlement of a pending dependent needs more than 192 KiB (it fits in 256 KiB).
+/// Every FULL (import or S) of this corpus fits in 128 KiB (not in 64 KiB).
 const REDUCED_LIMITS: &str = r#"{"unit_expansion_bytes":163840}"#;
+/// #826: the witnessed settlement's own live budget in those histories (test support
+/// `TRELLIS_TEST_WITNESS_JOIN_LIMITS`), 24 KiB. Since #865 the witness charges a pending
+/// dependent what FULL charges, so only a lower witness budget makes it exceed its bounds.
+const REDUCED_WITNESS_LIMITS: &str = r#"{"unit_expansion_bytes":24576}"#;
+/// The environment of the reduced-limit histories: FULL under `REDUCED_LIMITS`, the witnessed
+/// settlement under `REDUCED_WITNESS_LIMITS`.
+const REDUCED_ENV: [(&str, &str); 2] = [
+    ("TRELLIS_TEST_SEMANTIC_LIMITS", REDUCED_LIMITS),
+    ("TRELLIS_TEST_WITNESS_JOIN_LIMITS", REDUCED_WITNESS_LIMITS),
+];
 
 /// #826: under a live budget FULL fits but the witness does not, every S still ends caught
 /// up and equal to FULL (the in-S oracle is on) with no unavailable coverage, because the
@@ -2314,7 +2324,7 @@ const REDUCED_LIMITS: &str = r#"{"unit_expansion_bytes":163840}"#;
 #[test]
 fn native_first_reduced_limit_control() {
     let name = "proptest_native_first::native_first_reduced_limit_control";
-    if !isolated_with(name, &[("TRELLIS_TEST_SEMANTIC_LIMITS", REDUCED_LIMITS)]) {
+    if !isolated_with(name, &REDUCED_ENV) {
         return;
     }
     // B (target) goes away, so A (run calls target) is a pending dependent the witness settles.
@@ -2343,7 +2353,7 @@ fn native_first_reduced_limit_control() {
 /// undivided strategy (uniform over `1..=MAX_HISTORY`) gave its lengths, rounded up, so the
 /// bands together run at least as many histories of every length as one test did.
 fn reduced_limit_band(name: &'static str, lengths: std::ops::RangeInclusive<usize>) {
-    if !isolated_with(name, &[("TRELLIS_TEST_SEMANTIC_LIMITS", REDUCED_LIMITS)]) {
+    if !isolated_with(name, &REDUCED_ENV) {
         return;
     }
     let share = (lengths.end() - lengths.start() + 1) as u32;
