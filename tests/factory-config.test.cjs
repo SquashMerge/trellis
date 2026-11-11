@@ -1,7 +1,7 @@
 const assert = require("node:assert/strict");
-const { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } = require("node:fs");
+const { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } = require("node:fs");
 const { tmpdir } = require("node:os");
-const { delimiter, join, resolve: resolvePath } = require("node:path");
+const { delimiter, dirname, join, resolve: resolvePath } = require("node:path");
 const { spawnSync } = require("node:child_process");
 const test = require("node:test");
 
@@ -153,6 +153,56 @@ test("recognized issue lookup failures remain failures", () => {
     const result = resolve(config, fakeDir, "123", { FAKE_GH_EXIT: "23" });
     assert.equal(result.status, 23);
     assert.deepEqual(result.args?.slice(0, 3), ["issue", "view", "123"]);
+  } finally {
+    rmSync(fakeDir, { recursive: true, force: true });
+  }
+});
+
+// verify skips apt only when this helper proves Chromium's libraries resolve;
+// any library ldd cannot inspect must send verify back to apt.
+const BROWSER_PACKAGES = join(ROOT, "tests/browser/node_modules/playwright-core");
+test("browser library check fails when ldd cannot inspect a bundled library", { skip: !existsSync(BROWSER_PACKAGES) && "tests/browser packages are not installed" }, () => {
+  const fakeDir = mkdtempSync(join(tmpdir(), "trellis-browser-libs-"));
+  try {
+    const browsers = join(fakeDir, "browsers");
+    const env = { ...process.env, PLAYWRIGHT_BROWSERS_PATH: browsers };
+    const located = spawnSync(process.execPath, ["-e", `
+      const { registry } = require("playwright-core/lib/coreBundle").registry;
+      for (const name of ["chromium", "chromium-headless-shell"]) console.log(registry.findExecutable(name).executablePath());
+    `], { cwd: join(ROOT, "tests/browser"), env, encoding: "utf8" });
+    assert.equal(located.status, 0, located.stderr);
+    for (const executable of located.stdout.trim().split("\n")) {
+      mkdirSync(dirname(executable), { recursive: true });
+      writeFileSync(executable, "");
+      writeFileSync(join(dirname(executable), "libbundled.so"), "");
+    }
+    // Only the fake ldd is on PATH. In "spawn" mode it removes itself after
+    // inspecting the first executable, so the bundled library's spawn fails.
+    const ldd = join(fakeDir, "bin", "ldd");
+    const install = () => {
+      mkdirSync(dirname(ldd), { recursive: true });
+      writeFileSync(ldd, `#!/bin/sh
+case "$1" in *.so) if [ "$FAKE_LDD" = nonzero ]; then echo "not a dynamic executable" >&2; exit 1; fi ;; esac
+printf '\\tlibc.so.6 => /lib/libc.so.6 (0x0)\\n'
+if [ "$FAKE_LDD" = spawn ]; then /bin/rm -f "$0"; fi
+`);
+      chmodSync(ldd, 0o755);
+    };
+    const check = (mode) => {
+      install();
+      return spawnSync(process.execPath, ["tools/verify-browser-libs.mjs"], {
+        cwd: ROOT, encoding: "utf8", env: { ...env, PATH: dirname(ldd), FAKE_LDD: mode },
+      });
+    };
+    const resolved = check("ok");
+    assert.equal(resolved.status, 0, resolved.stdout + resolved.stderr);
+    assert.match(resolved.stdout, /every shared library resolves/);
+    for (const mode of ["nonzero", "spawn"]) {
+      const failed = check(mode);
+      assert.equal(failed.status, 1, `${mode}: ${failed.stdout}${failed.stderr}`);
+      assert.match(failed.stdout, /cannot check \(ldd could not inspect .*libbundled\.so\)/, mode);
+      assert.doesNotMatch(failed.stdout, /every shared library resolves/, mode);
+    }
   } finally {
     rmSync(fakeDir, { recursive: true, force: true });
   }

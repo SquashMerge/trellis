@@ -41,7 +41,9 @@ function main() {
     // Chromium loads the libraries bundled beside it (GL, Vulkan) at run time.
     for (const entry of readdirSync(directory)) {
       if (!/\.so(\.|$)/.test(entry)) continue;
-      (missingLibraries(join(directory, entry), directory) ?? []).forEach((library) => missing.add(library));
+      const bundled = missingLibraries(join(directory, entry), directory);
+      if (bundled === null) throw new Error(`ldd could not inspect ${join(directory, entry)}`);
+      bundled.forEach((library) => missing.add(library));
     }
     console.log(`verify browser libraries: checked ${executable}`);
   }
