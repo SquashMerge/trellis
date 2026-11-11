@@ -339,3 +339,93 @@ fn a_java_lambda_with_an_interaction_is_shown_under_its_call() {
     let (_, targets) = shown_under(&view, "wrap");
     assert_eq!(targets, ["thing"]);
 }
+
+#[test]
+fn review891_nested_declaration_inside_argument_is_not_a_callback() {
+    let view = publish(
+        &[
+            (
+                "src/lib.rs",
+                "fn run() {\n    wrap({ fn nested() { other::thing(); } 123 });\n}\nfn wrap(value: i32) {}\n",
+            ),
+            ("src/other.rs", "pub fn thing() {}\n"),
+        ],
+        s::Language::Rust,
+        vec![bind("run", 0, "wrap"), bind("nested", 0, "thing")],
+    );
+    assert!(
+        callbacks(&view).is_empty(),
+        "a nested function declaration is not a passed callback: {:#?}",
+        view.steps
+    );
+}
+
+#[test]
+fn review_callback_exact_visible_cap_is_admitted() {
+    // `f0` is external, so hidden; the view enriches and shows 199 steps: 197 calls, the
+    // callback's boundary and `wrap`. The block replaces the boundary: exactly 200.
+    let filler: String = (0..198).map(|n| format!("  f{n}();\n")).collect();
+    let source = format!(
+        "function run() {{\n{filler}  wrap(() => {{ other.thing(); }});\n}}\nfunction wrap(action) {{ return action(); }}\n"
+    );
+    let files = [("web/run.js", source.as_str()), ("web/other.js", JS_OTHER)];
+    let external = || Bind {
+        resolution: s::Resolution::External,
+        target: None,
+        ..bind("run", 0, "f0")
+    };
+    let bindings = || vec![external(), bind("anonymous#0", 0, "thing")];
+    let view = publish(&files, s::Language::Javascript, bindings());
+    assert_eq!(
+        callbacks(&view).len(),
+        1,
+        "replacement is exactly 200 shown steps"
+    );
+    assert!(!view.truncated_by.contains(&SequenceLimit::VisibleSteps));
+    let candidates = publish_with(&files, s::Language::Javascript, bindings(), true);
+    assert_eq!(callbacks(&candidates).len(), 1);
+}
+
+#[test]
+fn review891_callback_expansion_visible_charged_once() {
+    for (n, interactions) in [(99, false)] {
+        let source = "function run() { external(); wrap(() => { other.thing(); }); }\nfunction wrap(f) { f(); }\n";
+        let filler: String = (0..n).map(|i| format!("f{i}();\n")).collect();
+        let other = format!("class Other {{ thing() {{ {filler} }} }}\n");
+        let external = Bind {
+            resolution: s::Resolution::External,
+            target: None,
+            ..bind("run", 0, "external")
+        };
+        let view = publish_with(
+            &[("web/run.js", source), ("web/other.js", other.as_str())],
+            s::Language::Javascript,
+            vec![external, bind("anonymous#0", 0, "thing")],
+            interactions,
+        );
+        assert_eq!(callbacks(&view).len(), 1, "n={n}: {:?}", view.warnings);
+        assert!(!view.truncated, "n={n}: {:?}", view.warnings);
+    }
+}
+
+#[test]
+fn review891_callback_expansion_work_charged_once() {
+    for (n, interactions) in [(999, true)] {
+        let source = "function run() { external(); wrap(() => { other.thing(); }); }\nfunction wrap(f) { f(); }\n";
+        let filler: String = (0..n).map(|i| format!("f{i}();\n")).collect();
+        let other = format!("class Other {{ thing() {{ {filler} }} }}\n");
+        let external = Bind {
+            resolution: s::Resolution::External,
+            target: None,
+            ..bind("run", 0, "external")
+        };
+        let view = publish_with(
+            &[("web/run.js", source), ("web/other.js", other.as_str())],
+            s::Language::Javascript,
+            vec![external, bind("anonymous#0", 0, "thing")],
+            interactions,
+        );
+        assert_eq!(callbacks(&view).len(), 1, "n={n}: {:?}", view.warnings);
+        assert!(!view.truncated, "n={n}: {:?}", view.warnings);
+    }
+}

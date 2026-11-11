@@ -275,3 +275,109 @@ fn a_hop_inside_a_rust_closure_is_shown() {
             .any(|step| step.label.starts_with("Nested callable boundary"))
     );
 }
+
+#[test]
+fn review_891_callback_exactly_fills_visible_bound() {
+    let (_state, _root, store) = two_apps();
+    let response = store.evidence_response().unwrap();
+    let core = core(&response);
+    let mut view = sequence(&response, "load");
+    let before = shown(&view.steps);
+    let mut positive = view.clone();
+    annotate(&response, &core, &mut positive);
+    assert_eq!(blocks(&positive).len(), 1);
+    let delta = shown(&positive.steps) - before;
+    assert!(delta > 0);
+    // The current positive result tells us the true replacement cost, including await.
+    fill(&mut view);
+    view.steps.drain(0..delta);
+    assert_eq!(shown(&view.steps), crate::behavior::MAX_STEPS - delta);
+    annotate(&response, &core, &mut view);
+    assert_eq!(
+        blocks(&view).len(),
+        1,
+        "callback replacement exactly fits 200; true delta={delta}; warnings={:?}",
+        view.warnings
+    );
+    assert_eq!(shown(&view.steps), crate::behavior::MAX_STEPS);
+    assert_eq!(view.interfaces.as_ref().unwrap().hops, 1);
+    assert!(!view.truncated_by.contains(&SequenceLimit::VisibleSteps));
+}
+
+#[test]
+fn review891_nested_depth_refusal_reports_the_bound() {
+    for nesting in [11, 12] {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        write(dir, "Cargo.toml", "[package]\nname = \"alpha\"\n");
+        write(dir, "src/main.rs", SERVER);
+        write(dir, "web/package.json", "{\"name\":\"web-app\"}\n");
+        let mut body = "api(\"/api/sequence\", \"POST\");".to_owned();
+        for _ in 0..nesting {
+            body = format!("wrap(() => {{ {body} }});");
+        }
+        let source = format!(
+            "function api(path, method) {{ return fetch(path, {{method}}); }}\nfunction wrap(f) {{ f(); }}\nfunction run() {{ {body} }}\n"
+        );
+        write(dir, "web/app.js", &source);
+        let store = publish(&state, dir);
+        let response = store.evidence_response().unwrap();
+        let core = core(&response);
+        let mut view = sequence(&response, "run");
+        annotate(&response, &core, &mut view);
+        if nesting == 11 {
+            assert_eq!(blocks(&view).len(), nesting, "{:?}", view.warnings);
+            assert_eq!(view.interfaces.as_ref().unwrap().hops, 1);
+            assert!(!view.truncated, "{:?}", view.warnings);
+        } else {
+            assert!(blocks(&view).is_empty());
+            assert!(
+                view.truncated_by.contains(&SequenceLimit::Depth),
+                "{:?}",
+                view.warnings
+            );
+            assert!(
+                view.warnings.iter().any(|w| w
+                    == "Sequence depth limit reached; the callback passed to wrap is not shown."),
+                "{:?}",
+                view.warnings
+            );
+        }
+    }
+}
+
+#[test]
+fn review891_candidate_work_refusal_reports_the_bound() {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path();
+    write(dir, "Cargo.toml", "[package]\nname = \"alpha\"\n");
+    write(dir, "src/main.rs", SERVER);
+    write(dir, "web/package.json", "{\"name\":\"web-app\"}\n");
+    let body = format!(
+        "{} api(\"/api/sequence\", \"POST\");",
+        "console.log();\n".repeat(1000)
+    );
+    let source = format!(
+        "function api(path, method) {{ return fetch(path, {{method}}); }}\nfunction wrap(f) {{ f(); }}\nfunction run() {{ wrap(() => {{ {body} }}); wrap(() => {{ {body} }}); }}\n"
+    );
+    write(dir, "web/app.js", &source);
+    let store = publish(&state, dir);
+    let response = store.evidence_response().unwrap();
+    let core = core(&response);
+    let mut view = sequence(&response, "run");
+    annotate(&response, &core, &mut view);
+    assert!(
+        view.truncated_by.contains(&SequenceLimit::WorkSteps),
+        "{:?}",
+        view.warnings
+    );
+    assert!(
+        view.warnings
+            .iter()
+            .any(|w| w.contains("work limit") && w.contains("callback passed to wrap")),
+        "{:?}",
+        view.warnings
+    );
+}
