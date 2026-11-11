@@ -220,7 +220,8 @@ mod conversion {
         fs::write(root.join("src/a.js"), "function a(){}\n").unwrap();
         let stub_path = root.parent().unwrap().join("stub");
         script(&stub_path);
-        let store = Store::open_for_tests(&root.parent().unwrap().join("state"), &root).unwrap();
+        let state = root.parent().unwrap().join("state");
+        let store = crate::testing::retry_admission(|| Store::open_for_tests(&state, &root));
         let revision = publish(&store);
         let stub = Stub {
             path: stub_path,
