@@ -5475,6 +5475,8 @@ mod architecture_apps_tests;
 #[cfg(test)]
 mod published_admission_tests;
 #[cfg(test)]
+mod sequence_callback_hops_tests;
+#[cfg(test)]
 mod sequence_hops_tests;
 #[cfg(test)]
 mod terminal_status_contention_tests;
@@ -22408,6 +22410,10 @@ impl Store {
             show_all,
             interactions,
         )?;
+        // #888: a syntax-only view's callbacks can hold only a hop, decided by the read.
+        if view.semantic.tier == crate::behavior::EvidenceTier::Syntax {
+            graph_read::syntax_callbacks(self, tx, &selected_revision, &mut view, show_all)?;
+        }
         Ok(Some(view))
     }
 

@@ -67,6 +67,10 @@ const NON_EXTRACTION_ITEMS: &[(&str, &str)] = &[
 /// Modules outside native extraction that parse source. They compute read-time
 /// views or post-native semantic evidence, never native facts, graph or class projections.
 const NON_NATIVE_SOURCE_PARSERS: &[(&str, &str)] = &[
+    (
+        "src/behavior.rs",
+        "read-time sequence views: callback arguments (#888)",
+    ),
     ("src/behavior_bindings.rs", "read-time sequence views"),
     (
         "src/behavior_incidental.rs",
