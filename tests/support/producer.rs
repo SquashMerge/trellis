@@ -298,3 +298,45 @@ pub fn pickup_entry(checkout: &Checkout, producer: &str) -> Value {
         .unwrap()["pickup"]
         .clone()
 }
+
+/// `TRELLIS_TEST_AUTORUN_INTERVALS` for a daemon: the quiet period, the minimum interval between
+/// automatic starts and the owner's backstop, in milliseconds. The gate backstop is the same as
+/// the owner's. Every automatic-run test sets it, so a run never waits the production 60 s.
+pub fn auto_intervals(quiet_ms: u64, min_interval_ms: u64, backstop_ms: u64) -> (String, String) {
+    (
+        "TRELLIS_TEST_AUTORUN_INTERVALS".to_owned(),
+        json!({
+            "quietMs": quiet_ms,
+            "minIntervalMs": min_interval_ms,
+            "gateBackstopMs": backstop_ms,
+            "backstopMs": backstop_ms,
+        })
+        .to_string(),
+    )
+}
+
+/// Write `.trellis/producers.toml` of `root`, replacing any earlier one. This is the one place an
+/// automatic-run test says what is enabled, so a later slice can make them all gate-hermetic here.
+pub fn write_producers_toml(root: &Path, text: &str) {
+    fs::create_dir_all(root.join(".trellis")).unwrap();
+    fs::write(root.join(".trellis/producers.toml"), text).unwrap();
+}
+
+/// Enable automatic re-runs of `producer`; `extra` adds keys to its table.
+pub fn enable_auto(root: &Path, producer: &str, extra: &str) {
+    write_producers_toml(
+        root,
+        &format!("[auto.{producer}]\nenabled = true\n{extra}\n"),
+    );
+}
+
+/// The `autoRun` object of `producer` in the status reply.
+pub fn auto_run(checkout: &Checkout, producer: &str) -> Value {
+    producer_status(checkout)["producers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == producer)
+        .unwrap()["autoRun"]
+        .clone()
+}

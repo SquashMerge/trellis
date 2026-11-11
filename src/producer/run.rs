@@ -58,7 +58,7 @@ impl SupersedeToken {
         self.0.load(Ordering::SeqCst)
     }
 
-    fn same(&self, other: &Self) -> bool {
+    pub(super) fn same(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
 }
@@ -358,7 +358,7 @@ fn test_flag(_variable: &str) -> bool {
 /// Test-support hold point: bind the socket, announce it, and wait for the
 /// test to connect. Once per path, like the semantic cutoff hook.
 #[cfg(all(feature = "test-support", unix))]
-fn test_hook(variable: &str) {
+pub(super) fn test_hook(variable: &str) {
     use std::os::unix::net::UnixListener;
     let Some(path) = std::env::var_os(variable) else {
         return;
@@ -375,7 +375,7 @@ fn test_hook(variable: &str) {
 }
 
 #[cfg(not(all(feature = "test-support", unix)))]
-fn test_hook(_variable: &str) {}
+pub(super) fn test_hook(_variable: &str) {}
 
 /// Recover producer state of this checkout: runs left by another daemon and
 /// pickup directories no request names. Best effort; a failure leaves the
@@ -880,6 +880,11 @@ impl ProducerOwner {
     /// waiting for it. A manual run preempts an automatic run that is not importing and waits
     /// for it to leave, at most `PREEMPT_WAIT`.
     fn install(&self, active: &Arc<ActiveRun>) -> Result<()> {
+        self.install_within(active, PREEMPT_WAIT)
+    }
+
+    /// `install` with the preemption wait chosen by the caller, so a test need not wait 30 s.
+    fn install_within(&self, active: &Arc<ActiveRun>, preempt_wait: Duration) -> Result<()> {
         let mut slot = self.slot();
         let busy = |slot: &Slot| {
             let run_id = slot.run.as_ref().map_or("-", |run| run.run_id.as_str());
@@ -900,7 +905,7 @@ impl ProducerOwner {
                         return Err(busy(&slot));
                     }
                     slot.manual_waiting += 1;
-                    let deadline = Instant::now() + PREEMPT_WAIT;
+                    let deadline = Instant::now() + preempt_wait;
                     while slot.run.is_some() {
                         let left = deadline.saturating_duration_since(Instant::now());
                         if left.is_zero() {
@@ -1232,6 +1237,20 @@ mod tests {
         waiter.join().unwrap().unwrap();
         assert_eq!(owner.active_origin(), Some(RunOrigin::Manual));
         assert_eq!(owner.slot().manual_waiting, 0);
+    }
+
+    /// A preempted run that never leaves does not hold the manual run forever: the wait ends
+    /// with `producer_busy` and the waiter count returns to zero.
+    #[test]
+    fn preemption_wait_expires_as_busy() {
+        let owner = ProducerOwner::default();
+        let running = auto("a", &SupersedeToken::default());
+        owner.install(&running).unwrap();
+        let result = owner.install_within(&active("m"), Duration::from_millis(50));
+        assert!(is_busy(result));
+        assert_eq!(running.control().reason, Some(CancelReason::Preempted));
+        assert_eq!(owner.slot().manual_waiting, 0);
+        assert_eq!(owner.active_origin(), Some(RunOrigin::Auto));
     }
 
     #[test]

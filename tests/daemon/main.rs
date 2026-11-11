@@ -7,10 +7,18 @@
 mod child;
 #[path = "../common/mod.rs"]
 mod common;
+// Only the in-process automatic-run tests use these, and they need the test-support hooks.
+#[cfg(feature = "test-support")]
+#[path = "../support/semantic_batch.rs"]
+mod semantic_batch_support;
+#[cfg(feature = "test-support")]
+#[path = "../support/producer.rs"]
+mod support;
 
 mod build_identity;
 mod cli;
 mod cli_activation;
+mod daemon_auto_run;
 mod daemon_checkout;
 mod daemon_cli;
 mod daemon_crash_recovery;
