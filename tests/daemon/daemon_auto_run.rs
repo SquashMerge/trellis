@@ -65,6 +65,11 @@ impl Auto {
         );
         let (name, value) = support::auto_intervals(intervals.0, intervals.1, intervals.2);
         set_env(&name, value);
+        // No probe file is ever written: the gates read unknown, whatever the host does.
+        set_env(
+            support::AUTORUN_PROBES_ENV,
+            support::probes_file(stub_dir.path()),
+        );
 
         let identity = WorkspaceIdentity::discover(Some(&root), &root)
             .unwrap()

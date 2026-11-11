@@ -134,12 +134,36 @@ pub fn daemon_stderr(home: &Path) -> PathBuf {
     home.join("daemon.stderr")
 }
 
+/// The daemon's gate probes (#660 AC10), under test-support: the JSON file the daemon reads at
+/// every gate check. Every CLI of a checkout carries it, so a daemon it starts reads this file
+/// and never the host's load or power. The file is absent until a test writes it, which reads as
+/// unknown, so no automatic-run test depends on the machine.
+pub const AUTORUN_PROBES_ENV: &str = "TRELLIS_TEST_AUTORUN_PROBES";
+
+/// The probe file of the daemon a CLI under `home` starts.
+pub fn probes_file(home: &Path) -> PathBuf {
+    home.join("autorun-probes.json")
+}
+
+/// Set what the gate probes of the daemon under `home` report; `None` is unknown.
+pub fn set_probes(home: &Path, battery: Option<bool>, load: Option<bool>) {
+    let path = probes_file(home);
+    let staged = path.with_extension("tmp");
+    fs::write(
+        &staged,
+        json!({"battery": battery, "load": load}).to_string(),
+    )
+    .unwrap();
+    fs::rename(staged, path).unwrap();
+}
+
 pub fn cli(home: &Path) -> Command {
     let mut command = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")));
     command
         .env("HOME", home)
         .env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("daemon.pid"))
         .env(crate::child::DAEMON_STDERR, daemon_stderr(home))
+        .env(AUTORUN_PROBES_ENV, probes_file(home))
         .env_remove("XDG_CACHE_HOME")
         .env_remove("XDG_DATA_HOME")
         .stdin(Stdio::null());

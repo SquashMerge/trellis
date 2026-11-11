@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 pub mod approval;
 pub mod auto;
 pub mod auto_config;
+pub mod auto_gate;
 pub mod batch;
 pub mod detect;
 pub mod exec;
@@ -29,6 +30,8 @@ pub mod worktree;
 mod approval_tests;
 #[cfg(test)]
 mod auto_config_tests;
+#[cfg(test)]
+mod auto_gate_tests;
 #[cfg(test)]
 mod batch_tests;
 #[cfg(test)]

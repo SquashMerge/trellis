@@ -922,6 +922,15 @@ fn javascript_views(world: &World, mcp: &mut Mcp, edit: u32) -> (Value, Value, V
     (semantic_status, language, row)
 }
 
+/// Like `javascript_views`, once the head's semantic catch-up has published `semanticStatus ==
+/// []`: right after an edit the answer can still read `catchingUp` or `re-import pending`.
+fn settled_views(world: &World, mcp: &mut Mcp, edit: u32) -> (Value, Value, Value) {
+    trellis::testing::wait_until("semantic catch-up published", || {
+        declaration_semantic_status(mcp, &format!("edited{edit}")) == json!([])
+    });
+    javascript_views(world, mcp, edit)
+}
+
 const SCHEDULED_REASON: &str = "producer re-run scheduled";
 
 fn pending_status(state: &str, reason: &str) -> Value {
@@ -940,7 +949,7 @@ fn running_auto_run_labels_language_catching_up_and_nothing_else() {
 
     // Auto-run off: the committed projection, with no overlay.
     assert_eq!(auto_state(&world)["state"], "off");
-    let (off_status, off_described, off_row) = javascript_views(&world, &mut mcp, 1);
+    let (off_status, off_described, off_row) = settled_views(&world, &mut mcp, 1);
     assert_eq!(off_status, json!([]));
 
     world.mode(json!({"sleep": true}));
@@ -958,7 +967,14 @@ fn running_auto_run_labels_language_catching_up_and_nothing_else() {
     for document in described["documents"].as_array().unwrap() {
         assert_ne!(document["projection"]["semanticStatus"], "needsReimport");
     }
+    // The stub sleeps until it is stopped: end the run so no stub outlives the test.
+    let run_id = world.active_run()["runId"].as_str().unwrap().to_owned();
+    let output = world.producer("cancel", &["--run", &run_id]);
+    assert!(output.status.success(), "{}", stderr(&output));
     world.release_hook(SPAWNED);
+    wait_records(&world, "the cancelled run", |runs| {
+        runs.iter().all(|run| run["state"] == "cancelled")
+    });
 }
 
 /// With auto-run off the labels are empty: the answers read as committed after an edit, and
@@ -970,7 +986,7 @@ fn auto_off_leaves_needs_reimport_unchanged() {
     edit_head(&world, 1);
     let mut mcp = Mcp::initialized(&world);
     assert_eq!(auto_state(&world)["state"], "off");
-    let committed = javascript_views(&world, &mut mcp, 1);
+    let committed = settled_views(&world, &mut mcp, 1);
     assert_eq!(committed.0, json!([]));
     assert_eq!(committed.1["reimport"], Value::Null);
     assert_eq!(committed.2["reimport"], Value::Null);
@@ -984,4 +1000,75 @@ fn auto_off_leaves_needs_reimport_unchanged() {
     wait_auto(&world, "off");
     assert_eq!(javascript_views(&world, &mut mcp, 1), committed);
     assert!(auto_records(&world).is_empty());
+}
+
+// --- gates (#660 AC10) ---
+
+fn wait_deferred(world: &World, reason: &str) {
+    trellis::testing::wait_until(&format!("autoRun {reason}"), || {
+        let state = auto_state(world);
+        state["state"] == "deferred" && state["reason"] == reason
+    });
+}
+
+/// A gate defers a due producer, and the deferral is rechecked rather than permanent. A gate
+/// that closes while the run is in flight does not stop it.
+#[test]
+fn battery_and_load_gates_defer_and_never_stop_a_run() {
+    let world = hooked(&[SPAWNED]);
+    approve(&world, &[SPAWNED]);
+    let home = world.checkout.home.clone();
+    support::set_probes(&home, Some(true), Some(false));
+    edit_head(&world, 1);
+    world.emitting_variant(1);
+    enable(&world);
+
+    wait_deferred(&world, "deferred: battery");
+    let deferred = auto_state(&world);
+    assert!(deferred["nextEarliestStart"].is_u64());
+    assert!(deferred["dueSince"].is_u64());
+    assert!(auto_records(&world).is_empty());
+
+    support::set_probes(&home, Some(false), Some(true));
+    wait_deferred(&world, "deferred: load");
+    assert!(auto_records(&world).is_empty());
+
+    support::set_probes(&home, Some(false), Some(false));
+    world.wait_hook(SPAWNED);
+    assert_eq!(auto_state(&world)["state"], "running");
+
+    // Both gates close during the run: it is not stopped, and no second run starts.
+    support::set_probes(&home, Some(true), Some(true));
+    assert_eq!(auto_state(&world)["state"], "running");
+    assert_eq!(world.active_run()["origin"], "auto");
+    world.release_hook(SPAWNED);
+    let runs = wait_records(&world, "the automatic run", |runs| {
+        runs.iter().any(|run| run["state"] == "done")
+    });
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(runs[0]["outcome"], "imported");
+}
+
+/// Each switch turns off its own gate; a host that reports nothing never gates.
+#[test]
+fn gate_switches_off() {
+    let world = auto_world(&[], FAST);
+    approve(&world, &[]);
+    support::set_probes(&world.checkout.home, Some(true), Some(true));
+    edit_head(&world, 1);
+    world.emitting_variant(1);
+
+    support::enable_auto(&world.checkout.root, STUB, "batteryGate = false");
+    wait_deferred(&world, "deferred: load");
+
+    support::enable_auto(
+        &world.checkout.root,
+        STUB,
+        "batteryGate = false\nloadGate = false",
+    );
+    let runs = wait_records(&world, "the automatic run", |runs| {
+        runs.iter().any(|run| run["state"] == "done")
+    });
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(runs[0]["outcome"], "imported");
 }
