@@ -15,7 +15,69 @@ function sourceWitness(item) {
     (r.startByte == null || (Number.isSafeInteger(r.startByte) && r.startByte >= 0)) &&
     (r.endByte == null || (Number.isSafeInteger(r.endByte) && r.endByte > (r.startByte ?? -1)));
 }
+// HTTP interface hops (#853). A client call that interface evidence matches to a route of
+// another app targets that route's handler, drawn in its app's column (`app:<name>`). The
+// match is structural, by method and path; its confidence stays on the arrow and in the
+// inspector. An unresolved call has no handler and draws nothing new.
+const SEQUENCE_HOP_CONFIDENCE = {exact:"exact", template:"template", wrapperInferred:"wrapper-inferred"};
+function sequenceHop(view, step) {
+  const hop = step?.interface;
+  if (!["call", "boundary"].includes(step?.kind) || !step.callId || !sourceWitness(step) || hop?.kind !== "http" ||
+      !Object.hasOwn(SEQUENCE_HOP_CONFIDENCE, hop.confidence) || typeof hop.participant !== "string" || !hop.participant ||
+      typeof hop.method !== "string" || typeof hop.pathTemplate !== "string" || typeof hop.serverApp !== "string" || !hop.serverApp) return null;
+  const participant = view?.participants?.find(item => item.id === hop.participant);
+  return participant?.kind === "interfaceHandler" && participant.column?.id === `app:${hop.serverApp}` &&
+    typeof participant.declaration?.id === "string" && typeof participant.declaration.name === "string" && sourceWitness(participant.declaration) ? participant : null;
+}
+// The words of a hop (#853): method, path template, confidence, and that it is not proof.
+function sequenceHopLabel(hop) {
+  return `${hop.method} ${hop.pathTemplate} · ${SEQUENCE_HOP_CONFIDENCE[hop.confidence]} · structural match, not proof`;
+}
+// What the inspector says of a call's interface (#853), or "" when it has none.
+function sequenceInterfaceText(step, view) {
+  const hop = step?.interface;
+  if (hop?.kind !== "http") return "";
+  const route = [hop.method, hop.pathTemplate].filter(item => typeof item === "string").join(" ") || "path not readable";
+  if (sequenceHop(view, step)) return `HTTP interface hop · ${route} · ${SEQUENCE_HOP_CONFIDENCE[hop.confidence]} · ${hop.clientApp || "client"} → ${hop.serverApp} · structural match by method and path, not proof the request is sent`;
+  if (hop.confidence === "unresolved") return `HTTP client call · ${route} · unresolved: no route matched · a missing match proves nothing`;
+  // A match whose app column did not fit the participant limit is told, never drawn.
+  if (typeof hop.serverApp === "string" && hop.serverApp && Object.hasOwn(SEQUENCE_HOP_CONFIDENCE, hop.confidence))
+    return `HTTP interface · ${route} · ${SEQUENCE_HOP_CONFIDENCE[hop.confidence]} · ${hop.clientApp || "client"} → ${hop.serverApp} · not drawn: sequence participant limit · structural match, not proof`;
+  return "";
+}
+// The call-chain groups that hold a drawn hop (#853). A collapsed chain previews its first call
+// only when every member is shown, so a chain whose other calls stay hidden incidental calls
+// opens expanded: the hop the status line counts is drawn. As #646 opens highlighted chains.
+function sequenceHopGroups(view) {
+  const groups = new Set();
+  const walk = steps => {
+    let found = false;
+    for (const step of steps || []) {
+      if (step.hidden) continue;
+      const inner = walk(step.children) | walk(step.alternate);
+      const here = !!sequenceHop(view, step);
+      if (step.kind === "group" && inner) groups.add(step.id);
+      found ||= here || !!inner;
+    }
+    return found;
+  };
+  walk(view?.steps);
+  return groups;
+}
+// The view's interface reading (#853), for the status line. Absence is never no request.
+function sequenceInterfaceSummary(view) {
+  const read = view?.interfaces;
+  if (!read) return "";
+  if (read.state === "notMeasured") return "HTTP interfaces not measured yet for this revision";
+  if (read.state === "unavailable") return "HTTP interfaces unavailable";
+  if (read.state !== "ready") return "";
+  const count = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+  return [read.hops > 0 && `${count(read.hops, "HTTP interface hop", "HTTP interface hops")} (structural matches, not proof)`,
+    read.unresolved > 0 && count(read.unresolved, "unresolved HTTP call", "unresolved HTTP calls")].filter(Boolean).join(" · ");
+}
 function sequenceTarget(view, step) {
+  const hop = sequenceHop(view, step);
+  if (hop) return hop;
   const evidence = step?.callEvidence, pin = view?.revision;
   if (!["call", "boundary"].includes(step?.kind) || !step.callId || !sourceWitness(step) ||
       typeof pin?.indexGeneration !== "string" || !pin.indexGeneration || !Number.isSafeInteger(pin.indexRevision) ||
@@ -31,6 +93,8 @@ function sequenceTarget(view, step) {
 }
 function sequenceEvidenceLabel(step, view) {
   if (!["call", "boundary"].includes(step?.kind) || !step.callId) return "Measured source syntax";
+  // The matched route travels with the confidence wherever the hop is drawn, Show all included.
+  if (view && sequenceHop(view, step)) return `HTTP interface hop · ${sequenceHopLabel(step.interface)}`;
   const evidence = step.callEvidence;
   if (!evidence) return "measured syntax; target unverified";
   if (evidence.projection?.semanticStatus === "catchingUp") return "Semantic catching up - native syntax only";
@@ -47,7 +111,9 @@ function sequenceEvidenceLabel(step, view) {
     needsReimport:"Semantic needs re-import - native syntax only"};
   return labels[evidence.boundaryReason] || "Target unverified";
 }
-function sequenceTargetActionLabel(declaration) {
+function sequenceTargetActionLabel(declaration, participant = null) {
+  // A hop's handler continues on demand (#853): its own Sequence, in its own app.
+  if (participant?.kind === "interfaceHandler") return ["function", "method"].includes(declaration.kind) ? "Open handler sequence" : "Read handler source";
   return ["function", "method"].includes(declaration.kind) ? "Open callee sequence" : "Read declaration source";
 }
 // The evidence tier of a view (#522): the producer whose fresh bindings built its lanes,
@@ -161,9 +227,15 @@ function compactAnalysis(step) {
 const SEQUENCE_LABEL_LIMIT = 72;
 // The row of an arrow, in both renderers (#558): its number and the exact target's name. The
 // lane names the type. The call's source text and evidence are in the inspector and Show all.
-function sequenceArrowLabel(ordinal, target, collapsed, early, limit = SEQUENCE_LABEL_LIMIT) {
+function sequenceArrowLabel(ordinal, target, collapsed, early, limit = SEQUENCE_LABEL_LIMIT, hop = null) {
   const marker = `[${String(ordinal).padStart(3, "0")}]`, name = target.declaration.name || target.label;
   const suffix = `${collapsed ? ` +${collapsed} calls collapsed (entry preview)` : ""}${early}`;
+  if (hop && target.kind === "interfaceHandler") {
+    // The confidence and the caveat always show; a long path template is cut instead (#853).
+    const tail = ` · ${SEQUENCE_HOP_CONFIDENCE[hop.confidence]} · structural match, not proof${suffix}`, method = `${hop.method} `;
+    const room = Math.max(8, Math.max(limit, 96) - marker.length - 1 - method.length - tail.length);
+    return `${marker} ${method}${hop.pathTemplate.length > room ? `${hop.pathTemplate.slice(0, room - 1)}…` : hop.pathTemplate}${tail}`;
+  }
   const room = Math.max(12, limit - marker.length - 1 - suffix.length);
   return `${marker} ${name.length > room ? `${name.slice(0, room - 1)}…` : name}${suffix}`;
 }
@@ -186,6 +258,8 @@ function sequenceColumn(participant) {
 function sequenceColumnKind(participant) {
   const column = participant?.column, id = column?.id;
   if (typeof id !== "string" || !id || typeof column.label !== "string" || !column.label) return "";
+  // An HTTP interface hop's handler is drawn in its app's column (#853).
+  if (id.startsWith("app:") && participant.kind === "interfaceHandler") return "app";
   return id.startsWith("module:") ? "module" : id.startsWith("type:") ? "type" : "class";
 }
 // A lane's name as lines (#716): a long name breaks after `_`, `::`, `.`, `/` or `-`, or
@@ -398,6 +472,9 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
     }
     const target = sequenceTarget(view, step);
     if (target) { visibleTargets.add(target.id); targetProofs.set(target.id, step); }
+    // A shown step's own lane is drawn even when the call that opened it is drawn elsewhere: a
+    // wrapper whose call is an HTTP interface hop (#853) keeps its expanded body's lane.
+    if (step.lane != null && participantById.get(step.lane)?.declaration) visibleTargets.add(step.lane);
     pending.push(...nestedPending(step, depth + 1));
   }
   // Hidden chain members and replaced candidate hints must not leave ghost lanes.
@@ -432,8 +509,8 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
   // Interactions (#636): an activation spans a cross-column call's arrow to its return.
   const activations = make("g", {class:"sequence-activations"}); svg.append(activations);
   const arrowTops = new Map();
-  const kindLabels = {externalCandidate:"External type · candidate", unresolvedReceiver:"Receiver · type unresolved", unresolvedCallee:"Callee · unresolved", boundary:"Unknown target", builtin:"Built-in name", import:"Imported binding", receiver:"Receiver hint", internal:"Indexed target", method:"Selected method"};
-  const compactKinds = {externalCandidate:"candidate", unresolvedReceiver:"unresolved", unresolvedCallee:"unresolved", boundary:"unknown", builtin:"source hint", import:"source hint", receiver:"source hint", internal:"indexed", method:"selected"};
+  const kindLabels = {externalCandidate:"External type · candidate", unresolvedReceiver:"Receiver · type unresolved", unresolvedCallee:"Callee · unresolved", boundary:"Unknown target", builtin:"Built-in name", import:"Imported binding", receiver:"Receiver hint", internal:"Indexed target", method:"Selected method", interfaceHandler:"HTTP interface handler · structural match, not proof"};
+  const compactKinds = {externalCandidate:"candidate", unresolvedReceiver:"unresolved", unresolvedCallee:"unresolved", boundary:"unknown", builtin:"source hint", import:"source hint", receiver:"source hint", internal:"indexed", method:"selected", interfaceHandler:"HTTP handler"};
   const shorten = (text, limit) => text.length > limit ? `${text.slice(0, limit-1)}…` : text;
   for (const p of participants) {
     const x = positions.get(p.id), header = headers.get(p.id);
@@ -445,7 +522,7 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
       const member = p.members[0], proof = targetProofs.get(member.id);
       if (proof) {
         text.setAttribute("role", "button"); text.setAttribute("tabindex", "0");
-        text.setAttribute("aria-label", `${sequenceTargetActionLabel(member.declaration)}: ${member.declaration.name}`);
+        text.setAttribute("aria-label", `${sequenceTargetActionLabel(member.declaration, member)}: ${member.declaration.name}`);
         text.setAttribute("data-trellis-target-id", member.id);
         const open = () => { if ((!options.isCurrent || options.isCurrent()) && sequenceTarget(view, proof) === member) options.onOpenTarget(member.declaration, proof); };
         text.addEventListener("click", open);
@@ -495,7 +572,7 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
     // text is treated as equivalent, merged, or removed.
     const isControl = ["branch", "loop", "try"].includes(display.kind);
     let label = display.label || display.kind;
-    if (["call", "boundary"].includes(evidence.kind) && evidence.callEvidence) label = `${sequenceEvidenceLabel(evidence, view)} · ${label}`;
+    if (["call", "boundary"].includes(evidence.kind) && (evidence.callEvidence || sequenceHop(view, evidence))) label = `${sequenceEvidenceLabel(evidence, view)} · ${label}`;
     if (options.showDetails) {
       if (!operator && display.kind !== "group" && display.kind !== "call chain" && display.kind !== "call") label = `${display.kind} · ${label}`;
     } else {
@@ -522,7 +599,7 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
       labels = wrap(proven + shorten(evidence.label, Math.max(12, limit-proven.length-suffix.length)) + suffix, capacity);
     }
     const target = sequenceTarget(view, evidence), arrow = target && evidence.kind === "call" && columnX(target.id);
-    if (arrow && !options.showDetails) labels = [sequenceArrowLabel(ordinal, target, display.kind === "call chain" ? step.children.length - 1 : 0, early, limit)];
+    if (arrow && !options.showDetails) labels = [sequenceArrowLabel(ordinal, target, display.kind === "call chain" ? step.children.length - 1 : 0, early, limit, sequenceHop(view, evidence) && evidence.interface)];
     const extra = (labels.length-1)*16;
     control.append(make("rect", {x, y:top-(operator ? 19 : 15), width:Math.max(1,width-x-24), height:(operator ? 30 : 24)+extra, fill:"transparent", class:"sequence-row-hit"}));
     if (operator) {
@@ -669,4 +746,4 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
   return groupControls;
 }
 
-window.TrellisSequence = {render: renderSequence, target:sequenceTarget, evidenceLabel:sequenceEvidenceLabel, evidenceSummary:sequenceEvidenceSummary, basisLabel:sequenceBasisLabel, entry:sequenceEntry, earlyReturn:sequenceEarlyReturn, display:sequenceDisplay, beginRender:beginSequenceRender, targetActionLabel:sequenceTargetActionLabel, column:sequenceColumn, laneHeader:sequenceLaneHeader, compactLabel:sequenceCompactLabel, arrowLabel:sequenceArrowLabel, labelLimit:SEQUENCE_LABEL_LIMIT, emptySummary:sequenceEmptySummary, renderEmpty:renderSequenceEmpty, stepColumn:sequenceStepColumn};
+window.TrellisSequence = {render: renderSequence, target:sequenceTarget, hop:sequenceHop, hopLabel:sequenceHopLabel, hopGroups:sequenceHopGroups, interfaceText:sequenceInterfaceText, interfaceSummary:sequenceInterfaceSummary, evidenceLabel:sequenceEvidenceLabel, evidenceSummary:sequenceEvidenceSummary, basisLabel:sequenceBasisLabel, entry:sequenceEntry, earlyReturn:sequenceEarlyReturn, display:sequenceDisplay, beginRender:beginSequenceRender, targetActionLabel:sequenceTargetActionLabel, column:sequenceColumn, laneHeader:sequenceLaneHeader, compactLabel:sequenceCompactLabel, arrowLabel:sequenceArrowLabel, labelLimit:SEQUENCE_LABEL_LIMIT, emptySummary:sequenceEmptySummary, renderEmpty:renderSequenceEmpty, stepColumn:sequenceStepColumn};
