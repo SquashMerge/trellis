@@ -40,12 +40,14 @@ fn no_mains_supply_or_directory_is_unknown() {
 fn a_file_past_64_bytes_is_cut_off() {
     let temp = tempfile::tempdir().unwrap();
     supply(temp.path(), "AC", "Mains", None);
+    // Within the cap the file reads "1" (trimmed); the 64-byte cut drops the trailing "x", which
+    // would otherwise make the text "1...x" and not online.
     fs::write(
         temp.path().join("AC/online"),
-        format!("{}1", "0".repeat(64)),
+        format!("1{}x", " ".repeat(63)),
     )
     .unwrap();
-    assert_eq!(power_from_dir(temp.path()), Some(true));
+    assert_eq!(power_from_dir(temp.path()), Some(false));
 }
 
 #[test]
@@ -54,10 +56,19 @@ fn only_the_first_64_entries_are_read() {
     for index in 0..70 {
         supply(temp.path(), &format!("s{index:02}"), "Battery", None);
     }
-    supply(temp.path(), "zz", "Mains", Some("1"));
-    // Listing order is the file system's; the mains supply is read only when it is among the
-    // first 64, so the answer is one of the two, never a panic or an unbounded walk.
-    assert!(matches!(power_from_dir(temp.path()), None | Some(false)));
+    // Make the 65th entry in the file system's own listing order the only mains supply. A walk
+    // capped at 64 entries never reaches it (unknown); an uncapped walk finds it offline.
+    let listed: Vec<_> = fs::read_dir(temp.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    supply(
+        temp.path(),
+        listed[64].to_str().unwrap(),
+        "Mains",
+        Some("0"),
+    );
+    assert_eq!(power_from_dir(temp.path()), None);
 }
 
 #[test]

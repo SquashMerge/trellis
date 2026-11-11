@@ -572,6 +572,19 @@ fn status_rows_off_invalid_and_needs_approval() {
     assert_eq!(at(&mut s, &live(), base, 1).fallback.state, AutoState::Off);
 }
 
+/// While a run is active no start is possible, so no gate is consulted for a due producer.
+#[test]
+fn an_active_run_asks_no_gate() {
+    let base = Instant::now();
+    let mut s = ready(&[ALPHA, BETA], base);
+    activate(&mut s, ALPHA, NOW_MS);
+    let decision = at_gated(&mut s, &live(), base, 20, &mut |_| {
+        panic!("a gate is never consulted during a run")
+    });
+    assert!(decision.deferrals.is_empty());
+    assert_eq!(decision.action, Action::None);
+}
+
 #[test]
 fn newer_head_while_running_supersedes_until_requested() {
     let base = Instant::now();
