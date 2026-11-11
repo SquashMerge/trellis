@@ -1,4 +1,5 @@
 use super::*;
+use semantic_payload::{TARGET_CALL, TARGET_DECLARATION};
 use std::sync::{Arc, atomic::AtomicBool};
 
 fn pin(revision: u64) -> IndexPin {
@@ -9,7 +10,7 @@ fn pin(revision: u64) -> IndexPin {
 }
 fn fixture() -> Connection {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V42).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V43).unwrap();
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
     db.execute(
         "INSERT INTO semantic_producers VALUES('producer','1',?1,'semantic','utf8','executable')",
@@ -539,14 +540,14 @@ fn version(db: &Connection, vid: i64, content_hash: &str, kind: Option<&str>) {
 }
 
 /// `b.js` records `c.js` with its term at revision 1 and the one syntax ID it targets.
-fn record_term(db: &Connection, call: bool) {
+fn record_term(db: &Connection, flags: semantic_payload::TargetFlags) {
     let term = semantic_payload::dependency_term(
         db,
         &semantic_pin_key(pin(1)),
         &semantic_pin_key(pin(1)),
         "javascript",
         "c.js",
-        &[(vec![7u8; 16], call)],
+        &[(vec![7u8; 16], flags)],
     )
     .unwrap();
     db.execute(
@@ -556,7 +557,7 @@ fn record_term(db: &Connection, call: bool) {
     .unwrap();
     db.execute(
         "INSERT INTO semantic_projection_dependency_targets VALUES(2,'javascript','c.js',?1,?2)",
-        params![vec![7u8; 16], call],
+        params![vec![7u8; 16], flags],
     )
     .unwrap();
 }
@@ -582,7 +583,7 @@ fn dependency_with_an_equal_term_does_not_make_a_dependent_pending() {
     let db = fixture();
     version(&db, 3, "h1", Some("function"));
     version(&db, 4, "h2", Some("function"));
-    record_term(&db, true);
+    record_term(&db, TARGET_CALL);
     pending_within(&db, 10);
     assert_eq!(
         projected(&db, 2, "b.js").semantic_status,
@@ -600,7 +601,7 @@ fn dependency_whose_targeted_declaration_changed_makes_a_dependent_pending() {
         let db = fixture();
         version(&db, 3, "h1", Some("function"));
         version(&db, 4, "h2", kind);
-        record_term(&db, false);
+        record_term(&db, 0);
         pending_within(&db, 10);
         assert_eq!(
             projected(&db, 2, "b.js").semantic_status,
@@ -611,13 +612,17 @@ fn dependency_whose_targeted_declaration_changed_makes_a_dependent_pending() {
 }
 
 /// A call bound to a method reads whether the dependency's content changed since capture;
-/// a method called any other way, or a free function, does not.
+/// a method called any other way, or a free function, does not. An own symbol's declaration
+/// in the dependency reads it whatever its kind (#863).
 #[test]
-fn only_a_call_bound_to_a_method_reads_the_dependency_content() {
+fn only_a_method_call_or_a_symbol_declaration_reads_the_dependency_content() {
     for (kind, call, pending) in [
-        ("method", true, true),
-        ("method", false, false),
-        ("function", true, false),
+        ("method", TARGET_CALL, true),
+        ("method", 0, false),
+        ("function", TARGET_CALL, false),
+        ("function", TARGET_DECLARATION, true),
+        ("method", TARGET_DECLARATION, true),
+        ("function", TARGET_CALL | TARGET_DECLARATION, true),
     ] {
         let db = fixture();
         version(&db, 3, "h1", Some(kind));
@@ -638,18 +643,22 @@ fn only_a_call_bound_to_a_method_reads_the_dependency_content() {
 }
 
 /// Equal bytes under another extraction context are a new document version but the same
-/// content: a method call keeps its dispatch, so the term is equal.
+/// content: a method call keeps its dispatch and a symbol its declaration, so the term is
+/// equal.
 #[test]
 fn a_config_only_change_keeps_the_term_of_a_method_call() {
-    let db = fixture();
-    version(&db, 3, "h1", Some("method"));
-    version(&db, 4, "h1", Some("method"));
-    record_term(&db, true);
-    pending_within(&db, 10);
-    assert_eq!(
-        projected(&db, 2, "b.js").semantic_status,
-        SemanticStatus::OlderBasis
-    );
+    for flags in [TARGET_CALL, TARGET_DECLARATION] {
+        let db = fixture();
+        version(&db, 3, "h1", Some("method"));
+        version(&db, 4, "h1", Some("method"));
+        record_term(&db, flags);
+        pending_within(&db, 10);
+        assert_eq!(
+            projected(&db, 2, "b.js").semantic_status,
+            SemanticStatus::OlderBasis,
+            "{flags}"
+        );
+    }
 }
 
 /// A term that is NULL (the payload's own document, or no reuse key) is pending on any change;
@@ -659,7 +668,7 @@ fn null_term_and_over_bound_checks_are_pending() {
     let db = fixture();
     version(&db, 3, "h1", Some("function"));
     version(&db, 4, "h2", Some("function"));
-    record_term(&db, false);
+    record_term(&db, 0);
     db.execute("UPDATE semantic_projection_dependencies SET term=NULL", [])
         .unwrap();
     pending_within(&db, 10);
@@ -670,7 +679,7 @@ fn null_term_and_over_bound_checks_are_pending() {
     let db = fixture();
     version(&db, 3, "h1", Some("function"));
     version(&db, 4, "h2", Some("function"));
-    record_term(&db, false);
+    record_term(&db, 0);
     pending_within(&db, 1);
     assert_eq!(
         projected(&db, 2, "b.js").semantic_status,
@@ -683,7 +692,7 @@ fn null_term_and_over_bound_checks_are_pending() {
 fn deleted_dependency_makes_a_dependent_pending() {
     let db = fixture();
     version(&db, 3, "h1", Some("function"));
-    record_term(&db, false);
+    record_term(&db, 0);
     db.execute(
         "DELETE FROM revision_documents WHERE revision_id=?1 AND path='c.js'",
         [semantic_pin_key(pin(2))],

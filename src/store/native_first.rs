@@ -188,7 +188,7 @@ fn write_pending_within(
         JOIN semantic_coverage c ON c.payload_id=e.payload_id AND c.revision_id=x.basis_pin
         JOIN semantic_projection_origins o ON o.revision_id=?1 AND o.producer_id=c.producer_id AND o.basis_pin=x.basis_pin
         LEFT JOIN semantic_revision_raw_selections s ON s.revision_id=?1 AND s.producer_id=c.producer_id")?;
-    let mut targets = db.prepare("SELECT syntax_id,call FROM semantic_projection_dependency_targets WHERE payload_id=?1 AND language=?2 AND path=?3")?;
+    let mut targets = db.prepare("SELECT syntax_id,flags FROM semantic_projection_dependency_targets WHERE payload_id=?1 AND language=?2 AND path=?3")?;
     let mut mark = db.prepare("UPDATE semantic_projection_documents SET pending=1 WHERE revision_id=?1 AND producer_id=?2 AND language=?3 AND path=?4")?;
     let mut marked = BTreeSet::new();
     let mut budget = lookup_bound;
@@ -203,7 +203,7 @@ fn write_pending_within(
         let (stored, captured): (Option<String>, Option<String>) = (row.get(6)?, row.get(7)?);
         let pending = match (stored, captured) {
             (Some(stored), Some(captured)) => {
-                let targets: Vec<(Vec<u8>, bool)> = targets
+                let targets: Vec<(Vec<u8>, semantic_payload::TargetFlags)> = targets
                     .query_map(params![payload, language, path], |r| {
                         Ok((r.get(0)?, r.get(1)?))
                     })?

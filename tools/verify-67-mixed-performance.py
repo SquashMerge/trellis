@@ -27,7 +27,7 @@ import importlib.util
 
 REPO = Path(__file__).resolve().parents[1]
 DECODER_VERSION = "scip-0.10.0/CapturedScipFactV1/2"
-SCHEMA_VERSION = 42
+SCHEMA_VERSION = 43
 PINNED = REPO / "tools/synthetic-cohorts/manifest-v2.json"
 GENERATOR = REPO / "tools/synthetic-cohorts/generate.mjs"
 BATCH_MODULE = REPO / "tools/semantic-contract/semantic_batch.py"
