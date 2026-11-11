@@ -492,6 +492,14 @@ Server templates also come from Python Flask and FastAPI route decorators, under
 
 Server templates also come from Java Spring MVC mapping annotations on controller classes, joined to their class-level `@RequestMapping`, and from JAX-RS resource classes under their `@Path` and the snapshot's `@ApplicationPath`. Mappings inherited from a supertype count only when that supertype resolves to one type of the snapshot. Client paths also come from `java.net.http` requests, Spring `RestTemplate` calls and Spring `WebClient` requests whose URL is statically readable. Unlike an axios base URL, the base URL of a `RestTemplate` or `WebClient` is read even when it is absolute: its path is the prefix, so a match that needed it is `wrapperInferred`. A route whose prefix, path or method cannot be read is not extracted, and a Java call whose URL, base URL or method cannot be read is `unresolved`. As before, a missing match proves nothing.
 
+## Interface evidence amendment: Sequence hops (#853)
+
+**Status: proposed, for owner ratification. It applies the owner's #686 addition of 2026-11-04 (cross-app Sequence) as split into #853 on 2026-11-09. It changes how interface evidence is presented, not what it is: the evidence kind, the fields, the four values and their precedence are unchanged.**
+
+A Sequence (browser `/api/sequence`) may present interface evidence on a measured client call step. A call matched to a route whose handler is in another app than the call carries the match (`method`, `pathTemplate`, `confidence`, both apps and the handler's anchor kind) and is drawn as a **boundary hop** into the handler's app. The hop is labelled with the method, the path template, the confidence and "structural match, not proof". It is never presented as a resolved call: it is not `callEvidence`, it never sets `boundaryReason`, `resolution`, `dispatch` or `freshness`, and it never counts as a compiler- or producer-resolved edge. The handler's body is not expanded into the view; the handler's own Sequence opens on demand.
+
+A call matched to no route carries `confidence: "unresolved"` and no handler. It stays a boundary and draws nothing new. A match within one app, or with an end in no app, is not presented. Interface evidence that is not read for the view's revision (`interfaces.state` other than `ready`) says nothing about the view's calls, and a missing hop is never read as no request.
+
 ## Owner-ratified native-v9 correction: Java varargs
 
 **Status: owner-ratified 2026-10-24 (#279).** This narrow Java measurement ruling is approved independently; the #279 capability and reference amendments above are also ratified by the owner, 2026-10-24.
