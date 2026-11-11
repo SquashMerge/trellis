@@ -2148,6 +2148,8 @@ async fn serve_shutdown(signal: i32, kill_daemon: bool) {
     });
     let (mut release, _) = arrived.unwrap();
     use std::io::{Read, Write};
+    // On macOS an accepted socket inherits the nonblocking listener's O_NONBLOCK (#900).
+    release.set_nonblocking(false).unwrap();
     release
         .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
         .unwrap();
