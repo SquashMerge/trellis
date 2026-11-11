@@ -30,6 +30,8 @@ pub(crate) struct World {
     pub(crate) checkout: Checkout,
     pub(crate) stub_dir: TempDir,
     pub(crate) marker: PathBuf,
+    /// The environment the daemon was started with, so a restarted one is armed the same way.
+    pub(crate) env: Vec<(String, String)>,
 }
 
 impl World {
@@ -47,6 +49,19 @@ impl World {
     /// Like `with`, and `extra` is also set in the daemon's own environment, the process that
     /// launches the producer.
     pub(crate) fn with_env(hooks: &[(&str, &str)], extra: &[(&str, &str)]) -> Self {
+        Self::build(hooks, extra, workspace)
+    }
+
+    /// Like `with_env`, for a checkout that is a Git checkout from the start (the MCP server
+    /// serves only those), so no `.git` appears under a running daemon.
+    pub(crate) fn with_git(hooks: &[(&str, &str)], extra: &[(&str, &str)]) -> Self {
+        Self::build(hooks, extra, |root| {
+            workspace(root);
+            fs::create_dir_all(root.join(".git")).unwrap();
+        })
+    }
+
+    fn build(hooks: &[(&str, &str)], extra: &[(&str, &str)], setup: impl FnOnce(&Path)) -> Self {
         let stub_dir = tempfile::Builder::new()
             .prefix("producer-stub-")
             .tempdir_in("/tmp")
@@ -68,11 +83,12 @@ impl World {
                 .iter()
                 .map(|(name, value)| ((*name).to_owned(), (*value).to_owned())),
         );
-        let checkout = start_checkout(workspace, &env);
+        let checkout = start_checkout(setup, &env);
         Self {
             checkout,
             stub_dir,
             marker,
+            env,
         }
     }
 
@@ -159,6 +175,7 @@ impl World {
     pub(crate) fn command(&self, verb: &str, extra: &[&str]) -> std::process::Command {
         let mut command = self.checkout.cli();
         command
+            .envs(self.env.iter().map(|(name, value)| (name, value)))
             .args(["producer", verb, "--workspace"])
             .arg(&self.checkout.root)
             .args(extra);
@@ -270,11 +287,11 @@ pub(crate) fn reply(output: &Output) -> Value {
     })
 }
 
-fn stderr(output: &Output) -> String {
+pub(crate) fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
-fn marker_lines(world: &World) -> usize {
+pub(crate) fn marker_lines(world: &World) -> usize {
     fs::read_to_string(&world.marker).map_or(0, |text| text.lines().count())
 }
 
@@ -866,7 +883,7 @@ fn unknown_group_imports_the_frozen_snapshot_despite_a_later_rewrite() {
     assert!(stage_residue(&world).is_empty());
 }
 
-fn entries(dir: &Path) -> Vec<String> {
+pub(crate) fn entries(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = fs::read_dir(dir)
         .unwrap()
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
@@ -877,7 +894,7 @@ fn entries(dir: &Path) -> Vec<String> {
 
 /// What a queued generated import reads from its run directory: the producer's `out/`, or,
 /// when the group was not proven empty, also the frozen `snapshot/` its batch names (#624).
-fn import_inputs(record: &Value) -> Vec<&'static str> {
+pub(crate) fn import_inputs(record: &Value) -> Vec<&'static str> {
     match record["groupStatus"].as_str() {
         Some("empty") => vec!["batch", "out", "run.json"],
         Some("unknown" | "survived") => vec!["batch", "out", "run.json", "snapshot"],
@@ -915,6 +932,24 @@ fn plant_foreign_run(world: &World, id: &str) -> PathBuf {
     });
     fs::write(dir.join("run.json"), record.to_string()).unwrap();
     dir
+}
+
+/// A run record another daemon left unfinished, as an automatic run created at `created_at`.
+fn plant_foreign_auto_run(world: &World, id: &str, created_at: u64) -> PathBuf {
+    let dir = plant_foreign_run(world, id);
+    let path = dir.join("run.json");
+    let mut record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    record["origin"] = json!("auto");
+    record["createdAt"] = json!(created_at);
+    fs::write(&path, record.to_string()).unwrap();
+    dir
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
 }
 
 fn assert_abandoned_and_stripped(world: &World, id: &str) {
@@ -1134,4 +1169,59 @@ fn unknown_acceptance_keeps_an_importing_record_naming_the_request() {
     trellis::testing::wait_until("the accepted request to settle", || {
         support::request_rows(&world.checkout)[before].1 == "done"
     });
+}
+
+const HOUR_MS: u64 = 3_600_000;
+
+/// A daemon that crashed mid-run left an automatic run behind. The restarted daemon's sweep
+/// abandons it, which is not a failure, but it counts as the last automatic start: a crash can
+/// repeat a run at most once per minimum interval.
+#[test]
+fn crash_abandoned_auto_run_waits_min_interval() {
+    use crate::producer_auto::{approve, auto_records, auto_world, edit_head, enable, wait_auto};
+    let world = auto_world(&[], (50, HOUR_MS, 200));
+    approve(&world, &[]);
+    edit_head(&world, 1);
+    support::stop_daemon(&world.checkout.home);
+    let created = now_ms();
+    let foreign = run_id_text(9);
+    plant_foreign_auto_run(&world, &foreign, created);
+    enable(&world);
+
+    let output = world.producer("status", &[]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    trellis::testing::wait_until("restart sweep", || {
+        world.record(&foreign)["state"] == "failed"
+    });
+    assert_abandoned_and_stripped(&world, &foreign);
+    let state = wait_auto(&world, "scheduled");
+    assert_eq!(
+        state["nextEarliestStart"].as_u64().unwrap(),
+        created + HOUR_MS
+    );
+    assert_eq!(auto_records(&world).len(), 1, "only the abandoned run");
+    assert_eq!(world.run_ids().len(), 2, "no new run record");
+}
+
+#[test]
+fn crash_abandoned_auto_run_restarts_after_min_interval() {
+    use crate::producer_auto::{approve, auto_records, auto_world, edit_head, enable};
+    let world = auto_world(&[], (50, HOUR_MS, 200));
+    approve(&world, &[]);
+    edit_head(&world, 1);
+    world.emitting_variant(1);
+    support::stop_daemon(&world.checkout.home);
+    let foreign = run_id_text(10);
+    plant_foreign_auto_run(&world, &foreign, now_ms() - 2 * HOUR_MS);
+    enable(&world);
+
+    let output = world.producer("status", &[]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    trellis::testing::wait_until("the new automatic run imports", || {
+        auto_records(&world)
+            .iter()
+            .any(|run| run["runId"] != foreign.as_str() && run["state"] == "done")
+    });
+    assert_abandoned_and_stripped(&world, &foreign);
+    assert_eq!(auto_records(&world).len(), 2);
 }
