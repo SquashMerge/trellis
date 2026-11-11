@@ -709,9 +709,12 @@ pub(crate) fn callback_block(
     }
 }
 
+/// A document's syntax, parsed once per view for [`passed_callable`] (#888).
+pub(crate) type CallbackTree = tree_sitter::Tree;
+
 /// The syntax tree of `file` in its language, for [`passed_callable`]; `None` for a language
 /// with no callback rule.
-pub(crate) fn callback_tree(file: &SourceFile) -> Option<tree_sitter::Tree> {
+pub(crate) fn callback_tree(file: &SourceFile) -> Option<CallbackTree> {
     let language: tree_sitter::Language = match file.language.as_str() {
         "javascript" => tree_sitter_javascript::LANGUAGE.into(),
         "typescript" => crate::indexer_ts::grammar(&file.path),
@@ -729,7 +732,7 @@ pub(crate) fn callback_tree(file: &SourceFile) -> Option<tree_sitter::Tree> {
 /// is itself an argument of a call (a closure, lambda, arrow or function expression, alone in
 /// parentheses or as a Python keyword argument at most). A declaration nested inside an
 /// argument (a Rust `fn` in a block argument) is not passed, so it is not a callback.
-pub(crate) fn passed_callable(tree: &tree_sitter::Tree, start: usize, end: usize) -> bool {
+pub(crate) fn passed_callable(tree: &CallbackTree, start: usize, end: usize) -> bool {
     const CALLABLE: [&str; 7] = [
         "arrow_function",
         "function_expression",

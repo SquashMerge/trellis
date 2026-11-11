@@ -26,7 +26,7 @@ const MAX_CALLBACKS: usize = 64;
 pub(super) struct CallbackReader {
     documents: BTreeMap<String, SelectedDocument>,
     /// Each owner document's syntax, parsed once, for [`crate::behavior::passed_callable`].
-    trees: BTreeMap<String, Option<tree_sitter::Tree>>,
+    trees: BTreeMap<String, Option<crate::behavior::CallbackTree>>,
     built: usize,
     /// Steps built for candidates the view does not show: they share the work bound.
     work: usize,

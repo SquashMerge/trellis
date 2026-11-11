@@ -388,7 +388,8 @@ fn review_callback_exact_visible_cap_is_admitted() {
 
 #[test]
 fn review891_callback_expansion_visible_charged_once() {
-    for (n, interactions) in [(99, false)] {
+    {
+        let (n, interactions) = (99, false);
         let source = "function run() { external(); wrap(() => { other.thing(); }); }\nfunction wrap(f) { f(); }\n";
         let filler: String = (0..n).map(|i| format!("f{i}();\n")).collect();
         let other = format!("class Other {{ thing() {{ {filler} }} }}\n");
@@ -410,7 +411,8 @@ fn review891_callback_expansion_visible_charged_once() {
 
 #[test]
 fn review891_callback_expansion_work_charged_once() {
-    for (n, interactions) in [(999, true)] {
+    {
+        let (n, interactions) = (999, true);
         let source = "function run() { external(); wrap(() => { other.thing(); }); }\nfunction wrap(f) { f(); }\n";
         let filler: String = (0..n).map(|i| format!("f{i}();\n")).collect();
         let other = format!("class Other {{ thing() {{ {filler} }} }}\n");
