@@ -266,6 +266,9 @@ struct Active {
     supersede_requested: bool,
     /// `last_start` before this start, restored if the run never started.
     prev_start: Option<u64>,
+    /// `(templateSha256, approvedAt)` of the approval this launch carries. A template refusal
+    /// holds back only this pair, never an approval loaded while the launch was in flight.
+    approval: (String, u64),
 }
 
 /// The next attempt after a non-start waits for a newer signal or the backstop.
@@ -435,10 +438,8 @@ impl OwnerState {
             }
             LaunchOutcome::NeedsApproval => {
                 restore(self);
-                if let Some(ApprovalRead::Valid(approval)) = self.approvals.get(&producer) {
-                    let refused = (approval.template_sha256.clone(), approval.approved_at);
-                    self.template_refused.insert(producer.clone(), refused);
-                }
+                self.template_refused
+                    .insert(producer.clone(), active.approval);
             }
             LaunchOutcome::Finished { run_id, outcome } => {
                 if let Some(run_id) = run_id {
@@ -1134,6 +1135,7 @@ fn spawn_run(
         token: token.clone(),
         supersede_requested: false,
         prev_start,
+        approval: (approval.template_sha256.clone(), approval.approved_at),
     });
     let job: Box<dyn FnOnce() + Send> = {
         let runtime = deps.runtime.clone();

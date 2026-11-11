@@ -134,6 +134,12 @@ impl Probes for NoProbes {
 fn activate(s: &mut OwnerState, producer: &str, now_ms: u64) -> SupersedeToken {
     let token = SupersedeToken::default();
     let basis = s.head.as_ref().unwrap().native.clone();
+    let approval = match s.approvals.get(producer) {
+        Some(ApprovalRead::Valid(approval)) => {
+            (approval.template_sha256.clone(), approval.approved_at)
+        }
+        _ => (String::new(), 0),
+    };
     let prev_start = s.last_start.insert(producer.to_owned(), now_ms);
     s.active = Some(Active {
         producer: producer.to_owned(),
@@ -141,6 +147,7 @@ fn activate(s: &mut OwnerState, producer: &str, now_ms: u64) -> SupersedeToken {
         token: token.clone(),
         supersede_requested: false,
         prev_start,
+        approval,
     });
     token
 }
@@ -1647,4 +1654,65 @@ fn reactivation_seed_keeps_failure_and_interval() {
     assert_eq!(status.state, AutoState::Failed);
     assert_eq!(status.last_run_id.as_deref(), Some("a"));
     assert!(rt.launches().is_empty());
+}
+
+#[test]
+fn review_refusal_must_be_bound_to_the_approval_that_launched() {
+    let base = Instant::now();
+    let mut s = ready(&[ALPHA], base);
+    let token = activate(&mut s, ALPHA, NOW_MS);
+    // A manual import replaces approval A with B while A's launch is still planning.
+    let mut replacement = approval(ALPHA);
+    replacement.approved_at += 1;
+    replacement.template_sha256 = "b".repeat(64);
+    s.approvals
+        .insert(ALPHA.to_owned(), ApprovalRead::Valid(Box::new(replacement)));
+    s.apply(tagged(ALPHA, &token, LaunchOutcome::NeedsApproval), 1, base);
+    let decision = at(&mut s, &live(), base, 60);
+    assert_ne!(
+        decision.statuses[ALPHA].state,
+        AutoState::NeedsApproval,
+        "approval B was never tried; a refusal of A must not poison B"
+    );
+}
+
+#[test]
+fn review_old_template_refusal_must_not_poison_reloaded_approval() {
+    let rt = FakeRuntime::new();
+    let src = FakeSources::new(&[ALPHA], config(&[ALPHA], 10, 60));
+    let harness = Harness::start(&rt, &src, immediate());
+    // A launch has copied approval A and is planning outside the decider thread.
+    rt.wait_for("approval A launch", |state| state.launches.len() == 1);
+    rt.quiesce();
+    assert_eq!(harness.status(ALPHA).state, AutoState::Running);
+    let before = src.counts();
+    // A manual run imports at the same native revision and replaces A with B.
+    // Its semantic-only publication wakes the decider while A remains in flight.
+    let mut replacement = approval(ALPHA);
+    replacement.approved_at += 1;
+    replacement.template_sha256 = "b".repeat(64);
+    src.edit(|src| {
+        src.approvals
+            .insert(ALPHA.to_owned(), ApprovalRead::Valid(Box::new(replacement)));
+        src.pin_revision += 1;
+    });
+    harness.signal();
+    assert!(
+        src.counts().2 > before.2,
+        "pin signal must reload config/approvals"
+    );
+    assert_eq!(rt.launches().len(), 1, "old launch remains active");
+    assert_eq!(harness.status(ALPHA).state, AutoState::Running);
+    let version = rt.state.lock().unwrap().version;
+    // The old launch A now returns its template mismatch.
+    rt.finish(LaunchOutcome::NeedsApproval);
+    rt.wait_for("A refusal applied", |state| {
+        state.version > version && state.waiting == Some((state.version, state.expired))
+    });
+    let status = harness.status(ALPHA);
+    assert_ne!(
+        status.state,
+        AutoState::NeedsApproval,
+        "B was loaded while A was in flight, but only A's template was refused"
+    );
 }

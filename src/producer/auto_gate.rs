@@ -93,8 +93,10 @@ fn system_on_battery() -> Option<bool> {
     None
 }
 
-/// Power from a `power_supply` directory: with a `Mains` supply present, the host is on battery
-/// when none of them is online; with none, unknown. At most 64 entries and 64 bytes a file.
+/// Power from a `power_supply` directory: any `Mains` supply reading `online` 1 means on AC; the
+/// host is on battery only when at least one `Mains` supply exists and every one reads `online` 0.
+/// No `Mains` supply, or one whose `online` is missing, unreadable or neither 0 nor 1 (with none
+/// online), is unknown. At most 64 entries and 64 bytes a file.
 #[cfg(any(target_os = "linux", test))]
 pub(crate) fn power_from_dir(dir: &std::path::Path) -> Option<bool> {
     use std::io::Read;
@@ -110,16 +112,22 @@ pub(crate) fn power_from_dir(dir: &std::path::Path) -> Option<bool> {
         Some(text.trim().to_owned())
     };
     let mut mains = false;
-    let mut online = false;
+    let mut unknown = false;
     for entry in std::fs::read_dir(dir).ok()?.take(ENTRIES).flatten() {
         let path = entry.path();
         if read(path.join("type")).as_deref() != Some("Mains") {
             continue;
         }
         mains = true;
-        online |= read(path.join("online")).as_deref() == Some("1");
+        match read(path.join("online")).as_deref() {
+            Some("1") => return Some(false),
+            Some("0") => {}
+            // Missing, unreadable or unrecognised: this supply's state is unknown, and an unknown
+            // reading never gates (T09/AC10).
+            _ => unknown = true,
+        }
     }
-    mains.then_some(!online)
+    (mains && !unknown).then_some(true)
 }
 
 /// What macOS's providing power source type says: `Some(true)` on battery.

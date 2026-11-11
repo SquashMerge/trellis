@@ -159,3 +159,22 @@ fn check_tries_battery_first_and_honours_the_switches() {
     };
     assert_eq!(check(&neither, &Fixed(Some(true), Some(true))), None);
 }
+
+#[test]
+fn unreadable_mains_online_is_unknown_review_probe() {
+    for online in [None, Some("unknown")] {
+        let temp = tempfile::tempdir().unwrap();
+        supply(temp.path(), "AC", "Mains", online);
+        assert_eq!(power_from_dir(temp.path()), None, "online={online:?}");
+    }
+}
+
+#[test]
+fn an_unreadable_mains_beside_an_offline_one_is_unknown_and_an_online_one_wins() {
+    let temp = tempfile::tempdir().unwrap();
+    supply(temp.path(), "AC0", "Mains", Some("0"));
+    supply(temp.path(), "AC1", "Mains", None);
+    assert_eq!(power_from_dir(temp.path()), None);
+    supply(temp.path(), "AC2", "Mains", Some("1"));
+    assert_eq!(power_from_dir(temp.path()), Some(false));
+}
