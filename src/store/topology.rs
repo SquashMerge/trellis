@@ -571,7 +571,7 @@ impl WorkspaceIdentity {
     /// The lookup waits at most its own bound, and never past `by` (#131):
     /// a caller's deadline caps the wait, and reaching either is `unavailable`.
     pub fn git_common_dir_by(&self, by: Option<std::time::Instant>) -> Result<PathBuf> {
-        self.git_common_dir_with_executable_by(Path::new("git"), by)
+        self.git_common_dir_with_executable_by(&crate::testing::git_executable(), by)
     }
     /// Alternate executable permits a deterministic stalled-child fixture.
     #[doc(hidden)]

@@ -127,9 +127,37 @@ fn read(path: &Path) -> Value {
     serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
 }
 
+/// Set in the child test process that alone carries the canaries.
+const CANARY_CHILD: &str = "TRELLIS_TEST_PRODUCER_CANARY_CHILD";
+
 #[test]
 fn env_canaries_absent_per_profile_row() {
-    // Each test runs in its own process under nextest, so this is not racy.
+    // The canaries must be ambient in the test process, which every test in
+    // this binary shares under a plain `cargo test` (#869): one of them,
+    // `DYLD_INSERT_LIBRARIES`, makes every other test's children fail to
+    // load. Run the check in a child test process of its own instead. That
+    // child sets the canaries itself, after it started.
+    if std::env::var_os(CANARY_CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "producer_profiles::env_canaries_absent_per_profile_row",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(CANARY_CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "canary child: {}\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    // SAFETY: this child process runs only this test, on one thread.
     for name in CANARIES {
         unsafe { std::env::set_var(name, "canary") };
     }

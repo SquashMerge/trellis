@@ -88,7 +88,20 @@ async fn show_checks_targets_records_one_latest_request_and_answers_typed_outcom
     .router();
     let prefix = format!("/api/checkouts/{}", identity.root_key);
     let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
-    let workspace = trellis::mcp::OpenedWorkspace::new(identity);
+    // This session's own `launch_final` barrier, armed only while a call is
+    // held there: never process environment that the other tests in this
+    // binary read (#869).
+    let phase = temp.path().join("phase.sock");
+    let barrier = trellis::testing::PhaseBarrier::new("", &phase);
+    let workspace = trellis::mcp::OpenedWorkspace::new(identity)
+        .with_transport_hooks_for_tests(trellis::mcp::TransportHooksForTests {
+            scope: trellis::testing::FixtureScope {
+                phase: Some(barrier.clone()),
+                git: None,
+            },
+            ..Default::default()
+        })
+        .with_call_workers_for_tests(Default::default());
     let handle = tokio::runtime::Handle::current();
     let served = {
         let registry = registry.clone();
@@ -248,16 +261,16 @@ async fn show_checks_targets_records_one_latest_request_and_answers_typed_outcom
     // changed there is `root_changed`, and the show it would have answered is never
     // recorded. The control releases the same pause with the root intact.
     let marker = root.join(".git/trellis/workspace-id");
-    let phase = temp.path().join("phase.sock");
     let target = json!({"schemaVersion":1,"view":"source","path":"a.js","line":2});
     for drift in [true, false] {
         // The marker is moved aside and back, so the restored checkout keeps its identity.
         let aside = marker.with_extension("aside");
-        let (answer, next) = paused_at_launch_final(mcp, target.clone(), &phase, || {
-            if drift {
-                std::fs::rename(&marker, &aside).unwrap();
-            }
-        });
+        let (answer, next) =
+            paused_at_launch_final(mcp, target.clone(), (&phase, &barrier), || {
+                if drift {
+                    std::fs::rename(&marker, &aside).unwrap();
+                }
+            });
         if drift {
             std::fs::rename(&aside, &marker).unwrap();
         }
@@ -306,18 +319,13 @@ async fn show_checks_targets_records_one_latest_request_and_answers_typed_outcom
 fn paused_at_launch_final(
     mut mcp: Session,
     arguments: Value,
-    socket: &std::path::Path,
+    (socket, barrier): (&std::path::Path, &trellis::testing::PhaseBarrier),
     mutate: impl FnOnce(),
 ) -> (Value, Session) {
     use std::io::Read;
     let _ = std::fs::remove_file(socket);
     let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
-    // SAFETY: this nextest process runs only this test; nothing else reads these variables
-    // concurrently with the write.
-    unsafe {
-        std::env::set_var("TRELLIS_TEST_MCP_PHASE_SOCKET", socket);
-        std::env::set_var("TRELLIS_TEST_MCP_PHASE", "launch_final");
-    }
+    barrier.set_stages("launch_final");
     let call = std::thread::spawn(move || {
         let answer = mcp.show(arguments);
         (answer, mcp)
@@ -329,10 +337,7 @@ fn paused_at_launch_final(
     mutate();
     held.write_all(&[1]).unwrap();
     let (answer, mcp) = call.join().unwrap();
-    unsafe {
-        std::env::remove_var("TRELLIS_TEST_MCP_PHASE");
-        std::env::remove_var("TRELLIS_TEST_MCP_PHASE_SOCKET");
-    }
+    barrier.set_stages("");
     (answer, mcp)
 }
 
@@ -401,8 +406,9 @@ async fn show_records_only_at_a_successful_send_decision() {
         }),
         ..Default::default()
     };
-    let workspace =
-        trellis::mcp::OpenedWorkspace::new(identity).with_transport_hooks_for_tests(hooks);
+    let workspace = trellis::mcp::OpenedWorkspace::new(identity)
+        .with_transport_hooks_for_tests(hooks)
+        .with_call_workers_for_tests(Default::default());
     let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
     let served = {
         let (registry, handle) = (registry.clone(), tokio::runtime::Handle::current());
