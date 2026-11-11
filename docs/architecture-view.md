@@ -119,8 +119,10 @@ for HTTP interface evidence ([#788](https://github.com/SquashMerge/trellis/issue
 drawing is #789 and #790. App detection and the counting rule are in
 [rules.md implementation notes (#784)](rules.md#implementation-notes-784); the evidence
 meaning is the [contract-v1 #788 amendment](semantic-evidence/contract-v1.md). Detected app
-kinds are `cargo`, `npm` and `python` (owner ruling 2026-11-08); `python` apps are detected
-from `pyproject.toml` ([#807](https://github.com/SquashMerge/trellis/issues/807)).
+kinds are `cargo`, `npm`, `python`, `maven` and `gradle` (owner rulings 2026-11-08 and
+2026-11-10); `python` apps are detected from `pyproject.toml`
+([#807](https://github.com/SquashMerge/trellis/issues/807)), and `maven` and `gradle` apps from
+runnable `pom.xml` and Gradle build modules ([#854](https://github.com/SquashMerge/trellis/issues/854)).
 
 **Summary fields.**
 

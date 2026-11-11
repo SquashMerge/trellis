@@ -478,7 +478,7 @@
       const refocus = show && !target.hidden && !!target.contains?.(document.activeElement);
       target.hidden = line.hidden = !show; target.replaceChildren(); line.replaceChildren();
       const footnote = get("architecture-footnote"); footnote.hidden = !show;
-      if (show) footnote.textContent = `Apps are detected from build manifests (Cargo binary packages, package.json and pyproject.toml) or authored in .trellis/rules.toml. Layer order is compared within an app. Band and arrow counts are reference sites at ${window.TrellisIndexPin.label(payload)}; deviation totals are rule instances, as trellis rules check reports them; ≥ means a lower bound. HTTP interfaces are evidence, not proof.`;
+      if (show) footnote.textContent = `Apps are detected from build manifests (Cargo binary packages, package.json, pyproject.toml, and runnable Maven and Gradle modules) or authored in .trellis/rules.toml. Layer order is compared within an app. Band and arrow counts are reference sites at ${window.TrellisIndexPin.label(payload)}; deviation totals are rule instances, as trellis rules check reports them; ≥ means a lower bound. HTTP interfaces are evidence, not proof.`;
       if (!show) return;
       const choose = (name, text) => {
         const button = make("button", text); button.type = "button"; button.setAttribute("aria-pressed", String(scopeName(payload) === name));

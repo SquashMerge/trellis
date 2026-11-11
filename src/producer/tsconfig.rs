@@ -801,3 +801,128 @@ pub fn apply(
         }
     }
 }
+
+/// The most project configs `typescript.projectReferences` follows from one root.
+pub const MAX_REFERENCES: usize = 64;
+
+/// The `typescript.projectReferences` setting (#717): the project configs scip-typescript
+/// reaches through `references` from the chosen root `tsconfig.json`, followed as it follows
+/// them (each reference names a directory holding a `tsconfig.json`, or that file). Every
+/// config reached must be a retained input, which capture retains above JavaScript and
+/// TypeScript sources, so the worktree holds it and the plan hashes it; scip-typescript would
+/// otherwise skip a missing one silently. A reference that leaves the checkout, names another
+/// file name, or reaches a config that is not retained, a malformed `references`, a
+/// referenced config with a package `extends` (only the root's is supplied, #799), and more
+/// than [`MAX_REFERENCES`] configs are the typed refusal.
+pub fn references(inputs: &RetainedInputs, project: &Setting) -> Result<Setting> {
+    let name = "typescript.projectReferences";
+    let none = |detail: &str| Setting {
+        name,
+        value: Value::Array(Vec::new()),
+        source: Source::Default,
+        from: Vec::new(),
+        detail: detail.into(),
+    };
+    match project.value.as_str() {
+        Some(TSCONFIG) => {}
+        Some(JSCONFIG) => {
+            return Ok(none(
+                "a jsconfig.json project is read through a generated tsconfig.json, and references are not inherited through extends",
+            ));
+        }
+        _ => return Ok(none("the generated tsconfig.json has no references")),
+    }
+    let find = |path: &str| inputs.config.iter().find(|file| file.path == path);
+    let refuse = |reason: String| anyhow::anyhow!("{CONFIG_UNRESOLVED}: {reason}");
+    let root = find(TSCONFIG).ok_or_else(|| refuse("no root tsconfig.json".into()))?;
+    let mut reached: Vec<String> = Vec::new();
+    let mut origins = vec![Origin::of(root)];
+    let mut queue = std::collections::VecDeque::from([TSCONFIG.to_owned()]);
+    let mut seen = std::collections::BTreeSet::from([TSCONFIG.to_owned()]);
+    while let Some(path) = queue.pop_front() {
+        let input = find(&path).ok_or_else(|| refuse(format!("{path} is not retained")))?;
+        if input.bytes == crate::skipped_config::PLACEHOLDER {
+            return Err(refuse(format!(
+                "{path} is over the config input cap and was not read"
+            )));
+        }
+        let config = parse_jsonc(&input.bytes)
+            .filter(Value::is_object)
+            .ok_or_else(|| refuse(format!("{path} is not a JSON object")))?;
+        if path != TSCONFIG {
+            match extends_of(&config) {
+                Ok(extends) if extends.iter().all(|specifier| is_path(specifier)) => {}
+                Ok(_) => {
+                    return Err(refuse(format!(
+                        "{path} is a referenced project whose extends names a package; only the root config's package extends is supplied"
+                    )));
+                }
+                Err(Failure::Invalid(reason) | Failure::Missing(reason)) => {
+                    return Err(refuse(format!("{path}: {reason}")));
+                }
+            }
+        }
+        let items = match config.get("references") {
+            None | Some(Value::Null) => continue,
+            Some(Value::Array(items)) => items,
+            Some(_) => {
+                return Err(refuse(format!(
+                    "{path}: references is not an array of {{\"path\": string}} objects"
+                )));
+            }
+        };
+        for item in items {
+            let Some(specifier) = item.get("path").and_then(Value::as_str) else {
+                return Err(refuse(format!(
+                    "{path}: references is not an array of {{\"path\": string}} objects"
+                )));
+            };
+            let shown: String = specifier.chars().take(200).collect();
+            let joined = (!specifier.starts_with('/'))
+                .then(|| join(parent(&path), specifier))
+                .flatten()
+                .ok_or_else(|| {
+                    refuse(format!("{path} references {shown:?}, outside the checkout"))
+                })?;
+            let target = if joined.ends_with(".json") {
+                if joined != TSCONFIG && !joined.ends_with("/tsconfig.json") {
+                    return Err(refuse(format!(
+                        "{path} references {shown:?}, a config not named tsconfig.json, which capture does not retain"
+                    )));
+                }
+                joined
+            } else if joined.is_empty() {
+                TSCONFIG.to_owned()
+            } else {
+                format!("{joined}/{TSCONFIG}")
+            };
+            if !seen.insert(target.clone()) {
+                continue;
+            }
+            let Some(referenced) = find(&target) else {
+                return Err(refuse(format!(
+                    "{path} references {shown:?}, but capture retained no {target}: a nested tsconfig.json is retained only above JavaScript or TypeScript sources"
+                )));
+            };
+            if seen.len() > MAX_REFERENCES + 1 {
+                return Err(refuse(format!(
+                    "the project references reach more than {MAX_REFERENCES} configs"
+                )));
+            }
+            origins.push(Origin::of(referenced));
+            reached.push(target.clone());
+            queue.push_back(target);
+        }
+    }
+    if reached.is_empty() {
+        return Ok(none("the root tsconfig.json has no references"));
+    }
+    Ok(Setting {
+        name,
+        value: Value::from(reached),
+        source: Source::Project,
+        from: origins,
+        detail: "references of the root tsconfig.json, followed as scip-typescript follows them"
+            .into(),
+    })
+}

@@ -1,7 +1,7 @@
 //! One checkout-owned, bounded semantic unit. No main-index snapshot survives a return.
 use super::*;
 use crate::semantic_batch::RetainedStageContinuation;
-use crate::semantic_batch::{AdmittedBatch, BatchCounters, LookupBudget, StageOwner};
+use crate::semantic_batch::{AdmittedBatch, BatchCounters, BatchLimits, LookupBudget, StageOwner};
 use crate::semantic_import::{DestinationMutations, JoinContinuation};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -614,8 +614,10 @@ impl Store {
                         current.witness_ready = result?;
                         if current.witness_ready {
                             Self::semantic_phase_diagnostic("witness_prepared", "done");
-                            current.join =
-                                Some(JoinContinuation::new_witnessed(target.pin, limits.clone()));
+                            current.join = Some(JoinContinuation::new_witnessed(
+                                target.pin,
+                                witness_join_limits(&limits)?,
+                            ));
                         }
                         return Ok(None);
                     }
@@ -822,6 +824,18 @@ impl Store {
             }
         }
     }
+}
+
+/// The witnessed settlement's limits: the operation's own. Test support may lower them alone
+/// (`TRELLIS_TEST_WITNESS_JOIN_LIMITS`, a `BatchLimits` JSON object), so a witnessed attempt
+/// that exceeds its bounds while FULL fits (#826) stays reachable at fixture size: since #865
+/// the witness charges a pending dependent what FULL charges, so no shared limit separates them.
+fn witness_join_limits(limits: &BatchLimits) -> Result<BatchLimits> {
+    #[cfg(feature = "test-support")]
+    if let Ok(text) = std::env::var("TRELLIS_TEST_WITNESS_JOIN_LIMITS") {
+        return serde_json::from_str(&text).context("test witness join limits");
+    }
+    Ok(limits.clone())
 }
 
 /// The fallback reason a witnessed S records when a resource limit stopped it.

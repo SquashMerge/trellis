@@ -5,7 +5,7 @@
 //! (owner ruling 2026-11-07). Status shows an [`IGNORE_DIAGNOSTIC_CODE`] diagnostic for it.
 //!
 //! Root config inputs (`package.json`, `package-lock.json`, `Cargo.lock` and the rest of
-//! [`crate::capture::ROOT_INPUTS`]) and nested package and Cargo manifests are read for
+//! [`crate::capture::ROOT_CONFIG_INPUTS`]) and the nested config inputs are read for
 //! dependency and module-root facts, not as source. So they have their own cap,
 //! [`CONFIG_INPUT_MAX_BYTES`], separate from `--max-file-bytes` (owner ruling 2026-11-01,
 //! option (a)). One over that cap doesn't fail the index: the capture keeps its stat and

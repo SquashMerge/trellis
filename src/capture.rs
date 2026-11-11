@@ -18,7 +18,9 @@ use std::{
     },
 };
 
-pub const ROOT_INPUTS: &[&str] = &[
+/// Root project inputs: dependency manifests, lockfiles and project config. Each is a
+/// `config:` input and, in this order, a revision header dependency. New inputs are appended.
+pub const ROOT_CONFIG_INPUTS: &[&str] = &[
     "package.json",
     "tsconfig.json",
     "jsconfig.json",
@@ -41,9 +43,35 @@ pub const ROOT_INPUTS: &[&str] = &[
     "poetry.lock",
     "Pipfile",
     "Pipfile.lock",
-    "rust-toolchain",
-    "rust-toolchain.toml",
+    // pnpm workspace packages for structural resolution (#773).
+    "pnpm-workspace.yaml",
+    // scip-python project metadata and pyright config (#717).
+    "setup.cfg",
+    "pyrightconfig.json",
+    // scip-java's SCIP build tool (#717).
+    "lsif-java.json",
 ];
+
+/// Root toolchain selectors: each is a `toolchain:` input.
+pub const ROOT_TOOLCHAIN_INPUTS: &[&str] = &["rust-toolchain", "rust-toolchain.toml"];
+
+/// Every root input: the config inputs, then the toolchain selectors.
+pub fn root_inputs() -> impl Iterator<Item = &'static str> {
+    ROOT_CONFIG_INPUTS
+        .iter()
+        .chain(ROOT_TOOLCHAIN_INPUTS)
+        .copied()
+}
+
+/// Whether `relative` is a root input.
+pub fn is_root_input(relative: &str) -> bool {
+    root_inputs().any(|name| name == relative)
+}
+
+/// Whether `relative` is a root toolchain selector.
+pub fn is_root_toolchain_input(relative: &str) -> bool {
+    ROOT_TOOLCHAIN_INPUTS.contains(&relative)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Stamp {
@@ -443,24 +471,36 @@ fn nested_package_dirs(root: &Path, sources: &[PathBuf], extensions: &[&str]) ->
         .map(Path::to_path_buf)
         .collect()
 }
-/// A nested package root admitted for scip-typescript module markers (#443).
-pub(crate) fn nested_package_manifest(root: &Path, path: &Path) -> bool {
-    path.file_name().is_some_and(|name| name == "package.json")
-        && path.starts_with(root)
-        && path.parent() != Some(root)
+/// Nested config inputs: each file name is admitted in every directory strictly below the
+/// root that holds a source with one of its extensions, directly or nested.
+pub(crate) const NESTED_CONFIG_INPUTS: &[(&str, &[&str])] = &[
+    // scip-typescript module markers (owner ruling 2026-10-29, #443).
+    ("package.json", SCRIPT_EXTENSIONS),
+    // Cargo target symbol namespaces (owner ruling 2026-10-30, #394).
+    ("Cargo.toml", &["rs"]),
+    // Python app detection (owner ruling 2026-11-08, #807).
+    ("pyproject.toml", &["py"]),
+    // TypeScript project references a producer plan follows (#717).
+    ("tsconfig.json", SCRIPT_EXTENSIONS),
+    // Maven and Gradle app detection (owner ruling 2026-11-10, #854).
+    ("pom.xml", &["java"]),
+    ("build.gradle", &["java"]),
+    ("build.gradle.kts", &["java"]),
+];
+
+/// The nested config file names admitted above a source with `extension`.
+pub(crate) fn nested_config_names(extension: &str) -> impl Iterator<Item = &'static str> + '_ {
+    NESTED_CONFIG_INPUTS
+        .iter()
+        .filter(move |(_, extensions)| extensions.contains(&extension))
+        .map(|(name, _)| *name)
 }
-/// A nested Cargo manifest admitted for Cargo target symbol namespaces (owner ruling
-/// 2026-10-30, #394).
-pub(crate) fn nested_cargo_manifest(root: &Path, path: &Path) -> bool {
-    path.file_name().is_some_and(|name| name == "Cargo.toml")
-        && path.starts_with(root)
-        && path.parent() != Some(root)
-}
-/// A nested Python project manifest admitted for app detection (owner ruling 2026-11-08,
-/// #807).
-pub(crate) fn nested_pyproject_manifest(root: &Path, path: &Path) -> bool {
+
+/// A nested config input: a [`NESTED_CONFIG_INPUTS`] name strictly below the root.
+pub(crate) fn nested_config_input(root: &Path, path: &Path) -> bool {
     path.file_name()
-        .is_some_and(|name| name == "pyproject.toml")
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| NESTED_CONFIG_INPUTS.iter().any(|(known, _)| *known == name))
         && path.starts_with(root)
         && path.parent() != Some(root)
 }
@@ -634,6 +674,22 @@ fn walk(root: &Path, ignore_cap: u64, cancel: &CancelFlag) -> Result<Walked> {
     }
     let oversized = std::mem::take(&mut rules.oversized);
     Ok((inventory, sources, oversized))
+}
+
+/// The languages of the sources an index capture of `root` would admit, by the same
+/// walk and ignore rules, reading no source. For `producer doctor` (#880).
+pub fn languages_present(root: &Path) -> Result<BTreeSet<&'static str>> {
+    let root = fs::canonicalize(root)?;
+    let cancel = CancelFlag::default();
+    let (_, sources, _) = walk(
+        &root,
+        crate::skipped_config::CONFIG_INPUT_MAX_BYTES,
+        &cancel,
+    )?;
+    Ok(sources
+        .iter()
+        .filter_map(|path| language_of_path(path))
+        .collect())
 }
 
 /// The running image must be pinned before the executable pathname is replaced.
@@ -866,7 +922,7 @@ impl Capture {
             }
         }
         let mut skipped_inputs = BTreeSet::new();
-        for name in ROOT_INPUTS {
+        for name in root_inputs() {
             admit_input(
                 root.join(name),
                 config_cap,
@@ -914,23 +970,13 @@ impl Capture {
         // scip-typescript names a module relative to the nearest package.json directory, so
         // nested package roots of JavaScript sources are admitted beside the root inputs
         // (owner ruling 2026-10-29, #443). Like the producer, only a regular file counts.
-        // Rust symbol keys are scoped by Cargo target, so nested Cargo manifests of Rust
-        // sources are admitted the same way (owner ruling 2026-10-30, #394), and so are
-        // nested Python project manifests of Python sources, for app detection (owner
-        // ruling 2026-11-08, #807).
-        let nested = nested_package_dirs(&root, &sources, SCRIPT_EXTENSIONS)
-            .into_iter()
-            .map(|dir| dir.join("package.json"))
-            .chain(
-                nested_package_dirs(&root, &sources, &["rs"])
-                    .into_iter()
-                    .map(|dir| dir.join("Cargo.toml")),
-            )
-            .chain(
-                nested_package_dirs(&root, &sources, &["py"])
-                    .into_iter()
-                    .map(|dir| dir.join("pyproject.toml")),
-            );
+        // The other [`NESTED_CONFIG_INPUTS`] are admitted the same way, each above the
+        // sources it configures.
+        let nested = NESTED_CONFIG_INPUTS.iter().flat_map(|(name, extensions)| {
+            nested_package_dirs(&root, &sources, extensions)
+                .into_iter()
+                .map(move |dir| dir.join(name))
+        });
         for path in nested {
             if metadata(&path)?.is_some_and(|item| item.kind != 2) {
                 continue;
@@ -1194,12 +1240,9 @@ impl Capture {
                     Some(".gitignore" | ".ignore")
                 ) {
                     roles.push(format!("ignore:{relative}"));
-                } else if matches!(relative.as_str(), "rust-toolchain" | "rust-toolchain.toml") {
+                } else if is_root_toolchain_input(relative.as_str()) {
                     roles.push(format!("toolchain:{relative}"));
-                } else if ROOT_INPUTS.contains(&relative.as_str())
-                    || nested_package_manifest(&self.root, path)
-                    || nested_cargo_manifest(&self.root, path)
-                    || nested_pyproject_manifest(&self.root, path)
+                } else if is_root_input(relative.as_str()) || nested_config_input(&self.root, path)
                 {
                     roles.push(format!("config:{relative}"));
                 }
@@ -1252,10 +1295,10 @@ impl Capture {
             "missing admitted native executable role"
         );
         ensure!(
-            ROOT_INPUTS.iter().all(|name| {
+            root_inputs().all(|name| {
                 result.contains_key(&format!(
                     "{}:{name}",
-                    if matches!(*name, "rust-toolchain" | "rust-toolchain.toml") {
+                    if is_root_toolchain_input(name) {
                         "toolchain"
                     } else {
                         "config"
@@ -1319,13 +1362,9 @@ impl Capture {
                     Some(".gitignore" | ".ignore")
                 ) {
                     roles.push(format!("ignore:{rel}"));
-                } else if matches!(rel.as_str(), "rust-toolchain" | "rust-toolchain.toml") {
+                } else if is_root_toolchain_input(rel.as_str()) {
                     roles.push(format!("toolchain:{rel}"));
-                } else if ROOT_INPUTS.contains(&rel.as_str())
-                    || nested_package_manifest(&self.root, path)
-                    || nested_cargo_manifest(&self.root, path)
-                    || nested_pyproject_manifest(&self.root, path)
-                {
+                } else if is_root_input(rel.as_str()) || nested_config_input(&self.root, path) {
                     roles.push(format!("config:{rel}"));
                 }
             }

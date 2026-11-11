@@ -7329,7 +7329,7 @@ async fn real_typescript_bindings_show_in_query_mcp_status_and_methods() {
     // #528: describe and scopeCoverage report the imported JavaScript evidence beside the
     // native coverage, which keeps its syntax tier; other languages have no producer.
     let describe = mcp.call("trellis_workspace_describe", json!({"schemaVersion":1}));
-    assert_eq!(describe["data"]["toolVersion"], 25);
+    assert_eq!(describe["data"]["toolVersion"], 27);
     for (scope, rows) in [
         ("describe", &describe["data"]["languages"]),
         ("incoming", &incoming["data"]["scopeCoverage"]),
@@ -9294,21 +9294,29 @@ fn issue_826_world() -> (World, (PathBuf, String)) {
     (world, descriptor)
 }
 
-/// The live budget (`unit_expansion_bytes`) for #826's fixture, 192 KiB: FULL completes at
-/// 128 KiB (not at 64 KiB), the witnessed settlement needs more than 256 KiB (it completes
-/// at 512 KiB), as at real size the witness's reservation for a pending dependent does.
-const ISSUE_826_LIMITS: &str = r#"{"unit_expansion_bytes":196608}"#;
+/// The witnessed settlement's live budget (`unit_expansion_bytes`, through the test-support
+/// `TRELLIS_TEST_WITNESS_JOIN_LIMITS`) for #826's fallback tests. Since #865 the witness charges
+/// a pending dependent what FULL charges, so no shared limit admits FULL and denies the witness;
+/// this one lowers the witnessed settlement's alone, below what A's settlement needs.
+const ISSUE_826_WITNESS_LIMITS: &str = r#"{"unit_expansion_bytes":24576}"#;
 
 fn issue_826_env(counts: &Path, limits: Option<&str>) {
     // SAFETY: each test runs in its own process under nextest, and no other thread reads these.
     unsafe {
         std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", counts);
         std::env::set_var("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1");
+        std::env::remove_var("TRELLIS_TEST_WITNESS_JOIN_LIMITS");
         match limits {
             Some(limits) => std::env::set_var("TRELLIS_TEST_SEMANTIC_LIMITS", limits),
             None => std::env::remove_var("TRELLIS_TEST_SEMANTIC_LIMITS"),
         }
     }
+}
+
+/// Lowers the witnessed settlement's live budget alone (`ISSUE_826_WITNESS_LIMITS`).
+fn issue_826_witness_limit() {
+    // SAFETY: as in `issue_826_env`.
+    unsafe { std::env::set_var("TRELLIS_TEST_WITNESS_JOIN_LIMITS", ISSUE_826_WITNESS_LIMITS) };
 }
 
 fn assert_head_matches_full(world: &World, descriptor: &(PathBuf, String)) {
@@ -9322,12 +9330,15 @@ fn assert_head_matches_full(world: &World, descriptor: &(PathBuf, String)) {
 #[test]
 fn witness_limit_falls_back_to_full() {
     let edit = "struct S;\nimpl S { fn f(&self) { } }\nfn g() { }\n// edited\n";
-    for limits in [None, Some(ISSUE_826_LIMITS)] {
+    for reduced in [false, true] {
         let (world, descriptor) = issue_826_world();
         let counts = world._state.path().join("work-counts.json");
-        issue_826_env(&counts, limits);
+        issue_826_env(&counts, None);
+        if reduced {
+            issue_826_witness_limit();
+        }
         let work = local_edit(&world, "src/b.rs", edit, &counts);
-        if limits.is_some() {
+        if reduced {
             assert_eq!(work["witnessedRejoins"], 0, "{work}");
             assert_eq!(work["fullFallbacks"], 1, "{work}");
             assert_eq!(
@@ -9427,10 +9438,8 @@ fn a_later_producer_fallback_keeps_earlier_producer_copies() {
             DocSpec::new("src/c.rs"),
         ],
     );
-    // The import runs under the same limits as S: a payload keyed under other limits is not
-    // copied (owner ruling 2026-11-09).
     let counts = world._state.path().join("work-counts.json");
-    issue_826_env(&counts, Some(ISSUE_826_LIMITS));
+    issue_826_env(&counts, None);
     let rust = world.write(&rust);
     drop(world.publish(&rust).unwrap());
     let (a, b) = definitions_docs();
@@ -9442,6 +9451,7 @@ fn a_later_producer_fallback_keeps_earlier_producer_copies() {
     // is renamed, so JavaScript A is a pending dependent (its targeted declaration is gone)
     // the witness settles, over the limit.
     write_files(&world.root, &[("src/c.rs", "fn other() { let _ = 1; }\n")]);
+    issue_826_witness_limit();
     let work = local_edit(&world, "src/B.js", "function other(){ }\n", &counts);
     assert_eq!(
         work["producerIds"],
@@ -9496,6 +9506,116 @@ fn oracle_catches_unavailable_when_full_succeeds() {
     );
     assert_eq!(world.store.index_baseline().unwrap(), head);
     assert!(world.store.semantic_catch_up_pending_for_tests().unwrap());
+}
+
+/// #865: `src/b.rs` declares the method `S::f`, and each of `CALLERS_865` documents calls it
+/// (`s.f()`), so every caller's payload is call-sensitive on B. The batch is imported under
+/// `limits`, as S then runs.
+fn issue_865_world(limits: Option<&str>) -> (World, (PathBuf, String), PathBuf) {
+    let caller = |index: usize| {
+        (
+            format!("src/c{index}.rs"),
+            format!("fn r{index}(s: S) {{ s.f(); }}\n"),
+        )
+    };
+    let world = world(|root| {
+        write_files(root, &[("src/b.rs", ISSUE_865_B)]);
+        for index in 0..CALLERS_865 {
+            let (path, text) = caller(index);
+            write_files(root, &[(&path, &text)]);
+        }
+    });
+    let counts = world._state.path().join("work-counts.json");
+    issue_826_env(&counts, limits);
+    let symbol = |name: &str| format!("rust-analyzer cargo c 0.1.0 {name}");
+    let f = symbol("impl#[S]f().");
+    let mut docs = vec![
+        DocSpec::new("src/b.rs")
+            .occurrence(&[1, 12, 13], &[], &f, 1)
+            .symbol(&f, 26, &[]),
+    ];
+    for index in 0..CALLERS_865 {
+        let (path, _) = caller(index);
+        let name = symbol(&format!("r{index}()."));
+        let width = format!("r{index}").len() as i32;
+        docs.push(
+            DocSpec::new(&path)
+                .occurrence(&[0, 3, 3 + width], &[], &name, 1)
+                .occurrence(&[0, 14 + width, 15 + width], &[], &f, 0)
+                .symbol(&name, 17, &[]),
+        );
+    }
+    let mut fixture = world.fixture().reference("rust-analyzer");
+    fixture.artifact("rust", docs);
+    let descriptor = world.write(&fixture);
+    drop(world.publish(&descriptor).unwrap());
+    (world, descriptor, counts)
+}
+
+const ISSUE_865_B: &str = "struct S;\nimpl S { fn f(&self) { } }\n";
+const CALLERS_865: usize = 12;
+/// The live budget for #865's fixture, 192 KiB: FULL completes within it (at 64 KiB too), and
+/// so does the witnessed settlement of every call-sensitive dependent (at 48 KiB too). Before
+/// #865 the witness reserved about 227 KiB for each one-line caller and fell back to FULL.
+const ISSUE_865_LIMITS: &str = r#"{"unit_expansion_bytes":196608}"#;
+
+/// #865: the first comment edit to B after the capture flips the "unchanged" bit of every
+/// caller's dependency term (their `Direct` calls to `S::f` become `Unknown`, #557), so each
+/// caller is a pending dependent. The witness settles them within the same live budget FULL
+/// needs, instead of falling back to FULL (`witness_limit_exceeded`), and the head equals FULL
+/// (the in-S oracle is on). A second comment edit leaves every term alone and rotates only B.
+#[test]
+fn first_edit_after_capture_witnesses_many_call_sensitive_dependents() {
+    let (world, descriptor, counts) = issue_865_world(Some(ISSUE_865_LIMITS));
+    let calls = |world: &World| {
+        let head = world.store.index_baseline().unwrap();
+        rust_calls(world, &world.store.semantic_at(head).unwrap().call_bindings)
+    };
+    let dispatch = |world: &World| {
+        calls(world)
+            .into_iter()
+            .map(|call| call[3].clone())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    assert_eq!(calls(&world).len(), CALLERS_865);
+    assert_eq!(
+        dispatch(&world),
+        std::collections::BTreeSet::from(["Direct".to_owned()])
+    );
+    let work = local_edit(
+        &world,
+        "src/b.rs",
+        &format!("{ISSUE_865_B}// edited\n"),
+        &counts,
+    );
+    assert_eq!(work["fullFallbacks"], 0, "{work}");
+    assert_eq!(work["fallbackReasons"], json!([]), "{work}");
+    assert_eq!(work["witnessedRejoins"], 1, "{work}");
+    assert_eq!(
+        work["copiedDocuments"],
+        json!([]),
+        "every caller is pending: {work}"
+    );
+    assert_eq!(
+        dispatch(&world),
+        std::collections::BTreeSet::from(["Unknown".to_owned()])
+    );
+    assert_head_matches_full(&world, &descriptor);
+
+    let work = local_edit(
+        &world,
+        "src/b.rs",
+        &format!("{ISSUE_865_B}// edited twice\n"),
+        &counts,
+    );
+    assert_eq!(work["fullFallbacks"], 0, "{work}");
+    assert_eq!(work["witnessedRejoins"], 1, "{work}");
+    assert_eq!(
+        work["copiedDocuments"].as_array().unwrap().len(),
+        CALLERS_865,
+        "{work}"
+    );
+    assert_head_matches_full(&world, &descriptor);
 }
 
 /// #826 control for the oracle: FULL's own resource bound is a typed unavailable outcome the

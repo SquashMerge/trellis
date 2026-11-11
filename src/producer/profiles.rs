@@ -15,13 +15,18 @@ use std::{
 /// The pin id of the test-support stand-in producer.
 pub const STUB_NAME: &str = crate::scip_admission::STUB_PRODUCER;
 const RUST_REFUSAL: &str = "rust-analyzer cannot disable build scripts or proc macros";
-const JAVA_BUILD_FILES: [&str; 6] = [
+/// The root build files and, as `*/` patterns, the nested module build files capture retains
+/// above Java sources (#854).
+const JAVA_BUILD_FILES: [&str; 9] = [
     "pom.xml",
     "build.gradle",
     "build.gradle.kts",
     "settings.gradle",
     "settings.gradle.kts",
     "gradle.properties",
+    "*/pom.xml",
+    "*/build.gradle",
+    "*/build.gradle.kts",
 ];
 const SYSTEM_PATH: [&str; 2] = ["/usr/bin", "/bin"];
 
@@ -344,11 +349,22 @@ pub struct Generated {
 pub const SCIP_TYPESCRIPT_TSCONFIG: &[u8] =
     br#"{"compilerOptions":{"allowJs":true,"jsx":"preserve","target":"es2022","module":"commonjs"}}"#;
 
-/// A captured root input the row leaves out of the worktree.
+/// A captured root input the row leaves out of the worktree. A `path` of `*/name` leaves out
+/// every nested input of that file name.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Omission {
     pub path: &'static str,
     pub reason: String,
+}
+
+impl Omission {
+    /// Whether this omission leaves out the input at `path`.
+    pub fn matches(&self, path: &str) -> bool {
+        match self.path.strip_prefix('*') {
+            Some(suffix) => path.ends_with(suffix),
+            None => self.path == path,
+        }
+    }
 }
 
 /// The row's worktree omissions and additions.
@@ -378,7 +394,12 @@ pub fn rules(row: &Row) -> Rules {
                     path,
                     reason: "java build logic is denied in the restricted profile".into(),
                 })
-                .to_vec(),
+                .into_iter()
+                .chain([Omission {
+                    path: "lsif-java.json",
+                    reason: "the restricted profile writes its own lsif-java.json; the checkout's can name dependencies to fetch".into(),
+                }])
+                .collect(),
             generated: vec![Generated {
                 path: "worktree/lsif-java.json".into(),
                 bytes: br#"{"dependencies":[]}"#.to_vec(),
@@ -387,11 +408,13 @@ pub fn rules(row: &Row) -> Rules {
             args: Vec::new(),
         },
         (Target::Real(ProducerName::ScipPython), TrustProfile::Restricted) => Rules {
-            omit: vec![Omission {
-                path: "pyproject.toml",
-                reason: "the only captured file that can configure the interpreter pyright uses"
-                    .into(),
-            }],
+            omit: ["pyproject.toml", "pyrightconfig.json"]
+                .map(|path| Omission {
+                    path,
+                    reason: "a captured file that can configure the interpreter pyright uses"
+                        .into(),
+                })
+                .to_vec(),
             generated: vec![Generated {
                 path: "producer-config/environment.json".into(),
                 bytes: b"[]".to_vec(),

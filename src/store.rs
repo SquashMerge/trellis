@@ -3070,11 +3070,19 @@ impl EvidenceResponse {
             let path = match &input {
                 RetainedInput::Present { path, .. } | RetainedInput::Absent { path } => *path,
             };
-            // pyproject.toml declares Python source roots (#771); it is not required.
+            // pyproject.toml declares Python source roots (#771), pnpm-workspace.yaml pnpm
+            // workspace packages (#773), and the Maven and Gradle files Java apps (#854);
+            // none is required.
             let label = match path {
                 "Cargo.toml" => "Cargo",
                 "package.json" => "package.json",
                 "pyproject.toml" => "pyproject",
+                "pnpm-workspace.yaml" => "pnpm workspace",
+                "pom.xml"
+                | "build.gradle"
+                | "build.gradle.kts"
+                | "settings.gradle"
+                | "settings.gradle.kts" => "Java build",
                 _ => continue,
             };
             selected_ensure!(
@@ -3182,11 +3190,19 @@ impl EvidenceResponse {
                 continue;
             };
             let path = path.as_ref();
-            // Present nested manifests feed app detection (#784, #807); other consumers
-            // ignore them, as they do every path that is not a root input.
-            let nested = path.ends_with("/package.json")
-                || path.ends_with("/Cargo.toml")
-                || path.ends_with("/pyproject.toml");
+            // Present nested manifests feed app detection (#784, #807, #854) and workspace
+            // member resolution (#772, #773); other consumers ignore them, as they do every
+            // path that is not a root input.
+            let nested = [
+                "/package.json",
+                "/Cargo.toml",
+                "/pyproject.toml",
+                "/pom.xml",
+                "/build.gradle",
+                "/build.gradle.kts",
+            ]
+            .iter()
+            .any(|suffix| path.ends_with(suffix));
             if !nested && !matches!(path, "tsconfig.json" | "jsconfig.json") {
                 continue;
             }
@@ -10804,7 +10820,7 @@ fn revision_producer_binding(db: &Connection, revision_key: &str) -> Result<(Str
         );
         if let Some(relative) = key.strip_prefix("toolchain:") {
             selected_ensure!(
-                crate::capture::ROOT_INPUTS[22..].contains(&relative)
+                crate::capture::is_root_toolchain_input(relative)
                     && selectors.insert(relative.to_owned())
                     && matches!(
                         observation,
@@ -10839,7 +10855,7 @@ fn revision_producer_binding(db: &Connection, revision_key: &str) -> Result<(Str
         identities.push(serde_json::json!({"key":key,"observation":observation}));
     }
     selected_ensure!(
-        selectors.len() == crate::capture::ROOT_INPUTS[22..].len()
+        selectors.len() == crate::capture::ROOT_TOOLCHAIN_INPUTS.len()
             && identities.len() == selectors.len() + 1,
         "incompatible_index: selected producer input inventory incomplete"
     );
@@ -11615,10 +11631,10 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
         }
     }
     let mut expected = BTreeSet::from(["root:.".to_owned()]);
-    for name in &crate::capture::ROOT_INPUTS[..22] {
+    for name in crate::capture::ROOT_CONFIG_INPUTS {
         expected.insert(format!("config:{name}"));
     }
-    for name in &crate::capture::ROOT_INPUTS[22..] {
+    for name in crate::capture::ROOT_TOOLCHAIN_INPUTS {
         expected.insert(format!("toolchain:{name}"));
     }
     for directory in &directories {
@@ -11631,20 +11647,18 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
         }
         expected.insert(format!("directory:{directory}"));
     }
-    // Nested package roots of JavaScript and TypeScript sources (#443), nested Cargo
-    // manifests of Rust sources (#394) and nested Python project manifests of Python
-    // sources (#807); a non-regular one is not admitted.
+    // The nested config inputs above each source (`capture::NESTED_CONFIG_INPUTS`); a
+    // non-regular one is not admitted.
     for source in &source_paths {
-        let manifest = match crate::capture::language_of_path(Path::new(source)) {
-            Some("javascript" | "typescript") => "package.json",
-            Some("rust") => "Cargo.toml",
-            Some("python") => "pyproject.toml",
-            _ => continue,
+        let Some(extension) = Path::new(source).extension().and_then(|x| x.to_str()) else {
+            continue;
         };
-        for dir in Path::new(source).ancestors().skip(1) {
-            let key = format!("config:{}/{manifest}", dir.to_string_lossy());
-            if !dir.as_os_str().is_empty() && actual.contains(&key) {
-                expected.insert(key);
+        for manifest in crate::capture::nested_config_names(extension) {
+            for dir in Path::new(source).ancestors().skip(1) {
+                let key = format!("config:{}/{manifest}", dir.to_string_lossy());
+                if !dir.as_os_str().is_empty() && actual.contains(&key) {
+                    expected.insert(key);
+                }
             }
         }
     }

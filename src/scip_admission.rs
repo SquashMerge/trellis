@@ -27,6 +27,8 @@ struct HardwareProducer {
     target_pins: Vec<HardwareTargetPin>,
     #[serde(rename = "positionEncoding")]
     position_encoding: Option<String>,
+    #[serde(rename = "installMethod", default)]
+    install_method: Option<String>,
 }
 #[derive(Deserialize)]
 struct HardwareTargetPin {
@@ -104,6 +106,8 @@ impl PinnedProducer {
 
 struct Profiles {
     reference: Vec<PinnedProducer>,
+    /// `(producer name, installMethod)` of the reference rows, as captured.
+    install_methods: Vec<(String, String)>,
     synthetic: PinnedProducer,
 }
 
@@ -229,6 +233,11 @@ fn load_profiles() -> Option<Profiles> {
         .iter()
         .filter_map(|producer| reference_pin(producer, &hardware.profile_id, &host))
         .collect();
+    let install_methods = hardware
+        .semantic_producers
+        .iter()
+        .filter_map(|producer| Some((producer.name.clone(), producer.install_method.clone()?)))
+        .collect();
     let generator = synthetic.generator;
     if synthetic.identity_kind != "generatorSource"
         || !hexhash(&generator.source_sha256)
@@ -241,6 +250,7 @@ fn load_profiles() -> Option<Profiles> {
     }
     Some(Profiles {
         reference,
+        install_methods,
         synthetic: PinnedProducer {
             name: generator.name,
             version: generator.version,
@@ -253,6 +263,16 @@ fn load_profiles() -> Option<Profiles> {
             profile_id: synthetic.profile_id,
         },
     })
+}
+
+/// The reference profile row's `installMethod` for a producer id, as captured (#880).
+pub fn reference_install_method(producer_id: &str) -> Option<&'static str> {
+    profiles()
+        .ok()?
+        .install_methods
+        .iter()
+        .find(|(name, _)| name == producer_id)
+        .map(|(_, method)| method.as_str())
 }
 
 /// The pin for a producer id, as the store re-derives it from stored rows.
@@ -507,6 +527,7 @@ mod tests {
                 executable_hash: "not hex".into(),
             }],
             position_encoding: Some("utf8".into()),
+            install_method: None,
         };
         assert_eq!(reference_pin(&row, "p", "other"), None);
     }
