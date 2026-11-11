@@ -211,6 +211,54 @@ pub struct CallbackCandidate {
     pub outer_call: String,
     /// The participants the block's own resolved calls target, in columns already drawn.
     pub participants: Vec<Participant>,
+    /// The call it is passed to, as its source spells it: what a refusal names.
+    pub callee: String,
+    /// The bound that refused building it whole (Prime review on #891): the block then keeps
+    /// only its measured calls, so a read that finds a drawn hop among them reports the bound
+    /// with [`callback_warning`] instead of dropping the hop silently. Never shown.
+    pub refused: Option<SequenceLimit>,
+}
+impl CallbackCandidate {
+    /// A candidate refused by `limit`: only the measured calls of `body`, nested candidates'
+    /// included, are kept, flat.
+    pub(crate) fn refused(
+        boundary: &SequenceStep,
+        callee: &str,
+        outer_call: String,
+        body: &[SequenceStep],
+        limit: SequenceLimit,
+    ) -> Self {
+        let mut calls = vec![];
+        any_step(body, &mut |step| {
+            if step.call_id.is_some() {
+                calls.push(SequenceStep {
+                    children: vec![],
+                    alternate: vec![],
+                    folded: vec![],
+                    callback: None,
+                    ..step.clone()
+                });
+            }
+            false
+        });
+        Self {
+            block: callback_block(boundary, callee, calls),
+            outer_call,
+            participants: vec![],
+            callee: callee.to_owned(),
+            refused: Some(limit),
+        }
+    }
+}
+/// The warning of a callback a bound refused (#888): `bound` is `step`, `work` or `depth`.
+pub(crate) fn callback_warning(limit: SequenceLimit, callee: &str) -> String {
+    let bound = match limit {
+        SequenceLimit::VisibleSteps => "step",
+        SequenceLimit::WorkSteps => "work",
+        SequenceLimit::Depth => "depth",
+        SequenceLimit::Participants => "participant",
+    };
+    format!("Sequence {bound} limit reached; the callback passed to {callee} is not shown.")
 }
 /// Why a step is incidental (#536, #543).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -661,6 +709,59 @@ pub(crate) fn callback_block(
     }
 }
 
+/// The syntax tree of `file` in its language, for [`passed_callable`]; `None` for a language
+/// with no callback rule.
+pub(crate) fn callback_tree(file: &SourceFile) -> Option<tree_sitter::Tree> {
+    let language: tree_sitter::Language = match file.language.as_str() {
+        "javascript" => tree_sitter_javascript::LANGUAGE.into(),
+        "typescript" => crate::indexer_ts::grammar(&file.path),
+        "rust" => tree_sitter_rust::LANGUAGE.into(),
+        "java" => tree_sitter_java::LANGUAGE.into(),
+        "python" => tree_sitter_python::LANGUAGE.into(),
+        _ => return None,
+    };
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&language).ok()?;
+    parser.parse(&file.text, None)
+}
+
+/// #888 (Prime review on #891): whether `start..end` in `tree` is a callable expression that
+/// is itself an argument of a call (a closure, lambda, arrow or function expression, alone in
+/// parentheses or as a Python keyword argument at most). A declaration nested inside an
+/// argument (a Rust `fn` in a block argument) is not passed, so it is not a callback.
+pub(crate) fn passed_callable(tree: &tree_sitter::Tree, start: usize, end: usize) -> bool {
+    const CALLABLE: [&str; 7] = [
+        "arrow_function",
+        "function_expression",
+        "function",
+        "generator_function",
+        "closure_expression",
+        "lambda",
+        "lambda_expression",
+    ];
+    let Some(mut node) = tree.root_node().descendant_for_byte_range(start, end) else {
+        return false;
+    };
+    while !CALLABLE.contains(&node.kind()) {
+        match node.parent() {
+            Some(parent) if parent.start_byte() == start && parent.end_byte() == end => {
+                node = parent;
+            }
+            _ => return false,
+        }
+    }
+    if node.start_byte() != start || node.end_byte() != end {
+        return false;
+    }
+    let mut parent = node.parent();
+    while let Some(wrapper) =
+        parent.filter(|p| matches!(p.kind(), "parenthesized_expression" | "keyword_argument"))
+    {
+        parent = wrapper.parent();
+    }
+    parent.is_some_and(|p| matches!(p.kind(), "arguments" | "argument_list"))
+}
+
 /// The column a participant is drawn in (#558): its type or module, or its own.
 fn column_of(participant: &Participant) -> &str {
     participant
@@ -780,14 +881,21 @@ pub(crate) fn splice_callbacks(
             }) {
                 return None;
             }
-            let shown = visible_count(std::slice::from_ref(&candidate.block));
-            let work = step_count(std::slice::from_ref(&candidate.block));
+            if let Some(limit) = candidate.refused {
+                self.refuse(limit, &callback_warning(limit, &candidate.callee));
+                return None;
+            }
+            // The block replaces its boundary (Prime review on #891): it costs its body.
+            let shown = visible_count(&candidate.block.children);
+            let work = step_count(&candidate.block.children);
             if self.visible_bound && self.shown + shown > MAX_STEPS {
-                self.refuse(SequenceLimit::VisibleSteps, VISIBLE_WARNING);
+                let warning = callback_warning(SequenceLimit::VisibleSteps, &candidate.callee);
+                self.refuse(SequenceLimit::VisibleSteps, &warning);
                 return None;
             }
             if self.work + work > MAX_WORK_STEPS {
-                self.refuse(SequenceLimit::WorkSteps, BOUNDS_WARNING);
+                let warning = callback_warning(SequenceLimit::WorkSteps, &candidate.callee);
+                self.refuse(SequenceLimit::WorkSteps, &warning);
                 return None;
             }
             let mut added = self.participants.clone();

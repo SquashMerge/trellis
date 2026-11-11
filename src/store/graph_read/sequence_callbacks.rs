@@ -25,6 +25,8 @@ const MAX_CALLBACKS: usize = 64;
 #[derive(Default)]
 pub(super) struct CallbackReader {
     documents: BTreeMap<String, SelectedDocument>,
+    /// Each owner document's syntax, parsed once, for [`crate::behavior::passed_callable`].
+    trees: BTreeMap<String, Option<tree_sitter::Tree>>,
     built: usize,
     /// Steps built for candidates the view does not show: they share the work bound.
     work: usize,
@@ -77,6 +79,17 @@ impl CallbackReader {
         }) else {
             return Ok(None);
         };
+        // Only a callable that is itself an argument is passed (Prime review on #891).
+        let tree = self
+            .trees
+            .entry(step.path.clone())
+            .or_insert_with(|| crate::behavior::callback_tree(&document.file));
+        if !tree
+            .as_ref()
+            .is_some_and(|tree| crate::behavior::passed_callable(tree, start, end))
+        {
+            return Ok(None);
+        }
         // The innermost of `owner`'s measured calls whose source holds the callable.
         let Some(outer) = document
             .graph_calls
@@ -131,6 +144,21 @@ fn relabel(steps: &mut [SequenceStep], boundary: &SequenceStep) {
 /// Whether `steps` hold a measured call: only then can a read find a hop in them.
 fn has_call(steps: &[SequenceStep]) -> bool {
     crate::behavior::any_step(steps, &mut |step| step.call_id.is_some())
+}
+
+/// Keeps a callback `limit` refused as a refused candidate when its body holds a measured
+/// call (Prime review on #891): a read that finds a drawn hop among them reports the bound.
+fn refuse(
+    step: &mut SequenceStep,
+    callee: &str,
+    outer: String,
+    body: &[SequenceStep],
+    limit: SequenceLimit,
+) {
+    if has_call(body) {
+        let candidate = CallbackCandidate::refused(step, callee, outer, body, limit);
+        step.callback = Some(Box::new(candidate));
+    }
 }
 
 /// Who owns `step` in a list of `owner`'s steps drawn on `lane`: `owner`, or the expanded
@@ -198,7 +226,13 @@ impl Enrichment<'_, '_> {
                 at += 1;
                 continue;
             };
-            if body.steps.is_empty() || reader.work + step_count(&body.steps) > MAX_WORK_STEPS {
+            if body.steps.is_empty() {
+                at += 1;
+                continue;
+            }
+            if reader.work + step_count(&body.steps) > MAX_WORK_STEPS {
+                // Too much to enrich: a read that finds a hop in it reports the bound.
+                refuse(step, &callee, outer, &body.steps, SequenceLimit::WorkSteps);
                 at += 1;
                 continue;
             }
@@ -246,28 +280,30 @@ impl Enrichment<'_, '_> {
             )?;
             let step = &steps[at];
             if interacts(&body.steps, self.participants, seed) {
-                let shown = 1 + visible_count(&body.steps);
-                let work = 1 + step_count(&body.steps);
-                let refused = if !self.interactions && self.used + shown > MAX_STEPS {
-                    Some((SequenceLimit::VisibleSteps, "step"))
-                } else if self.work + work > MAX_WORK_STEPS {
-                    Some((SequenceLimit::WorkSteps, "work"))
+                // The block replaces its boundary, and the body already holds what enriching
+                // it expanded: the view keeps exactly the body (Prime review on #891), counted
+                // once against the counts before the transaction.
+                let (used, work) = (saved.7, saved.8);
+                let shown = visible_count(&body.steps);
+                let built = step_count(&body.steps);
+                let refused = if !self.interactions && used + shown > MAX_STEPS {
+                    Some(SequenceLimit::VisibleSteps)
+                } else if work + built > MAX_WORK_STEPS {
+                    Some(SequenceLimit::WorkSteps)
                 } else if depth + 2 + tree_depth(&body.steps) >= MAX_STEP_DEPTH {
-                    Some((SequenceLimit::Depth, "depth"))
+                    Some(SequenceLimit::Depth)
                 } else {
                     None
                 };
-                if let Some((limit, bound)) = refused {
+                if let Some(limit) = refused {
                     self.rollback(saved);
                     self.limits.insert(limit);
-                    self.warn(format!(
-                        "Sequence {bound} limit reached; the callback passed to {callee} is not shown."
-                    ));
+                    self.warn(crate::behavior::callback_warning(limit, &callee));
                     at += 1;
                     continue;
                 }
-                self.used += shown;
-                self.work += work;
+                self.used = used + shown;
+                self.work = work + built;
                 for warning in std::mem::take(&mut body.warnings) {
                     self.warn(warning);
                 }
@@ -286,13 +322,18 @@ impl Enrichment<'_, '_> {
             if refused {
                 self.limits.insert(SequenceLimit::Participants);
             }
-            if has_call(&body.steps) && depth + 2 + tree_depth(&body.steps) < MAX_STEP_DEPTH {
+            let step = &mut steps[at];
+            if depth + 2 + tree_depth(&body.steps) >= MAX_STEP_DEPTH {
+                refuse(step, &callee, outer, &body.steps, SequenceLimit::Depth);
+            } else if has_call(&body.steps) {
                 reader.work += step_count(&body.steps);
                 let block = callback_block(step, &callee, body.steps);
-                steps[at].callback = Some(Box::new(CallbackCandidate {
+                step.callback = Some(Box::new(CallbackCandidate {
                     block,
                     outer_call: outer,
                     participants,
+                    callee,
+                    refused: None,
                 }));
             }
             at += 1;
@@ -390,16 +431,22 @@ pub(in crate::store) fn syntax_callbacks(
                 depth + 2,
             )?;
             let work = step_count(&body.steps);
-            if has_call(&body.steps)
-                && reader.work + work <= MAX_WORK_STEPS
-                && depth + 2 + tree_depth(&body.steps) < MAX_STEP_DEPTH
-            {
+            if !has_call(&body.steps) {
+                continue;
+            }
+            if depth + 2 + tree_depth(&body.steps) >= MAX_STEP_DEPTH {
+                refuse(step, &callee, outer, &body.steps, SequenceLimit::Depth);
+            } else if reader.work + work > MAX_WORK_STEPS {
+                refuse(step, &callee, outer, &body.steps, SequenceLimit::WorkSteps);
+            } else {
                 reader.work += work;
                 let block = callback_block(step, &callee, body.steps);
                 step.callback = Some(Box::new(CallbackCandidate {
                     block,
                     outer_call: outer,
                     participants: vec![],
+                    callee,
+                    refused: None,
                 }));
             }
         }

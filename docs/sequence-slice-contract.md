@@ -428,10 +428,12 @@ holds a hop or another meaningful step; every other diagram stays exactly as it 
 #888 a callable passed to a call (`browseRequest(async () => api("/api/sequence"))`) was
 always a boundary, so `loadSequence`'s hop into the daemon was never reached.
 
-- **Callback.** A boundary step at exactly the range of an indexed function (an arrow or
-  function expression, a Rust closure, a Java or Python lambda) that lies inside one of the
-  owner's measured calls: the innermost such call is the call it is passed to. Nested
-  function declarations and callables outside a call stay boundaries.
+- **Callback.** A boundary step at exactly the range of an indexed function that is itself
+  an argument expression of one of the owner's measured calls: an arrow or function
+  expression, a Rust closure, a Java or Python lambda, alone in parentheses or as a Python
+  keyword argument at most. The innermost such call is the call it is passed to. A function
+  declared inside an argument (a Rust `fn` in a block argument) is not passed and stays a
+  boundary, as do callables outside a call (Prime review on #891).
 - **Shown when.** Its body, built and enriched like an expanded callee's, holds:
   - an **interaction**: a shown, non-incidental call whose exact target is drawn in another
     column than the step's own (what Interactions draws as an arrow, #636), in an enriched
@@ -457,9 +459,14 @@ always a boundary, so `loadSequence`'s hop into the daemon was never reached.
 - **Bounds.** A callback is enriched in one transaction after the view's own steps, so the
   view's own steps, expansions and bounds are unchanged. It is shown only within the bounds:
   the 200 shown steps (except the Interactions candidates, #663), the 2000 work steps, depth
-  24 and 20 columns. A callback that would pass one stays a boundary, and the view is
-  truncated by that bound with "Sequence <step|work|depth> limit reached; the callback passed
-  to <callee> is not shown." (or the participant warning). At most 64 callback bodies are
+  24 and 20 columns. The block replaces its boundary, so it costs exactly its body, callee
+  bodies its enrichment expanded included, counted once: a callback that exactly fits is
+  shown (Prime review on #891). A callback that would pass a bound stays a boundary, and the
+  view is truncated by that bound with "Sequence <step|work|depth> limit reached; the callback
+  passed to <callee> is not shown." (or the participant warning). That includes a callback
+  refused before the browser read (too deep, or past the work its candidates share): it keeps
+  its measured calls, so when one is a matched hop the read reports the bound instead of
+  dropping the hop silently. At most 64 callback bodies are
   built per view (each parses its file); later ones stay boundaries. Hidden steps are not
   searched for callbacks.
 - **Candidates.** A callback with a measured call but no interaction keeps its built block
