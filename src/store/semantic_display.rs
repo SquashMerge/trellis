@@ -980,6 +980,59 @@ pub struct LanguagePending {
     pub reason: String,
 }
 
+/// Runtime labels for languages whose producer has an automatic re-run in flight or failed
+/// (#660), keyed by language. Plain data: only the label comes from runtime state, never
+/// evidence, coverage or freshness.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AutoRunLabels {
+    /// Languages of every producer whose automatic re-run is scheduled or running.
+    pub catching_up: std::collections::BTreeSet<String>,
+    /// Languages of every producer whose last automatic re-run failed, with the reason.
+    pub failed: BTreeMap<String, String>,
+}
+
+/// The reason shown for a language whose producer re-run is scheduled or running.
+const RERUN_SCHEDULED: &str = "producer re-run scheduled";
+
+/// Rules 1 and 2 of the pending label: a catching-up language relabels its `NeedsReimport`
+/// documents `CatchingUp`; a failed one carries the failure as its re-import reason. Counts,
+/// freshness and producer never change. Returns the label when a rule matched.
+fn apply_auto_run_labels(
+    language: &str,
+    documents: &mut [crate::model::DocumentSemanticStatus],
+    reimport: &mut Option<crate::model::SemanticReimport>,
+    labels: &AutoRunLabels,
+) -> Option<LanguagePending> {
+    use crate::model::{SemanticReimport, SemanticStatus};
+    if labels.catching_up.contains(language) {
+        for document in documents {
+            if document.projection.semantic_status == SemanticStatus::NeedsReimport {
+                document.projection.semantic_status = SemanticStatus::CatchingUp;
+            }
+        }
+        return Some(LanguagePending {
+            status: SemanticStatus::CatchingUp,
+            reason: RERUN_SCHEDULED.to_owned(),
+        });
+    }
+    let reason = labels.failed.get(language)?;
+    *reimport = Some(SemanticReimport::NeedsReimport {
+        reason: reason.clone(),
+    });
+    Some(LanguagePending {
+        status: SemanticStatus::NeedsReimport,
+        reason: reason.clone(),
+    })
+}
+
+/// Applies the automatic re-run labels to a CLI status's committed projection (#660), after
+/// the cached status returns. A language without a row is not added.
+pub fn relabel_status(status: &mut crate::model::IndexStatus, labels: &AutoRunLabels) {
+    for row in &mut status.semantic_languages {
+        apply_auto_run_labels(&row.language, &mut row.documents, &mut row.reimport, labels);
+    }
+}
+
 /// The pending state of one language: its re-import reason, else `re-import required`
 /// when a document needs re-import, else `re-import pending` when one is catching up.
 fn language_pending(tier: &LanguageTier) -> Option<LanguagePending> {
@@ -1237,8 +1290,14 @@ impl EvidenceResponse {
                 tiers[at].documents.push(document);
             }
         }
-        for tier in &mut tiers {
-            tier.pending = language_pending(tier);
+        for (tier, language) in tiers.iter_mut().zip(MCP_LANGUAGES) {
+            tier.pending = apply_auto_run_labels(
+                language,
+                &mut tier.documents,
+                &mut tier.reimport,
+                &self.auto_run,
+            )
+            .or_else(|| language_pending(tier));
         }
         Ok(tiers)
     }
@@ -2142,6 +2201,69 @@ mod reimport_tests {
         assert_eq!(
             (reimport.status, reimport.reason.as_str()),
             (NeedsReimport, "producer profile pin changed")
+        );
+    }
+
+    /// #660 rule 1 relabels only `NeedsReimport` documents; rule 2 sets the reason and
+    /// leaves the documents; rule 1 wins when both name the language.
+    #[test]
+    fn auto_run_labels_relabel_only_needs_reimport_documents() {
+        use crate::model::SemanticStatus::{CatchingUp, NeedsReimport, OlderBasis};
+        let mut documents = vec![
+            document(NeedsReimport),
+            document(OlderBasis),
+            document(CatchingUp),
+            document(NeedsReimport),
+        ];
+        let mut reimport = None;
+        let mut labels = AutoRunLabels::default();
+        assert_eq!(
+            apply_auto_run_labels("rust", &mut documents, &mut reimport, &labels),
+            None
+        );
+        labels.catching_up.insert("rust".into());
+        labels
+            .failed
+            .insert("rust".into(), "automatic re-run failed: x".into());
+        let pending = apply_auto_run_labels("rust", &mut documents, &mut reimport, &labels);
+        assert_eq!(
+            pending,
+            Some(LanguagePending {
+                status: CatchingUp,
+                reason: "producer re-run scheduled".into()
+            })
+        );
+        let statuses: Vec<_> = documents
+            .iter()
+            .map(|d| d.projection.semantic_status)
+            .collect();
+        assert_eq!(statuses, [CatchingUp, OlderBasis, CatchingUp, CatchingUp]);
+        assert_eq!(reimport, None);
+        assert_eq!(
+            apply_auto_run_labels("java", &mut documents, &mut reimport, &labels),
+            None
+        );
+
+        labels.catching_up.clear();
+        let mut documents = vec![document(NeedsReimport), document(CatchingUp)];
+        let pending = apply_auto_run_labels("rust", &mut documents, &mut reimport, &labels);
+        assert_eq!(
+            pending,
+            Some(LanguagePending {
+                status: NeedsReimport,
+                reason: "automatic re-run failed: x".into()
+            })
+        );
+        let statuses: Vec<_> = documents
+            .iter()
+            .map(|d| d.projection.semantic_status)
+            .collect();
+        assert_eq!(statuses, [NeedsReimport, CatchingUp]);
+        assert_eq!(
+            reimport,
+            Some(crate::model::SemanticReimport::NeedsReimport {
+                reason: "automatic re-run failed: x".into()
+            })
         );
     }
 }
