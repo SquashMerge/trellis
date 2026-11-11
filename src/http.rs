@@ -3611,21 +3611,6 @@ type SelectedResponseHook = Arc<dyn Fn(&'static str) + Send + Sync>;
 #[cfg(feature = "test-support")]
 type DependencyHook = Arc<dyn Fn(&'static str) + Send + Sync>;
 
-/// Status semantic projections run by the browser's `/status` and `/status/head` reads
-/// themselves, counted on their own blocking threads: the dependency catalog build and
-/// other background readers in the same process never count (#700).
-#[cfg(feature = "test-support")]
-static BROWSER_STATUS_PROJECTIONS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-/// How many status semantic projections the browser's status reads have run in this
-/// process (#666, #700).
-#[cfg(feature = "test-support")]
-#[doc(hidden)]
-pub fn browser_status_semantic_projections_for_tests() -> usize {
-    BROWSER_STATUS_PROJECTIONS.load(Ordering::Relaxed)
-}
-
 #[derive(Clone)]
 pub struct ProvisionedBrowser {
     registry: Arc<tokio::sync::Mutex<crate::daemon::registry::CheckoutRegistry>>,
@@ -5434,10 +5419,12 @@ async fn provisioned_core_answer(
                 } else {
                     response.status()?
                 };
+                // Status semantic projections run by the browser's status reads
+                // themselves, counted on their own blocking thread: the dependency
+                // catalog build and other background readers never count (#700).
                 #[cfg(feature = "test-support")]
-                BROWSER_STATUS_PROJECTIONS.fetch_add(
+                runtime.count_browser_status_projections(
                     crate::store::status_semantic_projections_on_thread_for_tests() - projected,
-                    Ordering::Relaxed,
                 );
                 let catching_up = catching_up || response.semantic_catching_up()?;
                 status.catching_up |= catching_up;

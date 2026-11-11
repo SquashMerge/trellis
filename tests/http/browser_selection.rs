@@ -3077,10 +3077,12 @@ async fn caught_up_head(app: &axum::Router, head_path: &str) -> Value {
 #[cfg(feature = "test-support")]
 #[tokio::test]
 async fn browser_status_projections_count_the_full_status_itself() {
-    use trellis::http::browser_status_semantic_projections_for_tests as projections;
     let browser = held_catalog_browser();
     let (app, prefix) = (&browser.app, &browser.prefix);
     let full = caught_up_head(app, &format!("{prefix}/status/head")).await;
+    // This checkout's own count: other tests' status reads never reach it (#869).
+    let runtime = browser.registry.lock().await.runtime(&browser.key).unwrap();
+    let projections = || runtime.browser_status_semantic_projections_for_tests();
     let before = projections();
     let (code, _, status) =
         selected_json(app.clone(), "GET", &format!("{prefix}/status"), Value::Null).await;
@@ -3140,7 +3142,6 @@ async fn a_pending_watcher_hint_is_a_new_head_digest_at_the_same_revision() {
 #[cfg(feature = "test-support")]
 #[tokio::test]
 async fn unchanged_status_head_is_a_cheap_conditional_read() {
-    use trellis::http::browser_status_semantic_projections_for_tests as projections;
     let HeldCatalogBrowser {
         _temp,
         root,
@@ -3148,10 +3149,14 @@ async fn unchanged_status_head_is_a_cheap_conditional_read() {
         prefix,
         release,
         built,
-        ..
+        registry,
+        key,
     } = held_catalog_browser();
     let head_path = format!("{prefix}/status/head");
     let full = caught_up_head(&app, &head_path).await;
+    // This checkout's own count: other tests' status reads never reach it (#869).
+    let runtime = registry.lock().await.runtime(&key).unwrap();
+    let projections = || runtime.browser_status_semantic_projections_for_tests();
     // The head digest never runs a semantic projection, even while the catalog build,
     // released here, projects the same head in the background (#700).
     let before = projections();

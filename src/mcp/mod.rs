@@ -24,6 +24,9 @@ pub struct OpenedWorkspace {
     call_deadline: std::time::Duration,
     #[cfg(feature = "test-support")]
     hooks: TransportHooksForTests,
+    /// A fixture's call-worker budget, in place of the process-wide one.
+    #[cfg(feature = "test-support")]
+    call_workers: Option<CallWorkersForTests>,
 }
 
 /// A test hook given a call's JSON-RPC ID.
@@ -62,6 +65,9 @@ pub struct TransportHooksForTests {
     /// On the coordinator, at a finished call's send decision after its final
     /// root check, before the last input pass; given the call's ID.
     pub send_decision: Option<CallHookForTests>,
+    /// This connection's phase barrier and `git`, on the coordinator and every
+    /// thread it starts, in place of process environment (#869).
+    pub scope: crate::testing::FixtureScope,
 }
 #[cfg(feature = "test-support")]
 impl std::fmt::Debug for TransportHooksForTests {
@@ -90,7 +96,18 @@ impl OpenedWorkspace {
             call_deadline: CALL_DEADLINE,
             #[cfg(feature = "test-support")]
             hooks: TransportHooksForTests::default(),
+            #[cfg(feature = "test-support")]
+            call_workers: None,
         }
+    }
+    /// Count this connection's call workers against `budget`, which only the
+    /// fixture's own connections share, in place of the process-wide budget
+    /// (#869).
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn with_call_workers_for_tests(mut self, budget: CallWorkersForTests) -> Self {
+        self.call_workers = Some(budget);
+        self
     }
     /// Install transport pause points for this connection.
     #[cfg(feature = "test-support")]
@@ -121,6 +138,15 @@ impl OpenedWorkspace {
                 + deadline.saturating_duration_since(self.clock_now());
         }
         deadline
+    }
+    /// The call-worker budget this connection's workers count against: a
+    /// fixture's, or (`None`) the process-wide one.
+    fn call_workers(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicUsize>> {
+        #[cfg(feature = "test-support")]
+        if let Some(budget) = &self.call_workers {
+            return Some(budget.0.clone());
+        }
+        None
     }
     fn call_timer_enabled(&self) -> bool {
         #[cfg(feature = "test-support")]
@@ -853,35 +879,47 @@ const MAX_CALL_WORKERS: usize = 16;
 /// Outstanding calls per connection: a fifth is refused without queueing.
 pub(crate) const MAX_CONNECTION_CALLS: usize = 4;
 
-/// Call workers alive in this process, for tests of the worker budget.
+/// A call-worker budget that a fixture's connections share in place of the
+/// process-wide one (#869), so a test of the budget neither starves nor waits
+/// on the other tests in its test binary.
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
-pub fn live_call_workers_for_tests() -> usize {
-    CALL_WORKERS.load(std::sync::atomic::Ordering::Acquire)
+#[derive(Clone, Debug, Default)]
+pub struct CallWorkersForTests(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+#[cfg(feature = "test-support")]
+impl CallWorkersForTests {
+    /// Call workers alive on this budget.
+    pub fn live(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
-struct WorkerPermit;
+/// A live call worker's share of its budget: the process-wide one, or a
+/// fixture's.
+struct WorkerPermit(Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>);
 impl WorkerPermit {
-    fn acquire() -> Option<Self> {
+    fn acquire(budget: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>) -> Option<Self> {
         use std::sync::atomic::Ordering;
-        let mut live = CALL_WORKERS.load(Ordering::Acquire);
+        let workers = budget.as_deref().unwrap_or(&CALL_WORKERS);
+        let mut live = workers.load(Ordering::Acquire);
         while live < MAX_CALL_WORKERS {
-            match CALL_WORKERS.compare_exchange_weak(
-                live,
-                live + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return Some(WorkerPermit),
+            match workers.compare_exchange_weak(live, live + 1, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return Some(WorkerPermit(budget)),
                 Err(current) => live = current,
             }
         }
         None
     }
+    fn workers(&self) -> &std::sync::atomic::AtomicUsize {
+        self.0.as_deref().unwrap_or(&CALL_WORKERS)
+    }
 }
 impl Drop for WorkerPermit {
     fn drop(&mut self) {
-        CALL_WORKERS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.workers()
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 
@@ -933,9 +971,11 @@ fn start_final_check(
     inbox: &std::sync::mpsc::Sender<Input>,
 ) -> bool {
     let (witness, inbox) = (witness.clone(), inbox.clone());
+    let scope = crate::testing::inherit_scope();
     std::thread::Builder::new()
         .name("mcp-final-check".into())
         .spawn(move || {
+            let _scope = crate::testing::enter_scope(scope);
             let checked = phase_hook(stage).map(|()| witness.common_dirs_by(Some(deadline)));
             // The coordinator may have ended: nobody waits for this result.
             let _ = inbox.send(Input::FinalChecked(token, checked));
@@ -2420,6 +2460,8 @@ fn coordinate(
     use std::collections::{HashMap, VecDeque};
     use std::io::BufReader;
     use std::time::Instant;
+    #[cfg(feature = "test-support")]
+    let _scope = crate::testing::enter_scope(Some(workspace.hooks.scope.clone()));
     let workspace = std::sync::Arc::new(workspace);
     let (sender, receiver) = std::sync::mpsc::channel::<Input>();
     let reader_sender = sender.clone();
@@ -2914,7 +2956,7 @@ fn coordinate(
                     } else if live_calls(&session, &in_flight) >= MAX_CONNECTION_CALLS {
                         // The message names the per-connection limit (#528).
                         refuse("too_many_requests")
-                    } else if let Some(permit) = WorkerPermit::acquire() {
+                    } else if let Some(permit) = WorkerPermit::acquire(workspace.call_workers()) {
                         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                         let resolved: Resolved = Default::default();
                         let context = CallContext {
@@ -2933,10 +2975,12 @@ fn coordinate(
                         let token = admission.token;
                         #[cfg(feature = "test-support")]
                         let worker_done = workspace.hooks.worker_done.clone();
+                        let scope = crate::testing::inherit_scope();
                         let spawned =
                             std::thread::Builder::new()
                                 .name("mcp-call".into())
                                 .spawn(move || {
+                                    let _scope = crate::testing::enter_scope(scope);
                                     let _permit = permit;
                                     let outcome = run_call(context);
                                     let _ = done.send(Input::Done(token, outcome));
