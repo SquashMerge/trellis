@@ -174,7 +174,9 @@ export async function draw(view, { width, theme, highlight, pause, choice }) {
   const lines = routed.lines.map((item) => `<path d="${item.path}" fill="none" stroke="${line}" stroke-width="${item.width}"/><polygon points="${item.arrow}" fill="${line}"/>`);
   const svg = `<svg xmlns="${SVG_NS}" width="${layout.width}" height="${height}" viewBox="0 0 ${layout.width} ${height}" font-family="${FONT_FAMILY}">${inner.join("")}${lines.join("")}</svg>`;
   if (pause) await pause();
-  return { summary, images: [{ svg, width: layout.width, height, boxes: all, parts: plan.parts.map((_, i) => i) }], cards, sideBySide: true, layout };
+  // The composed image keeps each column's projection, so the Files card can tell a drawn chip from one in "+N more".
+  return { summary, images: [{ svg, width: layout.width, height, boxes: all, parts: plan.parts.map((_, i) => i), projections: drawings.map((d) => d?.projection ?? null) }],
+    cards, sideBySide: true, layout };
 }
 
 // The followed file's module chip in one drawing: `highlight` is [layerKey, group, app]; in

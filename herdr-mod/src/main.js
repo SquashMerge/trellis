@@ -400,6 +400,8 @@ export default class Trellis extends View {
     const options = kind === "metric" ? CONTROLS.metrics : CONTROLS.aggregates;
     this.menu = null;
     if (!options.some((option) => option.value === value)) return cx.notify();
+    // A captured label carries the old metric's value: drop it, as the browser's re-render clears its inspection.
+    if (kind === "metric" ? value !== this.metric : value !== this.aggregate) { if (this.inspect?.kind === "label") this.inspect = null; }
     if (kind === "metric") this.metric = value;
     else if (value !== this.aggregate) { this.aggregate = value; this.view = null; this.loadArchitecture(cx); }
     cx.notify();
@@ -823,12 +825,13 @@ export default class Trellis extends View {
       .when(place.hidden, (el) => el.child(div().text_size(12).text_color(t.dim).child(summary.tests.has(layer.name) ? "(tests/fixtures layer, not drawn)" : "(hidden layer, not drawn)")))
       .children(place.stats.map((stat) => this.stat(t, stat))));
     if (group) {
-      const drawnChip = place.rank >= 0 && this.drawn.images.some((one) => one && [...(one.projection?.nodes.values() ?? [])].some((n) => n.kind === "C" && n.record.group === group.name && n.record.layerKey === (layer?.name ?? null)));
+      const projections = this.drawn.images.flatMap((one) => (one ? [one.projection, ...(one.projections ?? [])] : [])).filter(Boolean);
+      const drawnChip = place.rank >= 0 && projections.some((projection) => [...projection.nodes.values()].some((n) => n.kind === "C" && n.record.group === group.name && n.record.layerKey === (layer?.name ?? null)));
       card.child(h_flex().gap(6).items_center().flex_wrap()
         .child(div().text_color(t.dim).child("Module"))
         .child(this.chip(t, group.name, group.value === undefined ? null : summary.scale.band(group.value)))
         .child(div().text_color(t.muted).child(`${plural(group.files.length, "file")}${group.value === undefined ? "" : ` · ${metric === "maintainabilityIndex" ? "min" : "max"} ${metric} ${display(group.value)}`} · #${place.rank + 1} of ${place.groups} in the layer`))
-        .child(div().text_size(12).text_color(t.dim).child(drawnChip ? "outlined in the diagram" : "in the band's “more” chip")));
+        .child(div().text_size(12).text_color(t.dim).child(drawnChip ? "outlined in the diagram" : "not drawn as its own chip: in the band's “+N more” chip, or the band is open")));
     }
     card.child(h_flex().gap(6).items_center().flex_wrap()
       .child(div().text_color(t.dim).child("File"))

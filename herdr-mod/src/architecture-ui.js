@@ -65,6 +65,8 @@ function card(pane, t, item) {
   return v_flex().id(`interface-card-${item.entry.client}-${item.entry.server}`).flex_none().max_w(360).gap(2).p(8).rounded(8).border_1().cursor_pointer()
     .border_color(selected ? t.accent : t.border).bg(t.surface).hover((s) => s.bg(t.hover))
     .on_click((_e, cx) => { pane.inspect = { kind: "interface", key: item.key, client: item.entry.client, server: item.entry.server }; cx.notify(); })
+    // Listed under the drawing, a card names its interface: the browser's gutter position does that there.
+    .child(div().id(`interface-card-name-${item.entry.client}-${item.entry.server}`).text_size(12).font_semibold().child(`${item.entry.client} → ${item.entry.server}`))
     .children(item.lines.map((line) => div().text_size(line.strong ? 13 : 12).when(Boolean(line.strong), (el) => el.font_semibold())
       .text_color(line.tone ? tone(t, line.tone) : t.foreground).child(line.text)))
     .children(item.ends.map((text) => div().text_size(12).text_color(t.dim).whitespace_normal().child(text)));

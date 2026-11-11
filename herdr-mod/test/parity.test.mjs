@@ -219,3 +219,56 @@ test("the pane, negative control: a one-app checkout shows no switcher, columns 
     assert.match(root.find("inspector").text(), /2 deviations/, "the deviations entry stays");
   } finally { await p.close(); }
 });
+
+// Review of 604f610b (Prime, #887): runtime reproductions turned into tests.
+test("review P2: side by side, reciprocal interface cards with equal counts each name their client → server", async () => {
+  const { div } = await import("gpui-kit");
+  const ui = await import("../src/architecture-ui.js");
+  const v = twoApps(), first = v.interfaces[0];
+  v.interfaces.push({ ...structuredClone(first), client: first.server, server: first.client,
+    ends: first.ends.map((e) => ({ ...e, clientLayer: e.serverLayer, serverLayer: e.clientLayer })) });
+  const out = await draw(v, { width: 1300, theme, highlight: null, choice: {} });
+  assert.equal(out.sideBySide, true);
+  assert.ok(out.cards.every((c) => c.ends.length === 0), "both are fully routed, so no end words name them");
+  const pane = new Trellis();
+  Object.assign(pane, { width: 1324, view: v, inspect: null, drawn: { ...out, view: v, assets: ["probe.svg"] } });
+  const root = div().children(ui.drawing(pane, theme, pane.drawn));
+  const one = root.find("interface-card-webapp-srv").text(), other = root.find("interface-card-srv-webapp").text();
+  assert.match(one, /^webapp → srv HTTP · 1 route/);
+  assert.match(other, /^srv → webapp HTTP · 1 route/);
+  assert.notEqual(one, other);
+});
+
+test("review P2: changing Color by drops an inspected label that carries the old metric's value", async () => {
+  const view = twoApps(), cx = { notify() {} };
+  const pane = new Trellis();
+  Object.assign(pane, { view, status: { pin: { indexGeneration: view.indexGeneration, indexRevision: view.indexRevision } }, rootKey: "a",
+    open: new Map([["core", true], ["server", true]]), drilled: new Set(), metric: "cognitive", aggregate: "max", scope: "srv", unassignedOpen: false, inspect: null });
+  const drawn = await draw(view, { width: 600, theme, highlight: null, choice: pane.choice() });
+  pane.drawn = { ...drawn, view, assets: ["unused"] };
+  const box = drawn.images[0].boxes.find((b) => b.kind === "M" && b.record.identity.path === "src/main.rs");
+  pane.press({ local_position: { x: box.x + box.w / 2, y: box.y + box.h / 2 } }, 0, cx);
+  assert.match(pane.inspect.text, /10/, "the label holds the cognitive value");
+  pane.choose("metric", "maxNesting", cx);
+  const redrawn = await draw(view, { width: 600, theme, highlight: null, choice: pane.choice() });
+  pane.drawn = { ...redrawn, view, assets: ["unused"] };
+  const { inspector } = await import("../src/architecture-ui.js");
+  const text = inspector(pane, theme, redrawn.summary, view)[0].text();
+  assert.doesNotMatch(text, /src\/main\.rs/, "no label from the previous metric");
+  assert.match(text, /^Architecture review/);
+  // Control: re-choosing the same metric keeps the selection.
+  pane.press({ local_position: { x: box.x + box.w / 2, y: box.y + box.h / 2 } }, 0, cx);
+  pane.choose("metric", "maxNesting", cx);
+  assert.equal(pane.inspect?.kind, "label");
+});
+
+test("review P3: side by side, the Files card says a visible followed chip is outlined, as stacked does", async () => {
+  const view = twoApps(), pane = new Trellis();
+  Object.assign(pane, { view, rootKey: "a", metric: "cognitive", aggregate: "max", scope: null, open: new Map(), drilled: new Set(), unassignedOpen: false });
+  const file = { path: "src/util.rs", checkout: { rootKey: "a", workspaceRoot: "/work/apps" } };
+  for (const width of [600, 1300]) {
+    const out = await draw(view, { width, theme, highlight: ["core", "util", "srv"], choice: {} });
+    pane.drawn = { ...out, view, assets: out.images.map(() => "unused") };
+    assert.match(pane.fileCard(theme, file, pane.placement(file)).text(), /outlined in the diagram/, `width ${width}`);
+  }
+});
