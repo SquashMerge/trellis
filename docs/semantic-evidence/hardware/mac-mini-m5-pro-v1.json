@@ -62,9 +62,9 @@
       "version": "native-v16",
       "installedAtCapture": true,
       "capturedOn": "2026-11-08",
-      "installMethod": "cargo build --locked --features test-support --bin trellis; feature/683 final extractor (s4-corpus-repin: TypeScript grammar, native constructs and class diagrams; re-pinned for the #800 review fix that skips type-only import expressions as calls, and for #807 nested pyproject.toml config inputs, captures unchanged) merged with main; descriptor and both captures reproducible from the README commands",
-      "artifactDigest": "sha256:4c3fc5c054fd09ea3e351861ff0f886597ad3e8a37686b7a6bcd6bc0406af614",
-      "executableHash": "4c3fc5c054fd09ea3e351861ff0f886597ad3e8a37686b7a6bcd6bc0406af614",
+      "installMethod": "cargo build --locked --features test-support --bin trellis; feature/683 final extractor (s4-corpus-repin: TypeScript grammar, native constructs and class diagrams; re-pinned for the #800 review fix that skips type-only import expressions as calls, for #807 nested pyproject.toml config inputs, and for the #772/#773/#828/#854/#717 extractor batch config inputs, captures unchanged) merged with main; descriptor and both captures reproducible from the README commands",
+      "artifactDigest": "sha256:52146f9e02702038ec4ebf7a5958da378ea9b718e2f270e618ed5bfebe89e78c",
+      "executableHash": "52146f9e02702038ec4ebf7a5958da378ea9b718e2f270e618ed5bfebe89e78c",
       "runtime": "trellis.native.syntax@native-v16 test-support capture build; nativeExtractor hash includes capture adapter and test-support feature flag; tree-sitter 0.27.1; tree-sitter-typescript 0.23.2; UTF-8; source-only extractionInputs []."
     },
     {
@@ -73,9 +73,9 @@
       "version": "native-v16",
       "installedAtCapture": true,
       "capturedOn": "2026-11-08",
-      "installMethod": "cargo build --locked --features test-support --bin trellis; feature/683 final extractor (s4-corpus-repin: TypeScript grammar, native constructs and class diagrams; re-pinned for the #800 review fix that skips type-only import expressions as calls, and for #807 nested pyproject.toml config inputs, captures unchanged) merged with main; TypeScript draft corpus captured twice byte-identical; descriptor and both captures reproducible from the README commands",
-      "artifactDigest": "sha256:4c3fc5c054fd09ea3e351861ff0f886597ad3e8a37686b7a6bcd6bc0406af614",
-      "executableHash": "4c3fc5c054fd09ea3e351861ff0f886597ad3e8a37686b7a6bcd6bc0406af614",
+      "installMethod": "cargo build --locked --features test-support --bin trellis; feature/683 final extractor (s4-corpus-repin: TypeScript grammar, native constructs and class diagrams; re-pinned for the #800 review fix that skips type-only import expressions as calls, for #807 nested pyproject.toml config inputs, and for the #772/#773/#828/#854/#717 extractor batch config inputs, captures unchanged) merged with main; TypeScript draft corpus captured twice byte-identical; descriptor and both captures reproducible from the README commands",
+      "artifactDigest": "sha256:52146f9e02702038ec4ebf7a5958da378ea9b718e2f270e618ed5bfebe89e78c",
+      "executableHash": "52146f9e02702038ec4ebf7a5958da378ea9b718e2f270e618ed5bfebe89e78c",
       "runtime": "trellis.native.syntax@native-v16 test-support capture build; nativeExtractor hash includes capture adapter and test-support feature flag; tree-sitter 0.27.1; tree-sitter-typescript 0.23.2; UTF-8; source-only extractionInputs []."
     },
     {
@@ -139,7 +139,7 @@
       "version": "0.12.3",
       "installedAtCapture": true,
       "capturedOn": "2026-09-27",
-      "installMethod": "coursier bootstrap --standalone com.sourcegraph:scip-java_2.13:0.12.3",
+      "installMethod": "coursier bootstrap --standalone com.sourcegraph:scip-java_2.13:0.12.3 -o ~/.local/bin/scip-java",
       "artifactDigest": "sha256:5bef376c8960f1b25fcbf1156bb3f61b4d3f338d94b6bbd1a474d2db957a36ff",
       "executableHash": "5bef376c8960f1b25fcbf1156bb3f61b4d3f338d94b6bbd1a474d2db957a36ff",
       "runtime": "coursier-managed Temurin javac selected by the build config jvm field: 17.0.20.1 by default, 25.0.4.1 verified with jvm 25; system OpenJDK 25.0.3",

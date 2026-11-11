@@ -1,6 +1,6 @@
 //! Bounded original-source reconstruction for the common settlement.
 use super::*;
-use crate::semantic_batch::staging::{WitnessFallback, original_rows_reservation};
+use crate::semantic_batch::staging::WitnessFallback;
 use crate::store::native_first::witness::{CoverageInput, OriginalRow, OriginalSourceWitness};
 
 pub(super) struct Prepared {
@@ -187,14 +187,14 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
         .conn()
         .prepare_cached("SELECT ord FROM sources WHERE language=?1 AND path=?2")?
         .query_row(params![doc.language, doc.path], |r| r.get(0))?;
-    // The typed event storage estimate admits decoded parents, children, indexing maps,
-    // the final claim map and the destination copy before any body is materialized.
-    let bytes = original_rows_reservation(join.conn(), source_ord)?;
-    let reservation = join.ctx.live.reserve(
-        bytes
-            .checked_mul(3)
-            .ok_or_else(|| ScipCaptureError::LimitExceeded("unit expansion".into()))?,
-    )?;
+    // Each event is admitted at the typed per-event decode bound before it is decoded, then
+    // keeps only the owned bytes of what it becomes, as FULL's `sizes` visitors count its rows
+    // (#865). The claim map and the destination copy are admitted at their measured size before
+    // they are built. A whole-document bound of three decode bounds (#826) denied a large
+    // call-sensitive dependent that FULL settles within the same live budget.
+    let mut reservation = join.ctx.live.reserve(0)?;
+    let captured_id = join.captured_id().to_owned();
+    let document_bytes = sizes::document(doc)?;
     let mut symbol_order = Vec::new();
     let mut declaration_order = Vec::new();
     let mut call_order = Vec::new();
@@ -220,8 +220,15 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
             "original association event ordinal gap"
         );
         expected += 1;
-        let body: String = row.get(1)?;
-        let event: OriginalRow = serde_json::from_str(&body)?;
+        // SQLite's borrowed text: the event is admitted before anything of it is allocated.
+        let (scratch, event) = admit_event(&join.ctx.live, row.get_ref(1)?.as_str()?)?;
+        reservation.grow(retained_bytes(
+            &event,
+            document_bytes,
+            &captured_id,
+            scratch.bytes(),
+        )?)?;
+        drop(scratch);
         match event {
             OriginalRow::Coverage(row) => {
                 anyhow::ensure!(
@@ -240,7 +247,7 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
                 } else {
                     &mut row.supported_roles
                 };
-                append(roles, ordinal, role)?;
+                append(&mut reservation, roles, ordinal, role)?;
             }
             OriginalRow::Basis(row) => {
                 let id = row.basis_id;
@@ -268,6 +275,7 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
                 ordinal,
                 key,
             } => append(
+                &mut reservation,
                 &mut bases
                     .get_mut(&basis_id)
                     .context("missing original basis")?
@@ -282,7 +290,7 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
                 );
             }
             OriginalRow::Symbol(row) => {
-                append(&mut symbol_order, row.ordinal, row.row_id)?;
+                append(&mut reservation, &mut symbol_order, row.ordinal, row.row_id)?;
                 anyhow::ensure!(
                     symbols
                         .insert(
@@ -303,6 +311,7 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
                 ordinal,
                 target,
             } => append(
+                &mut reservation,
                 &mut symbols
                     .get_mut(&row_id)
                     .context("missing original symbol")?
@@ -311,7 +320,12 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
                 target,
             )?,
             OriginalRow::DeclarationBinding(row) => {
-                append(&mut declaration_order, row.ordinal, row.row_id)?;
+                append(
+                    &mut reservation,
+                    &mut declaration_order,
+                    row.ordinal,
+                    row.row_id,
+                )?;
                 anyhow::ensure!(
                     declarations
                         .insert(
@@ -332,6 +346,7 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
                 ordinal,
                 key,
             } => append(
+                &mut reservation,
                 &mut declarations
                     .get_mut(&row_id)
                     .context("missing original binding")?
@@ -344,6 +359,7 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
                 ordinal,
                 id,
             } => append(
+                &mut reservation,
                 &mut declarations
                     .get_mut(&row_id)
                     .context("missing original binding")?
@@ -384,6 +400,7 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
                 ordinal,
                 role,
             } => append(
+                &mut reservation,
                 &mut references
                     .get_mut(&reference_id)
                     .context("missing original reference")?
@@ -396,6 +413,7 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
                 ordinal,
                 target,
             } => append(
+                &mut reservation,
                 &mut references
                     .get_mut(&reference_id)
                     .context("missing original reference")?
@@ -404,7 +422,7 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
                 target,
             )?,
             OriginalRow::CallBinding(row) => {
-                append(&mut call_order, row.ordinal, row.row_id)?;
+                append(&mut reservation, &mut call_order, row.ordinal, row.row_id)?;
                 anyhow::ensure!(
                     calls
                         .insert(
@@ -431,6 +449,7 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
                 ordinal,
                 id,
             } => append(
+                &mut reservation,
                 &mut calls
                     .get_mut(&row_id)
                     .context("missing original call")?
@@ -444,6 +463,7 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
                 ordinal,
                 target,
             } => append(
+                &mut reservation,
                 &mut calls
                     .get_mut(&row_id)
                     .context("missing original call")?
@@ -456,6 +476,7 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
                 ordinal,
                 target,
             } => append(
+                &mut reservation,
                 &mut calls
                     .get_mut(&row_id)
                     .context("missing original call")?
@@ -464,7 +485,7 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
                 target,
             )?,
             OriginalRow::TypeRelationship { ordinal, row } => {
-                append(&mut relationships, ordinal, row)?
+                append(&mut reservation, &mut relationships, ordinal, row)?
             }
         }
     }
@@ -478,7 +499,7 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
         return fallback("original source tuple identity differs");
     }
     let mut claimed = BTreeSet::new();
-    let mut raw_for = |id: &str| -> Result<String> {
+    let mut raw_for = |id: &str, reservation: &mut Reservation| -> Result<String> {
         let p = provenance
             .get(id)
             .context("original fact has no provenance")?;
@@ -513,24 +534,46 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
             capture == Some(p.capture_id),
             "original proof capture differs"
         );
+        reservation.grow(sizes::sum(&[
+            sizes::text(&derived.provenance_id),
+            sizes::map_entries::<String, ()>(1)?,
+            sizes::text(id),
+        ])?)?;
         claimed.insert(id.to_owned());
         Ok(derived.provenance_id.clone())
     };
     let mut facts = super::super::JoinedFacts::default();
+    // The ordered rows move out of their decoded maps into these vectors, allocated once at
+    // their exact final capacity after it is admitted: no push below reallocates.
+    reservation.grow(sizes::sum(&[
+        sizes::slots::<semantic::Symbol>(symbol_order.len())?,
+        sizes::slots::<semantic::DeclarationBinding>(declaration_order.len())?,
+        sizes::slots::<semantic::Reference>(references.len())?,
+        sizes::slots::<semantic::CallBinding>(call_order.len())?,
+        sizes::slots::<semantic::TypeRelationship>(relationships.len())?,
+    ])?)?;
+    facts.symbols.reserve_exact(symbol_order.len());
+    facts
+        .declaration_bindings
+        .reserve_exact(declaration_order.len());
+    facts.references.reserve_exact(references.len());
+    facts.call_bindings.reserve_exact(call_order.len());
+    facts.type_relationships.reserve_exact(relationships.len());
     for id in symbol_order {
         let mut row = symbols.remove(&id).context("missing ordered symbol")?;
-        row.provenance_id = raw_for(&row.provenance_id)?;
+        row.provenance_id = raw_for(&row.provenance_id, &mut reservation)?;
         facts.symbols.push(row);
     }
     for id in declaration_order {
         let mut row = declarations
             .remove(&id)
             .context("missing ordered declaration")?;
-        row.provenance_id = raw_for(&row.provenance_id)?;
+        row.provenance_id = raw_for(&row.provenance_id, &mut reservation)?;
         facts.declaration_bindings.push(row);
     }
     for mut row in references.into_values() {
-        row.provenance_id = raw_for(&row.provenance_id)?;
+        row.provenance_id = raw_for(&row.provenance_id, &mut reservation)?;
+        reservation.grow(claim_bytes(&row)?)?;
         if facts
             .reference_claims
             .insert(row.provenance_id.clone(), row.clone())
@@ -542,7 +585,7 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
     }
     for id in call_order {
         let mut row = calls.remove(&id).context("missing ordered call")?;
-        row.provenance_id = raw_for(&row.provenance_id)?;
+        row.provenance_id = raw_for(&row.provenance_id, &mut reservation)?;
         if !facts.reference_claims.contains_key(&row.provenance_id) {
             let anchor = &row.join.anchor;
             let mut matches = facts.references.iter().filter(|reference| {
@@ -558,6 +601,12 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
             if matches.next().is_some() {
                 return fallback("ambiguous original fused call reference");
             }
+            reservation.grow(sizes::sum(&[
+                claim_bytes(reference)?,
+                sizes::map_entries::<String, ()>(2)?,
+                sizes::text(&reference.provenance_id),
+                sizes::text(&row.provenance_id),
+            ])?)?;
             let mut reference = reference.clone();
             facts.fused_calls.insert(reference.provenance_id.clone());
             facts.fused_calls.insert(row.provenance_id.clone());
@@ -569,7 +618,7 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
         facts.call_bindings.push(row);
     }
     for mut row in relationships {
-        row.provenance_id = raw_for(&row.provenance_id)?;
+        row.provenance_id = raw_for(&row.provenance_id, &mut reservation)?;
         facts.type_relationships.push(row);
     }
     for (id, p) in &provenance {
@@ -607,6 +656,10 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
             capture == Some(p.capture_id),
             "original fused proof capture differs"
         );
+        reservation.grow(sizes::sum(&[
+            sizes::map_entries::<String, ()>(1)?,
+            sizes::text(&derived.provenance_id),
+        ])?)?;
         facts.fused_proofs.insert(derived.provenance_id.clone());
     }
     if coverage
@@ -614,8 +667,24 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
         .as_ref()
         .is_some_and(|r| r.captured_diagnostics)
     {
+        reservation.grow(sizes::sum(&[
+            sizes::map_entries::<native::DocumentKey, BTreeSet<String>>(1)?,
+            document_bytes,
+        ])?)?;
         facts.diagnostics.insert(doc.clone(), BTreeSet::new());
     }
+    // The destination copy, then the destination revision ID each re-keyed row takes in place
+    // of its captured one (the captured string is not released: conservative).
+    let rekeyed = facts.declaration_bindings.len()
+        + facts.references.len()
+        + facts.reference_claims.len()
+        + facts.call_bindings.len();
+    reservation.grow(sizes::sum(&[
+        sizes::joined_facts(&facts)?,
+        (rekeyed as u64)
+            .checked_mul(sizes::text(join.destination_id()))
+            .ok_or_else(|| ScipCaptureError::LimitExceeded("unit expansion".into()))?,
+    ])?)?;
     let mut destination = facts.clone();
     for row in &mut destination.declaration_bindings {
         row.join.anchor.revision_id = join.destination_id().to_owned();
@@ -643,6 +712,115 @@ pub(super) fn prepare(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Resul
     })
 }
 
+/// The typed per-event decode bound (#826's per-row estimate): a decoded event and its parse
+/// scratch stay within eight times its JSON body plus 512 bytes.
+fn event_bound(body: usize) -> Result<u64> {
+    (body as u64)
+        .checked_mul(8)
+        .and_then(|bytes| bytes.checked_add(512))
+        .ok_or_else(|| ScipCaptureError::LimitExceeded("unit expansion".into()).into())
+}
+
+/// Admits one original event at its decode bound, then decodes it from `body`, which the
+/// caller borrows from SQLite: nothing is allocated before the admission (#394). The returned
+/// guard holds the bound until the caller has charged what the event keeps.
+fn admit_event(live: &Rc<LiveBudget>, body: &str) -> Result<(Reservation, OriginalRow)> {
+    let scratch = live.reserve(event_bound(body.len())?)?;
+    let event = serde_json::from_str(body)?;
+    Ok((scratch, event))
+}
+
+/// The owned bytes one decoded original event keeps once `prepare` has placed it, counted as
+/// FULL's `sizes` visitors count the row it becomes: its value, its map entry or child slot,
+/// a parent's order slot, and the document and captured revision a reference gains. The few
+/// coverage and basis events of a document keep their decode `bound`. The slots of the vector
+/// an event is appended to are charged again, at real capacity, by `append`: conservative.
+fn retained_bytes(event: &OriginalRow, document: u64, revision: &str, bound: u64) -> Result<u64> {
+    use crate::store::native_first::witness::OriginalJoin;
+    let join = |row: &OriginalJoin| -> Result<u64> {
+        sizes::sum(&[
+            sizes::document(&row.document)?,
+            sizes::text(&row.revision_id),
+            sizes::text(&row.content_hash),
+            sizes::optional(&row.diagnostic),
+        ])
+    };
+    let target =
+        |target: &Option<semantic::Target>| target.as_ref().map_or(Ok(0), sizes::target_payload);
+    let string = |value: &str| sizes::sum(&[sizes::slots::<String>(1)?, sizes::text(value)]);
+    match event {
+        OriginalRow::Coverage(_) | OriginalRow::Basis(_) => Ok(bound),
+        OriginalRow::CoverageRole { .. } | OriginalRow::ReferenceRole { .. } => {
+            sizes::slots::<semantic::Role>(1)
+        }
+        OriginalRow::BasisLookupDependency { key, .. } => string(key),
+        OriginalRow::Provenance(row) => sizes::sum(&[
+            sizes::map_entries::<String, crate::store::native_first::witness::OriginalProvenance>(
+                1,
+            )?,
+            sizes::text(&row.id),
+            sizes::text(&row.id),
+            sizes::text(&row.content_hash),
+            sizes::text(&row.derived_from.provenance_id),
+            sizes::text(&row.derived_from.fact_digest),
+        ]),
+        OriginalRow::Symbol(row) => sizes::sum(&[
+            sizes::slots::<i64>(1)?,
+            sizes::map_entries::<i64, semantic::Symbol>(1)?,
+            sizes::symbol_key(&row.key)?,
+            sizes::optional(&row.display_name),
+            sizes::text(&row.provenance_id),
+        ]),
+        OriginalRow::SymbolTarget { target, .. }
+        | OriginalRow::ReferenceCandidate { target, .. }
+        | OriginalRow::CallCandidate { target, .. }
+        | OriginalRow::CallDispatch { target, .. } => sizes::target(target),
+        OriginalRow::DeclarationBinding(row) => sizes::sum(&[
+            sizes::slots::<i64>(1)?,
+            sizes::map_entries::<i64, semantic::DeclarationBinding>(1)?,
+            sizes::optional(&row.syntax_id),
+            join(&row.join)?,
+            sizes::text(&row.provenance_id),
+        ]),
+        OriginalRow::DeclarationSymbol { key, .. } => sizes::sum(&[
+            sizes::slots::<semantic::SymbolKey>(1)?,
+            sizes::symbol_key(key)?,
+        ]),
+        OriginalRow::DeclarationCandidate { id, .. }
+        | OriginalRow::CallJoinCandidate { id, .. } => string(id),
+        OriginalRow::Reference(row) => sizes::sum(&[
+            sizes::map_entries::<String, semantic::Reference>(1)?,
+            sizes::text(&row.id),
+            sizes::text(&row.id),
+            sizes::text(&row.owner_syntax_id),
+            document,
+            sizes::text(revision),
+            sizes::text(&row.spelling),
+            sizes::text(&row.lookup_key),
+            target(&row.declared_target)?,
+            sizes::text(&row.provenance_id),
+        ]),
+        OriginalRow::CallBinding(row) => sizes::sum(&[
+            sizes::slots::<i64>(1)?,
+            sizes::map_entries::<i64, semantic::CallBinding>(1)?,
+            sizes::optional(&row.call_id),
+            join(&row.join)?,
+            target(&row.declared_target)?,
+            sizes::text(&row.provenance_id),
+        ]),
+        OriginalRow::TypeRelationship { row, .. } => sizes::type_relationship(row),
+    }
+}
+
+/// The owned bytes of one reference row copied into the claim map, with its key.
+fn claim_bytes(row: &semantic::Reference) -> Result<u64> {
+    sizes::sum(&[
+        sizes::map_entries::<String, semantic::Reference>(1)?,
+        sizes::text(&row.provenance_id),
+        sizes::reference(row)? - std::mem::size_of::<semantic::Reference>() as u64,
+    ])
+}
+
 /// Whether `doc` is copied from its published basis (#669 H1): the join neither settles it
 /// nor checks its closure; the publisher copies its basis tuple.
 pub(super) fn copied(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Result<bool> {
@@ -665,26 +843,101 @@ fn reused_source(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Result<boo
     )
 }
 
-fn append<T>(values: &mut Vec<T>, ordinal: i64, value: T) -> Result<()> {
+/// Appends the child or order entry at `ordinal`. A growth charges the doubled buffer to
+/// `retained` before it is allocated, while the old one is still live, and releases the old
+/// buffer's charge after (FULL's `append_reserved_with`, #865): what `prepare` keeps is charged
+/// at its real capacity. The entry's own payload is charged by `retained_bytes`.
+fn append<T>(
+    retained: &mut Reservation,
+    values: &mut Vec<T>,
+    ordinal: i64,
+    value: T,
+) -> Result<()> {
     anyhow::ensure!(
         usize::try_from(ordinal)? == values.len(),
         "original child ordinal gap"
     );
-    values.push(value);
-    Ok(())
+    super::streaming::append_reserved_with(values, 0, retained, || value)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// #865, #394: an original event is admitted at its decode bound before anything of it is
+    /// allocated. A budget below the bound refuses it typed, at the same allocation peak as the
+    /// budget's own refusal; a budget at the bound decodes it.
+    #[test]
+    fn original_event_is_admitted_before_it_is_decoded() {
+        let body = serde_json::to_string(&OriginalRow::DeclarationCandidate {
+            row_id: 1,
+            ordinal: 0,
+            id: "sid:v1:".repeat(64),
+        })
+        .unwrap();
+        let bound = event_bound(body.len()).unwrap();
+        assert!(bound > body.len() as u64);
+        let denied = LiveBudget::new(bound - 1);
+        let (refused, _, refusal_peak) =
+            crate::test_alloc::measure_peak(|| admit_event(&denied, &body).err());
+        let (_, _, reserve_peak) = crate::test_alloc::measure_peak(|| denied.reserve(bound).err());
+        assert_eq!(
+            refusal_peak, reserve_peak,
+            "nothing allocated before the refusal"
+        );
+        assert!(matches!(
+            refused.unwrap().downcast_ref::<ScipCaptureError>(),
+            Some(ScipCaptureError::LimitExceeded(name)) if name == "unit expansion"
+        ));
+        assert_eq!(denied.high_water(), 0);
+        let allowed = LiveBudget::new(bound);
+        let (scratch, event) = admit_event(&allowed, &body).unwrap();
+        assert_eq!(scratch.bytes(), bound);
+        assert!(matches!(event, OriginalRow::DeclarationCandidate { .. }));
+    }
+
     #[test]
     fn original_children_require_contiguous_ordinals() {
+        let budget = LiveBudget::new(1 << 20);
+        let mut retained = budget.reserve(0).unwrap();
         let mut values = Vec::new();
-        append(&mut values, 0, "first").unwrap();
-        assert!(append(&mut values, 2, "gap").is_err());
-        assert!(append(&mut values, 0, "duplicate").is_err());
-        append(&mut values, 1, "second").unwrap();
+        append(&mut retained, &mut values, 0, "first").unwrap();
+        assert!(append(&mut retained, &mut values, 2, "gap").is_err());
+        assert!(append(&mut retained, &mut values, 0, "duplicate").is_err());
+        append(&mut retained, &mut values, 1, "second").unwrap();
         assert_eq!(values, ["first", "second"]);
+    }
+
+    /// #865: a child or order vector is charged at its real capacity, and a growth admits the
+    /// doubled buffer while the old one is still live. A budget that holds the vector's logical
+    /// length after the fifth append, but not that growth peak, refuses it typed and leaves the
+    /// vector as it was.
+    #[test]
+    fn original_child_growth_is_admitted_at_capacity_and_peak() {
+        let slot = std::mem::size_of::<u64>() as u64;
+        let fill = |limit: u64| {
+            let budget = LiveBudget::new(limit);
+            let mut retained = budget.reserve(0).unwrap();
+            let mut values: Vec<u64> = Vec::new();
+            for ordinal in 0..4 {
+                append(&mut retained, &mut values, ordinal, 0).unwrap();
+            }
+            assert_eq!(values.capacity(), 4);
+            assert_eq!(retained.bytes(), 4 * slot, "charged at capacity 4");
+            let result = append(&mut retained, &mut values, 4, 0);
+            (result, values, retained.bytes(), budget.high_water())
+        };
+        // Five logical slots fit, but the growth needs the old 4 and the new 8 at once.
+        let (refused, values, bytes, _) = fill(5 * slot);
+        assert!(matches!(
+            refused.unwrap_err().downcast_ref::<ScipCaptureError>(),
+            Some(ScipCaptureError::LimitExceeded(name)) if name == "unit expansion"
+        ));
+        assert_eq!((values.len(), values.capacity(), bytes), (4, 4, 4 * slot));
+        // Twelve slots admit the peak; the old buffer's charge is released after the growth.
+        let (grown, values, bytes, peak) = fill(12 * slot);
+        grown.unwrap();
+        assert_eq!((values.len(), values.capacity()), (5, 8));
+        assert_eq!((bytes, peak), (8 * slot, 12 * slot));
     }
 }

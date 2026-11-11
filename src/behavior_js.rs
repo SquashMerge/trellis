@@ -149,6 +149,8 @@ impl Builder<'_> {
             lane: None,
             folded: vec![],
             incidental: None,
+            interface: None,
+            callback: None,
         })
     }
     fn boundary(&mut self, n: Node<'_>, message: &str) -> Flow {
@@ -673,7 +675,7 @@ pub fn build(
     let mut b = Builder { language, file, seed, calls, bindings: crate::behavior_bindings::Bindings::new(tree.root_node(), &file.text), count: 0, view: SequenceView { semantic_warnings: vec![], semantic: Default::default(), incidental_steps: 0,
         revision, seed: seed.clone(), participants: vec![Participant { declaration: None, column: None, id: seed.id.clone(), label: bounded(&seed.name), kind: "method".into(), identification: "Selected source symbol.".into() }],
         steps: vec![], warnings: vec!["Static possible paths, not observed runtime order. Selectivity is an uncalibrated conservative heuristic. Implicit getters, coercions, iteration protocols, and other runtime effects are not expanded.".into()],
-        hidden_steps: 0, truncated: false, truncated_by: vec![],
+        hidden_steps: 0, truncated: false, truncated_by: vec![], interfaces: None,
     }};
     let f = if signature(node)
         && node.start_byte() == seed.range.start_byte

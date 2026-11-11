@@ -284,7 +284,8 @@ claims for it, and while a source of a language is unread, a symbol the artifact
 is unresolved rather than external in that language, and an unread Rust file a Cargo target
 reaches leaves every file of the workspace without a Cargo target. It recovers when the file changes back. Config
 inputs (the root `package.json`, `package-lock.json`, `Cargo.lock` and other root build and
-lock files, and nested `package.json`, `Cargo.toml` and (#807) `pyproject.toml` manifests) are
+lock files, and nested `package.json`, `Cargo.toml`, (#807) `pyproject.toml` and (#854)
+`pom.xml`, `build.gradle` and `build.gradle.kts` manifests) are
 read for dependency, package-root and app facts, not as source, so `--max-file-bytes` doesn't apply to them: each has its
 own 16 MiB cap (#581). One over it isn't read; it is skipped with a `config-input-oversized`
 status diagnostic and the rest of the checkout indexes. Its stored bytes are a short
@@ -338,11 +339,13 @@ trellis api GET '/api/checkouts'
 trellis api GET '/api/checkouts/<rootKey>/status'
 trellis api GET '/api/checkouts/<rootKey>/architecture?aggregate=max&role=production&workbench=true&indexGeneration=…&indexRevision=…'
 trellis api GET '/api/checkouts/<rootKey>/methods?indexGeneration=…&indexRevision=…&path=src/main.rs'
+trellis api GET '/api/checkouts/<rootKey>/architecture/details?kind=instances&rule=%24layers&…&rulesHash=…&offset=0'
+trellis api GET '/api/checkouts/<rootKey>/jobs/current'
 trellis api POST '/api/checkouts/<rootKey>/sequence' --body '{"seed":"…","expectedRevision":{…},"showAll":false,"interactions":true}'
 ```
 
 - **Authentication.** The private per-user socket is the caller's authentication, as for the rest of the CLI. No serve token is read, `trellis serve` need not be running, and nothing new listens.
-- **Allowlist.** Exactly the routes above, with those methods: `GET /api/checkouts` (no query), `GET …/status` (no query), `GET …/architecture`, `GET …/methods` and `POST …/sequence` (no query), with a 64-hex `rootKey`. Anything else is refused with `route_not_allowed` before the daemon is reached, and refused again by the daemon. GET takes no body and POST requires one.
+- **Allowlist.** Exactly the routes above, with those methods: `GET /api/checkouts` (no query), `GET …/status` (no query), `GET …/architecture`, `GET …/architecture/details` (the Deviations tree, #886), `GET …/methods`, `GET …/jobs/current` (no query; the status line's re-index note, #886) and `POST …/sequence` (no query), with a 64-hex `rootKey`. Anything else is refused with `route_not_allowed` before the daemon is reached, and refused again by the daemon. GET takes no body and POST requires one.
 - **Same handlers, same bounds.** Each request runs the provisioned browser's own handler for that route, with the same checkout selection, query validation, revision pins and typed errors. The target is at most 4,096 bytes of printable ASCII. A POST body is JSON of at most 64 KiB, inline or from stdin with `--body -`; that is tighter than the browser's 1 MiB because it travels in one 1 MiB socket frame. An answer over 16 MiB is `response_too_large`. The CLI waits at most 25 s per socket read on a silent daemon.
 - **Output.** Stdout is one line of JSON. Exit 0: the daemon's 2xx answer. Exit 1: the daemon's `{error:{code,message}}` answer, unchanged, so its code is kept. Exit 2: a typed failure with no daemon answer, printed as `{error:{code,message}}`: `route_not_allowed`, `invalid_request`, `body_too_large`, `daemon_unavailable` (no daemon could be reached or started, or the connection failed twice), `deadline_exceeded` (a daemon silent for 25 s), or `daemon_outdated` (a running daemon older than `trellis api`; restart it). Clap's own usage errors also exit 2, on stderr with nothing on stdout.
 - **Reading status starts indexing,** exactly as a browser read does: a selected checkout's runtime is activated and kept for the browser lifetime.

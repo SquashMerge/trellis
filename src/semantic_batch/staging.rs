@@ -662,22 +662,6 @@ impl Drop for WitnessStageWriter<'_> {
     }
 }
 
-/// Conservative owned decoding allowance, queried before reading event payloads.
-pub(crate) fn original_rows_reservation(conn: &Connection, source_ord: i64) -> Result<u64> {
-    let (bytes, rows): (i64, i64) = conn.prepare_cached("SELECT COALESCE(SUM(body_bytes),0),COUNT(*) FROM original_associations WHERE source_ord=?1")?.query_row(
-        [source_ord], |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    u64::try_from(bytes)?
-        .checked_mul(8)
-        .and_then(|bytes| {
-            u64::try_from(rows)
-                .ok()?
-                .checked_mul(512)
-                .and_then(|rows| bytes.checked_add(rows))
-        })
-        .ok_or_else(|| ScipCaptureError::LimitExceeded("unit expansion bytes".into()).into())
-}
-
 /// Both metadata routes must resolve every emitted provenance row, never silently drop it.
 pub(crate) fn check_proof_identity_closure(conn: &Connection) -> Result<()> {
     let invalid: bool = conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM claims WHERE claim_id<=0) OR

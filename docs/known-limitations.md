@@ -108,11 +108,26 @@ The embedding model is **not bundled**. Only an explicit `trellis model install`
 
 ### Producer versions
 
-Trellis accepts only one exact version of each [producer](quickstart.md#install-the-producers), and it doesn't install them. `scip-java` is checked by file hash, so a launcher built another way can be refused even at the right version.
+Trellis accepts only one exact version of each [producer](quickstart.md#install-the-producers). Producers are never bundled, and Trellis never installs one on its own: not the daemon, `producer plan`, `run` or `pickup`, or an automatic run. `trellis producer doctor` reports what is missing, and `trellis producer install <producer>` runs the one pinned install command only when you ask (#880). It does not cover:
+
+- prerequisites: Node, npm, a JDK, `coursier`, `rustup`, the pinned Rust toolchain and scip-java's own JDK in the coursier cache are yours to install; `producer install` refuses with `prerequisite_missing` without them;
+- other versions or install methods, and shims: a version-manager shim stays `unverifiable` after an install, because the shim still comes first on `PATH`;
+- your `PATH`: npm and rustup put the launcher where they always do, and `scip-java` goes to `~/.local/bin/scip-java`. If that folder isn't on your `PATH`, doctor's hint says so, and you add it yourself.
+
+`scip-java` is checked by file hash, so a launcher built another way can be refused even at the right version.
 
 ### TypeScript configs shared through npm
 
 A producer run's worktree holds no `node_modules`. When the root `tsconfig.json` `extends` an npm package, such as `@sindresorhus/tsconfig`, Trellis reads that package's config from the checkout's own `node_modules` and supplies it to the run ([#799](https://github.com/SquashMerge/trellis/issues/799)). Dependencies must be installed for this; without them, the run uses Trellis's generated tsconfig in place of the repo's, so the repo's own compiler options don't apply. The plan lists the replacement under `omitted`. Types from other installed packages are still not visible to the run. See [producer provisioning](semantic-evidence/producer-provisioning.md#scip-typescript-project-config).
+
+### Project settings a producer plan does not read
+
+A producer plan reads each producer's settings from the project's own files ([#717](https://github.com/SquashMerge/trellis/issues/717)), but not all of them. See [Project settings](semantic-evidence/producer-provisioning.md#project-settings).
+
+- **TypeScript workspaces.** The plan doesn't pass scip-typescript's `--yarn-workspaces` or `--pnpm-workspaces`, so a monorepo's packages are indexed only through the root project and its `references`. Structural import resolution does resolve workspace packages ([#773](https://github.com/SquashMerge/trellis/issues/773)); this limit is about the producer only.
+- **Project references to other file names.** A `references` entry must name a directory holding a `tsconfig.json`, or that file. A reference to another name, such as Vite's `tsconfig.app.json`, refuses the plan. So does a referenced project whose `extends` names an npm package. `--ts-project generated` runs without them.
+- **`rust-analyzer.toml`.** `rust-analyzer scip` 1.98.1 doesn't read it (probed 2026-11-10), so the plan doesn't capture or hash it. Cargo features come from the manifests, or from `--cargo-features`.
+- **The Python environment.** The plan doesn't detect or activate a `.venv`.
 
 ## Not in 0.1
 

@@ -137,6 +137,7 @@
               </div>
             </details>
           </div>
+          <div id="files-apps" class="architecture-apps files-apps" role="group" aria-label="App" hidden></div>
           <p class="browse-root detail" id="browse-root" hidden></p>
           <p id="files-state" class="detail" role="status"></p>
           <button hidden id="retry-files" type="button">Retry file list</button>
@@ -200,6 +201,7 @@
           </section>
           <section id="treemap-panel" class="view-panel" role="tabpanel" aria-labelledby="view-treemap" hidden>
             <div class="treemap-controls view-toolbar"><h2 class="sr-only">Treemap</h2>
+              <div id="treemap-apps" class="architecture-apps" role="group" aria-label="App" hidden></div>
               <label for="treemap-color">Color by</label><select id="treemap-color"><option value="role">Prod/test</option><option value="cyclomatic">Cyclomatic</option><option value="cognitive" selected>Cognitive</option><option value="maxNesting">Max nesting</option><option value="maintainabilityIndex">Maintainability (inverted heat)</option><option value="halstead.volume">Halstead volume</option><option value="fanOut">Fan-out</option></select>
               <label for="treemap-aggregate">Aggregation</label><select id="treemap-aggregate"><option value="max">max</option><option value="sum">sum</option><option value="mean">mean</option></select>
               <label for="treemap-path" class="sr-only">Path contains</label><input id="treemap-path" type="search" placeholder="Path contains…">
@@ -230,7 +232,7 @@
             <details id="sequence-warning-details" class="warning-disclosure"><summary>Sequence diagnostics <span id="sequence-warning-count"></span></summary><ul id="sequence-warnings" class="plain"></ul></details>
           </section>
           <section id="classes-panel" class="view-panel" role="tabpanel" aria-labelledby="view-classes" hidden>
-            <div class="bar class-search view-toolbar"><h2 class="sr-only">Class diagram</h2><label for="classes-query">Find a class</label><input id="classes-query" type="search" maxlength="200" placeholder="Class or qualified name…"><button id="classes-search" type="button">Search</button>
+            <div class="bar class-search view-toolbar"><h2 class="sr-only">Class diagram</h2><div id="classes-apps" class="architecture-apps" role="group" aria-label="App" hidden></div><label for="classes-query">Find a class</label><input id="classes-query" type="search" maxlength="200" placeholder="Class or qualified name…"><button id="classes-search" type="button">Search</button>
               <details class="popover view-about"><summary aria-label="About this view" title="About this view"><span aria-hidden="true">ⓘ</span></summary><div class="popover-body"><h3>About this view</h3><p class="class-intro">Measured class declarations only. No class hierarchy or type relationship is verified.</p></div></details>
             </div>
             <p id="classes-state" role="status" aria-live="polite">Search for a class, or right-click an indexed source file or method.</p>

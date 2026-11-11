@@ -4,7 +4,7 @@
   const ROOT_STYLE = "max-width:100%;height:auto;--_bg:var(--pele-bg,#fff);--_fg:var(--pele-fg,#1f1f1f);--_m:var(--pele-muted,#6e6e6e);--_l:var(--pele-line,#1f1f1f);--_s:var(--pele-surface,#f3f3f3);--_a:var(--pele-surface-alt,#e6e6e6);--_b:var(--pele-border,#8a8a8a);--_c:var(--pele-accent,#5b7bd5);color:var(--_fg);--_r:var(--pele-radius,4px);--_hw:var(--pele-heading-weight,bold);--_fm:var(--pele-font-mono,monospace);font:16px sans-serif;letter-spacing:normal;word-spacing:normal;text-transform:none;direction:ltr;font-family:var(--pele-font,sans-serif)";
   const SVG_NS = "http://www.w3.org/2000/svg";
   const LAYOUT = '%%{init: {"sequence": {"actorMargin": 12}}}%%';
-  const kinds = new Set(["call", "group", "branch", "loop", "try", "effect", "return", "throw", "exit", "await", "note", "boundary", "definition"]);
+  const kinds = new Set(["call", "group", "branch", "loop", "try", "effect", "return", "throw", "exit", "await", "note", "boundary", "definition", "callback"]);
   const tags = new Set(["svg", "g", "path", "rect", "text", "tspan"]);
   const attrs = new Set(["xmlns", "class", "viewBox", "width", "height", "fill", "fill-opacity", "role", "aria-roledescription", "transform", "stroke", "font-size", "data-id", "d", "x", "y", "rx", "text-anchor", "font-weight", "stroke-dasharray", "stroke-linecap", "xml:space"]);
   function unsupported(reason) { const error = new Error(reason); error.code = "unsupported"; throw error; }
@@ -81,7 +81,7 @@
       const evidence = preview || step, target = targetFor(evidence), lane = target && laneFor(target, evidence);
       const message = lane && evidence.kind === "call", type = message ? "message" : "note";
       const display = message && !options.showDetails
-        ? window.TrellisSequence.arrowLabel(ordinal, target, preview ? step.children.length - 1 : 0, early)
+        ? window.TrellisSequence.arrowLabel(ordinal, target, preview ? step.children.length - 1 : 0, early, undefined, window.TrellisSequence.hop(view, evidence) && evidence.interface)
         : `${marker} ${options.showDetails ? `${step.kind} ` : ""}${displayLabel}${early}`;
       const owner = ownerOf(step);
       const row = {ordinal, marker, display, step, id:step.id, callId:step.callId, path:step.path, range:step.range, revision:view.revision, previewEntryCallId:preview?.callId, preview, evidence, target, type, owner, lane};
@@ -90,9 +90,13 @@
       return row;
     };
     // An expanded callee body runs on the callee's lane, opened by the call before it (#522).
+    // A wrapper whose call is an HTTP interface hop (#853) draws its arrow to the handler's
+    // app, so its expanded body opens the wrapper's own lane here.
     function ownerOf(step) {
-      const ownerId = step.lane == null ? null : columnOf(view.participants.find(p => p.id === step.lane)).id;
-      const owner = step.lane == null ? lanes[0] : lanes.find(item => item.id === ownerId);
+      const laneParticipant = step.lane == null ? null : view.participants.find(p => p.id === step.lane);
+      const ownerId = step.lane == null ? null : columnOf(laneParticipant).id;
+      let owner = step.lane == null ? lanes[0] : lanes.find(item => item.id === ownerId);
+      if (!owner && laneParticipant?.declaration && witness(laneParticipant.declaration)) owner = laneFor(laneParticipant, null);
       if (!owner) unsupported("Unknown sequence lane");
       return owner;
     }
@@ -286,7 +290,7 @@
         for (const actor of actors.filter(node => node.getAttribute("data-id") === lane.alias)) {
           actor.setAttribute("role", "button"); actor.setAttribute("tabindex", "0");
           actor.setAttribute("data-trellis-target-id", participant.id);
-          actor.setAttribute("aria-label", `${window.TrellisSequence.targetActionLabel(participant.declaration)}: ${participant.declaration.name}`);
+          actor.setAttribute("aria-label", `${window.TrellisSequence.targetActionLabel(participant.declaration, participant)}: ${participant.declaration.name}`);
           const open = () => {
             if (active() && window.TrellisSequence.target(view, proof) === participant) options.onOpenTarget(participant.declaration, proof);
           };

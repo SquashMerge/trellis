@@ -20,7 +20,7 @@ fn native_components(
     Vec<serde_json::Value>,
     Vec<serde_json::Value>,
 ) {
-    const INPUTS: [&str; 24] = [
+    const INPUTS: [&str; 28] = [
         "package.json",
         "tsconfig.json",
         "jsconfig.json",
@@ -43,6 +43,10 @@ fn native_components(
         "poetry.lock",
         "Pipfile",
         "Pipfile.lock",
+        "pnpm-workspace.yaml",
+        "setup.cfg",
+        "pyrightconfig.json",
+        "lsif-java.json",
         "rust-toolchain",
         "rust-toolchain.toml",
     ];
@@ -52,17 +56,17 @@ fn native_components(
         }
         Err(_) => json!({"path":name,"type":"absent"}),
     };
-    let dependencies = INPUTS[..22]
+    let dependencies = INPUTS[..26]
         .iter()
         .map(|name| entry(name))
         .collect::<Vec<_>>();
     let mut config = dependencies.clone();
-    config.extend(INPUTS[22..].iter().map(|name| entry(name)));
+    config.extend(INPUTS[26..].iter().map(|name| entry(name)));
     config.push(json!({"nativeAdmission":{"maxFileBytes":max_file_bytes}}));
     for name in [".gitignore", ".ignore"] {
         config.push(entry(name));
     }
-    let toolchain = json!({"nativeExecutable":executable_hash,"rootRustToolchain":entry(INPUTS[22]),"rootRustToolchainToml":entry(INPUTS[23])});
+    let toolchain = json!({"nativeExecutable":executable_hash,"rootRustToolchain":entry(INPUTS[26]),"rootRustToolchainToml":entry(INPUTS[27])});
     (toolchain, config, dependencies)
 }
 

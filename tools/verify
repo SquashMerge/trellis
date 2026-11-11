@@ -105,9 +105,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Linux CI sets TRELLIS_BROWSER_SYSTEM_DEPS to install Chromium's system
-# packages (apt) while the lanes build. Only the browser suite at the end of
-# the rust lane needs them, and a slow apt mirror would otherwise hold up the
+# Linux CI sets TRELLIS_BROWSER_SYSTEM_DEPS to make sure Chromium's system
+# packages are present while the lanes build. If every shared library of the
+# pinned Chromium already resolves (GitHub's images ship most of them), apt is
+# skipped, so an apt mirror or DNS outage cannot fail the job; otherwise the
+# packages are installed with apt. Only the browser suite at the end of the
+# rust lane needs them, and a slow apt mirror would otherwise hold up the
 # whole run (#244). The lane polls for the status file because it is a
 # subshell and cannot `wait` on its sibling. Only a run that includes the
 # browser suite starts the install.
@@ -119,8 +122,12 @@ if [ -n "${TRELLIS_BROWSER_SYSTEM_DEPS:-}" ] && [ -n "$browser_lane" ]; then
   (
     start=$(date +%s)
     code=0
-    node tests/browser/node_modules/playwright/cli.js install-deps chromium >"$logs/browser-deps.log" 2>&1 || code=$?
-    echo "$code $(($(date +%s) - start))" >"$logs/browser-deps.tmp"
+    route=present
+    if ! node tools/verify-browser-libs.mjs >"$logs/browser-libs.log" 2>&1; then
+      route=apt
+      node tests/browser/node_modules/playwright/cli.js install-deps chromium >"$logs/browser-deps.log" 2>&1 || code=$?
+    fi
+    echo "$code $(($(date +%s) - start)) $route" >"$logs/browser-deps.tmp"
     mv "$logs/browser-deps.tmp" "$logs/browser-deps.status"
   ) &
   deps_pid=$!
@@ -137,8 +144,13 @@ browser_system_deps() {
     sleep 1
     waited=$((waited + 1))
   done
-  read -r code took <"$logs/browser-deps.status"
-  echo "verify: Chromium system package install finished in $took s (exit $code); the browser suite waited $waited s"
+  read -r code took route <"$logs/browser-deps.status"
+  cat "$logs/browser-libs.log"
+  if [ "$route" = present ]; then
+    echo "verify: Chromium's shared libraries all resolve; skipped the system package install (no apt); the browser suite waited $waited s"
+    return 0
+  fi
+  echo "verify: Chromium system package install (apt) finished in $took s (exit $code); the browser suite waited $waited s"
   if [ "$code" -ne 0 ]; then
     cat "$logs/browser-deps.log" >&2
     echo "verify: Chromium system package install failed (exit $code)" >&2
@@ -169,7 +181,7 @@ browser() {
   cargo build --locked --bin trellis
   python3 tools/verify-40-query-performance.py --smoke --binary "$target_dir/debug/trellis"
   browser_system_deps
-  TRELLIS_NAVIGATION_FIXTURE_BINARY="$target_dir/debug/trellis-navigation-fixture" TRELLIS_SUITE_BINARY="$target_dir/debug/trellis" node --test --test-concurrency=1 tests/browser/sequence-harness.test.cjs tests/browser/pele-block-labels.test.cjs tests/browser/sequence-pele.test.cjs tests/browser/sequence-readable.test.cjs tests/browser/sequence-interactions.test.cjs tests/browser/sequence.test.cjs tests/browser/sequence-cost.test.cjs tests/browser/brand.test.cjs tests/browser/connect.test.cjs tests/browser/viewer-shell.test.cjs tests/browser/files.test.cjs tests/browser/architecture-pele.test.cjs tests/browser/architecture.test.cjs tests/browser/architecture-apps.test.cjs tests/browser/architecture-routing.test.cjs tests/browser/treemap.test.cjs tests/browser/classes-pele.test.cjs tests/browser/classes-app.test.cjs tests/browser/classes-languages.test.cjs tests/browser/navigation-resolved.test.cjs
+  TRELLIS_NAVIGATION_FIXTURE_BINARY="$target_dir/debug/trellis-navigation-fixture" TRELLIS_SUITE_BINARY="$target_dir/debug/trellis" node --test --test-concurrency=1 tests/browser/sequence-harness.test.cjs tests/browser/pele-block-labels.test.cjs tests/browser/sequence-pele.test.cjs tests/browser/sequence-readable.test.cjs tests/browser/sequence-interactions.test.cjs tests/browser/sequence-hops.test.cjs tests/browser/sequence-hops-app.test.cjs tests/browser/sequence-callbacks.test.cjs tests/browser/sequence-callbacks-app.test.cjs tests/browser/sequence.test.cjs tests/browser/sequence-cost.test.cjs tests/browser/brand.test.cjs tests/browser/connect.test.cjs tests/browser/viewer-shell.test.cjs tests/browser/files.test.cjs tests/browser/architecture-pele.test.cjs tests/browser/architecture.test.cjs tests/browser/architecture-apps.test.cjs tests/browser/architecture-routing.test.cjs tests/browser/app-switcher.test.cjs tests/browser/treemap.test.cjs tests/browser/classes-pele.test.cjs tests/browser/classes-app.test.cjs tests/browser/classes-languages.test.cjs tests/browser/navigation-resolved.test.cjs
 }
 rust() {
   lint
@@ -210,8 +222,8 @@ checks() {
   node --check web/app.js
   node --check web/architecture-apps.js
   # The Herdr mod's logic over the browser's own Architecture adapter (#707); no install needed.
-  node --import ./herdr-mod/test/register.mjs --test herdr-mod/test/mod.test.mjs herdr-mod/test/view.test.mjs herdr-mod/test/setup.test.mjs
-  node --test tests/browse-ui.test.cjs tests/sequence-ui.test.cjs tests/token-ui.test.cjs tests/external-source-ui.test.cjs tests/dependency-ui.test.cjs tests/shell-ui.test.cjs tests/classes-ui.test.cjs tests/navigation-ui.test.cjs tests/metric-heat.test.cjs tests/viewer-metrics-ui.test.cjs tests/files-ui.test.cjs tests/architecture-ui.test.cjs tests/architecture-pele-ui.test.cjs tests/treemap-ui.test.cjs tests/treemap-pele.test.cjs tests/architecture-apps-ui.test.cjs
+  node --import ./herdr-mod/test/register.mjs --test herdr-mod/test/mod.test.mjs herdr-mod/test/view.test.mjs herdr-mod/test/parity.test.mjs herdr-mod/test/setup.test.mjs
+  node --test tests/browse-ui.test.cjs tests/sequence-ui.test.cjs tests/token-ui.test.cjs tests/external-source-ui.test.cjs tests/dependency-ui.test.cjs tests/shell-ui.test.cjs tests/classes-ui.test.cjs tests/navigation-ui.test.cjs tests/metric-heat.test.cjs tests/viewer-metrics-ui.test.cjs tests/files-ui.test.cjs tests/architecture-ui.test.cjs tests/architecture-pele-ui.test.cjs tests/treemap-ui.test.cjs tests/treemap-pele.test.cjs tests/architecture-apps-ui.test.cjs tests/app-switcher-ui.test.cjs
 }
 
 started=$(date +%s)

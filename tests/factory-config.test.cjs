@@ -1,7 +1,7 @@
 const assert = require("node:assert/strict");
-const { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } = require("node:fs");
+const { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } = require("node:fs");
 const { tmpdir } = require("node:os");
-const { delimiter, join, resolve: resolvePath } = require("node:path");
+const { delimiter, dirname, join, resolve: resolvePath } = require("node:path");
 const { spawnSync } = require("node:child_process");
 const test = require("node:test");
 
@@ -158,6 +158,56 @@ test("recognized issue lookup failures remain failures", () => {
   }
 });
 
+// verify skips apt only when this helper proves Chromium's libraries resolve;
+// any library ldd cannot inspect must send verify back to apt.
+const BROWSER_PACKAGES = join(ROOT, "tests/browser/node_modules/playwright-core");
+test("browser library check fails when ldd cannot inspect a bundled library", { skip: !existsSync(BROWSER_PACKAGES) && "tests/browser packages are not installed" }, () => {
+  const fakeDir = mkdtempSync(join(tmpdir(), "trellis-browser-libs-"));
+  try {
+    const browsers = join(fakeDir, "browsers");
+    const env = { ...process.env, PLAYWRIGHT_BROWSERS_PATH: browsers };
+    const located = spawnSync(process.execPath, ["-e", `
+      const { registry } = require("playwright-core/lib/coreBundle").registry;
+      for (const name of ["chromium", "chromium-headless-shell"]) console.log(registry.findExecutable(name).executablePath());
+    `], { cwd: join(ROOT, "tests/browser"), env, encoding: "utf8" });
+    assert.equal(located.status, 0, located.stderr);
+    for (const executable of located.stdout.trim().split("\n")) {
+      mkdirSync(dirname(executable), { recursive: true });
+      writeFileSync(executable, "");
+      writeFileSync(join(dirname(executable), "libbundled.so"), "");
+    }
+    // Only the fake ldd is on PATH. In "spawn" mode it removes itself after
+    // inspecting the first executable, so the bundled library's spawn fails.
+    const ldd = join(fakeDir, "bin", "ldd");
+    const install = () => {
+      mkdirSync(dirname(ldd), { recursive: true });
+      writeFileSync(ldd, `#!/bin/sh
+case "$1" in *.so) if [ "$FAKE_LDD" = nonzero ]; then echo "not a dynamic executable" >&2; exit 1; fi ;; esac
+printf '\\tlibc.so.6 => /lib/libc.so.6 (0x0)\\n'
+if [ "$FAKE_LDD" = spawn ]; then /bin/rm -f "$0"; fi
+`);
+      chmodSync(ldd, 0o755);
+    };
+    const check = (mode) => {
+      install();
+      return spawnSync(process.execPath, ["tools/verify-browser-libs.mjs"], {
+        cwd: ROOT, encoding: "utf8", env: { ...env, PATH: dirname(ldd), FAKE_LDD: mode },
+      });
+    };
+    const resolved = check("ok");
+    assert.equal(resolved.status, 0, resolved.stdout + resolved.stderr);
+    assert.match(resolved.stdout, /every shared library resolves/);
+    for (const mode of ["nonzero", "spawn"]) {
+      const failed = check(mode);
+      assert.equal(failed.status, 1, `${mode}: ${failed.stdout}${failed.stderr}`);
+      assert.match(failed.stdout, /cannot check \(ldd could not inspect .*libbundled\.so\)/, mode);
+      assert.doesNotMatch(failed.stdout, /every shared library resolves/, mode);
+    }
+  } finally {
+    rmSync(fakeDir, { recursive: true, force: true });
+  }
+});
+
 test("verify is one executable command and retains all checks", () => {
   const config = loadConfig();
   assert.equal(config.verify, "./tools/verify");
@@ -179,6 +229,11 @@ for arg in "$@"; do
   if [ "$arg" = tests/browser/sequence-harness.test.cjs ] && [ -z "\${TRELLIS_SUITE_BINARY:-}" ]; then exit 37; fi
   if [ "$arg" = tests/browser/navigation-resolved.test.cjs ] && [ -z "\${TRELLIS_NAVIGATION_FIXTURE_BINARY:-}" ]; then exit 38; fi
 done
+if [ "$1" = tools/verify-browser-libs.mjs ]; then
+  if [ "\${FAKE_VERIFY_MISSING_LIBS:-0}" = 1 ]; then echo "verify browser libraries: missing libfake.so.1"; exit 1; fi
+  echo "verify browser libraries: every shared library resolves"
+  exit 0
+fi
 if [ "\${FAKE_VERIFY_FAIL_DEPS:-0}" = 1 ] && [ "$2" = install-deps ]; then echo "fake apt failure"; exit 41; fi
 if [ -n "\${FAKE_VERIFY_HANG_DEPS:-}" ] && [ "$2" = install-deps ]; then echo $$ > "$FAKE_VERIFY_HANG_DEPS"; exec sleep 600; fi
 if [ "\${FAKE_VERIFY_NO_NEXTEST:-0}" = 1 ] && [ "$1" = nextest ]; then exit 101; fi
@@ -227,7 +282,7 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
         ["cp", join(resolvePath(ROOT, process.env.CARGO_TARGET_DIR || "target"), "debug", "trellis"), join(resolvePath(ROOT, process.env.CARGO_TARGET_DIR || "target"), "debug", "trellis-navigation-fixture")],
         ["cargo", "build", "--locked", "--bin", "trellis"],
         ["python3", "tools/verify-40-query-performance.py", "--smoke", "--binary", join(resolvePath(ROOT, process.env.CARGO_TARGET_DIR || "target"), "debug", "trellis")],
-        ["node", "--test", "--test-concurrency=1", "tests/browser/sequence-harness.test.cjs", "tests/browser/pele-block-labels.test.cjs", "tests/browser/sequence-pele.test.cjs", "tests/browser/sequence-readable.test.cjs", "tests/browser/sequence-interactions.test.cjs", "tests/browser/sequence.test.cjs", "tests/browser/sequence-cost.test.cjs", "tests/browser/brand.test.cjs", "tests/browser/connect.test.cjs", "tests/browser/viewer-shell.test.cjs", "tests/browser/files.test.cjs", "tests/browser/architecture-pele.test.cjs", "tests/browser/architecture.test.cjs", "tests/browser/architecture-apps.test.cjs", "tests/browser/architecture-routing.test.cjs", "tests/browser/treemap.test.cjs", "tests/browser/classes-pele.test.cjs", "tests/browser/classes-app.test.cjs", "tests/browser/classes-languages.test.cjs", "tests/browser/navigation-resolved.test.cjs"],
+        ["node", "--test", "--test-concurrency=1", "tests/browser/sequence-harness.test.cjs", "tests/browser/pele-block-labels.test.cjs", "tests/browser/sequence-pele.test.cjs", "tests/browser/sequence-readable.test.cjs", "tests/browser/sequence-interactions.test.cjs", "tests/browser/sequence-hops.test.cjs", "tests/browser/sequence-hops-app.test.cjs", "tests/browser/sequence-callbacks.test.cjs", "tests/browser/sequence-callbacks-app.test.cjs", "tests/browser/sequence.test.cjs", "tests/browser/sequence-cost.test.cjs", "tests/browser/brand.test.cjs", "tests/browser/connect.test.cjs", "tests/browser/viewer-shell.test.cjs", "tests/browser/files.test.cjs", "tests/browser/architecture-pele.test.cjs", "tests/browser/architecture.test.cjs", "tests/browser/architecture-apps.test.cjs", "tests/browser/architecture-routing.test.cjs", "tests/browser/app-switcher.test.cjs", "tests/browser/treemap.test.cjs", "tests/browser/classes-pele.test.cjs", "tests/browser/classes-app.test.cjs", "tests/browser/classes-languages.test.cjs", "tests/browser/navigation-resolved.test.cjs"],
       ],
       tests: [
         ["cargo", "nextest", "--version"],
@@ -249,8 +304,8 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
         ["node", "docs/semantic-evidence/check-policy.mjs", "--self-test"],
         ["node", "--check", "web/app.js"],
         ["node", "--check", "web/architecture-apps.js"],
-        ["node", "--import", "./herdr-mod/test/register.mjs", "--test", "herdr-mod/test/mod.test.mjs", "herdr-mod/test/view.test.mjs", "herdr-mod/test/setup.test.mjs"],
-        ["node", "--test", "tests/browse-ui.test.cjs", "tests/sequence-ui.test.cjs", "tests/token-ui.test.cjs", "tests/external-source-ui.test.cjs", "tests/dependency-ui.test.cjs", "tests/shell-ui.test.cjs", "tests/classes-ui.test.cjs", "tests/navigation-ui.test.cjs", "tests/metric-heat.test.cjs", "tests/viewer-metrics-ui.test.cjs", "tests/files-ui.test.cjs", "tests/architecture-ui.test.cjs", "tests/architecture-pele-ui.test.cjs", "tests/treemap-ui.test.cjs", "tests/treemap-pele.test.cjs", "tests/architecture-apps-ui.test.cjs"],
+        ["node", "--import", "./herdr-mod/test/register.mjs", "--test", "herdr-mod/test/mod.test.mjs", "herdr-mod/test/view.test.mjs", "herdr-mod/test/parity.test.mjs", "herdr-mod/test/setup.test.mjs"],
+        ["node", "--test", "tests/browse-ui.test.cjs", "tests/sequence-ui.test.cjs", "tests/token-ui.test.cjs", "tests/external-source-ui.test.cjs", "tests/dependency-ui.test.cjs", "tests/shell-ui.test.cjs", "tests/classes-ui.test.cjs", "tests/navigation-ui.test.cjs", "tests/metric-heat.test.cjs", "tests/viewer-metrics-ui.test.cjs", "tests/files-ui.test.cjs", "tests/architecture-ui.test.cjs", "tests/architecture-pele-ui.test.cjs", "tests/treemap-ui.test.cjs", "tests/treemap-pele.test.cjs", "tests/architecture-apps-ui.test.cjs", "tests/app-switcher-ui.test.cjs"],
       ],
     };
     function assertRan(commands, expected) {
@@ -270,17 +325,25 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
     assert.equal(success.result.status, 0, success.output);
     assertRan(success.commands, lanes);
     rmSync(log);
-    // With TRELLIS_BROWSER_SYSTEM_DEPS set, the system packages install in the
-    // background and the browser suite runs only after it succeeds (#244).
+    // With TRELLIS_BROWSER_SYSTEM_DEPS set, the system packages are checked
+    // and, only if a library is missing, installed in the background; the
+    // browser suite runs only after that succeeds (#244).
+    const libs = ["node", "tools/verify-browser-libs.mjs"];
     const deps = ["node", "tests/browser/node_modules/playwright/cli.js", "install-deps", "chromium"];
-    const withDeps = runVerify({ TRELLIS_BROWSER_SYSTEM_DEPS: "1" });
-    assert.equal(withDeps.result.status, 0, withDeps.output);
-    assertRan(withDeps.commands, { ...lanes, deps: [deps] });
-    assert.match(withDeps.result.stdout, /^verify: Chromium system package install finished in \d+ s \(exit 0\)/m);
+    const present = runVerify({ TRELLIS_BROWSER_SYSTEM_DEPS: "1" });
+    assert.equal(present.result.status, 0, present.output);
+    assertRan(present.commands, { ...lanes, deps: [libs] });
+    assert.match(present.result.stdout, /^verify: Chromium's shared libraries all resolve; skipped the system package install \(no apt\)/m);
     rmSync(log);
-    const depsFailure = runVerify({ TRELLIS_BROWSER_SYSTEM_DEPS: "1", FAKE_VERIFY_FAIL_DEPS: "1" });
+    const withDeps = runVerify({ TRELLIS_BROWSER_SYSTEM_DEPS: "1", FAKE_VERIFY_MISSING_LIBS: "1" });
+    assert.equal(withDeps.result.status, 0, withDeps.output);
+    assertRan(withDeps.commands, { ...lanes, deps: [libs, deps] });
+    assert.match(withDeps.result.stdout, /missing libfake\.so\.1/);
+    assert.match(withDeps.result.stdout, /^verify: Chromium system package install \(apt\) finished in \d+ s \(exit 0\)/m);
+    rmSync(log);
+    const depsFailure = runVerify({ TRELLIS_BROWSER_SYSTEM_DEPS: "1", FAKE_VERIFY_MISSING_LIBS: "1", FAKE_VERIFY_FAIL_DEPS: "1" });
     assert.equal(depsFailure.result.status, 1);
-    assertRan(depsFailure.commands, { ...lanes, deps: [deps], rust: lanes.rust.slice(0, -1) });
+    assertRan(depsFailure.commands, { ...lanes, deps: [libs, deps], rust: lanes.rust.slice(0, -1) });
     assert.match(depsFailure.result.stdout, /fake apt failure/);
     assert.match(depsFailure.result.stdout, /Chromium system package install failed \(exit 41\)/);
     assert.match(depsFailure.result.stderr, /failed lane\(s\): rust$/m);
@@ -290,7 +353,7 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
     const hangPid = join(fakeDir, "deps.pid");
     // A leaked install would hold verify's output open for its full 600 s.
     const earlyFailure = runVerify(
-      { TRELLIS_BROWSER_SYSTEM_DEPS: "1", FAKE_VERIFY_HANG_DEPS: hangPid, FAKE_VERIFY_FAIL_CLIPPY: "1" },
+      { TRELLIS_BROWSER_SYSTEM_DEPS: "1", FAKE_VERIFY_MISSING_LIBS: "1", FAKE_VERIFY_HANG_DEPS: hangPid, FAKE_VERIFY_FAIL_CLIPPY: "1" },
       120_000,
     );
     assert.equal(earlyFailure.result.error, undefined, "verify did not exit after its lane failed");
@@ -349,7 +412,7 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
     rmSync(log);
     const browserOnly = runVerify({ TRELLIS_BROWSER_SYSTEM_DEPS: "1" }, undefined, ["--lane", "browser"]);
     assert.equal(browserOnly.result.status, 0, browserOnly.output);
-    assertRan(browserOnly.commands, { setup: lanes.setup, browser, deps: [deps] });
+    assertRan(browserOnly.commands, { setup: lanes.setup, browser, deps: [libs] });
     rmSync(log);
     const failedHalf = runVerify({ FAKE_VERIFY_FAIL_CLIPPY: "1" }, undefined, ["--lane", "lint", "--lane", "tests"]);
     assert.equal(failedHalf.result.status, 23);

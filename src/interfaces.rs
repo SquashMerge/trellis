@@ -19,6 +19,8 @@ mod python_routes;
 mod python_tests;
 mod routes;
 mod rust_calls;
+#[cfg(test)]
+mod sequence_hop_tests;
 
 use crate::native_evidence::{Declaration, DeclarationRole, DocumentKey, Range};
 use crate::references::{DocumentInput, Snapshot, callers::Caller, work::Work};
@@ -705,6 +707,68 @@ pub(crate) fn endpoints(
         }));
     }
     Ok(rows)
+}
+
+/// What one client call of a Sequence reaches through HTTP interface evidence (#853).
+#[derive(Clone, Copy)]
+pub(crate) enum SequenceHop<'e> {
+    /// Matched to a route whose handler is in another app than the call: a boundary hop.
+    Cross {
+        route: &'e Route,
+        confidence: Confidence,
+        client_app: usize,
+        server_app: usize,
+    },
+    /// Matched to no route. It stays a boundary: no handler is guessed.
+    Unresolved {
+        call: &'e ClientCall,
+        client_app: Option<usize>,
+    },
+}
+
+/// The hop of each client call whose call ID is in `call_ids`, by call ID (#853). `app_of`
+/// gives a file's app. A call matched to a route of its own app, or whose call or handler is
+/// in no app, gets none: only a match between two apps crosses. A call ID read twice keeps
+/// its first call. Structural evidence, never proof that the request is sent.
+pub(crate) fn sequence_hops<'e>(
+    extraction: &'e Extraction,
+    app_of: impl Fn(&str) -> Option<usize>,
+    call_ids: &BTreeSet<&str>,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<BTreeMap<String, SequenceHop<'e>>> {
+    let mut hops = BTreeMap::new();
+    for (at, call) in extraction.calls.iter().enumerate() {
+        check()?;
+        let Some(id) = call.call_id.as_deref().filter(|id| call_ids.contains(id)) else {
+            continue;
+        };
+        if hops.contains_key(id) {
+            continue;
+        }
+        let client_app = app_of(&call.document.path);
+        let hop = match extraction.matched.get(at).copied().flatten() {
+            None => SequenceHop::Unresolved { call, client_app },
+            Some(found) => {
+                let route = extraction
+                    .routes
+                    .get(found.route)
+                    .context("store_unavailable: interface match without its route")?;
+                match (client_app, app_of(&route.handler.document.path)) {
+                    (Some(client_app), Some(server_app)) if client_app != server_app => {
+                        SequenceHop::Cross {
+                            route,
+                            confidence: found.confidence,
+                            client_app,
+                            server_app,
+                        }
+                    }
+                    _ => continue,
+                }
+            }
+        };
+        hops.insert(id.to_owned(), hop);
+    }
+    Ok(hops)
 }
 
 /// Splits a `/`-rooted template into segments. Only the one leading `/` is removed, so a

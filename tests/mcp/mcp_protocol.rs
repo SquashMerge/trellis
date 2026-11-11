@@ -3207,42 +3207,21 @@ fn catalog_rejects_contradictory_unresolved_and_resolved_failures() {
     assert_eq!(catalog.as_array().unwrap().len(), 13);
     for entry in catalog.as_array().unwrap() {
         let defs = &entry["outputSchema"]["$defs"];
-        // #836: the architecture tools nest their located and building errors beside the
-        // resolved one under `Failure.error.oneOf`; the resolved error is its first shape.
-        let resolved = &defs["Failure"]["properties"]["error"];
-        let resolved = resolved["oneOf"].get(0).unwrap_or(resolved);
+        // #864: one `Failure` per tool. An answering `workspace` requires `catchingUp` and
+        // excludes the unresolved `attemptedWorkspace` and `reason`; without a workspace there
+        // is no `catchingUp`.
+        let failure = &defs["Failure"];
+        assert_eq!(failure["if"], json!({"required":["workspace"]}));
+        assert_eq!(failure["then"]["required"], json!(["catchingUp"]));
+        let excluded = &failure["then"]["properties"]["error"]["properties"];
+        assert_eq!(excluded["attemptedWorkspace"], json!(false));
+        assert_eq!(excluded["reason"], json!(false));
+        assert_eq!(failure["else"], json!({"not":{"required":["catchingUp"]}}));
+        let error = &failure["properties"]["error"];
+        assert_eq!(error["additionalProperties"], false);
         assert_eq!(
-            resolved["properties"]["code"],
-            json!({"$ref":"#/$defs/ResolvedFailureCode"})
-        );
-        assert!(
-            !defs["ResolvedFailureCode"]["enum"]
-                .as_array()
-                .unwrap()
-                .contains(&json!("workspace_selection_failed"))
-        );
-        // The four failures without a workspace share `NoWorkspaceFailure`.
-        let error = &defs["NoWorkspaceFailure"]["properties"]["error"];
-        assert_eq!(error["properties"]["currentBasis"], json!({"const":null}));
-        assert_eq!(
-            error["properties"]["currentContentHash"],
-            json!({"const":null})
-        );
-        let [selection, invalid_workspace, _, _] = error["oneOf"].as_array().unwrap().as_slice()
-        else {
-            panic!("four NoWorkspaceFailure error shapes")
-        };
-        assert_eq!(
-            invalid_workspace["properties"]["retryable"],
-            json!({"const":false})
-        );
-        assert_eq!(
-            selection["then"]["properties"]["retryable"],
-            json!({"const":true})
-        );
-        assert_eq!(
-            selection["else"]["properties"]["retryable"],
-            json!({"const":false})
+            error["properties"]["attemptedWorkspace"]["additionalProperties"],
+            false
         );
     }
 }
@@ -3419,8 +3398,19 @@ fn stalling_git_path(
     temp: &Path,
     flag: &Path,
     once: bool,
-    (main, linked): (&Path, &Path),
+    checkouts: (&Path, &Path),
 ) -> std::ffi::OsString {
+    let git = stalling_git(temp, flag, once, checkouts);
+    let search = std::env::var_os("PATH").unwrap();
+    std::env::join_paths(
+        std::iter::once(git.parent().unwrap().to_path_buf()).chain(std::env::split_paths(&search)),
+    )
+    .unwrap()
+}
+
+/// The `git` executable [`stalling_git_path`] puts first on its PATH, for an
+/// in-process fixture connection to run in place of the one on `PATH`.
+fn stalling_git(temp: &Path, flag: &Path, once: bool, (main, linked): (&Path, &Path)) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let search = std::env::var_os("PATH").unwrap();
     let git = std::env::split_paths(&search)
@@ -3455,7 +3445,7 @@ exec '{}' "$@"
     )
     .unwrap();
     fs::set_permissions(bin.join("git"), fs::Permissions::from_mode(0o755)).unwrap();
-    std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&search))).unwrap()
+    bin.join("git")
 }
 
 /// #131: a final selected check whose Git lookup outlives its bound (a loaded
@@ -3536,12 +3526,21 @@ exec '{}' "$@"
     .unwrap();
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(bin.join("git"), fs::Permissions::from_mode(0o755)).unwrap();
-    let path =
-        std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&search))).unwrap();
     let socket = temp.path().join("phase.sock");
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    // This connection's own barrier and Git, never process environment that
+    // the other tests in this binary read (#869).
+    let hooks = trellis::mcp::TransportHooksForTests {
+        scope: trellis::testing::FixtureScope {
+            phase: Some(trellis::testing::PhaseBarrier::new(
+                "selected_final",
+                &socket,
+            )),
+            git: Some(bin.join("git")),
+        },
+        ..hooks
+    };
     struct FixtureGuard {
-        env: Vec<(&'static str, Option<std::ffi::OsString>)>,
         client: Option<std::os::unix::net::UnixStream>,
         session: Option<std::thread::JoinHandle<std::io::Result<()>>>,
         reader: Option<std::thread::JoinHandle<()>>,
@@ -3557,34 +3556,13 @@ exec '{}' "$@"
             if let Some(session) = self.session.take() {
                 let _ = session.join();
             }
-            for (key, value) in &self.env {
-                unsafe {
-                    match value {
-                        Some(value) => std::env::set_var(key, value),
-                        None => std::env::remove_var(key),
-                    }
-                }
-            }
         }
     }
     let mut cleanup = FixtureGuard {
-        env: [
-            "PATH",
-            "TRELLIS_TEST_MCP_PHASE",
-            "TRELLIS_TEST_MCP_PHASE_SOCKET",
-        ]
-        .into_iter()
-        .map(|key| (key, std::env::var_os(key)))
-        .collect(),
         client: None,
         session: None,
         reader: None,
     };
-    unsafe {
-        std::env::set_var("PATH", &path);
-        std::env::set_var("TRELLIS_TEST_MCP_PHASE", "selected_final");
-        std::env::set_var("TRELLIS_TEST_MCP_PHASE_SOCKET", &socket);
-    }
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
     let (client, mut reader, session) = hooked_session(&identity, &registry, 301, None, hooks);
     cleanup.client = Some(client);
@@ -3717,7 +3695,6 @@ fn describe_frame(id: Value, workspace: Option<&Path>) -> Vec<u8> {
 /// Frozen call clocks and a parked final-check helper for the two deadline
 /// ordering tests below. Every installed read gate is opened before teardown.
 struct FinalRecheckFixture {
-    env: Vec<(&'static str, Option<std::ffi::OsString>)>,
     stalled: PathBuf,
     linked: PathBuf,
     listener: std::os::unix::net::UnixListener,
@@ -3763,25 +3740,25 @@ impl FinalRecheckFixture {
         launch.freeze_mcp_call_clock_for_tests(origin);
         selected.freeze_mcp_call_clock_for_tests(origin);
         let clock = launch.clone();
+        let stalled = temp.join("stall-git");
+        let socket = temp.join("phase.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        // This connection's own barrier and Git, never process environment
+        // that the other tests in this binary read (#869).
         let hooks = trellis::mcp::TransportHooksForTests {
             paused_clock_for_tests: Some(std::sync::Arc::new(move || {
                 clock.mcp_call_clock_now_for_tests()
             })),
+            scope: trellis::testing::FixtureScope {
+                phase: Some(trellis::testing::PhaseBarrier::new(
+                    "selected_final,final_recheck",
+                    &socket,
+                )),
+                git: Some(stalling_git(temp, &stalled, false, (&main, &linked))),
+            },
             ..Default::default()
         };
-        let stalled = temp.join("stall-git");
-        let path = stalling_git_path(temp, &stalled, false, (&main, &linked));
-        let socket = temp.join("phase.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let mut fixture = Self {
-            env: [
-                "PATH",
-                "TRELLIS_TEST_MCP_PHASE",
-                "TRELLIS_TEST_MCP_PHASE_SOCKET",
-            ]
-            .into_iter()
-            .map(|key| (key, std::env::var_os(key)))
-            .collect(),
             stalled,
             linked,
             listener,
@@ -3792,11 +3769,6 @@ impl FinalRecheckFixture {
             reader: None,
             session: None,
         };
-        unsafe {
-            std::env::set_var("PATH", path);
-            std::env::set_var("TRELLIS_TEST_MCP_PHASE", "selected_final,final_recheck");
-            std::env::set_var("TRELLIS_TEST_MCP_PHASE_SOCKET", socket);
-        }
         let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
         let (client, reader, session) = hooked_session(&identity, &registry, 302, None, hooks);
         fixture.client = Some(client);
@@ -3860,14 +3832,6 @@ impl Drop for FinalRecheckFixture {
         }
         if let Some(session) = self.session.take() {
             let _ = session.join();
-        }
-        for (key, value) in &self.env {
-            unsafe {
-                match value {
-                    Some(value) => std::env::set_var(key, value),
-                    None => std::env::remove_var(key),
-                }
-            }
         }
     }
 }
@@ -4913,7 +4877,8 @@ async fn describe_reports_actual_degraded_watcher_on_selected_snapshot() {
     let daemon_handle = tokio::runtime::Handle::current();
     let session = std::thread::spawn(move || {
         trellis::mcp::run_socket(
-            trellis::mcp::OpenedWorkspace::new(identity),
+            trellis::mcp::OpenedWorkspace::new(identity)
+                .with_call_workers_for_tests(Default::default()),
             server,
             registry,
             31,
@@ -4993,10 +4958,14 @@ async fn describe_replies_at_its_deadline_while_the_read_is_still_running() {
         .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
         .unwrap();
     let daemon_handle = tokio::runtime::Handle::current();
+    // This test's own worker budget, not the one the binary's other tests share.
+    let workers = trellis::mcp::CallWorkersForTests::default();
+    let budget = workers.clone();
     let session = std::thread::spawn(move || {
         trellis::mcp::run_socket(
             trellis::mcp::OpenedWorkspace::new(identity)
-                .with_call_deadline_for_tests(Duration::from_millis(300)),
+                .with_call_deadline_for_tests(Duration::from_millis(300))
+                .with_call_workers_for_tests(budget),
             server,
             registry,
             34,
@@ -5031,7 +5000,7 @@ async fn describe_replies_at_its_deadline_while_the_read_is_still_running() {
     // reach the client. Once its worker has exited, the next line on the
     // connection is the next call's reply, not a late result.
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
-        while trellis::mcp::live_call_workers_for_tests() != 0 {
+        while workers.live() != 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -5102,7 +5071,8 @@ async fn describe_reports_published_watcher_health_while_an_inventory_holds_the_
     let daemon_handle = tokio::runtime::Handle::current();
     let session = std::thread::spawn(move || {
         trellis::mcp::run_socket(
-            trellis::mcp::OpenedWorkspace::new(identity),
+            trellis::mcp::OpenedWorkspace::new(identity)
+                .with_call_workers_for_tests(Default::default()),
             server,
             registry,
             32,
@@ -5212,7 +5182,8 @@ async fn describe_serves_valid_prior_head_while_startup_reconciliation_is_paused
     let daemon_handle = tokio::runtime::Handle::current();
     let session = std::thread::spawn(move || {
         trellis::mcp::run_socket(
-            trellis::mcp::OpenedWorkspace::new(identity),
+            trellis::mcp::OpenedWorkspace::new(identity)
+                .with_call_workers_for_tests(Default::default()),
             server,
             registry,
             44,
@@ -5296,7 +5267,8 @@ async fn describe_cold_initial_startup_reports_indexing_without_prior_coverage()
     let daemon_handle = tokio::runtime::Handle::current();
     let session = std::thread::spawn(move || {
         trellis::mcp::run_socket(
-            trellis::mcp::OpenedWorkspace::new(identity),
+            trellis::mcp::OpenedWorkspace::new(identity)
+                .with_call_workers_for_tests(Default::default()),
             server,
             registry,
             46,
@@ -5582,7 +5554,8 @@ async fn describe_counts_persisted_selected_and_unselected_native_coverage() {
     let daemon_handle = tokio::runtime::Handle::current();
     let session = std::thread::spawn(move || {
         trellis::mcp::run_socket(
-            trellis::mcp::OpenedWorkspace::new(identity),
+            trellis::mcp::OpenedWorkspace::new(identity)
+                .with_call_workers_for_tests(Default::default()),
             server,
             registry,
             48,
@@ -5671,7 +5644,8 @@ async fn describe_retries_direct_sqlite_contention_on_fresh_selected_snapshot() 
     let daemon_handle = tokio::runtime::Handle::current();
     let session = std::thread::spawn(move || {
         trellis::mcp::run_socket(
-            trellis::mcp::OpenedWorkspace::new(identity),
+            trellis::mcp::OpenedWorkspace::new(identity)
+                .with_call_workers_for_tests(Default::default()),
             server,
             registry,
             50,
@@ -5725,7 +5699,7 @@ async fn describe_retries_direct_sqlite_contention_on_fresh_selected_snapshot() 
     let envelope = &expired["result"]["structuredContent"];
     assert!(envelope.get("data").is_none());
     assert_eq!(envelope["error"]["retryable"], true);
-    let codes = trellis::mcp::catalog::list(true)["tools"][0]["outputSchema"]["$defs"]["ResolvedFailureCode"]["enum"].as_array().unwrap().clone();
+    let codes = trellis::mcp::catalog::list(true)["tools"][0]["outputSchema"]["$defs"]["Failure"]["properties"]["error"]["properties"]["code"]["enum"].as_array().unwrap().clone();
     assert!(codes.contains(&envelope["error"]["code"]));
     runtime.mcp_busy_reads_for_tests(0).unwrap();
     drop(client);
@@ -5804,7 +5778,12 @@ impl ReadGate {
     }
     fn open(&self) {
         let (state, changed) = &*self.0;
-        state.lock().unwrap().1 = true;
+        // Poison-tolerant: `Drop` opens the gate while a failed test unwinds,
+        // and a second panic there would abort the whole test binary.
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .1 = true;
         changed.notify_all();
     }
 }
@@ -5888,12 +5867,60 @@ pub(crate) fn socket_session(
     hooked_session(identity, registry, session, deadline, Default::default())
 }
 
+/// A [`socket_session`] whose call workers count against `workers`, its
+/// test's own budget, never the process-wide one the other tests in this
+/// binary share (#869).
+fn budgeted_session(
+    identity: &trellis::store::topology::WorkspaceIdentity,
+    registry: &std::sync::Arc<tokio::sync::Mutex<trellis::daemon::registry::CheckoutRegistry>>,
+    session: u64,
+    deadline: Option<Duration>,
+    workers: &trellis::mcp::CallWorkersForTests,
+) -> (
+    std::os::unix::net::UnixStream,
+    BufReader<std::os::unix::net::UnixStream>,
+    std::thread::JoinHandle<std::io::Result<()>>,
+) {
+    served_session(
+        identity,
+        registry,
+        session,
+        deadline,
+        Default::default(),
+        workers.clone(),
+    )
+}
+
+/// A session with its own call-worker budget, never the process-wide one the
+/// other tests in this binary share (#869).
 fn hooked_session(
     identity: &trellis::store::topology::WorkspaceIdentity,
     registry: &std::sync::Arc<tokio::sync::Mutex<trellis::daemon::registry::CheckoutRegistry>>,
     session: u64,
     deadline: Option<Duration>,
     hooks: trellis::mcp::TransportHooksForTests,
+) -> (
+    std::os::unix::net::UnixStream,
+    BufReader<std::os::unix::net::UnixStream>,
+    std::thread::JoinHandle<std::io::Result<()>>,
+) {
+    served_session(
+        identity,
+        registry,
+        session,
+        deadline,
+        hooks,
+        Default::default(),
+    )
+}
+
+fn served_session(
+    identity: &trellis::store::topology::WorkspaceIdentity,
+    registry: &std::sync::Arc<tokio::sync::Mutex<trellis::daemon::registry::CheckoutRegistry>>,
+    session: u64,
+    deadline: Option<Duration>,
+    hooks: trellis::mcp::TransportHooksForTests,
+    workers: trellis::mcp::CallWorkersForTests,
 ) -> (
     std::os::unix::net::UnixStream,
     BufReader<std::os::unix::net::UnixStream>,
@@ -5912,7 +5939,9 @@ fn hooked_session(
     if let Some(deadline) = deadline {
         workspace = workspace.with_call_deadline_for_tests(deadline);
     }
-    let workspace = workspace.with_transport_hooks_for_tests(hooks);
+    let workspace = workspace
+        .with_transport_hooks_for_tests(hooks)
+        .with_call_workers_for_tests(workers);
     let registry = registry.clone();
     let handle = tokio::runtime::Handle::current();
     let thread = std::thread::spawn(move || {
@@ -5993,10 +6022,16 @@ async fn timed_out_workers_keep_their_permits_across_connections() {
     let (identity, registry, runtime) = ready_registry(temp.path(), 72).await;
     let gate = ReadGate::default();
     runtime.set_mcp_read_gate_for_tests(gate.hook());
+    let workers = trellis::mcp::CallWorkersForTests::default();
     let mut connections = Vec::new();
     for connection in 0..4 {
-        let (mut client, mut reader, session) =
-            socket_session(&identity, &registry, 72, Some(Duration::from_millis(300)));
+        let (mut client, mut reader, session) = budgeted_session(
+            &identity,
+            &registry,
+            72,
+            Some(Duration::from_millis(300)),
+            &workers,
+        );
         for call in 0..4 {
             writeln!(client, "{}", describe_call(connection * 10 + call)).unwrap();
         }
@@ -6013,9 +6048,10 @@ async fn timed_out_workers_keep_their_permits_across_connections() {
     tokio::task::spawn_blocking(move || waiter.await_held(16))
         .await
         .unwrap();
-    assert_eq!(trellis::mcp::live_call_workers_for_tests(), 16);
+    assert_eq!(workers.live(), 16);
     // A new connection: every permit is still held by a timed-out worker.
-    let (mut client, mut reader, session) = socket_session(&identity, &registry, 72, None);
+    let (mut client, mut reader, session) =
+        budgeted_session(&identity, &registry, 72, None, &workers);
     writeln!(client, "{}", describe_call(99)).unwrap();
     let refused = next_reply(&mut reader);
     assert_eq!(
@@ -6028,7 +6064,7 @@ async fn timed_out_workers_keep_their_permits_across_connections() {
     );
     gate.open();
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
-        while trellis::mcp::live_call_workers_for_tests() != 0 {
+        while workers.live() != 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -6053,7 +6089,9 @@ async fn cancelled_call_writes_nothing_and_its_worker_exits() {
     let (identity, registry, runtime) = ready_registry(temp.path(), 73).await;
     let gate = ReadGate::default();
     runtime.set_mcp_read_gate_for_tests(gate.hook());
-    let (mut client, mut reader, session) = socket_session(&identity, &registry, 73, None);
+    let workers = trellis::mcp::CallWorkersForTests::default();
+    let (mut client, mut reader, session) =
+        budgeted_session(&identity, &registry, 73, None, &workers);
     writeln!(client, "{}", describe_call(1)).unwrap();
     let waiter = gate.clone();
     tokio::task::spawn_blocking(move || waiter.await_held(1))
@@ -6072,7 +6110,7 @@ async fn cancelled_call_writes_nothing_and_its_worker_exits() {
     assert_eq!(listed["id"], 2, "the cancelled call answered: {listed}");
     gate.open();
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
-        while trellis::mcp::live_call_workers_for_tests() != 0 {
+        while workers.live() != 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -6130,11 +6168,20 @@ fn frames_read() -> (
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_call_expires_from_its_read_while_the_coordinator_is_held() {
     let temp = tempfile::tempdir().unwrap();
-    let (identity, registry, _runtime) = ready_registry(temp.path(), 81).await;
+    let (identity, registry, runtime) = ready_registry(temp.path(), 81).await;
     let (send_decision, entered, release) = hold_send_decision(1);
     let (frame_read, read) = frames_read();
     let deadline = Duration::from_millis(300);
+    // A paused call clock: call 1 reaches its send decision however loaded the
+    // host is, and only the test moves time past either deadline (#869). A
+    // past origin makes any accidental real-clock check fail immediately.
+    runtime
+        .freeze_mcp_call_clock_for_tests(std::time::Instant::now() - trellis::mcp::CALL_DEADLINE);
+    let clock = runtime.clone();
     let hooks = trellis::mcp::TransportHooksForTests {
+        paused_clock_for_tests: Some(std::sync::Arc::new(move || {
+            clock.mcp_call_clock_now_for_tests()
+        })),
         frame_read: Some(frame_read),
         send_decision: Some(send_decision),
         ..Default::default()
@@ -6147,9 +6194,9 @@ async fn a_call_expires_from_its_read_while_the_coordinator_is_held() {
         .recv_timeout(trellis::testing::HANG_BACKSTOP)
         .expect("call 1 did not reach its send decision");
     writeln!(client, "{}", describe_call(2)).unwrap();
-    let accepted = read.recv_timeout(trellis::testing::HANG_BACKSTOP).unwrap();
-    // Wait out call 2's own deadline (measured from its read) while held.
-    tokio::time::sleep_until((accepted + deadline).into()).await;
+    read.recv_timeout(trellis::testing::HANG_BACKSTOP).unwrap();
+    // Pass call 2's own deadline (measured from its read) while held.
+    runtime.advance_mcp_clock_for_tests(deadline);
     release.send(()).unwrap();
     for id in [1, 2] {
         let reply = next_reply(&mut reader);
@@ -6909,7 +6956,9 @@ async fn mcp_find_selected_snapshot_ranks_and_keeps_zero_hit_scope() {
     };
     let session = std::thread::spawn(move || {
         trellis::mcp::run_socket(
-            trellis::mcp::OpenedWorkspace::new(identity).with_transport_hooks_for_tests(hooks),
+            trellis::mcp::OpenedWorkspace::new(identity)
+                .with_transport_hooks_for_tests(hooks)
+                .with_call_workers_for_tests(Default::default()),
             server,
             registry,
             143,
@@ -7285,7 +7334,9 @@ fn one_socket_call(
     let daemon_handle = tokio::runtime::Handle::current();
     let session = std::thread::spawn(move || {
         trellis::mcp::run_socket(
-            trellis::mcp::OpenedWorkspace::new(identity).with_call_deadline_for_tests(deadline),
+            trellis::mcp::OpenedWorkspace::new(identity)
+                .with_call_deadline_for_tests(deadline)
+                .with_call_workers_for_tests(Default::default()),
             server,
             registry,
             session_id,
@@ -8099,7 +8150,8 @@ async fn mcp_declaration_selected_identity_and_measured_record() {
     let handle = tokio::runtime::Handle::current();
     let session = std::thread::spawn(move || {
         trellis::mcp::run_socket(
-            trellis::mcp::OpenedWorkspace::new(identity),
+            trellis::mcp::OpenedWorkspace::new(identity)
+                .with_call_workers_for_tests(Default::default()),
             server,
             registry,
             143,
@@ -8822,7 +8874,7 @@ fn mcp_outgoing_wire_fixture_delayed(
         });
     }
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
-    let hooks = if timing.paused_call_clock {
+    let mut hooks = if timing.paused_call_clock {
         // A past origin makes any accidental real-clock check fail immediately.
         runtime.freeze_mcp_call_clock_for_tests(
             std::time::Instant::now() - trellis::mcp::CALL_DEADLINE,
@@ -8835,8 +8887,18 @@ fn mcp_outgoing_wire_fixture_delayed(
             ..Default::default()
         }
     } else {
-        Default::default()
+        trellis::mcp::TransportHooksForTests::default()
     };
+    // The hint stages are this connection's own barrier, never process
+    // environment that the other tests in this binary read (#869).
+    let hint_barrier = advance_hints.map(|stages| {
+        let path = temp.path().join("hint.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(false).unwrap();
+        let barrier = trellis::testing::PhaseBarrier::new(stages[0].0, &path);
+        hooks.scope.phase = Some(barrier.clone());
+        (stages, listener, barrier)
+    });
     let (mut client, mut reader, session) =
         hooked_session(&identity, &registry, 301, timing.call_deadline, hooks);
     if legacy {
@@ -8890,14 +8952,7 @@ fn mcp_outgoing_wire_fixture_delayed(
     }
     runtime.freeze_mcp_hint_clock_for_tests();
     let runtime_after_hints = runtime.clone();
-    let budget_gate = if let Some(stages) = advance_hints {
-        let path = temp.path().join("hint.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        listener.set_nonblocking(false).unwrap();
-        unsafe {
-            std::env::set_var("TRELLIS_TEST_MCP_PHASE", stages[0].0);
-            std::env::set_var("TRELLIS_TEST_MCP_PHASE_SOCKET", &path);
-        }
+    let budget_gate = if let Some((stages, listener, barrier)) = hint_barrier {
         Some(std::thread::spawn(move || {
             for (index, (stage, millis)) in stages.iter().enumerate() {
                 let mut gate = trellis::testing::accept_within_backstop(&listener);
@@ -8908,7 +8963,7 @@ fn mcp_outgoing_wire_fixture_delayed(
                 assert_eq!(received, format!("{stage}\n"));
                 runtime.advance_mcp_clock_for_tests(Duration::from_millis(*millis));
                 if let Some((next_stage, _)) = stages.get(index + 1) {
-                    unsafe { std::env::set_var("TRELLIS_TEST_MCP_PHASE", next_stage) };
+                    barrier.set_stages(next_stage);
                 }
                 gate.write_all(b"!").unwrap();
             }
@@ -8935,10 +8990,6 @@ fn mcp_outgoing_wire_fixture_delayed(
     let response: Value = serde_json::from_slice(&frame).unwrap();
     if let Some(gate) = budget_gate {
         gate.join().unwrap();
-        unsafe {
-            std::env::remove_var("TRELLIS_TEST_MCP_PHASE");
-            std::env::remove_var("TRELLIS_TEST_MCP_PHASE_SOCKET");
-        }
     }
     if check_selected_after_hints {
         assert!(
@@ -10054,6 +10105,11 @@ fn mcp_outgoing_corrupt_boundary_fixture(fault: &str) -> Value {
         assert_eq!(db.execute(sql, []).unwrap(), expect, "{fault}");
     }
     let mut registry = CheckoutRegistry::with_roots(topology);
+    // The subject is this one read's handling of the corrupt rows. An eagerly built
+    // Architecture core (#798) reads the same rows at activation, reports the corruption
+    // and latches the head for rebuild; a read that lands after it is then refused as
+    // store_unavailable whatever its own optional handling (#878). Build only on demand.
+    registry.architecture_on_demand_for_tests();
     registry.attach_launch(302, &identity).unwrap();
     registry.activate(&identity.root_key).unwrap();
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));

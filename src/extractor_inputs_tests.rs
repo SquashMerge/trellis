@@ -27,24 +27,20 @@ const NON_EXTRACTION_ITEMS: &[(&str, &str)] = &[
         "the admitted inputs; source bytes enter facts only through per-document content hashes",
     ),
     (
-        "capture::ROOT_INPUTS",
+        "capture::ROOT_CONFIG_INPUTS",
         "revision-header config inputs, captured and compared per revision",
     ),
     (
-        "capture::nested_package_manifest",
-        "selects nested package.json config inputs (#443), captured and compared per revision",
+        "capture::ROOT_TOOLCHAIN_INPUTS",
+        "revision-header toolchain selectors, captured and compared per revision",
+    ),
+    (
+        "capture::nested_config_input",
+        "selects nested config inputs (#443, #394, #807, #717, #854), captured and compared per revision",
     ),
     (
         "skipped_config::CONFIG_INPUT_MAX_BYTES",
         "the default config input cap (#581); a skipped input's placeholder is captured and compared per revision",
-    ),
-    (
-        "capture::nested_cargo_manifest",
-        "selects nested Cargo.toml config inputs (#394), captured and compared per revision",
-    ),
-    (
-        "capture::nested_pyproject_manifest",
-        "selects nested pyproject.toml config inputs (#807), captured and compared per revision",
     ),
     (
         "capture::CaptureInputObservation",
@@ -71,6 +67,10 @@ const NON_EXTRACTION_ITEMS: &[(&str, &str)] = &[
 /// Modules outside native extraction that parse source. They compute read-time
 /// views or post-native semantic evidence, never native facts, graph or class projections.
 const NON_NATIVE_SOURCE_PARSERS: &[(&str, &str)] = &[
+    (
+        "src/behavior.rs",
+        "read-time sequence views: callback arguments (#888)",
+    ),
     ("src/behavior_bindings.rs", "read-time sequence views"),
     (
         "src/behavior_incidental.rs",

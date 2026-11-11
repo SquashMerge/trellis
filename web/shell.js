@@ -219,6 +219,8 @@
   }
   function targetText(step, view) {
     const target = window.TrellisSequence?.target(view, step);
+    // An HTTP interface hop (#853) names the handler a route match found, not a resolved call.
+    if (target?.kind === "interfaceHandler") return `HTTP interface handler · ${target.declaration.name} in ${target.column.label} · ${location(target.declaration)} · structural match, not proof`;
     if (target) return `Resolved declaration · ${target.declaration.name} · ${location(target.declaration)}`;
     // A dynamic call names a declaration, not a runtime body (#557).
     const declared = step?.callEvidence?.dispatchTarget;
@@ -282,9 +284,10 @@
     const selection = {}; targetSelection = selection;
     // Why an incidental step is hidden by default (#543): server reasons, never inferred.
     const incidental = {external:"hidden: external call", logging:"hidden: logging (naming heuristic)", accessor:"hidden: trivial accessor"}[entry.incidental];
+    const interfaceText = window.TrellisSequence?.interfaceText?.(entry, view);
     text("inspector-evidence", (incidental ? `${incidental}${entry.hidden ? "" : " (shown by Show all)"} · ` : "") + (entry.callEvidence
       ? `${window.TrellisSequence.evidenceLabel(entry, view)} · ${[entry.callEvidence.dispatch, entry.callEvidence.freshness, entry.callEvidence.provenanceId, window.TrellisSequence.basisLabel?.(entry.callEvidence)].filter(Boolean).join(" · ")}. Static possible paths, not a runtime trace.`
-      : "Measured source steps, not a runtime trace or verified dispatch."));
+      : "Measured source steps, not a runtime trace or verified dispatch.") + (interfaceText ? ` ${interfaceText}.` : ""));
     const detail = get("inspector-detail");
     // Every original field and all nested guards, alternates and chain calls remain
     // available as safe text. Never infer equivalent guards or invent confidence.
@@ -303,7 +306,7 @@
     }
     if (detail) {
       if (target && typeof openTarget === "function") {
-        const action = make("button", window.TrellisSequence.targetActionLabel(target.declaration)); action.type = "button";
+        const action = make("button", window.TrellisSequence.targetActionLabel(target.declaration, target)); action.type = "button";
         action.setAttribute("data-trellis-target-id", target.id);
         action.addEventListener("click", () => { if (targetSelection === selection && window.TrellisSequence.target(view, entry) === target) openTarget(target.declaration, entry); });
         detail.append(action);

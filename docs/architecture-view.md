@@ -82,6 +82,35 @@ switcher and the drawing are [#789](https://github.com/SquashMerge/trellis/issue
 - **Exceptions are unchanged:** one file pair, previewed and applied through the existing
   routes.
 
+## The app switcher in Treemap, Classes and the Files tree (#852)
+
+[#852](https://github.com/SquashMerge/trellis/issues/852) gives Treemap, Classes and the Files
+tree the switcher Architecture has: All apps, then one choice per app name, in the same order and
+words. There is one choice for the page. Choosing in any view, Architecture included, changes it in
+all of them. It is kept in memory only, and a new checkout starts at All apps.
+
+- **One assignment.** The apps and each file's app come from the Architecture summary at the
+  shown pin and rules: each module's `app`, which is the assignment the rules check uses (through
+  the file's layer, else the most specific containing root). A path the summary has no module
+  for, such as an unindexed file or a folder, is assigned by the roots alone. The views read the
+  same cached summary as Architecture. With no ready summary that has two or more apps (no rules
+  file, rejected rules, a single app, or while it builds), there is no switcher and every view
+  shows the whole checkout. A summary for an older pin, session, checkout or rules epoch never
+  draws a switcher. As in Architecture, a summary without the chosen app ends the choice, and the
+  choice does not come back when the app does.
+- **All apps** shows each view as it was before #852.
+- **One app** filters each view to that app's files. Treemap draws them, and its summary says
+  `in this app`. A new choice starts at the whole checkout; a new assignment for the same choice
+  keeps the directory. Opening a file from Architecture into Treemap switches to the file's own
+  app, or to All apps when the file is in no app. The Files tree (the directory tree, the indexed
+  list and filter matches) lists the app's files and the folders that hold them, lie in its roots
+  or lead to them. Classes lists the app's classes for a name search, passing over at most ten
+  pages of other apps' classes per search. A file's own class list and a drawn diagram are not
+  filtered.
+- **Unassigned files are listed, never dropped.** A file with no layer belongs to its root's app,
+  so it is listed under that app. A file in no app is listed under All apps. Every filtered view
+  counts what it leaves out and says that All apps shows it.
+
 ## Apps and HTTP interfaces: data and extraction (#784, #788)
 
 **Status: proposed (owner-delegated, run 803).** This section says what the summary and
@@ -90,8 +119,10 @@ for HTTP interface evidence ([#788](https://github.com/SquashMerge/trellis/issue
 drawing is #789 and #790. App detection and the counting rule are in
 [rules.md implementation notes (#784)](rules.md#implementation-notes-784); the evidence
 meaning is the [contract-v1 #788 amendment](semantic-evidence/contract-v1.md). Detected app
-kinds are `cargo`, `npm` and `python` (owner ruling 2026-11-08); `python` apps are detected
-from `pyproject.toml` ([#807](https://github.com/SquashMerge/trellis/issues/807)).
+kinds are `cargo`, `npm`, `python`, `maven` and `gradle` (owner rulings 2026-11-08 and
+2026-11-10); `python` apps are detected from `pyproject.toml`
+([#807](https://github.com/SquashMerge/trellis/issues/807)), and `maven` and `gradle` apps from
+runnable `pom.xml` and Gradle build modules ([#854](https://github.com/SquashMerge/trellis/issues/854)).
 
 **Summary fields.**
 
@@ -566,6 +597,22 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
 - **Evidence, never proof.** Interfaces are never an input to `$layers`. A pair of layers in
   different apps stays `unknown` with reason `cross_app`, and the view makes no claim that one
   app calls another. Absence of a match proves nothing.
+
+### Sequence hops across apps (#853)
+
+A Sequence stays within its seed's app except at a matched interface. A client call that this
+evidence matches to a route of another app is drawn as a labelled boundary hop into an «app»
+lane for the handler's app: `POST /api/sequence · exact · structural match, not proof`. The
+confidence always shows. An unresolved call stays a boundary, and a match within one app is
+not a hop. **Open handler sequence** continues into the handler on demand. The Sequence reads
+the interface evidence of its own revision from the owner's published core and never waits
+for it; until it exists the status line says the interfaces are not measured yet. The DTO and
+drawing are specified in [sequence-slice-contract.md](sequence-slice-contract.md#http-interface-hops-across-apps-853).
+
+A hop inside a callback passed to a call (`browseRequest(async () => api("/api/sequence"))`) is
+drawn too: the callback's body is shown as a `callback` block under that call when it holds a
+hop or a cross-column call, and stays a boundary otherwise (#888,
+[contract](sequence-slice-contract.md#callbacks-that-hold-an-interaction-or-a-hop-888)).
 
 ## Module chips and counts (#424)
 

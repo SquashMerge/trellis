@@ -19,6 +19,7 @@ mod semantic_batch_support;
 mod support;
 
 mod producer_auto;
+mod producer_doctor;
 mod producer_e2e;
 mod producer_e2e_java;
 mod producer_e2e_rust;

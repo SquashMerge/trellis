@@ -430,3 +430,93 @@ fn template_covers_producer_trust_runtime_environment_limits_generation() {
         assert_ne!(&base, hash, "{what} is part of the template");
     }
 }
+
+/// #717, #773, #854: a real capture retains the new root inputs and the nested
+/// `tsconfig.json` and Maven/Gradle module files above the sources they configure, and only
+/// there; `rust-analyzer.toml`, which `rust-analyzer scip` does not read, is not retained. A
+/// plan over it follows the root's project references into the retained nested config.
+#[cfg(feature = "test-support")]
+#[test]
+fn a_real_capture_retains_the_new_inputs_a_plan_reads() {
+    use crate::indexer::{IndexOptions, index_workspace_bundle};
+    use std::sync::{Arc, atomic::AtomicBool};
+    let state = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(work.path()).unwrap();
+    let write = |path: &str, text: &str| {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    };
+    write(
+        "tsconfig.json",
+        r#"{"files":[],"references":[{"path":"./packages/a"}]}"#,
+    );
+    write("packages/a/tsconfig.json", "{}");
+    write("packages/a/src/a.ts", "export const a = 1;\n");
+    write("docs/tsconfig.json", "{}");
+    write("docs/pom.xml", "<project/>");
+    write("setup.cfg", "[metadata]\nname = cfg\n");
+    write("pyrightconfig.json", "{}");
+    write("lsif-java.json", "{}");
+    write("pnpm-workspace.yaml", "packages:\n  - packages/*\n");
+    write("rust-analyzer.toml", "cargo.features = [\"x\"]\n");
+    write("svc/pom.xml", "<project/>");
+    write("svc/build.gradle", "");
+    write("svc/build.gradle.kts", "");
+    write("svc/src/main/java/App.java", "class App {}\n");
+    let store = crate::store::Store::open_for_tests(state.path(), &root).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(root.clone()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    let expected = store.index_baseline().unwrap();
+    store
+        .publish_native(&graph, &capture, &native, &leader, expected, &cancel)
+        .unwrap();
+    let baseline = store.index_baseline().unwrap();
+    let inputs = store
+        .with_native_reader(baseline, |reader| RetainedInputs::read(reader))
+        .unwrap();
+    let mut paths: Vec<&str> = inputs.config.iter().map(|f| f.path.as_str()).collect();
+    paths.sort_unstable();
+    paths.dedup();
+    assert_eq!(
+        paths,
+        [
+            "lsif-java.json",
+            "packages/a/tsconfig.json",
+            "pnpm-workspace.yaml",
+            "pyrightconfig.json",
+            "setup.cfg",
+            "svc/build.gradle",
+            "svc/build.gradle.kts",
+            "svc/pom.xml",
+            "tsconfig.json",
+        ]
+    );
+    let row = profiles::row(
+        Target::Real(ProducerName::ScipTypescript),
+        TrustProfile::Restricted,
+    )
+    .unwrap();
+    let mut rules = profiles::rules(&row);
+    let settings = plan::settings_for(
+        row,
+        &mut rules,
+        &inputs,
+        &root,
+        &super::settings::Overrides::default(),
+    )
+    .unwrap();
+    let references = settings
+        .iter()
+        .find(|setting| setting.name == "typescript.projectReferences")
+        .unwrap();
+    assert_eq!(references.value, json!(["packages/a/tsconfig.json"]));
+}

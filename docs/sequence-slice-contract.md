@@ -353,6 +353,131 @@ Typed integrity, busy and pin failures abort the entire response, never returnin
 partially enriched view. Lanes/arrows prove static declaration targets only: no runtime
 receiver identity, timing, activations or return edges are inferred.
 
+### HTTP interface hops across apps (#853)
+
+Owner issue #853 (split from #685 and #686 with the owner's approval, 2026-11-09), under the
+owner's #686 addition of 2026-11-04. A Sequence reaches another app only at a matched HTTP
+interface: a client call that the #788 interface evidence matches to a route of another app
+is drawn as a labelled boundary hop into that route's handler. The evidence meaning is the
+[contract-v1 Sequence hop amendment](semantic-evidence/contract-v1.md#interface-evidence-amendment-sequence-hops-853).
+
+- **Read.** The browser's `/api/sequence` reads the view's client calls (each step's
+  `callId`) against the interface evidence of the view's own revision, from the
+  architecture core the owner published for it under the current rules file. The read never
+  waits for that core or asks for one, and it never fails the Sequence: `interfaces.state`
+  says how it went. `ready` was read; `notMeasured` has no core for the revision yet (the
+  owner builds every head's) or it was not kept; `unavailable` means the rules file or the
+  evidence failed. Busy storage is returned typed, like every other read. A view with no
+  call, or in a checkout with fewer than two apps (no interface is extracted), has no
+  `interfaces`, so its wire is unchanged.
+- **Hop.** A call matched to a route whose handler is in another app than the call (both
+  ends assigned to apps, as `trellis_rules_check` assigns files) carries `interface`:
+  `kind:"http"`, the route's `method` and `pathTemplate`, `confidence` (`exact`, `template`
+  or `wrapperInferred`), `clientApp`, `serverApp`, `handlerKind` and `participant`. The
+  participant is the handler's declaration, `kind:"interfaceHandler"`, drawn in the column
+  `app:<server app>` («app» lane), one lane per app. A call matched within one app, or with
+  an end in no app, is not a hop and is drawn as before.
+- **Arrow.** The hop's arrow goes from the column the call runs in to the app lane, in place
+  of the call's own target (a wrapper such as `api` keeps its expanded body, drawn on its own
+  lane). Its label is `[NNN] <method> <path template> · <confidence> · structural match, not
+  proof`, with `wrapperInferred` written "wrapper-inferred". The confidence and the caveat are
+  never cut; a long template is. In Interactions the arrow has its return and activation like
+  any cross-column call. A syntax-only (calls-first) view draws the same arrow.
+- **Shown.** A hop's call that arrived hidden as incidental (an external `fetch` or client) is
+  shown, and `hiddenSteps` and `incidentalSteps` no longer count it.
+- **Unresolved.** A client call matched to no route carries `interface` with `confidence:
+  "unresolved"`, its own `method` and `pathTemplate` when readable, and no `serverApp`,
+  `handlerKind` or `participant`. It stays a boundary: it draws exactly what it drew before and
+  no handler is guessed. The inspector says "unresolved: no route matched · a missing match
+  proves nothing".
+- **On demand.** The hop does not expand the handler's body into the view. The inspector's
+  **Open handler sequence**, and the lane header when the lane has one handler, open the
+  handler's own Sequence (in its app) at the same revision.
+- **Status line and inspector.** The status line adds "N HTTP interface hops (structural
+  matches, not proof)" and "N unresolved HTTP calls", or "HTTP interfaces not measured yet for
+  this revision" / "HTTP interfaces unavailable". The inspector names the route, the
+  confidence and the two apps, and says the match is by method and path, not proof the
+  request is sent.
+- **Bounds.** Hops add at most one participant per distinct handler of the view's calls, and
+  one lane per server app, within the unchanged bounds (Prime2 review on #885). A server app's
+  column is admitted like any target's: when 20 columns are drawn already, the handler gets no
+  participant, the call keeps its `interface` without one (the inspector says it was not
+  drawn) and the view is truncated by `participants` with the usual warning. A revealed
+  incidental call counts toward the 200 shown steps in every view the visible bound applies
+  to (all but the Interactions candidates, #663): the same cap runs again and truncates by
+  `visibleSteps`. `hiddenSteps`, `incidentalSteps`, `interfaces` counts and the handler
+  participants describe only the steps kept. The work, depth and arrow bounds are unchanged.
+- **Show all.** Show all steps keeps the source text and adds the hop's route: its evidence
+  label is `HTTP interface hop · <method> <path template> · <confidence> · structural match,
+  not proof` in both renderers.
+- **Chains.** A hop inside a call-chain group whose calls were all hidden (a Rust
+  `client.get(..).header(..).send()` with external bindings) reveals the group around it too,
+  before the shown-step cap, so the hop is reachable (Prime2 second review on #885). The
+  chain's other calls stay hidden incidental calls. Because a collapsed chain previews its
+  first call only when every member is shown, the browser opens a chain that holds a hop
+  expanded, as #646 opens highlighted chains. The drawn hops equal the status line's count.
+- **Wrapper lane.** A wrapper whose call is a hop keeps its own lane for its expanded body in
+  both renderers, so the body's arrows start from the wrapper's column.
+- **MCP.** No MCP tool returns a Sequence; `trellis_show` opens this browser view, which
+  draws its hops. No MCP output changes.
+
+### Callbacks that hold an interaction or a hop (#888)
+
+Owner issue #888, ruled option C on 2026-11-10: a callback's body is expanded only when it
+holds a hop or another meaningful step; every other diagram stays exactly as it was. Before
+#888 a callable passed to a call (`browseRequest(async () => api("/api/sequence"))`) was
+always a boundary, so `loadSequence`'s hop into the daemon was never reached.
+
+- **Callback.** A boundary step at exactly the range of an indexed function that is itself
+  an argument expression of one of the owner's measured calls: an arrow or function
+  expression, a Rust closure, a Java or Python lambda, alone in parentheses or as a Python
+  keyword argument at most. The innermost such call is the call it is passed to. A function
+  declared inside an argument (a Rust `fn` in a block argument) is not passed and stays a
+  boundary, as do callables outside a call (Prime review on #891).
+- **Shown when.** Its body, built and enriched like an expanded callee's, holds:
+  - an **interaction**: a shown, non-incidental call whose exact target is drawn in another
+    column than the step's own (what Interactions draws as an arrow, #636), in an enriched
+    view; or
+  - an **HTTP interface hop** (#853) whose handler is drawn, found by the browser read that
+    reads interface evidence, in any tier.
+
+  A callback whose calls stay in their own column, have no exact target, or make no client
+  call is not shown: its boundary, and the whole view, are what they were before (the
+  negative control). The decision is the same in every projection (Interactions,
+  calls-first, Show all), so incidental calls never make a callback shown.
+- **Block.** A shown callback is a step of kind `callback`, labelled `callback passed to
+  <callee> · when and how often it runs is unknown`, with the callback's source range and
+  its body as `children`. It goes under the call it is passed to (appended to that call's
+  `children`, after any body the call expands) when that call is a later shown sibling;
+  otherwise it takes the boundary's place (a Python lambda, whose boundary may leave the
+  path, puts the call under a guard). Its steps run on the boundary's lane: a callback runs
+  in the column of what defines it (#558). Nested callbacks are decided first; an outer
+  callback is shown when an inner one is.
+- **Drawn.** Calls-first and Show all draw the block as a frame (legacy tab "callback"; Pele
+  a plain frame with the block's own numbered row). Interactions draw no frame: its arrows
+  draw in its place, as for a branch (#636).
+- **Bounds.** A callback is enriched in one transaction after the view's own steps, so the
+  view's own steps, expansions and bounds are unchanged. It is shown only within the bounds:
+  the 200 shown steps (except the Interactions candidates, #663), the 2000 work steps, depth
+  24 and 20 columns. The block replaces its boundary, so it costs exactly its body, callee
+  bodies its enrichment expanded included, counted once: a callback that exactly fits is
+  shown (Prime review on #891). A callback that would pass a bound stays a boundary, and the
+  view is truncated by that bound with "Sequence <step|work|depth> limit reached; the callback
+  passed to <callee> is not shown." (or the participant warning). That includes a callback
+  refused before the browser read (too deep, or past the work its candidates share): it keeps
+  its measured calls, so when one is a matched hop the read reports the bound instead of
+  dropping the hop silently. At most 64 callback bodies are
+  built per view (each parses its file); later ones stay boundaries. Hidden steps are not
+  searched for callbacks.
+- **Candidates.** A callback with a measured call but no interaction keeps its built block
+  on the boundary, server-side only and never serialized, for the browser read: when that
+  read finds a drawn hop in it, it shows the block within the same bounds, then reveals and
+  caps as #853 does. `interfaces` counts only hops in shown steps.
+- **Languages.** JavaScript and TypeScript (arrow and function expressions), Rust (closures),
+  Java (lambdas) and Python (lambdas), wherever the indexer records the callable as a
+  declaration. Interactions need the language's semantic producer; hops need none.
+- **MCP.** No MCP tool returns a Sequence. No MCP output changes.
+
 ## Original syntax slice notes
 
 The notes below record the initial syntax-only slice; current revision and semantic DTO

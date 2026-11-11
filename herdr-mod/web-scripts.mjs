@@ -15,16 +15,39 @@ const WEB = {
   // the parameter shadows the real global, so the caller decides how text is measured.
   pele: { file: "vendor/pele-1.10.0-trellis.2.js", params: "globalThis", result: "pele" },
   "metric-heat": { file: "metric-heat.js", params: "window", result: "window.TrellisMetricHeat" },
-  // Only the pure helpers it exports (moduleKey, commonDirectory, groupModules) are used.
+  // The pure parts it exports: the summary display (`createDisplay`) and the module helpers.
   architecture: { file: "architecture.js", params: "window, document", result: "window.TrellisArchitecture" },
+  // Apps, All apps layout, interface cards and inspector facts (pure).
+  "architecture-apps": { file: "architecture-apps.js", params: "window", result: "window.TrellisArchitectureApps" },
+  // Only the pure Deviations tree model is used; its DOM view is not.
+  "architecture-deviations": { file: "architecture-deviations.js", params: "window, document", result: "window.TrellisDeviations" },
   "architecture-pele": { file: "architecture-pele.js", params: "window, document, DOMParser, TextEncoder", result: "window.TrellisArchitecturePele" },
   // The language-neutral Sequence helpers (labels, lanes, display); its own SVG renderer is unused.
   sequence: { file: "sequence.js", params: "window, document", result: "window.TrellisSequence" },
   "sequence-pele": { file: "sequence-pele.js", params: "window, document, DOMParser, TextEncoder", result: "window.TrellisPeleSequence" },
 };
 
+// Data read from the web app's own files at build time, so the mod can't drift from them:
+// the `--sm-*` colour tokens of style.css, and the Architecture toolbar's Color by and
+// Aggregation choices from index.html.
+const DATA = {
+  tokens: { file: "style.css", read: (text) => Object.fromEntries([...text.matchAll(/--(sm-[a-z-]+):\s*(#[0-9A-Fa-f]{6})\b/g)].map((m) => [m[1], m[2].toUpperCase()])) },
+  controls: { file: "index.html", read: (text) => {
+    const options = (id) => {
+      const select = new RegExp(`<select id="${id}">([\\s\\S]*?)</select>`).exec(text)?.[1];
+      if (!select) throw new Error(`select #${id} not found in index.html`);
+      return [...select.matchAll(/<option value="([^"]+)"( selected)?>([^<]+)<\/option>/g)].map((m) => ({ value: m[1], label: m[3], selected: Boolean(m[2]) }));
+    };
+    return { metrics: options("architecture-color"), aggregates: options("architecture-aggregate") };
+  } },
+};
+
 /** The ES module source for `trellis-web:<name>`, and the file it comes from. */
 export function webModule(name) {
+  if (DATA[name]) {
+    const file = join(web, DATA[name].file);
+    return { contents: `export default ${JSON.stringify(DATA[name].read(readFileSync(file, "utf8")))};\n`, file };
+  }
   const spec = WEB[name];
   if (!spec) throw new Error(`unknown trellis-web module ${name}`);
   const file = join(web, spec.file);

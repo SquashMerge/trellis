@@ -3,6 +3,7 @@
 //! The pure engine in `graph_query` asks a [`SnapshotGraphSource`] for facts; every fact it
 //! reads is recorded so a byte-reduced answer can be re-evaluated without SQL (#40).
 use super::*;
+mod sequence_callbacks;
 use crate::{
     graph_query::{
         DefaultProducers, DocumentFacts, GraphAnswer, GraphFacts, GraphIntegrity, GraphQuery,
@@ -11,6 +12,7 @@ use crate::{
     native_evidence::DocumentKey,
     semantic_evidence as sem,
 };
+pub(super) use sequence_callbacks::syntax_callbacks;
 
 /// Corruption found by the engine fails like any other selected-read corruption (#261).
 fn engine_error(error: anyhow::Error) -> anyhow::Error {
@@ -781,6 +783,15 @@ pub(super) fn sequence_calls(
     };
     let seed_id = view.seed.id.clone();
     enrichment.steps(&mut view.steps, &document, &seed_id, 0)?;
+    // #888: callbacks that hold an interaction, after the view's own steps and bounds.
+    enrichment.callbacks(
+        &mut sequence_callbacks::CallbackReader::default(),
+        &mut view.steps,
+        &seed_id,
+        None,
+        &seed_id,
+        0,
+    )?;
     let Enrichment {
         nodes,
         edges,

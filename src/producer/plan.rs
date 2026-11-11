@@ -403,12 +403,12 @@ pub(crate) fn settings_for(
 ) -> Result<Vec<Setting>> {
     use super::ProducerName::{RustAnalyzer, ScipJava, ScipPython, ScipTypescript};
     match row.target {
-        Target::Real(ScipTypescript) => Ok(vec![super::tsconfig::apply(
-            rules,
-            inputs,
-            workspace,
-            overrides.typescript_project,
-        )?]),
+        Target::Real(ScipTypescript) => {
+            let project =
+                super::tsconfig::apply(rules, inputs, workspace, overrides.typescript_project)?;
+            let references = super::tsconfig::references(inputs, &project)?;
+            Ok(vec![project, references])
+        }
         Target::Real(RustAnalyzer) => {
             super::settings::rust(rules, inputs, overrides.cargo_features.as_deref())
         }
@@ -536,7 +536,10 @@ pub fn status(store: &Store, request: &StatusRequest, stub: Option<&Stub>) -> Re
             let pin = target.pin();
             let base = match &pin {
                 Some(pin) => detect::resolve_base(target, pin, &declared, None, stub),
-                None => Err(detect::Unavailable("producer is not pinned".into())),
+                None => Err(detect::Unavailable(
+                    "producer is not pinned".into(),
+                    detect::UnavailableKind::Unverifiable,
+                )),
             };
             let trust = |trust: TrustProfile| -> Value {
                 if let Some(reason) = profiles::refusal(target, trust) {

@@ -143,6 +143,8 @@
 (function () {
   "use strict";
   const MAX_NODES = 24;
+  // A name search under one app passes over at most this many pages of other apps' classes (#852).
+  const APP_PAGES = 10;
   const WIDTH = 300, HEIGHT = 116, OPEN_HEIGHT = 390, STEP_X = 520;
   let api, ui, serial = 0, searchSerial = 0, seed = null, expanded = [], diagram = null;
   let positions = new Map(), cards = new Map(), stage = null, menu = null, menuAnchor = null, warningBox = null;
@@ -153,6 +155,8 @@
   // "pele" or "cards". Cards remain the visible fallback when Pele cannot
   // represent the returned declarations faithfully (Decision 0014 §2).
   let renderer = null, rendererNote = "";
+  // The last listed search and the app choice it listed under.
+  let lastLookup = null;
   const currentView = () => snapshot && valid(snapshot) && displayTicket === serial;
   function closeChooser() { if (chooser) chooser.remove(); chooser = null; }
   function selectedHierarchy(data) {
@@ -282,7 +286,7 @@
   function reset() {
     if (api && api.onChange) api.onChange();
     serial++; searchSerial++; diagramGeneration++; closeContextMenu(false);
-    seed = null; expanded = []; diagram = null; snapshot = null; showAll = false; memberChoices.clear(); closeChooser();
+    seed = null; expanded = []; diagram = null; snapshot = null; showAll = false; memberChoices.clear(); closeChooser(); lastLookup = null;
     if (controls) controls.hidden = true;
     if (ui) ui.results.hidden = false;
     positions = new Map(); cards = new Map(); stage = null;
@@ -353,14 +357,31 @@
     // Keep the current diagram and its callbacks usable while lookup is pending.
     // A failed non-revision request must not discard the only loaded view.
     state("Looking for indexed classes…", "loading");
+    // This search's record, once it is made. It settles however the search ends (listed, failed or
+    // superseded), but only while it is still the latest record, never a successor's.
+    let record = null;
     try {
       const params = new URLSearchParams({q, offset: String(offset), limit: "100", indexGeneration: c.revision.indexGeneration, indexRevision: String(c.revision.indexRevision)});
       if (path) params.set("path", path);
-      const data = await api.request(`/api/classes?${params}`);
-      if (ticket !== searchSerial || !valid(c)) return;
-      if (!window.TrellisIndexPin.equal(data.revision, c.revision)) {
-        reset(); api.onStale?.("Workspace revision changed. Search again.");
-        state("Workspace revision changed. Search again.", "stale"); return;
+      // A name search lists the chosen app's classes only (#852); a file's own classes are always listed.
+      const choice = path ? null : api.appFilter?.() || null;
+      // The search is recorded before it reads, so a choice made while it is pending lists again
+      // and supersedes it; every page is admitted only while the choice is still this one.
+      record = lastLookup = {path, q, choice, ticket, done:false};
+      const chosen = () => path || sameChoice(choice, api.appFilter?.() || null);
+      let data, items = [], outside = 0, pages = 0;
+      for (;;) {
+        data = await api.request(`/api/classes?${params}`);
+        if (ticket !== searchSerial || !valid(c) || !chosen()) return;
+        if (!window.TrellisIndexPin.equal(data.revision, c.revision)) {
+          reset(); api.onStale?.("Workspace revision changed. Search again.");
+          state("Workspace revision changed. Search again.", "stale"); return;
+        }
+        const page = data.items || [], kept = choice ? page.filter(definition => choice.holds(definition.symbol.path)) : page;
+        items.push(...kept); outside += page.length - kept.length; pages++;
+        // Pages of other apps' classes are passed over, a bounded number per search.
+        if (items.length || data.nextOffset == null || pages >= APP_PAGES || !(data.nextOffset > Number(params.get("offset")))) break;
+        params.set("offset", String(data.nextOffset));
       }
       serial++; closeContextMenu(false); closeChooser(); ui.results.hidden = false;
       controls.hidden = true;
@@ -370,7 +391,6 @@
         stage = null; cards = new Map(); positions = new Map(); ui.results.replaceChildren();
       }
       ui.diagram.setAttribute("aria-busy", "false");
-      const items = data.items || [];
       for (const definition of items) {
         const button = el("button", undefined, "classes-result"); button.type = "button";
         button.append(el("span", definition.qualifiedName || definition.symbol.name), el("span", definition.symbol.path, "classes-path"));
@@ -379,20 +399,24 @@
       }
       if (data.nextOffset != null) {
         const more = el("button", "More classes", "classes-more"); more.type = "button";
-        more.addEventListener("click", () => { if (!valid(c)) return; more.remove(); return lookup({path, q, offset: data.nextOffset}); });
+        const next = data.nextOffset;
+        more.addEventListener("click", () => { if (!valid(c)) return; more.remove(); return lookup({path, q, offset: next}); });
         ui.results.append(more);
       }
       const warnings = data.warnings || [];
       const unindexed = data.requireIndex || warnings.some(warning => /index workspace/i.test(warning));
       renderWarnings(warnings);
-      state(`${unindexed ? "Index workspace to populate class declarations." : items.length ? "Choose a class to show its declared relationships." : "No matching classes. Try another name or index supported source files."}${data.truncated ? " Results are partial." : ""}`, unindexed ? "unindexed" : data.truncated ? "partial" : items.length ? "ready" : "empty");
+      const appNote = choice && outside ? ` ${outside} ${outside === 1 ? "class" : "classes"} in other apps or no app passed over · All apps lists them.` : "";
+      state(`${unindexed ? "Index workspace to populate class declarations." : items.length ? "Choose a class to show its declared relationships." : choice ? `No matching classes in ${choice.name}${data.nextOffset != null ? " on these pages · More classes reads on" : ""}. Try another name or All apps.` : "No matching classes. Try another name or index supported source files."}${appNote}${data.truncated ? " Results are partial." : ""}`, unindexed ? "unindexed" : data.truncated ? "partial" : items.length ? "ready" : "empty");
       if (autoOpen && items.length) await loadDiagram(items[0].symbol.id, [], true);
     } catch (error) {
-      if (ticket === searchSerial && valid(c) && error.name !== "AbortError") {
+      if (ticket === searchSerial && valid(c) && error.name !== "AbortError" && (path || sameChoice(lastLookup?.choice, api.appFilter?.() || null))) {
         const conflict = window.TrellisIndexPin.isConflict(error);
         if (conflict) { reset(); api.onStale?.("Workspace revision changed. Search again."); }
         state(error.message || "Class lookup failed. Try Search again.", conflict ? "stale" : "error");
       }
+    } finally {
+      if (record && lastLookup === record) record.done = true;
     }
   }
   async function loadDiagram(nextSeed, nextExpanded, fresh = false, focusId = null) {
@@ -661,5 +685,16 @@
     }
     ui.diagram.append(ledger);
   }
-  window.TrellisClasses = Object.freeze({init, open, reset, showContextMenu, closeContextMenu});
+  // Two app choices are the same when they name the same app under the same assignment.
+  const sameChoice = (a, b) => (a?.name ?? null) === (b?.name ?? null) && a?.assigned === b?.assigned;
+  // The app choice changed (#852): a listed name search lists again under it. A drawn diagram, or a
+  // file's own classes, stay as they are.
+  function scopeChanged() {
+    if (!api || !ui || !lastLookup || lastLookup.path) return;
+    // A drawn diagram stays; a search still pending over it is replaced.
+    if (diagram && (lastLookup.done || lastLookup.ticket !== searchSerial)) return;
+    if (sameChoice(lastLookup.choice, api.appFilter?.() || null)) return;
+    return lookup({q:lastLookup.q});
+  }
+  window.TrellisClasses = Object.freeze({init, open, reset, showContextMenu, closeContextMenu, scopeChanged});
 })();

@@ -2,7 +2,8 @@
 //! watcher, the MCP server or daemon launch starts a producer; this module is
 //! reached only from the producer commands and, for a workspace that opted in
 //! and a manual run approved, from the checkout's `AutoRunOwner` (`auto.rs`,
-//! #660).
+//! #660). `install` runs a pinned install command only from the explicit
+//! `producer install` CLI command (#880).
 
 use serde::{Deserialize, Serialize};
 
@@ -12,8 +13,10 @@ pub mod auto_config;
 pub mod auto_gate;
 pub mod batch;
 pub mod detect;
+pub mod doctor;
 pub mod exec;
 pub mod import;
+pub mod install;
 pub mod pickup;
 pub mod pickup_watch;
 pub mod plan;

@@ -27,7 +27,7 @@ pub(in crate::semantic_import) fn sum(parts: &[u64]) -> Result<u64> {
             .ok_or_else(|| ScipCaptureError::LimitExceeded("unit expansion".into()).into())
     })
 }
-fn slots<T>(count: usize) -> Result<u64> {
+pub(in crate::semantic_import) fn slots<T>(count: usize) -> Result<u64> {
     note_estimate();
     (count as u64)
         .checked_mul(size_of::<T>() as u64)
@@ -36,10 +36,10 @@ fn slots<T>(count: usize) -> Result<u64> {
 pub(in crate::semantic_import) fn map_entries<K, V>(count: usize) -> Result<u64> {
     sum(&[slots::<(K, V)>(count)?, slots::<[usize; 4]>(count)?])
 }
-fn text(value: &str) -> u64 {
+pub(in crate::semantic_import) fn text(value: &str) -> u64 {
     value.len() as u64
 }
-fn optional(value: &Option<String>) -> u64 {
+pub(in crate::semantic_import) fn optional(value: &Option<String>) -> u64 {
     value.as_ref().map_or(0, |s| text(s))
 }
 fn strings(values: &[String]) -> Result<u64> {
@@ -243,7 +243,7 @@ pub(in crate::semantic_import) fn targets(values: &[semantic::Target]) -> Result
             sum(&[total, target_payload(t)?])
         })
 }
-fn join_payload(value: &semantic::Join) -> Result<u64> {
+pub(in crate::semantic_import) fn join_payload(value: &semantic::Join) -> Result<u64> {
     sum(&[
         document(&value.anchor.document)?,
         text(&value.anchor.revision_id),
@@ -338,4 +338,78 @@ pub(in crate::semantic_import) fn type_relationship(
         target_payload(&value.target)?,
         text(&value.provenance_id),
     ])
+}
+
+/// The owned bytes of one witnessed document's settled facts (#865): every row as the visitors
+/// above count it, the claim map with its keys, and the fused proof sets. What a clone of
+/// `facts` admits before it is made.
+pub(in crate::semantic_import) fn joined_facts(facts: &super::super::JoinedFacts) -> Result<u64> {
+    let mut total = sum(&[
+        slots::<semantic::Symbol>(facts.symbols.len())?,
+        slots::<semantic::DeclarationBinding>(facts.declaration_bindings.len())?,
+        slots::<semantic::Reference>(facts.references.len())?,
+        slots::<semantic::CallBinding>(facts.call_bindings.len())?,
+        slots::<semantic::TypeRelationship>(facts.type_relationships.len())?,
+        map_entries::<String, semantic::Reference>(facts.reference_claims.len())?,
+        map_entries::<String, ()>(facts.fused_proofs.len() + facts.fused_calls.len())?,
+        map_entries::<native::DocumentKey, BTreeSet<String>>(facts.diagnostics.len())?,
+    ])?;
+    let payload = |root: u64, bytes: u64| bytes - root;
+    for row in &facts.symbols {
+        total = sum(&[
+            total,
+            payload(size_of::<semantic::Symbol>() as u64, symbol(row)?),
+        ])?;
+    }
+    for row in &facts.declaration_bindings {
+        let bytes = binding(row)?;
+        total = sum(&[
+            total,
+            payload(size_of::<semantic::DeclarationBinding>() as u64, bytes),
+        ])?;
+    }
+    for row in facts
+        .references
+        .iter()
+        .chain(facts.reference_claims.values())
+    {
+        total = sum(&[
+            total,
+            payload(size_of::<semantic::Reference>() as u64, reference(row)?),
+        ])?;
+    }
+    for key in facts.reference_claims.keys() {
+        total = sum(&[total, text(key)])?;
+    }
+    for row in &facts.call_bindings {
+        total = sum(&[
+            total,
+            payload(size_of::<semantic::CallBinding>() as u64, call(row)?),
+        ])?;
+    }
+    for row in &facts.type_relationships {
+        let bytes = type_relationship(row)?;
+        total = sum(&[
+            total,
+            payload(size_of::<semantic::TypeRelationship>() as u64, bytes),
+        ])?;
+    }
+    for id in facts.fused_proofs.iter().chain(&facts.fused_calls) {
+        total = sum(&[total, text(id)])?;
+    }
+    for (doc, set) in &facts.diagnostics {
+        total = sum(&[total, document(doc)?, map_entries::<String, ()>(set.len())?])?;
+        for diagnostic in set {
+            total = sum(&[total, text(diagnostic)])?;
+        }
+    }
+    for (id, row) in &facts.joins {
+        total = sum(&[
+            total,
+            slots::<(String, semantic::Join)>(1)?,
+            text(id),
+            join_payload(row)?,
+        ])?;
+    }
+    Ok(total)
 }

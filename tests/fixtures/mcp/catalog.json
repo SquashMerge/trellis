@@ -72,13 +72,49 @@
           "type": "object"
         },
         "Failure": {
+          "type": "object",
           "additionalProperties": false,
           "properties": {
+            "schemaVersion": {
+              "const": 1
+            },
+            "requestId": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "catchingUp": {
+              "type": "boolean"
+            },
             "error": {
+              "type": "object",
               "additionalProperties": false,
               "properties": {
                 "code": {
-                  "$ref": "#/$defs/ResolvedFailureCode"
+                  "enum": [
+                    "invalid_request",
+                    "range_too_large",
+                    "unsupported_encoding",
+                    "revision_conflict",
+                    "index_not_ready",
+                    "not_found",
+                    "too_many_requests",
+                    "deadline_exceeded",
+                    "rebuild_in_progress",
+                    "root_changed",
+                    "store_unavailable",
+                    "checkout_capacity",
+                    "daemon_unavailable",
+                    "outcome_unknown",
+                    "workspace_selection_failed"
+                  ]
+                },
+                "message": {
+                  "$ref": "#/$defs/Text"
+                },
+                "retryable": {
+                  "type": "boolean"
                 },
                 "currentBasis": {
                   "anyOf": [
@@ -100,11 +136,47 @@
                     }
                   ]
                 },
-                "message": {
-                  "$ref": "#/$defs/Text"
+                "attemptedWorkspace": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "enum": [
+                        "path",
+                        "invalid_type"
+                      ]
+                    },
+                    "value": {
+                      "type": "string",
+                      "maxLength": 256
+                    },
+                    "utf8Bytes": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "truncated": {
+                      "type": "boolean"
+                    },
+                    "jsonType": {
+                      "enum": [
+                        "null",
+                        "boolean",
+                        "number",
+                        "array",
+                        "object"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ]
                 },
-                "retryable": {
-                  "type": "boolean"
+                "reason": {
+                  "enum": [
+                    "not_absolute",
+                    "not_checkout",
+                    "identity_changed",
+                    "unavailable"
+                  ]
                 }
               },
               "required": [
@@ -113,30 +185,39 @@
                 "retryable",
                 "currentBasis",
                 "currentContentHash"
-              ],
-              "type": "object"
-            },
-            "requestId": {
-              "$ref": "#/$defs/RequestId"
-            },
-            "schemaVersion": {
-              "const": 1
-            },
-            "workspace": {
-              "type": "string"
-            },
-            "catchingUp": {
-              "type": "boolean"
+              ]
             }
           },
           "required": [
             "schemaVersion",
             "requestId",
-            "error",
-            "workspace",
-            "catchingUp"
+            "error"
           ],
-          "type": "object"
+          "if": {
+            "required": [
+              "workspace"
+            ]
+          },
+          "then": {
+            "required": [
+              "catchingUp"
+            ],
+            "properties": {
+              "error": {
+                "properties": {
+                  "attemptedWorkspace": false,
+                  "reason": false
+                }
+              }
+            }
+          },
+          "else": {
+            "not": {
+              "required": [
+                "catchingUp"
+              ]
+            }
+          }
         },
         "Hash": {
           "pattern": "^[0-9a-f]{64}$",
@@ -395,237 +476,6 @@
             "provenanceId"
           ],
           "type": "object"
-        },
-        "AttemptedWorkspace": {
-          "oneOf": [
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "kind": {
-                  "const": "path"
-                },
-                "value": {
-                  "type": "string",
-                  "maxLength": 256
-                },
-                "utf8Bytes": {
-                  "$ref": "#/$defs/UInt"
-                },
-                "truncated": {
-                  "type": "boolean"
-                }
-              },
-              "required": [
-                "kind",
-                "value",
-                "utf8Bytes",
-                "truncated"
-              ]
-            },
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "kind": {
-                  "const": "invalid_type"
-                },
-                "jsonType": {
-                  "enum": [
-                    "null",
-                    "boolean",
-                    "number",
-                    "array",
-                    "object"
-                  ]
-                }
-              },
-              "required": [
-                "kind",
-                "jsonType"
-              ]
-            }
-          ]
-        },
-        "NoWorkspaceFailure": {
-          "additionalProperties": false,
-          "properties": {
-            "error": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "code": {
-                  "enum": [
-                    "workspace_selection_failed",
-                    "invalid_request",
-                    "too_many_requests",
-                    "deadline_exceeded",
-                    "range_too_large"
-                  ]
-                },
-                "message": {
-                  "$ref": "#/$defs/Text"
-                },
-                "retryable": {
-                  "type": "boolean"
-                },
-                "currentBasis": {
-                  "const": null
-                },
-                "currentContentHash": {
-                  "const": null
-                },
-                "attemptedWorkspace": {
-                  "$ref": "#/$defs/AttemptedWorkspace"
-                },
-                "reason": {
-                  "enum": [
-                    "not_absolute",
-                    "not_checkout",
-                    "identity_changed",
-                    "unavailable"
-                  ]
-                }
-              },
-              "required": [
-                "code",
-                "message",
-                "retryable",
-                "currentBasis",
-                "currentContentHash"
-              ],
-              "oneOf": [
-                {
-                  "properties": {
-                    "code": {
-                      "const": "workspace_selection_failed"
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace",
-                    "reason"
-                  ],
-                  "if": {
-                    "properties": {
-                      "reason": {
-                        "const": "unavailable"
-                      }
-                    }
-                  },
-                  "then": {
-                    "properties": {
-                      "retryable": {
-                        "const": true
-                      }
-                    }
-                  },
-                  "else": {
-                    "properties": {
-                      "retryable": {
-                        "const": false
-                      }
-                    }
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "const": "invalid_request"
-                    },
-                    "retryable": {
-                      "const": false
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace"
-                  ],
-                  "not": {
-                    "required": [
-                      "reason"
-                    ]
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "enum": [
-                        "too_many_requests",
-                        "deadline_exceeded"
-                      ]
-                    },
-                    "retryable": {
-                      "const": true
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace"
-                  ],
-                  "not": {
-                    "required": [
-                      "reason"
-                    ]
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "enum": [
-                        "invalid_request",
-                        "range_too_large"
-                      ]
-                    },
-                    "retryable": {
-                      "const": false
-                    }
-                  },
-                  "not": {
-                    "anyOf": [
-                      {
-                        "required": [
-                          "attemptedWorkspace"
-                        ]
-                      },
-                      {
-                        "required": [
-                          "reason"
-                        ]
-                      }
-                    ]
-                  }
-                }
-              ]
-            },
-            "requestId": {
-              "$ref": "#/$defs/RequestId"
-            },
-            "schemaVersion": {
-              "const": 1
-            }
-          },
-          "required": [
-            "schemaVersion",
-            "requestId",
-            "error"
-          ],
-          "type": "object"
-        },
-        "ResolvedFailureCode": {
-          "enum": [
-            "invalid_request",
-            "range_too_large",
-            "unsupported_encoding",
-            "revision_conflict",
-            "index_not_ready",
-            "not_found",
-            "too_many_requests",
-            "deadline_exceeded",
-            "rebuild_in_progress",
-            "root_changed",
-            "store_unavailable",
-            "checkout_capacity",
-            "daemon_unavailable",
-            "outcome_unknown"
-          ]
         },
         "RequestId": {
           "oneOf": [
@@ -910,7 +760,7 @@
                   "const": 1
                 },
                 "toolVersion": {
-                  "const": 26
+                  "const": 28
                 },
                 "watcherDegraded": {
                   "type": "boolean"
@@ -1027,6 +877,8 @@
                               "cargo",
                               "npm",
                               "python",
+                              "maven",
+                              "gradle",
                               null
                             ]
                           },
@@ -1167,9 +1019,6 @@
         },
         {
           "$ref": "#/$defs/Failure"
-        },
-        {
-          "$ref": "#/$defs/NoWorkspaceFailure"
         }
       ],
       "type": "object"
@@ -1408,13 +1257,51 @@
           "type": "object"
         },
         "Failure": {
+          "type": "object",
           "additionalProperties": false,
           "properties": {
+            "schemaVersion": {
+              "const": 1
+            },
+            "requestId": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "catchingUp": {
+              "type": "boolean"
+            },
             "error": {
+              "type": "object",
               "additionalProperties": false,
               "properties": {
                 "code": {
-                  "$ref": "#/$defs/ResolvedFailureCode"
+                  "enum": [
+                    "invalid_request",
+                    "range_too_large",
+                    "unsupported_encoding",
+                    "revision_conflict",
+                    "index_not_ready",
+                    "not_found",
+                    "too_many_requests",
+                    "deadline_exceeded",
+                    "rebuild_in_progress",
+                    "root_changed",
+                    "store_unavailable",
+                    "checkout_capacity",
+                    "daemon_unavailable",
+                    "outcome_unknown",
+                    "invalid_rules",
+                    "bounded_work",
+                    "workspace_selection_failed"
+                  ]
+                },
+                "message": {
+                  "$ref": "#/$defs/Text"
+                },
+                "retryable": {
+                  "type": "boolean"
                 },
                 "currentBasis": {
                   "anyOf": [
@@ -1436,11 +1323,47 @@
                     }
                   ]
                 },
-                "message": {
-                  "$ref": "#/$defs/Text"
+                "attemptedWorkspace": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "enum": [
+                        "path",
+                        "invalid_type"
+                      ]
+                    },
+                    "value": {
+                      "type": "string",
+                      "maxLength": 256
+                    },
+                    "utf8Bytes": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "truncated": {
+                      "type": "boolean"
+                    },
+                    "jsonType": {
+                      "enum": [
+                        "null",
+                        "boolean",
+                        "number",
+                        "array",
+                        "object"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ]
                 },
-                "retryable": {
-                  "type": "boolean"
+                "reason": {
+                  "enum": [
+                    "not_absolute",
+                    "not_checkout",
+                    "identity_changed",
+                    "unavailable"
+                  ]
                 }
               },
               "required": [
@@ -1449,30 +1372,39 @@
                 "retryable",
                 "currentBasis",
                 "currentContentHash"
-              ],
-              "type": "object"
-            },
-            "requestId": {
-              "$ref": "#/$defs/RequestId"
-            },
-            "schemaVersion": {
-              "const": 1
-            },
-            "workspace": {
-              "type": "string"
-            },
-            "catchingUp": {
-              "type": "boolean"
+              ]
             }
           },
           "required": [
             "schemaVersion",
             "requestId",
-            "error",
-            "workspace",
-            "catchingUp"
+            "error"
           ],
-          "type": "object"
+          "if": {
+            "required": [
+              "workspace"
+            ]
+          },
+          "then": {
+            "required": [
+              "catchingUp"
+            ],
+            "properties": {
+              "error": {
+                "properties": {
+                  "attemptedWorkspace": false,
+                  "reason": false
+                }
+              }
+            }
+          },
+          "else": {
+            "not": {
+              "required": [
+                "catchingUp"
+              ]
+            }
+          }
         },
         "Hash": {
           "pattern": "^[0-9a-f]{64}$",
@@ -1811,239 +1743,6 @@
             "provenanceId"
           ],
           "type": "object"
-        },
-        "AttemptedWorkspace": {
-          "oneOf": [
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "kind": {
-                  "const": "path"
-                },
-                "value": {
-                  "type": "string",
-                  "maxLength": 256
-                },
-                "utf8Bytes": {
-                  "$ref": "#/$defs/UInt"
-                },
-                "truncated": {
-                  "type": "boolean"
-                }
-              },
-              "required": [
-                "kind",
-                "value",
-                "utf8Bytes",
-                "truncated"
-              ]
-            },
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "kind": {
-                  "const": "invalid_type"
-                },
-                "jsonType": {
-                  "enum": [
-                    "null",
-                    "boolean",
-                    "number",
-                    "array",
-                    "object"
-                  ]
-                }
-              },
-              "required": [
-                "kind",
-                "jsonType"
-              ]
-            }
-          ]
-        },
-        "NoWorkspaceFailure": {
-          "additionalProperties": false,
-          "properties": {
-            "error": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "code": {
-                  "enum": [
-                    "workspace_selection_failed",
-                    "invalid_request",
-                    "too_many_requests",
-                    "deadline_exceeded",
-                    "range_too_large"
-                  ]
-                },
-                "message": {
-                  "$ref": "#/$defs/Text"
-                },
-                "retryable": {
-                  "type": "boolean"
-                },
-                "currentBasis": {
-                  "const": null
-                },
-                "currentContentHash": {
-                  "const": null
-                },
-                "attemptedWorkspace": {
-                  "$ref": "#/$defs/AttemptedWorkspace"
-                },
-                "reason": {
-                  "enum": [
-                    "not_absolute",
-                    "not_checkout",
-                    "identity_changed",
-                    "unavailable"
-                  ]
-                }
-              },
-              "required": [
-                "code",
-                "message",
-                "retryable",
-                "currentBasis",
-                "currentContentHash"
-              ],
-              "oneOf": [
-                {
-                  "properties": {
-                    "code": {
-                      "const": "workspace_selection_failed"
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace",
-                    "reason"
-                  ],
-                  "if": {
-                    "properties": {
-                      "reason": {
-                        "const": "unavailable"
-                      }
-                    }
-                  },
-                  "then": {
-                    "properties": {
-                      "retryable": {
-                        "const": true
-                      }
-                    }
-                  },
-                  "else": {
-                    "properties": {
-                      "retryable": {
-                        "const": false
-                      }
-                    }
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "const": "invalid_request"
-                    },
-                    "retryable": {
-                      "const": false
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace"
-                  ],
-                  "not": {
-                    "required": [
-                      "reason"
-                    ]
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "enum": [
-                        "too_many_requests",
-                        "deadline_exceeded"
-                      ]
-                    },
-                    "retryable": {
-                      "const": true
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace"
-                  ],
-                  "not": {
-                    "required": [
-                      "reason"
-                    ]
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "enum": [
-                        "invalid_request",
-                        "range_too_large"
-                      ]
-                    },
-                    "retryable": {
-                      "const": false
-                    }
-                  },
-                  "not": {
-                    "anyOf": [
-                      {
-                        "required": [
-                          "attemptedWorkspace"
-                        ]
-                      },
-                      {
-                        "required": [
-                          "reason"
-                        ]
-                      }
-                    ]
-                  }
-                }
-              ]
-            },
-            "requestId": {
-              "$ref": "#/$defs/RequestId"
-            },
-            "schemaVersion": {
-              "const": 1
-            }
-          },
-          "required": [
-            "schemaVersion",
-            "requestId",
-            "error"
-          ],
-          "type": "object"
-        },
-        "ResolvedFailureCode": {
-          "enum": [
-            "invalid_request",
-            "range_too_large",
-            "unsupported_encoding",
-            "revision_conflict",
-            "index_not_ready",
-            "not_found",
-            "too_many_requests",
-            "deadline_exceeded",
-            "rebuild_in_progress",
-            "root_changed",
-            "store_unavailable",
-            "checkout_capacity",
-            "daemon_unavailable",
-            "outcome_unknown",
-            "invalid_rules",
-            "bounded_work"
-          ]
         },
         "LanguageStatus": {
           "additionalProperties": false,
@@ -2445,9 +2144,6 @@
         },
         {
           "$ref": "#/$defs/Failure"
-        },
-        {
-          "$ref": "#/$defs/NoWorkspaceFailure"
         }
       ],
       "type": "object"
@@ -2673,13 +2369,51 @@
           "type": "object"
         },
         "Failure": {
+          "type": "object",
           "additionalProperties": false,
           "properties": {
+            "schemaVersion": {
+              "const": 1
+            },
+            "requestId": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "catchingUp": {
+              "type": "boolean"
+            },
             "error": {
+              "type": "object",
               "additionalProperties": false,
               "properties": {
                 "code": {
-                  "$ref": "#/$defs/ResolvedFailureCode"
+                  "enum": [
+                    "invalid_request",
+                    "range_too_large",
+                    "unsupported_encoding",
+                    "revision_conflict",
+                    "index_not_ready",
+                    "not_found",
+                    "too_many_requests",
+                    "deadline_exceeded",
+                    "rebuild_in_progress",
+                    "root_changed",
+                    "store_unavailable",
+                    "checkout_capacity",
+                    "daemon_unavailable",
+                    "outcome_unknown",
+                    "invalid_rules",
+                    "bounded_work",
+                    "workspace_selection_failed"
+                  ]
+                },
+                "message": {
+                  "$ref": "#/$defs/Text"
+                },
+                "retryable": {
+                  "type": "boolean"
                 },
                 "currentBasis": {
                   "anyOf": [
@@ -2701,11 +2435,47 @@
                     }
                   ]
                 },
-                "message": {
-                  "$ref": "#/$defs/Text"
+                "attemptedWorkspace": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "enum": [
+                        "path",
+                        "invalid_type"
+                      ]
+                    },
+                    "value": {
+                      "type": "string",
+                      "maxLength": 256
+                    },
+                    "utf8Bytes": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "truncated": {
+                      "type": "boolean"
+                    },
+                    "jsonType": {
+                      "enum": [
+                        "null",
+                        "boolean",
+                        "number",
+                        "array",
+                        "object"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ]
                 },
-                "retryable": {
-                  "type": "boolean"
+                "reason": {
+                  "enum": [
+                    "not_absolute",
+                    "not_checkout",
+                    "identity_changed",
+                    "unavailable"
+                  ]
                 }
               },
               "required": [
@@ -2714,30 +2484,39 @@
                 "retryable",
                 "currentBasis",
                 "currentContentHash"
-              ],
-              "type": "object"
-            },
-            "requestId": {
-              "$ref": "#/$defs/RequestId"
-            },
-            "schemaVersion": {
-              "const": 1
-            },
-            "workspace": {
-              "type": "string"
-            },
-            "catchingUp": {
-              "type": "boolean"
+              ]
             }
           },
           "required": [
             "schemaVersion",
             "requestId",
-            "error",
-            "workspace",
-            "catchingUp"
+            "error"
           ],
-          "type": "object"
+          "if": {
+            "required": [
+              "workspace"
+            ]
+          },
+          "then": {
+            "required": [
+              "catchingUp"
+            ],
+            "properties": {
+              "error": {
+                "properties": {
+                  "attemptedWorkspace": false,
+                  "reason": false
+                }
+              }
+            }
+          },
+          "else": {
+            "not": {
+              "required": [
+                "catchingUp"
+              ]
+            }
+          }
         },
         "Hash": {
           "pattern": "^[0-9a-f]{64}$",
@@ -2989,239 +2768,6 @@
             "provenanceId"
           ],
           "type": "object"
-        },
-        "AttemptedWorkspace": {
-          "oneOf": [
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "kind": {
-                  "const": "path"
-                },
-                "value": {
-                  "type": "string",
-                  "maxLength": 256
-                },
-                "utf8Bytes": {
-                  "$ref": "#/$defs/UInt"
-                },
-                "truncated": {
-                  "type": "boolean"
-                }
-              },
-              "required": [
-                "kind",
-                "value",
-                "utf8Bytes",
-                "truncated"
-              ]
-            },
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "kind": {
-                  "const": "invalid_type"
-                },
-                "jsonType": {
-                  "enum": [
-                    "null",
-                    "boolean",
-                    "number",
-                    "array",
-                    "object"
-                  ]
-                }
-              },
-              "required": [
-                "kind",
-                "jsonType"
-              ]
-            }
-          ]
-        },
-        "NoWorkspaceFailure": {
-          "additionalProperties": false,
-          "properties": {
-            "error": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "code": {
-                  "enum": [
-                    "workspace_selection_failed",
-                    "invalid_request",
-                    "too_many_requests",
-                    "deadline_exceeded",
-                    "range_too_large"
-                  ]
-                },
-                "message": {
-                  "$ref": "#/$defs/Text"
-                },
-                "retryable": {
-                  "type": "boolean"
-                },
-                "currentBasis": {
-                  "const": null
-                },
-                "currentContentHash": {
-                  "const": null
-                },
-                "attemptedWorkspace": {
-                  "$ref": "#/$defs/AttemptedWorkspace"
-                },
-                "reason": {
-                  "enum": [
-                    "not_absolute",
-                    "not_checkout",
-                    "identity_changed",
-                    "unavailable"
-                  ]
-                }
-              },
-              "required": [
-                "code",
-                "message",
-                "retryable",
-                "currentBasis",
-                "currentContentHash"
-              ],
-              "oneOf": [
-                {
-                  "properties": {
-                    "code": {
-                      "const": "workspace_selection_failed"
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace",
-                    "reason"
-                  ],
-                  "if": {
-                    "properties": {
-                      "reason": {
-                        "const": "unavailable"
-                      }
-                    }
-                  },
-                  "then": {
-                    "properties": {
-                      "retryable": {
-                        "const": true
-                      }
-                    }
-                  },
-                  "else": {
-                    "properties": {
-                      "retryable": {
-                        "const": false
-                      }
-                    }
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "const": "invalid_request"
-                    },
-                    "retryable": {
-                      "const": false
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace"
-                  ],
-                  "not": {
-                    "required": [
-                      "reason"
-                    ]
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "enum": [
-                        "too_many_requests",
-                        "deadline_exceeded"
-                      ]
-                    },
-                    "retryable": {
-                      "const": true
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace"
-                  ],
-                  "not": {
-                    "required": [
-                      "reason"
-                    ]
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "enum": [
-                        "invalid_request",
-                        "range_too_large"
-                      ]
-                    },
-                    "retryable": {
-                      "const": false
-                    }
-                  },
-                  "not": {
-                    "anyOf": [
-                      {
-                        "required": [
-                          "attemptedWorkspace"
-                        ]
-                      },
-                      {
-                        "required": [
-                          "reason"
-                        ]
-                      }
-                    ]
-                  }
-                }
-              ]
-            },
-            "requestId": {
-              "$ref": "#/$defs/RequestId"
-            },
-            "schemaVersion": {
-              "const": 1
-            }
-          },
-          "required": [
-            "schemaVersion",
-            "requestId",
-            "error"
-          ],
-          "type": "object"
-        },
-        "ResolvedFailureCode": {
-          "enum": [
-            "invalid_request",
-            "range_too_large",
-            "unsupported_encoding",
-            "revision_conflict",
-            "index_not_ready",
-            "not_found",
-            "too_many_requests",
-            "deadline_exceeded",
-            "rebuild_in_progress",
-            "root_changed",
-            "store_unavailable",
-            "checkout_capacity",
-            "daemon_unavailable",
-            "outcome_unknown",
-            "invalid_rules",
-            "bounded_work"
-          ]
         },
         "LanguageStatus": {
           "additionalProperties": false,
@@ -3863,9 +3409,6 @@
         },
         {
           "$ref": "#/$defs/Failure"
-        },
-        {
-          "$ref": "#/$defs/NoWorkspaceFailure"
         }
       ],
       "type": "object"
@@ -4173,13 +3716,49 @@
           "type": "object"
         },
         "Failure": {
+          "type": "object",
           "additionalProperties": false,
           "properties": {
+            "schemaVersion": {
+              "const": 1
+            },
+            "requestId": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "catchingUp": {
+              "type": "boolean"
+            },
             "error": {
+              "type": "object",
               "additionalProperties": false,
               "properties": {
                 "code": {
-                  "$ref": "#/$defs/ResolvedFailureCode"
+                  "enum": [
+                    "invalid_request",
+                    "range_too_large",
+                    "unsupported_encoding",
+                    "revision_conflict",
+                    "index_not_ready",
+                    "not_found",
+                    "too_many_requests",
+                    "deadline_exceeded",
+                    "rebuild_in_progress",
+                    "root_changed",
+                    "store_unavailable",
+                    "checkout_capacity",
+                    "daemon_unavailable",
+                    "outcome_unknown",
+                    "workspace_selection_failed"
+                  ]
+                },
+                "message": {
+                  "$ref": "#/$defs/Text"
+                },
+                "retryable": {
+                  "type": "boolean"
                 },
                 "currentBasis": {
                   "anyOf": [
@@ -4201,11 +3780,47 @@
                     }
                   ]
                 },
-                "message": {
-                  "$ref": "#/$defs/Text"
+                "attemptedWorkspace": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "enum": [
+                        "path",
+                        "invalid_type"
+                      ]
+                    },
+                    "value": {
+                      "type": "string",
+                      "maxLength": 256
+                    },
+                    "utf8Bytes": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "truncated": {
+                      "type": "boolean"
+                    },
+                    "jsonType": {
+                      "enum": [
+                        "null",
+                        "boolean",
+                        "number",
+                        "array",
+                        "object"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ]
                 },
-                "retryable": {
-                  "type": "boolean"
+                "reason": {
+                  "enum": [
+                    "not_absolute",
+                    "not_checkout",
+                    "identity_changed",
+                    "unavailable"
+                  ]
                 }
               },
               "required": [
@@ -4214,30 +3829,39 @@
                 "retryable",
                 "currentBasis",
                 "currentContentHash"
-              ],
-              "type": "object"
-            },
-            "requestId": {
-              "$ref": "#/$defs/RequestId"
-            },
-            "schemaVersion": {
-              "const": 1
-            },
-            "workspace": {
-              "type": "string"
-            },
-            "catchingUp": {
-              "type": "boolean"
+              ]
             }
           },
           "required": [
             "schemaVersion",
             "requestId",
-            "error",
-            "workspace",
-            "catchingUp"
+            "error"
           ],
-          "type": "object"
+          "if": {
+            "required": [
+              "workspace"
+            ]
+          },
+          "then": {
+            "required": [
+              "catchingUp"
+            ],
+            "properties": {
+              "error": {
+                "properties": {
+                  "attemptedWorkspace": false,
+                  "reason": false
+                }
+              }
+            }
+          },
+          "else": {
+            "not": {
+              "required": [
+                "catchingUp"
+              ]
+            }
+          }
         },
         "Hash": {
           "pattern": "^[0-9a-f]{64}$",
@@ -4596,237 +4220,6 @@
             "provenanceId"
           ],
           "type": "object"
-        },
-        "AttemptedWorkspace": {
-          "oneOf": [
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "kind": {
-                  "const": "path"
-                },
-                "value": {
-                  "type": "string",
-                  "maxLength": 256
-                },
-                "utf8Bytes": {
-                  "$ref": "#/$defs/UInt"
-                },
-                "truncated": {
-                  "type": "boolean"
-                }
-              },
-              "required": [
-                "kind",
-                "value",
-                "utf8Bytes",
-                "truncated"
-              ]
-            },
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "kind": {
-                  "const": "invalid_type"
-                },
-                "jsonType": {
-                  "enum": [
-                    "null",
-                    "boolean",
-                    "number",
-                    "array",
-                    "object"
-                  ]
-                }
-              },
-              "required": [
-                "kind",
-                "jsonType"
-              ]
-            }
-          ]
-        },
-        "NoWorkspaceFailure": {
-          "additionalProperties": false,
-          "properties": {
-            "error": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "code": {
-                  "enum": [
-                    "workspace_selection_failed",
-                    "invalid_request",
-                    "too_many_requests",
-                    "deadline_exceeded",
-                    "range_too_large"
-                  ]
-                },
-                "message": {
-                  "$ref": "#/$defs/Text"
-                },
-                "retryable": {
-                  "type": "boolean"
-                },
-                "currentBasis": {
-                  "const": null
-                },
-                "currentContentHash": {
-                  "const": null
-                },
-                "attemptedWorkspace": {
-                  "$ref": "#/$defs/AttemptedWorkspace"
-                },
-                "reason": {
-                  "enum": [
-                    "not_absolute",
-                    "not_checkout",
-                    "identity_changed",
-                    "unavailable"
-                  ]
-                }
-              },
-              "required": [
-                "code",
-                "message",
-                "retryable",
-                "currentBasis",
-                "currentContentHash"
-              ],
-              "oneOf": [
-                {
-                  "properties": {
-                    "code": {
-                      "const": "workspace_selection_failed"
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace",
-                    "reason"
-                  ],
-                  "if": {
-                    "properties": {
-                      "reason": {
-                        "const": "unavailable"
-                      }
-                    }
-                  },
-                  "then": {
-                    "properties": {
-                      "retryable": {
-                        "const": true
-                      }
-                    }
-                  },
-                  "else": {
-                    "properties": {
-                      "retryable": {
-                        "const": false
-                      }
-                    }
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "const": "invalid_request"
-                    },
-                    "retryable": {
-                      "const": false
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace"
-                  ],
-                  "not": {
-                    "required": [
-                      "reason"
-                    ]
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "enum": [
-                        "too_many_requests",
-                        "deadline_exceeded"
-                      ]
-                    },
-                    "retryable": {
-                      "const": true
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace"
-                  ],
-                  "not": {
-                    "required": [
-                      "reason"
-                    ]
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "enum": [
-                        "invalid_request",
-                        "range_too_large"
-                      ]
-                    },
-                    "retryable": {
-                      "const": false
-                    }
-                  },
-                  "not": {
-                    "anyOf": [
-                      {
-                        "required": [
-                          "attemptedWorkspace"
-                        ]
-                      },
-                      {
-                        "required": [
-                          "reason"
-                        ]
-                      }
-                    ]
-                  }
-                }
-              ]
-            },
-            "requestId": {
-              "$ref": "#/$defs/RequestId"
-            },
-            "schemaVersion": {
-              "const": 1
-            }
-          },
-          "required": [
-            "schemaVersion",
-            "requestId",
-            "error"
-          ],
-          "type": "object"
-        },
-        "ResolvedFailureCode": {
-          "enum": [
-            "invalid_request",
-            "range_too_large",
-            "unsupported_encoding",
-            "revision_conflict",
-            "index_not_ready",
-            "not_found",
-            "too_many_requests",
-            "deadline_exceeded",
-            "rebuild_in_progress",
-            "root_changed",
-            "store_unavailable",
-            "checkout_capacity",
-            "daemon_unavailable",
-            "outcome_unknown"
-          ]
         },
         "LineSpan": {
           "$ref": "#/$defs/Range"
@@ -5400,9 +4793,6 @@
         },
         {
           "$ref": "#/$defs/Failure"
-        },
-        {
-          "$ref": "#/$defs/NoWorkspaceFailure"
         }
       ],
       "type": "object"
@@ -5891,13 +5281,49 @@
           "type": "object"
         },
         "Failure": {
+          "type": "object",
           "additionalProperties": false,
           "properties": {
+            "schemaVersion": {
+              "const": 1
+            },
+            "requestId": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "catchingUp": {
+              "type": "boolean"
+            },
             "error": {
+              "type": "object",
               "additionalProperties": false,
               "properties": {
                 "code": {
-                  "$ref": "#/$defs/ResolvedFailureCode"
+                  "enum": [
+                    "invalid_request",
+                    "range_too_large",
+                    "unsupported_encoding",
+                    "revision_conflict",
+                    "index_not_ready",
+                    "not_found",
+                    "too_many_requests",
+                    "deadline_exceeded",
+                    "rebuild_in_progress",
+                    "root_changed",
+                    "store_unavailable",
+                    "checkout_capacity",
+                    "daemon_unavailable",
+                    "outcome_unknown",
+                    "workspace_selection_failed"
+                  ]
+                },
+                "message": {
+                  "$ref": "#/$defs/Text"
+                },
+                "retryable": {
+                  "type": "boolean"
                 },
                 "currentBasis": {
                   "anyOf": [
@@ -5919,11 +5345,47 @@
                     }
                   ]
                 },
-                "message": {
-                  "$ref": "#/$defs/Text"
+                "attemptedWorkspace": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "enum": [
+                        "path",
+                        "invalid_type"
+                      ]
+                    },
+                    "value": {
+                      "type": "string",
+                      "maxLength": 256
+                    },
+                    "utf8Bytes": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "truncated": {
+                      "type": "boolean"
+                    },
+                    "jsonType": {
+                      "enum": [
+                        "null",
+                        "boolean",
+                        "number",
+                        "array",
+                        "object"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ]
                 },
-                "retryable": {
-                  "type": "boolean"
+                "reason": {
+                  "enum": [
+                    "not_absolute",
+                    "not_checkout",
+                    "identity_changed",
+                    "unavailable"
+                  ]
                 }
               },
               "required": [
@@ -5932,30 +5394,39 @@
                 "retryable",
                 "currentBasis",
                 "currentContentHash"
-              ],
-              "type": "object"
-            },
-            "requestId": {
-              "$ref": "#/$defs/RequestId"
-            },
-            "schemaVersion": {
-              "const": 1
-            },
-            "workspace": {
-              "type": "string"
-            },
-            "catchingUp": {
-              "type": "boolean"
+              ]
             }
           },
           "required": [
             "schemaVersion",
             "requestId",
-            "error",
-            "workspace",
-            "catchingUp"
+            "error"
           ],
-          "type": "object"
+          "if": {
+            "required": [
+              "workspace"
+            ]
+          },
+          "then": {
+            "required": [
+              "catchingUp"
+            ],
+            "properties": {
+              "error": {
+                "properties": {
+                  "attemptedWorkspace": false,
+                  "reason": false
+                }
+              }
+            }
+          },
+          "else": {
+            "not": {
+              "required": [
+                "catchingUp"
+              ]
+            }
+          }
         },
         "Hash": {
           "pattern": "^[0-9a-f]{64}$",
@@ -6333,237 +5804,6 @@
             "provenanceId"
           ],
           "type": "object"
-        },
-        "AttemptedWorkspace": {
-          "oneOf": [
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "kind": {
-                  "const": "path"
-                },
-                "value": {
-                  "type": "string",
-                  "maxLength": 256
-                },
-                "utf8Bytes": {
-                  "$ref": "#/$defs/UInt"
-                },
-                "truncated": {
-                  "type": "boolean"
-                }
-              },
-              "required": [
-                "kind",
-                "value",
-                "utf8Bytes",
-                "truncated"
-              ]
-            },
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "kind": {
-                  "const": "invalid_type"
-                },
-                "jsonType": {
-                  "enum": [
-                    "null",
-                    "boolean",
-                    "number",
-                    "array",
-                    "object"
-                  ]
-                }
-              },
-              "required": [
-                "kind",
-                "jsonType"
-              ]
-            }
-          ]
-        },
-        "NoWorkspaceFailure": {
-          "additionalProperties": false,
-          "properties": {
-            "error": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "code": {
-                  "enum": [
-                    "workspace_selection_failed",
-                    "invalid_request",
-                    "too_many_requests",
-                    "deadline_exceeded",
-                    "range_too_large"
-                  ]
-                },
-                "message": {
-                  "$ref": "#/$defs/Text"
-                },
-                "retryable": {
-                  "type": "boolean"
-                },
-                "currentBasis": {
-                  "const": null
-                },
-                "currentContentHash": {
-                  "const": null
-                },
-                "attemptedWorkspace": {
-                  "$ref": "#/$defs/AttemptedWorkspace"
-                },
-                "reason": {
-                  "enum": [
-                    "not_absolute",
-                    "not_checkout",
-                    "identity_changed",
-                    "unavailable"
-                  ]
-                }
-              },
-              "required": [
-                "code",
-                "message",
-                "retryable",
-                "currentBasis",
-                "currentContentHash"
-              ],
-              "oneOf": [
-                {
-                  "properties": {
-                    "code": {
-                      "const": "workspace_selection_failed"
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace",
-                    "reason"
-                  ],
-                  "if": {
-                    "properties": {
-                      "reason": {
-                        "const": "unavailable"
-                      }
-                    }
-                  },
-                  "then": {
-                    "properties": {
-                      "retryable": {
-                        "const": true
-                      }
-                    }
-                  },
-                  "else": {
-                    "properties": {
-                      "retryable": {
-                        "const": false
-                      }
-                    }
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "const": "invalid_request"
-                    },
-                    "retryable": {
-                      "const": false
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace"
-                  ],
-                  "not": {
-                    "required": [
-                      "reason"
-                    ]
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "enum": [
-                        "too_many_requests",
-                        "deadline_exceeded"
-                      ]
-                    },
-                    "retryable": {
-                      "const": true
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace"
-                  ],
-                  "not": {
-                    "required": [
-                      "reason"
-                    ]
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "enum": [
-                        "invalid_request",
-                        "range_too_large"
-                      ]
-                    },
-                    "retryable": {
-                      "const": false
-                    }
-                  },
-                  "not": {
-                    "anyOf": [
-                      {
-                        "required": [
-                          "attemptedWorkspace"
-                        ]
-                      },
-                      {
-                        "required": [
-                          "reason"
-                        ]
-                      }
-                    ]
-                  }
-                }
-              ]
-            },
-            "requestId": {
-              "$ref": "#/$defs/RequestId"
-            },
-            "schemaVersion": {
-              "const": 1
-            }
-          },
-          "required": [
-            "schemaVersion",
-            "requestId",
-            "error"
-          ],
-          "type": "object"
-        },
-        "ResolvedFailureCode": {
-          "enum": [
-            "invalid_request",
-            "range_too_large",
-            "unsupported_encoding",
-            "revision_conflict",
-            "index_not_ready",
-            "not_found",
-            "too_many_requests",
-            "deadline_exceeded",
-            "rebuild_in_progress",
-            "root_changed",
-            "store_unavailable",
-            "checkout_capacity",
-            "daemon_unavailable",
-            "outcome_unknown"
-          ]
         },
         "LineSpan": {
           "$ref": "#/$defs/Range"
@@ -7379,9 +6619,6 @@
         },
         {
           "$ref": "#/$defs/Failure"
-        },
-        {
-          "$ref": "#/$defs/NoWorkspaceFailure"
         }
       ],
       "type": "object"
@@ -7617,13 +6854,49 @@
           "type": "object"
         },
         "Failure": {
+          "type": "object",
           "additionalProperties": false,
           "properties": {
+            "schemaVersion": {
+              "const": 1
+            },
+            "requestId": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "catchingUp": {
+              "type": "boolean"
+            },
             "error": {
+              "type": "object",
               "additionalProperties": false,
               "properties": {
                 "code": {
-                  "$ref": "#/$defs/ResolvedFailureCode"
+                  "enum": [
+                    "invalid_request",
+                    "range_too_large",
+                    "unsupported_encoding",
+                    "revision_conflict",
+                    "index_not_ready",
+                    "not_found",
+                    "too_many_requests",
+                    "deadline_exceeded",
+                    "rebuild_in_progress",
+                    "root_changed",
+                    "store_unavailable",
+                    "checkout_capacity",
+                    "daemon_unavailable",
+                    "outcome_unknown",
+                    "workspace_selection_failed"
+                  ]
+                },
+                "message": {
+                  "$ref": "#/$defs/Text"
+                },
+                "retryable": {
+                  "type": "boolean"
                 },
                 "currentBasis": {
                   "anyOf": [
@@ -7645,11 +6918,47 @@
                     }
                   ]
                 },
-                "message": {
-                  "$ref": "#/$defs/Text"
+                "attemptedWorkspace": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "enum": [
+                        "path",
+                        "invalid_type"
+                      ]
+                    },
+                    "value": {
+                      "type": "string",
+                      "maxLength": 256
+                    },
+                    "utf8Bytes": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "truncated": {
+                      "type": "boolean"
+                    },
+                    "jsonType": {
+                      "enum": [
+                        "null",
+                        "boolean",
+                        "number",
+                        "array",
+                        "object"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ]
                 },
-                "retryable": {
-                  "type": "boolean"
+                "reason": {
+                  "enum": [
+                    "not_absolute",
+                    "not_checkout",
+                    "identity_changed",
+                    "unavailable"
+                  ]
                 }
               },
               "required": [
@@ -7658,30 +6967,39 @@
                 "retryable",
                 "currentBasis",
                 "currentContentHash"
-              ],
-              "type": "object"
-            },
-            "requestId": {
-              "$ref": "#/$defs/RequestId"
-            },
-            "schemaVersion": {
-              "const": 1
-            },
-            "workspace": {
-              "type": "string"
-            },
-            "catchingUp": {
-              "type": "boolean"
+              ]
             }
           },
           "required": [
             "schemaVersion",
             "requestId",
-            "error",
-            "workspace",
-            "catchingUp"
+            "error"
           ],
-          "type": "object"
+          "if": {
+            "required": [
+              "workspace"
+            ]
+          },
+          "then": {
+            "required": [
+              "catchingUp"
+            ],
+            "properties": {
+              "error": {
+                "properties": {
+                  "attemptedWorkspace": false,
+                  "reason": false
+                }
+              }
+            }
+          },
+          "else": {
+            "not": {
+              "required": [
+                "catchingUp"
+              ]
+            }
+          }
         },
         "Hash": {
           "pattern": "^[0-9a-f]{64}$",
@@ -7868,237 +7186,6 @@
             "provenanceId"
           ],
           "type": "object"
-        },
-        "AttemptedWorkspace": {
-          "oneOf": [
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "kind": {
-                  "const": "path"
-                },
-                "value": {
-                  "type": "string",
-                  "maxLength": 256
-                },
-                "utf8Bytes": {
-                  "$ref": "#/$defs/UInt"
-                },
-                "truncated": {
-                  "type": "boolean"
-                }
-              },
-              "required": [
-                "kind",
-                "value",
-                "utf8Bytes",
-                "truncated"
-              ]
-            },
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "kind": {
-                  "const": "invalid_type"
-                },
-                "jsonType": {
-                  "enum": [
-                    "null",
-                    "boolean",
-                    "number",
-                    "array",
-                    "object"
-                  ]
-                }
-              },
-              "required": [
-                "kind",
-                "jsonType"
-              ]
-            }
-          ]
-        },
-        "NoWorkspaceFailure": {
-          "additionalProperties": false,
-          "properties": {
-            "error": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "code": {
-                  "enum": [
-                    "workspace_selection_failed",
-                    "invalid_request",
-                    "too_many_requests",
-                    "deadline_exceeded",
-                    "range_too_large"
-                  ]
-                },
-                "message": {
-                  "$ref": "#/$defs/Text"
-                },
-                "retryable": {
-                  "type": "boolean"
-                },
-                "currentBasis": {
-                  "const": null
-                },
-                "currentContentHash": {
-                  "const": null
-                },
-                "attemptedWorkspace": {
-                  "$ref": "#/$defs/AttemptedWorkspace"
-                },
-                "reason": {
-                  "enum": [
-                    "not_absolute",
-                    "not_checkout",
-                    "identity_changed",
-                    "unavailable"
-                  ]
-                }
-              },
-              "required": [
-                "code",
-                "message",
-                "retryable",
-                "currentBasis",
-                "currentContentHash"
-              ],
-              "oneOf": [
-                {
-                  "properties": {
-                    "code": {
-                      "const": "workspace_selection_failed"
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace",
-                    "reason"
-                  ],
-                  "if": {
-                    "properties": {
-                      "reason": {
-                        "const": "unavailable"
-                      }
-                    }
-                  },
-                  "then": {
-                    "properties": {
-                      "retryable": {
-                        "const": true
-                      }
-                    }
-                  },
-                  "else": {
-                    "properties": {
-                      "retryable": {
-                        "const": false
-                      }
-                    }
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "const": "invalid_request"
-                    },
-                    "retryable": {
-                      "const": false
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace"
-                  ],
-                  "not": {
-                    "required": [
-                      "reason"
-                    ]
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "enum": [
-                        "too_many_requests",
-                        "deadline_exceeded"
-                      ]
-                    },
-                    "retryable": {
-                      "const": true
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace"
-                  ],
-                  "not": {
-                    "required": [
-                      "reason"
-                    ]
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "enum": [
-                        "invalid_request",
-                        "range_too_large"
-                      ]
-                    },
-                    "retryable": {
-                      "const": false
-                    }
-                  },
-                  "not": {
-                    "anyOf": [
-                      {
-                        "required": [
-                          "attemptedWorkspace"
-                        ]
-                      },
-                      {
-                        "required": [
-                          "reason"
-                        ]
-                      }
-                    ]
-                  }
-                }
-              ]
-            },
-            "requestId": {
-              "$ref": "#/$defs/RequestId"
-            },
-            "schemaVersion": {
-              "const": 1
-            }
-          },
-          "required": [
-            "schemaVersion",
-            "requestId",
-            "error"
-          ],
-          "type": "object"
-        },
-        "ResolvedFailureCode": {
-          "enum": [
-            "invalid_request",
-            "range_too_large",
-            "unsupported_encoding",
-            "revision_conflict",
-            "index_not_ready",
-            "not_found",
-            "too_many_requests",
-            "deadline_exceeded",
-            "rebuild_in_progress",
-            "root_changed",
-            "store_unavailable",
-            "checkout_capacity",
-            "daemon_unavailable",
-            "outcome_unknown"
-          ]
         },
         "LineSpan": {
           "$ref": "#/$defs/Range"
@@ -9347,9 +8434,6 @@
         },
         {
           "$ref": "#/$defs/Failure"
-        },
-        {
-          "$ref": "#/$defs/NoWorkspaceFailure"
         }
       ],
       "type": "object"
@@ -9481,13 +8565,49 @@
           "type": "object"
         },
         "Failure": {
+          "type": "object",
           "additionalProperties": false,
           "properties": {
+            "schemaVersion": {
+              "const": 1
+            },
+            "requestId": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "catchingUp": {
+              "type": "boolean"
+            },
             "error": {
+              "type": "object",
               "additionalProperties": false,
               "properties": {
                 "code": {
-                  "$ref": "#/$defs/ResolvedFailureCode"
+                  "enum": [
+                    "invalid_request",
+                    "range_too_large",
+                    "unsupported_encoding",
+                    "revision_conflict",
+                    "index_not_ready",
+                    "not_found",
+                    "too_many_requests",
+                    "deadline_exceeded",
+                    "rebuild_in_progress",
+                    "root_changed",
+                    "store_unavailable",
+                    "checkout_capacity",
+                    "daemon_unavailable",
+                    "outcome_unknown",
+                    "workspace_selection_failed"
+                  ]
+                },
+                "message": {
+                  "$ref": "#/$defs/Text"
+                },
+                "retryable": {
+                  "type": "boolean"
                 },
                 "currentBasis": {
                   "anyOf": [
@@ -9509,11 +8629,47 @@
                     }
                   ]
                 },
-                "message": {
-                  "$ref": "#/$defs/Text"
+                "attemptedWorkspace": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "enum": [
+                        "path",
+                        "invalid_type"
+                      ]
+                    },
+                    "value": {
+                      "type": "string",
+                      "maxLength": 256
+                    },
+                    "utf8Bytes": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "truncated": {
+                      "type": "boolean"
+                    },
+                    "jsonType": {
+                      "enum": [
+                        "null",
+                        "boolean",
+                        "number",
+                        "array",
+                        "object"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ]
                 },
-                "retryable": {
-                  "type": "boolean"
+                "reason": {
+                  "enum": [
+                    "not_absolute",
+                    "not_checkout",
+                    "identity_changed",
+                    "unavailable"
+                  ]
                 }
               },
               "required": [
@@ -9522,30 +8678,39 @@
                 "retryable",
                 "currentBasis",
                 "currentContentHash"
-              ],
-              "type": "object"
-            },
-            "requestId": {
-              "$ref": "#/$defs/RequestId"
-            },
-            "schemaVersion": {
-              "const": 1
-            },
-            "workspace": {
-              "type": "string"
-            },
-            "catchingUp": {
-              "type": "boolean"
+              ]
             }
           },
           "required": [
             "schemaVersion",
             "requestId",
-            "error",
-            "workspace",
-            "catchingUp"
+            "error"
           ],
-          "type": "object"
+          "if": {
+            "required": [
+              "workspace"
+            ]
+          },
+          "then": {
+            "required": [
+              "catchingUp"
+            ],
+            "properties": {
+              "error": {
+                "properties": {
+                  "attemptedWorkspace": false,
+                  "reason": false
+                }
+              }
+            }
+          },
+          "else": {
+            "not": {
+              "required": [
+                "catchingUp"
+              ]
+            }
+          }
         },
         "Hash": {
           "pattern": "^[0-9a-f]{64}$",
@@ -9613,237 +8778,6 @@
             "provenanceId"
           ],
           "type": "object"
-        },
-        "AttemptedWorkspace": {
-          "oneOf": [
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "kind": {
-                  "const": "path"
-                },
-                "value": {
-                  "type": "string",
-                  "maxLength": 256
-                },
-                "utf8Bytes": {
-                  "$ref": "#/$defs/UInt"
-                },
-                "truncated": {
-                  "type": "boolean"
-                }
-              },
-              "required": [
-                "kind",
-                "value",
-                "utf8Bytes",
-                "truncated"
-              ]
-            },
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "kind": {
-                  "const": "invalid_type"
-                },
-                "jsonType": {
-                  "enum": [
-                    "null",
-                    "boolean",
-                    "number",
-                    "array",
-                    "object"
-                  ]
-                }
-              },
-              "required": [
-                "kind",
-                "jsonType"
-              ]
-            }
-          ]
-        },
-        "NoWorkspaceFailure": {
-          "additionalProperties": false,
-          "properties": {
-            "error": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "code": {
-                  "enum": [
-                    "workspace_selection_failed",
-                    "invalid_request",
-                    "too_many_requests",
-                    "deadline_exceeded",
-                    "range_too_large"
-                  ]
-                },
-                "message": {
-                  "$ref": "#/$defs/Text"
-                },
-                "retryable": {
-                  "type": "boolean"
-                },
-                "currentBasis": {
-                  "const": null
-                },
-                "currentContentHash": {
-                  "const": null
-                },
-                "attemptedWorkspace": {
-                  "$ref": "#/$defs/AttemptedWorkspace"
-                },
-                "reason": {
-                  "enum": [
-                    "not_absolute",
-                    "not_checkout",
-                    "identity_changed",
-                    "unavailable"
-                  ]
-                }
-              },
-              "required": [
-                "code",
-                "message",
-                "retryable",
-                "currentBasis",
-                "currentContentHash"
-              ],
-              "oneOf": [
-                {
-                  "properties": {
-                    "code": {
-                      "const": "workspace_selection_failed"
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace",
-                    "reason"
-                  ],
-                  "if": {
-                    "properties": {
-                      "reason": {
-                        "const": "unavailable"
-                      }
-                    }
-                  },
-                  "then": {
-                    "properties": {
-                      "retryable": {
-                        "const": true
-                      }
-                    }
-                  },
-                  "else": {
-                    "properties": {
-                      "retryable": {
-                        "const": false
-                      }
-                    }
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "const": "invalid_request"
-                    },
-                    "retryable": {
-                      "const": false
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace"
-                  ],
-                  "not": {
-                    "required": [
-                      "reason"
-                    ]
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "enum": [
-                        "too_many_requests",
-                        "deadline_exceeded"
-                      ]
-                    },
-                    "retryable": {
-                      "const": true
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace"
-                  ],
-                  "not": {
-                    "required": [
-                      "reason"
-                    ]
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "enum": [
-                        "invalid_request",
-                        "range_too_large"
-                      ]
-                    },
-                    "retryable": {
-                      "const": false
-                    }
-                  },
-                  "not": {
-                    "anyOf": [
-                      {
-                        "required": [
-                          "attemptedWorkspace"
-                        ]
-                      },
-                      {
-                        "required": [
-                          "reason"
-                        ]
-                      }
-                    ]
-                  }
-                }
-              ]
-            },
-            "requestId": {
-              "$ref": "#/$defs/RequestId"
-            },
-            "schemaVersion": {
-              "const": 1
-            }
-          },
-          "required": [
-            "schemaVersion",
-            "requestId",
-            "error"
-          ],
-          "type": "object"
-        },
-        "ResolvedFailureCode": {
-          "enum": [
-            "invalid_request",
-            "range_too_large",
-            "unsupported_encoding",
-            "revision_conflict",
-            "index_not_ready",
-            "not_found",
-            "too_many_requests",
-            "deadline_exceeded",
-            "rebuild_in_progress",
-            "root_changed",
-            "store_unavailable",
-            "checkout_capacity",
-            "daemon_unavailable",
-            "outcome_unknown"
-          ]
         },
         "RequestId": {
           "oneOf": [
@@ -9957,9 +8891,6 @@
         },
         {
           "$ref": "#/$defs/Failure"
-        },
-        {
-          "$ref": "#/$defs/NoWorkspaceFailure"
         }
       ],
       "type": "object"
@@ -10687,13 +9618,51 @@
           "type": "string"
         },
         "Failure": {
+          "type": "object",
           "additionalProperties": false,
           "properties": {
+            "schemaVersion": {
+              "const": 1
+            },
+            "requestId": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "catchingUp": {
+              "type": "boolean"
+            },
             "error": {
+              "type": "object",
               "additionalProperties": false,
               "properties": {
                 "code": {
-                  "$ref": "#/$defs/ResolvedFailureCode"
+                  "enum": [
+                    "invalid_request",
+                    "range_too_large",
+                    "unsupported_encoding",
+                    "revision_conflict",
+                    "index_not_ready",
+                    "not_found",
+                    "too_many_requests",
+                    "deadline_exceeded",
+                    "rebuild_in_progress",
+                    "root_changed",
+                    "store_unavailable",
+                    "checkout_capacity",
+                    "daemon_unavailable",
+                    "outcome_unknown",
+                    "invalid_rules",
+                    "bounded_work",
+                    "workspace_selection_failed"
+                  ]
+                },
+                "message": {
+                  "$ref": "#/$defs/Text"
+                },
+                "retryable": {
+                  "type": "boolean"
                 },
                 "currentBasis": {
                   "anyOf": [
@@ -10715,125 +9684,39 @@
                     }
                   ]
                 },
-                "message": {
-                  "$ref": "#/$defs/Text"
-                },
-                "retryable": {
-                  "type": "boolean"
-                }
-              },
-              "required": [
-                "code",
-                "message",
-                "retryable",
-                "currentBasis",
-                "currentContentHash"
-              ],
-              "type": "object"
-            },
-            "requestId": {
-              "$ref": "#/$defs/RequestId"
-            },
-            "schemaVersion": {
-              "const": 1
-            },
-            "workspace": {
-              "type": "string"
-            },
-            "catchingUp": {
-              "type": "boolean"
-            }
-          },
-          "required": [
-            "schemaVersion",
-            "requestId",
-            "error",
-            "workspace",
-            "catchingUp"
-          ],
-          "type": "object"
-        },
-        "AttemptedWorkspace": {
-          "oneOf": [
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "kind": {
-                  "const": "path"
-                },
-                "value": {
-                  "type": "string",
-                  "maxLength": 256
-                },
-                "utf8Bytes": {
-                  "$ref": "#/$defs/UInt"
-                },
-                "truncated": {
-                  "type": "boolean"
-                }
-              },
-              "required": [
-                "kind",
-                "value",
-                "utf8Bytes",
-                "truncated"
-              ]
-            },
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "kind": {
-                  "const": "invalid_type"
-                },
-                "jsonType": {
-                  "enum": [
-                    "null",
-                    "boolean",
-                    "number",
-                    "array",
-                    "object"
-                  ]
-                }
-              },
-              "required": [
-                "kind",
-                "jsonType"
-              ]
-            }
-          ]
-        },
-        "NoWorkspaceFailure": {
-          "additionalProperties": false,
-          "properties": {
-            "error": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "code": {
-                  "enum": [
-                    "workspace_selection_failed",
-                    "invalid_request",
-                    "too_many_requests",
-                    "deadline_exceeded",
-                    "range_too_large"
-                  ]
-                },
-                "message": {
-                  "$ref": "#/$defs/Text"
-                },
-                "retryable": {
-                  "type": "boolean"
-                },
-                "currentBasis": {
-                  "const": null
-                },
-                "currentContentHash": {
-                  "const": null
-                },
                 "attemptedWorkspace": {
-                  "$ref": "#/$defs/AttemptedWorkspace"
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "enum": [
+                        "path",
+                        "invalid_type"
+                      ]
+                    },
+                    "value": {
+                      "type": "string",
+                      "maxLength": 256
+                    },
+                    "utf8Bytes": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "truncated": {
+                      "type": "boolean"
+                    },
+                    "jsonType": {
+                      "enum": [
+                        "null",
+                        "boolean",
+                        "number",
+                        "array",
+                        "object"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ]
                 },
                 "reason": {
                   "enum": [
@@ -10850,113 +9733,7 @@
                 "retryable",
                 "currentBasis",
                 "currentContentHash"
-              ],
-              "oneOf": [
-                {
-                  "properties": {
-                    "code": {
-                      "const": "workspace_selection_failed"
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace",
-                    "reason"
-                  ],
-                  "if": {
-                    "properties": {
-                      "reason": {
-                        "const": "unavailable"
-                      }
-                    }
-                  },
-                  "then": {
-                    "properties": {
-                      "retryable": {
-                        "const": true
-                      }
-                    }
-                  },
-                  "else": {
-                    "properties": {
-                      "retryable": {
-                        "const": false
-                      }
-                    }
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "const": "invalid_request"
-                    },
-                    "retryable": {
-                      "const": false
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace"
-                  ],
-                  "not": {
-                    "required": [
-                      "reason"
-                    ]
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "enum": [
-                        "too_many_requests",
-                        "deadline_exceeded"
-                      ]
-                    },
-                    "retryable": {
-                      "const": true
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace"
-                  ],
-                  "not": {
-                    "required": [
-                      "reason"
-                    ]
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "enum": [
-                        "invalid_request",
-                        "range_too_large"
-                      ]
-                    },
-                    "retryable": {
-                      "const": false
-                    }
-                  },
-                  "not": {
-                    "anyOf": [
-                      {
-                        "required": [
-                          "attemptedWorkspace"
-                        ]
-                      },
-                      {
-                        "required": [
-                          "reason"
-                        ]
-                      }
-                    ]
-                  }
-                }
               ]
-            },
-            "requestId": {
-              "$ref": "#/$defs/RequestId"
-            },
-            "schemaVersion": {
-              "const": 1
             }
           },
           "required": [
@@ -10964,27 +9741,31 @@
             "requestId",
             "error"
           ],
-          "type": "object"
-        },
-        "ResolvedFailureCode": {
-          "enum": [
-            "invalid_request",
-            "range_too_large",
-            "unsupported_encoding",
-            "revision_conflict",
-            "index_not_ready",
-            "not_found",
-            "too_many_requests",
-            "deadline_exceeded",
-            "rebuild_in_progress",
-            "root_changed",
-            "store_unavailable",
-            "checkout_capacity",
-            "daemon_unavailable",
-            "outcome_unknown",
-            "invalid_rules",
-            "bounded_work"
-          ]
+          "if": {
+            "required": [
+              "workspace"
+            ]
+          },
+          "then": {
+            "required": [
+              "catchingUp"
+            ],
+            "properties": {
+              "error": {
+                "properties": {
+                  "attemptedWorkspace": false,
+                  "reason": false
+                }
+              }
+            }
+          },
+          "else": {
+            "not": {
+              "required": [
+                "catchingUp"
+              ]
+            }
+          }
         },
         "RequestId": {
           "oneOf": [
@@ -12413,9 +11194,6 @@
         },
         {
           "$ref": "#/$defs/Failure"
-        },
-        {
-          "$ref": "#/$defs/NoWorkspaceFailure"
         }
       ],
       "type": "object"
@@ -12596,78 +11374,222 @@
           "type": "object"
         },
         "Failure": {
+          "type": "object",
           "additionalProperties": false,
           "properties": {
-            "error": {
-              "oneOf": [
-                {
-                  "additionalProperties": false,
-                  "properties": {
-                    "code": {
-                      "$ref": "#/$defs/ResolvedFailureCode"
-                    },
-                    "currentBasis": {
-                      "anyOf": [
-                        {
-                          "$ref": "#/$defs/Basis"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ]
-                    },
-                    "currentContentHash": {
-                      "anyOf": [
-                        {
-                          "$ref": "#/$defs/Hash"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ]
-                    },
-                    "message": {
-                      "$ref": "#/$defs/Text"
-                    },
-                    "retryable": {
-                      "type": "boolean"
-                    }
-                  },
-                  "required": [
-                    "code",
-                    "message",
-                    "retryable",
-                    "currentBasis",
-                    "currentContentHash"
-                  ],
-                  "type": "object"
-                },
-                {
-                  "$ref": "#/$defs/BuildingError"
-                }
-              ]
+            "schemaVersion": {
+              "const": 1
             },
             "requestId": {
               "$ref": "#/$defs/RequestId"
-            },
-            "schemaVersion": {
-              "const": 1
             },
             "workspace": {
               "type": "string"
             },
             "catchingUp": {
               "type": "boolean"
+            },
+            "error": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "enum": [
+                    "invalid_request",
+                    "range_too_large",
+                    "unsupported_encoding",
+                    "revision_conflict",
+                    "index_not_ready",
+                    "not_found",
+                    "too_many_requests",
+                    "deadline_exceeded",
+                    "rebuild_in_progress",
+                    "root_changed",
+                    "store_unavailable",
+                    "checkout_capacity",
+                    "daemon_unavailable",
+                    "outcome_unknown",
+                    "invalid_rules",
+                    "rules_not_found",
+                    "bounded_work",
+                    "response_too_large",
+                    "workspace_selection_failed",
+                    "building"
+                  ]
+                },
+                "message": {
+                  "$ref": "#/$defs/Text"
+                },
+                "retryable": {
+                  "type": "boolean"
+                },
+                "currentBasis": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Basis"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "currentContentHash": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Hash"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "attemptedWorkspace": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "enum": [
+                        "path",
+                        "invalid_type"
+                      ]
+                    },
+                    "value": {
+                      "type": "string",
+                      "maxLength": 256
+                    },
+                    "utf8Bytes": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "truncated": {
+                      "type": "boolean"
+                    },
+                    "jsonType": {
+                      "enum": [
+                        "null",
+                        "boolean",
+                        "number",
+                        "array",
+                        "object"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ]
+                },
+                "reason": {
+                  "enum": [
+                    "not_absolute",
+                    "not_checkout",
+                    "identity_changed",
+                    "unavailable"
+                  ]
+                },
+                "progress": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "phase": {
+                          "enum": [
+                            "reading",
+                            "resolving",
+                            "evaluating",
+                            "measuring"
+                          ]
+                        },
+                        "completed": {
+                          "$ref": "#/$defs/UInt"
+                        },
+                        "total": {
+                          "$ref": "#/$defs/UInt"
+                        }
+                      },
+                      "required": [
+                        "phase",
+                        "completed",
+                        "total"
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "retryAfterMs": {
+                  "$ref": "#/$defs/UInt"
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "retryable",
+                "currentBasis",
+                "currentContentHash"
+              ],
+              "if": {
+                "properties": {
+                  "code": {
+                    "const": "building"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "progress",
+                  "retryAfterMs"
+                ],
+                "properties": {
+                  "retryable": {
+                    "const": true
+                  },
+                  "currentBasis": {
+                    "$ref": "#/$defs/Basis"
+                  },
+                  "currentContentHash": {
+                    "const": null
+                  }
+                }
+              },
+              "else": {
+                "properties": {
+                  "progress": false,
+                  "retryAfterMs": false
+                }
+              }
             }
           },
           "required": [
             "schemaVersion",
             "requestId",
-            "error",
-            "workspace",
-            "catchingUp"
+            "error"
           ],
-          "type": "object"
+          "if": {
+            "required": [
+              "workspace"
+            ]
+          },
+          "then": {
+            "required": [
+              "catchingUp"
+            ],
+            "properties": {
+              "error": {
+                "properties": {
+                  "attemptedWorkspace": false,
+                  "reason": false
+                }
+              }
+            }
+          },
+          "else": {
+            "not": {
+              "required": [
+                "catchingUp"
+              ]
+            }
+          }
         },
         "Hash": {
           "pattern": "^[0-9a-f]{64}$",
@@ -12748,241 +11670,6 @@
             "provenanceId"
           ],
           "type": "object"
-        },
-        "AttemptedWorkspace": {
-          "oneOf": [
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "kind": {
-                  "const": "path"
-                },
-                "value": {
-                  "type": "string",
-                  "maxLength": 256
-                },
-                "utf8Bytes": {
-                  "$ref": "#/$defs/UInt"
-                },
-                "truncated": {
-                  "type": "boolean"
-                }
-              },
-              "required": [
-                "kind",
-                "value",
-                "utf8Bytes",
-                "truncated"
-              ]
-            },
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "kind": {
-                  "const": "invalid_type"
-                },
-                "jsonType": {
-                  "enum": [
-                    "null",
-                    "boolean",
-                    "number",
-                    "array",
-                    "object"
-                  ]
-                }
-              },
-              "required": [
-                "kind",
-                "jsonType"
-              ]
-            }
-          ]
-        },
-        "NoWorkspaceFailure": {
-          "additionalProperties": false,
-          "properties": {
-            "error": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "code": {
-                  "enum": [
-                    "workspace_selection_failed",
-                    "invalid_request",
-                    "too_many_requests",
-                    "deadline_exceeded",
-                    "range_too_large"
-                  ]
-                },
-                "message": {
-                  "$ref": "#/$defs/Text"
-                },
-                "retryable": {
-                  "type": "boolean"
-                },
-                "currentBasis": {
-                  "const": null
-                },
-                "currentContentHash": {
-                  "const": null
-                },
-                "attemptedWorkspace": {
-                  "$ref": "#/$defs/AttemptedWorkspace"
-                },
-                "reason": {
-                  "enum": [
-                    "not_absolute",
-                    "not_checkout",
-                    "identity_changed",
-                    "unavailable"
-                  ]
-                }
-              },
-              "required": [
-                "code",
-                "message",
-                "retryable",
-                "currentBasis",
-                "currentContentHash"
-              ],
-              "oneOf": [
-                {
-                  "properties": {
-                    "code": {
-                      "const": "workspace_selection_failed"
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace",
-                    "reason"
-                  ],
-                  "if": {
-                    "properties": {
-                      "reason": {
-                        "const": "unavailable"
-                      }
-                    }
-                  },
-                  "then": {
-                    "properties": {
-                      "retryable": {
-                        "const": true
-                      }
-                    }
-                  },
-                  "else": {
-                    "properties": {
-                      "retryable": {
-                        "const": false
-                      }
-                    }
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "const": "invalid_request"
-                    },
-                    "retryable": {
-                      "const": false
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace"
-                  ],
-                  "not": {
-                    "required": [
-                      "reason"
-                    ]
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "enum": [
-                        "too_many_requests",
-                        "deadline_exceeded"
-                      ]
-                    },
-                    "retryable": {
-                      "const": true
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace"
-                  ],
-                  "not": {
-                    "required": [
-                      "reason"
-                    ]
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "enum": [
-                        "invalid_request",
-                        "range_too_large"
-                      ]
-                    },
-                    "retryable": {
-                      "const": false
-                    }
-                  },
-                  "not": {
-                    "anyOf": [
-                      {
-                        "required": [
-                          "attemptedWorkspace"
-                        ]
-                      },
-                      {
-                        "required": [
-                          "reason"
-                        ]
-                      }
-                    ]
-                  }
-                }
-              ]
-            },
-            "requestId": {
-              "$ref": "#/$defs/RequestId"
-            },
-            "schemaVersion": {
-              "const": 1
-            }
-          },
-          "required": [
-            "schemaVersion",
-            "requestId",
-            "error"
-          ],
-          "type": "object"
-        },
-        "ResolvedFailureCode": {
-          "enum": [
-            "invalid_request",
-            "range_too_large",
-            "unsupported_encoding",
-            "revision_conflict",
-            "index_not_ready",
-            "not_found",
-            "too_many_requests",
-            "deadline_exceeded",
-            "rebuild_in_progress",
-            "root_changed",
-            "store_unavailable",
-            "checkout_capacity",
-            "daemon_unavailable",
-            "outcome_unknown",
-            "invalid_rules",
-            "rules_not_found",
-            "bounded_work",
-            "response_too_large"
-          ]
         },
         "LineSpan": {
           "$ref": "#/$defs/Range"
@@ -14398,71 +13085,6 @@
             "name",
             "document"
           ]
-        },
-        "BuildingError": {
-          "additionalProperties": false,
-          "properties": {
-            "code": {
-              "const": "building"
-            },
-            "currentBasis": {
-              "$ref": "#/$defs/Basis"
-            },
-            "currentContentHash": {
-              "const": null
-            },
-            "message": {
-              "$ref": "#/$defs/Text"
-            },
-            "retryable": {
-              "const": true
-            },
-            "progress": {
-              "anyOf": [
-                {
-                  "type": "object",
-                  "additionalProperties": false,
-                  "properties": {
-                    "phase": {
-                      "enum": [
-                        "reading",
-                        "resolving",
-                        "evaluating",
-                        "measuring"
-                      ]
-                    },
-                    "completed": {
-                      "$ref": "#/$defs/UInt"
-                    },
-                    "total": {
-                      "$ref": "#/$defs/UInt"
-                    }
-                  },
-                  "required": [
-                    "phase",
-                    "completed",
-                    "total"
-                  ]
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "retryAfterMs": {
-              "$ref": "#/$defs/UInt"
-            }
-          },
-          "required": [
-            "code",
-            "message",
-            "retryable",
-            "currentBasis",
-            "currentContentHash",
-            "progress",
-            "retryAfterMs"
-          ],
-          "type": "object"
         }
       },
       "oneOf": [
@@ -14740,9 +13362,6 @@
         },
         {
           "$ref": "#/$defs/Failure"
-        },
-        {
-          "$ref": "#/$defs/NoWorkspaceFailure"
         }
       ],
       "type": "object"
@@ -14920,81 +13539,225 @@
           "type": "object"
         },
         "Failure": {
+          "type": "object",
           "additionalProperties": false,
           "properties": {
-            "error": {
-              "oneOf": [
-                {
-                  "additionalProperties": false,
-                  "properties": {
-                    "code": {
-                      "$ref": "#/$defs/ResolvedFailureCode"
-                    },
-                    "currentBasis": {
-                      "anyOf": [
-                        {
-                          "$ref": "#/$defs/Basis"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ]
-                    },
-                    "currentContentHash": {
-                      "anyOf": [
-                        {
-                          "$ref": "#/$defs/Hash"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ]
-                    },
-                    "message": {
-                      "$ref": "#/$defs/Text"
-                    },
-                    "retryable": {
-                      "type": "boolean"
-                    }
-                  },
-                  "required": [
-                    "code",
-                    "message",
-                    "retryable",
-                    "currentBasis",
-                    "currentContentHash"
-                  ],
-                  "type": "object"
-                },
-                {
-                  "$ref": "#/$defs/LocatedRuleError"
-                },
-                {
-                  "$ref": "#/$defs/BuildingError"
-                }
-              ]
+            "schemaVersion": {
+              "const": 1
             },
             "requestId": {
               "$ref": "#/$defs/RequestId"
-            },
-            "schemaVersion": {
-              "const": 1
             },
             "workspace": {
               "type": "string"
             },
             "catchingUp": {
               "type": "boolean"
+            },
+            "error": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "enum": [
+                    "invalid_request",
+                    "range_too_large",
+                    "unsupported_encoding",
+                    "revision_conflict",
+                    "index_not_ready",
+                    "not_found",
+                    "too_many_requests",
+                    "deadline_exceeded",
+                    "rebuild_in_progress",
+                    "root_changed",
+                    "store_unavailable",
+                    "checkout_capacity",
+                    "daemon_unavailable",
+                    "outcome_unknown",
+                    "invalid_rules",
+                    "rules_not_found",
+                    "bounded_work",
+                    "response_too_large",
+                    "workspace_selection_failed",
+                    "building"
+                  ]
+                },
+                "message": {
+                  "$ref": "#/$defs/Text"
+                },
+                "retryable": {
+                  "type": "boolean"
+                },
+                "currentBasis": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Basis"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "currentContentHash": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Hash"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "attemptedWorkspace": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "enum": [
+                        "path",
+                        "invalid_type"
+                      ]
+                    },
+                    "value": {
+                      "type": "string",
+                      "maxLength": 256
+                    },
+                    "utf8Bytes": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "truncated": {
+                      "type": "boolean"
+                    },
+                    "jsonType": {
+                      "enum": [
+                        "null",
+                        "boolean",
+                        "number",
+                        "array",
+                        "object"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ]
+                },
+                "reason": {
+                  "enum": [
+                    "not_absolute",
+                    "not_checkout",
+                    "identity_changed",
+                    "unavailable"
+                  ]
+                },
+                "diagnostic": {
+                  "$ref": "#/$defs/RuleDiagnostic"
+                },
+                "progress": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "phase": {
+                          "enum": [
+                            "reading",
+                            "resolving",
+                            "evaluating",
+                            "measuring"
+                          ]
+                        },
+                        "completed": {
+                          "$ref": "#/$defs/UInt"
+                        },
+                        "total": {
+                          "$ref": "#/$defs/UInt"
+                        }
+                      },
+                      "required": [
+                        "phase",
+                        "completed",
+                        "total"
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "retryAfterMs": {
+                  "$ref": "#/$defs/UInt"
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "retryable",
+                "currentBasis",
+                "currentContentHash"
+              ],
+              "if": {
+                "properties": {
+                  "code": {
+                    "const": "building"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "progress",
+                  "retryAfterMs"
+                ],
+                "properties": {
+                  "retryable": {
+                    "const": true
+                  },
+                  "currentBasis": {
+                    "$ref": "#/$defs/Basis"
+                  },
+                  "currentContentHash": {
+                    "const": null
+                  }
+                }
+              },
+              "else": {
+                "properties": {
+                  "progress": false,
+                  "retryAfterMs": false
+                }
+              }
             }
           },
           "required": [
             "schemaVersion",
             "requestId",
-            "error",
-            "workspace",
-            "catchingUp"
+            "error"
           ],
-          "type": "object"
+          "if": {
+            "required": [
+              "workspace"
+            ]
+          },
+          "then": {
+            "required": [
+              "catchingUp"
+            ],
+            "properties": {
+              "error": {
+                "properties": {
+                  "attemptedWorkspace": false,
+                  "reason": false
+                }
+              }
+            }
+          },
+          "else": {
+            "not": {
+              "required": [
+                "catchingUp"
+              ]
+            }
+          }
         },
         "Hash": {
           "pattern": "^[0-9a-f]{64}$",
@@ -15068,241 +13831,6 @@
             "provenanceId"
           ],
           "type": "object"
-        },
-        "AttemptedWorkspace": {
-          "oneOf": [
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "kind": {
-                  "const": "path"
-                },
-                "value": {
-                  "type": "string",
-                  "maxLength": 256
-                },
-                "utf8Bytes": {
-                  "$ref": "#/$defs/UInt"
-                },
-                "truncated": {
-                  "type": "boolean"
-                }
-              },
-              "required": [
-                "kind",
-                "value",
-                "utf8Bytes",
-                "truncated"
-              ]
-            },
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "kind": {
-                  "const": "invalid_type"
-                },
-                "jsonType": {
-                  "enum": [
-                    "null",
-                    "boolean",
-                    "number",
-                    "array",
-                    "object"
-                  ]
-                }
-              },
-              "required": [
-                "kind",
-                "jsonType"
-              ]
-            }
-          ]
-        },
-        "NoWorkspaceFailure": {
-          "additionalProperties": false,
-          "properties": {
-            "error": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "code": {
-                  "enum": [
-                    "workspace_selection_failed",
-                    "invalid_request",
-                    "too_many_requests",
-                    "deadline_exceeded",
-                    "range_too_large"
-                  ]
-                },
-                "message": {
-                  "$ref": "#/$defs/Text"
-                },
-                "retryable": {
-                  "type": "boolean"
-                },
-                "currentBasis": {
-                  "const": null
-                },
-                "currentContentHash": {
-                  "const": null
-                },
-                "attemptedWorkspace": {
-                  "$ref": "#/$defs/AttemptedWorkspace"
-                },
-                "reason": {
-                  "enum": [
-                    "not_absolute",
-                    "not_checkout",
-                    "identity_changed",
-                    "unavailable"
-                  ]
-                }
-              },
-              "required": [
-                "code",
-                "message",
-                "retryable",
-                "currentBasis",
-                "currentContentHash"
-              ],
-              "oneOf": [
-                {
-                  "properties": {
-                    "code": {
-                      "const": "workspace_selection_failed"
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace",
-                    "reason"
-                  ],
-                  "if": {
-                    "properties": {
-                      "reason": {
-                        "const": "unavailable"
-                      }
-                    }
-                  },
-                  "then": {
-                    "properties": {
-                      "retryable": {
-                        "const": true
-                      }
-                    }
-                  },
-                  "else": {
-                    "properties": {
-                      "retryable": {
-                        "const": false
-                      }
-                    }
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "const": "invalid_request"
-                    },
-                    "retryable": {
-                      "const": false
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace"
-                  ],
-                  "not": {
-                    "required": [
-                      "reason"
-                    ]
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "enum": [
-                        "too_many_requests",
-                        "deadline_exceeded"
-                      ]
-                    },
-                    "retryable": {
-                      "const": true
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace"
-                  ],
-                  "not": {
-                    "required": [
-                      "reason"
-                    ]
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "enum": [
-                        "invalid_request",
-                        "range_too_large"
-                      ]
-                    },
-                    "retryable": {
-                      "const": false
-                    }
-                  },
-                  "not": {
-                    "anyOf": [
-                      {
-                        "required": [
-                          "attemptedWorkspace"
-                        ]
-                      },
-                      {
-                        "required": [
-                          "reason"
-                        ]
-                      }
-                    ]
-                  }
-                }
-              ]
-            },
-            "requestId": {
-              "$ref": "#/$defs/RequestId"
-            },
-            "schemaVersion": {
-              "const": 1
-            }
-          },
-          "required": [
-            "schemaVersion",
-            "requestId",
-            "error"
-          ],
-          "type": "object"
-        },
-        "ResolvedFailureCode": {
-          "enum": [
-            "invalid_request",
-            "range_too_large",
-            "unsupported_encoding",
-            "revision_conflict",
-            "index_not_ready",
-            "not_found",
-            "too_many_requests",
-            "deadline_exceeded",
-            "rebuild_in_progress",
-            "root_changed",
-            "store_unavailable",
-            "checkout_capacity",
-            "daemon_unavailable",
-            "outcome_unknown",
-            "invalid_rules",
-            "rules_not_found",
-            "bounded_work",
-            "response_too_large"
-          ]
         },
         "LineSpan": {
           "$ref": "#/$defs/Range"
@@ -16018,117 +14546,6 @@
             "attribution",
             "message"
           ]
-        },
-        "LocatedRuleError": {
-          "additionalProperties": false,
-          "properties": {
-            "code": {
-              "const": "invalid_rules"
-            },
-            "currentBasis": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/Basis"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "currentContentHash": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/Hash"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "message": {
-              "$ref": "#/$defs/Text"
-            },
-            "retryable": {
-              "type": "boolean"
-            },
-            "diagnostic": {
-              "$ref": "#/$defs/RuleDiagnostic"
-            }
-          },
-          "required": [
-            "code",
-            "message",
-            "retryable",
-            "currentBasis",
-            "currentContentHash",
-            "diagnostic"
-          ],
-          "type": "object"
-        },
-        "BuildingError": {
-          "additionalProperties": false,
-          "properties": {
-            "code": {
-              "const": "building"
-            },
-            "currentBasis": {
-              "$ref": "#/$defs/Basis"
-            },
-            "currentContentHash": {
-              "const": null
-            },
-            "message": {
-              "$ref": "#/$defs/Text"
-            },
-            "retryable": {
-              "const": true
-            },
-            "progress": {
-              "anyOf": [
-                {
-                  "type": "object",
-                  "additionalProperties": false,
-                  "properties": {
-                    "phase": {
-                      "enum": [
-                        "reading",
-                        "resolving",
-                        "evaluating",
-                        "measuring"
-                      ]
-                    },
-                    "completed": {
-                      "$ref": "#/$defs/UInt"
-                    },
-                    "total": {
-                      "$ref": "#/$defs/UInt"
-                    }
-                  },
-                  "required": [
-                    "phase",
-                    "completed",
-                    "total"
-                  ]
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "retryAfterMs": {
-              "$ref": "#/$defs/UInt"
-            }
-          },
-          "required": [
-            "code",
-            "message",
-            "retryable",
-            "currentBasis",
-            "currentContentHash",
-            "progress",
-            "retryAfterMs"
-          ],
-          "type": "object"
         },
         "ExternalIdentity": {
           "type": "object",
@@ -17271,9 +15688,6 @@
         },
         {
           "$ref": "#/$defs/Failure"
-        },
-        {
-          "$ref": "#/$defs/NoWorkspaceFailure"
         }
       ],
       "type": "object"
@@ -17712,81 +16126,225 @@
           "type": "object"
         },
         "Failure": {
+          "type": "object",
           "additionalProperties": false,
           "properties": {
-            "error": {
-              "oneOf": [
-                {
-                  "additionalProperties": false,
-                  "properties": {
-                    "code": {
-                      "$ref": "#/$defs/ResolvedFailureCode"
-                    },
-                    "currentBasis": {
-                      "anyOf": [
-                        {
-                          "$ref": "#/$defs/Basis"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ]
-                    },
-                    "currentContentHash": {
-                      "anyOf": [
-                        {
-                          "$ref": "#/$defs/Hash"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ]
-                    },
-                    "message": {
-                      "$ref": "#/$defs/Text"
-                    },
-                    "retryable": {
-                      "type": "boolean"
-                    }
-                  },
-                  "required": [
-                    "code",
-                    "message",
-                    "retryable",
-                    "currentBasis",
-                    "currentContentHash"
-                  ],
-                  "type": "object"
-                },
-                {
-                  "$ref": "#/$defs/LocatedRuleError"
-                },
-                {
-                  "$ref": "#/$defs/BuildingError"
-                }
-              ]
+            "schemaVersion": {
+              "const": 1
             },
             "requestId": {
               "$ref": "#/$defs/RequestId"
-            },
-            "schemaVersion": {
-              "const": 1
             },
             "workspace": {
               "type": "string"
             },
             "catchingUp": {
               "type": "boolean"
+            },
+            "error": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "enum": [
+                    "invalid_request",
+                    "range_too_large",
+                    "unsupported_encoding",
+                    "revision_conflict",
+                    "index_not_ready",
+                    "not_found",
+                    "too_many_requests",
+                    "deadline_exceeded",
+                    "rebuild_in_progress",
+                    "root_changed",
+                    "store_unavailable",
+                    "checkout_capacity",
+                    "daemon_unavailable",
+                    "outcome_unknown",
+                    "invalid_rules",
+                    "rules_not_found",
+                    "bounded_work",
+                    "response_too_large",
+                    "workspace_selection_failed",
+                    "building"
+                  ]
+                },
+                "message": {
+                  "$ref": "#/$defs/Text"
+                },
+                "retryable": {
+                  "type": "boolean"
+                },
+                "currentBasis": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Basis"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "currentContentHash": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Hash"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "attemptedWorkspace": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "enum": [
+                        "path",
+                        "invalid_type"
+                      ]
+                    },
+                    "value": {
+                      "type": "string",
+                      "maxLength": 256
+                    },
+                    "utf8Bytes": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "truncated": {
+                      "type": "boolean"
+                    },
+                    "jsonType": {
+                      "enum": [
+                        "null",
+                        "boolean",
+                        "number",
+                        "array",
+                        "object"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ]
+                },
+                "reason": {
+                  "enum": [
+                    "not_absolute",
+                    "not_checkout",
+                    "identity_changed",
+                    "unavailable"
+                  ]
+                },
+                "diagnostic": {
+                  "$ref": "#/$defs/RuleDiagnostic"
+                },
+                "progress": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "phase": {
+                          "enum": [
+                            "reading",
+                            "resolving",
+                            "evaluating",
+                            "measuring"
+                          ]
+                        },
+                        "completed": {
+                          "$ref": "#/$defs/UInt"
+                        },
+                        "total": {
+                          "$ref": "#/$defs/UInt"
+                        }
+                      },
+                      "required": [
+                        "phase",
+                        "completed",
+                        "total"
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "retryAfterMs": {
+                  "$ref": "#/$defs/UInt"
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "retryable",
+                "currentBasis",
+                "currentContentHash"
+              ],
+              "if": {
+                "properties": {
+                  "code": {
+                    "const": "building"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "progress",
+                  "retryAfterMs"
+                ],
+                "properties": {
+                  "retryable": {
+                    "const": true
+                  },
+                  "currentBasis": {
+                    "$ref": "#/$defs/Basis"
+                  },
+                  "currentContentHash": {
+                    "const": null
+                  }
+                }
+              },
+              "else": {
+                "properties": {
+                  "progress": false,
+                  "retryAfterMs": false
+                }
+              }
             }
           },
           "required": [
             "schemaVersion",
             "requestId",
-            "error",
-            "workspace",
-            "catchingUp"
+            "error"
           ],
-          "type": "object"
+          "if": {
+            "required": [
+              "workspace"
+            ]
+          },
+          "then": {
+            "required": [
+              "catchingUp"
+            ],
+            "properties": {
+              "error": {
+                "properties": {
+                  "attemptedWorkspace": false,
+                  "reason": false
+                }
+              }
+            }
+          },
+          "else": {
+            "not": {
+              "required": [
+                "catchingUp"
+              ]
+            }
+          }
         },
         "Hash": {
           "pattern": "^[0-9a-f]{64}$",
@@ -17860,241 +16418,6 @@
             "provenanceId"
           ],
           "type": "object"
-        },
-        "AttemptedWorkspace": {
-          "oneOf": [
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "kind": {
-                  "const": "path"
-                },
-                "value": {
-                  "type": "string",
-                  "maxLength": 256
-                },
-                "utf8Bytes": {
-                  "$ref": "#/$defs/UInt"
-                },
-                "truncated": {
-                  "type": "boolean"
-                }
-              },
-              "required": [
-                "kind",
-                "value",
-                "utf8Bytes",
-                "truncated"
-              ]
-            },
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "kind": {
-                  "const": "invalid_type"
-                },
-                "jsonType": {
-                  "enum": [
-                    "null",
-                    "boolean",
-                    "number",
-                    "array",
-                    "object"
-                  ]
-                }
-              },
-              "required": [
-                "kind",
-                "jsonType"
-              ]
-            }
-          ]
-        },
-        "NoWorkspaceFailure": {
-          "additionalProperties": false,
-          "properties": {
-            "error": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "code": {
-                  "enum": [
-                    "workspace_selection_failed",
-                    "invalid_request",
-                    "too_many_requests",
-                    "deadline_exceeded",
-                    "range_too_large"
-                  ]
-                },
-                "message": {
-                  "$ref": "#/$defs/Text"
-                },
-                "retryable": {
-                  "type": "boolean"
-                },
-                "currentBasis": {
-                  "const": null
-                },
-                "currentContentHash": {
-                  "const": null
-                },
-                "attemptedWorkspace": {
-                  "$ref": "#/$defs/AttemptedWorkspace"
-                },
-                "reason": {
-                  "enum": [
-                    "not_absolute",
-                    "not_checkout",
-                    "identity_changed",
-                    "unavailable"
-                  ]
-                }
-              },
-              "required": [
-                "code",
-                "message",
-                "retryable",
-                "currentBasis",
-                "currentContentHash"
-              ],
-              "oneOf": [
-                {
-                  "properties": {
-                    "code": {
-                      "const": "workspace_selection_failed"
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace",
-                    "reason"
-                  ],
-                  "if": {
-                    "properties": {
-                      "reason": {
-                        "const": "unavailable"
-                      }
-                    }
-                  },
-                  "then": {
-                    "properties": {
-                      "retryable": {
-                        "const": true
-                      }
-                    }
-                  },
-                  "else": {
-                    "properties": {
-                      "retryable": {
-                        "const": false
-                      }
-                    }
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "const": "invalid_request"
-                    },
-                    "retryable": {
-                      "const": false
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace"
-                  ],
-                  "not": {
-                    "required": [
-                      "reason"
-                    ]
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "enum": [
-                        "too_many_requests",
-                        "deadline_exceeded"
-                      ]
-                    },
-                    "retryable": {
-                      "const": true
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace"
-                  ],
-                  "not": {
-                    "required": [
-                      "reason"
-                    ]
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "enum": [
-                        "invalid_request",
-                        "range_too_large"
-                      ]
-                    },
-                    "retryable": {
-                      "const": false
-                    }
-                  },
-                  "not": {
-                    "anyOf": [
-                      {
-                        "required": [
-                          "attemptedWorkspace"
-                        ]
-                      },
-                      {
-                        "required": [
-                          "reason"
-                        ]
-                      }
-                    ]
-                  }
-                }
-              ]
-            },
-            "requestId": {
-              "$ref": "#/$defs/RequestId"
-            },
-            "schemaVersion": {
-              "const": 1
-            }
-          },
-          "required": [
-            "schemaVersion",
-            "requestId",
-            "error"
-          ],
-          "type": "object"
-        },
-        "ResolvedFailureCode": {
-          "enum": [
-            "invalid_request",
-            "range_too_large",
-            "unsupported_encoding",
-            "revision_conflict",
-            "index_not_ready",
-            "not_found",
-            "too_many_requests",
-            "deadline_exceeded",
-            "rebuild_in_progress",
-            "root_changed",
-            "store_unavailable",
-            "checkout_capacity",
-            "daemon_unavailable",
-            "outcome_unknown",
-            "invalid_rules",
-            "rules_not_found",
-            "bounded_work",
-            "response_too_large"
-          ]
         },
         "LineSpan": {
           "$ref": "#/$defs/Range"
@@ -18768,117 +17091,6 @@
             "attribution",
             "message"
           ]
-        },
-        "LocatedRuleError": {
-          "additionalProperties": false,
-          "properties": {
-            "code": {
-              "const": "invalid_rules"
-            },
-            "currentBasis": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/Basis"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "currentContentHash": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/Hash"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "message": {
-              "$ref": "#/$defs/Text"
-            },
-            "retryable": {
-              "type": "boolean"
-            },
-            "diagnostic": {
-              "$ref": "#/$defs/RuleDiagnostic"
-            }
-          },
-          "required": [
-            "code",
-            "message",
-            "retryable",
-            "currentBasis",
-            "currentContentHash",
-            "diagnostic"
-          ],
-          "type": "object"
-        },
-        "BuildingError": {
-          "additionalProperties": false,
-          "properties": {
-            "code": {
-              "const": "building"
-            },
-            "currentBasis": {
-              "$ref": "#/$defs/Basis"
-            },
-            "currentContentHash": {
-              "const": null
-            },
-            "message": {
-              "$ref": "#/$defs/Text"
-            },
-            "retryable": {
-              "const": true
-            },
-            "progress": {
-              "anyOf": [
-                {
-                  "type": "object",
-                  "additionalProperties": false,
-                  "properties": {
-                    "phase": {
-                      "enum": [
-                        "reading",
-                        "resolving",
-                        "evaluating",
-                        "measuring"
-                      ]
-                    },
-                    "completed": {
-                      "$ref": "#/$defs/UInt"
-                    },
-                    "total": {
-                      "$ref": "#/$defs/UInt"
-                    }
-                  },
-                  "required": [
-                    "phase",
-                    "completed",
-                    "total"
-                  ]
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "retryAfterMs": {
-              "$ref": "#/$defs/UInt"
-            }
-          },
-          "required": [
-            "code",
-            "message",
-            "retryable",
-            "currentBasis",
-            "currentContentHash",
-            "progress",
-            "retryAfterMs"
-          ],
-          "type": "object"
         },
         "ExternalIdentity": {
           "type": "object",
@@ -19952,9 +18164,6 @@
         },
         {
           "$ref": "#/$defs/Failure"
-        },
-        {
-          "$ref": "#/$defs/NoWorkspaceFailure"
         }
       ],
       "type": "object"
@@ -20169,237 +18378,6 @@
           "minimum": 0,
           "type": "integer"
         },
-        "AttemptedWorkspace": {
-          "oneOf": [
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "kind": {
-                  "const": "path"
-                },
-                "value": {
-                  "type": "string",
-                  "maxLength": 256
-                },
-                "utf8Bytes": {
-                  "$ref": "#/$defs/UInt"
-                },
-                "truncated": {
-                  "type": "boolean"
-                }
-              },
-              "required": [
-                "kind",
-                "value",
-                "utf8Bytes",
-                "truncated"
-              ]
-            },
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "kind": {
-                  "const": "invalid_type"
-                },
-                "jsonType": {
-                  "enum": [
-                    "null",
-                    "boolean",
-                    "number",
-                    "array",
-                    "object"
-                  ]
-                }
-              },
-              "required": [
-                "kind",
-                "jsonType"
-              ]
-            }
-          ]
-        },
-        "NoWorkspaceFailure": {
-          "additionalProperties": false,
-          "properties": {
-            "error": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "code": {
-                  "enum": [
-                    "workspace_selection_failed",
-                    "invalid_request",
-                    "too_many_requests",
-                    "deadline_exceeded",
-                    "range_too_large"
-                  ]
-                },
-                "message": {
-                  "$ref": "#/$defs/Text"
-                },
-                "retryable": {
-                  "type": "boolean"
-                },
-                "currentBasis": {
-                  "const": null
-                },
-                "currentContentHash": {
-                  "const": null
-                },
-                "attemptedWorkspace": {
-                  "$ref": "#/$defs/AttemptedWorkspace"
-                },
-                "reason": {
-                  "enum": [
-                    "not_absolute",
-                    "not_checkout",
-                    "identity_changed",
-                    "unavailable"
-                  ]
-                }
-              },
-              "required": [
-                "code",
-                "message",
-                "retryable",
-                "currentBasis",
-                "currentContentHash"
-              ],
-              "oneOf": [
-                {
-                  "properties": {
-                    "code": {
-                      "const": "workspace_selection_failed"
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace",
-                    "reason"
-                  ],
-                  "if": {
-                    "properties": {
-                      "reason": {
-                        "const": "unavailable"
-                      }
-                    }
-                  },
-                  "then": {
-                    "properties": {
-                      "retryable": {
-                        "const": true
-                      }
-                    }
-                  },
-                  "else": {
-                    "properties": {
-                      "retryable": {
-                        "const": false
-                      }
-                    }
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "const": "invalid_request"
-                    },
-                    "retryable": {
-                      "const": false
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace"
-                  ],
-                  "not": {
-                    "required": [
-                      "reason"
-                    ]
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "enum": [
-                        "too_many_requests",
-                        "deadline_exceeded"
-                      ]
-                    },
-                    "retryable": {
-                      "const": true
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace"
-                  ],
-                  "not": {
-                    "required": [
-                      "reason"
-                    ]
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "enum": [
-                        "invalid_request",
-                        "range_too_large"
-                      ]
-                    },
-                    "retryable": {
-                      "const": false
-                    }
-                  },
-                  "not": {
-                    "anyOf": [
-                      {
-                        "required": [
-                          "attemptedWorkspace"
-                        ]
-                      },
-                      {
-                        "required": [
-                          "reason"
-                        ]
-                      }
-                    ]
-                  }
-                }
-              ]
-            },
-            "requestId": {
-              "$ref": "#/$defs/RequestId"
-            },
-            "schemaVersion": {
-              "const": 1
-            }
-          },
-          "required": [
-            "schemaVersion",
-            "requestId",
-            "error"
-          ],
-          "type": "object"
-        },
-        "ResolvedFailureCode": {
-          "enum": [
-            "invalid_request",
-            "range_too_large",
-            "unsupported_encoding",
-            "revision_conflict",
-            "index_not_ready",
-            "not_found",
-            "too_many_requests",
-            "deadline_exceeded",
-            "rebuild_in_progress",
-            "root_changed",
-            "store_unavailable",
-            "checkout_capacity",
-            "daemon_unavailable",
-            "outcome_unknown"
-          ]
-        },
         "RequestId": {
           "oneOf": [
             {
@@ -20413,13 +18391,49 @@
           ]
         },
         "Failure": {
+          "type": "object",
           "additionalProperties": false,
           "properties": {
+            "schemaVersion": {
+              "const": 1
+            },
+            "requestId": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "catchingUp": {
+              "type": "boolean"
+            },
             "error": {
+              "type": "object",
               "additionalProperties": false,
               "properties": {
                 "code": {
-                  "$ref": "#/$defs/ResolvedFailureCode"
+                  "enum": [
+                    "invalid_request",
+                    "range_too_large",
+                    "unsupported_encoding",
+                    "revision_conflict",
+                    "index_not_ready",
+                    "not_found",
+                    "too_many_requests",
+                    "deadline_exceeded",
+                    "rebuild_in_progress",
+                    "root_changed",
+                    "store_unavailable",
+                    "checkout_capacity",
+                    "daemon_unavailable",
+                    "outcome_unknown",
+                    "workspace_selection_failed"
+                  ]
+                },
+                "message": {
+                  "$ref": "#/$defs/Text"
+                },
+                "retryable": {
+                  "type": "boolean"
                 },
                 "currentBasis": {
                   "anyOf": [
@@ -20441,11 +18455,47 @@
                     }
                   ]
                 },
-                "message": {
-                  "$ref": "#/$defs/Text"
+                "attemptedWorkspace": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "enum": [
+                        "path",
+                        "invalid_type"
+                      ]
+                    },
+                    "value": {
+                      "type": "string",
+                      "maxLength": 256
+                    },
+                    "utf8Bytes": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "truncated": {
+                      "type": "boolean"
+                    },
+                    "jsonType": {
+                      "enum": [
+                        "null",
+                        "boolean",
+                        "number",
+                        "array",
+                        "object"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ]
                 },
-                "retryable": {
-                  "type": "boolean"
+                "reason": {
+                  "enum": [
+                    "not_absolute",
+                    "not_checkout",
+                    "identity_changed",
+                    "unavailable"
+                  ]
                 }
               },
               "required": [
@@ -20454,30 +18504,39 @@
                 "retryable",
                 "currentBasis",
                 "currentContentHash"
-              ],
-              "type": "object"
-            },
-            "requestId": {
-              "$ref": "#/$defs/RequestId"
-            },
-            "schemaVersion": {
-              "const": 1
-            },
-            "workspace": {
-              "type": "string"
-            },
-            "catchingUp": {
-              "type": "boolean"
+              ]
             }
           },
           "required": [
             "schemaVersion",
             "requestId",
-            "error",
-            "workspace",
-            "catchingUp"
+            "error"
           ],
-          "type": "object"
+          "if": {
+            "required": [
+              "workspace"
+            ]
+          },
+          "then": {
+            "required": [
+              "catchingUp"
+            ],
+            "properties": {
+              "error": {
+                "properties": {
+                  "attemptedWorkspace": false,
+                  "reason": false
+                }
+              }
+            }
+          },
+          "else": {
+            "not": {
+              "required": [
+                "catchingUp"
+              ]
+            }
+          }
         }
       },
       "oneOf": [
@@ -20595,9 +18654,6 @@
         },
         {
           "$ref": "#/$defs/Failure"
-        },
-        {
-          "$ref": "#/$defs/NoWorkspaceFailure"
         }
       ],
       "type": "object"
@@ -20721,241 +18777,6 @@
           "minimum": 0,
           "type": "integer"
         },
-        "AttemptedWorkspace": {
-          "oneOf": [
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "kind": {
-                  "const": "path"
-                },
-                "value": {
-                  "type": "string",
-                  "maxLength": 256
-                },
-                "utf8Bytes": {
-                  "$ref": "#/$defs/UInt"
-                },
-                "truncated": {
-                  "type": "boolean"
-                }
-              },
-              "required": [
-                "kind",
-                "value",
-                "utf8Bytes",
-                "truncated"
-              ]
-            },
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "kind": {
-                  "const": "invalid_type"
-                },
-                "jsonType": {
-                  "enum": [
-                    "null",
-                    "boolean",
-                    "number",
-                    "array",
-                    "object"
-                  ]
-                }
-              },
-              "required": [
-                "kind",
-                "jsonType"
-              ]
-            }
-          ]
-        },
-        "NoWorkspaceFailure": {
-          "additionalProperties": false,
-          "properties": {
-            "error": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "code": {
-                  "enum": [
-                    "workspace_selection_failed",
-                    "invalid_request",
-                    "too_many_requests",
-                    "deadline_exceeded",
-                    "range_too_large"
-                  ]
-                },
-                "message": {
-                  "$ref": "#/$defs/Text"
-                },
-                "retryable": {
-                  "type": "boolean"
-                },
-                "currentBasis": {
-                  "const": null
-                },
-                "currentContentHash": {
-                  "const": null
-                },
-                "attemptedWorkspace": {
-                  "$ref": "#/$defs/AttemptedWorkspace"
-                },
-                "reason": {
-                  "enum": [
-                    "not_absolute",
-                    "not_checkout",
-                    "identity_changed",
-                    "unavailable"
-                  ]
-                }
-              },
-              "required": [
-                "code",
-                "message",
-                "retryable",
-                "currentBasis",
-                "currentContentHash"
-              ],
-              "oneOf": [
-                {
-                  "properties": {
-                    "code": {
-                      "const": "workspace_selection_failed"
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace",
-                    "reason"
-                  ],
-                  "if": {
-                    "properties": {
-                      "reason": {
-                        "const": "unavailable"
-                      }
-                    }
-                  },
-                  "then": {
-                    "properties": {
-                      "retryable": {
-                        "const": true
-                      }
-                    }
-                  },
-                  "else": {
-                    "properties": {
-                      "retryable": {
-                        "const": false
-                      }
-                    }
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "const": "invalid_request"
-                    },
-                    "retryable": {
-                      "const": false
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace"
-                  ],
-                  "not": {
-                    "required": [
-                      "reason"
-                    ]
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "enum": [
-                        "too_many_requests",
-                        "deadline_exceeded"
-                      ]
-                    },
-                    "retryable": {
-                      "const": true
-                    }
-                  },
-                  "required": [
-                    "attemptedWorkspace"
-                  ],
-                  "not": {
-                    "required": [
-                      "reason"
-                    ]
-                  }
-                },
-                {
-                  "properties": {
-                    "code": {
-                      "enum": [
-                        "invalid_request",
-                        "range_too_large"
-                      ]
-                    },
-                    "retryable": {
-                      "const": false
-                    }
-                  },
-                  "not": {
-                    "anyOf": [
-                      {
-                        "required": [
-                          "attemptedWorkspace"
-                        ]
-                      },
-                      {
-                        "required": [
-                          "reason"
-                        ]
-                      }
-                    ]
-                  }
-                }
-              ]
-            },
-            "requestId": {
-              "$ref": "#/$defs/RequestId"
-            },
-            "schemaVersion": {
-              "const": 1
-            }
-          },
-          "required": [
-            "schemaVersion",
-            "requestId",
-            "error"
-          ],
-          "type": "object"
-        },
-        "ResolvedFailureCode": {
-          "enum": [
-            "invalid_request",
-            "range_too_large",
-            "unsupported_encoding",
-            "revision_conflict",
-            "index_not_ready",
-            "not_found",
-            "too_many_requests",
-            "deadline_exceeded",
-            "rebuild_in_progress",
-            "root_changed",
-            "store_unavailable",
-            "checkout_capacity",
-            "daemon_unavailable",
-            "outcome_unknown",
-            "invalid_rules",
-            "rules_not_found",
-            "bounded_work",
-            "response_too_large"
-          ]
-        },
         "RequestId": {
           "oneOf": [
             {
@@ -20969,143 +18790,222 @@
           ]
         },
         "Failure": {
+          "type": "object",
           "additionalProperties": false,
           "properties": {
-            "error": {
-              "oneOf": [
-                {
-                  "additionalProperties": false,
-                  "properties": {
-                    "code": {
-                      "$ref": "#/$defs/ResolvedFailureCode"
-                    },
-                    "currentBasis": {
-                      "anyOf": [
-                        {
-                          "$ref": "#/$defs/Basis"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ]
-                    },
-                    "currentContentHash": {
-                      "anyOf": [
-                        {
-                          "$ref": "#/$defs/Hash"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ]
-                    },
-                    "message": {
-                      "$ref": "#/$defs/Text"
-                    },
-                    "retryable": {
-                      "type": "boolean"
-                    }
-                  },
-                  "required": [
-                    "code",
-                    "message",
-                    "retryable",
-                    "currentBasis",
-                    "currentContentHash"
-                  ],
-                  "type": "object"
-                },
-                {
-                  "$ref": "#/$defs/BuildingError"
-                }
-              ]
+            "schemaVersion": {
+              "const": 1
             },
             "requestId": {
               "$ref": "#/$defs/RequestId"
-            },
-            "schemaVersion": {
-              "const": 1
             },
             "workspace": {
               "type": "string"
             },
             "catchingUp": {
               "type": "boolean"
+            },
+            "error": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "enum": [
+                    "invalid_request",
+                    "range_too_large",
+                    "unsupported_encoding",
+                    "revision_conflict",
+                    "index_not_ready",
+                    "not_found",
+                    "too_many_requests",
+                    "deadline_exceeded",
+                    "rebuild_in_progress",
+                    "root_changed",
+                    "store_unavailable",
+                    "checkout_capacity",
+                    "daemon_unavailable",
+                    "outcome_unknown",
+                    "invalid_rules",
+                    "rules_not_found",
+                    "bounded_work",
+                    "response_too_large",
+                    "workspace_selection_failed",
+                    "building"
+                  ]
+                },
+                "message": {
+                  "$ref": "#/$defs/Text"
+                },
+                "retryable": {
+                  "type": "boolean"
+                },
+                "currentBasis": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Basis"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "currentContentHash": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Hash"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "attemptedWorkspace": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "enum": [
+                        "path",
+                        "invalid_type"
+                      ]
+                    },
+                    "value": {
+                      "type": "string",
+                      "maxLength": 256
+                    },
+                    "utf8Bytes": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "truncated": {
+                      "type": "boolean"
+                    },
+                    "jsonType": {
+                      "enum": [
+                        "null",
+                        "boolean",
+                        "number",
+                        "array",
+                        "object"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ]
+                },
+                "reason": {
+                  "enum": [
+                    "not_absolute",
+                    "not_checkout",
+                    "identity_changed",
+                    "unavailable"
+                  ]
+                },
+                "progress": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "phase": {
+                          "enum": [
+                            "reading",
+                            "resolving",
+                            "evaluating",
+                            "measuring"
+                          ]
+                        },
+                        "completed": {
+                          "$ref": "#/$defs/UInt"
+                        },
+                        "total": {
+                          "$ref": "#/$defs/UInt"
+                        }
+                      },
+                      "required": [
+                        "phase",
+                        "completed",
+                        "total"
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "retryAfterMs": {
+                  "$ref": "#/$defs/UInt"
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "retryable",
+                "currentBasis",
+                "currentContentHash"
+              ],
+              "if": {
+                "properties": {
+                  "code": {
+                    "const": "building"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "progress",
+                  "retryAfterMs"
+                ],
+                "properties": {
+                  "retryable": {
+                    "const": true
+                  },
+                  "currentBasis": {
+                    "$ref": "#/$defs/Basis"
+                  },
+                  "currentContentHash": {
+                    "const": null
+                  }
+                }
+              },
+              "else": {
+                "properties": {
+                  "progress": false,
+                  "retryAfterMs": false
+                }
+              }
             }
           },
           "required": [
             "schemaVersion",
             "requestId",
-            "error",
-            "workspace",
-            "catchingUp"
+            "error"
           ],
-          "type": "object"
-        },
-        "BuildingError": {
-          "additionalProperties": false,
-          "properties": {
-            "code": {
-              "const": "building"
-            },
-            "currentBasis": {
-              "$ref": "#/$defs/Basis"
-            },
-            "currentContentHash": {
-              "const": null
-            },
-            "message": {
-              "$ref": "#/$defs/Text"
-            },
-            "retryable": {
-              "const": true
-            },
-            "progress": {
-              "anyOf": [
-                {
-                  "type": "object",
-                  "additionalProperties": false,
-                  "properties": {
-                    "phase": {
-                      "enum": [
-                        "reading",
-                        "resolving",
-                        "evaluating",
-                        "measuring"
-                      ]
-                    },
-                    "completed": {
-                      "$ref": "#/$defs/UInt"
-                    },
-                    "total": {
-                      "$ref": "#/$defs/UInt"
-                    }
-                  },
-                  "required": [
-                    "phase",
-                    "completed",
-                    "total"
-                  ]
-                },
-                {
-                  "type": "null"
+          "if": {
+            "required": [
+              "workspace"
+            ]
+          },
+          "then": {
+            "required": [
+              "catchingUp"
+            ],
+            "properties": {
+              "error": {
+                "properties": {
+                  "attemptedWorkspace": false,
+                  "reason": false
                 }
-              ]
-            },
-            "retryAfterMs": {
-              "$ref": "#/$defs/UInt"
+              }
             }
           },
-          "required": [
-            "code",
-            "message",
-            "retryable",
-            "currentBasis",
-            "currentContentHash",
-            "progress",
-            "retryAfterMs"
-          ],
-          "type": "object"
+          "else": {
+            "not": {
+              "required": [
+                "catchingUp"
+              ]
+            }
+          }
         },
         "Warning": {
           "additionalProperties": false,
@@ -21431,9 +19331,6 @@
         },
         {
           "$ref": "#/$defs/Failure"
-        },
-        {
-          "$ref": "#/$defs/NoWorkspaceFailure"
         }
       ],
       "type": "object"

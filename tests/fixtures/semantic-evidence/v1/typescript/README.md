@@ -38,7 +38,7 @@ Native measurement does no type checking, so `tsconfig.json` (`allowJs:false`,
 `captures/native.json` has SHA-256
 `92febb682d97fd2b8042bef076fffd5de100984d021df3e8af181d0c676ae180`. The compiled
 native extractor hash is
-`4c3fc5c054fd09ea3e351861ff0f886597ad3e8a37686b7a6bcd6bc0406af614`, pinned as
+`52146f9e02702038ec4ebf7a5958da378ea9b718e2f270e618ed5bfebe89e78c`, pinned as
 `trellis-native-v16-typescript-test-support` in
 `docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json`. It is the final
 native-v16 extractor of #683. The #800 review re-pinned it after the extractor
@@ -47,7 +47,9 @@ stopped measuring type-only import expressions (`typeof import("m")`,
 The #801 recapture changed only `src/geometry.ts` (the class-owned calls above),
 under the same extractor hash. #807 re-pinned the hash when capture began selecting nested
 `pyproject.toml` files as config inputs; two recaptures are byte-identical to the
-stored capture.
+stored capture. The #772/#773/#828/#854/#717 extractor batch re-pinned it again for its
+new root and nested config inputs; two recaptures are byte-identical to the stored
+capture.
 
 ## Reproduce
 

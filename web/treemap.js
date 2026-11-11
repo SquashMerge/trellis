@@ -16,7 +16,9 @@
   const testFile = file => file.fileRole === "test" || classification(file) === "test";
   const count = value => Number.isSafeInteger(value) && value >= 0;
   const metrics = new Set(["role", "cognitive", "cyclomatic", "maxNesting", "maintainabilityIndex", "halstead.volume", "fanOut"]);
-  function create({request, context, readSource, onConflict = () => {}, onInspect = () => {}}) {
+  // `appFilter()` is the page's app choice (#852): null for All apps, else `{name, holds(path)}`.
+  // `showApp(path)` makes the choice one that shows an indexed path.
+  function create({request, context, readSource, onConflict = () => {}, onInspect = () => {}, appFilter = () => null, showApp = () => {}}) {
     let serial = 0, renderSerial = 0, selectionSerial = 0, navigationSerial = 0, view = null, basis = null, selectedKey = null;
     let metric = "cognitive", aggregate = "max", role = "production", relative = false, hideTests = true, path = "", language = "", scope = null;
     let relayout = null, resizeTimer = null;
@@ -97,8 +99,10 @@
       }
       return payload;
     }
+    // The app choice in force for the drawn files; set as each render starts.
+    let inApp = null;
     function included(file) {
-      return (!hideTests || !testFile(file)) && (!language || file.language === language) && (!path || file.path.includes(path)) &&
+      return (!inApp || inApp.holds(file.path)) && (!hideTests || !testFile(file)) && (!language || file.language === language) && (!path || file.path.includes(path)) &&
         (!scope || (file.sourceSetId === scope.sourceSetId && (!scope.path || file.path.startsWith(scope.path + "/"))));
     }
     function visibleFiles() {
@@ -161,7 +165,7 @@
     async function render(select = null) {
       if (!usable()) return;
       const payload = view, c = basis, ticket = ++renderSerial;
-      let ready = false; relayout = null;
+      let ready = false; relayout = null; inApp = appFilter();
       const active = () => current(c) && view === payload && ticket === renderSerial;
       const interactive = () => active() && ready;
       clearInspection(); get("treemap-diagram").replaceChildren(); get("treemap-files").replaceChildren();
@@ -221,7 +225,7 @@
           button.addEventListener("click", () => inspect(file, interactive)); get("treemap-files").append(button);
         }
         const total = files.reduce((sum, file) => sum + file.physicalLines, 0);
-        const message = files.length ? `${files.length} of ${payload.files.length} indexed files · ${total} physical file lines · ${aggregate} · ${population()} · test files ${hideTests ? "hidden" : "shown"} · ${exclusions(payload.files)}.` : `No indexed files match this scope and filters. Change the filters${scope ? " or use All indexed files" : ""}.`;
+        const message = files.length ? `${files.length} of ${payload.files.length} indexed files${inApp ? " in this app" : ""} · ${total} physical file lines · ${aggregate} · ${population()} · test files ${hideTests ? "hidden" : "shown"} · ${exclusions(payload.files)}.` : `No indexed files match this scope and filters. Change the filters${scope ? " or use All indexed files" : ""}${inApp ? " or choose All apps" : ""}.`;
         state(`${message}${payload.layerExclusionsWarning ? ` · ${payload.layerExclusionsWarning}` : ""}`, files.length ? "ready" : "empty", payload.layerExclusionsWarning || "");
         if (select) { const file = files.find(item => identity(item) === select); if (file) inspect(file, interactive); }
         // Resizes during the first paint had no relayout to call; reconcile with the box once.
@@ -257,12 +261,23 @@
         if (error.status === 409 && ["revision_conflict", "pin_expired", "root_changed"].includes(error.code)) onConflict(error);
       } finally { if (current(c) && !view) get("treemap-diagram").setAttribute("aria-busy", "false"); }
     }
+    // The app choice or its assignment changed (#852): the held files are drawn again, never read. A
+    // new choice starts at the whole checkout; the same choice keeps the directory.
+    function scopeChanged() {
+      if (!usable()) return;
+      const next = appFilter()?.name ?? null;
+      if (next === null && !inApp) return;
+      if (next !== (inApp?.name ?? null)) { navigationSerial++; scope = null; }
+      return render();
+    }
     async function openFile(file, pin) {
       if (!file || ![file.sourceSetId, file.language, file.path].every(value => typeof value === "string" && value.length) || !window.TrellisIndexPin.equal(pin, context().pin)) return false;
       const navigation = ++navigationSerial, loading = refresh(), c = capture(); await loading;
       if (navigation !== navigationSerial || !current(c) || !usable() || !window.TrellisIndexPin.equal(pin, basis.pin)) return false;
       const selected = view.files.find(item => identity(item) === identity(file));
       if (!selected) { state("Requested indexed file identity was not returned. Nothing selected.", "error"); return false; }
+      // A file outside the chosen app is shown under its own app's choice.
+      if (appFilter() && !appFilter().holds(selected.path)) showApp(selected.path);
       path = ""; language = ""; get("treemap-path").value = ""; get("treemap-language").value = "";
       scope = {sourceSetId:selected.sourceSetId, path:selected.path.includes("/") ? selected.path.slice(0, selected.path.lastIndexOf("/")) : ""};
       if (testFile(selected)) { hideTests = false; get("treemap-hide-tests").checked = false; }
@@ -297,7 +312,7 @@
       const next = event.target.checked ? "all" : "production";
       if (next === role) return; role = next; return refresh();
     });
-    return {refresh, reset, clearInspection, openFile};
+    return {refresh, reset, clearInspection, openFile, scopeChanged};
   }
   window.TrellisTreemap = {create, identity, quartiles, band, metricValue, classification, testFile};
 })();

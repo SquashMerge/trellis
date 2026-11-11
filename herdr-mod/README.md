@@ -2,14 +2,15 @@
 
 A [Herdr app](https://herdr.dev) mod that shows Trellis in a pane beside the coding agents (#707). It has two views, drawn the same way the web app draws them:
 
-- **Architecture:** the layer stack, with the layers and their counts as native rows.
+- **Architecture:** the web app's Architecture view (#886): Color by and Aggregation, the app switcher with one column per app, HTTP interface cards and cross-app lines, the deviation counts and the Deviations tree, the heat legend and the inspector, with the layers and their counts as native rows.
 - **Sequence:** a method's static call sequence, with its steps as native rows. Clicking a proven call re-centers on that method.
 
 Both views follow the file selected in the `trellis-files` panel. The pane talks to the Trellis daemon on the machine the shown space lives on.
 
 - `src/main.js` is the pane: the followed checkout with a pin, index status, typed error states, the diagram and the layer list.
 - `src/client.js` is the daemon client: routes, the two transports (`fetch` here, `trellis api` elsewhere) and typed errors.
-- `src/diagram.js` draws Architecture. It uses the browser's own `web/architecture-pele.js`, `web/metric-heat.js`, `web/architecture.js` helpers and the vendored Pele, bundled unchanged.
+- `src/diagram.js` draws Architecture. It uses the browser's own `web/architecture-pele.js`, `web/metric-heat.js`, `web/architecture.js` (`createDisplay`), `web/architecture-apps.js`, `web/architecture-deviations.js` (its model) and the vendored Pele, bundled unchanged, and reads the colour tokens and the Color by choices from `web/style.css` and `web/index.html` at build time.
+- `src/architecture-ui.js` lays out the Architecture tab's native parts: controls, switcher, column headers, interface cards, legend, inspector and Deviations tree.
 - `src/sequence.js` draws Sequence. It uses `web/sequence-pele.js` and the helpers in `web/sequence.js`, bundled unchanged.
 - `src/dom.js` is the small SVG DOM the adapter needs, because the mod runtime has none.
 - `trellis-files/publish-selection.patch` is the one change to a clone of Herdr's shipped Files mod.
@@ -126,6 +127,6 @@ Reading a checkout's status starts indexing it, so only checkouts an agent, the 
 - After every change, run `herdr-app check ~/.config/herdr-app/mods/trellis` and `herdr-app status`. Then look at the pane with `herdr-app shot <file>`.
 - `node test/harness.mjs --url <daemon> --token-file <file> [--cwd <folder>] [--select <path>] [--click layer-<name>]` runs the real `src/main.js` in Node. It runs against a live daemon, with stand-ins for Herdr's modules, and prints the text the pane would show and the drawing it wrote. It checks the data path, not the picture.
 
-- `node --import ./herdr-mod/test/register.mjs --test herdr-mod/test/mod.test.mjs herdr-mod/test/view.test.mjs herdr-mod/test/setup.test.mjs`, run from the repository root, tests the logic. `view.test.mjs` runs the real pane against a fake daemon through the `trellis api` transport, with a stand-in `trellis` that prints and exits as the CLI does. `setup.test.mjs` runs `setup-viewer.sh` against a stand-in mini (an `ssh` script over a temporary home). They need no install, and `tools/verify` runs them in the `checks` lane.
+- `node --import ./herdr-mod/test/register.mjs --test herdr-mod/test/mod.test.mjs herdr-mod/test/view.test.mjs herdr-mod/test/parity.test.mjs herdr-mod/test/setup.test.mjs`, run from the repository root, tests the logic. `view.test.mjs` runs the real pane against a fake daemon through the `trellis api` transport, with a stand-in `trellis` that prints and exits as the CLI does. `setup.test.mjs` runs `setup-viewer.sh` against a stand-in mini (an `ssh` script over a temporary home). They need no install, and `tools/verify` runs them in the `checks` lane.
 
 The build itself isn't part of `tools/verify`, because it needs `npm ci`, which downloads esbuild.

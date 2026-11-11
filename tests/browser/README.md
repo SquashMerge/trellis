@@ -192,6 +192,15 @@ reads), at three widths with and without test edges, and to a synthetic summary 
 two shared boxes and a shared-to-shared arrow. It also checks the width scale's ordering and
 clamps. It needs no daemon.
 
+### App switcher (#852)
+
+`app-switcher.test.cjs` indexes a two-app checkout (an authored Rust `srv`, a detected JavaScript
+`web`, a browser test that is web's through its layer, an unassigned vendored file under web's
+root, and a tool in no app) and drives the one app choice that Treemap, Classes, the Files tree
+and Architecture share: each view's filter, the switchers' pressed state, and the button geometry
+at 1200 and 760 px under classic 15px scrollbars. Its negative control is a one-app checkout,
+which draws no switcher and filters nothing.
+
 ## Treemap acceptance
 
 `treemap.test.cjs` drives the real daemon, indexed per-file line/role/metric response

@@ -10,9 +10,11 @@ use tree_sitter::{Node, Parser, Tree};
 use work::Work;
 
 pub(crate) mod callers;
+mod cargo_workspace;
 pub mod external;
 mod java;
 mod javascript;
+mod js_workspace;
 pub(crate) mod parallel_check;
 mod python;
 mod rust;
@@ -606,7 +608,10 @@ fn resolve(
             0 => {
                 let packages =
                     external::RustPackages::new(&snapshot.manifests, &mut work, &mut check)?;
-                let catalog = rust::Catalog::new(&docs, &trees, &document_map, work, &mut check)?;
+                let workspace =
+                    cargo_workspace::Workspace::new(&snapshot.manifests, &mut work, &mut check)?;
+                let catalog =
+                    rust::Catalog::new(&docs, &trees, &document_map, &workspace, work, &mut check)?;
                 let used = catalog.work.used;
                 return Ok((CatalogJob::Rust(Box::new((catalog, packages))), used));
             }
@@ -631,12 +636,15 @@ fn resolve(
                         &mut work,
                         &mut check,
                     )?;
+                    let workspaces =
+                        js_workspace::Workspaces::new(&snapshot.manifests, &mut work, &mut check)?;
                     Some(javascript::Catalog::new(
                         &docs,
                         &trees,
                         &document_map,
                         &selected,
                         &packages,
+                        &workspaces,
                         snapshot.root_tsconfig.as_ref(),
                         &mut work,
                         request,
@@ -1313,7 +1321,8 @@ impl SiteContext<'_> {
 
 fn merge_work(work: &mut Work, used: usize, check: &mut impl FnMut() -> Result<()>) -> Result<()> {
     check()?;
-    ensure!(work.charge(used), "bounded_work: reference owner lookup");
+    // The request total, not the phase whose count tipped it over (#894).
+    ensure!(work.charge(used), "bounded_work: reference work total");
     Ok(())
 }
 
@@ -2163,7 +2172,14 @@ mod parallel_tests {
             if language == 0 {
                 rx.lock().unwrap().recv().unwrap();
                 let packages = external::RustPackages::new(&[], &mut work, &mut check)?;
-                let catalog = rust::Catalog::new(&docs, &trees, &documents, work, &mut check)?;
+                let catalog = rust::Catalog::new(
+                    &docs,
+                    &trees,
+                    &documents,
+                    &cargo_workspace::Workspace::default(),
+                    work,
+                    &mut check,
+                )?;
                 Ok(CatalogJob::Rust(Box::new((catalog, packages))))
             } else {
                 let catalog = java::Catalog::new(&docs, &trees, &selected, &mut work, &mut check)?;
@@ -2280,7 +2296,8 @@ mod parallel_tests {
         assert!(error.to_string().starts_with("bounded_work:"));
         let mut total = Work::new(3);
         merge_work(&mut total, 2, &mut || Ok(())).unwrap();
-        assert!(merge_work(&mut total, 2, &mut || Ok(())).is_err());
+        let error = merge_work(&mut total, 2, &mut || Ok(())).unwrap_err();
+        assert_eq!(error.to_string(), "bounded_work: reference work total");
         assert_eq!(total.used, 4);
     }
 }

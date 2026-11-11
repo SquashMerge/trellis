@@ -10,6 +10,9 @@ struct ResolveContext<'a, 'b> {
     packages: &'a external::RustPackages,
     docs: &'a [&'b DocumentInput],
     waive_external: bool,
+    /// The lookup reached this crate from another workspace member (#772), so `pub(crate)`
+    /// names are not visible.
+    foreign: bool,
 }
 #[derive(Default)]
 struct ExportTrace {
@@ -111,13 +114,53 @@ struct Import {
     alias: Option<String>,
     star: bool,
     public: bool,
+    /// `pub(crate)`: visible in its own crate only.
+    crate_only: bool,
     uncertain: bool,
+}
+/// A scope's imports in source order. Named imports are also indexed by binding name and star
+/// imports listed, so a name lookup reads only the imports that can bind it (#894).
+#[derive(Default)]
+struct Imports {
+    all: Vec<Import>,
+    named: BTreeMap<String, Vec<usize>>,
+    stars: Vec<usize>,
+}
+impl Imports {
+    fn push(&mut self, import: Import) {
+        let index = self.all.len();
+        if import.star {
+            self.stars.push(index);
+        } else if let Some(name) = import.binding_name() {
+            self.named.entry(name.to_owned()).or_default().push(index);
+        }
+        self.all.push(import);
+    }
+    /// The named imports binding `name`, in source order.
+    fn named(&self, name: &str) -> impl Iterator<Item = &Import> {
+        self.named
+            .get(name)
+            .into_iter()
+            .flatten()
+            .map(|&index| &self.all[index])
+    }
+    /// The star imports, in source order.
+    fn stars(&self) -> impl Iterator<Item = &Import> {
+        self.stars.iter().map(|&index| &self.all[index])
+    }
 }
 #[derive(Clone)]
 struct Binding {
     candidate: Option<Candidate>,
     public: bool,
+    /// `pub(crate)`: visible in its own crate only.
+    crate_only: bool,
     uncertain: bool,
+}
+impl Binding {
+    fn visible(&self, context: ResolveContext<'_, '_>) -> bool {
+        self.public && !(self.crate_only && context.foreign)
+    }
 }
 struct Scope {
     document: usize,
@@ -127,7 +170,7 @@ struct Scope {
     module: usize,
     directory: String,
     explicit: BTreeMap<Name, Vec<Binding>>,
-    imports: Vec<Import>,
+    imports: Imports,
     opaque: bool,
     /// Something past the walk bounds was skipped here, so even an explicit name can collide.
     cut: bool,
@@ -142,12 +185,15 @@ struct ModuleEdge {
 pub(super) struct Catalog {
     scopes: Vec<Scope>,
     scope_indexes: BTreeMap<usize, ScopeIndex>,
-    export_memo: BTreeMap<(usize, usize, bool), std::sync::Arc<ExportMemo>>,
+    export_memo: BTreeMap<(usize, usize, bool, bool), std::sync::Arc<ExportMemo>>,
     export_traces: Vec<ExportTrace>,
     files: BTreeMap<usize, usize>,
     file_declarations: BTreeMap<usize, DeclarationId>,
     roots: BTreeMap<usize, BTreeSet<usize>>,
     ambiguous: BTreeSet<usize>,
+    /// The extern crate names each crate root scope binds to proved Cargo workspace member
+    /// libraries (#772): the library root's file scope, or `None` when bound but unproved.
+    externs: BTreeMap<usize, BTreeMap<String, Option<usize>>>,
     pub(super) work: Work,
 }
 
@@ -156,6 +202,7 @@ impl Catalog {
         docs: &[&DocumentInput],
         trees: &[Tree],
         documents: &BTreeMap<DocumentKey, usize>,
+        workspace: &super::cargo_workspace::Workspace,
         work: Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Self> {
@@ -168,7 +215,20 @@ impl Catalog {
             file_declarations: BTreeMap::new(),
             roots: BTreeMap::new(),
             ambiguous: BTreeSet::new(),
+            externs: BTreeMap::new(),
             work,
+        };
+        // A crate root: a conventional root of the checkout's package, or a library or binary
+        // root of a proved Cargo workspace member (#772). Its modules live in its directory.
+        let crate_root = |doc: &DocumentInput| -> Option<String> {
+            let path = doc.key.path.as_str();
+            if matches!(path, "src/lib.rs" | "src/main.rs") {
+                return Some("src".to_owned());
+            }
+            workspace.crate_root(&doc.key.source_set_id, path)?;
+            // A root at the checkout's top level (`[lib] path = "lib.rs"`) has the checkout
+            // directory, `""`, as its module directory.
+            Some(path.rsplit_once('/').map_or("", |(dir, _)| dir).to_owned())
         };
         let mut declarations = BTreeMap::new();
         for (document, doc) in docs.iter().enumerate() {
@@ -202,8 +262,8 @@ impl Catalog {
                 );
             }
             let path = &doc.key.path;
-            let directory = if matches!(path.as_str(), "src/lib.rs" | "src/main.rs") {
-                "src".to_owned()
+            let directory = if let Some(directory) = crate_root(doc) {
+                directory
             } else if let Some(prefix) = path.strip_suffix("/mod.rs") {
                 prefix.to_owned()
             } else {
@@ -243,7 +303,7 @@ impl Catalog {
             if edge.child.is_none() {
                 let scope = &result.scopes[edge.scope];
                 let doc = docs[scope.document];
-                let prefix = format!("{}/{}", scope.directory, edge.name);
+                let prefix = child_path(&scope.directory, &edge.name);
                 let candidates = find(
                     doc,
                     &[format!("{prefix}.rs"), format!("{prefix}/mod.rs")],
@@ -283,11 +343,25 @@ impl Catalog {
         }
         // A file is owned only by a unique, witnessed chain from a conventional root.
         for (&document, &scope) in &result.files.clone() {
-            if !matches!(
-                docs[document].key.path.as_str(),
-                "src/lib.rs" | "src/main.rs"
-            ) {
+            if crate_root(docs[document]).is_none() {
                 continue;
+            }
+            let key = &docs[document].key;
+            if let Some(root) = workspace.crate_root(&key.source_set_id, &key.path) {
+                let mut externs = BTreeMap::new();
+                for (name, library) in workspace.externs(&key.source_set_id, root) {
+                    result.step(check)?;
+                    let library = library.and_then(|path| {
+                        let document = documents.get(&DocumentKey {
+                            source_set_id: key.source_set_id.clone(),
+                            language: "rust".into(),
+                            path: path.to_owned(),
+                        })?;
+                        result.files.get(document).copied()
+                    });
+                    externs.insert(name, library);
+                }
+                result.externs.insert(scope, externs);
             }
             let mut pending = vec![(scope, BTreeSet::new())];
             while let Some((current, mut route)) = pending.pop() {
@@ -356,7 +430,10 @@ impl Catalog {
                 Some(_) => (BTreeSet::new(), true),
                 None => possible_module_names(&file.text),
             };
-            let below = format!("{}/", self.scopes[owner].directory);
+            let below = match self.scopes[owner].directory.as_str() {
+                "" => String::new(),
+                directory => format!("{directory}/"),
+            };
             for (&other, &child) in &self.files.clone() {
                 self.step(check)?;
                 let path = &docs[other].key.path;
@@ -409,8 +486,8 @@ impl Catalog {
         scope: usize,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Vec<Import>> {
-        self.charge(self.scopes[scope].imports.len(), check)?;
-        Ok(self.scopes[scope].imports.clone())
+        self.charge(self.scopes[scope].imports.all.len(), check)?;
+        Ok(self.scopes[scope].imports.all.clone())
     }
     fn add_scope(
         &mut self,
@@ -436,7 +513,7 @@ impl Catalog {
             module,
             directory,
             explicit: BTreeMap::new(),
-            imports: Vec::new(),
+            imports: Imports::default(),
             opaque: false,
             cut: false,
         });
@@ -527,6 +604,7 @@ impl Catalog {
                         .push(Binding {
                             candidate: None,
                             public: visibility(doc, child).is_some(),
+                            crate_only: false,
                             uncertain: true,
                         });
                 }
@@ -534,17 +612,22 @@ impl Catalog {
             }
             if child.kind() == "use_declaration" {
                 let public = visibility(doc, child).is_some();
-                let restricted = visibility(doc, child).is_some_and(|v| v != "pub");
+                let crate_only = crate_visibility(doc, child);
+                let restricted = visibility(doc, child).is_some_and(|v| v != "pub") && !crate_only;
                 if let Some(argument) = child.child_by_field_name("argument") {
                     let (imports, cut) = imports(
                         doc,
                         argument,
-                        public,
+                        (public, crate_only),
                         item_uncertain || restricted,
                         &mut self.work,
                         check,
                     )?;
-                    self.scopes[scope].imports.extend(imports);
+                    // Indexed once here; a name lookup then reads only its matches (#894).
+                    self.charge(imports.len(), check)?;
+                    for import in imports {
+                        self.scopes[scope].imports.push(import);
+                    }
                     // A skipped import could bind any name, so nothing here is proved absent.
                     self.scopes[scope].opaque |= cut;
                     self.scopes[scope].cut |= cut;
@@ -594,7 +677,10 @@ impl Catalog {
                     proof: BTreeSet::from([document]),
                 });
                 let public = visibility(doc, child).is_some();
-                let restricted = visibility(doc, child).is_some_and(|v| v != "pub");
+                // `pub(crate)` is visible throughout its crate (#828); other restricted
+                // visibilities are not modeled.
+                let crate_only = crate_visibility(doc, child);
+                let restricted = visibility(doc, child).is_some_and(|v| v != "pub") && !crate_only;
                 for &namespace in namespaces {
                     self.step(check)?;
                     self.scopes[scope]
@@ -604,6 +690,7 @@ impl Catalog {
                         .push(Binding {
                             candidate: candidate.clone(),
                             public,
+                            crate_only,
                             uncertain: item_uncertain
                                 || restricted
                                 || item_custom
@@ -611,7 +698,7 @@ impl Catalog {
                         });
                 }
                 if child.kind() == "mod_item" {
-                    let directory = format!("{}/{}", self.scopes[scope].directory, name);
+                    let directory = child_path(&self.scopes[scope].directory, &name);
                     let child_scope = if let Some(body) = child.child_by_field_name("body") {
                         let child_scope =
                             self.add_scope(document, body, Some(scope), directory, true, check)?;
@@ -701,6 +788,7 @@ impl Catalog {
                             .push(Binding {
                                 candidate: None,
                                 public: false,
+                                crate_only: false,
                                 uncertain: true,
                             });
                     }
@@ -812,7 +900,7 @@ impl Catalog {
             let bucket = result.names.entry(key).or_default();
             for binding in bindings {
                 self.step(check)?;
-                if exported && !binding.public {
+                if exported && !binding.visible(context) {
                     continue;
                 }
                 if binding.uncertain {
@@ -827,20 +915,32 @@ impl Catalog {
                 }
             }
         }
-        let imports = self.scope_imports(scope, check)?;
-        for import in imports
-            .iter()
-            .filter(|i| !i.star && i.binding_name() == Some(name))
-        {
+        // Only the imports that can bind `name`: its named imports and every star (#894).
+        let named: Vec<Import> = self.scopes[scope].imports.named(name).cloned().collect();
+        let stars: Vec<Import> = self.scopes[scope].imports.stars().cloned().collect();
+        self.charge(named.len() + stars.len(), check)?;
+        for import in &named {
             let mut resolved = if import.uncertain {
                 Names {
                     unknown_set: true,
                     ..Names::default()
                 }
             } else {
-                self.path(scope, &import.path, depth + 1, route, context, check)?
+                // The import's own path resolves in its defining crate; whether the caller
+                // may see the import is checked against the caller's context below.
+                self.path(
+                    scope,
+                    &import.path,
+                    depth + 1,
+                    route,
+                    ResolveContext {
+                        foreign: false,
+                        ..context
+                    },
+                    check,
+                )?
             };
-            if resolved.unknown_set && (!exported || import.public) {
+            if resolved.unknown_set && (!exported || import.visible(context)) {
                 // An unproved named import has a known spelling but unproved namespace.
                 for namespace in [TYPE, VALUE] {
                     result
@@ -856,7 +956,7 @@ impl Catalog {
             }
             for ((namespace, _), bucket) in std::mem::take(&mut resolved.names) {
                 explicit_namespaces.insert(namespace);
-                if exported && !import.public {
+                if exported && !import.visible(context) {
                     continue;
                 }
                 self.merge_bucket(
@@ -876,30 +976,30 @@ impl Catalog {
                 .filter(|(_, b)| b.unknown || !b.candidates.is_empty())
                 .map(|((ns, _), _)| *ns),
         );
-        let mut stars = Names::default();
-        for import in imports.iter().filter(|i| i.star && (!exported || i.public)) {
+        let mut star_names = Names::default();
+        for import in stars.iter().filter(|i| !exported || i.visible(context)) {
             if self.waived_star(scope, import, context, check)? {
                 continue;
             }
             let expanded =
                 self.expand(scope, import, depth + 1, route, context, Some(name), check)?;
-            stars.unknown_set |= expanded.unknown_set;
+            star_names.unknown_set |= expanded.unknown_set;
             for (key, bucket) in expanded
                 .names
                 .into_iter()
                 .filter(|((_, spelling), _)| spelling == name)
             {
-                self.merge_bucket(stars.names.entry(key).or_default(), bucket, check)?;
+                self.merge_bucket(star_names.names.entry(key).or_default(), bucket, check)?;
             }
         }
-        for (key, mut bucket) in stars.names {
+        for (key, mut bucket) in star_names.names {
             if explicit_namespaces.contains(&key.0) {
                 continue;
             }
-            bucket.unknown |= stars.unknown_set;
+            bucket.unknown |= star_names.unknown_set;
             result.names.insert(key, bucket);
         }
-        if stars.unknown_set {
+        if star_names.unknown_set {
             for namespace in [TYPE, VALUE] {
                 if !explicit_namespaces.contains(&namespace) {
                     result
@@ -976,7 +1076,7 @@ impl Catalog {
         path: &[String],
         depth: usize,
         route: &mut Route,
-        context: ResolveContext<'_, '_>,
+        mut context: ResolveContext<'_, '_>,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Names> {
         self.step(check)?;
@@ -990,6 +1090,7 @@ impl Catalog {
         let mut index = 0;
         let mut current = self.scopes[scope].module;
         let mut lexical = false;
+        let mut crate_root = self.root(scope).expect("proved root");
         match path[0].as_str() {
             "crate" => {
                 current = self.root(scope).expect("proved root");
@@ -1017,22 +1118,7 @@ impl Catalog {
             }
         }
         if index == path.len() {
-            // A module prefix alone is useful as an expansion target, not a synthetic declaration.
-            let mut names = Names::default();
-            let document = self.scopes[current].document;
-            let candidate = Candidate {
-                declaration: self.file_declarations[&document].clone(),
-                module: Some(current),
-                follow: depth,
-                proof: BTreeSet::from([document]),
-            };
-            names
-                .names
-                .entry((TYPE, path[index - 1].clone()))
-                .or_default()
-                .candidates
-                .insert(candidate.declaration.clone(), candidate);
-            return Ok(names);
+            return Ok(self.module_name(current, &path[index - 1], depth));
         }
         let mut proof = BTreeSet::new();
         loop {
@@ -1059,6 +1145,37 @@ impl Catalog {
                 && let Some(parent) = self.scopes[current].parent
             {
                 current = parent;
+                continue;
+            }
+            // An unbound first segment can name a workspace member crate the importing crate
+            // depends on (#772); local names shadow it, as in the extern prelude.
+            if lexical
+                && index == 0
+                && !found.unknown_set
+                && found
+                    .names
+                    .values()
+                    .all(|b| b.candidates.is_empty() && !b.unknown)
+                && let Some(library) = self
+                    .externs
+                    .get(&crate_root)
+                    .and_then(|externs| externs.get(&path[0]))
+                    .copied()
+            {
+                let Some(library) = library else {
+                    return Ok(Names {
+                        unknown_set: true,
+                        ..Names::default()
+                    });
+                };
+                lexical = false;
+                context.foreign = true;
+                crate_root = library;
+                current = library;
+                index = 1;
+                if index == path.len() {
+                    return Ok(self.module_name(current, &path[0], depth));
+                }
                 continue;
             }
             lexical = false;
@@ -1092,13 +1209,41 @@ impl Catalog {
             proof.extend(next.proof.iter().copied());
             depth = depth.max(next.follow);
             current = next.module.expect("proved module");
-            if self.root(current) != self.root(scope) {
-                return Ok(Names {
-                    unknown_set: true,
-                    ..Names::default()
-                });
+            // A proved binding (such as `use member::model as alias;`) can name a module of
+            // another workspace member: the rest of the path continues in that crate, with
+            // its foreign visibility.
+            match self.root(current) {
+                Some(root) if root == crate_root => {}
+                Some(root) => {
+                    crate_root = root;
+                    context.foreign = self.root(scope) != Some(root);
+                }
+                None => {
+                    return Ok(Names {
+                        unknown_set: true,
+                        ..Names::default()
+                    });
+                }
             }
         }
+    }
+    /// A module prefix alone, useful as an expansion target, not a synthetic declaration.
+    fn module_name(&self, module: usize, name: &str, depth: usize) -> Names {
+        let mut names = Names::default();
+        let document = self.scopes[module].document;
+        let candidate = Candidate {
+            declaration: self.file_declarations[&document].clone(),
+            module: Some(module),
+            follow: depth,
+            proof: BTreeSet::from([document]),
+        };
+        names
+            .names
+            .entry((TYPE, name.to_owned()))
+            .or_default()
+            .candidates
+            .insert(candidate.declaration.clone(), candidate);
+        names
     }
     #[allow(clippy::too_many_arguments)] // Select a spelling without copying the full export set.
     fn expand(
@@ -1118,7 +1263,19 @@ impl Catalog {
                 ..Names::default()
             });
         }
-        let target = self.path(scope, &import.path, depth, route, context, check)?;
+        // The glob's path resolves in its defining crate; the caller's context still filters
+        // the names the target exports.
+        let target = self.path(
+            scope,
+            &import.path,
+            depth,
+            route,
+            ResolveContext {
+                foreign: false,
+                ..context
+            },
+            check,
+        )?;
         let mut modules = Vec::new();
         let mut unknown = target.unknown_set;
         for ((namespace, _), bucket) in target.names {
@@ -1247,7 +1404,7 @@ impl Catalog {
         }
         // Depth and waiver mode affect unknown sets. Cached computations are valid only
         // when none of their consulted route keys is already visiting in this caller.
-        let key = (module, depth, context.waive_external);
+        let key = (module, depth, context.waive_external, context.foreign);
         if let Some(memo) = self.export_memo.get(&key).cloned() {
             self.charge(memo.consulted.len(), check)?;
             if memo.consulted.is_disjoint(route) {
@@ -1306,7 +1463,10 @@ impl Catalog {
             self.step(check)?;
             let count = self.scopes[module].explicit[&key].len();
             self.charge(count, check)?;
-            if self.scopes[module].explicit[&key].iter().any(|b| b.public) {
+            if self.scopes[module].explicit[&key]
+                .iter()
+                .any(|b| b.visible(context))
+            {
                 spellings.insert(key.1);
             }
         }
@@ -1315,7 +1475,7 @@ impl Catalog {
             unknown_set: self.scopes[module].opaque,
             ..Names::default()
         };
-        for import in imports.iter().filter(|i| i.public) {
+        for import in imports.iter().filter(|i| i.visible(context)) {
             self.step(check)?;
             if import.star {
                 if self.waived_star(module, import, context, check)? {
@@ -1387,6 +1547,7 @@ impl Catalog {
                             packages,
                             docs,
                             waive_external: false,
+                            foreign: false,
                         },
                         Some(first),
                         check,
@@ -1496,6 +1657,7 @@ impl Catalog {
             packages,
             docs,
             waive_external: true,
+            foreign: false,
         };
         let mut route = BTreeSet::new();
         let mut shadowed = false;
@@ -1629,7 +1791,16 @@ fn parts(value: &str) -> Option<Vec<String>> {
             .all(|p| !p.is_empty() && p.chars().all(|c| c == '_' || c.is_alphanumeric())))
     .then(|| parts.into_iter().map(str::to_owned).collect())
 }
+/// Whether `node` is `pub(crate)`.
+fn crate_visibility(doc: &DocumentInput, node: Node<'_>) -> bool {
+    visibility(doc, node).is_some_and(|v| {
+        v.chars().filter(|c| !c.is_whitespace()).collect::<String>() == "pub(crate)"
+    })
+}
 impl Import {
+    fn visible(&self, context: ResolveContext<'_, '_>) -> bool {
+        self.public && !(self.crate_only && context.foreign)
+    }
     fn binding_name(&self) -> Option<&str> {
         if self.star || self.alias.as_deref() == Some("_") {
             None
@@ -1643,7 +1814,7 @@ impl Import {
 fn imports(
     doc: &DocumentInput,
     root: Node<'_>,
-    public: bool,
+    (public, crate_only): (bool, bool),
     uncertain: bool,
     work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
@@ -1713,6 +1884,7 @@ fn imports(
                     alias,
                     star,
                     public,
+                    crate_only,
                     uncertain,
                 });
             }
@@ -1752,7 +1924,7 @@ pub(super) fn extract(
         }
         if node.kind() == "use_declaration" {
             if let Some(argument) = node.child_by_field_name("argument") {
-                for import in imports(doc, argument, false, false, work, check)?.0 {
+                for import in imports(doc, argument, (false, false), false, work, check)?.0 {
                     ensure!(result.len() < SITES, "bounded_work: reference site count");
                     result.push(RawSite {
                         start: import.start,
@@ -1785,6 +1957,15 @@ pub(super) fn extract(
     Ok(result)
 }
 
+/// The path of module `name` in module directory `directory` (`""` is the checkout's).
+fn child_path(directory: &str, name: &str) -> String {
+    if directory.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{directory}/{name}")
+    }
+}
+
 #[cfg(test)]
 mod cache_tests {
     use super::*;
@@ -1798,7 +1979,7 @@ mod cache_tests {
             module,
             directory: "src".into(),
             explicit: BTreeMap::new(),
-            imports: Vec::new(),
+            imports: Imports::default(),
             opaque: false,
             cut: false,
         }
@@ -1824,6 +2005,7 @@ mod cache_tests {
             vec![Binding {
                 candidate: Some(candidate),
                 public: true,
+                crate_only: false,
                 uncertain: false,
             }],
         );
@@ -1837,6 +2019,7 @@ mod cache_tests {
             alias: None,
             star: true,
             public: true,
+            crate_only: false,
             uncertain: false,
         }
     }
@@ -1853,6 +2036,7 @@ mod cache_tests {
             files: BTreeMap::new(),
             file_declarations: BTreeMap::new(),
             ambiguous: BTreeSet::new(),
+            externs: BTreeMap::new(),
             work: Work::new(work::reference_limit(0, 0)),
         }
     }
@@ -1875,6 +2059,7 @@ mod cache_tests {
             packages: &packages,
             docs: &[],
             waive_external: false,
+            foreign: false,
         };
         for blocked_name in ["f", "*"] {
             for warm_first in [false, true] {
@@ -1913,6 +2098,7 @@ mod cache_tests {
             packages: &packages,
             docs: &[],
             waive_external: false,
+            foreign: false,
         };
         for blocked_name in ["f", "*"] {
             for warm_first in [false, true] {
@@ -1989,6 +2175,7 @@ mod cache_tests {
                 packages: &packages,
                 docs: &docs,
                 waive_external,
+                foreign: false,
             };
             let names = mode_catalog
                 .exports(0, depth, &mut Route::new(), context, &mut check)
@@ -2012,6 +2199,7 @@ mod cache_tests {
             packages: &packages,
             docs: &[],
             waive_external: false,
+            foreign: false,
         };
         for depth in [1, FOLLOW, 1] {
             let names = forwarding_catalog
@@ -2033,6 +2221,7 @@ mod cache_tests {
             packages: &packages,
             docs: &[],
             waive_external: false,
+            foreign: false,
         };
         let mut root = scope(0, 0);
         bind(&mut root, TYPE, "left", candidate(2, Some(1), &[0, 2]));
