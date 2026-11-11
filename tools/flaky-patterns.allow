@@ -166,7 +166,6 @@ store-open tests/semantic/semantic_publication_paths.rs semantic_executable_drif
 store-open tests/semantic/semantic_publication_paths.rs rebuilt_executable_retains_semantic_head_context_without_reusing_evidence -- opens before spawning the drift child and after it has exited
 
 # global-counter
-global-counter src/http.rs * -- #700: counts only the browser status reads' own blocking threads, never other readers
 global-counter src/references.rs * -- a test-support limit that tests set, not a count
 global-counter src/semantic_batch/testing.rs * -- unique stage and join id allocators; never asserted on
 global-counter src/store/native_first/witness.rs family_reserves_before_decoding_prefetched_children -- local to one single-threaded test; its decode fn pointer cannot capture a counter
