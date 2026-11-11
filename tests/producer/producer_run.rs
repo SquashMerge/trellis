@@ -49,6 +49,19 @@ impl World {
     /// Like `with`, and `extra` is also set in the daemon's own environment, the process that
     /// launches the producer.
     pub(crate) fn with_env(hooks: &[(&str, &str)], extra: &[(&str, &str)]) -> Self {
+        Self::build(hooks, extra, workspace)
+    }
+
+    /// Like `with_env`, for a checkout that is a Git checkout from the start (the MCP server
+    /// serves only those), so no `.git` appears under a running daemon.
+    pub(crate) fn with_git(hooks: &[(&str, &str)], extra: &[(&str, &str)]) -> Self {
+        Self::build(hooks, extra, |root| {
+            workspace(root);
+            fs::create_dir_all(root.join(".git")).unwrap();
+        })
+    }
+
+    fn build(hooks: &[(&str, &str)], extra: &[(&str, &str)], setup: impl FnOnce(&Path)) -> Self {
         let stub_dir = tempfile::Builder::new()
             .prefix("producer-stub-")
             .tempdir_in("/tmp")
@@ -70,7 +83,7 @@ impl World {
                 .iter()
                 .map(|(name, value)| ((*name).to_owned(), (*value).to_owned())),
         );
-        let checkout = start_checkout(workspace, &env);
+        let checkout = start_checkout(setup, &env);
         Self {
             checkout,
             stub_dir,

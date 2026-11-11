@@ -474,6 +474,46 @@ fn newer_head_while_running_supersedes_until_requested() {
     assert_eq!(at(&mut s, &live(), base, 3).action, Action::None);
 }
 
+/// A producer that left the evaluated set loses its schedule date: when it returns it is a new
+/// entry, not the old one (and not first in line by an old date).
+#[test]
+fn due_since_is_fresh_after_the_producer_returns() {
+    let base = Instant::now();
+    type Drop = fn(&mut OwnerState);
+    let drops: [(&str, Drop); 3] = [
+        ("invalid", |s| {
+            s.config = ConfigState::Invalid("producers.toml syntax error")
+        }),
+        ("missing", |s| s.config = ConfigState::Missing),
+        ("table removed", |s| s.config = config(&[BETA], 10, 60)),
+    ];
+    for (name, drop_producer) in drops {
+        let mut s = ready(&[ALPHA, BETA], base);
+        let first = at(&mut s, &live(), base, 1);
+        assert_eq!(
+            first.statuses[ALPHA].due_since,
+            Some(NOW_MS + 1000),
+            "{name}"
+        );
+        drop_producer(&mut s);
+        let gone = at(&mut s, &live(), base, 2);
+        assert!(
+            gone.statuses
+                .get(ALPHA)
+                .is_none_or(|status| status.due_since.is_none()),
+            "{name}"
+        );
+        assert!(!s.due_since.contains_key(ALPHA), "{name}");
+        s.config = config(&[ALPHA, BETA], 10, 60);
+        let back = at(&mut s, &live(), base, 5);
+        assert_eq!(
+            back.statuses[ALPHA].due_since,
+            Some(NOW_MS + 5000),
+            "{name}"
+        );
+    }
+}
+
 // --- failure handling and seeding ---
 
 #[test]

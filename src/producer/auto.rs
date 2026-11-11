@@ -447,16 +447,17 @@ impl OwnerState {
         true
     }
 
-    /// Record the dates the pass just published: set on entry, cleared with the schedule.
+    /// Record the dates the pass just published: set on entry, and cleared with the schedule,
+    /// including for a producer the pass no longer evaluates (its table or the whole file went).
     fn sync_due_since(&mut self, statuses: &BTreeMap<String, AutoRunStatus>) {
+        self.due_since.retain(|producer, _| {
+            statuses
+                .get(producer)
+                .is_some_and(|status| status.due_since.is_some())
+        });
         for (producer, status) in statuses {
-            match status.due_since {
-                Some(since) => {
-                    self.due_since.entry(producer.clone()).or_insert(since);
-                }
-                None => {
-                    self.due_since.remove(producer);
-                }
+            if let Some(since) = status.due_since {
+                self.due_since.entry(producer.clone()).or_insert(since);
             }
         }
     }

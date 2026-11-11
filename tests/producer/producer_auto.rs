@@ -106,6 +106,17 @@ pub(crate) fn auto_world(hooks: &[(&str, &str)], intervals: (u64, u64, u64)) -> 
     )
 }
 
+fn auto_git_world(intervals: (u64, u64, u64)) -> World {
+    let (name, value) = support::auto_intervals(intervals.0, intervals.1, intervals.2);
+    World::with_git(
+        &[],
+        &[
+            (trellis::testing::NATIVE_WATCHER_ENV, "on"),
+            (name.as_str(), value.as_str()),
+        ],
+    )
+}
+
 /// Hold points a run passes in order; a hook name is its socket file.
 const PRESLOT: &str = "preslot.sock";
 const SPAWNED: &str = "spawned.sock";
@@ -427,7 +438,7 @@ fn auto_run_field_shape() {
 
 #[test]
 fn invalid_config_reports_invalid_config_daemon_unaffected() {
-    let world = auto_world(&[], FAST);
+    let world = auto_git_world(FAST);
     approve(&world, &[]);
     support::write_producers_toml(&world.checkout.root, "[auto.trellis-synthetic-scip\n");
     let state = wait_auto(&world, "invalidConfig");
@@ -435,12 +446,7 @@ fn invalid_config_reports_invalid_config_daemon_unaffected() {
     assert_eq!(state["enabled"], false);
     assert_eq!(state["dueSince"], Value::Null);
 
-    // The daemon and its MCP server are unaffected. The server serves Git checkouts, and the
-    // daemon reconciles the new `.git` before it answers again.
-    fs::create_dir_all(world.checkout.root.join(".git")).unwrap();
-    trellis::testing::wait_until("the reconciled daemon", || {
-        world.producer("status", &[]).status.success()
-    });
+    // The daemon and its MCP server are unaffected.
     let mut mcp = Mcp::start(&world);
     let init = mcp.ask(
         "initialize",
