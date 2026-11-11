@@ -81,8 +81,9 @@ jobs:
         if: runner.os == 'Linux'
         run: touch "$RUNNER_TEMP/build-start"
       # verify provisions the browser packages and the pinned Chromium itself.
-      # On Linux the browser job also installs Chromium's system packages in the
-      # background, since only the browser suite at its end needs them (#244).
+      # On Linux the browser job also checks Chromium's system libraries in the
+      # background, and installs them with apt only if one is missing, since
+      # only the browser suite at its end needs them (#244).
       - run: ./tools/verify ${{ matrix.lanes }}
         env:
           PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/pw-browsers
