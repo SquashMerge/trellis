@@ -179,6 +179,11 @@ for arg in "$@"; do
   if [ "$arg" = tests/browser/sequence-harness.test.cjs ] && [ -z "\${TRELLIS_SUITE_BINARY:-}" ]; then exit 37; fi
   if [ "$arg" = tests/browser/navigation-resolved.test.cjs ] && [ -z "\${TRELLIS_NAVIGATION_FIXTURE_BINARY:-}" ]; then exit 38; fi
 done
+if [ "$1" = tools/verify-browser-libs.mjs ]; then
+  if [ "\${FAKE_VERIFY_MISSING_LIBS:-0}" = 1 ]; then echo "verify browser libraries: missing libfake.so.1"; exit 1; fi
+  echo "verify browser libraries: every shared library resolves"
+  exit 0
+fi
 if [ "\${FAKE_VERIFY_FAIL_DEPS:-0}" = 1 ] && [ "$2" = install-deps ]; then echo "fake apt failure"; exit 41; fi
 if [ -n "\${FAKE_VERIFY_HANG_DEPS:-}" ] && [ "$2" = install-deps ]; then echo $$ > "$FAKE_VERIFY_HANG_DEPS"; exec sleep 600; fi
 if [ "\${FAKE_VERIFY_NO_NEXTEST:-0}" = 1 ] && [ "$1" = nextest ]; then exit 101; fi
@@ -270,17 +275,25 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
     assert.equal(success.result.status, 0, success.output);
     assertRan(success.commands, lanes);
     rmSync(log);
-    // With TRELLIS_BROWSER_SYSTEM_DEPS set, the system packages install in the
-    // background and the browser suite runs only after it succeeds (#244).
+    // With TRELLIS_BROWSER_SYSTEM_DEPS set, the system packages are checked
+    // and, only if a library is missing, installed in the background; the
+    // browser suite runs only after that succeeds (#244).
+    const libs = ["node", "tools/verify-browser-libs.mjs"];
     const deps = ["node", "tests/browser/node_modules/playwright/cli.js", "install-deps", "chromium"];
-    const withDeps = runVerify({ TRELLIS_BROWSER_SYSTEM_DEPS: "1" });
-    assert.equal(withDeps.result.status, 0, withDeps.output);
-    assertRan(withDeps.commands, { ...lanes, deps: [deps] });
-    assert.match(withDeps.result.stdout, /^verify: Chromium system package install finished in \d+ s \(exit 0\)/m);
+    const present = runVerify({ TRELLIS_BROWSER_SYSTEM_DEPS: "1" });
+    assert.equal(present.result.status, 0, present.output);
+    assertRan(present.commands, { ...lanes, deps: [libs] });
+    assert.match(present.result.stdout, /^verify: Chromium's shared libraries all resolve; skipped the system package install \(no apt\)/m);
     rmSync(log);
-    const depsFailure = runVerify({ TRELLIS_BROWSER_SYSTEM_DEPS: "1", FAKE_VERIFY_FAIL_DEPS: "1" });
+    const withDeps = runVerify({ TRELLIS_BROWSER_SYSTEM_DEPS: "1", FAKE_VERIFY_MISSING_LIBS: "1" });
+    assert.equal(withDeps.result.status, 0, withDeps.output);
+    assertRan(withDeps.commands, { ...lanes, deps: [libs, deps] });
+    assert.match(withDeps.result.stdout, /missing libfake\.so\.1/);
+    assert.match(withDeps.result.stdout, /^verify: Chromium system package install \(apt\) finished in \d+ s \(exit 0\)/m);
+    rmSync(log);
+    const depsFailure = runVerify({ TRELLIS_BROWSER_SYSTEM_DEPS: "1", FAKE_VERIFY_MISSING_LIBS: "1", FAKE_VERIFY_FAIL_DEPS: "1" });
     assert.equal(depsFailure.result.status, 1);
-    assertRan(depsFailure.commands, { ...lanes, deps: [deps], rust: lanes.rust.slice(0, -1) });
+    assertRan(depsFailure.commands, { ...lanes, deps: [libs, deps], rust: lanes.rust.slice(0, -1) });
     assert.match(depsFailure.result.stdout, /fake apt failure/);
     assert.match(depsFailure.result.stdout, /Chromium system package install failed \(exit 41\)/);
     assert.match(depsFailure.result.stderr, /failed lane\(s\): rust$/m);
@@ -290,7 +303,7 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
     const hangPid = join(fakeDir, "deps.pid");
     // A leaked install would hold verify's output open for its full 600 s.
     const earlyFailure = runVerify(
-      { TRELLIS_BROWSER_SYSTEM_DEPS: "1", FAKE_VERIFY_HANG_DEPS: hangPid, FAKE_VERIFY_FAIL_CLIPPY: "1" },
+      { TRELLIS_BROWSER_SYSTEM_DEPS: "1", FAKE_VERIFY_MISSING_LIBS: "1", FAKE_VERIFY_HANG_DEPS: hangPid, FAKE_VERIFY_FAIL_CLIPPY: "1" },
       120_000,
     );
     assert.equal(earlyFailure.result.error, undefined, "verify did not exit after its lane failed");
@@ -349,7 +362,7 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
     rmSync(log);
     const browserOnly = runVerify({ TRELLIS_BROWSER_SYSTEM_DEPS: "1" }, undefined, ["--lane", "browser"]);
     assert.equal(browserOnly.result.status, 0, browserOnly.output);
-    assertRan(browserOnly.commands, { setup: lanes.setup, browser, deps: [deps] });
+    assertRan(browserOnly.commands, { setup: lanes.setup, browser, deps: [libs] });
     rmSync(log);
     const failedHalf = runVerify({ FAKE_VERIFY_FAIL_CLIPPY: "1" }, undefined, ["--lane", "lint", "--lane", "tests"]);
     assert.equal(failedHalf.result.status, 23);
