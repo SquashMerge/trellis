@@ -1321,7 +1321,8 @@ impl SiteContext<'_> {
 
 fn merge_work(work: &mut Work, used: usize, check: &mut impl FnMut() -> Result<()>) -> Result<()> {
     check()?;
-    ensure!(work.charge(used), "bounded_work: reference owner lookup");
+    // The request total, not the phase whose count tipped it over (#894).
+    ensure!(work.charge(used), "bounded_work: reference work total");
     Ok(())
 }
 
@@ -2295,7 +2296,8 @@ mod parallel_tests {
         assert!(error.to_string().starts_with("bounded_work:"));
         let mut total = Work::new(3);
         merge_work(&mut total, 2, &mut || Ok(())).unwrap();
-        assert!(merge_work(&mut total, 2, &mut || Ok(())).is_err());
+        let error = merge_work(&mut total, 2, &mut || Ok(())).unwrap_err();
+        assert_eq!(error.to_string(), "bounded_work: reference work total");
         assert_eq!(total.used, 4);
     }
 }

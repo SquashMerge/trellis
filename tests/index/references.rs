@@ -2075,6 +2075,58 @@ fn references_rust_normal_checkout_all_sources_share_scaled_work_budget() {
     }
 }
 
+/// A name lookup reads only the imports that can bind it (#894). Every glob child's lookup
+/// of `items` in the hub used to clone and scan the hub's 1,501 imports, and the hub's own
+/// exports did so once per exported name, so the work grew as names times imports. That
+/// exceeded this snapshot's ~5.2M allowance. Indexed lookups use about 0.8M of it.
+#[test]
+fn references_rust_glob_children_of_a_hub_with_many_imports_stay_within_budget() {
+    const NAMES: usize = 1500;
+    const CHILDREN: usize = 8;
+    const CALLS: usize = 10;
+    let items: String = (0..NAMES)
+        .map(|i| format!("pub fn n{i:04}() {{}}\n"))
+        .collect();
+    let list: Vec<String> = (0..NAMES).map(|i| format!("n{i:04}")).collect();
+    let mut hub = format!(
+        "pub use crate::items;\npub use crate::items::{{{}}};\n",
+        list.join(", ")
+    );
+    for child in 0..CHILDREN {
+        hub.push_str(&format!("pub mod child_{child:02};\n"));
+    }
+    let children: Vec<(String, String)> = (0..CHILDREN)
+        .map(|child| {
+            let calls: String = (0..CALLS)
+                .map(|k| format!("    items::n{:04}();\n", child * CALLS + k))
+                .collect();
+            (
+                format!("src/hub/child_{child:02}.rs"),
+                format!("use super::*;\npub fn run() {{\n{calls}}}\n"),
+            )
+        })
+        .collect();
+    let mut files = vec![
+        ("src/lib.rs", "pub mod items;\npub mod hub;\n"),
+        ("src/items.rs", items.as_str()),
+        ("src/hub.rs", hub.as_str()),
+    ];
+    files.extend(
+        children
+            .iter()
+            .map(|(path, text)| (path.as_str(), text.as_str())),
+    );
+    let input = snapshot(&files);
+    let data = references::project(&input, &["src/hub/**".into()], 1, &mut || Ok(()))
+        .expect("indexed import lookups fit the scaled allowance")
+        .data;
+    for child in [0, CHILDREN - 1] {
+        let source = format!("src/hub/child_{child:02}.rs");
+        let pair = edge(&data, "production", &source, "src/items.rs");
+        assert_eq!(pair["kindCounts"]["call"], CALLS, "{pair}");
+    }
+}
+
 #[test]
 fn references_rust_repository_src_projects_within_existing_work_budget() {
     // Use this build's checkout, not a runtime Cargo environment variable or the
