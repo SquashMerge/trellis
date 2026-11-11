@@ -36,8 +36,35 @@ struct Auto {
     runtime: Arc<CheckoutRuntime>,
 }
 
+/// Set only in the child test process that carries one test's environment.
+const CHILD: &str = "TRELLIS_TEST_DAEMON_AUTO_RUN_CHILD";
+
+/// These tests arm the stub, the intervals and the hook sockets through process environment, which
+/// the daemon's threads read, so they must not share a process with other tests (#869). The
+/// parent run re-executes this test binary for the one test, with the marker set only on the
+/// child, and returns `false`; the child returns `true` and runs the body.
+fn in_own_process(test: &str) -> bool {
+    if std::env::var_os(CHILD).is_some() {
+        return true;
+    }
+    let path = format!("daemon_auto_run::{test}");
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &path, "--test-threads=1", "--nocapture"])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "{test} child: {}\n{stdout}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
+}
+
 fn set_env(name: &str, value: impl AsRef<std::ffi::OsStr>) {
-    // Each test is its own process, and the daemon's threads only read these once armed.
+    // SAFETY: only the child process of `in_own_process` gets here, and it runs this one test.
     unsafe { std::env::set_var(name, value) };
 }
 
@@ -289,6 +316,9 @@ impl Auto {
 /// and the head to be quiet, and starts one run, at the final head.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn checkout_burst_is_one_trigger() {
+    if !in_own_process("checkout_burst_is_one_trigger") {
+        return;
+    }
     let auto = Auto::start((200, 0, 200));
     auto.approve(0);
     auto.hold(&[PRESLOT]);
@@ -340,6 +370,9 @@ async fn checkout_burst_is_one_trigger() {
 /// head imports.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn edit_during_importing_ends_stale_basis() {
+    if !in_own_process("edit_during_importing_ends_stale_basis") {
+        return;
+    }
     let auto = Auto::start((50, 0, 200));
     auto.approve(0);
     auto.write_javascript(0, "function edited1() { g(); }\n");
@@ -403,6 +436,9 @@ async fn edit_during_importing_ends_stale_basis() {
 /// retires, and its owner goes with it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn idle_schedule_does_not_hold_retirement() {
+    if !in_own_process("idle_schedule_does_not_hold_retirement") {
+        return;
+    }
     let mut auto = Auto::start((3_600_000, 0, 200));
     auto.approve(0);
     auto.write_javascript(0, "function edited() { g(); }\n");
@@ -420,6 +456,9 @@ async fn idle_schedule_does_not_hold_retirement() {
 /// after the run is over.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn active_auto_run_holds_retirement() {
+    if !in_own_process("active_auto_run_holds_retirement") {
+        return;
+    }
     let mut auto = Auto::start((50, 0, 200));
     auto.approve(0);
     auto.write_javascript(0, "function edited() { g(); }\n");

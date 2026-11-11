@@ -977,10 +977,12 @@ fn running_auto_run_labels_language_catching_up_and_nothing_else() {
     });
 }
 
-/// With auto-run off the labels are empty: the answers read as committed after an edit, and
-/// turning it on and off again changes only the label.
+/// With auto-run off (default, then explicitly disabled) the daemon adds no label and starts no
+/// run: the views are the same before and after, and no automatic run record appears. That the
+/// documents read `needsReimport` without a label is asserted in
+/// `tests/semantic/auto_run_labels.rs::empty_labels_change_nothing`.
 #[test]
-fn auto_off_leaves_needs_reimport_unchanged() {
+fn auto_off_adds_no_label_and_starts_no_run() {
     let world = hooked_git(&[SPAWNED]);
     approve(&world, &[SPAWNED]);
     edit_head(&world, 1);
