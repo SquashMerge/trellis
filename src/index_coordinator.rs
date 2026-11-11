@@ -1962,9 +1962,7 @@ fn run_semantic_batch_request(
     before_publish: &mut Option<Option<IndexPin>>,
 ) -> Result<IndexPin> {
     use crate::{
-        semantic_batch::{
-            BatchCounters, BatchLimits, LookupBudget, StageInput, StageOwner, stage_batch,
-        },
+        semantic_batch::{BatchCounters, LookupBudget, StageInput, StageOwner, stage_batch},
         semantic_import::{DestinationMutations, join_staged},
         store::requests::SemanticImportJob,
     };
@@ -1983,8 +1981,9 @@ fn run_semantic_batch_request(
         }
     }
     .map_err(|error| batch_error(error.into()))?;
-    let limits =
-        BatchLimits::effective().map_err(|error| anyhow::anyhow!("invalid_request: {error}"))?;
+    let limits = store
+        .batch_limits()
+        .map_err(|error| anyhow::anyhow!("invalid_request: {error}"))?;
     // One budget serves every attempt below, so a destination change cannot spend it twice.
     let mut budget = LookupBudget::new(&limits);
     let mut counters = BatchCounters::default();

@@ -1742,18 +1742,19 @@ impl<'w> Harness<'w> {
         }
         self.dead = true;
         // The product path, not the test oracle (which also reads the basis), must fail.
-        let oracle = std::env::var_os("TRELLIS_TEST_LOCAL_FULL_ORACLE");
-        // SAFETY: the isolated child runs one test on one thread.
-        unsafe { std::env::remove_var("TRELLIS_TEST_LOCAL_FULL_ORACLE") };
+        let oracle = world.store.semantic_test_hooks_for_tests().full_oracle;
+        let set_oracle = |on: bool| {
+            world
+                .store
+                .update_semantic_test_hooks_for_tests(|hooks| hooks.full_oracle = on)
+        };
+        set_oracle(false);
         clear_work_counts();
         let result =
             world
                 .store
                 .complete_pending_semantic_for_tests(n, &self.session, &world.cancel);
-        if let Some(oracle) = oracle {
-            // SAFETY: as above.
-            unsafe { std::env::set_var("TRELLIS_TEST_LOCAL_FULL_ORACLE", oracle) };
-        }
+        set_oracle(oracle);
         match result {
             Err(error) => {
                 let text = format!("{error:#}");

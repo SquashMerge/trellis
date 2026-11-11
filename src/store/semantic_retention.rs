@@ -259,7 +259,8 @@ impl Store {
                 continue;
             }
             let present = retention::inputs_present(&options)?;
-            if present && !retention::descriptor_admissible(&options, &batch_publication_limits())?
+            if present
+                && !retention::descriptor_admissible(&options, &self.batch_publication_limits())?
             {
                 // An inadmissible retained descriptor is a missing input: its needs-reimport
                 // row stays published, and the slot goes so it is never queued again (#811).

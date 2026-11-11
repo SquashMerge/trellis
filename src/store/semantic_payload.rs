@@ -215,6 +215,9 @@ pub(in crate::store) fn dependency_term(
 pub(in crate::store) struct KeyInputs {
     join_inputs: String,
     reuse: bool,
+    /// Test seam: the store's FULL oracle checks every payload a write reuses.
+    #[cfg(feature = "test-support")]
+    check_hits: bool,
 }
 
 impl KeyInputs {
@@ -224,13 +227,8 @@ impl KeyInputs {
     }
 
     /// The running build's digest: the hash of its join modules (`build/semantic_join_inputs.rs`)
-    /// and of the join limits this operation applies.
-    pub(in crate::store) fn current() -> Self {
-        #[cfg(feature = "test-support")]
-        let limits = crate::semantic_batch::BatchLimits::effective()
-            .unwrap_or(crate::semantic_batch::BatchLimits::PRODUCTION);
-        #[cfg(not(feature = "test-support"))]
-        let limits = crate::semantic_batch::BatchLimits::PRODUCTION;
+    /// and of the join `limits` this operation applies.
+    pub(in crate::store) fn current(limits: &crate::semantic_batch::BatchLimits) -> Self {
         Self {
             join_inputs: crate::native_ids::digest(
                 b"trellis.semantic-join-inputs.v1\0",
@@ -240,6 +238,8 @@ impl KeyInputs {
                 })),
             ),
             reuse: true,
+            #[cfg(feature = "test-support")]
+            check_hits: false,
         }
     }
 
@@ -255,6 +255,18 @@ impl KeyInputs {
     pub(in crate::store) fn without_reuse(mut self) -> Self {
         self.reuse = false;
         self
+    }
+
+    /// Test seam: the FULL oracle checks each reused payload (`SemanticTestHooks::full_oracle`).
+    #[cfg(feature = "test-support")]
+    pub(in crate::store) fn checking_hits(mut self, check: bool) -> Self {
+        self.check_hits = check;
+        self
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(in crate::store) fn check_hits(&self) -> bool {
+        self.check_hits
     }
 }
 
@@ -584,8 +596,13 @@ mod tests {
         let key = |inputs: &KeyInputs| {
             payload_key(inputs, &producer, "d", "c", "javascript", "a.js", "v", &[])
         };
-        let current = KeyInputs::current();
-        assert_eq!(key(&current), key(&KeyInputs::current()));
+        let current = KeyInputs::current(&crate::semantic_batch::BatchLimits::PRODUCTION);
+        assert_eq!(
+            key(&current),
+            key(&KeyInputs::current(
+                &crate::semantic_batch::BatchLimits::PRODUCTION
+            ))
+        );
         assert_ne!(
             key(&current),
             key(&current.clone().with_join_inputs("other"))
@@ -749,8 +766,14 @@ mod tests {
         // The document itself is in the revision; its dependencies are not.
         db.execute("INSERT INTO document_versions(vid,id,language,path,content_hash,extraction_context,producer_id,producer_version,byte_length,source_bytes,native_witness) VALUES(1,'v','javascript','main.js',?1,?1,'p','1',0,x'',?1)", ["b".repeat(64)]).unwrap();
         db.execute("INSERT INTO revision_documents VALUES('key','javascript','main.js',1,1,NULL,NULL,1,1,'complete',NULL,0,1)", []).unwrap();
-        let error = write_import_coverage(&db, "key", &publication, None, &KeyInputs::current())
-            .unwrap_err();
+        let error = write_import_coverage(
+            &db,
+            "key",
+            &publication,
+            None,
+            &KeyInputs::current(&crate::semantic_batch::BatchLimits::PRODUCTION),
+        )
+        .unwrap_err();
         assert!(
             error.is::<SelectedIntegrity>()
                 && format!("{error:#}").contains("semantic dependency endpoint missing"),
@@ -789,7 +812,14 @@ mod tests {
             db.execute("INSERT INTO document_versions(vid,id,language,path,content_hash,extraction_context,producer_id,producer_version,byte_length,source_bytes,native_witness) VALUES(?1,?2,'javascript',?3,?4,?4,'p','1',0,x'',?4)", params![vid, format!("v{vid}"), path, format!("{vid:064}")]).unwrap();
             db.execute("INSERT INTO revision_documents VALUES('key','javascript',?1,?2,1,NULL,NULL,1,1,'complete',NULL,?2,1)", params![path, vid]).unwrap();
         }
-        write_import_coverage(&db, "key", &publication, None, &KeyInputs::current()).unwrap();
+        write_import_coverage(
+            &db,
+            "key",
+            &publication,
+            None,
+            &KeyInputs::current(&crate::semantic_batch::BatchLimits::PRODUCTION),
+        )
+        .unwrap();
         let (rows, terms, targets): (i64, i64, i64) = db
             .query_row(
                 "SELECT (SELECT COUNT(*) FROM semantic_projection_dependencies),(SELECT COUNT(term) FROM semantic_projection_dependencies),(SELECT COUNT(*) FROM semantic_projection_dependency_targets)",

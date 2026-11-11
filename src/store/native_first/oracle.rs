@@ -4,9 +4,8 @@
 use super::*;
 use crate::{native_ids, semantic_batch::AdmittedBatch, semantic_evidence as sem};
 
-pub(in crate::store) fn enabled() -> bool {
-    std::env::var_os("TRELLIS_TEST_LOCAL_FULL_ORACLE").is_some()
-        || TEST_REJOIN_ORACLE_MISMATCH.get()
+pub(in crate::store) fn enabled(store: &Store) -> bool {
+    store.semantic_test_hooks().full_oracle || TEST_REJOIN_ORACLE_MISMATCH.get()
 }
 
 pub(super) fn check(
@@ -304,7 +303,7 @@ fn full_rejoin(
         &captured,
         &captured_native,
         &captured_sources,
-        &store.identity,
+        store,
         cancel,
     )?;
     ensure!(

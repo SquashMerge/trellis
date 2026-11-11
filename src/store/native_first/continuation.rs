@@ -373,7 +373,7 @@ impl Store {
             };
             if let Some(_published_pin) = published {
                 #[cfg(feature = "test-support")]
-                if super::oracle::enabled() {
+                if super::oracle::enabled(self) {
                     let durable = self.cache()?;
                     for prepared in &state.prepared {
                         if let Some(full) = &prepared.oracle_full
@@ -390,7 +390,11 @@ impl Store {
                     }
                 }
                 #[cfg(feature = "test-support")]
-                let counts_result = write_semantic_work_counts(_published_pin, &state.target);
+                let counts_result = write_semantic_work_counts(
+                    self.semantic_test_hooks().work_counts_file.as_deref(),
+                    _published_pin,
+                    &state.target,
+                );
                 *continuation = None;
                 #[cfg(feature = "test-support")]
                 counts_result?;
@@ -400,7 +404,7 @@ impl Store {
         }
         let selection = state.target.selections[state.next].clone();
         let stage_parent = self.semantic_stage_parent()?;
-        let limits = batch_publication_limits();
+        let limits = self.batch_publication_limits();
         let target = state.target.clone();
         let held = state.read.clone();
         let result = self.with_pending_semantic_inputs(&target, &held, |db, destination_read| {
@@ -444,7 +448,7 @@ impl Store {
                             authority: None,
                             // Test-support switch: take the bounded FULL path without a witness attempt.
                             #[cfg(feature = "test-support")]
-                            full: std::env::var_os("TRELLIS_TEST_FORCE_FULL_REJOIN").is_some(),
+                            full: self.semantic_test_hooks().force_full_rejoin,
                             #[cfg(not(feature = "test-support"))]
                             full: false,
                             target_cursor: super::local_targets::TargetIndexCursor::default(),
@@ -616,7 +620,7 @@ impl Store {
                             Self::semantic_phase_diagnostic("witness_prepared", "done");
                             current.join = Some(JoinContinuation::new_witnessed(
                                 target.pin,
-                                witness_join_limits(&limits)?,
+                                witness_join_limits(self, &limits)?,
                             ));
                         }
                         return Ok(None);
@@ -671,7 +675,7 @@ impl Store {
                             "semantic continuation destination identity mismatch"
                         );
                         #[cfg(feature = "test-support")]
-                        if super::oracle::enabled() {
+                        if super::oracle::enabled(self) {
                             let comparison = super::oracle::check(
                                 self,
                                 db,
@@ -795,7 +799,7 @@ impl Store {
                 // unbounded in-memory oracle cannot model; every other unavailable S must
                 // be one the independent FULL rejoin also fails (#826).
                 #[cfg(feature = "test-support")]
-                if super::oracle::enabled() && !(_full && resource_limit(&error)) {
+                if super::oracle::enabled(self) && !(_full && resource_limit(&error)) {
                     let checked = self.with_pending_semantic_inputs(&target, &held, |db, _| {
                         super::oracle::check_unavailable(
                             self, db, &target, &selection, &producer, cancel,
@@ -827,12 +831,13 @@ impl Store {
 }
 
 /// The witnessed settlement's limits: the operation's own. Test support may lower them alone
-/// (`TRELLIS_TEST_WITNESS_JOIN_LIMITS`, a `BatchLimits` JSON object), so a witnessed attempt
-/// that exceeds its bounds while FULL fits (#826) stays reachable at fixture size: since #865
-/// the witness charges a pending dependent what FULL charges, so no shared limit separates them.
-fn witness_join_limits(limits: &BatchLimits) -> Result<BatchLimits> {
+/// (`SemanticTestHooks::witness_join_limits`, a `BatchLimits` JSON object), so a witnessed
+/// attempt that exceeds its bounds while FULL fits (#826) stays reachable at fixture size: since
+/// #865 the witness charges a pending dependent what FULL charges, so no shared limit separates
+/// them.
+fn witness_join_limits(_store: &Store, limits: &BatchLimits) -> Result<BatchLimits> {
     #[cfg(feature = "test-support")]
-    if let Ok(text) = std::env::var("TRELLIS_TEST_WITNESS_JOIN_LIMITS") {
+    if let Some(text) = _store.semantic_test_hooks().witness_join_limits {
         return serde_json::from_str(&text).context("test witness join limits");
     }
     Ok(limits.clone())
@@ -852,8 +857,12 @@ fn resource_limit(error: &anyhow::Error) -> bool {
 }
 
 #[cfg(feature = "test-support")]
-fn write_semantic_work_counts(pin: IndexPin, target: &PendingSemanticTarget) -> Result<()> {
-    if let Some(file) = std::env::var_os("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE") {
+fn write_semantic_work_counts(
+    file: Option<&Path>,
+    pin: IndexPin,
+    target: &PendingSemanticTarget,
+) -> Result<()> {
+    if let Some(file) = file {
         let mut work = crate::semantic_import::publication_work();
         work["indexPin"] = serde_json::to_value(pin)?;
         work["producerIds"] = serde_json::to_value(

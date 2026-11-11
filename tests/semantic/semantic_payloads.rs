@@ -56,11 +56,10 @@ fn payload_world() -> (World, IndexPin, PathBuf) {
 /// Turns on the FULL oracle and the work counts, and fixes the retention clock.
 fn instrument(world: &World) -> PathBuf {
     let counts = world._state.path().join("work-counts.json");
-    // SAFETY: each test runs in its own process under nextest, and no other thread reads these.
-    unsafe {
-        std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts);
-        std::env::set_var("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1");
-    }
+    world.store.update_semantic_test_hooks_for_tests(|hooks| {
+        hooks.work_counts_file = Some(counts.clone());
+        hooks.full_oracle = true;
+    });
     world.store.set_retention_clock_for_tests(1_000, 0);
     counts
 }
@@ -654,8 +653,9 @@ fn unavailable_failed_row_is_never_reused() {
         .publish_local_for_tests(&options, &capture, &leader, &world.cancel)
         .unwrap();
     drop(leader);
-    // SAFETY: as in `payload_world`.
-    unsafe { std::env::remove_var("TRELLIS_TEST_LOCAL_FULL_ORACLE") };
+    world
+        .store
+        .update_semantic_test_hooks_for_tests(|hooks| hooks.full_oracle = false);
     world
         .store
         .with_semantic_content_fault_for_tests(|| {
@@ -878,13 +878,16 @@ fn copy_does_not_name_a_payload_another_join_digest_wrote() {
     );
 }
 
-/// With `value` set in the environment for one catch-up, as the forced-FULL reference runs it.
+/// One local edit with S forced onto FULL, as the forced-FULL reference runs it.
 fn full_edit(world: &World, path: &str, text: &str, counts: &std::path::Path) {
-    // SAFETY: each test runs in its own process under nextest, and no other thread reads it.
-    unsafe { std::env::set_var("TRELLIS_TEST_FORCE_FULL_REJOIN", "1") };
+    let force = |on: bool| {
+        world
+            .store
+            .update_semantic_test_hooks_for_tests(|hooks| hooks.force_full_rejoin = on)
+    };
+    force(true);
     local_edit(world, path, text, counts);
-    // SAFETY: as above.
-    unsafe { std::env::remove_var("TRELLIS_TEST_FORCE_FULL_REJOIN") };
+    force(false);
 }
 
 /// The call-graph view of `run` at the head, with the index pin (which differs per store)
@@ -910,6 +913,12 @@ fn s_reuse_snapshot_equals_full_snapshot() {
     let (reuse, _import, counts) = payload_world();
     let reference = crate::semantic_batch_store::reference_world(&reuse);
     reference.store.set_payload_reuse_for_tests(false);
+    // The same work counts file and in-S oracle as `reuse`'s.
+    reference
+        .store
+        .update_semantic_test_hooks_for_tests(|hooks| {
+            *hooks = reuse.store.semantic_test_hooks_for_tests()
+        });
     let descriptor = payload_batch(&reuse);
     reference.publish(&descriptor).unwrap();
     let same = |step: &str| {
