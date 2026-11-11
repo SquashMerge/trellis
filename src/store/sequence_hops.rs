@@ -29,16 +29,15 @@ pub(crate) const HANDLER_KIND: &str = "interfaceHandler";
 const HANDLER_IDENTIFICATION: &str =
     "HTTP interface handler: a structural method and path match, not proof.";
 
-/// The call IDs of every step of `steps`, nested ones included.
+/// The call IDs of every step of `steps`, nested ones and callback candidates' (#888) included.
 pub(crate) fn call_ids(steps: &[SequenceStep]) -> BTreeSet<String> {
     let mut ids = BTreeSet::new();
-    let mut pending: Vec<&SequenceStep> = steps.iter().collect();
-    while let Some(step) = pending.pop() {
+    crate::behavior::any_step(steps, &mut |step| {
         if let Some(id) = &step.call_id {
             ids.insert(id.clone());
         }
-        pending.extend(step.children.iter().chain(&step.alternate));
-    }
+        false
+    });
     ids
 }
 
@@ -234,7 +233,16 @@ impl EvidenceResponse {
             }
             revealed
         }
-        let revealed = reveal(&mut view.steps, &found);
+        // #888: a callback whose body holds a drawn hop is shown under the call it is passed
+        // to, within the view's bounds; every other candidate stays the boundary it was.
+        let drawn = |step: &SequenceStep| {
+            step.call_id
+                .as_deref()
+                .and_then(|id| found.get(id))
+                .is_some_and(|hop| hop.participant.is_some())
+        };
+        let spliced = crate::behavior::splice_callbacks(view, &drawn, visible_bound);
+        let revealed = reveal(&mut view.steps, &found) || spliced;
         if column_limited {
             view.limit(crate::behavior::SequenceLimit::Participants);
             const WARNING: &str =

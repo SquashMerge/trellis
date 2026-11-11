@@ -189,7 +189,18 @@ fn language_name(language: s::Language) -> &'static str {
     }
 }
 
+/// The declaration named `name`, or for `anonymous#N` (#888) the Nth anonymous function
+/// (an arrow, closure or lambda) in source order, counted from 0.
 fn declaration<'a>(native: &'a n::Artifact, name: &str) -> &'a n::Declaration {
+    if let Some(nth) = name.strip_prefix("anonymous#") {
+        let mut anonymous: Vec<_> = native
+            .declarations
+            .iter()
+            .filter(|d| d.kind == "anonymousFunction")
+            .collect();
+        anonymous.sort_by_key(|d| (d.document.path.clone(), d.range.start));
+        return anonymous[nth.parse::<usize>().unwrap()];
+    }
     native
         .declarations
         .iter()

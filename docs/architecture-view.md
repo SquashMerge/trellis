@@ -609,6 +609,11 @@ the interface evidence of its own revision from the owner's published core and n
 for it; until it exists the status line says the interfaces are not measured yet. The DTO and
 drawing are specified in [sequence-slice-contract.md](sequence-slice-contract.md#http-interface-hops-across-apps-853).
 
+A hop inside a callback passed to a call (`browseRequest(async () => api("/api/sequence"))`) is
+drawn too: the callback's body is shown as a `callback` block under that call when it holds a
+hop or a cross-column call, and stays a boundary otherwise (#888,
+[contract](sequence-slice-contract.md#callbacks-that-hold-an-interaction-or-a-hop-888)).
+
 ## Module chips and counts (#424)
 
 The view always draws the full stack: every ordered layer, with the shared layers beside

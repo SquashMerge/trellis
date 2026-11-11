@@ -714,7 +714,8 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
       } else if (fragment) {
         const start = y, x = 18 + depth * 10;
         const box = make("rect", {x, y:start-19, width:width-x-18, height:34, class:"sequence-fragment"}); group.append(box);
-        const operator = {branch:"alt", loop:"loop", try:"try"}[step.kind] || "block";
+        // A callback block (#888): the body of a callable passed to the call above it.
+        const operator = {branch:"alt", loop:"loop", try:"try", callback:"callback"}[step.kind] || "block";
         y += sourceControl(group, step, x, y, step, step, operator); y += 34;
         draw(step.children, group, depth+1);
         if (step.alternate?.length) {

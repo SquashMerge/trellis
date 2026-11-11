@@ -19,6 +19,7 @@ mod graph_query_store;
 mod graph_query_store_filters;
 mod mcp_protocol;
 mod navigation_resolved;
+mod sequence_callbacks;
 mod sequence_columns;
 mod sequence_incidental;
 mod show;

@@ -174,6 +174,7 @@ impl Builder<'_> {
             folded: vec![],
             incidental: None,
             interface: None,
+            callback: None,
         })
     }
     fn boundary(&mut self, n: Node<'_>, message: &str) -> Flow {
@@ -786,6 +787,7 @@ pub fn build(
             folded: vec![],
             incidental: None,
             interface: None,
+            callback: None,
         });
         return Ok(b.view);
     };

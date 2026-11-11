@@ -421,6 +421,56 @@ is drawn as a labelled boundary hop into that route's handler. The evidence mean
 - **MCP.** No MCP tool returns a Sequence; `trellis_show` opens this browser view, which
   draws its hops. No MCP output changes.
 
+### Callbacks that hold an interaction or a hop (#888)
+
+Owner issue #888, ruled option C on 2026-11-10: a callback's body is expanded only when it
+holds a hop or another meaningful step; every other diagram stays exactly as it was. Before
+#888 a callable passed to a call (`browseRequest(async () => api("/api/sequence"))`) was
+always a boundary, so `loadSequence`'s hop into the daemon was never reached.
+
+- **Callback.** A boundary step at exactly the range of an indexed function (an arrow or
+  function expression, a Rust closure, a Java or Python lambda) that lies inside one of the
+  owner's measured calls: the innermost such call is the call it is passed to. Nested
+  function declarations and callables outside a call stay boundaries.
+- **Shown when.** Its body, built and enriched like an expanded callee's, holds:
+  - an **interaction**: a shown, non-incidental call whose exact target is drawn in another
+    column than the step's own (what Interactions draws as an arrow, #636), in an enriched
+    view; or
+  - an **HTTP interface hop** (#853) whose handler is drawn, found by the browser read that
+    reads interface evidence, in any tier.
+
+  A callback whose calls stay in their own column, have no exact target, or make no client
+  call is not shown: its boundary, and the whole view, are what they were before (the
+  negative control). The decision is the same in every projection (Interactions,
+  calls-first, Show all), so incidental calls never make a callback shown.
+- **Block.** A shown callback is a step of kind `callback`, labelled `callback passed to
+  <callee> · when and how often it runs is unknown`, with the callback's source range and
+  its body as `children`. It goes under the call it is passed to (appended to that call's
+  `children`, after any body the call expands) when that call is a later shown sibling;
+  otherwise it takes the boundary's place (a Python lambda, whose boundary may leave the
+  path, puts the call under a guard). Its steps run on the boundary's lane: a callback runs
+  in the column of what defines it (#558). Nested callbacks are decided first; an outer
+  callback is shown when an inner one is.
+- **Drawn.** Calls-first and Show all draw the block as a frame (legacy tab "callback"; Pele
+  a plain frame with the block's own numbered row). Interactions draw no frame: its arrows
+  draw in its place, as for a branch (#636).
+- **Bounds.** A callback is enriched in one transaction after the view's own steps, so the
+  view's own steps, expansions and bounds are unchanged. It is shown only within the bounds:
+  the 200 shown steps (except the Interactions candidates, #663), the 2000 work steps, depth
+  24 and 20 columns. A callback that would pass one stays a boundary, and the view is
+  truncated by that bound with "Sequence <step|work|depth> limit reached; the callback passed
+  to <callee> is not shown." (or the participant warning). At most 64 callback bodies are
+  built per view (each parses its file); later ones stay boundaries. Hidden steps are not
+  searched for callbacks.
+- **Candidates.** A callback with a measured call but no interaction keeps its built block
+  on the boundary, server-side only and never serialized, for the browser read: when that
+  read finds a drawn hop in it, it shows the block within the same bounds, then reveals and
+  caps as #853 does. `interfaces` counts only hops in shown steps.
+- **Languages.** JavaScript and TypeScript (arrow and function expressions), Rust (closures),
+  Java (lambdas) and Python (lambdas), wherever the indexer records the callable as a
+  declaration. Interactions need the language's semantic producer; hops need none.
+- **MCP.** No MCP tool returns a Sequence. No MCP output changes.
+
 ## Original syntax slice notes
 
 The notes below record the initial syntax-only slice; current revision and semantic DTO
