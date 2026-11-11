@@ -9618,6 +9618,72 @@ fn first_edit_after_capture_witnesses_many_call_sensitive_dependents() {
     assert_head_matches_full(&world, &descriptor);
 }
 
+/// #863: `src/a.rs` carries the symbol information of `g`, whose only definition is in
+/// `src/b.rs`. Settlement gives an own symbol with no captured exact definition in its document
+/// the destination row's declarations, which FULL discovers over unchanged documents only. That
+/// row is empty on both paths: B's definition is not Common-compatible without B's own symbol
+/// kind (#473), and B cannot carry one too ("duplicate semantic symbol key"). With the in-S
+/// oracle on, the head equals FULL after comment edits to B and the revert (D5).
+#[test]
+fn symbol_declared_only_in_a_changed_dependency_matches_full() {
+    const B: &str = "fn g() { }\n";
+    let world = world(|root| {
+        write_files(
+            root,
+            &[
+                ("src/a.rs", "fn r() { g(); }\n"),
+                ("src/b.rs", B),
+                ("src/c.rs", "fn other() { }\n"),
+            ],
+        )
+    });
+    let counts = world._state.path().join("work-counts.json");
+    issue_826_env(&counts, None);
+    let symbol = |name: &str| format!("rust-analyzer cargo c 0.1.0 {name}");
+    let (r, g) = (symbol("r()."), symbol("g()."));
+    let mut fixture = world.fixture().reference("rust-analyzer");
+    fixture.artifact(
+        "rust",
+        vec![
+            DocSpec::new("src/a.rs")
+                .occurrence(&[0, 3, 4], &[], &r, 1)
+                .occurrence(&[0, 9, 10], &[], &g, 0)
+                .symbol(&r, 17, &[])
+                .symbol(&g, 17, &[]),
+            DocSpec::new("src/b.rs").occurrence(&[0, 3, 4], &[], &g, 1),
+            DocSpec::new("src/c.rs"),
+        ],
+    );
+    let descriptor = world.write(&fixture);
+    drop(world.publish(&descriptor).unwrap());
+    let declarations = |world: &World| {
+        let head = world.store.index_baseline().unwrap();
+        let facts = world.store.semantic_at(head).unwrap();
+        facts
+            .symbols
+            .iter()
+            .filter(|row| row.key.symbol == g)
+            .map(|row| row.declarations.len())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        declarations(&world),
+        vec![0],
+        "B's definition is not Common-compatible"
+    );
+
+    for edit in [
+        format!("{B}// edited\n"),
+        format!("{B}// edited twice\n"),
+        B.to_owned(),
+    ] {
+        let work = local_edit(&world, "src/b.rs", &edit, &counts);
+        assert_eq!(work["fullFallbacks"], 0, "{work}");
+        assert_head_matches_full(&world, &descriptor);
+    }
+    assert_eq!(declarations(&world), vec![0]);
+}
+
 /// #826 control for the oracle: FULL's own resource bound is a typed unavailable outcome the
 /// unbounded oracle does not flag, so S still publishes it (`failed`, never partial rows).
 #[test]
