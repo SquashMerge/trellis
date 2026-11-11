@@ -1,6 +1,6 @@
 use super::TrustProfile;
 use super::run::{CancelRequest, RunRequest, sweep_state};
-use super::state::{DaemonIdentity, RunRecord, RunState, StateDir};
+use super::state::{DaemonIdentity, RunOrigin, RunRecord, RunState, StateDir};
 use crate::semantic_batch::descriptor::GenerationOrigin;
 use crate::store::{Store, requests::GeneratedImportOptions};
 use serde_json::json;
@@ -31,6 +31,7 @@ fn abandoned_record(id: &str) -> RunRecord {
         finished_at: None,
         diagnostics: None,
         group_status: None,
+        origin: RunOrigin::Manual,
     }
 }
 

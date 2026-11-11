@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod approval;
 pub mod batch;
 pub mod detect;
 pub mod exec;
@@ -22,6 +23,8 @@ pub mod state;
 pub mod tsconfig;
 pub mod worktree;
 
+#[cfg(test)]
+mod approval_tests;
 #[cfg(test)]
 mod batch_tests;
 #[cfg(test)]

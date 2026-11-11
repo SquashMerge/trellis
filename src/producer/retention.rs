@@ -795,6 +795,7 @@ mod tests {
                     daemon: super::super::state::DaemonIdentity::current(),
                     process: None,
                     group_status: None,
+                    origin: super::super::state::RunOrigin::Manual,
                     request_id: None,
                     created_at: n as u64,
                     finished_at: Some(n as u64),
