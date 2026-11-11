@@ -15,8 +15,10 @@ process-wide test-oracle settings in a dedicated child process, so they also
 work with ordinary concurrent `cargo test` runs.
 The scheduled workflow reports a failed run in an issue, linking the logs; an
 existing open issue of the same title receives a comment instead of a duplicate.
-The nightly nextest profile allows the stateful retention property 15 minutes
-while preserving the normal five-minute timeout for every other test. It sets
+The nightly nextest profile gives each 256-case generated-history property a
+30-minute hang backstop, because at that case count they legitimately take
+several minutes (#874); every other test keeps the normal five-minute
+timeout. It sets
 `TRELLIS_RETENTION_TRACE` so a failed or timed-out run reports each started
 history and its completed duration; normal test runs do not emit this trace.
 
