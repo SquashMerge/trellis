@@ -41,6 +41,8 @@ const result = await build({
   metafile: true,
 });
 for (const asset of ["mod.json"]) copyFileSync(join(here, asset), join(outdir, asset));
+// The web app's brand mark, which the pane's header shows as the browser's does (#886).
+copyFileSync(join(here, "..", "web", "brand", "trellis-mark-transparent-v1.png"), join(outdir, "trellis-mark.png"));
 const size = statSync(join(outdir, "main.js")).size;
 writeFileSync(join(outdir, "meta.json"), JSON.stringify(result.metafile));
 console.log(`dist/main.js ${(size / 1024).toFixed(1)} KiB`);
@@ -50,7 +52,7 @@ if (args.includes("--install")) {
   const target = join(home, "mods", "trellis");
   mkdirSync(target, { recursive: true });
   // mod.json first: a new main.js reloads every copy, and should see the final mod.json.
-  for (const asset of ["mod.json", "main.js"]) copyFileSync(join(outdir, asset), join(target, asset));
+  for (const asset of ["mod.json", "trellis-mark.png", "main.js"]) copyFileSync(join(outdir, asset), join(target, asset));
   // A viewing machine streams this from here: `ssh MINI 'cat ~/.config/herdr-app/mods/trellis/setup-viewer.sh' | sh -s MINI`.
   copyFileSync(join(here, "setup-viewer.sh"), join(target, "setup-viewer.sh"));
   console.log(`installed ${target}`);

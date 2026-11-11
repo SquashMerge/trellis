@@ -194,8 +194,40 @@
     const from = origin(item);
     return `${item.name} · ${item.roots.length ? `roots ${rootList(item)}` : "no roots"}${from ? ` · ${from}` : ""}`;
   }
+  // What every count in the All apps view means, under the inspector (`pin` is the snapshot's label).
+  const footnote = pin => `Apps are detected from build manifests (Cargo binary packages, package.json, pyproject.toml, and runnable Maven and Gradle modules) or authored in .trellis/rules.toml. Layer order is compared within an app. Band and arrow counts are reference sites at ${pin}; deviation totals are rule instances, as trellis rules check reports them; ≥ means a lower bound. HTTP interfaces are evidence, not proof.`;
   const duplicateNotice = item =>
     `${item.apps.length} detected apps share the name ${item.name} (${manifestList(item)}). A layer cannot name them; rules.md Amendment (#783).`;
+
+  // ---- Inspector facts, shared by the browser's inspector and the Herdr mod (#886). Values are the DTO's. ----
+  const shown = value => typeof value === "number" && Number.isFinite(value) ? String(value) : "—";
+  const text = value => typeof value === "string" ? value : "";
+  // The interface inspector (AC15): its ends, the counts grid and the wrappers line.
+  function interfaceFacts(entry) {
+    const counts = record(entry?.counts) ? entry.counts : {}, confidence = record(counts.confidence) ? counts.confidence : {};
+    const wrappers = entry.wrappers, prefix = wrappers?.prefix;
+    return {title:`${entry.client} → ${entry.server}`, basis:"HTTP · method and path match · structural evidence, not proof",
+      ends:[`Client end: ${entry.client} · ${layerNames(entry, "clientLayer")}`, `Server end: ${entry.server} · ${layerNames(entry, "serverLayer")}`],
+      rows:[["Matched routes", shown(counts.matchedRoutes)], ["Client call sites", shown(counts.callSites)],
+        ["◆ Server-only routes", shown(counts.serverOnly), "warning"], ["◆ Client-only calls", shown(counts.clientOnly), "warning"],
+        ["exact", shown(confidence.exact)], ["template", shown(confidence.template)], ["wrapper-inferred", shown(confidence.wrapperInferred)], ["unresolved", shown(confidence.unresolved)]],
+      wrappers:Array.isArray(wrappers?.callees) ? `Wrappers: ${wrappers.callees.filter(name => typeof name === "string").join(", ")}${prefix ? ` · Client prefix: ${text(prefix.client)} → ${text(prefix.server)}` : ""}` : null};
+  }
+  // The app inspector: what was detected, how much of it has layers, and the interfaces it takes part in.
+  function appFacts(item, view) {
+    const layers = Array.isArray(view?.layers) ? view.layers : [], interfaces = (Array.isArray(view?.interfaces) ? view.interfaces : []).filter(record);
+    const ordered = layers.filter(layer => !layer.shared && layer.app === item.name).length;
+    const sharedLayers = layers.filter(layer => layer.shared && (layer.apps == null || strings(layer.apps).includes(item.name))).length;
+    const unassigned = (Array.isArray(view?.modules) ? view.modules : []).filter(module => module.layer === null && module.app === item.name).length;
+    const deviates = count(item.counts?.deviates);
+    return {title:item.name, detail:`${item.languages.join(", ") || "no languages"} · ${item.roots.map(root => root || "./").join(", ") || "no roots"}`,
+      rows:[["Files", String(item.fileCount)], ["Layers", `${ordered} + ${sharedLayers} shared`],
+        ...interfaces.filter(entry => entry.client === item.name).map(entry => [`Calls to ${entry.server}`, shown(entry.counts?.callSites)]),
+        ["Deviations", deviates ? `↑ ${plural(deviates, "deviation")}` : "0", deviates ? "error" : null],
+        ["Unassigned", unassigned ? `◇ ${unassigned} unassigned` : "0", unassigned ? "warning" : null]],
+      origin:origin(item), duplicate:item.duplicate ? duplicateNotice(item) : null, layered:ordered > 0,
+      interfaces:interfaces.filter(entry => entry.client === item.name || entry.server === item.name)};
+  }
 
   // ---- The app selection that Architecture, Treemap, Classes and the Files tree share (#852). ----
   // `assignment` is a ready summary's answer to "which app is this file in": each module's `app`, the
@@ -264,6 +296,6 @@
   // The switcher's choices, in Architecture's order and words: All apps, then one per app name.
   const choices = assigned => assigned ? [{name:null, text:"All apps"}, ...assigned.groups.map(item => ({name:item.name, text:label(item)}))] : [];
   window.TrellisArchitectureApps = {groups, group, scoped, link, stubs, sumCounts, label, origin, sourceLine, duplicateNotice,
-    layout, confidenceText, cardText, cardName, endsText, header, routes, sharedSides, key,
+    layout, confidenceText, cardText, cardName, endsText, header, routes, sharedSides, key, interfaceFacts, appFacts, footnote,
     assignment, rootApp, appOf, chosen, holdsFile, holdsFolder, selection, choices};
 })();

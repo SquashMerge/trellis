@@ -1,239 +1,221 @@
 // The Architecture diagram, drawn by the browser's own code: web/architecture-pele.js (the
-// Pele adapter: projection, validation, labels, routed arrows) and the vendored Pele are
-// bundled unchanged and run here headless over src/dom.js. The summary-display options the
-// browser's web/architecture.js builds inside its DOM-bound `create()` closure are ported
-// below, with its defaults (metric cognitive, aggregate max, production role, fixed bands,
-// tests hidden); they are marked with the function names they mirror. Keep them in step.
+// Pele adapter: projection, validation, labels, routed arrows) and the vendored Pele run here
+// headless over src/dom.js. What the browser derives from a payload for its summary display
+// (band labels and stat chips, module chips and their budget, the per-app parts of All apps,
+// the heat scale) is web/architecture.js's own `createDisplay`, and the app switcher, column
+// headers, interface cards, cross-app lines and inspector facts are web/architecture-apps.js's.
+// All are bundled unchanged (#886), so the two views can't drift. The colour tokens and the
+// Color by and Aggregation choices are read from web/style.css and web/index.html at build time.
 import makeMetricHeat from "trellis-web:metric-heat";
+import makeApps from "trellis-web:architecture-apps";
 import makeArchitecture from "trellis-web:architecture";
 import makeArchitecturePele from "trellis-web:architecture-pele";
+import makeDeviations from "trellis-web:architecture-deviations";
+import TOKENS from "trellis-web:tokens";
+import CONTROLS from "trellis-web:controls";
 import { DOMParser, TextEncoder, serialize } from "./dom.js";
 import { FONT_FAMILY, document, pele } from "./runtime.js";
 
 export { measure } from "./runtime.js";
 
-const heat = makeMetricHeat({});
-const helpers = makeArchitecture({ TrellisMetricHeat: heat }, document);
+export const heat = makeMetricHeat({});
+export const apps = makeApps({});
+const helpers = makeArchitecture({ TrellisMetricHeat: heat, TrellisArchitectureApps: apps }, document);
 const adapter = makeArchitecturePele({ pele }, document, DOMParser, TextEncoder);
-const { metricValue, createScale } = heat;
-const { moduleKey, commonDirectory, groupModules } = helpers;
+/** The Deviations tree's pure model (web/architecture-deviations.js). */
+export const deviationModel = makeDeviations({}, document).model;
+export { TOKENS, CONTROLS };
 
-// --- web/architecture.js summary display, ported (browser defaults) ---
-const METRIC = "cognitive", AGGREGATE = "max", ROLE = "production";
+// The browser's defaults are the selects' own: the `selected` option, else the first.
+const initial = (options) => (options.find((option) => option.selected) ?? options[0]).value;
+export const DEFAULT_METRIC = initial(CONTROLS.metrics), DEFAULT_AGGREGATE = initial(CONTROLS.aggregates);
+
 const finite = (value) => typeof value === "number" && Number.isFinite(value);
-const display = (value) => (finite(value) ? String(value) : "—");
-const plural = (count, word) => `${count} ${word}${count === 1 ? "" : "s"}`;
-const STATS = [["up", "↑", "upward deviation", true], ["cross", "⇄", "peer or shared deviation", true], ["down", "↓", "downward"],
-  ["shared", "→shared ", "into shared"], ["allowed", "allowed ", "allowed by policy"], ["excepted", "excepted ", "excepted"], ["unknown", "unknown ", "unknown"]];
-const ENTRY_CAP = 40, BOX_CAP = 150;
-const callables = () => "production callables";
-const same = (a, b) => moduleKey(a) === moduleKey(b);
-const hint = (layer) => (["expanded", "collapsed", "hidden"].includes(layer.display) ? layer.display : null);
-
-/** Everything the browser derives from one payload for its summary display (#391, #449). */
-export function summarize(view, open = new Map()) {
-  const expanded = (layer) => (open.has(layer.name) ? open.get(layer.name) : hint(layer) === "expanded");
-  const layerOf = (identity) => (identity.kind !== "externalPackage"
-    ? view.modules.find((module) => same(module.identity, identity))?.layer
-    : view.references?.externalPackages?.find((item) => same(item.identity, identity))?.layer ?? null);
-  const worst = (modules) => {
-    const values = modules.map((module) => metricValue(module.metrics, METRIC)).filter(finite);
-    return values.length ? Math.max(...values) : null;
-  };
-  // layerCounts: outgoing production reference sites by verdict.
-  function layerCounts(layer) {
-    const byName = new Map(view.layers.map((item) => [item.name, item]));
-    const counts = { up: 0, cross: 0, down: 0, shared: 0, allowed: 0, excepted: 0, unknown: 0 };
-    for (const edge of view.edges) {
-      if (edge.sourceLayer !== layer.name || edge.role !== "production") continue;
-      const destination = byName.get(edge.destinationLayer), ordered = !layer.shared && destination && !destination.shared;
-      if (edge.excepted) counts.excepted += edge.count;
-      else if (edge.status === "deviates") counts[ordered && destination.order < layer.order ? "up" : "cross"] += edge.count;
-      else if (edge.status !== "conforms") counts.unknown += edge.count;
-      else if (destination?.shared) counts.shared += edge.count;
-      else counts[ordered && destination.order > layer.order ? "down" : "allowed"] += edge.count;
-    }
-    return counts;
-  }
-  const coverageOf = (layerName, siteRole) => (view.references?.coverage || []).find((row) => row.layer === layerName && row.role === siteRole) || null;
-  const lowerBound = (layerName, siteRole) => (coverageOf(layerName, siteRole)?.unresolvedSites ?? 1) > 0;
-  function layerStats(layer) {
-    const counts = layerCounts(layer), bound = lowerBound(layer.name, "production") ? "≥" : "";
-    return STATS.filter(([key]) => counts[key] > 0).map(([key, glyph, words, error]) =>
-      ({ key, count: counts[key], text: `${glyph}${bound}${counts[key]}`, label: `${bound ? "at least " : ""}${counts[key]} outgoing production reference sites · ${words}`, tone: error ? "error" : "neutral" }));
-  }
-  function layerLabel(layer) {
-    const modules = view.modules.filter((module) => module.layer === layer.name);
-    const values = modules.map((module) => metricValue(module.metrics, METRIC)).filter(finite);
-    const packages = (view.references?.externalPackages || []).filter((item) => layerOf(item.identity) === layer.name);
-    const max = values.length ? String(values.reduce((most, value) => Math.max(most, value), -Infinity)) : "—";
-    const parts = [`${layer.shared ? "Shared" : layer.order} · ${layer.name}`, `${plural(modules.length, "file")}${packages.length ? ` · ${packages.length} external packages` : ""}`, `max ${max}`];
-    return parts.join(layer.shared ? "\n" : " · ");
-  }
-  function testLayer(layer) {
-    const members = view.modules.filter((module) => module.layer === layer.name);
-    const test = (module) => module.excludedReason === "fixture" || (module.roleCounts?.production === 0 && module.roleCounts?.test > 0);
-    const empty = (module) => !module.excludedReason && module.roleCounts?.production === 0 && module.roleCounts?.test === 0;
-    return members.some(test) && members.every((module) => test(module) || empty(module));
-  }
-  const flagged = (edge) => (edge.status === "deviates" && !edge.excepted) || edge.status === "unknown";
-  const edgeTone = (edge) => (edge.role === "test" ? "neutral" : edge.status === "unknown" ? "unknown" : flagged(edge) ? "deviation" : "allowed");
-  const percent = (part, whole) => {
-    if (!whole) return "—";
-    const value = (part / whole) * 100;
-    return part > 0 && value < 1 ? "<1%" : part < whole && value > 99 ? ">99%" : `${Math.round(value)}%`;
-  };
-  const edgeTier = (edge) => ({ semantic: "; semantic bindings", mixed: "; syntax and semantic bindings" })[edge.evidenceTier] || "";
-  function edgeText(edge) {
-    const covered = edge.coverage || coverageOf(edge.sourceLayer, edge.role);
-    const bound = edge.coverage ? edge.coverage.complete !== true : lowerBound(edge.sourceLayer, edge.role);
-    if (!covered) return { bound };
-    const share = percent(covered.mappedSites, covered.sites);
-    const label = `${bound ? "lower bound; " : ""}${share} of ${covered.sites} ${edge.role} reference sites from ${edge.sourceLayer} mapped to a module${edgeTier(edge)}`;
-    return { bound, label, note: bound && ["deviation", "unknown"].includes(edgeTone(edge)) ? `${share} mapped` : "" };
-  }
-  // summary: unhinted test/fixture layers and authored hidden layers are not drawn.
-  const tests = new Set(view.layers.filter((layer) => hint(layer) === null && testLayer(layer)).map((layer) => layer.name));
-  const hidden = view.layers.filter((layer) => hint(layer) === "hidden" || tests.has(layer.name));
-  const layers = new Set(view.layers.filter((layer) => !hidden.includes(layer)).map((layer) => layer.name));
-  const visible = view.modules.filter((module) => (module.layer === null || layers.has(module.layer)) && module.declarationCount > 0);
-  const scale = createScale(METRIC, AGGREGATE, visible.map((module) => metricValue(module.metrics, METRIC)), false);
-  const budget = { left: BOX_CAP, truncated: 0 };
-  function level(layerKey, base, members) {
-    return groupModules(members, base).map(([name, files]) => {
-      files.sort((a, b) => a.identity.path.localeCompare(b.identity.path));
-      if (files.length === 1) return { type: "module", module: files[0], name };
-      // The mod draws no drilled-in directories yet: a directory module stays one chip.
-      const prefix = `${base}${name}`, key = JSON.stringify([layerKey, prefix]), value = worst(files);
-      const amount = `max ${display(value)}`;
-      return { type: "directory", key, open: false, size: files.length, band: scale.band(value), entries: [], children: null,
-        label: `${name}\n${plural(files.length, "file")} · ${amount}\n${prefix}`, shown: `${name}\n${display(value)} · ${plural(files.length, "file")}` };
-    });
-  }
-  function capped(layerKey, list) {
-    const room = Math.min(ENTRY_CAP, budget.left), kept = list.length > room ? list.slice(0, Math.max(0, room - 1)) : list;
-    budget.left -= kept.length;
-    if (kept.length === list.length) return kept;
-    const omitted = list.slice(kept.length).reduce((sum, entry) => sum + (entry.size ?? 1), 0);
-    budget.truncated += omitted;
-    if (budget.left < 1) return kept;
-    budget.left -= 1;
-    return [...kept, { type: "note", layerKey, label: `${plural(omitted, "file")} not drawn · diagram size cap\nselect to list ${layerKey === null ? "unassigned" : "this layer's"} files`,
-      shown: `${plural(omitted, "file")}\nnot drawn (cap)` }];
-  }
-  function entries(layerKey, modules) {
-    const measured = modules.filter((module) => module.declarationCount > 0);
-    const result = capped(layerKey, level(layerKey, commonDirectory(modules.map((module) => module.identity.path)), measured));
-    const unmeasured = modules.length - measured.length;
-    if (unmeasured && budget.left > 0) {
-      budget.left -= 1;
-      result.push({ type: "note", layerKey, label: `${plural(unmeasured, "file")} · metrics unavailable\nno ${callables()}`, shown: `${plural(unmeasured, "file")}\nno metrics` });
-    }
-    return result;
-  }
-  // The groups a collapsed band summarizes, hottest first: the module chips.
-  function moduleGroups(modules) {
-    const measured = modules.filter((module) => module.declarationCount > 0);
-    const groups = groupModules(measured, commonDirectory(modules.map((module) => module.identity.path))).map(([name, files]) => ({ name, files, value: worst(files) }));
-    const severity = (value) => (!finite(value) ? -Infinity : value);
-    return groups.sort((a, b) => severity(b.value) - severity(a.value) || a.name.localeCompare(b.name));
-  }
-  function summaryChips(layerKey, modules, columns) {
-    const groups = moduleGroups(modules);
-    const room = Math.min(columns, ENTRY_CAP, budget.left), kept = groups.length > room ? groups.slice(0, Math.max(Math.min(1, room), room - 1)) : groups;
-    budget.left -= kept.length;
-    const chips = kept.map(({ name, files, value }) => ({ type: "chip", layerKey, band: scale.band(value),
-      label: `${name} · ${plural(files.length, "file")} · ${METRIC} ${display(value)}`, shown: `${name}\n${display(value)}`, group: name }));
-    const rest = groups.length - kept.length;
-    if (rest > 0 && budget.left > 0) {
-      budget.left -= 1;
-      chips.push({ type: "chip", layerKey, band: null, label: `${plural(rest, "more module")} · open the band to see them`, shown: `+${rest} more\nopen band` });
-    }
-    return chips;
-  }
-  const unassigned = view.modules.filter((module) => module.layer === null).length;
-  const options = {
-    showTests: false, metric: METRIC, aggregate: AGGREGATE,
-    moduleValue: (module) => metricValue(module.metrics, METRIC),
-    moduleBand: (module) => scale.band(metricValue(module.metrics, METRIC)),
-    layerLabel, layerStats, edgeText, edgeTone,
-    display: { layers, expanded: (name) => budget.left > 0 && expanded(view.layers.find((layer) => layer.name === name)),
-      entries: (key, modules) => entries(key, modules), reset: () => { budget.left = BOX_CAP; budget.truncated = 0; },
-      summary: (key, modules, columns) => summaryChips(key, modules, columns), edge: () => true,
-      unassigned: { label: `Unassigned / unknown\n${plural(unassigned, "file")} · no layer`, expanded: false } },
-    // Selection callbacks make the adapter mark nodes as controls; clicks are hit-tested (see DESIGN-NOTES).
-    onSelectModule() {}, onSelectEdge() {}, onSelectLayer() {}, onToggleLayer() {}, onToggleDirectory() {}, onToggleUnassigned() {}, onSelectNote() {},
-  };
-  return { options, hidden, tests, layers, scale, budget, layerStats, layerCounts, moduleGroups, worst, expanded };
-}
-
-// The browser's dark brand palette, as the adapter writes it, to the theme colour names the
-// mod draws with. Heat keeps its order (neutral, then three warmer steps).
-function palette(t) {
-  return {
-    "#0B0C10": t.background, "#F7F7FB": t.foreground, "#B8BAC8": t.muted, "#777A8E": t.input || t.dim,
-    "#14151D": t.surface, "#1D1E2A": t.raised, "#343644": t.border, "#FF8E9A": t.ansi1,
-    "#FFC20A": t.ansi11 || t.ansi3, "#FFAA10": t.ansi3, "#FF7A00": t.ansi9 || t.ansi1,
-  };
-}
+export const display = (value) => (finite(value) ? String(value) : "—");
+export const plural = (count, word) => `${count} ${word}${count === 1 ? "" : "s"}`;
 
 /**
- * Lays out and draws one payload at `width` (logical px). Returns the themed SVG text, its
- * size, and the drawn controls' boxes (for hit-testing clicks) and the module chips by layer.
- * Throws a typed Error (`code`) when the payload or the drawing is invalid; never a partial
- * drawing.
+ * Everything the browser derives from one payload for the current choices: `metric`,
+ * `aggregate`, `scope` (an app name, or null for All apps), and the display state `open`
+ * (band → open), `drilled` (open directory modules) and `unassigned` (the unassigned row open).
  */
-export async function draw(view, { width, open, theme, highlight, pause }) {
-  const summary = summarize(view, open);
+export function summarize(view, { open = new Map(), drilled = new Set(), unassigned = false, metric = DEFAULT_METRIC, aggregate = DEFAULT_AGGREGATE, scope = null } = {}) {
+  const shown = { open, drilled, unassigned, hidden: false };
+  let drawn = null;
+  // web/architecture.js scopeGroup: with fewer than two apps there is no switcher, so no scope.
+  const scopeGroup = (payload = view) => (scope === null || payload?.state !== "ready" || !(payload.apps?.length >= 2) ? null : apps.group(payload, scope));
+  const shared = helpers.createDisplay({ metric: () => metric, aggregate: () => aggregate, role: () => "production", relative: () => false,
+    showTests: () => false, view: () => view, model: () => drawn ?? view, shown: () => shown, endMark: () => null, scopeGroup });
+  const group = scopeGroup();
+  const plan = shared.plan(view, group?.name ?? null);
+  drawn = plan.payload;
+  return {
+    ...shared, plan, group, scope: group?.name ?? null, metric, aggregate, scale: plan.scale, layers: plan.layout.layers, tests: plan.layout.tests,
+    hidden: plan.layout.hidden, choices: apps.choices(apps.assignment(view)),
+    // An app with no ordered layer draws nothing: its files are listed as unassigned (AC13).
+    noLayers: group !== null && !plan.payload.layers.some((layer) => !layer.shared),
+    reviewCounts: shared.reviewCounts(view, group),
+  };
+}
+
+// The browser's dark palette, as the adapter writes it, to the Herdr theme where a theme
+// colour has the same role: background, text, surfaces and lines. The heat ramp, the error
+// tone and ink on heat stay the web app's own tokens (web/style.css), so chips read the same.
+function palette(t) {
+  return {
+    [TOKENS["sm-ink"]]: t.background, [TOKENS["sm-white"]]: t.foreground, [TOKENS["sm-muted"]]: t.muted, [TOKENS["sm-control"]]: t.input || t.dim,
+    [TOKENS["sm-surface"]]: t.surface, [TOKENS["sm-raised"]]: t.raised, [TOKENS["sm-line"]]: t.border,
+  };
+}
+/** The fill of heat band 0–3, as the browser draws it (band 0 is the theme's line colour). */
+export const heatFill = (t, band) => (band > 0 ? [TOKENS["sm-gold"], TOKENS["sm-amber"], TOKENS["sm-orange"]][band - 1] : t.border);
+export const HEAT_INK = TOKENS["sm-ink"], ERROR = TOKENS["sm-error"], WARNING = TOKENS["sm-gold"];
+
+// Pressing a control in the image is hit-tested (see DESIGN-NOTES); the adapter only needs
+// the callbacks to exist to mark nodes and stat chips as controls.
+const HANDLERS = { onSelectModule() {}, onSelectEdge() {}, onSelectLayer() {}, onToggleLayer() {}, onToggleDirectory() {}, onToggleUnassigned() {},
+  onSelectNote() {}, onOpenDeviation() {}, onSelectInterface() {} };
+// The "Selected" word on an interface stub is shown by the browser's CSS only while it is
+// pressed; an image has no CSS, so it is left out.
+const HIDDEN_CLASSES = ["architecture-selected-tag", "architecture-selected-tag-back"];
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+async function renderPart(view, options) {
   const container = document.createElement("div");
   // `pause` yields to the host between heavy phases: the Herdr runtime silently ends a task
   // whose one synchronous run is too long (see DESIGN-NOTES, "The synchronous-run cap").
-  const outcome = await adapter.render(container, view, { ...summary.options, width, pause });
+  const outcome = await adapter.render(container, view, { ...options, ...HANDLERS });
   if (outcome?.status !== "ready") {
-    const error = new Error(outcome?.error?.message || "Architecture mapping failed. Nothing displayed.");
+    const error = new Error(outcome?.error?.message || outcome?.reason || "Architecture mapping failed. Nothing displayed.");
     error.code = outcome?.error?.code || "render_failed";
     throw error;
   }
   const root = container.children[0];
+  return { root, projection: outcome.projection, bands: outcome.bands, width: Number(root.getAttribute("width")), height: Number(root.getAttribute("height")) };
+}
+
+/**
+ * Lays out and draws one payload at `width` (logical px) for `choice` (see `summarize`).
+ * Returns the summary and the images: one for a single stack, one composed image for All
+ * apps side by side (with the cross-app lines), or one per app column when the columns stack
+ * (null for an app with no layers). Each image has its themed SVG text, size and the drawn
+ * controls' boxes (for hit-testing). Throws a typed Error (`code`) when the payload or the
+ * drawing is invalid; never a partial drawing.
+ */
+export async function draw(view, { width, theme, highlight, pause, choice }) {
+  const summary = summarize(view, choice);
+  const { plan } = summary;
+  if (summary.noLayers) return { summary, images: [], cards: [], sideBySide: false };
   const colors = palette(theme);
-  root.setAttribute("font-family", FONT_FAMILY);
-  // Heat chips carry ink text on a warm fill; ink must stay dark in a light theme too.
-  const ink = theme.ansi0 || "#000000";
-  const chips = new Map();
-  for (const item of outcome.projection.nodes.values()) if (item.kind === "C" && item.record.group) chips.set(JSON.stringify([item.record.layerKey, item.record.group]), item.id);
-  const highlighted = highlight ? chips.get(JSON.stringify(highlight)) : null;
-  const override = (el) => {
+  const override = (highlighted) => (el) => {
+    const cls = (el.getAttribute?.("class") || "").split(/\s+/);
+    if (HIDDEN_CLASSES.some((name) => cls.includes(name))) return null;
     const out = {};
     for (const [name, value] of el.attrs) {
       if (name !== "fill" && name !== "stroke") continue;
-      const upper = value.toUpperCase();
-      if (el.localName === "text" && upper === "#0B0C10") out[name] = ink;
-      else if (colors[upper]) out[name] = colors[upper];
+      // Ink text sits on heat fills, which keep the web colours: it stays ink.
+      if (el.localName === "text" && value.toUpperCase() === TOKENS["sm-ink"]) continue;
+      if (colors[value.toUpperCase()]) out[name] = colors[value.toUpperCase()];
     }
     if (highlighted && el.localName === "rect" && el.parentNode?.getAttribute("data-id") === highlighted) {
       out.stroke = theme.accent; out["stroke-width"] = 3;
     }
     return out;
   };
+  const options = (part, partWidth, sharedSide) => summary.options(part, plan.scale, { width: partWidth, pause,
+    ...(summary.scope !== null ? { title: `${summary.scope} · ordered layers` } : part.group ? { title: `${part.group.name} · ordered layers`, sharedSide } : {}) });
+
+  if (!plan.allApps) {
+    const drawn = await renderPart(plan.payload, options(plan.parts[0], width));
+    if (pause) await pause();
+    const image = finish(drawn, override(chipId(drawn.projection, highlight)), 0);
+    if (pause) await pause();
+    return { summary, images: [{ ...image, parts: [0] }], cards: [], sideBySide: false };
+  }
+
+  // All apps (#790): web/architecture.js drawApps, with the grid composed into one SVG.
+  let layout = apps.layout({ width, count: plan.parts.length });
+  const sides = summary.sides(view, plan.parts, layout.sideBySide);
+  const drawings = [];
+  for (const [index, part] of plan.parts.entries()) {
+    const layered = part.slice.layers.some((layer) => !layer.shared);
+    drawings.push(layered ? await renderPart(part.slice, options(part, layout.widths[index], sides.get(part.group.name))) : null);
+    if (pause) await pause();
+  }
+  // A drawing wider than its column (an unbreakable name) widens the column.
+  layout = apps.layout({ width, count: plan.parts.length, natural: drawings.map((d) => d?.width ?? 0) });
+  const places = new Map(plan.parts.map((part, index) => {
+    const x = layout.sideBySide ? layout.columns[index].x : 0, frames = drawings[index]?.bands ?? new Map();
+    return [part.group.name, { index, top: 0, bands: new Map([...frames].filter(([, f]) => f).map(([name, f]) => [name, { x: f.x + x, y: f.y, w: f.w, h: f.h }])) }];
+  }));
+  const entries = view.interfaces.filter((entry) => entry && places.has(entry.client) && places.has(entry.server) && entry.client !== entry.server);
+  const routed = apps.routes({ interfaces: entries }, layout, places, adapter.edgeWidth);
+  const cards = entries.map((entry) => ({ entry, key: apps.key(entry), lines: apps.cardText(entry), ends: apps.endsText(entry, routed.undrawn.get(entry) || []),
+    name: apps.cardName(entry), client: places.get(entry.client).index, server: places.get(entry.server).index }));
+  const highlighted = (index) => chipId(drawings[index]?.projection, highlight, plan.parts[index].group.name);
+
+  if (!layout.sideBySide) {
+    const images = drawings.map((drawn, index) => (drawn ? { ...finish(drawn, override(highlighted(index)), index), parts: [index] } : null));
+    if (pause) await pause();
+    return { summary, images, cards, sideBySide: false, layout };
+  }
+  // Side by side: each column's SVG nested at its x, and the interface lines over the gutters.
+  const height = Math.max(1, ...drawings.map((d) => d?.height ?? 0)) + 8;
+  const inner = [], all = [];
+  for (const [index, drawn] of drawings.entries()) {
+    if (!drawn) continue;
+    const x = layout.columns[index].x;
+    drawn.root.setAttribute("x", String(x)); drawn.root.setAttribute("y", "0");
+    const one = finish(drawn, override(highlighted(index)), index);
+    inner.push(one.svg);
+    for (const box of one.boxes) all.push({ ...box, x: box.x + x });
+  }
+  const line = theme.input || theme.border;
+  const lines = routed.lines.map((item) => `<path d="${item.path}" fill="none" stroke="${line}" stroke-width="${item.width}"/><polygon points="${item.arrow}" fill="${line}"/>`);
+  const svg = `<svg xmlns="${SVG_NS}" width="${layout.width}" height="${height}" viewBox="0 0 ${layout.width} ${height}" font-family="${FONT_FAMILY}">${inner.join("")}${lines.join("")}</svg>`;
   if (pause) await pause();
-  const svg = serialize(root, override);
-  if (pause) await pause();
-  const size = { width: Number(root.getAttribute("width")), height: Number(root.getAttribute("height")) };
-  return { svg, ...size, summary, projection: outcome.projection, boxes: boxes(root, outcome.projection) };
+  // The composed image keeps each column's projection, so the Files card can tell a drawn chip from one in "+N more".
+  return { summary, images: [{ svg, width: layout.width, height, boxes: all, parts: plan.parts.map((_, i) => i), projections: drawings.map((d) => d?.projection ?? null) }],
+    cards, sideBySide: true, layout };
+}
+
+// The followed file's module chip in one drawing: `highlight` is [layerKey, group, app]; in
+// All apps only the file's own app's column outlines it.
+function chipId(projection, highlight, app = null) {
+  if (!projection || !highlight || (app !== null && highlight[2] != null && highlight[2] !== app)) return null;
+  for (const item of projection.nodes.values()) if (item.kind === "C" && item.record.group && item.record.layerKey === highlight[0] && item.record.group === highlight[1]) return item.id;
+  return null;
+}
+
+function finish(drawn, override, part) {
+  drawn.root.setAttribute("font-family", FONT_FAMILY);
+  const svg = serialize(drawn.root, override);
+  return { svg, width: drawn.width, height: drawn.height, projection: drawn.projection, boxes: boxes(drawn.root, drawn.projection, part) };
 }
 
 // Each drawn control's box in SVG units, which are the image's logical pixels: a click on the
-// image is hit-tested against these (the smallest box under the pointer wins).
-function boxes(root, projection) {
+// image is hit-tested against these (the smallest box under the pointer wins). Stat chips that
+// act (an upward deviation, an HTTP interface stub) are boxes of kind "A" with their action.
+function boxes(root, projection, part) {
   const out = [];
+  const place = (node, rect) => {
+    let x = Number(rect.getAttribute("x") || 0), y = Number(rect.getAttribute("y") || 0);
+    const at = /translate\(\s*(-?[\d.]+)[ ,]+(-?[\d.]+)\s*\)/.exec(node.getAttribute("transform") || "");
+    if (at) { x += Number(at[1]); y += Number(at[2]); }
+    return { x, y, w: Number(rect.getAttribute("width")), h: Number(rect.getAttribute("height")) };
+  };
   for (const node of root.querySelectorAll("[data-trellis-architecture-id]")) {
     const id = node.getAttribute("data-trellis-architecture-id"), item = projection.nodes.get(id) || projection.edges.get(id);
     const rect = node.querySelector(":scope > rect") || node.querySelector("rect");
     if (!item || !rect) continue;
-    let x = Number(rect.getAttribute("x") || 0), y = Number(rect.getAttribute("y") || 0);
-    const at = /translate\(\s*(-?[\d.]+)[ ,]+(-?[\d.]+)\s*\)/.exec(node.getAttribute("transform") || "");
-    if (at) { x += Number(at[1]); y += Number(at[2]); }
-    out.push({ id, kind: item.kind, x, y, w: Number(rect.getAttribute("width")), h: Number(rect.getAttribute("height")), record: item.record, label: item.full });
+    out.push({ id, kind: item.kind, ...place(node, rect), record: item.record, label: item.full, part });
+  }
+  for (const node of root.querySelectorAll("[data-trellis-action-id]")) {
+    const rect = node.querySelector("rect");
+    let action = null;
+    try { action = JSON.parse(node.getAttribute("data-trellis-action-id")); } catch { continue; }
+    if (!rect || !Array.isArray(action)) continue;
+    out.push({ id: node.getAttribute("data-trellis-action-id"), kind: "A", ...place(node, rect), action, label: node.getAttribute("aria-label"), part });
   }
   return out;
 }
@@ -241,5 +223,3 @@ function boxes(root, projection) {
 export function hit(boxes, x, y) {
   return boxes.filter((b) => x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h).sort((a, b) => a.w * a.h - b.w * b.h)[0] || null;
 }
-
-export { heat, plural, display };

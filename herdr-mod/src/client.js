@@ -113,7 +113,12 @@ export function createClient({ url = DEFAULT_URL, tokenFile, machine = null, tra
     base, machine, transport: viaExec ? "exec" : "fetch",
     checkouts: () => request("/api/checkouts"),
     status: (rootKey) => checkout(rootKey, "status"),
-    architecture: (rootKey, pin) => checkout(rootKey, `architecture?aggregate=max&role=production&workbench=true&${pinQuery(pin)}`),
+    architecture: (rootKey, pin, aggregate = "max") => checkout(rootKey, `architecture?aggregate=${encodeURIComponent(aggregate)}&role=production&workbench=true&${pinQuery(pin)}`),
+    // One page of Architecture detail (the Deviations tree, #886), at the summary's pin and rules hash.
+    details: (rootKey, pin, rulesHash, params, offset = 0) => checkout(rootKey,
+      `architecture/details?${new URLSearchParams({ ...params, indexGeneration: pin.indexGeneration, indexRevision: String(pin.indexRevision), rulesHash, offset: String(offset) })}`),
+    // The checkout's current index job, or null: the status line's "Last re-index failed" note.
+    job: (rootKey) => checkout(rootKey, "jobs/current"),
     methods: (rootKey, pin, path) => checkout(rootKey, `methods?${pinQuery(pin)}&path=${encodeURIComponent(path)}`),
     sequence: (rootKey, pin, seed) => checkout(rootKey, "sequence", { seed, expectedRevision: pin, showAll: false, interactions: true }),
   };
@@ -129,14 +134,15 @@ export function pinOf(value) {
 export const samePin = (a, b) => (!a && !b) || (!!a && !!b && a.indexGeneration === b.indexGeneration && a.indexRevision === b.indexRevision);
 export const pinLabel = (pin) => `${pin.indexGeneration.slice(0, 8)}:${pin.indexRevision}`;
 
-/** web/app.js payloadOf: the Architecture states the browser accepts, or a typed error. */
-export function architecturePayload(data, pin) {
+/** web/architecture.js payloadOf: the Architecture states the browser accepts, or a typed error. */
+export function architecturePayload(data, pin, aggregate = "max") {
   const payload = data?.payload;
   if (!payload || !samePin({ indexGeneration: payload.indexGeneration, indexRevision: payload.indexRevision }, pin)) {
     throw new TrellisError("revision_conflict", "Architecture snapshot changed. Refreshing.");
   }
   if (payload.state === "building") return payload;
-  if (!["ready", "missing_rules", "no_layers"].includes(payload.state) || payload.aggregate !== "max" || payload.role !== "production" ||
+  if (!["ready", "missing_rules", "no_layers"].includes(payload.state) || !Array.isArray(payload.apps) || !Array.isArray(payload.interfaces) ||
+      payload.aggregate !== aggregate || payload.role !== "production" ||
       payload.workbench !== true || payload.metricsVersion !== "metrics:v1" ||
       !["syntax", "mixed"].includes(payload.evidenceTier) || payload.semanticComplete !== false ||
       !Array.isArray(payload.layers) || !Array.isArray(payload.modules) || !Array.isArray(payload.edges) ||
@@ -157,4 +163,22 @@ export function indexLabel(row) {
   return row.catchingUp === true ? { text: `Catching up · rev ${label}`, state: "catching-up", shape: "◐" }
     : row.catchingUp === false ? { text: `Fresh · rev ${label}`, state: "fresh", shape: "○" }
     : { text: `Indexed · idle · rev ${label}`, state: "unknown", shape: "◇" };
+}
+
+/** web/architecture.js details: one validated page of Architecture detail, or a typed error. */
+export function detailPage(data, pin, rulesHash, kind, offset) {
+  const page = data?.payload;
+  if (!page || !samePin({ indexGeneration: page.indexGeneration, indexRevision: page.indexRevision }, pin) || page.rulesFile?.contentHash !== rulesHash ||
+      page.kind !== kind || page.offset !== offset || !Array.isArray(page.items) || !Number.isSafeInteger(page.total) ||
+      !(page.nextOffset === null || (Number.isSafeInteger(page.nextOffset) && page.nextOffset > offset))) {
+    throw new TrellisError("invalid_response", "Invalid Architecture detail response. Nothing displayed.");
+  }
+  return page;
+}
+
+/** web/app.js jobCause: the recorded failure code and reason, never the generic job message. */
+export function jobCause(job) {
+  const code = typeof job?.error?.code === "string" && job.error.code ? job.error.code : "cause not recorded";
+  const reason = typeof job?.error?.reason === "string" && job.error.reason ? `: ${job.error.reason}` : "";
+  return `${code}${reason}`;
 }

@@ -58,6 +58,8 @@ pub fn cli_api_route(method: &str, target: &str, has_body: bool) -> anyhow::Resu
         let suffix = match (method, suffix, query.is_some()) {
             ("GET", "status", false) => Some("status"),
             ("GET", "architecture", _) => Some("architecture"),
+            ("GET", "architecture/details", _) => Some("architecture/details"),
+            ("GET", "jobs/current", false) => Some("jobs/current"),
             ("GET", "methods", _) => Some("methods"),
             ("POST", "sequence", false) => Some("sequence"),
             _ => None,
@@ -162,6 +164,12 @@ mod tests {
             ),
             ("GET", "methods?path=src%2Fmain.rs", false),
             ("POST", "sequence", true),
+            (
+                "GET",
+                "architecture/details?kind=instances&rule=%24layers&offset=0",
+                false,
+            ),
+            ("GET", "jobs/current", false),
         ] {
             let target = format!("/api/checkouts/{KEY}/{suffix}");
             assert!(
@@ -179,6 +187,8 @@ mod tests {
             ("POST", format!("/api/checkouts/{KEY}/index")),
             ("GET", format!("/api/checkouts/{KEY}/sequence")),
             ("GET", format!("/api/checkouts/{KEY}/status?x=1")),
+            ("GET", format!("/api/checkouts/{KEY}/jobs/current?x=1")),
+            ("GET", format!("/api/checkouts/{KEY}/architecture/rules")),
             ("GET", "/api/checkouts?x=1".to_owned()),
             ("GET", "/api/daemon/status".to_owned()),
             ("GET", "/".to_owned()),

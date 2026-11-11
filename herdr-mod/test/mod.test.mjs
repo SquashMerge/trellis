@@ -14,8 +14,12 @@ const { fixture } = createRequire(import.meta.url)("../../tests/fixtures/pele-1.
 const view = () => {
   const v = fixture();
   for (const m of v.modules) m.declarationCount = 1;
-  return { ...v, rulesFile: { contentHash: "abc" }, references: { coverage: [] } };
+  return { ...v, rulesFile: { contentHash: "abc" }, references: { coverage: [] }, apps: [], interfaces: [] };
 };
+// The web app's own colour tokens, read here from web/style.css, not from the mod.
+const css = readFileSync(new URL("../../web/style.css", import.meta.url), "utf8");
+const token = (name) => new RegExp(`--${name}:\\s*(#[0-9A-Fa-f]{6})`).exec(css)[1].toUpperCase();
+const WEB_HEAT = [token("sm-gold"), token("sm-amber"), token("sm-orange")];
 const theme = { background: "#000001", foreground: "#000002", muted: "#000003", input: "#000004", surface: "#000005", raised: "#000006",
   border: "#000007", accent: "#000008", ansi0: "#000009", ansi1: "#00000a", ansi3: "#00000b", ansi9: "#00000c", ansi11: "#00000d" };
 
@@ -39,12 +43,13 @@ test("text is measured with Pele's own headless widths", () => {
 });
 
 test("the diagram is the browser adapter's drawing, themed, with a box per control", async () => {
-  const out = await draw(view(), { width: 900, open: new Map(), theme, highlight: null });
+  const [out] = (await draw(view(), { width: 900, theme, highlight: null })).images;
   assert.match(out.svg, /^<svg xmlns="http:\/\/www.w3.org\/2000\/svg" class="pele pele-block trellis-architecture-svg"/);
   assert.ok(out.width > 0 && out.width <= 900 && out.height > 0);
-  // No brand colour survives: every fill and stroke is a theme colour or none.
+  // Surfaces, text and lines are theme colours; heat, the error tone and ink on heat are the web app's tokens.
+  const web = [...WEB_HEAT, token("sm-error"), token("sm-ink")];
   const colours = new Set([...out.svg.matchAll(/(?:fill|stroke)="([^"]+)"/g)].map((m) => m[1]));
-  for (const colour of colours) assert.ok(colour === "none" || Object.values(theme).includes(colour), `unthemed colour ${colour}`);
+  for (const colour of colours) assert.ok(colour === "none" || Object.values(theme).includes(colour) || web.includes(colour.toUpperCase()), `unthemed colour ${colour}`);
   assert.equal(out.boxes.filter((b) => b.kind === "L").length, 5);
   assert.equal(out.boxes.filter((b) => b.kind === "E").length, 4, "test edges stay hidden, as in the browser");
   const arrow = out.boxes.find((b) => b.kind === "E");
@@ -54,19 +59,19 @@ test("the diagram is the browser adapter's drawing, themed, with a box per contr
 
 test("opening a band and highlighting a module chip change only the drawing", async () => {
   const v = view(), before = JSON.stringify(v);
-  const closed = await draw(v, { width: 900, open: new Map(), theme, highlight: null });
-  const open = await draw(v, { width: 900, open: new Map([["UI", true]]), theme, highlight: null });
+  const [closed] = (await draw(v, { width: 900, theme, highlight: null, choice: { open: new Map() } })).images;
+  const [open] = (await draw(v, { width: 900, theme, highlight: null, choice: { open: new Map([["UI", true]]) } })).images;
   assert.ok(open.boxes.some((b) => b.kind === "M"), "an open band shows file chips");
   assert.ok(!closed.boxes.some((b) => b.kind === "M"));
   const group = summarize(v).moduleGroups(v.modules.filter((m) => m.layer === "UI"))[0];
-  const marked = await draw(v, { width: 900, open: new Map(), theme, highlight: ["UI", group.name] });
+  const [marked] = (await draw(v, { width: 900, theme, highlight: ["UI", group.name] })).images;
   assert.ok(marked.svg.includes(`stroke="${theme.accent}"`));
   assert.equal(JSON.stringify(v), before);
 });
 
 test("an invalid payload is a typed error, never a partial drawing", async () => {
   const v = view(); v.modules.push(v.modules[0]);
-  await assert.rejects(draw(v, { width: 900, open: new Map(), theme, highlight: null }), (e) => /duplicate Architecture module/.test(e.message) && e.code === "unsupported");
+  await assert.rejects(draw(v, { width: 900, theme, highlight: null }), (e) => /duplicate Architecture module/.test(e.message) && e.code === "unsupported");
 });
 
 test("the client accepts loopback only and types every failure", async () => {
@@ -101,8 +106,8 @@ test("Architecture answers are checked against the pin, as the browser checks th
 test("yielding between drawing phases changes nothing in either drawing", async () => {
   let pauses = 0;
   const pause = async () => { pauses++; await new Promise((r) => setTimeout(r, 0)); };
-  const plain = await draw(view(), { width: 900, open: new Map(), theme, highlight: null });
-  const yielded = await draw(view(), { width: 900, open: new Map(), theme, highlight: null, pause });
+  const [plain] = (await draw(view(), { width: 900, theme, highlight: null })).images;
+  const [yielded] = (await draw(view(), { width: 900, theme, highlight: null, pause })).images;
   assert.equal(yielded.svg, plain.svg);
   assert.deepEqual(yielded.boxes, plain.boxes);
   assert.ok(pauses >= 6, `Architecture yields between fit attempts and phases (${pauses})`);
