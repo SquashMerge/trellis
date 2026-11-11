@@ -7161,10 +7161,10 @@ fn authenticate_stored_batch(
     captured: &crate::semantic_evidence::CapturedComponents,
     r1: &crate::native_evidence::Artifact,
     sources: &BTreeMap<crate::native_evidence::DocumentKey, Vec<u8>>,
-    identity: &topology::WorkspaceIdentity,
-    limits: &crate::semantic_batch::BatchLimits,
+    store: &Store,
     cancel: &CancelFlag,
 ) -> Result<AttestedProfileProducer> {
+    let identity = &*store.identity;
     use crate::native_ids::digest;
     use crate::scip_raw::{
         self, AuthenticatedArtifact, AuthenticatedScipDocument, DocumentSource, VecSink,
@@ -7232,6 +7232,7 @@ fn authenticate_stored_batch(
     }
     let cargo_targets = cargo_targets.finish();
     // The limits admission ran under, so a document capped there is capped here.
+    let limits = &store.batch_limits().map_err(anyhow::Error::msg)?;
     let mut claims = Vec::new();
     let mut capped = scip_raw::CappedDocuments::new();
     for capture in &raw.captures {

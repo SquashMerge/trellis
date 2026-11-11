@@ -303,8 +303,7 @@ fn full_rejoin(
         &captured,
         &captured_native,
         &captured_sources,
-        &store.identity,
-        &store.batch_limits().map_err(anyhow::Error::msg)?,
+        store,
         cancel,
     )?;
     ensure!(
