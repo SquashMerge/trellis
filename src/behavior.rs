@@ -196,6 +196,69 @@ pub struct SequenceStep {
     /// The HTTP interface this client call reaches (#853), when it is a read client call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface: Option<InterfaceHop>,
+    /// #888: on a callback boundary, the callback's body as built but not shown: it holds
+    /// no interaction, so the boundary stays as it was. The read that finds an HTTP interface
+    /// hop in it shows it then ([`splice_callbacks`]). Never serialized: a candidate only.
+    #[serde(skip)]
+    pub callback: Option<Box<CallbackCandidate>>,
+}
+/// A callback's body that Sequence built but does not show yet (#888).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallbackCandidate {
+    /// The block that replaces the boundary when it is shown: kind [`CALLBACK_KIND`].
+    pub block: SequenceStep,
+    /// The measured call the callback is passed to.
+    pub outer_call: String,
+    /// The participants the block's own resolved calls target, in columns already drawn.
+    pub participants: Vec<Participant>,
+    /// The call it is passed to, as its source spells it: what a refusal names.
+    pub callee: String,
+    /// The bound that refused building it whole (Prime review on #891): the block then keeps
+    /// only its measured calls, so a read that finds a drawn hop among them reports the bound
+    /// with [`callback_warning`] instead of dropping the hop silently. Never shown.
+    pub refused: Option<SequenceLimit>,
+}
+impl CallbackCandidate {
+    /// A candidate refused by `limit`: only the measured calls of `body`, nested candidates'
+    /// included, are kept, flat.
+    pub(crate) fn refused(
+        boundary: &SequenceStep,
+        callee: &str,
+        outer_call: String,
+        body: &[SequenceStep],
+        limit: SequenceLimit,
+    ) -> Self {
+        let mut calls = vec![];
+        any_step(body, &mut |step| {
+            if step.call_id.is_some() {
+                calls.push(SequenceStep {
+                    children: vec![],
+                    alternate: vec![],
+                    folded: vec![],
+                    callback: None,
+                    ..step.clone()
+                });
+            }
+            false
+        });
+        Self {
+            block: callback_block(boundary, callee, calls),
+            outer_call,
+            participants: vec![],
+            callee: callee.to_owned(),
+            refused: Some(limit),
+        }
+    }
+}
+/// The warning of a callback a bound refused (#888): `bound` is `step`, `work` or `depth`.
+pub(crate) fn callback_warning(limit: SequenceLimit, callee: &str) -> String {
+    let bound = match limit {
+        SequenceLimit::VisibleSteps => "step",
+        SequenceLimit::WorkSteps => "work",
+        SequenceLimit::Depth => "depth",
+        SequenceLimit::Participants => "participant",
+    };
+    format!("Sequence {bound} limit reached; the callback passed to {callee} is not shown.")
 }
 /// Why a step is incidental (#536, #543).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -609,6 +672,294 @@ pub(crate) fn cap_depth(view: &mut SequenceView) {
     }
 }
 
+/// #888: a callback block, the body of a callable passed to a measured call. It is shown, under
+/// that call, only when it holds an interaction ([`interacts`]) or an HTTP interface hop;
+/// any other callback stays the boundary it always was. When and how often it runs is unknown.
+pub const CALLBACK_KIND: &str = "callback";
+
+/// The block that shows `body`, the steps of the callback at `boundary`, passed to `callee`.
+/// It keeps the boundary's identity, range and lane: the callback runs in its definer's column.
+pub(crate) fn callback_block(
+    boundary: &SequenceStep,
+    callee: &str,
+    body: Vec<SequenceStep>,
+) -> SequenceStep {
+    let callee: String = {
+        let mut name: String = callee.chars().take(80).collect();
+        if callee.chars().count() > 80 {
+            name.push('…');
+        }
+        name
+    };
+    SequenceStep {
+        kind: CALLBACK_KIND.into(),
+        label: format!("callback passed to {callee} · when and how often it runs is unknown"),
+        call_id: None,
+        target: None,
+        resolution: None,
+        call_evidence: None,
+        children: body,
+        alternate: vec![],
+        hidden: false,
+        folded: vec![],
+        incidental: None,
+        interface: None,
+        callback: None,
+        ..boundary.clone()
+    }
+}
+
+/// A document's syntax, parsed once per view for [`passed_callable`] (#888).
+pub(crate) type CallbackTree = tree_sitter::Tree;
+
+/// The syntax tree of `file` in its language, for [`passed_callable`]; `None` for a language
+/// with no callback rule.
+pub(crate) fn callback_tree(file: &SourceFile) -> Option<CallbackTree> {
+    let language: tree_sitter::Language = match file.language.as_str() {
+        "javascript" => tree_sitter_javascript::LANGUAGE.into(),
+        "typescript" => crate::indexer_ts::grammar(&file.path),
+        "rust" => tree_sitter_rust::LANGUAGE.into(),
+        "java" => tree_sitter_java::LANGUAGE.into(),
+        "python" => tree_sitter_python::LANGUAGE.into(),
+        _ => return None,
+    };
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&language).ok()?;
+    parser.parse(&file.text, None)
+}
+
+/// #888 (Prime review on #891): whether `start..end` in `tree` is a callable expression that
+/// is itself an argument of a call (a closure, lambda, arrow or function expression, alone in
+/// parentheses or as a Python keyword argument at most). A declaration nested inside an
+/// argument (a Rust `fn` in a block argument) is not passed, so it is not a callback.
+pub(crate) fn passed_callable(tree: &CallbackTree, start: usize, end: usize) -> bool {
+    const CALLABLE: [&str; 7] = [
+        "arrow_function",
+        "function_expression",
+        "function",
+        "generator_function",
+        "closure_expression",
+        "lambda",
+        "lambda_expression",
+    ];
+    let Some(mut node) = tree.root_node().descendant_for_byte_range(start, end) else {
+        return false;
+    };
+    while !CALLABLE.contains(&node.kind()) {
+        match node.parent() {
+            Some(parent) if parent.start_byte() == start && parent.end_byte() == end => {
+                node = parent;
+            }
+            _ => return false,
+        }
+    }
+    if node.start_byte() != start || node.end_byte() != end {
+        return false;
+    }
+    let mut parent = node.parent();
+    while let Some(wrapper) =
+        parent.filter(|p| matches!(p.kind(), "parenthesized_expression" | "keyword_argument"))
+    {
+        parent = wrapper.parent();
+    }
+    parent.is_some_and(|p| matches!(p.kind(), "arguments" | "argument_list"))
+}
+
+/// The column a participant is drawn in (#558): its type or module, or its own.
+fn column_of(participant: &Participant) -> &str {
+    participant
+        .column
+        .as_ref()
+        .map_or(participant.id.as_str(), |column| column.id.as_str())
+}
+
+/// Whether `steps` show an interaction (#636): a shown, non-incidental call whose exact target
+/// is drawn in another column than the step's own. What the Interactions view draws as an
+/// arrow, and what makes a callback worth showing (#888).
+pub(crate) fn interacts(steps: &[SequenceStep], participants: &[Participant], seed: &str) -> bool {
+    let column = |id: &str| participants.iter().find(|p| p.id == id).map(column_of);
+    steps.iter().filter(|step| !step.hidden).any(|step| {
+        let crosses = step.kind == "call"
+            && step.incidental.is_none()
+            && step
+                .target
+                .as_deref()
+                .and_then(column)
+                .is_some_and(|target| Some(target) != column(step.lane.as_deref().unwrap_or(seed)));
+        crosses
+            || interacts(&step.children, participants, seed)
+            || interacts(&step.alternate, participants, seed)
+    })
+}
+
+/// Shows the callback `block` in place of the boundary at `at` (#888). The block goes under
+/// the call it is passed to when that call is a later shown sibling, after any body the call
+/// expands; otherwise it takes the boundary's place. True when `at` no longer holds a step
+/// of its own: the boundary was removed.
+pub(crate) fn place_callback(
+    steps: &mut Vec<SequenceStep>,
+    at: usize,
+    block: SequenceStep,
+    outer: &str,
+) -> bool {
+    let host = (at + 1..steps.len())
+        .find(|&j| steps[j].call_id.as_deref() == Some(outer))
+        .filter(|&j| !steps[j].hidden);
+    match host {
+        Some(j) => {
+            steps.remove(at);
+            steps[j - 1].children.push(block);
+            true
+        }
+        None => {
+            steps[at] = block;
+            false
+        }
+    }
+}
+
+/// Every step of `steps` and what they nest, candidates' blocks included: what a read must
+/// look at to decide on a candidate (#888).
+pub(crate) fn any_step(
+    steps: &[SequenceStep],
+    found: &mut dyn FnMut(&SequenceStep) -> bool,
+) -> bool {
+    steps.iter().any(|step| {
+        found(step)
+            || any_step(&step.children, found)
+            || any_step(&step.alternate, found)
+            || step
+                .callback
+                .as_ref()
+                .is_some_and(|candidate| any_step(std::slice::from_ref(&candidate.block), found))
+    })
+}
+
+/// Shows each callback candidate whose block holds a step `accept` takes (#888), within the
+/// view's bounds: its participants' columns must fit (#558), and its steps the work bound and,
+/// when `visible_bound` holds, the shown-step bound. A candidate that does not fit stays the
+/// boundary it was, and the view is truncated by that bound. Nested candidates are decided
+/// first. Every other candidate is dropped. True when a block was shown.
+pub(crate) fn splice_callbacks(
+    view: &mut SequenceView,
+    accept: &dyn Fn(&SequenceStep) -> bool,
+    visible_bound: bool,
+) -> bool {
+    struct Splice<'v> {
+        participants: &'v mut Vec<Participant>,
+        warnings: &'v mut Vec<String>,
+        limits: Vec<SequenceLimit>,
+        shown: usize,
+        work: usize,
+        visible_bound: bool,
+        spliced: bool,
+    }
+    impl Splice<'_> {
+        fn refuse(&mut self, limit: SequenceLimit, warning: &str) {
+            self.limits.push(limit);
+            if !self.warnings.iter().any(|w| w == warning) {
+                self.warnings.push(warning.into());
+            }
+        }
+        /// Decides `candidate`'s nested candidates, then whether it is shown.
+        fn decide(
+            &mut self,
+            mut candidate: CallbackCandidate,
+            accept: &dyn Fn(&SequenceStep) -> bool,
+        ) -> Option<SequenceStep> {
+            let mut nested = Splice {
+                participants: &mut candidate.participants,
+                warnings: &mut *self.warnings,
+                limits: vec![],
+                shown: 0,
+                work: 0,
+                visible_bound: false,
+                spliced: false,
+            };
+            nested.walk(&mut candidate.block.children, accept);
+            let limits = std::mem::take(&mut nested.limits);
+            self.limits.extend(limits);
+            if !any_step(std::slice::from_ref(&candidate.block), &mut |step| {
+                accept(step)
+            }) {
+                return None;
+            }
+            if let Some(limit) = candidate.refused {
+                self.refuse(limit, &callback_warning(limit, &candidate.callee));
+                return None;
+            }
+            // The block replaces its boundary (Prime review on #891): it costs its body.
+            let shown = visible_count(&candidate.block.children);
+            let work = step_count(&candidate.block.children);
+            if self.visible_bound && self.shown + shown > MAX_STEPS {
+                let warning = callback_warning(SequenceLimit::VisibleSteps, &candidate.callee);
+                self.refuse(SequenceLimit::VisibleSteps, &warning);
+                return None;
+            }
+            if self.work + work > MAX_WORK_STEPS {
+                let warning = callback_warning(SequenceLimit::WorkSteps, &candidate.callee);
+                self.refuse(SequenceLimit::WorkSteps, &warning);
+                return None;
+            }
+            let mut added = self.participants.clone();
+            for participant in candidate.participants {
+                if added.iter().any(|p| p.id == participant.id) {
+                    continue;
+                }
+                let column = participant.column.clone().unwrap_or(SequenceColumn {
+                    id: participant.id.clone(),
+                    label: participant.label.clone(),
+                });
+                if !crate::behavior_columns::fits(&added, &column) {
+                    self.refuse(
+                        SequenceLimit::Participants,
+                        "Sequence participant limit reached; additional targets are not shown.",
+                    );
+                    return None;
+                }
+                added.push(participant);
+            }
+            *self.participants = added;
+            self.shown += shown;
+            self.work += work;
+            self.spliced = true;
+            Some(candidate.block)
+        }
+        fn walk(&mut self, steps: &mut Vec<SequenceStep>, accept: &dyn Fn(&SequenceStep) -> bool) {
+            let mut at = 0;
+            while at < steps.len() {
+                if let Some(candidate) = steps[at].callback.take() {
+                    let outer = candidate.outer_call.clone();
+                    if let Some(block) = self.decide(*candidate, accept)
+                        && place_callback(steps, at, block, &outer)
+                    {
+                        continue;
+                    }
+                } else {
+                    self.walk(&mut steps[at].children, accept);
+                    self.walk(&mut steps[at].alternate, accept);
+                }
+                at += 1;
+            }
+        }
+    }
+    let mut splice = Splice {
+        shown: visible_count(&view.steps),
+        work: step_count(&view.steps),
+        participants: &mut view.participants,
+        warnings: &mut view.warnings,
+        limits: vec![],
+        visible_bound,
+        spliced: false,
+    };
+    splice.walk(&mut view.steps, accept);
+    let (limits, spliced) = (splice.limits, splice.spliced);
+    for limit in limits {
+        view.limit(limit);
+    }
+    spliced
+}
+
 #[cfg(test)]
 mod external_package_tests {
     use super::ExternalPackage;
@@ -671,5 +1022,107 @@ mod external_package_tests {
         ] {
             assert_eq!(ExternalPackage::from_scip(symbol), None, "{symbol:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod callback_tests {
+    use super::*;
+
+    fn step(id: &str, kind: &str) -> SequenceStep {
+        SequenceStep {
+            id: id.into(),
+            kind: kind.into(),
+            label: id.into(),
+            path: "a.js".into(),
+            range: SourceRange::default(),
+            call_id: None,
+            target: None,
+            resolution: None,
+            call_evidence: None,
+            children: vec![],
+            alternate: vec![],
+            hidden: false,
+            lane: None,
+            folded: vec![],
+            incidental: None,
+            interface: None,
+            callback: None,
+        }
+    }
+
+    fn participant(id: &str, column: &str) -> Participant {
+        Participant {
+            id: id.into(),
+            label: id.into(),
+            kind: "function".into(),
+            identification: String::new(),
+            declaration: None,
+            column: Some(SequenceColumn {
+                id: column.into(),
+                label: column.into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn only_a_shown_non_incidental_call_into_another_column_interacts() {
+        let participants = [
+            participant("seed", "module:a"),
+            participant("same", "module:a"),
+            participant("other", "module:b"),
+        ];
+        let call = |target: &str| SequenceStep {
+            target: Some(target.into()),
+            call_id: Some(format!("call:{target}")),
+            ..step(target, "call")
+        };
+        assert!(!interacts(&[call("same")], &participants, "seed"));
+        assert!(interacts(&[call("other")], &participants, "seed"));
+        let hidden = SequenceStep {
+            hidden: true,
+            ..call("other")
+        };
+        assert!(!interacts(&[hidden], &participants, "seed"));
+        let incidental = SequenceStep {
+            incidental: Some(IncidentalReason::Accessor),
+            ..call("other")
+        };
+        assert!(!interacts(&[incidental], &participants, "seed"));
+        // Nested in a branch, it still interacts; on the other column's own lane, it does not.
+        let mut branch = step("if", "branch");
+        branch.children.push(call("other"));
+        assert!(interacts(&[branch], &participants, "seed"));
+        let own = SequenceStep {
+            lane: Some("other".into()),
+            ..call("other")
+        };
+        assert!(!interacts(&[own], &participants, "seed"));
+    }
+
+    #[test]
+    fn a_block_goes_under_its_later_shown_call_or_takes_the_boundary_place() {
+        let outer = SequenceStep {
+            call_id: Some("outer".into()),
+            ..step("call", "call")
+        };
+        let block = || callback_block(&step("boundary", "boundary"), "wrap", vec![]);
+        let mut steps = vec![step("boundary", "boundary"), outer.clone()];
+        assert!(place_callback(&mut steps, 0, block(), "outer"));
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].children[0].kind, CALLBACK_KIND);
+        // A hidden call (an incidental `setTimeout`) would hide the block: it stays in place.
+        let hidden = SequenceStep {
+            hidden: true,
+            ..outer.clone()
+        };
+        let mut steps = vec![step("boundary", "boundary"), hidden];
+        assert!(!place_callback(&mut steps, 0, block(), "outer"));
+        assert_eq!(steps[0].kind, CALLBACK_KIND);
+        assert!(steps[1].children.is_empty());
+        // No such later sibling: in place.
+        let mut steps = vec![outer, step("boundary", "boundary")];
+        assert!(!place_callback(&mut steps, 1, block(), "outer"));
+        assert_eq!(steps[1].kind, CALLBACK_KIND);
     }
 }

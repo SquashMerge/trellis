@@ -6828,7 +6828,8 @@ impl McpSession {
         client
             .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
             .unwrap();
-        let workspace = trellis::mcp::OpenedWorkspace::new(identity);
+        let workspace = trellis::mcp::OpenedWorkspace::new(identity)
+            .with_call_workers_for_tests(Default::default());
         let handle = tokio::runtime::Handle::current();
         let thread = std::thread::spawn(move || {
             trellis::mcp::run_socket(workspace, server, registry, session, handle)

@@ -695,6 +695,8 @@ impl CheckoutRegistry {
             #[cfg(feature = "test-support")]
             search_coverage_scans: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "test-support")]
+            browser_status_projections: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "test-support")]
             mcp_hint_clock_origin: std::sync::Mutex::new(None),
             #[cfg(feature = "test-support")]
             mcp_call_clock_origin: std::sync::Mutex::new(None),
@@ -1845,6 +1847,10 @@ pub struct CheckoutRuntime {
     /// Pending-head cache scans that describe/status coverage started (#806).
     #[cfg(feature = "test-support")]
     search_coverage_scans: std::sync::atomic::AtomicUsize,
+    /// Status semantic projections the browser's own status reads ran on this
+    /// checkout (#666, #700); per checkout, so no other test's reads count (#869).
+    #[cfg(feature = "test-support")]
+    browser_status_projections: std::sync::atomic::AtomicUsize,
     #[cfg(feature = "test-support")]
     mcp_call_clock_origin: std::sync::Mutex<Option<Instant>>,
     /// Optional hint clock can be frozen separately from the real mandatory deadline.
@@ -2726,6 +2732,22 @@ impl CheckoutRuntime {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Count status semantic projections a browser status read ran here.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn count_browser_status_projections(&self, projections: usize) {
+        self.browser_status_projections
+            .fetch_add(projections, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// How many status semantic projections the browser's `/status` and
+    /// `/status/head` reads have run on this checkout (#666, #700).
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn browser_status_semantic_projections_for_tests(&self) -> usize {
+        self.browser_status_projections
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Optional pending-head hash scans MCP search started on this checkout.
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
@@ -3530,7 +3552,7 @@ fn common_identity_by(
 /// Probe membership before writing a worktree marker. Git output is bounded and
 /// the root identity is checked on both sides of the probe.
 fn common_identity_unattached(identity: &WorkspaceIdentity) -> Result<(u64, u64), SelectionError> {
-    common_identity_unattached_with_executable(identity, Path::new("git"))
+    common_identity_unattached_with_executable(identity, &crate::testing::git_executable())
 }
 
 fn common_identity_unattached_with_executable(
@@ -3692,6 +3714,7 @@ mod selection_tests {
             search: None,
             search_coverage: std::sync::Mutex::new(None),
             search_coverage_scans: std::sync::atomic::AtomicUsize::new(0),
+            browser_status_projections: std::sync::atomic::AtomicUsize::new(0),
             root_lost: std::sync::atomic::AtomicBool::new(false),
             initial_indexing: true,
             rules_edit_owner: std::sync::Mutex::new(()),

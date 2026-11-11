@@ -153,21 +153,37 @@ pub(crate) fn native_watcher_requested() -> bool {
 /// MCP coordinator, the daemon relay and the storage reads they drive. Normal
 /// calls do not connect to or wait for a test socket. It lives here, not in
 /// `mcp`, so storage has no upward reference (#791).
+///
+/// A subprocess fixture names the barrier in `TRELLIS_TEST_MCP_PHASE` and
+/// `TRELLIS_TEST_MCP_PHASE_SOCKET`. An in-process fixture installs a
+/// [`PhaseBarrier`] on its own MCP connection instead (see [`FixtureScope`]),
+/// so tests sharing one test binary never see each other's barrier (#869).
 #[cfg(feature = "test-support")]
 pub(crate) fn phase_hook(stage: &str) -> std::io::Result<()> {
     use std::io::{Read, Write};
-    // One stage, or several separated by commas.
-    if !std::env::var("TRELLIS_TEST_MCP_PHASE")
-        .is_ok_and(|stages| stages.split(',').any(|named| named == stage))
-    {
-        return Ok(());
-    }
-    let path = std::env::var_os("TRELLIS_TEST_MCP_PHASE_SOCKET").ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "missing MCP fixture socket",
-        )
-    })?;
+    let scoped = SCOPE.with(|scope| scope.borrow().as_ref().and_then(|s| s.phase.clone()));
+    let path = match scoped {
+        Some(barrier) => {
+            if !barrier.names(stage) {
+                return Ok(());
+            }
+            barrier.socket.into_os_string()
+        }
+        None => {
+            // One stage, or several separated by commas.
+            if !std::env::var("TRELLIS_TEST_MCP_PHASE")
+                .is_ok_and(|stages| stages.split(',').any(|named| named == stage))
+            {
+                return Ok(());
+            }
+            std::env::var_os("TRELLIS_TEST_MCP_PHASE_SOCKET").ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "missing MCP fixture socket",
+                )
+            })?
+        }
+    };
     let mut stream = std::os::unix::net::UnixStream::connect(path)?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(std::time::Duration::from_secs(10)))?;
@@ -181,6 +197,103 @@ pub(crate) fn phase_hook(stage: &str) -> std::io::Result<()> {
 #[cfg(not(feature = "test-support"))]
 pub(crate) fn phase_hook(_: &str) -> std::io::Result<()> {
     Ok(())
+}
+
+/// An in-process fixture's [`phase_hook`] barrier: the stages it holds (one,
+/// or several separated by commas) and the socket it reports them to. Clones
+/// share the stages, so a fixture can move its barrier on between stages.
+#[cfg(feature = "test-support")]
+#[derive(Clone, Debug)]
+pub struct PhaseBarrier {
+    stages: std::sync::Arc<std::sync::Mutex<String>>,
+    socket: std::path::PathBuf,
+}
+
+#[cfg(feature = "test-support")]
+impl PhaseBarrier {
+    pub fn new(stages: &str, socket: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            stages: std::sync::Arc::new(std::sync::Mutex::new(stages.to_owned())),
+            socket: socket.into(),
+        }
+    }
+
+    /// Hold `stages` from now on, in place of the earlier ones.
+    pub fn set_stages(&self, stages: &str) {
+        *self.stages.lock().unwrap() = stages.to_owned();
+    }
+
+    fn names(&self, stage: &str) -> bool {
+        self.stages
+            .lock()
+            .unwrap()
+            .split(',')
+            .any(|named| named == stage)
+    }
+}
+
+/// Fixture inputs one in-process MCP connection carries on its own threads
+/// (#869), in place of process-global environment that every test in the same
+/// binary would read: its [`PhaseBarrier`], and the `git` executable its
+/// common-directory lookups run instead of the one on `PATH`.
+#[cfg(feature = "test-support")]
+#[derive(Clone, Debug, Default)]
+pub struct FixtureScope {
+    pub phase: Option<PhaseBarrier>,
+    pub git: Option<std::path::PathBuf>,
+}
+
+#[cfg(feature = "test-support")]
+thread_local! {
+    static SCOPE: std::cell::RefCell<Option<FixtureScope>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The fixture scope a thread passes on to the threads it starts.
+#[cfg(feature = "test-support")]
+pub(crate) type InheritedScope = Option<FixtureScope>;
+#[cfg(not(feature = "test-support"))]
+#[derive(Clone, Copy)]
+pub(crate) struct InheritedScope;
+
+/// This thread's fixture scope, to enter on a thread it starts.
+#[cfg(feature = "test-support")]
+pub(crate) fn inherit_scope() -> InheritedScope {
+    SCOPE.with(|scope| scope.borrow().clone())
+}
+#[cfg(not(feature = "test-support"))]
+pub(crate) fn inherit_scope() -> InheritedScope {
+    InheritedScope
+}
+
+/// Install `scope` on this thread until the guard drops, which restores the
+/// earlier one: a pooled thread never keeps a finished connection's scope.
+#[must_use]
+pub(crate) struct ScopeGuard(InheritedScope);
+
+#[cfg(feature = "test-support")]
+pub(crate) fn enter_scope(scope: InheritedScope) -> ScopeGuard {
+    ScopeGuard(SCOPE.with(|current| current.replace(scope)))
+}
+#[cfg(not(feature = "test-support"))]
+pub(crate) fn enter_scope(scope: InheritedScope) -> ScopeGuard {
+    ScopeGuard(scope)
+}
+
+impl Drop for ScopeGuard {
+    fn drop(&mut self) {
+        #[cfg(feature = "test-support")]
+        SCOPE.with(|current| *current.borrow_mut() = self.0.take());
+    }
+}
+
+/// The `git` a common-directory lookup runs: the fixture scope's, or the one
+/// on `PATH`.
+pub(crate) fn git_executable() -> std::path::PathBuf {
+    #[cfg(feature = "test-support")]
+    if let Some(git) = SCOPE.with(|scope| scope.borrow().as_ref().and_then(|s| s.git.clone())) {
+        return git;
+    }
+    std::path::PathBuf::from("git")
 }
 
 /// A fixture process recorded before its PID can become stale. The start time

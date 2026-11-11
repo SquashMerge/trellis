@@ -5,13 +5,13 @@ use crate::behavior::{InterfaceHop, InterfacesState, SequenceStep, SequenceView}
 use crate::indexer::{IndexOptions, index_workspace_bundle};
 use std::{fs, sync::atomic::AtomicBool};
 
-fn write(root: &std::path::Path, path: &str, text: &str) {
+pub(super) fn write(root: &std::path::Path, path: &str, text: &str) {
     let path = root.join(path);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, text).unwrap();
 }
 
-const SERVER: &str = "async fn sequence() {}\nasync fn item() {}\nasync fn head() {}\n\
+pub(super) const SERVER: &str = "async fn sequence() {}\nasync fn item() {}\nasync fn head() {}\n\
 fn router() -> Router {\n    Router::new()\n        .route(\"/api/sequence\", post(sequence))\n        \
 .route(\"/api/items/{id}\", get(item))\n        .route(\"/api/checkouts/{root}/status/head\", get(head))\n}\n\
 fn main() {}\n";
@@ -24,7 +24,7 @@ await api(`/api/items/${id}`, \"GET\");\n  await api(\"/api/status/head\", \"GET
 await api(dynamic, \"GET\");\n  await api(\"/api/nowhere\", \"GET\");\n}\n\
 function local() { return load(1, \"x\"); }\n";
 
-fn publish(state: &tempfile::TempDir, dir: &std::path::Path) -> Store {
+pub(super) fn publish(state: &tempfile::TempDir, dir: &std::path::Path) -> Store {
     let store = crate::testing::retry_admission(|| Store::open_for_tests(state.path(), dir));
     let cancel = Arc::new(AtomicBool::new(false));
     let (graph, native, capture) = index_workspace_bundle(
@@ -59,7 +59,7 @@ fn two_apps() -> (tempfile::TempDir, tempfile::TempDir, Store) {
     (state, root, store)
 }
 
-fn core(response: &EvidenceResponse) -> ArchitectureCore {
+pub(super) fn core(response: &EvidenceResponse) -> ArchitectureCore {
     let pin = response.selected_pin(None).unwrap();
     response
         .architecture_core_at(
@@ -72,7 +72,7 @@ fn core(response: &EvidenceResponse) -> ArchitectureCore {
         .unwrap()
 }
 
-fn sequence(response: &EvidenceResponse, name: &str) -> SequenceView {
+pub(super) fn sequence(response: &EvidenceResponse, name: &str) -> SequenceView {
     let pin = response.selected_pin(None).unwrap();
     let (_, symbols) = response.symbols_at(name, 20).unwrap();
     let seed = symbols
@@ -83,7 +83,7 @@ fn sequence(response: &EvidenceResponse, name: &str) -> SequenceView {
 }
 
 /// Each annotated step, by the line its call is on.
-fn hops(view: &SequenceView) -> BTreeMap<usize, InterfaceHop> {
+pub(super) fn hops(view: &SequenceView) -> BTreeMap<usize, InterfaceHop> {
     let mut found = BTreeMap::new();
     let mut pending: Vec<&SequenceStep> = view.steps.iter().collect();
     while let Some(step) = pending.pop() {
@@ -385,7 +385,11 @@ fn the_hop_fields_serialize_as_the_browser_reads_them() {
     );
 }
 
-fn annotate(response: &EvidenceResponse, core: &ArchitectureCore, view: &mut SequenceView) {
+pub(super) fn annotate(
+    response: &EvidenceResponse,
+    core: &ArchitectureCore,
+    view: &mut SequenceView,
+) {
     response
         .annotate_sequence_interfaces(
             view,
@@ -396,7 +400,7 @@ fn annotate(response: &EvidenceResponse, core: &ArchitectureCore, view: &mut Seq
         .unwrap();
 }
 
-fn shown(steps: &[SequenceStep]) -> usize {
+pub(super) fn shown(steps: &[SequenceStep]) -> usize {
     steps
         .iter()
         .map(|step| usize::from(!step.hidden) + shown(&step.children) + shown(&step.alternate))

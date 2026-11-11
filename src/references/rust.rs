@@ -118,6 +118,37 @@ struct Import {
     crate_only: bool,
     uncertain: bool,
 }
+/// A scope's imports in source order. Named imports are also indexed by binding name and star
+/// imports listed, so a name lookup reads only the imports that can bind it (#894).
+#[derive(Default)]
+struct Imports {
+    all: Vec<Import>,
+    named: BTreeMap<String, Vec<usize>>,
+    stars: Vec<usize>,
+}
+impl Imports {
+    fn push(&mut self, import: Import) {
+        let index = self.all.len();
+        if import.star {
+            self.stars.push(index);
+        } else if let Some(name) = import.binding_name() {
+            self.named.entry(name.to_owned()).or_default().push(index);
+        }
+        self.all.push(import);
+    }
+    /// The named imports binding `name`, in source order.
+    fn named(&self, name: &str) -> impl Iterator<Item = &Import> {
+        self.named
+            .get(name)
+            .into_iter()
+            .flatten()
+            .map(|&index| &self.all[index])
+    }
+    /// The star imports, in source order.
+    fn stars(&self) -> impl Iterator<Item = &Import> {
+        self.stars.iter().map(|&index| &self.all[index])
+    }
+}
 #[derive(Clone)]
 struct Binding {
     candidate: Option<Candidate>,
@@ -139,7 +170,7 @@ struct Scope {
     module: usize,
     directory: String,
     explicit: BTreeMap<Name, Vec<Binding>>,
-    imports: Vec<Import>,
+    imports: Imports,
     opaque: bool,
     /// Something past the walk bounds was skipped here, so even an explicit name can collide.
     cut: bool,
@@ -455,8 +486,8 @@ impl Catalog {
         scope: usize,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Vec<Import>> {
-        self.charge(self.scopes[scope].imports.len(), check)?;
-        Ok(self.scopes[scope].imports.clone())
+        self.charge(self.scopes[scope].imports.all.len(), check)?;
+        Ok(self.scopes[scope].imports.all.clone())
     }
     fn add_scope(
         &mut self,
@@ -482,7 +513,7 @@ impl Catalog {
             module,
             directory,
             explicit: BTreeMap::new(),
-            imports: Vec::new(),
+            imports: Imports::default(),
             opaque: false,
             cut: false,
         });
@@ -592,7 +623,11 @@ impl Catalog {
                         &mut self.work,
                         check,
                     )?;
-                    self.scopes[scope].imports.extend(imports);
+                    // Indexed once here; a name lookup then reads only its matches (#894).
+                    self.charge(imports.len(), check)?;
+                    for import in imports {
+                        self.scopes[scope].imports.push(import);
+                    }
                     // A skipped import could bind any name, so nothing here is proved absent.
                     self.scopes[scope].opaque |= cut;
                     self.scopes[scope].cut |= cut;
@@ -880,11 +915,11 @@ impl Catalog {
                 }
             }
         }
-        let imports = self.scope_imports(scope, check)?;
-        for import in imports
-            .iter()
-            .filter(|i| !i.star && i.binding_name() == Some(name))
-        {
+        // Only the imports that can bind `name`: its named imports and every star (#894).
+        let named: Vec<Import> = self.scopes[scope].imports.named(name).cloned().collect();
+        let stars: Vec<Import> = self.scopes[scope].imports.stars().cloned().collect();
+        self.charge(named.len() + stars.len(), check)?;
+        for import in &named {
             let mut resolved = if import.uncertain {
                 Names {
                     unknown_set: true,
@@ -941,33 +976,30 @@ impl Catalog {
                 .filter(|(_, b)| b.unknown || !b.candidates.is_empty())
                 .map(|((ns, _), _)| *ns),
         );
-        let mut stars = Names::default();
-        for import in imports
-            .iter()
-            .filter(|i| i.star && (!exported || i.visible(context)))
-        {
+        let mut star_names = Names::default();
+        for import in stars.iter().filter(|i| !exported || i.visible(context)) {
             if self.waived_star(scope, import, context, check)? {
                 continue;
             }
             let expanded =
                 self.expand(scope, import, depth + 1, route, context, Some(name), check)?;
-            stars.unknown_set |= expanded.unknown_set;
+            star_names.unknown_set |= expanded.unknown_set;
             for (key, bucket) in expanded
                 .names
                 .into_iter()
                 .filter(|((_, spelling), _)| spelling == name)
             {
-                self.merge_bucket(stars.names.entry(key).or_default(), bucket, check)?;
+                self.merge_bucket(star_names.names.entry(key).or_default(), bucket, check)?;
             }
         }
-        for (key, mut bucket) in stars.names {
+        for (key, mut bucket) in star_names.names {
             if explicit_namespaces.contains(&key.0) {
                 continue;
             }
-            bucket.unknown |= stars.unknown_set;
+            bucket.unknown |= star_names.unknown_set;
             result.names.insert(key, bucket);
         }
-        if stars.unknown_set {
+        if star_names.unknown_set {
             for namespace in [TYPE, VALUE] {
                 if !explicit_namespaces.contains(&namespace) {
                     result
@@ -1947,7 +1979,7 @@ mod cache_tests {
             module,
             directory: "src".into(),
             explicit: BTreeMap::new(),
-            imports: Vec::new(),
+            imports: Imports::default(),
             opaque: false,
             cut: false,
         }
