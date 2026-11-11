@@ -2277,6 +2277,7 @@ impl CheckoutRuntime {
         }
         let (response, catching_up) = self.evidence_response()?;
         let mut status = response.status()?;
+        crate::store::relabel_status(&mut status, &self.auto_run.labels());
         status.catching_up = catching_up;
         status.watcher = Some(self.resources()?.scheduler.checkout_watcher_witness());
         let search_head = self.search_head_coverage(&response, status.revision, &mut || Ok(()))?;
@@ -3016,7 +3017,10 @@ impl CheckoutRuntime {
                 hook();
             }
         }
-        let response = resources.store.evidence_response_daemon_local()?;
+        let response = resources
+            .store
+            .evidence_response_daemon_local()?
+            .with_auto_run_labels(self.auto_run.labels());
         let catching_up = catching_up || response.semantic_catching_up()?;
         Ok((
             CheckoutEvidence {

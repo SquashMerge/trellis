@@ -470,7 +470,7 @@ fn invalid_config_reports_invalid_config_daemon_unaffected() {
 }
 
 /// A raw JSON-RPC session with `trellis mcp` over stdio.
-struct Mcp {
+pub(crate) struct Mcp {
     child: std::process::Child,
     stdin: Option<std::process::ChildStdin>,
     lines: std::sync::mpsc::Receiver<String>,
@@ -480,18 +480,31 @@ struct Mcp {
 
 impl Mcp {
     fn start(world: &World) -> Self {
+        Self::start_in(
+            &world.checkout,
+            &world.env,
+            world.stub_dir.path().join("mcp.stderr"),
+        )
+    }
+
+    /// The server of `checkout`, with `env` added to its environment; its stderr goes to
+    /// `stderr`.
+    pub(crate) fn start_in(
+        checkout: &support::Checkout,
+        env: &[(String, String)],
+        stderr: PathBuf,
+    ) -> Self {
         use std::io::BufRead;
-        let mut child = world
-            .checkout
+        let mut child = checkout
             .cli()
-            .envs(world.env.iter().map(|(name, value)| (name, value)))
+            .envs(env.iter().map(|(name, value)| (name, value)))
             .arg("mcp")
             .arg("--workspace")
-            .arg(&world.checkout.root)
-            .current_dir(&world.checkout.root)
+            .arg(&checkout.root)
+            .current_dir(&checkout.root)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(fs::File::create(world.stub_dir.path().join("mcp.stderr")).unwrap())
+            .stderr(fs::File::create(&stderr).unwrap())
             .spawn()
             .unwrap();
         let stdout = child.stdout.take().unwrap();
@@ -509,19 +522,19 @@ impl Mcp {
             child,
             stdin,
             lines,
-            stderr: world.stub_dir.path().join("mcp.stderr"),
+            stderr,
             next: 1,
         }
     }
 
-    fn send(&mut self, value: &Value) {
+    pub(crate) fn send(&mut self, value: &Value) {
         use std::io::Write;
         let stdin = self.stdin.as_mut().unwrap();
         writeln!(stdin, "{value}").unwrap();
         stdin.flush().unwrap();
     }
 
-    fn ask(&mut self, method: &str, params: Value) -> Value {
+    pub(crate) fn ask(&mut self, method: &str, params: Value) -> Value {
         let id = self.next;
         self.next += 1;
         self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
@@ -550,7 +563,7 @@ impl Drop for Mcp {
 
 #[test]
 fn failed_auto_run_reports_reason_and_waits_for_head_change() {
-    let world = hooked(&[PRESLOT]);
+    let world = hooked_git(&[PRESLOT]);
     approve(&world, &[PRESLOT]);
     edit_head(&world, 1);
     world.mode(json!({"stderr": 1, "exit": 1}));
@@ -564,6 +577,18 @@ fn failed_auto_run_reports_reason_and_waits_for_head_change() {
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0]["outcome"], "producer_failed");
     assert_eq!(failed["lastRunId"], runs[0]["runId"]);
+
+    // The failure is the language's re-import reason in every view.
+    let mut mcp = Mcp::initialized(&world);
+    let (status, described, row) = javascript_views(&world, &mut mcp, 1);
+    assert_eq!(
+        status,
+        pending_status("needsReimport", "automatic re-run failed: producer_failed")
+    );
+    let reimport =
+        json!({"state": "needsReimport", "reason": "automatic re-run failed: producer_failed"});
+    assert_eq!(described["reimport"], reimport);
+    assert_eq!(row["reimport"], reimport);
 
     // At the same head nothing retries: a request that changes nothing wakes the daemon, and a
     // later reply shows no second run started.
@@ -588,6 +613,9 @@ fn failed_auto_run_reports_reason_and_waits_for_head_change() {
         runs.iter().any(|run| run["state"] == "done")
     });
     assert_eq!(wait_auto(&world, "idle")["reason"], Value::Null);
+    let (status, described, _) = javascript_views(&world, &mut mcp, 2);
+    assert_eq!(status, json!([]));
+    assert_eq!(described["reimport"], Value::Null);
 }
 
 /// Retire the daemon and bring a new one up through the armed environment: its owner is
@@ -805,4 +833,155 @@ fn root_loss_cancels_auto_run() {
     let record = read();
     assert_eq!(record["origin"], "auto");
     assert_eq!(record["outcome"], "root_changed");
+}
+
+// --- read-path labels (#660 D10) ---
+
+/// Like `hooked`, for a Git checkout: the MCP server serves only those.
+fn hooked_git(sockets: &[&'static str]) -> World {
+    let hooks: Vec<_> = sockets.iter().map(|socket| hook(socket)).collect();
+    let (name, value) = support::auto_intervals(FAST.0, FAST.1, FAST.2);
+    World::with_git(
+        &hooks,
+        &[
+            (trellis::testing::NATIVE_WATCHER_ENV, "on"),
+            (name.as_str(), value.as_str()),
+        ],
+    )
+}
+
+impl Mcp {
+    fn initialized(world: &World) -> Self {
+        Self::handshake(Self::start(world))
+    }
+
+    pub(crate) fn handshake(mut mcp: Self) -> Self {
+        let init = mcp.ask(
+            "initialize",
+            json!({"protocolVersion": "2025-11-25", "capabilities": {},
+                "clientInfo": {"name": "auto", "version": "1"}}),
+        );
+        assert_eq!(init["result"]["protocolVersion"], "2025-11-25");
+        mcp.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+        mcp
+    }
+
+    /// The structured content of a tool call; a tool-level error fails the test.
+    pub(crate) fn tool(&mut self, name: &str, arguments: Value) -> Value {
+        let reply = self.ask("tools/call", json!({"name": name, "arguments": arguments}));
+        assert!(reply["result"]["isError"] != true, "{name}: {reply}");
+        reply["result"]["structuredContent"].clone()
+    }
+}
+
+/// The `semanticStatus` of `trellis_declaration` for the first symbol matching `query`, once the
+/// head indexes one.
+pub(crate) fn declaration_semantic_status(mcp: &mut Mcp, query: &str) -> Value {
+    let mut symbol = Value::Null;
+    trellis::testing::wait_until("the symbol is indexed", || {
+        let found = mcp.tool(
+            "trellis_find_symbols",
+            json!({"schemaVersion": 1, "query": query, "limit": 5}),
+        );
+        symbol = found["data"]["symbols"][0]["symbolId"].clone();
+        symbol.is_string()
+    });
+    mcp.tool(
+        "trellis_declaration",
+        json!({"schemaVersion": 1, "symbolId": symbol}),
+    )["semanticStatus"]
+        .clone()
+}
+
+/// What the stub's language (javascript) reports through the MCP tools and the CLI at the head
+/// the test just edited to: `(semanticStatus of a declaration answer, describe's javascript
+/// semantic block, the status reply's javascript row)`.
+fn javascript_views(world: &World, mcp: &mut Mcp, edit: u32) -> (Value, Value, Value) {
+    let semantic_status = declaration_semantic_status(mcp, &format!("edited{edit}"));
+    let described = mcp.tool("trellis_workspace_describe", json!({"schemaVersion": 1}));
+    let language = described["data"]["languages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["language"] == "javascript")
+        .unwrap()["semantic"]
+        .clone();
+    let status = crate::child::run_cli_json(
+        world
+            .checkout
+            .cli()
+            .args(["status", "--workspace"])
+            .arg(&world.checkout.root),
+        "status",
+    );
+    let row = status["semanticLanguages"]
+        .as_array()
+        .map(|rows| rows.iter().find(|row| row["language"] == "javascript"))
+        .and_then(|row| row.cloned())
+        .unwrap_or(Value::Null);
+    (semantic_status, language, row)
+}
+
+const SCHEDULED_REASON: &str = "producer re-run scheduled";
+
+fn pending_status(state: &str, reason: &str) -> Value {
+    json!([{"language": "javascript", "state": state, "reason": reason}])
+}
+
+/// While the automatic run is in flight the language is catching up with `producer re-run
+/// scheduled` in `semanticStatus`, and the committed evidence is untouched. Without the run the
+/// same head reads exactly as committed.
+#[test]
+fn running_auto_run_labels_language_catching_up_and_nothing_else() {
+    let world = hooked_git(&[SPAWNED]);
+    approve(&world, &[SPAWNED]);
+    edit_head(&world, 1);
+    let mut mcp = Mcp::initialized(&world);
+
+    // Auto-run off: the committed projection, with no overlay.
+    assert_eq!(auto_state(&world)["state"], "off");
+    let (off_status, off_described, off_row) = javascript_views(&world, &mut mcp, 1);
+    assert_eq!(off_status, json!([]));
+
+    world.mode(json!({"sleep": true}));
+    enable(&world);
+    world.wait_hook(SPAWNED);
+    let running = auto_state(&world);
+    assert_eq!(running["state"], "running");
+    assert_eq!(world.active_run()["origin"], "auto");
+
+    let (status, described, row) = javascript_views(&world, &mut mcp, 1);
+    assert_eq!(status, pending_status("catchingUp", SCHEDULED_REASON));
+    // Evidence, coverage and freshness come from the committed revision.
+    assert_eq!(described, off_described);
+    assert_eq!(row, off_row);
+    for document in described["documents"].as_array().unwrap() {
+        assert_ne!(document["projection"]["semanticStatus"], "needsReimport");
+    }
+    world.release_hook(SPAWNED);
+}
+
+/// With auto-run off the labels are empty: the answers read as committed after an edit, and
+/// turning it on and off again changes only the label.
+#[test]
+fn auto_off_leaves_needs_reimport_unchanged() {
+    let world = hooked_git(&[SPAWNED]);
+    approve(&world, &[SPAWNED]);
+    edit_head(&world, 1);
+    let mut mcp = Mcp::initialized(&world);
+    assert_eq!(auto_state(&world)["state"], "off");
+    let committed = javascript_views(&world, &mut mcp, 1);
+    assert_eq!(committed.0, json!([]));
+    assert_eq!(committed.1["reimport"], Value::Null);
+    assert_eq!(committed.2["reimport"], Value::Null);
+    assert_eq!(javascript_views(&world, &mut mcp, 1), committed);
+
+    // Explicitly disabled: still no label.
+    support::write_producers_toml(
+        &world.checkout.root,
+        &format!("[auto.{STUB}]\nenabled = false\n"),
+    );
+    wait_auto(&world, "off");
+    assert_eq!(javascript_views(&world, &mut mcp, 1), committed);
+    assert!(auto_records(&world).is_empty());
 }

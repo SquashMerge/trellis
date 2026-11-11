@@ -114,6 +114,7 @@ impl Store {
             store.admitted = Some((selected.pin, selected.headers));
             let response = EvidenceResponse {
                 stable_lookup_keys: Default::default(),
+                auto_run: Default::default(),
                 optional_recovery: OptionalRecovery::new(&store),
                 store,
                 db,

@@ -27,8 +27,9 @@ pub use search_startup::RecentSearchCheckout;
 #[cfg(feature = "test-support")]
 pub(crate) use semantic_display::status_semantic_projections_on_thread_for_tests;
 pub use semantic_display::{
-    CallSemantic, CoverageDocument, LANGUAGE_NOTE, LanguagePending, LanguageTier, McpSemantic,
-    NO_PRODUCER_NOTE, ProducerNotPublished, ProducerSelection, multiple_producers_note,
+    AutoRunLabels, CallSemantic, CoverageDocument, LANGUAGE_NOTE, LanguagePending, LanguageTier,
+    McpSemantic, NO_PRODUCER_NOTE, ProducerNotPublished, ProducerSelection,
+    multiple_producers_note, relabel_status,
 };
 pub use semantic_retention::AutoRunHead;
 pub(crate) mod symbol_trigrams;
@@ -1575,6 +1576,8 @@ pub struct EvidenceResponse {
     stable_lookup_keys: std::cell::RefCell<
         BTreeMap<crate::native_evidence::DocumentKey, Arc<BTreeMap<String, String>>>,
     >,
+    /// Runtime labels for automatic producer re-runs (#660); empty unless the daemon sets them.
+    auto_run: AutoRunLabels,
 }
 /// Optional evidence cannot invalidate the required answer already being read.
 /// Publish its repair request after that answer's fence, or on an early exit.
@@ -1843,6 +1846,12 @@ const ENDPOINTS_LIMITATION: &str = "Endpoints are structural matches of register
 const ENDPOINTS_NOT_EXTRACTED: &str = "not extracted: fewer than two apps";
 
 impl EvidenceResponse {
+    /// Carry the runtime automatic re-run labels into `mcp_language_tiers` (#660).
+    pub fn with_auto_run_labels(mut self, labels: AutoRunLabels) -> Self {
+        self.auto_run = labels;
+        self
+    }
+
     /// The checked arguments of one architecture operation.
     pub(crate) fn architecture_arguments(
         kind: &str,
@@ -4056,6 +4065,7 @@ impl EvidenceResponse {
             fence,
             optional_recovery,
             stable_lookup_keys: _,
+            auto_run: _,
         } = self;
         let snapshot_valid = fence.verify(&store, Some(&db)).is_ok();
         let snapshot = if matches!(policy, EvidenceFencePolicy::ExactPin(_)) {
@@ -14944,6 +14954,7 @@ impl Store {
             fence: ReadFence(selected.pin),
             optional_recovery,
             stable_lookup_keys: std::cell::RefCell::new(BTreeMap::new()),
+            auto_run: AutoRunLabels::default(),
         })
     }
 

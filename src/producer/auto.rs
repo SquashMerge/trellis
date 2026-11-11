@@ -850,6 +850,34 @@ impl AutoRunOwner {
         }
     }
 
+    /// The runtime labels for the read path (#660), from the same publication cell as `status`:
+    /// the languages of every producer scheduled or running, and of every one that failed.
+    pub(crate) fn labels(&self) -> crate::store::AutoRunLabels {
+        let published = self
+            .published
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let stub = crate::producer::profiles::Stub::from_env().is_some();
+        let mut labels = crate::store::AutoRunLabels::default();
+        for (producer, status) in &published.statuses {
+            let Some(target) = Target::parse(producer, stub) else {
+                continue;
+            };
+            for language in target.languages() {
+                match (status.state, &status.reason) {
+                    (AutoState::Scheduled | AutoState::Running, _) => {
+                        labels.catching_up.insert((*language).to_owned());
+                    }
+                    (AutoState::Failed, Some(reason)) => {
+                        labels.failed.insert((*language).to_owned(), reason.clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        labels
+    }
+
     pub(crate) fn status(&self, producer: &str) -> AutoRunStatus {
         let published = self
             .published
