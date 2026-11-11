@@ -299,7 +299,7 @@ fn crate_paths(code: &str) -> BTreeSet<String> {
 /// bumps.
 const NON_OUTPUT_STORE_ITEMS: &[(&str, &str)] = &[
     (
-        "CACHE_SCHEMA_V42",
+        "CACHE_SCHEMA_V43",
         "the schema text; a change bumps the schema version",
     ),
     (
