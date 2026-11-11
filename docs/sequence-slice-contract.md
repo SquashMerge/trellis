@@ -410,6 +410,12 @@ is drawn as a labelled boundary hop into that route's handler. The evidence mean
 - **Show all.** Show all steps keeps the source text and adds the hop's route: its evidence
   label is `HTTP interface hop · <method> <path template> · <confidence> · structural match,
   not proof` in both renderers.
+- **Chains.** A hop inside a call-chain group whose calls were all hidden (a Rust
+  `client.get(..).header(..).send()` with external bindings) reveals the group around it too,
+  before the shown-step cap, so the hop is reachable (Prime2 second review on #885). The
+  chain's other calls stay hidden incidental calls. Because a collapsed chain previews its
+  first call only when every member is shown, the browser opens a chain that holds a hop
+  expanded, as #646 opens highlighted chains. The drawn hops equal the status line's count.
 - **Wrapper lane.** A wrapper whose call is a hop keeps its own lane for its expanded body in
   both renderers, so the body's arrows start from the wrapper's column.
 - **MCP.** No MCP tool returns a Sequence; `trellis_show` opens this browser view, which

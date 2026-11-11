@@ -1411,7 +1411,7 @@ function sequenceTargetAction(data, current) {
 }
 async function renderFilesMini(current) {
   if (!filesMini || !filesSymbol) return;
-  const data = filesMini, revision = data.revision, expanded = new Set(), container = $("files-mini-sequence");
+  const data = filesMini, revision = data.revision, expanded = window.TrellisSequence.hopGroups(data), container = $("files-mini-sequence");
   const readSource = step => { if (current()) return openFilesLocation(step, revision); };
   const options = {showDetails:false, isCurrent:current, onOpenTarget:sequenceTargetAction(data, current)};
   options.onUnsupported = reason => { if (current()) { window.TrellisSequence.render(container, data, readSource, expanded, options); $("files-mini-state").textContent += ` · Pele fell back: ${reason}`; } };
@@ -1848,7 +1848,8 @@ async function loadSequence(admitted = null, preserveSource = false, callerCurre
       if (open) $("inspector-detail")?.prepend(open);
     };
     const diagram = $("sequence-diagram");
-    const expanded = new Set();
+    // Chains holding an HTTP interface hop open expanded (#853).
+    const expanded = window.TrellisSequence.hopGroups(data);
     if (sequenceBoundary?.symbolId === symbol.id) {
       const ids = new Set(sequenceBoundary.callIds);
       const reveal = step => {

@@ -555,3 +555,104 @@ fn the_interactions_candidates_keep_their_unbounded_shown_steps() {
     );
     assert_eq!(view.interfaces.unwrap().hops, 3);
 }
+
+/// Calls reachable in a drawing: renderers never descend into a hidden step.
+fn drawn_hops(steps: &[SequenceStep]) -> usize {
+    steps
+        .iter()
+        .filter(|step| !step.hidden)
+        .map(|step| {
+            usize::from(
+                step.interface
+                    .as_ref()
+                    .is_some_and(|hop| hop.participant.is_some()),
+            ) + drawn_hops(&step.children)
+                + drawn_hops(&step.alternate)
+        })
+        .sum()
+}
+
+#[test]
+fn a_hop_inside_a_hidden_chain_group_reveals_the_group() {
+    // Prime2 second review on #885: `client.get(..).header(..).send()` is one call-chain group;
+    // semantic enrichment hides a group whose external calls are all hidden. Revealing the
+    // matched `get` must reveal the group around it, or neither renderer reaches the hop.
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path();
+    write(
+        dir,
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"server\", \"client\"]\n",
+    );
+    write(dir, "server/Cargo.toml", "[package]\nname = \"server\"\n");
+    write(
+        dir,
+        "server/src/main.rs",
+        "async fn health() {}\nfn router() -> Router {\n    Router::new().route(\"/health\", get(health))\n}\nfn main() {}\n",
+    );
+    write(dir, "client/Cargo.toml", "[package]\nname = \"client\"\n");
+    write(
+        dir,
+        "client/src/main.rs",
+        "use reqwest::Client;\nasync fn run(client: Client) {\n    client.get(\"/health\").header(\"x\", \"v\").send().await;\n}\nfn main() {}\n",
+    );
+    let store = publish(&state, dir);
+    let response = store.evidence_response().unwrap();
+    let core = core(&response);
+    let mut view = sequence(&response, "run");
+    // As semantic enrichment leaves it: the chain's external calls hidden, so the group too.
+    let kinds = view_kinds(&view);
+    let group = view
+        .steps
+        .iter_mut()
+        .find(|step| step.kind == "group")
+        .unwrap_or_else(|| panic!("a chain group: {kinds:?}"));
+    group.hidden = true;
+    for child in &mut group.children {
+        child.hidden = true;
+        child.incidental = Some(crate::behavior::IncidentalReason::External);
+    }
+    view.hidden_steps = crate::behavior::hidden_count(&view.steps);
+    view.incidental_steps = crate::behavior::incidental_count(&view.steps);
+    annotate(&response, &core, &mut view);
+    let read = view.interfaces.clone().unwrap();
+    assert_eq!(read.hops, 1, "{:?}", hops(&view));
+    let group = view.steps.iter().find(|step| step.kind == "group").unwrap();
+    assert!(!group.hidden, "the group around the revealed call is shown");
+    let get = group
+        .children
+        .iter()
+        .find(|child| child.interface.is_some())
+        .unwrap();
+    assert!(!get.hidden);
+    assert_eq!(
+        get.interface.as_ref().unwrap().server_app.as_deref(),
+        Some("server")
+    );
+    // The other chain calls stay hidden incidental calls.
+    assert!(
+        group
+            .children
+            .iter()
+            .filter(|child| child.interface.is_none())
+            .all(|child| child.hidden && child.incidental.is_some())
+    );
+    // What the renderers can reach is what the status line says.
+    assert_eq!(drawn_hops(&view.steps), read.hops);
+    assert_eq!(
+        view.hidden_steps,
+        crate::behavior::hidden_count(&view.steps)
+    );
+    assert_eq!(
+        view.incidental_steps,
+        crate::behavior::incidental_count(&view.steps)
+    );
+}
+
+fn view_kinds(view: &SequenceView) -> Vec<(String, String)> {
+    view.steps
+        .iter()
+        .map(|step| (step.kind.clone(), step.label.clone()))
+        .collect()
+}

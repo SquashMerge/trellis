@@ -259,3 +259,40 @@ test("an expanded wrapper in its own column keeps its lane: its body's arrow sta
   assert.equal(geometry.from, geometry.client, JSON.stringify(geometry));
   assert.equal(geometry.backTo, geometry.client, JSON.stringify(geometry));
 });
+
+// Prime2 second review on #885: `client.get("/health").header("x", "v").send().await` is one
+// call-chain group. The daemon reveals the matched `get` and the group around it; the other
+// chain calls stay hidden incidental calls. Every projection draws the hop the status counts.
+function chainView() {
+  const view = hopView();
+  const [method, pathTemplate, confidence, handler] = HOPS["c-exact"];
+  const call = (id, label, extra = {}) => ({...structuredClone(view.steps[0]), id, label, callId:`callid:${id}`, children:[], alternate:[], target:undefined,
+    callEvidence:{boundaryReason:"external", resolution:"resolved", dispatch:"direct", freshness:"fresh", provenanceId:`proof:${id}`}, interface:undefined, ...extra});
+  const get = call("get", 'client.get("/health")', {hidden:false, interface:{kind:"http", method, pathTemplate, confidence, clientApp:"web", serverApp:"daemon", handlerKind:"declaration", participant:`interface:daemon:${handler}`}});
+  const header = call("header", 'header("x", "v")', {hidden:true, incidental:"external"}), send = call("send", "send", {hidden:true, incidental:"external"});
+  for (const step of [get, header, send]) { delete step.target; if (!step.interface) delete step.interface; }
+  const group = {...structuredClone(view.steps[0]), id:"group", kind:"group", label:'client.get("/health") → header("x", "v") → send (3 calls)', callId:null, hidden:false, children:[get, header, send], alternate:[]};
+  delete group.callEvidence; delete group.target; delete group.interface;
+  view.steps = [group];
+  view.participants = view.participants.filter(participant => participant.id !== "api" && (participant.kind !== "interfaceHandler" || participant.id === `interface:daemon:${handler}`));
+  view.interfaces = {state:"ready", hops:1, unresolved:0}; view.hiddenSteps = 2; view.incidentalSteps = 2;
+  return view;
+}
+test("a hop inside a call-chain group is drawn in every projection, as many as the status line counts", async () => {
+  const view = chainView();
+  // The app opens chains that hold a hop (`hopGroups`), as #646 opens highlighted chains.
+  assert.deepEqual(await page.evaluate(view => [...TrellisSequence.hopGroups(view)], view), ["group"]);
+  for (const [options, expanded] of [[{interactions:true}, []], [{}, ["group"]], [{showDetails:true}, ["group"]]]) {
+    const drawn = await page.evaluate(async ({view, options, expanded}) => {
+      const container = document.getElementById("sequence-diagram");
+      const result = await TrellisPeleSequence.render(container, view, null, new Set(expanded), options);
+      const pele = [...container.querySelectorAll(".pele-edge-label")].filter(node => /structural match, not proof/.test(node.textContent)).length;
+      TrellisSequence.render(container, view, null, new Set(expanded), options);
+      const legacy = [...container.querySelectorAll(".sequence-arrow[data-trellis-target-id]")].filter(node => node.getAttribute("data-trellis-target-id").startsWith("interface:")).length;
+      return {status:result.status, reason:result.reason, pele, legacy, summary:TrellisSequence.interfaceSummary(view)};
+    }, {view, options, expanded});
+    assert.equal(drawn.status, "rendered", drawn.reason);
+    assert.deepEqual([drawn.pele, drawn.legacy], [view.interfaces.hops, view.interfaces.hops], JSON.stringify({options, expanded, drawn}));
+    assert.equal(drawn.summary, "1 HTTP interface hop (structural matches, not proof)");
+  }
+});

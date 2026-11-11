@@ -45,6 +45,25 @@ function sequenceInterfaceText(step, view) {
     return `HTTP interface · ${route} · ${SEQUENCE_HOP_CONFIDENCE[hop.confidence]} · ${hop.clientApp || "client"} → ${hop.serverApp} · not drawn: sequence participant limit · structural match, not proof`;
   return "";
 }
+// The call-chain groups that hold a drawn hop (#853). A collapsed chain previews its first call
+// only when every member is shown, so a chain whose other calls stay hidden incidental calls
+// opens expanded: the hop the status line counts is drawn. As #646 opens highlighted chains.
+function sequenceHopGroups(view) {
+  const groups = new Set();
+  const walk = steps => {
+    let found = false;
+    for (const step of steps || []) {
+      if (step.hidden) continue;
+      const inner = walk(step.children) | walk(step.alternate);
+      const here = !!sequenceHop(view, step);
+      if (step.kind === "group" && inner) groups.add(step.id);
+      found ||= here || !!inner;
+    }
+    return found;
+  };
+  walk(view?.steps);
+  return groups;
+}
 // The view's interface reading (#853), for the status line. Absence is never no request.
 function sequenceInterfaceSummary(view) {
   const read = view?.interfaces;
@@ -727,4 +746,4 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
   return groupControls;
 }
 
-window.TrellisSequence = {render: renderSequence, target:sequenceTarget, hop:sequenceHop, hopLabel:sequenceHopLabel, interfaceText:sequenceInterfaceText, interfaceSummary:sequenceInterfaceSummary, evidenceLabel:sequenceEvidenceLabel, evidenceSummary:sequenceEvidenceSummary, basisLabel:sequenceBasisLabel, entry:sequenceEntry, earlyReturn:sequenceEarlyReturn, display:sequenceDisplay, beginRender:beginSequenceRender, targetActionLabel:sequenceTargetActionLabel, column:sequenceColumn, laneHeader:sequenceLaneHeader, compactLabel:sequenceCompactLabel, arrowLabel:sequenceArrowLabel, labelLimit:SEQUENCE_LABEL_LIMIT, emptySummary:sequenceEmptySummary, renderEmpty:renderSequenceEmpty, stepColumn:sequenceStepColumn};
+window.TrellisSequence = {render: renderSequence, target:sequenceTarget, hop:sequenceHop, hopLabel:sequenceHopLabel, hopGroups:sequenceHopGroups, interfaceText:sequenceInterfaceText, interfaceSummary:sequenceInterfaceSummary, evidenceLabel:sequenceEvidenceLabel, evidenceSummary:sequenceEvidenceSummary, basisLabel:sequenceBasisLabel, entry:sequenceEntry, earlyReturn:sequenceEarlyReturn, display:sequenceDisplay, beginRender:beginSequenceRender, targetActionLabel:sequenceTargetActionLabel, column:sequenceColumn, laneHeader:sequenceLaneHeader, compactLabel:sequenceCompactLabel, arrowLabel:sequenceArrowLabel, labelLimit:SEQUENCE_LABEL_LIMIT, emptySummary:sequenceEmptySummary, renderEmpty:renderSequenceEmpty, stepColumn:sequenceStepColumn};

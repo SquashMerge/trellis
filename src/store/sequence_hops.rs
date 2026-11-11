@@ -209,20 +209,32 @@ impl EvidenceResponse {
             };
             found.insert(id, annotation);
         }
-        let mut revealed = false;
-        let mut pending: Vec<&mut SequenceStep> = view.steps.iter_mut().collect();
-        while let Some(step) = pending.pop() {
-            if let Some(hop) = step.call_id.as_deref().and_then(|id| found.get(id)) {
-                // An incidental call (`fetch`, an external client) is hidden by default; its
-                // hop is the interaction, so it is shown.
-                if hop.participant.is_some() && step.hidden && step.incidental.take().is_some() {
-                    step.hidden = false;
-                    revealed = true;
+        // An incidental call (`fetch`, an external client) is hidden by default; its hop is the
+        // interaction, so it is shown, with every hidden step around it (a call-chain group
+        // whose calls were all hidden, Prime2 second review on #885): renderers never descend
+        // into a hidden step. Before the cap below, so revealed steps count toward it.
+        fn reveal(steps: &mut [SequenceStep], found: &BTreeMap<String, InterfaceHop>) -> bool {
+            let mut revealed = false;
+            for step in steps {
+                let mut inner = reveal(&mut step.children, found);
+                inner |= reveal(&mut step.alternate, found);
+                if let Some(hop) = step.call_id.as_deref().and_then(|id| found.get(id)) {
+                    if hop.participant.is_some() && step.hidden && step.incidental.is_some() {
+                        step.incidental = None;
+                        step.hidden = false;
+                        revealed = true;
+                    }
+                    step.interface = Some(hop.clone());
                 }
-                step.interface = Some(hop.clone());
+                if inner && step.hidden {
+                    step.hidden = false;
+                    step.incidental = None;
+                }
+                revealed |= inner;
             }
-            pending.extend(step.children.iter_mut().chain(step.alternate.iter_mut()));
+            revealed
         }
+        let revealed = reveal(&mut view.steps, &found);
         if column_limited {
             view.limit(crate::behavior::SequenceLimit::Participants);
             const WARNING: &str =
