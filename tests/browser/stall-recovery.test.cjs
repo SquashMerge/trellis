@@ -11,7 +11,8 @@ const {chromium} = require("playwright");
 const H = require("./sequence-harness.cjs");
 
 const KEY = "trellis.daemonToken.v1";
-const source = "function inspect(input) { return helper(input); }\nfunction helper(value) { return value + 1; }\n";
+const source = "function inspect(input) { return helper(input); }\nfunction helper(value) { return value + 1; }\n" +
+  "class Shape {\n  area() { return helper(1); }\n}\n";
 // A hang backstop only (functional tests carry no speed bound): recovery backs off from 2 s.
 const RECOVERED_MS = 60000;
 test.before(async () => H.setup(), {timeout:960000});
@@ -97,6 +98,31 @@ test("after a stall the tab reloads its failed view and clears Catching up from 
   await page.waitForFunction(() => document.querySelector("#catching-up").hidden, null, {timeout:RECOVERED_MS});
   await page.waitForFunction(() => !/Catching up/.test(document.querySelector("#workspace-index-label")?.textContent || ""), null, {timeout:RECOVERED_MS});
   assert.equal(await page.locator("#error").evaluate(node => node.hidden), true, "the stall's error is cleared by the successful retry");
+}));
+
+test("a Classes view that stalls retries its class read and recovers to the class, not to an earlier Sequence", {timeout:240000}, async () => published(async ({page, paths, server}) => {
+  await H.connect(page, server, paths.token);
+  await openMethod(page, "inspect");
+  await sequenceShown("inspect")(page);
+  const stall = await stallable(page, server);
+  await page.locator("#view-classes").click();
+  await page.locator("#classes-query").fill("Shape");
+  await page.locator("#classes-search").click();
+  const result = page.locator(".classes-result").filter({hasText:"Shape"}).first();
+  await result.waitFor();
+  stall.only = "class-diagram"; stall.on = true;
+  await result.click();
+  // Two failed class reads: the first, then recovery's first retry, visibly.
+  await page.waitForFunction(() => /Request (failed|timed out)|Failed to fetch/.test(document.querySelector("#classes-state")?.textContent || ""));
+  for (const started = Date.now(); stall.failed.filter(path => path === "class-diagram").length < 2;) {
+    assert.ok(Date.now() - started < RECOVERED_MS, `recovery retried the class read: ${stall.failed.join()}`);
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  stall.on = false;
+  await page.waitForFunction(() => /Pele rendered|fell back/.test(document.querySelector("#classes-state")?.textContent || ""), null, {timeout:RECOVERED_MS});
+  assert.ok(await page.locator("#classes-diagram").evaluate(node => node.textContent.includes("Shape")), "the class is drawn");
+  assert.equal(await page.locator("#view-classes").getAttribute("aria-selected"), "true", "Classes stays the view on screen");
+  assert.equal(await page.locator("#classes-panel").evaluate(node => node.hidden), false);
 }));
 
 test("a reload after a stall keeps the remembered sign-in", {timeout:240000}, async () => published(async ({page, paths, server}) => {

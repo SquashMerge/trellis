@@ -2279,6 +2279,7 @@ async function stalledShowHarness() {
     requests.push([path, options]);
     if (path === "/api/status") { statusReply.pending = deferred(); return statusReply.pending.promise; }
     if (path === "/api/status/head") return response({revision:SHOW_PIN, catchingUp:false, indexedAt:null, viewRequest:null});
+    if (!options?.body) return response({});
     const seed = JSON.parse(options.body).seed;
     seeds.push(seed);
     if (seed === "agent" && h.stalled) return {ok:false, status:503, json:async () => { throw new SyntaxError("Unexpected token '<'"); }};
@@ -2312,6 +2313,10 @@ test("a user navigation while recovery reads status wins over the stopped show, 
   assert.equal(h.run("selectedMethod.id"), "user");
   await answerStatus();
   assert.equal(h.run("selectedMethod.id"), "user", "the user's view stays");
+  // The stale show is dropped and the view on screen is refreshed instead: answer its status read.
+  await answerStatus();
+  assert.equal(h.run("recovery"), null, "the refreshed view ends recovery");
+  assert.notEqual(h.run("selectedMethod?.id"), "agent");
   assert.equal(h.get("agent-shown").hidden, true, "nothing says the agent moved this view");
   assert.equal(h.run("stalledShow"), null, "the stale show is dropped");
   assert.equal(seeds.filter(seed => seed === "agent").length, 1, "the stale show read nothing more");
@@ -2323,7 +2328,7 @@ test("a user navigation while recovery reads status wins over the stopped show, 
     : options?.body ? (seeds.push(JSON.parse(options.body).seed), response(view(JSON.parse(options.body).seed))) : response({});
   h.run("refreshView = async () => { await api('/api/status'); }");
   await recover();
-  assert.equal(h.run("selectedMethod.id"), "user");
+  assert.notEqual(h.run("selectedMethod?.id"), "agent");
   assert.equal(seeds.filter(seed => seed === "agent").length, 1);
 });
 test("a newer show while recovery reads status wins over the stopped one", async () => {
@@ -2354,4 +2359,30 @@ test("a show that loses the view to a user navigation is not kept for recovery, 
   read.resolve(response(view("agent"))); await show; await settleMany();
   assert.equal(h.run("selectedMethod.id"), "user");
   assert.equal(h.run("stalledShow"), null);
+});
+test("a stall just after an attempt ended goes on with the backoff instead of starting over", async () => {
+  const h = harness();
+  let answers = false;
+  h.context.fetch = async () => answers ? response({revision:STALL_PIN}) : {ok:false, status:503, json:async () => ({})};
+  h.run("refreshView = async () => { await api('/api/status'); }");
+  await assert.rejects(h.run("api('/api/git')"));
+  let [[id, timer]] = recoveryTimers(h); h.timers.delete(id);
+  assert.equal(timer.delay, 2000);
+  answers = true; timer.callback(); await settleMany();
+  assert.equal(h.run("recovery"), null);
+  // A view refreshed without waiting (Architecture) stalls right after: the same outage.
+  answers = false;
+  await assert.rejects(h.run("api('/api/architecture')"));
+  [[id, timer]] = recoveryTimers(h);
+  assert.equal(timer.delay, 4000);
+});
+test("recovery's Refresh reloads the Classes view on screen, not an earlier Sequence", async () => {
+  const h = harness(), calls = [];
+  h.run("status.workspaceRoot = '/synthetic'; selectedMethod = {id:'old', name:'old', path:'a.js'}; $('treemap-panel').hidden = true; $('architecture-panel').hidden = true");
+  h.context.TrellisClassesRetry = () => calls.push("classes");
+  h.run("window.TrellisClasses = {retry: () => TrellisClassesRetry(), reset() {}}; currentDiagramView = () => 'classes'; loadSequence = async () => { TrellisClassesRetry.sequence = true; }");
+  h.context.fetch = async request => request === "/api/status" ? response({revision:STALL_PIN, catchingUp:false, stats:{}}) : response({});
+  await h.run("refreshView()").catch(() => {});
+  assert.deepEqual(calls, ["classes"]);
+  assert.equal(h.context.TrellisClassesRetry.sequence, undefined);
 });

@@ -371,17 +371,21 @@ function observeViewRequest(value) {
 const TRANSIENT_CODES = new Set(["storage_busy", "deadline_exceeded", "bounded_work", "rebuild_in_progress"]);
 const PATH_FORBIDDEN = new Set(["source_forbidden", "symlink_forbidden", "directory_forbidden"]);
 const RECOVERY_FIRST_MS = 2000, RECOVERY_MAX_MS = 60000;
-let recovery = null, stalledShow = null, stallCount = 0;
+let recovery = null, stalledShow = null, stallCount = 0, recovered = null;
 function noteStall() {
   if (!token || !selectedRootKey) return;
   stallCount++;
   const scope = `${epoch}:${selectedRootKey}`;
   if (recovery?.scope === scope) { recovery.again = true; return; }
+  // A view refreshed but not awaited (Architecture) can stall again just after an attempt
+  // ended: that is the same outage, so the backoff goes on instead of starting over.
+  const delay = recovered?.scope === scope && Date.now() - recovered.at <= RECOVERY_MAX_MS
+    ? Math.min(recovered.delay * 2, RECOVERY_MAX_MS) : RECOVERY_FIRST_MS;
   clearRecovery();
-  recovery = {scope, delay:RECOVERY_FIRST_MS, timer:null, again:false};
+  recovery = {scope, delay, timer:null, again:false};
   recovery.timer = setTimeout(() => void recover(recovery), recovery.delay);
 }
-function clearRecovery() { if (recovery) clearTimeout(recovery.timer); recovery = null; stalledShow = null; }
+function clearRecovery() { if (recovery) clearTimeout(recovery.timer); recovery = null; stalledShow = null; recovered = null; }
 async function recover(attempt) {
   attempt.timer = null;
   if (recovery !== attempt || attempt.scope !== `${epoch}:${selectedRootKey}`) return;
@@ -396,17 +400,20 @@ async function recover(attempt) {
   // while it is awaited is still seen by the check below. The show then loads its own view.
   await perform(claim ? () => refreshStatus() : refreshView);
   if (recovery !== attempt) return;
+  if (claim && !attempt.again) {
+    // The show loads its own view, so its reads decide whether this attempt succeeded. If
+    // something else took the view while status was read, the stale show is dropped and the
+    // view on screen is refreshed instead.
+    if (owns(claim)) { stalledShow = null; await perform(() => showAgentView(claim.request)); }
+    else { if (stalledShow === claim) stalledShow = null; await perform(refreshView); }
+    if (recovery !== attempt) return;
+  }
   if (attempt.again) {
     attempt.delay = Math.min(attempt.delay * 2, RECOVERY_MAX_MS);
     attempt.timer = setTimeout(() => void recover(attempt), attempt.delay);
     return;
   }
-  recovery = null;
-  if (!claim) return;
-  if (owns(claim)) { stalledShow = null; await perform(() => showAgentView(claim.request)); return; }
-  // Something else took the view while status was read: drop the show and refresh the view.
-  if (stalledShow === claim) stalledShow = null;
-  await perform(refreshView);
+  recovery = null; recovered = {scope:attempt.scope, delay:attempt.delay, at:Date.now()};
 }
 function agentLabel(request) {
   return request.view === "source" ? `${request.path}:${request.line}` : request.view === "class" ? "Class diagram" : "Sequence";
@@ -446,7 +453,11 @@ async function applyAgentView(request, pin, context, ticket, owned, claim) {
     await navigateDiagram(data.seed, pin, "sequence", data, false, null, null, true);
   } else if (request.view === "class") {
     rememberVisible(pin);
+    const stalls = stallCount;
     await navigateDiagram({id:request.symbolId}, pin, "class", null, false, null, null, true);
+    // Classes reports its own load failure; a stall during it leaves the show to recovery,
+    // which owns the view this show itself opened.
+    if (stallCount !== stalls) { claim.marks = viewMarks(); return false; }
   } else {
     // The source read takes its own serials, which a user's source or Files choice advances;
     // the read paints only while this show is still the latest and unpinned. Nothing else is
@@ -1190,6 +1201,8 @@ async function refreshView() {
   if (section !== "files" && !$("treemap-panel").hidden) await treemap?.refresh();
   // Not awaited: Architecture may be building, and this view shows that itself (#556).
   else if (section !== "files" && !$("architecture-panel").hidden) void architecture?.refresh();
+  // The view on screen is reloaded, never an earlier Sequence behind it (#906).
+  else if (section !== "files" && currentDiagramView() === "classes") await window.TrellisClasses?.retry?.();
   else if (section !== "files" && selectedMethod) await loadSequence();
   schedulePoll();
 }

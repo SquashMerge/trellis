@@ -157,6 +157,8 @@
   let renderer = null, rendererNote = "";
   // The last listed search and the app choice it listed under.
   let lastLookup = null;
+  // The latest search or diagram read, so a stalled one can be read again (#906).
+  let lastRead = null;
   const currentView = () => snapshot && valid(snapshot) && displayTicket === serial;
   function closeChooser() { if (chooser) chooser.remove(); chooser = null; }
   function selectedHierarchy(data) {
@@ -286,7 +288,7 @@
   function reset() {
     if (api && api.onChange) api.onChange();
     serial++; searchSerial++; diagramGeneration++; closeContextMenu(false);
-    seed = null; expanded = []; diagram = null; snapshot = null; showAll = false; memberChoices.clear(); closeChooser(); lastLookup = null;
+    seed = null; expanded = []; diagram = null; snapshot = null; showAll = false; memberChoices.clear(); closeChooser(); lastLookup = null; lastRead = null;
     if (controls) controls.hidden = true;
     if (ui) ui.results.hidden = false;
     positions = new Map(); cards = new Map(); stage = null;
@@ -349,6 +351,7 @@
   }
   async function lookup({path = "", q = "", offset = 0, autoOpen = false} = {}) {
     const c = context(), ticket = ++searchSerial;
+    if (!offset) lastRead = () => lookup({path, q, autoOpen});
     // Lookup supersedes a pending diagram request. Restore the visible diagram's
     // action ticket; the old response is still rejected by searchSerial.
     if (diagram && snapshot && valid(snapshot)) displayTicket = serial;
@@ -422,6 +425,7 @@
   async function loadDiagram(nextSeed, nextExpanded, fresh = false, focusId = null) {
     // A chosen diagram owns status/notices; late catalog pages must not replace them.
     const searchTicket = ++searchSerial;
+    lastRead = () => loadDiagram(nextSeed, nextExpanded, fresh, focusId);
     const c = context(), ticket = ++serial, focusBefore = document.activeElement;
     const restoreFocus = () => {
       if ((!fresh && !focusId) || ticket !== serial || !valid(c) || displayTicket !== ticket) return;
@@ -696,5 +700,7 @@
     if (sameChoice(lastLookup.choice, api.appFilter?.() || null)) return;
     return lookup({q:lastLookup.q});
   }
-  window.TrellisClasses = Object.freeze({init, open, reset, showContextMenu, closeContextMenu, scopeChanged});
+  // Reads the shown search or diagram again, as its own action would (stall recovery, #906).
+  function retry() { return lastRead?.(); }
+  window.TrellisClasses = Object.freeze({init, open, reset, retry, showContextMenu, closeContextMenu, scopeChanged});
 })();
