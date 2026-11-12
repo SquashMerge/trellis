@@ -2145,6 +2145,8 @@ test("#911 a line's symbol is its target's qualified name: Type::method from the
   rows[0].instance.evidence[0].target = {syntaxId:"j1",displayKey:"src/Main.java#Outer.Inner.run",document:docId("src/Main.java", "java"),lines:{start:4,end:4}};
   assert.equal(symbolOfLine(model.build(rows, layers), 20), "Outer.Inner.run");
   assert.equal(symbolOfLine(model.build(rows, layers), 30), "x", "a site with no target reads its spelling");
+  rows[0].instance.evidence[0].target = {syntaxId:"a1",displayKey:"src/http/worker.rs#implementation@4",document:docId("src/http/worker.rs"),lines:{start:4,end:9}};
+  assert.equal(symbolOfLine(model.build(rows, layers), 20), "enqueue_generated_semantic_import", "a target with no named segment reads the spelling, never its key (#941)");
 });
 
 test("#911 a line row shows the qualified name on one line, with the full name and both places as its tooltip", async () => {
@@ -2164,6 +2166,29 @@ test("#911 a line row shows the qualified name on one line, with the full name a
   const css = fs.readFileSync(path.join(__dirname, "../web/style.css"), "utf8");
   assert.match(css, /\.deviation-name \{[^}]*flex-wrap: nowrap/, "the name cell never wraps");
   assert.match(css, /\.deviation-name > \.deviation-symbol \{[^}]*text-overflow: ellipsis; white-space: nowrap/, "a long symbol truncates with an ellipsis");
+});
+
+// #941: the inspector's Refers to field reads the line's qualified name and its definition's path:line, never the internal key.
+test("#941 the inspector's Refers to shows the qualified name and path:line, never the internal key", async () => {
+  const h = deviationsHarness({rows:implTargetRows()});
+  h.deps.outline = async path => ({items:path === "src/http/worker.rs" ? workerOutline : [], nextOffset:null});
+  const dev = h.sandbox.window.TrellisDeviations.create(h.deps);
+  await dev.open(h.trigger); await h.expandAll();
+  const refersTo = () => {
+    const nodes = descendants(h.inspections.at(-1).target), dt = nodes.findIndex(item => item.tagName === "dt" && item.textContent === "Refers to");
+    return nodes.slice(dt + 1).find(item => item.tagName === "dd").textContent;
+  };
+  await h.treeRows().find(row => row.dataset.level === "3" && /^Line 20,/.test(row.attrs["aria-label"])).dispatch("click");
+  assert.equal(refersTo(), "DaemonState::enqueue_generated_semantic_import · src/http/worker.rs:88");
+  assert.doesNotMatch(text(h.inspections.at(-1).target), /implementation@4|worker\.rs#/, "the internal key is never shown");
+
+  const bare = deviationsHarness({rows:implTargetRows()});
+  bare.deps.outline = async () => ({items:[], nextOffset:null});
+  const plain = bare.sandbox.window.TrellisDeviations.create(bare.deps);
+  await plain.open(bare.trigger); await bare.expandAll();
+  await bare.treeRows().find(row => row.dataset.level === "3" && /^Line 20,/.test(row.attrs["aria-label"])).dispatch("click");
+  assert.doesNotMatch(text(bare.inspections.at(-1).target), /implementation@4|worker\.rs#/, "without the impl's type the name is unqualified, never the key");
+  assert.match(text(bare.inspections.at(-1).target), /enqueue_generated_semantic_import · src\/http\/worker\.rs:88/);
 });
 
 // ---- #860 review: closure naming takes the nearest named *callable*, and typed stale outline errors are conflicts. ----
