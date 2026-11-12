@@ -2690,69 +2690,30 @@ impl EvidenceResponse {
             }
             modules.push(row);
         }
-        // Keep policy and exception contributions separate even on the same pair.
+        // Keep policy and exception contributions separate even on the same pair. An edge's
+        // pairs and their sampled sites are paged by the details route's `edge` kind (#917).
         type SummaryKey = (String, String, String, String, bool, Option<String>);
         let mut summaries: BTreeMap<SummaryKey, serde_json::Value> = BTreeMap::new();
-        for (field, evaluated, role) in [
-            ("production", "instances", "production"),
-            ("tests", "testOnly", "test"),
-        ] {
-            let verdicts: BTreeMap<_, _> = rules[evaluated]
-                .as_array()
-                .context("store_unavailable: layer verdicts")?
-                .iter()
-                .filter(|row| row["rule"] == "$layers" && !row["destination"].is_null())
-                .map(|row| {
-                    (
-                        (row["target"].to_string(), row["destination"].to_string()),
-                        row,
-                    )
-                })
-                .collect();
-            for pair in references.data[field]
-                .as_array()
-                .context("store_unavailable: reference pairs")?
-            {
-                check()?;
-                let verdict = verdicts
-                    .get(&(pair["source"].to_string(), pair["target"].to_string()))
-                    .context("store_unavailable: architecture verdict join")?;
-                let (Some(source), Some(destination)) = (
-                    verdict["sourceLayer"].as_str(),
-                    verdict["destinationLayer"].as_str(),
-                ) else {
-                    continue;
-                };
-                if source == destination {
-                    continue;
-                }
-                if verdict["unresolved"]
-                    .as_array()
-                    .is_some_and(|reasons| reasons.iter().any(|reason| reason == "cross_app"))
-                {
-                    continue;
-                }
-                let status = verdict["status"]
-                    .as_str()
-                    .context("store_unavailable: layer status")?;
-                let excepted = verdict["excepted"]
-                    .as_bool()
-                    .context("store_unavailable: layer exception")?;
-                let reason = verdict["exceptionReason"].as_str().map(str::to_owned);
+        crate::architecture_details::edge_pairs(
+            &references.data,
+            &rules,
+            &mut *check,
+            |role, edge, pair| {
                 let summary = summaries
                     .entry((
-                        source.into(),
-                        destination.into(),
+                        edge.source.into(),
+                        edge.destination.into(),
                         role.into(),
-                        status.into(),
-                        excepted,
-                        reason.clone(),
+                        edge.status.into(),
+                        edge.excepted,
+                        edge.reason.map(str::to_owned),
                     ))
                     .or_insert_with(|| {
                         serde_json::json!({
-                            "sourceLayer": source, "destinationLayer": destination, "role": role,
-                            "status": status, "excepted": excepted, "exceptionReason": reason,
-                            "count": 0, "semanticSites": 0, "pairs": []
+                            "key": edge.key(role),
+                            "sourceLayer": edge.source, "destinationLayer": edge.destination,
+                            "role": role, "status": edge.status, "excepted": edge.excepted,
+                            "exceptionReason": edge.reason, "count": 0, "semanticSites": 0
                         })
                     });
                 summary["count"] = serde_json::json!(
@@ -2767,12 +2728,9 @@ impl EvidenceResponse {
                             .as_u64()
                             .context("store_unavailable: reference semantic count")?
                 );
-                summary["pairs"]
-                    .as_array_mut()
-                    .expect("constructed pairs")
-                    .push(pair.clone());
-            }
-        }
+                Ok(())
+            },
+        )?;
         // Undrawn detail (sites, pairs, instances) is served by paged detail reads (#448).
         let (mut references, mut rules) = crate::architecture_details::summary(
             &references.data,

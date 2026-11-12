@@ -1023,7 +1023,9 @@
     }
     function pairs(target, values, active, emptyNote = true) {
       if (!values.length) { if (emptyNote) paragraph(target, NO_PAIRS); return; }
-      boundaryCallers(target, values, active);
+      boundaryCallers(target, values, active); pairDetails(target, values, active);
+    }
+    function pairDetails(target, values, active) {
       for (const pair of values) {
         const details = make("details"); details.append(make("summary", `${targetLabel(pair.source)} → ${targetLabel(pair.target)} · ${pair.count} reference sites`));
         paragraph(details, `${pair.sites.length} sampled sites · ${pair.omittedSites} omitted sites. Counts remain exact; samples are not exhaustive.`);
@@ -1041,6 +1043,15 @@
         }
         target.append(details);
       }
+    }
+    // An edge's pairs and sampled sites are read on demand from the details route's `edge`
+    // kind (#917). Boundary callers group every pair loaded so far, above the pair list.
+    function edgePairs(target, record, active) {
+      const callers = make("div"), loaded = []; target.append(callers);
+      // The edge's bounded `key` names it; its reason text never travels in the request.
+      detailList(target, {kind:"edge", key:record.key, limit:"500"}, active, (list, items) => {
+        loaded.push(...items); callers.replaceChildren(); boundaryCallers(callers, loaded, active); pairDetails(list, items, active);
+      }, NO_PAIRS);
     }
     function values(target, metrics) {
       const list = make("dl", undefined, "metric-inspector-values");
@@ -1195,7 +1206,7 @@
       } else if (kind === "edge") {
         title.textContent = `${record.sourceLayer} → ${record.destinationLayer}`;
         paragraph(target, `${record.count} exact ${record.role} ${edgeSites(record)} · ${record.status}${record.excepted ? ` · excepted: ${record.exceptionReason}` : " · not excepted"}${record.role === "test" ? " · hypothetical policy only; never a production violation" : ""}.`);
-        pairs(target, record.pairs, active);
+        edgePairs(target, record, active);
       } else if (kind === "layer") {
         title.textContent = record.name; paragraph(target, layerLabel(record));
         for (const module of payload.modules.filter(item => item.layer === record.name)) {

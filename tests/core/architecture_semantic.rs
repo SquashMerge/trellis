@@ -448,12 +448,11 @@ fn semantic_sites_keep_sample_and_summary_bounds() {
     assert_eq!(low["sites"].as_array().unwrap().len(), 3);
     assert_eq!(low["omittedSites"], 118);
     let summary = view(&store, pin);
+    // Edges carry no pairs or site samples; the details route's edge kind pages them (#917).
     for arrow in summary["edges"].as_array().unwrap() {
-        for pair in arrow["pairs"].as_array().unwrap() {
-            assert!(pair["sites"].as_array().unwrap().len() <= 5);
-        }
+        assert!(arrow.get("pairs").is_none(), "{arrow}");
     }
-    // The summary carries no per-site arrays beyond the pair samples.
+    // The summary carries no per-site arrays.
     assert!(summary["references"].get("unresolved").is_none());
     assert!(serde_json::to_vec(&summary).unwrap().len() < 256 * 1024);
 }

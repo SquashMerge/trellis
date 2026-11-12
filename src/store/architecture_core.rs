@@ -127,60 +127,15 @@ struct RulesPart {
 
 type SummaryKey = (String, String, bool);
 
-/// A shared finished summary. With `pairs` false it is written without `edges[].pairs`, the
-/// per-file pairs and their sampled sites (#915, owner ruling 2026-11-11); the shared value is
-/// not copied.
-pub(crate) struct ArchitectureSummary {
-    pub(crate) payload: Arc<serde_json::Value>,
-    pub(crate) pairs: bool,
-}
+/// A shared finished summary. Edges carry no per-file pairs: the edge scope of
+/// `architecture/details` pages them (#917).
+pub(crate) struct ArchitectureSummary(pub(crate) Arc<serde_json::Value>);
 impl serde::Serialize for ArchitectureSummary {
     fn serialize<S: serde::Serializer>(
         &self,
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
-        use serde::ser::{SerializeMap, SerializeSeq};
-        struct Without<'a>(&'a serde_json::Map<String, serde_json::Value>, &'a str);
-        impl serde::Serialize for Without<'_> {
-            fn serialize<S: serde::Serializer>(
-                &self,
-                serializer: S,
-            ) -> std::result::Result<S::Ok, S::Error> {
-                let mut map = serializer.serialize_map(None)?;
-                for (key, value) in self.0.iter().filter(|(key, _)| *key != self.1) {
-                    map.serialize_entry(key, value)?;
-                }
-                map.end()
-            }
-        }
-        struct Edges<'a>(&'a [serde_json::Value]);
-        impl serde::Serialize for Edges<'_> {
-            fn serialize<S: serde::Serializer>(
-                &self,
-                serializer: S,
-            ) -> std::result::Result<S::Ok, S::Error> {
-                let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
-                for edge in self.0 {
-                    match edge.as_object() {
-                        Some(edge) => seq.serialize_element(&Without(edge, "pairs"))?,
-                        None => seq.serialize_element(edge)?,
-                    }
-                }
-                seq.end()
-            }
-        }
-        let object = match self.payload.as_object() {
-            Some(object) if !self.pairs => object,
-            _ => return self.payload.serialize(serializer),
-        };
-        let mut map = serializer.serialize_map(Some(object.len()))?;
-        for (key, value) in object {
-            match value.as_array() {
-                Some(edges) if key == "edges" => map.serialize_entry(key, &Edges(edges))?,
-                _ => map.serialize_entry(key, value)?,
-            }
-        }
-        map.end()
+        self.0.serialize(serializer)
     }
 }
 
