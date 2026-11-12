@@ -301,9 +301,13 @@ impl BrowserCheckoutsProbe {
                     entry.identity.rediscover()?;
                 }
                 if let Some(runtime) = runtime {
-                    let (response, catching_up) = runtime.evidence_response()?;
-                    let revision = response.status()?.revision;
-                    response.finish((revision, Some(catching_up)))
+                    // The listing carries each checkout's Git header; a publication that holds
+                    // readers out reports `storage_busy` at once instead of delaying it (#905).
+                    crate::store::with_spill_answer_by(Instant::now(), || {
+                        let (response, catching_up) = runtime.evidence_response()?;
+                        let revision = response.status()?.revision;
+                        response.finish((revision, Some(catching_up)))
+                    })
                 } else {
                     let roots = roots
                         .as_ref()
@@ -2779,6 +2783,9 @@ impl CheckoutRuntime {
             RuntimePhase::Ready => {
                 resources.scheduler.checkout_watch_pending()
                     || resources.scheduler.fifo_pending()
+                    // A publication holding readers out is work in progress; asking the index
+                    // would only wait for its COMMIT (#905).
+                    || resources.store.publication_holds_readers()
                     || resources
                         .store
                         .pending_semantic_target()
