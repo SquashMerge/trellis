@@ -62,7 +62,7 @@ test("the thirteen-tool order and unchanged schemas are explicit", () => {
     "trellis_rules_explain", "trellis_show", "trellis_endpoints",
   ]);
   const describe = tools[0].outputSchema.oneOf[0].properties.data.properties;
-  assert.equal(describe.toolVersion.const, 28);
+  assert.equal(describe.toolVersion.const, 29);
   assert.equal(search.inputSchema.additionalProperties, false);
   assert.equal(search.inputSchema.properties.limit.default, 10);
   assert.equal(search.inputSchema.properties.limit.maximum, 50);
@@ -118,8 +118,9 @@ test("native coverage labels do not claim the selected semantic tier", () => {
     const validate = ajv.compile({ $schema: schema.$schema, $defs: schema.$defs,
       $ref: "#/$defs/LanguageStatus" });
     const coverage = { selected: 2, complete: 1, partial: 1, failed: 0, unselected: 0 };
+    const documentStatus = { olderBasis: 3, catchingUp: 1, needsReimport: 0 };
     const semantic = { available: true, producerId: "rust-analyzer", freshness: "fresh",
-      coverage, note: null, reimport: null, documents: [] };
+      coverage, note: null, reimport: null, documentStatus };
     if (tool.name === "trellis_workspace_describe") semantic.partialReasons = null;
     const status = { language: "rust", nativeCoverageTier: "syntax", coverage, semantic };
     assert.ok(validate(status), `${tool.name}: ${JSON.stringify(validate.errors)}`);
@@ -131,6 +132,13 @@ test("native coverage labels do not claim the selected semantic tier", () => {
     assert.ok(validate({ ...status, semantic: { ...semantic, reimport } }), tool.name);
     const { reimport: _, ...missing } = semantic;
     assert.equal(validate({ ...status, semantic: missing }), false, tool.name);
+    // #930: per-status counts replace the #620 per-document list; both are closed.
+    const { documentStatus: __, ...uncounted } = semantic;
+    assert.equal(validate({ ...status, semantic: { ...uncounted, documents: [] } }), false, tool.name);
+    for (const invalid of [{ olderBasis: 3, catchingUp: 1 }, { ...documentStatus, current: 0 },
+      { ...documentStatus, olderBasis: -1 }, { ...documentStatus, catchingUp: "1" }]) {
+      assert.equal(validate({ ...status, semantic: { ...semantic, documentStatus: invalid } }), false, tool.name);
+    }
     for (const invalid of [{ state: "fresh", reason: "changed" }, { state: "needsReimport" },
       { ...reimport, extra: true }, { ...reimport, reason: "" }]) {
       assert.equal(validate({ ...status, semantic: { ...semantic, reimport: invalid } }), false, tool.name);
@@ -362,10 +370,12 @@ test("each tool's one failure schema accepts exactly the #864 failure shape", ()
     "trellis_endpoints"];
   // #851: an `app` filter of these fails as the rules check does.
   const appFiltered = ["trellis_find_symbols", "trellis_search_symbols", "trellis_call_graph"];
+  // #930: every tool may answer `response_too_large` for a finished answer over the cap.
   const codesOf = (name) => [...resolved,
-    ...(architecture.includes(name) ? ["invalid_rules", "rules_not_found", "bounded_work", "response_too_large"]
+    ...(architecture.includes(name) ? ["invalid_rules", "rules_not_found", "bounded_work"]
       : appFiltered.includes(name) ? ["invalid_rules", "bounded_work"] : []),
-    "workspace_selection_failed", ...(architecture.includes(name) ? ["building"] : [])];
+    "response_too_large", "workspace_selection_failed",
+    ...(architecture.includes(name) ? ["building"] : [])];
   const keys = (object, allowed) => Object.keys(object).every((key) => allowed.includes(key));
   const common = ["code", "message", "retryable", "currentBasis", "currentContentHash"];
   const attemptedOk = (value) => value !== null && typeof value === "object" && !Array.isArray(value)

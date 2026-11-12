@@ -863,10 +863,11 @@ async fn workbench_architecture_option_forwards_hidden_layer_population() {
     }
 }
 
-/// #915 (owner ruling 2026-11-11): `pairs=false` leaves `edges[].pairs` out and changes
-/// nothing else; the default and `pairs=true` are the full answer; other values are refused.
+/// #917 (owner 2026-11-11): summary edges carry no `pairs`; the details route's `edge` kind
+/// pages them. `pairs=false` (#915) stays accepted and changes nothing; `pairs=true` and other
+/// values are refused.
 #[tokio::test]
-async fn architecture_pairs_false_leaves_out_edge_pairs_and_nothing_else() {
+async fn architecture_edges_carry_no_pairs_and_pairs_false_changes_nothing() {
     let (base, _runtime, browser, key) = fixture_with_roles(true).await;
     write_rules(
         &base,
@@ -877,20 +878,24 @@ async fn architecture_pairs_false_leaves_out_edge_pairs_and_nothing_else() {
     assert_eq!(status, StatusCode::OK, "{full}");
     let edges = full["payload"]["edges"].as_array().unwrap();
     assert!(!edges.is_empty(), "{full}");
-    assert!(
-        edges.iter().all(|edge| edge["pairs"]
-            .as_array()
-            .is_some_and(|pairs| !pairs.is_empty())),
-        "{full}"
-    );
-    let (status, explicit) = request(
-        app.clone(),
-        &key,
-        "?role=production&pairs=true&workbench=true",
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{explicit}");
-    assert_eq!(explicit, full);
+    for edge in edges {
+        assert!(edge.get("pairs").is_none(), "{edge}");
+        for field in [
+            "key",
+            "sourceLayer",
+            "destinationLayer",
+            "role",
+            "status",
+            "excepted",
+            "exceptionReason",
+            "count",
+            "semanticSites",
+            "evidenceTier",
+            "coverage",
+        ] {
+            assert!(edge.get(field).is_some(), "{field}: {edge}");
+        }
+    }
     let (status, compact) = request(
         app.clone(),
         &key,
@@ -898,12 +903,9 @@ async fn architecture_pairs_false_leaves_out_edge_pairs_and_nothing_else() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{compact}");
-    let mut expected = full.clone();
-    for edge in expected["payload"]["edges"].as_array_mut().unwrap() {
-        edge.as_object_mut().unwrap().remove("pairs");
-    }
-    assert_eq!(compact, expected);
+    assert_eq!(compact, full);
     for query in [
+        "?pairs=true",
         "?pairs=",
         "?pairs=0",
         "?pairs=False",
@@ -917,6 +919,228 @@ async fn architecture_pairs_false_leaves_out_edge_pairs_and_nothing_else() {
             error["error"]["code"], "invalid_request",
             "{query}: {error}"
         );
+    }
+}
+
+/// The `edge` details scope naming one summary edge by its bounded `key` (#917).
+fn edge_scope(edge: &Value) -> String {
+    let key = edge["key"].as_str().unwrap();
+    assert_eq!(key.len(), 64, "{edge}");
+    format!("kind=edge&key={key}")
+}
+
+/// #917: the `edge` kind pages one summary edge's pairs, with their sampled sites, at the
+/// summary's pin and rules hash. Its pages concatenate to exactly the reference pairs the edge
+/// counts; an unknown edge, a stale pin or rules file and a bad offset are typed failures.
+#[tokio::test]
+async fn architecture_edge_details_page_each_edges_pairs_at_the_summary_pin() {
+    let (base, runtime, browser, key) = fixture_with_roles(true).await;
+    write_rules(
+        &base,
+        "version=1\n[layers.app]\norder=2\npaths=['src/roles.rs','tests/**']\n[layers.target]\norder=1\npaths=['src/target.rs']",
+    );
+    let app = browser.router();
+    let (status, summary) = request(app.clone(), &key, "").await;
+    assert_eq!(status, StatusCode::OK, "{summary}");
+    let summary = &summary["payload"];
+    let pin: trellis::model::IndexPin = serde_json::from_value(serde_json::json!({
+        "indexGeneration": summary["indexGeneration"], "indexRevision": summary["indexRevision"]
+    }))
+    .unwrap();
+    let (response, _) = runtime.evidence_response().unwrap();
+    let references = response
+        .architecture_response(
+            "references",
+            &serde_json::json!({ "expectedBasis": pin }),
+            &mut || Ok(()),
+        )
+        .unwrap();
+    response.finish(()).unwrap();
+    let hash = summary["rulesFile"]["contentHash"].as_str().unwrap();
+    let pinned = format!(
+        "indexGeneration={}&indexRevision={}&rulesHash={hash}",
+        pin.index_generation, pin.index_revision
+    );
+    let edges = summary["edges"].as_array().unwrap();
+    assert!(edges.len() >= 2, "{summary}");
+    let mut seen = Vec::new();
+    for edge in edges {
+        let scope = edge_scope(edge);
+        let pairs = all_details(&app, &key, &format!("{scope}&{pinned}"), 1).await;
+        assert!(!pairs.is_empty(), "{scope}");
+        let sum = |field: &str| {
+            pairs
+                .iter()
+                .map(|pair| pair[field].as_u64().unwrap())
+                .sum::<u64>()
+        };
+        assert_eq!(sum("count"), edge["count"].as_u64().unwrap(), "{scope}");
+        assert_eq!(
+            sum("semanticSites"),
+            edge["semanticSites"].as_u64().unwrap(),
+            "{scope}"
+        );
+        let field = if edge["role"] == "test" {
+            "tests"
+        } else {
+            "production"
+        };
+        for pair in &pairs {
+            assert!(
+                pair["sites"].is_array() && pair["omittedSites"].is_u64(),
+                "{pair}"
+            );
+            assert!(
+                references[field].as_array().unwrap().contains(pair),
+                "an edge's pair is the reference pair itself: {pair}"
+            );
+            seen.push((field, pair.clone()));
+        }
+    }
+    // No pair counts under two edges.
+    let total = seen.len();
+    seen.sort_by_key(|(field, pair)| (*field, pair.to_string()));
+    seen.dedup();
+    assert_eq!(seen.len(), total);
+    let first = edge_scope(&edges[0]);
+    let (status, page) = request(
+        app.clone(),
+        &key,
+        &format!("/details?{first}&{pinned}&limit=500"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(page["payload"]["kind"], "edge");
+    let total = page["payload"]["total"].as_u64().unwrap();
+    // Keys that name no edge at this pin and rules file.
+    let edge_key = edges[0]["key"].as_str().unwrap();
+    let flipped = format!(
+        "{}{}",
+        if edge_key.starts_with('0') { "1" } else { "0" },
+        &edge_key[1..]
+    );
+    for scope in [
+        format!("kind=edge&key={flipped}"),
+        format!("kind=edge&key={}", "f".repeat(64)),
+    ] {
+        let (status, error) =
+            request(app.clone(), &key, &format!("/details?{scope}&{pinned}")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{scope}: {error}");
+        assert_eq!(error["error"]["code"], "not_found", "{scope}: {error}");
+    }
+    // Malformed scopes and offsets are invalid requests; the identity fields are not accepted.
+    for query in [
+        format!("{first}&{pinned}&offset={}", total + 1),
+        format!("{first}&{pinned}&offset=-1"),
+        format!("{first}&{pinned}&limit=0"),
+        format!("kind=edge&{pinned}"),
+        format!("kind=edge&key={}&{pinned}", &edge_key[1..]),
+        format!("kind=edge&key={}&{pinned}", edge_key.to_uppercase()),
+        format!("{first}&{pinned}&path=src%2Froles.rs"),
+        format!("{first}&{pinned}&sourceLayer=app"),
+        format!("{first}&{pinned}&exceptionReason=Reviewed"),
+        format!("{first}&{pinned}&path=x"),
+        format!("kind=pairs&key=foo&{pinned}"),
+        format!("kind=pairs&key=&{pinned}"),
+        format!("kind=pairs&key={edge_key}&{pinned}"),
+        format!("kind=instances&key={edge_key}&{pinned}"),
+    ] {
+        let (status, error) = request(app.clone(), &key, &format!("/details?{query}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {error}");
+        assert_eq!(
+            error["error"]["code"], "invalid_request",
+            "{query}: {error}"
+        );
+    }
+    // A stale pin and a changed rules file are the summary's typed conflicts.
+    let stale_pin = format!(
+        "/details?{first}&indexGeneration={}&indexRevision={}&rulesHash={hash}",
+        pin.index_generation,
+        pin.index_revision + 1
+    );
+    let (status, conflict) = request(app.clone(), &key, &stale_pin).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+    assert!(
+        matches!(
+            conflict["error"]["code"].as_str(),
+            Some("revision_conflict" | "pin_expired")
+        ),
+        "{conflict}"
+    );
+    let (status, conflict) = request(
+        app.clone(),
+        &key,
+        &format!(
+            "/details?{first}&indexGeneration={}&indexRevision={}&rulesHash=sha256%3Aold",
+            pin.index_generation, pin.index_revision
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+    assert_eq!(conflict["error"]["code"], "rules_conflict");
+}
+
+/// #917: an exception reason of any length the rules file accepts, past the 4096-byte
+/// request field bound (4,097 ASCII characters) or multibyte (1,000 three-byte characters, about
+/// 9 KB percent-encoded), names its edge through the bounded `key`, so its pairs still page. A
+/// key from before the rules changed is a typed conflict at the old rules hash.
+#[tokio::test]
+async fn architecture_edges_with_long_exception_reasons_page_by_key() {
+    let (base, _runtime, browser, key) = fixture_with_roles(true).await;
+    let app = browser.router();
+    let mut previous: Option<(String, String)> = None;
+    for reason in ["r".repeat(4097), "境".repeat(1000)] {
+        write_rules(
+            &base,
+            &format!(
+                "version=1\n[layers.app]\norder=2\npaths=['src/roles.rs','tests/**']\n[layers.target]\norder=1\npaths=['src/target.rs']\n[[exceptions]]\nrule='$layers'\ntarget={{language='rust',path='src/roles.rs'}}\ndestination={{language='rust',path='src/target.rs'}}\nreason='{reason}'"
+            ),
+        );
+        let (status, summary) = request(app.clone(), &key, "").await;
+        assert_eq!(status, StatusCode::OK, "{summary}");
+        let summary = &summary["payload"];
+        let pinned = format!(
+            "indexGeneration={}&indexRevision={}&rulesHash={}",
+            summary["indexGeneration"].as_str().unwrap(),
+            summary["indexRevision"],
+            summary["rulesFile"]["contentHash"].as_str().unwrap()
+        );
+        let excepted: Vec<&Value> = summary["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|edge| edge["exceptionReason"] == reason.as_str())
+            .collect();
+        assert!(!excepted.is_empty(), "{summary}");
+        for edge in excepted {
+            let pairs = all_details(&app, &key, &format!("{}&{pinned}", edge_scope(edge)), 1).await;
+            assert_eq!(
+                pairs
+                    .iter()
+                    .map(|pair| pair["count"].as_u64().unwrap())
+                    .sum::<u64>(),
+                edge["count"].as_u64().unwrap(),
+                "{edge}"
+            );
+            assert!(
+                pairs
+                    .iter()
+                    .all(|pair| pair["target"]["path"] == "src/target.rs")
+            );
+        }
+        if let Some((scope, old)) = previous.take() {
+            let (status, conflict) =
+                request(app.clone(), &key, &format!("/details?{scope}&{old}")).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+            assert_eq!(conflict["error"]["code"], "rules_conflict");
+        }
+        let first = summary["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|edge| edge["exceptionReason"] == reason.as_str())
+            .unwrap();
+        previous = Some((edge_scope(first), pinned));
     }
 }
 

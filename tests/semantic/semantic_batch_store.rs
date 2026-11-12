@@ -7318,7 +7318,7 @@ async fn real_typescript_bindings_show_in_query_mcp_status_and_methods() {
     // #528: describe and scopeCoverage report the imported JavaScript evidence beside the
     // native coverage, which keeps its syntax tier; other languages have no producer.
     let describe = mcp.call("trellis_workspace_describe", json!({"schemaVersion":1}));
-    assert_eq!(describe["data"]["toolVersion"], 28);
+    assert_eq!(describe["data"]["toolVersion"], 29);
     for (scope, rows) in [
         ("describe", &describe["data"]["languages"]),
         ("incoming", &incoming["data"]["scopeCoverage"]),
@@ -8145,6 +8145,101 @@ fn witnessed_local_rejoin_preserves_real_partial_import_metadata() {
             .reasons,
         reasons
     );
+}
+
+/// #930: during semantic catch-up after an edit, the unchanged documents are `olderBasis`
+/// and the edited one is pending. With more of them than fit in a 64 KiB response as the
+/// #620 per-document list, describe, find and search still answer, and each language row
+/// counts its documents by read status instead of listing them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn catch_up_answers_count_document_statuses_past_the_response_cap() {
+    use trellis::model::SemanticStatus;
+    const DOCUMENTS: usize = 200;
+    let world = world_with(
+        |root| {
+            fs::create_dir_all(root.join(".git")).unwrap();
+            WorkspaceIdentity::discover(Some(root), root)
+                .unwrap()
+                .attach_marker()
+                .unwrap();
+            uniform_workspace(root, &["javascript"], DOCUMENTS);
+        },
+        true,
+    );
+    let mut fixture = world.fixture();
+    let docs = fixture.paths("javascript");
+    fixture.artifact("javascript", docs);
+    let (p, admitted, _) = world.publish(&world.write(&fixture)).unwrap();
+    drop(admitted);
+    let producer = world.store.semantic_at(p).unwrap().producers[0].id.clone();
+    // The edit publishes native N; startup stays held, so no S catches it up.
+    fs::write(
+        world.root.join("javascript/u00000.js"),
+        "function u00000() { g(); g(); }\n",
+    )
+    .unwrap();
+    let (graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(world.root.clone()),
+        world.store.root_id(),
+        &world.cancel,
+        |_| {},
+    )
+    .unwrap();
+    let leader = world.store.publication_for_tests().unwrap();
+    let pin = world
+        .store
+        .publish_native(&graph, &capture, &native, &leader, p, &world.cancel)
+        .unwrap();
+    drop(leader);
+    let mut counts = [0u64; 3];
+    let mut listed = Vec::new();
+    for number in 0..DOCUMENTS {
+        let path = format!("javascript/u{number:05}.js");
+        let projection = world
+            .store
+            .semantic_projection_at(pin, &producer, "javascript", &path)
+            .unwrap()
+            .unwrap();
+        counts[match projection.semantic_status {
+            SemanticStatus::OlderBasis => 0,
+            SemanticStatus::CatchingUp => 1,
+            SemanticStatus::NeedsReimport => 2,
+        }] += 1;
+        listed.push(
+            json!({"producerId":producer,"language":"javascript","path":path,
+            "projection":projection}),
+        );
+    }
+    assert!(counts[0] > 0 && counts[1] + counts[2] > 0, "{counts:?}");
+    let list = serde_json::to_vec(&listed).unwrap().len();
+    assert!(list > trellis::mcp::wire::RESPONSE_BYTES, "{list}");
+    let expected = json!({"olderBasis":counts[0],"catchingUp":counts[1],"needsReimport":counts[2]});
+    let basis = json!({"indexGeneration":pin.index_generation.to_string(),
+        "indexRevision":pin.index_revision});
+    let javascript = |rows: &Value| {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["language"] == "javascript")
+            .cloned()
+            .expect("the JavaScript row")
+    };
+    let mut mcp = McpSession::start(&world, 930);
+    let described = mcp.success("trellis_workspace_describe", json!({"schemaVersion":1}));
+    assert_eq!(described["evidenceBasis"], basis);
+    let row = javascript(&described["data"]["languages"]);
+    assert_eq!(row["semantic"]["documentStatus"], expected, "{row}");
+    assert!(row["semantic"].get("documents").is_none(), "{row}");
+    for name in ["trellis_find_symbols", "trellis_search_symbols"] {
+        for query in ["u00001", "absent_from_every_document"] {
+            let reply = mcp.success(name, json!({"schemaVersion":1,"query":query}));
+            assert_eq!(reply["evidenceBasis"], basis, "{name}");
+            let row = javascript(&reply["data"]["scopeCoverage"]);
+            assert_eq!(row["semantic"]["documentStatus"], expected, "{name}: {row}");
+        }
+    }
+    // Every answer validates against the advertised closed schemas.
+    mcp.finish();
 }
 
 /// Architecture wire evidence keeps the imported proof's identity beside native N.
