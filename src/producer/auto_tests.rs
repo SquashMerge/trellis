@@ -1028,6 +1028,8 @@ struct Rt {
     /// `(seen, expired)` while the owner is blocked in `wait_state_change`.
     waiting: Option<(u64, u64)>,
     waits: Vec<(u64, Duration)>,
+    /// `wake` calls. A run thread wakes only after `cell.put`, so each counts a stored outcome.
+    wakes: u64,
     ready: bool,
     intent: bool,
     slot: Option<RunOrigin>,
@@ -1087,6 +1089,15 @@ impl FakeRuntime {
         });
     }
 
+    /// The `n`th launch outcome is stored, and the owner has taken it. Queue removal is not
+    /// enough: the run thread stores the outcome and wakes the owner only after `launch`
+    /// returns. Once that wake is counted, an owner settled at the current version read it
+    /// before taking the cell.
+    fn outcome_applied(&self, n: u64) {
+        self.wait_for("the outcome to be stored", |state| state.wakes >= n);
+        self.quiesce();
+    }
+
     fn launches(&self) -> Vec<(String, String)> {
         self.state.lock().unwrap().launches.clone()
     }
@@ -1138,7 +1149,10 @@ impl AutoRunRuntime for FakeRuntime {
     }
 
     fn wake(&self) {
-        self.bump();
+        self.with(|state| {
+            state.version += 1;
+            state.wakes += 1;
+        });
     }
 
     fn launch(&self, request: LaunchRequest) -> LaunchOutcome {
@@ -1433,10 +1447,7 @@ fn loop_slot_busy_waits_for_next_signal() {
     let harness = Harness::start(&rt, &src, immediate());
     rt.finish(LaunchOutcome::SlotBusy);
     rt.wait_for("the launch", |state| !state.launches.is_empty());
-    rt.wait_for("the outcome to be taken", |state| {
-        state.outcomes.is_empty() && state.waiting.is_some_and(|(seen, _)| seen == state.version)
-    });
-    rt.quiesce();
+    rt.outcome_applied(1);
     assert_eq!(rt.launches().len(), 1);
     // The next attempt waits for a newer signal or the backstop, nothing sooner.
     let last = *rt.state.lock().unwrap().waits.last().unwrap();
@@ -1538,8 +1549,7 @@ fn prelaunch_failure_backs_off_within_runtime() {
     let harness = Harness::start(&rt, &src, immediate());
     rt.wait_for("the launch", |state| !state.launches.is_empty());
     rt.finish(finished(failed("plan_unavailable", "h1")));
-    rt.wait_for("the failure", |state| state.outcomes.is_empty());
-    rt.quiesce();
+    rt.outcome_applied(1);
     harness.signal();
     harness.signal();
     assert_eq!(rt.launches().len(), 1);
