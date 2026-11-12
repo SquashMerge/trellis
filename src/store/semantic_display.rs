@@ -1827,7 +1827,7 @@ pub(super) fn architecture_semantic(
         while let Some(row) = cursor.next()? {
             admit()?;
             // A missing required freshness row is corruption, never a filtered fact.
-            pp.freshness(row.get(17)?)?;
+            let basis_freshness = pp.freshness(row.get(17)?)?;
             let call_id = id_codec::decode_occ(row.get_ref(0)?.as_blob()?)
                 .map_err(|_| SelectedIntegrity("invalid semantic call ID".into()))?;
             let ordinal: i64 = row.get(10)?;
@@ -1877,9 +1877,11 @@ pub(super) fn architecture_semantic(
                 binding_metadata
                     .insert("historicalExternalTargets".into(), json!(external_targets));
             }
-            // What a fresh read at the basis binds: a resolved internal target, confirmed
-            // current there and in this snapshot (#934).
-            let basis_site = row.get_ref(3)?.as_str()? == "resolved"
+            // What a read at the basis binds: a resolved internal target, confirmed current
+            // there and in this snapshot (#934), from a proof that read admits: any not
+            // `stale`, possibly stale included (#936).
+            let basis_site = basis_freshness != sem::Freshness::Stale
+                && row.get_ref(3)?.as_str()? == "resolved"
                 && row.get_ref(4)?.as_str_or_null()? == Some("internal")
                 && row.get_ref(5)?.as_blob_or_null()?.is_some()
                 && row.get::<_, Option<i64>>(9)? == Some(0)
@@ -1942,10 +1944,11 @@ pub(super) fn architecture_semantic(
         let mut cursor = references.query(params![payload, historical, key, tuple])?;
         while let Some(row) = cursor.next()? {
             admit()?;
-            pp.freshness(row.get(9)?)?;
-            // What a fresh read at the basis binds: a resolved internal target in this
-            // snapshot (#934).
-            let basis_site = row.get_ref(2)?.as_str()? == "resolved"
+            let basis_freshness = pp.freshness(row.get(9)?)?;
+            // What a read at the basis binds: a resolved internal target in this snapshot
+            // (#934), from a proof that read admits: any not `stale` (#936).
+            let basis_site = basis_freshness != sem::Freshness::Stale
+                && row.get_ref(2)?.as_str()? == "resolved"
                 && row.get_ref(3)?.as_blob_or_null()?.is_some()
                 && locate(
                     row.get_ref(4)?.as_str_or_null()?,

@@ -13225,7 +13225,14 @@ fn bounded_full_rejoin_accepts_empty_destination_and_preserves_selected_capture(
 /// its own at P. An ordinary call ambiguous between two candidates is no site at P; when a
 /// candidate's document is catching up it is still none at N. A call P resolved to one
 /// internal target is a site at P, and stays one at N as a labelled boundary.
+///
+/// With `carried` (#936), an unrelated edit and semantic catch-up first make P the S head
+/// whose proofs are carried forward `possiblyStale`; P then reads them, labelled.
 async fn catch_up_boundary_world(ambiguous: bool) -> (World, u64, Value) {
+    catch_up_boundary_world_from(ambiguous, false).await
+}
+
+async fn catch_up_boundary_world_from(ambiguous: bool, carried: bool) -> (World, u64, Value) {
     use trellis::model::SemanticStatus;
     let world = world_with(
         |root| {
@@ -13264,15 +13271,46 @@ async fn catch_up_boundary_world(ambiguous: bool) -> (World, u64, Value) {
             ],
         )],
     );
-    let (p, admitted, _) = world.publish(&descriptor).unwrap();
+    let (mut p, admitted, _) = world.publish(&descriptor).unwrap();
     drop(admitted);
     let producer = world.store.semantic_at(p).unwrap().producers[0].id.clone();
+    if carried {
+        write_files(&world.root, &[("src/C.js", "function unrelated(){ }\n")]);
+        let options = IndexOptions::new(world.root.clone());
+        let capture = trellis::capture::Capture::admit(&options, &world.cancel, &|_| {}).unwrap();
+        let leader = world.store.publication_for_tests().unwrap();
+        world
+            .store
+            .publish_local_for_tests(&options, &capture, &leader, &world.cancel)
+            .unwrap();
+        drop(leader);
+        p = world
+            .store
+            .catch_up_semantic_for_tests(&world.cancel)
+            .unwrap();
+        assert!(!world.store.semantic_catch_up_pending_for_tests().unwrap());
+    }
     let sites = |reply: &Value| {
         reply["data"]["counts"]["mappedSites"].as_u64().unwrap()
             + reply["data"]["counts"]["unresolvedSites"].as_u64().unwrap()
     };
-    let mut mcp = McpSession::start(&world, 9348 + u64::from(ambiguous));
+    let mut mcp = McpSession::start(&world, 9348 + u64::from(ambiguous) + 2 * u64::from(carried));
     let at_p = mcp.success("trellis_references", json!({"schemaVersion":1,"limit":50}));
+    assert_eq!(at_p["evidenceBasis"], json!(p));
+    if carried {
+        // P's site rests on carried-forward evidence: present, and labelled as such.
+        let semantic: Vec<&Value> = at_p["data"]["production"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|edge| edge["sites"].as_array().unwrap())
+            .filter(|site| site["mapping"] == "semantic")
+            .collect();
+        assert_eq!(semantic.len(), u64::from(!ambiguous) as usize, "{at_p}");
+        for site in semantic {
+            assert_eq!(site["freshness"], "possiblyStale", "{site}");
+        }
+    }
     let before = sites(&at_p);
     // A whitespace-only edit to B publishes native N only: A is older basis, B catching up.
     fs::write(
@@ -13314,6 +13352,30 @@ async fn catch_up_boundary_world(ambiguous: bool) -> (World, u64, Value) {
 async fn review934_ambiguous_pending_candidate_adds_no_site() {
     let (_world, before, at_n) = catch_up_boundary_world(true).await;
     assert_eq!(before, 0, "{at_n}");
+}
+
+/// #936 (from the #935 review): P is an S head whose proofs are `possiblyStale` after an
+/// unrelated edit. Its resolved internal call is a site at P, labelled `possiblyStale`, and a
+/// later whitespace edit to its target keeps exactly that site at N as a boundary that still
+/// says `possiblyStale`: whether the site exists does not depend on which file changed later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn possibly_stale_site_stays_one_labelled_site_when_its_target_catches_up() {
+    let (_world, before, at_n) = catch_up_boundary_world_from(false, true).await;
+    assert_eq!(before, 1, "{at_n}");
+    let unresolved = at_n["data"]["unresolved"].as_array().unwrap();
+    assert_eq!(unresolved.len(), 1, "{at_n}");
+    assert_eq!(
+        unresolved[0]["reason"], "semantic_endpoint_catching_up",
+        "{at_n}"
+    );
+    assert_eq!(
+        unresolved[0]["site"]["freshness"], "possiblyStale",
+        "{at_n}"
+    );
+    assert_eq!(
+        unresolved[0]["site"]["historicalFreshness"], "possiblyStale",
+        "{at_n}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
