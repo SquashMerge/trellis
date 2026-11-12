@@ -107,8 +107,10 @@ or an untyped 502, 503 or 504) is a stall, not an answer. The page then runs the
 doubles the wait up to 60 s while the daemon still does not answer. One attempt runs at a time,
 and a new checkout, session or Disconnect forgets it. Other typed failures, such as
 `revision_conflict`, `not_found` or `corrupt`, keep their own handling and are not retried.
-An agent show (#818) that a stall stopped is shown after the refresh, unless a newer show, a
-user navigation or a pin has taken the view since.
+An agent show (#818) that a stall stopped is shown after recovery reads status again. Ownership
+is checked when it is applied: a newer show, a user navigation, a pin, or a checkout, session or
+pin change since it stopped takes the view, and the stopped show is dropped, never replayed.
+An untyped 502, 503 or 504 counts as a stall whatever its body: JSON, HTML or empty.
 
 The follow poll's head digest carries `catchingUp`. When the head is the displayed revision and
 its value differs from the status on screen, the page reads status again once, so **Catching

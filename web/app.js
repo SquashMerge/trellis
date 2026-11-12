@@ -385,23 +385,28 @@ function clearRecovery() { if (recovery) clearTimeout(recovery.timer); recovery 
 async function recover(attempt) {
   attempt.timer = null;
   if (recovery !== attempt || attempt.scope !== `${epoch}:${selectedRootKey}`) return;
-  // A user navigation, pin or newer show since the stopped show takes the view from it.
-  const claim = stalledShow && stalledShow.ticket === showSerial && !followPinned && stalledShow.marks === viewMarks() &&
-    navigationCurrent(stalledShow.context) ? stalledShow : null;
-  stalledShow = null; attempt.again = false;
-  await perform(refreshView);
+  attempt.again = false;
+  // A stopped show still owns the view only while it is the newest show and nothing has moved
+  // the view since it stopped: no user navigation, pin, checkout, session or pin change.
+  const owns = claim => !!claim && claim === stalledShow && claim.ticket === showSerial && !followPinned &&
+    claim.marks === viewMarks() && navigationCurrent(claim.context) && IndexPin.equal(claim.request.revision, status?.revision);
+  if (!owns(stalledShow)) stalledShow = null;
+  const claim = stalledShow;
+  // With a claim, only status is read first: status reads move no view, so a navigation made
+  // while it is awaited is still seen by the check below. The show then loads its own view.
+  await perform(claim ? () => refreshStatus() : refreshView);
   if (recovery !== attempt) return;
-  // Refresh's own reads are not a user navigation, so the stopped show keeps its claim across them.
-  const pending = [stalledShow, claim].find(value => value && value.ticket === showSerial)?.request;
-  stalledShow = null;
   if (attempt.again) {
-    if (pending) stalledShow = {request:pending, ticket:showSerial, marks:viewMarks(), context:navigationContext()};
     attempt.delay = Math.min(attempt.delay * 2, RECOVERY_MAX_MS);
     attempt.timer = setTimeout(() => void recover(attempt), attempt.delay);
     return;
   }
   recovery = null;
-  if (pending && !followPinned && IndexPin.equal(pending.revision, status?.revision)) await perform(() => showAgentView(pending));
+  if (!claim) return;
+  if (owns(claim)) { stalledShow = null; await perform(() => showAgentView(claim.request)); return; }
+  // Something else took the view while status was read: drop the show and refresh the view.
+  if (stalledShow === claim) stalledShow = null;
+  await perform(refreshView);
 }
 function agentLabel(request) {
   return request.view === "source" ? `${request.path}:${request.line}` : request.view === "class" ? "Class diagram" : "Sequence";
@@ -415,16 +420,17 @@ async function showAgentView(request) {
   if (!token || !selectedRootKey || !status?.revision) return;
   const pin = IndexPin.copy(status.revision), context = navigationContext(), ticket = ++showSerial, started = viewMarks();
   const owned = () => ticket === showSerial && !followPinned && viewMarks() === started && navigationCurrent(context);
-  const stalls = stallCount;
+  // `claim.marks` are the view's marks this show itself left; a source read takes its own.
+  const stalls = stallCount, claim = {request, ticket, marks:started, context};
   let applied = false;
-  try { applied = await applyAgentView(request, pin, context, ticket, owned); }
+  try { applied = await applyAgentView(request, pin, context, ticket, owned, claim); }
   finally {
-    // A show that a stall stopped is shown after recovery, unless something else owns the view by then.
-    if (!applied && stallCount !== stalls && ticket === showSerial && !followPinned && navigationCurrent(context))
-      stalledShow = {request, ticket, marks:viewMarks(), context};
+    // Only a show that still owns the view, and that a stall stopped, waits for recovery.
+    if (!applied && stallCount !== stalls && ticket === showSerial && !followPinned && navigationCurrent(context) && claim.marks === viewMarks())
+      stalledShow = claim;
   }
 }
-async function applyAgentView(request, pin, context, ticket, owned) {
+async function applyAgentView(request, pin, context, ticket, owned, claim) {
   // The deep link's stale-pin rule: never show a target from another snapshot.
   if (!IndexPin.equal(request.revision, pin)) {
     showAgentNote(`The agent showed a ${agentLabel(request)} at index ${IndexPin.label(request.revision)}; this view is at ${IndexPin.label(pin)}.`, request, false);
@@ -448,8 +454,11 @@ async function applyAgentView(request, pin, context, ticket, owned) {
     const before = visibleEntry(pin);
     const mine = () => ticket === showSerial && !followPinned && navigationCurrent(context);
     const range = {startLine:request.line, endLine:request.line};
-    const painted = section === "files" ? await openFilesLocation({path:request.path, range}, pin, mine)
-      : await showCachedSource(request.path, range, pin, mine);
+    const reading = section === "files" ? openFilesLocation({path:request.path, range}, pin, mine)
+      : showCachedSource(request.path, range, pin, mine);
+    // The read advanced its own serials before its first await; later changes are someone else's.
+    claim.marks = viewMarks();
+    const painted = await reading;
     if (painted !== true || !mine()) return;
     writeEntry(before);
     const entry = captureSourceEntry();
