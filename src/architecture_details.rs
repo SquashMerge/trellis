@@ -113,15 +113,6 @@ impl Query {
             Kind::Interfaces => &["client", "server", "list"],
             Kind::Edge => &["key"],
         };
-        // An edge is named by its bounded summary `key`, never by its reason text.
-        let key = fields.remove("key");
-        if (kind == Kind::Edge)
-            != key.as_deref().is_some_and(|key| {
-                key.len() == 64 && key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-            })
-        {
-            return Err(InvalidQuery);
-        }
         let common = [
             "indexGeneration",
             "indexRevision",
@@ -135,6 +126,16 @@ impl Query {
             || fields
                 .values()
                 .any(|value| value.is_empty() || value.len() > 4096 || value.contains('\0'))
+        {
+            return Err(InvalidQuery);
+        }
+        // Only `edge` reaches here with a `key` (any other kind refused it above, present even
+        // empty). An edge is named by its bounded summary key, never by its reason text.
+        let key = fields.remove("key");
+        if kind == Kind::Edge
+            && !key.as_deref().is_some_and(|key| {
+                key.len() == 64 && key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            })
         {
             return Err(InvalidQuery);
         }
@@ -852,10 +853,31 @@ mod tests {
         ] {
             assert!(query(invalid).is_err(), "{invalid:?}");
         }
-        assert!(
-            query(&[("kind", "pairs"), ("key", plain.as_str())]).is_err(),
-            "a key belongs to the edge kind only"
-        );
+        // Each scope parameter's presence is checked against the kind, even when empty or
+        // malformed: a key belongs to the edge kind only, and the edge kind takes nothing else.
+        for (kind, name, value) in [
+            ("pairs", "key", plain.as_str()),
+            ("pairs", "key", "foo"),
+            ("pairs", "key", ""),
+            ("instances", "key", plain.as_str()),
+            ("unresolved", "key", ""),
+            ("interfaces", "key", "foo"),
+            ("edge", "path", "x"),
+            ("edge", "path", ""),
+            ("edge", "role", "production"),
+        ] {
+            let mut extra = vec![("kind", kind), (name, value)];
+            if kind == "edge" {
+                extra.push(("key", plain.as_str()));
+            }
+            assert!(query(&extra).is_err(), "{kind}: {name}={value:?}");
+        }
+        // The valid forms are still accepted.
+        assert!(query(&[("key", plain.as_str())]).is_ok());
+        for kind in ["pairs", "instances", "unresolved"] {
+            assert!(query(&[("kind", kind)]).is_ok(), "{kind}");
+        }
+        assert!(query(&[("kind", "pairs"), ("path", "x")]).is_ok());
     }
     /// #784: the `app` filter keeps the rows whose bucket's name matches, so two apps that
     /// share a name answer to one filter value, and a row with no app matches none.

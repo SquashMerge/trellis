@@ -1039,6 +1039,11 @@ async fn architecture_edge_details_page_each_edges_pairs_at_the_summary_pin() {
         format!("{first}&{pinned}&path=src%2Froles.rs"),
         format!("{first}&{pinned}&sourceLayer=app"),
         format!("{first}&{pinned}&exceptionReason=Reviewed"),
+        format!("{first}&{pinned}&path=x"),
+        format!("kind=pairs&key=foo&{pinned}"),
+        format!("kind=pairs&key=&{pinned}"),
+        format!("kind=pairs&key={edge_key}&{pinned}"),
+        format!("kind=instances&key={edge_key}&{pinned}"),
     ] {
         let (status, error) = request(app.clone(), &key, &format!("/details?{query}")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {error}");
