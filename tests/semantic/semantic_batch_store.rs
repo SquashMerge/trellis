@@ -8242,6 +8242,140 @@ async fn catch_up_answers_count_document_statuses_past_the_response_cap() {
     mcp.finish();
 }
 
+/// #934: during semantic catch-up the unchanged documents' older-basis projection answers
+/// P's reference sites, with labels, and never a superset of them. P's use-site claims that
+/// no structural site spells add no site, as they add none at P, so a revision
+/// whose sites fit the budget at P still fits it while catching up: references and rules
+/// answer instead of `bounded_work` for the whole catch-up window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn catch_up_answers_architecture_within_the_basis_site_budget() {
+    use trellis::model::SemanticStatus;
+    const DOCUMENTS: usize = 20;
+    const IMPORT: &str = "import { g } from './g.js';\n";
+    const BODY: &str = "const v = 1; return v;";
+    let world = world_with(
+        |root| {
+            fs::create_dir_all(root.join(".git")).unwrap();
+            WorkspaceIdentity::discover(Some(root), root)
+                .unwrap()
+                .attach_marker()
+                .unwrap();
+            let mut files: Vec<(String, String)> = (0..DOCUMENTS)
+                .map(|number| {
+                    (
+                        format!("src/u{number:05}.js"),
+                        format!("{IMPORT}export function u{number:05}() {{ {BODY} }}\n"),
+                    )
+                })
+                .collect();
+            files.push(("src/g.js".into(), "export function g() {}\n".into()));
+            let files: Vec<(&str, &str)> = files
+                .iter()
+                .map(|(path, text)| (path.as_str(), text.as_str()))
+                .collect();
+            write_files(root, &files);
+            write_files(
+                root,
+                &[(
+                    ".trellis/rules.toml",
+                    r#"version = 1
+[roles.entry]
+select = { name = "u00001", language = ["javascript"] }
+[roles.helper]
+select = { name = "g", language = ["javascript"] }
+[[rules]]
+id = "entry-must-not-call-helper"
+for_each = "entry"
+forbid = [{ calls = "helper" }]
+"#,
+                )],
+            );
+        },
+        true,
+    );
+    let mut fixture = world.fixture();
+    // Each `export function uNNNNN() { const v = 1; return v; }` carries one resolved use,
+    // of `v` in `return v`, that is neither a call nor a type: no structural site spells it,
+    // and at P it adds no site of its own.
+    let docs = fixture
+        .paths("javascript")
+        .into_iter()
+        .map(|doc| match doc.path.as_str() {
+            "src/g.js" => doc
+                .occurrence(&[0, 16, 17], &[], "pkg g.", 1)
+                .symbol("pkg g.", 17, &[]),
+            _ => doc.occurrence(&[1, 47, 48], &[], "pkg g.", 0),
+        })
+        .collect();
+    fixture.artifact("javascript", docs);
+    let (p, admitted, _) = world.publish(&world.write(&fixture)).unwrap();
+    drop(admitted);
+    let producer = world.store.semantic_at(p).unwrap().producers[0].id.clone();
+    assert_eq!(
+        world.count("SELECT count(*) FROM semantic_references WHERE site='use'"),
+        DOCUMENTS as i64
+    );
+    let sites = |reply: &Value| {
+        let counts = &reply["data"]["counts"];
+        counts["mappedSites"].as_u64().unwrap() + counts["unresolvedSites"].as_u64().unwrap()
+    };
+    let mut mcp = McpSession::start(&world, 934);
+    let arguments = json!({"schemaVersion":1,"limit":50});
+    let at_p = mcp.success("trellis_references", arguments.clone());
+    assert_eq!(at_p["evidenceBasis"], json!(p));
+    // Every site at P is a structural import of `g`; the semantic uses add none.
+    let budget = sites(&at_p);
+    assert_eq!(budget, DOCUMENTS as u64, "{at_p}");
+    // The edit keeps its one import and publishes native N; startup stays held, so no
+    // S catches it up, and the head is built under P's exact site count.
+    trellis::references::set_site_limit_for_tests(budget as usize);
+    fs::write(
+        world.root.join("src/u00000.js"),
+        format!("{IMPORT}export function u00000() {{  {BODY} }}\n"),
+    )
+    .unwrap();
+    let (graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(world.root.clone()),
+        world.store.root_id(),
+        &world.cancel,
+        |_| {},
+    )
+    .unwrap();
+    let leader = world.store.publication_for_tests().unwrap();
+    let pin = world
+        .store
+        .publish_native(&graph, &capture, &native, &leader, p, &world.cancel)
+        .unwrap();
+    drop(leader);
+    let older = world
+        .store
+        .semantic_projection_at(pin, &producer, "javascript", "src/u00001.js")
+        .unwrap()
+        .unwrap();
+    assert_eq!(older.semantic_status, SemanticStatus::OlderBasis);
+    let references = mcp.success("trellis_references", arguments.clone());
+    let checked = mcp.success("trellis_rules_check", arguments.clone());
+    let instance = checked["data"]["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|instance| instance["rule"] == "entry-must-not-call-helper")
+        .cloned()
+        .unwrap();
+    let mut explain = arguments;
+    explain["rule"] = instance["rule"].clone();
+    explain["target"] = instance["target"].clone();
+    let explained = mcp.success("trellis_rules_explain", explain);
+    for reply in [&references, &checked, &explained] {
+        assert_eq!(reply["evidenceBasis"], json!(pin), "{reply}");
+        assert_eq!(reply["catchingUp"], true, "{reply}");
+        assert_eq!(reply["data"]["partial"], true, "{reply}");
+    }
+    assert_eq!(sites(&references), budget, "{references}");
+    trellis::references::set_site_limit_for_tests(usize::MAX);
+    mcp.finish();
+}
+
 /// Architecture wire evidence keeps the imported proof's identity beside native N.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn architecture_wire_preserves_canonical_proof_identity_at_current_and_older_basis() {

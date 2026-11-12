@@ -1426,7 +1426,9 @@ fn prepare_file(
     }
     // Calls and type references with an internal target that no structural site covers
     // are sites of their own, one per range (a call first). Unbound, ambiguous,
-    // unresolved and external bindings add no site.
+    // unresolved and external bindings add no site. An older-basis projection (#620)
+    // follows the same rule, so it answers P's sites with labels and never a superset
+    // of them (#934): its internal binding whose endpoint is catching up is a boundary.
     let mut covered = BTreeSet::new();
     for calls_first in [true, false] {
         for (index, anchor) in anchors.iter().enumerate() {
@@ -1434,11 +1436,11 @@ fn prepare_file(
             if anchor.call_id.is_some() != calls_first
                 || consumed[index]
                 || !usable(anchor)
-                || (!matches!(anchor.outcome, SemanticOutcome::Internal(..))
-                    && !anchor.metadata.contains_key("projection"))
-                || (anchor.call_id.is_none()
-                    && !anchor.type_role
-                    && !anchor.metadata.contains_key("projection"))
+                || !matches!(
+                    anchor.outcome,
+                    SemanticOutcome::Internal(..) | SemanticOutcome::Boundary
+                )
+                || (anchor.call_id.is_none() && !anchor.type_role)
                 || !covered.insert((anchor.range.start, anchor.range.end))
             {
                 continue;
