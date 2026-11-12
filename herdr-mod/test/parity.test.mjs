@@ -107,7 +107,7 @@ test("negative control: a one-app checkout has no switcher, no columns, no cards
 
 // --- the pane, end to end against a fake daemon ---
 
-function fakeDaemon(payload, { job = null } = {}) {
+function fakeDaemon(payload, { job = null, details = null } = {}) {
   const at = { indexGeneration: payload.indexGeneration, indexRevision: payload.indexRevision }, seen = [], TOKEN = "b".repeat(64), KEY = "a".repeat(64);
   const server = createServer((req, res) => {
     seen.push(req.url);
@@ -120,7 +120,7 @@ function fakeDaemon(payload, { job = null } = {}) {
     if (url.pathname === `${base}architecture`) return send(200, { payload: { ...payload, aggregate: url.searchParams.get("aggregate") } });
     if (url.pathname === `${base}architecture/details`) {
       assert.equal(url.searchParams.get("rulesHash"), payload.rulesFile.contentHash);
-      return send(200, read("apps-deviations.json"));
+      return send(200, details ?? read("apps-deviations.json"));
     }
     send(404, { error: { code: "not_found", message: "No such route" } });
   });
@@ -159,6 +159,23 @@ async function pane(payload, options) {
   const close = async () => { await view.close(); daemon.server.close(); rmSync(dir, { recursive: true, force: true }); };
   return { view, cx, settle, click, close, seen: daemon.seen, root: () => last };
 }
+
+test("#911 a deviation line reads its target's name, never the internal declaration key", async () => {
+  const details = read("apps-deviations.json"), site = details.payload.items[0].instance.evidence[0];
+  site.target = { syntaxId: "sid:v1:911", displayKey: "src/api.rs#implementation@4.enqueue_generated_semantic_import",
+    document: { sourceSetId: site.document.sourceSetId, language: "rust", path: "src/api.rs" }, lines: { start: 3, end: 5 } };
+  site.targetReason = null;
+  const p = await pane(twoApps(), { details });
+  try {
+    await p.settle();
+    await p.click("review-deviations");
+    await p.click("deviation-file-0");
+    const root = await p.click("deviation-fn-1");
+    const tree = root.find("deviation-tree").text();
+    assert.match(tree, /L2 enqueue_generated_semantic_import call → api\.rs:3/, "the line shows the method's name and its definition");
+    assert.doesNotMatch(tree, /implementation@4|src\/api\.rs#/, "the internal key is never the label");
+  } finally { await p.close(); }
+});
 
 test("the pane: logo, status line, switcher, columns, interface card, deviations entry and tree, Color by and Aggregation", async () => {
   const p = await pane(twoApps(), { job: { id: "j", state: "failed", error: { code: "index_failed", message: "Index job failed", reason: "internal error" } } });

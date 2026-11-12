@@ -226,7 +226,7 @@ export function deviations(pane, t, summary, view) {
         const e = line.evidence, target = e.target;
         rows.push(row(`deviation-line-${rows.length}`, 2, null)
           .child(div().w(44).flex_none().text_size(12).text_color(t.dim).child(`L${e.lines?.start ?? "—"}`))
-          .child(div().flex_1().min_w(0).truncate().font_family("JetBrains Mono").text_size(12).child(target?.displayKey ?? e.spelling ?? ""))
+          .child(div().flex_1().min_w(0).truncate().font_family("JetBrains Mono").text_size(12).child(line.symbol))
           .child(div().flex_none().px(4).rounded(3).border_1().border_color(t.border).text_size(11).text_color(t.muted).child(TAGS[line.kind] ?? line.kind))
           .child(div().flex_none().text_size(12).text_color(t.dim).child(target ? `→ ${basename(target.document.path)}:${target.lines.start}` : `→ ${basename(line.instance.destination.path ?? line.instance.destination.package ?? "")} · file only`)));
       }
