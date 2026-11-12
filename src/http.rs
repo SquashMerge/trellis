@@ -4288,12 +4288,9 @@ async fn provisioned_core(
         if let Some(hook) = hook {
             hook("after_handler");
         }
-        let catching_up = browser
-            .registry
-            .lock()
-            .await
-            .runtime(&root_key)
-            .is_some_and(|runtime| runtime.catching_up());
+        // Sampled outside the registry lock: the flag may read the index (#905).
+        let runtime = browser.registry.lock().await.runtime(&root_key);
+        let catching_up = runtime.is_some_and(|runtime| runtime.catching_up());
         result.map(|response| (response, catching_up))
     } else {
         let runtime = {
@@ -4361,12 +4358,8 @@ async fn provisioned_core(
     let (mut response, catching_up) = match answer {
         Ok(pair) => pair,
         Err(error) => {
-            let catching_up = browser
-                .registry
-                .lock()
-                .await
-                .runtime(&root_key)
-                .map_or(!is_git, |runtime| runtime.catching_up());
+            let runtime = browser.registry.lock().await.runtime(&root_key);
+            let catching_up = runtime.map_or(!is_git, |runtime| runtime.catching_up());
             (error.into_response(), catching_up)
         }
     };

@@ -31,7 +31,8 @@ struct Auto {
     root: PathBuf,
     topology: TopologyRoots,
     identity: WorkspaceIdentity,
-    registry: CheckoutRegistry,
+    /// Shared with an MCP session (`Auto::mcp`), as the daemon shares it.
+    registry: Arc<tokio::sync::Mutex<CheckoutRegistry>>,
     key: String,
     runtime: Arc<CheckoutRuntime>,
 }
@@ -115,7 +116,7 @@ impl Auto {
             root,
             topology,
             identity,
-            registry,
+            registry: Arc::new(tokio::sync::Mutex::new(registry)),
             key,
             runtime,
         };
@@ -251,8 +252,9 @@ impl Auto {
 
     /// The checkout has no client: it releases once nothing keeps it active.
     fn try_release(&mut self) -> bool {
-        self.registry.disconnect(1);
-        self.registry.release(&self.key).unwrap()
+        let mut registry = self.registry.try_lock().unwrap();
+        registry.disconnect(1);
+        registry.release(&self.key).unwrap()
     }
 
     fn auto_state(&self) -> Value {
@@ -485,4 +487,159 @@ async fn active_auto_run_holds_retirement() {
         auto.try_release()
     });
     assert!(!auto.runtime.has_active_resources());
+}
+
+/// One in-process MCP session over the fixture's registry, as the daemon serves a client.
+struct Mcp {
+    client: UnixStream,
+    reader: std::io::BufReader<UnixStream>,
+    session: Option<JoinHandle<std::io::Result<()>>>,
+    next_id: i64,
+}
+
+impl Mcp {
+    fn start(auto: &Auto) -> Self {
+        let (client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+            .unwrap();
+        let identity = WorkspaceIdentity::discover(Some(&auto.root), &auto.root)
+            .unwrap()
+            .attach_marker()
+            .unwrap();
+        let workspace = trellis::mcp::OpenedWorkspace::new(identity)
+            .with_call_workers_for_tests(Default::default());
+        let (registry, handle) = (auto.registry.clone(), tokio::runtime::Handle::current());
+        let session = std::thread::spawn(move || {
+            trellis::mcp::run_socket(workspace, server, registry, 1, handle)
+        });
+        let reader = std::io::BufReader::new(client.try_clone().unwrap());
+        Self {
+            client,
+            reader,
+            session: Some(session),
+            next_id: 0,
+        }
+    }
+
+    /// One tool call's structured envelope.
+    fn call(&mut self, name: &str, arguments: Value) -> Value {
+        use std::io::{BufRead, Write};
+        self.next_id += 1;
+        let request = json!({"jsonrpc":"2.0","id":self.next_id,"method":"tools/call","params":{
+            "name":name,"arguments":arguments,"_meta":{
+                "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities":{}}}});
+        writeln!(self.client, "{request}").unwrap();
+        let mut line = String::new();
+        self.reader.read_line(&mut line).unwrap();
+        let reply: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(reply["id"], self.next_id, "{reply}");
+        reply["result"]["structuredContent"].clone()
+    }
+}
+
+impl Drop for Mcp {
+    fn drop(&mut self) {
+        let _ = self.client.shutdown(std::net::Shutdown::Both);
+        if let Some(session) = self.session.take() {
+            let _ = session.join();
+        }
+    }
+}
+
+/// The read surface the issue names, against the fixture's one edited function.
+fn read_surface(mcp: &mut Mcp, lookup: &str) -> Vec<(&'static str, Value)> {
+    let symbol = json!({"schemaVersion":1,"lookupKey":lookup});
+    vec![
+        (
+            "trellis_workspace_describe",
+            mcp.call("trellis_workspace_describe", json!({"schemaVersion":1})),
+        ),
+        (
+            "trellis_find_symbols",
+            mcp.call(
+                "trellis_find_symbols",
+                json!({"schemaVersion":1,"query":"edited","compact":true}),
+            ),
+        ),
+        (
+            "trellis_declaration",
+            mcp.call("trellis_declaration", symbol.clone()),
+        ),
+        (
+            "trellis_outgoing_calls",
+            mcp.call("trellis_outgoing_calls", symbol),
+        ),
+    ]
+}
+
+/// MCP reads keep answering while an automatic run runs its producer and while its import's
+/// publication holds the index (#905). During the producer phase they answer from the prior
+/// validated head. While the publication has spilled to `index.db` and holds every reader out,
+/// they answer the typed, retryable `rebuild_in_progress` within the call's deadline, never a
+/// plain `deadline_exceeded`. After COMMIT they answer from the new head.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reads_answer_while_an_auto_run_runs_and_imports() {
+    if !in_own_process("reads_answer_while_an_auto_run_runs_and_imports") {
+        return;
+    }
+    let auto = Auto::start((50, 0, 200));
+    auto.approve(0);
+    auto.write_javascript(0, "function edited() { g(); }\nfunction g() {}\n");
+    auto.index().join().unwrap().unwrap();
+    let prior = auto.settle();
+    auto.emit(1);
+    let mut mcp = Mcp::start(&auto);
+    let found = mcp.call(
+        "trellis_find_symbols",
+        json!({"schemaVersion":1,"query":"edited","compact":true}),
+    );
+    let lookup = found["data"]["symbols"][0]["stableLookupKey"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{found}"))
+        .to_owned();
+
+    // The producer has started.
+    auto.hold(&[SPAWNED]);
+    auto.enable();
+    auto.wait_hook(SPAWNED);
+    assert_eq!(auto.status()["activeRun"]["origin"], "auto");
+    for (tool, envelope) in read_surface(&mut mcp, &lookup) {
+        assert!(envelope.get("error").is_none(), "{tool}: {envelope}");
+        assert_eq!(
+            envelope["evidenceBasis"]["indexRevision"], prior["indexRevision"],
+            "{tool}: {envelope}"
+        );
+    }
+
+    // Its import's publication has spilled and waits before COMMIT.
+    let pause = auto.stub_dir.path().join("commit.sock");
+    set_env("TRELLIS_TEST_BATCH_WRITER_CACHE_KIB", "64");
+    set_env("TRELLIS_TEST_SEMANTIC_PAUSE_BEFORE_COMMIT_SOCKET", &pause);
+    auto.release_hook(SPAWNED);
+    let ready = pause.with_extension("ready");
+    trellis::testing::wait_until("the publication paused before COMMIT", || ready.exists());
+    for (tool, envelope) in read_surface(&mut mcp, &lookup) {
+        assert_eq!(
+            envelope["error"]["code"], "rebuild_in_progress",
+            "{tool}: {envelope}"
+        );
+        assert_eq!(envelope["error"]["retryable"], true, "{tool}: {envelope}");
+    }
+
+    UnixStream::connect(&pause).unwrap();
+    let runs = auto.wait_auto("the automatic run", |runs| {
+        runs.iter().any(|run| run["state"] == "done")
+    });
+    assert_eq!(runs[0]["outcome"], "imported");
+    let published = auto.settle();
+    assert_ne!(published, prior);
+    for (tool, envelope) in read_surface(&mut mcp, &lookup) {
+        assert!(envelope.get("error").is_none(), "{tool}: {envelope}");
+        assert_eq!(
+            envelope["evidenceBasis"]["indexRevision"], published["indexRevision"],
+            "{tool}: {envelope}"
+        );
+    }
 }
