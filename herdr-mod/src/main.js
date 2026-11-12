@@ -20,7 +20,7 @@ import { v_flex, h_flex } from "gpui-base";
 import { appHome, focused, layout, machines, props, setShared, shared, spaces, theme } from "herdr";
 import * as fs from "fs/promises";
 import { TrellisError, architecturePayload, createClient, detailPage, indexLabel, jobCause, pinLabel, pinOf, samePin, validRootKey } from "./client.js";
-import { CONTROLS, DEFAULT_AGGREGATE, DEFAULT_METRIC, ERROR, HEAT_INK, apps, deviationModel, draw, heat, heatFill, hit, plural, display } from "./diagram.js";
+import { CONTROLS, DEFAULT_AGGREGATE, DEFAULT_METRIC, ERROR, HEAT_INK, apps, deviationModel, draw, heat, heatFill, hit, plural, display, summarize } from "./diagram.js";
 import * as ui from "./architecture-ui.js";
 import { drawSequence, helpers as sequenceHelpers, targetOf } from "./sequence.js";
 import { ensureFilesPanel } from "./panels.js";
@@ -35,6 +35,8 @@ const DRAW_TIMEOUT_MS = 15000;
 const WIDTH_SLACK = 8, PAD = 12;
 const SELECTED_FILE = "trellis.selectedFile";
 const HEAT_NAMES = ["low", "moderate", "high", "very high"];
+// The top tabs, in order (#939: Deviations is its own tab).
+const TABS = ["architecture", "sequence", "deviations"];
 // The Deviations tree's read (web/architecture-deviations.js PARAMS), and its page bound.
 const DEVIATION_PARAMS = { kind: "instances", rule: "$layers", status: "deviates", role: "production", excepted: "false", limit: "500" };
 const MAX_DEVIATION_PAGES = 40;
@@ -66,7 +68,7 @@ export default class Trellis extends View {
     this.events = 0; this.agent = null; this.selection = null; this.focusKey = null; this.fileKey = null;
     this.pinned = (() => { try { return localStorage.getItem("trellis.pinned") === "true"; } catch { return false; } })();
     this.files = {};
-    this.tab = (() => { try { return localStorage.getItem("trellis.tab") === "sequence" ? "sequence" : "architecture"; } catch { return "architecture"; } })();
+    this.tab = (() => { try { const tab = localStorage.getItem("trellis.tab"); return TABS.includes(tab) ? tab : "architecture"; } catch { return "architecture"; } })();
     // The layout's trellis-files is reached only through the tab bar's Files button.
     try { ensureFilesPanel({ shared, setShared, layout }); } catch { /* the pane works without it */ }
     this.observe();
@@ -422,14 +424,67 @@ export default class Trellis extends View {
     return group ? { ...apps.scoped(view, group.name), rules: { ...view.rules, counts: group.counts } } : view;
   }
 
-  // Opens the Deviations tree, on one edge ("source→destination") or all of them, reading every
-  // page of production `$layers` deviations at the summary's pin and rules hash.
+  // The top tab; the choice is kept, as the browser keeps its view.
+  setTab(tab, cx) {
+    this.tab = tab;
+    try { localStorage.setItem("trellis.tab", tab); } catch { /* a convenience only */ }
+    cx.notify();
+  }
+
+  // The Deviations tab on one edge ("source→destination") or all of them (#939): the review
+  // chip, an arrow on the diagram and an app's deviation count open it with their filter.
   openDeviations(edge, cx) {
+    this.setTab("deviations", cx);
+    this.loadDeviations(edge, cx);
+  }
+
+  // An app's deviation count: that app's slice, every edge.
+  openAppDeviations(name, cx) {
+    this.setScope(name, cx);
+    this.openDeviations(null, cx);
+  }
+
+  // A deviation line, as the browser's main line action: the caller's sequence when the line
+  // has one (Open in Sequence); otherwise its location, since this pane has no source view.
+  openLine(line, cx) {
+    const e = line.evidence;
+    if (deviationModel.canOpenSequence(e)) {
+      this.setTab("sequence", cx);
+      const seed = { id: e.caller.syntaxId, name: e.caller.name ?? null, path: e.caller.document?.path ?? null };
+      // The Files selection's method list stays, as when the agent shows a sequence; reading it
+      // for a newer selection doesn't replace the caller's sequence.
+      const file = this.followed(), path = file?.checkout?.rootKey === this.rootKey ? file.path : null;
+      if (path && path !== this.seq.file) { this.seq = { file: path, history: [], expanded: new Set() }; this.loadMethods(cx, false); }
+      this.loadSequence(seed, true, cx);
+      return;
+    }
+    const path = e.document?.path ?? line.instance.target.path;
+    if (this.devs) this.devs.notice = `${e.lines ? `${path}:${e.lines.start}` : path} · This pane has no source view; open it in the browser.`;
+    cx.notify();
+  }
+
+  // The tree's summary (its app and edge words): the drawing's when it is current, else the
+  // payload's own for the chosen app, without drawing.
+  deviationSummary() {
+    const drawn = this.current();
+    if (drawn && drawn.choice?.scope === this.scope) return drawn.summary;
+    if (this.devSummary?.view !== this.view || this.devSummary.scope !== this.scope) this.devSummary = { view: this.view, scope: this.scope, summary: summarize(this.view, { scope: this.scope }) };
+    return this.devSummary.summary;
+  }
+
+  // Reads the Deviations tree: every page of production `$layers` deviations at the summary's
+  // pin and rules hash. A tree already read for this payload and app is only filtered again.
+  loadDeviations(edge, cx) {
     const view = this.view, pin = this.status?.pin, rootKey = this.rootKey, serial = this.serial, client = this.client;
     if (!view || view.state !== "ready" || !pin) return;
+    const held = this.devs;
+    if (held?.base && !held.error) {
+      held.edge = edge; held.tree = deviationModel.filter(held.base, { edge, callsOnly: false }); held.notice = null;
+      return cx.notify();
+    }
     const group = this.scope === null || !(view.apps?.length >= 2) ? null : apps.group(view, this.scope);
     const params = group ? { ...DEVIATION_PARAMS, app: group.name } : { ...DEVIATION_PARAMS };
-    const devs = { edge, expanded: new Set(), base: null, tree: null, error: null, progress: "" };
+    const devs = { edge, expanded: new Set(), base: null, tree: null, error: null, progress: "", notice: null };
     this.devs = devs;
     const live = () => this.devs === devs && serial === this.serial && view === this.view;
     cx.spawn(async (cx) => {
@@ -483,8 +538,8 @@ export default class Trellis extends View {
 
   // A press on the diagram (image `index`): a band opens or folds, as its header does in the
   // browser; a directory module opens one level; the unassigned row opens; an upward ↑ chip or a
-  // deviating arrow opens the Deviations tree on its edge; an interface stub inspects the
-  // interface; anything else is inspected by its full accessible label.
+  // deviating arrow (its label, line or head) opens the Deviations tab on its edge; an interface
+  // stub inspects the interface; anything else is inspected by its full accessible label.
   press(event, index, cx) {
     const drawn = this.current(), at = event?.local_position;
     if (!drawn || !at || !drawn.images[index]) return;
@@ -530,7 +585,7 @@ export default class Trellis extends View {
     this.loadMethods(cx);
   }
 
-  loadMethods(cx) {
+  loadMethods(cx, open = true) {
     const { rootKey, serial, client } = this, pin = this.status?.pin, seq = this.seq, run = {};
     seq.methodsRun = run;
     const live = () => serial === this.serial && seq === this.seq && run === seq.methodsRun;
@@ -542,7 +597,7 @@ export default class Trellis extends View {
         seq.methods = data.items.map((item) => item?.symbol).filter((symbol) => typeof symbol?.id === "string" && typeof symbol.name === "string");
         const named = seq.methods.filter((m) => !m.name.startsWith("<"));
         const first = seq.methods.find((m) => m.id === seq.keep?.id) || named.find((m) => data.items.find((i) => i.symbol === m)?.consequential) || named[0] || seq.methods[0];
-        if (first) this.loadSequence(first, false, cx);
+        if (first && open) this.loadSequence(first, false, cx);
       } catch (error) {
         if (!live()) return;
         seq.methodsError = fail(error);
@@ -712,6 +767,8 @@ export default class Trellis extends View {
     const place = file?.checkout?.rootKey === this.rootKey ? this.placement(file) : null;
     const highlight = place?.group ? [place.layer?.name ?? null, place.group.name, place.module.app ?? null] : null;
     if (this.tab === "architecture") this.scheduleDraw(cx, highlight);
+    // The Deviations tab reads its tree once the payload is here, and again for a new one or another app.
+    else if (this.tab === "deviations") { if (!this.devs) this.loadDeviations(null, cx); }
     else { this.followSequence(file, cx); this.scheduleSequenceDraw(cx); }
 
     return v_flex().id("root").size_full().min_h(0).bg(t.background).text_color(t.foreground).text_size(13)
@@ -737,10 +794,10 @@ export default class Trellis extends View {
           .child(image(LOGO).w(16).h(20))
           .child(div().font_semibold().text_size(14).child("Trellis"))
           .child(div().text_size(12).text_color(t.dim).child("by SquashMerge")))
-        .children(["architecture", "sequence"].map((tab) => div().id(`tab-${tab}`).px(8).h(24).flex().items_center().rounded(6).cursor_pointer()
+        .children(TABS.map((tab) => div().id(`tab-${tab}`).px(8).h(24).flex().items_center().rounded(6).cursor_pointer()
           .text_color(this.tab === tab ? t.foreground : t.dim).when(this.tab === tab, (el) => el.bg(t.selected)).hover((s) => s.bg(t.hover))
-          .on_click((_e, cx) => { this.tab = tab; try { localStorage.setItem("trellis.tab", tab); } catch { /* a convenience only */ } cx.notify(); })
-          .child(tab === "architecture" ? "Architecture" : "Sequence")))
+          .on_click((_e, cx) => this.setTab(tab, cx))
+          .child({ architecture: "Architecture", sequence: "Sequence", deviations: "Deviations" }[tab])))
         .child(div().flex_1())
         // The checkout is followed, not chosen: a label, and a pin that stops agent follow.
         .child(div().id("checkout-label").max_w(220).truncate().text_color(row ? t.foreground : t.dim)
@@ -781,7 +838,9 @@ export default class Trellis extends View {
     if (!this.status) return [this.note(t, "Reading index status…")];
     if (!this.status.pin) return [this.note(t, this.status.catchingUp ? "Indexing this checkout. The diagram appears when the first revision is published." : "This checkout has no index yet.")];
     if (this.tab === "sequence") return this.sequenceBody(t, file);
-    const controls = ui.controls(this, t);
+    // The Deviations tab is the tree alone: Color by and Aggregation change only the drawing.
+    const tree = this.tab === "deviations";
+    const controls = tree ? [] : ui.controls(this, t);
     if (this.viewError) return [...controls, this.problem(t, this.viewError, "Architecture")];
     if (this.building) {
       const phase = { reading: "reading indexed files", resolving: "resolving references", evaluating: "evaluating rules", measuring: "measuring code" }[this.building.phase] || "preparing";
@@ -792,11 +851,14 @@ export default class Trellis extends View {
     if (!view) return [...controls, this.note(t, "Reading indexed architecture and reviewed rules…")];
     if (view.state === "missing_rules") return [this.note(t, "No reviewed rules file. Create or review .trellis/rules.toml to configure layers.")];
     if (view.state === "no_layers") return [this.note(t, "No authored layers are configured. Review .trellis/rules.toml to configure layers.")];
+    if (tree) {
+      const summary = this.deviationSummary();
+      return [...ui.switcher(this, t, summary, view), ...(this.devs ? ui.deviations(this, t, summary, view) : [this.note(t, `Reading deviations at ${this.pinText()}…`)])];
+    }
     const drawn = this.current();
     // The switcher and controls come from the drawing's summary, so they always match what is drawn.
     const out = [...controls];
     if (drawn) out.push(...ui.switcher(this, t, drawn.summary, view));
-    if (drawn && this.devs) return [...out, ...ui.deviations(this, t, drawn.summary, view)];
     if (file) out.push(this.fileCard(t, file, place));
     if (this.drawError) out.push(this.problem(t, this.drawError, "Diagram"));
     else if (drawn?.summary.noLayers) out.push(...ui.noLayers(t, drawn.summary, view));
