@@ -10,6 +10,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createRequire } from "node:module";
 import { join } from "node:path";
+import { gzipSync } from "node:zlib";
 import { state } from "./stubs/herdr.js";
 import Trellis from "../src/main.js";
 
@@ -78,22 +79,29 @@ function fakeDaemon({ ready = false, checkouts = [{ key: KEY, root: ROOT }], pay
   return new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve({ server, seen, port: server.address().port })));
 }
 
-// `trellis api` as the CLI behaves: exit 0 with the daemon's 2xx JSON, exit 1 with its {error}
-// answer unchanged, exit 2 with a typed {error} when no daemon answers. `mode` "timeout" stands
-// for exec's own timeout, which rejects.
+// `trellis api --gzip`'s stdout for one line of JSON (#915).
+const packed = (text) => `${gzipSync(`${text}\n`).toString("base64")}\n`;
+// Herdr's exec output cap, which the remote stand-in enforces as the app does.
+const EXEC_OUTPUT_MAX = 8 * 1024 * 1024;
+
+// `trellis api --gzip` as the CLI behaves: exit 0 with the daemon's 2xx JSON, exit 1 with its
+// {error} answer unchanged, exit 2 with a typed {error} when no daemon answers, each gzip+base64.
+// `mode` "timeout" stands for exec's own timeout, which rejects; so does output over the cap.
 function fakeTrellis(port, { mode = "ok" } = {}) {
   const calls = [];
   state.exec = async (command, args, options) => {
     calls.push({ command, args, on: options?.on ?? null, timeout: options?.timeout });
     if (command !== "trellis" || args[0] !== "api") return { code: 127, stdout: "", stderr: "not found" };
     if (mode === "timeout") throw new Error("exec timed out after 30000 ms");
-    if (mode === "unreachable") return { code: 2, stdout: '{"error":{"code":"daemon_unavailable","message":"The daemon call failed (daemon_unavailable)."}}\n', stderr: "" };
+    if (mode === "unreachable") return { code: 2, stdout: packed('{"error":{"code":"daemon_unavailable","message":"The daemon call failed (daemon_unavailable)."}}'), stderr: "" };
     const [, method, target, flag, body] = args;
-    assert.ok(method === "GET" ? args.length === 3 : flag === "--body", `argv shape: ${args}`);
+    assert.ok(method === "GET" ? args.length === 4 : flag === "--body" && args.length === 6, `argv shape: ${args}`);
+    assert.equal(args.at(-1), "--gzip", `argv shape: ${args}`);
     const response = await fetch(`http://127.0.0.1:${port}${target}`, method === "GET" ? { headers: { Authorization: `Bearer ${TOKEN}` } }
       : { method, headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" }, body });
-    const text = await response.text();
-    return { code: response.ok ? 0 : 1, stdout: `${text}\n`, stderr: "" };
+    const stdout = packed(await response.text());
+    if (stdout.length > EXEC_OUTPUT_MAX) throw new Error("exec output exceeded 8 MiB");
+    return { code: response.ok ? 0 : 1, stdout, stderr: "" };
   };
   return calls;
 }
@@ -183,7 +191,7 @@ test("trellis api failures are typed: a daemon error keeps its code, an unreacha
     fakeTrellis(port);
     const failing = state.exec;
     state.exec = (command, args, options) => args[2].endsWith("/status")
-      ? Promise.resolve({ code: 1, stdout: '{"error":{"code":"index_not_ready","message":"reindex required"}}\n', stderr: "" }) : failing(command, args, options);
+      ? Promise.resolve({ code: 1, stdout: packed('{"error":{"code":"index_not_ready","message":"reindex required"}}'), stderr: "" }) : failing(command, args, options);
     let { view, settle } = mount({ transport: "exec" });
     assert.match((await settle()).text(), /Index not ready \(index_not_ready: reindex required\)/);
     await view.close();
@@ -191,6 +199,22 @@ test("trellis api failures are typed: a daemon error keeps its code, an unreacha
     const timeout = await run("timeout");
     assert.match(timeout, /daemon_timeout/);
     assert.match(timeout, /did not answer within 30 s/);
+    // Any other rejection keeps its own message (#915): the size cap that hid a 6.8 MB answer
+    // as an unreachable machine. It is one bounded line.
+    state.exec = async () => { throw new Error(`output exceeded 8 MiB\n${"x".repeat(1000)}`); };
+    ({ view, settle } = mount({ transport: "exec" }));
+    let text = (await settle()).text();
+    assert.match(text, /exec_failed/);
+    assert.match(text, /Running trellis api on this computer failed: output exceeded 8 MiB x/);
+    assert.doesNotMatch(text, /machine_unreachable|x{300}/);
+    await view.close();
+    // A rejection naming a connection failure stays machine_unreachable, with its message.
+    state.exec = async () => { throw new Error("machine mini is unreachable: connection refused"); };
+    ({ view, settle } = mount({ transport: "exec" }));
+    text = (await settle()).text();
+    assert.match(text, /machine_unreachable/);
+    assert.match(text, /connection refused/);
+    await view.close();
     // No `trellis` on that machine's PATH.
     state.exec = async () => ({ code: 127, stdout: "", stderr: "trellis: command not found" });
     ({ view, settle } = mount({ transport: "exec" }));
@@ -200,6 +224,16 @@ test("trellis api failures are typed: a daemon error keeps its code, an unreacha
     state.exec = async () => ({ code: 2, stdout: "", stderr: "error: unrecognized subcommand 'api'" });
     ({ view, settle } = mount({ transport: "exec" }));
     assert.match((await settle()).text(), /trellis_outdated/);
+    await view.close();
+    // A trellis with `api` but before `--gzip` (#915).
+    state.exec = async () => ({ code: 2, stdout: "", stderr: "error: unexpected argument '--gzip' found" });
+    ({ view, settle } = mount({ transport: "exec" }));
+    assert.match((await settle()).text(), /trellis_outdated The trellis on this computer has no `api --gzip`/);
+    await view.close();
+    // Output that isn't gzip+base64 JSON.
+    state.exec = async () => ({ code: 0, stdout: '{"checkouts":[]}\n', stderr: "" });
+    ({ view, settle } = mount({ transport: "exec" }));
+    assert.match((await settle()).text(), /invalid_response/);
     await view.close();
   } finally { delete state.exec; server.close(); rmSync(dir, { recursive: true, force: true }); }
 });
@@ -224,6 +258,47 @@ test("a drawing the runtime ends is a typed timeout, not Drawing… for ever, in
     assert.equal(view.seqDrawing, false);
     await view.close();
   } finally { delete state.exec; server.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+// #915: a real checkout's Architecture answer was 6.8 MB, nearly all `edges[].pairs`. On another
+// machine the pane asks for `pairs=false` and for gzip+base64, so an answer that is far over
+// exec's 8 MiB as plain JSON arrives, decodes and draws.
+test("a large Architecture answer over remote exec is asked without pairs, decodes from gzip and draws", async () => {
+  const site = { basis: { artifactHash: "a".repeat(64), producerHash: "b".repeat(64), revisionId: `revision:v2:${"c".repeat(64)}` }, spelling: "crate::x::y" };
+  const big = architecture();
+  for (const [i, edge] of big.edges.entries()) edge.pairs = Array.from({ length: 1200 }, (_, j) => ({ count: 1, source: { path: `src/${i}-${j}.rs` }, sites: Array(5).fill(site) }));
+  // Modules and other fields the pane keeps, padded past the cap even without pairs.
+  big.padding = "trellis ".repeat(1.2 * 1024 * 1024);
+  const full = JSON.stringify({ payload: big }), compact = JSON.stringify({ payload: { ...big, edges: big.edges.map(({ pairs, ...edge }) => edge) } });
+  assert.ok(full.length - compact.length > EXEC_OUTPUT_MAX && compact.length > EXEC_OUTPUT_MAX && packed(compact).length < EXEC_OUTPUT_MAX / 8, "pairs alone and the rest alone are each over the cap as JSON; gzip is not");
+  const { server, seen, port } = await fakeDaemon();
+  // The daemon's `pairs=false`: the same answer without `edges[].pairs`.
+  server.removeAllListeners("request");
+  server.on("request", (req, res) => {
+    const url = new URL(req.url, "http://x");
+    seen.push({ url: req.url });
+    const send = (value) => { res.writeHead(200, { "Content-Type": "application/json" }); res.end(value); };
+    if (url.pathname === "/api/checkouts") return send(JSON.stringify({ checkouts: [{ rootKey: KEY, state: "available", workspaceRoot: ROOT, revision: pin, catchingUp: false }] }));
+    if (url.pathname.endsWith("/status")) return send(JSON.stringify({ workspaceRoot: ROOT, revision: pin, catchingUp: false }));
+    if (url.pathname.endsWith("/jobs/current")) return send("null");
+    if (url.pathname.endsWith("/architecture")) return send(url.searchParams.get("pairs") === "false" ? compact : full);
+    res.writeHead(404); res.end('{"error":{"code":"not_found","message":"Not found"}}');
+  });
+  const dir = mkdtempSync(join(tmpdir(), "trellis-view-"));
+  Object.assign(state, { appHome: dir, focused: { cwd: ROOT }, shared: {}, spaces: [{ active: true, machine: "mini" }], machines: [{ name: "mini", layout: "ready" }] });
+  const calls = fakeTrellis(port);
+  try {
+    const { view, cx, until } = mount({});
+    let root = await until(/Drawing the layer stack|\[image mods\/trellis\/\.render\/architecture-/);
+    root.find("root").props.size({ width: 900, height: 700 }, cx);
+    root = await until(/\[image mods\/trellis\/\.render\/architecture-/);
+    assert.doesNotMatch(root.text(), /exec_failed|machine_unreachable|invalid_response/);
+    const reads = seen.filter((r) => new URL(r.url, "http://x").pathname.endsWith("/architecture"));
+    assert.ok(reads.length > 0 && reads.every((r) => new URL(r.url, "http://x").searchParams.get("pairs") === "false"), "Architecture is asked without pairs");
+    assert.ok(calls.every((c) => c.on === "mini" && c.args.at(-1) === "--gzip"));
+    assert.ok(view.view && view.view.edges.length === big.edges.length && view.view.edges.every((edge) => !("pairs" in edge)));
+    await view.close();
+  } finally { delete state.exec; state.spaces = []; delete state.machines; server.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
 // #809: the pane follows the focused agent's checkout; a mod pane's focus (cwd null) keeps it;

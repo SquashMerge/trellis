@@ -3170,9 +3170,11 @@ impl CheckoutRuntime {
         Ok((bytes, catching_up, Some(outcome)))
     }
 
+    /// `pairs`: false leaves `edges[].pairs` out of the answer (#915).
     pub fn architecture_response(
         &self,
         options: &crate::store::MetricsOptions,
+        pairs: bool,
         check: &mut (impl FnMut() -> anyhow::Result<()> + Send),
         hooks: MetricsResponseHooks<'_>,
         max_bytes: usize,
@@ -3192,7 +3194,10 @@ impl CheckoutRuntime {
             let pin = match &view {
                 crate::store::ArchitectureView::Ready { pin, .. } => *pin,
                 crate::store::ArchitectureView::Done(payload) => {
-                    return Ok(ArchitectureSummary(Arc::new(payload.clone())));
+                    return Ok(ArchitectureSummary {
+                        payload: Arc::new(payload.clone()),
+                        pairs,
+                    });
                 }
             };
             let config = config.as_ref().expect("ready config");
@@ -3210,7 +3215,7 @@ impl CheckoutRuntime {
             )?;
             response
                 .architecture_view_at(options, view, config, &core, &mut check)
-                .map(ArchitectureSummary)
+                .map(|payload| ArchitectureSummary { payload, pairs })
         })
     }
 
