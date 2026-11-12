@@ -78,6 +78,10 @@ pub struct SemanticAnchor {
     /// A call binding whose dispatch is direct or a constructor.
     pub direct: bool,
     pub outcome: SemanticOutcome,
+    /// The binding resolves to an internal declaration its own basis confirmed current: the
+    /// binding a site of its own needs at that basis. A projected binding keeps it when its
+    /// endpoint is now catching up (#934).
+    pub basis_site: bool,
     pub provenance_id: String,
     pub metadata: BTreeMap<String, Value>,
 }
@@ -137,7 +141,10 @@ pub struct ReferenceBase {
     sources: Vec<Option<SourceReferences>>,
     /// Language to selected producer.
     producers: BTreeMap<String, String>,
-    semantic_documents: Vec<Value>,
+    /// How many projected documents (#620) are in each read status: older basis, catching
+    /// up, needs re-import. Counts only (#932, follows owner ruling #930 2026-11-12), so an
+    /// answer stays small however many documents are catching up.
+    document_status: [usize; 3],
     /// The most sites each edge keeps; `select` samples at most this many.
     sample_limit: usize,
     work_used: usize,
@@ -899,18 +906,18 @@ fn resolve(
         modules,
         sources,
         producers,
-        semantic_documents: docs
+        document_status: docs
             .iter()
-            .filter_map(|doc| {
-                doc.semantic.projection.as_ref().map(|projection| {
-                    json!({
-                        "producerId":doc.semantic.producer_id,"language":doc.key.language,
-                        "path":doc.key.path,"projection":projection,
-                        "coverageState":doc.semantic.coverage_state,"boundary":doc.semantic.boundary
-                    })
-                })
-            })
-            .collect(),
+            .filter_map(|doc| doc.semantic.projection.as_ref())
+            .fold([0; 3], |mut counts, projection| {
+                use crate::model::SemanticStatus;
+                counts[match projection.semantic_status {
+                    SemanticStatus::OlderBasis => 0,
+                    SemanticStatus::CatchingUp => 1,
+                    SemanticStatus::NeedsReimport => 2,
+                }] += 1;
+                counts
+            }),
         sample_limit,
         work_used: rust.work.used,
     })
@@ -1091,8 +1098,9 @@ impl ReferenceBase {
                 "referencesVersion":"references:v2","indexGeneration":self.pin.index_generation.to_string(),
                 "indexRevision":self.pin.index_revision,"evidenceTier":if semantic_sites > 0 { "mixed" } else { "syntax" },"semanticComplete":false,
                 "semanticProducers":semantic_producers,
-                "semanticDocuments":self.semantic_documents,
-                "partial":!self.semantic_documents.is_empty(),
+                "semanticDocumentStatus":{"olderBasis":self.document_status[0],
+                    "catchingUp":self.document_status[1],"needsReimport":self.document_status[2]},
+                "partial":self.document_status.iter().any(|&count| count > 0),
                 "modules":emitted_modules,"externalPackages":external_packages.into_values().collect::<Vec<_>>(),"production":production,"tests":tests,"unresolved":unresolved,
                 "counts":{"scannedDocuments":scanned,"mappedSites":mapped,"unresolvedSites":unresolved.len(),"semanticSites":semantic_sites},
                 "partialFiles":partial_files,
@@ -1430,7 +1438,8 @@ fn prepare_file(
     // are sites of their own, one per range (a call first). Unbound, ambiguous,
     // unresolved and external bindings add no site. An older-basis projection (#620)
     // follows the same rule, so it answers P's sites with labels and never a superset
-    // of them (#934): its internal binding whose endpoint is catching up is a boundary.
+    // of them (#934): a binding that was such a site at P, and whose endpoint is now
+    // catching up, is a boundary site; any other boundary is never a site of its own.
     let mut covered = BTreeSet::new();
     for calls_first in [true, false] {
         for (index, anchor) in anchors.iter().enumerate() {
@@ -1438,10 +1447,11 @@ fn prepare_file(
             if anchor.call_id.is_some() != calls_first
                 || consumed[index]
                 || !usable(anchor)
-                || !matches!(
-                    anchor.outcome,
-                    SemanticOutcome::Internal(..) | SemanticOutcome::Boundary
-                )
+                || !match anchor.outcome {
+                    SemanticOutcome::Internal(..) => true,
+                    SemanticOutcome::Boundary => anchor.basis_site,
+                    _ => false,
+                }
                 || (anchor.call_id.is_none() && !anchor.type_role)
                 || !covered.insert((anchor.range.start, anchor.range.end))
             {
@@ -1789,6 +1799,7 @@ mod historical_projection_tests {
             type_role: true,
             direct: false,
             outcome,
+            basis_site: false,
             provenance_id: "proof".into(),
             metadata: BTreeMap::from([(
                 "projection".into(),
