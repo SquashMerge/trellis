@@ -1117,7 +1117,11 @@ async fn architecture_edges_with_long_exception_reasons_page_by_key() {
                 edge["count"].as_u64().unwrap(),
                 "{edge}"
             );
-            assert!(pairs.iter().all(|pair| pair["target"]["path"] == "src/target.rs"));
+            assert!(
+                pairs
+                    .iter()
+                    .all(|pair| pair["target"]["path"] == "src/target.rs")
+            );
         }
         if let Some((scope, old)) = previous.take() {
             let (status, conflict) =

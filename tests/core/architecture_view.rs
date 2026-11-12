@@ -135,13 +135,12 @@ fn architecture_exact_counts_roles_policy_samples_and_full_identity_metrics() {
         &store,
         &data,
         "edge",
-        &[
-            ("sourceLayer", "store"),
-            ("destinationLayer", "entry"),
-            ("role", "production"),
-            ("status", "deviates"),
-            ("excepted", "false"),
-        ],
+        &[(
+            "key",
+            edge("store", "entry", "production")["key"]
+                .as_str()
+                .unwrap(),
+        )],
         1,
     );
     assert_eq!(
