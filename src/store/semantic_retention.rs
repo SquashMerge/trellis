@@ -106,6 +106,11 @@ pub struct AutoRunHead {
     pub due: BTreeMap<String, bool>,
 }
 
+// A re-import row of this producer, or a producer-less legacy row (#632), for one language.
+// Any producer's import of the language clears a legacy row, so it is due for each of them.
+const REIMPORT_FOR: &str = "SELECT EXISTS(SELECT 1 FROM semantic_reimport
+    WHERE revision_id=?1 AND producer IN (?2,'') AND language=?3)";
+
 const SELECTED_CAPTURE: &str = "SELECT b.captured_revision,s.captured_pin
     FROM semantic_revision_raw_selections s
     JOIN semantic_raw_batches b ON b.batch_id=s.batch_id AND b.producer_id=s.producer_id
@@ -124,9 +129,11 @@ const DOCUMENTS_DIFFER: &str = "SELECT EXISTS(
 
 impl Store {
     /// Which of `producers` (ID and languages) are due an automatic re-run at the head, read
-    /// in one snapshot. Due means a re-import row for one of its languages, or a language whose
-    /// default producer's selected batch was captured at another native revision with
-    /// different documents. No selection and no row is not due; manifest-only changes never are.
+    /// in one snapshot. Everything is keyed by the producer asked about (#660 AC5): it is due
+    /// for a re-import row of its own, or a producer-less legacy row, on one of its languages,
+    /// or when its own selected batch was captured at another native revision and one of its
+    /// languages has different documents. Another producer's row or batch never makes it due.
+    /// No selection and no row is not due; manifest-only changes never are.
     pub fn auto_run_due(&self, producers: &[(&str, &[&str])]) -> Result<AutoRunHead> {
         self.with_evidence(|db| {
             let pin = self.read_revision(db, None)?.pin;
@@ -136,31 +143,34 @@ impl Store {
                 [&key],
                 |row| row.get(0),
             )?;
-            let reimports = semantic_reimport_at(db, &key)?;
-            let defaults = semantic_display::default_producers(db, &key)?;
             let mut due = BTreeMap::new();
             for (producer, languages) in producers {
-                let mut is_due = languages
-                    .iter()
-                    .any(|language| reimports.contains_key(*language));
+                let mut is_due = false;
                 for language in languages.iter() {
+                    is_due = db
+                        .prepare_cached(REIMPORT_FOR)?
+                        .query_row(params![key, producer, language], |row| row.get(0))?;
                     if is_due {
                         break;
                     }
-                    let Some(default) = defaults.producer(language) else {
-                        continue;
-                    };
-                    let captured: Option<(String, String)> = db
-                        .prepare_cached(SELECTED_CAPTURE)?
-                        .query_row(params![key, default], |row| Ok((row.get(0)?, row.get(1)?)))
-                        .optional()?;
-                    let Some((captured_revision, captured_pin)) = captured else {
-                        continue;
-                    };
-                    if captured_revision != native_revision_id {
+                }
+                let captured: Option<(String, String)> = if is_due {
+                    None
+                } else {
+                    db.prepare_cached(SELECTED_CAPTURE)?
+                        .query_row(params![key, producer], |row| Ok((row.get(0)?, row.get(1)?)))
+                        .optional()?
+                };
+                if let Some((captured_revision, captured_pin)) = captured
+                    && captured_revision != native_revision_id
+                {
+                    for language in languages.iter() {
                         is_due = db
                             .prepare_cached(DOCUMENTS_DIFFER)?
                             .query_row(params![key, captured_pin, language], |row| row.get(0))?;
+                        if is_due {
+                            break;
+                        }
                     }
                 }
                 due.insert((*producer).to_string(), is_due);

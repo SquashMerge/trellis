@@ -8265,6 +8265,7 @@ forbid = [{ calls = "helper" }]
             "trellis_declaration",
             "trellis_outgoing_calls",
             "trellis_incoming_calls",
+            "trellis_call_graph",
         ] {
             let answer = mcp.success(
                 tool,

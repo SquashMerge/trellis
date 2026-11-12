@@ -290,4 +290,4 @@ Published status remains catching up while semantic work remains. Per-document r
 - **Lease only while a run is active.** It holds a `background_lease` only while a run is active (D9), so an idle owner never keeps a runtime alive.
 - **Schedules only in `Ready`.** `RetireRequested` drops the schedule (D9); the next activation re-evaluates.
 
-The FIFO, watcher and retirement order is unchanged. §8 gains exactly two senders of the state signal, each of which updates its durable condition first: the registry after every manual producer run returns, and the owner's run thread after it stores an outcome. Lease changes still do not bump the signal. The owner's 60 s wait is a liveness backstop only.
+The FIFO, watcher and retirement order is unchanged. §8 gains two senders of the state signal, each of which updates its durable condition first: the registry after every manual producer run returns, and the owner's run thread after it stores an outcome. The owner's shutdown also bumps the signal once, after setting its closed flag, so its decider exits at the next wake. Lease changes still do not bump the signal. The owner's 60 s wait is a liveness backstop only.
