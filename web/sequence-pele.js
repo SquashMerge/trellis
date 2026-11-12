@@ -134,7 +134,13 @@
         else if (step.kind === "try" || (step.kind !== "group" && (children.length || alternate.length) && !displayProjection.returns?.has(step))) frame = "rect";
         // Interactions (#636): a loop around arrows is a frame only, labelled, with no row.
         const loopFrame = !!displayProjection.loops?.has(step);
-        const heading = loopFrame ? displayProjection.loopLabel(step) : options.showDetails ? step.label : shortened(window.TrellisSequence.compactLabel(step));
+        // Interactions (#907): so is a branch around arrows, and a same-column call's expanded
+        // body: a shaded region whose first statement is a note naming the callee.
+        const branchFrame = !!displayProjection.branches?.has(step), calleeFrame = !!displayProjection.callees?.has(step);
+        if (branchFrame) frame = displayProjection.frameKind(step);
+        else if (calleeFrame) frame = "rect";
+        const heading = loopFrame ? displayProjection.loopLabel(step) : branchFrame ? displayProjection.frameLabel(step)
+          : options.showDetails ? step.label : shortened(window.TrellisSequence.compactLabel(step));
         // An unqualified Interactions loop has a tag and no guard: Pele then draws no label.
         const header = frame && frame !== "rect" ? {kind:frame, header:heading ? `[${heading}]` : null, alternate:frame === "alt" ? "[alternate path]" : null} : null;
         if (frame) {
@@ -142,7 +148,12 @@
           frames.push(frame);
           if (header) frameHeaders.push(header);
         }
-        const row = loopFrame ? null : add(step, preview);
+        if (calleeFrame) {
+          const name = {display:displayProjection.frameLabel(step)};
+          emit(`Note over ${ownerOf(step).alias}: ${encode(name.display)}`, name);
+          noteOrder.push(name);
+        }
+        const row = loopFrame || branchFrame || calleeFrame ? null : add(step, preview);
         const returns = displayProjection.returns?.has(step) && row?.type === "message";
         if (returns) { emit(`activate ${row.lane.alias}`); activations++; }
         if (!collapsed) {

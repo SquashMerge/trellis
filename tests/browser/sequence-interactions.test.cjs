@@ -71,12 +71,14 @@ function coordinateView() {
   return view;
 }
 const INTERACTIONS = {interactions:true};
-// Source order; the branch and the same-column helper draw nothing, so their arrows carry no mark.
+// Source order. The branch and the same-column helper are frames around their arrows (#907), not
+// rows, so their arrows keep their numbers.
 const ARROWS = ["c-open", "c-loop-open", "c-loop-start", "c-start", "c-refresh", "c-deliver", "c-deliver>show", "c-helper>run"];
 const LABELS = ["[001] open", "[002] open", "[003] start", "[004] start", "[005] refresh", "[006] deliver", "[007] show", "[008] run"];
 const RETURNS = ["c-open", "c-loop-open", "c-loop-start", "c-start", "c-refresh", "c-deliver>show", "c-deliver", "c-helper>run"];
-// e1 if2 u1 ret2 · u2 if-loop ret-loop c-helper-in-loop · if6 e6 u3 · d1 d3 · c-helper · e9 u5.
-const HIDDEN = 16;
+// e1 if2 u1 ret2 · u2 if-loop ret-loop c-helper-in-loop · e6 u3 · d1 d3 · e9 u5. The branch if6
+// and the helper c-helper are drawn as frames (#907).
+const HIDDEN = 14;
 
 async function render(view, options = INTERACTIONS) {
   return page.evaluate(async ({view, options}) => {
@@ -113,8 +115,8 @@ test("Pele draws only cross-column calls, with returns, in source order, and not
   assert.deepEqual(await ids("#sequence-diagram .pele-message[data-trellis-return-step-id]", "data-trellis-return-step-id"), RETURNS);
   assert.equal(await page.locator("#sequence-diagram .pele-message").count(), ARROWS.length + RETURNS.length);
   assert.equal(await page.locator("#sequence-diagram .pele-activation").count(), RETURNS.length);
-  // No internal-step row, badge or note: only the intro note.
-  assert.equal(await page.locator("#sequence-diagram .pele-note").count(), 1);
+  // No internal-step row, badge or note: only the intro note and the helper frame's name (#907).
+  assert.deepEqual(await page.locator("#sequence-diagram .pele-note").allTextContents(), ["Static possible paths - not a runtime trace", "helper"]);
   assert.equal(await page.locator("#sequence-diagram [data-trellis-badge-id]").count(), 0);
   assert.equal(await page.evaluate(view => TrellisSequence.display(view, {interactions:true}).hiddenSteps, view), HIDDEN);
   // Arrows run top to bottom in source order.
@@ -149,6 +151,133 @@ test("a loop around arrows is one labelled UML frame around exactly them, with n
   assert.equal(await page.locator('#sequence-diagram [data-presentation="interaction-loop"] .sequence-control-label').count(), 0);
   loop.children[1].folded = [{...structuredClone(loop.children[0]), id:"q", kind:"branch", label:"?: continue only on success; otherwise early return", callId:null}];
   assert.equal(await page.evaluate(view => { const d = TrellisSequence.display(view, {interactions:true}); return d.loopLabel(view.steps[3]); }, plain), "may exit early");
+});
+
+// #907: `enqueue_generated_semantic_import`. The same-column `admission_lease` expands a body
+// whose `match` wakes the inbox in one arm; then the seed enqueues into the store, and wakes the
+// inbox again in the `Err` arm of a `match` on that call's result.
+function enqueueView() {
+  const view = coordinateView(), template = view.steps[0], seed = view.seed;
+  view.participants = view.participants.filter(p => p.id === seed.id);
+  const method = (id, column) => view.participants.push({id, label:id, kind:"method", identification:"Fresh exact target",
+    declaration:{...structuredClone(seed), id, name:id, path:`src/${column}.rs`}, column:{id:`type:${column}`, label:column}});
+  method("admission_lease", "DaemonState"); method("enqueue_as", "Store"); method("wake", "Inbox");
+  view.participants[0].column = {id:"type:DaemonState", label:"DaemonState"};
+  const step = (id, kind, label, extra = {}) => ({...structuredClone(template), id, kind, label, callId:null, children:[], alternate:[], hidden:false, ...extra});
+  const call = (id, target, extra = {}) => step(id, "call", `self.${target}()`, {callId:`callid:${id}`, target,
+    callEvidence:{boundaryReason:"none", resolution:"resolved", dispatch:"direct", freshness:"fresh", provenanceId:`proof:${id}`}, ...extra});
+  const arm = (id, pattern, children) => step(id, "branch", `only if no earlier arm selected and pattern matches: ${pattern}`, {children});
+  const match = (id, arms, extra = {}) => step(id, "branch", "match: mutually exclusive arms; first matching pattern with true guard", {alternate:arms, ...extra});
+  const lane = {lane:"admission_lease"};
+  view.steps = [
+    call("lease", "admission_lease", {children:[
+      match("lease>match", [arm("lease>closing", "RuntimeState::Closing", [step("lease>ret", "return", "return Err(x)", lane)]),
+        arm("lease>retiring", "RuntimeState::RetireRequested { session, .. }", [call("lease>wake", "wake", lane)]), arm("lease>other", "_", [])], lane)]}),
+    call("enqueue", "enqueue_as"),
+    match("match", [arm("ok", "Ok(row)", []), arm("err", "Err(error)", [call("err>wake", "wake"), step("err>ret", "return", "return Err(error)")])]),
+    call("wake", "wake")
+  ];
+  return view;
+}
+
+test("#907: a same-column call's body around an arrow is a frame named for its callee, before the next call", async () => {
+  const view = enqueueView();
+  assert.equal((await render(view)).status, "rendered");
+  assert.deepEqual(await page.locator("#sequence-diagram .pele-edge-label").allTextContents(), ["[001] wake", "[002] enqueue_as", "[003] wake", "[004] wake"]);
+  // The callee frame: a shaded region opened by a note naming the callee, around its arrow only.
+  assert.deepEqual(await page.locator("#sequence-diagram .pele-note").allTextContents(), ["Static possible paths - not a runtime trace", "admission_lease"]);
+  assert.equal(await page.locator("#sequence-diagram .pele-rect").count(), 1);
+  const region = await box(page.locator("#sequence-diagram .pele-rect"));
+  assert.ok(region.top < (await box(label("lease>wake"))).y && (await box(label("lease>wake"))).y < region.bottom, "the lease's wake is inside its frame");
+  for (const id of ["enqueue", "err>wake", "wake"]) assert.ok((await box(label(id))).y > region.bottom, `${id} after the frame`);
+  await legacy(view);
+  const callee = page.locator('#sequence-diagram [data-presentation="interaction-callee"]');
+  assert.equal(await callee.count(), 1);
+  assert.equal(await callee.locator(":scope > .sequence-fragment-operator").evaluate(n => n.firstChild.textContent), "admission_lease");
+  assert.deepEqual(await callee.locator(".sequence-source").evaluateAll(nodes => nodes.map(n => n.getAttribute("data-source-step-id"))), ["lease>wake"]);
+  assert.deepEqual(await ids("#sequence-diagram .sequence-source", "data-source-step-id"), ["lease>wake", "enqueue", "err>wake", "wake"], "frames are not rows");
+  // A same-column call whose body draws no arrow is still nothing.
+  const quiet = enqueueView(); quiet.steps[0].children = [];
+  assert.equal(await page.evaluate(view => TrellisSequence.display(view, {interactions:true}).callees.size, quiet), 0);
+});
+
+test("#907: a branch around an arrow is an alt frame, an arm an opt frame, and arms without an arrow draw nothing", async () => {
+  const view = enqueueView();
+  assert.equal((await render(view)).status, "rendered");
+  // Pele appends a frame after the frames nested in it: the arm, then its match.
+  const kinds = await page.locator("#sequence-diagram .pele-frame .pele-frame-kind").allTextContents();
+  assert.deepEqual(kinds, ["opt", "alt", "opt", "alt"]);
+  // Pele wraps a long header over lines; compare without whitespace, as its validator does.
+  const headers = await page.locator("#sequence-diagram .pele-frame").evaluateAll(nodes => nodes.map(n => [...n.querySelectorAll(".pele-frame-label")].map(l => l.textContent.replace(/\s+/g, ""))));
+  const squeeze = rows => rows.map(row => row.map(text => text.replace(/\s+/g, "")));
+  assert.deepEqual(headers, squeeze([
+    ["[only if no earlier arm selected and pattern matches: RuntimeState::Reti…]"],
+    ["[alternate path]", "[match · first matching arm]"],
+    ["[only if no earlier arm selected and pattern matches: Err(error)]"],
+    ["[alternate path]", "[match · first matching arm]"]]));
+  const frames = page.locator("#sequence-diagram .pele-frame");
+  const err = await box(frames.nth(2).locator("rect, path").first()), match = await box(frames.nth(3).locator("rect, path").first());
+  const inside = async (frame, id) => { const y = (await box(label(id))).y; return frame.top < y && y < frame.bottom; };
+  assert.ok(await inside(err, "err>wake") && await inside(match, "err>wake"), "the Err arm's wake is in its arm and its match");
+  for (const id of ["enqueue", "wake"]) assert.ok(!(await inside(match, id)), `${id} outside the match`);
+  assert.ok((await box(label("enqueue"))).y < match.top, "the scrutinee call comes before its match");
+  await legacy(view);
+  const branches = page.locator('#sequence-diagram [data-presentation="interaction-branch"]');
+  assert.deepEqual(await branches.evaluateAll(nodes => nodes.map(n => n.querySelector(":scope > .sequence-fragment-operator").firstChild.textContent)), ["alt", "opt", "alt", "opt"]);
+  // The legacy heading is cut to the width left at its depth; its title keeps the whole text.
+  const legacyHeadings = await branches.evaluateAll(nodes => nodes.map(n => { const text = n.querySelector(":scope > .sequence-control-label"); return [text.firstChild.textContent, text.querySelector("title").textContent]; }));
+  assert.deepEqual(legacyHeadings.map(([, title]) => title), [
+    "[match · first matching arm]", "[only if no earlier arm selected and pattern matches: RuntimeState::RetireRequested { session, .. }]",
+    "[match · first matching arm]", "[only if no earlier arm selected and pattern matches: Err(error)]"]);
+  for (const [shown, title] of legacyHeadings) assert.ok(shown === title || shown.endsWith("…]") && title.startsWith(shown.slice(0, -2)), JSON.stringify({shown, title}));
+  // An if with an else around an arrow is alt; the coordinate view's if6 holds c-refresh.
+  const display = await page.evaluate(view => { const d = TrellisSequence.display(view, {interactions:true}); return [...d.branches].map(s => [s.id, d.frameKind(s), d.frameLabel(s)]); }, coordinateView());
+  assert.deepEqual(display, [["if6", "alt", "if refresh"]]);
+  // A try groups with branches: alt with its handlers, opt without.
+  const tried = coordinateView(), [open] = [tried.steps[2]];
+  const body = {...structuredClone(tried.steps[0]), id:"try", kind:"try", label:"try; exception behavior unknown", children:[open], alternate:[]};
+  tried.steps = [body, {...structuredClone(body), id:"try-catch", alternate:[{...structuredClone(open), id:"catch>open", callId:"callid:catch>open"}], children:[]}];
+  assert.deepEqual(await page.evaluate(view => { const d = TrellisSequence.display(view, {interactions:true}); return [...d.branches].map(s => d.frameKind(s)); }, tried), ["opt", "alt"]);
+  assert.equal((await render(tried)).status, "rendered");
+  assert.deepEqual(await page.locator("#sequence-diagram .pele-frame .pele-frame-kind").allTextContents(), ["opt", "alt"]);
+});
+
+test("#907: deeply nested legacy frame headings are cut to the width left at their depth, and keep their full text", async () => {
+  const view = enqueueView(), wake = view.steps[3];
+  const pattern = "RuntimeState::RetireRequested { session, attempts, waiting, .. }";
+  // Twelve levels: alternating same-column helpers and match arms, around one arrow.
+  const helper = view.participants.find(p => p.id === "admission_lease");
+  helper.declaration.name = helper.label = "admission_lease_for_a_very_long_named_runtime_helper";
+  let inner = {...structuredClone(wake), id:"deep>wake"};
+  for (let level = 12; level > 0; level--) {
+    const id = `level-${level}`;
+    inner = level % 2
+      ? {...structuredClone(view.steps[0]), id, callId:`callid:${id}`, children:[inner]}
+      : {...structuredClone(view.steps[2].alternate[1]), id, label:`only if no earlier arm selected and pattern matches: ${pattern}`, children:[inner], alternate:[]};
+  }
+  view.steps = [inner];
+  await legacy(view, INTERACTIONS);
+  const measured = await page.evaluate(() => {
+    const svg = document.querySelector("#sequence-diagram svg"), width = Number(svg.getAttribute("viewBox").split(" ")[2]);
+    const frames = [...svg.querySelectorAll('[data-presentation="interaction-branch"], [data-presentation="interaction-callee"]')];
+    return {width, frames:frames.map(frame => {
+      const box = frame.querySelector(":scope > .sequence-fragment").getBBox();
+      return {right:box.x + box.width, texts:[...frame.querySelectorAll(":scope > .sequence-fragment-operator, :scope > .sequence-control-label")]
+        .map(text => ({right:text.getBBox().x + text.getBBox().width, shown:text.firstChild.textContent, title:text.querySelector("title").textContent}))};
+    })};
+  });
+  assert.equal(measured.frames.length, 12);
+  for (const frame of measured.frames) {
+    assert.ok(frame.right <= measured.width, JSON.stringify(frame));
+    for (const text of frame.texts) {
+      assert.ok(text.right <= frame.right && text.right <= measured.width, `heading inside its frame: ${JSON.stringify({text, frame:frame.right, width:measured.width})}`);
+      assert.ok(text.title === text.shown || text.title.startsWith(text.shown.replace(/…\]?$/, "")), JSON.stringify(text));
+    }
+  }
+  // The deepest headings were cut, and their titles keep the whole text.
+  const deepest = measured.frames.at(-1).texts, callee = measured.frames.at(-2).texts[0];
+  assert.match(deepest[1].shown, /…\]$/); assert.equal(deepest[1].title, `[only if no earlier arm selected and pattern matches: ${pattern}]`);
+  assert.equal(callee.title, "admission_lease_for_a_very_long_named_runtime_helper");
 });
 
 test("a nested chain starts on its callee's column and returns before its caller does", async () => {
