@@ -1,5 +1,6 @@
 #![cfg(feature = "test-support")]
-//! Architecture references and rules use fresh selected semantic bindings (#523).
+//! Architecture references and rules use selected semantic bindings that are not stale
+//! (#523): fresh ones, and possibly stale ones labelled as such (#936).
 use crate::graph_fixtures::{
     Bind, PRODUCER, Publisher, Spec, add_second_producer, bind, syntax_id,
 };
@@ -336,12 +337,55 @@ fn without_a_semantic_import_rules_stay_unknown_and_arrows_bounded() {
     assert_eq!(arrow["coverage"]["complete"], false);
 }
 
+/// #936 (owner ruling 2026-11-12): possibly stale evidence, here from producer drift, keeps
+/// mapping sites and settling rules until a producer re-run replaces it, and every site and
+/// rule row it supports says `possiblyStale`.
+#[test]
+fn possibly_stale_evidence_maps_sites_labelled_possibly_stale() {
+    let mut drift = semantic();
+    drift.requested_version = "v2".into();
+    let (_state, _root, store, pin) = publish(&drift);
+    let references = read(&store, "references", json!({"expectedBasis":pin}));
+    assert_eq!(references["evidenceTier"], "mixed");
+    assert_eq!(references["counts"]["semanticSites"], 2);
+    let orphan = edge(&references, "src/orphan.rs", "src/high.rs").unwrap();
+    assert_eq!(orphan["evidenceTier"], "semantic");
+    let low = edge(&references, "src/low.rs", "src/high.rs").unwrap();
+    assert_eq!(low["semanticSites"], 1);
+    let semantic_sites: Vec<&Value> = [orphan, low]
+        .into_iter()
+        .flat_map(|edge| edge["sites"].as_array().unwrap())
+        .filter(|site| site["mapping"] == "semantic")
+        .collect();
+    assert_eq!(semantic_sites.len(), 2, "{references}");
+    for site in semantic_sites {
+        assert_eq!(site["freshness"], "possiblyStale", "{site}");
+        assert_eq!(site["historicalFreshness"], "possiblyStale", "{site}");
+        assert!(site.get("projection").is_none(), "{site}");
+    }
+    let check = read(&store, "check", json!({"expectedBasis":pin}));
+    let required = instance(&check, "orphan-calls-upper", "src/orphan.rs", None);
+    assert_eq!(required["status"], "conforms");
+    let binding = required["constraints"][0]["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "semanticBinding" && e["provenanceId"] == "call-orphan-0")
+        .unwrap();
+    assert_eq!(binding["freshness"], "possiblyStale", "{binding}");
+    assert_eq!(
+        instance(&check, "lower-never-goes", "src/low.rs", None)["status"],
+        "deviates"
+    );
+}
+
 #[test]
 fn stale_unusable_and_unbound_evidence_reverts_to_structural() {
-    // Producer drift makes every binding possibly stale.
-    let mut stale = semantic();
-    stale.requested_version = "v2".into();
-    let (_state, _root, store, pin) = publish(&stale);
+    // Stale evidence keeps the producer listed but is left out, as before #936.
+    let (state, root, store, pin) = publish(&semantic());
+    drop(store);
+    mark_all_stale(&state);
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
     assert_syntax_only_with_producer(&store, pin);
 
     // Unresolved and ambiguous bindings never guess a target, and an unresolved binding
@@ -694,6 +738,21 @@ fn bound_method_call_evidence_names_caller_and_target() {
         assert_eq!(other["targetReason"], "unresolved", "{other}");
     }
     assert_eq!(evidence.len(), 3);
+}
+
+/// Marks every published semantic freshness row `stale`, as for a document whose bytes changed.
+fn mark_all_stale(state: &tempfile::TempDir) {
+    let index = fs::read_dir(state.path().join("cache/indexes"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap()
+        .join("index.db");
+    let db = rusqlite::Connection::open(index).unwrap();
+    let changed = db
+        .execute("UPDATE semantic_coverage_freshness SET freshness='stale'", [])
+        .unwrap();
+    assert!(changed > 0);
 }
 
 /// Deletes only the per-revision freshness association of the basis behind `provenance`.
