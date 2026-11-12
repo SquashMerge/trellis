@@ -14,10 +14,12 @@ metal = ["candle-core/metal", "candle-nn/metal"]
 [dependencies]
 anyhow = "1"
 axum = "0.8"
+base64 = "0.22"
 candle-core = "=0.11.1"
 candle-nn = "=0.11.1"
 clap = { version = "4", features = ["derive"] }
 directories = "6"
+flate2 = "1"
 hex = "0.4"
 git2 = { version = "=0.21.0", default-features = false, features = ["vendored-libgit2"] }
 ignore = "0.4"

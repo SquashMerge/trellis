@@ -4148,6 +4148,65 @@ fn api_cli_answers_allowed_routes_through_the_daemon() {
     }
 }
 
+/// `trellis api --gzip` (#915): stdout is one line of base64 of the gzip of the plain output,
+/// with the same exit code, for an answer (0), a daemon error (1) and a typed refusal (2).
+#[test]
+fn api_cli_gzip_prints_the_plain_output_compressed_with_the_same_exit_code() {
+    use base64::Engine;
+    use std::io::Read;
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let _daemon = AutoDaemonGuard::for_home(&home);
+    let root = checkout(temp.path(), "apigzip");
+    run(&home, "index", &root);
+    let raw = |args: &[&str]| {
+        let output = cli(&home).arg("api").args(args).output().unwrap();
+        (output.status.code().unwrap(), output.stdout)
+    };
+    let unknown = format!("/api/checkouts/{}/status", "0".repeat(64));
+    for (target, expected) in [
+        ("/api/checkouts", 0),
+        (unknown.as_str(), 1),
+        ("/api/daemon/status", 2),
+    ] {
+        let (code, plain) = raw(&["GET", target]);
+        assert_eq!(
+            code,
+            expected,
+            "{target}: {}",
+            String::from_utf8_lossy(&plain)
+        );
+        let (code, packed) = raw(&["GET", target, "--gzip"]);
+        assert_eq!(code, expected, "{target}");
+        let text = std::str::from_utf8(&packed).unwrap();
+        let line = text
+            .strip_suffix('\n')
+            .unwrap_or_else(|| panic!("{target}: {text}"));
+        assert!(!line.contains('\n'), "one line: {text}");
+        let compressed = base64::engine::general_purpose::STANDARD
+            .decode(line)
+            .unwrap();
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(compressed.as_slice())
+            .read_to_end(&mut decoded)
+            .unwrap();
+        let (decoded, plain): (Value, Value) = (
+            serde_json::from_slice(&decoded).unwrap(),
+            serde_json::from_slice(&plain).unwrap(),
+        );
+        // The checkout list carries live fields; the rest prints byte for byte the same JSON.
+        if expected == 0 {
+            assert_eq!(
+                decoded["checkouts"].as_array().map(Vec::len),
+                plain["checkouts"].as_array().map(Vec::len)
+            );
+        } else {
+            assert_eq!(decoded, plain, "{target}");
+        }
+    }
+}
+
 #[test]
 fn api_cli_refuses_other_routes_before_reaching_a_daemon() {
     let temp = short_temp();

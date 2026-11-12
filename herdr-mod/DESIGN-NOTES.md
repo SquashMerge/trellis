@@ -136,7 +136,7 @@ Next steps, in increasing cost:
 Mods run in the app that draws them. When the owner views the mini from the laptop, the mod runs on the laptop, and a `fetch` to `127.0.0.1` would reach the laptop. Herdr has no remote `fetch` and no port forwarding. So the pane picks the machine from the shown space (`spaces()[i].machine`, `null` for this computer), unless props name one. A machine Herdr marks `unavailable` in `machines()` is a typed `machine_unavailable` state.
 
 - **This computer:** `fetch(url)`, with the token read from the token file into the client closure.
-- **Another machine (#817):** each request is one `exec("trellis", ["api", METHOD, target, ("--body", JSON)], { on: machine, timeout: 30000 })`. `trellis api` is a bounded CLI passthrough to exactly the routes this mod uses (checkouts, status, Architecture, methods, sequence). It reaches that machine's daemon over the private per-user socket, the way `trellis status` does, so no token is read by the mod or by any shell, and `trellis serve` needn't be running there. Its contract is in [`docs/daemon-v1.md`](../docs/daemon-v1.md#trellis-api-browser-routes-through-the-cli-817). The pane reads its stdout and exit code:
+- **Another machine (#817):** each request is one `exec("trellis", ["api", METHOD, target, ("--body", JSON), "--gzip"], { on: machine, timeout: 30000 })`. `trellis api` is a bounded CLI passthrough to exactly the routes this mod uses (checkouts, status, Architecture, methods, sequence). It reaches that machine's daemon over the private per-user socket, the way `trellis status` does, so no token is read by the mod or by any shell, and `trellis serve` needn't be running there. Its contract is in [`docs/daemon-v1.md`](../docs/daemon-v1.md#trellis-api-browser-routes-through-the-cli-817). The pane reads its stdout and exit code:
 
   | Outcome | Code |
   |---|---|
@@ -145,11 +145,15 @@ Mods run in the app that draws them. When the owner views the mini from the lapt
   | Exit 2 | the CLI's typed code: `daemon_unavailable`, `deadline_exceeded`, `route_not_allowed`, `daemon_outdated` and so on |
   | Exit 127 | `trellis_missing` |
   | No JSON, and clap's "unrecognized subcommand" | `trellis_outdated` |
+  | No JSON, and clap's "unexpected argument '--gzip'" | `trellis_outdated` |
+  | Output that isn't gzip+base64 JSON | `invalid_response` |
   | `exec` rejected with a timeout | `daemon_timeout` |
   | `exec` rejected, naming a connection failure (unreachable, refused, offline…) | `machine_unreachable`, with the rejection's message |
   | `exec` rejected otherwise | `exec_failed`, with the rejection's message (one line, at most 300 characters; the exec argv holds no secret) |
 
-  Answers are bounded by the CLI's 16 MiB and exec's 8 MiB. The CLI gives up on a silent daemon after 25 s, before exec's 30 s. A POST body (sequence seed and pin) is in the command's argv; it holds no secret.
+  **Answer size (#915, owner ruling 2026-11-11).** `--gzip` makes stdout one line of base64 of the gzipped JSON, which the mod decodes with the runtime's `zlib.gunzipSync`. Exit codes are unchanged. A `trellis` with `api` but no `--gzip` gives clap's "unexpected argument" and is `trellis_outdated`; output that doesn't decode to JSON is `invalid_response`. On both transports Architecture is asked with `pairs=false`: the pane draws edges and reads pairs and sites from the details route, so it leaves out `edges[].pairs`, which were 6.27 MB of the trellis checkout's 6.82 MB answer. With both, that answer is about 164 KB on the wire: 0.86 MB of JSON without pairs, gzipped and base64-encoded. The pane accepts an edge with or without `pairs`, so #917 can make that the route's default without a mod change.
+
+  Answers are bounded by the CLI's 16 MiB, decoded, and exec's 8 MiB, encoded. The CLI gives up on a silent daemon after 25 s, before exec's 30 s. A POST body (sequence seed and pin) is in the command's argv; it holds no secret.
 - **Why `fetch` stays for this computer.** The brief allowed either. `fetch` works with a daemon started before `trellis api` existed, so the owner's pane on the mini keeps working until the new binary is installed and the daemon restarts. It also spawns no process per poll. Its one gap is the missing request timeout (the runtime's `fetch` takes none); `transport: "exec"` uses the CLI here too, with its 25 s bound, and needs no token. Once every machine runs a `trellis` with `api`, switching this computer to the CLI as well would remove the token handling from the mod entirely; it would be equally bounded.
 - **The token, on this computer only.** It is never in the viewing app's logs, mod state or any `exec` argument. On another machine there is no token in the mod's path at all.
 - **Polling:** status every 5 s locally, and every 10 s for another machine, because each poll runs a command there.

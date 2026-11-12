@@ -6,11 +6,17 @@
 // `exec("trellis", ["api", …], { on: machine })` per request (#817). The CLI reaches that
 // machine's daemon over its private socket, as every Trellis command does, so no token is read
 // by the mod or a shell there. It serves only the routes this client uses, with the browser's
-// bounds, and prints the daemon's JSON. Responses are bounded by exec's 8 MiB and timed out.
+// bounds, and prints the daemon's JSON, here gzip+base64 (`--gzip`). Responses are bounded by
+// the CLI's 16 MiB (decoded) and exec's 8 MiB (encoded), and timed out.
 // A rejected exec keeps its own message: `machine_unreachable` when it names a connection
 // failure, `exec_failed` otherwise (#915).
 // The token is never logged, put in state, written anywhere, or included in an error message.
+// Each `trellis api` answer comes back gzip+base64 (`--gzip`, #915): the exec output cap is
+// 8 MiB, and a real checkout's Architecture answer was 6.8 MB of JSON. The pane also asks
+// Architecture for `pairs=false`; it draws edges, and reads pairs from the details route.
 import { exec, home, readTextFile } from "herdr";
+import { Buffer } from "buffer";
+import { gunzipSync } from "zlib";
 
 const LOOPBACK = /^http:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):([0-9]{1,5})$/;
 const TOKEN = /^[A-Za-z0-9_-]{1,512}$/;
@@ -93,7 +99,7 @@ export function createClient({ url = DEFAULT_URL, tokenFile, machine = null, tra
   // `trellis api` on the daemon's machine. Exit 0: the daemon's 2xx JSON. Exit 1: the daemon's
   // own `{error}` answer. Exit 2: a typed failure with no answer (refused route, daemon down).
   async function viaCli(path, body) {
-    const args = body === undefined ? ["api", "GET", path] : ["api", "POST", path, "--body", JSON.stringify(body)];
+    const args = body === undefined ? ["api", "GET", path, "--gzip"] : ["api", "POST", path, "--body", JSON.stringify(body), "--gzip"];
     const on = machine ?? "this computer";
     let result;
     try { result = await exec("trellis", args, { on: machine, timeout: EXEC_TIMEOUT_MS }); }
@@ -105,9 +111,10 @@ export function createClient({ url = DEFAULT_URL, tokenFile, machine = null, tra
     }
     if (result.code === 127) throw new TrellisError("trellis_missing", `trellis isn't on the PATH on ${on}.`);
     let data;
-    try { data = JSON.parse(result.stdout); }
+    try { data = JSON.parse(gunzipSync(Buffer.from(result.stdout.trim(), "base64")).toString("utf8")); }
     catch {
       if (/unrecognized subcommand/.test(result.stderr || "")) throw new TrellisError("trellis_outdated", `The trellis on ${on} has no \`api\` command. Install a newer Trellis there.`);
+      if (/unexpected argument '--gzip'/.test(result.stderr || "")) throw new TrellisError("trellis_outdated", `The trellis on ${on} has no \`api --gzip\`. Install a newer Trellis there.`);
       throw new TrellisError("invalid_response", `trellis api on ${on} printed no JSON (exit ${result.code}).`);
     }
     if (result.code === 0) return data;
@@ -126,7 +133,9 @@ export function createClient({ url = DEFAULT_URL, tokenFile, machine = null, tra
     base, machine, transport: viaExec ? "exec" : "fetch",
     checkouts: () => request("/api/checkouts"),
     status: (rootKey) => checkout(rootKey, "status"),
-    architecture: (rootKey, pin, aggregate = "max") => checkout(rootKey, `architecture?aggregate=${encodeURIComponent(aggregate)}&role=production&workbench=true&${pinQuery(pin)}`),
+    // `pairs=false` (#915): the pane never reads `edges[].pairs`, and an answer without the field is
+    // accepted whether or not it was asked for (#917 may make that the default).
+    architecture: (rootKey, pin, aggregate = "max") => checkout(rootKey, `architecture?aggregate=${encodeURIComponent(aggregate)}&role=production&workbench=true&pairs=false&${pinQuery(pin)}`),
     // One page of Architecture detail (the Deviations tree, #886), at the summary's pin and rules hash.
     details: (rootKey, pin, rulesHash, params, offset = 0) => checkout(rootKey,
       `architecture/details?${new URLSearchParams({ ...params, indexGeneration: pin.indexGeneration, indexRevision: String(pin.indexRevision), rulesHash, offset: String(offset) })}`),
