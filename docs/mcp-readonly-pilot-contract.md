@@ -735,6 +735,14 @@ changes, only the order of rows within two arrays. This section wins over the #7
 - **Descriptors beside their rows.** A grouped page's `externalPackages` lists the descriptor of each external target among that page's rows, once, in the whole answer's order, as a check page lists the semantic bases its instances use (#725). A row pays for the descriptor it is first on the page to need when the page is fitted to its target, so descriptors never fill a page ahead of its rows, and a row `limit` also bounds them. #775 keeps only the descriptors of emitted external destinations, and each of those is some row's target, so the pages together list every one, unchanged; nothing is dropped and no omitted count is needed.
 - **Unchanged:** rows, groups, sums, row order, `counts` and the other whole-result fields, the descriptor shape, the page target and every bound.
 
+## Amendment (#912): rules explain lists only its instance's unassigned ends
+
+**Status: ratified 2026-11-11 by the supervising agent under the owner's delegation ([#912](https://github.com/SquashMerge/trellis/issues/912)), following the #559 ruling.** As in #559, the informational list is scoped to what was asked about, and the checkout-wide total is not. `toolVersion` is unchanged (28): no schema changes.
+
+- **The problem.** `trellis_rules_explain` names one instance, but its `unassigned` array carried the whole checkout's informational catalog, every unassigned module and unassigned external identity, with their `externalPackages` descriptors. Each explain call paged through all of it, and `page.total` counted it.
+- **The answer.** Explain's `unassigned` keeps only the catalog entries that are a returned instance's (in `instances` or `testOnly`) `target` or `destination`: for example the unassigned destination of a `layer_unassigned` instance. `externalPackages` closes over the returned instances and those entries only. `page.total` therefore counts the instance's own items.
+- **Unchanged.** `unassignedFileCount` stays the checkout-wide number of unassigned files, so the count is still there. `trellis_rules_check` lists the whole catalog (filtered by `paths` and `app`, as before). Evaluation, verdicts, counts, the field set and the schemas are unchanged.
+
 ## Tool catalog
 
 ### `trellis_workspace_describe` (W1)
@@ -1042,8 +1050,9 @@ in full document-key order (#347 owner amendment). The required `externalPackage
 array contains descriptors for emitted external destinations only. References use
 `references:v2` and check/explain use `rules:v2`; these closed pre-release shapes
 replace v1 without compatibility. Check/explain descriptors close all returned
-external destinations and informational unassigned external identities, including
-a preserved unassigned catalog after explain filtering.
+external destinations and informational unassigned external identities. Explain's
+unassigned catalog keeps only the explained instances' own unassigned ends
+([#912](#amendment-912-rules-explain-lists-only-its-instances-unassigned-ends)).
 A no-match source scope returns complete empty structural arrays and zero counts other than `unassignedFileCount`,
 while `semanticComplete:false` remains invariant. Module revision/hash/provenance
 links and all selected unresolved sites remain intact. Rules assign layers across
