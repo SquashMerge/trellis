@@ -1507,6 +1507,108 @@ impl Clone for Source<'_> { fn clone(&self) -> Self { self.client.get("/trait-im
         );
     }
 
+    /// #921 sixth review: a module or a glob could make the impl's name another type, so a
+    /// `self` field counts only with the struct and the impl both at the top level of a
+    /// document that has no glob import anywhere. A nested owner is an accepted loss.
+    #[test]
+    fn a_self_field_counts_only_at_top_level_without_globs() {
+        let models = r#"
+pub struct Api {
+    pub client: std::collections::HashMap<&'static str, u8>,
+}
+"#;
+        let paths = |client: &str| -> Vec<String> {
+            run(&[
+                ("client/src/lib.rs", client),
+                ("client/src/models.rs", models),
+            ])
+            .calls
+            .iter()
+            .map(|call| {
+                format!(
+                    "{} {}",
+                    call.method.as_deref().unwrap_or("?"),
+                    call.path_template.as_deref().unwrap_or("?")
+                )
+            })
+            .collect()
+        };
+        let nested_glob = r#"
+mod models;
+struct Api { client: reqwest::Client }
+
+mod cached {
+    use crate::models::*;
+    impl Api {
+        pub fn cached(&self) -> Option<&u8> {
+            self.client.get("/fake")
+        }
+    }
+}
+"#;
+        assert_eq!(paths(nested_glob), Vec::<String>::new());
+    }
+
+    /// #921 sixth review, second variant: a top-level glob can make the impl's name another
+    /// document's type while a nested struct declares the only client field.
+    #[test]
+    fn a_top_level_glob_disables_a_self_field() {
+        let models = r#"
+pub struct Api {
+    pub client: std::collections::HashMap<&'static str, u8>,
+}
+"#;
+        let paths = |client: &str| -> Vec<String> {
+            run(&[
+                ("client/src/lib.rs", client),
+                ("client/src/models.rs", models),
+            ])
+            .calls
+            .iter()
+            .map(|call| {
+                format!(
+                    "{} {}",
+                    call.method.as_deref().unwrap_or("?"),
+                    call.path_template.as_deref().unwrap_or("?")
+                )
+            })
+            .collect()
+        };
+        let top_glob = r#"
+mod owned {
+    pub struct Api { pub client: reqwest::Client }
+}
+mod models;
+use models::*;
+impl Api {
+    fn cached(&self) -> Option<&u8> {
+        self.client.get("/fake")
+    }
+}
+"#;
+        assert_eq!(paths(top_glob), Vec::<String>::new());
+        let nested_owner = r#"
+mod owned {
+    pub struct Api { pub client: reqwest::Client }
+    impl Api {
+        pub fn control(&self) { self.client.get("/control"); }
+    }
+}
+mod models;
+"#;
+        // Accepted loss (precision over recall).
+        assert_eq!(paths(nested_owner), Vec::<String>::new());
+        let direct = r#"
+struct Api { client: reqwest::Client }
+impl Api {
+    pub fn request(&self) { self.client.get("http://localhost/control-self"); }
+}
+"#;
+        assert_eq!(paths(direct), ["GET /control-self"]);
+        let imported = "use other::Api;\nstruct Api { client: reqwest::Client }\nimpl Api { fn f(&self) { self.client.get(\"/imported\"); } }\n";
+        assert_eq!(reqwest_paths(imported), Vec::<String>::new());
+    }
+
     /// #921 review: a chain is a client only while every step keeps the client type. A
     /// request's headers are not a client, nor is another type's `new()`.
     #[test]

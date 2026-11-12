@@ -75,6 +75,7 @@ fn collect(
     let mut imported = BTreeSet::new();
     let mut fields: BTreeMap<&str, (usize, bool, Option<&str>)> = BTreeMap::new();
     let mut globs = Vec::new();
+    let mut any_glob = false;
     let mut field_nodes = Vec::new();
     let mut bindings: BTreeMap<&str, Vec<Node<'_>>> = BTreeMap::new();
     walk(root, check, &mut |node, check| {
@@ -100,9 +101,12 @@ fn collect(
                             .or_default()
                             .push(binding);
                     }
-                    "use_wildcard" if local => {
-                        local_glob = true;
-                        globs.push(binding.byte_range());
+                    "use_wildcard" => {
+                        any_glob = true;
+                        if local {
+                            local_glob = true;
+                            globs.push(binding.byte_range());
+                        }
                     }
                     _ => {}
                 }
@@ -167,7 +171,9 @@ fn collect(
         ..document
     };
     // A field counts only when it is the one field of that name in the document, declared
-    // with the client type by a struct whose name the document declares once.
+    // with the client type by a top-level struct whose name the document declares once and
+    // never imports, in a document with no glob import anywhere (#921 review): a glob or a
+    // module could make the impl's name another type.
     for field in field_nodes {
         if let Some(name) = field.child_by_field_name("name") {
             let client = field
@@ -176,7 +182,7 @@ fn collect(
             let owner = field
                 .parent()
                 .and_then(|list| list.parent())
-                .filter(|item| item.kind() == "struct_item")
+                .filter(|item| item.kind() == "struct_item" && top_level(*item))
                 .and_then(|item| item.child_by_field_name("name"))
                 .map(|owner| document.text(owner));
             let entry = fields
@@ -190,7 +196,7 @@ fn collect(
         fields: fields
             .into_iter()
             .filter_map(|(name, (count, client, owner))| {
-                let owner = owner.filter(|owner| declared.get(owner) == Some(&1))?;
+                let owner = owner.filter(|owner| !any_glob && declared.get(owner) == Some(&1))?;
                 (count == 1 && client).then_some((name, owner))
             })
             .collect(),
@@ -383,9 +389,10 @@ impl<'a> Document<'a> {
 
     /// Whether a receiver is unambiguously a `reqwest` client (#910). Precision wins over
     /// recall: a missed call is acceptable, a false one is not. The receiver is a
-    /// constructor chain ([`Self::constructed`]); `self.<field>` inside an `impl` of the
-    /// struct that declares the field, when that is the one field of its name in the
-    /// document, has the client type, and the struct's name is declared once; or a name
+    /// constructor chain ([`Self::constructed`]); `self.<field>` inside a top-level `impl`
+    /// of the top-level struct that declares the field, when that is the one field of its
+    /// name in the document, has the client type, the struct's name is declared once and
+    /// imported nowhere, and the document has no glob import; or a name
     /// bound once in its function, by a parameter or `let` written with the client type,
     /// before the call. Its name says nothing.
     fn client(&self, receiver: Node<'a>) -> bool {
@@ -405,12 +412,15 @@ impl<'a> Document<'a> {
         }
     }
 
-    /// The type an enclosing `impl` is for, as written, without its generic arguments
-    /// (`impl Source<'_>` is for `Source`).
+    /// The type an enclosing top-level `impl` is for, as written, without its generic
+    /// arguments (`impl Source<'_>` is for `Source`). An `impl` inside a module has none.
     fn impl_type(&self, node: Node<'a>) -> Option<&'a str> {
         let mut current = node.parent();
         while let Some(ancestor) = current {
             if ancestor.kind() == "impl_item" {
+                if !top_level(ancestor) {
+                    return None;
+                }
                 let mut ty = ancestor.child_by_field_name("type")?;
                 if ty.kind() == "generic_type" {
                     ty = ty.child_by_field_name("type")?;
@@ -694,6 +704,12 @@ impl<'a> Document<'a> {
             _ => None,
         }
     }
+}
+
+/// Whether an item is at the top level of its document, outside every inline module.
+fn top_level(item: Node<'_>) -> bool {
+    item.parent()
+        .is_some_and(|parent| parent.kind() == "source_file")
 }
 
 /// The path of an absolute URL or a rooted path, cut at `?` or `#`, with `{}` for each

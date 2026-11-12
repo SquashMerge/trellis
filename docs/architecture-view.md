@@ -493,9 +493,10 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
   is acceptable, a false one is not (#910). It is one of:
   - a chain from `Client::new()`, or from `Client::builder()`, builder methods, `.build()`
     and then `?`, `.unwrap()` or `.expect(..)`, each optionally followed by `.clone()`;
-  - `self.<field>` inside an `impl` (inherent or trait, generic arguments aside) of the
-    struct that declares the field, where that is the one field of its name in the document,
-    it has the client type, and the struct's name is declared once in the document;
+  - `self.<field>` inside a top-level `impl` (inherent or trait, generic arguments aside)
+    of the top-level struct that declares the field, where that is the one field of its name
+    in the document, it has the client type, the struct's name is declared once and
+    imported nowhere in the document, and the document has no glob import anywhere;
   - a name bound exactly once in its function, before the call, by a parameter or `let`
     written with the client type. Any other binding of the name in the function (a
     rebinding, `let` without a type, destructuring or shorthand field, `match` arm or guard
