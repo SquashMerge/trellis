@@ -746,7 +746,7 @@
           if (item.id !== "sequence") return item.run();
           // Reading a sequence can take seconds: the button says so and takes no second click (#940).
           node.disabled = true; node.setAttribute("aria-busy", "true"); node.textContent = "Opening sequence…";
-          try { await item.run(); } finally { node.disabled = false; node.removeAttribute("aria-busy"); node.textContent = item.label; }
+          try { await item.run(); } finally { node.disabled = false; node.setAttribute("aria-busy", "false"); node.textContent = item.label; }
         });
         return node;
       };
