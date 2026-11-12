@@ -727,6 +727,14 @@ changes, only the order of rows within two arrays. This section wins over the #7
 - **Catalog.** Only the describe `kind` enum and the `toolVersion` constant change, on top of #864's slimmed failure schemas. Measured with the `compacted_catalog_keeps_its_recovered_margin` construction, the `tools/list` frame is 211,952 bytes modern and 211,895 legacy, against the 235,520-byte compacted-frame limit. Before #864, the same change measured 232,485 and 232,428 bytes, 17 more than at `toolVersion` 25.
 - **Unchanged:** every other tool, field and bound.
 
+## Amendment (#912): rules explain lists only its instance's unassigned ends
+
+**Status:** implemented (owner-reported 0.2 release blocker, [#912](https://github.com/SquashMerge/trellis/issues/912)). It follows the #559 ruling's pattern: the informational list is scoped to what was asked about, and the checkout-wide total is not. `toolVersion` is unchanged (28): no schema changes.
+
+- **The problem.** `trellis_rules_explain` names one instance, but its `unassigned` array carried the whole checkout's informational catalog, every unassigned module and unassigned external identity, with their `externalPackages` descriptors. Each explain call paged through all of it, and `page.total` counted it.
+- **The answer.** Explain's `unassigned` keeps only the catalog entries that are a returned instance's (in `instances` or `testOnly`) `target` or `destination`: for example the unassigned destination of a `layer_unassigned` instance. `externalPackages` closes over the returned instances and those entries only. `page.total` therefore counts the instance's own items.
+- **Unchanged.** `unassignedFileCount` stays the checkout-wide number of unassigned files, so the count is still there. `trellis_rules_check` lists the whole catalog (filtered by `paths` and `app`, as before). Evaluation, verdicts, counts, the field set and the schemas are unchanged.
+
 ## Tool catalog
 
 ### `trellis_workspace_describe` (W1)
@@ -1034,8 +1042,9 @@ in full document-key order (#347 owner amendment). The required `externalPackage
 array contains descriptors for emitted external destinations only. References use
 `references:v2` and check/explain use `rules:v2`; these closed pre-release shapes
 replace v1 without compatibility. Check/explain descriptors close all returned
-external destinations and informational unassigned external identities, including
-a preserved unassigned catalog after explain filtering.
+external destinations and informational unassigned external identities. Explain's
+unassigned catalog keeps only the explained instances' own unassigned ends
+([#912](#amendment-912-rules-explain-lists-only-its-instances-unassigned-ends)).
 A no-match source scope returns complete empty structural arrays and zero counts other than `unassignedFileCount`,
 while `semanticComplete:false` remains invariant. Module revision/hash/provenance
 links and all selected unresolved sites remain intact. Rules assign layers across

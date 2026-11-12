@@ -3141,6 +3141,18 @@ pub fn explain(
         payload[count_field] = count;
     }
     ensure!(found, "not_found: rule instance");
+    // #912: the informational unassigned catalog keeps only the explained instances'
+    // own ends (their source or destination). `unassignedFileCount` stays checkout-wide,
+    // and `trellis_rules_check` lists the whole catalog.
+    let ends: BTreeSet<String> = ["instances", "testOnly"]
+        .into_iter()
+        .flat_map(|field| payload[field].as_array().expect("checked rows"))
+        .flat_map(|row| [row["target"].to_string(), row["destination"].to_string()])
+        .collect();
+    payload["unassigned"]
+        .as_array_mut()
+        .context("store_unavailable: unassigned catalog absent")?
+        .retain(|identity| ends.contains(&identity.to_string()));
     payload["externalPackages"] = json!(package_closure(
         payload["externalPackages"]
             .as_array()
