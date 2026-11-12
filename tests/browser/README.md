@@ -148,6 +148,17 @@ rail's whole-catalog filter reaching an unopened folder, and one-row view toolba
 "About this view" popovers. Controls inside closed popovers are opened with `H.reveal` before use.
 The suite harness waits for arrival instead of choosing the checkout.
 
+## Stall recovery (#906)
+
+`stall-recovery.test.cjs` uses the real daemon and shell. It is the one browser suite that
+intercepts application requests, and only to simulate a daemon stall: while the stall lasts,
+the selected checkout's API requests answer an untyped 503 or fail as a timed-out connection,
+alternately. It checks that after the stall the tab reloads its failed Sequence view and clears
+**Catching up** from fresh status without a reload or a click; that a reload after a stall (with
+a typed `source_forbidden` refusal during it) keeps the remembered token; and that a real
+`trellis_show` whose sequence read stalled is shown once the daemon answers again. Waits are
+hang backstops, not speed bounds.
+
 ## Architecture acceptance
 
 `architecture.test.cjs` uses an isolated real daemon, authenticated checkout selection and
