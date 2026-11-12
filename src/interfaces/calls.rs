@@ -1126,6 +1126,7 @@ fn app() -> App {
 use reqwest::{Client, Method};
 const BASE: &str = "http://localhost:8080";
 const HEALTH: &str = "http://localhost:8080/health";
+struct Api { client: Client }
 async fn calls(client: &Client, http_client: Client, id: u32, host: &str, url: String) {
     client.get("http://localhost:8080/health").send().await;
     reqwest::get(HEALTH).await;
@@ -1193,7 +1194,7 @@ async fn calls(client: &Client, http_client: Client, id: u32, host: &str, url: S
                 .all(|call| call.prefix == ClientPrefix::Written)
         );
         let first = &found.calls[0];
-        assert_eq!(first.lines.start, 6);
+        assert_eq!(first.lines.start, 7);
         assert!(first.call_id.is_some());
         let caller = serde_json::to_value(first.caller.as_ref().unwrap()).unwrap();
         assert_eq!(caller["name"], "calls");
@@ -1227,6 +1228,77 @@ mod tests {
         ]);
         assert!(found.calls.is_empty(), "{}", found.calls.len());
         assert!(!found.routes.is_empty());
+    }
+
+    /// #910: a `.get` counts only on a receiver that is a `reqwest` client by its type or
+    /// constructor. A slice, `Vec` or map `.get`, or a name merely containing `client`, is
+    /// not a client call, even in a document that mentions `reqwest`.
+    #[test]
+    fn a_get_on_a_receiver_that_is_not_a_reqwest_client_is_not_a_client_call() {
+        let lookalikes = r#"
+use reqwest::Client;
+struct Cache { client: HashMap<String, String> }
+struct Mixed { http: Client }
+struct Other { http: Vec<u8> }
+fn fits(route: &[Seg], client: &[Seg]) { client.get("/health"); }
+fn listed(client: Vec<&str>, clients: HashMap<&str, u8>) {
+    client.get("/health");
+    clients.get("/health");
+}
+fn local(cache: Cache, other: Other) {
+    let client = vec!["/health"];
+    client.get("/health");
+    let http_client = Config::new();
+    http_client.post("/api/users");
+    cache.client.get("/health");
+    other.http.get("/health");
+    let client = Other::new().get("/health");
+}
+fn shadowed(client: Client) {
+    let client = [1, 2];
+    client.get("/health");
+}
+fn untyped() { client.get("/health"); }
+"#;
+        assert_eq!(reqwest_paths(lookalikes), Vec::<String>::new());
+    }
+
+    /// #910 positive controls: the client types and constructors still count.
+    #[test]
+    fn a_get_on_a_reqwest_client_by_type_or_constructor_is_a_client_call() {
+        let clients = r#"
+use reqwest::{blocking, Client as Http};
+struct Api { client: reqwest::Client, plain: Http }
+async fn calls(api: &Api, c: &Http, b: reqwest::blocking::Client) -> Result<()> {
+    reqwest::Client::new().get("http://h/new").send().await?;
+    reqwest::Client::builder().timeout(T).build()?.get("http://h/built").send().await?;
+    let client = reqwest::Client::builder().build()?;
+    client.post("/built/let").send().await?;
+    let copy = client.clone();
+    copy.delete("/clone");
+    let typed: Http = make();
+    typed.put("/typed");
+    c.get("/param");
+    b.head("/blocking");
+    api.client.get("/field");
+    api.plain.patch("/alias");
+    Ok(())
+}
+"#;
+        assert_eq!(
+            reqwest_paths(clients),
+            [
+                "GET /new",
+                "GET /built",
+                "POST /built/let",
+                "DELETE /clone",
+                "PUT /typed",
+                "GET /param",
+                "HEAD /blocking",
+                "GET /field",
+                "PATCH /alias",
+            ]
+        );
     }
 
     #[test]

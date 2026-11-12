@@ -488,8 +488,14 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
   `reqwest::get(url)` and `reqwest::blocking::get(url)` (`GET`); `c.get(url)`, `.post`,
   `.put`, `.delete`, `.patch` and `.head` (the method of the name); and
   `c.request(Method::M, url)` (method unreadable unless `Method::M` or a path ending in
-  `Method::M`). The receiver `c` must read as a client: a name or field containing `client`
-  in any case, or a `Client::new()` or `Client::builder()` chain. The URL, looked through
+  `Method::M`). The receiver `c` must be a `reqwest` client by its type or constructor, never by its
+  name (#910): a `Client::new()` or `Client::builder()` chain (through method calls, `?` and
+  `.await`); a field whose every declaration in the document has the client type; or a name
+  whose last binding before the call in its function is a parameter or `let` with the client
+  type, or a `let` of such a receiver or its `.clone()`. The client type is
+  `reqwest::Client`, `reqwest::blocking::Client`, or a name a `use reqwest::..` gives it
+  (`Client`, or the alias of `Client as Http`), seen through `&`. Block scopes are not
+  modelled, and a field declared in another document is not read. The URL, looked through
   `&`, is a string literal without escapes, a visible constant, or a `format!` whose
   substitutions are read where they are a string literal or a visible constant with no
   format specification (`{x}`, `{}`, `{0}`), and are `{}` otherwise: a fill, width,

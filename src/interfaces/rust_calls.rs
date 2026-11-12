@@ -52,9 +52,12 @@ fn collect(
     work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<()> {
-    let document = Document {
+    let mut document = Document {
         source: &doc.file.text,
         constants: BTreeMap::new(),
+        clients: BTreeSet::new(),
+        fields: BTreeSet::new(),
+        bindings: BTreeMap::new(),
     };
     // A name declared more than once anywhere may be shadowed, so it is never read. Only a
     // top-level declaration is read, and only from outside every inline module. Every
@@ -65,6 +68,9 @@ fn collect(
     let mut local_glob = false;
     let mut modules = Vec::new();
     let mut sites = Vec::new();
+    let mut imports = Vec::new();
+    let mut fields = Vec::new();
+    let mut bindings: BTreeMap<&str, Vec<Node<'_>>> = BTreeMap::new();
     walk(root, check, &mut |node, check| {
         let binding = match node.kind() {
             "use_declaration" | "closure_parameters" => Some(node),
@@ -82,6 +88,10 @@ fn collect(
                 match inner.kind() {
                     "identifier" => {
                         bound.insert(document.text(inner));
+                        bindings
+                            .entry(document.text(inner))
+                            .or_default()
+                            .push(binding);
                     }
                     "use_wildcard" if local => local_glob = true,
                     _ => {}
@@ -91,6 +101,8 @@ fn collect(
         }
         match node.kind() {
             "mod_item" => modules.push(node.byte_range()),
+            "use_declaration" => imports.push(node),
+            "field_declaration" => fields.push(node),
             "const_item" | "static_item" => {
                 let name = node.child_by_field_name("name").map(|n| document.text(n));
                 let value = node
@@ -109,7 +121,26 @@ fn collect(
         }
         Ok(false)
     })?;
+    for import in imports {
+        document.import(import);
+    }
+    // A field name is read only when every field of that name in the document is a client.
+    let mut typed: BTreeMap<&str, bool> = BTreeMap::new();
+    for field in fields {
+        if let Some(name) = field.child_by_field_name("name") {
+            let client = field
+                .child_by_field_name("type")
+                .is_some_and(|ty| document.client_type(ty));
+            *typed.entry(document.text(name)).or_insert(true) &= client;
+        }
+    }
+    let fields = typed
+        .into_iter()
+        .filter_map(|(name, client)| client.then_some(name))
+        .collect();
     let document = Document {
+        fields,
+        bindings,
         constants: constants
             .into_iter()
             .filter(|(name, _)| !local_glob && !bound.contains(name.as_str()))
@@ -162,7 +193,17 @@ struct Document<'a> {
     source: &'a str,
     /// Same-document `const` and `static` strings, each name declared once.
     constants: BTreeMap<String, String>,
+    /// The names a `use reqwest::..` declaration gives the `reqwest` client type.
+    clients: BTreeSet<&'a str>,
+    /// The struct field names of this document declared only with a `reqwest` client type.
+    fields: BTreeSet<&'a str>,
+    /// Every pattern that binds each name: a parameter, `let`, closure parameter, `match`,
+    /// `if let`, `while let` or `for` pattern, or an import.
+    bindings: BTreeMap<&'a str, Vec<Node<'a>>>,
 }
+
+/// How many bindings a receiver is followed through (`let b = a.clone();`).
+const FOLLOWED: usize = 8;
 
 impl<'a> Document<'a> {
     fn text(&self, node: Node<'_>) -> &'a str {
@@ -228,18 +269,165 @@ impl<'a> Document<'a> {
         }
     }
 
-    /// Whether a receiver reads as a `reqwest` client: a name or field containing `client`
-    /// (any case), or a `Client::new()` or `Client::builder()` chain.
-    fn client(&self, receiver: Node<'a>) -> bool {
-        let named = |node: Node<'_>| self.text(node).to_ascii_lowercase().contains("client");
-        match receiver.kind() {
-            "identifier" => named(receiver),
-            "field_expression" => receiver.child_by_field_name("field").is_some_and(named),
-            "call_expression" | "try_expression" | "await_expression" => {
-                let text: String = self.text(receiver).split_whitespace().collect();
-                text.contains("Client::new()") || text.contains("Client::builder()")
+    /// Records the names a `use reqwest::..` declaration gives the client type: `Client`,
+    /// or the alias of `Client as Http`.
+    fn import(&mut self, declaration: Node<'a>) {
+        let Some(argument) = declaration.child_by_field_name("argument") else {
+            return;
+        };
+        let path: String = self.text(argument).split_whitespace().collect();
+        if !path.trim_start_matches("::").starts_with("reqwest::") {
+            return;
+        }
+        let mut stack = vec![argument];
+        while let Some(node) = stack.pop() {
+            match node.kind() {
+                "use_as_clause" => {
+                    let original = node.child_by_field_name("path").map(|p| self.text(p));
+                    if original.is_some_and(|p| p == "Client" || p.ends_with("::Client"))
+                        && let Some(alias) = node.child_by_field_name("alias")
+                    {
+                        self.clients.insert(self.text(alias));
+                    }
+                }
+                "identifier" if self.text(node) == "Client" => {
+                    self.clients.insert("Client");
+                }
+                _ => stack.extend(Self::named_children(node)),
             }
+        }
+    }
+
+    /// Whether a written type is the `reqwest` client, seen through references:
+    /// `reqwest::Client`, `reqwest::blocking::Client`, or a name imported for it.
+    fn client_type(&self, ty: Node<'_>) -> bool {
+        let mut ty = ty;
+        while ty.kind() == "reference_type" {
+            let Some(inner) = ty.child_by_field_name("type") else {
+                return false;
+            };
+            ty = inner;
+        }
+        let text: String = self.text(ty).split_whitespace().collect();
+        let text = text.trim_start_matches("::");
+        matches!(text, "reqwest::Client" | "reqwest::blocking::Client")
+            || self.clients.contains(text)
+    }
+
+    /// Whether a receiver is a `reqwest` client (#910): a `Client::new()` or
+    /// `Client::builder()` chain, a field declared in this document with the client type,
+    /// or a name whose binding before the call is a parameter or `let` of the client type,
+    /// or a `let` of such a receiver or its `.clone()`. Its name says nothing.
+    fn client(&self, receiver: Node<'a>) -> bool {
+        self.client_within(receiver, FOLLOWED)
+    }
+
+    fn client_within(&self, receiver: Node<'a>, follow: usize) -> bool {
+        match receiver.kind() {
+            "identifier" => follow > 0 && self.bound_client(receiver, follow - 1),
+            "field_expression" => receiver
+                .child_by_field_name("field")
+                .is_some_and(|field| self.fields.contains(self.text(field))),
+            "reference_expression" => receiver
+                .child_by_field_name("value")
+                .is_some_and(|value| self.client_within(value, follow)),
+            _ => self.constructed(receiver),
+        }
+    }
+
+    /// Whether the binding a name has at its use is a `reqwest` client. The binding is the
+    /// last pattern of the name in the enclosing function that ends before the use; block
+    /// scopes are not modelled.
+    fn bound_client(&self, name: Node<'a>, follow: usize) -> bool {
+        let mut function = name.parent();
+        while let Some(node) = function {
+            if node.kind() == "function_item" {
+                break;
+            }
+            function = node.parent();
+        }
+        let Some(function) = function else {
+            return false;
+        };
+        let Some(pattern) = self
+            .bindings
+            .get(self.text(name))
+            .into_iter()
+            .flatten()
+            .filter(|pattern| {
+                function.start_byte() <= pattern.start_byte()
+                    && pattern.end_byte() <= name.start_byte()
+            })
+            .max_by_key(|pattern| pattern.start_byte())
+        else {
+            return false;
+        };
+        let Some(binding) = pattern.parent().filter(|_| pattern.kind() == "identifier") else {
+            return false;
+        };
+        match binding.kind() {
+            "parameter" => binding
+                .child_by_field_name("type")
+                .is_some_and(|ty| self.client_type(ty)),
+            "let_declaration" => match binding.child_by_field_name("type") {
+                Some(ty) => self.client_type(ty),
+                None => binding.child_by_field_name("value").is_some_and(|value| {
+                    let value = self.cloned(value).unwrap_or(value);
+                    self.client_within(value, follow)
+                }),
+            },
             _ => false,
+        }
+    }
+
+    /// The receiver of a `.clone()` call.
+    fn cloned(&self, value: Node<'a>) -> Option<Node<'a>> {
+        let function = value
+            .child_by_field_name("function")
+            .filter(|_| value.kind() == "call_expression" && Self::arguments(value).is_empty())?;
+        let field = function.child_by_field_name("field")?;
+        (function.kind() == "field_expression" && self.text(field) == "clone")
+            .then(|| function.child_by_field_name("value"))
+            .flatten()
+    }
+
+    /// Whether an expression is a chain that starts at `Client::new()` or
+    /// `Client::builder()` for the `reqwest` client type, through method calls, `?` and
+    /// `.await`.
+    fn constructed(&self, expression: Node<'a>) -> bool {
+        let mut node = expression;
+        loop {
+            match node.kind() {
+                "call_expression" => {
+                    let Some(function) = node.child_by_field_name("function") else {
+                        return false;
+                    };
+                    match function.kind() {
+                        "field_expression" => match function.child_by_field_name("value") {
+                            Some(value) => node = value,
+                            None => return false,
+                        },
+                        "scoped_identifier" => {
+                            let (Some(path), Some(name)) = (
+                                function.child_by_field_name("path"),
+                                function.child_by_field_name("name"),
+                            ) else {
+                                return false;
+                            };
+                            return matches!(self.text(name), "new" | "builder")
+                                && self.client_type(path);
+                        }
+                        _ => return false,
+                    }
+                }
+                "try_expression" | "await_expression" | "parenthesized_expression" => {
+                    match node.named_child(0) {
+                        Some(inner) => node = inner,
+                        None => return false,
+                    }
+                }
+                _ => return false,
+            }
         }
     }
 
