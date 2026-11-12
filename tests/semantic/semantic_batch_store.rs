@@ -8823,7 +8823,11 @@ forbid = [{{ calls = "helper" }}]
                         assert!(!whole.is_empty(), "{name}: {full}");
                         // The unchanged Rust fixture has only one reference module; its
                         // positive offset is terminal. JS also covers a nonempty suffix.
-                        if language == "javascript" || name != "trellis_references" {
+                        // #912: explain pages only its instance and that instance's own
+                        // unassigned ends, so it may be one item; check covers the suffix.
+                        if name == "trellis_rules_check"
+                            || (language == "javascript" && name == "trellis_references")
+                        {
                             assert!(whole.len() > 1);
                         }
                         assert_eq!(full["data"]["page"]["total"], whole.len());

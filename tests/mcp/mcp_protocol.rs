@@ -12701,7 +12701,10 @@ async fn rules_explain_scopes_the_unassigned_catalog_to_the_instance() {
     let data = ask(2, "trellis_rules_explain", explain(&assigned));
     assert_eq!(data["instances"].as_array().unwrap().len(), 1, "{data}");
     assert_eq!(data["unassigned"], json!([]), "{data}");
-    assert_eq!(data["unassignedFileCount"], 60, "the total stays checkout-wide");
+    assert_eq!(
+        data["unassignedFileCount"], 60,
+        "the total stays checkout-wide"
+    );
     assert_eq!(
         data["page"],
         json!({"offset":0,"nextOffset":null,"total":1})
