@@ -7,6 +7,8 @@
 // machine's daemon over its private socket, as every Trellis command does, so no token is read
 // by the mod or a shell there. It serves only the routes this client uses, with the browser's
 // bounds, and prints the daemon's JSON. Responses are bounded by exec's 8 MiB and timed out.
+// A rejected exec keeps its own message: `machine_unreachable` when it names a connection
+// failure, `exec_failed` otherwise (#915).
 // The token is never logged, put in state, written anywhere, or included in an error message.
 import { exec, home, readTextFile } from "herdr";
 
@@ -14,6 +16,15 @@ const LOOPBACK = /^http:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):([0-9]{1,5})$/;
 const TOKEN = /^[A-Za-z0-9_-]{1,512}$/;
 // `trellis api` gives up on a silent daemon after 25 s; exec's own backstop is a little later.
 const EXEC_TIMEOUT_MS = 30000;
+// An `exec` rejection that names a connection failure; any other rejection is `exec_failed`.
+const UNREACHABLE = /unreachable|not connected|disconnected|connection (?:refused|reset|closed|lost|failed)|no route to host|offline|unknown machine|no such machine/i;
+// The rejection's own words, bounded and on one line. Its argv holds no secret: the exec
+// transport never reads a token.
+const EXEC_REASON_MAX = 300;
+function execReason(error) {
+  const text = String(error?.message ?? error ?? "").replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim() || "no reason given";
+  return text.length > EXEC_REASON_MAX ? `${text.slice(0, EXEC_REASON_MAX - 1)}…` : text;
+}
 export const DEFAULT_URL = "http://127.0.0.1:8877";
 export const validRootKey = (key) => typeof key === "string" && /^[0-9a-f]{64}$/.test(key);
 
@@ -87,8 +98,10 @@ export function createClient({ url = DEFAULT_URL, tokenFile, machine = null, tra
     let result;
     try { result = await exec("trellis", args, { on: machine, timeout: EXEC_TIMEOUT_MS }); }
     catch (error) {
-      if (/time(d)? ?out/i.test(String(error?.message ?? error))) throw new TrellisError("daemon_timeout", `trellis api on ${on} did not answer within ${EXEC_TIMEOUT_MS / 1000} s.`);
-      throw new TrellisError("machine_unreachable", `Cannot run trellis on ${on}: the machine is unreachable or trellis isn't on its PATH.`);
+      const reason = execReason(error);
+      if (/time(d)? ?out/i.test(reason)) throw new TrellisError("daemon_timeout", `trellis api on ${on} did not answer within ${EXEC_TIMEOUT_MS / 1000} s.`);
+      if (UNREACHABLE.test(reason)) throw new TrellisError("machine_unreachable", `Cannot reach ${on}: ${reason}`);
+      throw new TrellisError("exec_failed", `Running trellis api on ${on} failed: ${reason}`);
     }
     if (result.code === 127) throw new TrellisError("trellis_missing", `trellis isn't on the PATH on ${on}.`);
     let data;

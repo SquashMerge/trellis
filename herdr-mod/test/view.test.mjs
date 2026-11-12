@@ -191,6 +191,22 @@ test("trellis api failures are typed: a daemon error keeps its code, an unreacha
     const timeout = await run("timeout");
     assert.match(timeout, /daemon_timeout/);
     assert.match(timeout, /did not answer within 30 s/);
+    // Any other rejection keeps its own message (#915): the size cap that hid a 6.8 MB answer
+    // as an unreachable machine. It is one bounded line.
+    state.exec = async () => { throw new Error(`output exceeded 8 MiB\n${"x".repeat(1000)}`); };
+    ({ view, settle } = mount({ transport: "exec" }));
+    let text = (await settle()).text();
+    assert.match(text, /exec_failed/);
+    assert.match(text, /Running trellis api on this computer failed: output exceeded 8 MiB x/);
+    assert.doesNotMatch(text, /machine_unreachable|x{300}/);
+    await view.close();
+    // A rejection naming a connection failure stays machine_unreachable, with its message.
+    state.exec = async () => { throw new Error("machine mini is unreachable: connection refused"); };
+    ({ view, settle } = mount({ transport: "exec" }));
+    text = (await settle()).text();
+    assert.match(text, /machine_unreachable/);
+    assert.match(text, /connection refused/);
+    await view.close();
     // No `trellis` on that machine's PATH.
     state.exec = async () => ({ code: 127, stdout: "", stderr: "trellis: command not found" });
     ({ view, settle } = mount({ transport: "exec" }));
