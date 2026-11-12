@@ -489,21 +489,21 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
   `reqwest::get(url)` and `reqwest::blocking::get(url)` (`GET`); `c.get(url)`, `.post`,
   `.put`, `.delete`, `.patch` and `.head` (the method of the name); and
   `c.request(Method::M, url)` (method unreadable unless `Method::M` or a path ending in
-  `Method::M`). The receiver `c` must be a `reqwest` client by its type or constructor, never by its
-  name (#910): `Client::new()`, or `Client::builder()`, builder methods, `.build()` and then `?`,
-  `.unwrap()` or `.expect(..)`, each optionally followed by `.clone()` (any other method may
-  change the type); a field whose every declaration in the document has the client type; or
-  a name whose binding in scope at the call, in its function, is a parameter or `let` with
-  the client type, or a `let` of such a receiver or its `.clone()`. A `let` is in scope from
-  its end to the end of its block, so its initializer reads the previous binding; any other
-  pattern (`for`, `match`, `if let`, closure parameter, import) hides the name over its whole
-  construct, and so does every name a destructuring pattern binds (tuple, struct, shorthand
-  field, slice, `ref`, `@`). The client type is `reqwest::Client`, `reqwest::blocking::Client`,
-  or a name whose nearest declaration in scope is a `use reqwest::..` of the client
-  (`Client`, or the alias of `Client as Http`). A declaration is in scope in the block,
-  module or item that holds it, not in an inline `mod` nested there; a nearer import, glob,
-  item or type parameter of the name hides an outer one, and an explicit import beats a glob
-  in the same scope. It is seen through `&`. A field declared in another document is not read. The URL, looked through
+  `Method::M`). The receiver `c` must be unambiguously a `reqwest` client, never by its name; a missed call
+  is acceptable, a false one is not (#910). It is one of:
+  - a chain from `Client::new()`, or from `Client::builder()`, builder methods, `.build()`
+    and then `?`, `.unwrap()` or `.expect(..)`, each optionally followed by `.clone()`;
+  - `self.<field>` where that field is declared once in the document, with the client type;
+  - a name bound exactly once in its function, before the call, by a parameter or `let`
+    written with the client type. Any other binding of the name in the function (a
+    rebinding, `let` without a type, destructuring or shorthand field, `match` arm or guard
+    pattern, closure parameter, `for`, `if let`, import) makes it ambiguous.
+
+  The client type is `reqwest::Client` or `reqwest::blocking::Client`, seen through `&`, or a
+  name (`Client`, or the alias of `Client as Http`) imported from `reqwest` at the top level
+  of the document that nothing else in the document declares: no other import, item (`mod`,
+  `struct`, `type` and so on) or name in a generic parameter list. Nested modules, type
+  aliases, generics and types from other documents are not read. The URL, looked through
   `&`, is a string literal without escapes, a visible constant, or a `format!` whose
   substitutions are read where they are a string literal or a visible constant with no
   format specification (`{x}`, `{}`, `{0}`), and are `{}` otherwise: a fill, width,

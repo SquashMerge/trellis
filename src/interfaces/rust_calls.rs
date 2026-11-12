@@ -52,11 +52,10 @@ fn collect(
     work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<()> {
-    let mut document = Document {
+    let document = Document {
         source: &doc.file.text,
         constants: BTreeMap::new(),
-        types: Vec::new(),
-        modules: Vec::new(),
+        clients: BTreeSet::new(),
         fields: BTreeSet::new(),
         bindings: BTreeMap::new(),
     };
@@ -69,10 +68,12 @@ fn collect(
     let mut local_glob = false;
     let mut modules = Vec::new();
     let mut sites = Vec::new();
-    let mut imports = Vec::new();
-    let mut declared = Vec::new();
-    let mut parameters = Vec::new();
-    let mut fields = Vec::new();
+    // How often each type-namespace name is declared anywhere in the document, and the
+    // names a top-level `use reqwest::..` gives the client (#910, precision over recall).
+    let mut declared: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut imported = BTreeSet::new();
+    let mut fields: BTreeMap<&str, (usize, bool)> = BTreeMap::new();
+    let mut field_nodes = Vec::new();
     let mut bindings: BTreeMap<&str, Vec<Node<'_>>> = BTreeMap::new();
     walk(root, check, &mut |node, check| {
         let binding = match node.kind() {
@@ -103,27 +104,33 @@ fn collect(
                 Ok(false)
             })?;
         }
-        match node.kind() {
+        let kind = node.kind();
+        if kind.ends_with("_item")
+            && let Some(name) = node.child_by_field_name("name")
+        {
+            *declared.entry(document.text(name)).or_default() += 1;
+        }
+        match kind {
             "mod_item" => modules.push(node.byte_range()),
-            "use_declaration" => imports.push(node),
-            "struct_item" | "enum_item" | "union_item" | "type_item" | "trait_item" => {
-                declared.extend(node.child_by_field_name("name"));
-            }
-            "type_parameters" => {
-                for parameter in Document::named_children(node) {
-                    let name = match parameter.kind() {
-                        "type_identifier" => Some(parameter),
-                        _ => parameter
-                            .child_by_field_name("name")
-                            .or_else(|| parameter.child_by_field_name("left")),
-                    };
-                    // A type parameter is in scope over the item that declares it.
-                    if let (Some(name), Some(item)) = (name, node.parent()) {
-                        parameters.push((item.byte_range(), name));
+            "use_declaration" => {
+                let top = node.parent().is_some_and(|parent| parent.id() == root.id());
+                for (name, client) in document.imports(node) {
+                    *declared.entry(name).or_default() += 1;
+                    if client && top {
+                        imported.insert(name);
                     }
                 }
             }
-            "field_declaration" => fields.push(node),
+            // Every name anywhere in a generic parameter list, bounds included.
+            "type_parameters" => {
+                walk(node, check, &mut |inner, _| {
+                    if matches!(inner.kind(), "identifier" | "type_identifier") {
+                        *declared.entry(document.text(inner)).or_default() += 1;
+                    }
+                    Ok(false)
+                })?;
+            }
+            "field_declaration" => field_nodes.push(node),
             "const_item" | "static_item" => {
                 let name = node.child_by_field_name("name").map(|n| document.text(n));
                 let value = node
@@ -142,36 +149,30 @@ fn collect(
         }
         Ok(false)
     })?;
-    document.modules = modules.clone();
-    for import in imports {
-        document.import(import);
-    }
-    for name in declared {
-        if let Some(scope) = name.parent().and_then(|item| item.parent()) {
-            document
-                .types
-                .push((scope.byte_range(), document.text(name), false));
-        }
-    }
-    for (scope, name) in parameters {
-        document.types.push((scope, document.text(name), false));
-    }
-    // A field name is read only when every field of that name in the document is a client.
-    let mut typed: BTreeMap<&str, bool> = BTreeMap::new();
-    for field in fields {
+    // An imported client name counts only when nothing else in the document declares it.
+    let document = Document {
+        clients: imported
+            .into_iter()
+            .filter(|name| declared.get(name) == Some(&1))
+            .collect(),
+        ..document
+    };
+    // A field counts only when it is the one field of that name in the document.
+    for field in field_nodes {
         if let Some(name) = field.child_by_field_name("name") {
             let client = field
                 .child_by_field_name("type")
                 .is_some_and(|ty| document.client_type(ty));
-            *typed.entry(document.text(name)).or_insert(true) &= client;
+            let entry = fields.entry(document.text(name)).or_insert((0, true));
+            entry.0 += 1;
+            entry.1 &= client;
         }
     }
-    let fields = typed
-        .into_iter()
-        .filter_map(|(name, client)| client.then_some(name))
-        .collect();
     let document = Document {
-        fields,
+        fields: fields
+            .into_iter()
+            .filter_map(|(name, (count, client))| (count == 1 && client).then_some(name))
+            .collect(),
         bindings,
         constants: constants
             .into_iter()
@@ -225,20 +226,15 @@ struct Document<'a> {
     source: &'a str,
     /// Same-document `const` and `static` strings, each name declared once.
     constants: BTreeMap<String, String>,
-    /// Every type name an import, item or type parameter declares, with the byte range of
-    /// the scope that holds it and whether it is the `reqwest` client. A glob import is `*`.
-    types: Vec<(std::ops::Range<usize>, &'a str, bool)>,
-    /// The byte ranges of the inline modules, which do not see their parent's imports.
-    modules: Vec<std::ops::Range<usize>>,
-    /// The struct field names of this document declared only with a `reqwest` client type.
+    /// The names a top-level `use reqwest::..` gives the client that nothing else in the
+    /// document declares.
+    clients: BTreeSet<&'a str>,
+    /// The field names declared once in the document, with the client type.
     fields: BTreeSet<&'a str>,
     /// Every pattern that binds each name: a parameter, `let`, closure parameter, `match`,
     /// `if let`, `while let` or `for` pattern, or an import.
     bindings: BTreeMap<&'a str, Vec<Node<'a>>>,
 }
-
-/// How many bindings a receiver is followed through (`let b = a.clone();`).
-const FOLLOWED: usize = 8;
 
 impl<'a> Document<'a> {
     fn text(&self, node: Node<'_>) -> &'a str {
@@ -304,54 +300,48 @@ impl<'a> Document<'a> {
         }
     }
 
-    /// Records every name a `use` declaration binds, within the scope that holds it. A name
-    /// is the client when the import is rooted at `reqwest` and names `Client`, aliased or
-    /// not (`Client`, `Client as Http`). A glob binds any name and is never the client.
-    fn import(&mut self, declaration: Node<'a>) {
-        let (Some(argument), Some(scope)) = (
-            declaration.child_by_field_name("argument"),
-            declaration.parent().map(|parent| parent.byte_range()),
-        ) else {
-            return;
+    /// Every name a `use` declaration binds, and whether it is the client: rooted at
+    /// `reqwest` and naming `Client`, aliased or not (`Client`, `Client as Http`). A glob
+    /// binds no name it can be known by.
+    fn imports(&self, declaration: Node<'a>) -> Vec<(&'a str, bool)> {
+        let Some(argument) = declaration.child_by_field_name("argument") else {
+            return Vec::new();
         };
         let path: String = self.text(argument).split_whitespace().collect();
         let rooted = path.trim_start_matches("::").starts_with("reqwest::");
         let client =
             |original: &str| rooted && (original == "Client" || original.ends_with("::Client"));
+        let mut names = Vec::new();
         let mut stack = vec![argument];
         while let Some(node) = stack.pop() {
             match node.kind() {
                 "use_as_clause" => {
                     let original = node.child_by_field_name("path").map(|p| self.text(p));
                     if let Some(alias) = node.child_by_field_name("alias") {
-                        let is = original.is_some_and(client);
-                        self.types.push((scope.clone(), self.text(alias), is));
+                        names.push((self.text(alias), original.is_some_and(client)));
                     }
                 }
                 "scoped_identifier" => {
                     if let Some(name) = node.child_by_field_name("name") {
                         let name = self.text(name);
-                        self.types.push((scope.clone(), name, client(name)));
+                        names.push((name, client(name)));
                     }
                 }
                 "identifier" => {
                     let name = self.text(node);
-                    self.types.push((scope.clone(), name, client(name)));
+                    names.push((name, client(name)));
                 }
-                "use_wildcard" => self.types.push((scope.clone(), "*", false)),
                 // The path of `a::{..}` is a prefix; only its list binds.
                 "scoped_use_list" => stack.extend(node.child_by_field_name("list")),
                 _ => stack.extend(Self::named_children(node)),
             }
         }
+        names
     }
 
     /// Whether a written type is the `reqwest` client, seen through references:
-    /// `reqwest::Client`, `reqwest::blocking::Client`, or a name whose nearest declaration
-    /// in scope is a `reqwest` import of the client (#921 review). A declaration is in scope
-    /// inside the block, module or item that holds it, but not inside an inline module
-    /// nested there. A nearer import, item or type parameter of the name, or a nearer glob,
-    /// hides an outer client import; an explicit name wins over a glob in the same scope.
+    /// `reqwest::Client`, `reqwest::blocking::Client`, or a name a top-level reqwest import
+    /// gives the client and nothing else in the document declares.
     fn client_type(&self, ty: Node<'_>) -> bool {
         let mut ty = ty;
         while ty.kind() == "reference_type" {
@@ -362,52 +352,35 @@ impl<'a> Document<'a> {
         }
         let text: String = self.text(ty).split_whitespace().collect();
         let text = text.trim_start_matches("::");
-        if matches!(text, "reqwest::Client" | "reqwest::blocking::Client") {
-            return true;
-        }
-        let at = ty.byte_range();
-        self.types
-            .iter()
-            .filter(|(scope, name, _)| {
-                (*name == text || *name == "*")
-                    && within(&at, scope)
-                    && !self
-                        .modules
-                        .iter()
-                        .any(|module| within(module, scope) && within(&at, module))
-            })
-            // The nearest scope is the narrowest; within it an explicit name beats a glob.
-            .min_by_key(|(scope, name, _)| (scope.end - scope.start, *name == "*"))
-            .is_some_and(|(_, _, client)| *client)
+        matches!(text, "reqwest::Client" | "reqwest::blocking::Client")
+            || self.clients.contains(text)
     }
 
-    /// Whether a receiver is a `reqwest` client (#910): a `Client::new()` or
-    /// `Client::builder()` chain, a field declared in this document with the client type,
-    /// or a name whose binding before the call is a parameter or `let` of the client type,
-    /// or a `let` of such a receiver or its `.clone()`. Its name says nothing.
+    /// Whether a receiver is unambiguously a `reqwest` client (#910). Precision wins over
+    /// recall: a missed call is acceptable, a false one is not. The receiver is a
+    /// constructor chain ([`Self::constructed`]), `self.<field>` for a field declared once
+    /// in the document with the client type, or a name bound once in its function, by a
+    /// parameter or `let` written with the client type, before the call. Its name says
+    /// nothing.
     fn client(&self, receiver: Node<'a>) -> bool {
-        self.client_within(receiver, FOLLOWED)
-    }
-
-    fn client_within(&self, receiver: Node<'a>, follow: usize) -> bool {
         match receiver.kind() {
-            "identifier" => follow > 0 && self.bound_client(receiver, follow - 1),
-            "field_expression" => receiver
-                .child_by_field_name("field")
-                .is_some_and(|field| self.fields.contains(self.text(field))),
-            "reference_expression" => receiver
-                .child_by_field_name("value")
-                .is_some_and(|value| self.client_within(value, follow)),
+            "identifier" => self.bound_client(receiver),
+            "field_expression" => {
+                receiver
+                    .child_by_field_name("value")
+                    .is_some_and(|value| value.kind() == "self")
+                    && receiver
+                        .child_by_field_name("field")
+                        .is_some_and(|field| self.fields.contains(self.text(field)))
+            }
             _ => self.constructed(receiver),
         }
     }
 
-    /// Whether the binding a name has at its use is a `reqwest` client. The binding is the
-    /// last pattern of the name in the enclosing function whose scope holds the use: a
-    /// `let` from its end to the end of its block (never its own initializer), a parameter
-    /// in its function or closure, and any other pattern conservatively over its whole
-    /// construct (#921 review). Only a parameter or `let` can be a client.
-    fn bound_client(&self, name: Node<'a>, follow: usize) -> bool {
+    /// Whether a name is bound exactly once in its enclosing function, before the use, by a
+    /// parameter or `let` written with the client type. Any other binding of the name in the
+    /// function (a rebinding, pattern, closure parameter or import) makes it ambiguous.
+    fn bound_client(&self, name: Node<'a>) -> bool {
         let mut function = name.parent();
         while let Some(node) = function {
             if node.kind() == "function_item" {
@@ -418,86 +391,33 @@ impl<'a> Document<'a> {
         let Some(function) = function else {
             return false;
         };
-        let at = name.byte_range();
-        let Some(pattern) = self
+        let inside: Vec<_> = self
             .bindings
             .get(self.text(name))
             .into_iter()
             .flatten()
-            .filter(|pattern| function.start_byte() <= pattern.start_byte())
             .filter(|pattern| {
-                Self::scope(**pattern)
-                    .is_some_and(|(scope, from)| from <= at.start && within(&at, &scope))
+                function.start_byte() <= pattern.start_byte()
+                    && pattern.end_byte() <= function.end_byte()
             })
-            .max_by_key(|pattern| pattern.start_byte())
+            .collect();
+        let [pattern] = inside[..] else {
+            return false;
+        };
+        let Some(binding) = pattern
+            .parent()
+            .filter(|_| pattern.kind() == "identifier" && pattern.end_byte() <= name.start_byte())
         else {
             return false;
         };
-        let Some(binding) = pattern.parent().filter(|_| pattern.kind() == "identifier") else {
-            return false;
-        };
-        match binding.kind() {
-            "parameter" => binding
+        matches!(binding.kind(), "parameter" | "let_declaration")
+            && binding
                 .child_by_field_name("type")
-                .is_some_and(|ty| self.client_type(ty)),
-            "let_declaration" => match binding.child_by_field_name("type") {
-                Some(ty) => self.client_type(ty),
-                None => binding.child_by_field_name("value").is_some_and(|value| {
-                    let value = self.cloned(value).unwrap_or(value);
-                    self.client_within(value, follow)
-                }),
-            },
-            _ => false,
-        }
+                .is_some_and(|ty| self.client_type(ty))
     }
 
-    /// Where a binding pattern's names are in scope: the range that holds them, and the byte
-    /// from which they are visible.
-    fn scope(pattern: Node<'_>) -> Option<(std::ops::Range<usize>, usize)> {
-        let parent = pattern.parent()?;
-        let ancestor = |kinds: &[&str]| {
-            let mut node = pattern.parent();
-            while let Some(current) = node {
-                if kinds.contains(&current.kind()) {
-                    return Some(current);
-                }
-                node = current.parent();
-            }
-            None
-        };
-        match (pattern.kind(), parent.kind()) {
-            ("use_declaration", _) => Some((parent.byte_range(), pattern.end_byte())),
-            ("closure_parameters", _) => Some((parent.byte_range(), pattern.end_byte())),
-            (_, "let_declaration") => Some((parent.parent()?.byte_range(), parent.end_byte())),
-            (_, "parameter") => {
-                let owner = ancestor(&["function_item", "closure_expression"])?;
-                Some((owner.byte_range(), pattern.end_byte()))
-            }
-            (_, "for_expression") => {
-                let body = parent.child_by_field_name("body")?;
-                Some((body.byte_range(), body.start_byte()))
-            }
-            (_, "let_condition") => {
-                let owner = ancestor(&["if_expression", "while_expression"])?;
-                Some((owner.byte_range(), pattern.end_byte()))
-            }
-            _ => Some((parent.byte_range(), pattern.end_byte())),
-        }
-    }
-
-    /// The receiver of a `.clone()` call.
-    fn cloned(&self, value: Node<'a>) -> Option<Node<'a>> {
-        let function = value
-            .child_by_field_name("function")
-            .filter(|_| value.kind() == "call_expression" && Self::arguments(value).is_empty())?;
-        let field = function.child_by_field_name("field")?;
-        (function.kind() == "field_expression" && self.text(field) == "clone")
-            .then(|| function.child_by_field_name("value"))
-            .flatten()
-    }
-
-    /// Whether an expression yields a `reqwest` client by construction (#921 review):
-    /// `Client::new()`, or `Client::builder()`, any builder methods, `.build()` and then `?`,
+    /// Whether an expression yields a `reqwest` client by construction, with `Client` a
+    /// client type ([`Self::client_type`]): `Client::new()`, or `Client::builder()`, any builder methods, `.build()` and then `?`,
     /// `.unwrap()` or `.expect(..)`; each optionally followed by `.clone()`. Any other method
     /// may change the type, so the chain is then not a client.
     fn constructed(&self, expression: Node<'a>) -> bool {
@@ -721,11 +641,6 @@ impl<'a> Document<'a> {
             _ => None,
         }
     }
-}
-
-/// Whether one byte range lies inside another.
-fn within(inner: &std::ops::Range<usize>, outer: &std::ops::Range<usize>) -> bool {
-    outer.start <= inner.start && inner.end <= outer.end
 }
 
 /// The path of an absolute URL or a rooted path, cut at `?` or `#`, with `{}` for each

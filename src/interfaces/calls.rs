@@ -1263,8 +1263,9 @@ fn untyped() { client.get("/health"); }
         assert_eq!(reqwest_paths(lookalikes), Vec::<String>::new());
     }
 
-    /// #921 review: a binding counts only where it is in scope. An expired inner client
-    /// does not type an outer map, and a `for` pattern hides the name in its body.
+    /// #921 review: a name bound more than once in its function is never a client, so an
+    /// expired inner client does not type an outer map. The other calls here are accepted
+    /// losses (precision over recall): `m` and `c` are each bound twice.
     #[test]
     fn a_binding_counts_only_where_it_is_in_scope() {
         let expired = r#"
@@ -1284,19 +1285,20 @@ fn f(c: Client, m: HashMap<&str, u8>) {
     c.get("/after");
 }
 "#;
-        assert_eq!(reqwest_paths(inner), ["GET /inner", "GET /after"]);
+        assert_eq!(reqwest_paths(inner), Vec::<String>::new());
     }
 
-    /// #921 review: a `let` initializer reads the binding before the `let`.
+    /// #921 review: `let c = c.clone()` binds `c` twice, so the call is an accepted loss
+    /// (precision over recall), never a false call.
     #[test]
     fn a_let_initializer_reads_the_previous_binding() {
         let same_name = r#"use reqwest::Client; fn f(c: Client) { let c = c.clone(); c.get("/same-name-clone"); }"#;
-        assert_eq!(reqwest_paths(same_name), ["GET /same-name-clone"]);
+        assert_eq!(reqwest_paths(same_name), Vec::<String>::new());
     }
 
-    /// #921 review: an import types a name only where it is in scope. A module's
-    /// `use reqwest::Client` does not reach an unrelated root `Client`, and a root import
-    /// does not reach an inline module.
+    /// #921 review: only a top-level reqwest import that nothing else in the document
+    /// declares types a name. A module's import never does, and a root import is unread
+    /// once a module declares its own `Client` (an accepted loss).
     #[test]
     fn a_reqwest_import_types_a_name_only_where_it_is_in_scope() {
         let nested = r#"
@@ -1312,11 +1314,14 @@ fn f(c: Client) { c.get("/root"); }
 mod other { struct Client; fn g(c: Client) { c.get("/other"); } }
 mod net { use reqwest::Client; fn h(c: &Client) { c.get("/net"); } }
 "#;
-        assert_eq!(reqwest_paths(root), ["GET /root", "GET /net"]);
+        assert_eq!(reqwest_paths(root), Vec::<String>::new());
+        let only = "use reqwest::Client;\nfn f(c: Client) { c.get(\"/only\"); }\n";
+        assert_eq!(reqwest_paths(only), ["GET /only"]);
     }
 
-    /// #921 re-review: the nearest declaration of a type name in scope decides it. A nearer
-    /// import, glob, item or type parameter named `Client` hides an outer reqwest import.
+    /// #921 re-review: any other import, item or type parameter named `Client` in the
+    /// document makes the name ambiguous, so it is never a client; `/kept` and `/explicit`
+    /// are accepted losses (precision over recall).
     #[test]
     fn a_nearer_declaration_of_the_name_hides_the_reqwest_import() {
         let nearer = r#"
@@ -1339,11 +1344,11 @@ fn item() { struct Client; fn g(c: Client) { c.get("/item"); } }
 fn kept(c: Client) { c.get("/kept"); }
 mod inner { use reqwest::*; use reqwest::Client; fn h(c: Client) { c.get("/explicit"); } }
 "#;
-        assert_eq!(reqwest_paths(others), ["GET /kept", "GET /explicit"]);
+        assert_eq!(reqwest_paths(others), Vec::<String>::new());
     }
 
-    /// #921 re-review: every name a pattern binds hides an outer client, a shorthand field
-    /// among them.
+    /// #921 re-review: every name a pattern binds, a shorthand field among them, makes the
+    /// name ambiguous in its function; `/kept` is an accepted loss.
     #[test]
     fn every_name_a_pattern_binds_hides_an_outer_client() {
         let shorthand = r#"
@@ -1364,7 +1369,46 @@ fn f(c: reqwest::Client, pair: (u8, Map), slot: Slot) {
     c.get("/kept");
 }
 "#;
-        assert_eq!(reqwest_paths(others), ["GET /kept"]);
+        assert_eq!(reqwest_paths(others), Vec::<String>::new());
+    }
+
+    /// #921 fourth review: a match guard's pattern binding and a nearer module item are
+    /// never a client. A const generic named `Client` makes the import ambiguous, so the
+    /// real call is not read: a lost call is accepted, a false one is not.
+    #[test]
+    fn a_guard_binding_a_module_item_and_a_const_generic_make_the_name_ambiguous() {
+        let guard = r#"
+struct Slot { c: std::collections::HashMap<&'static str, u8> }
+fn f(c: reqwest::Client, slot: Slot) {
+    match slot {
+        Slot { c } if c.get("/fake").is_some() => (),
+        _ => ()
+    }
+}
+"#;
+        assert_eq!(reqwest_paths(guard), Vec::<String>::new());
+        let module = r#"
+use reqwest::Client;
+fn f() {
+    mod Client {
+        pub fn new() -> std::collections::HashMap<&'static str, u8> {
+            std::collections::HashMap::new()
+        }
+    }
+    let mut cache = Client::new();
+    cache.insert("/fake", 1u8);
+    cache.get("/fake");
+}
+"#;
+        assert_eq!(reqwest_paths(module), Vec::<String>::new());
+        let generic = r#"
+use reqwest::Client;
+fn kept<const Client: usize>(c: Client) {
+    c.get("/kept");
+}
+"#;
+        // Accepted loss (precision over recall).
+        assert_eq!(reqwest_paths(generic), Vec::<String>::new());
     }
 
     /// #921 review: a chain is a client only while every step keeps the client type. A
@@ -1398,20 +1442,20 @@ fn f() {
         let clients = r#"
 use reqwest::{blocking, Client as Http};
 struct Api { client: reqwest::Client, plain: Http }
-async fn calls(api: &Api, c: &Http, b: reqwest::blocking::Client) -> Result<()> {
-    reqwest::Client::new().get("http://h/new").send().await?;
-    reqwest::Client::builder().timeout(T).build()?.get("http://h/built").send().await?;
-    let client = reqwest::Client::builder().build()?;
-    client.post("/built/let").send().await?;
-    let copy = client.clone();
-    copy.delete("/clone");
-    let typed: Http = make();
-    typed.put("/typed");
-    c.get("/param");
-    b.head("/blocking");
-    api.client.get("/field");
-    api.plain.patch("/alias");
-    Ok(())
+impl Api {
+    async fn calls(&self, c: &Http, b: reqwest::blocking::Client) -> Result<()> {
+        reqwest::Client::new().get("http://h/new").send().await?;
+        reqwest::Client::builder().timeout(T).build()?.get("http://h/built").send().await?;
+        Http::new().clone().delete("/clone");
+        Http::builder().build().expect("client").post("/expect");
+        let typed: Http = make();
+        typed.put("/typed");
+        c.get("/param");
+        b.head("/blocking");
+        self.client.get("/field");
+        self.plain.patch("/alias");
+        Ok(())
+    }
 }
 "#;
         assert_eq!(
@@ -1419,8 +1463,8 @@ async fn calls(api: &Api, c: &Http, b: reqwest::blocking::Client) -> Result<()> 
             [
                 "GET /new",
                 "GET /built",
-                "POST /built/let",
                 "DELETE /clone",
+                "POST /expect",
                 "PUT /typed",
                 "GET /param",
                 "HEAD /blocking",
@@ -1428,6 +1472,20 @@ async fn calls(api: &Api, c: &Http, b: reqwest::blocking::Client) -> Result<()> 
                 "PATCH /alias",
             ]
         );
+        // Accepted losses (precision over recall): an untyped `let`, a field read through
+        // anything but `self`, and a field name two structs declare.
+        let lost = r#"
+use reqwest::Client;
+struct Api { client: Client }
+struct Other { client: Client }
+fn f(api: &Api) {
+    let made = Client::new();
+    made.get("/untyped-let");
+    api.client.get("/not-self");
+}
+impl Api { fn g(&self) { self.client.get("/two-structs"); } }
+"#;
+        assert_eq!(reqwest_paths(lost), Vec::<String>::new());
     }
 
     #[test]
