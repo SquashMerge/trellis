@@ -31,7 +31,7 @@ const result = await build({
   target: "es2022",
   outfile: join(outdir, "main.js"),
   // The runtime's own modules.
-  external: ["gpui-kit", "gpui-base", "herdr", "fs/promises"],
+  external: ["gpui-kit", "gpui-base", "herdr", "fs/promises", "buffer", "zlib"],
   plugins: [webPlugin],
   legalComments: "inline",
   // Pele is already minified; the rest is small. Keep names so runtime stack traces stay readable.

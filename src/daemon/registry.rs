@@ -301,9 +301,13 @@ impl BrowserCheckoutsProbe {
                     entry.identity.rediscover()?;
                 }
                 if let Some(runtime) = runtime {
-                    let (response, catching_up) = runtime.evidence_response()?;
-                    let revision = response.status()?.revision;
-                    response.finish((revision, Some(catching_up)))
+                    // The listing carries each checkout's Git header; a publication that holds
+                    // readers out reports `storage_busy` at once instead of delaying it (#905).
+                    crate::store::with_spill_answer_by(Instant::now(), || {
+                        let (response, catching_up) = runtime.evidence_response()?;
+                        let revision = response.status()?.revision;
+                        response.finish((revision, Some(catching_up)))
+                    })
                 } else {
                     let roots = roots
                         .as_ref()
@@ -2779,6 +2783,9 @@ impl CheckoutRuntime {
             RuntimePhase::Ready => {
                 resources.scheduler.checkout_watch_pending()
                     || resources.scheduler.fifo_pending()
+                    // A publication holding readers out is work in progress; asking the index
+                    // would only wait for its COMMIT (#905).
+                    || resources.store.publication_holds_readers()
                     || resources
                         .store
                         .pending_semantic_target()
@@ -3170,9 +3177,11 @@ impl CheckoutRuntime {
         Ok((bytes, catching_up, Some(outcome)))
     }
 
+    /// `pairs`: false leaves `edges[].pairs` out of the answer (#915).
     pub fn architecture_response(
         &self,
         options: &crate::store::MetricsOptions,
+        pairs: bool,
         check: &mut (impl FnMut() -> anyhow::Result<()> + Send),
         hooks: MetricsResponseHooks<'_>,
         max_bytes: usize,
@@ -3192,7 +3201,10 @@ impl CheckoutRuntime {
             let pin = match &view {
                 crate::store::ArchitectureView::Ready { pin, .. } => *pin,
                 crate::store::ArchitectureView::Done(payload) => {
-                    return Ok(ArchitectureSummary(Arc::new(payload.clone())));
+                    return Ok(ArchitectureSummary {
+                        payload: Arc::new(payload.clone()),
+                        pairs,
+                    });
                 }
             };
             let config = config.as_ref().expect("ready config");
@@ -3210,7 +3222,7 @@ impl CheckoutRuntime {
             )?;
             response
                 .architecture_view_at(options, view, config, &core, &mut check)
-                .map(ArchitectureSummary)
+                .map(|payload| ArchitectureSummary { payload, pairs })
         })
     }
 

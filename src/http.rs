@@ -4288,12 +4288,9 @@ async fn provisioned_core(
         if let Some(hook) = hook {
             hook("after_handler");
         }
-        let catching_up = browser
-            .registry
-            .lock()
-            .await
-            .runtime(&root_key)
-            .is_some_and(|runtime| runtime.catching_up());
+        // Sampled outside the registry lock: the flag may read the index (#905).
+        let runtime = browser.registry.lock().await.runtime(&root_key);
+        let catching_up = runtime.is_some_and(|runtime| runtime.catching_up());
         result.map(|response| (response, catching_up))
     } else {
         let runtime = {
@@ -4361,12 +4358,8 @@ async fn provisioned_core(
     let (mut response, catching_up) = match answer {
         Ok(pair) => pair,
         Err(error) => {
-            let catching_up = browser
-                .registry
-                .lock()
-                .await
-                .runtime(&root_key)
-                .map_or(!is_git, |runtime| runtime.catching_up());
+            let runtime = browser.registry.lock().await.runtime(&root_key);
+            let catching_up = runtime.map_or(!is_git, |runtime| runtime.catching_up());
             (error.into_response(), catching_up)
         }
     };
@@ -4549,7 +4542,39 @@ fn selected_mutation_error(error: ApiError, outcome: &str) -> Response {
     response
 }
 
-fn architecture_query(uri: &axum::http::Uri) -> Result<crate::store::MetricsOptions, ApiError> {
+/// The Architecture options, and whether `edges[].pairs` is in the answer: `pairs=false`
+/// leaves it out (#915, owner ruling 2026-11-11); the default is the full answer.
+fn architecture_query(
+    uri: &axum::http::Uri,
+) -> Result<(crate::store::MetricsOptions, bool), ApiError> {
+    let mut pairs = None;
+    let mut rest = Vec::new();
+    for pair in uri.query().into_iter().flat_map(|query| query.split('&')) {
+        match pair.split_once('=') {
+            Some(("pairs", value)) => {
+                let value = match value {
+                    "true" => true,
+                    "false" => false,
+                    _ => return Err(invalid()),
+                };
+                if pairs.replace(value).is_some() {
+                    return Err(invalid());
+                }
+            }
+            _ => rest.push(pair),
+        }
+    }
+    let uri = if pairs.is_some() {
+        let rest = if rest.is_empty() {
+            "/".to_owned()
+        } else {
+            format!("/?{}", rest.join("&"))
+        };
+        rest.parse::<axum::http::Uri>().map_err(|_| invalid())?
+    } else {
+        uri.clone()
+    };
+    let uri = &uri;
     let mut options = metrics_query(uri)?;
     // metrics_query already decodes and rejects duplicate/unknown fields. Architecture
     // accepts only the complete pin, aggregation and role, not metrics selectors.
@@ -4570,7 +4595,7 @@ fn architecture_query(uri: &axum::http::Uri) -> Result<crate::store::MetricsOpti
     {
         options.aggregate = "max".into();
     }
-    Ok(options)
+    Ok((options, pairs.unwrap_or(true)))
 }
 
 /// Detail pages require the summary's full pin and rules hash; see
@@ -4829,13 +4854,13 @@ async fn provisioned_core_answer(
                 None
             };
             let detail_read = details.is_some();
-            let options = if detail_read {
+            let (options, pairs) = if detail_read {
                 // A detail page evaluates the whole revision, like the summary.
-                crate::store::MetricsOptions::default()
+                (crate::store::MetricsOptions::default(), true)
             } else if architecture {
                 architecture_query(uri)?
             } else {
-                metrics_query(uri)?
+                (metrics_query(uri)?, true)
             };
             let runtime = runtime.clone();
             // The guard belongs to this request future, not to the blocking worker.
@@ -4928,7 +4953,7 @@ async fn provisioned_core_answer(
                 let result = if let Some(details) = &details {
                     runtime.architecture_details_response(details, &mut check, hooks, metrics.limit)
                 } else if architecture {
-                    runtime.architecture_response(&options, &mut check, hooks, metrics.limit)
+                    runtime.architecture_response(&options, pairs, &mut check, hooks, metrics.limit)
                 } else {
                     runtime.metrics_response(&options, &mut check, hooks, metrics.limit)
                 };
@@ -5010,7 +5035,7 @@ async fn provisioned_core_answer(
             let apply = matches!(route, BrowserCoreRoute::RulesApply);
             let inventory = matches!(route, BrowserCoreRoute::RulesInventory);
             let pin = if inventory {
-                let options = architecture_query(uri)?;
+                let (options, _) = architecture_query(uri)?;
                 if uri.query().is_some_and(|query| {
                     query.split('&').any(|pair| {
                         !matches!(

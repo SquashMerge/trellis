@@ -87,6 +87,10 @@ struct ApiArgs {
     /// The POST body: JSON, at most 64 KiB, or `-` to read it from stdin.
     #[arg(long, allow_hyphen_values = true)]
     body: Option<String>,
+    /// Print the output gzip-compressed and base64-encoded, on one line; exit codes and the
+    /// 16 MiB answer bound (on the decoded answer) are unchanged (#915).
+    #[arg(long)]
+    gzip: bool,
 }
 #[cfg(feature = "test-support")]
 #[derive(Args)]
@@ -933,10 +937,31 @@ fn api_command(args: &ApiArgs) -> i32 {
         }
     };
     let mut stdout = std::io::stdout().lock();
-    let _ = serde_json::to_writer(&mut stdout, &value);
-    let _ = stdout.write_all(b"\n");
+    let _ = stdout.write_all(&api_output(&value, args.gzip));
     let _ = stdout.flush();
     code
+}
+
+/// What `trellis api` prints: one line of JSON, or with `--gzip` one line of base64 of that
+/// line gzip-compressed (#915).
+fn api_output(value: &serde_json::Value, gzip: bool) -> Vec<u8> {
+    use base64::Engine;
+    use std::io::Write;
+    let mut line = serde_json::to_vec(value).unwrap_or_default();
+    line.push(b'\n');
+    if !gzip {
+        return line;
+    }
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let compressed = encoder
+        .write_all(&line)
+        .and_then(|()| encoder.finish())
+        .unwrap_or_default();
+    let mut text = base64::engine::general_purpose::STANDARD
+        .encode(compressed)
+        .into_bytes();
+    text.push(b'\n');
+    text
 }
 
 fn socket_path() -> Result<PathBuf> {

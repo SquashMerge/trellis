@@ -863,6 +863,63 @@ async fn workbench_architecture_option_forwards_hidden_layer_population() {
     }
 }
 
+/// #915 (owner ruling 2026-11-11): `pairs=false` leaves `edges[].pairs` out and changes
+/// nothing else; the default and `pairs=true` are the full answer; other values are refused.
+#[tokio::test]
+async fn architecture_pairs_false_leaves_out_edge_pairs_and_nothing_else() {
+    let (base, _runtime, browser, key) = fixture_with_roles(true).await;
+    write_rules(
+        &base,
+        "version=1\n[layers.app]\norder=2\npaths=['src/roles.rs','tests/**']\n[layers.target]\norder=1\npaths=['src/target.rs']",
+    );
+    let app = browser.router();
+    let (status, full) = request(app.clone(), &key, "?role=production&workbench=true").await;
+    assert_eq!(status, StatusCode::OK, "{full}");
+    let edges = full["payload"]["edges"].as_array().unwrap();
+    assert!(!edges.is_empty(), "{full}");
+    assert!(
+        edges.iter().all(|edge| edge["pairs"]
+            .as_array()
+            .is_some_and(|pairs| !pairs.is_empty())),
+        "{full}"
+    );
+    let (status, explicit) = request(
+        app.clone(),
+        &key,
+        "?role=production&pairs=true&workbench=true",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{explicit}");
+    assert_eq!(explicit, full);
+    let (status, compact) = request(
+        app.clone(),
+        &key,
+        "?pairs=false&role=production&workbench=true",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{compact}");
+    let mut expected = full.clone();
+    for edge in expected["payload"]["edges"].as_array_mut().unwrap() {
+        edge.as_object_mut().unwrap().remove("pairs");
+    }
+    assert_eq!(compact, expected);
+    for query in [
+        "?pairs=",
+        "?pairs=0",
+        "?pairs=False",
+        "?pairs",
+        "?pairs=false&pairs=false",
+        "?pairs=false&unexpected=x",
+    ] {
+        let (status, error) = request(app.clone(), &key, query).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {error}");
+        assert_eq!(
+            error["error"]["code"], "invalid_request",
+            "{query}: {error}"
+        );
+    }
+}
+
 /// Every detail page of one kind, followed from offset 0 with `limit`.
 async fn all_details(app: &axum::Router, key: &str, query: &str, limit: usize) -> Vec<Value> {
     let (mut offset, mut items) = (0, Vec::new());
