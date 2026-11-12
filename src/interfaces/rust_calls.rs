@@ -56,8 +56,9 @@ fn collect(
         source: &doc.file.text,
         constants: BTreeMap::new(),
         clients: BTreeSet::new(),
-        fields: BTreeSet::new(),
+        fields: BTreeMap::new(),
         bindings: BTreeMap::new(),
+        globs: Vec::new(),
     };
     // A name declared more than once anywhere may be shadowed, so it is never read. Only a
     // top-level declaration is read, and only from outside every inline module. Every
@@ -72,7 +73,8 @@ fn collect(
     // names a top-level `use reqwest::..` gives the client (#910, precision over recall).
     let mut declared: BTreeMap<&str, usize> = BTreeMap::new();
     let mut imported = BTreeSet::new();
-    let mut fields: BTreeMap<&str, (usize, bool)> = BTreeMap::new();
+    let mut fields: BTreeMap<&str, (usize, bool, Option<&str>)> = BTreeMap::new();
+    let mut globs = Vec::new();
     let mut field_nodes = Vec::new();
     let mut bindings: BTreeMap<&str, Vec<Node<'_>>> = BTreeMap::new();
     walk(root, check, &mut |node, check| {
@@ -98,17 +100,23 @@ fn collect(
                             .or_default()
                             .push(binding);
                     }
-                    "use_wildcard" if local => local_glob = true,
+                    "use_wildcard" if local => {
+                        local_glob = true;
+                        globs.push(binding.byte_range());
+                    }
                     _ => {}
                 }
                 Ok(false)
             })?;
         }
         let kind = node.kind();
+        // An item also binds its name for the locals of a function that holds it: a block's
+        // `const c` hides a parameter `c`.
         if kind.ends_with("_item")
             && let Some(name) = node.child_by_field_name("name")
         {
             *declared.entry(document.text(name)).or_default() += 1;
+            bindings.entry(document.text(name)).or_default().push(node);
         }
         match kind {
             "mod_item" => modules.push(node.byte_range()),
@@ -149,21 +157,31 @@ fn collect(
         }
         Ok(false)
     })?;
-    // An imported client name counts only when nothing else in the document declares it.
+    // An imported client name counts only when nothing else in the document declares it,
+    // and no glob below the top level may bring in another type of that name.
     let document = Document {
         clients: imported
             .into_iter()
-            .filter(|name| declared.get(name) == Some(&1))
+            .filter(|name| !local_glob && declared.get(name) == Some(&1))
             .collect(),
         ..document
     };
-    // A field counts only when it is the one field of that name in the document.
+    // A field counts only when it is the one field of that name in the document, declared
+    // with the client type by a struct whose name the document declares once.
     for field in field_nodes {
         if let Some(name) = field.child_by_field_name("name") {
             let client = field
                 .child_by_field_name("type")
                 .is_some_and(|ty| document.client_type(ty));
-            let entry = fields.entry(document.text(name)).or_insert((0, true));
+            let owner = field
+                .parent()
+                .and_then(|list| list.parent())
+                .filter(|item| item.kind() == "struct_item")
+                .and_then(|item| item.child_by_field_name("name"))
+                .map(|owner| document.text(owner));
+            let entry = fields
+                .entry(document.text(name))
+                .or_insert((0, true, owner));
             entry.0 += 1;
             entry.1 &= client;
         }
@@ -171,9 +189,13 @@ fn collect(
     let document = Document {
         fields: fields
             .into_iter()
-            .filter_map(|(name, (count, client))| (count == 1 && client).then_some(name))
+            .filter_map(|(name, (count, client, owner))| {
+                let owner = owner.filter(|owner| declared.get(owner) == Some(&1))?;
+                (count == 1 && client).then_some((name, owner))
+            })
             .collect(),
         bindings,
+        globs,
         constants: constants
             .into_iter()
             .filter(|(name, _)| !local_glob && !bound.contains(name.as_str()))
@@ -229,11 +251,14 @@ struct Document<'a> {
     /// The names a top-level `use reqwest::..` gives the client that nothing else in the
     /// document declares.
     clients: BTreeSet<&'a str>,
-    /// The field names declared once in the document, with the client type.
-    fields: BTreeSet<&'a str>,
+    /// The field names declared once in the document, with the client type, each with the
+    /// struct that declares it.
+    fields: BTreeMap<&'a str, &'a str>,
     /// Every pattern that binds each name: a parameter, `let`, closure parameter, `match`,
-    /// `if let`, `while let` or `for` pattern, or an import.
+    /// `if let`, `while let` or `for` pattern, an import, or a named item.
     bindings: BTreeMap<&'a str, Vec<Node<'a>>>,
+    /// The byte ranges of the glob imports below the top level.
+    globs: Vec<std::ops::Range<usize>>,
 }
 
 impl<'a> Document<'a> {
@@ -358,28 +383,49 @@ impl<'a> Document<'a> {
 
     /// Whether a receiver is unambiguously a `reqwest` client (#910). Precision wins over
     /// recall: a missed call is acceptable, a false one is not. The receiver is a
-    /// constructor chain ([`Self::constructed`]), `self.<field>` for a field declared once
-    /// in the document with the client type, or a name bound once in its function, by a
-    /// parameter or `let` written with the client type, before the call. Its name says
-    /// nothing.
+    /// constructor chain ([`Self::constructed`]); `self.<field>` inside an `impl` of the
+    /// struct that declares the field, when that is the one field of its name in the
+    /// document, has the client type, and the struct's name is declared once; or a name
+    /// bound once in its function, by a parameter or `let` written with the client type,
+    /// before the call. Its name says nothing.
     fn client(&self, receiver: Node<'a>) -> bool {
         match receiver.kind() {
             "identifier" => self.bound_client(receiver),
             "field_expression" => {
-                receiver
-                    .child_by_field_name("value")
-                    .is_some_and(|value| value.kind() == "self")
-                    && receiver
-                        .child_by_field_name("field")
-                        .is_some_and(|field| self.fields.contains(self.text(field)))
+                let owner = receiver
+                    .child_by_field_name("field")
+                    .and_then(|field| self.fields.get(self.text(field)));
+                let (Some(owner), Some(value)) = (owner, receiver.child_by_field_name("value"))
+                else {
+                    return false;
+                };
+                value.kind() == "self" && self.impl_type(receiver) == Some(*owner)
             }
             _ => self.constructed(receiver),
         }
     }
 
+    /// The type an enclosing `impl` is for, as written, without its generic arguments
+    /// (`impl Source<'_>` is for `Source`).
+    fn impl_type(&self, node: Node<'a>) -> Option<&'a str> {
+        let mut current = node.parent();
+        while let Some(ancestor) = current {
+            if ancestor.kind() == "impl_item" {
+                let mut ty = ancestor.child_by_field_name("type")?;
+                if ty.kind() == "generic_type" {
+                    ty = ty.child_by_field_name("type")?;
+                }
+                return Some(self.text(ty).trim());
+            }
+            current = ancestor.parent();
+        }
+        None
+    }
+
     /// Whether a name is bound exactly once in its enclosing function, before the use, by a
     /// parameter or `let` written with the client type. Any other binding of the name in the
-    /// function (a rebinding, pattern, closure parameter or import) makes it ambiguous.
+    /// function (a rebinding, pattern, closure parameter, import or named item such as a
+    /// block's `const`), or any glob import in the function, makes it ambiguous.
     fn bound_client(&self, name: Node<'a>) -> bool {
         let mut function = name.parent();
         while let Some(node) = function {
@@ -401,9 +447,16 @@ impl<'a> Document<'a> {
                     && pattern.end_byte() <= function.end_byte()
             })
             .collect();
+        let glob = self
+            .globs
+            .iter()
+            .any(|glob| function.start_byte() <= glob.start && glob.end <= function.end_byte());
         let [pattern] = inside[..] else {
             return false;
         };
+        if glob {
+            return false;
+        }
         let Some(binding) = pattern
             .parent()
             .filter(|_| pattern.kind() == "identifier" && pattern.end_byte() <= name.start_byte())

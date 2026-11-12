@@ -493,16 +493,20 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
   is acceptable, a false one is not (#910). It is one of:
   - a chain from `Client::new()`, or from `Client::builder()`, builder methods, `.build()`
     and then `?`, `.unwrap()` or `.expect(..)`, each optionally followed by `.clone()`;
-  - `self.<field>` where that field is declared once in the document, with the client type;
+  - `self.<field>` inside an `impl` (inherent or trait, generic arguments aside) of the
+    struct that declares the field, where that is the one field of its name in the document,
+    it has the client type, and the struct's name is declared once in the document;
   - a name bound exactly once in its function, before the call, by a parameter or `let`
     written with the client type. Any other binding of the name in the function (a
     rebinding, `let` without a type, destructuring or shorthand field, `match` arm or guard
-    pattern, closure parameter, `for`, `if let`, import) makes it ambiguous.
+    pattern, closure parameter, `for`, `if let`, import, or a named item such as a block's
+    `const`), or any glob import in the function, makes it ambiguous.
 
   The client type is `reqwest::Client` or `reqwest::blocking::Client`, seen through `&`, or a
   name (`Client`, or the alias of `Client as Http`) imported from `reqwest` at the top level
   of the document that nothing else in the document declares: no other import, item (`mod`,
-  `struct`, `type` and so on) or name in a generic parameter list. Nested modules, type
+  `struct`, `type` and so on) or name in a generic parameter list, and no glob import
+  below the top level. Nested modules, type
   aliases, generics and types from other documents are not read. The URL, looked through
   `&`, is a string literal without escapes, a visible constant, or a `format!` whose
   substitutions are read where they are a string literal or a visible constant with no
