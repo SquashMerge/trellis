@@ -67,6 +67,8 @@ pub struct Query {
     pub server: Option<String>,
     /// `interfaces`: `matched`, `serverOnly` or `clientOnly`.
     pub list: Option<String>,
+    /// `edge`: the summary edge's `key` (#917).
+    pub key: Option<String>,
 }
 
 /// A malformed detail query; the HTTP route answers `invalid_request`.
@@ -109,26 +111,14 @@ impl Query {
             Kind::Pairs => &["role", "path", "source", "target", "layer", "unlayered"],
             Kind::Unresolved => &["path"],
             Kind::Interfaces => &["client", "server", "list"],
-            Kind::Edge => &[
-                "sourceLayer",
-                "destinationLayer",
-                "role",
-                "status",
-                "excepted",
-                "exceptionReason",
-            ],
+            Kind::Edge => &["key"],
         };
-        // An edge is named by its whole summary identity; only a null reason is left out.
-        if kind == Kind::Edge
-            && [
-                "sourceLayer",
-                "destinationLayer",
-                "role",
-                "status",
-                "excepted",
-            ]
-            .iter()
-            .any(|name| !fields.contains_key(*name))
+        // An edge is named by its bounded summary `key`, never by its reason text.
+        let key = fields.remove("key");
+        if (kind == Kind::Edge)
+            != key.as_deref().is_some_and(|key| {
+                key.len() == 64 && key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            })
         {
             return Err(InvalidQuery);
         }
@@ -239,6 +229,7 @@ impl Query {
             client: fields.remove("client"),
             server: fields.remove("server"),
             list,
+            key,
         })
     }
 }
@@ -305,6 +296,23 @@ pub(crate) struct EdgeKey<'a> {
     pub(crate) status: &'a str,
     pub(crate) excepted: bool,
     pub(crate) reason: Option<&'a str>,
+}
+
+impl EdgeKey<'_> {
+    /// The summary edge's bounded `key` (#917): SHA-256 hex of its whole identity, so a detail
+    /// read names the edge without sending its layer names or exception reason.
+    pub(crate) fn key(&self, role: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let identity = json!([
+            self.source,
+            self.destination,
+            role,
+            self.status,
+            self.excepted,
+            self.reason
+        ]);
+        hex::encode(Sha256::digest(identity.to_string().as_bytes()))
+    }
 }
 
 /// Visit every reference pair that a summary edge counts, production before test, in
@@ -559,13 +567,7 @@ pub(crate) fn page(
         }
         Kind::Edge => {
             edge_pairs(references, rules, check, |role, edge, pair| {
-                if role_is(role)
-                    && query.source_layer.as_deref() == Some(edge.source)
-                    && query.destination_layer.as_deref() == Some(edge.destination)
-                    && query.status.as_deref() == Some(edge.status)
-                    && query.excepted == Some(edge.excepted)
-                    && query.exception_reason.as_deref() == edge.reason
-                {
+                if query.key.as_deref() == Some(edge.key(role).as_str()) {
                     admit(&|| pair.clone())?;
                 }
                 Ok(())
@@ -717,11 +719,14 @@ mod tests {
             "unresolved"
         );
     }
-    /// #917: the `edge` kind pages exactly the pairs one summary edge counts, by its whole
-    /// identity, in evaluation order; same-layer, unassigned and cross-app pairs belong to no
-    /// edge, and an edge that counts nothing is `not_found`.
+    /// #917: the `edge` kind pages exactly the pairs one summary edge counts, named by its
+    /// bounded `key`, in evaluation order; same-layer, unassigned and cross-app pairs belong to
+    /// no edge, a key that names no edge is `not_found`, and reasons of any length (past the
+    /// 4096-byte field bound, or multibyte) never travel in the request.
     #[test]
     fn edge_pages_hold_exactly_one_edges_pairs() {
+        let long = "r".repeat(4097);
+        let wide = "境".repeat(1000);
         let pair = |to: &str, count: u64| {
             json!({"source":{"path":"a.rs"},"target":{"path":to},"count":count,"semanticSites":0,
                 "sites":[{"relationKind":"call"}],"omittedSites":count - 1})
@@ -734,41 +739,45 @@ mod tests {
         };
         let references = json!({
             "production":[pair("b.rs", 2), pair("e.rs", 4), pair("c.rs", 1), pair("s.rs", 1),
-                pair("u.rs", 1), pair("x.rs", 1)],
+                pair("u.rs", 1), pair("x.rs", 1), pair("l.rs", 1), pair("l2.rs", 2), pair("w.rs", 1)],
             "tests":[pair("b.rs", 3)],
         });
         let rules = json!({"rulesFile":{"contentHash":"hash"},
             "instances":[verdict("b.rs", Some("high"), None), verdict("e.rs", Some("high"), Some("ok")),
                 verdict("c.rs", Some("high"), None), verdict("s.rs", Some("low"), None),
-                verdict("u.rs", None, None), verdict("x.rs", Some("high"), None)],
+                verdict("u.rs", None, None), verdict("x.rs", Some("high"), None),
+                verdict("l.rs", Some("high"), Some(&long)), verdict("l2.rs", Some("high"), Some(&long)),
+                verdict("w.rs", Some("high"), Some(&wide))],
             "testOnly":[verdict("b.rs", Some("high"), None)]});
         let native = BTreeMap::new();
         let layers = Layers::new(&native, &rules);
-        let edge = |extra: &[(&str, &str)]| {
+        let key = |destination: &str, role: &str, status: &str, reason: Option<&str>| {
+            EdgeKey {
+                source: "low",
+                destination,
+                status,
+                excepted: reason.is_some(),
+                reason,
+            }
+            .key(role)
+        };
+        let query = |extra: &[(&str, &str)]| {
             let mut fields: BTreeMap<String, String> = [
                 ("kind", "edge"),
                 ("indexGeneration", "12345678-1234-4123-8123-123456789abc"),
                 ("indexRevision", "1"),
                 ("rulesHash", "hash"),
                 ("limit", "1"),
-                ("sourceLayer", "low"),
-                ("destinationLayer", "high"),
-                ("role", "production"),
-                ("status", "deviates"),
-                ("excepted", "false"),
             ]
             .into_iter()
             .map(|(k, v)| (k.to_owned(), v.to_owned()))
             .collect();
             for (k, v) in extra {
-                if v.is_empty() {
-                    fields.remove(*k);
-                } else {
-                    fields.insert((*k).to_owned(), (*v).to_owned());
-                }
+                fields.insert((*k).to_owned(), (*v).to_owned());
             }
             Query::from_fields(fields)
         };
+        let edge = |key: &str| query(&[("key", key)]).unwrap();
         let all = |query: Query| {
             let (mut query, mut items) = (query, Vec::new());
             loop {
@@ -790,32 +799,41 @@ mod tests {
                 .map(|item| item["target"]["path"].as_str().unwrap().to_owned())
                 .collect()
         };
+        let plain = key("high", "production", "deviates", None);
         // One pair per page; the pages concatenate to the edge's pairs, items unchanged.
-        let plain = all(edge(&[]).unwrap()).unwrap();
-        assert_eq!(plain[0], references["production"][0]);
-        assert_eq!(targets(plain), ["b.rs", "c.rs"]);
-        let excepted = edge(&[("excepted", "true"), ("exceptionReason", "ok")]).unwrap();
-        assert_eq!(targets(all(excepted).unwrap()), ["e.rs"]);
-        let test = all(edge(&[("role", "test")]).unwrap()).unwrap();
+        let items = all(edge(&plain)).unwrap();
+        assert_eq!(items[0], references["production"][0]);
+        assert_eq!(targets(items), ["b.rs", "c.rs"]);
+        let excepted = key("high", "production", "deviates", Some("ok"));
+        assert_eq!(targets(all(edge(&excepted)).unwrap()), ["e.rs"]);
+        let long_key = key("high", "production", "deviates", Some(&long));
+        assert_eq!(targets(all(edge(&long_key)).unwrap()), ["l.rs", "l2.rs"]);
+        let wide_key = key("high", "production", "deviates", Some(&wide));
+        assert_eq!(targets(all(edge(&wide_key)).unwrap()), ["w.rs"]);
+        let test = all(edge(&key("high", "test", "deviates", None))).unwrap();
         assert_eq!(test, [references["tests"][0].clone()]);
-        // Every reference pair counts under the same edges as the summary.
-        let mut counted = Vec::new();
-        edge_pairs(&references, &rules, &mut || Ok(()), |role, key, pair| {
-            counted.push((role, key.excepted, pair["target"]["path"].clone()));
+        // Every reference pair counts under the same edges as the summary, keyed alike.
+        let mut keys = BTreeMap::new();
+        edge_pairs(&references, &rules, &mut || Ok(()), |role, edge, _| {
+            *keys.entry(edge.key(role)).or_insert(0) += 1;
             Ok(())
         })
         .unwrap();
-        assert_eq!(counted.len(), 4, "{counted:?}");
+        assert_eq!(keys.values().sum::<i32>(), 7, "{keys:?}");
+        assert_eq!(keys.len(), 5);
+        for known in [&plain, &excepted, &long_key, &wide_key] {
+            assert!(keys.contains_key(known.as_str()));
+        }
         for unknown in [
-            edge(&[("status", "conforms")]).unwrap(),
-            edge(&[("destinationLayer", "low")]).unwrap(),
-            edge(&[("exceptionReason", "ok")]).unwrap(),
-            edge(&[("excepted", "true")]).unwrap(),
+            key("high", "production", "conforms", None),
+            key("low", "production", "deviates", None),
+            key("high", "production", "deviates", Some(&long[1..])),
+            "0".repeat(64),
         ] {
-            let error = all(unknown).unwrap_err().to_string();
+            let error = all(edge(&unknown)).unwrap_err().to_string();
             assert!(error.starts_with("not_found: architecture edge"), "{error}");
         }
-        let mut past = edge(&[]).unwrap();
+        let mut past = edge(&plain);
         past.offset = 3;
         assert!(
             page(&past, &references, &rules, &layers, None, &mut || Ok(()))
@@ -823,18 +841,21 @@ mod tests {
                 .to_string()
                 .starts_with("invalid_request")
         );
+        let upper = plain.to_uppercase();
         for invalid in [
-            &[("status", "")][..],
-            &[("excepted", "")],
-            &[("sourceLayer", "")],
-            &[("role", "")],
-            &[("role", "all")],
-            &[("excepted", "maybe")],
-            &[("path", "a.rs")],
-            &[("layer", "low")],
+            &[][..],
+            &[("key", &plain[1..])],
+            &[("key", upper.as_str())],
+            &[("key", plain.as_str()), ("sourceLayer", "low")],
+            &[("key", plain.as_str()), ("exceptionReason", "ok")],
+            &[("key", plain.as_str()), ("path", "a.rs")],
         ] {
-            assert!(edge(invalid).is_err(), "{invalid:?}");
+            assert!(query(invalid).is_err(), "{invalid:?}");
         }
+        assert!(
+            query(&[("kind", "pairs"), ("key", plain.as_str())]).is_err(),
+            "a key belongs to the edge kind only"
+        );
     }
     /// #784: the `app` filter keeps the rows whose bucket's name matches, so two apps that
     /// share a name answer to one filter value, and a row with no app matches none.

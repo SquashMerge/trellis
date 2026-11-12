@@ -938,8 +938,8 @@ it on the request unless the owner holds it.
 detail. On this repository it went from about 35 MB to about 0.75 MB. Its fields are:
 
 - `layers`, `modules` and summary `edges`. An edge has no pairs or site samples: the
-  `edge` detail kind pages its contributing pairs and their bounded site samples (#917,
-  owner 2026-11-11). Each edge also has `semanticSites` (the sum of its pairs'),
+  `edge` detail kind pages its contributing pairs and their bounded site samples by the
+  edge's `key` (#917, owner 2026-11-11). Each edge also has `semanticSites` (the sum of its pairs'),
   `evidenceTier` (`syntax`, `semantic` or `mixed`) and `coverage`, its source layer and
   role's coverage row plus `complete` (no unresolved site) (#523);
 - `evidenceTier` (`syntax` or `mixed`) at the top level, as in the references payload;
@@ -982,7 +982,7 @@ The kinds and their exact-match filters are:
 | `pairs` | `{role, sourceLayer, targetLayer, pair}`: production pairs, then test pairs | `role`, `path` (source or target path), `source` and `target` (an exact endpoint identity as JSON: a native target or an external package), `layer` (either endpoint), `unlayered=true` (same-layer or an unassigned endpoint) |
 | `unresolved` | one unresolved site | `path` (source path) |
 | `interfaces` (#788) | one interface row | `client`, `server`, `list` (`matched`, `serverOnly` or `clientOnly`) |
-| `edge` (#917) | one reference pair with its sampled sites, as `trellis references` prints it: the pairs one summary edge counts | required: `sourceLayer`, `destinationLayer`, `role`, `status`, `excepted`; `exceptionReason` exactly when the edge has one. An identity that names no edge fails 404 `not_found` |
+| `edge` (#917) | one reference pair with its sampled sites, as `trellis references` prints it: the pairs one summary edge counts | required: `key`, the edge's summary `key` (SHA-256 hex of its layers, role, status, excepted and full exception reason); nothing else. A key that names no edge fails 404 `not_found` |
 
 The response is `{indexGeneration, indexRevision, rulesFile, kind, offset, total,
 nextOffset, items}`. `total` counts every matching item; `nextOffset` is null on the

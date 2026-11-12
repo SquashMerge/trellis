@@ -2661,6 +2661,7 @@ impl EvidenceResponse {
                     ))
                     .or_insert_with(|| {
                         serde_json::json!({
+                            "key": edge.key(role),
                             "sourceLayer": edge.source, "destinationLayer": edge.destination,
                             "role": role, "status": edge.status, "excepted": edge.excepted,
                             "exceptionReason": edge.reason, "count": 0, "semanticSites": 0

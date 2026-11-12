@@ -1014,10 +1014,8 @@
     // kind (#917). Boundary callers group every pair loaded so far, above the pair list.
     function edgePairs(target, record, active) {
       const callers = make("div"), loaded = []; target.append(callers);
-      const scope = {kind:"edge", sourceLayer:record.sourceLayer, destinationLayer:record.destinationLayer, role:record.role,
-        status:record.status, excepted:String(record.excepted), limit:"500"};
-      if (record.exceptionReason !== null) scope.exceptionReason = record.exceptionReason;
-      detailList(target, scope, active, (list, items) => {
+      // The edge's bounded `key` names it; its reason text never travels in the request.
+      detailList(target, {kind:"edge", key:record.key, limit:"500"}, active, (list, items) => {
         loaded.push(...items); callers.replaceChildren(); boundaryCallers(callers, loaded, active); pairDetails(list, items, active);
       }, NO_PAIRS);
     }

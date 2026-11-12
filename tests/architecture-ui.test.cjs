@@ -27,7 +27,9 @@ function fixture(aggregate = "max", hash = "rules-one", role = "production") {
 // The daemon's paged detail route (#448), answered from the last full fixture. The
 // controller receives only the summary (the harness strips the detail arrays).
 const flush = () => new Promise(resolve => setImmediate(resolve));
-const edgeKey = edge => JSON.stringify([edge.sourceLayer, edge.destinationLayer, edge.role, edge.status, String(edge.excepted), edge.exceptionReason ?? null]);
+// The daemon's bounded edge key (#917): a SHA-256 of the edge's whole identity.
+const edgeKey = edge => require("node:crypto").createHash("sha256")
+  .update(JSON.stringify([edge.sourceLayer, edge.destinationLayer, edge.role, edge.status, !!edge.excepted, edge.exceptionReason ?? null])).digest("hex");
 function emulateDetails(full, url, edgePairs) {
   const query = new URL(url, "http://local").searchParams, kind = query.get("kind");
   const layerOf = id => full.modules.find(module => JSON.stringify(module.identity) === JSON.stringify(id))?.layer ??
@@ -50,7 +52,7 @@ function emulateDetails(full, url, edgePairs) {
         (!query.has("unlayered") || item.sourceLayer === null || item.targetLayer === null || item.sourceLayer === item.targetLayer));
   } else if (kind === "edge") {
     // #917: one summary edge's pairs, by its whole identity; an unknown edge is a typed 404.
-    const found = edgePairs.get(JSON.stringify(["sourceLayer", "destinationLayer", "role", "status", "excepted", "exceptionReason"].map(key => query.get(key))));
+    const found = edgePairs.get(query.get("key"));
     if (!found?.length) throw Object.assign(new Error("No such Architecture edge at this pin and rules file"), {status:404, code:"not_found"});
     items = found;
   } else if (kind === "interfaces") {
@@ -96,7 +98,10 @@ function harness() {
     const {instances, testOnly, unassigned, externalPackages, ...rules} = full.rules;
     // #917: summary edges carry no pairs; the edge kind pages them. The pairs move to the
     // emulation, and the test's own edge objects stay the ones the controller draws.
-    for (const edge of full.edges || []) if (Object.hasOwn(edge, "pairs")) { edgePairs.set(edgeKey(edge), edge.pairs); delete edge.pairs; }
+    for (const edge of full.edges || []) {
+      edge.key ??= edgeKey(edge);
+      if (Object.hasOwn(edge, "pairs")) { edgePairs.set(edge.key, edge.pairs); delete edge.pairs; }
+    }
     return {...data, payload:{...full, references, rules}};
   },context:() => context,
     readSource:(site,revision,current) => reads.push({site,revision,current}),openSequence:(...args) => sequences.push(args),onConflict:() => conflicts.push(true)});
@@ -1928,9 +1933,8 @@ test("#917 the edge inspector pages its pairs from the edge kind, with sampled s
   assert.equal(h.get("architecture-inspector-title").textContent, "UI → Storage");
   assert.equal(h.detailCalls.length, 1, "selecting the edge reads its first page");
   const scope = new URL(h.detailCalls[0].url, "http://local").searchParams;
-  deq(Object.fromEntries(["kind","sourceLayer","destinationLayer","role","status","excepted","exceptionReason","limit","offset"].map(key => [key, scope.get(key)])),
-    {kind:"edge",sourceLayer:"UI",destinationLayer:"Storage",role:"production",status:"conforms",excepted:"false",exceptionReason:null,limit:"500",offset:"0"},
-    "the edge's whole identity; a null reason is left out");
+  deq([...scope.keys()].sort(), ["indexGeneration","indexRevision","key","kind","limit","offset","rulesHash"], "the edge is named by its key alone");
+  deq(["kind","key","limit","offset"].map(key => scope.get(key)), ["edge", view.edges[0].key, "500", "0"]);
   const content = () => h.get("architecture-inspector-content");
   const groups = () => descendants(content()).filter(item => item.className === "architecture-caller");
   assert.equal(groups().length, 1);
@@ -1951,6 +1955,20 @@ test("#917 the edge inspector pages its pairs from the edge kind, with sampled s
   assert.equal(h.reads.length, 1, "go-to-site reads the sampled site's source");
   assert.equal(h.reads[0].site.path, "src/a.rs"); assert.equal(h.reads[0].site.range.startLine, 1);
   assert.equal(h.reads[0].revision.indexGeneration, pin.indexGeneration);
+});
+
+test("#917 an excepted edge with a long reason is read by its key; the reason never travels", async () => {
+  for (const reason of ["r".repeat(4097), "境".repeat(1000)]) {
+    const h = harness(), dto = fixture();
+    Object.assign(dto.edges[0], {excepted:true, exceptionReason:reason});
+    h.setResponse(async () => ({payload:dto})); await h.controller.refresh();
+    const {view, options} = h.renders.at(-1);
+    options.onSelectEdge(view.edges[0]); await flush(); await flush();
+    assert.equal(h.detailCalls.length, 1);
+    assert.ok(h.detailCalls[0].url.length < 512, "a bounded request");
+    assert.equal(h.detailCalls[0].url.includes("rrrr") || h.detailCalls[0].url.includes(encodeURIComponent("境")), false);
+    assert.match(text(h.get("architecture-inspector-content")), /src\/a\.rs → src\/b\.rs · 7 reference sites/);
+  }
 });
 
 test("#917 an edge the daemon no longer knows shows its typed error and a reload, not a partial list", async () => {

@@ -881,6 +881,7 @@ async fn architecture_edges_carry_no_pairs_and_pairs_false_changes_nothing() {
     for edge in edges {
         assert!(edge.get("pairs").is_none(), "{edge}");
         for field in [
+            "key",
             "sourceLayer",
             "destinationLayer",
             "role",
@@ -921,20 +922,11 @@ async fn architecture_edges_carry_no_pairs_and_pairs_false_changes_nothing() {
     }
 }
 
-/// The `edge` details scope naming one summary edge by its whole identity (#917).
+/// The `edge` details scope naming one summary edge by its bounded `key` (#917).
 fn edge_scope(edge: &Value) -> String {
-    let mut scope = format!(
-        "kind=edge&sourceLayer={}&destinationLayer={}&role={}&status={}&excepted={}",
-        url_encode(edge["sourceLayer"].as_str().unwrap()),
-        url_encode(edge["destinationLayer"].as_str().unwrap()),
-        edge["role"].as_str().unwrap(),
-        edge["status"].as_str().unwrap(),
-        edge["excepted"].as_bool().unwrap(),
-    );
-    if let Some(reason) = edge["exceptionReason"].as_str() {
-        scope.push_str(&format!("&exceptionReason={}", url_encode(reason)));
-    }
-    scope
+    let key = edge["key"].as_str().unwrap();
+    assert_eq!(key.len(), 64, "{edge}");
+    format!("kind=edge&key={key}")
 }
 
 /// #917: the `edge` kind pages one summary edge's pairs, with their sampled sites, at the
@@ -1020,53 +1012,33 @@ async fn architecture_edge_details_page_each_edges_pairs_at_the_summary_pin() {
     assert_eq!(status, StatusCode::OK, "{page}");
     assert_eq!(page["payload"]["kind"], "edge");
     let total = page["payload"]["total"].as_u64().unwrap();
-    // Unknown edges: another status, another layer, a reason the edge does not have.
-    let other_status = if edges[0]["status"] == "deviates" {
-        "conforms"
-    } else {
-        "deviates"
-    };
-    let mut unknown = vec![
-        first.replace(
-            &format!("status={}", edges[0]["status"].as_str().unwrap()),
-            &format!("status={other_status}"),
-        ),
-        first.replace(
-            &format!(
-                "sourceLayer={}",
-                url_encode(edges[0]["sourceLayer"].as_str().unwrap())
-            ),
-            "sourceLayer=nowhere",
-        ),
-    ];
-    if edges[0]["exceptionReason"].is_null() {
-        unknown.push(format!("{first}&exceptionReason=Reviewed"));
-    }
-    for scope in unknown {
+    // Keys that name no edge at this pin and rules file.
+    let edge_key = edges[0]["key"].as_str().unwrap();
+    let flipped = format!(
+        "{}{}",
+        if edge_key.starts_with('0') { "1" } else { "0" },
+        &edge_key[1..]
+    );
+    for scope in [
+        format!("kind=edge&key={flipped}"),
+        format!("kind=edge&key={}", "f".repeat(64)),
+    ] {
         let (status, error) =
             request(app.clone(), &key, &format!("/details?{scope}&{pinned}")).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{scope}: {error}");
         assert_eq!(error["error"]["code"], "not_found", "{scope}: {error}");
     }
-    // Malformed scopes and offsets are invalid requests.
-    let missing_status = first.replace(
-        &format!("&status={}", edges[0]["status"].as_str().unwrap()),
-        "",
-    );
+    // Malformed scopes and offsets are invalid requests; the identity fields are not accepted.
     for query in [
         format!("{first}&{pinned}&offset={}", total + 1),
         format!("{first}&{pinned}&offset=-1"),
         format!("{first}&{pinned}&limit=0"),
-        format!("{missing_status}&{pinned}"),
+        format!("kind=edge&{pinned}"),
+        format!("kind=edge&key={}&{pinned}", &edge_key[1..]),
+        format!("kind=edge&key={}&{pinned}", edge_key.to_uppercase()),
         format!("{first}&{pinned}&path=src%2Froles.rs"),
-        format!("{first}&{pinned}&excepted=maybe"),
-        format!(
-            "{}&{pinned}",
-            first.replace(
-                &format!("&role={}", edges[0]["role"].as_str().unwrap()),
-                "&role=all"
-            )
-        ),
+        format!("{first}&{pinned}&sourceLayer=app"),
+        format!("{first}&{pinned}&exceptionReason=Reviewed"),
     ] {
         let (status, error) = request(app.clone(), &key, &format!("/details?{query}")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {error}");
@@ -1101,6 +1073,66 @@ async fn architecture_edge_details_page_each_edges_pairs_at_the_summary_pin() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
     assert_eq!(conflict["error"]["code"], "rules_conflict");
+}
+
+/// #917: an exception reason of any length the rules file accepts, past the 4096-byte
+/// request field bound (4,097 ASCII characters) or multibyte (1,000 three-byte characters, about
+/// 9 KB percent-encoded), names its edge through the bounded `key`, so its pairs still page. A
+/// key from before the rules changed is a typed conflict at the old rules hash.
+#[tokio::test]
+async fn architecture_edges_with_long_exception_reasons_page_by_key() {
+    let (base, _runtime, browser, key) = fixture_with_roles(true).await;
+    let app = browser.router();
+    let mut previous: Option<(String, String)> = None;
+    for reason in ["r".repeat(4097), "境".repeat(1000)] {
+        write_rules(
+            &base,
+            &format!(
+                "version=1\n[layers.app]\norder=2\npaths=['src/roles.rs','tests/**']\n[layers.target]\norder=1\npaths=['src/target.rs']\n[[exceptions]]\nrule='$layers'\ntarget={{language='rust',path='src/roles.rs'}}\ndestination={{language='rust',path='src/target.rs'}}\nreason='{reason}'"
+            ),
+        );
+        let (status, summary) = request(app.clone(), &key, "").await;
+        assert_eq!(status, StatusCode::OK, "{summary}");
+        let summary = &summary["payload"];
+        let pinned = format!(
+            "indexGeneration={}&indexRevision={}&rulesHash={}",
+            summary["indexGeneration"].as_str().unwrap(),
+            summary["indexRevision"],
+            summary["rulesFile"]["contentHash"].as_str().unwrap()
+        );
+        let excepted: Vec<&Value> = summary["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|edge| edge["exceptionReason"] == reason.as_str())
+            .collect();
+        assert!(!excepted.is_empty(), "{summary}");
+        for edge in excepted {
+            let pairs = all_details(&app, &key, &format!("{}&{pinned}", edge_scope(edge)), 1).await;
+            assert_eq!(
+                pairs
+                    .iter()
+                    .map(|pair| pair["count"].as_u64().unwrap())
+                    .sum::<u64>(),
+                edge["count"].as_u64().unwrap(),
+                "{edge}"
+            );
+            assert!(pairs.iter().all(|pair| pair["target"]["path"] == "src/target.rs"));
+        }
+        if let Some((scope, old)) = previous.take() {
+            let (status, conflict) =
+                request(app.clone(), &key, &format!("/details?{scope}&{old}")).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+            assert_eq!(conflict["error"]["code"], "rules_conflict");
+        }
+        let first = summary["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|edge| edge["exceptionReason"] == reason.as_str())
+            .unwrap();
+        previous = Some((edge_scope(first), pinned));
+    }
 }
 
 /// Every detail page of one kind, followed from offset 0 with `limit`.

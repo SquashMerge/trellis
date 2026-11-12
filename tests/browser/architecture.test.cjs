@@ -147,10 +147,8 @@ async function architecture(selected, aggregate = "max", role = "production") {
 async function edgePairs(selected, dto, edge) {
   const pairs = [];
   for (let offset = 0; offset !== null;) {
-    const query = new URLSearchParams({kind:"edge", sourceLayer:edge.sourceLayer, destinationLayer:edge.destinationLayer, role:edge.role,
-      status:edge.status, excepted:String(edge.excepted), indexGeneration:dto.indexGeneration, indexRevision:dto.indexRevision,
+    const query = new URLSearchParams({kind:"edge", key:edge.key, indexGeneration:dto.indexGeneration, indexRevision:dto.indexRevision,
       rulesHash:dto.rulesFile.contentHash, offset, limit:2});
-    if (edge.exceptionReason !== null) query.set("exceptionReason", edge.exceptionReason);
     const page = await H.api(selected.server.base, selected.paths.token, "GET", H.scoped(selected.server.rootKey, `architecture/details?${query}`));
     assert.equal(page.status, 200, JSON.stringify(page.data));
     pairs.push(...page.data.payload.items); offset = page.data.payload.nextOffset;
@@ -919,8 +917,9 @@ test("Architecture arrow inspector keeps exact evidence for an excepted arrow, a
   await edge.focus(); await page.keyboard.press("Enter"); await settled(page);
   assert.equal(edgeReads().length, 1, "selecting the arrow reads its pairs once, on demand");
   const scope = edgeReads()[0].url.searchParams;
-  assert.deepEqual(["sourceLayer", "destinationLayer", "role", "excepted"].map(key => scope.get(key)), ["low", "top", "production", "true"]);
-  assert.equal(typeof scope.get("exceptionReason"), "string", "an excepted edge is named with its reason");
+  const excepted = dto.edges.find(edge => edge.role === "production" && edge.sourceLayer === "low" && edge.destinationLayer === "top" && edge.excepted);
+  assert.equal(scope.get("key"), excepted.key, "the excepted edge is named by its key");
+  assert.equal(scope.has("exceptionReason"), false, "its reason never travels");
   assert.equal(await page.locator("#architecture-deviations").isVisible(), false, "an excepted arrow is not a deviation: it keeps the inspector");
   assert.equal(await page.locator("#architecture-review-panel").isVisible(), false, "and opens no review list");
   assert.equal(await page.locator("#architecture-inspector-content input[type=checkbox]").count(), 0);
