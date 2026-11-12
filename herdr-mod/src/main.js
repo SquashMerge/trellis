@@ -454,8 +454,8 @@ export default class Trellis extends View {
       // The Files selection's method list stays, as when the agent shows a sequence; reading it
       // for a newer selection doesn't replace the caller's sequence.
       const file = this.followed(), path = file?.checkout?.rootKey === this.rootKey ? file.path : null;
-      if (path && path !== this.seq.file) { this.seq = { file: path, history: [], expanded: new Set() }; this.loadMethods(cx, false); }
-      this.loadSequence(seed, true, cx);
+      if (path && path !== this.seq.file) { this.seq = { file: path, history: [], expanded: new Set() }; this.loadMethods(cx); }
+      this.loadSequence(seed, true, cx, this.seq, "caller");
       return;
     }
     const path = e.document?.path ?? line.instance.target.path;
@@ -574,9 +574,9 @@ export default class Trellis extends View {
   // a sequence is never shown under another revision's header (#824).
   reloadSequence(cx) {
     const back = this.shown?.back?.seq;
-    if (back?.seed && back !== this.seq) this.loadSequence(back.seed, false, cx, back);
+    if (back?.seed && back !== this.seq) this.loadSequence(back.seed, false, cx, back, "reload");
     if (!this.seq?.file) {
-      if (this.seq?.seed) this.loadSequence(this.seq.seed, false, cx);
+      if (this.seq?.seed) this.loadSequence(this.seq.seed, false, cx, this.seq, "reload");
       return;
     }
     const keep = this.seq.seed;
@@ -585,8 +585,11 @@ export default class Trellis extends View {
     this.loadMethods(cx);
   }
 
-  loadMethods(cx, open = true) {
-    const { rootKey, serial, client } = this, pin = this.status?.pin, seq = this.seq, run = {};
+  // The file's method list. Its first consequential method opens unless a choice was made
+  // while it was read; a caller chosen from Deviations (#939) is kept, and read again here
+  // after a revision change, even when it isn't in this file's list.
+  loadMethods(cx) {
+    const { rootKey, serial, client } = this, pin = this.status?.pin, seq = this.seq, run = {}, picks = seq.picks;
     seq.methodsRun = run;
     const live = () => serial === this.serial && seq === this.seq && run === seq.methodsRun;
     cx.spawn(async (cx) => {
@@ -596,8 +599,10 @@ export default class Trellis extends View {
         if (!Array.isArray(data?.items)) throw new TrellisError("invalid_response", "Invalid method list. Nothing displayed.");
         seq.methods = data.items.map((item) => item?.symbol).filter((symbol) => typeof symbol?.id === "string" && typeof symbol.name === "string");
         const named = seq.methods.filter((m) => !m.name.startsWith("<"));
+        if (seq.picks !== picks) return;
+        if (seq.caller && seq.keep) return this.loadSequence(seq.keep, false, cx, seq, "reload");
         const first = seq.methods.find((m) => m.id === seq.keep?.id) || named.find((m) => data.items.find((i) => i.symbol === m)?.consequential) || named[0] || seq.methods[0];
-        if (first && open) this.loadSequence(first, false, cx);
+        if (first) this.loadSequence(first, false, cx, seq, "auto");
       } catch (error) {
         if (!live()) return;
         seq.methodsError = fail(error);
@@ -606,9 +611,13 @@ export default class Trellis extends View {
   }
 
   // Opens one method's sequence; `push` keeps the current one for Back (a re-center).
-  // `seq` is the shown sequence, or the one an agent show's Back returns to.
-  loadSequence(symbol, push, cx, seq = this.seq) {
+  // `seq` is the shown sequence, or the one an agent show's Back returns to. `how` is "auto"
+  // (the method list's own pick), "reload" (the same seed at a new revision), "caller" (a
+  // Deviations line's caller, which owns the selection until another pick), or a pick.
+  loadSequence(symbol, push, cx, seq = this.seq, how = "pick") {
     const { rootKey, serial, client } = this, pin = this.status?.pin, run = {};
+    // A pick or a caller outranks a method list still being read; a reload keeps the owner.
+    if (how === "pick" || how === "caller") { seq.picks = (seq.picks || 0) + 1; seq.caller = how === "caller"; }
     if (push && seq.seed) seq.history = [...seq.history, seq.seed].slice(-MAX_HISTORY);
     Object.assign(seq, { seed: { id: symbol.id, name: symbol.name, path: symbol.path }, data: null, drawn: null, error: null, selected: null, expanded: new Set(), loading: true, run });
     // Only the newest sequence request of this view may set data, an error or loading.
