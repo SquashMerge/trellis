@@ -813,6 +813,28 @@ pub fn failure(id: &Value, code: &str) -> Value {
       "code":code,"message":message,"retryable":retryable,
       "currentBasis":null,"currentContentHash":null}})
 }
+/// A finished answer over the response cap, as that one call's typed failure (#930). It
+/// keeps the answer's attribution (`workspace`, `catchingUp`) and its `evidenceBasis` as the
+/// current basis. It is retryable only while the answering workspace is catching up, when
+/// what the answer reports may still change; otherwise the same request answers the same.
+pub fn response_too_large(id: &Value, answer: &Value) -> Value {
+    let mut envelope = failure(id, "response_too_large");
+    envelope["error"]["message"] =
+        json!("Result exceeds the 65,536-byte response cap; narrow the request");
+    if let Some(basis) = answer
+        .get("evidenceBasis")
+        .filter(|basis| basis.is_object())
+    {
+        envelope["error"]["currentBasis"] = basis.clone();
+    }
+    if let Some(workspace) = answer.get("workspace") {
+        let catching_up = answer.get("catchingUp") == Some(&json!(true));
+        envelope["error"]["retryable"] = json!(catching_up);
+        envelope["workspace"] = workspace.clone();
+        envelope["catchingUp"] = json!(catching_up);
+    }
+    envelope
+}
 pub fn describe(id: &Value, label: &str) -> Value {
     super::projection::describe(id, label, "unavailable", None, None, None, false)
 }
@@ -1551,7 +1573,7 @@ mod tests {
             json!(-9007199254740991_i64),
         ];
         let describe_expected = json!({"schemaVersion":1,"requestId":7,"evidenceBasis":null,"data":{
-            "workspaceLabel":"selected","indexState":"unavailable","progress":null,"watcherDegraded":false,"languages":[],"toolVersion":28,"schemaVersion":1,
+            "workspaceLabel":"selected","indexState":"unavailable","progress":null,"watcherDegraded":false,"languages":[],"toolVersion":29,"schemaVersion":1,
             "searchIndex":{"backend":null,"unavailableReason":null},
             "apps":{"state":"unavailable","items":[],"noApp":null},
             "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,"sourceLines":200,"defaultLimit":20,"callDefaultLimit":6,"maxLimit":50,"pageBytes":24576,"calleeTextBytes":1024,"hintWorkMs":1000,"deadlineMs":5000,"concurrency":4}},

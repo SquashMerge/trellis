@@ -51,6 +51,21 @@ fn counts(row: &[u64; 5]) -> Value {
     json!({"selected":row[0],"complete":row[1],"partial":row[2],"failed":row[3],"unselected":row[4]})
 }
 
+/// How many of a language's projected documents (#620) are in each read status (#930):
+/// counts only, so a row stays small however many documents are catching up.
+fn document_status(tier: &crate::store::LanguageTier) -> Value {
+    use crate::model::SemanticStatus;
+    let mut counts = [0u64; 3];
+    for document in &tier.documents {
+        counts[match document.projection.semantic_status {
+            SemanticStatus::OlderBasis => 0,
+            SemanticStatus::CatchingUp => 1,
+            SemanticStatus::NeedsReimport => 2,
+        }] += 1;
+    }
+    json!({"olderBasis":counts[0],"catchingUp":counts[1],"needsReimport":counts[2]})
+}
+
 /// The five `LanguageStatus` rows, in #22 language order, from per-language native
 /// tuple counts [selected, complete, partial, failed, unselected] and each language's
 /// selected imported evidence (#528). `nativeCoverageTier` and `coverage` describe the
@@ -67,7 +82,7 @@ fn language_status(rows: &[[u64; 5]; 5], tiers: &Tiers) -> Vec<Value> {
             "semantic":{"available":tier.semantic(),"producerId":tier.producer_id,
                 "freshness":if tier.freshness.is_empty() {"unavailable"} else {tier.freshness},
                 "coverage":counts(&tier.counts),"note":tier.note,"reimport":tier.reimport,
-                "documents":tier.documents}})
+                "documentStatus":document_status(tier)}})
         })
         .collect()
 }
@@ -167,7 +182,7 @@ pub fn describe(
     let deadline_ms = u64::try_from(super::CALL_DEADLINE.as_millis()).unwrap_or(u64::MAX);
     json!({"schemaVersion":1,"requestId":id,"evidenceBasis":basis,
       "data":{"workspaceLabel":label,"indexState":state,"progress":progress,
-      "watcherDegraded":degraded,"languages":languages,"toolVersion":28,"schemaVersion":1,
+      "watcherDegraded":degraded,"languages":languages,"toolVersion":29,"schemaVersion":1,
       "searchIndex":crate::search_model::SearchAvailability::default(),
       // #851: the head's apps, when its architecture is read; the call fills them in.
       "apps":{"state":"unavailable","items":[],"noApp":null},
@@ -368,7 +383,7 @@ mod tests {
         );
         assert_eq!(ready["evidenceBasis"], basis);
         assert_eq!(ready["data"]["watcherDegraded"], true);
-        assert_eq!(ready["data"]["toolVersion"], 28);
+        assert_eq!(ready["data"]["toolVersion"], 29);
         assert_eq!(
             ready["data"]["languages"][1]["coverage"],
             json!({
@@ -659,7 +674,7 @@ for (const name of ['trellis_outgoing_calls','trellis_incoming_calls']) {
             rust["semantic"],
             json!({"available":true,"producerId":"rust-analyzer","freshness":"fresh","note":null,
                 "coverage":{"selected":355,"complete":300,"partial":55,"failed":0,"unselected":0},
-                "partialReasons":null,"reimport":null,"documents":[]})
+                "partialReasons":null,"reimport":null,"documentStatus":{"olderBasis":0,"catchingUp":0,"needsReimport":0}})
         );
         assert_eq!(
             fresh["data"]["languages"][0]["semantic"]["available"],
@@ -1346,10 +1361,10 @@ mod find_tests {
             assert_eq!(
                 data["scopeCoverage"],
                 json!([
-                    {"language":"java","nativeCoverageTier":"syntax","coverage":{"selected":4,"complete":4,"partial":0,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null,"reimport":null,"documents":[]}},
-                    {"language":"rust","nativeCoverageTier":"syntax","coverage":{"selected":117,"complete":6,"partial":111,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null,"reimport":null,"documents":[]}},
-                    {"language":"python","nativeCoverageTier":"syntax","coverage":{"selected":9,"complete":9,"partial":0,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null,"reimport":null,"documents":[]}},
-                    {"language":"javascript","nativeCoverageTier":"syntax","coverage":{"selected":140,"complete":140,"partial":0,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null,"reimport":null,"documents":[]}}
+                    {"language":"java","nativeCoverageTier":"syntax","coverage":{"selected":4,"complete":4,"partial":0,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null,"reimport":null,"documentStatus":{"olderBasis":0,"catchingUp":0,"needsReimport":0}}},
+                    {"language":"rust","nativeCoverageTier":"syntax","coverage":{"selected":117,"complete":6,"partial":111,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null,"reimport":null,"documentStatus":{"olderBasis":0,"catchingUp":0,"needsReimport":0}}},
+                    {"language":"python","nativeCoverageTier":"syntax","coverage":{"selected":9,"complete":9,"partial":0,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null,"reimport":null,"documentStatus":{"olderBasis":0,"catchingUp":0,"needsReimport":0}}},
+                    {"language":"javascript","nativeCoverageTier":"syntax","coverage":{"selected":140,"complete":140,"partial":0,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null,"reimport":null,"documentStatus":{"olderBasis":0,"catchingUp":0,"needsReimport":0}}}
                 ])
             );
             // Incomplete selected scope: partial, one aggregate warning first.
@@ -2287,16 +2302,8 @@ mod compact_symbol_tests {
     #[test]
     fn a_large_unrelated_scope_row_does_not_reject_a_fitting_hit() {
         let mut tiers: Tiers = Default::default();
-        tiers[1].documents = (0..700)
-            .map(|i| {
-                serde_json::from_value(json!({"producerId":"rust-analyzer","language":"rust",
-                "path":format!("src/projected/module_{i:04}.rs"),
-                "projection":{"currentPin":{"indexGeneration":"123e4567-e89b-42d3-a456-426614174000","indexRevision":2},
-                    "semanticBasisPin":{"indexGeneration":"123e4567-e89b-42d3-a456-426614174000","indexRevision":1},
-                    "basisNativeRevisionId":"revision:v2:historical","semanticStatus":"olderBasis"}}))
-                .unwrap()
-            })
-            .collect();
+        // Rows are bounded since #930; an oversized note stands in for any large row.
+        tiers[1].note = Some("n".repeat(crate::mcp::wire::RESPONSE_BYTES));
         let rust_row = serde_json::to_vec(&language_status(&SCOPE, &tiers)[1])
             .unwrap()
             .len();
@@ -2342,6 +2349,100 @@ mod compact_symbol_tests {
                 "zero hits keep the oversized Rust row"
             );
         }
+    }
+
+    /// #930: during catch-up a language row counts its projected documents by read status
+    /// instead of listing them, so more documents than fit in a response as the #620 list
+    /// leave find, search and describe answering, even with zero hits.
+    #[test]
+    fn catch_up_rows_count_document_statuses_instead_of_listing_them() {
+        let status = |i: usize| match i % 7 {
+            0 => "catchingUp",
+            1 => "needsReimport",
+            _ => "olderBasis",
+        };
+        let mut tiers: Tiers = Default::default();
+        tiers[1].documents = (0..700)
+            .map(|i| {
+                serde_json::from_value(json!({"producerId":"rust-analyzer","language":"rust",
+                "path":format!("src/projected/module_{i:04}.rs"),
+                "projection":{"currentPin":{"indexGeneration":"123e4567-e89b-42d3-a456-426614174000","indexRevision":2},
+                    "semanticBasisPin":{"indexGeneration":"123e4567-e89b-42d3-a456-426614174000","indexRevision":1},
+                    "basisNativeRevisionId":"revision:v2:historical","semanticStatus":status(i)}}))
+                .unwrap()
+            })
+            .collect();
+        let listed = serde_json::to_vec(&tiers[1].documents).unwrap().len();
+        assert!(listed > crate::mcp::wire::RESPONSE_BYTES, "{listed}");
+        let counts = json!({"olderBasis":500,"catchingUp":100,"needsReimport":100});
+        let rows = language_status(&SCOPE, &tiers);
+        assert_eq!(rows[1]["semantic"]["documentStatus"], counts);
+        assert!(rows[1]["semantic"].get("documents").is_none());
+        let zero = json!({"olderBasis":0,"catchingUp":0,"needsReimport":0});
+        assert_eq!(rows[0]["semantic"]["documentStatus"], zero);
+        for compact in [false, true] {
+            for hits in [
+                &[("navigationAt", "javascript", "web/app.js", false)][..],
+                &[],
+            ] {
+                let found = find(
+                    &json!(1),
+                    fixture(hits, false),
+                    &tiers,
+                    root(),
+                    false,
+                    true,
+                    compact,
+                )
+                .unwrap()
+                .expect("find fits during catch-up");
+                // A hit lists only its own language; zero hits list every searched one.
+                if hits.is_empty() {
+                    let rust = found["data"]["scopeCoverage"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|row| row["language"] == "rust")
+                        .expect("the searched Rust scope row");
+                    assert_eq!(rust["semantic"]["documentStatus"], counts);
+                }
+                let searched = search(
+                    &json!(1),
+                    search_result(fixture(hits, false)),
+                    &tiers,
+                    root(),
+                    false,
+                    true,
+                    compact,
+                )
+                .unwrap()
+                .expect("search fits during catch-up");
+                assert_eq!(
+                    searched["data"]["hits"].as_array().unwrap().len(),
+                    hits.len()
+                );
+            }
+        }
+        let described = describe(
+            &json!(1),
+            "w",
+            "ready",
+            None,
+            Some((SCOPE, tiers)),
+            Some(
+                json!({"indexGeneration":"123e4567-e89b-42d3-a456-426614174000","indexRevision":2}),
+            ),
+            false,
+        );
+        assert_eq!(
+            described["data"]["languages"][1]["semantic"]["documentStatus"],
+            counts
+        );
+        assert_eq!(
+            described["partial"], true,
+            "pending documents keep describe partial"
+        );
+        assert!(line_bytes(&json!(1), &described, true) < crate::mcp::wire::RESPONSE_BYTES);
     }
 
     /// Full find and search list each distinct coverage diagnostic once in
@@ -5945,7 +6046,7 @@ for (const output of outputs) {
                     "semantic":{"available":false,"producerId":null,"freshness":"unavailable",
                         "coverage":zero,
                         "note":"semantic producer does not cover this language; showing syntax",
-                        "partialReasons":null,"reimport":null,"documents":[]}})
+                        "partialReasons":null,"reimport":null,"documentStatus":{"olderBasis":0,"catchingUp":0,"needsReimport":0}}})
             })
             .collect();
         languages[1]["coverage"] =
@@ -6001,22 +6102,22 @@ for (const output of outputs) {
             .unwrap()
             .len();
         let bytes = line_bytes(&id, &answer, true);
-        assert_eq!((shown, bytes), (43, 24_560));
+        assert_eq!((shown, bytes), (42, 24_353));
         assert!(bytes <= target);
         assert_eq!(
             answer["data"]["coverageDocuments"]["page"]["nextOffset"],
-            43
+            42
         );
         // One more document would not fit: the page is the largest that does.
         let mut over = answer.clone();
         over["data"]["coverageDocuments"]["items"]
             .as_array_mut()
             .unwrap()
-            .push(json!({"language":"rust","path":documents[43].path,"state":"failed","reasons":["other"]}));
-        over["data"]["coverageDocuments"]["page"]["nextOffset"] = json!(44);
-        assert_eq!(line_bytes(&id, &over, true), 25_027);
+            .push(json!({"language":"rust","path":documents[42].path,"state":"failed","reasons":["other"]}));
+        over["data"]["coverageDocuments"]["page"]["nextOffset"] = json!(43);
+        assert_eq!(line_bytes(&id, &over, true), 24_820);
         // Negative control: sizing before the search configuration and workspace are
-        // attached, as 647751cd did, admits 44 documents and a final line over target.
+        // attached, as 647751cd did, admits more documents and a final line over target.
         let mut bare = ready.clone();
         bare["data"]["searchIndex"] = json!({"backend":null,"unavailableReason":null});
         for field in ["workspace", "catchingUp"] {

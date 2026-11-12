@@ -887,7 +887,7 @@ fn exact_tool(v: &Value, code: Option<&str>, modern: bool, label: &str, home: &P
                     row["semantic"],
                     json!({"available":false,"producerId":null,"freshness":"unavailable",
                         "coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},
-                        "documents":[],
+                        "documentStatus":{"olderBasis":0,"catchingUp":0,"needsReimport":0},
                         "note":"no semantic producer published; showing syntax","partialReasons":null,"reimport":null})
                 );
             }
@@ -6216,6 +6216,59 @@ async fn a_call_expires_from_its_read_while_the_coordinator_is_held() {
     session.join().unwrap().unwrap();
 }
 
+/// #930: a finished answer over the response cap answers that one call with a typed
+/// `response_too_large` in its resolved shape. It never ends the connection: a call in
+/// flight beside it and the next call both answer normally.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_oversized_answer_is_typed_and_keeps_the_connection() {
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, registry, _runtime) = ready_registry(temp.path(), 930).await;
+    let hooks = trellis::mcp::TransportHooksForTests {
+        committed_response: Some(std::sync::Arc::new(|id: &Value, response: &mut Value| {
+            if id.as_i64() == Some(1) {
+                response["result"]["structuredContent"]["data"]["workspaceLabel"] =
+                    json!("x".repeat(70_000));
+            }
+        })),
+        ..Default::default()
+    };
+    let (mut client, mut reader, session) = hooked_session(&identity, &registry, 930, None, hooks);
+    writeln!(client, "{}", describe_call(1)).unwrap();
+    writeln!(client, "{}", describe_call(2)).unwrap();
+    let mut replies: Vec<Value> = (0..2).map(|_| next_reply(&mut reader)).collect();
+    replies.sort_by_key(|reply| reply["id"].as_i64());
+    let oversized = &replies[0];
+    assert_eq!(oversized["id"], 1, "{oversized}");
+    assert_eq!(oversized["result"]["isError"], true, "{oversized}");
+    let envelope = &oversized["result"]["structuredContent"];
+    assert_eq!(
+        envelope["error"]["code"], "response_too_large",
+        "{oversized}"
+    );
+    // Not catching up: the same request answers the same, so it is not retryable.
+    assert_eq!(envelope["catchingUp"], false, "{oversized}");
+    assert_eq!(envelope["error"]["retryable"], false, "{oversized}");
+    assert!(envelope["workspace"].is_string(), "{oversized}");
+    assert!(
+        envelope["error"]["currentBasis"]["indexRevision"].is_u64(),
+        "{oversized}"
+    );
+    assert!(envelope.get("data").is_none());
+    for reply in [&replies[1], &{
+        writeln!(client, "{}", describe_call(3)).unwrap();
+        next_reply(&mut reader)
+    }] {
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        assert_eq!(
+            reply["result"]["structuredContent"]["data"]["toolVersion"], 29,
+            "{reply}"
+        );
+    }
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
 /// A find answers wholly from the snapshot it admitted, even while a newer
 /// publication is pending; the next call sees the newer revision.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7168,7 +7221,7 @@ async fn mcp_find_selected_snapshot_ranks_and_keeps_zero_hit_scope() {
             "failed":counts[3],"unselected":counts[4]},
             "semantic":{"available":false,"producerId":null,"freshness":"unavailable",
                 "coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},
-                "documents":[],
+                "documentStatus":{"olderBasis":0,"catchingUp":0,"needsReimport":0},
                 "note":"no semantic producer published; showing syntax","reimport":null}})
     };
     assert_eq!(

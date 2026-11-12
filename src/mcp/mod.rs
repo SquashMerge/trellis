@@ -33,6 +33,11 @@ pub struct OpenedWorkspace {
 #[cfg(feature = "test-support")]
 pub type CallHookForTests = std::sync::Arc<dyn Fn(&serde_json::Value) + Send + Sync>;
 
+/// A test hook given a finished call's ID and its committed response (#930).
+#[cfg(feature = "test-support")]
+pub type CommittedResponseHook =
+    std::sync::Arc<dyn Fn(&serde_json::Value, &mut serde_json::Value) + Send + Sync>;
+
 #[cfg(feature = "test-support")]
 type EvidenceErrorHook =
     std::sync::Arc<dyn Fn(&serde_json::Value, &'static str, &str) + Send + Sync>;
@@ -65,6 +70,9 @@ pub struct TransportHooksForTests {
     /// On the coordinator, at a finished call's send decision after its final
     /// root check, before the last input pass; given the call's ID.
     pub send_decision: Option<CallHookForTests>,
+    /// On the coordinator, given a finished call's ID and its committed JSON-RPC
+    /// response just before it is written; a test may enlarge it past the cap (#930).
+    pub committed_response: Option<CommittedResponseHook>,
     /// This connection's phase barrier and `git`, on the coordinator and every
     /// thread it starts, in place of process environment (#869).
     pub scope: crate::testing::FixtureScope,
@@ -2149,6 +2157,14 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
             {
                 envelope = projection::coverage_documents(id, envelope, documents, request, modern);
             }
+            // #930: describe fits its final answer like the other tools; one over the
+            // response cap is that call's typed failure.
+            if name == "trellis_workspace_describe"
+                && envelope.get("data").is_some()
+                && projection::line_bytes(id, &envelope, modern) > wire::RESPONSE_BYTES
+            {
+                envelope = tools::response_too_large(id, &envelope);
+            }
             tool.response = if architecture::is_tool(&name) || name == architecture::PROMPT_NAME {
                 // Tools page their arrays into the response cap; the prompt never pages.
                 let paging = architecture::is_tool(&name)
@@ -2886,7 +2902,15 @@ fn coordinate(
                 .prepare(token, response)
                 .and_then(|prepared| session.commit(prepared))
             {
-                wire::write_relayed_response(&mut writer, call.relay, &value)?;
+                #[cfg(feature = "test-support")]
+                let value = {
+                    let mut value = value;
+                    if let Some(hook) = &workspace.hooks.committed_response {
+                        hook(&call.id, &mut value);
+                    }
+                    value
+                };
+                send_call(&mut writer, &call, &value)?;
             }
         }
         let now = workspace.clock_now();
@@ -3079,6 +3103,43 @@ fn coordinate(
                 wire::write_relayed_capped(&mut writer, relay, &value, cap)?;
             }
         }
+    }
+}
+
+/// Writes one call's committed response. A response over the cap answers that call
+/// `response_too_large` instead (#930), in the shape its deadline failure would take, so
+/// one oversized answer never ends the connection or the other calls on it; only a failed
+/// write does.
+fn send_call(
+    writer: &mut impl std::io::Write,
+    call: &InFlight,
+    response: &serde_json::Value,
+) -> std::io::Result<()> {
+    match wire::write_relayed_response(writer, call.relay, response) {
+        Err(error) if wire::is_too_large(&error) => {
+            let envelope = match &*call.resolved.lock().unwrap() {
+                Some((root, catching_up)) => {
+                    let mut answer =
+                        tools::attributed_root(serde_json::json!({}), root, *catching_up);
+                    answer["evidenceBasis"] =
+                        response["result"]["structuredContent"]["evidenceBasis"].clone();
+                    tools::response_too_large(&call.id, &answer)
+                }
+                None => {
+                    let mut envelope =
+                        tools::response_too_large(&call.id, &serde_json::Value::Null);
+                    envelope["error"]["attemptedWorkspace"] = tools::attempted(&call.attempted);
+                    envelope
+                }
+            };
+            let result = tools::result(&call.name, envelope, call.modern);
+            wire::write_relayed_response(
+                writer,
+                call.relay,
+                &architecture::response(&call.id, result),
+            )
+        }
+        written => written,
     }
 }
 
