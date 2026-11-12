@@ -129,9 +129,30 @@ fn architecture_exact_counts_roles_policy_samples_and_full_identity_metrics() {
     assert_eq!(edge("entry", "peer", "production")["status"], "deviates");
     assert_eq!(edge("shared", "entry", "production")["status"], "deviates");
     assert_eq!(edge("entry", "shared", "production")["status"], "conforms");
-    let sampled = edge("store", "entry", "production")["pairs"]
-        .as_array()
-        .unwrap()
+    // The edge's pairs and site samples come from the details route's edge kind (#917).
+    assert!(edge("store", "entry", "production").get("pairs").is_none());
+    let pairs = details(
+        &store,
+        &data,
+        "edge",
+        &[(
+            "key",
+            edge("store", "entry", "production")["key"]
+                .as_str()
+                .unwrap(),
+        )],
+        1,
+    );
+    assert_eq!(
+        pairs
+            .iter()
+            .map(|p| p["count"].as_u64().unwrap())
+            .sum::<u64>(),
+        edge("store", "entry", "production")["count"]
+            .as_u64()
+            .unwrap()
+    );
+    let sampled = pairs
         .iter()
         .find(|p| p["target"]["path"] == "src/other.rs")
         .unwrap();

@@ -27,7 +27,10 @@ function fixture(aggregate = "max", hash = "rules-one", role = "production") {
 // The daemon's paged detail route (#448), answered from the last full fixture. The
 // controller receives only the summary (the harness strips the detail arrays).
 const flush = () => new Promise(resolve => setImmediate(resolve));
-function emulateDetails(full, url) {
+// The daemon's bounded edge key (#917): a SHA-256 of the edge's whole identity.
+const edgeKey = edge => require("node:crypto").createHash("sha256")
+  .update(JSON.stringify([edge.sourceLayer, edge.destinationLayer, edge.role, edge.status, !!edge.excepted, edge.exceptionReason ?? null])).digest("hex");
+function emulateDetails(full, url, edgePairs) {
   const query = new URL(url, "http://local").searchParams, kind = query.get("kind");
   const layerOf = id => full.modules.find(module => JSON.stringify(module.identity) === JSON.stringify(id))?.layer ??
     full.references.externalPackages?.find(item => JSON.stringify(item.identity) === JSON.stringify(id))?.layer ?? null;
@@ -47,6 +50,11 @@ function emulateDetails(full, url) {
         is(JSON.stringify(item.pair.source), "source") && is(JSON.stringify(item.pair.target), "target") &&
         (!query.has("layer") || [item.sourceLayer, item.targetLayer].includes(query.get("layer"))) &&
         (!query.has("unlayered") || item.sourceLayer === null || item.targetLayer === null || item.sourceLayer === item.targetLayer));
+  } else if (kind === "edge") {
+    // #917: one summary edge's pairs, by its whole identity; an unknown edge is a typed 404.
+    const found = edgePairs.get(query.get("key"));
+    if (!found?.length) throw Object.assign(new Error("No such Architecture edge at this pin and rules file"), {status:404, code:"not_found"});
+    items = found;
   } else if (kind === "interfaces") {
     items = (full.interfaceRows || []).filter(item => is(item.client, "client") && is(item.server, "server") && is(item.list, "list"));
   } else items = full.references.unresolved.filter(item => is(item.source.path, "path"));
@@ -56,7 +64,7 @@ function emulateDetails(full, url) {
     nextOffset:offset + limit < items.length ? offset + limit : null, items:items.slice(offset, offset + limit)}};
 }
 function harness() {
-  const elements = new Map(), calls = [], detailCalls = [], renders = [], reads = [], conflicts = [], timers = [];
+  const elements = new Map(), calls = [], detailCalls = [], renders = [], reads = [], conflicts = [], timers = [], edgePairs = new Map(), sequences = [];
   let context = {rootKey:"checkout-one",session:1,pin}, response = async () => ({payload:fixture(),catchingUp:false}), full = null, detailError = null, detailGate = null;
   // Created nodes with an id (the inspector's review chips, #449) resolve by that id; the newest wins.
   const created = [];
@@ -81,18 +89,24 @@ function harness() {
   }};
   vm.runInNewContext(pinSource + "\n" + fs.readFileSync(path.join(__dirname, "../web/metric-heat.js"), "utf8") + "\n" + fs.readFileSync(path.join(__dirname, "../web/architecture-apps.js"), "utf8") + "\n" + fs.readFileSync(path.join(__dirname, "../web/architecture-deviations.js"), "utf8") + "\n" + source, {window,document,URLSearchParams,console,setTimeout:(run,delay) => {timers.push({run,delay}); return timers.length;},clearTimeout:id => {if (id) timers[id-1].run = null;}});
   const controller = window.TrellisArchitecture.create({request:async (url,current,options) => {
-    if (url.startsWith("/api/architecture/details?")) { detailCalls.push({url,current}); if (detailError) throw detailError; if (detailGate) await detailGate; return emulateDetails(full, url); }
+    if (url.startsWith("/api/architecture/details?")) { detailCalls.push({url,current}); if (detailError) throw detailError; if (detailGate) await detailGate; return emulateDetails(full, url, edgePairs); }
     calls.push({url,current,options}); const data = await response(url,options);
     if (!url.startsWith("/api/architecture?") || !data?.payload?.references) return data;
     // The daemon sends the summary; only the detail emulation sees the full arrays.
     full = data.payload;
     const {production, tests, unresolved, modules, ...references} = full.references;
     const {instances, testOnly, unassigned, externalPackages, ...rules} = full.rules;
+    // #917: summary edges carry no pairs; the edge kind pages them. The pairs move to the
+    // emulation, and the test's own edge objects stay the ones the controller draws.
+    for (const edge of full.edges || []) {
+      edge.key ??= edgeKey(edge);
+      if (Object.hasOwn(edge, "pairs")) { edgePairs.set(edge.key, edge.pairs); delete edge.pairs; }
+    }
     return {...data, payload:{...full, references, rules}};
   },context:() => context,
-    readSource:(site,revision,current) => reads.push({site,revision,current}),onConflict:() => conflicts.push(true)});
+    readSource:(site,revision,current) => reads.push({site,revision,current}),openSequence:(...args) => sequences.push(args),onConflict:() => conflicts.push(true)});
   const button = label => {const found = descendants(get("architecture-inspector-content")).find(item => item.tagName === "button" && item.textContent === label);assert.ok(found, `Missing ${label}`);return found;};
-  return {timers,window,controller,calls,detailCalls,renders,reads,conflicts,get,button,setContext:value => {context=value;},setResponse:fn => {response=fn;},setRenderer:fn => {renderer=fn;},setDetailError:error => {detailError=error;},setDetailGate:gate => {detailGate=gate;}};
+  return {timers,window,controller,calls,detailCalls,renders,sequences,reads,conflicts,get,button,setContext:value => {context=value;},setResponse:fn => {response=fn;},setRenderer:fn => {renderer=fn;},setDetailError:error => {detailError=error;},setDetailGate:gate => {detailGate=gate;}};
 }
 
 test("init is inert; one owned pin/digest supplies metric values and explicit sampled source actions", async () => {
@@ -1904,6 +1918,75 @@ test("AC25 a selected stub marks its end band with a word, and leaving the selec
   assert.match(h.renders.at(-1).options.layerLabel(h.renders.at(-1).view.layers.find(item => item.name === "Storage")), /server end$/);
 });
 
+// ---- #917: an edge's pairs and sampled sites are read on demand from the edge kind. ----
+test("#917 the edge inspector pages its pairs from the edge kind, with sampled sites, go-to-site and boundary callers", async () => {
+  const h = harness(), dto = fixture();
+  const caller = {syntaxId:"syn-run", stableLookupKey:"src/a.rs::run", name:"run", document:{sourceSetId:"workspace",language:"rust",path:"src/a.rs"}};
+  const site = (n, extra = {}) => ({role:"production",relationKind:"call",spelling:`crate::b::f${n}`,lines:{start:n + 1,end:n + 1},
+    range:{start:n * 10,end:n * 10 + 5},ownerSyntaxId:"owner",callId:`call-${n}`,caller,...extra});
+  const a = dto.modules[0].identity, b = dto.modules[1].identity;
+  // 501 pairs: two pages at the edge scope's 500-pair limit, with one caller on both pages.
+  const pairs = Array.from({length:501}, (_, n) => ({source:a,target:{...b, path:`src/b${n}.rs`},count:2,
+    sites:n === 500 ? [site(n), site(n + 1, {callId:null, caller:null, callerReason:"No measured caller here."})] : [site(n)],
+    omittedSites:n === 500 ? 0 : 1,evidenceTier:"syntax",semanticSites:0}));
+  Object.assign(dto.edges[0], {count:1002, pairs});
+  h.setResponse(async () => ({payload:dto})); await h.controller.refresh();
+  const {view, options} = h.renders.at(-1);
+  assert.equal(h.detailCalls.length, 0, "the summary load reads no pairs");
+  assert.equal(view.edges.some(edge => Object.hasOwn(edge, "pairs")), false, "and the summary edges carry none");
+  options.onSelectEdge(view.edges[0]); await flush(); await flush();
+  assert.equal(h.get("architecture-inspector-title").textContent, "UI → Storage");
+  assert.equal(h.detailCalls.length, 1, "selecting the edge reads its first page");
+  const scope = new URL(h.detailCalls[0].url, "http://local").searchParams;
+  deq([...scope.keys()].sort(), ["indexGeneration","indexRevision","key","kind","limit","offset","rulesHash"], "the edge is named by its key alone");
+  deq(["kind","key","limit","offset"].map(key => scope.get(key)), ["edge", view.edges[0].key, "500", "0"]);
+  const content = () => h.get("architecture-inspector-content");
+  const groups = () => descendants(content()).filter(item => item.className === "architecture-caller");
+  assert.equal(groups().length, 1);
+  assert.match(text(groups()[0]), /run · src\/a\.rs · 500 sampled boundary sites/);
+  assert.match(text(content()), /src\/a\.rs → src\/b0\.rs · 2 reference sites/);
+  assert.match(text(content()), /1 sampled sites · 1 omitted sites/, "the omitted-sites note");
+  await h.button("Show more (1 more of 501)").fire("click"); await flush();
+  assert.equal(new URL(h.detailCalls.at(-1).url, "http://local").searchParams.get("offset"), "500");
+  assert.equal(groups().length, 1, "boundary callers group every loaded pair, across pages");
+  assert.match(text(groups()[0]), /run · src\/a\.rs · 501 sampled boundary sites/);
+  assert.match(text(content()), /crate::b::f501 · No measured caller here\./, "a site without a measured caller is listed apart");
+  assert.match(text(content()), /src\/a\.rs → src\/b500\.rs · 2 reference sites.*2 sampled sites · 0 omitted sites/s);
+  const open = descendants(groups()[0]).find(item => item.tagName === "button" && item.textContent === "Open sequence");
+  await open.fire("click");
+  assert.equal(h.sequences.length, 1); assert.equal(h.sequences[0][0], caller); assert.equal(h.sequences[0][1].length, 501);
+  const go = descendants(content()).find(item => item.tagName === "button" && item.textContent === "Read indexed reference source");
+  await go.fire("click");
+  assert.equal(h.reads.length, 1, "go-to-site reads the sampled site's source");
+  assert.equal(h.reads[0].site.path, "src/a.rs"); assert.equal(h.reads[0].site.range.startLine, 1);
+  assert.equal(h.reads[0].revision.indexGeneration, pin.indexGeneration);
+});
+
+test("#917 an excepted edge with a long reason is read by its key; the reason never travels", async () => {
+  for (const reason of ["r".repeat(4097), "境".repeat(1000)]) {
+    const h = harness(), dto = fixture();
+    Object.assign(dto.edges[0], {excepted:true, exceptionReason:reason});
+    h.setResponse(async () => ({payload:dto})); await h.controller.refresh();
+    const {view, options} = h.renders.at(-1);
+    options.onSelectEdge(view.edges[0]); await flush(); await flush();
+    assert.equal(h.detailCalls.length, 1);
+    assert.ok(h.detailCalls[0].url.length < 512, "a bounded request");
+    assert.equal(h.detailCalls[0].url.includes("rrrr") || h.detailCalls[0].url.includes(encodeURIComponent("境")), false);
+    assert.match(text(h.get("architecture-inspector-content")), /src\/a\.rs → src\/b\.rs · 7 reference sites/);
+  }
+});
+
+test("#917 an edge the daemon no longer knows shows its typed error and a reload, not a partial list", async () => {
+  const h = harness(), dto = fixture();
+  h.setResponse(async () => ({payload:dto})); await h.controller.refresh();
+  const {view, options} = h.renders.at(-1);
+  h.setDetailError(Object.assign(new Error("No such Architecture edge at this pin and rules file"), {status:404, code:"not_found"}));
+  options.onSelectEdge(view.edges[0]); await flush(); await flush();
+  assert.match(text(h.get("architecture-inspector-content")), /No such Architecture edge/);
+  assert.ok(h.button("Reload Architecture"));
+  assert.equal(descendants(h.get("architecture-inspector-content")).some(item => item.className === "architecture-caller"), false);
+});
+
 // ---- #845: edges and arrows open the Deviations tree; the old per-edge review is gone. ----
 const pressedChips = h => treeChips(h).filter(chip => chip.attrs["aria-pressed"] === "true").map(chip => chip.dataset.key);
 function edgeRoutingFixture() {
@@ -1924,18 +2007,18 @@ test("#845 selecting a deviating arrow opens the tree on its edge; other arrows 
     assert.deepEqual(pressedChips(h), [key], "with that edge's chip pressed");
     assert.equal(h.get("architecture-deviations-calls").checked, false);
     assert.equal(h.get("architecture-review-panel").hidden, true, "no review list opens");
-    assert.equal(h.detailCalls.some(call => new URL(call.url, "http://local").searchParams.has("sourceLayer")), false, "no per-edge instance list is read");
+    assert.equal(h.detailCalls.some(call => new URL(call.url, "http://local").searchParams.has("sourceLayer") && new URL(call.url, "http://local").searchParams.get("kind") !== "edge"), false, "no per-edge instance list is read");
   }
   await h.get("architecture-deviations-back").fire("click");
   assert.equal(h.get("architecture-deviations").hidden, true, "Back closes the tree");
   assert.equal(h.get("architecture-inspector-title").textContent, "Architecture review", "and returns to the drawing's resting inspector");
   for (const index of [2, 3, 4]) {
-    const reads = h.detailCalls.length;
+    const reads = h.detailCalls.filter(call => new URL(call.url, "http://local").searchParams.get("kind") === "instances").length;
     options.onSelectEdge(dto.edges[index]); await flush();
     assert.equal(h.get("architecture-deviations").hidden, true, "an excepted, test-only or allowed arrow does not open the tree");
     assert.equal(h.get("architecture-inspector-title").textContent, `${dto.edges[index].sourceLayer} → ${dto.edges[index].destinationLayer}`, "the edge inspector shows the arrow");
     assert.equal(h.get("architecture-review-panel").hidden, true);
-    assert.equal(h.detailCalls.length, reads, "the edge inspector lists no rule instances");
+    assert.equal(h.detailCalls.filter(call => new URL(call.url, "http://local").searchParams.get("kind") === "instances").length, reads, "the edge inspector lists no rule instances");
     assert.equal(descendants(h.get("architecture-inspector-content")).some(item => item.tagName === "input"), false, "no checkboxes");
   }
 });

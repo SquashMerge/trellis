@@ -12836,6 +12836,113 @@ async fn rules_check_paths_scope_the_unassigned_list_through_every_page() {
     session.join().unwrap().unwrap();
 }
 
+/// #912: explaining one instance never returns the checkout's whole unassigned catalog.
+/// Its `unassigned` lists only the instance's own unassigned ends, `unassignedFileCount`
+/// stays checkout-wide, and `page.total` counts exactly the items returned.
+#[tokio::test(flavor = "current_thread")]
+async fn rules_explain_scopes_the_unassigned_catalog_to_the_instance() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    let temp = tempfile::tempdir().unwrap();
+    let mut files: Vec<(String, String)> = (0..60)
+        .map(|i| {
+            (
+                format!("loose_{i:03}.js"),
+                "export const x = 1;\n".to_owned(),
+            )
+        })
+        .collect();
+    files.push(("app_main.js".into(), "export const y = 1;\n".into()));
+    files.push((
+        "lib_000.js".into(),
+        "import { y } from './app_main.js';\n".into(),
+    ));
+    files.push((
+        "lib_001.js".into(),
+        "import { x } from './loose_005.js';\n".into(),
+    ));
+    let borrowed: Vec<_> = files
+        .iter()
+        .map(|(p, t)| (p.as_str(), t.as_str()))
+        .collect();
+    let (identity, topology) = published_inactive_checkout(temp.path(), &borrowed);
+    fs::create_dir(identity.root.join(".trellis")).unwrap();
+    fs::write(
+        identity.root.join(".trellis/rules.toml"),
+        "version = 1\n[layers.app]\norder = 2\npaths = [\"app_main.js\"]\n[layers.lib]\norder = 1\npaths = [\"lib_*.js\"]\n",
+    )
+    .unwrap();
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(912, &identity).unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    architecture_built(&registry, &identity).await;
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 912, None);
+    let mut structured = Vec::new();
+    let mut ask = |id: i64, name: &str, arguments: Value| {
+        let frame = modern(
+            json!(id),
+            "tools/call",
+            json!({"name":name,"arguments":arguments}),
+        );
+        writeln!(client, "{frame}").unwrap();
+        let reply = next_reply(&mut reader);
+        tool(&reply, None, true);
+        let envelope = reply["result"]["structuredContent"].clone();
+        structured.push(json!({"name":name,"structuredContent":envelope.clone()}));
+        envelope["data"].clone()
+    };
+    // Check still pages the whole catalog.
+    let check = ask(
+        1,
+        "trellis_rules_check",
+        json!({"schemaVersion":1,"limit":50}),
+    );
+    assert_eq!(check["unassignedFileCount"], 60);
+    let instance = |source: &str| {
+        check["instances"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["rule"] == "$layers" && row["target"]["path"] == source)
+            .unwrap_or_else(|| panic!("{source} instance: {check}"))
+            .clone()
+    };
+    let explain = |row: &Value| {
+        json!({"schemaVersion":1,"rule":"$layers","target":row["target"],
+            "destination":row["destination"]})
+    };
+    // Both ends assigned: no unassigned file comes back, and the page holds just the
+    // instance.
+    let assigned = instance("lib_000.js");
+    assert_eq!(assigned["destination"]["path"], "app_main.js");
+    let data = ask(2, "trellis_rules_explain", explain(&assigned));
+    assert_eq!(data["instances"].as_array().unwrap().len(), 1, "{data}");
+    assert_eq!(data["unassigned"], json!([]), "{data}");
+    assert_eq!(
+        data["unassignedFileCount"], 60,
+        "the total stays checkout-wide"
+    );
+    assert_eq!(
+        data["page"],
+        json!({"offset":0,"nextOffset":null,"total":1})
+    );
+    // An unassigned destination is the one unassigned item listed.
+    let loose = instance("lib_001.js");
+    assert_eq!(loose["destination"]["path"], "loose_005.js");
+    assert_eq!(loose["status"], "unknown");
+    let data = ask(3, "trellis_rules_explain", explain(&loose));
+    assert_eq!(data["unassigned"], json!([loose["destination"]]), "{data}");
+    assert_eq!(data["unassignedFileCount"], 60);
+    assert_eq!(
+        data["page"],
+        json!({"offset":0,"nextOffset":null,"total":2})
+    );
+    drop(ask);
+    validate_structured_content(&structured);
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
 /// #769: a check instance that omits evidence carries a ready-made `nextCall`. Its
 /// `trellis_rules_explain` arguments, sent back verbatim, succeed and return that
 /// instance with all of its evidence. An instance that omits nothing has no hint.
