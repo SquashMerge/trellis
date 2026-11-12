@@ -750,7 +750,10 @@ fn mark_all_stale(state: &tempfile::TempDir) {
         .join("index.db");
     let db = rusqlite::Connection::open(index).unwrap();
     let changed = db
-        .execute("UPDATE semantic_coverage_freshness SET freshness='stale'", [])
+        .execute(
+            "UPDATE semantic_coverage_freshness SET freshness='stale'",
+            [],
+        )
         .unwrap();
     assert!(changed > 0);
 }

@@ -8585,7 +8585,10 @@ forbid = [{ calls = "helper" }]
     )
     .unwrap();
     // An edit that touches neither document: S carries both forward as possibly stale.
-    write_files(&world.root, &[("src/other.js", "export function other() {}\n")]);
+    write_files(
+        &world.root,
+        &[("src/other.js", "export function other() {}\n")],
+    );
     let options = IndexOptions::new(world.root.clone());
     let capture = trellis::capture::Capture::admit(&options, &world.cancel, &|_| {}).unwrap();
     let leader = world.store.publication_for_tests().unwrap();
@@ -8594,7 +8597,10 @@ forbid = [{ calls = "helper" }]
         .publish_local_for_tests(&options, &capture, &leader, &world.cancel)
         .unwrap();
     drop(leader);
-    let caught = world.store.catch_up_semantic_for_tests(&world.cancel).unwrap();
+    let caught = world
+        .store
+        .catch_up_semantic_for_tests(&world.cancel)
+        .unwrap();
     assert_ne!(caught, native);
     assert!(!world.store.semantic_catch_up_pending_for_tests().unwrap());
     let mut mcp = McpSession::start(&world, 936);
@@ -8619,7 +8625,12 @@ forbid = [{ calls = "helper" }]
             assert_eq!(reply["evidenceBasis"], json!(pin), "{reply}");
         }
         // Semantic catch-up is over: no document reads an older basis or is pending.
-        assert_eq!(references["data"]["semanticDocuments"], json!([]), "{references}");
+        assert_eq!(
+            references["data"]["semanticDocumentStatus"],
+            json!({"olderBasis":0,"catchingUp":0,"needsReimport":0}),
+            "{references}"
+        );
+        assert_eq!(references["data"]["partial"], false, "{references}");
         assert_eq!(references["data"]["evidenceTier"], "mixed", "{references}");
         let mut freshness: Vec<Value> = references["data"]["production"]
             .as_array()
