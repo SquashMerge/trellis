@@ -130,7 +130,8 @@ runnable `pom.xml` and Gradle build modules ([#854](https://github.com/SquashMer
   `kind`, `manifest`, `roots`, `entries`, `counts` (production `$layers` and other rule
   instances given to the app, equal to the CLI's `apps[].counts`), `languages`, `fileCount`,
   `unassignedFileCount` and `source: "manifest"`. `fileCount` and `unassignedFileCount` count
-  the modules whose app is this one. (#794: authored apps come first, by name, with
+  the modules whose app is this one. `languages` lists their languages, leaving out modules in
+  an authored `display = "hidden"` layer, such as fixtures (#909). (#794: authored apps come first, by name, with
   `source: "override"`, `kind` and `manifest` null, `entries` empty and `roots` as authored,
   possibly several; a detected app an authored root shadows is not listed. The browser labels
   an authored app "Authored in .trellis/rules.toml" where a detected one says "Detected from

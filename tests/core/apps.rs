@@ -122,7 +122,7 @@ fn real_manifests(root: &Path) -> Vec<(String, String)> {
 }
 
 #[test]
-fn trellis_layout_detects_daemon_and_web_apps() {
+fn trellis_layout_detects_daemon_herdr_mod_and_web_apps() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let rules_file = fs::read_to_string(manifest.join(".trellis/rules.toml")).unwrap();
     let mut owned = real_manifests(manifest);
@@ -183,6 +183,7 @@ fn trellis_layout_detects_daemon_and_web_apps() {
         apps,
         [
             ("trellis", "Cargo.toml"),
+            ("trellis-herdr-mod", "herdr-mod/package.json"),
             ("trellis-web", "web/package.json")
         ]
     );

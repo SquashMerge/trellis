@@ -2218,7 +2218,8 @@ impl EvidenceResponse {
     }
 
     /// #851: the effective app inventory for `trellis_workspace_describe`, each app with its
-    /// languages and file count, and the files in no app.
+    /// languages and file count, and the files in no app. A file in an authored hidden layer
+    /// counts but adds no language (#909).
     pub(crate) fn app_inventory(
         assignment: &crate::rules::AppAssignment<'_>,
         whole: &crate::references::Projection,
@@ -2236,12 +2237,12 @@ impl EvidenceResponse {
             match assignment.file(path) {
                 Some(app) => {
                     files[app].0 += 1;
-                    files[app].1.insert(
-                        identity["language"]
-                            .as_str()
-                            .context("store_unavailable: module language")?
-                            .to_owned(),
-                    );
+                    let language = identity["language"]
+                        .as_str()
+                        .context("store_unavailable: module language")?;
+                    if assignment.counts_language(path) {
+                        files[app].1.insert(language.to_owned());
+                    }
                 }
                 None => no_app += 1,
             }
@@ -2673,7 +2674,10 @@ impl EvidenceResponse {
                     let entry = &mut app_files[index];
                     entry.0 += 1;
                     entry.1 += usize::from(layer.is_none());
-                    entry.2.insert(key.1);
+                    // #909: hidden tooling, test-harness and fixture layers add no language.
+                    if !layer.is_some_and(|layer| crate::rules::hidden_layer(config, layer)) {
+                        entry.2.insert(key.1);
+                    }
                 }
                 None => unassigned_files += usize::from(layer.is_none()),
             }
