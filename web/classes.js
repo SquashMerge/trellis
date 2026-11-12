@@ -426,6 +426,7 @@
     // A chosen diagram owns status/notices; late catalog pages must not replace them.
     const searchTicket = ++searchSerial;
     lastRead = () => loadDiagram(nextSeed, nextExpanded, fresh, focusId);
+    let outcome = null;
     const c = context(), ticket = ++serial, focusBefore = document.activeElement;
     const restoreFocus = () => {
       if ((!fresh && !focusId) || ticket !== serial || !valid(c) || displayTicket !== ticket) return;
@@ -460,6 +461,8 @@
     } catch (error) {
       if (ticket === serial && searchTicket === searchSerial && valid(c) && error.name !== "AbortError") {
         const conflict = window.TrellisIndexPin.isConflict(error);
+        // Stall recovery (#906) is told when this, still-current, read stalled; never a stale one's.
+        if (error.transient) outcome = {stalled:true};
         const recoverable = diagram && snapshot && valid(snapshot) && ![401, 403].includes(error.status) && !conflict;
         if (recoverable) {
           // This request never published a new view. Restore only the still-current cached view.
@@ -474,6 +477,7 @@
         }
       }
     } finally { if (ticket === serial && searchTicket === searchSerial && valid(c)) ui.diagram.setAttribute("aria-busy", "false"); }
+    return outcome;
   }
   function classActions(node) {
     const c = snapshot, generation = diagramGeneration;

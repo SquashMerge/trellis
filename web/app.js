@@ -453,11 +453,17 @@ async function applyAgentView(request, pin, context, ticket, owned, claim) {
     await navigateDiagram(data.seed, pin, "sequence", data, false, null, null, true);
   } else if (request.view === "class") {
     rememberVisible(pin);
-    const stalls = stallCount;
-    await navigateDiagram({id:request.symbolId}, pin, "class", null, false, null, null, true);
-    // Classes reports its own load failure; a stall during it leaves the show to recovery,
-    // which owns the view this show itself opened.
-    if (stallCount !== stalls) { claim.marks = viewMarks(); return false; }
+    const opening = navigateDiagram({id:request.symbolId}, pin, "class", null, false, null, null, true);
+    // This show's own navigation has taken its ticket; only a later navigation changes it.
+    const navigation = navigationSerial;
+    const outcome = await opening;
+    // Classes reports its own load failure. Only a stall of this show's own, still-current class
+    // read, with nothing navigated since, leaves the show to recovery, which then owns the view
+    // the show itself opened. Any other failure or stall drops the show (#906).
+    if (outcome?.stalled && navigation === navigationSerial && ticket === showSerial && !followPinned && navigationCurrent(context)) {
+      claim.marks = viewMarks(); return false;
+    }
+    if (navigation !== navigationSerial || ticket !== showSerial) return false;
   } else {
     // The source read takes its own serials, which a user's source or Files choice advances;
     // the read paints only while this show is still the latest and unpinned. Nothing else is

@@ -2386,3 +2386,48 @@ test("recovery's Refresh reloads the Classes view on screen, not an earlier Sequ
   assert.deepEqual(calls, ["classes"]);
   assert.equal(h.context.TrellisClassesRetry.sequence, undefined);
 });
+// A Classes show is kept for recovery only when its own, still-current class read stalled.
+async function classShowHarness() {
+  const {h, requests} = await showHarness();
+  h.run("status.workspaceRoot = '/synthetic'; $('treemap-panel').hidden = true; $('architecture-panel').hidden = true");
+  const opens = [];
+  h.context.ClassesStub = {opens, open(options) { const read = deferred(); opens.push({options, read, reset:false}); return read.promise; },
+    reset() { for (const open of opens) open.reset = true; }};
+  h.run("window.TrellisClasses = {open: options => ClassesStub.open(options), reset: () => ClassesStub.reset(), retry: async () => {}, closeContextMenu() {}, scopeChanged() {}}");
+  h.context.fetch = async (path, options) => {
+    requests.push([path, options]);
+    if (path === "/api/sequence") return response(view(JSON.parse(options.body).seed));
+    if (path === "/api/status") return response({revision:SHOW_PIN, catchingUp:false, stats:{}});
+    if (path === "/api/status/head") return response({revision:SHOW_PIN, catchingUp:false, indexedAt:null, viewRequest:null});
+    return {ok:false, status:503, json:async () => ({})};
+  };
+  return {h, opens};
+}
+test("a Classes show whose own class read stalled is kept for recovery", async () => {
+  const {h, opens} = await classShowHarness();
+  const show = h.run(`observeViewRequest(${JSON.stringify(shown(4, {view:"class", symbolId:"K"}))})`);
+  await settleMany();
+  assert.equal(opens.length, 1);
+  await assert.rejects(h.run("api('/api/class-diagram', 'POST', {})"), /503/);
+  opens[0].read.resolve({stalled:true}); await show; await settleMany();
+  assert.equal(h.run("stalledShow?.request.symbolId"), "K");
+  assert.equal(h.get("agent-shown").hidden, true);
+});
+test("a user navigation during a Classes show's read wins, even when an unrelated read stalls", async () => {
+  const {h, opens} = await classShowHarness();
+  const show = h.run(`observeViewRequest(${JSON.stringify(shown(4, {view:"class", symbolId:"K"}))})`);
+  await settleMany();
+  // An unrelated Git status read stalls, and the user opens a Sequence.
+  await assert.rejects(h.run("api('/api/git')"), /503/);
+  await h.run("navigateDiagram({id:'user', name:'user', path:'a.js'}, status.revision)"); await settleMany();
+  assert.equal(h.run("selectedMethod.id"), "user");
+  // Classes itself rejects its stale read, so it reports no stall of its own.
+  assert.equal(opens[0].reset, true);
+  opens[0].read.resolve(null); await show; await settleMany();
+  assert.equal(h.run("stalledShow"), null, "the old show is not re-stamped with the user's marks");
+  // Recovery refreshes the user's view and never replays the show.
+  const [[id, timer]] = recoveryTimers(h); h.timers.delete(id); timer.callback(); await settleMany();
+  assert.equal(opens.length, 1, "no second class read");
+  assert.equal(h.run("selectedMethod.id"), "user");
+  assert.equal(h.get("agent-shown").hidden, true);
+});
