@@ -568,7 +568,10 @@ async function api(path, method = "GET", body, callerCurrent = () => true, condi
           ...(conditional?.etag ? {"If-None-Match": conditional.etag} : {})},
         body: body === undefined ? undefined : JSON.stringify(body)});
       if (!current()) throw aborted();
-      data = response.status === 204 ? null : response.status === 304 && conditional?.etag ? conditional.data : await response.json();
+      // An error answer may carry no JSON at all (a proxy's or a dying server's HTML, or an empty
+      // body); it is still classified by its status below (#906).
+      data = response.status === 204 ? null : response.status === 304 && conditional?.etag ? conditional.data
+        : response.ok ? await response.json() : await response.json().catch(() => null);
     })()]);
   } catch (error) {
     if (!current()) throw aborted();

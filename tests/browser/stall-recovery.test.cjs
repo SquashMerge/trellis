@@ -42,16 +42,21 @@ async function published(callback) {
     rmSync(paths.temp, {recursive:true, force:true, maxRetries:10, retryDelay:100});
   }
 }
-// While `stall.on`, every request to the selected checkout's API answers 503 (no typed body)
-// or fails as a timed-out connection, alternately. `stall.only` narrows it to one route.
+// While `stall.on`, every request to the selected checkout's API answers an untyped 503, an
+// HTML 503 or an empty 502, or fails as a timed-out connection, in turn. `stall.only` narrows it to one route.
 async function stallable(page, server) {
   const stall = {on:false, only:null, failed:[]};
   await page.route(url => url.pathname.startsWith(`/api/checkouts/${server.rootKey}/`), async route => {
     const path = new URL(route.request().url()).pathname.slice(`/api/checkouts/${server.rootKey}/`.length);
     if (!stall.on || (stall.only && path !== stall.only)) return route.fallback();
     stall.failed.push(path);
-    if (stall.failed.length % 2) return route.fulfill({status:503, contentType:"application/json", body:"{}"});
-    return route.abort("timedout");
+    // What a stalled daemon or a proxy in front of it sends: untyped JSON, HTML, nothing, or no answer.
+    switch (stall.failed.length % 4) {
+      case 1: return route.fulfill({status:503, contentType:"application/json", body:"{}"});
+      case 2: return route.fulfill({status:503, contentType:"text/html", body:"<html><body>Service Unavailable</body></html>"});
+      case 3: return route.fulfill({status:502, body:""});
+      default: return route.abort("timedout");
+    }
   });
   return stall;
 }

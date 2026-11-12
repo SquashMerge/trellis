@@ -2230,3 +2230,42 @@ test("a head digest whose catchingUp differs from status reads status once, whic
   h.run("observePinnedHead()"); await settleMany();
   assert.deepEqual(requests, ["/api/status/head", "/api/status", "/api/status/head"], "status agrees now; nothing more is read");
 });
+// A proxy's or a dying server's answer has no JSON: HTML or an empty body.
+const htmlReply = status => ({ok:false, status, json:async () => { throw new SyntaxError("Unexpected token '<'"); }});
+const emptyReply = status => ({ok:false, status, json:async () => { throw new SyntaxError("Unexpected end of JSON input"); }});
+test("an HTML 503 or an empty 502 is a stall and starts recovery", async () => {
+  for (const [name, reply, message] of [["html 503", () => htmlReply(503), /Request failed \(503\)/], ["empty 502", () => emptyReply(502), /Request failed \(502\)/]]) {
+    const h = harness();
+    h.context.fetch = async () => reply();
+    const error = await h.run("api('/api/git')").catch(failure => failure);
+    assert.match(error.message, message, name);
+    assert.equal(error.transient, true, name);
+    assert.equal(recoveryTimers(h).length, 1, name);
+  }
+  // The follow poll's head read is the same api(): an HTML 503 there starts recovery too.
+  const h = harness();
+  h.run("status.workspaceRoot = '/synthetic'");
+  h.context.fetch = async () => htmlReply(503);
+  h.run("observePinnedHead()"); await settleMany();
+  assert.equal(recoveryTimers(h).length, 1);
+});
+test("recovery keeps backing off across repeated HTML 503s until the daemon answers", async () => {
+  const h = harness();
+  let answers = false;
+  h.context.fetch = async () => answers ? response({revision:STALL_PIN}) : htmlReply(503);
+  h.run("refreshView = async () => { await api('/api/status'); }");
+  await assert.rejects(h.run("api('/api/git')"), /Request failed \(503\)/);
+  const delays = [];
+  for (let i = 0; i < 5; i++) {
+    const pending = recoveryTimers(h);
+    assert.equal(pending.length, 1, `attempt ${i} is scheduled`);
+    const [id, timer] = pending[0];
+    delays.push(timer.delay); h.timers.delete(id);
+    if (i === 4) answers = true;
+    timer.callback(); await settleMany();
+  }
+  assert.deepEqual(delays, [2000, 4000, 8000, 16000, 32000]);
+  assert.equal(recoveryTimers(h).length, 0);
+  assert.equal(h.run("recovery"), null);
+  assert.equal(h.get("error").hidden, true);
+});
