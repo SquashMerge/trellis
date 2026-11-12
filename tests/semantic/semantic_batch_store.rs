@@ -8242,17 +8242,15 @@ async fn catch_up_answers_count_document_statuses_past_the_response_cap() {
     mcp.finish();
 }
 
-/// #934: during semantic catch-up the unchanged documents' older-basis projection answers
-/// P's reference sites, with labels, and never a superset of them. P's use-site claims that
-/// no structural site spells add no site, as they add none at P, so a revision
-/// whose sites fit the budget at P still fits it while catching up: references and rules
-/// answer instead of `bounded_work` for the whole catch-up window.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn catch_up_answers_architecture_within_the_basis_site_budget() {
-    use trellis::model::SemanticStatus;
-    const DOCUMENTS: usize = 20;
-    const IMPORT: &str = "import { g } from './g.js';\n";
-    const BODY: &str = "const v = 1; return v;";
+const CATCH_UP_DOCUMENTS: usize = 20;
+const CATCH_UP_IMPORT: &str = "import { g } from './g.js';\n";
+const CATCH_UP_BODY: &str = "const v = 1; return v;";
+
+/// #934: P, a published import of `CATCH_UP_DOCUMENTS` modules that each import `g`, one
+/// structural site apiece. Each `export function uNNNNN() { const v = 1; return v; }` also
+/// carries one resolved use, of `v` in `return v`, that is neither a call nor a type: no
+/// structural site spells it, and at P it adds no site of its own.
+fn catch_up_world() -> (World, IndexPin, String) {
     let world = world_with(
         |root| {
             fs::create_dir_all(root.join(".git")).unwrap();
@@ -8260,25 +8258,20 @@ async fn catch_up_answers_architecture_within_the_basis_site_budget() {
                 .unwrap()
                 .attach_marker()
                 .unwrap();
-            let mut files: Vec<(String, String)> = (0..DOCUMENTS)
+            let mut files: Vec<(String, String)> = (0..CATCH_UP_DOCUMENTS)
                 .map(|number| {
                     (
                         format!("src/u{number:05}.js"),
-                        format!("{IMPORT}export function u{number:05}() {{ {BODY} }}\n"),
+                        format!(
+                            "{CATCH_UP_IMPORT}export function u{number:05}() {{ {CATCH_UP_BODY} }}\n"
+                        ),
                     )
                 })
                 .collect();
             files.push(("src/g.js".into(), "export function g() {}\n".into()));
-            let files: Vec<(&str, &str)> = files
-                .iter()
-                .map(|(path, text)| (path.as_str(), text.as_str()))
-                .collect();
-            write_files(root, &files);
-            write_files(
-                root,
-                &[(
-                    ".trellis/rules.toml",
-                    r#"version = 1
+            files.push((
+                ".trellis/rules.toml".into(),
+                r#"version = 1
 [roles.entry]
 select = { name = "u00001", language = ["javascript"] }
 [roles.helper]
@@ -8287,16 +8280,18 @@ select = { name = "g", language = ["javascript"] }
 id = "entry-must-not-call-helper"
 for_each = "entry"
 forbid = [{ calls = "helper" }]
-"#,
-                )],
-            );
+"#
+                .into(),
+            ));
+            let files: Vec<(&str, &str)> = files
+                .iter()
+                .map(|(path, text)| (path.as_str(), text.as_str()))
+                .collect();
+            write_files(root, &files);
         },
         true,
     );
     let mut fixture = world.fixture();
-    // Each `export function uNNNNN() { const v = 1; return v; }` carries one resolved use,
-    // of `v` in `return v`, that is neither a call nor a type: no structural site spells it,
-    // and at P it adds no site of its own.
     let docs = fixture
         .paths("javascript")
         .into_iter()
@@ -8313,25 +8308,18 @@ forbid = [{ calls = "helper" }]
     let producer = world.store.semantic_at(p).unwrap().producers[0].id.clone();
     assert_eq!(
         world.count("SELECT count(*) FROM semantic_references WHERE site='use'"),
-        DOCUMENTS as i64
+        CATCH_UP_DOCUMENTS as i64
     );
-    let sites = |reply: &Value| {
-        let counts = &reply["data"]["counts"];
-        counts["mappedSites"].as_u64().unwrap() + counts["unresolvedSites"].as_u64().unwrap()
-    };
-    let mut mcp = McpSession::start(&world, 934);
-    let arguments = json!({"schemaVersion":1,"limit":50});
-    let at_p = mcp.success("trellis_references", arguments.clone());
-    assert_eq!(at_p["evidenceBasis"], json!(p));
-    // Every site at P is a structural import of `g`; the semantic uses add none.
-    let budget = sites(&at_p);
-    assert_eq!(budget, DOCUMENTS as u64, "{at_p}");
-    // The edit keeps its one import and publishes native N; startup stays held, so no
-    // S catches it up, and the head is built under P's exact site count.
-    trellis::references::set_site_limit_for_tests(budget as usize);
+    (world, p, producer)
+}
+
+/// #934: an edit to `src/u00000.js` that keeps its one import publishes native N. Startup
+/// stays held, so no S catches it up: every other module reads P as `olderBasis`.
+fn publish_catch_up_edit(world: &World, p: IndexPin, producer: &str) -> IndexPin {
+    use trellis::model::SemanticStatus;
     fs::write(
         world.root.join("src/u00000.js"),
-        format!("{IMPORT}export function u00000() {{  {BODY} }}\n"),
+        format!("{CATCH_UP_IMPORT}export function u00000() {{  {CATCH_UP_BODY} }}\n"),
     )
     .unwrap();
     let (graph, native, capture) = index_workspace_bundle(
@@ -8349,10 +8337,17 @@ forbid = [{ calls = "helper" }]
     drop(leader);
     let older = world
         .store
-        .semantic_projection_at(pin, &producer, "javascript", "src/u00001.js")
+        .semantic_projection_at(pin, producer, "javascript", "src/u00001.js")
         .unwrap()
         .unwrap();
     assert_eq!(older.semantic_status, SemanticStatus::OlderBasis);
+    pin
+}
+
+/// #934: references, rules check and rules explain all answer at the catch-up head N,
+/// labelled as catching up and partial. Returns the references answer.
+fn catch_up_architecture_answers(mcp: &mut McpSession, pin: IndexPin) -> Value {
+    let arguments = json!({"schemaVersion":1,"limit":50});
     let references = mcp.success("trellis_references", arguments.clone());
     let checked = mcp.success("trellis_rules_check", arguments.clone());
     let instance = checked["data"]["instances"]
@@ -8371,8 +8366,47 @@ forbid = [{ calls = "helper" }]
         assert_eq!(reply["catchingUp"], true, "{reply}");
         assert_eq!(reply["data"]["partial"], true, "{reply}");
     }
+    references
+}
+
+/// #934: during semantic catch-up the unchanged documents' older-basis projection answers
+/// P's reference sites, with labels, and never a superset of them. P's use-site claims that
+/// no structural site spells add no site, as they add none at P, so a revision whose sites
+/// fit the budget at P still fits it while catching up: references and rules answer instead
+/// of `bounded_work` for the whole catch-up window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn catch_up_answers_architecture_within_the_basis_site_budget() {
+    let (world, p, producer) = catch_up_world();
+    let sites = |reply: &Value| {
+        let counts = &reply["data"]["counts"];
+        counts["mappedSites"].as_u64().unwrap() + counts["unresolvedSites"].as_u64().unwrap()
+    };
+    let mut mcp = McpSession::start(&world, 934);
+    let at_p = mcp.success("trellis_references", json!({"schemaVersion":1,"limit":50}));
+    assert_eq!(at_p["evidenceBasis"], json!(p));
+    // Every site at P is a structural import of `g`; the semantic uses add none.
+    let budget = sites(&at_p);
+    assert_eq!(budget, CATCH_UP_DOCUMENTS as u64, "{at_p}");
+    // N's core is built under P's exact site count.
+    trellis::references::set_site_limit_for_tests(budget as usize);
+    let pin = publish_catch_up_edit(&world, p, &producer);
+    let references = catch_up_architecture_answers(&mut mcp, pin);
     assert_eq!(sites(&references), budget, "{references}");
-    trellis::references::set_site_limit_for_tests(usize::MAX);
+    mcp.finish();
+}
+
+/// #934: the older-basis projection reads each stored semantic row once. A projected
+/// binding's declared endpoint is the binding's own row, so it is not admitted a second
+/// time against the snapshot's semantic row bound: P's evidence that fits the bound at P
+/// still fits it while catching up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn catch_up_admits_each_projected_semantic_row_once() {
+    let (world, p, producer) = catch_up_world();
+    // Exactly P's stored use rows; the older-basis modules hold all but the edited one's.
+    trellis::store::set_architecture_semantic_rows_for_tests(CATCH_UP_DOCUMENTS);
+    let mut mcp = McpSession::start(&world, 9341);
+    let pin = publish_catch_up_edit(&world, p, &producer);
+    catch_up_architecture_answers(&mut mcp, pin);
     mcp.finish();
 }
 

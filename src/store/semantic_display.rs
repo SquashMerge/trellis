@@ -1451,6 +1451,23 @@ impl EvidenceResponse {
 /// At most this many semantic rows are admitted into one architecture snapshot (#523).
 const ARCHITECTURE_SEMANTIC_ROWS: usize = 2_000_000;
 
+#[cfg(feature = "test-support")]
+static TEST_SEMANTIC_ROWS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(ARCHITECTURE_SEMANTIC_ROWS);
+
+/// Lower the semantic evidence row bound, so a test's small revision can reach it.
+#[cfg(feature = "test-support")]
+pub fn set_architecture_semantic_rows_for_tests(limit: usize) {
+    TEST_SEMANTIC_ROWS.store(limit, std::sync::atomic::Ordering::Release);
+}
+
+fn semantic_rows_limit() -> usize {
+    #[cfg(feature = "test-support")]
+    return TEST_SEMANTIC_ROWS.load(std::sync::atomic::Ordering::Acquire);
+    #[cfg(not(feature = "test-support"))]
+    ARCHITECTURE_SEMANTIC_ROWS
+}
+
 fn architecture_derived_from(
     capture_id: Option<i64>,
     provenance_id: Option<String>,
@@ -1524,7 +1541,7 @@ pub(super) fn architecture_semantic(
     let mut admit = || -> Result<()> {
         rows += 1;
         ensure!(
-            rows <= ARCHITECTURE_SEMANTIC_ROWS,
+            rows <= semantic_rows_limit(),
             "bounded_work: architecture semantic evidence"
         );
         Ok(())
@@ -1738,6 +1755,8 @@ pub(super) fn architecture_semantic(
         "SELECT declared_kind,declared_internal_language,declared_internal_path,declared_internal_syntax_id,CASE WHEN declared_kind='internal' THEN COALESCE(declared_internal_native_revision_id,?3) END,declared_external_scheme,declared_external_symbol,declared_external_scope,declared_external_language,declared_external_path,'declared' FROM semantic_references WHERE payload_id=?1 AND reference_id=?2
          UNION ALL SELECT kind,internal_language,internal_path,internal_syntax_id,CASE WHEN kind='internal' THEN COALESCE(internal_native_revision_id,?3) END,external_scheme,external_symbol,external_scope,external_language,external_path,'candidate' FROM semantic_reference_candidates WHERE payload_id=?1 AND reference_id=?2",
     )?;
+    let eligible: std::cell::RefCell<HashMap<(String, usize, IndexPin), bool>> =
+        std::cell::RefCell::default();
     for (tuple, i, producer, complete, projection) in tuples {
         let historical = projection.is_some();
         let endpoint = |language: Option<&str>, path: Option<&str>| -> Result<Option<usize>> {
@@ -1745,17 +1764,33 @@ pub(super) fn architecture_semantic(
                 return Ok(None);
             };
             if let Some(projection) = &projection {
-                let doc = &documents[target];
-                if super::native_first::endpoint_boundary(
-                    db,
-                    pin,
-                    &producer,
-                    &doc.key.language,
-                    &doc.key.path,
-                    projection.semantic_basis_pin,
-                )?
-                .is_some()
-                {
+                // One eligibility read per target document and basis (#934): every
+                // endpoint of every projected row asks, and the answer is the document's.
+                let basis = projection.semantic_basis_pin;
+                let known = eligible
+                    .borrow()
+                    .get(&(producer.clone(), target, basis))
+                    .copied();
+                let current = match known {
+                    Some(current) => current,
+                    None => {
+                        let doc = &documents[target];
+                        let current = super::native_first::endpoint_boundary(
+                            db,
+                            pin,
+                            &producer,
+                            &doc.key.language,
+                            &doc.key.path,
+                            basis,
+                        )?
+                        .is_none();
+                        eligible
+                            .borrow_mut()
+                            .insert((producer.clone(), target, basis), current);
+                        current
+                    }
+                };
+                if !current {
                     return Ok(None);
                 }
             }
@@ -1821,7 +1856,10 @@ pub(super) fn architecture_semantic(
                 let mut alternatives =
                     call_endpoints.query(params![row.get::<_, i64>(11)?, native])?;
                 while let Some(target) = alternatives.next()? {
-                    admit()?;
+                    // The declared endpoint is this binding's own row, admitted above (#934).
+                    if target.get_ref(10)?.as_str()? != "declared" {
+                        admit()?;
+                    }
                     if target.get_ref(0)?.as_str_or_null()? == Some("internal") {
                         eligible_endpoints &= endpoint(
                             target.get_ref(1)?.as_str_or_null()?,
@@ -1926,7 +1964,10 @@ pub(super) fn architecture_semantic(
                     native
                 ])?;
                 while let Some(target) = alternatives.next()? {
-                    admit()?;
+                    // The declared endpoint is this reference's own row, admitted above (#934).
+                    if target.get_ref(10)?.as_str()? != "declared" {
+                        admit()?;
+                    }
                     if target.get_ref(0)?.as_str_or_null()? == Some("internal") {
                         eligible_endpoints &= endpoint(
                             target.get_ref(1)?.as_str_or_null()?,
