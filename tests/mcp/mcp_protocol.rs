@@ -790,7 +790,8 @@ fn rules_envelopes_accept_classified_evidence_and_kind_counts() {
                 "instances":[instance],"testOnly":[],"counts":counts,"testCounts":counts,
                 "apps":[{"name":"trellis","source":"manifest","manifest":"Cargo.toml","counts":counts}],"noApp":{"counts":counts},
                 "unassignedFileCount":0,"unassigned":[],"partialFiles":[],"limitations":[],
-                "externalPackages":[],"page":page,"semanticBases":[]},
+                "externalPackages":[],"page":page,"semanticBases":[],
+                "semanticDocumentStatus":{"olderBasis":0,"catchingUp":0,"needsReimport":0}},
             "warnings":[],"partial":false,"truncated":false,"truncationReason":null,
             "workspace":"/selected","catchingUp":false})
     };
