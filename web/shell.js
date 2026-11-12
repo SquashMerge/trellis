@@ -147,6 +147,9 @@
       if (tab) tab.tabIndex = key === name ? 0 : -1;
     }
     syncViewTabs();
+    // Focus on another tab moves to the shown one, so no tab but the selected one looks current (#913).
+    const focused = document.activeElement;
+    if (focused?.closest?.("#diagram-tabs") && focused !== get(`view-${name}`)) get(`view-${name}`)?.focus();
     viewCallback?.(name);
   }
   function syncViewTabs() {

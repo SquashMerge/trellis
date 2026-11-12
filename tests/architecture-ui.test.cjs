@@ -1562,7 +1562,12 @@ test("AC12 info_counts_scope_to_app", async () => {
   assert.ok(notice().includes("1 of 6 production rule instances unknown in daemon."), "the app's summed counts");
   assert.ok(notice().includes("1 unassigned native file modules remain unknown in daemon."), "the app's unassigned modules");
   assert.ok(notice().includes("4 unassigned identities (native files and external packages) in the rule-check catalog (whole checkout)."));
-  assert.match(h.get("architecture-coverage").textContent, /^9 of 9 reference sites mapped/, "coverage stays the whole snapshot");
+  // #913: one app's coverage and site counts are its own layers' (daemon: Storage and the Shared layers it sees).
+  assert.match(h.get("architecture-coverage").textContent, /^2 of 2 reference sites from daemon's layers mapped/, "coverage counts the app's layers");
+  assert.ok(notice().includes("2 mapped reference sites · 0 bound by semantic evidence · 0 unresolved from daemon's layers. Missing sites do not prove absence."));
+  await chooseApp(h, "All apps");
+  assert.match(h.get("architecture-coverage").textContent, /^9 of 9 reference sites mapped/, "All apps counts the whole snapshot");
+  assert.ok(notice().includes("9 mapped reference sites · 0 bound by semantic evidence · 0 unresolved. Missing sites do not prove absence."));
 });
 
 test("AC13 an app no ordered layer names shows the setup help and its unassigned files", async () => {
