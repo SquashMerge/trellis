@@ -80,8 +80,20 @@ paths = [
   "tools/metrics-oracle/**", "tools/metrics-bench/**", "tools/semantic-search/**",
   "tools/synthetic-cohorts/generate.mjs", "tools/synthetic-cohorts/test/**",
   "docs/semantic-evidence/check-policy.mjs", "docs/semantic-evidence/id-test-vectors/**",
-  "build.rs", "build/**", "examples/**", "herdr-mod/**",
+  "build.rs", "build/**", "examples/**",
 ]
+
+# --- app "trellis-herdr-mod" (herdr-mod/package.json): the Herdr app mod (#707, #909).
+[layers.herdr-mod]
+app = "trellis-herdr-mod"
+order = 1
+paths = ["herdr-mod/**"]
+
+[layers.herdr-mod-tests]
+app = "trellis-herdr-mod"
+display = "hidden"
+order = 0
+paths = ["herdr-mod/test/**"]
 
 # Captured sample programs are inputs, not Trellis runtime implementations.
 [layers.fixture-inputs]
