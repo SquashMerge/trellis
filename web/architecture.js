@@ -863,6 +863,11 @@
       for (const entry of entriesOf) {
         const words = apps.endsText(entry, routed.undrawn.get(entry) || []), button = make("button", undefined, "architecture-interface-card");
         button.type = "button"; button.setAttribute("aria-pressed", "false"); button.setAttribute("data-trellis-action-id", apps.key(entry)); button.setAttribute("data-trellis-card", "interface");
+        const client = places.get(entry.client), server = places.get(entry.server), gutter = Math.min(client.index, server.index);
+        // A gutter narrower than a card (#949) lists the card under the grid, as for columns that are not adjacent;
+        // away from its gutter a card names its interface, as the Herdr pane's cards do.
+        const floats = plan.sideBySide && Math.abs(client.index - server.index) === 1 && apps.cardFits(plan.gutters[gutter]);
+        if (plan.sideBySide && !floats) button.append(make("span", `${entry.client} → ${entry.server}`, "architecture-card-line"));
         for (const row of apps.cardText(entry)) {
           const item = make("span", row.text, "architecture-card-line");
           if (row.strong) item.dataset.strong = "true";
@@ -873,10 +878,8 @@
         button.append(make("span", "Selected", "architecture-selected-tag"));
         button.setAttribute("aria-label", apps.cardName(entry)); cardEntries.set(button, entry);
         button.addEventListener("click", () => { if (!active()) return; inspect("interface", entry); pressOnly(button); });
-        const client = places.get(entry.client), server = places.get(entry.server), gutter = Math.min(client.index, server.index);
         if (!plan.sideBySide) columns[client.index].after(button);
-        // A gutter narrower than a card (#949) lists the card under the grid, as for columns that are not adjacent.
-        else if (Math.abs(client.index - server.index) === 1 && apps.cardFits(plan.gutters[gutter])) {
+        else if (floats) {
           // Below its own lines, so the card never covers a run; later cards in the gutter stack under it.
           const ys = routed.lines.filter(item => item.entry === entry).map(item => item.y), start = ys.length ? Math.max(...ys) + 14 : Math.min(client.top, server.top);
           const top = Math.max(start, floor.get(gutter) || 0);

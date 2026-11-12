@@ -98,7 +98,8 @@ test("all_apps_layout: columns side by side with a lane-sized gutter, the card u
   const card = page.locator(".architecture-interface-card");
   assert.equal(await card.count(), 1);
   const lines = await card.locator(".architecture-card-line").allTextContents();
-  assert.equal(lines[0], "HTTP · 1 route"); assert.match(lines[1], /^\d+ call sites?$/);
+  // Listed under the grid (#949), the card first names its interface.
+  assert.equal(lines[0], `${longName} → srv`); assert.equal(lines[1], "HTTP · 1 route"); assert.match(lines[2], /^\d+ call sites?$/);
   assert.ok(lines.includes("◆ 1 server-only")); assert.ok(lines.includes("◆ 1 client-only"));
   const boxes = await page.evaluate(() => {
     const rect = node => { const r = node.getBoundingClientRect(); return {left:r.left, right:r.right, top:r.top, bottom:r.bottom}; };
@@ -132,14 +133,15 @@ const serverFirstFiles = new Map([
 const serverFirstRules = "version=1\n[layers.server]\napp='srv'\norder=1\npaths=['src/**']\n[layers.first]\napp='one'\norder=1\npaths=['one/**']\n[layers.second]\napp='two'\norder=1\npaths=['two/**']\n";
 
 test("#949 three apps at a realistic width: the server between its two clients, side by side with both lines, the inspector open", {timeout:240000}, async () => published(serverFirstFiles, serverFirstRules, async ({page}) => {
-  // A canvas of about 1100px beside the open inspector.
-  await page.setViewportSize({width:1700, height:1000});
+  // Three 352px columns and two 48px gutters need 1152px of canvas plus its 24px padding: 1780 gives a
+  // canvas of about 1200px beside the open inspector, with room for a classic 15px scrollbar.
+  await page.setViewportSize({width:1780, height:1000});
   await page.locator("#architecture-state[data-state=ready]").waitFor({state:"attached"});
   await page.waitForFunction(() => document.querySelectorAll(".architecture-app-column").length === 3 && document.querySelector(".architecture-apps-grid")?.dataset.layout === "columns"
     && !document.getElementById("architecture-diagram").dataset.layout).catch(() => {});
   const inputs = await layoutInputs(page);
   assert.ok(inputs.inspector > 0, `the inspector is open: ${JSON.stringify(inputs)}`);
-  assert.ok(inputs.canvasClientWidth >= 1080 && inputs.canvasClientWidth <= 1180, `a canvas of about 1100px: ${JSON.stringify(inputs)}`);
+  assert.ok(inputs.canvasClientWidth <= 1260, `a canvas well under main's 1408px threshold: ${JSON.stringify(inputs)}`);
   assert.equal(inputs.layout, "columns", `the three columns sit side by side: ${JSON.stringify(inputs)}`);
   assert.deepEqual(await page.locator(".architecture-app-column").evaluateAll(nodes => nodes.map(node => node.getAttribute("aria-label"))), ["two", "srv", "one"],
     "the client with more matched routes on the server's left, the other on its right");

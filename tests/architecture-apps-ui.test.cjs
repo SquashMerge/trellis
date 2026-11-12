@@ -260,6 +260,7 @@ test("gutters and lanes (#949): a gutter as wide as its lines, a line per end in
   const under = descendants(h.get("architecture-diagram")).find(item => item.className === "architecture-apps-cards");
   assert.deepEqual(cardsOf(h).map(item => [item.parent === under, item.attrs["data-gutter"]]), [[true, undefined], [true, undefined], [true, undefined]],
     "a 48px gutter is narrower than a card, so every card is listed under the grid");
+  assert.deepEqual(cardsOf(h).map(item => item.children[0].textContent), ["web → api", "api → db", "db → api"], "and names its interface");
 });
 
 test("interface order (#949): 3 apps at a realistic width put the server between its 2 clients, side by side with both lines", async () => {
@@ -276,7 +277,7 @@ test("interface order (#949): 3 apps at a realistic width put the server between
   assert.deepEqual(columnsOf(h).map(item => item.attrs["aria-label"]), ["two", "srv", "one"]);
   const lines = descendants(h.get("architecture-diagram")).filter(item => item.attrs.class === "architecture-apps-line");
   assert.deepEqual(lines.map(item => JSON.parse(item.attrs["data-interface"]).slice(1)), [["one", "srv"], ["two", "srv"]], "both interfaces run as lines");
-  assert.equal(cardsOf(h).some(item => /→/.test(text(item))), false, "no end is left to words");
+  assert.equal(cardsOf(h).some(item => descendants(item).some(child => child.className === "architecture-card-ends")), false, "no end is left to words");
 });
 
 test("an interface between columns that are not adjacent, or stacked columns, name their ends in words", async () => {
