@@ -136,7 +136,10 @@ pub struct ReferenceBase {
     sources: Vec<Option<SourceReferences>>,
     /// Language to selected producer.
     producers: BTreeMap<String, String>,
-    semantic_documents: Vec<Value>,
+    /// How many projected documents (#620) are in each read status: older basis, catching
+    /// up, needs re-import. Counts only (#932, follows owner ruling #930 2026-11-12), so an
+    /// answer stays small however many documents are catching up.
+    document_status: [usize; 3],
     /// The most sites each edge keeps; `select` samples at most this many.
     sample_limit: usize,
     work_used: usize,
@@ -897,18 +900,18 @@ fn resolve(
         modules,
         sources,
         producers,
-        semantic_documents: docs
+        document_status: docs
             .iter()
-            .filter_map(|doc| {
-                doc.semantic.projection.as_ref().map(|projection| {
-                    json!({
-                        "producerId":doc.semantic.producer_id,"language":doc.key.language,
-                        "path":doc.key.path,"projection":projection,
-                        "coverageState":doc.semantic.coverage_state,"boundary":doc.semantic.boundary
-                    })
-                })
-            })
-            .collect(),
+            .filter_map(|doc| doc.semantic.projection.as_ref())
+            .fold([0; 3], |mut counts, projection| {
+                use crate::model::SemanticStatus;
+                counts[match projection.semantic_status {
+                    SemanticStatus::OlderBasis => 0,
+                    SemanticStatus::CatchingUp => 1,
+                    SemanticStatus::NeedsReimport => 2,
+                }] += 1;
+                counts
+            }),
         sample_limit,
         work_used: rust.work.used,
     })
@@ -1089,8 +1092,9 @@ impl ReferenceBase {
                 "referencesVersion":"references:v2","indexGeneration":self.pin.index_generation.to_string(),
                 "indexRevision":self.pin.index_revision,"evidenceTier":if semantic_sites > 0 { "mixed" } else { "syntax" },"semanticComplete":false,
                 "semanticProducers":semantic_producers,
-                "semanticDocuments":self.semantic_documents,
-                "partial":!self.semantic_documents.is_empty(),
+                "semanticDocumentStatus":{"olderBasis":self.document_status[0],
+                    "catchingUp":self.document_status[1],"needsReimport":self.document_status[2]},
+                "partial":self.document_status.iter().any(|&count| count > 0),
                 "modules":emitted_modules,"externalPackages":external_packages.into_values().collect::<Vec<_>>(),"production":production,"tests":tests,"unresolved":unresolved,
                 "counts":{"scannedDocuments":scanned,"mappedSites":mapped,"unresolvedSites":unresolved.len(),"semanticSites":semantic_sites},
                 "partialFiles":partial_files,
