@@ -549,6 +549,21 @@ fn paged(id: &Value, name: &str, mut envelope: Value, paging: Paging, modern: bo
                     .any(|wanted| item["status"].as_str() == Some(wanted.as_str()))
             })
     };
+    // #908: a grouped answer pages only its rows. Each page lists the external descriptors
+    // of its own rows' targets, as a check page lists its semantic bases (#725), so the
+    // descriptors ride beside their rows and never fill a page ahead of them.
+    let packages = match &group {
+        Some(_) => envelope["data"]["externalPackages"]
+            .as_array_mut()
+            .map(std::mem::take)
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let package_index: std::collections::BTreeMap<String, usize> = packages
+        .iter()
+        .enumerate()
+        .map(|(index, package)| (package["identity"].to_string(), index))
+        .collect();
     let fields = paged_fields(name);
     let mut items = Vec::new();
     for field in fields {
@@ -607,14 +622,24 @@ fn paged(id: &Value, name: &str, mut envelope: Value, paging: Paging, modern: bo
         // Its whole-result refs are never shorter than the page's own.
         let refs = if rules && instance {
             basis_refs(&mut item)
+        } else if field == "groups" {
+            package_index
+                .get(&item["target"].to_string())
+                .copied()
+                .into_iter()
+                .collect()
         } else {
             Default::default()
         };
         let entries = refs
             .difference(&listed)
             .map(|index| {
-                serde_json::to_vec(&basis_entry(&bases[*index], *index))
-                    .map_or(usize::MAX, |bytes| bytes.len() + 1)
+                let entry = if rules {
+                    basis_entry(&bases[*index], *index)
+                } else {
+                    packages[*index].clone()
+                };
+                serde_json::to_vec(&entry).map_or(usize::MAX, |bytes| bytes.len() + 1)
             })
             .fold(0, usize::saturating_add);
         let size = serde_json::to_vec(&item)
@@ -633,6 +658,9 @@ fn paged(id: &Value, name: &str, mut envelope: Value, paging: Paging, modern: bo
                     json!((offset + 1 < total).then_some(offset + 1));
                 if rules {
                     page_bases(&mut single["data"], &bases);
+                }
+                if group.is_some() {
+                    page_packages(&mut single["data"], &packages, &refs);
                 }
                 if frame_bytes(&single) < super::wire::RESPONSE_BYTES {
                     return capped_whole(id, name, single, modern);
@@ -657,7 +685,16 @@ fn paged(id: &Value, name: &str, mut envelope: Value, paging: Paging, modern: bo
     if rules {
         page_bases(&mut envelope["data"], &bases);
     }
+    if group.is_some() {
+        page_packages(&mut envelope["data"], &packages, &listed);
+    }
     capped_whole(id, name, envelope, modern)
+}
+
+/// A grouped references page's `externalPackages` (#908): the descriptors of its rows'
+/// external targets, each once, in the whole answer's order.
+fn page_packages(data: &mut Value, packages: &[Value], used: &std::collections::BTreeSet<usize>) {
+    data["externalPackages"] = used.iter().map(|index| packages[*index].clone()).collect();
 }
 
 /// The `package` group of a native module in no app (#837). An app's group is its manifest
@@ -1768,6 +1805,106 @@ mod tests {
         assert_eq!(data["groupBy"], "file");
         assert_eq!(data["groups"], json!([]));
         assert_eq!(data["page"]["total"], 1 + 401 + 400 + 100);
+    }
+
+    /// #908: 52 external descriptors whose manifest evidence alone is over a page never push
+    /// the grouped rows off the first page. A page lists only its rows' external targets'
+    /// descriptors, so `limit` bounds them too, and the pages together list each once.
+    #[test]
+    fn grouped_pages_list_only_their_rows_external_descriptors() {
+        let id = json!(7);
+        let identity = |n: usize| {
+            json!({"kind":"externalPackage","sourceSetId":"s","language":"rust",
+                "package":format!("crate_{n:02}"),"standardLibrary":false})
+        };
+        let evidence = |n: usize, section: &str| {
+            json!({"kind":"manifest","sourceSetId":"s","nativeRevisionId":"r".repeat(64),
+                "dependencyHash":"d".repeat(64),"path":"Cargo.toml","contentHash":"c".repeat(64),
+                "importRoot":format!("crate_{n:02}"),"section":section,"key":format!("crate_{n:02}"),
+                "versionConstraint":"=1.2.3"})
+        };
+        let packages: Vec<Value> = (0..52)
+            .map(|n| {
+                json!({"identity":identity(n),"ecosystem":"cargo",
+                    "evidence":[evidence(n, "dependencies"), evidence(n, "dev-dependencies")]})
+            })
+            .collect();
+        let bytes = serde_json::to_vec(&packages).unwrap().len();
+        assert!(bytes > PAGE_BYTES, "descriptors alone are {bytes} bytes");
+        let edge = |source: &str, target: Value, count: usize| {
+            json!({"source":module(source),"target":target,"count":count,"sites":[],
+                "omittedSites":count,"evidenceTier":"syntax","semanticSites":0})
+        };
+        let mut production = vec![edge("src/mcp.rs", module("src/store.rs"), 60)];
+        production.extend((0..52).map(|n| edge("src/lib.rs", identity(n), 1)));
+        let data = json!({"referencesVersion":"references:v2","indexGeneration":"g","indexRevision":1,
+            "evidenceTier":"syntax","semanticComplete":false,"semanticProducers":[],"semanticDocuments":[],
+            "partial":false,"modules":[],"externalPackages":packages,"production":production,
+            "tests":[],"unresolved":[],
+            "counts":{"scannedDocuments":3,"mappedSites":112,"unresolvedSites":0,"semanticSites":0},
+            "partialFiles":[],"limitations":[],
+            crate::rules::PATH_APPS:{"src/mcp.rs":"Cargo.toml","src/store.rs":"Cargo.toml",
+                "src/lib.rs":"Cargo.toml"}});
+        let mut whole = envelope(&id, data);
+        whole["workspace"] = json!("/checkout");
+        whole["catchingUp"] = json!(false);
+        let package = Grouping {
+            package: true,
+            ..Grouping::default()
+        };
+        let page = |offset: u64, rows: Option<usize>| {
+            let paging = Paging {
+                offset,
+                instances: rows,
+                status: None,
+                group: Some(package.clone()),
+            };
+            let result = capped(&id, "trellis_references", whole.clone(), Some(paging), true);
+            result["structuredContent"]["data"].clone()
+        };
+        let first = page(0, None);
+        assert_eq!(
+            first["groups"][0],
+            json!({"source":"Cargo.toml","target":"Cargo.toml","sites":60,"production":60,"test":0})
+        );
+        assert_eq!(first["page"]["total"], 53, "the sequence is the rows");
+        for rows in [None, Some(5)] {
+            let (mut offset, mut listed, mut shown) = (0, Vec::new(), 0);
+            loop {
+                let data = page(offset, rows);
+                let targets: Vec<&Value> = data["groups"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| &row["target"])
+                    .filter(|target| target.is_object())
+                    .collect();
+                let identities: Vec<&Value> = data["externalPackages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|package| &package["identity"])
+                    .collect();
+                assert_eq!(identities, targets, "{rows:?}");
+                if let Some(rows) = rows {
+                    assert!(identities.len() <= rows);
+                }
+                shown += data["groups"].as_array().unwrap().len();
+                listed.extend(data["externalPackages"].as_array().unwrap().iter().cloned());
+                match data["page"]["nextOffset"].as_u64() {
+                    Some(next) => offset = next,
+                    None => break,
+                }
+            }
+            assert_eq!(shown, 53, "{rows:?}");
+            assert_eq!(
+                listed,
+                whole["data"]["externalPackages"]
+                    .as_array()
+                    .unwrap()
+                    .clone()
+            );
+        }
     }
 
     /// #837: `package` groups native modules by the store's file apps (an app's manifest,
