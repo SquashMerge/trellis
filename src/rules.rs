@@ -3096,7 +3096,7 @@ pub(crate) fn evaluate_prepared<'a>(
     Ok(Evaluation {
         data: json!({"rulesVersion":"rules:v2","indexGeneration":refs.data["indexGeneration"],"indexRevision":refs.data["indexRevision"],"rulesFile":descriptor(config),
         "counts":counts(&instances),"apps":app_counts,"noApp":{"counts":no_app},"testCounts":counts(&test_only),"instances":instances,"testOnly":test_only,"unassigned":unassigned,"unassignedFileCount":unassigned_files,"externalPackages":external_packages,
-        "partialFiles":partial_files,"limitations":limitations,"semanticDocuments":refs.data["semanticDocuments"],"partial":refs.data["partial"]}),
+        "partialFiles":partial_files,"limitations":limitations,"semanticDocumentStatus":refs.data["semanticDocumentStatus"],"partial":refs.data["partial"]}),
         layers: assignments,
     })
 }
