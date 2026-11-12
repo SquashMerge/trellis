@@ -496,10 +496,13 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
   the client type, or a `let` of such a receiver or its `.clone()`. A `let` is in scope from
   its end to the end of its block, so its initializer reads the previous binding; any other
   pattern (`for`, `match`, `if let`, closure parameter, import) hides the name over its whole
-  construct. The client type is `reqwest::Client`, `reqwest::blocking::Client`, or a name a
-  `use reqwest::..` gives it (`Client`, or the alias of `Client as Http`) where that import is
-  in scope: in the block or module that holds it, not in an inline `mod` nested there. It is
-  seen through `&`. A field declared in another document is not read. The URL, looked through
+  construct, and so does every name a destructuring pattern binds (tuple, struct, shorthand
+  field, slice, `ref`, `@`). The client type is `reqwest::Client`, `reqwest::blocking::Client`,
+  or a name whose nearest declaration in scope is a `use reqwest::..` of the client
+  (`Client`, or the alias of `Client as Http`). A declaration is in scope in the block,
+  module or item that holds it, not in an inline `mod` nested there; a nearer import, glob,
+  item or type parameter of the name hides an outer one, and an explicit import beats a glob
+  in the same scope. It is seen through `&`. A field declared in another document is not read. The URL, looked through
   `&`, is a string literal without escapes, a visible constant, or a `format!` whose
   substitutions are read where they are a string literal or a visible constant with no
   format specification (`{x}`, `{}`, `{0}`), and are `{}` otherwise: a fill, width,

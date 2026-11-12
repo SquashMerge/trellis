@@ -55,7 +55,7 @@ fn collect(
     let mut document = Document {
         source: &doc.file.text,
         constants: BTreeMap::new(),
-        clients: Vec::new(),
+        types: Vec::new(),
         modules: Vec::new(),
         fields: BTreeSet::new(),
         bindings: BTreeMap::new(),
@@ -70,6 +70,8 @@ fn collect(
     let mut modules = Vec::new();
     let mut sites = Vec::new();
     let mut imports = Vec::new();
+    let mut declared = Vec::new();
+    let mut parameters = Vec::new();
     let mut fields = Vec::new();
     let mut bindings: BTreeMap<&str, Vec<Node<'_>>> = BTreeMap::new();
     walk(root, check, &mut |node, check| {
@@ -87,7 +89,8 @@ fn collect(
                 && node.parent().is_some_and(|parent| parent.id() != root.id());
             walk(binding, check, &mut |inner, _| {
                 match inner.kind() {
-                    "identifier" => {
+                    // Every name the pattern binds, a shorthand field (`Slot { c }`) too.
+                    "identifier" | "shorthand_field_identifier" => {
                         bound.insert(document.text(inner));
                         bindings
                             .entry(document.text(inner))
@@ -103,6 +106,23 @@ fn collect(
         match node.kind() {
             "mod_item" => modules.push(node.byte_range()),
             "use_declaration" => imports.push(node),
+            "struct_item" | "enum_item" | "union_item" | "type_item" | "trait_item" => {
+                declared.extend(node.child_by_field_name("name"));
+            }
+            "type_parameters" => {
+                for parameter in Document::named_children(node) {
+                    let name = match parameter.kind() {
+                        "type_identifier" => Some(parameter),
+                        _ => parameter
+                            .child_by_field_name("name")
+                            .or_else(|| parameter.child_by_field_name("left")),
+                    };
+                    // A type parameter is in scope over the item that declares it.
+                    if let (Some(name), Some(item)) = (name, node.parent()) {
+                        parameters.push((item.byte_range(), name));
+                    }
+                }
+            }
             "field_declaration" => fields.push(node),
             "const_item" | "static_item" => {
                 let name = node.child_by_field_name("name").map(|n| document.text(n));
@@ -125,6 +145,16 @@ fn collect(
     document.modules = modules.clone();
     for import in imports {
         document.import(import);
+    }
+    for name in declared {
+        if let Some(scope) = name.parent().and_then(|item| item.parent()) {
+            document
+                .types
+                .push((scope.byte_range(), document.text(name), false));
+        }
+    }
+    for (scope, name) in parameters {
+        document.types.push((scope, document.text(name), false));
     }
     // A field name is read only when every field of that name in the document is a client.
     let mut typed: BTreeMap<&str, bool> = BTreeMap::new();
@@ -195,9 +225,9 @@ struct Document<'a> {
     source: &'a str,
     /// Same-document `const` and `static` strings, each name declared once.
     constants: BTreeMap<String, String>,
-    /// The names a `use reqwest::..` declaration gives the `reqwest` client type, each with
-    /// the byte range of the scope that holds the declaration.
-    clients: Vec<(std::ops::Range<usize>, &'a str)>,
+    /// Every type name an import, item or type parameter declares, with the byte range of
+    /// the scope that holds it and whether it is the `reqwest` client. A glob import is `*`.
+    types: Vec<(std::ops::Range<usize>, &'a str, bool)>,
     /// The byte ranges of the inline modules, which do not see their parent's imports.
     modules: Vec<std::ops::Range<usize>>,
     /// The struct field names of this document declared only with a `reqwest` client type.
@@ -274,8 +304,9 @@ impl<'a> Document<'a> {
         }
     }
 
-    /// Records the names a `use reqwest::..` declaration gives the client type: `Client`,
-    /// or the alias of `Client as Http`, within the scope that holds the declaration.
+    /// Records every name a `use` declaration binds, within the scope that holds it. A name
+    /// is the client when the import is rooted at `reqwest` and names `Client`, aliased or
+    /// not (`Client`, `Client as Http`). A glob binds any name and is never the client.
     fn import(&mut self, declaration: Node<'a>) {
         let (Some(argument), Some(scope)) = (
             declaration.child_by_field_name("argument"),
@@ -284,32 +315,43 @@ impl<'a> Document<'a> {
             return;
         };
         let path: String = self.text(argument).split_whitespace().collect();
-        if !path.trim_start_matches("::").starts_with("reqwest::") {
-            return;
-        }
+        let rooted = path.trim_start_matches("::").starts_with("reqwest::");
+        let client =
+            |original: &str| rooted && (original == "Client" || original.ends_with("::Client"));
         let mut stack = vec![argument];
         while let Some(node) = stack.pop() {
             match node.kind() {
                 "use_as_clause" => {
                     let original = node.child_by_field_name("path").map(|p| self.text(p));
-                    if original.is_some_and(|p| p == "Client" || p.ends_with("::Client"))
-                        && let Some(alias) = node.child_by_field_name("alias")
-                    {
-                        self.clients.push((scope.clone(), self.text(alias)));
+                    if let Some(alias) = node.child_by_field_name("alias") {
+                        let is = original.is_some_and(client);
+                        self.types.push((scope.clone(), self.text(alias), is));
                     }
                 }
-                "identifier" if self.text(node) == "Client" => {
-                    self.clients.push((scope.clone(), "Client"));
+                "scoped_identifier" => {
+                    if let Some(name) = node.child_by_field_name("name") {
+                        let name = self.text(name);
+                        self.types.push((scope.clone(), name, client(name)));
+                    }
                 }
+                "identifier" => {
+                    let name = self.text(node);
+                    self.types.push((scope.clone(), name, client(name)));
+                }
+                "use_wildcard" => self.types.push((scope.clone(), "*", false)),
+                // The path of `a::{..}` is a prefix; only its list binds.
+                "scoped_use_list" => stack.extend(node.child_by_field_name("list")),
                 _ => stack.extend(Self::named_children(node)),
             }
         }
     }
 
     /// Whether a written type is the `reqwest` client, seen through references:
-    /// `reqwest::Client`, `reqwest::blocking::Client`, or a name imported for it where that
-    /// import is in scope: inside the scope of its declaration, and not inside an inline
-    /// module nested there, since a module does not see its parent's imports (#921 review).
+    /// `reqwest::Client`, `reqwest::blocking::Client`, or a name whose nearest declaration
+    /// in scope is a `reqwest` import of the client (#921 review). A declaration is in scope
+    /// inside the block, module or item that holds it, but not inside an inline module
+    /// nested there. A nearer import, item or type parameter of the name, or a nearer glob,
+    /// hides an outer client import; an explicit name wins over a glob in the same scope.
     fn client_type(&self, ty: Node<'_>) -> bool {
         let mut ty = ty;
         while ty.kind() == "reference_type" {
@@ -320,16 +362,23 @@ impl<'a> Document<'a> {
         }
         let text: String = self.text(ty).split_whitespace().collect();
         let text = text.trim_start_matches("::");
+        if matches!(text, "reqwest::Client" | "reqwest::blocking::Client") {
+            return true;
+        }
         let at = ty.byte_range();
-        matches!(text, "reqwest::Client" | "reqwest::blocking::Client")
-            || self.clients.iter().any(|(scope, name)| {
-                *name == text
+        self.types
+            .iter()
+            .filter(|(scope, name, _)| {
+                (*name == text || *name == "*")
                     && within(&at, scope)
                     && !self
                         .modules
                         .iter()
                         .any(|module| within(module, scope) && within(&at, module))
             })
+            // The nearest scope is the narrowest; within it an explicit name beats a glob.
+            .min_by_key(|(scope, name, _)| (scope.end - scope.start, *name == "*"))
+            .is_some_and(|(_, _, client)| *client)
     }
 
     /// Whether a receiver is a `reqwest` client (#910): a `Client::new()` or

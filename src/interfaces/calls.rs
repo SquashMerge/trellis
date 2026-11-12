@@ -1315,6 +1315,58 @@ mod net { use reqwest::Client; fn h(c: &Client) { c.get("/net"); } }
         assert_eq!(reqwest_paths(root), ["GET /root", "GET /net"]);
     }
 
+    /// #921 re-review: the nearest declaration of a type name in scope decides it. A nearer
+    /// import, glob, item or type parameter named `Client` hides an outer reqwest import.
+    #[test]
+    fn a_nearer_declaration_of_the_name_hides_the_reqwest_import() {
+        let nearer = r#"
+use reqwest::Client;
+fn f() {
+    {
+        use std::collections::HashMap as Client;
+        let mut cache = Client::new();
+        cache.insert("/fake", 1u8);
+        cache.get("/fake");
+    }
+}
+"#;
+        assert_eq!(reqwest_paths(nearer), Vec::<String>::new());
+        let others = r#"
+use reqwest::Client;
+fn glob(c: Client) { use std::collections::*; let d: Client = make(); d.get("/glob"); }
+fn generic<Client: Get>(c: Client) { c.get("/generic"); }
+fn item() { struct Client; fn g(c: Client) { c.get("/item"); } }
+fn kept(c: Client) { c.get("/kept"); }
+mod inner { use reqwest::*; use reqwest::Client; fn h(c: Client) { c.get("/explicit"); } }
+"#;
+        assert_eq!(reqwest_paths(others), ["GET /kept", "GET /explicit"]);
+    }
+
+    /// #921 re-review: every name a pattern binds hides an outer client, a shorthand field
+    /// among them.
+    #[test]
+    fn every_name_a_pattern_binds_hides_an_outer_client() {
+        let shorthand = r#"
+struct Slot { c: std::collections::HashMap<&'static str, u8> }
+fn f(c: reqwest::Client, slot: Slot) {
+    let Slot { c } = slot;
+    c.get("/fake");
+}
+"#;
+        assert_eq!(reqwest_paths(shorthand), Vec::<String>::new());
+        let others = r#"
+fn f(c: reqwest::Client, pair: (u8, Map), slot: Slot) {
+    { let (_, c) = pair; c.get("/tuple"); }
+    { let Slot { ref c, .. } = slot; c.get("/ref"); }
+    { let c @ Slot { .. } = slot; c.get("/at"); }
+    { let [c, ..] = maps; c.get("/slice"); }
+    if let Some(Slot { c }) = found { c.get("/if-let"); }
+    c.get("/kept");
+}
+"#;
+        assert_eq!(reqwest_paths(others), ["GET /kept"]);
+    }
+
     /// #921 review: a chain is a client only while every step keeps the client type. A
     /// request's headers are not a client, nor is another type's `new()`.
     #[test]
