@@ -7318,7 +7318,7 @@ async fn real_typescript_bindings_show_in_query_mcp_status_and_methods() {
     // #528: describe and scopeCoverage report the imported JavaScript evidence beside the
     // native coverage, which keeps its syntax tier; other languages have no producer.
     let describe = mcp.call("trellis_workspace_describe", json!({"schemaVersion":1}));
-    assert_eq!(describe["data"]["toolVersion"], 27);
+    assert_eq!(describe["data"]["toolVersion"], 28);
     for (scope, rows) in [
         ("describe", &describe["data"]["languages"]),
         ("incoming", &incoming["data"]["scopeCoverage"]),
@@ -8254,6 +8254,27 @@ forbid = [{ calls = "helper" }]
             assert_eq!(pending.semantic_status, SemanticStatus::CatchingUp);
         }
         let basis = json!(pin);
+        // #660: the evidence tools list the answer's pending languages from committed data.
+        // The retained P batch finishes, so JavaScript is only catching up at the later head.
+        let expected_status = if historical {
+            json!([{"language":"javascript","state":"catchingUp","reason":"re-import pending"}])
+        } else {
+            json!([])
+        };
+        for tool in [
+            "trellis_declaration",
+            "trellis_outgoing_calls",
+            "trellis_incoming_calls",
+        ] {
+            let answer = mcp.success(
+                tool,
+                json!({"schemaVersion":1,"expectedBasis":basis,"symbolId":syntax_id}),
+            );
+            assert_eq!(
+                answer["semanticStatus"], expected_status,
+                "{tool}: {answer}"
+            );
+        }
         let arguments = json!({"schemaVersion":1,"expectedBasis":basis,"limit":50});
         let references = mcp.success("trellis_references", arguments.clone());
         let checked = mcp.success("trellis_rules_check", arguments.clone());

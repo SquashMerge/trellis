@@ -279,7 +279,7 @@ If a run fails, `.diagnostics.stderrTail` and `.diagnostics.stdoutTail` in its o
 
 ### Re-run after edits
 
-Semantic evidence describes the code as it was when you imported it. **Any** change to an indexed source file or project config affects imported evidence for **every** language: the changed file's evidence is [stale](#stale-and-possibly-stale), and every other file's is [possibly stale](#stale-and-possibly-stale). Trellis keeps the old results for unchanged files and labels them, but it never re-runs a producer by itself. To refresh, repeat the commands above for each producer you use:
+Semantic evidence describes the code as it was when you imported it. **Any** change to an indexed source file or project config affects imported evidence for **every** language: the changed file's evidence is [stale](#stale-and-possibly-stale), and every other file's is [possibly stale](#stale-and-possibly-stale). Trellis keeps the old results for unchanged files and labels them, but it doesn't re-run a producer by itself unless you turn on [automatic re-runs](#automatic-re-runs-optional). To refresh, repeat the commands above for each producer you use:
 
 ```sh
 for P in scip-typescript scip-python scip-java; do
@@ -289,6 +289,31 @@ done
 ```
 
 You always need a new plan. An old hash fails with `plan_changed`. If you edit a file during a run, it fails with `stale_basis`, and you run it again.
+
+### Automatic re-runs (optional)
+
+Trellis can re-run a producer for you after you edit, switch branches or pull. It is off by default. Turn it on per producer in `.trellis/producers.toml` at the checkout root:
+
+```toml
+[auto.rust-analyzer]
+enabled = true
+quietSecs = 60          # 1 to 3600: wait this long after the last change
+minIntervalSecs = 600   # 60 to 86400: at least this long between automatic starts
+batteryGate = true      # don't start on battery
+loadGate = true         # don't start while the machine is busy
+```
+
+Only `enabled` is needed; the rest show their defaults. A value out of range isn't clamped: the file is rejected, and `producer status` shows `invalidConfig` with the reason.
+
+**One manual run approves.** The file alone starts nothing. An automatic run needs an approval, and only a manual `producer run` that ends `imported` writes one. It records the trust profile, limits, executable and environment of that run. If you have changed the toolchain since, or the checkout was garbage-collected or replaced, `producer status` shows `needsApproval` with a reason, and you run the producer by hand again.
+
+Trellis starts a run only when the checkout has been quiet for `quietSecs`, no indexing is pending, nothing else is running a producer and at least `minIntervalSecs` have passed since the last automatic start. If you change files while it runs, the run is cancelled and tried again after the next quiet period. A manual `producer run` takes priority over an automatic run that hasn't reached its import yet.
+
+**The gates.** Before a start, Trellis skips the run while the machine is on battery or its 1-minute load is at or above its CPU count, and checks again about a minute later. An unknown reading doesn't hold a run back. A gate never stops a run that has begun. Turn one off with `batteryGate = false` or `loadGate = false`.
+
+**What you see.** Each producer in `trellis producer status` has an `autoRun` object with `state` (`off`, `idle`, `scheduled`, `running`, `deferred`, `failed`, `needsApproval` or `invalidConfig`), a `reason` and the times `dueSince` and `nextEarliestStart`. While a run is scheduled or running, evidence that would say **needs re-import** says **catching up** instead. After a failure it keeps **needs re-import** with the reason `automatic re-run failed: <code>`, and Trellis doesn't try again until the checkout changes or `minIntervalSecs` has passed, whichever is later.
+
+**Settings.** An automatic run doesn't use your manual overrides, such as `--cargo-features`. It reads settings from your project's files, as a plain `plan` does. If you rely on an override, automatic runs can differ from yours. See [known limitations](known-limitations.md#automatic-re-runs).
 
 ### Project settings
 

@@ -1828,7 +1828,14 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                             semantic => semantic?,
                         };
                         Ok(projection::outgoing(
-                            id, found, &semantic, compact, root, sampled, modern,
+                            id,
+                            found,
+                            &semantic,
+                            &response.mcp_language_tiers()?,
+                            compact,
+                            root,
+                            sampled,
+                            modern,
                         )
                         .map_err(|error| anyhow::anyhow!(error))?
                         .unwrap_or_else(|| tools::failure(id, "range_too_large")))
@@ -1972,6 +1979,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                             &mut answer,
                             stable_lookup_key.as_deref(),
                             &node_keys,
+                            &response.mcp_language_tiers()?,
                             compact,
                             root,
                             sampled,

@@ -622,6 +622,28 @@ fn producer_spawn_reachable_only_from_run() {
         ["src/daemon/registry.rs", "src/producer/run.rs"],
         "start_run is called from the run owner and the registry's run handler only"
     );
+    let (_, registry) = files
+        .iter()
+        .find(|(file, _)| file == "src/daemon/registry.rs")
+        .unwrap();
+    assert_eq!(
+        whole_words(registry, "start_run"),
+        2,
+        "the registry calls start_run twice: cli_producer_run and the automatic launch"
+    );
+}
+
+/// The automatic re-run owner decides; it never starts a process, and it learns of edits from the
+/// published head, not from raw watcher events (#660).
+#[test]
+fn auto_owner_names_neither_start_run_nor_watch() {
+    let files = production(|_| true, false);
+    let (_, auto) = files
+        .iter()
+        .find(|(file, _)| file == "src/producer/auto.rs")
+        .unwrap();
+    assert_eq!(whole_words(auto, "start_run"), 0);
+    assert!(!auto.contains("watch"), "auto.rs consults a watcher");
 }
 
 /// The body of the first `fn name(` item in `text`, braces included.

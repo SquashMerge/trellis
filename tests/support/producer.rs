@@ -134,12 +134,36 @@ pub fn daemon_stderr(home: &Path) -> PathBuf {
     home.join("daemon.stderr")
 }
 
+/// The daemon's gate probes (#660 AC10), under test-support: the JSON file the daemon reads at
+/// every gate check. Every CLI of a checkout carries it, so a daemon it starts reads this file
+/// and never the host's load or power. The file is absent until a test writes it, which reads as
+/// unknown, so no automatic-run test depends on the machine.
+pub const AUTORUN_PROBES_ENV: &str = "TRELLIS_TEST_AUTORUN_PROBES";
+
+/// The probe file of the daemon a CLI under `home` starts.
+pub fn probes_file(home: &Path) -> PathBuf {
+    home.join("autorun-probes.json")
+}
+
+/// Set what the gate probes of the daemon under `home` report; `None` is unknown.
+pub fn set_probes(home: &Path, battery: Option<bool>, load: Option<bool>) {
+    let path = probes_file(home);
+    let staged = path.with_extension("tmp");
+    fs::write(
+        &staged,
+        json!({"battery": battery, "load": load}).to_string(),
+    )
+    .unwrap();
+    fs::rename(staged, path).unwrap();
+}
+
 pub fn cli(home: &Path) -> Command {
     let mut command = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")));
     command
         .env("HOME", home)
         .env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("daemon.pid"))
         .env(crate::child::DAEMON_STDERR, daemon_stderr(home))
+        .env(AUTORUN_PROBES_ENV, probes_file(home))
         .env_remove("XDG_CACHE_HOME")
         .env_remove("XDG_DATA_HOME")
         .stdin(Stdio::null());
@@ -296,5 +320,47 @@ pub fn pickup_entry(checkout: &Checkout, producer: &str) -> Value {
         .iter()
         .find(|entry| entry["name"] == producer)
         .unwrap()["pickup"]
+        .clone()
+}
+
+/// `TRELLIS_TEST_AUTORUN_INTERVALS` for a daemon: the quiet period, the minimum interval between
+/// automatic starts and the owner's backstop, in milliseconds. The gate backstop is the same as
+/// the owner's. Every automatic-run test sets it, so a run never waits the production 60 s.
+pub fn auto_intervals(quiet_ms: u64, min_interval_ms: u64, backstop_ms: u64) -> (String, String) {
+    (
+        "TRELLIS_TEST_AUTORUN_INTERVALS".to_owned(),
+        json!({
+            "quietMs": quiet_ms,
+            "minIntervalMs": min_interval_ms,
+            "gateBackstopMs": backstop_ms,
+            "backstopMs": backstop_ms,
+        })
+        .to_string(),
+    )
+}
+
+/// Write `.trellis/producers.toml` of `root`, replacing any earlier one. This is the one place an
+/// automatic-run test says what is enabled, so a later slice can make them all gate-hermetic here.
+pub fn write_producers_toml(root: &Path, text: &str) {
+    fs::create_dir_all(root.join(".trellis")).unwrap();
+    fs::write(root.join(".trellis/producers.toml"), text).unwrap();
+}
+
+/// Enable automatic re-runs of `producer`; `extra` adds keys to its table.
+pub fn enable_auto(root: &Path, producer: &str, extra: &str) {
+    write_producers_toml(
+        root,
+        &format!("[auto.{producer}]\nenabled = true\n{extra}\n"),
+    );
+}
+
+/// The `autoRun` object of `producer` in the status reply.
+pub fn auto_run(checkout: &Checkout, producer: &str) -> Value {
+    producer_status(checkout)["producers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == producer)
+        .unwrap()["autoRun"]
         .clone()
 }

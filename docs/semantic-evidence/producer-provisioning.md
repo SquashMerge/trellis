@@ -118,6 +118,10 @@ A `jsconfig.json` project follows no references, because TypeScript does not inh
 - The restricted profile omits the root and nested build files (capture retains nested `pom.xml`, `build.gradle` and `build.gradle.kts` above Java sources for app detection, #854) and the checkout's `lsif-java.json`, whose dependencies scip-java would fetch, so `java.buildTool` is `SCIP` (the Trellis-written `lsif-java.json`), nothing is passed, and `--java-build-tool` is `invalid_request`.
 - Not derived: the JDK version and the Gradle or Maven modules. Gradle build files are code, and Maven's come from XML with parent POMs and property interpolation; neither is read safely without running the build. The trusted build applies its own toolchain and modules. The restricted JVM stays scip-java's default, a host prerequisite (see below), so a project's declared JDK cannot make an offline run fetch another one.
 
+### Settings and automatic re-runs (#660)
+
+Settings-derived arguments (Cargo features, the TypeScript project, the Python project name and version, the Java build tool) are excluded from the approval's `templateSha256` (owner ruling 2026-11-08 on #660, D3), so editing them neither widens trust nor needs a new approval. An automatic run re-derives the settings at the current head, without the manual overrides (`--cargo-features` and the others are not stored in the approval); a run therefore uses the project's own files as a plain `plan` does. The template hash is over exactly these members: `templateVersion` (1); `producer` `{name, languages, version, pinnedExecutableHash, positionEncoding, launcher, verification}`; `trustProfile`; `runtimeExecutables`; `environment`; `limits`; and `generation`. It excludes `workspace`, `command` (argv, cwd, env), `settings`, `inputs`, `policy` and `output`.
+
 ### scip-java JVM prerequisite
 
 Restricted scip-java runs with `COURSIER_MODE=offline` (`src/producer/profiles.rs`). The restricted worktree omits build files and writes an `lsif-java.json` with no `jvm` field, so scip-java uses its default JVM, Temurin 17.0.20.1. That JDK must already be present in `COURSIER_ARCHIVE_CACHE` as a host prerequisite, because Trellis downloads nothing. On the reference host it is at `~/Library/Caches/Coursier/arc/https/github.com/adoptium/temurin17-binaries/releases/download/jdk-17.0.20.1%252B1/OpenJDK17U-jdk_aarch64_mac_hotspot_17.0.20.1_1.tar.gz/jdk-17.0.20.1+1`, created on 2026-08-21. The exact command that provisioned it is not recoverable. It is a coursier archive-cache entry from a prior manual coursier-driven JVM fetch by the owner (for example `cs java --jvm temurin:17` or an earlier online scip-java run), not from anything Trellis ran.
@@ -131,6 +135,8 @@ The CLI sends a closed environment: `PATH`, `HOME`, and `RUSTUP_HOME`, `CARGO_HO
 - `COURSIER_CACHE` and `COURSIER_ARCHIVE_CACHE`: `$HOME/Library/Caches/Coursier/{v1,arc}` on macOS and `$HOME/.cache/coursier/{v1,arc}` on Linux.
 
 No shell activation is needed or used: the mise tool directories are added to the declared `PATH` directly, and the shims are never used.
+
+**Automatic re-runs (#660).** The approval that lets Trellis re-run a producer automatically stores the environment of the manual run that created it (the same closed environment, as detected for that run), together with the trust profile, limits and executable; the owner replays it, it never detects a new one (owner ruling 2026-11-08, D2).
 
 ## CI
 

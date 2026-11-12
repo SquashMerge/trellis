@@ -13,6 +13,8 @@ mod semantic_batch_support;
 #[path = "../support/producer.rs"]
 mod support;
 
+mod auto_run_due;
+mod auto_run_labels;
 mod java_semantic_import;
 mod proptest_native_first;
 mod proptest_witness_rejoin;

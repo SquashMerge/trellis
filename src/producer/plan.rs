@@ -14,7 +14,7 @@ use crate::scip_admission::PinnedProducer;
 use crate::semantic_batch::descriptor::SourceManifestHasher;
 use crate::store::{NativeReader, Store};
 use anyhow::{Result, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -27,7 +27,7 @@ pub const DEFAULT_MEMORY_MIB: u64 = 8192;
 pub const MAX_PAYLOAD_BYTES: usize = 16 * 1024;
 const MAX_EXECUTABLE_BYTES: usize = 4096;
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LimitsRequest {
     pub timeout_secs: u64,
@@ -203,6 +203,36 @@ pub fn effective_limits(request: LimitsRequest) -> Limits {
     }
 }
 
+/// The plan's `producer` object.
+fn producer_json(row: Row, pin: &PinnedProducer, resolution: &Resolution) -> Value {
+    json!({
+        "name": row.target.name(),
+        "languages": row.target.languages(),
+        "version": pin.version,
+        "pinnedExecutableHash": pin.executable_hash,
+        "positionEncoding": encoding_name(pin.position_encoding),
+        "launcher": resolution.launcher.to_string_lossy(),
+        "verification": {
+            "method": resolution.verification.method,
+            "observed": resolution.verification.observed,
+            "result": "verified",
+        },
+    })
+}
+
+/// The plan's `limits` object.
+fn limits_json(request: LimitsRequest) -> Value {
+    let limits = effective_limits(request);
+    json!({
+        "timeoutSecs": request.timeout_secs,
+        "memoryBytes": limits.memory_bytes,
+        "memoryEnforcement": "sampled",
+        "sampleMs": limits.sample.as_millis() as u64,
+        "artifactBytes": limits.artifact_bytes,
+        "logBytes": limits.log_bytes,
+    })
+}
+
 /// The plan without its hash.
 pub fn build(parts: &Parts<'_>) -> Value {
     let row = &parts.row;
@@ -218,26 +248,13 @@ pub fn build(parts: &Parts<'_>) -> Value {
     );
     let layout = worktree::layout(&parts.basis.inputs, parts.rules);
     let generation: GenerationTable = profiles::run_generation(row, parts.resolution);
-    let limits = effective_limits(parts.limits);
     let caches: Vec<Value> = profiles::declared_caches(row, parts.declared)
         .into_iter()
         .map(|(name, path)| json!({"name": name, "path": path.to_string_lossy()}))
         .collect();
     json!({
         "workspace": parts.workspace,
-        "producer": {
-            "name": row.target.name(),
-            "languages": row.target.languages(),
-            "version": parts.pin.version,
-            "pinnedExecutableHash": parts.pin.executable_hash,
-            "positionEncoding": encoding_name(parts.pin.position_encoding),
-            "launcher": parts.resolution.launcher.to_string_lossy(),
-            "verification": {
-                "method": parts.resolution.verification.method,
-                "observed": parts.resolution.verification.observed,
-                "result": "verified",
-            },
-        },
+        "producer": producer_json(*row, parts.pin, parts.resolution),
         "trustProfile": row.trust,
         "command": {
             "argv": spec.argv,
@@ -273,14 +290,7 @@ pub fn build(parts: &Parts<'_>) -> Value {
             "declaredCaches": caches,
         },
         "policy": profiles::policies(row),
-        "limits": {
-            "timeoutSecs": parts.limits.timeout_secs,
-            "memoryBytes": limits.memory_bytes,
-            "memoryEnforcement": "sampled",
-            "sampleMs": limits.sample.as_millis() as u64,
-            "artifactBytes": limits.artifact_bytes,
-            "logBytes": limits.log_bytes,
-        },
+        "limits": limits_json(parts.limits),
         "output": {
             "runDirectory": run,
             "artifact": "out/index.scip",
@@ -364,6 +374,22 @@ impl Prepared {
             run_dir,
         })
     }
+}
+
+/// The hash an approval binds (#660): the plan's producer, trust, runtime, environment, limits
+/// and generation, and nothing that follows the checkout (workspace, command, settings, inputs,
+/// policy, output). A manual run's approval holds while those stay as they were approved.
+pub fn template_sha256(prepared: &Prepared, environment: &Environment) -> String {
+    let template = json!({
+        "templateVersion": 1,
+        "producer": producer_json(prepared.row, &prepared.pin, &prepared.resolution),
+        "trustProfile": prepared.row.trust,
+        "runtimeExecutables": prepared.resolution.runtime_executables(),
+        "environment": environment,
+        "limits": limits_json(prepared.limits),
+        "generation": profiles::run_generation(&prepared.row, &prepared.resolution),
+    });
+    hex::encode(Sha256::digest(canonical(&template)))
 }
 
 /// The producer's settings, read from the retained root inputs (and, for a scip-typescript
@@ -452,6 +478,7 @@ fn last_run(record: &RunRecord) -> Value {
         "planSha256": record.plan_sha256,
         "sourceRevision": record.source_revision,
         "createdAt": record.created_at,
+        "origin": record.origin,
         "finishedAt": record.finished_at,
         "groupStatus": record.group_status,
     })

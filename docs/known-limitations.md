@@ -22,7 +22,7 @@ The [owner's macOS memory ruling](https://github.com/SquashMerge/trellis/issues/
 
 ### Edits after a large semantic import
 
-Trellis publishes native results first and catches semantic evidence up in the background ([native-first publication, #668](https://github.com/SquashMerge/trellis/pull/668)). Reads stay available, and responses label older-basis, catching-up and needs-re-import evidence until catch-up finishes. Catch-up time is **not bounded**.
+Trellis publishes native results first and catches semantic evidence up in the background ([native-first publication, #668](https://github.com/SquashMerge/trellis/pull/668)). Reads stay available, and responses label older-basis, catching-up and needs-re-import evidence until catch-up finishes. Catch-up time is **not bounded**. A producer's own re-run, which you start or which [automatic re-runs](#automatic-re-runs) start, is a separate and much longer step.
 
 In a 2026-11-05 dogfood run on a copy of the Trellis checkout with Rust and JavaScript imported, native results were readable in mostly 1–3 s. Median semantic catch-up was about 32 s for the first edit after daemon start, 9–13 s for later edits, and about 113 s for a `Cargo.toml` edit on a fresh daemon, with peak RSS of 3.6–7.4 GiB. The host load was not controlled and single runs varied up to 2×. These are observations from a loaded host, not a controlled benchmark or a latency guarantee. See the [0.1.0 release notes](release-notes-0.1.md#catch-up-performance).
 
@@ -54,13 +54,26 @@ Trellis doesn't index `.jsx`.
 
 ### Semantic evidence after an upgrade
 
-An index rebuild does not make retained producer evidence fresh by itself. Trellis tries the last successful `producer run` batch again through normal validated import. Missing inputs, a changed native capture or incompatible producer pins leave a typed **semantic evidence needs re-import** reason in status, the web app and MCP. Trellis never runs the producer automatically.
+An index rebuild does not make retained producer evidence fresh by itself. Trellis tries the last successful `producer run` batch again through normal validated import. Missing inputs, a changed native capture or incompatible producer pins leave a typed **semantic evidence needs re-import** reason in status, the web app and MCP. Trellis runs the producer by itself only if you opted in to [automatic re-runs](#automatic-re-runs).
 
 The first upgrade onto this behavior needs re-import because previous versions deleted successful run inputs. This applies only to languages a producer covered (a successful `producer run` or a configured pickup); a language that never had a producer stays not configured. There is no old-index migration. Only one successful run's inputs are retained per producer, in place, and GC may remove them. This is not an artifact archive. See [upgrade recovery](quickstart.md#upgrading-trellis).
 
 ### Stale evidence after edits
 
-Semantic evidence is tied to one version of the checkout. After any edit to an indexed file or project config, the changed file's evidence is stale, and every other file's evidence, in every language, is [possibly stale](quickstart.md#stale-and-possibly-stale) until you re-import. Sequence falls back to syntax, and possibly stale calls aren't followed. Trellis never re-runs a producer by itself. With `producer pickup`, it only re-imports a file that has changed.
+Semantic evidence is tied to one version of the checkout. After any edit to an indexed file or project config, the changed file's evidence is stale, and every other file's evidence, in every language, is [possibly stale](quickstart.md#stale-and-possibly-stale) until you re-import. Sequence falls back to syntax, and possibly stale calls aren't followed. Trellis re-runs a producer by itself only if you opted in to [automatic re-runs](#automatic-re-runs). With `producer pickup`, it only re-imports a file that has changed.
+
+### Automatic re-runs
+
+Automatic producer re-runs ([quickstart](quickstart.md#automatic-re-runs-optional)) have these limits:
+
+- **Off by default.** Nothing starts until you enable a producer in `.trellis/producers.toml` and one manual run of it has imported. A missing, changed-toolchain or replaced-checkout approval needs a new manual run.
+- **A run is expensive.** It is the same run a manual `producer run` makes: a build or analysis of the whole checkout, with the producer's own CPU, memory and disk use, and one more published revision per import.
+- **A 60-second floor and two gates.** `minIntervalSecs` cannot be set below 60, and a start is skipped on battery or at a load at or above the CPU count. Where the power state or load can't be read, the gate doesn't apply. The gates are checked at start only.
+- **Manifest-only changes don't trigger.** A change that touches only a manifest, with no indexed source document added, changed or removed in a language the producer covers, doesn't make a run due.
+- **Manual overrides aren't used.** Automatic runs re-derive settings from your project's files; options such as `--cargo-features` that you passed to a manual run are not stored in the approval.
+- **The rate limit and the failure back-off survive a restart.** They are restored from the producer's newest automatic run record, and lapse only if count retention has pruned it.
+- **Some failures are remembered only for the checkout runtime's lifetime, until the checkout is reactivated.** A failure that happens before a run record is written (a refused plan preparation, an error before the run starts, a thread that could not start) is not saved. Each time the checkout is reactivated, Trellis tries it once more at an unchanged head; the attempt is cheap and starts no producer.
+- **Browser views show committed labels only.** The web app doesn't show the scheduled or running **catching up** label; `trellis status`, `producer status` and MCP do.
 
 ### Sequence diagrams are not traces
 

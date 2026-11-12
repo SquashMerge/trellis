@@ -3,12 +3,15 @@
 //! owner alone writes `run.json` and alone signals the child; callers observe
 //! the published record and the returned terminal reply.
 
+use super::approval;
 use super::batch::{self, ARTIFACT_PATH, BatchSpec};
 use super::exec::{self, Ending, Hooks, ProducerSpec};
 use super::import::{self, ImportOutcome};
 use super::plan::{self, PlanRequest, Prepared};
 use super::profiles::{self, Stub};
-use super::state::{DaemonIdentity, RunRecord, RunState, StateDir, SweepReport, now_millis};
+use super::state::{
+    DaemonIdentity, RunOrigin, RunRecord, RunState, StateDir, SweepReport, now_millis,
+};
 use super::worktree;
 use super::{
     Diagnostics, GroupStatus, NOT_CANCELLABLE, NOT_FOUND, PLAN_CHANGED, PRODUCER_BUSY,
@@ -30,17 +33,53 @@ use std::{
     os::unix::fs::DirBuilderExt,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, MutexGuard, PoisonError,
+        Arc, Condvar, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicBool, Ordering},
     },
+    time::{Duration, Instant},
 };
 use uuid::Uuid;
+
+/// How long a manual run waits for a preempted automatic run to release the slot (#660).
+pub const PREEMPT_WAIT: Duration = Duration::from_secs(30);
+
+/// Asks one automatic run to end because the head moved on (#660). The owner raises it before
+/// it looks at the slot, so a run that installs later still finds it.
+#[derive(Clone, Debug, Default)]
+pub struct SupersedeToken(Arc<AtomicBool>);
+
+impl SupersedeToken {
+    pub fn request(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_requested(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// What `supersede` found.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AutoCancel {
+    /// The token's run was stopped, or will be when it installs.
+    Requested,
+    /// The token's run is past the point where it can be stopped.
+    NotCancellable,
+    /// No active run carries the token.
+    NoAutoRun,
+}
 
 /// The `producer_run` payload: a plan request plus the hash the caller inspected.
 #[derive(Clone, Debug)]
 pub struct RunRequest {
     pub plan: PlanRequest,
     pub plan_sha256: String,
+    pub origin: RunOrigin,
+    pub supersede: Option<SupersedeToken>,
 }
 
 impl RunRequest {
@@ -57,7 +96,19 @@ impl RunRequest {
         Ok(Self {
             plan: PlanRequest::parse(&rest)?,
             plan_sha256: hash,
+            origin: RunOrigin::Manual,
+            supersede: None,
         })
+    }
+
+    /// An automatic re-run of an approved plan (#660). Only the checkout's owner builds one.
+    pub fn automatic(plan: PlanRequest, plan_sha256: String, token: SupersedeToken) -> Self {
+        Self {
+            plan,
+            plan_sha256,
+            origin: RunOrigin::Auto,
+            supersede: Some(token),
+        }
     }
 }
 
@@ -94,6 +145,8 @@ pub struct RunContext<'a> {
 enum CancelReason {
     Requested,
     RootChanged,
+    Superseded,
+    Preempted,
 }
 
 struct Control {
@@ -115,6 +168,8 @@ struct ActiveRun {
     plan_sha256: String,
     source_revision: String,
     created_at: u64,
+    origin: RunOrigin,
+    supersede: Option<SupersedeToken>,
     /// Read by the worktree writer, the monitor loop and the snapshot preflight.
     cancel: Arc<AtomicBool>,
     control: Mutex<Control>,
@@ -148,7 +203,14 @@ impl ActiveRun {
 /// Owns the checkout's producer runs. Cloning shares the same slot.
 #[derive(Clone, Default)]
 pub struct ProducerOwner {
-    slot: Arc<Mutex<Slot>>,
+    slot: Arc<SlotCell>,
+}
+
+/// The slot and the signal that it was released.
+#[derive(Default)]
+struct SlotCell {
+    slot: Mutex<Slot>,
+    released: Condvar,
 }
 
 /// The run slot and the owner's closed mark, changed together under one lock so a
@@ -159,6 +221,8 @@ struct Slot {
     /// The checkout is closing or lost its root; a runtime is never reopened, so
     /// the mark is permanent.
     closed: bool,
+    /// Manual runs waiting for a preempted automatic run to leave; automatic runs yield to them.
+    manual_waiting: u32,
 }
 
 /// Clears the owner's slot on every exit, and only its own run's.
@@ -177,6 +241,7 @@ impl Drop for SlotGuard<'_> {
         {
             slot.run = None;
         }
+        self.owner.slot.released.notify_all();
     }
 }
 
@@ -243,7 +308,7 @@ impl Finish {
 }
 
 /// The typed `<class>[: <reason>]` head of an error message.
-fn typed_code(error: &anyhow::Error) -> (String, String) {
+pub(super) fn typed_code(error: &anyhow::Error) -> (String, String) {
     let message = error.to_string();
     let line: String = message
         .lines()
@@ -292,7 +357,7 @@ fn test_flag(_variable: &str) -> bool {
 /// Test-support hold point: bind the socket, announce it, and wait for the
 /// test to connect. Once per path, like the semantic cutoff hook.
 #[cfg(all(feature = "test-support", unix))]
-fn test_hook(variable: &str) {
+pub(super) fn test_hook(variable: &str) {
     use std::os::unix::net::UnixListener;
     let Some(path) = std::env::var_os(variable) else {
         return;
@@ -309,7 +374,7 @@ fn test_hook(variable: &str) {
 }
 
 #[cfg(not(all(feature = "test-support", unix)))]
-fn test_hook(_variable: &str) {}
+pub(super) fn test_hook(_variable: &str) {}
 
 /// Recover producer state of this checkout: runs left by another daemon and
 /// pickup directories no request names. Best effort; a failure leaves the
@@ -351,6 +416,19 @@ impl Run<'_> {
         let reason = self.active.control().reason;
         let finish = match reason {
             Some(CancelReason::RootChanged) => Finish::failed("root_changed", ROOT_CHANGED),
+            Some(reason @ (CancelReason::Superseded | CancelReason::Preempted)) => Finish {
+                state: RunState::Cancelled,
+                outcome: "cancelled",
+                error_code: Some(
+                    match reason {
+                        CancelReason::Superseded => "cancelled: superseded",
+                        _ => "cancelled: preempted",
+                    }
+                    .to_owned(),
+                ),
+                import: None,
+                diagnostics: None,
+            },
             _ => Finish {
                 state: RunState::Cancelled,
                 outcome: "cancelled",
@@ -716,7 +794,31 @@ fn writeln_stderr(text: &str) -> std::io::Result<()> {
 
 impl ProducerOwner {
     fn slot(&self) -> MutexGuard<'_, Slot> {
-        self.slot.lock().unwrap_or_else(PoisonError::into_inner)
+        self.slot
+            .slot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Who started the active run, if one is active.
+    pub fn active_origin(&self) -> Option<RunOrigin> {
+        self.slot().run.as_ref().map(|run| run.origin)
+    }
+
+    /// Stop the automatic run carrying `token`, because the head moved on. The token is raised
+    /// before the slot is read, so a run that installs after this call is stopped when it does.
+    pub fn supersede(&self, token: &SupersedeToken) -> AutoCancel {
+        token.request();
+        let slot = self.slot();
+        match &slot.run {
+            Some(run) if run.supersede.as_ref().is_some_and(|own| own.same(token)) => {
+                match run.request_cancel(CancelReason::Superseded) {
+                    Ok(_) => AutoCancel::Requested,
+                    Err(_) => AutoCancel::NotCancellable,
+                }
+            }
+            _ => AutoCancel::NoAutoRun,
+        }
     }
 
     /// `activeRun` of the status reply.
@@ -733,6 +835,7 @@ impl ProducerOwner {
             "planSha256": run.plan_sha256,
             "sourceRevision": run.source_revision,
             "createdAt": run.created_at,
+            "origin": run.origin,
             "requestId": control.request_id,
             "process": control.process,
             "groupStatus": control.group_status,
@@ -773,14 +876,63 @@ impl ProducerOwner {
 
     /// Put `active` in the slot. An owner closed before this moment installs it already
     /// cancelled, so the run ends as `root_changed` without starting anything.
+    ///
+    /// An automatic run never waits: it is busy while the slot is taken or a manual run is
+    /// waiting for it. A manual run preempts an automatic run that is not importing and waits
+    /// for it to leave, at most `PREEMPT_WAIT`.
     fn install(&self, active: &Arc<ActiveRun>) -> Result<()> {
+        self.install_within(active, PREEMPT_WAIT)
+    }
+
+    /// `install` with the preemption wait chosen by the caller, so a test need not wait 30 s.
+    fn install_within(&self, active: &Arc<ActiveRun>, preempt_wait: Duration) -> Result<()> {
         let mut slot = self.slot();
-        if let Some(current) = &slot.run {
-            anyhow::bail!("{PRODUCER_BUSY}: run {} is active", current.run_id);
+        let busy = |slot: &Slot| {
+            let run_id = slot.run.as_ref().map_or("-", |run| run.run_id.as_str());
+            anyhow::anyhow!("{PRODUCER_BUSY}: run {run_id} is active")
+        };
+        match active.origin {
+            RunOrigin::Auto if slot.run.is_some() || slot.manual_waiting > 0 => {
+                return Err(busy(&slot));
+            }
+            RunOrigin::Auto => {}
+            // A second manual run never joins the first one's wait.
+            RunOrigin::Manual if slot.manual_waiting > 0 => return Err(busy(&slot)),
+            RunOrigin::Manual => {
+                if let Some(current) = slot.run.clone() {
+                    let preempted = current.origin == RunOrigin::Auto
+                        && current.request_cancel(CancelReason::Preempted).is_ok();
+                    if !preempted {
+                        return Err(busy(&slot));
+                    }
+                    slot.manual_waiting += 1;
+                    let deadline = Instant::now() + preempt_wait;
+                    while slot.run.is_some() {
+                        let left = deadline.saturating_duration_since(Instant::now());
+                        if left.is_zero() {
+                            slot.manual_waiting -= 1;
+                            return Err(busy(&slot));
+                        }
+                        slot = self
+                            .slot
+                            .released
+                            .wait_timeout(slot, left)
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .0;
+                    }
+                    slot.manual_waiting -= 1;
+                }
+            }
         }
         slot.run = Some(active.clone());
         if slot.closed {
             let _ = active.request_cancel(CancelReason::RootChanged);
+        } else if active
+            .supersede
+            .as_ref()
+            .is_some_and(SupersedeToken::is_requested)
+        {
+            let _ = active.request_cancel(CancelReason::Superseded);
         }
         Ok(())
     }
@@ -807,6 +959,8 @@ impl ProducerOwner {
             plan_sha256: request.plan_sha256.clone(),
             source_revision: prepared.basis.source_revision.clone(),
             created_at: now_millis(),
+            origin: request.origin,
+            supersede: request.supersede.clone(),
             cancel: Arc::new(AtomicBool::new(false)),
             control: Mutex::new(Control {
                 phase: RunState::Materializing,
@@ -849,6 +1003,7 @@ impl ProducerOwner {
             finished_at: None,
             diagnostics: None,
             group_status: None,
+            origin: active.origin,
         };
         state.write_run_record(&record)?;
         let mut run = Run {
@@ -893,6 +1048,14 @@ impl ProducerOwner {
         if let Ok(keep) = store.pending_generation_dirs() {
             let _ = state.prune_runs(&keep);
         }
+        // Only a manual import approves later automatic runs, and only the operator's request
+        // does: the record is the one they inspected, never a run Trellis started itself.
+        if active.origin == RunOrigin::Manual && finish.outcome == "imported" {
+            let approved = approval::record(&request.plan, &prepared, identity);
+            if let Err(error) = approval::write(&state, &approved) {
+                let _ = writeln_stderr(&format!("producer approval not written: {error:#}"));
+            }
+        }
         written?;
         Ok(json!({
             "runId": run_id,
@@ -903,6 +1066,7 @@ impl ProducerOwner {
             "producer": active.producer,
             "trustProfile": active.trust_profile,
             "sourceRevision": active.source_revision,
+            "origin": active.origin,
             "import": finish.import.as_ref().map(|imported| json!({
                 "requestId": imported.request_id,
                 "publishedRevision": imported.published_revision,
@@ -918,6 +1082,18 @@ mod tests {
     use super::*;
 
     fn active(run_id: &str) -> Arc<ActiveRun> {
+        active_as(run_id, RunOrigin::Manual, None)
+    }
+
+    fn auto(run_id: &str, token: &SupersedeToken) -> Arc<ActiveRun> {
+        active_as(run_id, RunOrigin::Auto, Some(token.clone()))
+    }
+
+    fn active_as(
+        run_id: &str,
+        origin: RunOrigin,
+        supersede: Option<SupersedeToken>,
+    ) -> Arc<ActiveRun> {
         Arc::new(ActiveRun {
             run_id: run_id.to_owned(),
             producer: "stub".to_owned(),
@@ -925,6 +1101,8 @@ mod tests {
             plan_sha256: "0".repeat(64),
             source_revision: "revision".to_owned(),
             created_at: 1,
+            origin,
+            supersede,
             cancel: Arc::new(AtomicBool::new(false)),
             control: Mutex::new(Control {
                 phase: RunState::Materializing,
@@ -935,6 +1113,10 @@ mod tests {
                 group_status: None,
             }),
         })
+    }
+
+    fn is_busy(result: Result<()>) -> bool {
+        result.is_err_and(|error| error.to_string().starts_with(PRODUCER_BUSY))
     }
 
     /// Shutdown before the run takes its slot is not lost: the run installs cancelled
@@ -967,5 +1149,150 @@ mod tests {
         let error = run.request_cancel(CancelReason::Requested).unwrap_err();
         assert!(error.to_string().starts_with(NOT_CANCELLABLE));
         assert!(!run.cancel.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn install_honours_supersede_token() {
+        let owner = ProducerOwner::default();
+        let token = SupersedeToken::default();
+        token.request();
+        let run = auto("a", &token);
+        owner.install(&run).unwrap();
+        assert!(run.cancel.load(Ordering::SeqCst));
+        assert_eq!(run.control().reason, Some(CancelReason::Superseded));
+
+        // A run that was never superseded installs untouched.
+        let owner = ProducerOwner::default();
+        let run = auto("b", &SupersedeToken::default());
+        owner.install(&run).unwrap();
+        assert!(!run.cancel.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn supersede_sets_token_when_no_run() {
+        let owner = ProducerOwner::default();
+        let token = SupersedeToken::default();
+        assert!(!token.is_requested());
+        assert_eq!(owner.supersede(&token), AutoCancel::NoAutoRun);
+        assert!(token.is_requested());
+        assert_eq!(owner.active_origin(), None);
+    }
+
+    #[test]
+    fn supersede_ignores_other_runs() {
+        let owner = ProducerOwner::default();
+        let (own, other) = (SupersedeToken::default(), SupersedeToken::default());
+        let manual = active("m");
+        owner.install(&manual).unwrap();
+        assert_eq!(owner.supersede(&other), AutoCancel::NoAutoRun);
+        assert!(!manual.cancel.load(Ordering::SeqCst));
+        drop(SlotGuard {
+            owner: &owner,
+            run: manual,
+        });
+
+        let run = auto("a", &own);
+        owner.install(&run).unwrap();
+        assert_eq!(owner.active_origin(), Some(RunOrigin::Auto));
+        assert_eq!(owner.supersede(&other), AutoCancel::NoAutoRun);
+        assert!(other.is_requested() && !run.cancel.load(Ordering::SeqCst));
+        assert_eq!(owner.supersede(&own), AutoCancel::Requested);
+        assert!(run.cancel.load(Ordering::SeqCst));
+        assert_eq!(run.control().reason, Some(CancelReason::Superseded));
+    }
+
+    #[test]
+    fn supersede_of_an_importing_run_is_not_cancellable() {
+        let owner = ProducerOwner::default();
+        let token = SupersedeToken::default();
+        let run = auto("a", &token);
+        run.control().phase = RunState::Importing;
+        owner.install(&run).unwrap();
+        assert_eq!(owner.supersede(&token), AutoCancel::NotCancellable);
+        assert!(!run.cancel.load(Ordering::SeqCst));
+    }
+
+    /// A manual run cancels a running automatic run and takes its slot once it leaves. The
+    /// waiter is released by the slot guard's drop, not by a timer.
+    #[test]
+    fn preemption_waits_for_release() {
+        let owner = ProducerOwner::default();
+        let running = auto("a", &SupersedeToken::default());
+        owner.install(&running).unwrap();
+        let manual = active("m");
+        let waiter = {
+            let (owner, manual) = (owner.clone(), manual.clone());
+            std::thread::spawn(move || owner.install(&manual))
+        };
+        while !running.cancel.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        assert_eq!(running.control().reason, Some(CancelReason::Preempted));
+        assert_eq!(owner.slot().manual_waiting, 1);
+        assert_eq!(owner.active_origin(), Some(RunOrigin::Auto));
+
+        drop(SlotGuard {
+            owner: &owner,
+            run: running,
+        });
+        waiter.join().unwrap().unwrap();
+        assert_eq!(owner.active_origin(), Some(RunOrigin::Manual));
+        assert_eq!(owner.slot().manual_waiting, 0);
+    }
+
+    /// A preempted run that never leaves does not hold the manual run forever: the wait ends
+    /// with `producer_busy` and the waiter count returns to zero.
+    #[test]
+    fn preemption_wait_expires_as_busy() {
+        let owner = ProducerOwner::default();
+        let running = auto("a", &SupersedeToken::default());
+        owner.install(&running).unwrap();
+        let result = owner.install_within(&active("m"), Duration::from_millis(50));
+        assert!(is_busy(result));
+        assert_eq!(running.control().reason, Some(CancelReason::Preempted));
+        assert_eq!(owner.slot().manual_waiting, 0);
+        assert_eq!(owner.active_origin(), Some(RunOrigin::Auto));
+    }
+
+    #[test]
+    fn manual_against_manual_or_an_importing_run_is_busy() {
+        let owner = ProducerOwner::default();
+        owner.install(&active("a")).unwrap();
+        assert!(is_busy(owner.install(&active("b"))));
+
+        let owner = ProducerOwner::default();
+        let importing = auto("a", &SupersedeToken::default());
+        importing.control().phase = RunState::Importing;
+        owner.install(&importing).unwrap();
+        assert!(is_busy(owner.install(&active("b"))));
+        assert!(!importing.cancel.load(Ordering::SeqCst));
+        assert_eq!(owner.slot().manual_waiting, 0);
+
+        let owner = ProducerOwner::default();
+        let finished = auto("a", &SupersedeToken::default());
+        finished.control().finished = true;
+        owner.install(&finished).unwrap();
+        assert!(is_busy(owner.install(&active("b"))));
+    }
+
+    #[test]
+    fn auto_against_a_run_or_a_waiting_manual_run_is_busy() {
+        let owner = ProducerOwner::default();
+        owner.install(&active("a")).unwrap();
+        assert!(is_busy(
+            owner.install(&auto("b", &SupersedeToken::default()))
+        ));
+
+        let owner = ProducerOwner::default();
+        owner.slot().manual_waiting = 1;
+        assert!(is_busy(
+            owner.install(&auto("b", &SupersedeToken::default()))
+        ));
+        // A second manual run does not join the first one's wait.
+        assert!(is_busy(owner.install(&active("m"))));
+        owner.slot().manual_waiting = 0;
+        owner
+            .install(&auto("c", &SupersedeToken::default()))
+            .unwrap();
     }
 }

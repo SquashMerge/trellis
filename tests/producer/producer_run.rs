@@ -20,33 +20,48 @@ use support::{
 use crate::semantic_batch_support;
 use semantic_batch_support::{BatchFixture, edit_scip, uniform_workspace};
 
-const STUB: &str = "trellis-synthetic-scip";
+pub(crate) const STUB: &str = "trellis-synthetic-scip";
 
 fn workspace(root: &Path) {
     uniform_workspace(root, &["javascript"], 3);
 }
 
-struct World {
-    checkout: Checkout,
-    stub_dir: TempDir,
-    marker: PathBuf,
+pub(crate) struct World {
+    pub(crate) checkout: Checkout,
+    pub(crate) stub_dir: TempDir,
+    pub(crate) marker: PathBuf,
+    /// The environment the daemon was started with, so a restarted one is armed the same way.
+    pub(crate) env: Vec<(String, String)>,
 }
 
 impl World {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::with(&[])
     }
 
     /// `hooks` maps hook environment variables to socket file names inside the stub
     /// directory. The stub's mode starts empty and is set per test with `mode`. The daemon
     /// shortens the termination grace so a stopped group is gone quickly.
-    fn with(hooks: &[(&str, &str)]) -> Self {
+    pub(crate) fn with(hooks: &[(&str, &str)]) -> Self {
         Self::with_env(hooks, &[])
     }
 
     /// Like `with`, and `extra` is also set in the daemon's own environment, the process that
     /// launches the producer.
-    fn with_env(hooks: &[(&str, &str)], extra: &[(&str, &str)]) -> Self {
+    pub(crate) fn with_env(hooks: &[(&str, &str)], extra: &[(&str, &str)]) -> Self {
+        Self::build(hooks, extra, workspace)
+    }
+
+    /// Like `with_env`, for a checkout that is a Git checkout from the start (the MCP server
+    /// serves only those), so no `.git` appears under a running daemon.
+    pub(crate) fn with_git(hooks: &[(&str, &str)], extra: &[(&str, &str)]) -> Self {
+        Self::build(hooks, extra, |root| {
+            workspace(root);
+            fs::create_dir_all(root.join(".git")).unwrap();
+        })
+    }
+
+    fn build(hooks: &[(&str, &str)], extra: &[(&str, &str)], setup: impl FnOnce(&Path)) -> Self {
         let stub_dir = tempfile::Builder::new()
             .prefix("producer-stub-")
             .tempdir_in("/tmp")
@@ -68,15 +83,16 @@ impl World {
                 .iter()
                 .map(|(name, value)| ((*name).to_owned(), (*value).to_owned())),
         );
-        let checkout = start_checkout(workspace, &env);
+        let checkout = start_checkout(setup, &env);
         Self {
             checkout,
             stub_dir,
             marker,
+            env,
         }
     }
 
-    fn index_db(&self) -> PathBuf {
+    pub(crate) fn index_db(&self) -> PathBuf {
         use trellis::store::topology::{TopologyRoots, WorkspaceIdentity};
         let roots = TopologyRoots::isolated_for_tests(
             cache_dir(&self.checkout.home),
@@ -88,7 +104,7 @@ impl World {
     }
 
     /// A valid synthetic artifact over the javascript documents, bound to the run worktree.
-    fn artifact(&self, edit: impl FnOnce(&mut scip::types::Index)) -> PathBuf {
+    pub(crate) fn artifact(&self, edit: impl FnOnce(&mut scip::types::Index)) -> PathBuf {
         let mut fixture =
             BatchFixture::from_published(&self.index_db(), &self.checkout.root).synthetic();
         let docs = fixture.paths("javascript");
@@ -104,7 +120,7 @@ impl World {
 
     /// An artifact the shallow batch scan accepts but admission refuses: its tool version is
     /// not the pin's.
-    fn unpinned_artifact(&self) -> PathBuf {
+    pub(crate) fn unpinned_artifact(&self) -> PathBuf {
         self.artifact(|index| {
             index
                 .metadata
@@ -118,7 +134,7 @@ impl World {
     }
 
     /// The stub's behavior: it records its argv, then does `extra`.
-    fn mode(&self, extra: Value) {
+    pub(crate) fn mode(&self, extra: Value) {
         let mut mode = json!({"marker": self.marker});
         mode.as_object_mut()
             .unwrap()
@@ -127,13 +143,13 @@ impl World {
     }
 
     /// A stub that emits a valid artifact and exits.
-    fn emitting(&self) {
+    pub(crate) fn emitting(&self) {
         self.emitting_variant(0);
     }
 
     /// Like `emitting`, with bytes that differ per `variant`: the same artifact cannot be
     /// imported twice.
-    fn emitting_variant(&self, variant: u32) {
+    pub(crate) fn emitting_variant(&self, variant: u32) {
         let artifact = self.artifact(|index| {
             index
                 .metadata
@@ -148,24 +164,25 @@ impl World {
         self.mode(json!({"emit": artifact}));
     }
 
-    fn hook(&self, name: &str) -> PathBuf {
+    pub(crate) fn hook(&self, name: &str) -> PathBuf {
         self.stub_dir.path().join(name)
     }
 
-    fn producer(&self, verb: &str, extra: &[&str]) -> Output {
+    pub(crate) fn producer(&self, verb: &str, extra: &[&str]) -> Output {
         self.command(verb, extra).output().unwrap()
     }
 
-    fn command(&self, verb: &str, extra: &[&str]) -> std::process::Command {
+    pub(crate) fn command(&self, verb: &str, extra: &[&str]) -> std::process::Command {
         let mut command = self.checkout.cli();
         command
+            .envs(self.env.iter().map(|(name, value)| (name, value)))
             .args(["producer", verb, "--workspace"])
             .arg(&self.checkout.root)
             .args(extra);
         command
     }
 
-    fn plan(&self, extra: &[&str]) -> Value {
+    pub(crate) fn plan(&self, extra: &[&str]) -> Value {
         let mut args = vec!["--producer", STUB];
         args.extend_from_slice(extra);
         let output = self.producer("plan", &args);
@@ -177,7 +194,7 @@ impl World {
     }
 
     /// The `producer run` arguments for the plan of `extra`.
-    fn run_args(&self, extra: &[&str]) -> Vec<String> {
+    pub(crate) fn run_args(&self, extra: &[&str]) -> Vec<String> {
         let plan = self.plan(extra);
         let mut args = vec!["--producer".to_owned(), STUB.to_owned()];
         args.extend(extra.iter().map(|arg| (*arg).to_owned()));
@@ -188,7 +205,7 @@ impl World {
         args
     }
 
-    fn spawn_run(&self, extra: &[&str]) -> Child {
+    pub(crate) fn spawn_run(&self, extra: &[&str]) -> Child {
         let args = self.run_args(extra);
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         self.command("run", &args)
@@ -198,11 +215,11 @@ impl World {
             .unwrap()
     }
 
-    fn run(&self, extra: &[&str]) -> Output {
+    pub(crate) fn run(&self, extra: &[&str]) -> Output {
         self.spawn_run(extra).wait_with_output().unwrap()
     }
 
-    fn status(&self) -> Value {
+    pub(crate) fn status(&self) -> Value {
         let output = self.producer("status", &[]);
         crate::child::cli_json_with(
             &output,
@@ -211,7 +228,7 @@ impl World {
         )
     }
 
-    fn stub_entry(&self) -> Value {
+    pub(crate) fn stub_entry(&self) -> Value {
         self.status()["producers"]
             .as_array()
             .unwrap()
@@ -221,11 +238,11 @@ impl World {
             .clone()
     }
 
-    fn runs_dir(&self) -> PathBuf {
+    pub(crate) fn runs_dir(&self) -> PathBuf {
         state_dir(&self.checkout).join("runs")
     }
 
-    fn run_ids(&self) -> Vec<String> {
+    pub(crate) fn run_ids(&self) -> Vec<String> {
         let mut ids: Vec<String> = fs::read_dir(self.runs_dir())
             .map(|dir| {
                 dir.map(|entry| entry.unwrap().file_name().into_string().unwrap())
@@ -236,22 +253,22 @@ impl World {
         ids
     }
 
-    fn record(&self, run_id: &str) -> Value {
+    pub(crate) fn record(&self, run_id: &str) -> Value {
         serde_json::from_slice(&fs::read(self.runs_dir().join(run_id).join("run.json")).unwrap())
             .unwrap()
     }
 
     /// Wait for a hook socket to be announced, hold the run there, and release it later.
-    fn wait_hook(&self, name: &str) {
+    pub(crate) fn wait_hook(&self, name: &str) {
         let ready = self.hook(name).with_extension("ready");
         trellis::testing::wait_until("hook announced", || ready.exists());
     }
 
-    fn release_hook(&self, name: &str) {
+    pub(crate) fn release_hook(&self, name: &str) {
         UnixStream::connect(self.hook(name)).unwrap();
     }
 
-    fn active_run(&self) -> Value {
+    pub(crate) fn active_run(&self) -> Value {
         let mut active = Value::Null;
         trellis::testing::wait_until("active run", || {
             active = self.status()["activeRun"].clone();
@@ -261,7 +278,7 @@ impl World {
     }
 }
 
-fn reply(output: &Output) -> Value {
+pub(crate) fn reply(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
         panic!(
             "no JSON on stdout; stderr: {}",
@@ -270,11 +287,11 @@ fn reply(output: &Output) -> Value {
     })
 }
 
-fn stderr(output: &Output) -> String {
+pub(crate) fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
-fn marker_lines(world: &World) -> usize {
+pub(crate) fn marker_lines(world: &World) -> usize {
     fs::read_to_string(&world.marker).map_or(0, |text| text.lines().count())
 }
 
@@ -311,6 +328,7 @@ fn explicit_run_imports_stub_artifact() {
     assert_eq!(reply["diagnostics"]["exit"]["code"], 0);
     // An ordinary exit is proven empty on every platform, so no snapshot preflight runs.
     assert_eq!(reply["diagnostics"]["groupStatus"], "empty");
+    assert_eq!(reply["origin"], "manual");
 
     assert_eq!(marker_lines(&world), 1, "the stub ran exactly once");
     assert_eq!(world.run_ids(), [reply["runId"].as_str().unwrap()]);
@@ -318,6 +336,8 @@ fn explicit_run_imports_stub_artifact() {
     assert_eq!(record["state"], "done");
     assert_eq!(record["outcome"], "imported");
     assert_eq!(record["requestId"], reply["import"]["requestId"]);
+    assert_eq!(record["origin"], "manual");
+    assert_eq!(world.stub_entry()["lastRun"]["origin"], "manual");
 }
 
 #[test]
@@ -863,7 +883,7 @@ fn unknown_group_imports_the_frozen_snapshot_despite_a_later_rewrite() {
     assert!(stage_residue(&world).is_empty());
 }
 
-fn entries(dir: &Path) -> Vec<String> {
+pub(crate) fn entries(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = fs::read_dir(dir)
         .unwrap()
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
@@ -874,7 +894,7 @@ fn entries(dir: &Path) -> Vec<String> {
 
 /// What a queued generated import reads from its run directory: the producer's `out/`, or,
 /// when the group was not proven empty, also the frozen `snapshot/` its batch names (#624).
-fn import_inputs(record: &Value) -> Vec<&'static str> {
+pub(crate) fn import_inputs(record: &Value) -> Vec<&'static str> {
     match record["groupStatus"].as_str() {
         Some("empty") => vec!["batch", "out", "run.json"],
         Some("unknown" | "survived") => vec!["batch", "out", "run.json", "snapshot"],
@@ -912,6 +932,24 @@ fn plant_foreign_run(world: &World, id: &str) -> PathBuf {
     });
     fs::write(dir.join("run.json"), record.to_string()).unwrap();
     dir
+}
+
+/// A run record another daemon left unfinished, as an automatic run created at `created_at`.
+fn plant_foreign_auto_run(world: &World, id: &str, created_at: u64) -> PathBuf {
+    let dir = plant_foreign_run(world, id);
+    let path = dir.join("run.json");
+    let mut record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    record["origin"] = json!("auto");
+    record["createdAt"] = json!(created_at);
+    fs::write(&path, record.to_string()).unwrap();
+    dir
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
 }
 
 fn assert_abandoned_and_stripped(world: &World, id: &str) {
@@ -1131,4 +1169,59 @@ fn unknown_acceptance_keeps_an_importing_record_naming_the_request() {
     trellis::testing::wait_until("the accepted request to settle", || {
         support::request_rows(&world.checkout)[before].1 == "done"
     });
+}
+
+const HOUR_MS: u64 = 3_600_000;
+
+/// A daemon that crashed mid-run left an automatic run behind. The restarted daemon's sweep
+/// abandons it, which is not a failure, but it counts as the last automatic start: a crash can
+/// repeat a run at most once per minimum interval.
+#[test]
+fn crash_abandoned_auto_run_waits_min_interval() {
+    use crate::producer_auto::{approve, auto_records, auto_world, edit_head, enable, wait_auto};
+    let world = auto_world(&[], (50, HOUR_MS, 200));
+    approve(&world, &[]);
+    edit_head(&world, 1);
+    support::stop_daemon(&world.checkout.home);
+    let created = now_ms();
+    let foreign = run_id_text(9);
+    plant_foreign_auto_run(&world, &foreign, created);
+    enable(&world);
+
+    let output = world.producer("status", &[]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    trellis::testing::wait_until("restart sweep", || {
+        world.record(&foreign)["state"] == "failed"
+    });
+    assert_abandoned_and_stripped(&world, &foreign);
+    let state = wait_auto(&world, "scheduled");
+    assert_eq!(
+        state["nextEarliestStart"].as_u64().unwrap(),
+        created + HOUR_MS
+    );
+    assert_eq!(auto_records(&world).len(), 1, "only the abandoned run");
+    assert_eq!(world.run_ids().len(), 2, "no new run record");
+}
+
+#[test]
+fn crash_abandoned_auto_run_restarts_after_min_interval() {
+    use crate::producer_auto::{approve, auto_records, auto_world, edit_head, enable};
+    let world = auto_world(&[], (50, HOUR_MS, 200));
+    approve(&world, &[]);
+    edit_head(&world, 1);
+    world.emitting_variant(1);
+    support::stop_daemon(&world.checkout.home);
+    let foreign = run_id_text(10);
+    plant_foreign_auto_run(&world, &foreign, now_ms() - 2 * HOUR_MS);
+    enable(&world);
+
+    let output = world.producer("status", &[]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    trellis::testing::wait_until("the new automatic run imports", || {
+        auto_records(&world)
+            .iter()
+            .any(|run| run["runId"] != foreign.as_str() && run["state"] == "done")
+    });
+    assert_abandoned_and_stripped(&world, &foreign);
+    assert_eq!(auto_records(&world).len(), 2);
 }

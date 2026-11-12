@@ -97,7 +97,82 @@ pub(crate) fn retention_root_key(identity: &super::topology::WorkspaceIdentity) 
     format!("{}:{}", identity.record_id, identity.inode)
 }
 
+/// The head's identity and which producers an automatic re-run is due for (#660 SD11).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AutoRunHead {
+    pub pin: IndexPin,
+    pub native_revision_id: String,
+    /// Producer ID to whether a re-run is due.
+    pub due: BTreeMap<String, bool>,
+}
+
+const SELECTED_CAPTURE: &str = "SELECT b.captured_revision,s.captured_pin
+    FROM semantic_revision_raw_selections s
+    JOIN semantic_raw_batches b ON b.batch_id=s.batch_id AND b.producer_id=s.producer_id
+    WHERE s.revision_id=?1 AND s.producer_id=?2";
+
+// Added, changed or removed documents of one language: the symmetric difference over (path, version).
+const DOCUMENTS_DIFFER: &str = "SELECT EXISTS(
+        SELECT 1 FROM revision_documents h WHERE h.revision_id=?1 AND h.language=?3
+        AND NOT EXISTS(SELECT 1 FROM revision_documents c
+            WHERE c.revision_id=?2 AND c.language=?3 AND c.path=h.path AND c.vid=h.vid)
+    ) OR EXISTS(
+        SELECT 1 FROM revision_documents c WHERE c.revision_id=?2 AND c.language=?3
+        AND NOT EXISTS(SELECT 1 FROM revision_documents h
+            WHERE h.revision_id=?1 AND h.language=?3 AND h.path=c.path AND h.vid=c.vid)
+    )";
+
 impl Store {
+    /// Which of `producers` (ID and languages) are due an automatic re-run at the head, read
+    /// in one snapshot. Due means a re-import row for one of its languages, or a language whose
+    /// default producer's selected batch was captured at another native revision with
+    /// different documents. No selection and no row is not due; manifest-only changes never are.
+    pub fn auto_run_due(&self, producers: &[(&str, &[&str])]) -> Result<AutoRunHead> {
+        self.with_evidence(|db| {
+            let pin = self.read_revision(db, None)?.pin;
+            let key = semantic_pin_key(pin);
+            let native_revision_id: String = db.query_row(
+                "SELECT native_revision_id FROM native_revisions WHERE id=?1",
+                [&key],
+                |row| row.get(0),
+            )?;
+            let reimports = semantic_reimport_at(db, &key)?;
+            let defaults = semantic_display::default_producers(db, &key)?;
+            let mut due = BTreeMap::new();
+            for (producer, languages) in producers {
+                let mut is_due = languages
+                    .iter()
+                    .any(|language| reimports.contains_key(*language));
+                for language in languages.iter() {
+                    if is_due {
+                        break;
+                    }
+                    let Some(default) = defaults.producer(language) else {
+                        continue;
+                    };
+                    let captured: Option<(String, String)> = db
+                        .prepare_cached(SELECTED_CAPTURE)?
+                        .query_row(params![key, default], |row| Ok((row.get(0)?, row.get(1)?)))
+                        .optional()?;
+                    let Some((captured_revision, captured_pin)) = captured else {
+                        continue;
+                    };
+                    if captured_revision != native_revision_id {
+                        is_due = db
+                            .prepare_cached(DOCUMENTS_DIFFER)?
+                            .query_row(params![key, captured_pin, language], |row| row.get(0))?;
+                    }
+                }
+                due.insert((*producer).to_string(), is_due);
+            }
+            Ok(AutoRunHead {
+                pin,
+                native_revision_id,
+                due,
+            })
+        })
+    }
+
     pub(crate) fn attach_retention(&self, db: &Connection) -> Result<StateDir> {
         let state = StateDir::open(&self.roots, &self.identity)?;
         // Never `st_dev`: APFS renumbers it across reboots (#811).

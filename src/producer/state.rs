@@ -19,6 +19,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+/// The most an approval record may hold.
+pub const MAX_APPROVAL_BYTES: u64 = 64 * 1024;
 /// Terminal run records kept per root key.
 pub const RETAINED_RUNS: usize = 10;
 /// Directories that exist only while the producer phase is running.
@@ -50,6 +52,16 @@ impl RunState {
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Done | Self::Failed | Self::Cancelled)
     }
+}
+
+/// Who asked for a run: an operator command, or the checkout's automatic re-run owner (#660).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RunOrigin {
+    /// Every run before #660 was manual, so a record without `origin` reads as this.
+    #[default]
+    Manual,
+    Auto,
 }
 
 /// The daemon that owns a run, identified by PID and start time.
@@ -92,6 +104,8 @@ pub struct RunRecord {
     /// What was established about the producer's process group once Trellis stopped owning
     /// it; `None` while the producer runs or when none was started.
     pub group_status: Option<GroupStatus>,
+    #[serde(default)]
+    pub origin: RunOrigin,
 }
 
 /// `pickup.json` (D6): at most one entry per producer.
@@ -299,6 +313,59 @@ impl StateDir {
         ensure_private(&self.path.join("pickups"))?;
         ensure_private(&dir)?;
         Ok(dir)
+    }
+
+    /// `approvals/<producer>.json`. The name becomes a file name, so it is a bounded slug.
+    pub fn approval_path(&self, producer: &str) -> Result<PathBuf> {
+        ensure!(
+            (1..=64).contains(&producer.len())
+                && producer
+                    .bytes()
+                    .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-')),
+            "invalid_request: producer name"
+        );
+        Ok(self.path.join("approvals").join(format!("{producer}.json")))
+    }
+
+    /// The approval record's bytes; `None` when there is no `approvals/` directory or record.
+    /// A record over 64 KiB is an error.
+    pub fn read_approval_bytes(&self, producer: &str) -> Result<Option<Vec<u8>>> {
+        use std::io::Read;
+        let path = self.approval_path(producer)?;
+        check_private(&self.path)?;
+        let dir = self.path.join("approvals");
+        match fs::symlink_metadata(&dir) {
+            Ok(_) => check_private(&dir)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("inspect {}", dir.display())),
+        }
+        let file = match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+        };
+        let mut bytes = Vec::new();
+        file.take(MAX_APPROVAL_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("read {}", path.display()))?;
+        ensure!(
+            bytes.len() as u64 <= MAX_APPROVAL_BYTES,
+            corrupt("approval record")
+        );
+        Ok(Some(bytes))
+    }
+
+    /// Replace the approval record atomically, creating `approvals/` at 0700.
+    pub fn write_approval_bytes(&self, producer: &str, bytes: &[u8]) -> Result<()> {
+        self.approval_path(producer)?;
+        check_private(&self.path)?;
+        let dir = self.path.join("approvals");
+        ensure_private(&dir)?;
+        write_atomic(&dir, &format!("{producer}.json"), bytes)
     }
 
     pub fn write_run_record(&self, record: &RunRecord) -> Result<()> {

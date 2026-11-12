@@ -1,6 +1,7 @@
 //! In-memory checkout admission. Retained entries never own checkout resources.
 use crate::http::RuntimePhase;
 use crate::model::{IndexPin, MAX_ACTIVE_CHECKOUTS};
+use crate::producer::auto::LaunchOutcome;
 use crate::store::{
     Store,
     topology::{TopologyRoots, WorkspaceIdentity},
@@ -685,6 +686,7 @@ impl CheckoutRegistry {
             rules_edit_owner: std::sync::Mutex::new(()),
             pickup: crate::producer::pickup::PickupOwner::default(),
             producer: crate::producer::run::ProducerOwner::default(),
+            auto_run: crate::producer::auto::AutoRunOwner::default(),
             view_requests: Default::default(),
             search: self.search.clone(),
             search_coverage: std::sync::Mutex::new(None),
@@ -746,6 +748,15 @@ impl CheckoutRegistry {
         runtime
             .pickup
             .start_watch(&runtime.resources()?.store, &scheduler);
+        runtime.auto_run.start(
+            Arc::new(AutoHost {
+                runtime: Arc::downgrade(&runtime),
+            }),
+            Arc::new(crate::producer::auto::StoreSources::new(
+                runtime.resources()?.store.clone(),
+                crate::producer::profiles::Stub::from_env(),
+            )),
+        );
         scheduler.begin_startup_reconciliation();
         Ok(runtime)
     }
@@ -834,6 +845,7 @@ impl CheckoutRegistry {
                     .root_lost
                     .store(true, std::sync::atomic::Ordering::Release);
             }
+            runtime.auto_run.shutdown();
             runtime.pickup.shutdown();
             runtime.resources.lock().unwrap().take();
         }
@@ -844,6 +856,7 @@ impl CheckoutRegistry {
         let runtimes: Vec<_> = registry.lock().await.runtimes.values().cloned().collect();
         tokio::task::spawn_blocking(move || {
             for runtime in runtimes {
+                runtime.auto_run.shutdown();
                 runtime.producer.shutdown();
                 runtime.pickup.shutdown();
             }
@@ -1881,6 +1894,8 @@ pub struct CheckoutRuntime {
     pickup: crate::producer::pickup::PickupOwner,
     /// The only owner of this checkout's producer runs.
     producer: crate::producer::run::ProducerOwner,
+    /// The only owner of this checkout's automatic producer re-runs (#660).
+    auto_run: crate::producer::auto::AutoRunOwner,
     /// The latest agent `trellis_show` and whether a viewer is open (#818).
     view_requests: super::view_request::ViewRequests,
 }
@@ -1946,6 +1961,78 @@ struct RunWatchGuard(Arc<std::sync::atomic::AtomicBool>);
 impl Drop for RunWatchGuard {
     fn drop(&mut self) {
         self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// The checkout runtime as its `AutoRunOwner` sees it (#660). It holds the runtime weakly, so the
+/// owner's thread never keeps a retired checkout alive; once the runtime or its resources are
+/// gone it reports a runtime that is neither alive nor ready, and the owner exits.
+struct AutoHost {
+    runtime: std::sync::Weak<CheckoutRuntime>,
+}
+
+impl crate::producer::auto::AutoRunRuntime for AutoHost {
+    fn alive(&self) -> bool {
+        self.runtime
+            .upgrade()
+            .is_some_and(|runtime| runtime.resources().is_ok())
+    }
+
+    fn phase_ready(&self) -> bool {
+        self.runtime.upgrade().is_some_and(|runtime| {
+            runtime
+                .resources()
+                .is_ok_and(|resources| resources.scheduler.runtime_phase() == RuntimePhase::Ready)
+        })
+    }
+
+    fn intent_pending(&self) -> bool {
+        let Some(Ok(resources)) = self.runtime.upgrade().map(|runtime| runtime.resources()) else {
+            return true;
+        };
+        resources.scheduler.fifo_pending() || resources.scheduler.checkout_watch_pending()
+    }
+
+    fn active_origin(&self) -> Option<crate::producer::state::RunOrigin> {
+        match self.runtime.upgrade() {
+            Some(runtime) => runtime.producer.active_origin(),
+            None => Some(crate::producer::state::RunOrigin::Manual),
+        }
+    }
+
+    fn supersede(
+        &self,
+        token: &crate::producer::run::SupersedeToken,
+    ) -> crate::producer::run::AutoCancel {
+        match self.runtime.upgrade() {
+            Some(runtime) => runtime.producer.supersede(token),
+            None => crate::producer::run::AutoCancel::NoAutoRun,
+        }
+    }
+
+    fn state_version(&self) -> u64 {
+        self.runtime
+            .upgrade()
+            .map_or(0, |runtime| runtime.state_version())
+    }
+
+    fn wait_state_change(&self, seen: u64, timeout: Duration) {
+        if let Some(runtime) = self.runtime.upgrade() {
+            runtime.wait_state_change(seen, timeout);
+        }
+    }
+
+    fn wake(&self) {
+        if let Some(Ok(resources)) = self.runtime.upgrade().map(|runtime| runtime.resources()) {
+            resources.scheduler.note_state_change();
+        }
+    }
+
+    fn launch(&self, request: crate::producer::auto::LaunchRequest) -> LaunchOutcome {
+        match self.runtime.upgrade() {
+            Some(runtime) => runtime.auto_launch(request),
+            None => LaunchOutcome::NotReady,
+        }
     }
 }
 
@@ -2196,6 +2283,7 @@ impl CheckoutRuntime {
         }
         let (response, catching_up) = self.evidence_response()?;
         let mut status = response.status()?;
+        crate::store::relabel_status(&mut status, &self.auto_run.labels());
         status.catching_up = catching_up;
         status.watcher = Some(self.resources()?.scheduler.checkout_watcher_witness());
         let search_head = self.search_head_coverage(&response, status.revision, &mut || Ok(()))?;
@@ -2228,14 +2316,39 @@ impl CheckoutRuntime {
         resources.store.verify_root()?;
         let stub = crate::producer::profiles::Stub::from_env();
         let mut status = crate::producer::plan::status(&resources.store, &request, stub.as_ref())?;
-        status["activeRun"] = self.producer.status();
+        let status_run = self.producer.status();
+        status["activeRun"] = status_run.clone();
         if let Some(producers) = status["producers"].as_array_mut() {
             for producer in producers {
                 let name = producer["name"].as_str().unwrap_or_default().to_owned();
                 producer["pickup"] = self.pickup.status(&resources.store, &name);
+                producer["autoRun"] = self.auto_run_status(&name, &status_run);
             }
         }
         Ok(status)
+    }
+
+    /// `autoRun` of one producer in the status reply (#660). While the producer's automatic run
+    /// is active, `lastRunId` is that run's.
+    fn auto_run_status(&self, producer: &str, active_run: &serde_json::Value) -> serde_json::Value {
+        use crate::producer::auto::AutoState;
+        let status = self.auto_run.status(producer);
+        let running = status.state == AutoState::Running
+            && active_run["origin"] == "auto"
+            && active_run["producer"] == producer;
+        let last_run_id = if running {
+            active_run["runId"].clone()
+        } else {
+            serde_json::json!(status.last_run_id)
+        };
+        serde_json::json!({
+            "enabled": status.enabled,
+            "state": status.state.as_str(),
+            "reason": status.reason,
+            "dueSince": status.due_since,
+            "nextEarliestStart": status.next_earliest_start,
+            "lastRunId": last_run_id,
+        })
     }
 
     /// Run one producer after the caller inspected its plan, and reply with the terminal
@@ -2251,14 +2364,105 @@ impl CheckoutRuntime {
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let _finished = RunWatchGuard(done.clone());
         self.watch_run_closing(resources.scheduler.clone(), done);
-        self.producer.start_run(
+        let reply = self.producer.start_run(
             &crate::producer::run::RunContext {
                 store: &resources.store,
                 scheduler: &resources.scheduler,
                 stub: stub.as_ref(),
             },
             &request,
-        )
+        );
+        // The end of a manual run frees the slot an automatic run may be waiting for.
+        resources.scheduler.note_state_change();
+        reply
+    }
+
+    /// Run the approved automatic re-run `request` for this checkout's `AutoRunOwner`, and map
+    /// how it ended. The lease is the background kind: it never cancels a retirement, and it is
+    /// held only while the run is.
+    fn auto_launch(&self, request: crate::producer::auto::LaunchRequest) -> LaunchOutcome {
+        use crate::producer::approval::{self, Refusal};
+        use crate::producer::auto::{AutoOutcome, failure_code, is_failure};
+        let Ok(resources) = self.resources() else {
+            return LaunchOutcome::NotReady;
+        };
+        let Some(_lease) = resources.scheduler.background_lease() else {
+            return LaunchOutcome::NotReady;
+        };
+        if resources.scheduler.runtime_phase() != RuntimePhase::Ready
+            || resources.store.verify_root().is_err()
+        {
+            return LaunchOutcome::NotReady;
+        }
+        let expected = request.expected_revision.clone();
+        let failed = |code: &str| LaunchOutcome::Finished {
+            run_id: None,
+            outcome: AutoOutcome::Failed {
+                code: failure_code(code),
+                basis: expected.clone(),
+            },
+        };
+        let stub = crate::producer::profiles::Stub::from_env();
+        let run = match approval::run_request(
+            &resources.store,
+            &request.approval,
+            stub.as_ref(),
+            &expected,
+            request.token,
+        ) {
+            Ok(run) => run,
+            Err(Refusal::HeadMoved) => return LaunchOutcome::HeadMoved,
+            Err(Refusal::Template) => return LaunchOutcome::NeedsApproval,
+            Err(Refusal::Failed(code)) => return failed(&code),
+        };
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _finished = RunWatchGuard(done.clone());
+        self.watch_run_closing(resources.scheduler.clone(), done);
+        let result = self.producer.start_run(
+            &crate::producer::run::RunContext {
+                store: &resources.store,
+                scheduler: &resources.scheduler,
+                stub: stub.as_ref(),
+            },
+            &run,
+        );
+        match result {
+            Err(error) => {
+                let message = error.to_string();
+                match message.split(':').next().unwrap_or_default() {
+                    crate::producer::PLAN_CHANGED => LaunchOutcome::HeadMoved,
+                    crate::producer::PRODUCER_BUSY => LaunchOutcome::SlotBusy,
+                    "root_changed" => LaunchOutcome::NotReady,
+                    _ => failed(&message),
+                }
+            }
+            Ok(reply) => {
+                let text = |key: &str| reply[key].as_str().map(str::to_owned);
+                let (outcome, error_code) = (text("outcome"), text("errorCode"));
+                let outcome = match error_code.as_deref() {
+                    _ if outcome.as_deref() == Some("imported") => AutoOutcome::Imported,
+                    Some("cancelled: superseded") => AutoOutcome::Superseded,
+                    Some("cancelled: preempted") => AutoOutcome::Preempted,
+                    _ if is_failure(outcome.as_deref(), error_code.as_deref()) => {
+                        AutoOutcome::Failed {
+                            code: failure_code(
+                                error_code
+                                    .as_deref()
+                                    .or(outcome.as_deref())
+                                    .unwrap_or_default(),
+                            ),
+                            basis: text("sourceRevision").unwrap_or_else(|| expected.clone()),
+                        }
+                    }
+                    // Lost root or abandonment: neither a failure nor a start to wait out.
+                    _ => return LaunchOutcome::NotReady,
+                };
+                LaunchOutcome::Finished {
+                    run_id: text("runId"),
+                    outcome,
+                }
+            }
+        }
     }
 
     /// Cancel a run that has not yet enqueued its import.
@@ -2835,7 +3039,10 @@ impl CheckoutRuntime {
                 hook();
             }
         }
-        let response = resources.store.evidence_response_daemon_local()?;
+        let response = resources
+            .store
+            .evidence_response_daemon_local()?
+            .with_auto_run_labels(self.auto_run.labels());
         let catching_up = catching_up || response.semantic_catching_up()?;
         Ok((
             CheckoutEvidence {
@@ -3720,6 +3927,7 @@ mod selection_tests {
             rules_edit_owner: std::sync::Mutex::new(()),
             pickup: crate::producer::pickup::PickupOwner::default(),
             producer: crate::producer::run::ProducerOwner::default(),
+            auto_run: crate::producer::auto::AutoRunOwner::default(),
             view_requests: Default::default(),
             mcp_clock_skew_ms: std::sync::atomic::AtomicU64::new(0),
             search_hash_scans: std::sync::atomic::AtomicUsize::new(0),

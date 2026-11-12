@@ -1,6 +1,7 @@
 use super::process_info;
 use super::state::{
-    DaemonIdentity, PickupConfig, PickupEntry, RETAINED_RUNS, RunRecord, RunState, StateDir,
+    DaemonIdentity, PickupConfig, PickupEntry, RETAINED_RUNS, RunOrigin, RunRecord, RunState,
+    StateDir,
 };
 use super::{GroupStatus, ProcessIdentity, TrustProfile};
 use crate::store::topology::{TopologyRoots, WorkspaceIdentity};
@@ -68,6 +69,7 @@ fn record(n: u32, state: RunState, daemon: DaemonIdentity) -> RunRecord {
         finished_at: None,
         diagnostics: None,
         group_status: None,
+        origin: RunOrigin::Manual,
     }
 }
 
@@ -600,4 +602,86 @@ fn sweep_publishes_the_abandoned_record_only_after_the_strip() {
         .map(|entry| entry.unwrap().file_name())
         .collect();
     assert_eq!(names, ["run.json"]);
+}
+
+#[test]
+fn origin_round_trips_and_a_record_without_it_reads_as_manual() {
+    let fixture = fixture();
+    let state = state(&fixture);
+    state.create_run_dir(&run_id(1)).unwrap();
+    let mut auto = record(1, RunState::Done, DaemonIdentity::current());
+    auto.origin = RunOrigin::Auto;
+    state.write_run_record(&auto).unwrap();
+    let path = state.run_dir(&run_id(1)).unwrap().join("run.json");
+    let json: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(json["origin"], "auto");
+    assert_eq!(state.read_run_record(&run_id(1)).unwrap(), Some(auto));
+
+    // A record written before #660 has no `origin`, and still passes the closed parse.
+    let mut old = json;
+    old.as_object_mut().unwrap().remove("origin");
+    fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+    let read = state.read_run_record(&run_id(1)).unwrap().unwrap();
+    assert_eq!(read.origin, RunOrigin::Manual);
+}
+
+/// The sweep and run retention scan `runs/` and `pickups/`: an approval is neither.
+#[test]
+fn approvals_are_untouched_by_the_sweep_and_by_prune_runs() {
+    let fixture = fixture();
+    let state = state(&fixture);
+    state
+        .write_approval_bytes("rust-analyzer", b"approved")
+        .unwrap();
+    for n in 1..=(RETAINED_RUNS as u32 + 3) {
+        state.create_run_dir(&run_id(n)).unwrap();
+        state
+            .write_run_record(&record(n, RunState::Done, DaemonIdentity::current()))
+            .unwrap();
+    }
+    state.create_run_dir(&run_id(100)).unwrap();
+    state
+        .write_run_record(&record(100, RunState::Running, other_daemon()))
+        .unwrap();
+    state.prune_runs(&BTreeSet::new()).unwrap();
+    state
+        .sweep(&DaemonIdentity::current(), &BTreeSet::new())
+        .unwrap();
+    assert_eq!(
+        state.read_approval_bytes("rust-analyzer").unwrap(),
+        Some(b"approved".to_vec())
+    );
+}
+
+#[test]
+fn approval_bytes_are_private_bounded_and_named_safely() {
+    let fixture = fixture();
+    let state = state(&fixture);
+    assert_eq!(state.read_approval_bytes("rust-analyzer").unwrap(), None);
+    assert!(!state.path().join("approvals").exists());
+    state.write_approval_bytes("rust-analyzer", b"{}").unwrap();
+    let dir = state.path().join("approvals");
+    assert_eq!(mode(&dir), 0o700);
+    assert_eq!(mode(&dir.join("rust-analyzer.json")), 0o600);
+    assert_eq!(state.read_approval_bytes("scip-java").unwrap(), None);
+
+    for name in ["", "../x", "Rust", "a/b", &"a".repeat(65)] {
+        assert!(state.approval_path(name).is_err(), "{name:?}");
+        assert!(state.write_approval_bytes(name, b"x").is_err(), "{name:?}");
+        assert!(state.read_approval_bytes(name).is_err(), "{name:?}");
+    }
+
+    fs::write(dir.join("rust-analyzer.json"), vec![b'x'; 64 * 1024]).unwrap();
+    assert!(
+        state
+            .read_approval_bytes("rust-analyzer")
+            .unwrap()
+            .is_some()
+    );
+    fs::write(dir.join("rust-analyzer.json"), vec![b'x'; 64 * 1024 + 1]).unwrap();
+    assert!(state.read_approval_bytes("rust-analyzer").is_err());
+
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(state.read_approval_bytes("rust-analyzer").is_err());
+    assert!(state.write_approval_bytes("rust-analyzer", b"x").is_err());
 }

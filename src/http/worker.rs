@@ -802,7 +802,7 @@ impl DaemonState {
 
     /// A lease for the Architecture owner's read. Unlike a client's lease it never cancels
     /// a requested retirement: nothing is waiting for this work.
-    pub(super) fn background_lease(&self) -> Option<AdmissionLease> {
+    pub(crate) fn background_lease(&self) -> Option<AdmissionLease> {
         let state = self.runtime.lock().unwrap();
         if matches!(
             *state,
@@ -1023,7 +1023,7 @@ impl DaemonState {
     }
 
     /// Bump the state version and wake state waiters (read readiness, close).
-    pub(super) fn note_state_change(&self) {
+    pub(crate) fn note_state_change(&self) {
         // Under the state lock, so a waiter that checked the version cannot
         // miss this notification.
         let _state = self.runtime.lock().unwrap();
