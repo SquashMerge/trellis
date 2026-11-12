@@ -87,7 +87,7 @@ const drawn = async page => {
   await page.locator(".architecture-apps-grid .architecture-interface-card").waitFor({state:"attached"});
 };
 
-test("all_apps_layout: columns side by side with a gutter card and a hidden overlay line, stacked when narrow", {timeout:240000}, async () => published(httpFiles, httpRules, async ({page}) => {
+test("all_apps_layout: columns side by side with a lane-sized gutter, the card under the grid and a hidden overlay line, stacked when narrow", {timeout:240000}, async () => published(httpFiles, httpRules, async ({page}) => {
   await drawn(page);
   const grid = page.locator("#architecture-diagram .architecture-apps-grid");
   await columnsDrawn(page);
@@ -101,12 +101,14 @@ test("all_apps_layout: columns side by side with a gutter card and a hidden over
   assert.equal(lines[0], "HTTP · 1 route"); assert.match(lines[1], /^\d+ call sites?$/);
   assert.ok(lines.includes("◆ 1 server-only")); assert.ok(lines.includes("◆ 1 client-only"));
   const boxes = await page.evaluate(() => {
-    const rect = node => { const r = node.getBoundingClientRect(); return {left:r.left, right:r.right}; };
+    const rect = node => { const r = node.getBoundingClientRect(); return {left:r.left, right:r.right, top:r.top, bottom:r.bottom}; };
     const [first, second] = [...document.querySelectorAll(".architecture-app-column")].map(rect);
-    return {first, second, card:rect(document.querySelector(".architecture-interface-card"))};
+    return {first, second, grid:rect(document.querySelector(".architecture-apps-grid")), card:rect(document.querySelector(".architecture-interface-card")),
+      under:!!document.querySelector(".architecture-apps-cards .architecture-interface-card")};
   });
-  assert.ok(boxes.card.left >= boxes.first.right - 1 && boxes.card.right <= boxes.second.left + 1, "the card sits in the gutter between the columns");
-  assert.ok(Math.round(boxes.second.left - boxes.first.right) === 176, "176px gutter");
+  // #949: one line, so the gutter is the least 48px, narrower than a card, which is listed under the grid.
+  assert.equal(Math.round(boxes.second.left - boxes.first.right), 48, `48px gutter: ${JSON.stringify(boxes)}`);
+  assert.ok(boxes.under && boxes.card.top >= boxes.grid.bottom - 1, `the card sits under the grid: ${JSON.stringify(boxes)}`);
   const overlay = page.locator(".architecture-apps-overlay");
   assert.equal(await overlay.getAttribute("aria-hidden"), "true");
   assert.ok(await overlay.locator(".architecture-apps-line").count() >= 1, "the matched ends run as lines");
@@ -117,6 +119,32 @@ test("all_apps_layout: columns side by side with a gutter card and a hidden over
   await page.locator(".architecture-interface-card .architecture-card-ends").first().waitFor({state:"attached"});
   assert.equal(await page.locator(".architecture-apps-line").count(), 0, "no line is drawn when the columns stack");
   assert.match(await page.locator(".architecture-interface-card").textContent(), /→/, "the card names both ends in words");
+}));
+
+// #949: a Rust server with two JavaScript clients, `one` calling one route and `two` three. The server comes
+// first in manifest order, so only interface order puts it between its clients.
+const serverFirstFiles = new Map([
+  ["Cargo.toml", '[package]\nname = "srv"\n'],
+  ["src/main.rs", 'async fn a() {}\nasync fn b() {}\nasync fn c() {}\nfn router() -> Router {\n    Router::new().route("/a", get(a)).route("/b", get(b)).route("/c", get(c))\n}\nfn main() {}\n'],
+  ["one/package.json", '{"name":"one"}\n'], ["one/app.js", 'async function load(api) {\n  await api("/a");\n}\n'],
+  ["two/package.json", '{"name":"two"}\n'], ["two/app.js", 'async function load(api) {\n  await api("/a");\n  await api("/b");\n  await api("/c");\n}\n'],
+]);
+const serverFirstRules = "version=1\n[layers.server]\napp='srv'\norder=1\npaths=['src/**']\n[layers.first]\napp='one'\norder=1\npaths=['one/**']\n[layers.second]\napp='two'\norder=1\npaths=['two/**']\n";
+
+test("#949 three apps at a realistic width: the server between its two clients, side by side with both lines, the inspector open", {timeout:240000}, async () => published(serverFirstFiles, serverFirstRules, async ({page}) => {
+  // A canvas of about 1100px beside the open inspector.
+  await page.setViewportSize({width:1700, height:1000});
+  await page.locator("#architecture-state[data-state=ready]").waitFor({state:"attached"});
+  await page.waitForFunction(() => document.querySelectorAll(".architecture-app-column").length === 3 && document.querySelector(".architecture-apps-grid")?.dataset.layout === "columns"
+    && !document.getElementById("architecture-diagram").dataset.layout).catch(() => {});
+  const inputs = await layoutInputs(page);
+  assert.ok(inputs.inspector > 0, `the inspector is open: ${JSON.stringify(inputs)}`);
+  assert.ok(inputs.canvasClientWidth >= 1080 && inputs.canvasClientWidth <= 1180, `a canvas of about 1100px: ${JSON.stringify(inputs)}`);
+  assert.equal(inputs.layout, "columns", `the three columns sit side by side: ${JSON.stringify(inputs)}`);
+  assert.deepEqual(await page.locator(".architecture-app-column").evaluateAll(nodes => nodes.map(node => node.getAttribute("aria-label"))), ["two", "srv", "one"],
+    "the client with more matched routes on the server's left, the other on its right");
+  assert.equal(await page.locator(".architecture-apps-overlay .architecture-apps-line").count(), 2, "both interfaces run as lines");
+  assert.equal(await page.locator(".architecture-interface-card .architecture-card-ends").count(), 0, "no end is left to words");
 }));
 
 test("all_apps_selected_word: a selected header or card says Selected, and is pressed", {timeout:240000}, async () => published(httpFiles, httpRules, async ({page}) => {

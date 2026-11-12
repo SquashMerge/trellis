@@ -147,7 +147,8 @@ test("stubs sum a client's ends, bound a server's shared routes, skip other laye
   assert.equal(apps.link(view, "web", "api"), view.interfaces[0]); assert.equal(apps.link(view, "api", "nobody"), null);
 });
 
-// All apps (#790): three apps in a row, web -> api -> db, with a second interface running back from db to web.
+// All apps (#790): three apps in a row, web -> api -> db, with a second interface running back from db to api.
+// api serves web and db, so interface order (#949) keeps the inventory's web | api | db.
 function threeApps(extra = {}) {
   const layer = (name, app) => ({name, order:1, shared:false, app, apps:null});
   const module = (file, name, app) => ({identity:identity(file), layer:name, app, physicalLines:3, declarationCount:1, metrics:{cognitive:4}});
@@ -159,8 +160,7 @@ function threeApps(extra = {}) {
   [layer("UI", "web"), layer("Api", "api"), layer("Data", "db")], [module("web/a.js", "UI", "web"), module("api/a.js", "Api", "api"), module("db/a.js", "Data", "db")]);
   dto.interfaces = [entry("web", "api", [end("UI", "Api", 2, 5), end("UI", "Api", 1, 1)], {matchedRoutes:3, callSites:6, serverOnly:2, clientOnly:0, confidence:{exact:4, template:0, wrapperInferred:2, unresolved:0}}),
     entry("api", "db", [end("Api", "Data", 1, 40)], {matchedRoutes:1, callSites:40}),
-    entry("db", "api", [end("Data", "Api", 1, 2)], {matchedRoutes:1, callSites:2, clientOnly:7}),
-    entry("db", "web", [end("Data", "UI", 1, 3)], {matchedRoutes:1, callSites:3})];
+    entry("db", "api", [end("Data", "Api", 1, 2)], {matchedRoutes:1, callSites:2, clientOnly:7})];
   dto.noApp = {counts:counts(0, 0, 0), unassignedFileCount:9};
   return Object.assign(dto, extra);
 }
@@ -170,17 +170,36 @@ const columnsOf = h => grid(h).children.filter(item => item.attrs.role === "grou
 const cardsOf = h => descendants(h.get("architecture-diagram")).filter(item => item.attrs["data-trellis-card"] === "interface");
 const headers = h => descendants(h.get("architecture-diagram")).filter(item => item.className === "architecture-app-header");
 
-test("layout: side by side from n x 352 + (n - 1) x 176, else stacked", () => {
-  const apps = appsModule(), plan = (width, count) => JSON.parse(JSON.stringify(apps.layout({width, count})));
-  assert.equal(plan(1407, 3).sideBySide, false); assert.equal(plan(1408, 3).sideBySide, true);
-  assert.equal(plan(880, 2).sideBySide, true); assert.equal(plan(879, 2).sideBySide, false);
-  assert.deepEqual(plan(1408, 3).columns.map(column => column.x), [0, 528, 1056]); assert.equal(plan(1408, 3).widths[0], 352);
-  assert.equal(plan(1600, 3).widths[0], Math.floor((1600 - 2 * 176) / 3));
+test("layout (#949): side by side from n x 352 plus each gutter sized to its lanes, else stacked", () => {
+  const apps = appsModule(), plan = (width, count, lanes) => JSON.parse(JSON.stringify(apps.layout({width, count, lanes})));
+  // A gutter is max(48, lanes x 6 + 2 x 8 + 8): 48 up to four lanes, then 6px a lane.
+  assert.deepEqual(plan(2400, 5, [0, 1, 4, 5]).gutters, [48, 48, 48, 54]); assert.deepEqual(plan(2000, 2, [26]).gutters, [180]);
+  assert.deepEqual(plan(2000, 3).gutters, [48, 48], "no lanes known: the least gutter");
+  assert.equal(plan(1151, 3, [2, 1]).sideBySide, false); assert.equal(plan(1152, 3, [2, 1]).sideBySide, true, "3 x 352 + 2 x 48");
+  assert.equal(plan(1157, 3, [5, 1]).sideBySide, false); assert.equal(plan(1158, 3, [5, 1]).sideBySide, true, "a five-lane gutter is 54px");
+  assert.equal(plan(752, 2, [1]).sideBySide, true); assert.equal(plan(751, 2, [1]).sideBySide, false);
+  assert.deepEqual(plan(1152, 3, [2, 1]).columns.map(column => column.x), [0, 400, 800]); assert.equal(plan(1152, 3, [2, 1]).widths[0], 352);
+  assert.equal(plan(1600, 3, [2, 1]).widths[0], Math.floor((1600 - 2 * 48) / 3));
   assert.equal(plan(300, 3).widths[0], 352, "text never shrinks below the least column; the diagram scrolls");
-  const wide = JSON.parse(JSON.stringify(apps.layout({width:1408, count:3, natural:[352, 900, 100]})));
+  assert.deepEqual(plan(300, 3).gutters, [], "stacked columns have no gutter");
+  const wide = JSON.parse(JSON.stringify(apps.layout({width:1158, count:3, lanes:[5, 1], natural:[352, 900, 100]})));
   assert.deepEqual(wide.widths, [352, 900, 352], "a drawing wider than its column widens it, and never narrows one");
-  assert.deepEqual(wide.columns.map(column => column.x), [0, 528, 1604]); assert.equal(wide.width, 1956);
+  assert.deepEqual(wide.columns.map(column => column.x), [0, 406, 1354]); assert.equal(wide.width, 1706);
   assert.equal(plan(NaN, 2).sideBySide, false);
+  assert.equal(apps.cardFits(176), true); assert.equal(apps.cardFits(175), false, "a card floats only in a gutter at least a card wide");
+});
+
+test("columnOrder (#949): each server sits between its clients, the busier on its left; ties and apps with no interface keep manifest order", () => {
+  const apps = appsModule(), link = (client, server, matchedRoutes) => ({client, server, ends:[], counts:{matchedRoutes}});
+  const order = (names, ...interfaces) => [...apps.columnOrder({interfaces}, names)];
+  assert.deepEqual(order(["trellis", "herdr-mod", "web"], link("web", "trellis", 28), link("herdr-mod", "trellis", 30)), ["herdr-mod", "trellis", "web"]);
+  assert.deepEqual(order(["trellis", "herdr-mod", "web"], link("web", "trellis", 28), link("herdr-mod", "trellis", 3)), ["web", "trellis", "herdr-mod"], "the client with the most matched routes on the left");
+  assert.deepEqual(order(["srv", "b", "a"], link("a", "srv", 4), link("b", "srv", 4)), ["b", "srv", "a"], "a tie keeps manifest order");
+  assert.deepEqual(order(["srv", "a", "b", "c"], link("a", "srv", 1), link("b", "srv", 9), link("c", "srv", 5)), ["b", "srv", "c", "a"], "the rest after the right client");
+  assert.deepEqual(order(["solo", "srv", "other", "web"], link("web", "srv", 2)), ["solo", "web", "srv", "other"], "apps with no interface keep their places; a block takes its first member's");
+  assert.deepEqual(order(["x", "y", "z"]), ["x", "y", "z"], "no interface: manifest order");
+  assert.deepEqual(order(["x", "y"], link("x", "x", 5), link("y", "ghost", 5), null), ["x", "y"], "a self link, an absent app or a hostile entry orders nothing");
+  assert.deepEqual(order(["web", "api", "db"], link("web", "api", 3), link("api", "db", 1)), ["web", "api", "db"], "a chain: an app placed beside one server stays");
 });
 
 test("card_counts_equal_dto: every number on a card is the DTO's, non-zero confidence only, and ◆ lines only when above zero", () => {
@@ -198,7 +217,7 @@ test("a column per app with its header totals read from the DTO; an app without 
   const dto = threeApps(); dto.layers = dto.layers.filter(layer => layer.name !== "Data"); dto.modules = dto.modules.filter(item => item.layer !== "Data");
   const h = controller(dto); await h.architecture.refresh();
   assert.equal(grid(h).dataset.layout, "columns");
-  assert.deepEqual(columnsOf(h).map(item => item.attrs["aria-label"]), ["web", "api", "db"], "in the order of the inventory");
+  assert.deepEqual(columnsOf(h).map(item => item.attrs["aria-label"]), ["web", "api", "db"], "in interface order, here the inventory's");
   assert.deepEqual(h.renders.map(render => render.options.title), ["web · ordered layers", "api · ordered layers"], "db has no layer to draw");
   assert.deepEqual(headers(h).map(flat), [
     "web javascript · web · 2 files · max 4 (cognitive) · 3 deviations Selected", "api javascript · api · 2 files · max 4 (cognitive) · 1 deviation Selected",
@@ -216,32 +235,58 @@ test("each column's budget is floor(150 / n) and its drawing opens the shown lay
   assert.deepEqual(budgets.map(count => count <= 50), [true, true, true], "no column draws more than floor(150 / 3) chips");
 });
 
-test("gutters and lanes: one card per interface, a line per end in its own lane, the arrowhead at the server end", async () => {
+test("gutters and lanes (#949): a gutter as wide as its lines, a line per end in its own lane, the arrowhead at the server end, cards under the grid", async () => {
   const h = controller(threeApps(), {width:1408}); await h.architecture.refresh();
-  assert.equal(cardsOf(h).length, 4);
+  assert.equal(cardsOf(h).length, 3);
+  // Two lines in each gutter, so each is the least 48px: columns of floor((1408 - 96) / 3) = 437 at x 0, 485 and 970.
+  assert.deepEqual(grid(h).style.gridTemplateColumns.split(" "), ["437px", "48px", "437px", "48px", "437px"]);
+  assert.deepEqual(columnsOf(h).map(item => item.style.gridColumn), ["1", "3", "5"], "a column takes every other track");
   const lines = descendants(h.get("architecture-diagram")).filter(item => item.attrs.class === "architecture-apps-line");
   const forward = lines.filter(item => item.attrs["data-interface"] === JSON.stringify(["interface", "web", "api"]));
   assert.equal(forward.length, 2, "each end has a line"); assert.deepEqual(forward.map(item => item.attrs["stroke-width"]), ["6", "2"], "edgeWidth of that end's call sites");
   const lane = line => Number(line.attrs.d.match(/L(\d+),/)[1]);
-  const gutterOne = lines.filter(item => /web|api/.test(item.attrs["data-interface"]) && !/db/.test(item.attrs["data-interface"]));
-  const laneXs = gutterOne.map(lane); assert.equal(new Set(laneXs).size, laneXs.length, "no two lines share a lane");
-  assert.ok(laneXs.every(x => x > 352 && x < 528), "the lanes run inside the 176px gutter between the first two columns");
+  const laneXs = forward.map(lane); assert.equal(new Set(laneXs).size, laneXs.length, "no two lines share a lane");
+  assert.ok(laneXs.every(x => x > 437 && x < 485), `the lanes run inside the 48px gutter between the first two columns: ${laneXs}`);
   const arrow = descendants(h.get("architecture-diagram")).find(item => item.attrs.class === "architecture-apps-arrow" && item.attrs["data-interface"] === JSON.stringify(["interface", "web", "api"]));
-  assert.ok(arrow.attrs.points.startsWith("538,"), "the head sits on the server band's left border");
+  assert.ok(arrow.attrs.points.startsWith("495,"), "the head sits on the server band's left border: " + arrow.attrs.points);
   const backwards = descendants(h.get("architecture-diagram")).find(item => item.attrs.class === "architecture-apps-arrow" && item.attrs["data-interface"] === JSON.stringify(["interface", "db", "api"]));
-  assert.ok(backwards.attrs.points.startsWith("838,"), "B -> A runs the other way and ends on the server's right border: " + backwards.attrs.points);
+  assert.ok(backwards.attrs.points.startsWith("795,"), "B -> A runs the other way and ends on the server's right border: " + backwards.attrs.points);
   const overlay = descendants(h.get("architecture-diagram")).find(item => item.attrs.class === "architecture-apps-overlay");
-  assert.equal(overlay.attrs["aria-hidden"], "true");
+  assert.equal(overlay.attrs["aria-hidden"], "true"); assert.equal(overlay.attrs.width, "1407");
   assert.equal(descendants(overlay).some(item => /error/.test(item.attrs.class || "")), false, "never the error tone");
   const card = cardsOf(h)[0];
   assert.match(card.attrs["aria-label"], /^HTTP interface from web layer UI to api layer Api: 3 matched routes/);
   assert.equal(descendants(card).some(item => item.className === "architecture-card-ends"), false, "both ends are drawn, so no words");
+  const under = descendants(h.get("architecture-diagram")).find(item => item.className === "architecture-apps-cards");
+  assert.deepEqual(cardsOf(h).map(item => [item.parent === under, item.attrs["data-gutter"]]), [[true, undefined], [true, undefined], [true, undefined]],
+    "a 48px gutter is narrower than a card, so every card is listed under the grid");
+});
+
+test("interface order (#949): 3 apps at a realistic width put the server between its 2 clients, side by side with both lines", async () => {
+  const dto = threeApps();
+  // Manifest order srv | one | two: srv serves both, two with more matched routes.
+  dto.apps = [app("srv", "Cargo.toml", "srv", counts(1, 0, 0)), app("one", "one/package.json", "one", counts(1, 0, 0)), app("two", "two/package.json", "two", counts(1, 0, 0))];
+  dto.layers = [["Api", "srv"], ["UiOne", "one"], ["UiTwo", "two"]].map(([name, owner]) => ({name, order:1, shared:false, app:owner, apps:null}));
+  dto.modules = dto.layers.map(layer => ({identity:identity(`${layer.app}/a.js`), layer:layer.name, app:layer.app, physicalLines:3, declarationCount:1, metrics:{cognitive:1}}));
+  const entry = (client, layer, routes) => ({client, server:"srv", kind:"http", ends:[{clientLayer:layer, serverLayer:"Api", routes, callSites:routes}], wrappers:{callees:[], prefix:null},
+    counts:{matchedRoutes:routes, callSites:routes, serverOnly:0, clientOnly:0, confidence:{exact:routes, template:0, wrapperInferred:0, unresolved:0}}});
+  dto.interfaces = [entry("one", "UiOne", 3), entry("two", "UiTwo", 28)];
+  const h = controller(dto, {width:1152}); await h.architecture.refresh();
+  assert.equal(grid(h).dataset.layout, "columns", "3 x 352 + 2 x 48 fits");
+  assert.deepEqual(columnsOf(h).map(item => item.attrs["aria-label"]), ["two", "srv", "one"]);
+  const lines = descendants(h.get("architecture-diagram")).filter(item => item.attrs.class === "architecture-apps-line");
+  assert.deepEqual(lines.map(item => JSON.parse(item.attrs["data-interface"]).slice(1)), [["one", "srv"], ["two", "srv"]], "both interfaces run as lines");
+  assert.equal(cardsOf(h).some(item => /→/.test(text(item))), false, "no end is left to words");
 });
 
 test("an interface between columns that are not adjacent, or stacked columns, name their ends in words", async () => {
-  const h = controller(threeApps()); await h.architecture.refresh();
-  const far = cardsOf(h).find(item => item.attrs["data-trellis-action-id"] === JSON.stringify(["interface", "db", "web"]));
-  assert.match(flat(far), /db · Data → web · UI/); assert.equal(far.attrs["data-gutter"], undefined, "it is not placed in a gutter");
+  // A chain web -> api -> db, and web -> db past api, which no order can make adjacent.
+  const dto = threeApps(); dto.interfaces.push({...structuredClone(dto.interfaces[1]), client:"web", server:"db", ends:[{clientLayer:"UI", serverLayer:"Data", routes:1, callSites:3}]});
+  const h = controller(dto); await h.architecture.refresh();
+  assert.deepEqual(columnsOf(h).map(item => item.attrs["aria-label"]), ["web", "api", "db"]);
+  const far = cardsOf(h).find(item => item.attrs["data-trellis-action-id"] === JSON.stringify(["interface", "web", "db"]));
+  assert.match(flat(far), /web · UI → db · Data/); assert.equal(far.attrs["data-gutter"], undefined, "it is not placed in a gutter");
+  assert.equal(descendants(h.get("architecture-diagram")).some(item => item.attrs["data-interface"] === JSON.stringify(["interface", "web", "db"])), false, "and draws no line");
   const narrow = controller(threeApps(), {width:900}); await narrow.architecture.refresh();
   assert.equal(grid(narrow).dataset.layout, "stacked");
   assert.equal(descendants(narrow.get("architecture-diagram")).some(item => item.attrs.class === "architecture-apps-line"), false, "no line in a stacked layout");
@@ -296,7 +341,7 @@ test("AC25 selecting a column header or a card shows the word Selected, presses 
 
 test("T00 markup in app names and layers is text: no element is created from a column, card or aside", async () => {
   const bad = '<img src=x onerror="window.__pwned=1">';
-  const dto = threeApps(); dto.apps[0].name = bad; dto.layers[0].app = bad; dto.modules[0].app = bad; dto.interfaces[0].client = bad; dto.interfaces[3].server = bad;
+  const dto = threeApps(); dto.apps[0].name = bad; dto.layers[0].app = bad; dto.modules[0].app = bad; dto.interfaces[0].client = bad;
   const h = controller(dto); await h.architecture.refresh();
   const all = descendants(h.get("architecture-diagram"));
   assert.equal(all.filter(item => item.tagName === "img").length, 0); assert.equal(h.window.__pwned, undefined);
@@ -358,7 +403,7 @@ function sides({interfaces, names = ["web", "api"], bands = {web:{UI:false, Comm
 test("#850 shared_side_two_apps: an interface on the ordered layers puts each Shared band away from the partner", () => {
   assert.deepEqual(sides({interfaces:[["web", "api", [["UI", "Api"]]]]}), {web:"left", api:"right"});
   assert.deepEqual(sides({interfaces:[["api", "web", [["Api", "UI"], ["Store", "UI"]]]], names:["api", "web"]}), {api:"left", web:"right"},
-    "manifest order decides the columns, whichever app is the client");
+    "the given column order decides, whichever app is the client");
 });
 test("#850 shared_side_fallbacks: ties keep the right; a Shared end, both-side partners and hidden or far ends count by crossings", () => {
   // No interface, or only undrawn, far or stacked ends: no line, so the right, as in the one-app view.

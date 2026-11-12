@@ -68,21 +68,27 @@
   }
 
   // ---- All apps (#790): pure layout, card text and overlay routing. The controller draws and measures. ----
-  const COLUMN_MIN = 352, GUTTER = 176, ARROW = 8, LANE_TOP = 8, LANE_STEP = 6;
+  const COLUMN_MIN = 352, GUTTER_MIN = 48, LANE_MARGIN = 8, CARD = 176, ARROW = 8, LANE_TOP = 8, LANE_STEP = 6;
   const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
-  // Columns sit side by side when they all fit at their least width with a gutter between each; else they stack.
-  // `natural` is each drawing's own measured width: a column never narrows below it, and whatever then
-  // overflows the pane scrolls.
-  function layout({width, count, natural = []}) {
-    const n = Number.isSafeInteger(count) && count > 0 ? count : 1, wide = Number.isFinite(width) ? width : 0;
-    const sideBySide = n > 1 && wide >= n * COLUMN_MIN + (n - 1) * GUTTER;
-    const base = sideBySide ? Math.floor((wide - (n - 1) * GUTTER) / n) : Math.max(COLUMN_MIN, Math.floor(wide));
+  // A gutter is as wide as its lanes need (#949; owner ruling 2026-11-12): a lane per drawn end, an arrowhead's
+  // room on each side and a margin, and never under 48px.
+  const gutterWidth = lanes => Math.max(GUTTER_MIN, count(lanes) * LANE_STEP + 2 * ARROW + LANE_MARGIN);
+  // Columns sit side by side when they all fit at their least width with each gutter between them; else they stack.
+  // `lanes[i]` is the number of lines gutter i (after column i) carries. `natural` is each drawing's own measured
+  // width: a column never narrows below it, and whatever then overflows the pane scrolls.
+  function layout({width, count:columnCount, natural = [], lanes = []}) {
+    const n = Number.isSafeInteger(columnCount) && columnCount > 0 ? columnCount : 1, wide = Number.isFinite(width) ? width : 0;
+    const gutters = Array.from({length:n - 1}, (_, index) => gutterWidth(lanes[index])), between = gutters.reduce((sum, each) => sum + each, 0);
+    const sideBySide = n > 1 && wide >= n * COLUMN_MIN + between;
+    const base = sideBySide ? Math.floor((wide - between) / n) : Math.max(COLUMN_MIN, Math.floor(wide));
     const widths = Array.from({length:n}, (_, index) => Math.max(base, Number.isFinite(natural[index]) ? natural[index] : 0));
-    if (!sideBySide) { const all = Math.max(...widths); return {sideBySide, gutter:GUTTER, count:n, widths:widths.map(() => all), columns:widths.map(() => ({x:0, width:all})), width:all}; }
+    if (!sideBySide) { const all = Math.max(...widths); return {sideBySide, gutters:[], count:n, widths:widths.map(() => all), columns:widths.map(() => ({x:0, width:all})), width:all}; }
     let x = 0;
-    const columns = widths.map(each => { const column = {x, width:each}; x += each + GUTTER; return column; });
-    return {sideBySide, gutter:GUTTER, count:n, widths, columns, width:x - GUTTER};
+    const columns = widths.map((each, index) => { const column = {x, width:each}; x += each + (gutters[index] || 0); return column; });
+    return {sideBySide, gutters, count:n, widths, columns, width:x};
   }
+  // A card floats in its gutter only when the gutter is at least a card wide; otherwise it is listed under the grid.
+  const cardFits = gutter => Number.isFinite(gutter) && gutter >= CARD;
   // Non-zero evidence counts of the call sites, as the DTO reports them.
   function confidenceText(counts) {
     const confidence = record(counts?.confidence) ? counts.confidence : {};
@@ -142,7 +148,7 @@
     }
     const used = new Map(), lines = placed.map(item => {
       const slot = used.get(item.gutter) || 0; used.set(item.gutter, slot + 1);
-      const left = plan.columns[item.gutter].x + plan.columns[item.gutter].width, laneX = left + Math.round(plan.gutter * (slot + 1) / (lanes.get(item.gutter) + 1));
+      const left = plan.columns[item.gutter].x + plan.columns[item.gutter].width, laneX = left + Math.round(plan.gutters[item.gutter] * (slot + 1) / (lanes.get(item.gutter) + 1));
       const y0 = Math.min(item.from.y + item.from.h - 4, item.from.y + LANE_TOP + LANE_STEP * slot);
       const y1 = Math.min(item.to.y + item.to.h - 4, item.to.y + LANE_TOP + LANE_STEP * slot);
       const x0 = item.rightward ? item.from.x + item.from.w : item.from.x, x1 = item.rightward ? item.to.x : item.to.x + item.to.w, d = item.rightward ? 1 : -1;
@@ -153,11 +159,11 @@
     return {lines, undrawn};
   }
   // An end draws a line only between adjacent columns, and only when both of its layers are drawn bands
-  // (`has(place, layer)`). `routes` and `sharedSides` share this test, so a side is chosen from drawn lines alone.
+  // (`has(place, layer)`). `routes`, `sharedSides` and `laneCounts` share this test, so a side and a gutter are chosen from drawn lines alone.
   const drawable = (client, server, end, has) => !!client && !!server && Math.abs(client.index - server.index) === 1 &&
     has(client, end.clientLayer) && has(server, end.serverLayer);
   // Which side of each side-by-side column its Shared bands take (#850; owner decision 2026-11-09).
-  // Columns keep manifest order (`names`). Only an end between adjacent columns draws a line, and it
+  // Columns are in interface order (`names`, see columnOrder). Only an end between adjacent columns draws a line, and it
   // leaves its band toward the partner column: an end on an ordered band crosses the Shared bands
   // when they sit on that side, and an end on a Shared band crosses the ordered stack when they sit
   // on the other. Each column takes the side with fewer such crossings; a tie, including a column with
@@ -181,6 +187,43 @@
     }
     return new Map(names.map((name, index) => [name, cost[index].left < cost[index].right ? "left" : "right"]));
   }
+  // Interface order (#949; owner ruling 2026-11-12, amending the 2026-11-09 manifest order): from manifest order
+  // (`names`), each server app sits between its clients, the client with the most matched routes on its left,
+  // the next on its right and the rest after them; ties keep manifest order. Servers are taken in manifest
+  // order, and an app already placed beside an earlier server stays where it is. Apps with no interface keep
+  // their manifest order, and a block takes the place of its first member.
+  function columnOrder(view, names) {
+    const at = new Map(names.map((name, index) => [name, index])), routesOf = new Map();
+    for (const entry of Array.isArray(view?.interfaces) ? view.interfaces.filter(record) : []) {
+      if (!at.has(entry.client) || !at.has(entry.server) || entry.client === entry.server) continue;
+      const pair = JSON.stringify([entry.client, entry.server]);
+      routesOf.set(pair, (routesOf.get(pair) || 0) + count(entry.counts?.matchedRoutes));
+    }
+    const routes = (client, server) => routesOf.get(JSON.stringify([client, server]));
+    let order = [...names];
+    const placed = new Set();
+    for (const server of names) {
+      if (placed.has(server)) continue;
+      const clients = names.filter(name => name !== server && !placed.has(name) && routes(name, server) !== undefined)
+        .sort((a, b) => routes(b, server) - routes(a, server) || at.get(a) - at.get(b));
+      if (!clients.length) continue;
+      const block = [clients[0], server, ...clients.slice(1)], first = order.findIndex(name => block.includes(name)), rest = order.filter(name => !block.includes(name));
+      order = [...rest.slice(0, first), ...block, ...rest.slice(first)];
+      for (const name of block) placed.add(name);
+    }
+    return order;
+  }
+  // How many lines each gutter of side-by-side columns in order `names` carries: the ends `drawable` lets through,
+  // with `band` as for `sharedSides`. Known before any column is drawn, so the gutters can be sized to them.
+  function laneCounts(view, names, band) {
+    const at = new Map(names.map((name, index) => [name, {name, index}])), lanes = names.slice(1).map(() => 0);
+    const has = (place, layer) => typeof layer === "string" && typeof band(place.name, layer) === "boolean";
+    for (const entry of Array.isArray(view?.interfaces) ? view.interfaces.filter(record) : []) {
+      const client = at.get(entry.client), server = at.get(entry.server);
+      for (const end of endsOf(entry)) if (drawable(client, server, end, has)) lanes[Math.min(client.index, server.index)]++;
+    }
+    return lanes;
+  }
   const endsOf = entry => (Array.isArray(entry?.ends) ? entry.ends : []).filter(record);
   const key = entry => JSON.stringify(["interface", entry.client, entry.server]);
   const label = item => item.languages.length ? `${item.name} · ${item.languages.join(", ")}` : item.name;
@@ -202,11 +245,12 @@
   // ---- Inspector facts, shared by the browser's inspector and the Herdr mod (#886). Values are the DTO's. ----
   const shown = value => typeof value === "number" && Number.isFinite(value) ? String(value) : "—";
   const text = value => typeof value === "string" ? value : "";
-  // The interface inspector (AC15): its ends, the counts grid and the wrappers line.
+  // The interface inspector (AC15): its ends, the counts grid, the wrappers line and the matched list's heading (#950).
   function interfaceFacts(entry) {
     const counts = record(entry?.counts) ? entry.counts : {}, confidence = record(counts.confidence) ? counts.confidence : {};
     const wrappers = entry.wrappers, prefix = wrappers?.prefix;
     return {title:`${entry.client} → ${entry.server}`, basis:"HTTP · method and path match · structural evidence, not proof",
+      matchedHeading:`Matched routes (${shown(counts.matchedRoutes)})`,
       ends:[`Client end: ${entry.client} · ${layerNames(entry, "clientLayer")}`, `Server end: ${entry.server} · ${layerNames(entry, "serverLayer")}`],
       rows:[["Matched routes", shown(counts.matchedRoutes)], ["Client call sites", shown(counts.callSites)],
         ["◆ Server-only routes", shown(counts.serverOnly), "warning"], ["◆ Client-only calls", shown(counts.clientOnly), "warning"],
@@ -296,6 +340,6 @@
   // The switcher's choices, in Architecture's order and words: All apps, then one per app name.
   const choices = assigned => assigned ? [{name:null, text:"All apps"}, ...assigned.groups.map(item => ({name:item.name, text:label(item)}))] : [];
   window.TrellisArchitectureApps = {groups, group, scoped, link, stubs, sumCounts, label, origin, sourceLine, duplicateNotice,
-    layout, confidenceText, cardText, cardName, endsText, header, routes, sharedSides, key, interfaceFacts, appFacts, footnote,
+    layout, cardFits, columnOrder, laneCounts, confidenceText, cardText, cardName, endsText, header, routes, sharedSides, key, interfaceFacts, appFacts, footnote,
     assignment, rootApp, appOf, chosen, holdsFile, holdsFolder, selection, choices};
 })();

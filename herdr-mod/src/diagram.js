@@ -134,7 +134,9 @@ export async function draw(view, { width, theme, highlight, pause, choice }) {
   }
 
   // All apps (#790): web/architecture.js drawApps, with the grid composed into one SVG.
-  let layout = apps.layout({ width, count: plan.parts.length });
+  // Each gutter is as wide as the lines it carries (#949), counted before any column is drawn.
+  const lanes = summary.lanes(view, plan.parts);
+  let layout = apps.layout({ width, count: plan.parts.length, lanes });
   const sides = summary.sides(view, plan.parts, layout.sideBySide);
   const drawings = [];
   for (const [index, part] of plan.parts.entries()) {
@@ -143,7 +145,7 @@ export async function draw(view, { width, theme, highlight, pause, choice }) {
     if (pause) await pause();
   }
   // A drawing wider than its column (an unbreakable name) widens the column.
-  layout = apps.layout({ width, count: plan.parts.length, natural: drawings.map((d) => d?.width ?? 0) });
+  layout = apps.layout({ width, count: plan.parts.length, lanes, natural: drawings.map((d) => d?.width ?? 0) });
   const places = new Map(plan.parts.map((part, index) => {
     const x = layout.sideBySide ? layout.columns[index].x : 0, frames = drawings[index]?.bands ?? new Map();
     return [part.group.name, { index, top: 0, bands: new Map([...frames].filter(([, f]) => f).map(([name, f]) => [name, { x: f.x + x, y: f.y, w: f.w, h: f.h }])) }];
