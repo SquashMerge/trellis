@@ -239,3 +239,14 @@ other browser tests keep the normal binary. For a focused run after browser prov
 run `node --test tests/browser/navigation-resolved.test.cjs`. It builds a test-support
 binary when `TRELLIS_NAVIGATION_FIXTURE_BINARY` is absent. To avoid that build, point the
 variable at a prebuilt test-support `trellis` executable.
+
+## Dogfooding fixes (#913)
+
+- `viewer-shell.test.cjs` sends a real `trellis_show` through a `trellis mcp` stdio session while
+  Architecture is open, then uses the agent note's Back. After each step the only selected, shown
+  or focused view tab is the view on screen.
+- `connect.test.cjs` checks the connect footer: the index follows file changes and producer
+  re-runs are opt-in (docs/quickstart.md "Automatic re-runs").
+- `architecture-apps.test.cjs` checks that layer numbers count only shown layers (a hidden first
+  layer leaves the next at 1, per app, in All apps, one app and the inspector; a revealed hidden
+  layer reads "Hidden"), and that one app's coverage line and About counts are that app's layers.

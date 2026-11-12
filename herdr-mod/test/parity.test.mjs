@@ -272,3 +272,33 @@ test("review P3: side by side, the Files card says a visible followed chip is ou
     assert.match(pane.fileCard(theme, file, pane.placement(file)).text(), /outlined in the diagram/, `width ${width}`);
   }
 });
+
+// #913: layer numbers count only the shown layers. With srv's first layer hidden, core is 1, in the
+// band label the drawing carries and in the shared label the pane's layer list and Files card use.
+test("#913 layer numbers: a hidden first layer takes no number, so the first shown layer is 1", async () => {
+  const view = twoApps();
+  view.layers = view.layers.map((l) => (l.name === "server" ? { ...l, display: "hidden" } : l));
+  const layer = (name) => view.layers.find((l) => l.name === name);
+  for (const scope of ["srv", null]) {
+    const summary = summarize(view, { scope });
+    assert.equal(summary.layerNumber(layer("core")), 1, `core is srv's first shown layer (scope ${scope})`);
+    assert.equal(summary.layerNumber(layer("server")), null, "the hidden layer takes no number");
+    assert.equal(summary.layerTag(layer("server")), "Hidden");
+    if (scope === null) assert.equal(summary.layerNumber(layer("client")), 1, "All apps: each app counts from 1");
+    assert.match(summary.layerLabel(layer("core")), /^1 · core/);
+  }
+  const [image] = (await draw(view, { width: 600, theme, highlight: null, choice: { scope: "srv" } })).images;
+  assert.match(image.svg, /1 · core/);
+  assert.doesNotMatch(image.svg, /2 · core/);
+  // Control: with every layer shown, the numbers are the authored stack's.
+  const shown = summarize(twoApps(), { scope: "srv" });
+  assert.match(shown.layerLabel(twoApps().layers.find((l) => l.name === "core")), /^2 · core/);
+});
+
+// #913: one app's coverage line counts that app's layers; All apps counts the checkout.
+test("#913 coverage: one app counts its own layers' reference sites, All apps the checkout's", () => {
+  const view = twoApps();
+  assert.match(summarize(view).coverageSummary(view), /^4 of 5 reference sites mapped to a module/);
+  assert.match(summarize(view, { scope: "srv" }).coverageSummary(view), /^4 of 5 reference sites from srv's layers mapped to a module/);
+  assert.match(summarize(view, { scope: "webapp" }).coverageSummary(view), /^0 of 0 reference sites from webapp's layers mapped to a module \(—\)$/);
+});

@@ -1204,7 +1204,8 @@ function filesFailure(error, target, current) {
 async function setSection(name, view = null) {
   if (!["files", "diagrams"].includes(name) || !selectedRootKey) return;
   if (section === name) {
-    const target = name === "files" ? filesBasis === "working" ? $("files-diff") : workspaceSource ? $("source") : $("file-filter") : $("view-sequence");
+    // Already in Diagrams: focus the tab of the view on screen, never a fixed one (#913).
+    const target = name === "files" ? filesBasis === "working" ? $("files-diff") : workspaceSource ? $("source") : $("file-filter") : $(`view-${view || currentDiagramView()}`);
     target?.focus(); return;
   }
   architecture?.reset();
