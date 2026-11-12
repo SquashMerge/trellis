@@ -22,6 +22,8 @@ pub enum Kind {
     Pairs,
     Unresolved,
     Interfaces,
+    /// One summary edge's pairs (#917).
+    Edge,
 }
 
 impl Kind {
@@ -31,6 +33,7 @@ impl Kind {
             Self::Pairs => "pairs",
             Self::Unresolved => "unresolved",
             Self::Interfaces => "interfaces",
+            Self::Edge => "edge",
         }
     }
 }
@@ -87,6 +90,7 @@ impl Query {
             Some("pairs") => Kind::Pairs,
             Some("unresolved") => Kind::Unresolved,
             Some("interfaces") => Kind::Interfaces,
+            Some("edge") => Kind::Edge,
             _ => return Err(InvalidQuery),
         };
         let allowed: &[&str] = match kind {
@@ -105,7 +109,29 @@ impl Query {
             Kind::Pairs => &["role", "path", "source", "target", "layer", "unlayered"],
             Kind::Unresolved => &["path"],
             Kind::Interfaces => &["client", "server", "list"],
+            Kind::Edge => &[
+                "sourceLayer",
+                "destinationLayer",
+                "role",
+                "status",
+                "excepted",
+                "exceptionReason",
+            ],
         };
+        // An edge is named by its whole summary identity; only a null reason is left out.
+        if kind == Kind::Edge
+            && [
+                "sourceLayer",
+                "destinationLayer",
+                "role",
+                "status",
+                "excepted",
+            ]
+            .iter()
+            .any(|name| !fields.contains_key(*name))
+        {
+            return Err(InvalidQuery);
+        }
         let common = [
             "indexGeneration",
             "indexRevision",
@@ -269,6 +295,79 @@ impl<'a> Layers<'a> {
             .as_str()
             .and_then(|path| self.native.get(path).copied().flatten())
     }
+}
+
+/// The summary edge a reference pair counts under (#917): its layers, verdict and exception.
+/// The role is passed beside it.
+pub(crate) struct EdgeKey<'a> {
+    pub(crate) source: &'a str,
+    pub(crate) destination: &'a str,
+    pub(crate) status: &'a str,
+    pub(crate) excepted: bool,
+    pub(crate) reason: Option<&'a str>,
+}
+
+/// Visit every reference pair that a summary edge counts, production before test, in
+/// evaluation order, with its role and edge. Same-layer, unassigned and cross-app pairs draw
+/// no edge. The summary's `edges` and the details route's `edge` kind both come from here.
+pub(crate) fn edge_pairs<'a>(
+    references: &'a Value,
+    rules: &'a Value,
+    check: &mut (impl FnMut() -> Result<()> + Send),
+    mut visit: impl FnMut(&'static str, EdgeKey<'a>, &'a Value) -> Result<()>,
+) -> Result<()> {
+    for (field, evaluated, role) in [
+        ("production", "instances", "production"),
+        ("tests", "testOnly", "test"),
+    ] {
+        let verdicts: BTreeMap<_, _> = rules[evaluated]
+            .as_array()
+            .context("store_unavailable: layer verdicts")?
+            .iter()
+            .filter(|row| row["rule"] == "$layers" && !row["destination"].is_null())
+            .map(|row| {
+                (
+                    (row["target"].to_string(), row["destination"].to_string()),
+                    row,
+                )
+            })
+            .collect();
+        for pair in references[field]
+            .as_array()
+            .context("store_unavailable: reference pairs")?
+        {
+            check()?;
+            let verdict = verdicts
+                .get(&(pair["source"].to_string(), pair["target"].to_string()))
+                .context("store_unavailable: architecture verdict join")?;
+            let (Some(source), Some(destination)) = (
+                verdict["sourceLayer"].as_str(),
+                verdict["destinationLayer"].as_str(),
+            ) else {
+                continue;
+            };
+            if source == destination
+                || verdict["unresolved"]
+                    .as_array()
+                    .is_some_and(|reasons| reasons.iter().any(|reason| reason == "cross_app"))
+            {
+                continue;
+            }
+            let key = EdgeKey {
+                source,
+                destination,
+                status: verdict["status"]
+                    .as_str()
+                    .context("store_unavailable: layer status")?,
+                excepted: verdict["excepted"]
+                    .as_bool()
+                    .context("store_unavailable: layer exception")?,
+                reason: verdict["exceptionReason"].as_str(),
+            };
+            visit(role, key, pair)?;
+        }
+    }
+    Ok(())
 }
 
 /// The bounded default view fields: exact counts and limitations, without the
@@ -458,6 +557,22 @@ pub(crate) fn page(
                 admit(&|| interfaces.item(row))?;
             }
         }
+        Kind::Edge => {
+            edge_pairs(references, rules, check, |role, edge, pair| {
+                if role_is(role)
+                    && query.source_layer.as_deref() == Some(edge.source)
+                    && query.destination_layer.as_deref() == Some(edge.destination)
+                    && query.status.as_deref() == Some(edge.status)
+                    && query.excepted == Some(edge.excepted)
+                    && query.exception_reason.as_deref() == edge.reason
+                {
+                    admit(&|| pair.clone())?;
+                }
+                Ok(())
+            })?;
+            // Every summary edge counts at least one pair.
+            ensure!(total > 0, "not_found: architecture edge");
+        }
     }
     ensure!(query.offset <= total, "invalid_request: detail offset");
     Ok(json!({
@@ -601,6 +716,125 @@ mod tests {
             page["items"][0]["pair"]["sites"][1]["targetReason"],
             "unresolved"
         );
+    }
+    /// #917: the `edge` kind pages exactly the pairs one summary edge counts, by its whole
+    /// identity, in evaluation order; same-layer, unassigned and cross-app pairs belong to no
+    /// edge, and an edge that counts nothing is `not_found`.
+    #[test]
+    fn edge_pages_hold_exactly_one_edges_pairs() {
+        let pair = |to: &str, count: u64| {
+            json!({"source":{"path":"a.rs"},"target":{"path":to},"count":count,"semanticSites":0,
+                "sites":[{"relationKind":"call"}],"omittedSites":count - 1})
+        };
+        let verdict = |to: &str, destination: Option<&str>, excepted: Option<&str>| {
+            json!({"rule":"$layers","target":{"path":"a.rs"},"destination":{"path":to},
+                "sourceLayer":"low","destinationLayer":destination,"status":"deviates",
+                "excepted":excepted.is_some(),"exceptionReason":excepted,
+                "unresolved": if to == "x.rs" { json!(["cross_app"]) } else { json!([]) }})
+        };
+        let references = json!({
+            "production":[pair("b.rs", 2), pair("e.rs", 4), pair("c.rs", 1), pair("s.rs", 1),
+                pair("u.rs", 1), pair("x.rs", 1)],
+            "tests":[pair("b.rs", 3)],
+        });
+        let rules = json!({"rulesFile":{"contentHash":"hash"},
+            "instances":[verdict("b.rs", Some("high"), None), verdict("e.rs", Some("high"), Some("ok")),
+                verdict("c.rs", Some("high"), None), verdict("s.rs", Some("low"), None),
+                verdict("u.rs", None, None), verdict("x.rs", Some("high"), None)],
+            "testOnly":[verdict("b.rs", Some("high"), None)]});
+        let native = BTreeMap::new();
+        let layers = Layers::new(&native, &rules);
+        let edge = |extra: &[(&str, &str)]| {
+            let mut fields: BTreeMap<String, String> = [
+                ("kind", "edge"),
+                ("indexGeneration", "12345678-1234-4123-8123-123456789abc"),
+                ("indexRevision", "1"),
+                ("rulesHash", "hash"),
+                ("limit", "1"),
+                ("sourceLayer", "low"),
+                ("destinationLayer", "high"),
+                ("role", "production"),
+                ("status", "deviates"),
+                ("excepted", "false"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+            for (k, v) in extra {
+                if v.is_empty() {
+                    fields.remove(*k);
+                } else {
+                    fields.insert((*k).to_owned(), (*v).to_owned());
+                }
+            }
+            Query::from_fields(fields)
+        };
+        let all = |query: Query| {
+            let (mut query, mut items) = (query, Vec::new());
+            loop {
+                let page = page(&query, &references, &rules, &layers, None, &mut || Ok(()))?;
+                assert_eq!(page["kind"], "edge");
+                items.extend(page["items"].as_array().unwrap().iter().cloned());
+                match page["nextOffset"].as_u64() {
+                    Some(next) => query.offset = next as usize,
+                    None => {
+                        assert_eq!(page["total"], items.len());
+                        return Ok::<_, anyhow::Error>(items);
+                    }
+                }
+            }
+        };
+        let targets = |items: Vec<Value>| -> Vec<String> {
+            items
+                .iter()
+                .map(|item| item["target"]["path"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        // One pair per page; the pages concatenate to the edge's pairs, items unchanged.
+        let plain = all(edge(&[]).unwrap()).unwrap();
+        assert_eq!(plain[0], references["production"][0]);
+        assert_eq!(targets(plain), ["b.rs", "c.rs"]);
+        let excepted = edge(&[("excepted", "true"), ("exceptionReason", "ok")]).unwrap();
+        assert_eq!(targets(all(excepted).unwrap()), ["e.rs"]);
+        let test = all(edge(&[("role", "test")]).unwrap()).unwrap();
+        assert_eq!(test, [references["tests"][0].clone()]);
+        // Every reference pair counts under the same edges as the summary.
+        let mut counted = Vec::new();
+        edge_pairs(&references, &rules, &mut || Ok(()), |role, key, pair| {
+            counted.push((role, key.excepted, pair["target"]["path"].clone()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(counted.len(), 4, "{counted:?}");
+        for unknown in [
+            edge(&[("status", "conforms")]).unwrap(),
+            edge(&[("destinationLayer", "low")]).unwrap(),
+            edge(&[("exceptionReason", "ok")]).unwrap(),
+            edge(&[("excepted", "true")]).unwrap(),
+        ] {
+            let error = all(unknown).unwrap_err().to_string();
+            assert!(error.starts_with("not_found: architecture edge"), "{error}");
+        }
+        let mut past = edge(&[]).unwrap();
+        past.offset = 3;
+        assert!(
+            page(&past, &references, &rules, &layers, None, &mut || Ok(()))
+                .unwrap_err()
+                .to_string()
+                .starts_with("invalid_request")
+        );
+        for invalid in [
+            &[("status", "")][..],
+            &[("excepted", "")],
+            &[("sourceLayer", "")],
+            &[("role", "")],
+            &[("role", "all")],
+            &[("excepted", "maybe")],
+            &[("path", "a.rs")],
+            &[("layer", "low")],
+        ] {
+            assert!(edge(invalid).is_err(), "{invalid:?}");
+        }
     }
     /// #784: the `app` filter keeps the rows whose bucket's name matches, so two apps that
     /// share a name answer to one filter value, and a row with no app matches none.

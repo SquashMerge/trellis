@@ -4549,29 +4549,20 @@ fn selected_mutation_error(error: ApiError, outcome: &str) -> Response {
     response
 }
 
-/// The Architecture options, and whether `edges[].pairs` is in the answer: `pairs=false`
-/// leaves it out (#915, owner ruling 2026-11-11); the default is the full answer.
-fn architecture_query(
-    uri: &axum::http::Uri,
-) -> Result<(crate::store::MetricsOptions, bool), ApiError> {
-    let mut pairs = None;
+/// The Architecture options. Edges never carry their per-file pairs: the details route's
+/// `edge` kind pages them (#917, owner 2026-11-11). `pairs=false`, which asked for that
+/// answer under #915, stays accepted once and changes nothing; `pairs=true` is refused.
+fn architecture_query(uri: &axum::http::Uri) -> Result<crate::store::MetricsOptions, ApiError> {
+    let mut pairs = false;
     let mut rest = Vec::new();
     for pair in uri.query().into_iter().flat_map(|query| query.split('&')) {
         match pair.split_once('=') {
-            Some(("pairs", value)) => {
-                let value = match value {
-                    "true" => true,
-                    "false" => false,
-                    _ => return Err(invalid()),
-                };
-                if pairs.replace(value).is_some() {
-                    return Err(invalid());
-                }
-            }
+            Some(("pairs", "false")) if !pairs => pairs = true,
+            Some(("pairs", _)) => return Err(invalid()),
             _ => rest.push(pair),
         }
     }
-    let uri = if pairs.is_some() {
+    let uri = if pairs {
         let rest = if rest.is_empty() {
             "/".to_owned()
         } else {
@@ -4602,7 +4593,7 @@ fn architecture_query(
     {
         options.aggregate = "max".into();
     }
-    Ok((options, pairs.unwrap_or(true)))
+    Ok(options)
 }
 
 /// Detail pages require the summary's full pin and rules hash; see
@@ -4861,13 +4852,13 @@ async fn provisioned_core_answer(
                 None
             };
             let detail_read = details.is_some();
-            let (options, pairs) = if detail_read {
+            let options = if detail_read {
                 // A detail page evaluates the whole revision, like the summary.
-                (crate::store::MetricsOptions::default(), true)
+                crate::store::MetricsOptions::default()
             } else if architecture {
                 architecture_query(uri)?
             } else {
-                (metrics_query(uri)?, true)
+                metrics_query(uri)?
             };
             let runtime = runtime.clone();
             // The guard belongs to this request future, not to the blocking worker.
@@ -4960,7 +4951,7 @@ async fn provisioned_core_answer(
                 let result = if let Some(details) = &details {
                     runtime.architecture_details_response(details, &mut check, hooks, metrics.limit)
                 } else if architecture {
-                    runtime.architecture_response(&options, pairs, &mut check, hooks, metrics.limit)
+                    runtime.architecture_response(&options, &mut check, hooks, metrics.limit)
                 } else {
                     runtime.metrics_response(&options, &mut check, hooks, metrics.limit)
                 };
@@ -5023,6 +5014,13 @@ async fn provisioned_core_answer(
                         if text.starts_with("invalid_request:") {
                             return Err(invalid());
                         }
+                        if text.starts_with("not_found: architecture edge") {
+                            return Err(ApiError(
+                                StatusCode::NOT_FOUND,
+                                "not_found",
+                                "No such Architecture edge at this pin and rules file",
+                            ));
+                        }
                     }
                     return Err(ApiError::from(error));
                 }
@@ -5042,7 +5040,7 @@ async fn provisioned_core_answer(
             let apply = matches!(route, BrowserCoreRoute::RulesApply);
             let inventory = matches!(route, BrowserCoreRoute::RulesInventory);
             let pin = if inventory {
-                let (options, _) = architecture_query(uri)?;
+                let options = architecture_query(uri)?;
                 if uri.query().is_some_and(|query| {
                     query.split('&').any(|pair| {
                         !matches!(

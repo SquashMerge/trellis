@@ -143,6 +143,21 @@ async function architecture(selected, aggregate = "max", role = "production") {
   }
 }
 
+// #917: summary edges carry no pairs; the details route's edge kind pages one edge's pairs.
+async function edgePairs(selected, dto, edge) {
+  const pairs = [];
+  for (let offset = 0; offset !== null;) {
+    const query = new URLSearchParams({kind:"edge", sourceLayer:edge.sourceLayer, destinationLayer:edge.destinationLayer, role:edge.role,
+      status:edge.status, excepted:String(edge.excepted), indexGeneration:dto.indexGeneration, indexRevision:dto.indexRevision,
+      rulesHash:dto.rulesFile.contentHash, offset, limit:2});
+    if (edge.exceptionReason !== null) query.set("exceptionReason", edge.exceptionReason);
+    const page = await H.api(selected.server.base, selected.paths.token, "GET", H.scoped(selected.server.rootKey, `architecture/details?${query}`));
+    assert.equal(page.status, 200, JSON.stringify(page.data));
+    pairs.push(...page.data.payload.items); offset = page.data.payload.nextOffset;
+  }
+  return pairs;
+}
+
 // #845: a deviating arrow opens the Deviations tree on its edge; Back returns to the arrow.
 test("Architecture deviating arrows open the Deviations tree on their edge, and Back returns to the arrow", {timeout:240000}, async () => published(rules, async selected => {
   const {page, requests} = selected;
@@ -216,7 +231,8 @@ test("Architecture does not invent a caller for syntax-only non-call boundary si
     await ready(page);
     const edge = page.locator("#architecture-diagram").getByRole("button", {name:/production sites · upward\s+deviation · exception/}).first();
     await edge.focus(); await page.keyboard.press("Enter"); await settled(page);
-    const pair = page.locator("#architecture-inspector-content > details").filter({has:page.locator("summary", {hasText:/src\/low\.rs → src\/top\.rs/})}).first();
+    // #917: the arrow's pairs load on demand into the inspector's edge detail list.
+  const pair = page.locator("#architecture-inspector-content .architecture-detail-list[data-detail-kind=edge] details").filter({has:page.locator("summary", {hasText:/src\/low\.rs → src\/top\.rs/})}).first();
     await pair.locator(":scope > summary").click();
     const unknown = page.locator("#architecture-inspector-content .architecture-caller-unavailable");
     await unknown.first().waitFor({state:"visible"});
@@ -392,7 +408,10 @@ test("Architecture uses real pinned structural sites, authored native-file layer
     }
   }
   assert.deepEqual(new Map(dto.edges.map(edge => [summaryKey(edge), edge.count])), expected);
-  for (const edge of dto.edges) assert.equal(siteTotal(edge.pairs), edge.count, "samples cannot replace exact site counts");
+  for (const edge of dto.edges) {
+    assert.equal(edge.pairs, undefined, "the summary edge carries no pairs (#917)");
+    assert.equal(siteTotal(await edgePairs(selected, dto, edge)), edge.count, "samples cannot replace exact site counts");
+  }
   assert.equal(siteTotal(dto.edges.filter(edge => edge.role === "production")), 8, "same-layer and unassigned sites stay outside summary arrows");
   assert.ok(dto.edges.some(edge => edge.sourceLayer === "top" && edge.destinationLayer === "low" && edge.status === "conforms"), "skipped orders conform");
   for (const [sourceLayer, destinationLayer] of [["low", "top"], ["mid", "peer"], ["shared", "mid"]]) {
@@ -894,8 +913,14 @@ test("Architecture arrow inspector keeps exact evidence for an excepted arrow, a
   await ready(page);
   const dto = (await architecture(selected)).data.payload;
   const edge = page.locator("#architecture-diagram").getByRole("button", {name:/^2 production sites · upward\s+deviation · exception/});
+  const edgeReads = () => selected.requests.filter(row => row.url.pathname.endsWith("/architecture/details") && row.url.searchParams.get("kind") === "edge");
+  assert.equal(edgeReads().length, 0, "no edge's pairs are read before its arrow is selected (#917)");
   // In the summary a skip-level count can sit under a peer count; select it by keyboard.
   await edge.focus(); await page.keyboard.press("Enter"); await settled(page);
+  assert.equal(edgeReads().length, 1, "selecting the arrow reads its pairs once, on demand");
+  const scope = edgeReads()[0].url.searchParams;
+  assert.deepEqual(["sourceLayer", "destinationLayer", "role", "excepted"].map(key => scope.get(key)), ["low", "top", "production", "true"]);
+  assert.equal(typeof scope.get("exceptionReason"), "string", "an excepted edge is named with its reason");
   assert.equal(await page.locator("#architecture-deviations").isVisible(), false, "an excepted arrow is not a deviation: it keeps the inspector");
   assert.equal(await page.locator("#architecture-review-panel").isVisible(), false, "and opens no review list");
   assert.equal(await page.locator("#architecture-inspector-content input[type=checkbox]").count(), 0);
@@ -911,7 +936,8 @@ test("Architecture arrow inspector keeps exact evidence for an excepted arrow, a
   await sample.getByRole("button", {name:"Read indexed reference source", exact:true}).click();
   await page.waitForFunction(() => document.querySelector("#source .source-line.highlight"));
   assert.match(await page.locator("#source-path").textContent(), /src\/low\.rs.*cached snapshot/is);
-  const reference = dto.edges.filter(edge => edge.role === "production").flatMap(edge => edge.pairs).find(value => value.source.path === "src/low.rs" && value.target.path === "src/top.rs");
+  const loaded = await Promise.all(dto.edges.filter(edge => edge.role === "production").map(edge => edgePairs(selected, dto, edge)));
+  const reference = loaded.flat().find(value => value.source.path === "src/low.rs" && value.target.path === "src/top.rs");
   assert.equal(await page.locator("#source .source-line.highlight .line-number").first().textContent(), String(reference.sites[0].lines.start));
 
   await page.locator("#architecture-unassigned").click();
@@ -1233,7 +1259,7 @@ test("Architecture unassigned files match rules_check without counting external 
     assert.equal(typeof partialModule.contentHash, "string");
     assert.equal(typeof partialModule.provenanceId, "string");
     assert.ok(checked.unassigned.some(identity => identityKey(identity) === identityKey(partialModule.identity)));
-    assert.ok(dto.edges.every(edge => edge.pairs.every(pair => pair.source.path !== "src/latin.rs" && pair.target.path !== "src/latin.rs")), "the partial module invents no reference edges");
+    for (const edge of dto.edges) assert.ok((await edgePairs(selected, dto, edge)).every(pair => pair.source.path !== "src/latin.rs" && pair.target.path !== "src/latin.rs"), "the partial module invents no reference edges");
     assert.equal(await page.locator("#architecture-unassigned").textContent(), `${checked.unassignedFileCount} unassigned files`);
     await page.locator("#architecture-unassigned").click();
     assert.deepEqual(await page.locator("#architecture-review-list .architecture-rule-row").evaluateAll(rows => rows.map(row => row.dataset.source).sort()), files);
