@@ -2094,7 +2094,9 @@ impl CheckoutRuntime {
     /// selected snapshot (#777), with search's precedence minus the per-query
     /// causes: model diagnostics, then the matrix the owner published for this
     /// pin, then owner work pending (counted from the cache), else
-    /// `matrix_not_resident`. `None` without a search service or matrix owner.
+    /// `matrix_not_resident`. Like search, it first rearms an evicted head
+    /// (#942), without touching its idle timer. `None` without a search
+    /// service or matrix owner.
     /// Without a matrix for `pin`, the head is counted once per pin and the
     /// cache once per cache write (#806), not on every call.
     pub(crate) fn search_head_coverage(
@@ -2121,6 +2123,10 @@ impl CheckoutRuntime {
         let Some(head) = scheduler.search_head_slot(false) else {
             return Ok(None);
         };
+        // Like search, rearm an evicted head before sampling it, so both report
+        // the same state; unlike search, this is not use and extends no
+        // residency (#942, owner ruling 2026-11-12).
+        head.rearm_request();
         let model_id = crate::search_embed::model_id_for_card_format(
             crate::search_card::CardFormat::V1.as_str(),
         );
