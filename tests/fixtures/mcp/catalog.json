@@ -722,7 +722,7 @@
                   "const": 1
                 },
                 "toolVersion": {
-                  "const": 29
+                  "const": 30
                 },
                 "watcherDegraded": {
                   "type": "boolean"
@@ -12828,51 +12828,6 @@
             "semanticStatus"
           ]
         },
-        "DocumentSemanticStatus": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "producerId": {
-              "$ref": "#/$defs/Text"
-            },
-            "language": {
-              "$ref": "#/$defs/Language"
-            },
-            "path": {
-              "type": "string",
-              "minLength": 1
-            },
-            "projection": {
-              "$ref": "#/$defs/SemanticProjection"
-            },
-            "coverageState": {
-              "type": [
-                "string",
-                "null"
-              ],
-              "enum": [
-                "notRequested",
-                "omitted",
-                "unsupported",
-                "failed",
-                "partial",
-                "complete",
-                null
-              ]
-            },
-            "boundary": {
-              "type": "boolean"
-            }
-          },
-          "required": [
-            "producerId",
-            "language",
-            "path",
-            "projection",
-            "coverageState",
-            "boundary"
-          ]
-        },
         "SemanticBasis": {
           "additionalProperties": false,
           "properties": {
@@ -13119,11 +13074,25 @@
                     ]
                   }
                 },
-                "semanticDocuments": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/$defs/DocumentSemanticStatus"
-                  }
+                "semanticDocumentStatus": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "olderBasis": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "catchingUp": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "needsReimport": {
+                      "$ref": "#/$defs/UInt"
+                    }
+                  },
+                  "required": [
+                    "olderBasis",
+                    "catchingUp",
+                    "needsReimport"
+                  ]
                 },
                 "partial": {
                   "type": "boolean"
@@ -13179,6 +13148,7 @@
               },
               "required": [
                 "referencesVersion",
+                "semanticDocumentStatus",
                 "indexGeneration",
                 "indexRevision",
                 "evidenceTier",
@@ -15158,51 +15128,6 @@
             "semanticStatus"
           ]
         },
-        "DocumentSemanticStatus": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "producerId": {
-              "$ref": "#/$defs/Text"
-            },
-            "language": {
-              "$ref": "#/$defs/Language"
-            },
-            "path": {
-              "type": "string",
-              "minLength": 1
-            },
-            "projection": {
-              "$ref": "#/$defs/SemanticProjection"
-            },
-            "coverageState": {
-              "type": [
-                "string",
-                "null"
-              ],
-              "enum": [
-                "notRequested",
-                "omitted",
-                "unsupported",
-                "failed",
-                "partial",
-                "complete",
-                null
-              ]
-            },
-            "boundary": {
-              "type": "boolean"
-            }
-          },
-          "required": [
-            "producerId",
-            "language",
-            "path",
-            "projection",
-            "coverageState",
-            "boundary"
-          ]
-        },
         "DerivedFrom": {
           "additionalProperties": false,
           "properties": {
@@ -15487,11 +15412,25 @@
                     "status"
                   ]
                 },
-                "semanticDocuments": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/$defs/DocumentSemanticStatus"
-                  }
+                "semanticDocumentStatus": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "olderBasis": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "catchingUp": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "needsReimport": {
+                      "$ref": "#/$defs/UInt"
+                    }
+                  },
+                  "required": [
+                    "olderBasis",
+                    "catchingUp",
+                    "needsReimport"
+                  ]
                 },
                 "partial": {
                   "type": "boolean"
@@ -15505,6 +15444,7 @@
               },
               "required": [
                 "rulesVersion",
+                "semanticDocumentStatus",
                 "indexGeneration",
                 "indexRevision",
                 "rulesFile",
@@ -17703,51 +17643,6 @@
             "semanticStatus"
           ]
         },
-        "DocumentSemanticStatus": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "producerId": {
-              "$ref": "#/$defs/Text"
-            },
-            "language": {
-              "$ref": "#/$defs/Language"
-            },
-            "path": {
-              "type": "string",
-              "minLength": 1
-            },
-            "projection": {
-              "$ref": "#/$defs/SemanticProjection"
-            },
-            "coverageState": {
-              "type": [
-                "string",
-                "null"
-              ],
-              "enum": [
-                "notRequested",
-                "omitted",
-                "unsupported",
-                "failed",
-                "partial",
-                "complete",
-                null
-              ]
-            },
-            "boundary": {
-              "type": "boolean"
-            }
-          },
-          "required": [
-            "producerId",
-            "language",
-            "path",
-            "projection",
-            "coverageState",
-            "boundary"
-          ]
-        },
         "DerivedFrom": {
           "additionalProperties": false,
           "properties": {
@@ -17965,11 +17860,25 @@
                     "total"
                   ]
                 },
-                "semanticDocuments": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/$defs/DocumentSemanticStatus"
-                  }
+                "semanticDocumentStatus": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "olderBasis": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "catchingUp": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "needsReimport": {
+                      "$ref": "#/$defs/UInt"
+                    }
+                  },
+                  "required": [
+                    "olderBasis",
+                    "catchingUp",
+                    "needsReimport"
+                  ]
                 },
                 "partial": {
                   "type": "boolean"
@@ -17983,6 +17892,7 @@
               },
               "required": [
                 "rulesVersion",
+                "semanticDocumentStatus",
                 "indexGeneration",
                 "indexRevision",
                 "rulesFile",
