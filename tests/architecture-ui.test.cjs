@@ -1562,7 +1562,12 @@ test("AC12 info_counts_scope_to_app", async () => {
   assert.ok(notice().includes("1 of 6 production rule instances unknown in daemon."), "the app's summed counts");
   assert.ok(notice().includes("1 unassigned native file modules remain unknown in daemon."), "the app's unassigned modules");
   assert.ok(notice().includes("4 unassigned identities (native files and external packages) in the rule-check catalog (whole checkout)."));
-  assert.match(h.get("architecture-coverage").textContent, /^9 of 9 reference sites mapped/, "coverage stays the whole snapshot");
+  // #913: one app's coverage and site counts are its own layers' (daemon: Storage and the Shared layers it sees).
+  assert.match(h.get("architecture-coverage").textContent, /^2 of 2 reference sites from daemon's layers mapped/, "coverage counts the app's layers");
+  assert.ok(notice().includes("2 mapped reference sites · 0 bound by semantic evidence · 0 unresolved from daemon's layers. Missing sites do not prove absence."));
+  await chooseApp(h, "All apps");
+  assert.match(h.get("architecture-coverage").textContent, /^9 of 9 reference sites mapped/, "All apps counts the whole snapshot");
+  assert.ok(notice().includes("9 mapped reference sites · 0 bound by semantic evidence · 0 unresolved. Missing sites do not prove absence."));
 });
 
 test("AC13 an app no ordered layer names shows the setup help and its unassigned files", async () => {
@@ -2033,6 +2038,49 @@ test("#845 a closure owner is named after its nearest named callable from the Fi
   const degraded = failing.sandbox.window.TrellisDeviations.create(failing.deps);
   await degraded.open(failing.trigger); await failing.expandAll();
   assert.ok(failing.byLabel("(anonymous)"), "an unreadable outline keeps the row, unnamed");
+});
+
+// #911: a line row reads its target's qualified name, not the declaration's internal key, on one truncated line.
+function implTargetRows() {
+  const rows = deviationRows(), site = rows[0].instance.evidence[0];
+  site.target = {syntaxId:"t911",displayKey:"src/http/worker.rs#implementation@4.enqueue_generated_semantic_import",document:docId("src/http/worker.rs"),lines:{start:88,end:120}};
+  site.spelling = "enqueue_generated_semantic_import";
+  return rows;
+}
+const workerOutline = [{symbol:{id:"impl4",name:"<implementation@4>",kind:"class",parent:null},nativeKind:"implementation",implTarget:"DaemonState"},
+  {symbol:{id:"t911",name:"enqueue_generated_semantic_import",kind:"method",parent:"impl4"},nativeKind:"method"}];
+const symbolOfLine = (tree, start) => tree.files[0].functions.flatMap(fn => fn.lines).find(line => line.start === start).symbol;
+
+test("#911 a line's symbol is its target's qualified name: Type::method from the impl block, Class.method elsewhere", () => {
+  const {model} = deviationsHarness().sandbox.window.TrellisDeviations, rows = implTargetRows(), layers = deviationView().layers;
+  deq([...model.implSites(rows)].map(([path, ids]) => [path, [...ids]]), [["src/http/worker.rs", ["t911"]]], "only a Rust target behind an unnamed impl needs its outline");
+  assert.equal(symbolOfLine(model.build(rows, layers), 20), "enqueue_generated_semantic_import", "without the outline the unnamed impl is left out, never shown as a key");
+  const impls = model.implNames(["t911"], workerOutline);
+  deq(impls.get("t911"), ["DaemonState"]);
+  assert.equal(symbolOfLine(model.build(rows, layers, null, impls), 20), "DaemonState::enqueue_generated_semantic_import");
+  assert.equal(symbolOfLine(model.filter(model.build(rows, layers, null, impls), {edge:null, callsOnly:true}), 20), "DaemonState::enqueue_generated_semantic_import", "a filter keeps the names");
+  rows[0].instance.evidence[0].target = {syntaxId:"j1",displayKey:"src/Main.java#Outer.Inner.run",document:docId("src/Main.java", "java"),lines:{start:4,end:4}};
+  assert.equal(symbolOfLine(model.build(rows, layers), 20), "Outer.Inner.run");
+  assert.equal(symbolOfLine(model.build(rows, layers), 30), "x", "a site with no target reads its spelling");
+});
+
+test("#911 a line row shows the qualified name on one line, with the full name and both places as its tooltip", async () => {
+  const h = deviationsHarness({rows:implTargetRows()}), reads = [];
+  h.deps.outline = async (path, offset) => { reads.push([path, offset]); return {items:path === "src/http/worker.rs" ? workerOutline : [], nextOffset:null}; };
+  const dev = h.sandbox.window.TrellisDeviations.create(h.deps);
+  await dev.open(h.trigger); await h.expandAll();
+  deq(reads, [["src/store.rs", 0], ["src/http/worker.rs", 0]], "one outline read per file names its closures and its targets' impl blocks");
+  const row = h.treeRows().find(item => item.dataset.level === "3" && /^Line 20,/.test(item.attrs["aria-label"]));
+  const symbol = descendants(row).find(item => item.className === "deviation-symbol");
+  assert.equal(symbol.textContent, "DaemonState::enqueue_generated_semantic_import");
+  assert.equal(symbol.attrs.title, "DaemonState::enqueue_generated_semantic_import · src/store.rs:20 → src/http/worker.rs:88");
+  assert.match(row.attrs["aria-label"], /^Line 20, DaemonState::enqueue_generated_semantic_import, call, defined at src\/http\/worker\.rs:88$/);
+  assert.doesNotMatch(text(h.get("architecture-deviations-tree")), /implementation@4|worker\.rs#/, "the internal key is never shown");
+  const fn = descendants(h.byLabel("S::enqueue")).find(item => item.className === "deviation-label");
+  assert.equal(fn.attrs.title, "S::enqueue · src/store.rs", "a function row's tooltip holds its full name and file");
+  const css = fs.readFileSync(path.join(__dirname, "../web/style.css"), "utf8");
+  assert.match(css, /\.deviation-name \{[^}]*flex-wrap: nowrap/, "the name cell never wraps");
+  assert.match(css, /\.deviation-name > \.deviation-symbol \{[^}]*text-overflow: ellipsis; white-space: nowrap/, "a long symbol truncates with an ellipsis");
 });
 
 // ---- #860 review: closure naming takes the nearest named *callable*, and typed stale outline errors are conflicts. ----

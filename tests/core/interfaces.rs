@@ -351,6 +351,83 @@ fn one_app_and_no_calls_have_no_interfaces() {
     assert_eq!(unmatched.summary["interfaces"], json!([]));
 }
 
+/// #909: a standalone `package.json` nested under a root Cargo app, in no workspace and named
+/// by no manifest, is an app of its own, so its `fetch` calls are the nested app's client calls
+/// of the Cargo app's routes: through the nested app's layer, or, with no layer for its files,
+/// through its root, the most specific one containing them. A hidden fixture layer's Java and
+/// Python files count toward the root app's files but add no language.
+#[test]
+fn a_nested_standalone_package_is_an_app_whose_fetch_calls_are_its_own() {
+    const MOD_CLIENT: &str = "export async function poll() {\n  await fetch(\"/health\");\n  await fetch(\"/items/7\");\n}\n";
+    let server_and_fixtures = "version = 1\n\
+        [layers.server]\napp = 'srv'\norder = 1\npaths = ['src/**']\n\
+        [layers.fixtures]\napp = 'srv'\ndisplay = 'hidden'\norder = 0\npaths = ['tests/fixtures/**']\n";
+    let with_mod_layer = format!(
+        "{server_and_fixtures}[layers.mod]\napp = 'mod-app'\norder = 1\npaths = ['mod/**']\n"
+    );
+    for (rules, client_layer) in [
+        (server_and_fixtures.to_owned(), Value::Null),
+        (with_mod_layer, json!("mod")),
+    ] {
+        let published = publish(&[
+            (".trellis/rules.toml", rules.as_str()),
+            ("Cargo.toml", "[package]\nname = \"srv\"\n"),
+            ("src/main.rs", SERVER),
+            (
+                "mod/package.json",
+                "{\"name\":\"mod-app\",\"private\":true}\n",
+            ),
+            ("mod/src/client.js", MOD_CLIENT),
+            (
+                "tests/fixtures/java/App.java",
+                "class App { void run() {} }\n",
+            ),
+            ("tests/fixtures/python/app.py", "def run():\n    pass\n"),
+        ]);
+        let apps: Vec<(&Value, &Value)> = published.summary["apps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|app| (&app["name"], &app["manifest"]))
+            .collect();
+        assert_eq!(
+            apps,
+            [
+                (&json!("srv"), &json!("Cargo.toml")),
+                (&json!("mod-app"), &json!("mod/package.json")),
+            ],
+            "{client_layer}"
+        );
+        let interfaces = published.summary["interfaces"].as_array().unwrap();
+        assert_eq!(interfaces.len(), 1, "{client_layer}: {interfaces:#?}");
+        assert_eq!(
+            (&interfaces[0]["client"], &interfaces[0]["server"]),
+            (&json!("mod-app"), &json!("srv"))
+        );
+        let matched = details(&published, &[("list", "matched")], 100);
+        let sites: Vec<(&Value, &Value)> = matched
+            .iter()
+            .flat_map(|item| item["entry"]["callSites"].as_array().unwrap())
+            .map(|site| (&site["document"]["path"], &site["layer"]))
+            .collect();
+        assert_eq!(
+            sites,
+            [(&json!("mod/src/client.js"), &client_layer); 2],
+            "{client_layer}"
+        );
+        let srv = &published.summary["apps"][0];
+        assert_eq!(
+            (&srv["languages"], &srv["fileCount"]),
+            (&json!(["rust"]), &json!(3)),
+            "{client_layer}"
+        );
+        assert_eq!(
+            published.summary["apps"][1]["languages"],
+            json!(["javascript"])
+        );
+    }
+}
+
 /// #794 (U3): a front end embedded in a Rust crate, with no manifest of its own, is one
 /// detected app; an authored app at its root makes the crate's routes and its calls an
 /// interface between two apps.
@@ -396,6 +473,7 @@ fn trellis_real_router_and_client() {
     let texts: Vec<(String, String)> = [
         ".trellis/rules.toml",
         "Cargo.toml",
+        "herdr-mod/package.json",
         "web/package.json",
         "src/http.rs",
         "web/app.js",
@@ -412,6 +490,8 @@ fn trellis_real_router_and_client() {
         .map(|(path, text)| (path.as_str(), text.as_str()))
         .collect();
     files.push(("src/main.rs", "fn main() {}\n"));
+    // A source keeps the Herdr mod's manifest captured, so its app (#909) is detected.
+    files.push(("herdr-mod/src/stub.js", "export const a = 1;\n"));
     let published = publish(&files);
     let interfaces = published.summary["interfaces"].as_array().unwrap();
     assert_eq!(interfaces.len(), 1, "{interfaces:#?}");
@@ -996,9 +1076,10 @@ fn a_server_without_a_framework_import_has_no_routes() {
 
 /// #855 on Trellis itself: with `fetch`, axios and the JavaScript frameworks read, every
 /// JavaScript and TypeScript source under `web/` and `herdr-mod/` and every build manifest the
-/// capture walk admits still give exactly one interface, `trellis-web` to `trellis`.
+/// capture walk admits give one interface per client app: `trellis-herdr-mod` (#909) and
+/// `trellis-web`, each to `trellis`.
 #[test]
-fn trellis_whole_web_client_still_has_one_interface() {
+fn trellis_web_and_herdr_mod_clients_each_have_one_interface() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut owned: Vec<(String, String)> = Vec::new();
     let walk = ignore::WalkBuilder::new(root)
@@ -1068,7 +1149,11 @@ fn trellis_whole_web_client_still_has_one_interface() {
         .iter()
         .map(|i| (i["client"].as_str().unwrap(), i["server"].as_str().unwrap()))
         .collect();
-    assert_eq!(pairs, [("trellis-web", "trellis")], "{interfaces:#?}");
+    assert_eq!(
+        pairs,
+        [("trellis-herdr-mod", "trellis"), ("trellis-web", "trellis")],
+        "{interfaces:#?}"
+    );
     // The `api` wrapper's own `fetch` is its implementation, not a call of its own.
     let client_only = details(&published, &[("list", "clientOnly")], 200);
     assert!(!client_only.is_empty());

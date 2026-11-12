@@ -219,3 +219,28 @@ test("real Connect preserves explicit token opt-in, file loading, restore, typed
     rmSync(paths.temp, {recursive:true, force:true, maxRetries:10, retryDelay:100});
   }
 });
+
+// #913: automatic re-runs exist (#660), so the footer no longer says "no automatic indexing". It says what
+// docs/quickstart.md says: the index follows file changes, and producer re-runs are opt-in.
+test("the connect footer says the index follows file changes and producer re-runs are opt-in", {timeout:240000}, async () => {
+  const paths = H.fixture(source, "flow.js");
+  let server, browser, context;
+  try {
+    const indexed = await H.run(H.binary, ["index", "--workspace", paths.workspace], {env:paths.env, timeout:120000});
+    server = await H.startDaemon(paths, indexed.json().status.revision.indexRevision);
+    browser = await chromium.launch();
+    context = await browser.newContext({viewport:{width:1440, height:900}});
+    const page = await context.newPage();
+    await page.goto(`${server.base}/`, {waitUntil:"networkidle"});
+    await disconnected(page);
+    const topology = page.locator(".connection-footer-topology");
+    assert.equal(await topology.isVisible(), true);
+    assert.equal(await topology.textContent(), "Loopback only · bearer token · index follows file changes · producer re-runs are opt-in");
+    assert.doesNotMatch(await page.locator("body > footer").textContent(), /no automatic indexing/i);
+  } finally {
+    await context?.close();
+    await browser?.close();
+    await H.stopDaemon(server);
+    rmSync(paths.temp, {recursive:true, force:true, maxRetries:10, retryDelay:100});
+  }
+});

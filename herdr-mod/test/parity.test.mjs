@@ -107,7 +107,7 @@ test("negative control: a one-app checkout has no switcher, no columns, no cards
 
 // --- the pane, end to end against a fake daemon ---
 
-function fakeDaemon(payload, { job = null } = {}) {
+function fakeDaemon(payload, { job = null, details = null } = {}) {
   const at = { indexGeneration: payload.indexGeneration, indexRevision: payload.indexRevision }, seen = [], TOKEN = "b".repeat(64), KEY = "a".repeat(64);
   const server = createServer((req, res) => {
     seen.push(req.url);
@@ -120,7 +120,7 @@ function fakeDaemon(payload, { job = null } = {}) {
     if (url.pathname === `${base}architecture`) return send(200, { payload: { ...payload, aggregate: url.searchParams.get("aggregate") } });
     if (url.pathname === `${base}architecture/details`) {
       assert.equal(url.searchParams.get("rulesHash"), payload.rulesFile.contentHash);
-      return send(200, read("apps-deviations.json"));
+      return send(200, details ?? read("apps-deviations.json"));
     }
     send(404, { error: { code: "not_found", message: "No such route" } });
   });
@@ -159,6 +159,23 @@ async function pane(payload, options) {
   const close = async () => { await view.close(); daemon.server.close(); rmSync(dir, { recursive: true, force: true }); };
   return { view, cx, settle, click, close, seen: daemon.seen, root: () => last };
 }
+
+test("#911 a deviation line reads its target's name, never the internal declaration key", async () => {
+  const details = read("apps-deviations.json"), site = details.payload.items[0].instance.evidence[0];
+  site.target = { syntaxId: "sid:v1:911", displayKey: "src/api.rs#implementation@4.enqueue_generated_semantic_import",
+    document: { sourceSetId: site.document.sourceSetId, language: "rust", path: "src/api.rs" }, lines: { start: 3, end: 5 } };
+  site.targetReason = null;
+  const p = await pane(twoApps(), { details });
+  try {
+    await p.settle();
+    await p.click("review-deviations");
+    await p.click("deviation-file-0");
+    const root = await p.click("deviation-fn-1");
+    const tree = root.find("deviation-tree").text();
+    assert.match(tree, /L2 enqueue_generated_semantic_import call → api\.rs:3/, "the line shows the method's name and its definition");
+    assert.doesNotMatch(tree, /implementation@4|src\/api\.rs#/, "the internal key is never the label");
+  } finally { await p.close(); }
+});
 
 test("the pane: logo, status line, switcher, columns, interface card, deviations entry and tree, Color by and Aggregation", async () => {
   const p = await pane(twoApps(), { job: { id: "j", state: "failed", error: { code: "index_failed", message: "Index job failed", reason: "internal error" } } });
@@ -271,4 +288,34 @@ test("review P3: side by side, the Files card says a visible followed chip is ou
     pane.drawn = { ...out, view, assets: out.images.map(() => "unused") };
     assert.match(pane.fileCard(theme, file, pane.placement(file)).text(), /outlined in the diagram/, `width ${width}`);
   }
+});
+
+// #913: layer numbers count only the shown layers. With srv's first layer hidden, core is 1, in the
+// band label the drawing carries and in the shared label the pane's layer list and Files card use.
+test("#913 layer numbers: a hidden first layer takes no number, so the first shown layer is 1", async () => {
+  const view = twoApps();
+  view.layers = view.layers.map((l) => (l.name === "server" ? { ...l, display: "hidden" } : l));
+  const layer = (name) => view.layers.find((l) => l.name === name);
+  for (const scope of ["srv", null]) {
+    const summary = summarize(view, { scope });
+    assert.equal(summary.layerNumber(layer("core")), 1, `core is srv's first shown layer (scope ${scope})`);
+    assert.equal(summary.layerNumber(layer("server")), null, "the hidden layer takes no number");
+    assert.equal(summary.layerTag(layer("server")), "Hidden");
+    if (scope === null) assert.equal(summary.layerNumber(layer("client")), 1, "All apps: each app counts from 1");
+    assert.match(summary.layerLabel(layer("core")), /^1 · core/);
+  }
+  const [image] = (await draw(view, { width: 600, theme, highlight: null, choice: { scope: "srv" } })).images;
+  assert.match(image.svg, /1 · core/);
+  assert.doesNotMatch(image.svg, /2 · core/);
+  // Control: with every layer shown, the numbers are the authored stack's.
+  const shown = summarize(twoApps(), { scope: "srv" });
+  assert.match(shown.layerLabel(twoApps().layers.find((l) => l.name === "core")), /^2 · core/);
+});
+
+// #913: one app's coverage line counts that app's layers; All apps counts the checkout.
+test("#913 coverage: one app counts its own layers' reference sites, All apps the checkout's", () => {
+  const view = twoApps();
+  assert.match(summarize(view).coverageSummary(view), /^4 of 5 reference sites mapped to a module/);
+  assert.match(summarize(view, { scope: "srv" }).coverageSummary(view), /^4 of 5 reference sites from srv's layers mapped to a module/);
+  assert.match(summarize(view, { scope: "webapp" }).coverageSummary(view), /^0 of 0 reference sites from webapp's layers mapped to a module \(—\)$/);
 });

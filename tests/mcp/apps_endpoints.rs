@@ -245,6 +245,38 @@ async fn describe_lists_detected_and_authored_apps() {
     session.finish();
 }
 
+/// #909: describe's `languages` leave out an app's files in authored hidden layers (here Java
+/// and Python fixtures), which still count in its `fileCount`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn describe_languages_leave_out_hidden_fixture_layers() {
+    let mut files = files();
+    files.push((
+        "tests/fixtures/java/App.java",
+        "class App { void run() {} }\n",
+    ));
+    files.push(("tests/fixtures/python/app.py", "def run():\n    pass\n"));
+    let rules = format!(
+        "{RULES}[layers.fixtures]\napp = \"srv\"\ndisplay = \"hidden\"\norder = 0\n\
+        paths = [\"tests/fixtures/**\"]\n"
+    );
+    let checkout = Checkout::publish(&files, Some(&rules), 8519).await;
+    let mut session = checkout.session();
+    let described = session.ask(
+        "trellis_workspace_describe",
+        json!({"schemaVersion":1}),
+        None,
+    );
+    let apps = &described["data"]["apps"];
+    assert_eq!(apps["state"], "ready", "{apps}");
+    let srv = &apps["items"][1];
+    assert_eq!(srv["name"], "srv");
+    assert_eq!(
+        (&srv["languages"], &srv["fileCount"]),
+        (&json!(["rust"]), &json!(3))
+    );
+    session.finish();
+}
+
 /// The `app` filter of references, check, find, search and the call graph: each keeps what
 /// the rules check assigns to that app, an app may be named by its manifest path, and an
 /// unknown app is a typed `not_found` on every tool.

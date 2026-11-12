@@ -130,7 +130,8 @@ runnable `pom.xml` and Gradle build modules ([#854](https://github.com/SquashMer
   `kind`, `manifest`, `roots`, `entries`, `counts` (production `$layers` and other rule
   instances given to the app, equal to the CLI's `apps[].counts`), `languages`, `fileCount`,
   `unassignedFileCount` and `source: "manifest"`. `fileCount` and `unassignedFileCount` count
-  the modules whose app is this one. (#794: authored apps come first, by name, with
+  the modules whose app is this one. `languages` lists their languages, leaving out modules in
+  an authored `display = "hidden"` layer, such as fixtures (#909). (#794: authored apps come first, by name, with
   `source: "override"`, `kind` and `manifest` null, `entries` empty and `roots` as authored,
   possibly several; a detected app an authored root shadows is not listed. The browser labels
   an authored app "Authored in .trellis/rules.toml" where a detected one says "Detected from
@@ -842,7 +843,8 @@ header leads back with "← Architecture", or "← <app>" in a one-app stack.
   method or constructor, or a binding whose whole initializer is a function
   (`callableInitializer`); named variables, fields and types on the way are skipped (#860). A
   method reads `Type::name` from its `impl` block. A closure with no enclosing callable up to
-  its file's root is "(module level)". At most 50 files are named per tree; a file whose
+  its file's root is "(module level)". At most 50 files are named per tree, counting the
+  files read for line symbols; a file whose
   outline cannot be read keeps "(anonymous)", but an outline read that answers
   `revision_conflict`, `pin_expired` or `root_changed` is the tree's conflict, handled as below,
   and shows no tree.
@@ -862,7 +864,14 @@ header leads back with "← Architecture", or "← <app>" in a one-app stack.
   exact. The footer says what `≥` means.
 - **Line rows** read `L<line> <symbol>` with a kind tag and, on one line, `→ <file>:<line>` for
   the definition, or `→ <file> · file only` without a binding; the full path and the reason
-  are the tooltip and the accessible name.
+  are the tooltip and the accessible name. The symbol is the definition's qualified name
+  (`DaemonState::enqueue`, `Outer.run`), never its internal key: its written key without the
+  path, where a Rust method's unnamed `impl` block reads its type from the same Files outline
+  read that names closures (at most 50 files per tree), and is left out when that read fails.
+  A site without a definition reads its spelling (#911).
+- **One line per row (#911).** File, function and line rows never wrap: a long path, function
+  or symbol is truncated with an ellipsis, and its tooltip holds the full text with the file
+  (and, for a line, the call site and the definition).
 - **Line actions.** One menu with the label "Line actions" opens from the `⋯` button, a
   right-click or Shift+F10: **Open in Sequence** (only when the line has a measured caller),
   **Go to call site**, **Go to definition** (only with a target), **Copy location** and

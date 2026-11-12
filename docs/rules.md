@@ -1505,7 +1505,9 @@ closure contract is unchanged for those tools. No new snapshot or semantic proof
 is invented. Explain filters both arrays
 by the exact identity and recomputes counts for that filtered output. Check and
 explain include the external descriptors needed by returned instances and
-unassigned identities; explain preserves its informational unassigned catalog.
+unassigned identities. Explain keeps only the unassigned identities that are a returned
+instance's own source or destination ([#912](mcp-readonly-pilot-contract.md#amendment-912-rules-explain-lists-only-its-instances-unassigned-ends));
+`unassignedFileCount` stays checkout-wide, and check lists the whole catalog.
 These pre-release `references:v2` / `rules:v2` shapes replace v1 without a
 compatibility mode.
 

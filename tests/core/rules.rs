@@ -390,7 +390,8 @@ fn rules_source_filter_scopes_the_unassigned_catalog_but_not_layer_assignment() 
     assert_eq!(row["destinationLayer"], "core");
     assert_eq!(row["status"], "conforms");
 
-    // Explain keeps both the narrowed list and the checkout-wide total.
+    // #912: explain lists only the instance's own unassigned ends (here none: `std` is
+    // another instance's destination) and keeps the checkout-wide total.
     let explained = rules::explain(
         data.clone(),
         "$layers",
@@ -399,7 +400,8 @@ fn rules_source_filter_scopes_the_unassigned_catalog_but_not_layer_assignment() 
         &mut || Ok(()),
     )
     .unwrap();
-    assert_eq!(explained["unassigned"], data["unassigned"]);
+    assert_eq!(explained["unassigned"], json!([]));
+    assert_eq!(explained["externalPackages"], json!([]));
     assert_eq!(explained["unassignedFileCount"], 2);
 
     // An unassigned file selects itself, by exact path or by glob.
@@ -1162,7 +1164,7 @@ fn rules_external_bans_have_no_exception_syntax() {
 }
 
 #[test]
-fn rules_external_explain_preserves_unassigned_and_trims_only_unused_assigned_descriptors() {
+fn rules_external_explain_keeps_its_unassigned_ends_and_trims_only_unused_assigned_descriptors() {
     let input = snapshot(&[("src/lib.rs", "pub fn run(){}")]);
     let mut refs = projected_package(&input, "std", true);
     let mut unused = refs.data["externalPackages"][0].clone();
@@ -1188,7 +1190,12 @@ fn rules_external_explain_preserves_unassigned_and_trims_only_unused_assigned_de
         &mut || Ok(()),
     )
     .unwrap();
+    // Its unassigned source and denied destination are both the instance's own ends.
     assert_eq!(explained["unassigned"], data["unassigned"]);
+    assert_eq!(
+        explained["unassigned"],
+        json!([ban["target"], ban["destination"]])
+    );
     assert_eq!(explained["externalPackages"], data["externalPackages"]);
     for destination in [
         json!({"kind":"externalPackage","sourceSetId":"s","language":"rust","package":"std","standardLibrary":true,"extra":true}),

@@ -18,7 +18,8 @@ This is browser credential storage, not an OS keychain. Use it only in a trusted
 profile. Other scripts on the same origin can read it. Disconnect removes the saved token;
 if storage access is blocked the UI reports that site data must be cleared manually.
 Unchecking Remember also removes the saved value. Authentication rejection forgets it;
-ordinary network failures do not. localhost and127.0.0.1 store separately.
+ordinary network failures, a daemon stall and a typed refusal to read one path
+(`source_forbidden`, `symlink_forbidden`, `directory_forbidden`) do not (#906). localhost and127.0.0.1 store separately.
 
 Validation: real browser loaded the token file, saved after connection, restored a64-character
 value after reload, reconnected without re-entry, and removed storage on Disconnect. Tests

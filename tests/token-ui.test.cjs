@@ -827,3 +827,13 @@ test("newer checkout list freshness updates the selected card and header at the 
   assert.deepEqual(h.requests.slice(before).map(request => request.url),["/api/checkouts",`${SCOPED}/git`]);
   assert.deepEqual(JSON.parse(JSON.stringify(h.run("status.revision"))),pin);
 });
+test("a typed refusal to read one path keeps the session and the saved token (#906)", async () => {
+  const h = harness(); await h.connect("synthetic-new", true);
+  for (const code of ["source_forbidden", "symlink_forbidden", "directory_forbidden"]) {
+    h.context.fetch = async () => ({ok:false, status:403, json:async () => ({error:{code, message:"Source access is not allowed"}})});
+    await assert.rejects(h.run("api('/api/source?path=a.js')"), /Source access is not allowed/);
+    assert.equal(h.stored.get(KEY), "synthetic-new", code);
+    assert.equal(h.run("token"), "synthetic-new", code);
+    assert.equal(h.get("connect-form").hidden, true, code);
+  }
+});

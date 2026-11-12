@@ -1385,12 +1385,20 @@ pub(crate) fn hidden_layer_paths(
     for path in paths {
         check()?;
         if let Some(layer) = matcher.select(path, &mut work, check)?
-            && config.layers[layer].display.as_deref() == Some("hidden")
+            && hidden_layer(config, layer)
         {
             hidden.insert((*path).to_owned());
         }
     }
     Ok(hidden)
+}
+
+/// Whether `layer` is authored `display = "hidden"`: tooling, test harnesses and fixtures.
+pub(crate) fn hidden_layer(config: &Config, layer: &str) -> bool {
+    config
+        .layers
+        .get(layer)
+        .is_some_and(|layer| layer.display.as_deref() == Some("hidden"))
 }
 
 struct LayerMatcher<'a> {
@@ -1655,6 +1663,15 @@ impl<'a> AppAssignment<'a> {
         match self.config {
             Some(config) => AppScope::new(config, &self.apps).file(path, self.layer(path)),
             None => crate::apps::containing(&self.apps, path),
+        }
+    }
+
+    /// Whether `path`'s language counts toward its app's `languages` (#909): not when its
+    /// layer is authored hidden (tooling, test harnesses and fixtures).
+    pub(crate) fn counts_language(&self, path: &str) -> bool {
+        match (self.config, self.layer(path)) {
+            (Some(config), Some(layer)) => !hidden_layer(config, layer),
+            _ => true,
         }
     }
 
@@ -3141,6 +3158,18 @@ pub fn explain(
         payload[count_field] = count;
     }
     ensure!(found, "not_found: rule instance");
+    // #912: the informational unassigned catalog keeps only the explained instances'
+    // own ends (their source or destination). `unassignedFileCount` stays checkout-wide,
+    // and `trellis_rules_check` lists the whole catalog.
+    let ends: BTreeSet<String> = ["instances", "testOnly"]
+        .into_iter()
+        .flat_map(|field| payload[field].as_array().expect("checked rows"))
+        .flat_map(|row| [row["target"].to_string(), row["destination"].to_string()])
+        .collect();
+    payload["unassigned"]
+        .as_array_mut()
+        .context("store_unavailable: unassigned catalog absent")?
+        .retain(|identity| ends.contains(&identity.to_string()));
     payload["externalPackages"] = json!(package_closure(
         payload["externalPackages"]
             .as_array()

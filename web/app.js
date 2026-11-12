@@ -71,6 +71,7 @@ function observePinnedHead() {
           // A later response cannot erase a newer same-generation observation.
           if (!observation.head || head.indexGeneration !== observation.head.indexGeneration || head.indexRevision >= observation.head.indexRevision) observation.head = head;
           observation.failed = false;
+          if (IndexPin.equal(head, pin)) observeCatchingUp(data.catchingUp);
           observeViewRequest(data.viewRequest);
         } catch (error) {
           if (!current() || headObservation !== observation || error.name === "AbortError") return;
@@ -81,6 +82,17 @@ function observePinnedHead() {
       }
     } finally { observation.pending = false; }
   })();
+}
+// The head digest carries `catchingUp`. When the head is the revision this page shows and the
+// value no longer matches its status, status is read again, once per changed value, so a
+// finished re-run clears Catching up (#906).
+let catchingUpAsked = null;
+function observeCatchingUp(value) {
+  if (typeof value !== "boolean" || !status || value === (status.catchingUp === true)) { catchingUpAsked = null; return; }
+  const asked = `${epoch}:${selectedRootKey}:${IndexPin.key(status.revision)}:${value}`;
+  if (catchingUpAsked === asked) return;
+  catchingUpAsked = asked;
+  void refreshStatus().catch(() => {});
 }
 function currentHeadContext(value, session, root, workspace, pin) {
   return value.session === session && value.root === root && value.workspace === workspace && IndexPin.equal(value.pin, pin);
@@ -351,6 +363,58 @@ function observeViewRequest(value) {
   if (followPinned) return;
   return perform(() => showAgentView(request));
 }
+// Stall recovery (#906). A read that met a deadline, a failed connection or a busy daemon is
+// not left failed or loading: the page runs the menu's Refresh (fresh status, then the visible
+// view) after 2 s, doubling to at most 60 s while the daemon still does not answer. One attempt
+// runs at a time; a new checkout, session or Disconnect forgets it. A show that a stall stopped
+// is shown afterwards if it still owns the view.
+const TRANSIENT_CODES = new Set(["storage_busy", "deadline_exceeded", "bounded_work", "rebuild_in_progress"]);
+const PATH_FORBIDDEN = new Set(["source_forbidden", "symlink_forbidden", "directory_forbidden"]);
+const RECOVERY_FIRST_MS = 2000, RECOVERY_MAX_MS = 60000;
+let recovery = null, stalledShow = null, stallCount = 0, recovered = null;
+function noteStall() {
+  if (!token || !selectedRootKey) return;
+  stallCount++;
+  const scope = `${epoch}:${selectedRootKey}`;
+  if (recovery?.scope === scope) { recovery.again = true; return; }
+  // A view refreshed but not awaited (Architecture) can stall again just after an attempt
+  // ended: that is the same outage, so the backoff goes on instead of starting over.
+  const delay = recovered?.scope === scope && Date.now() - recovered.at <= RECOVERY_MAX_MS
+    ? Math.min(recovered.delay * 2, RECOVERY_MAX_MS) : RECOVERY_FIRST_MS;
+  clearRecovery();
+  recovery = {scope, delay, timer:null, again:false};
+  recovery.timer = setTimeout(() => void recover(recovery), recovery.delay);
+}
+function clearRecovery() { if (recovery) clearTimeout(recovery.timer); recovery = null; stalledShow = null; recovered = null; }
+async function recover(attempt) {
+  attempt.timer = null;
+  if (recovery !== attempt || attempt.scope !== `${epoch}:${selectedRootKey}`) return;
+  attempt.again = false;
+  // A stopped show still owns the view only while it is the newest show and nothing has moved
+  // the view since it stopped: no user navigation, pin, checkout, session or pin change.
+  const owns = claim => !!claim && claim === stalledShow && claim.ticket === showSerial && !followPinned &&
+    claim.marks === viewMarks() && navigationCurrent(claim.context) && IndexPin.equal(claim.request.revision, status?.revision);
+  if (!owns(stalledShow)) stalledShow = null;
+  const claim = stalledShow;
+  // With a claim, only status is read first: status reads move no view, so a navigation made
+  // while it is awaited is still seen by the check below. The show then loads its own view.
+  await perform(claim ? () => refreshStatus() : refreshView);
+  if (recovery !== attempt) return;
+  if (claim && !attempt.again) {
+    // The show loads its own view, so its reads decide whether this attempt succeeded. If
+    // something else took the view while status was read, the stale show is dropped and the
+    // view on screen is refreshed instead.
+    if (owns(claim)) { stalledShow = null; await perform(() => showAgentView(claim.request)); }
+    else { if (stalledShow === claim) stalledShow = null; await perform(refreshView); }
+    if (recovery !== attempt) return;
+  }
+  if (attempt.again) {
+    attempt.delay = Math.min(attempt.delay * 2, RECOVERY_MAX_MS);
+    attempt.timer = setTimeout(() => void recover(attempt), attempt.delay);
+    return;
+  }
+  recovery = null; recovered = {scope:attempt.scope, delay:attempt.delay, at:Date.now()};
+}
 function agentLabel(request) {
   return request.view === "source" ? `${request.path}:${request.line}` : request.view === "class" ? "Class diagram" : "Sequence";
 }
@@ -358,15 +422,26 @@ function agentLabel(request) {
 // the user navigates (any navigation, diagram, section or source change), the view is pinned,
 // or the checkout, session or pin changes; a stale show changes nothing.
 let showSerial = 0;
+const viewMarks = () => `${navigationSerial}:${diagramSerial}:${sectionSerial}:${sourceSerial}`;
 async function showAgentView(request) {
   if (!token || !selectedRootKey || !status?.revision) return;
-  const pin = IndexPin.copy(status.revision), context = navigationContext(), ticket = ++showSerial;
-  const marks = () => `${navigationSerial}:${diagramSerial}:${sectionSerial}:${sourceSerial}`, started = marks();
-  const owned = () => ticket === showSerial && !followPinned && marks() === started && navigationCurrent(context);
+  const pin = IndexPin.copy(status.revision), context = navigationContext(), ticket = ++showSerial, started = viewMarks();
+  const owned = () => ticket === showSerial && !followPinned && viewMarks() === started && navigationCurrent(context);
+  // `claim.marks` are the view's marks this show itself left; a source read takes its own.
+  const stalls = stallCount, claim = {request, ticket, marks:started, context};
+  let applied = false;
+  try { applied = await applyAgentView(request, pin, context, ticket, owned, claim); }
+  finally {
+    // Only a show that still owns the view, and that a stall stopped, waits for recovery.
+    if (!applied && stallCount !== stalls && ticket === showSerial && !followPinned && navigationCurrent(context) && claim.marks === viewMarks())
+      stalledShow = claim;
+  }
+}
+async function applyAgentView(request, pin, context, ticket, owned, claim) {
   // The deep link's stale-pin rule: never show a target from another snapshot.
   if (!IndexPin.equal(request.revision, pin)) {
     showAgentNote(`The agent showed a ${agentLabel(request)} at index ${IndexPin.label(request.revision)}; this view is at ${IndexPin.label(pin)}.`, request, false);
-    return;
+    return true;
   }
   let title = agentLabel(request), pushed = true;
   if (request.view === "sequence") {
@@ -378,7 +453,17 @@ async function showAgentView(request) {
     await navigateDiagram(data.seed, pin, "sequence", data, false, null, null, true);
   } else if (request.view === "class") {
     rememberVisible(pin);
-    await navigateDiagram({id:request.symbolId}, pin, "class", null, false, null, null, true);
+    const opening = navigateDiagram({id:request.symbolId}, pin, "class", null, false, null, null, true);
+    // This show's own navigation has taken its ticket; only a later navigation changes it.
+    const navigation = navigationSerial;
+    const outcome = await opening;
+    // Classes reports its own load failure. Only a stall of this show's own, still-current class
+    // read, with nothing navigated since, leaves the show to recovery, which then owns the view
+    // the show itself opened. Any other failure or stall drops the show (#906).
+    if (outcome?.stalled && navigation === navigationSerial && ticket === showSerial && !followPinned && navigationCurrent(context)) {
+      claim.marks = viewMarks(); return false;
+    }
+    if (navigation !== navigationSerial || ticket !== showSerial) return false;
   } else {
     // The source read takes its own serials, which a user's source or Files choice advances;
     // the read paints only while this show is still the latest and unpinned. Nothing else is
@@ -386,15 +471,19 @@ async function showAgentView(request) {
     const before = visibleEntry(pin);
     const mine = () => ticket === showSerial && !followPinned && navigationCurrent(context);
     const range = {startLine:request.line, endLine:request.line};
-    const painted = section === "files" ? await openFilesLocation({path:request.path, range}, pin, mine)
-      : await showCachedSource(request.path, range, pin, mine);
+    const reading = section === "files" ? openFilesLocation({path:request.path, range}, pin, mine)
+      : showCachedSource(request.path, range, pin, mine);
+    // The read advanced its own serials before its first await; later changes are someone else's.
+    claim.marks = viewMarks();
+    const painted = await reading;
     if (painted !== true || !mine()) return;
     writeEntry(before);
     const entry = captureSourceEntry();
     pushed = !!entry && !!window.history?.pushState;
     if (entry) rememberNavigation(entry, false, "#source");
   }
-  if (ticket === showSerial && navigationCurrent(context)) showAgentNote(`Shown by agent · ${title}`, null, pushed && !!window.history?.pushState);
+  if (ticket === showSerial && navigationCurrent(context)) { showAgentNote(`Shown by agent · ${title}`, null, pushed && !!window.history?.pushState); return true; }
+  return false;
 }
 // The view visible now as a history entry, so agent Back returns to it rather than to a
 // sequence still held from an earlier visit (#824). Written only when the show publishes.
@@ -492,7 +581,7 @@ async function api(path, method = "GET", body, callerCurrent = () => true, condi
   const current = () => callerCurrent() && session === epoch && root === selectedRootKey && (!guarded || (operationCurrent() && sourceAtStart === sourceSerial));
   let response, data, timer;
   const controller = new AbortController(); pendingRequests.add(controller);
-  const timeoutError = new Error("Request timed out. No automatic retry was made. Refresh status before trying again.");
+  const timeoutError = new Error("Request timed out. Trellis retries once the daemon answers again.");
   timeoutError.name = "TimeoutError";
   const deadline = 15000;
   try {
@@ -505,9 +594,17 @@ async function api(path, method = "GET", body, callerCurrent = () => true, condi
           ...(conditional?.etag ? {"If-None-Match": conditional.etag} : {})},
         body: body === undefined ? undefined : JSON.stringify(body)});
       if (!current()) throw aborted();
-      data = response.status === 204 ? null : response.status === 304 && conditional?.etag ? conditional.data : await response.json();
+      // An error answer may carry no JSON at all (a proxy's or a dying server's HTML, or an empty
+      // body); it is still classified by its status below (#906).
+      data = response.status === 204 ? null : response.status === 304 && conditional?.etag ? conditional.data
+        : response.ok ? await response.json() : await response.json().catch(() => null);
     })()]);
-  } catch (error) { if (!current()) throw aborted(); throw error; }
+  } catch (error) {
+    if (!current()) throw aborted();
+    // A deadline or a failed fetch (no response) is a stall, not an answer (#906).
+    if (error === timeoutError || (!response && error?.name === "TypeError")) { error.transient = true; noteStall(); }
+    throw error;
+  }
   finally { clearTimeout(timer); pendingRequests.delete(controller); }
   // Check before any HTTP error side effects, including invalidation on 409.
   if (!current()) throw aborted();
@@ -519,8 +616,12 @@ async function api(path, method = "GET", body, callerCurrent = () => true, condi
     error.reason = data?.error?.reason;
     if (error.code === "invalid_rules") error.diagnostic = data.error;
     error.workspaceRoot = response.headers?.get?.("X-Trellis-Workspace") || null;
-    if (error.status === 401 || error.status === 403) disconnect(`Authentication failed (${error.code || error.status}). Connect with a daemon token again.`);
+    // A typed refusal to read one path is not an authentication rejection, so it keeps the
+    // sign-in and the saved token (#906).
+    if (error.status === 401 || (error.status === 403 && !PATH_FORBIDDEN.has(error.code))) disconnect(`Authentication failed (${error.code || error.status}). Connect with a daemon token again.`);
     else if (root && error.code === "workspace_selection_failed") invalidateSelection("Checkout identity changed. Choose an available checkout again.");
+    error.transient = TRANSIENT_CODES.has(error.code) || (!error.code && [502, 503, 504].includes(error.status));
+    if (error.transient) noteStall();
     throw error;
   }
   if (conditional) {
@@ -734,7 +835,7 @@ function resetCheckout() {
   classSupport = null;
   for (const controller of pendingRequests) controller.abort();
   clearTimeout(pollTimer); pollTimer = null; statusSerial++;
-  clearTimeout(followTimer); followTimer = null; followSeen = null; hideAgentNote();
+  clearTimeout(followTimer); followTimer = null; followSeen = null; hideAgentNote(); clearRecovery();
   pairRefreshPending = false; pairRefreshQueued = null;
   clearDependencyCatalog(); clearExternalSources(); clearBrowse(); clearSource(); sourceCache.clear();
   status = null; statusUnavailable = false; jobUnavailable = false; indexNotReady = false; staleMessage = ""; job = null; waitingForJob = false;
@@ -1106,6 +1207,8 @@ async function refreshView() {
   if (section !== "files" && !$("treemap-panel").hidden) await treemap?.refresh();
   // Not awaited: Architecture may be building, and this view shows that itself (#556).
   else if (section !== "files" && !$("architecture-panel").hidden) void architecture?.refresh();
+  // The view on screen is reloaded, never an earlier Sequence behind it (#906).
+  else if (section !== "files" && currentDiagramView() === "classes") await window.TrellisClasses?.retry?.();
   else if (section !== "files" && selectedMethod) await loadSequence();
   schedulePoll();
 }
@@ -1204,7 +1307,8 @@ function filesFailure(error, target, current) {
 async function setSection(name, view = null) {
   if (!["files", "diagrams"].includes(name) || !selectedRootKey) return;
   if (section === name) {
-    const target = name === "files" ? filesBasis === "working" ? $("files-diff") : workspaceSource ? $("source") : $("file-filter") : $("view-sequence");
+    // Already in Diagrams: focus the tab of the view on screen, never a fixed one (#913).
+    const target = name === "files" ? filesBasis === "working" ? $("files-diff") : workspaceSource ? $("source") : $("file-filter") : $(`view-${view || currentDiagramView()}`);
     target?.focus(); return;
   }
   architecture?.reset();
