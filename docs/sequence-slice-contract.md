@@ -309,19 +309,30 @@ meaning changes, and the server response is the same.
   tagged "loop", with the guard "[may exit early]" only when its frame draws an exit (calls-first's
   mark: a `return`, `throw` or `exit` in it) or a step in it carries a folded `?` or guard
   (#542, #558). The frame is not a row and takes no row number. Nested loops nest frames.
-- **Everything else draws nothing.** Internal steps (branches, effects, boundaries, loops
-  without an arrow), same-column calls, nested callables and calls without an exact target
-  draw no row, badge or note. A branch, try, chain or same-column call that encloses an arrow
-  draws no frame; its arrows draw in its place. The status line gives one count, "Interactions
-  · N internal steps hidden": the shown DTO steps that draw nothing. Show all steps draws them.
+- **Branch and callee frames (#907, owner ruling 2026-11-11).** A branch or try that encloses
+  an arrow is drawn as a UML `alt` frame around its arrows, or `opt` when it has no alternate
+  (an `if` without `else`, one `match` arm). Its header is the compact label calls-first draws
+  for it (#558); each `match` arm is a branch of its own, so an arm with an arrow is a nested
+  frame. A same-column call whose expanded body encloses an arrow is drawn as a frame labelled
+  with its callee's declaration name, around that body's arrows. Like a loop frame, neither is
+  a row or takes a row number, and neither counts toward any bound. A branch, try or
+  same-column call that encloses no arrow still draws nothing.
+- **Everything else draws nothing.** Internal steps (effects, boundaries, branches and loops
+  without an arrow), same-column calls without an arrow in their body, nested callables and
+  calls without an exact target draw no row, badge or note. A chain, a callback block or a call
+  without an exact target that encloses an arrow draws no frame; its arrows draw in its place.
+  The status line gives one count, "Interactions · N internal steps hidden": the shown DTO
+  steps that draw nothing. Show all steps draws them.
 - **Inspector.** Selecting an arrow shows the same step and evidence as the step view.
 - **Empty.** An enriched view whose shown calls draw no arrow draws no diagram and says why,
   with "Show all steps": "All calls stay within <seed column>." when every shown call has an
   exact target; "All resolved calls stay within <seed column>; N calls have no exact
   target." when some do not; "None of the N calls has an exact target, so no arrow is drawn
   between columns." (or "The one call has no exact target, …") when none does.
-- **Renderers.** Both renderers draw the same arrows, returns, activations and loop frames.
-  Pele validates the returns, activation count and frames it draws, as it validates rows.
+- **Renderers.** Both renderers draw the same arrows, returns, activations and loop, branch
+  and callee frames. Pele draws a callee frame as a shaded region whose first statement is a
+  note naming the callee (#907). Pele validates the returns, activation count, frames and
+  notes it draws, as it validates rows.
 
 ### Interactions bound after filtering (#663)
 
@@ -454,8 +465,10 @@ always a boundary, so `loadSequence`'s hop into the daemon was never reached.
   in the column of what defines it (#558). Nested callbacks are decided first; an outer
   callback is shown when an inner one is.
 - **Drawn.** Calls-first and Show all draw the block as a frame (legacy tab "callback"; Pele
-  a plain frame with the block's own numbered row). Interactions draw no frame: its arrows
-  draw in its place, as for a branch (#636).
+  a plain frame with the block's own numbered row). Interactions draw no frame for the block
+  itself: its arrows draw in its place, as for a chain (#636). A same-column call it sits
+  under is a callee frame around them when that call has an exact target (#907, owner ruling
+  2026-11-11).
 - **Bounds.** A callback is enriched in one transaction after the view's own steps, so the
   view's own steps, expansions and bounds are unchanged. It is shown only within the bounds:
   the 200 shown steps (except the Interactions candidates, #663), the 2000 work steps, depth

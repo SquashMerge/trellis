@@ -22,4 +22,5 @@ mod navigation_resolved;
 mod sequence_callbacks;
 mod sequence_columns;
 mod sequence_incidental;
+mod sequence_match_order;
 mod show;
