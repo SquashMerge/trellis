@@ -745,7 +745,7 @@ fn evaluate(
         next_earliest_start: Some(quiet_ms.max(interval_at_ms)),
         ..status(
             AutoState::Scheduled,
-            Some("producer re-run scheduled".to_owned()),
+            Some(crate::store::RERUN_SCHEDULED.to_owned()),
         )
     }
 }

@@ -991,8 +991,9 @@ pub struct AutoRunLabels {
     pub failed: BTreeMap<String, String>,
 }
 
-/// The reason shown for a language whose producer re-run is scheduled or running.
-const RERUN_SCHEDULED: &str = "producer re-run scheduled";
+/// The reason shown for a language whose producer re-run is scheduled or running, and the
+/// `autoRun.reason` of a scheduled producer (#660): one string for both.
+pub(crate) const RERUN_SCHEDULED: &str = "producer re-run scheduled";
 
 /// Rules 1 and 2 of the pending label: a catching-up language relabels its `NeedsReimport`
 /// documents `CatchingUp`; a failed one carries the failure as its re-import reason. Counts,

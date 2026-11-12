@@ -230,3 +230,60 @@ fn no_selection_and_no_row_is_not_due() {
     world.reindex();
     assert!(!world.due(JAVASCRIPT));
 }
+
+/// Another producer covering the same language (#897).
+const OTHER: &str = "trellis-other-scip";
+
+impl World {
+    fn insert_reimport(&self, producer: &str, language: &str) {
+        let head = self.store.index_baseline().unwrap();
+        let key = format!("pin:v1:{}:{}", head.index_generation, head.index_revision);
+        Connection::open(&self.index_db)
+            .unwrap()
+            .execute(
+                "INSERT INTO semantic_reimport VALUES(?1,?2,?3,'import a current artifact')",
+                rusqlite::params![key, producer, language],
+            )
+            .unwrap();
+    }
+}
+
+#[test]
+fn another_producers_reimport_row_is_not_due_for_this_one() {
+    let world = World::new(FILES);
+    world.import_javascript();
+    world.insert_reimport(OTHER, "javascript");
+    let head = world
+        .store
+        .auto_run_due(&[(PRODUCER, JAVASCRIPT), (OTHER, JAVASCRIPT)])
+        .unwrap();
+    assert!(!head.due[PRODUCER]);
+    assert!(head.due[OTHER]);
+}
+
+#[test]
+fn a_producer_less_legacy_row_is_due_for_every_producer_of_its_language() {
+    let world = World::new(FILES);
+    world.import_javascript();
+    world.insert_reimport("", "javascript");
+    let head = world
+        .store
+        .auto_run_due(&[(PRODUCER, JAVASCRIPT), (OTHER, JAVASCRIPT)])
+        .unwrap();
+    assert!(head.due[PRODUCER]);
+    assert!(head.due[OTHER]);
+}
+
+#[test]
+fn another_producers_stale_batch_is_not_due_for_this_one() {
+    let world = World::new(FILES);
+    world.import_javascript();
+    world.write("src/B.js", "function target(){ return 2; }\n");
+    world.reindex();
+    let head = world
+        .store
+        .auto_run_due(&[(PRODUCER, JAVASCRIPT), (OTHER, JAVASCRIPT)])
+        .unwrap();
+    assert!(head.due[PRODUCER]);
+    assert!(!head.due[OTHER]);
+}

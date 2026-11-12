@@ -307,7 +307,7 @@ Only `enabled` is needed; the rest show their defaults. A value out of range isn
 
 **One manual run approves.** The file alone starts nothing. An automatic run needs an approval, and only a manual `producer run` that ends `imported` writes one. It records the trust profile, limits, executable and environment of that run. If you have changed the toolchain since, or the checkout was garbage-collected or replaced, `producer status` shows `needsApproval` with a reason, and you run the producer by hand again.
 
-Trellis starts a run only when the checkout has been quiet for `quietSecs`, no indexing is pending, nothing else is running a producer and at least `minIntervalSecs` have passed since the last automatic start. If you change files while it runs, the run is cancelled and tried again after the next quiet period. A manual `producer run` takes priority over an automatic run that hasn't reached its import yet.
+Trellis starts a run only when the checkout has been quiet for `quietSecs`, no indexing is pending, nothing else is running a producer and at least `minIntervalSecs` have passed since the last automatic start. If you change files while it runs, the run is cancelled and tried again after whichever is later: the next quiet period, or `minIntervalSecs` after the cancelled run started. A manual `producer run` takes priority over an automatic run that hasn't reached its import yet.
 
 **The gates.** Before a start, Trellis skips the run while the machine is on battery or its 1-minute load is at or above its CPU count, and checks again about a minute later. An unknown reading doesn't hold a run back. A gate never stops a run that has begun. Turn one off with `batteryGate = false` or `loadGate = false`.
 

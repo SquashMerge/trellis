@@ -25,6 +25,7 @@ pub use search::{
     SearchHeadChanged, SearchHeadDelta,
 };
 pub use search_startup::RecentSearchCheckout;
+pub(crate) use semantic_display::RERUN_SCHEDULED;
 #[cfg(feature = "test-support")]
 pub(crate) use semantic_display::status_semantic_projections_on_thread_for_tests;
 pub use semantic_display::{
