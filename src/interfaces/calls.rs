@@ -1509,7 +1509,7 @@ impl Clone for Source<'_> { fn clone(&self) -> Self { self.client.get("/trait-im
 
     /// #921 sixth review: a module or a glob could make the impl's name another type, so a
     /// `self` field counts only with the struct and the impl both at the top level of a
-    /// document that has no glob import anywhere. A nested owner is an accepted loss.
+    /// document that has no top-level glob import. A nested owner is an accepted loss.
     #[test]
     fn a_self_field_counts_only_at_top_level_without_globs() {
         let models = r#"
@@ -1605,6 +1605,19 @@ impl Api {
 }
 "#;
         assert_eq!(paths(direct), ["GET /control-self"]);
+        // A glob inside a nested module cannot change the top-level names, so it does not
+        // block the call.
+        let tests_glob = r#"
+struct Api { client: reqwest::Client }
+impl Api {
+    fn request(&self) { self.client.get("/with-test-glob"); }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+}
+"#;
+        assert_eq!(paths(tests_glob), ["GET /with-test-glob"]);
         let imported = "use other::Api;\nstruct Api { client: reqwest::Client }\nimpl Api { fn f(&self) { self.client.get(\"/imported\"); } }\n";
         assert_eq!(reqwest_paths(imported), Vec::<String>::new());
     }

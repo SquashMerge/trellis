@@ -75,7 +75,7 @@ fn collect(
     let mut imported = BTreeSet::new();
     let mut fields: BTreeMap<&str, (usize, bool, Option<&str>)> = BTreeMap::new();
     let mut globs = Vec::new();
-    let mut any_glob = false;
+    let mut top_glob = false;
     let mut field_nodes = Vec::new();
     let mut bindings: BTreeMap<&str, Vec<Node<'_>>> = BTreeMap::new();
     walk(root, check, &mut |node, check| {
@@ -101,13 +101,11 @@ fn collect(
                             .or_default()
                             .push(binding);
                     }
-                    "use_wildcard" => {
-                        any_glob = true;
-                        if local {
-                            local_glob = true;
-                            globs.push(binding.byte_range());
-                        }
+                    "use_wildcard" if local => {
+                        local_glob = true;
+                        globs.push(binding.byte_range());
                     }
+                    "use_wildcard" => top_glob = true,
                     _ => {}
                 }
                 Ok(false)
@@ -172,8 +170,9 @@ fn collect(
     };
     // A field counts only when it is the one field of that name in the document, declared
     // with the client type by a top-level struct whose name the document declares once and
-    // never imports, in a document with no glob import anywhere (#921 review): a glob or a
-    // module could make the impl's name another type.
+    // never imports, in a document with no top-level glob import (#921 review): a top-level
+    // glob or a module could make the impl's name another type. A glob inside a nested
+    // module cannot, since names never resolve outward from a child module.
     for field in field_nodes {
         if let Some(name) = field.child_by_field_name("name") {
             let client = field
@@ -196,7 +195,7 @@ fn collect(
         fields: fields
             .into_iter()
             .filter_map(|(name, (count, client, owner))| {
-                let owner = owner.filter(|owner| !any_glob && declared.get(owner) == Some(&1))?;
+                let owner = owner.filter(|owner| !top_glob && declared.get(owner) == Some(&1))?;
                 (count == 1 && client).then_some((name, owner))
             })
             .collect(),
@@ -392,7 +391,7 @@ impl<'a> Document<'a> {
     /// constructor chain ([`Self::constructed`]); `self.<field>` inside a top-level `impl`
     /// of the top-level struct that declares the field, when that is the one field of its
     /// name in the document, has the client type, the struct's name is declared once and
-    /// imported nowhere, and the document has no glob import; or a name
+    /// imported nowhere, and the document has no top-level glob import; or a name
     /// bound once in its function, by a parameter or `let` written with the client type,
     /// before the call. Its name says nothing.
     fn client(&self, receiver: Node<'a>) -> bool {

@@ -496,7 +496,9 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
   - `self.<field>` inside a top-level `impl` (inherent or trait, generic arguments aside)
     of the top-level struct that declares the field, where that is the one field of its name
     in the document, it has the client type, the struct's name is declared once and
-    imported nowhere in the document, and the document has no glob import anywhere;
+    imported nowhere in the document, and the document has no glob import at its top
+    level (a glob inside a nested module, such as `#[cfg(test)] mod tests { use super::*; }`,
+    cannot change what the top-level names resolve to);
   - a name bound exactly once in its function, before the call, by a parameter or `let`
     written with the client type. Any other binding of the name in the function (a
     rebinding, `let` without a type, destructuring or shorthand field, `match` arm or guard
