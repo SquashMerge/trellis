@@ -169,6 +169,7 @@ store-open tests/semantic/semantic_publication_paths.rs rebuilt_executable_retai
 global-counter src/references.rs * -- a test-support limit that tests set, not a count
 global-counter src/semantic_batch/testing.rs * -- unique stage and join id allocators; never asserted on
 global-counter src/store/native_first/witness.rs family_reserves_before_decoding_prefetched_children -- local to one single-threaded test; its decode fn pointer cannot capture a counter
+global-counter src/store/semantic_display.rs * -- a test-support limit that tests set, not a count
 global-counter tests/daemon/daemon_cli.rs detached_with_log -- unique log file id allocator; never asserted on
 
 # short-wait: the duration is the input under test, not a bound on a wait
