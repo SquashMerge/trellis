@@ -1875,6 +1875,17 @@ pub(super) fn architecture_semantic(
                 binding_metadata
                     .insert("historicalExternalTargets".into(), json!(external_targets));
             }
+            // What a fresh read at the basis binds: a resolved internal target, confirmed
+            // current there and in this snapshot (#934).
+            let basis_site = row.get_ref(3)?.as_str()? == "resolved"
+                && row.get_ref(4)?.as_str_or_null()? == Some("internal")
+                && row.get_ref(5)?.as_blob_or_null()?.is_some()
+                && row.get::<_, Option<i64>>(9)? == Some(0)
+                && locate(
+                    row.get_ref(6)?.as_str_or_null()?,
+                    row.get_ref(7)?.as_str_or_null()?,
+                )
+                .is_some();
             let outcome = match (
                 row.get_ref(3)?.as_str()?,
                 row.get_ref(4)?.as_str_or_null()?,
@@ -1914,6 +1925,7 @@ pub(super) fn architecture_semantic(
                 } else {
                     SemanticOutcome::Boundary
                 },
+                basis_site,
                 provenance_id: provenance_id.clone(),
                 metadata: binding_metadata,
             };
@@ -1929,6 +1941,15 @@ pub(super) fn architecture_semantic(
         while let Some(row) = cursor.next()? {
             admit()?;
             pp.freshness(row.get(9)?)?;
+            // What a fresh read at the basis binds: a resolved internal target in this
+            // snapshot (#934).
+            let basis_site = row.get_ref(2)?.as_str()? == "resolved"
+                && row.get_ref(3)?.as_blob_or_null()?.is_some()
+                && locate(
+                    row.get_ref(4)?.as_str_or_null()?,
+                    row.get_ref(5)?.as_str_or_null()?,
+                )
+                .is_some();
             let outcome = match (
                 row.get_ref(2)?.as_str()?,
                 sid(row.get_ref(3)?.as_blob_or_null()?)?,
@@ -1993,6 +2014,7 @@ pub(super) fn architecture_semantic(
                 } else {
                     SemanticOutcome::Boundary
                 },
+                basis_site,
                 provenance_id: pp.provenance_id(reference_ordinal)?,
                 metadata: reference_metadata,
             });

@@ -13106,3 +13106,110 @@ fn bounded_full_rejoin_accepts_empty_destination_and_preserves_selected_capture(
     assert_eq!(sources, prior_sources);
     assert!(world.stage_dirs().is_empty());
 }
+
+/// #934 review: a projected binding becomes a boundary site at N only if it was a site of
+/// its own at P. An ordinary call ambiguous between two candidates is no site at P; when a
+/// candidate's document is catching up it is still none at N. A call P resolved to one
+/// internal target is a site at P, and stays one at N as a labelled boundary.
+async fn catch_up_boundary_world(ambiguous: bool) -> (World, u64, Value) {
+    use trellis::model::SemanticStatus;
+    let world = world_with(
+        |root| {
+            fs::create_dir_all(root.join(".git")).unwrap();
+            WorkspaceIdentity::discover(Some(root), root)
+                .unwrap()
+                .attach_marker()
+                .unwrap();
+            write_files(
+                root,
+                &[
+                    ("src/A.js", DEFINITIONS_A),
+                    ("src/B.js", "function target(){ }\nfunction other(){ }\n"),
+                ],
+            );
+        },
+        true,
+    );
+    let mut a = DocSpec::new("src/A.js")
+        .occurrence(&[0, 9, 12], &[], "pkg run.", 1)
+        .occurrence(&[0, 16, 22], &[0, 16, 24], "pkg target.", 0);
+    if ambiguous {
+        a = a.occurrence(&[0, 16, 22], &[0, 16, 24], "pkg other.", 0);
+    }
+    let descriptor = one_artifact_per_language(
+        &world,
+        vec![(
+            "javascript",
+            vec![
+                a.symbol("pkg run.", 17, &[]),
+                DocSpec::new("src/B.js")
+                    .occurrence(&[0, 9, 15], &[], "pkg target.", 1)
+                    .occurrence(&[1, 9, 14], &[], "pkg other.", 1)
+                    .symbol("pkg target.", 17, &[])
+                    .symbol("pkg other.", 17, &[]),
+            ],
+        )],
+    );
+    let (p, admitted, _) = world.publish(&descriptor).unwrap();
+    drop(admitted);
+    let producer = world.store.semantic_at(p).unwrap().producers[0].id.clone();
+    let sites = |reply: &Value| {
+        reply["data"]["counts"]["mappedSites"].as_u64().unwrap()
+            + reply["data"]["counts"]["unresolvedSites"].as_u64().unwrap()
+    };
+    let mut mcp = McpSession::start(&world, 9348 + u64::from(ambiguous));
+    let at_p = mcp.success("trellis_references", json!({"schemaVersion":1,"limit":50}));
+    let before = sites(&at_p);
+    // A whitespace-only edit to B publishes native N only: A is older basis, B catching up.
+    fs::write(
+        world.root.join("src/B.js"),
+        "function target(){  }\nfunction other(){ }\n",
+    )
+    .unwrap();
+    let (graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(world.root.clone()),
+        world.store.root_id(),
+        &world.cancel,
+        |_| {},
+    )
+    .unwrap();
+    let leader = world.store.publication_for_tests().unwrap();
+    let pin = world
+        .store
+        .publish_native(&graph, &capture, &native, &leader, p, &world.cancel)
+        .unwrap();
+    drop(leader);
+    let status = |path| {
+        world
+            .store
+            .semantic_projection_at(pin, &producer, "javascript", path)
+            .unwrap()
+            .unwrap()
+            .semantic_status
+    };
+    assert_eq!(status("src/A.js"), SemanticStatus::OlderBasis);
+    assert_eq!(status("src/B.js"), SemanticStatus::CatchingUp);
+    let at_n = mcp.success("trellis_references", json!({"schemaVersion":1,"limit":50}));
+    assert_eq!(at_n["evidenceBasis"], json!(pin));
+    assert_eq!(sites(&at_n), before, "P={at_p} N={at_n}");
+    mcp.finish();
+    (world, before, at_n)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review934_ambiguous_pending_candidate_adds_no_site() {
+    let (_world, before, at_n) = catch_up_boundary_world(true).await;
+    assert_eq!(before, 0, "{at_n}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn catch_up_keeps_a_resolved_internal_site_as_its_boundary() {
+    let (_world, before, at_n) = catch_up_boundary_world(false).await;
+    assert_eq!(before, 1, "{at_n}");
+    let unresolved = at_n["data"]["unresolved"].as_array().unwrap();
+    assert_eq!(unresolved.len(), 1, "{at_n}");
+    assert_eq!(
+        unresolved[0]["reason"], "semantic_endpoint_catching_up",
+        "{at_n}"
+    );
+}
