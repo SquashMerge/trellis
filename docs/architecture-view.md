@@ -2,9 +2,10 @@
 
 Architecture is a tab in Diagrams for reviewing dependencies and authoring reviewed
 exceptions in the checkout. It shows authored layer bands and directed module references:
-**structural references · syntax evidence**, plus fresh call and type bindings of each
+**structural references · syntax evidence**, plus call and type bindings of each
 language's selected semantic producer where one is imported
-([#523](rules.md#semantic-bindings-523)). A native module is one
+([#523](rules.md#semantic-bindings-523)): fresh ones, and possibly stale ones labelled
+`possiblyStale` until a producer re-run replaces them (#936, owner ruling 2026-11-12). A native module is one
 indexed file with its full `(sourceSetId, language, path, sid)` identity. Paths are labels,
 not inferred package names or identities; module chips (below) only group them for display.
 
@@ -985,7 +986,7 @@ detail. On this repository it went from about 35 MB to about 0.75 MB. Its fields
   every scanned reference site once, structural or semantic; a site with at least one mapped target is mapped,
   and one with a residual reason is unresolved, so a site can be both; one an external
   semantic binding resolved is neither. `semanticSites`
-  counts sites a fresh binding mapped or bound outside the checkout. The rows sum to
+  counts sites a binding that is not stale mapped or bound outside the checkout (#936). The rows sum to
   `counts.mappedSites`, `counts.unresolvedSites` and `counts.semanticSites`, and there are at most two per layer;
 - `apps`, `noApp`, `interfaces` and `modules[].app` (#784, #788; see
   [Apps and HTTP interfaces](#apps-and-http-interfaces-data-and-extraction-784-788));
@@ -1124,8 +1125,8 @@ or partial mapping is installed. Local assets and the existing CSP remain in for
 Natural-size diagrams scroll inside their canvas instead of shrinking text to fit.
 Desktop panes scroll independently; narrow screens reuse Explorer/Inspector drawers.
 
-Architecture evidence is syntax-tier (`evidenceTier:"syntax"`), or `mixed` once fresh
-semantic bindings map any site; `semanticComplete` stays false either way. Coverage and
+Architecture evidence is syntax-tier (`evidenceTier:"syntax"`), or `mixed` once
+semantic bindings that are not stale map any site (#936, owner ruling 2026-11-12); `semanticComplete` stays false either way. Coverage and
 limitations are visible; missing references do not prove there is no dependency.
 Module-level Flow is deferred to [#324](https://github.com/SquashMerge/trellis/issues/324).
 The module inspector's **Open in Treemap** action opens the exact source-set/language/path

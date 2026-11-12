@@ -1487,11 +1487,13 @@ fn architecture_derived_from(
     }
 }
 
-/// Fresh bindings of each document under its language's default producer (#483), for
+/// Bindings of each document under its language's default producer (#483), for
 /// architecture references and rules (#523). Only rows of a selected, complete or partial
-/// coverage tuple whose proof is fresh are read; anything else stays syntax-only. An
-/// internal call target must also be confirmed current (`stale_target = 0`), and an
-/// internal target outside the snapshot's documents is left out.
+/// coverage tuple whose proof is not `stale` are read; anything else stays syntax-only.
+/// Possibly stale rows, such as the evidence S carries forward after an edit, are read until
+/// a producer re-run replaces them, each labelled with its own freshness (#936, owner ruling
+/// 2026-11-12). An internal call target must also be confirmed current (`stale_target = 0`),
+/// and an internal target outside the snapshot's documents is left out.
 pub(super) fn architecture_semantic(
     db: &Connection,
     revision_key: &str,
@@ -1719,7 +1721,7 @@ pub(super) fn architecture_semantic(
          FROM semantic_call_bindings b
          JOIN semantic_provenance p ON p.payload_id=b.payload_id AND p.ordinal=b.provenance_ordinal
          LEFT JOIN semantic_coverage_freshness f ON f.revision_id=?5 AND f.tuple_id=?7 AND f.basis_id=p.basis_id
-         WHERE b.payload_id=?1 AND b.call_id IS NOT NULL AND (?4 OR f.basis_id IS NULL OR f.freshness='fresh')
+         WHERE b.payload_id=?1 AND b.call_id IS NOT NULL AND (?4 OR f.basis_id IS NULL OR f.freshness<>'stale')
            AND b.join_document_language=?2 AND b.join_document_path=?3",
     )?;
     let mut references = db.prepare_cached(
@@ -1730,7 +1732,7 @@ pub(super) fn architecture_semantic(
          FROM semantic_references r
          JOIN semantic_provenance p ON p.payload_id=r.payload_id AND p.ordinal=r.provenance_ordinal
          LEFT JOIN semantic_coverage_freshness f ON f.revision_id=?3 AND f.tuple_id=?4 AND f.basis_id=p.basis_id
-         WHERE r.payload_id=?1 AND r.site='use' AND (?2 OR f.basis_id IS NULL OR f.freshness='fresh')
+         WHERE r.payload_id=?1 AND r.site='use' AND (?2 OR f.basis_id IS NULL OR f.freshness<>'stale')
            AND (?2 OR (r.resolution='resolved' AND r.declared_kind='internal') OR r.resolution='external')",
     )?;
     let mut relationships = db.prepare_cached(
@@ -1742,7 +1744,7 @@ pub(super) fn architecture_semantic(
          FROM semantic_type_relationships t
          JOIN semantic_provenance p ON p.payload_id=t.payload_id AND p.ordinal=t.provenance_ordinal
          LEFT JOIN semantic_coverage_freshness f ON f.revision_id=?3 AND f.tuple_id=?4 AND f.basis_id=p.basis_id
-         WHERE t.payload_id=?1 AND (?2 OR f.basis_id IS NULL OR f.freshness='fresh') AND t.source_kind='internal'
+         WHERE t.payload_id=?1 AND (?2 OR f.basis_id IS NULL OR f.freshness<>'stale') AND t.source_kind='internal'
            AND t.kind IN ('extends','implements')
          ORDER BY t.ordinal",
     )?;
@@ -1825,7 +1827,7 @@ pub(super) fn architecture_semantic(
         while let Some(row) = cursor.next()? {
             admit()?;
             // A missing required freshness row is corruption, never a filtered fact.
-            pp.freshness(row.get(17)?)?;
+            let basis_freshness = pp.freshness(row.get(17)?)?;
             let call_id = id_codec::decode_occ(row.get_ref(0)?.as_blob()?)
                 .map_err(|_| SelectedIntegrity("invalid semantic call ID".into()))?;
             let ordinal: i64 = row.get(10)?;
@@ -1875,9 +1877,11 @@ pub(super) fn architecture_semantic(
                 binding_metadata
                     .insert("historicalExternalTargets".into(), json!(external_targets));
             }
-            // What a fresh read at the basis binds: a resolved internal target, confirmed
-            // current there and in this snapshot (#934).
-            let basis_site = row.get_ref(3)?.as_str()? == "resolved"
+            // What a read at the basis binds: a resolved internal target, confirmed current
+            // there and in this snapshot (#934), from a proof that read admits: any not
+            // `stale`, possibly stale included (#936).
+            let basis_site = basis_freshness != sem::Freshness::Stale
+                && row.get_ref(3)?.as_str()? == "resolved"
                 && row.get_ref(4)?.as_str_or_null()? == Some("internal")
                 && row.get_ref(5)?.as_blob_or_null()?.is_some()
                 && row.get::<_, Option<i64>>(9)? == Some(0)
@@ -1940,10 +1944,11 @@ pub(super) fn architecture_semantic(
         let mut cursor = references.query(params![payload, historical, key, tuple])?;
         while let Some(row) = cursor.next()? {
             admit()?;
-            pp.freshness(row.get(9)?)?;
-            // What a fresh read at the basis binds: a resolved internal target in this
-            // snapshot (#934).
-            let basis_site = row.get_ref(2)?.as_str()? == "resolved"
+            let basis_freshness = pp.freshness(row.get(9)?)?;
+            // What a read at the basis binds: a resolved internal target in this snapshot
+            // (#934), from a proof that read admits: any not `stale` (#936).
+            let basis_site = basis_freshness != sem::Freshness::Stale
+                && row.get_ref(2)?.as_str()? == "resolved"
                 && row.get_ref(3)?.as_blob_or_null()?.is_some()
                 && locate(
                     row.get_ref(4)?.as_str_or_null()?,

@@ -8551,6 +8551,120 @@ async fn catch_up_admits_each_projected_semantic_row_once() {
     mcp.finish();
 }
 
+/// #936 (owner ruling 2026-11-12): once S publishes the head and catch-up is over, the
+/// evidence S carried forward is `possiblyStale`, and Architecture keeps using it, labelled,
+/// until a producer re-run imports fresh evidence that replaces it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn architecture_keeps_possibly_stale_evidence_after_catch_up_until_a_fresh_import() {
+    let files = ["src/lib.js", "src/main.js"];
+    let (world, _) = real_fixture_world("issue444-javascript-calls", &files);
+    let (p, _) = publish_real_fixture(&world, "issue444-javascript-calls", &files);
+    let (native_p, _) = world.store.retained_native_snapshot_at(p).unwrap();
+    let helper_call = native_p
+        .calls
+        .iter()
+        .find(|call| {
+            call.document.path == "src/main.js" && call.spelling.as_deref() == Some("helper")
+        })
+        .unwrap()
+        .id
+        .clone();
+    fs::create_dir_all(world.root.join(".trellis")).unwrap();
+    fs::write(
+        world.root.join(".trellis/rules.toml"),
+        r#"version = 1
+[roles.entry]
+select = { name = "caller", language = ["javascript"] }
+[roles.helper]
+select = { name = "helper", language = ["javascript"] }
+[[rules]]
+id = "entry-must-not-call-helper"
+for_each = "entry"
+forbid = [{ calls = "helper" }]
+"#,
+    )
+    .unwrap();
+    // An edit that touches neither document: S carries both forward as possibly stale.
+    write_files(
+        &world.root,
+        &[("src/other.js", "export function other() {}\n")],
+    );
+    let options = IndexOptions::new(world.root.clone());
+    let capture = trellis::capture::Capture::admit(&options, &world.cancel, &|_| {}).unwrap();
+    let leader = world.store.publication_for_tests().unwrap();
+    let native = world
+        .store
+        .publish_local_for_tests(&options, &capture, &leader, &world.cancel)
+        .unwrap();
+    drop(leader);
+    let caught = world
+        .store
+        .catch_up_semantic_for_tests(&world.cancel)
+        .unwrap();
+    assert_ne!(caught, native);
+    assert!(!world.store.semantic_catch_up_pending_for_tests().unwrap());
+    let mut mcp = McpSession::start(&world, 936);
+    let answers = |mcp: &mut McpSession, pin: IndexPin| {
+        let arguments = json!({"schemaVersion":1,"expectedBasis":pin,"limit":50});
+        let references = mcp.success("trellis_references", arguments.clone());
+        let checked = mcp.success("trellis_rules_check", arguments.clone());
+        let instance = checked["data"]["instances"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|instance| instance["rule"] == "entry-must-not-call-helper")
+            .cloned()
+            .unwrap();
+        // The helper call is bound, so the forbidden call is found, not unknown.
+        assert_eq!(instance["status"], "deviates", "{checked}");
+        let mut explain = arguments;
+        explain["rule"] = instance["rule"].clone();
+        explain["target"] = instance["target"].clone();
+        let explained = mcp.success("trellis_rules_explain", explain);
+        for reply in [&references, &checked, &explained] {
+            assert_eq!(reply["evidenceBasis"], json!(pin), "{reply}");
+        }
+        // Semantic catch-up is over: no document reads an older basis or is pending.
+        assert_eq!(
+            references["data"]["semanticDocumentStatus"],
+            json!({"olderBasis":0,"catchingUp":0,"needsReimport":0}),
+            "{references}"
+        );
+        assert_eq!(references["data"]["partial"], false, "{references}");
+        assert_eq!(references["data"]["evidenceTier"], "mixed", "{references}");
+        let mut freshness: Vec<Value> = references["data"]["production"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|edge| edge["sites"].as_array().unwrap())
+            .filter(|site| site["callId"] == json!(helper_call) && site["mapping"] == "semantic")
+            .inspect(|site| assert!(site.get("projection").is_none(), "{site}"))
+            .map(|site| site["freshness"].clone())
+            .collect();
+        for reply in [&checked, &explained] {
+            let rows = reply["data"]["instances"][0]["constraints"][0]["evidence"]
+                .as_array()
+                .unwrap();
+            let bound: Vec<Value> = rows
+                .iter()
+                .filter(|row| row["kind"] == "semanticBinding")
+                .map(|row| row["freshness"].clone())
+                .collect();
+            assert!(!bound.is_empty(), "{reply}");
+            freshness.extend(bound);
+        }
+        assert!(freshness.len() >= 3, "{references}");
+        freshness.dedup();
+        freshness
+    };
+    assert_eq!(answers(&mut mcp, caught), [json!("possiblyStale")]);
+    // A producer re-run imports fresh evidence, which replaces the possibly stale rows.
+    let (fresh, _) = publish_real_fixture(&world, "issue444-javascript-calls", &files);
+    assert_ne!(fresh, caught);
+    assert_eq!(answers(&mut mcp, fresh), [json!("fresh")]);
+    mcp.finish();
+}
+
 /// Architecture wire evidence keeps the imported proof's identity beside native N.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn architecture_wire_preserves_canonical_proof_identity_at_current_and_older_basis() {
@@ -13111,7 +13225,14 @@ fn bounded_full_rejoin_accepts_empty_destination_and_preserves_selected_capture(
 /// its own at P. An ordinary call ambiguous between two candidates is no site at P; when a
 /// candidate's document is catching up it is still none at N. A call P resolved to one
 /// internal target is a site at P, and stays one at N as a labelled boundary.
+///
+/// With `carried` (#936), an unrelated edit and semantic catch-up first make P the S head
+/// whose proofs are carried forward `possiblyStale`; P then reads them, labelled.
 async fn catch_up_boundary_world(ambiguous: bool) -> (World, u64, Value) {
+    catch_up_boundary_world_from(ambiguous, false).await
+}
+
+async fn catch_up_boundary_world_from(ambiguous: bool, carried: bool) -> (World, u64, Value) {
     use trellis::model::SemanticStatus;
     let world = world_with(
         |root| {
@@ -13150,15 +13271,46 @@ async fn catch_up_boundary_world(ambiguous: bool) -> (World, u64, Value) {
             ],
         )],
     );
-    let (p, admitted, _) = world.publish(&descriptor).unwrap();
+    let (mut p, admitted, _) = world.publish(&descriptor).unwrap();
     drop(admitted);
     let producer = world.store.semantic_at(p).unwrap().producers[0].id.clone();
+    if carried {
+        write_files(&world.root, &[("src/C.js", "function unrelated(){ }\n")]);
+        let options = IndexOptions::new(world.root.clone());
+        let capture = trellis::capture::Capture::admit(&options, &world.cancel, &|_| {}).unwrap();
+        let leader = world.store.publication_for_tests().unwrap();
+        world
+            .store
+            .publish_local_for_tests(&options, &capture, &leader, &world.cancel)
+            .unwrap();
+        drop(leader);
+        p = world
+            .store
+            .catch_up_semantic_for_tests(&world.cancel)
+            .unwrap();
+        assert!(!world.store.semantic_catch_up_pending_for_tests().unwrap());
+    }
     let sites = |reply: &Value| {
         reply["data"]["counts"]["mappedSites"].as_u64().unwrap()
             + reply["data"]["counts"]["unresolvedSites"].as_u64().unwrap()
     };
-    let mut mcp = McpSession::start(&world, 9348 + u64::from(ambiguous));
+    let mut mcp = McpSession::start(&world, 9348 + u64::from(ambiguous) + 2 * u64::from(carried));
     let at_p = mcp.success("trellis_references", json!({"schemaVersion":1,"limit":50}));
+    assert_eq!(at_p["evidenceBasis"], json!(p));
+    if carried {
+        // P's site rests on carried-forward evidence: present, and labelled as such.
+        let semantic: Vec<&Value> = at_p["data"]["production"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|edge| edge["sites"].as_array().unwrap())
+            .filter(|site| site["mapping"] == "semantic")
+            .collect();
+        assert_eq!(semantic.len(), u64::from(!ambiguous) as usize, "{at_p}");
+        for site in semantic {
+            assert_eq!(site["freshness"], "possiblyStale", "{site}");
+        }
+    }
     let before = sites(&at_p);
     // A whitespace-only edit to B publishes native N only: A is older basis, B catching up.
     fs::write(
@@ -13200,6 +13352,30 @@ async fn catch_up_boundary_world(ambiguous: bool) -> (World, u64, Value) {
 async fn review934_ambiguous_pending_candidate_adds_no_site() {
     let (_world, before, at_n) = catch_up_boundary_world(true).await;
     assert_eq!(before, 0, "{at_n}");
+}
+
+/// #936 (from the #935 review): P is an S head whose proofs are `possiblyStale` after an
+/// unrelated edit. Its resolved internal call is a site at P, labelled `possiblyStale`, and a
+/// later whitespace edit to its target keeps exactly that site at N as a boundary that still
+/// says `possiblyStale`: whether the site exists does not depend on which file changed later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn possibly_stale_site_stays_one_labelled_site_when_its_target_catches_up() {
+    let (_world, before, at_n) = catch_up_boundary_world_from(false, true).await;
+    assert_eq!(before, 1, "{at_n}");
+    let unresolved = at_n["data"]["unresolved"].as_array().unwrap();
+    assert_eq!(unresolved.len(), 1, "{at_n}");
+    assert_eq!(
+        unresolved[0]["reason"], "semantic_endpoint_catching_up",
+        "{at_n}"
+    );
+    assert_eq!(
+        unresolved[0]["site"]["freshness"], "possiblyStale",
+        "{at_n}"
+    );
+    assert_eq!(
+        unresolved[0]["site"]["historicalFreshness"], "possiblyStale",
+        "{at_n}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

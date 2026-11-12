@@ -1281,12 +1281,17 @@ CallerReason = "syntax_only"|"enclosing_callable_unknown"|"stable_lookup_unavail
 
 Where a document's language has a selected producer (the per-language default of
 #483: the sole published producer covering it), the projection also reads that
-producer's **fresh** evidence for the document, from a selected `complete` or
+producer's evidence for the document, from a selected `complete` or
 `partial` coverage tuple: call bindings of measured calls, resolved or external
 use-site semantic references, and `extends`/`implements` relationships. Rows whose
-proof is not `fresh`, and internal call targets not confirmed current
+proof is `stale`, and internal call targets not confirmed current
 (`staleTarget` not `false`), are left out, so stale evidence reverts to structural
-evidence. A call is represented by its lowest-provenance binding, as in the call
+evidence. **Amendment (#936, owner ruling 2026-11-12):** `possiblyStale` rows are
+read as well, so after an edit the evidence that semantic catch-up carries forward
+keeps serving Architecture until a producer re-run imports `fresh` evidence that
+replaces it. Each site and rule evidence row such a binding supports carries
+`freshness:"possiblyStale"`, and the language's semantic tier keeps reporting its
+worst freshness and counts. A call is represented by its lowest-provenance binding, as in the call
 graph; when that one is unusable the call has no binding. Any internal target must
 be a declaration of this snapshot (semantic references carry no separate
 current-target flag); its module is the declaration's file.

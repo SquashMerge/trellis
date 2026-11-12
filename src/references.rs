@@ -46,7 +46,8 @@ pub struct Snapshot {
     pub evidence_gaps: BTreeMap<DocumentKey, &'static str>,
 }
 
-/// Selected producer evidence: current fresh bindings or an authorized historical overlay.
+/// Selected producer evidence: current bindings that are not stale (fresh or possibly stale,
+/// #936) or an authorized historical overlay.
 /// Historical outcomes retain P authority and cannot be re-resolved against native N.
 #[derive(Debug, Default, Clone)]
 pub struct DocumentSemantic {
@@ -56,7 +57,7 @@ pub struct DocumentSemantic {
     pub complete: bool,
     /// Call bindings of measured calls and resolved semantic references, by source range.
     pub anchors: Vec<SemanticAnchor>,
-    /// Fresh `extends`/`implements` relationships whose source is declared here.
+    /// `extends`/`implements` relationships, not stale, whose source is declared here.
     pub relationships: Vec<SemanticRelationship>,
     /// Native-N selection of a validated historical semantic basis, or explicit pending.
     pub projection: Option<crate::model::SemanticProjection>,
@@ -98,7 +99,7 @@ pub enum SemanticOutcome {
     Boundary,
 }
 
-/// A fresh semantic type relationship from a declaration of this document.
+/// A semantic type relationship, not stale, from a declaration of this document.
 #[derive(Debug, Clone)]
 pub struct SemanticRelationship {
     /// `extends` or `implements`.
@@ -124,7 +125,7 @@ pub(crate) struct SiteCoverage {
     pub sites: usize,
     pub mapped: usize,
     pub unresolved: usize,
-    /// Sites mapped or bound outside the checkout by a fresh semantic binding (#523).
+    /// Sites mapped or bound outside the checkout by a semantic binding (#523, #936).
     pub semantic: usize,
 }
 /// Every resolved reference of one revision, by source document, before path selection and
@@ -245,11 +246,12 @@ struct Site {
     caller: Option<callers::Caller>,
     caller_reason: Option<&'static str>,
     owner: Option<SiteOwner>,
-    /// Set only when a fresh semantic binding resolves the site to an indexed declaration.
+    /// Set only when a semantic binding resolves the site to an indexed declaration.
     target: Option<ReferenceTarget>,
     /// Why `target` is null: `structural_only`, `unresolved`, `external` or `ambiguous`.
     target_reason: Option<&'static str>,
-    /// `structural` (captured syntax conventions) or `semantic` (a fresh producer binding).
+    /// `structural` (captured syntax conventions) or `semantic` (a producer binding, labelled
+    /// with its freshness).
     mapping: &'static str,
     /// The semantic binding's provenance; null for structural sites.
     provenance_id: Option<String>,
@@ -1177,7 +1179,7 @@ pub(crate) fn display_key(d: &Declaration) -> String {
     format!("{}#{}", d.document.path, segments.join("."))
 }
 
-/// How a fresh semantic binding resolves a site, or `None` to keep its structural result
+/// How a semantic binding resolves a site, or `None` to keep its structural result
 /// (`structural` is `None` for a semantic-only site, which is then dropped).
 fn semantic_resolution(
     anchor: &SemanticAnchor,

@@ -1156,7 +1156,11 @@ reports its `evidenceTier` and `semanticSites` (#523; see
 [rules](rules.md#semantic-bindings-523)). Stored
 Decision 0011 roles separate production and tests: feature-only `test-support`
 remains production. Call/type constraints use only fresh selected bindings and stay
-unknown without them, never invented positive bindings. Peer/shared-outbound policy
+unknown without them, never invented positive bindings. **Amendment (#936, owner
+ruling 2026-11-12):** "fresh" here also admits `possiblyStale` bindings, such as the
+evidence semantic catch-up carries forward after an edit, until a producer re-run
+imports fresh evidence that replaces them; `stale` bindings stay out. Each site and
+rule evidence row such a binding supports carries `freshness:"possiblyStale"`. Peer/shared-outbound policy
 must be explicit reviewed rules, not inferred defaults.
 
 The three tools retain the resolved envelope/selection/admission failure forms,
