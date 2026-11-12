@@ -8356,6 +8356,201 @@ forbid = [{ calls = "helper" }]
     mcp.finish();
 }
 
+const CATCH_UP_DOCUMENTS: usize = 20;
+const CATCH_UP_IMPORT: &str = "import { g } from './g.js';\n";
+const CATCH_UP_BODY: &str = "const v = 1; return v;";
+
+/// #934: P, a published import of `CATCH_UP_DOCUMENTS` modules that each import `g`, one
+/// structural site apiece. Each `export function uNNNNN() { const v = 1; return v; }` also
+/// carries one resolved use, of `v` in `return v`, that is neither a call nor a type: no
+/// structural site spells it, and at P it adds no site of its own.
+fn catch_up_world() -> (World, IndexPin, String) {
+    let world = world_with(
+        |root| {
+            fs::create_dir_all(root.join(".git")).unwrap();
+            WorkspaceIdentity::discover(Some(root), root)
+                .unwrap()
+                .attach_marker()
+                .unwrap();
+            let mut files: Vec<(String, String)> = (0..CATCH_UP_DOCUMENTS)
+                .map(|number| {
+                    (
+                        format!("src/u{number:05}.js"),
+                        format!(
+                            "{CATCH_UP_IMPORT}export function u{number:05}() {{ {CATCH_UP_BODY} }}\n"
+                        ),
+                    )
+                })
+                .collect();
+            files.push(("src/g.js".into(), "export function g() {}\n".into()));
+            files.push((
+                ".trellis/rules.toml".into(),
+                r#"version = 1
+[roles.entry]
+select = { name = "u00001", language = ["javascript"] }
+[roles.helper]
+select = { name = "g", language = ["javascript"] }
+[[rules]]
+id = "entry-must-not-call-helper"
+for_each = "entry"
+forbid = [{ calls = "helper" }]
+"#
+                .into(),
+            ));
+            let files: Vec<(&str, &str)> = files
+                .iter()
+                .map(|(path, text)| (path.as_str(), text.as_str()))
+                .collect();
+            write_files(root, &files);
+        },
+        true,
+    );
+    let mut fixture = world.fixture();
+    let docs = fixture
+        .paths("javascript")
+        .into_iter()
+        .map(|doc| match doc.path.as_str() {
+            "src/g.js" => doc
+                .occurrence(&[0, 16, 17], &[], "pkg g.", 1)
+                .symbol("pkg g.", 17, &[]),
+            _ => doc.occurrence(&[1, 47, 48], &[], "pkg g.", 0),
+        })
+        .collect();
+    fixture.artifact("javascript", docs);
+    let (p, admitted, _) = world.publish(&world.write(&fixture)).unwrap();
+    drop(admitted);
+    let producer = world.store.semantic_at(p).unwrap().producers[0].id.clone();
+    assert_eq!(
+        world.count("SELECT count(*) FROM semantic_references WHERE site='use'"),
+        CATCH_UP_DOCUMENTS as i64
+    );
+    (world, p, producer)
+}
+
+/// #934: an edit to `src/u00000.js` that keeps its one import publishes native N. Startup
+/// stays held, so no S catches it up: every other module reads P as `olderBasis`.
+fn publish_catch_up_edit(world: &World, p: IndexPin, producer: &str) -> IndexPin {
+    use trellis::model::SemanticStatus;
+    fs::write(
+        world.root.join("src/u00000.js"),
+        format!("{CATCH_UP_IMPORT}export function u00000() {{  {CATCH_UP_BODY} }}\n"),
+    )
+    .unwrap();
+    let (graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(world.root.clone()),
+        world.store.root_id(),
+        &world.cancel,
+        |_| {},
+    )
+    .unwrap();
+    let leader = world.store.publication_for_tests().unwrap();
+    let pin = world
+        .store
+        .publish_native(&graph, &capture, &native, &leader, p, &world.cancel)
+        .unwrap();
+    drop(leader);
+    let older = world
+        .store
+        .semantic_projection_at(pin, producer, "javascript", "src/u00001.js")
+        .unwrap()
+        .unwrap();
+    assert_eq!(older.semantic_status, SemanticStatus::OlderBasis);
+    pin
+}
+
+/// #934: references, rules check and rules explain all answer at the catch-up head N,
+/// labelled as catching up and partial, with N's document status counts (#932). Returns
+/// the references answer.
+fn catch_up_architecture_answers(
+    world: &World,
+    producer: &str,
+    mcp: &mut McpSession,
+    pin: IndexPin,
+) -> Value {
+    use trellis::model::SemanticStatus;
+    let mut counts = [0u64; 3];
+    let paths = (0..CATCH_UP_DOCUMENTS)
+        .map(|number| format!("src/u{number:05}.js"))
+        .chain(["src/g.js".to_owned()]);
+    for path in paths {
+        let projection = world
+            .store
+            .semantic_projection_at(pin, producer, "javascript", &path)
+            .unwrap()
+            .unwrap();
+        counts[match projection.semantic_status {
+            SemanticStatus::OlderBasis => 0,
+            SemanticStatus::CatchingUp => 1,
+            SemanticStatus::NeedsReimport => 2,
+        }] += 1;
+    }
+    assert!(counts[0] > 0 && counts[1] + counts[2] == 1, "{counts:?}");
+    let expected = json!({"olderBasis":counts[0],"catchingUp":counts[1],"needsReimport":counts[2]});
+    let arguments = json!({"schemaVersion":1,"limit":50});
+    let references = mcp.success("trellis_references", arguments.clone());
+    let checked = mcp.success("trellis_rules_check", arguments.clone());
+    let instance = checked["data"]["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|instance| instance["rule"] == "entry-must-not-call-helper")
+        .cloned()
+        .unwrap();
+    let mut explain = arguments;
+    explain["rule"] = instance["rule"].clone();
+    explain["target"] = instance["target"].clone();
+    let explained = mcp.success("trellis_rules_explain", explain);
+    for reply in [&references, &checked, &explained] {
+        assert_eq!(reply["evidenceBasis"], json!(pin), "{reply}");
+        assert_eq!(reply["catchingUp"], true, "{reply}");
+        assert_eq!(reply["data"]["partial"], true, "{reply}");
+        assert_eq!(reply["data"]["semanticDocumentStatus"], expected, "{reply}");
+        assert!(reply["data"].get("semanticDocuments").is_none(), "{reply}");
+    }
+    references
+}
+
+/// #934: during semantic catch-up the unchanged documents' older-basis projection answers
+/// P's reference sites, with labels, and never a superset of them. P's use-site claims that
+/// no structural site spells add no site, as they add none at P, so a revision whose sites
+/// fit the budget at P still fits it while catching up: references and rules answer instead
+/// of `bounded_work` for the whole catch-up window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn catch_up_answers_architecture_within_the_basis_site_budget() {
+    let (world, p, producer) = catch_up_world();
+    let sites = |reply: &Value| {
+        let counts = &reply["data"]["counts"];
+        counts["mappedSites"].as_u64().unwrap() + counts["unresolvedSites"].as_u64().unwrap()
+    };
+    let mut mcp = McpSession::start(&world, 934);
+    let at_p = mcp.success("trellis_references", json!({"schemaVersion":1,"limit":50}));
+    assert_eq!(at_p["evidenceBasis"], json!(p));
+    // Every site at P is a structural import of `g`; the semantic uses add none.
+    let budget = sites(&at_p);
+    assert_eq!(budget, CATCH_UP_DOCUMENTS as u64, "{at_p}");
+    // N's core is built under P's exact site count.
+    trellis::references::set_site_limit_for_tests(budget as usize);
+    let pin = publish_catch_up_edit(&world, p, &producer);
+    let references = catch_up_architecture_answers(&world, &producer, &mut mcp, pin);
+    assert_eq!(sites(&references), budget, "{references}");
+    mcp.finish();
+}
+
+/// #934: the older-basis projection reads each stored semantic row once. A projected
+/// binding's declared endpoint is the binding's own row, so it is not admitted a second
+/// time against the snapshot's semantic row bound: P's evidence that fits the bound at P
+/// still fits it while catching up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn catch_up_admits_each_projected_semantic_row_once() {
+    let (world, p, producer) = catch_up_world();
+    // Exactly P's stored use rows; the older-basis modules hold all but the edited one's.
+    trellis::store::set_architecture_semantic_rows_for_tests(CATCH_UP_DOCUMENTS);
+    let mut mcp = McpSession::start(&world, 9341);
+    let pin = publish_catch_up_edit(&world, p, &producer);
+    catch_up_architecture_answers(&world, &producer, &mut mcp, pin);
+    mcp.finish();
+}
+
 /// Architecture wire evidence keeps the imported proof's identity beside native N.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn architecture_wire_preserves_canonical_proof_identity_at_current_and_older_basis() {
@@ -12910,4 +13105,111 @@ fn bounded_full_rejoin_accepts_empty_destination_and_preserves_selected_capture(
     assert_eq!(json!(retained), json!(prior_native));
     assert_eq!(sources, prior_sources);
     assert!(world.stage_dirs().is_empty());
+}
+
+/// #934 review: a projected binding becomes a boundary site at N only if it was a site of
+/// its own at P. An ordinary call ambiguous between two candidates is no site at P; when a
+/// candidate's document is catching up it is still none at N. A call P resolved to one
+/// internal target is a site at P, and stays one at N as a labelled boundary.
+async fn catch_up_boundary_world(ambiguous: bool) -> (World, u64, Value) {
+    use trellis::model::SemanticStatus;
+    let world = world_with(
+        |root| {
+            fs::create_dir_all(root.join(".git")).unwrap();
+            WorkspaceIdentity::discover(Some(root), root)
+                .unwrap()
+                .attach_marker()
+                .unwrap();
+            write_files(
+                root,
+                &[
+                    ("src/A.js", DEFINITIONS_A),
+                    ("src/B.js", "function target(){ }\nfunction other(){ }\n"),
+                ],
+            );
+        },
+        true,
+    );
+    let mut a = DocSpec::new("src/A.js")
+        .occurrence(&[0, 9, 12], &[], "pkg run.", 1)
+        .occurrence(&[0, 16, 22], &[0, 16, 24], "pkg target.", 0);
+    if ambiguous {
+        a = a.occurrence(&[0, 16, 22], &[0, 16, 24], "pkg other.", 0);
+    }
+    let descriptor = one_artifact_per_language(
+        &world,
+        vec![(
+            "javascript",
+            vec![
+                a.symbol("pkg run.", 17, &[]),
+                DocSpec::new("src/B.js")
+                    .occurrence(&[0, 9, 15], &[], "pkg target.", 1)
+                    .occurrence(&[1, 9, 14], &[], "pkg other.", 1)
+                    .symbol("pkg target.", 17, &[])
+                    .symbol("pkg other.", 17, &[]),
+            ],
+        )],
+    );
+    let (p, admitted, _) = world.publish(&descriptor).unwrap();
+    drop(admitted);
+    let producer = world.store.semantic_at(p).unwrap().producers[0].id.clone();
+    let sites = |reply: &Value| {
+        reply["data"]["counts"]["mappedSites"].as_u64().unwrap()
+            + reply["data"]["counts"]["unresolvedSites"].as_u64().unwrap()
+    };
+    let mut mcp = McpSession::start(&world, 9348 + u64::from(ambiguous));
+    let at_p = mcp.success("trellis_references", json!({"schemaVersion":1,"limit":50}));
+    let before = sites(&at_p);
+    // A whitespace-only edit to B publishes native N only: A is older basis, B catching up.
+    fs::write(
+        world.root.join("src/B.js"),
+        "function target(){  }\nfunction other(){ }\n",
+    )
+    .unwrap();
+    let (graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(world.root.clone()),
+        world.store.root_id(),
+        &world.cancel,
+        |_| {},
+    )
+    .unwrap();
+    let leader = world.store.publication_for_tests().unwrap();
+    let pin = world
+        .store
+        .publish_native(&graph, &capture, &native, &leader, p, &world.cancel)
+        .unwrap();
+    drop(leader);
+    let status = |path| {
+        world
+            .store
+            .semantic_projection_at(pin, &producer, "javascript", path)
+            .unwrap()
+            .unwrap()
+            .semantic_status
+    };
+    assert_eq!(status("src/A.js"), SemanticStatus::OlderBasis);
+    assert_eq!(status("src/B.js"), SemanticStatus::CatchingUp);
+    let at_n = mcp.success("trellis_references", json!({"schemaVersion":1,"limit":50}));
+    assert_eq!(at_n["evidenceBasis"], json!(pin));
+    assert_eq!(sites(&at_n), before, "P={at_p} N={at_n}");
+    mcp.finish();
+    (world, before, at_n)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review934_ambiguous_pending_candidate_adds_no_site() {
+    let (_world, before, at_n) = catch_up_boundary_world(true).await;
+    assert_eq!(before, 0, "{at_n}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn catch_up_keeps_a_resolved_internal_site_as_its_boundary() {
+    let (_world, before, at_n) = catch_up_boundary_world(false).await;
+    assert_eq!(before, 1, "{at_n}");
+    let unresolved = at_n["data"]["unresolved"].as_array().unwrap();
+    assert_eq!(unresolved.len(), 1, "{at_n}");
+    assert_eq!(
+        unresolved[0]["reason"], "semantic_endpoint_catching_up",
+        "{at_n}"
+    );
 }
