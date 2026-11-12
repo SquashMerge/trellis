@@ -1685,6 +1685,37 @@ test("Deviations tree classifies lines and opens one menu three ways", {timeout:
   }, new Map(), base);
 });
 
+test("Deviations tree keeps a long function and line on one line each, truncated, with the full text as the tooltip (#911)", {timeout:240000}, async () => {
+  const {config, base} = deviationsFixture();
+  const method = `enqueue_generated_semantic_import_${"with_a_long_descriptive_suffix_".repeat(4)}end`, callee = `target_${"with_an_equally_long_descriptive_name_".repeat(4)}end`;
+  base.set("src/top.rs", `${base.get("src/top.rs")}pub fn ${callee}() {}\n`);
+  base.set("src/low.rs", `${base.get("src/low.rs")}pub struct DaemonState;\nimpl DaemonState {\n    pub fn ${method}(&self) { crate::top::${callee}(); }\n}\n`);
+  await published(config, async selected => {
+    const {page} = selected;
+    await ready(page);
+    await openDeviations(page);
+    await chipNamed(page, /low → top/).click();
+    await expandTree(page);
+    const fn = treeRow(page, 2).filter({has:page.locator(".deviation-label", {hasText:`DaemonState::${method}`})});
+    assert.equal(await fn.count(), 1, "the function row reads Type::method");
+    const label = fn.locator(".deviation-label");
+    assert.equal(await label.getAttribute("title"), `DaemonState::${method} · src/low.rs`);
+    const line = treeRow(page, 3).filter({has:page.locator(".deviation-symbol", {hasText:callee})});
+    assert.equal(await line.count(), 1);
+    const symbol = line.locator(".deviation-symbol");
+    assert.match(await symbol.getAttribute("title"), new RegExp(`^(?:crate::top::)?${callee} · src/low\\.rs:\\d+$`), "the tooltip holds the full name and the call site");
+    for (const [name, row, cell] of [["function", fn, label], ["line", line, symbol]]) {
+      const metrics = await cell.evaluate(node => ({lineHeight:parseFloat(getComputedStyle(node).lineHeight), height:node.getBoundingClientRect().height,
+        rowHeight:node.closest(".deviation-name").getBoundingClientRect().height, truncated:node.scrollWidth > node.clientWidth, overflow:getComputedStyle(node).textOverflow}));
+      assert.ok(metrics.height <= metrics.lineHeight * 1.5 && metrics.rowHeight <= metrics.lineHeight * 1.5, `the ${name} row is one line: ${JSON.stringify(metrics)}`);
+      assert.equal(metrics.truncated, true, `the long ${name} name is truncated`);
+      assert.equal(metrics.overflow, "ellipsis", `with an ellipsis`);
+      assert.equal(await row.locator(".deviation-actions, .deviation-menu").count(), 1);
+    }
+    await capture(page, "architecture-deviations-long-names");
+  }, new Map(), base);
+});
+
 test("Deviations tree explains a selection that a filter hides", {timeout:240000}, async () => {
   const {config, base} = deviationsFixture();
   await published(config, async selected => {

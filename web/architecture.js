@@ -68,6 +68,30 @@
       if (!external(identity)) return view.modules.find(module => same(module.identity, identity))?.layer;
       return view.references?.externalPackages?.find(item => same(item.identity, identity))?.layer ?? null;
     }
+    // Layer numbers count only the layers on show (#913): a hidden layer (an authored `display = "hidden"`,
+    // or an unhinted tests/fixtures layer while tests are left out) takes none, so the first band shown is 1.
+    // Peers share a number, and each app's stack counts from 1, as layer order is compared within an app.
+    let numbering = null;
+    function layerNumber(layer) {
+      if (layer.shared) return null;
+      const source = state.model(), role = state.role();
+      if (numbering?.source !== source || numbering.role !== role) {
+        const hidden = new Set(summary(source).hidden.map(item => item.name)), orders = new Map();
+        for (const item of source.layers) {
+          if (item.shared || hidden.has(item.name)) continue;
+          const app = item.app ?? null;
+          if (!orders.has(app)) orders.set(app, new Set());
+          orders.get(app).add(item.order);
+        }
+        const sorted = new Map([...orders].map(([app, set]) => [app, [...set].sort((a, b) => a - b)]));
+        numbering = {source, role, hidden, sorted};
+      }
+      if (numbering.hidden.has(layer.name)) return null;
+      const index = numbering.sorted.get(layer.app ?? null)?.indexOf(layer.order) ?? -1;
+      return index < 0 ? null : index + 1;
+    }
+    // A band's tag: its number, "Shared", or "Hidden" for a hidden layer the reader chose to show.
+    const layerTag = layer => layer.shared ? "Shared" : layerNumber(layer) ?? "Hidden";
     function layerLabel(layer) {
       const metric = state.metric(), endMark = state.endMark();
       const modules = state.model().modules.filter(module => module.layer === layer.name);
@@ -75,7 +99,7 @@
       const packages = (state.view().references?.externalPackages || []).filter(item => layerOf(item.identity) === layer.name);
       const max = values.length ? String(values.reduce((most, value) => Math.max(most, value), -Infinity)) : "—";
       // The narrow shared box stacks its header; ordered bands keep one line.
-      const parts = [`${layer.shared ? "Shared" : layer.order} · ${layer.name}`, `${plural(modules.length, "file")}${packages.length ? ` · ${packages.length} external packages` : ""}`];
+      const parts = [`${layerTag(layer)} · ${layer.name}`, `${plural(modules.length, "file")}${packages.length ? ` · ${packages.length} external packages` : ""}`];
       if (metric !== "layer") parts.push(`max ${max}`);
       if (endMark?.layer === layer.name) parts.push(`${endMark.side} end`);
       return parts.join(layer.shared ? "\n" : " · ");
@@ -278,7 +302,7 @@
         showTests:state.showTests(), metric, aggregate:state.aggregate(), ...extra,
         moduleValue:module => metric === "layer" ? undefined : metricValue(module.metrics, metric),
         moduleBand:module => metric === "layer" ? null : scale.band(metricValue(module.metrics, metric)),
-        layerLabel, layerStats:name === undefined ? layerStats : layer => layerStats(layer, name, slice), edgeText, edgeTone,
+        layerLabel, layerNumber, layerStats:name === undefined ? layerStats : layer => layerStats(layer, name, slice), edgeText, edgeTone,
         display:{layers:part.layout.layers, expanded:name => budget.left > 0 && expanded(slice.layers.find(layer => layer.name === name)), entries:(key, modules) => entries(key, modules, scale, budget), reset:() => { budget.left = cap; budget.truncated = 0; },
           summary:(key, modules, columns) => summaryChips(key, modules, columns, scale, budget),
           edge:() => true,
@@ -301,10 +325,17 @@
     }
     // Measured coverage beside the arrow key, the one place it is said (#449, #525):
     // drawn counts are lower bounds. Rule-instance counts live behind the ⓘ.
+    // One app (#913): the rows of that app's own layers, as the drawing shows only that app's slice.
+    function coverageRows(payload) {
+      const rows = payload.references?.coverage || [], group = state.scopeGroup(payload);
+      if (!group) return {rows, group};
+      const names = new Set(apps().scoped(payload, group.name).layers.map(layer => layer.name));
+      return {rows:rows.filter(row => names.has(row.layer)), group};
+    }
     function coverageSummary(payload) {
-      const rows = payload.references?.coverage || [];
+      const {rows, group} = coverageRows(payload);
       const sites = rows.reduce((sum, row) => sum + row.sites, 0), mapped = rows.reduce((sum, row) => sum + row.mappedSites, 0);
-      const parts = [`${mapped.toLocaleString("en-US")} of ${sites.toLocaleString("en-US")} reference sites mapped to a module (${percent(mapped, sites)})`];
+      const parts = [`${mapped.toLocaleString("en-US")} of ${sites.toLocaleString("en-US")} reference sites${group ? ` from ${group.name}'s layers` : ""} mapped to a module (${percent(mapped, sites)})`];
       if (rows.some(row => row.unresolvedSites > 0)) parts.push("≥ counts are lower bounds");
       return parts.join(" · ");
     }
@@ -325,9 +356,9 @@
     // The heat legend's words for a scale.
     const legendText = scale => state.metric() === "layer" ? "Layer membership · neutral chips; no metric heat."
       : `${scale.label} · ${state.metric()} · ${state.aggregate()} · ${state.role() === "all" ? "all indexed callables" : callables()}`;
-    return {layerOf, layerLabel, layerCounts, layerStats, interfaceStats, hint, expanded, testLayer, flagged, edgeTone, coverageOf, percent,
+    return {layerOf, layerNumber, layerTag, layerLabel, layerCounts, layerStats, interfaceStats, hint, expanded, testLayer, flagged, edgeTone, coverageOf, percent,
       lowerBound, edgeText, summary, worst, level, capped, entries, moduleGroups, summaryChips, plan, options, sides, columnHeader,
-      coverageSummary, ruleCounts, reviewCounts, legendText, callables};
+      coverageRows, coverageSummary, ruleCounts, reviewCounts, legendText, callables};
   }
   const BUILD_PHASES = {reading:"reading indexed files", resolving:"resolving references", evaluating:"evaluating rules", measuring:"measuring code"};
   // The app choice when the page shares none: memory only, per checkout.
@@ -451,7 +482,10 @@
       const target = get("architecture-notice-content"); target.replaceChildren();
       paragraph(target, `Code ${window.TrellisIndexPin.label(view)} · rules ${view.rulesFile.contentHash} · ${aggregate} · ${population()}.`);
       const references = view.references;
-      paragraph(target, `${references?.counts?.mappedSites ?? 0} mapped reference sites · ${references?.counts?.semanticSites ?? 0} bound by semantic evidence · ${references?.counts?.unresolvedSites ?? 0} unresolved. Missing sites do not prove absence.`);
+      // One app counts the sites from its own layers, as the arrow key's coverage does (#913).
+      const {rows, group:scoped} = shared.coverageRows(view), sum = key => rows.reduce((total, row) => total + (row[key] ?? 0), 0);
+      const counts = scoped ? {mappedSites:sum("mappedSites"), semanticSites:sum("semanticSites"), unresolvedSites:sum("unresolvedSites")} : references?.counts;
+      paragraph(target, `${counts?.mappedSites ?? 0} mapped reference sites · ${counts?.semanticSites ?? 0} bound by semantic evidence · ${counts?.unresolvedSites ?? 0} unresolved${scoped ? ` from ${scoped.name}'s layers` : ""}. Missing sites do not prove absence.`);
       if (ruleCounts(view)) paragraph(target, ruleCounts(view));
       for (const limitation of references?.limitations || []) paragraph(target, limitation);
       const group = scopeGroup(), unassigned = unassignedOf(view, group);

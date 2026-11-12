@@ -70,8 +70,27 @@
       const key = owner.stableLookupKey, prefix = `${instance.target.path}::`;
       return (typeof key === "string" && key.startsWith(prefix) ? key.slice(prefix.length) : key) ?? owner.name ?? "(anonymous)";
     };
-    // `names` maps an unnamed owner's syntax ID to its nearest named enclosing callable (from `closureNames`).
-    function assemble(rows, layers, {edge = null, callsOnly = false} = {}, names = null) {
+    // A line's symbol is its resolved target's written name without its path, qualified by its named ancestors
+    // (`Type::method` in Rust, `Class.method` elsewhere). An unnamed Rust impl block reads its type from `impls`
+    // (from `implNames`, the Files outline) and is otherwise left out. A site with no target reads its spelling (#911).
+    const ANONYMOUS = /^[A-Za-z_]+@\d+$/, IMPL = /^implementation@\d+$/;
+    const segmentsOf = target => {
+      const key = target.displayKey, path = target.document?.path;
+      let rest = typeof path === "string" && key.startsWith(`${path}#`) ? key.slice(path.length + 1) : key.slice(key.indexOf("#") + 1);
+      if (typeof path === "string" && rest.startsWith(`${path}.`)) rest = rest.slice(path.length + 1);
+      return rest.split(".");
+    };
+    const symbolOf = (evidence, impls) => {
+      const t = evidence.target;
+      if (!record(t) || typeof t.displayKey !== "string") return typeof evidence.spelling === "string" ? evidence.spelling : "";
+      const types = impls?.get(t.syntaxId) ?? [];
+      let next = 0;
+      const parts = segmentsOf(t).map(part => !ANONYMOUS.test(part) ? part : IMPL.test(part) ? types[next++] ?? null : null).filter(Boolean);
+      return parts.join(t.document?.language === "rust" ? "::" : ".") || t.displayKey;
+    };
+    // `names` maps an unnamed owner's syntax ID to its nearest named enclosing callable (from `closureNames`);
+    // `impls` maps a target's syntax ID to the types of its unnamed impl blocks (from `implNames`).
+    function assemble(rows, layers, {edge = null, callsOnly = false} = {}, names = null, impls = null) {
       const direction = directionOf(layers), files = new Map();
       for (const {instance:i} of rows) {
         const pair = edgeKey(i.sourceLayer, i.destinationLayer);
@@ -101,7 +120,7 @@
           const fn = file.functions.get(id);
           fn.callsExact &&= callsExact; fn.refsExact &&= refsExact;
           fn.lines.push({key:lineKey(i, evidence), evidence, instance:i, kind, fn:fn.label, closure:!!enclosing, direction:direction(i.sourceLayer, i.destinationLayer),
-            start:evidence.lines?.start ?? 0});
+            start:evidence.lines?.start ?? 0, symbol:symbolOf(evidence, impls)});
         }
       }
       const done = [...files.values()].filter(file => !callsOnly || file.calls > 0).map(file => {
@@ -120,8 +139,8 @@
       sortBy(done, file => -file.shown, file => file.path);
       return {files:done, totals:{files:done.length, references:done.reduce((sum, file) => sum + file.references, 0), calls:done.reduce((sum, file) => sum + file.calls, 0)}};
     }
-    const build = (rows, layers, names = null) => ({...assemble(rows, layers, {}, names), rows, layers, names});
-    const filter = (tree, options) => ({...assemble(tree.rows, tree.layers, options, tree.names), rows:tree.rows, layers:tree.layers, names:tree.names});
+    const build = (rows, layers, names = null, impls = null) => ({...assemble(rows, layers, {}, names, impls), rows, layers, names, impls});
+    const filter = (tree, options) => ({...assemble(tree.rows, tree.layers, options, tree.names, tree.impls), rows:tree.rows, layers:tree.layers, names:tree.names, impls:tree.impls});
     // The unnamed owners to name, by file: an owner with neither a name nor a stable key that is not the file module.
     function unnamedOwners(rows) {
       const files = new Map();
@@ -158,6 +177,34 @@
         names.set(id, known.get(item.symbol.id) ?? {syntaxId:item.symbol.id, name:type ? `${type}::${item.symbol.name}` : item.symbol.name, stableLookupKey:null});
       }
       return names;
+    }
+    // The Rust targets whose written key passes through an unnamed impl block, by file: their type is in the outline.
+    function implSites(rows) {
+      const files = new Map();
+      for (const {instance:i} of rows) for (const evidence of i.evidence) {
+        const t = evidence.target;
+        if (!record(t) || typeof t.displayKey !== "string" || typeof t.syntaxId !== "string" || t.document?.language !== "rust" || typeof t.document.path !== "string" ||
+          !segmentsOf(t).some(part => IMPL.test(part))) continue;
+        if (!files.has(t.document.path)) files.set(t.document.path, new Set());
+        files.get(t.document.path).add(t.syntaxId);
+      }
+      return files;
+    }
+    // Each target's unnamed impl blocks, outermost first, as the types they implement (null when unknown).
+    function implNames(ids, outline, impls = new Map()) {
+      const byId = new Map();
+      for (const item of Array.isArray(outline) ? outline : []) if (record(item?.symbol) && typeof item.symbol.id === "string") byId.set(item.symbol.id, item);
+      for (const id of ids) {
+        const item = byId.get(id), types = [];
+        if (!item) continue;
+        for (let parent = byId.get(item.symbol.parent), hops = 0; parent && hops < 64; parent = byId.get(parent.symbol.parent), hops++) {
+          if (unnamed(parent.symbol.name) && (parent.nativeKind === "implementation" || "implTarget" in parent)) {
+            types.unshift(typeof parent.implTarget === "string" && parent.implTarget ? parent.implTarget : null);
+          }
+        }
+        impls.set(id, types);
+      }
+      return impls;
     }
     // One chip per layer pair, from the summary edges; `bound` is the same rule as the diagram arrows.
     function chips(view, edgeText) {
@@ -197,7 +244,7 @@
       }
     };
     const canOpenSequence = evidence => !!(evidence.caller?.syntaxId && evidence.caller.stableLookupKey && evidence.callId);
-    return Object.freeze({lineKey, valid, build, filter, chips, exceptionNote, keyAction, canOpenSequence, kindOf, unnamedOwners, closureNames});
+    return Object.freeze({lineKey, valid, build, filter, chips, exceptionNote, keyAction, canOpenSequence, kindOf, unnamedOwners, closureNames, implSites, implNames});
   })();
 
   function create(deps) {
@@ -277,9 +324,9 @@
           if (offset !== null) { progress = `Reading deviations… ${num(read.length)} of ${num(page.total)} instances`; renderState(); }
         }
         if (!read.every(model.valid)) throw new Error(INVALID);
-        const names = await nameClosures(read, active);
+        const {names, impls} = await nameSymbols(read, active);
         if (!active()) return;
-        base = model.build(read, view.layers, names); phase = "ready";
+        base = model.build(read, view.layers, names, impls); phase = "ready";
         refilter(); settle(restoring);
       } catch (error) {
         if (!active() || error?.name === "AbortError") return;
@@ -287,18 +334,21 @@
         if (error?.status === 409 && CONFLICTS.includes(error.code)) deps.onConflict();
       }
     }
-    // Best effort: a file whose outline cannot be read keeps "(anonymous)"; only a lost owner stops the load.
-    // The outline lists a parent before its children, so paging stops once every wanted owner is seen.
-    async function nameClosures(rows, active) {
-      const names = new Map();
-      if (typeof deps.outline !== "function") return names;
-      for (const [path, ids] of [...model.unnamedOwners(rows)].slice(0, CLOSURE_FILES)) {
-        progress = `Naming closures in ${path}…`; renderState();
-        const items = [], wanted = new Set(ids);
+    // Best effort: a file whose outline cannot be read keeps "(anonymous)", and its targets' impl types; only a lost
+    // owner stops the load. The outline lists a parent before its children, so paging stops once every wanted item is seen.
+    // One read per file names both its closures (#845) and its targets' impl blocks (#911).
+    async function nameSymbols(rows, active) {
+      const names = new Map(), impls = new Map();
+      if (typeof deps.outline !== "function") return {names, impls};
+      const owners = model.unnamedOwners(rows), targets = model.implSites(rows);
+      for (const path of [...new Set([...owners.keys(), ...targets.keys()])].slice(0, CLOSURE_FILES)) {
+        progress = `Naming symbols in ${path}…`; renderState();
+        const ownerIds = owners.get(path) ?? new Set(), targetIds = targets.get(path) ?? new Set();
+        const items = [], wanted = new Set([...ownerIds, ...targetIds]);
         try {
           for (let offset = 0, pages = 0; offset !== null && wanted.size && pages < OUTLINE_PAGES; pages++) {
             const page = await deps.outline(path, offset, active);
-            if (!active()) return names;
+            if (!active()) return {names, impls};
             for (const item of page.items) { items.push(item); wanted.delete(item?.symbol?.id); }
             offset = page.nextOffset;
           }
@@ -306,9 +356,10 @@
           // A typed stale answer means the pin is gone: it is the tree's conflict, never an unnamed tree (#860).
           if (!active() || error?.name === "AbortError" || (error?.status === 409 && CONFLICTS.includes(error.code))) throw error;
         }
-        model.closureNames(rows, ids, items, names);
+        if (ownerIds.size) model.closureNames(rows, ownerIds, items, names);
+        if (targetIds.size) model.implNames(targetIds, items, impls);
       }
-      return names;
+      return {names, impls};
     }
     function describe(error) {
       if (error?.status === 409 && CONFLICTS.includes(error.code)) return "The index moved to a newer revision. Reload deviations.";
@@ -519,6 +570,7 @@
       if (tone) node.dataset.tone = tone;
       return node;
     };
+    const titled = (node, title) => { node.setAttribute("title", title); return node; };
     const caret = item => {
       const node = cell(item.expanded ? "▾" : "▸", "deviation-caret");
       node.setAttribute("aria-hidden", "true");
@@ -535,7 +587,7 @@
       if (item.kind === "file") {
         const f = item.file;
         el.setAttribute("aria-expanded", String(item.expanded));
-        name.append(caret(item), cell(f.path, "deviation-path"));
+        name.append(caret(item), titled(cell(f.path, "deviation-path"), f.path));
         for (const edge of f.edges) {
           const n = s.callsOnly ? edge.calls : edge.count;
           reach.append(cell(`${edge.direction === "up" ? "▲" : "⇄"} ${edge.destinationLayer} ${num(n)}`, "deviation-edge", "error"));
@@ -548,20 +600,22 @@
       } else if (item.kind === "function") {
         const fn = item.fn;
         el.setAttribute("aria-expanded", String(item.expanded));
-        name.append(caret(item), cell(fn.label, "deviation-label"));
+        name.append(caret(item), titled(cell(fn.label, "deviation-label"), `${fn.label} · ${item.file.path}`));
         calls = countCell(fn.calls, !fn.callsExact, "deviation-calls"); refs = countCell(s.callsOnly ? fn.calls : fn.references, s.callsOnly ? !fn.callsExact : !fn.refsExact, "deviation-refs");
         el.setAttribute("aria-label", `${fn.label}, ${spoken(fn.calls, !fn.callsExact, "calls")}, ${s.callsOnly ? spoken(fn.calls, !fn.callsExact, "references") : spoken(fn.references, !fn.refsExact, "references")}`);
       } else if (item.kind === "more") {
         const u = item.file.unlisted;
         const text = s.callsOnly ? `+ ${num(u.call)} more ${u.call === 1 ? "call" : "calls"} not listed`
           : `+ ${num(KINDS.reduce((sum, kind) => sum + u[kind], 0))} more not listed: ${KINDS.filter(kind => u[kind] > 0).map(kind => plural(u[kind], ...NOUNS[kind])).join(" · ")}`;
-        name.append(cell(text, "deviation-label deviation-muted"));
+        name.append(titled(cell(text, "deviation-label deviation-muted"), text));
         el.setAttribute("aria-label", text);
       } else {
         const {line} = item, e = line.evidence, t = e.target, lineNo = e.lines?.start;
-        const symbol = t?.displayKey ?? e.spelling ?? "";
+        // One line, as the design draws it: the qualified name, truncated; the full name and both places are the tooltip (#911).
+        const symbol = line.symbol, at = `${line.instance.target.path}:${lineNo ?? "—"}`;
         const tag = cell(TAGS[line.kind], "badge deviation-kind"); tag.dataset.kind = line.kind;
-        name.append(cell(`L${lineNo ?? "—"}`, "deviation-line deviation-muted"), cell(symbol, "deviation-symbol"), tag);
+        name.append(cell(`L${lineNo ?? "—"}`, "deviation-line deviation-muted"),
+          titled(cell(symbol, "deviation-symbol"), t ? `${symbol} · ${at} → ${t.document.path}:${t.lines.start}` : `${symbol} · ${at}`), tag);
         let where;
         // One line, as the design draws it: the file name and line; the full path is the tooltip.
         let target;

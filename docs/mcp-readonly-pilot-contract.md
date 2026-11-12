@@ -727,6 +727,14 @@ changes, only the order of rows within two arrays. This section wins over the #7
 - **Catalog.** Only the describe `kind` enum and the `toolVersion` constant change, on top of #864's slimmed failure schemas. Measured with the `compacted_catalog_keeps_its_recovered_margin` construction, the `tools/list` frame is 211,952 bytes modern and 211,895 legacy, against the 235,520-byte compacted-frame limit. Before #864, the same change measured 232,485 and 232,428 bytes, 17 more than at `toolVersion` 25.
 - **Unchanged:** every other tool, field and bound.
 
+## Amendment (#908): grouped references page only their rows
+
+**Status: ratified 2026-11-11 by the supervising agent under the owner's delegation ([#908](https://github.com/SquashMerge/trellis/issues/908)), following the #725 per-page `semanticBases` pattern.** Owner dogfooding of 0.2 found that `groupBy:"package"` on this checkout answered an empty `groups` on its first page: the 52 `externalPackages` descriptors (each with its manifest evidence) came first in the #775 page sequence and filled the 24,576-byte page target, so every row moved to a later page. `toolVersion` stays **28**: no catalog schema or text changes. This section wins over the **What stays** and **Paging** bullets of [Amendment (#775)](#amendment-775-references-group-by-directory-or-package) where they differ; `file` mode is unchanged.
+
+- **Sequence.** With `directory` or `package` the paged sequence is `groups` alone. `page.total` counts rows, offsets index rows, and `limit` is still the most rows on one page.
+- **Descriptors beside their rows.** A grouped page's `externalPackages` lists the descriptor of each external target among that page's rows, once, in the whole answer's order, as a check page lists the semantic bases its instances use (#725). A row pays for the descriptor it is first on the page to need when the page is fitted to its target, so descriptors never fill a page ahead of its rows, and a row `limit` also bounds them. #775 keeps only the descriptors of emitted external destinations, and each of those is some row's target, so the pages together list every one, unchanged; nothing is dropped and no omitted count is needed.
+- **Unchanged:** rows, groups, sums, row order, `counts` and the other whole-result fields, the descriptor shape, the page target and every bound.
+
 ## Tool catalog
 
 ### `trellis_workspace_describe` (W1)
@@ -1255,7 +1263,7 @@ Before read admission has sampled `catchingUp`, a `too_many_requests` or `deadli
 | `index_not_ready` | No valid published head; true |
 | `not_found` | Valid ID or cached path missing; false |
 | `too_many_requests`, `deadline_exceeded` | Admission cap or deadline; true |
-| `rebuild_in_progress` | A large publication has spilled to `index.db` and holds every reader of the prior head out until it commits (#210); the read waits up to 10 s for that commit and then reads the new head (a pinned read keeps its pin), and fails with this only if the publication still holds the index (#674); true |
+| `rebuild_in_progress` | A large publication (a rebuild, or a semantic batch import such as a producer run's, #905) has spilled to `index.db` and holds every reader of the prior head out until it commits (#210); the read waits up to 10 s for that commit, and never past half a second before the call's deadline (W1, #905), and then reads the new head (a pinned read keeps its pin), and fails with this only if the publication still holds the index (#674); true |
 | `root_changed` | Opened workspace root pathname missing or its `(device,inode)` differs, including the final response check; false for this opened workspace, `currentBasis:null` |
 | `store_unavailable` | Unsafe/unreadable/invalid store or missing required coverage; false (no automatic same-call retry) |
 | `workspace_selection_failed` | No answering checkout; typed reason `not_absolute`, `not_checkout`, `identity_changed` (false), or `unavailable` (true). Attempted workspace is bounded and tagged. |

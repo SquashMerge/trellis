@@ -191,6 +191,39 @@ pub const SPILLED_PUBLICATION_READ_WAIT: Duration = Duration::from_secs(10);
 thread_local! {
     /// The end of the current lock attempt's wait on a spilled publication.
     static SPILL_WAIT_UNTIL: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+    /// When this thread's caller must have its answer (#905): a wait on a spilled
+    /// publication ends by then, so the read fails typed `rebuild_in_progress` before its
+    /// caller's own deadline instead of past it.
+    static SPILL_ANSWER_BY: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `read` with every wait on a spilled publication ending by `answer_by` (#905). An MCP
+/// call answers within its deadline (W1); the ordinary spill wait is longer than that.
+/// Nested scopes keep the earlier instant.
+pub fn with_spill_answer_by<T>(answer_by: Instant, read: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Instant>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SPILL_ANSWER_BY.with(|cell| cell.set(self.0));
+        }
+    }
+    let previous = SPILL_ANSWER_BY.with(std::cell::Cell::get);
+    let _restore = Restore(previous);
+    let effective = previous.map_or(answer_by, |earlier| earlier.min(answer_by));
+    SPILL_ANSWER_BY.with(|cell| cell.set(Some(effective)));
+    read()
+}
+
+impl Store {
+    /// Whether a publication's transaction currently holds this checkout's readers out
+    /// (#905). An advisory sample of the gate's own mark; it never waits.
+    pub(crate) fn publication_holds_readers(&self) -> bool {
+        self.publication_gate
+            .readers_blocked
+            .lock()
+            .unwrap()
+            .is_some()
+    }
 }
 
 /// What a busy read found on its gate.
@@ -227,9 +260,12 @@ impl PublicationGate {
             return SpillWait::Expired;
         }
         let until = SPILL_WAIT_UNTIL.with(|until| {
-            let end = until
-                .get()
-                .unwrap_or_else(|| Instant::now() + self.spill_read_wait());
+            let end = until.get().unwrap_or_else(|| {
+                let wait = Instant::now() + self.spill_read_wait();
+                SPILL_ANSWER_BY
+                    .with(std::cell::Cell::get)
+                    .map_or(wait, |answer_by| answer_by.min(wait))
+            });
             until.set(Some(end));
             end
         });
@@ -355,15 +391,24 @@ impl<'a> ReadersBlockedWatch<'a> {
             )
         };
         if status == rusqlite::ffi::SQLITE_OK && current > 0 {
-            *self.gate.readers_blocked.lock().unwrap() = Some(SpilledPublication {
-                rebuild: RebuildInProgress {
-                    since: SystemTime::now(),
-                    documents: self.documents,
-                },
-                publisher: std::thread::current().id(),
-            });
-            self.marked = true;
+            self.mark();
         }
+    }
+    /// Mark the transaction as holding readers out now, without waiting to observe a spill.
+    /// The mark is read only by a reader SQLite has already found locked, and this daemon is
+    /// the index's sole writer, so while the transaction is open any such lock is its own.
+    fn mark(&mut self) {
+        if self.marked {
+            return;
+        }
+        *self.gate.readers_blocked.lock().unwrap() = Some(SpilledPublication {
+            rebuild: RebuildInProgress {
+                since: SystemTime::now(),
+                documents: self.documents,
+            },
+            publisher: std::thread::current().id(),
+        });
+        self.marked = true;
     }
 }
 impl Drop for ReadersBlockedWatch<'_> {
@@ -15270,11 +15315,17 @@ impl Store {
         let stage_uri = stage_attach_uri(&stage.db_path());
         let conn = self.cache_write()?;
         let db: &Connection = &conn;
-        storage_result(db.pragma_update(
-            None,
-            "cache_size",
-            -i64::try_from(limits::BATCH_WRITER_CACHE_KIB)?,
-        ))?;
+        #[allow(unused_mut)]
+        let mut cache_kib = i64::try_from(limits::BATCH_WRITER_CACHE_KIB)?;
+        // A tiny writer cache makes a small test batch spill like a large producer's (#905).
+        #[cfg(feature = "test-support")]
+        if let Some(kib) = std::env::var("TRELLIS_TEST_BATCH_WRITER_CACHE_KIB")
+            .ok()
+            .and_then(|kib| kib.parse().ok())
+        {
+            cache_kib = kib;
+        }
+        storage_result(db.pragma_update(None, "cache_size", -cache_kib))?;
         storage_result(db.execute("ATTACH DATABASE ?1 AS stage", [&stage_uri]))?;
         let attachment = StageAttachment(db);
         let retained_state = self.attach_retention(db)?;
@@ -15288,6 +15339,9 @@ impl Store {
             stage.budget(&batch_limits).check()?;
             Ok(())
         };
+        // Declared before the transaction so it drops after it: on an error or unwind the
+        // mark stays set until the rollback has released the lock (#905).
+        let mut blocked = ReadersBlockedWatch::new(&self.publication_gate, 0);
         let tx = storage_result(Transaction::new_unchecked(
             db,
             TransactionBehavior::Immediate,
@@ -15309,6 +15363,13 @@ impl Store {
             "joined batch superseded by a later join attempt"
         );
         let descriptor = Descriptor::parse(&descriptor_bytes)?;
+        // A large batch spills to `index.db` long before COMMIT, holding every reader of the
+        // prior head out for the rest of the transaction (#210, #905). Readers that SQLite
+        // finds locked from here on wait on the gate's signal and fail typed
+        // `rebuild_in_progress`, never as untyped contention retried to a deadline.
+        blocked.documents =
+            usize::try_from(descriptor.totals.source_documents).unwrap_or(usize::MAX);
+        blocked.mark();
         let producer = descriptor.check_producer()?.producer();
         let old_key = semantic_pin_key(expected);
         let head_native: String = tx.query_row(
@@ -15489,6 +15550,8 @@ impl Store {
             Err(commit_error) => {
                 drop(attachment);
                 drop(conn);
+                // The transaction has ended: its own settlement read is ordinary contention.
+                drop(blocked);
                 let state = self.batch_commit_state(expected, next, joined.descriptor_sha256())?;
                 match state {
                     BatchCommitState::Committed => Ok(next),

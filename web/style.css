@@ -597,10 +597,13 @@ button:is(.selected, [aria-pressed="true"]) .badge { background: var(--clear); c
 #architecture-deviations .deviation-row:hover { background: var(--node); }
 #architecture-deviations .deviation-row:focus-visible { outline-offset: -2px; }
 #architecture-deviations .deviation-row[aria-selected="true"], #architecture-deviations .deviation-row[aria-selected="true"] * { background: var(--selected); color: var(--on-selected); border-color: var(--on-selected); }
-#architecture-deviations .deviation-name { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--sp-1) var(--sp-2); min-width: 0; }
+/* Each row is one line: a long name truncates with an ellipsis and its title holds the full text (#911). */
+#architecture-deviations .deviation-name { display: flex; flex-wrap: nowrap; align-items: baseline; gap: var(--sp-1) var(--sp-2); min-width: 0; }
+#architecture-deviations .deviation-name > * { flex: none; }
 #architecture-deviations .deviation-path, #architecture-deviations .deviation-label, #architecture-deviations .deviation-symbol, #architecture-deviations .deviation-target,
 #architecture-deviations .deviation-line { font: 13px/1.5 var(--mono); }
-#architecture-deviations .deviation-path { overflow-wrap: anywhere; }
+#architecture-deviations .deviation-name > .deviation-path, #architecture-deviations .deviation-name > .deviation-label,
+#architecture-deviations .deviation-name > .deviation-symbol { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #architecture-deviations .deviation-row[data-level="1"] .deviation-path { font-weight: 600; }
 #architecture-deviations .deviation-reach { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 var(--sp-2); min-width: 0; }
 #architecture-deviations .deviation-target { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; overflow-wrap: normal; }

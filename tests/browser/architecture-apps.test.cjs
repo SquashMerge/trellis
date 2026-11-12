@@ -273,3 +273,64 @@ test("#850 negative control: a Shared end and an ordered end toward the partner 
   await page.evaluate(() => { const chip = document.querySelectorAll('.pele-cluster[data-trellis-layer-id="common"] > rect')[1]; chip.setAttribute("y", String(Number(chip.getAttribute("y")) - 10)); });
   assert.notDeepEqual((await sharedGeometry(page)).overlaps, [], "a chip drawn over a header line is reported");
 }));
+
+// #913: srv has a hidden tooling layer at order 1, then entry and core; web has one layer. srv's
+// entry → core call is a production reference from srv's layers; web's own layer has none.
+const numberedFiles = new Map([
+  ["Cargo.toml", '[package]\nname = "srv"\n'],
+  ["src/main.rs", "mod core;\nmod tools;\nfn main() { core::work(); }\n"],
+  ["src/core.rs", "pub fn work() -> u32 { 1 }\n"],
+  ["src/tools.rs", "pub fn tool() -> u32 { crate::core::work() }\n"],
+  ["web/package.json", '{"name":"web"}\n'],
+  ["web/app.js", "export function load() { return 1; }\n"],
+]);
+const numberedRules = "version=1\n[layers.tooling]\napp='srv'\norder=1\ndisplay='hidden'\npaths=['src/tools.rs']\n" +
+  "[layers.entry]\napp='srv'\norder=2\npaths=['src/main.rs']\n[layers.core]\napp='srv'\norder=3\npaths=['src/core.rs']\n" +
+  "[layers.client]\napp='web'\norder=1\npaths=['web/**']\n";
+const bandLabel = (page, layer) => page.locator(`#architecture-diagram [data-trellis-layer-id="${layer}"]`).first().evaluate(node => node.getAttribute("aria-label") || node.textContent);
+const chooseApp = async (page, name) => {
+  await page.locator("#architecture-apps button", {hasText:name}).click();
+  await page.waitForFunction(text => [...document.querySelectorAll("#architecture-apps button")].some(button => button.textContent.startsWith(text) && button.getAttribute("aria-pressed") === "true"), name);
+  await page.locator("#architecture-state[data-state=ready]").waitFor({state:"attached"});
+};
+
+test("#913 layer numbers count only the shown layers: a hidden first layer leaves entry at 1, in All apps, one app and the inspector", {timeout:240000}, async () => published(numberedFiles, numberedRules, async ({page}) => {
+  await page.locator("#architecture-state[data-state=ready]").waitFor({state:"attached"});
+  await page.locator('#architecture-diagram [data-trellis-layer-id="entry"]').first().waitFor({state:"attached"});
+  assert.match(await bandLabel(page, "entry"), /^1 · entry/, "All apps: srv's first shown layer is 1");
+  assert.match(await bandLabel(page, "core"), /^2 · core/);
+  assert.match(await bandLabel(page, "client"), /^1 · client/, "each app counts from 1");
+  await chooseApp(page, "srv");
+  await page.locator('#architecture-diagram [data-trellis-layer-id="entry"]').first().waitFor({state:"attached"});
+  assert.match(await bandLabel(page, "entry"), /^1 · entry/, "one app: the hidden tooling layer takes no number");
+  assert.match(await bandLabel(page, "core"), /^2 · core/);
+  await page.locator('#architecture-diagram [data-trellis-layer-id="entry"]').first().click();
+  await page.waitForFunction(() => [...document.querySelectorAll("#architecture-inspector-content p")].some(p => /^1 · entry/.test(p.textContent)));
+  // Shown on request, the hidden layer is labelled Hidden and the numbers do not move.
+  await page.locator("#architecture-hidden-toggle").click();
+  await page.locator('#architecture-diagram [data-trellis-layer-id="tooling"]').first().waitFor({state:"attached"});
+  assert.match(await bandLabel(page, "tooling"), /^Hidden · tooling/);
+  assert.match(await bandLabel(page, "entry"), /^1 · entry/);
+}));
+
+test("#913 one app's coverage footnote and About counts are that app's, the whole checkout's in All apps", {timeout:240000}, async () => published(numberedFiles, numberedRules, async ({page}) => {
+  await page.locator("#architecture-state[data-state=ready]").waitFor({state:"attached"});
+  const coverage = () => page.locator("#architecture-coverage").textContent();
+  const about = () => page.locator("#architecture-notice-content p").nth(1).textContent();
+  const sites = text => Number(text.match(/of ([\d,]+) reference sites/)[1].replace(/,/g, ""));
+  const all = await coverage(), allAbout = await about();
+  assert.match(all, /^\d+ of \d+ reference sites mapped to a module/, "All apps: the checkout's sites");
+  assert.doesNotMatch(allAbout, /layers\./);
+  await chooseApp(page, "web");
+  await page.waitForFunction(() => /from web's layers/.test(document.getElementById("architecture-coverage").textContent));
+  const web = await coverage();
+  assert.match(web, /^0 of 0 reference sites from web's layers mapped to a module/, `web's layer has no reference sites: ${web} (checkout: ${all})`);
+  assert.match(await about(), /^0 mapped reference sites · 0 bound by semantic evidence · 0 unresolved from web's layers\./);
+  await chooseApp(page, "srv");
+  await page.waitForFunction(() => /from srv's layers/.test(document.getElementById("architecture-coverage").textContent));
+  const srv = await coverage();
+  assert.ok(sites(srv) > 0 && sites(srv) <= sites(all), `srv counts its own sites: ${srv} (checkout: ${all})`);
+  assert.match(await about(), /from srv's layers\./);
+  await chooseApp(page, "All apps");
+  await page.waitForFunction(text => document.getElementById("architecture-coverage").textContent === text, all);
+}));
