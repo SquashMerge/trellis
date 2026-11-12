@@ -490,8 +490,28 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
   `reqwest::get(url)` and `reqwest::blocking::get(url)` (`GET`); `c.get(url)`, `.post`,
   `.put`, `.delete`, `.patch` and `.head` (the method of the name); and
   `c.request(Method::M, url)` (method unreadable unless `Method::M` or a path ending in
-  `Method::M`). The receiver `c` must read as a client: a name or field containing `client`
-  in any case, or a `Client::new()` or `Client::builder()` chain. The URL, looked through
+  `Method::M`). The receiver `c` must be unambiguously a `reqwest` client, never by its name; a missed call
+  is acceptable, a false one is not (#910). It is one of:
+  - a chain from `Client::new()`, or from `Client::builder()`, builder methods, `.build()`
+    and then `?`, `.unwrap()` or `.expect(..)`, each optionally followed by `.clone()`;
+  - `self.<field>` inside a top-level `impl` (inherent or trait, generic arguments aside)
+    of the top-level struct that declares the field, where that is the one field of its name
+    in the document, it has the client type, the struct's name is declared once and
+    imported nowhere in the document, and the document has no glob import at its top
+    level (a glob inside a nested module, such as `#[cfg(test)] mod tests { use super::*; }`,
+    cannot change what the top-level names resolve to);
+  - a name bound exactly once in its function, before the call, by a parameter or `let`
+    written with the client type. Any other binding of the name in the function (a
+    rebinding, `let` without a type, destructuring or shorthand field, `match` arm or guard
+    pattern, closure parameter, `for`, `if let`, import, or a named item such as a block's
+    `const`), or any glob import in the function, makes it ambiguous.
+
+  The client type is `reqwest::Client` or `reqwest::blocking::Client`, seen through `&`, or a
+  name (`Client`, or the alias of `Client as Http`) imported from `reqwest` at the top level
+  of the document that nothing else in the document declares: no other import, item (`mod`,
+  `struct`, `type` and so on) or name in a generic parameter list, and no glob import
+  below the top level. Nested modules, type
+  aliases, generics and types from other documents are not read. The URL, looked through
   `&`, is a string literal without escapes, a visible constant, or a `format!` whose
   substitutions are read where they are a string literal or a visible constant with no
   format specification (`{x}`, `{}`, `{0}`), and are `{}` otherwise: a fill, width,
