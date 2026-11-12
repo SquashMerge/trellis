@@ -343,15 +343,19 @@ function sequenceStepColumn(view, step) {
 //   keeps source order, its callee's body (nested cross-column chains) and a return after it;
 // - a loop that encloses an arrow is a UML loop frame around its arrows, with no row of its own
 //   and no row number; it says " · may exit early" when its own frame draws an exit;
+// - a branch or try that encloses an arrow is an `alt` frame (`opt` with no alternate) around
+//   its arrows, headed by calls-first's compact label; a same-column call whose expanded body
+//   encloses an arrow is a frame named for its callee (#907). Like loops, neither is a row;
 // - every other step draws nothing: internal steps, nested callables, calls without a target and
-//   any branch, try, chain or same-column call around an arrow (`through`: its arrows draw in
-//   its place). `hiddenSteps` counts the shown DTO steps that draw nothing; Show all has them.
+//   any chain or callback around an arrow (`through`: its arrows draw in its place).
+//   `hiddenSteps` counts the shown DTO steps that draw nothing; Show all has them.
 // - at most SEQUENCE_INTERACTION_LIMIT arrows are drawn, in source order (#663). The server
 //   sends Interactions candidates before its visible step bound, which counts internal steps;
 //   this bound counts arrows only, and `omittedInteractions` counts the arrows past it.
 const SEQUENCE_INTERACTION_LIMIT = 200;
 function sequenceInteractions(view, options, earlyReturn) {
   const visible = new Set(), through = new Set(), loops = new Set(), returns = new Set(), holds = new Set();
+  const branches = new Set(), callees = new Set();
   const nested = step => [...(step.children || []), ...(step.alternate || [])];
   const crosses = step => {
     if (step.kind !== "call") return false;
@@ -376,6 +380,9 @@ function sequenceInteractions(view, options, earlyReturn) {
       if (step.hidden) continue;
       if (returns.has(step)) visible.add(step);
       else if (step.kind === "loop" && holds.has(step)) { visible.add(step); loops.add(step); }
+      // #907: a branch, or a same-column call's expanded body, around an arrow is a frame.
+      else if (["branch", "try"].includes(step.kind) && holds.has(step)) { visible.add(step); branches.add(step); }
+      else if (step.kind === "call" && holds.has(step) && sequenceTarget(view, step)) { visible.add(step); callees.add(step); }
       else if (holds.has(step)) { through.add(step); hiddenSteps++; }
       else { fold(step); continue; }
       place(step.children); place(step.alternate);
@@ -388,7 +395,16 @@ function sequenceInteractions(view, options, earlyReturn) {
   // The frame's tag says "loop"; its guard says only what qualifies it, if anything.
   const loopLabel = step => earlyReturn(step) || exits(step) ? "may exit early" : "";
   const omittedInteractions = Math.max(0, arrows - SEQUENCE_INTERACTION_LIMIT);
-  return {interactions:true, visible, through, loops, returns, hiddenSteps, omittedInteractions, loopLabel, earlyReturn};
+  // A branch frame's header is calls-first's compact label; a callee frame's is the callee's name.
+  const frameKind = step => step.alternate?.length ? "alt" : "opt";
+  const frameLabel = step => {
+    if (callees.has(step)) { const target = sequenceTarget(view, step); return compactName(target.declaration?.name || target.label, SEQUENCE_LABEL_LIMIT); }
+    return compactName(sequenceCompactLabel(step).replace(/\s+/g, " "), SEQUENCE_LABEL_LIMIT);
+  };
+  return {interactions:true, visible, through, loops, branches, callees, returns, hiddenSteps, omittedInteractions, loopLabel, frameKind, frameLabel, earlyReturn};
+}
+function compactName(text, limit) {
+  return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
 }
 // What to say when the admitted view has no displayed calls (#594).
 // Counts come from the server; the reasons are the steps' own.
@@ -470,7 +486,8 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
       if (target) { visibleTargets.add(target.id); targetProofs.set(target.id, entry); }
       continue;
     }
-    const target = sequenceTarget(view, step);
+    // A callee frame (#907) runs in its caller's column and opens no lane of its own.
+    const target = displayProjection.callees?.has(step) ? null : sequenceTarget(view, step);
     if (target) { visibleTargets.add(target.id); targetProofs.set(target.id, step); }
     // A shown step's own lane is drawn even when the call that opened it is drawn elsewhere: a
     // wrapper whose call is an HTTP interface hop (#853) keeps its expanded body's lane.
@@ -666,6 +683,26 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
         if (label) group.append(make("text", {x:x+tabWidth+12, y:start, class:"sequence-control-label"}, `[${label}]`));
         y += 34;
         draw(step.children, group, depth+1); draw(step.alternate, group, depth+1);
+        y += 4; box.setAttribute("height", y-start+8); y += 14;
+        continue;
+      }
+      if (displayProjection.branches?.has(step) || displayProjection.callees?.has(step)) {
+        // Interactions (#907): a frame around its arrows, not a row: no number.
+        const callee = displayProjection.callees.has(step), start = y, x = 18 + depth * 10;
+        const operator = callee ? displayProjection.frameLabel(step) : displayProjection.frameKind(step);
+        group.setAttribute("data-presentation", callee ? "interaction-callee" : "interaction-branch");
+        const box = make("rect", {x, y:start-19, width:width-x-18, height:34, class:"sequence-fragment"}); group.append(box);
+        const tabWidth = Math.max(80, operator.length * 8 + 28);
+        group.append(make("path", {d:`M ${x} ${start-19} H ${x+tabWidth} V ${start+1} L ${x+tabWidth-10} ${start+11} H ${x} Z`, class:"sequence-fragment-tab"}));
+        group.append(make("text", {x:x+12, y:start, class:"sequence-fragment-operator"}, operator));
+        if (!callee) group.append(make("text", {x:x+tabWidth+12, y:start, class:"sequence-control-label"}, `[${displayProjection.frameLabel(step)}]`));
+        y += 34;
+        draw(step.children, group, depth+1);
+        if (step.alternate?.length) {
+          group.append(make("line", {x1:x, x2:width-18, y1:y-12, y2:y-12, class:"sequence-divider"}));
+          group.append(make("text", {x:x+10, y:y+2, class:"sequence-meta"}, "else / alternate")); y += 24;
+          draw(step.alternate, group, depth+1);
+        }
         y += 4; box.setAttribute("height", y-start+8); y += 14;
         continue;
       }
