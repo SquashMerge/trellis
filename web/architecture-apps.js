@@ -68,19 +68,21 @@
   }
 
   // ---- All apps (#790): pure layout, card text and overlay routing. The controller draws and measures. ----
-  const COLUMN_MIN = 352, GUTTER_MIN = 48, LANE_MARGIN = 8, CARD = 176, ARROW = 8, LANE_TOP = 8, LANE_STEP = 6;
+  const COLUMN_MIN = 352, ALWAYS_BESIDE = 4, GUTTER_MIN = 48, LANE_MARGIN = 8, CARD = 176, ARROW = 8, LANE_TOP = 8, LANE_STEP = 6;
   const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
   // A gutter is as wide as its lanes need (#949; owner ruling 2026-11-12): a lane per drawn end, an arrowhead's
   // room on each side and a margin, and never under 48px.
   const gutterWidth = lanes => Math.max(GUTTER_MIN, count(lanes) * LANE_STEP + 2 * ARROW + LANE_MARGIN);
-  // Columns sit side by side when they all fit at their least width with each gutter between them; else they stack.
+  // Never stack; scroll (#949/#950, owner ruling 2026-11-12): two to four columns always sit side by side, each
+  // at least 352px with each gutter between them, and a narrower pane scrolls. Only `drawer` (the page at the
+  // narrow-screen drawer width) stacks them. Five or more sit side by side only when they all fit.
   // `lanes[i]` is the number of lines gutter i (after column i) carries. `natural` is each drawing's own measured
   // width: a column never narrows below it, and whatever then overflows the pane scrolls.
-  function layout({width, count:columnCount, natural = [], lanes = []}) {
+  function layout({width, count:columnCount, natural = [], lanes = [], drawer = false}) {
     const n = Number.isSafeInteger(columnCount) && columnCount > 0 ? columnCount : 1, wide = Number.isFinite(width) ? width : 0;
     const gutters = Array.from({length:n - 1}, (_, index) => gutterWidth(lanes[index])), between = gutters.reduce((sum, each) => sum + each, 0);
-    const sideBySide = n > 1 && wide >= n * COLUMN_MIN + between;
-    const base = sideBySide ? Math.floor((wide - between) / n) : Math.max(COLUMN_MIN, Math.floor(wide));
+    const sideBySide = n > 1 && drawer !== true && (n <= ALWAYS_BESIDE || wide >= n * COLUMN_MIN + between);
+    const base = sideBySide ? Math.max(COLUMN_MIN, Math.floor((wide - between) / n)) : Math.max(COLUMN_MIN, Math.floor(wide));
     const widths = Array.from({length:n}, (_, index) => Math.max(base, Number.isFinite(natural[index]) ? natural[index] : 0));
     if (!sideBySide) { const all = Math.max(...widths); return {sideBySide, gutters:[], count:n, widths:widths.map(() => all), columns:widths.map(() => ({x:0, width:all})), width:all}; }
     let x = 0;

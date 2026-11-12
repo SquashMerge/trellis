@@ -87,10 +87,14 @@ export function drawing(pane, t, drawn) {
   if (!plan.allApps) { out.push(picture(0)); return out; }
   const parts = plan.parts, cards = drawn.cards.map((item) => card(pane, t, item));
   if (drawn.sideBySide) {
-    // Each gutter has its own width (#949), so a spacer of that width sits between two headers.
-    out.push(h_flex().id("app-columns").flex_none().items_start()
-      .children(parts.flatMap((part, index) => [...(index ? [div().flex_none().w(drawn.layout.gutters[index - 1])] : []), columnHeader(pane, t, part, drawn.layout.widths[index])])));
-    out.push(picture(0));
+    // Never stack; scroll (#949/#950, owner ruling 2026-11-12): the pane has no drawer, so the columns stay side by
+    // side and the headers and the drawing scroll sideways together when they are wider than the pane. Each gutter
+    // has its own width (#949), so a spacer of that width sits between two headers.
+    out.push(div().id("app-scroll").w_full().flex_none().overflow_x_scrollbar()
+      .child(v_flex().flex_none().w(drawn.layout.width).gap(12)
+        .child(h_flex().id("app-columns").flex_none().items_start()
+          .children(parts.flatMap((part, index) => [...(index ? [div().flex_none().w(drawn.layout.gutters[index - 1])] : []), columnHeader(pane, t, part, drawn.layout.widths[index])])))
+        .child(picture(0))));
     // The browser floats a card in the gutter between its two columns; the pane lists them under the drawing.
     if (cards.length) out.push(h_flex().id("interface-cards").flex_none().gap(8).flex_wrap().items_start().children(cards));
     parts.forEach((part, index) => { if (!part.slice.layers.some((l) => !l.shared)) out.push(unassignedBox(t, `app-unlayered-${index}`, part.group.name, part.group.unassignedFileCount)); });

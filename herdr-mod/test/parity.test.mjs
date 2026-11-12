@@ -43,17 +43,25 @@ test("colours: the web app's Color by default, its heat scale and its heat token
   for (const heat of [token("sm-gold"), token("sm-amber"), token("sm-orange")]) assert.ok(!fills(cool.svg).has(heat), `Layer colouring has no heat (${heat})`);
 });
 
-test("apps: the switcher's choices, one column per app, side by side or stacked, and one app's stack", async () => {
+test("apps: the switcher's choices, one column per app, side by side at any width with a sideways scroll, and one app's stack", async () => {
+  const { div } = await import("gpui-kit");
+  const ui = await import("../src/architecture-ui.js");
   const view = twoApps(), summary = summarize(view);
   assert.deepEqual(summary.choices.map((c) => c.text), ["All apps", "srv · rust", "webapp · javascript"]);
   assert.equal(apps.sourceLine(summary.group, view.apps.length), "2 apps · hidden layers and unassigned files grouped below");
-  const stacked = await draw(view, { width: 600, theme, highlight: null, choice: {} });
-  assert.equal(stacked.sideBySide, false);
-  assert.equal(stacked.images.length, 2, "one drawing per app column");
   // Interface order (#949), from the shared plan: the client webapp sits left of its server srv.
   assert.deepEqual(summary.plan.parts.map((part) => part.group.name), ["webapp", "srv"]);
-  assert.match(stacked.images[0].svg, /webapp · ordered/, "the title wraps at this width");
-  assert.match(stacked.images[1].svg, /srv · ordered/);
+  // Never stack; scroll (#949/#950, owner ruling 2026-11-12): the pane has no drawer, so 600px keeps the columns
+  // side by side at 352px each, wider than the pane, and the pane scrolls them sideways.
+  const narrow = await draw(view, { width: 600, theme, highlight: null, choice: {} });
+  assert.equal(narrow.sideBySide, true); assert.equal(narrow.images.length, 1, "one composed drawing");
+  assert.deepEqual(narrow.layout.widths, [352, 352]); assert.equal(narrow.images[0].width, 752, "352 + 48 + 352, wider than the 600px pane");
+  assert.match(narrow.images[0].svg, /webapp · ordered[\s\S]*srv · ordered/);
+  const pane = new Trellis();
+  Object.assign(pane, { width: 624, view, inspect: null, drawn: { ...narrow, view, assets: ["probe.svg"] } });
+  const root = div().children(ui.drawing(pane, theme, pane.drawn)), scroll = root.find("app-scroll");
+  assert.equal(scroll?.props.scrollX, true, "the headers and the drawing scroll sideways");
+  assert.ok(scroll.find("app-columns") && scroll.find("diagram"), "together");
   const wide = await draw(view, { width: 1300, theme, highlight: null, choice: {} });
   assert.equal(wide.sideBySide, true);
   assert.equal(wide.images.length, 1, "side by side is one composed drawing");

@@ -40,7 +40,9 @@ function controller(payload, options = {}) {
   const bands = view => new Map(view.layers.filter(layer => !layer.shared).map((layer, index) => [layer.name, {x:10, y:40 + index * 80, w:options.bandWidth ?? 300, h:60}]));
   let renderer = async (container, view, renderOptions) => { renders.push({view, options:renderOptions}); container.replaceChildren(node("svg")); return {status:"ready", bands:bands(view)}; };
   const window = {TrellisArchitecturePele:{render:(...args) => renderer(...args), edgeWidth:count => 1 + count},
-    TrellisShell:{clearArchitectureInspector() {}, showArchitectureInspector() {}}};
+    TrellisShell:{clearArchitectureInspector() {}, showArchitectureInspector() {}},
+    // `drawer`: the page is at the narrow-screen drawer width, the one width at which All apps stacks.
+    matchMedia:query => ({matches:query === "(max-width: 900px)" && options.drawer === true})};
   get("architecture-diagram").clientWidth = options.width ?? 1500;
   vm.runInNewContext([pinSource, read("web/metric-heat.js"), read("web/architecture-apps.js"), read("web/architecture-deviations.js"), read("web/architecture.js")].join("\n"),
     {window, document, URLSearchParams, console, setTimeout, clearTimeout});
@@ -170,22 +172,30 @@ const columnsOf = h => grid(h).children.filter(item => item.attrs.role === "grou
 const cardsOf = h => descendants(h.get("architecture-diagram")).filter(item => item.attrs["data-trellis-card"] === "interface");
 const headers = h => descendants(h.get("architecture-diagram")).filter(item => item.className === "architecture-app-header");
 
-test("layout (#949): side by side from n x 352 plus each gutter sized to its lanes, else stacked", () => {
-  const apps = appsModule(), plan = (width, count, lanes) => JSON.parse(JSON.stringify(apps.layout({width, count, lanes})));
+test("layout (#949, owner ruling 2026-11-12): 2 to 4 columns always side by side, 352px or wider, gutters sized to their lanes; only the drawer stacks", () => {
+  const apps = appsModule(), plan = (width, count, lanes, extra = {}) => JSON.parse(JSON.stringify(apps.layout({width, count, lanes, ...extra})));
   // A gutter is max(48, lanes x 6 + 2 x 8 + 8): 48 up to four lanes, then 6px a lane.
   assert.deepEqual(plan(2400, 5, [0, 1, 4, 5]).gutters, [48, 48, 48, 54]); assert.deepEqual(plan(2000, 2, [26]).gutters, [180]);
   assert.deepEqual(plan(2000, 3).gutters, [48, 48], "no lanes known: the least gutter");
-  assert.equal(plan(1151, 3, [2, 1]).sideBySide, false); assert.equal(plan(1152, 3, [2, 1]).sideBySide, true, "3 x 352 + 2 x 48");
-  assert.equal(plan(1157, 3, [5, 1]).sideBySide, false); assert.equal(plan(1158, 3, [5, 1]).sideBySide, true, "a five-lane gutter is 54px");
-  assert.equal(plan(752, 2, [1]).sideBySide, true); assert.equal(plan(751, 2, [1]).sideBySide, false);
-  assert.deepEqual(plan(1152, 3, [2, 1]).columns.map(column => column.x), [0, 400, 800]); assert.equal(plan(1152, 3, [2, 1]).widths[0], 352);
-  assert.equal(plan(1600, 3, [2, 1]).widths[0], Math.floor((1600 - 2 * 48) / 3));
-  assert.equal(plan(300, 3).widths[0], 352, "text never shrinks below the least column; the diagram scrolls");
-  assert.deepEqual(plan(300, 3).gutters, [], "stacked columns have no gutter");
+  // Never stack; scroll: any width keeps 2 to 4 columns side by side at 352px or more, wider than the pane.
+  for (const count of [2, 3, 4]) for (const width of [0, 300, 1098, 1151]) {
+    const at = plan(width, count, [2, 1, 1]);
+    assert.equal(at.sideBySide, true, `${count} columns at ${width}px`); assert.ok(at.widths.every(each => each >= 352), `${count} at ${width}: ${at.widths}`);
+  }
+  const narrow = plan(1098, 3, [2, 1]);
+  assert.deepEqual(narrow.columns.map(column => column.x), [0, 400, 800]); assert.equal(narrow.width, 1152, "wider than the 1098px pane, so the canvas scrolls");
+  assert.equal(plan(1600, 3, [2, 1]).widths[0], Math.floor((1600 - 2 * 48) / 3), "a wider pane widens the columns");
+  // Only the drawer width stacks, at one width for every column.
+  const drawer = plan(1600, 3, [2, 1], {drawer:true});
+  assert.equal(drawer.sideBySide, false); assert.deepEqual(drawer.gutters, [], "stacked columns have no gutter"); assert.deepEqual(drawer.widths, [1600, 1600, 1600]);
+  assert.deepEqual(plan(300, 2, [1], {drawer:true}).widths, [352, 352], "text never shrinks below the least column; the diagram scrolls");
+  // Five or more sit side by side only when they all fit.
+  assert.equal(plan(5 * 352 + 4 * 48 - 1, 5).sideBySide, false); assert.equal(plan(5 * 352 + 4 * 48, 5).sideBySide, true);
+  assert.equal(plan(5000, 1).sideBySide, false, "one column is never side by side");
   const wide = JSON.parse(JSON.stringify(apps.layout({width:1158, count:3, lanes:[5, 1], natural:[352, 900, 100]})));
   assert.deepEqual(wide.widths, [352, 900, 352], "a drawing wider than its column widens it, and never narrows one");
   assert.deepEqual(wide.columns.map(column => column.x), [0, 406, 1354]); assert.equal(wide.width, 1706);
-  assert.equal(plan(NaN, 2).sideBySide, false);
+  assert.equal(plan(NaN, 2).sideBySide, true, "an unmeasured pane still lays 2 columns side by side");
   assert.equal(apps.cardFits(176), true); assert.equal(apps.cardFits(175), false, "a card floats only in a gutter at least a card wide");
 });
 
@@ -288,7 +298,10 @@ test("an interface between columns that are not adjacent, or stacked columns, na
   const far = cardsOf(h).find(item => item.attrs["data-trellis-action-id"] === JSON.stringify(["interface", "web", "db"]));
   assert.match(flat(far), /web · UI → db · Data/); assert.equal(far.attrs["data-gutter"], undefined, "it is not placed in a gutter");
   assert.equal(descendants(h.get("architecture-diagram")).some(item => item.attrs["data-interface"] === JSON.stringify(["interface", "web", "db"])), false, "and draws no line");
-  const narrow = controller(threeApps(), {width:900}); await narrow.architecture.refresh();
+  // Only the narrow-screen drawer width stacks (owner ruling 2026-11-12); a narrow desktop canvas stays in columns.
+  const desktop = controller(threeApps(), {width:900}); await desktop.architecture.refresh();
+  assert.equal(grid(desktop).dataset.layout, "columns"); assert.equal(grid(desktop).style.width, "1152px", "wider than the canvas, which scrolls");
+  const narrow = controller(threeApps(), {width:700, drawer:true}); await narrow.architecture.refresh();
   assert.equal(grid(narrow).dataset.layout, "stacked");
   assert.equal(descendants(narrow.get("architecture-diagram")).some(item => item.attrs.class === "architecture-apps-line"), false, "no line in a stacked layout");
   for (const card of cardsOf(narrow)) assert.match(text(card), /→/);
@@ -434,7 +447,7 @@ test("#850 each column's drawing is asked for its Shared side; the one-app view 
   assert.deepEqual(h.renders.map(render => [render.options.title.split(" ")[0], render.options.sharedSide]), [["web", "left"], ["api", "right"]]);
   await h.get("architecture-apps").children.find(item => item.textContent.startsWith("web")).fire("click"); await flush();
   assert.equal(h.renders.at(-1).options.sharedSide, undefined, "one app: unchanged");
-  const narrow = controller(dto, {width:700}); await narrow.architecture.refresh();
+  const narrow = controller(dto, {width:700, drawer:true}); await narrow.architecture.refresh();
   assert.deepEqual(narrow.renders.map(render => render.options.sharedSide), ["right", "right"], "stacked columns keep the right");
 });
 test("#850 shared_side_drawn_lines_only: an end whose partner layer is null or undrawn draws no line and counts nothing", () => {

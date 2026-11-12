@@ -665,8 +665,13 @@ key under the drawing shows the width at 1, 10, 100 and ≥1000 sites. The chann
 toward the fitted width. This is layout only: records, counts and identities are unchanged.
 
 All apps layout (#790, #850; owner decision 2026-11-09, amended by #949/#950, owner ruling 2026-11-12). With two or more apps, All apps draws
-one column per app, side by side in **interface order** when they fit (each at least 352px,
-with each gutter between them as wide as its lanes need), else stacked. Interface order
+one column per app, side by side in **interface order**, each at least 352px with each gutter
+between them as wide as its lanes need. **Never stack; scroll** (#949/#950, owner ruling
+2026-11-12): with two to four apps the columns always sit side by side, and the canvas scrolls
+horizontally when it is narrower than them. They stack only at the narrow-screen drawer width
+(900px and under, where the Explorer and Inspector become drawers); five or more apps sit side
+by side only when they all fit, else stack. The Herdr pane has no drawer, so it never stacks two to
+four apps and scrolls them sideways. Interface order
 (#949/#950, owner ruling 2026-11-12) starts from manifest order and places each server app
 between its clients: the client with the most matched routes on its left, the next on its
 right, and the rest after them; ties keep manifest order. Servers are taken in manifest order,

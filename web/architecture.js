@@ -26,6 +26,8 @@
   const ENTRY_CAP = 40, BOX_CAP = 150;
   // Resize re-layout: the quiet period, and the width change that is worth a new drawing.
   const RESIZE_DEBOUNCE_MS = 150, RESIZE_SLACK = 8;
+  // The narrow-screen drawer width (web/shell.js): the only width at which All apps columns stack (#949/#950).
+  const DRAWER_WIDTH = "(max-width: 900px)";
   const stem = name => { const dot = name.lastIndexOf("."); return dot > 0 ? name.slice(0, dot) : name; };
   // A directory module's own root file: shown first when it opens, never as a "mod" chip.
   const ROOT_FILES = new Set(["mod.rs", "__init__.py"]);
@@ -810,8 +812,9 @@
     }
     async function drawApps({full, parts, canvas, width, stack, active, layout}) {
       // Each gutter is as wide as the lines it carries (#949), so the lanes are counted before any column is drawn.
-      const laneCounts = shared.lanes(full, parts);
-      let plan = apps.layout({width, count:parts.length, lanes:laneCounts});
+      // Columns stack only at the narrow-screen drawer width (#949/#950, owner ruling 2026-11-12); else the canvas scrolls.
+      const laneCounts = shared.lanes(full, parts), drawer = !!window.matchMedia?.(DRAWER_WIDTH)?.matches;
+      let plan = apps.layout({width, count:parts.length, lanes:laneCounts, drawer});
       const pele = window.TrellisArchitecturePele, grid = make("div", undefined, "architecture-apps-grid"), columns = [], boxes = [], bandsOf = new Map();
       // Side by side, the grid's tracks alternate column and gutter, and column i takes track 2i + 1.
       const place = () => {
@@ -849,7 +852,7 @@
       }
       canvas.replaceChildren(grid);
       // A drawing wider than its column (an unbreakable name) widens the column; the diagram scrolls.
-      plan = apps.layout({width, count:parts.length, lanes:laneCounts, natural:boxes.map(box => Math.ceil(box.scrollWidth || 0))}); place();
+      plan = apps.layout({width, count:parts.length, lanes:laneCounts, drawer, natural:boxes.map(box => Math.ceil(box.scrollWidth || 0))}); place();
       // Frames are in each drawing's own coordinates; the overlay and the cards live in the grid's.
       const rect = node => node.getBoundingClientRect?.() || null, origin = rect(grid), places = new Map();
       parts.forEach((part, index) => {

@@ -41,10 +41,9 @@ async function published(files, rules, callback) {
     const indexed = await H.run(H.binary, ["index", "--workspace", paths.workspace], {env:paths.env, timeout:120000});
     server = await H.startDaemon(paths, indexed.json().status.revision.indexRevision);
     browser = await chromium.launch();
-    // Two columns need a canvas of 2·352 + 176 = 880px plus its 24px padding. At 1440 the canvas
-    // was 912px with overlay scrollbars but 897px where Chromium draws a classic 15px scrollbar in
-    // the stable gutter (Linux, and CI Macs without a trackpad), which stacks the columns. 1600
-    // leaves a margin no scrollbar or font takes away; the stacked layout is asserted at 760.
+    // Two to four columns sit side by side at any desktop width, and the canvas scrolls when they are wider
+    // (#949/#950, owner ruling 2026-11-12); 1600 fits two without a scroll. The stacked layout is asserted at the
+    // drawer width, 760.
     context = await browser.newContext({viewport:{width:1600, height:1000}});
     const page = await context.newPage(), errors = [];
     page.on("pageerror", error => errors.push(error.message));
@@ -132,21 +131,27 @@ const serverFirstFiles = new Map([
 ]);
 const serverFirstRules = "version=1\n[layers.server]\napp='srv'\norder=1\npaths=['src/**']\n[layers.first]\napp='one'\norder=1\npaths=['one/**']\n[layers.second]\napp='two'\norder=1\npaths=['two/**']\n";
 
-test("#949 three apps at a realistic width: the server between its two clients, side by side with both lines, the inspector open", {timeout:240000}, async () => published(serverFirstFiles, serverFirstRules, async ({page}) => {
-  // Three 352px columns and two 48px gutters need 1152px of canvas plus its 24px padding: 1780 gives a
-  // canvas of about 1200px beside the open inspector, with room for a classic 15px scrollbar.
-  await page.setViewportSize({width:1780, height:1000});
+test("#949 three apps at a realistic width: the server between its two clients, side by side with both lines and a sideways scroll, the inspector open; stacked only at drawer width", {timeout:240000}, async () => published(serverFirstFiles, serverFirstRules, async ({page}) => {
+  // A canvas of about 1100px beside the open inspector. Three 352px columns and two 48px gutters take 1152px,
+  // so the columns stay side by side and the canvas scrolls (never stack; owner ruling 2026-11-12).
+  await page.setViewportSize({width:1700, height:1000});
   await page.locator("#architecture-state[data-state=ready]").waitFor({state:"attached"});
   await page.waitForFunction(() => document.querySelectorAll(".architecture-app-column").length === 3 && document.querySelector(".architecture-apps-grid")?.dataset.layout === "columns"
     && !document.getElementById("architecture-diagram").dataset.layout).catch(() => {});
   const inputs = await layoutInputs(page);
   assert.ok(inputs.inspector > 0, `the inspector is open: ${JSON.stringify(inputs)}`);
-  assert.ok(inputs.canvasClientWidth <= 1260, `a canvas well under main's 1408px threshold: ${JSON.stringify(inputs)}`);
+  assert.ok(inputs.canvasClientWidth >= 1050 && inputs.canvasClientWidth <= 1150, `a canvas of about 1100px: ${JSON.stringify(inputs)}`);
   assert.equal(inputs.layout, "columns", `the three columns sit side by side: ${JSON.stringify(inputs)}`);
   assert.deepEqual(await page.locator(".architecture-app-column").evaluateAll(nodes => nodes.map(node => node.getAttribute("aria-label"))), ["two", "srv", "one"],
     "the client with more matched routes on the server's left, the other on its right");
   assert.equal(await page.locator(".architecture-apps-overlay .architecture-apps-line").count(), 2, "both interfaces run as lines");
   assert.equal(await page.locator(".architecture-interface-card .architecture-card-ends").count(), 0, "no end is left to words");
+  const scroll = await page.evaluate(() => { const canvas = document.getElementById("architecture-diagram"); return {scrollWidth:canvas.scrollWidth, clientWidth:canvas.clientWidth}; });
+  assert.ok(scroll.scrollWidth > scroll.clientWidth, `the canvas scrolls sideways instead of stacking: ${JSON.stringify(scroll)}`);
+  // At the narrow-screen drawer width (900px and under), and only there, the columns stack.
+  await page.setViewportSize({width:860, height:1000});
+  await page.waitForFunction(() => document.querySelector(".architecture-apps-grid")?.dataset.layout === "stacked");
+  assert.equal(await page.locator(".architecture-apps-line").count(), 0, "a stacked layout draws no line");
 }));
 
 test("all_apps_selected_word: a selected header or card says Selected, and is pressed", {timeout:240000}, async () => published(httpFiles, httpRules, async ({page}) => {
