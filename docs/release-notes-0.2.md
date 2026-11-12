@@ -361,7 +361,7 @@ to **43**, so every index is recreated on first use. See
 - **Architecture on a remote machine:** the pane asks for Architecture without edge
   pairs, and on a remote machine calls `trellis api --gzip`, which prints one line of
   base64 gzip of the usual output with the same exit code. On Trellis's own checkout
-  the remote answer drops from 6.8 MB, over Herdr's 8 MiB exec cap, to about 164 KB.
+  the remote answer drops from 6.8 MB to about 164 KB.
   An exec failure that isn't a connection failure is now `exec_failed` with its
   message, not `machine_unreachable`, and a `trellis` without `--gzip` is
   `trellis_outdated`. ([#919](https://github.com/SquashMerge/trellis/pull/919))
