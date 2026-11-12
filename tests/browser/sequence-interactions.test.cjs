@@ -193,7 +193,7 @@ test("#907: a same-column call's body around an arrow is a frame named for its c
   await legacy(view);
   const callee = page.locator('#sequence-diagram [data-presentation="interaction-callee"]');
   assert.equal(await callee.count(), 1);
-  assert.equal(await callee.locator(":scope > .sequence-fragment-operator").textContent(), "admission_lease");
+  assert.equal(await callee.locator(":scope > .sequence-fragment-operator").evaluate(n => n.firstChild.textContent), "admission_lease");
   assert.deepEqual(await callee.locator(".sequence-source").evaluateAll(nodes => nodes.map(n => n.getAttribute("data-source-step-id"))), ["lease>wake"]);
   assert.deepEqual(await ids("#sequence-diagram .sequence-source", "data-source-step-id"), ["lease>wake", "enqueue", "err>wake", "wake"], "frames are not rows");
   // A same-column call whose body draws no arrow is still nothing.
@@ -223,10 +223,13 @@ test("#907: a branch around an arrow is an alt frame, an arm an opt frame, and a
   assert.ok((await box(label("enqueue"))).y < match.top, "the scrutinee call comes before its match");
   await legacy(view);
   const branches = page.locator('#sequence-diagram [data-presentation="interaction-branch"]');
-  assert.deepEqual(await branches.evaluateAll(nodes => nodes.map(n => n.querySelector(":scope > .sequence-fragment-operator").textContent)), ["alt", "opt", "alt", "opt"]);
-  assert.deepEqual(await branches.evaluateAll(nodes => nodes.map(n => n.querySelector(":scope > .sequence-control-label").textContent)), [
-    "[match · first matching arm]", "[only if no earlier arm selected and pattern matches: RuntimeState::Reti…]",
+  assert.deepEqual(await branches.evaluateAll(nodes => nodes.map(n => n.querySelector(":scope > .sequence-fragment-operator").firstChild.textContent)), ["alt", "opt", "alt", "opt"]);
+  // The legacy heading is cut to the width left at its depth; its title keeps the whole text.
+  const legacyHeadings = await branches.evaluateAll(nodes => nodes.map(n => { const text = n.querySelector(":scope > .sequence-control-label"); return [text.firstChild.textContent, text.querySelector("title").textContent]; }));
+  assert.deepEqual(legacyHeadings.map(([, title]) => title), [
+    "[match · first matching arm]", "[only if no earlier arm selected and pattern matches: RuntimeState::RetireRequested { session, .. }]",
     "[match · first matching arm]", "[only if no earlier arm selected and pattern matches: Err(error)]"]);
+  for (const [shown, title] of legacyHeadings) assert.ok(shown === title || shown.endsWith("…]") && title.startsWith(shown.slice(0, -2)), JSON.stringify({shown, title}));
   // An if with an else around an arrow is alt; the coordinate view's if6 holds c-refresh.
   const display = await page.evaluate(view => { const d = TrellisSequence.display(view, {interactions:true}); return [...d.branches].map(s => [s.id, d.frameKind(s), d.frameLabel(s)]); }, coordinateView());
   assert.deepEqual(display, [["if6", "alt", "if refresh"]]);
@@ -237,6 +240,44 @@ test("#907: a branch around an arrow is an alt frame, an arm an opt frame, and a
   assert.deepEqual(await page.evaluate(view => { const d = TrellisSequence.display(view, {interactions:true}); return [...d.branches].map(s => d.frameKind(s)); }, tried), ["opt", "alt"]);
   assert.equal((await render(tried)).status, "rendered");
   assert.deepEqual(await page.locator("#sequence-diagram .pele-frame .pele-frame-kind").allTextContents(), ["opt", "alt"]);
+});
+
+test("#907: deeply nested legacy frame headings are cut to the width left at their depth, and keep their full text", async () => {
+  const view = enqueueView(), wake = view.steps[3];
+  const pattern = "RuntimeState::RetireRequested { session, attempts, waiting, .. }";
+  // Twelve levels: alternating same-column helpers and match arms, around one arrow.
+  const helper = view.participants.find(p => p.id === "admission_lease");
+  helper.declaration.name = helper.label = "admission_lease_for_a_very_long_named_runtime_helper";
+  let inner = {...structuredClone(wake), id:"deep>wake"};
+  for (let level = 12; level > 0; level--) {
+    const id = `level-${level}`;
+    inner = level % 2
+      ? {...structuredClone(view.steps[0]), id, callId:`callid:${id}`, children:[inner]}
+      : {...structuredClone(view.steps[2].alternate[1]), id, label:`only if no earlier arm selected and pattern matches: ${pattern}`, children:[inner], alternate:[]};
+  }
+  view.steps = [inner];
+  await legacy(view, INTERACTIONS);
+  const measured = await page.evaluate(() => {
+    const svg = document.querySelector("#sequence-diagram svg"), width = Number(svg.getAttribute("viewBox").split(" ")[2]);
+    const frames = [...svg.querySelectorAll('[data-presentation="interaction-branch"], [data-presentation="interaction-callee"]')];
+    return {width, frames:frames.map(frame => {
+      const box = frame.querySelector(":scope > .sequence-fragment").getBBox();
+      return {right:box.x + box.width, texts:[...frame.querySelectorAll(":scope > .sequence-fragment-operator, :scope > .sequence-control-label")]
+        .map(text => ({right:text.getBBox().x + text.getBBox().width, shown:text.firstChild.textContent, title:text.querySelector("title").textContent}))};
+    })};
+  });
+  assert.equal(measured.frames.length, 12);
+  for (const frame of measured.frames) {
+    assert.ok(frame.right <= measured.width, JSON.stringify(frame));
+    for (const text of frame.texts) {
+      assert.ok(text.right <= frame.right && text.right <= measured.width, `heading inside its frame: ${JSON.stringify({text, frame:frame.right, width:measured.width})}`);
+      assert.ok(text.title === text.shown || text.title.startsWith(text.shown.replace(/…\]?$/, "")), JSON.stringify(text));
+    }
+  }
+  // The deepest headings were cut, and their titles keep the whole text.
+  const deepest = measured.frames.at(-1).texts, callee = measured.frames.at(-2).texts[0];
+  assert.match(deepest[1].shown, /…\]$/); assert.equal(deepest[1].title, `[only if no earlier arm selected and pattern matches: ${pattern}]`);
+  assert.equal(callee.title, "admission_lease_for_a_very_long_named_runtime_helper");
 });
 
 test("a nested chain starts on its callee's column and returns before its caller does", async () => {

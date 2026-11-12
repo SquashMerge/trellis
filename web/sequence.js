@@ -397,11 +397,13 @@ function sequenceInteractions(view, options, earlyReturn) {
   const omittedInteractions = Math.max(0, arrows - SEQUENCE_INTERACTION_LIMIT);
   // A branch frame's header is calls-first's compact label; a callee frame's is the callee's name.
   const frameKind = step => step.alternate?.length ? "alt" : "opt";
-  const frameLabel = step => {
-    if (callees.has(step)) { const target = sequenceTarget(view, step); return compactName(target.declaration?.name || target.label, SEQUENCE_LABEL_LIMIT); }
-    return compactName(sequenceCompactLabel(step).replace(/\s+/g, " "), SEQUENCE_LABEL_LIMIT);
+  // `frameText` is the whole heading; `frameLabel` is it at the label limit.
+  const frameText = step => {
+    if (callees.has(step)) { const target = sequenceTarget(view, step); return target.declaration?.name || target.label; }
+    return sequenceCompactLabel(step).replace(/\s+/g, " ");
   };
-  return {interactions:true, visible, through, loops, branches, callees, returns, hiddenSteps, omittedInteractions, loopLabel, frameKind, frameLabel, earlyReturn};
+  const frameLabel = step => compactName(frameText(step), SEQUENCE_LABEL_LIMIT);
+  return {interactions:true, visible, through, loops, branches, callees, returns, hiddenSteps, omittedInteractions, loopLabel, frameKind, frameLabel, frameText, earlyReturn};
 }
 function compactName(text, limit) {
   return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
@@ -689,13 +691,21 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
       if (displayProjection.branches?.has(step) || displayProjection.callees?.has(step)) {
         // Interactions (#907): a frame around its arrows, not a row: no number.
         const callee = displayProjection.callees.has(step), start = y, x = 18 + depth * 10;
-        const operator = callee ? displayProjection.frameLabel(step) : displayProjection.frameKind(step);
+        // Each heading is cut to the width left at its depth, as row labels are; its title keeps it whole.
+        const room = width - 18 - x, full = callee ? displayProjection.frameText(step) : displayProjection.frameKind(step);
+        const operator = shorten(callee ? displayProjection.frameLabel(step) : full, Math.max(4, Math.floor((room - 28) / 8)));
         group.setAttribute("data-presentation", callee ? "interaction-callee" : "interaction-branch");
-        const box = make("rect", {x, y:start-19, width:width-x-18, height:34, class:"sequence-fragment"}); group.append(box);
-        const tabWidth = Math.max(80, operator.length * 8 + 28);
+        const box = make("rect", {x, y:start-19, width:room, height:34, class:"sequence-fragment"}); group.append(box);
+        const tabWidth = Math.min(room, Math.max(80, operator.length * 8 + 28));
         group.append(make("path", {d:`M ${x} ${start-19} H ${x+tabWidth} V ${start+1} L ${x+tabWidth-10} ${start+11} H ${x} Z`, class:"sequence-fragment-tab"}));
-        group.append(make("text", {x:x+12, y:start, class:"sequence-fragment-operator"}, operator));
-        if (!callee) group.append(make("text", {x:x+tabWidth+12, y:start, class:"sequence-control-label"}, `[${displayProjection.frameLabel(step)}]`));
+        const tab = make("text", {x:x+12, y:start, class:"sequence-fragment-operator"}, operator);
+        tab.append(make("title", {}, full)); group.append(tab);
+        if (!callee) {
+          const heading = displayProjection.frameLabel(step), labelX = x + tabWidth + 12;
+          const capacity = Math.max(4, Math.floor((width - 18 - 8 - labelX) / 7.8));
+          const text = make("text", {x:labelX, y:start, class:"sequence-control-label"}, `[${shorten(heading, capacity - 2)}]`);
+          text.append(make("title", {}, `[${displayProjection.frameText(step)}]`)); group.append(text);
+        }
         y += 34;
         draw(step.children, group, depth+1);
         if (step.alternate?.length) {
