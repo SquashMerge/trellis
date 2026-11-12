@@ -139,7 +139,7 @@
     const rowWidth = columns => columns * (chip + NODE_PAD) + (columns - 1) * GRID_GAP - NODE_PAD;
     const headerWidth = layer => !display ? null : layer.shared ? chip : Math.max(chip, rowWidth(bandColumns(layer)));
     for (const layer of drawn) {
-      const header = options.layerLabel?.(layer) ?? `${layer.name}\n${layer.shared ? "Shared" : `Order ${layer.order}`}`;
+      const header = options.layerLabel?.(layer) ?? `${layer.name}\n${layer.shared ? "Shared" : `Order ${options.layerNumber?.(layer) ?? layer.order}`}`;
       // Non-zero reference counts become compact chips on their own header lines.
       const stats = display ? (options.layerStats?.(layer) || []).filter(stat => typeof stat?.text === "string" && stat.text) : [];
       const widest = stats.reduce((most, stat) => Math.max(most, statWidth(stat, measure)), 0);
@@ -232,7 +232,7 @@
         if (width > span * peers.length) source.push(`space:${width - span * peers.length}`);
         continue;
       }
-      if (peers.length > 1) open(addNode("B",null,`Peer layers · order ${order}`),peers.length);
+      if (peers.length > 1) open(addNode("B",null,`Peer layers · order ${options.layerNumber?.(peers[0]) ?? order}`),peers.length);
       peers.forEach(layer => emitLayer(layer)); if (peers.length > 1) source.push("end");
     }
     source.push("end");

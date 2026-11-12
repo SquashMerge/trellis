@@ -2159,3 +2159,275 @@ test("openFilesLocation reports an aborted read as not painted", async () => {
   hold.resolve(sourceFile("a.rs"));
   assert.equal(await read, false);
 });
+
+// #906: a stall is not left failed or loading, and a finished re-run clears Catching up.
+const STALL_PIN = {indexGeneration:"12345678-1234-4123-8123-123456789abc", indexRevision:1};
+const recoveryTimers = h => [...h.timers.entries()].filter(([, timer]) => timer.delay >= 2000 && timer.delay <= 60000 && timer.delay !== 5000 && timer.delay !== 15000);
+const settleMany = async () => { for (let i = 0; i < 6; i++) await settleHead(); };
+test("a stalled read runs Refresh after 2 s, doubling to 60 s, until the daemon answers", async () => {
+  const h = harness(), attempts = [];
+  let answers = false;
+  h.context.fetch = async request => answers ? response({revision:STALL_PIN}) : {ok:false, status:503, json:async () => ({})};
+  // Refresh itself is covered elsewhere; here it is one status read.
+  h.run("refreshView = async () => { await api('/api/status'); }");
+  await assert.rejects(h.run("api('/api/git')"), /Request failed \(503\)/);
+  const delays = [];
+  for (let i = 0; i < 8; i++) {
+    const pending = recoveryTimers(h);
+    assert.equal(pending.length, 1, `one recovery attempt is scheduled: ${JSON.stringify([...h.timers.values()].map(t => t.delay))}`);
+    const [id, timer] = pending[0];
+    delays.push(timer.delay); h.timers.delete(id);
+    if (i === 7) answers = true;
+    timer.callback(); await settleMany();
+    attempts.push(h.get("error").hidden);
+  }
+  assert.deepEqual(delays, [2000, 4000, 8000, 16000, 32000, 60000, 60000, 60000]);
+  assert.equal(recoveryTimers(h).length, 0, "an answered Refresh ends recovery");
+  assert.equal(h.run("recovery"), null);
+  assert.equal(h.get("error").hidden, true, "the stall's error is cleared");
+  assert.deepEqual(attempts.slice(0, 7), Array(7).fill(false), "each failed attempt says why");
+});
+test("a client deadline or a failed connection starts recovery; a typed answer does not", async () => {
+  for (const [name, reply, stalls] of [
+    ["deadline", () => new Promise(() => {}), true],
+    ["connection", async () => { throw new TypeError("Failed to fetch"); }, true],
+    ["storage_busy", async () => ({ok:false, status:409, json:async () => ({error:{code:"storage_busy", message:"Storage is busy"}})}), true],
+    ["not_found", async () => ({ok:false, status:404, json:async () => ({error:{code:"not_found", message:"Not found"}})}), false],
+    ["revision_conflict", async () => ({ok:false, status:409, json:async () => ({error:{code:"revision_conflict", message:"Changed"}})}), false],
+    ["corrupt", async () => ({ok:false, status:503, json:async () => ({error:{code:"corrupt", message:"Corrupt"}})}), false],
+  ]) {
+    const h = harness();
+    h.context.fetch = reply;
+    const pending = h.run("api('/api/git')").catch(error => error);
+    if (name === "deadline") { await settleHead(); const [id, timer] = [...h.timers.entries()].find(([, t]) => t.delay === 15000); h.timers.delete(id); timer.callback(); }
+    const error = await pending;
+    assert.equal(error.transient === true, stalls, name);
+    assert.equal(recoveryTimers(h).length, stalls ? 1 : 0, name);
+  }
+});
+test("Disconnect or another checkout forgets a scheduled recovery", async () => {
+  const h = harness();
+  h.context.fetch = async () => ({ok:false, status:503, json:async () => ({})});
+  await assert.rejects(h.run("api('/api/git')"));
+  assert.equal(recoveryTimers(h).length, 1);
+  h.run("resetCheckout()");
+  assert.equal(recoveryTimers(h).length, 0);
+  assert.equal(h.run("recovery"), null);
+});
+test("a head digest whose catchingUp differs from status reads status once, which clears Catching up", async () => {
+  const h = harness(), requests = [];
+  h.run("status.workspaceRoot = '/synthetic'; status.catchingUp = true; $('catching-up').hidden = false");
+  h.context.fetch = async request => {
+    requests.push(request);
+    if (request === "/api/status/head") return response({revision:STALL_PIN, catchingUp:false, indexedAt:null, viewRequest:null});
+    if (request === "/api/status") return response({revision:STALL_PIN, catchingUp:false, stats:{}});
+    throw new Error("Unexpected " + request);
+  };
+  h.run("observePinnedHead()"); await settleMany();
+  assert.deepEqual(requests, ["/api/status/head", "/api/status"]);
+  assert.equal(h.get("catching-up").hidden, true);
+  assert.equal(h.run("status.catchingUp"), false);
+  h.run("observePinnedHead()"); await settleMany();
+  assert.deepEqual(requests, ["/api/status/head", "/api/status", "/api/status/head"], "status agrees now; nothing more is read");
+});
+// A proxy's or a dying server's answer has no JSON: HTML or an empty body.
+const htmlReply = status => ({ok:false, status, json:async () => { throw new SyntaxError("Unexpected token '<'"); }});
+const emptyReply = status => ({ok:false, status, json:async () => { throw new SyntaxError("Unexpected end of JSON input"); }});
+test("an HTML 503 or an empty 502 is a stall and starts recovery", async () => {
+  for (const [name, reply, message] of [["html 503", () => htmlReply(503), /Request failed \(503\)/], ["empty 502", () => emptyReply(502), /Request failed \(502\)/]]) {
+    const h = harness();
+    h.context.fetch = async () => reply();
+    const error = await h.run("api('/api/git')").catch(failure => failure);
+    assert.match(error.message, message, name);
+    assert.equal(error.transient, true, name);
+    assert.equal(recoveryTimers(h).length, 1, name);
+  }
+  // The follow poll's head read is the same api(): an HTML 503 there starts recovery too.
+  const h = harness();
+  h.run("status.workspaceRoot = '/synthetic'");
+  h.context.fetch = async () => htmlReply(503);
+  h.run("observePinnedHead()"); await settleMany();
+  assert.equal(recoveryTimers(h).length, 1);
+});
+test("recovery keeps backing off across repeated HTML 503s until the daemon answers", async () => {
+  const h = harness();
+  let answers = false;
+  h.context.fetch = async () => answers ? response({revision:STALL_PIN}) : htmlReply(503);
+  h.run("refreshView = async () => { await api('/api/status'); }");
+  await assert.rejects(h.run("api('/api/git')"), /Request failed \(503\)/);
+  const delays = [];
+  for (let i = 0; i < 5; i++) {
+    const pending = recoveryTimers(h);
+    assert.equal(pending.length, 1, `attempt ${i} is scheduled`);
+    const [id, timer] = pending[0];
+    delays.push(timer.delay); h.timers.delete(id);
+    if (i === 4) answers = true;
+    timer.callback(); await settleMany();
+  }
+  assert.deepEqual(delays, [2000, 4000, 8000, 16000, 32000]);
+  assert.equal(recoveryTimers(h).length, 0);
+  assert.equal(h.run("recovery"), null);
+  assert.equal(h.get("error").hidden, true);
+});
+// A show stopped by a stall is applied after recovery only if it still owns the view when it is
+// applied: not if the user navigated, or a newer show started, while recovery read status.
+async function stalledShowHarness() {
+  const {browser, h, requests} = await showHarness();
+  h.run("status.workspaceRoot = '/synthetic'");
+  const seeds = [], statusReply = {pending:null};
+  h.context.fetch = async (path, options) => {
+    requests.push([path, options]);
+    if (path === "/api/status") { statusReply.pending = deferred(); return statusReply.pending.promise; }
+    if (path === "/api/status/head") return response({revision:SHOW_PIN, catchingUp:false, indexedAt:null, viewRequest:null});
+    if (!options?.body) return response({});
+    const seed = JSON.parse(options.body).seed;
+    seeds.push(seed);
+    if (seed === "agent" && h.stalled) return {ok:false, status:503, json:async () => { throw new SyntaxError("Unexpected token '<'"); }};
+    return response(view(seed));
+  };
+  h.stalled = true;
+  await h.run(`observeViewRequest(${JSON.stringify(shown(4))})`); await settleMany();
+  assert.equal(h.get("agent-shown").hidden, true, "a stopped show is not shown");
+  assert.equal(h.run("stalledShow?.request.symbolId"), "agent");
+  h.stalled = false;
+  const recover = async () => {
+    const [[id, timer]] = recoveryTimers(h); h.timers.delete(id); timer.callback(); await settleMany();
+  };
+  const answerStatus = async () => {
+    statusReply.pending.resolve(response({revision:SHOW_PIN, catchingUp:false, stats:{}})); await settleMany();
+  };
+  return {browser, h, seeds, recover, answerStatus};
+}
+test("a stopped show is applied after recovery when nothing else took the view", async () => {
+  const {h, seeds, recover, answerStatus} = await stalledShowHarness();
+  await recover(); await answerStatus();
+  assert.equal(h.run("selectedMethod.id"), "agent");
+  assert.match(h.get("agent-shown-label").textContent, /^Shown by agent · Sequence · agent$/);
+  assert.deepEqual(seeds, ["agent", "agent"]);
+  assert.equal(h.run("stalledShow"), null);
+});
+test("a user navigation while recovery reads status wins over the stopped show, which is not replayed later", async () => {
+  const {h, seeds, recover, answerStatus} = await stalledShowHarness();
+  await recover();
+  await h.run("navigateDiagram({id:'user', name:'user', path:'a.js'}, status.revision)"); await settleMany();
+  assert.equal(h.run("selectedMethod.id"), "user");
+  await answerStatus();
+  assert.equal(h.run("selectedMethod.id"), "user", "the user's view stays");
+  // The stale show is dropped and the view on screen is refreshed instead: answer its status read.
+  await answerStatus();
+  assert.equal(h.run("recovery"), null, "the refreshed view ends recovery");
+  assert.notEqual(h.run("selectedMethod?.id"), "agent");
+  assert.equal(h.get("agent-shown").hidden, true, "nothing says the agent moved this view");
+  assert.equal(h.run("stalledShow"), null, "the stale show is dropped");
+  assert.equal(seeds.filter(seed => seed === "agent").length, 1, "the stale show read nothing more");
+  // A later stall and recovery does not bring it back.
+  h.context.fetch = async () => ({ok:false, status:503, json:async () => ({})});
+  await assert.rejects(h.run("api('/api/git')"));
+  h.context.fetch = async (path, options) => path === "/api/status" ? response({revision:SHOW_PIN, catchingUp:false, stats:{}})
+    : path === "/api/status/head" ? response({revision:SHOW_PIN, catchingUp:false, indexedAt:null, viewRequest:null})
+    : options?.body ? (seeds.push(JSON.parse(options.body).seed), response(view(JSON.parse(options.body).seed))) : response({});
+  h.run("refreshView = async () => { await api('/api/status'); }");
+  await recover();
+  assert.notEqual(h.run("selectedMethod?.id"), "agent");
+  assert.equal(seeds.filter(seed => seed === "agent").length, 1);
+});
+test("a newer show while recovery reads status wins over the stopped one", async () => {
+  const {h, seeds, recover, answerStatus} = await stalledShowHarness();
+  await recover();
+  await h.run(`observeViewRequest(${JSON.stringify(shown(5, {view:"sequence", symbolId:"newer"}))})`); await settleMany();
+  assert.equal(h.run("selectedMethod.id"), "newer");
+  await answerStatus();
+  assert.equal(h.run("selectedMethod.id"), "newer");
+  assert.match(h.get("agent-shown-label").textContent, /^Shown by agent · Sequence · newer$/);
+  assert.equal(h.run("stalledShow"), null);
+  assert.equal(seeds.filter(seed => seed === "agent").length, 1);
+});
+test("a show that loses the view to a user navigation is not kept for recovery, even when another read stalls", async () => {
+  const {h, requests} = await showHarness();
+  h.run("status.workspaceRoot = '/synthetic'");
+  const read = deferred();
+  h.context.fetch = async (path, options) => {
+    requests.push([path, options]);
+    if (path === "/api/sequence" && JSON.parse(options.body).seed === "agent") return read.promise;
+    if (path === "/api/sequence") return response(view(JSON.parse(options.body).seed));
+    return {ok:false, status:503, json:async () => ({})};
+  };
+  const show = h.run(`observeViewRequest(${JSON.stringify(shown(4))})`);
+  await settleHead();
+  await h.run("navigateDiagram({id:'user', name:'user', path:'a.js'}, status.revision)");
+  await assert.rejects(h.run("api('/api/git')"), /503/);
+  read.resolve(response(view("agent"))); await show; await settleMany();
+  assert.equal(h.run("selectedMethod.id"), "user");
+  assert.equal(h.run("stalledShow"), null);
+});
+test("a stall just after an attempt ended goes on with the backoff instead of starting over", async () => {
+  const h = harness();
+  let answers = false;
+  h.context.fetch = async () => answers ? response({revision:STALL_PIN}) : {ok:false, status:503, json:async () => ({})};
+  h.run("refreshView = async () => { await api('/api/status'); }");
+  await assert.rejects(h.run("api('/api/git')"));
+  let [[id, timer]] = recoveryTimers(h); h.timers.delete(id);
+  assert.equal(timer.delay, 2000);
+  answers = true; timer.callback(); await settleMany();
+  assert.equal(h.run("recovery"), null);
+  // A view refreshed without waiting (Architecture) stalls right after: the same outage.
+  answers = false;
+  await assert.rejects(h.run("api('/api/architecture')"));
+  [[id, timer]] = recoveryTimers(h);
+  assert.equal(timer.delay, 4000);
+});
+test("recovery's Refresh reloads the Classes view on screen, not an earlier Sequence", async () => {
+  const h = harness(), calls = [];
+  h.run("status.workspaceRoot = '/synthetic'; selectedMethod = {id:'old', name:'old', path:'a.js'}; $('treemap-panel').hidden = true; $('architecture-panel').hidden = true");
+  h.context.TrellisClassesRetry = () => calls.push("classes");
+  h.run("window.TrellisClasses = {retry: () => TrellisClassesRetry(), reset() {}}; currentDiagramView = () => 'classes'; loadSequence = async () => { TrellisClassesRetry.sequence = true; }");
+  h.context.fetch = async request => request === "/api/status" ? response({revision:STALL_PIN, catchingUp:false, stats:{}}) : response({});
+  await h.run("refreshView()").catch(() => {});
+  assert.deepEqual(calls, ["classes"]);
+  assert.equal(h.context.TrellisClassesRetry.sequence, undefined);
+});
+// A Classes show is kept for recovery only when its own, still-current class read stalled.
+async function classShowHarness() {
+  const {h, requests} = await showHarness();
+  h.run("status.workspaceRoot = '/synthetic'; $('treemap-panel').hidden = true; $('architecture-panel').hidden = true");
+  const opens = [];
+  h.context.ClassesStub = {opens, open(options) { const read = deferred(); opens.push({options, read, reset:false}); return read.promise; },
+    reset() { for (const open of opens) open.reset = true; }};
+  h.run("window.TrellisClasses = {open: options => ClassesStub.open(options), reset: () => ClassesStub.reset(), retry: async () => {}, closeContextMenu() {}, scopeChanged() {}}");
+  h.context.fetch = async (path, options) => {
+    requests.push([path, options]);
+    if (path === "/api/sequence") return response(view(JSON.parse(options.body).seed));
+    if (path === "/api/status") return response({revision:SHOW_PIN, catchingUp:false, stats:{}});
+    if (path === "/api/status/head") return response({revision:SHOW_PIN, catchingUp:false, indexedAt:null, viewRequest:null});
+    return {ok:false, status:503, json:async () => ({})};
+  };
+  return {h, opens};
+}
+test("a Classes show whose own class read stalled is kept for recovery", async () => {
+  const {h, opens} = await classShowHarness();
+  const show = h.run(`observeViewRequest(${JSON.stringify(shown(4, {view:"class", symbolId:"K"}))})`);
+  await settleMany();
+  assert.equal(opens.length, 1);
+  await assert.rejects(h.run("api('/api/class-diagram', 'POST', {})"), /503/);
+  opens[0].read.resolve({stalled:true}); await show; await settleMany();
+  assert.equal(h.run("stalledShow?.request.symbolId"), "K");
+  assert.equal(h.get("agent-shown").hidden, true);
+});
+test("a user navigation during a Classes show's read wins, even when an unrelated read stalls", async () => {
+  const {h, opens} = await classShowHarness();
+  const show = h.run(`observeViewRequest(${JSON.stringify(shown(4, {view:"class", symbolId:"K"}))})`);
+  await settleMany();
+  // An unrelated Git status read stalls, and the user opens a Sequence.
+  await assert.rejects(h.run("api('/api/git')"), /503/);
+  await h.run("navigateDiagram({id:'user', name:'user', path:'a.js'}, status.revision)"); await settleMany();
+  assert.equal(h.run("selectedMethod.id"), "user");
+  // Classes itself rejects its stale read, so it reports no stall of its own.
+  assert.equal(opens[0].reset, true);
+  opens[0].read.resolve(null); await show; await settleMany();
+  assert.equal(h.run("stalledShow"), null, "the old show is not re-stamped with the user's marks");
+  // Recovery refreshes the user's view and never replays the show.
+  const [[id, timer]] = recoveryTimers(h); h.timers.delete(id); timer.callback(); await settleMany();
+  assert.equal(opens.length, 1, "no second class read");
+  assert.equal(h.run("selectedMethod.id"), "user");
+  assert.equal(h.get("agent-shown").hidden, true);
+});

@@ -318,6 +318,7 @@ classes. Aggregate limits fail without publishing. These are guardrails, not a p
 | GET | `/api/jobs/{id}` | Job, or 404 |
 | POST | `/api/jobs/{id}/cancel` | Request cancellation; completed jobs stay completed |
 | GET | `/api/source?path=...&indexGeneration=...&indexRevision=...` | `{revision, file}`; cached source only, optional complete pair guard |
+| GET | `/api/checkouts/{rootKey}/architecture?aggregate=...&role=...&workbench=...&pairs=...&indexGeneration=...&indexRevision=...` | The Architecture summary ([architecture view](architecture-view.md)). Every field is optional, but the pin is both halves or neither; each may appear once. `aggregate` is `max` (default), `sum` or `mean`; `role` `all` (default), `production` or `test`; `workbench` `true` or `false` (default). `pairs` is `true` (default: the full answer) or `false`, which leaves `edges[].pairs`, the per-file pairs and their sampled sites, out of each edge and changes nothing else (#915, owner ruling 2026-11-11). Any other value is `400 invalid_request`. The payload doesn't echo `pairs`; a client that doesn't read pairs accepts an edge with or without them. If edge pairs move to the details route by default (#917), `pairs=false` stays accepted. |
 
 Unknown request fields are rejected. Retired Tools endpoints use the ordinary unknown-route response; there is no compatibility API for saved records or providers.
 
@@ -337,7 +338,7 @@ For DTO details, see [the frontend handoff](daemon-v1-api-handoff.md).
 ```sh
 trellis api GET '/api/checkouts'
 trellis api GET '/api/checkouts/<rootKey>/status'
-trellis api GET '/api/checkouts/<rootKey>/architecture?aggregate=max&role=production&workbench=true&indexGeneration=…&indexRevision=…'
+trellis api GET '/api/checkouts/<rootKey>/architecture?aggregate=max&role=production&workbench=true&pairs=false&indexGeneration=…&indexRevision=…' --gzip
 trellis api GET '/api/checkouts/<rootKey>/methods?indexGeneration=…&indexRevision=…&path=src/main.rs'
 trellis api GET '/api/checkouts/<rootKey>/architecture/details?kind=instances&rule=%24layers&…&rulesHash=…&offset=0'
 trellis api GET '/api/checkouts/<rootKey>/jobs/current'
@@ -348,6 +349,7 @@ trellis api POST '/api/checkouts/<rootKey>/sequence' --body '{"seed":"…","expe
 - **Allowlist.** Exactly the routes above, with those methods: `GET /api/checkouts` (no query), `GET …/status` (no query), `GET …/architecture`, `GET …/architecture/details` (the Deviations tree, #886), `GET …/methods`, `GET …/jobs/current` (no query; the status line's re-index note, #886) and `POST …/sequence` (no query), with a 64-hex `rootKey`. Anything else is refused with `route_not_allowed` before the daemon is reached, and refused again by the daemon. GET takes no body and POST requires one.
 - **Same handlers, same bounds.** Each request runs the provisioned browser's own handler for that route, with the same checkout selection, query validation, revision pins and typed errors. The target is at most 4,096 bytes of printable ASCII. A POST body is JSON of at most 64 KiB, inline or from stdin with `--body -`; that is tighter than the browser's 1 MiB because it travels in one 1 MiB socket frame. An answer over 16 MiB is `response_too_large`. The CLI waits at most 25 s per socket read on a silent daemon.
 - **Output.** Stdout is one line of JSON. Exit 0: the daemon's 2xx answer. Exit 1: the daemon's `{error:{code,message}}` answer, unchanged, so its code is kept. Exit 2: a typed failure with no daemon answer, printed as `{error:{code,message}}`: `route_not_allowed`, `invalid_request`, `body_too_large`, `daemon_unavailable` (no daemon could be reached or started, or the connection failed twice), `deadline_exceeded` (a daemon silent for 25 s), or `daemon_outdated` (a running daemon older than `trellis api`; restart it). Clap's own usage errors also exit 2, on stderr with nothing on stdout.
+- **`--gzip`** (#915, owner ruling 2026-11-11). Stdout is instead one line of standard base64 (with padding) of the gzip of exactly the line printed without it, newline included. It applies to every outcome that prints JSON (exit 0, 1 and 2), and the exit codes are unchanged; clap's usage errors still print nothing on stdout. The 16 MiB `response_too_large` bound applies to the decoded answer, as before. The Herdr mod passes it on every request it runs through `trellis api`, because Herdr's `exec` caps output at 8 MiB and a real checkout's Architecture answer was 6.8 MB of JSON.
 - **Reading status starts indexing,** exactly as a browser read does: a selected checkout's runtime is activated and kept for the browser lifetime.
 
 ## Current limits

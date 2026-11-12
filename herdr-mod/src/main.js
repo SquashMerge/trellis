@@ -820,7 +820,7 @@ export default class Trellis extends View {
     const band = value === undefined ? null : summary.scale.band(value);
     card.child(h_flex().gap(6).items_center().flex_wrap()
       .child(div().text_color(t.dim).child("Layer"))
-      .child(div().font_semibold().child(layer ? `${layer.shared ? "Shared" : layer.order} · ${layer.name}` : "Unassigned / unknown"))
+      .child(div().font_semibold().child(layer ? `${summary.layerTag(layer)} · ${layer.name}` : "Unassigned / unknown"))
       .when(Boolean(module.app), (el) => el.child(div().text_size(12).text_color(t.dim).child(`app ${module.app}`)))
       .when(place.hidden, (el) => el.child(div().text_size(12).text_color(t.dim).child(summary.tests.has(layer.name) ? "(tests/fixtures layer, not drawn)" : "(hidden layer, not drawn)")))
       .children(place.stats.map((stat) => this.stat(t, stat))));
@@ -868,7 +868,7 @@ export default class Trellis extends View {
           .when(current, (el) => el.bg(t.selected))
           .when(drawnLayer, (el) => el.cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => { this.open.set(layer.name, !open); cx.notify(); }))
           .child(div().w(14).text_color(t.dim).child(drawnLayer ? (open ? "▾" : "▸") : "·"))
-          .child(div().w(52).text_color(t.dim).child(layer.shared ? "Shared" : `Order ${layer.order}`))
+          .child(div().w(52).text_color(t.dim).child(layer.shared ? "Shared" : summary.layerNumber(layer) === null ? "Hidden" : `Order ${summary.layerNumber(layer)}`))
           .child(div().font_semibold().text_color(drawnLayer ? t.foreground : t.dim).child(layer.name))
           .child(div().text_color(t.muted).child(`${plural(members.length, "file")}${worst === undefined ? "" : ` · ${summary.metric === "maintainabilityIndex" ? "min" : "max"} ${display(worst)}`}`))
           .when(!drawnLayer, (el) => el.child(div().text_size(12).text_color(t.dim).child(part.layout.tests.has(layer.name) ? "tests/fixtures · not drawn" : "hidden · not drawn")))

@@ -1386,3 +1386,61 @@ test("late Git from an old root and an older checkout list cannot regress select
     await page.unroute(listPattern, respondList); await page.unroute(rootPattern, respondOld); await page.unroute(otherPattern, respondOther);
   }
 }, undefined, {git:true, additionalRootKeys:["d".repeat(64)]}));
+
+// One `trellis mcp` stdio session against the suite's daemon, for an agent's trellis_show (#818).
+async function agentShow(paths, args) {
+  const {spawn} = require("node:child_process");
+  const child = spawn(H.binary, ["mcp", "--workspace", paths.workspace], {env:paths.env, stdio:["pipe", "pipe", "pipe"]});
+  let buffer = "", stderr = "";
+  const waiting = new Map();
+  child.stderr.on("data", chunk => { stderr = (stderr + chunk).slice(-8000); });
+  child.stdout.on("data", chunk => {
+    buffer += chunk;
+    for (let at = buffer.indexOf("\n"); at >= 0; at = buffer.indexOf("\n")) {
+      const line = buffer.slice(0, at); buffer = buffer.slice(at + 1);
+      if (!line.trim()) continue;
+      const reply = JSON.parse(line);
+      waiting.get(reply.id)?.(reply); waiting.delete(reply.id);
+    }
+  });
+  const ask = (id, method, params) => new Promise((resolveReply, reject) => {
+    const timer = setTimeout(() => reject(new Error(`trellis mcp ${method} hung: ${stderr}`)), 120000);
+    waiting.set(id, reply => { clearTimeout(timer); resolveReply(reply); });
+    child.stdin.write(`${JSON.stringify({jsonrpc:"2.0", id, method, params})}\n`);
+  });
+  try {
+    const init = await ask(1, "initialize", {protocolVersion:"2025-11-25", capabilities:{}, clientInfo:{name:"browser-acceptance", version:"1"}});
+    assert.ok(init.result, JSON.stringify(init));
+    child.stdin.write(`${JSON.stringify({jsonrpc:"2.0", method:"notifications/initialized"})}\n`);
+    const shown = await ask(2, "tools/call", {name:"trellis_show", arguments:{schemaVersion:1, ...args}});
+    return shown.result?.structuredContent;
+  } finally { child.stdin.end(); child.kill("SIGTERM"); }
+}
+
+// #913: an agent show moves this view to Sequence; Back returns to Architecture. Every time, the one tab
+// that is selected or focused is the view on screen.
+test("#913: after an agent show and Back, the selected tab is the view on screen", {timeout:240000}, async () => published(async ({page, paths, server}) => {
+  const tabs = () => page.evaluate(() => ["sequence", "classes", "architecture", "treemap"].map(name => {
+    const tab = document.getElementById(`view-${name}`);
+    return {name, selected:tab.getAttribute("aria-selected") === "true", shown:!document.getElementById(`${name}-panel`).hidden,
+      focused:document.activeElement === tab};
+  }));
+  const only = async (name, when) => {
+    const state = await tabs(), detail = `${when}: ${JSON.stringify(state)}`;
+    assert.deepEqual(state.filter(tab => tab.shown).map(tab => tab.name), [name], detail);
+    assert.deepEqual(state.filter(tab => tab.selected).map(tab => tab.name), [name], detail);
+    assert.ok(state.every(tab => !tab.focused || tab.name === name), `no other tab keeps focus: ${detail}`);
+  };
+  await page.locator("#architecture-panel").waitFor({state:"visible"});
+  await only("architecture", "arrival");
+  const id = await H.seedId(server, paths.token, "measured");
+  const outcome = await agentShow(paths, {view:"sequence", symbolId:id});
+  assert.equal(outcome?.data?.outcome, "shown", JSON.stringify(outcome));
+  await page.locator("#agent-shown:not([hidden])").waitFor({timeout:30000});
+  await page.locator("#sequence-panel").waitFor({state:"visible"});
+  await only("sequence", "after the show");
+  await page.locator("#agent-shown-back").click();
+  await page.locator("#architecture-panel").waitFor({state:"visible"});
+  await page.waitForFunction(() => document.getElementById("view-architecture").getAttribute("aria-selected") === "true");
+  await only("architecture", "after Back");
+}, undefined, {git:true}));

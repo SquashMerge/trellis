@@ -11902,6 +11902,168 @@ async fn references_group_by_app_and_select_sources_under_a_prefix() {
     session.join().unwrap().unwrap();
 }
 
+/// #908: on this checkout's shape (a Rust crate whose modules use each other and 52 external
+/// crates), `groupBy:"package"` pages its in-checkout app rows from the first page, and the
+/// external descriptors never fill a page ahead of them: each page lists only the descriptors
+/// of its own rows' external targets, so a row `limit` bounds them too. Every page together
+/// lists every descriptor of the file answer exactly once per page that targets it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn package_groups_lead_the_page_when_many_external_crates_are_used() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    const CRATES: usize = 52;
+    let temp = tempfile::tempdir().unwrap();
+    let mut manifest =
+        String::from("[package]\nname = \"shape\"\nversion = \"0.1.0\"\n\n[dependencies]\n");
+    let mut lib = String::from("pub mod store;\npub mod mcp;\n");
+    for n in 0..CRATES {
+        manifest.push_str(&format!(
+            "external_dependency_crate_{n:02} = {{ version = \"=1.2.3\", features = [\"full\"] }}\n"
+        ));
+        lib.push_str(&format!(
+            "pub fn use_{n:02}() {{ external_dependency_crate_{n:02}::run(); }}\n"
+        ));
+    }
+    manifest.push_str("\n[dev-dependencies]\n");
+    for n in 0..CRATES {
+        manifest.push_str(&format!("external_dependency_crate_{n:02} = \"1\"\n"));
+    }
+    let store = "pub fn open() {}\n";
+    let mut mcp = String::new();
+    for _ in 0..(CRATES + 8) {
+        mcp.push_str("pub fn call() { crate::store::open(); }\n");
+    }
+    let (identity, topology) = published_inactive_checkout(
+        temp.path(),
+        &[
+            ("Cargo.toml", manifest.as_str()),
+            ("src/main.rs", "fn main() {}\n"),
+            ("src/lib.rs", lib.as_str()),
+            ("src/store.rs", store),
+            ("src/mcp.rs", mcp.as_str()),
+        ],
+    );
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(908, &identity).unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    architecture_built(&registry, &identity).await;
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 908, None);
+    let mut structured = Vec::new();
+    let mut ask = |id: i32, arguments: Value| {
+        writeln!(
+            client,
+            "{}",
+            modern(
+                json!(id),
+                "tools/call",
+                json!({"name":"trellis_references","arguments":arguments})
+            )
+        )
+        .unwrap();
+        let reply = next_reply(&mut reader);
+        tool(&reply, None, true);
+        let envelope = reply["result"]["structuredContent"].clone();
+        structured.push(json!({"name":"trellis_references","structuredContent":envelope}));
+        envelope
+    };
+    let file = ask(1, json!({"schemaVersion":1}));
+    let basis = file["evidenceBasis"].clone();
+    let descriptors = |data: &Value| data["externalPackages"].as_array().unwrap().clone();
+    // Page through the file answer for its whole descriptor list.
+    let mut all = descriptors(&file["data"]);
+    let mut next = file["data"]["page"]["nextOffset"].clone();
+    let mut id = 2;
+    while let Some(offset) = next.as_u64() {
+        let page = ask(
+            id,
+            json!({"schemaVersion":1,"expectedBasis":basis,"offset":offset}),
+        );
+        all.extend(descriptors(&page["data"]));
+        next = page["data"]["page"]["nextOffset"].clone();
+        id += 1;
+    }
+    assert_eq!(all.len(), CRATES, "every crate is an emitted destination");
+
+    let first = ask(
+        id,
+        json!({"schemaVersion":1,"expectedBasis":basis,"groupBy":"package"}),
+    );
+    let data = &first["data"];
+    assert_eq!(data["groupBy"], "package");
+    let groups = data["groups"].as_array().unwrap();
+    assert_eq!(
+        groups.first(),
+        Some(&json!({"source":"Cargo.toml","target":"Cargo.toml",
+            "sites":CRATES + 8,"production":CRATES + 8,"test":0})),
+        "the in-checkout app row leads the first page"
+    );
+    // A page lists exactly the descriptors of its own rows' external targets.
+    let targets = |data: &Value| -> Vec<Value> {
+        let mut targets: Vec<Value> = data["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["target"].clone())
+            .filter(Value::is_object)
+            .collect();
+        targets.sort_by_key(Value::to_string);
+        targets.dedup();
+        targets
+    };
+    let identities = |data: &Value| -> Vec<Value> {
+        let mut identities: Vec<Value> = descriptors(data)
+            .iter()
+            .map(|package| package["identity"].clone())
+            .collect();
+        identities.sort_by_key(Value::to_string);
+        identities
+    };
+    assert_eq!(identities(data), targets(data));
+    assert_eq!(
+        data["page"]["total"],
+        CRATES + 1,
+        "the sequence is the rows"
+    );
+
+    // Every page, with and without a row limit: rows concatenate to the whole sequence and
+    // each crate's descriptor appears beside its row, no more than `limit` on a page.
+    for limit in [None, Some(5)] {
+        let mut offset = 0u64;
+        let (mut rows, mut listed) = (Vec::new(), Vec::new());
+        loop {
+            id += 1;
+            let mut arguments = json!({"schemaVersion":1,"expectedBasis":basis,"groupBy":"package","offset":offset});
+            if let Some(limit) = limit {
+                arguments["limit"] = json!(limit);
+            }
+            let page = ask(id, arguments);
+            let data = &page["data"];
+            assert_eq!(identities(data), targets(data));
+            if let Some(limit) = limit {
+                assert!(descriptors(data).len() <= limit);
+                assert!(data["groups"].as_array().unwrap().len() <= limit);
+            }
+            rows.extend(data["groups"].as_array().unwrap().iter().cloned());
+            listed.extend(descriptors(data));
+            match data["page"]["nextOffset"].as_u64() {
+                Some(next) => offset = next,
+                None => break,
+            }
+        }
+        assert_eq!(rows.len(), CRATES + 1, "{limit:?}");
+        let key = |packages: &mut Vec<Value>| {
+            packages.sort_by_key(Value::to_string);
+        };
+        key(&mut listed);
+        key(&mut all);
+        assert_eq!(listed, all, "{limit:?}: every descriptor, unchanged, once");
+    }
+    drop(ask);
+    validate_structured_content(&structured);
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
 /// #837 (Prime2 review of #861): `package` rejects the rules exactly when an unfiltered
 /// `trellis_rules_check` does. An ambiguity only in a file that the read's `prefix` or
 /// `paths` excludes, which nothing references, still fails `package` as `invalid_rules`.

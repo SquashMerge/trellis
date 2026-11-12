@@ -760,6 +760,9 @@ struct DescribedSnapshot {
 pub const CALL_DEADLINE: std::time::Duration = std::time::Duration::from_millis(5000);
 /// An architecture read stops waiting for the owner this long before its deadline.
 const ARCHITECTURE_ANSWER_TIME: std::time::Duration = std::time::Duration::from_secs(1);
+/// A read held out by a spilled publication stops waiting for its COMMIT this long before
+/// the call's deadline, and answers `rebuild_in_progress` (#905).
+const SPILL_ANSWER_TIME: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Outgoing and incoming calls emit this many items unless `limit` says otherwise (#528):
 /// six semantic bindings with their proofs measured about 23.5 KB on this repository's
@@ -2984,13 +2987,22 @@ fn coordinate(
                         #[cfg(feature = "test-support")]
                         let worker_done = workspace.hooks.worker_done.clone();
                         let scope = crate::testing::inherit_scope();
+                        // A read held out by a spilled publication answers typed
+                        // `rebuild_in_progress` before the call's deadline (#905).
+                        let answer_by = workspace.helper_deadline(deadline);
+                        let answer_by = answer_by
+                            .checked_sub(SPILL_ANSWER_TIME)
+                            .unwrap_or(answer_by);
                         let spawned =
                             std::thread::Builder::new()
                                 .name("mcp-call".into())
                                 .spawn(move || {
                                     let _scope = crate::testing::enter_scope(scope);
                                     let _permit = permit;
-                                    let outcome = run_call(context);
+                                    let outcome =
+                                        crate::store::with_spill_answer_by(answer_by, || {
+                                            run_call(context)
+                                        });
                                     let _ = done.send(Input::Done(token, outcome));
                                     #[cfg(feature = "test-support")]
                                     if let Some(hook) = worker_done {
