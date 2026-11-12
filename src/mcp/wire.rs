@@ -74,10 +74,32 @@ pub fn write_relayed_capped(
     response: &Value,
     cap: usize,
 ) -> io::Result<()> {
+    // Encoded and checked before any byte is written, so a response over the cap leaves
+    // the stream at a frame boundary and the caller can answer it otherwise (#930).
+    let encoded = encode_capped(response, cap)?;
     if let Some(relay) = relay {
         write!(writer, "{relay} ")?;
     }
-    write_capped(writer, response, cap)
+    writer.write_all(&encoded)?;
+    writer.flush()
+}
+
+/// A response whose complete line exceeds its cap. Nothing of it was written.
+#[derive(Debug)]
+pub struct ResponseTooLarge;
+impl std::fmt::Display for ResponseTooLarge {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("response too large")
+    }
+}
+impl std::error::Error for ResponseTooLarge {}
+
+/// Whether a write failed only because the response exceeded its cap (#930): the
+/// stream is intact, unlike after an I/O error.
+pub fn is_too_large(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<ResponseTooLarge>())
 }
 
 fn read_capped_frame(reader: &mut impl BufRead, cap: usize) -> io::Result<Frame> {
@@ -286,15 +308,20 @@ pub fn write_response(writer: &mut impl Write, response: &Value) -> io::Result<(
     write_capped(writer, response, RESPONSE_BYTES)
 }
 fn write_capped(writer: &mut impl Write, response: &Value, cap: usize) -> io::Result<()> {
+    let encoded = encode_capped(response, cap)?;
+    writer.write_all(&encoded)?;
+    writer.flush()
+}
+/// The response line with its LF, or [`ResponseTooLarge`] when it exceeds `cap`.
+fn encode_capped(response: &Value, cap: usize) -> io::Result<Vec<u8>> {
     let phase = crate::search_model::SearchPhaseTimer::start("wire_serialization");
     let mut encoded = serde_json::to_vec(response).map_err(io::Error::other)?;
     drop(phase);
     if encoded.len() + 1 > cap {
-        return Err(io::Error::other("response too large"));
+        return Err(io::Error::other(ResponseTooLarge));
     }
     encoded.push(b'\n');
-    writer.write_all(&encoded)?;
-    writer.flush()
+    Ok(encoded)
 }
 #[cfg(test)]
 mod tests {
@@ -307,6 +334,9 @@ mod tests {
         let mut out = Vec::new();
         assert!(write_response(&mut out, &over).is_err());
         assert!(write_relayed_response(&mut out, None, &over).is_err());
+        // #930: typed, and a relayed frame writes not even its prefix.
+        let error = write_relayed_response(&mut out, Some(7), &over).unwrap_err();
+        assert!(is_too_large(&error), "{error}");
         assert!(out.is_empty());
         write_relayed_capped(&mut out, Some(7), &over, CATALOG_BYTES).unwrap();
         assert_eq!(out.len(), "7 ".len() + RESPONSE_BYTES + 1);

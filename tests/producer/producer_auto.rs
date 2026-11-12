@@ -964,9 +964,11 @@ fn running_auto_run_labels_language_catching_up_and_nothing_else() {
     // Evidence, coverage and freshness come from the committed revision.
     assert_eq!(described, off_described);
     assert_eq!(row, off_row);
-    for document in described["documents"].as_array().unwrap() {
-        assert_ne!(document["projection"]["semanticStatus"], "needsReimport");
-    }
+    // #930: the row counts its documents by status; a scheduled run labels none needsReimport.
+    assert_eq!(
+        described["documentStatus"]["needsReimport"], 0,
+        "{described}"
+    );
     // The stub sleeps until it is stopped: end the run so no stub outlives the test.
     let run_id = world.active_run()["runId"].as_str().unwrap().to_owned();
     let output = world.producer("cancel", &["--run", &run_id]);

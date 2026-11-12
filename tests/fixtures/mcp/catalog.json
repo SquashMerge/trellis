@@ -107,6 +107,7 @@
                     "checkout_capacity",
                     "daemon_unavailable",
                     "outcome_unknown",
+                    "response_too_large",
                     "workspace_selection_failed"
                   ]
                 },
@@ -358,11 +359,25 @@
                     }
                   ]
                 },
-                "documents": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/$defs/DocumentSemanticStatus"
-                  }
+                "documentStatus": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "olderBasis": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "catchingUp": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "needsReimport": {
+                      "$ref": "#/$defs/UInt"
+                    }
+                  },
+                  "required": [
+                    "olderBasis",
+                    "catchingUp",
+                    "needsReimport"
+                  ],
+                  "type": "object"
                 }
               },
               "required": [
@@ -373,7 +388,7 @@
                 "note",
                 "partialReasons",
                 "reimport",
-                "documents"
+                "documentStatus"
               ],
               "type": "object"
             }
@@ -607,59 +622,6 @@
             "environment"
           ]
         },
-        "SemanticProjection": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "currentPin": {
-              "$ref": "#/$defs/Basis"
-            },
-            "semanticBasisPin": {
-              "$ref": "#/$defs/Basis"
-            },
-            "basisNativeRevisionId": {
-              "$ref": "#/$defs/Text"
-            },
-            "semanticStatus": {
-              "enum": [
-                "olderBasis",
-                "catchingUp",
-                "needsReimport"
-              ]
-            }
-          },
-          "required": [
-            "currentPin",
-            "semanticBasisPin",
-            "basisNativeRevisionId",
-            "semanticStatus"
-          ]
-        },
-        "DocumentSemanticStatus": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "producerId": {
-              "$ref": "#/$defs/Text"
-            },
-            "language": {
-              "$ref": "#/$defs/Language"
-            },
-            "path": {
-              "type": "string",
-              "minLength": 1
-            },
-            "projection": {
-              "$ref": "#/$defs/SemanticProjection"
-            }
-          },
-          "required": [
-            "producerId",
-            "language",
-            "path",
-            "projection"
-          ]
-        },
         "CoverageCounts": {
           "additionalProperties": false,
           "properties": {
@@ -760,7 +722,7 @@
                   "const": 1
                 },
                 "toolVersion": {
-                  "const": 28
+                  "const": 29
                 },
                 "watcherDegraded": {
                   "type": "boolean"
@@ -1294,6 +1256,7 @@
                     "outcome_unknown",
                     "invalid_rules",
                     "bounded_work",
+                    "response_too_large",
                     "workspace_selection_failed"
                   ]
                 },
@@ -1802,11 +1765,25 @@
                     }
                   ]
                 },
-                "documents": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/$defs/DocumentSemanticStatus"
-                  }
+                "documentStatus": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "olderBasis": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "catchingUp": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "needsReimport": {
+                      "$ref": "#/$defs/UInt"
+                    }
+                  },
+                  "required": [
+                    "olderBasis",
+                    "catchingUp",
+                    "needsReimport"
+                  ],
+                  "type": "object"
                 }
               },
               "required": [
@@ -1816,7 +1793,7 @@
                 "coverage",
                 "note",
                 "reimport",
-                "documents"
+                "documentStatus"
               ],
               "type": "object"
             }
@@ -1870,59 +1847,6 @@
               "minimum": -9007199254740991,
               "type": "integer"
             }
-          ]
-        },
-        "SemanticProjection": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "currentPin": {
-              "$ref": "#/$defs/Basis"
-            },
-            "semanticBasisPin": {
-              "$ref": "#/$defs/Basis"
-            },
-            "basisNativeRevisionId": {
-              "$ref": "#/$defs/Text"
-            },
-            "semanticStatus": {
-              "enum": [
-                "olderBasis",
-                "catchingUp",
-                "needsReimport"
-              ]
-            }
-          },
-          "required": [
-            "currentPin",
-            "semanticBasisPin",
-            "basisNativeRevisionId",
-            "semanticStatus"
-          ]
-        },
-        "DocumentSemanticStatus": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "producerId": {
-              "$ref": "#/$defs/Text"
-            },
-            "language": {
-              "$ref": "#/$defs/Language"
-            },
-            "path": {
-              "type": "string",
-              "minLength": 1
-            },
-            "projection": {
-              "$ref": "#/$defs/SemanticProjection"
-            }
-          },
-          "required": [
-            "producerId",
-            "language",
-            "path",
-            "projection"
           ]
         },
         "CompactSymbol": {
@@ -2406,6 +2330,7 @@
                     "outcome_unknown",
                     "invalid_rules",
                     "bounded_work",
+                    "response_too_large",
                     "workspace_selection_failed"
                   ]
                 },
@@ -2827,11 +2752,25 @@
                     }
                   ]
                 },
-                "documents": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/$defs/DocumentSemanticStatus"
-                  }
+                "documentStatus": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "olderBasis": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "catchingUp": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "needsReimport": {
+                      "$ref": "#/$defs/UInt"
+                    }
+                  },
+                  "required": [
+                    "olderBasis",
+                    "catchingUp",
+                    "needsReimport"
+                  ],
+                  "type": "object"
                 }
               },
               "required": [
@@ -2841,7 +2780,7 @@
                 "coverage",
                 "note",
                 "reimport",
-                "documents"
+                "documentStatus"
               ],
               "type": "object"
             }
@@ -3085,59 +3024,6 @@
             "embedded",
             "lexical",
             "unavailableReason"
-          ]
-        },
-        "SemanticProjection": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "currentPin": {
-              "$ref": "#/$defs/Basis"
-            },
-            "semanticBasisPin": {
-              "$ref": "#/$defs/Basis"
-            },
-            "basisNativeRevisionId": {
-              "$ref": "#/$defs/Text"
-            },
-            "semanticStatus": {
-              "enum": [
-                "olderBasis",
-                "catchingUp",
-                "needsReimport"
-              ]
-            }
-          },
-          "required": [
-            "currentPin",
-            "semanticBasisPin",
-            "basisNativeRevisionId",
-            "semanticStatus"
-          ]
-        },
-        "DocumentSemanticStatus": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "producerId": {
-              "$ref": "#/$defs/Text"
-            },
-            "language": {
-              "$ref": "#/$defs/Language"
-            },
-            "path": {
-              "type": "string",
-              "minLength": 1
-            },
-            "projection": {
-              "$ref": "#/$defs/SemanticProjection"
-            }
-          },
-          "required": [
-            "producerId",
-            "language",
-            "path",
-            "projection"
           ]
         },
         "CompactSearchHit": {
@@ -3751,6 +3637,7 @@
                     "checkout_capacity",
                     "daemon_unavailable",
                     "outcome_unknown",
+                    "response_too_large",
                     "workspace_selection_failed"
                   ]
                 },
@@ -4409,11 +4296,25 @@
                     }
                   ]
                 },
-                "documents": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/$defs/DocumentSemanticStatus"
-                  }
+                "documentStatus": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "olderBasis": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "catchingUp": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "needsReimport": {
+                      "$ref": "#/$defs/UInt"
+                    }
+                  },
+                  "required": [
+                    "olderBasis",
+                    "catchingUp",
+                    "needsReimport"
+                  ],
+                  "type": "object"
                 }
               },
               "required": [
@@ -4423,7 +4324,7 @@
                 "coverage",
                 "note",
                 "reimport",
-                "documents"
+                "documentStatus"
               ],
               "type": "object"
             }
@@ -4435,59 +4336,6 @@
             "semantic"
           ],
           "type": "object"
-        },
-        "SemanticProjection": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "currentPin": {
-              "$ref": "#/$defs/Basis"
-            },
-            "semanticBasisPin": {
-              "$ref": "#/$defs/Basis"
-            },
-            "basisNativeRevisionId": {
-              "$ref": "#/$defs/Text"
-            },
-            "semanticStatus": {
-              "enum": [
-                "olderBasis",
-                "catchingUp",
-                "needsReimport"
-              ]
-            }
-          },
-          "required": [
-            "currentPin",
-            "semanticBasisPin",
-            "basisNativeRevisionId",
-            "semanticStatus"
-          ]
-        },
-        "DocumentSemanticStatus": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "producerId": {
-              "$ref": "#/$defs/Text"
-            },
-            "language": {
-              "$ref": "#/$defs/Language"
-            },
-            "path": {
-              "type": "string",
-              "minLength": 1
-            },
-            "projection": {
-              "$ref": "#/$defs/SemanticProjection"
-            }
-          },
-          "required": [
-            "producerId",
-            "language",
-            "path",
-            "projection"
-          ]
         },
         "CoverageCounts": {
           "additionalProperties": false,
@@ -5316,6 +5164,7 @@
                     "checkout_capacity",
                     "daemon_unavailable",
                     "outcome_unknown",
+                    "response_too_large",
                     "workspace_selection_failed"
                   ]
                 },
@@ -6073,11 +5922,25 @@
                     }
                   ]
                 },
-                "documents": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/$defs/DocumentSemanticStatus"
-                  }
+                "documentStatus": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "olderBasis": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "catchingUp": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "needsReimport": {
+                      "$ref": "#/$defs/UInt"
+                    }
+                  },
+                  "required": [
+                    "olderBasis",
+                    "catchingUp",
+                    "needsReimport"
+                  ],
+                  "type": "object"
                 }
               },
               "required": [
@@ -6087,7 +5950,7 @@
                 "coverage",
                 "note",
                 "reimport",
-                "documents"
+                "documentStatus"
               ],
               "type": "object"
             }
@@ -6889,6 +6752,7 @@
                     "checkout_capacity",
                     "daemon_unavailable",
                     "outcome_unknown",
+                    "response_too_large",
                     "workspace_selection_failed"
                   ]
                 },
@@ -7481,11 +7345,25 @@
                     }
                   ]
                 },
-                "documents": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/$defs/DocumentSemanticStatus"
-                  }
+                "documentStatus": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "olderBasis": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "catchingUp": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "needsReimport": {
+                      "$ref": "#/$defs/UInt"
+                    }
+                  },
+                  "required": [
+                    "olderBasis",
+                    "catchingUp",
+                    "needsReimport"
+                  ],
+                  "type": "object"
                 }
               },
               "required": [
@@ -7495,7 +7373,7 @@
                 "coverage",
                 "note",
                 "reimport",
-                "documents"
+                "documentStatus"
               ],
               "type": "object"
             }
@@ -8600,6 +8478,7 @@
                     "checkout_capacity",
                     "daemon_unavailable",
                     "outcome_unknown",
+                    "response_too_large",
                     "workspace_selection_failed"
                   ]
                 },
@@ -9655,6 +9534,7 @@
                     "outcome_unknown",
                     "invalid_rules",
                     "bounded_work",
+                    "response_too_large",
                     "workspace_selection_failed"
                   ]
                 },
@@ -10527,11 +10407,25 @@
                     }
                   ]
                 },
-                "documents": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/$defs/DocumentSemanticStatus"
-                  }
+                "documentStatus": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "olderBasis": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "catchingUp": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "needsReimport": {
+                      "$ref": "#/$defs/UInt"
+                    }
+                  },
+                  "required": [
+                    "olderBasis",
+                    "catchingUp",
+                    "needsReimport"
+                  ],
+                  "type": "object"
                 }
               },
               "required": [
@@ -10541,7 +10435,7 @@
                 "coverage",
                 "note",
                 "reimport",
-                "documents"
+                "documentStatus"
               ],
               "type": "object"
             }
@@ -18426,6 +18320,7 @@
                     "checkout_capacity",
                     "daemon_unavailable",
                     "outcome_unknown",
+                    "response_too_large",
                     "workspace_selection_failed"
                   ]
                 },
