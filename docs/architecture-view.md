@@ -489,13 +489,17 @@ with an evidence gap are skipped. Work is bounded; over the bound the read fails
   `.put`, `.delete`, `.patch` and `.head` (the method of the name); and
   `c.request(Method::M, url)` (method unreadable unless `Method::M` or a path ending in
   `Method::M`). The receiver `c` must be a `reqwest` client by its type or constructor, never by its
-  name (#910): a `Client::new()` or `Client::builder()` chain (through method calls, `?` and
-  `.await`); a field whose every declaration in the document has the client type; or a name
-  whose last binding before the call in its function is a parameter or `let` with the client
-  type, or a `let` of such a receiver or its `.clone()`. The client type is
-  `reqwest::Client`, `reqwest::blocking::Client`, or a name a `use reqwest::..` gives it
-  (`Client`, or the alias of `Client as Http`), seen through `&`. Block scopes are not
-  modelled, and a field declared in another document is not read. The URL, looked through
+  name (#910): `Client::new()`, or `Client::builder()`, builder methods, `.build()` and then `?`,
+  `.unwrap()` or `.expect(..)`, each optionally followed by `.clone()` (any other method may
+  change the type); a field whose every declaration in the document has the client type; or
+  a name whose binding in scope at the call, in its function, is a parameter or `let` with
+  the client type, or a `let` of such a receiver or its `.clone()`. A `let` is in scope from
+  its end to the end of its block, so its initializer reads the previous binding; any other
+  pattern (`for`, `match`, `if let`, closure parameter, import) hides the name over its whole
+  construct. The client type is `reqwest::Client`, `reqwest::blocking::Client`, or a name a
+  `use reqwest::..` gives it (`Client`, or the alias of `Client as Http`) where that import is
+  in scope: in the block or module that holds it, not in an inline `mod` nested there. It is
+  seen through `&`. A field declared in another document is not read. The URL, looked through
   `&`, is a string literal without escapes, a visible constant, or a `format!` whose
   substitutions are read where they are a string literal or a visible constant with no
   format specification (`{x}`, `{}`, `{0}`), and are `{}` otherwise: a fill, width,

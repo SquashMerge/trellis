@@ -55,7 +55,8 @@ fn collect(
     let mut document = Document {
         source: &doc.file.text,
         constants: BTreeMap::new(),
-        clients: BTreeSet::new(),
+        clients: Vec::new(),
+        modules: Vec::new(),
         fields: BTreeSet::new(),
         bindings: BTreeMap::new(),
     };
@@ -121,6 +122,7 @@ fn collect(
         }
         Ok(false)
     })?;
+    document.modules = modules.clone();
     for import in imports {
         document.import(import);
     }
@@ -193,8 +195,11 @@ struct Document<'a> {
     source: &'a str,
     /// Same-document `const` and `static` strings, each name declared once.
     constants: BTreeMap<String, String>,
-    /// The names a `use reqwest::..` declaration gives the `reqwest` client type.
-    clients: BTreeSet<&'a str>,
+    /// The names a `use reqwest::..` declaration gives the `reqwest` client type, each with
+    /// the byte range of the scope that holds the declaration.
+    clients: Vec<(std::ops::Range<usize>, &'a str)>,
+    /// The byte ranges of the inline modules, which do not see their parent's imports.
+    modules: Vec<std::ops::Range<usize>>,
     /// The struct field names of this document declared only with a `reqwest` client type.
     fields: BTreeSet<&'a str>,
     /// Every pattern that binds each name: a parameter, `let`, closure parameter, `match`,
@@ -270,9 +275,12 @@ impl<'a> Document<'a> {
     }
 
     /// Records the names a `use reqwest::..` declaration gives the client type: `Client`,
-    /// or the alias of `Client as Http`.
+    /// or the alias of `Client as Http`, within the scope that holds the declaration.
     fn import(&mut self, declaration: Node<'a>) {
-        let Some(argument) = declaration.child_by_field_name("argument") else {
+        let (Some(argument), Some(scope)) = (
+            declaration.child_by_field_name("argument"),
+            declaration.parent().map(|parent| parent.byte_range()),
+        ) else {
             return;
         };
         let path: String = self.text(argument).split_whitespace().collect();
@@ -287,11 +295,11 @@ impl<'a> Document<'a> {
                     if original.is_some_and(|p| p == "Client" || p.ends_with("::Client"))
                         && let Some(alias) = node.child_by_field_name("alias")
                     {
-                        self.clients.insert(self.text(alias));
+                        self.clients.push((scope.clone(), self.text(alias)));
                     }
                 }
                 "identifier" if self.text(node) == "Client" => {
-                    self.clients.insert("Client");
+                    self.clients.push((scope.clone(), "Client"));
                 }
                 _ => stack.extend(Self::named_children(node)),
             }
@@ -299,7 +307,9 @@ impl<'a> Document<'a> {
     }
 
     /// Whether a written type is the `reqwest` client, seen through references:
-    /// `reqwest::Client`, `reqwest::blocking::Client`, or a name imported for it.
+    /// `reqwest::Client`, `reqwest::blocking::Client`, or a name imported for it where that
+    /// import is in scope: inside the scope of its declaration, and not inside an inline
+    /// module nested there, since a module does not see its parent's imports (#921 review).
     fn client_type(&self, ty: Node<'_>) -> bool {
         let mut ty = ty;
         while ty.kind() == "reference_type" {
@@ -310,8 +320,16 @@ impl<'a> Document<'a> {
         }
         let text: String = self.text(ty).split_whitespace().collect();
         let text = text.trim_start_matches("::");
+        let at = ty.byte_range();
         matches!(text, "reqwest::Client" | "reqwest::blocking::Client")
-            || self.clients.contains(text)
+            || self.clients.iter().any(|(scope, name)| {
+                *name == text
+                    && within(&at, scope)
+                    && !self
+                        .modules
+                        .iter()
+                        .any(|module| within(module, scope) && within(&at, module))
+            })
     }
 
     /// Whether a receiver is a `reqwest` client (#910): a `Client::new()` or
@@ -336,8 +354,10 @@ impl<'a> Document<'a> {
     }
 
     /// Whether the binding a name has at its use is a `reqwest` client. The binding is the
-    /// last pattern of the name in the enclosing function that ends before the use; block
-    /// scopes are not modelled.
+    /// last pattern of the name in the enclosing function whose scope holds the use: a
+    /// `let` from its end to the end of its block (never its own initializer), a parameter
+    /// in its function or closure, and any other pattern conservatively over its whole
+    /// construct (#921 review). Only a parameter or `let` can be a client.
     fn bound_client(&self, name: Node<'a>, follow: usize) -> bool {
         let mut function = name.parent();
         while let Some(node) = function {
@@ -349,14 +369,16 @@ impl<'a> Document<'a> {
         let Some(function) = function else {
             return false;
         };
+        let at = name.byte_range();
         let Some(pattern) = self
             .bindings
             .get(self.text(name))
             .into_iter()
             .flatten()
+            .filter(|pattern| function.start_byte() <= pattern.start_byte())
             .filter(|pattern| {
-                function.start_byte() <= pattern.start_byte()
-                    && pattern.end_byte() <= name.start_byte()
+                Self::scope(**pattern)
+                    .is_some_and(|(scope, from)| from <= at.start && within(&at, &scope))
             })
             .max_by_key(|pattern| pattern.start_byte())
         else {
@@ -380,6 +402,40 @@ impl<'a> Document<'a> {
         }
     }
 
+    /// Where a binding pattern's names are in scope: the range that holds them, and the byte
+    /// from which they are visible.
+    fn scope(pattern: Node<'_>) -> Option<(std::ops::Range<usize>, usize)> {
+        let parent = pattern.parent()?;
+        let ancestor = |kinds: &[&str]| {
+            let mut node = pattern.parent();
+            while let Some(current) = node {
+                if kinds.contains(&current.kind()) {
+                    return Some(current);
+                }
+                node = current.parent();
+            }
+            None
+        };
+        match (pattern.kind(), parent.kind()) {
+            ("use_declaration", _) => Some((parent.byte_range(), pattern.end_byte())),
+            ("closure_parameters", _) => Some((parent.byte_range(), pattern.end_byte())),
+            (_, "let_declaration") => Some((parent.parent()?.byte_range(), parent.end_byte())),
+            (_, "parameter") => {
+                let owner = ancestor(&["function_item", "closure_expression"])?;
+                Some((owner.byte_range(), pattern.end_byte()))
+            }
+            (_, "for_expression") => {
+                let body = parent.child_by_field_name("body")?;
+                Some((body.byte_range(), body.start_byte()))
+            }
+            (_, "let_condition") => {
+                let owner = ancestor(&["if_expression", "while_expression"])?;
+                Some((owner.byte_range(), pattern.end_byte()))
+            }
+            _ => Some((parent.byte_range(), pattern.end_byte())),
+        }
+    }
+
     /// The receiver of a `.clone()` call.
     fn cloned(&self, value: Node<'a>) -> Option<Node<'a>> {
         let function = value
@@ -391,22 +447,31 @@ impl<'a> Document<'a> {
             .flatten()
     }
 
-    /// Whether an expression is a chain that starts at `Client::new()` or
-    /// `Client::builder()` for the `reqwest` client type, through method calls, `?` and
-    /// `.await`.
+    /// Whether an expression yields a `reqwest` client by construction (#921 review):
+    /// `Client::new()`, or `Client::builder()`, any builder methods, `.build()` and then `?`,
+    /// `.unwrap()` or `.expect(..)`; each optionally followed by `.clone()`. Any other method
+    /// may change the type, so the chain is then not a client.
     fn constructed(&self, expression: Node<'a>) -> bool {
+        // The steps from the receiver back to the constructor.
+        let mut steps = Vec::new();
         let mut node = expression;
-        loop {
+        let root = loop {
             match node.kind() {
                 "call_expression" => {
                     let Some(function) = node.child_by_field_name("function") else {
                         return false;
                     };
                     match function.kind() {
-                        "field_expression" => match function.child_by_field_name("value") {
-                            Some(value) => node = value,
-                            None => return false,
-                        },
+                        "field_expression" => {
+                            let (Some(field), Some(value)) = (
+                                function.child_by_field_name("field"),
+                                function.child_by_field_name("value"),
+                            ) else {
+                                return false;
+                            };
+                            steps.push(self.text(field));
+                            node = value;
+                        }
                         "scoped_identifier" => {
                             let (Some(path), Some(name)) = (
                                 function.child_by_field_name("path"),
@@ -414,21 +479,49 @@ impl<'a> Document<'a> {
                             ) else {
                                 return false;
                             };
-                            return matches!(self.text(name), "new" | "builder")
-                                && self.client_type(path);
+                            if !self.client_type(path) {
+                                return false;
+                            }
+                            break self.text(name);
                         }
                         _ => return false,
                     }
                 }
-                "try_expression" | "await_expression" | "parenthesized_expression" => {
+                "try_expression" => {
+                    steps.push("?");
                     match node.named_child(0) {
                         Some(inner) => node = inner,
                         None => return false,
                     }
                 }
+                "parenthesized_expression" => match node.named_child(0) {
+                    Some(inner) => node = inner,
+                    None => return false,
+                },
                 _ => return false,
             }
+        };
+        #[derive(PartialEq)]
+        enum Made {
+            Client,
+            Builder,
+            Built,
         }
+        let mut made = match root {
+            "new" => Made::Client,
+            "builder" => Made::Builder,
+            _ => return false,
+        };
+        for step in steps.into_iter().rev() {
+            made = match (made, step) {
+                (Made::Builder, "build") => Made::Built,
+                (Made::Builder, step) if step != "?" => Made::Builder,
+                (Made::Built, "?" | "unwrap" | "expect") => Made::Client,
+                (Made::Client, "clone") => Made::Client,
+                _ => return false,
+            };
+        }
+        made == Made::Client
     }
 
     /// A string constant declared once at the top of the document, when the call is outside
@@ -579,6 +672,11 @@ impl<'a> Document<'a> {
             _ => None,
         }
     }
+}
+
+/// Whether one byte range lies inside another.
+fn within(inner: &std::ops::Range<usize>, outer: &std::ops::Range<usize>) -> bool {
+    outer.start <= inner.start && inner.end <= outer.end
 }
 
 /// The path of an absolute URL or a rooted path, cut at `?` or `#`, with `{}` for each

@@ -1263,6 +1263,83 @@ fn untyped() { client.get("/health"); }
         assert_eq!(reqwest_paths(lookalikes), Vec::<String>::new());
     }
 
+    /// #921 review: a binding counts only where it is in scope. An expired inner client
+    /// does not type an outer map, and a `for` pattern hides the name in its body.
+    #[test]
+    fn a_binding_counts_only_where_it_is_in_scope() {
+        let expired = r#"
+fn f() {
+    let cache = std::collections::HashMap::<&str, u8>::new();
+    { let cache = reqwest::Client::new(); }
+    cache.get("/health");
+}
+"#;
+        assert_eq!(reqwest_paths(expired), Vec::<String>::new());
+        let inner = r#"
+use reqwest::Client;
+fn f(c: Client, m: HashMap<&str, u8>) {
+    { let m = c.clone(); m.get("/inner"); }
+    m.get("/outer");
+    for c in [1] { c.get("/loop"); }
+    c.get("/after");
+}
+"#;
+        assert_eq!(reqwest_paths(inner), ["GET /inner", "GET /after"]);
+    }
+
+    /// #921 review: a `let` initializer reads the binding before the `let`.
+    #[test]
+    fn a_let_initializer_reads_the_previous_binding() {
+        let same_name = r#"use reqwest::Client; fn f(c: Client) { let c = c.clone(); c.get("/same-name-clone"); }"#;
+        assert_eq!(reqwest_paths(same_name), ["GET /same-name-clone"]);
+    }
+
+    /// #921 review: an import types a name only where it is in scope. A module's
+    /// `use reqwest::Client` does not reach an unrelated root `Client`, and a root import
+    /// does not reach an inline module.
+    #[test]
+    fn a_reqwest_import_types_a_name_only_where_it_is_in_scope() {
+        let nested = r#"
+mod net { use reqwest::Client; }
+struct Client;
+impl Client { fn get(&self, _: &str) {} }
+fn f(c: Client) { c.get("/health"); }
+"#;
+        assert_eq!(reqwest_paths(nested), Vec::<String>::new());
+        let root = r#"
+use reqwest::Client;
+fn f(c: Client) { c.get("/root"); }
+mod other { struct Client; fn g(c: Client) { c.get("/other"); } }
+mod net { use reqwest::Client; fn h(c: &Client) { c.get("/net"); } }
+"#;
+        assert_eq!(reqwest_paths(root), ["GET /root", "GET /net"]);
+    }
+
+    /// #921 review: a chain is a client only while every step keeps the client type. A
+    /// request's headers are not a client, nor is another type's `new()`.
+    #[test]
+    fn only_a_chain_that_yields_a_reqwest_client_is_a_client() {
+        let headers = r#"
+use reqwest::Client;
+fn f() {
+    let headers = Client::new().get("http://h/real").build().unwrap().headers().clone();
+    headers.get("/fake");
+}
+"#;
+        assert_eq!(reqwest_paths(headers), ["GET /real"]);
+        let others = r#"
+use reqwest::Client;
+fn f() {
+    HeaderMap::new().get("/header-map");
+    Client::builder().get("/builder");
+    Client::builder().build().get("/result");
+    Client::new().clone().get("/cloned");
+    Client::builder().https_only(true).build().expect("client").get("/expected");
+}
+"#;
+        assert_eq!(reqwest_paths(others), ["GET /cloned", "GET /expected"]);
+    }
+
     /// #910 positive controls: the client types and constructors still count.
     #[test]
     fn a_get_on_a_reqwest_client_by_type_or_constructor_is_a_client_call() {
