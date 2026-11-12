@@ -71,6 +71,7 @@ function observePinnedHead() {
           // A later response cannot erase a newer same-generation observation.
           if (!observation.head || head.indexGeneration !== observation.head.indexGeneration || head.indexRevision >= observation.head.indexRevision) observation.head = head;
           observation.failed = false;
+          if (IndexPin.equal(head, pin)) observeCatchingUp(data.catchingUp);
           observeViewRequest(data.viewRequest);
         } catch (error) {
           if (!current() || headObservation !== observation || error.name === "AbortError") return;
@@ -81,6 +82,17 @@ function observePinnedHead() {
       }
     } finally { observation.pending = false; }
   })();
+}
+// The head digest carries `catchingUp`. When the head is the revision this page shows and the
+// value no longer matches its status, status is read again, once per changed value, so a
+// finished re-run clears Catching up (#906).
+let catchingUpAsked = null;
+function observeCatchingUp(value) {
+  if (typeof value !== "boolean" || !status || value === (status.catchingUp === true)) { catchingUpAsked = null; return; }
+  const asked = `${epoch}:${selectedRootKey}:${IndexPin.key(status.revision)}:${value}`;
+  if (catchingUpAsked === asked) return;
+  catchingUpAsked = asked;
+  void refreshStatus().catch(() => {});
 }
 function currentHeadContext(value, session, root, workspace, pin) {
   return value.session === session && value.root === root && value.workspace === workspace && IndexPin.equal(value.pin, pin);
@@ -351,6 +363,46 @@ function observeViewRequest(value) {
   if (followPinned) return;
   return perform(() => showAgentView(request));
 }
+// Stall recovery (#906). A read that met a deadline, a failed connection or a busy daemon is
+// not left failed or loading: the page runs the menu's Refresh (fresh status, then the visible
+// view) after 2 s, doubling to at most 60 s while the daemon still does not answer. One attempt
+// runs at a time; a new checkout, session or Disconnect forgets it. A show that a stall stopped
+// is shown afterwards if it still owns the view.
+const TRANSIENT_CODES = new Set(["storage_busy", "deadline_exceeded", "bounded_work", "rebuild_in_progress"]);
+const PATH_FORBIDDEN = new Set(["source_forbidden", "symlink_forbidden", "directory_forbidden"]);
+const RECOVERY_FIRST_MS = 2000, RECOVERY_MAX_MS = 60000;
+let recovery = null, stalledShow = null, stallCount = 0;
+function noteStall() {
+  if (!token || !selectedRootKey) return;
+  stallCount++;
+  const scope = `${epoch}:${selectedRootKey}`;
+  if (recovery?.scope === scope) { recovery.again = true; return; }
+  clearRecovery();
+  recovery = {scope, delay:RECOVERY_FIRST_MS, timer:null, again:false};
+  recovery.timer = setTimeout(() => void recover(recovery), recovery.delay);
+}
+function clearRecovery() { if (recovery) clearTimeout(recovery.timer); recovery = null; stalledShow = null; }
+async function recover(attempt) {
+  attempt.timer = null;
+  if (recovery !== attempt || attempt.scope !== `${epoch}:${selectedRootKey}`) return;
+  // A user navigation, pin or newer show since the stopped show takes the view from it.
+  const claim = stalledShow && stalledShow.ticket === showSerial && !followPinned && stalledShow.marks === viewMarks() &&
+    navigationCurrent(stalledShow.context) ? stalledShow : null;
+  stalledShow = null; attempt.again = false;
+  await perform(refreshView);
+  if (recovery !== attempt) return;
+  // Refresh's own reads are not a user navigation, so the stopped show keeps its claim across them.
+  const pending = [stalledShow, claim].find(value => value && value.ticket === showSerial)?.request;
+  stalledShow = null;
+  if (attempt.again) {
+    if (pending) stalledShow = {request:pending, ticket:showSerial, marks:viewMarks(), context:navigationContext()};
+    attempt.delay = Math.min(attempt.delay * 2, RECOVERY_MAX_MS);
+    attempt.timer = setTimeout(() => void recover(attempt), attempt.delay);
+    return;
+  }
+  recovery = null;
+  if (pending && !followPinned && IndexPin.equal(pending.revision, status?.revision)) await perform(() => showAgentView(pending));
+}
 function agentLabel(request) {
   return request.view === "source" ? `${request.path}:${request.line}` : request.view === "class" ? "Class diagram" : "Sequence";
 }
@@ -358,15 +410,25 @@ function agentLabel(request) {
 // the user navigates (any navigation, diagram, section or source change), the view is pinned,
 // or the checkout, session or pin changes; a stale show changes nothing.
 let showSerial = 0;
+const viewMarks = () => `${navigationSerial}:${diagramSerial}:${sectionSerial}:${sourceSerial}`;
 async function showAgentView(request) {
   if (!token || !selectedRootKey || !status?.revision) return;
-  const pin = IndexPin.copy(status.revision), context = navigationContext(), ticket = ++showSerial;
-  const marks = () => `${navigationSerial}:${diagramSerial}:${sectionSerial}:${sourceSerial}`, started = marks();
-  const owned = () => ticket === showSerial && !followPinned && marks() === started && navigationCurrent(context);
+  const pin = IndexPin.copy(status.revision), context = navigationContext(), ticket = ++showSerial, started = viewMarks();
+  const owned = () => ticket === showSerial && !followPinned && viewMarks() === started && navigationCurrent(context);
+  const stalls = stallCount;
+  let applied = false;
+  try { applied = await applyAgentView(request, pin, context, ticket, owned); }
+  finally {
+    // A show that a stall stopped is shown after recovery, unless something else owns the view by then.
+    if (!applied && stallCount !== stalls && ticket === showSerial && !followPinned && navigationCurrent(context))
+      stalledShow = {request, ticket, marks:viewMarks(), context};
+  }
+}
+async function applyAgentView(request, pin, context, ticket, owned) {
   // The deep link's stale-pin rule: never show a target from another snapshot.
   if (!IndexPin.equal(request.revision, pin)) {
     showAgentNote(`The agent showed a ${agentLabel(request)} at index ${IndexPin.label(request.revision)}; this view is at ${IndexPin.label(pin)}.`, request, false);
-    return;
+    return true;
   }
   let title = agentLabel(request), pushed = true;
   if (request.view === "sequence") {
@@ -394,7 +456,8 @@ async function showAgentView(request) {
     pushed = !!entry && !!window.history?.pushState;
     if (entry) rememberNavigation(entry, false, "#source");
   }
-  if (ticket === showSerial && navigationCurrent(context)) showAgentNote(`Shown by agent · ${title}`, null, pushed && !!window.history?.pushState);
+  if (ticket === showSerial && navigationCurrent(context)) { showAgentNote(`Shown by agent · ${title}`, null, pushed && !!window.history?.pushState); return true; }
+  return false;
 }
 // The view visible now as a history entry, so agent Back returns to it rather than to a
 // sequence still held from an earlier visit (#824). Written only when the show publishes.
@@ -492,7 +555,7 @@ async function api(path, method = "GET", body, callerCurrent = () => true, condi
   const current = () => callerCurrent() && session === epoch && root === selectedRootKey && (!guarded || (operationCurrent() && sourceAtStart === sourceSerial));
   let response, data, timer;
   const controller = new AbortController(); pendingRequests.add(controller);
-  const timeoutError = new Error("Request timed out. No automatic retry was made. Refresh status before trying again.");
+  const timeoutError = new Error("Request timed out. Trellis retries once the daemon answers again.");
   timeoutError.name = "TimeoutError";
   const deadline = 15000;
   try {
@@ -507,7 +570,12 @@ async function api(path, method = "GET", body, callerCurrent = () => true, condi
       if (!current()) throw aborted();
       data = response.status === 204 ? null : response.status === 304 && conditional?.etag ? conditional.data : await response.json();
     })()]);
-  } catch (error) { if (!current()) throw aborted(); throw error; }
+  } catch (error) {
+    if (!current()) throw aborted();
+    // A deadline or a failed fetch (no response) is a stall, not an answer (#906).
+    if (error === timeoutError || (!response && error?.name === "TypeError")) { error.transient = true; noteStall(); }
+    throw error;
+  }
   finally { clearTimeout(timer); pendingRequests.delete(controller); }
   // Check before any HTTP error side effects, including invalidation on 409.
   if (!current()) throw aborted();
@@ -519,8 +587,12 @@ async function api(path, method = "GET", body, callerCurrent = () => true, condi
     error.reason = data?.error?.reason;
     if (error.code === "invalid_rules") error.diagnostic = data.error;
     error.workspaceRoot = response.headers?.get?.("X-Trellis-Workspace") || null;
-    if (error.status === 401 || error.status === 403) disconnect(`Authentication failed (${error.code || error.status}). Connect with a daemon token again.`);
+    // A typed refusal to read one path is not an authentication rejection, so it keeps the
+    // sign-in and the saved token (#906).
+    if (error.status === 401 || (error.status === 403 && !PATH_FORBIDDEN.has(error.code))) disconnect(`Authentication failed (${error.code || error.status}). Connect with a daemon token again.`);
     else if (root && error.code === "workspace_selection_failed") invalidateSelection("Checkout identity changed. Choose an available checkout again.");
+    error.transient = TRANSIENT_CODES.has(error.code) || (!error.code && [502, 503, 504].includes(error.status));
+    if (error.transient) noteStall();
     throw error;
   }
   if (conditional) {
@@ -734,7 +806,7 @@ function resetCheckout() {
   classSupport = null;
   for (const controller of pendingRequests) controller.abort();
   clearTimeout(pollTimer); pollTimer = null; statusSerial++;
-  clearTimeout(followTimer); followTimer = null; followSeen = null; hideAgentNote();
+  clearTimeout(followTimer); followTimer = null; followSeen = null; hideAgentNote(); clearRecovery();
   pairRefreshPending = false; pairRefreshQueued = null;
   clearDependencyCatalog(); clearExternalSources(); clearBrowse(); clearSource(); sourceCache.clear();
   status = null; statusUnavailable = false; jobUnavailable = false; indexNotReady = false; staleMessage = ""; job = null; waitingForJob = false;

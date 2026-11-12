@@ -98,6 +98,26 @@ clears revision-bound selections before rebinding; choose the file or method aga
 new head. Old symbol IDs and ranges are never carried across pins. Retired saved views
 and notes are not restored by this presentation behavior.
 
+## Recovery after a stall (#906)
+
+A browser read that hits the 15-second request timeout, fails to connect, or gets a typed
+transient answer (`storage_busy`, `deadline_exceeded`, `bounded_work`, `rebuild_in_progress`,
+or an untyped 502, 503 or 504) is a stall, not an answer. The page then runs the menu's
+**Refresh** by itself: fresh status first, then the visible view. It tries after 2 s and
+doubles the wait up to 60 s while the daemon still does not answer. One attempt runs at a time,
+and a new checkout, session or Disconnect forgets it. Other typed failures, such as
+`revision_conflict`, `not_found` or `corrupt`, keep their own handling and are not retried.
+An agent show (#818) that a stall stopped is shown after the refresh, unless a newer show, a
+user navigation or a pin has taken the view since.
+
+The follow poll's head digest carries `catchingUp`. When the head is the displayed revision and
+its value differs from the status on screen, the page reads status again once, so **Catching
+up** clears when a re-run ends without a manual refresh.
+
+A typed refusal to read one path (`source_forbidden`, `symlink_forbidden`,
+`directory_forbidden`) is an ordinary error. Only an authentication rejection (401, or another
+403) disconnects and forgets a saved token ([browser token](browser-token.md)).
+
 ## Metric tree and inspector
 
 Use [`metrics:v1`](metrics.md), explicitly scoped to **production callables** by default. The

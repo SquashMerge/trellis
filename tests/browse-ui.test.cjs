@@ -2159,3 +2159,74 @@ test("openFilesLocation reports an aborted read as not painted", async () => {
   hold.resolve(sourceFile("a.rs"));
   assert.equal(await read, false);
 });
+
+// #906: a stall is not left failed or loading, and a finished re-run clears Catching up.
+const STALL_PIN = {indexGeneration:"12345678-1234-4123-8123-123456789abc", indexRevision:1};
+const recoveryTimers = h => [...h.timers.entries()].filter(([, timer]) => timer.delay >= 2000 && timer.delay <= 60000 && timer.delay !== 5000 && timer.delay !== 15000);
+const settleMany = async () => { for (let i = 0; i < 6; i++) await settleHead(); };
+test("a stalled read runs Refresh after 2 s, doubling to 60 s, until the daemon answers", async () => {
+  const h = harness(), attempts = [];
+  let answers = false;
+  h.context.fetch = async request => answers ? response({revision:STALL_PIN}) : {ok:false, status:503, json:async () => ({})};
+  // Refresh itself is covered elsewhere; here it is one status read.
+  h.run("refreshView = async () => { await api('/api/status'); }");
+  await assert.rejects(h.run("api('/api/git')"), /Request failed \(503\)/);
+  const delays = [];
+  for (let i = 0; i < 8; i++) {
+    const pending = recoveryTimers(h);
+    assert.equal(pending.length, 1, `one recovery attempt is scheduled: ${JSON.stringify([...h.timers.values()].map(t => t.delay))}`);
+    const [id, timer] = pending[0];
+    delays.push(timer.delay); h.timers.delete(id);
+    if (i === 7) answers = true;
+    timer.callback(); await settleMany();
+    attempts.push(h.get("error").hidden);
+  }
+  assert.deepEqual(delays, [2000, 4000, 8000, 16000, 32000, 60000, 60000, 60000]);
+  assert.equal(recoveryTimers(h).length, 0, "an answered Refresh ends recovery");
+  assert.equal(h.run("recovery"), null);
+  assert.equal(h.get("error").hidden, true, "the stall's error is cleared");
+  assert.deepEqual(attempts.slice(0, 7), Array(7).fill(false), "each failed attempt says why");
+});
+test("a client deadline or a failed connection starts recovery; a typed answer does not", async () => {
+  for (const [name, reply, stalls] of [
+    ["deadline", () => new Promise(() => {}), true],
+    ["connection", async () => { throw new TypeError("Failed to fetch"); }, true],
+    ["storage_busy", async () => ({ok:false, status:409, json:async () => ({error:{code:"storage_busy", message:"Storage is busy"}})}), true],
+    ["not_found", async () => ({ok:false, status:404, json:async () => ({error:{code:"not_found", message:"Not found"}})}), false],
+    ["revision_conflict", async () => ({ok:false, status:409, json:async () => ({error:{code:"revision_conflict", message:"Changed"}})}), false],
+    ["corrupt", async () => ({ok:false, status:503, json:async () => ({error:{code:"corrupt", message:"Corrupt"}})}), false],
+  ]) {
+    const h = harness();
+    h.context.fetch = reply;
+    const pending = h.run("api('/api/git')").catch(error => error);
+    if (name === "deadline") { await settleHead(); const [id, timer] = [...h.timers.entries()].find(([, t]) => t.delay === 15000); h.timers.delete(id); timer.callback(); }
+    const error = await pending;
+    assert.equal(error.transient === true, stalls, name);
+    assert.equal(recoveryTimers(h).length, stalls ? 1 : 0, name);
+  }
+});
+test("Disconnect or another checkout forgets a scheduled recovery", async () => {
+  const h = harness();
+  h.context.fetch = async () => ({ok:false, status:503, json:async () => ({})});
+  await assert.rejects(h.run("api('/api/git')"));
+  assert.equal(recoveryTimers(h).length, 1);
+  h.run("resetCheckout()");
+  assert.equal(recoveryTimers(h).length, 0);
+  assert.equal(h.run("recovery"), null);
+});
+test("a head digest whose catchingUp differs from status reads status once, which clears Catching up", async () => {
+  const h = harness(), requests = [];
+  h.run("status.workspaceRoot = '/synthetic'; status.catchingUp = true; $('catching-up').hidden = false");
+  h.context.fetch = async request => {
+    requests.push(request);
+    if (request === "/api/status/head") return response({revision:STALL_PIN, catchingUp:false, indexedAt:null, viewRequest:null});
+    if (request === "/api/status") return response({revision:STALL_PIN, catchingUp:false, stats:{}});
+    throw new Error("Unexpected " + request);
+  };
+  h.run("observePinnedHead()"); await settleMany();
+  assert.deepEqual(requests, ["/api/status/head", "/api/status"]);
+  assert.equal(h.get("catching-up").hidden, true);
+  assert.equal(h.run("status.catchingUp"), false);
+  h.run("observePinnedHead()"); await settleMany();
+  assert.deepEqual(requests, ["/api/status/head", "/api/status", "/api/status/head"], "status agrees now; nothing more is read");
+});
