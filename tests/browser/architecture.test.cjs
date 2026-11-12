@@ -232,7 +232,7 @@ test("Architecture does not invent a caller for syntax-only non-call boundary si
     const edge = page.locator("#architecture-diagram").getByRole("button", {name:/production sites · upward\s+deviation · exception/}).first();
     await edge.focus(); await page.keyboard.press("Enter"); await settled(page);
     // #917: the arrow's pairs load on demand into the inspector's edge detail list.
-  const pair = page.locator("#architecture-inspector-content .architecture-detail-list[data-detail-kind=edge] details").filter({has:page.locator("summary", {hasText:/src\/low\.rs → src\/top\.rs/})}).first();
+    const pair = page.locator("#architecture-inspector-content .architecture-detail-list[data-detail-kind=edge] details").filter({has:page.locator("summary", {hasText:/src\/low\.rs → src\/top\.rs/})}).first();
     await pair.locator(":scope > summary").click();
     const unknown = page.locator("#architecture-inspector-content .architecture-caller-unavailable");
     await unknown.first().waitFor({state:"visible"});
@@ -925,7 +925,8 @@ test("Architecture arrow inspector keeps exact evidence for an excepted arrow, a
   assert.equal(await page.locator("#architecture-review-panel").isVisible(), false, "and opens no review list");
   assert.equal(await page.locator("#architecture-inspector-content input[type=checkbox]").count(), 0);
   assert.match(await page.locator("#architecture-inspector-content").textContent(), /2 exact production structural reference sites · deviates · excepted/);
-  const pair = page.locator("#architecture-inspector-content > details").filter({has:page.locator("summary", {hasText:/src\/low\.rs → src\/top\.rs/})}).first();
+  // #917: the arrow's pairs load on demand into the inspector's edge detail list.
+  const pair = page.locator("#architecture-inspector-content .architecture-detail-list[data-detail-kind=edge] details").filter({has:page.locator("summary", {hasText:/src\/low\.rs → src\/top\.rs/})}).first();
   await pair.locator(":scope > summary").click();
   assert.match(await pair.textContent(), /2 sampled sites.*0 omitted sites/is);
   const sample = pair.locator(":scope > details").filter({has:page.locator("summary", {hasText:/production · call/})}).first();
