@@ -115,7 +115,7 @@ test("real shell loads local brand fonts, preserves Connect and source, and rend
     const tabs=page.getByRole("tablist",{name:"Workspace views"}).getByRole("tab");
     // Libraries left the tab row (#450); Classes appears once production JavaScript is measured.
     await page.locator("#view-classes").waitFor({state:"visible"});
-    assert.deepEqual(await tabs.allTextContents(),["Architecture","Treemap","Sequence","Classes"]);
+    assert.deepEqual(await tabs.allTextContents(),["Architecture","Treemap","Sequence","Classes","Deviations"]);
     async function activeTab(name) {
       const tab=tabs.filter({hasText:new RegExp(`^${name}$`)});
       assert.equal(await tab.getAttribute("aria-selected"),"true");

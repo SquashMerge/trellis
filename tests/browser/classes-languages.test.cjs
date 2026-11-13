@@ -74,7 +74,7 @@ test("published JavaScript classes render through Pele with members, menus and m
     assert.deepEqual(catalog.items.map(item => item.qualifiedName).sort(), ["view.View", "widgets.Panel", "widgets.Widget"]);
     // #450: production JavaScript is class-catalog code, so the Classes tab earns its place.
     await page.locator("#view-classes").waitFor({state:"visible"});
-    assert.deepEqual(await page.getByRole("tablist", {name:"Workspace views"}).getByRole("tab").allTextContents(), ["Architecture", "Treemap", "Sequence", "Classes"]);
+    assert.deepEqual(await page.getByRole("tablist", {name:"Workspace views"}).getByRole("tab").allTextContents(), ["Architecture", "Treemap", "Sequence", "Classes", "Deviations"]);
     const widget = catalog.items.find(item => item.qualifiedName === "widgets.Widget");
     assert.equal(widget.language, "javascript");
 
@@ -257,7 +257,7 @@ test("Classes stays hidden when the checkout's class-catalog code is test-only",
     const tabs = page.getByRole("tablist", {name:"Workspace views"}).getByRole("tab");
     await page.waitForFunction(() => /Indexed snapshot/.test(document.querySelector("#metrics-state")?.textContent || ""));
     assert.equal(await page.locator("#view-classes").isVisible(), false);
-    assert.deepEqual(await tabs.allTextContents(), ["Architecture", "Treemap", "Sequence"]);
+    assert.deepEqual(await tabs.allTextContents(), ["Architecture", "Treemap", "Sequence", "Deviations"]);
     assert.equal(requests.some(row => row.url.pathname.endsWith("/classes")), false, "no production code: the class catalog is not asked");
     await H.reveal(page, "#metric-include-tests");
     await page.locator("#metric-include-tests").check();
