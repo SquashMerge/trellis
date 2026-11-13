@@ -259,8 +259,8 @@ body:not(.daemon-connected) .connection-footer-brand { margin-right: auto; }
 .retained-pin-status { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; min-width: 0; color: var(--sm-gold); font-size: 14px; }
 .retained-pin-status span { overflow-wrap: anywhere; }
 /* An agent's trellis_show moved this view (#818): a small note with Back. */
-.agent-shown { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; min-width: 0; color: var(--secondary); font-size: 14px; }
-.agent-shown span { overflow-wrap: anywhere; }
+.agent-shown, .sequence-open { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; min-width: 0; color: var(--secondary); font-size: 14px; }
+.agent-shown span, .sequence-open span { overflow-wrap: anywhere; }
 .follow-agent { font-size: 12px; }
 /* Three real panes. Only their contents scroll. */
 .workspace-frame { position: relative; display: grid; grid-template-columns: 244px minmax(0, 1fr) 284px; flex: 1; min-height: 0; }

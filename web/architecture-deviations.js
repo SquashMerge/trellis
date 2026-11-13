@@ -72,7 +72,8 @@
     };
     // A line's symbol is its resolved target's written name without its path, qualified by its named ancestors
     // (`Type::method` in Rust, `Class.method` elsewhere). An unnamed Rust impl block reads its type from `impls`
-    // (from `implNames`, the Files outline) and is otherwise left out. A site with no target reads its spelling (#911).
+    // (from `implNames`, the Files outline) and is otherwise left out. A site with no target, or whose target has no named
+    // segment, reads its spelling (#911, #941).
     const ANONYMOUS = /^[A-Za-z_]+@\d+$/, IMPL = /^implementation@\d+$/;
     const segmentsOf = target => {
       const key = target.displayKey, path = target.document?.path;
@@ -86,7 +87,7 @@
       const types = impls?.get(t.syntaxId) ?? [];
       let next = 0;
       const parts = segmentsOf(t).map(part => !ANONYMOUS.test(part) ? part : IMPL.test(part) ? types[next++] ?? null : null).filter(Boolean);
-      return parts.join(t.document?.language === "rust" ? "::" : ".") || t.displayKey;
+      return parts.join(t.document?.language === "rust" ? "::" : ".") || (typeof evidence.spelling === "string" && evidence.spelling) || t.displayKey;
     };
     // `names` maps an unnamed owner's syntax ID to its nearest named enclosing callable (from `closureNames`);
     // `impls` maps a target's syntax ID to the types of its unnamed impl blocks (from `implNames`).
@@ -725,7 +726,9 @@
       target.append(make("p", labels[line.kind], "detail"), make("p", `in ${line.fn}${line.closure ? " (in a closure)" : ""}`));
       const list = make("dl");
       const row = (term, value, tone) => { const dd = make("dd", value); if (tone) dd.dataset.tone = tone; list.append(make("dt", term), dd); };
-      row("Refers to", t ? t.displayKey : `${e.spelling ?? ""} (spelling, not a resolved symbol)`);
+      // The line's qualified name (#911) and where it is defined; the target's internal key is never shown (#941).
+      row("Refers to", t ? (validLines(t.lines) && typeof t.document?.path === "string" ? `${line.symbol} · ${t.document.path}:${t.lines.start}` : line.symbol)
+        : `${e.spelling ?? ""} (spelling, not a resolved symbol)`);
       row("Defined at", t ? `${t.document.path}:${t.lines.start}` : REASONS[e.targetReason] ?? "no binding");
       row("Layers", `${up ? "↑" : "⇄"} ${i.sourceLayer} → ${i.destinationLayer} ${up ? "upward " : ""}deviation`, "error");
       row("File pair", `${i.target.path} → ${i.destination.path}`);
@@ -738,7 +741,13 @@
       const primary = items.find(item => item.id === "sequence") || items.find(item => item.id === "call-site");
       const button = item => {
         const node = make("button", item.label, item === primary ? "deviation-primary" : "deviation-secondary"); node.type = "button"; node.dataset.action = item.id;
-        node.addEventListener("click", () => { if (active()) return item.run(); });
+        node.addEventListener("click", async () => {
+          if (!active() || node.disabled) return;
+          if (item.id !== "sequence") return item.run();
+          // Reading a sequence can take seconds: the button says so and takes no second click (#940).
+          node.disabled = true; node.setAttribute("aria-busy", "true"); node.textContent = "Opening sequence…";
+          try { await item.run(); } finally { node.disabled = false; node.setAttribute("aria-busy", "false"); node.textContent = item.label; }
+        });
         return node;
       };
       if (primary) target.append(button(primary));

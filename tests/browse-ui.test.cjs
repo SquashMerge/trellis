@@ -2469,3 +2469,24 @@ test("a user navigation during a Classes show's read wins, even when an unrelate
   assert.equal(h.run("selectedMethod.id"), "user");
   assert.equal(h.get("agent-shown").hidden, true);
 });
+
+// #940 review: Retry owns the view as the original open does.
+test("Open in Sequence Retry does not replace a view chosen while its sequence read is pending (#940)", async () => {
+  const {h} = await showHarness();
+  h.get("sequence-open").dataset = {};
+  h.context.fetch = async () => ({ok:false,status:503,json:async()=>({error:{code:"storage_busy",message:"The index is busy."}})});
+  await h.run("openArchitectureSequence({syntaxId:'caller',name:'caller'}, [{callId:'call-1'}], status.revision, {}, () => true)");
+  assert.match(h.get("sequence-open-label").textContent, /Open in Sequence failed: The index is busy/);
+  const read = deferred();
+  h.context.fetch = () => read.promise;
+  const retry = h.run("sequenceOpen.retry()");
+  assert.match(h.get("sequence-open-label").textContent, /Opening sequence for caller/);
+  h.run("window.TrellisShell.showView('classes')");
+  assert.equal(h.get("classes-panel").hidden, false, "the user's newly chosen view is shown");
+  read.resolve(response(view("caller")));
+  await retry;
+  assert.equal(h.run("selectedMethod.id"), "old", "the retry must not navigate after the user chose another view");
+  assert.equal(h.get("classes-panel").hidden, false);
+  assert.match(h.get("sequence-open-label").textContent, /The view changed; Open in Sequence was cancelled/);
+  assert.equal(h.get("sequence-open").hidden, false);
+});

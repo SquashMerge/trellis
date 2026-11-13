@@ -1847,6 +1847,155 @@ async function showHighlight(page) {
 }
 const hashCallIds = page => page.evaluate(() => new URLSearchParams(location.hash.slice(location.hash.indexOf("?") + 1)).getAll("callId"));
 
+// The inspector's primary button, not the line menu, is what a click on a selected line offers (#940).
+test("Deviations inspector Open in Sequence shows the Sequence tab with the call highlighted (#940)", {timeout:240000}, async () => {
+  const {config, base} = deviationsFixture();
+  await published(config, async selected => {
+    const {page} = selected;
+    await ready(page);
+    await openDeviations(page);
+    await chipNamed(page, /low → top/).click();
+    await expandTree(page);
+    const line = lineRow(page, "src/low.rs", 1);
+    await line.click();
+    const open = page.locator("#architecture-inspector-content").getByRole("button", {name:"Open in Sequence", exact:true});
+    const request = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/sequence") && response.request().method() === "POST");
+    await open.click();
+    await request;
+    await page.locator("#sequence-panel").waitFor({state:"visible"});
+    assert.equal(await page.locator("#view-sequence").getAttribute("aria-selected"), "true", "the Sequence tab is the active tab");
+    assert.equal(await page.locator("#view-architecture").getAttribute("aria-selected"), "false");
+    assert.equal(await page.locator("#architecture-panel").isHidden(), true, "Deviations is no longer on screen");
+    await showHighlight(page);
+    const ids = await hashCallIds(page);
+    assert.equal(ids.length, 1);
+    assert.equal(await highlights(page).count(), 1);
+    assert.equal(await highlights(page).first().getAttribute("data-trellis-call-id"), ids[0], "the deviation's call is the highlighted one");
+  }, new Map(), base);
+});
+
+// Open in Sequence can take seconds on a real checkout (#940): the read is held here so the wait is observable.
+const sequencePattern = "**/api/checkouts/*/sequence";
+async function inspectLowLine(page) {
+  await ready(page);
+  await openDeviations(page);
+  await chipNamed(page, /low → top/).click();
+  await expandTree(page);
+  await lineRow(page, "src/low.rs", 1).click();
+  return page.locator("#architecture-inspector-content [data-action=sequence]");
+}
+
+test("Deviations inspector Open in Sequence shows that it is opening until the Sequence tab shows the call (#940)", {timeout:240000}, async () => {
+  const {config, base} = deviationsFixture();
+  await published(config, async ({page}) => {
+    const open = await inspectLowLine(page);
+    const hold = holdDetails();
+    // A route the page has already given up on (it closed) is not this test's failure.
+    const handler = async route => { hold.entered(); await hold.gate; await route.continue().catch(() => {}); };
+    await page.route(sequencePattern, handler);
+    try {
+      await open.click();
+      await hold.seen;
+      const note = page.locator("#sequence-open");
+      await note.waitFor({state:"visible"});
+      assert.match(await note.textContent(), /^Opening sequence for low…/);
+      assert.equal(await open.isDisabled(), true, "the button takes no second click while it opens");
+      assert.equal(await open.getAttribute("aria-busy"), "true");
+      assert.equal(await open.textContent(), "Opening sequence…");
+      assert.equal(await page.locator("#view-architecture").getAttribute("aria-selected"), "true", "nothing has moved yet");
+      hold.release();
+      await page.locator("#sequence-panel").waitFor({state:"visible"});
+      await showHighlight(page);
+      assert.equal(await page.locator("#view-sequence").getAttribute("aria-selected"), "true");
+      assert.equal(await note.isHidden(), true, "the note goes once the sequence is shown");
+    } finally { hold.release(); await page.unroute(sequencePattern, handler); }
+  }, new Map(), base);
+});
+
+test("Deviations Open in Sequence that the index overtakes says so and retries at the new head (#940)", {timeout:240000}, async () => {
+  const {config, base} = deviationsFixture();
+  await published(config, async ({page, paths, pin, server, requests}) => {
+    const open = await inspectLowLine(page);
+    const hold = holdDetails();
+    // A route the page has already given up on (it closed) is not this test's failure.
+    const handler = async route => { hold.entered(); await hold.gate; await route.continue().catch(() => {}); };
+    await page.route(sequencePattern, handler);
+    let head;
+    try {
+      await open.click();
+      await hold.seen;
+      // The checkout is edited while the sequence is read, and the page refreshes, as its stall recovery does.
+      const changed = `${base.get("src/top.rs")}pub fn added() {}\n`;
+      writeFileSync(join(paths.workspace, "src/top.rs"), changed);
+      head = await H.indexThroughApi(server, paths.token, pin, "src/top.rs", changed);
+      assert.ok(head.indexRevision > pin.indexRevision);
+      await H.reveal(page, "#refresh"); await page.locator("#refresh").click();
+      // "Revision <generation>:<n> ·", not any ":<n>" (the indexed time has those too).
+      await page.waitForFunction(revision => new RegExp(`Revision [0-9a-f]+:${revision} ·`).test(document.querySelector("#status")?.textContent ?? ""), head.indexRevision);
+      hold.release();
+      const note = page.locator("#sequence-open");
+      await note.filter({hasText:"The index moved to a newer revision; Open in Sequence was cancelled."}).waitFor({state:"visible"});
+      assert.equal(await page.locator("#view-architecture").getAttribute("aria-selected"), "true");
+    } finally { hold.release(); await page.unroute(sequencePattern, handler); }
+    const retried = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/sequence") && response.request().postDataJSON()?.expectedRevision?.indexRevision === head.indexRevision);
+    await page.locator("#sequence-open-retry").click();
+    await retried;
+    await page.locator("#sequence-panel").waitFor({state:"visible"});
+    await showHighlight(page);
+    assert.equal(await page.locator("#view-sequence").getAttribute("aria-selected"), "true");
+    assert.equal(await highlights(page).count(), 1, "the unchanged caller's call is highlighted at the new head");
+    assert.equal(await page.locator("#sequence-open").isHidden(), true);
+    // The move to the new head is the point of this test; the suite-wide pin check covers the reads before it.
+    for (let i = requests.length - 1; i >= 0; i--) if (requests[i].url.searchParams.get("indexRevision") && requests[i].url.searchParams.get("indexRevision") !== String(pin.indexRevision)) requests.splice(i, 1);
+  }, new Map(), base);
+});
+
+test("Deviations Open in Sequence that another view overtakes says so instead of ending silently (#940)", {timeout:240000}, async () => {
+  const {config, base} = deviationsFixture();
+  await published(config, async ({page}) => {
+    const open = await inspectLowLine(page);
+    const hold = holdDetails();
+    const handler = async route => { hold.entered(); await hold.gate; await route.continue().catch(() => {}); };
+    await page.route(sequencePattern, handler);
+    try {
+      await open.click();
+      await hold.seen;
+      await page.locator("#architecture-deviations-back").click();
+      hold.release();
+      await page.locator("#sequence-open").filter({hasText:"The view changed; Open in Sequence was cancelled."}).waitFor({state:"visible"});
+      assert.equal(await page.locator("#view-architecture").getAttribute("aria-selected"), "true", "the view the user chose stays");
+      assert.equal(await page.locator("#sequence-open-retry").isVisible(), true);
+      await page.locator("#sequence-open-close").click();
+      assert.equal(await page.locator("#sequence-open").isHidden(), true, "the note can be dismissed");
+    } finally { hold.release(); await page.unroute(sequencePattern, handler); }
+  }, new Map(), base);
+});
+
+test("Deviations Open in Sequence whose read fails says so and retries (#940)", {timeout:240000}, async () => {
+  const {config, base} = deviationsFixture();
+  await published(config, async ({page}) => {
+    const open = await inspectLowLine(page);
+    // A busy daemon is a stall the page recovers from by refreshing the view behind the open.
+    const handler = route => route.fulfill({status:503, contentType:"application/json", body:JSON.stringify({error:{code:"storage_busy", message:"The index is busy."}})});
+    await page.route(sequencePattern, handler);
+    // Stall recovery refreshes the view 2 s after the busy answer. Retry is pressed once that has
+    // settled: a refresh during Retry's read is a view change, which drops it with the note.
+    const recovered = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/status"), {timeout:30000});
+    try {
+      await open.click();
+      await page.locator("#sequence-open").filter({hasText:"Open in Sequence failed: The index is busy."}).waitFor({state:"visible"});
+    } finally { await page.unroute(sequencePattern, handler); }
+    await recovered;
+    await ready(page);
+    assert.match(await page.locator("#sequence-open").textContent(), /Open in Sequence failed/, "recovery keeps the note");
+    await page.locator("#sequence-open-retry").click();
+    await page.locator("#sequence-panel").waitFor({state:"visible"});
+    await showHighlight(page);
+    assert.equal(await page.locator("#view-sequence").getAttribute("aria-selected"), "true");
+    assert.equal(await page.locator("#sequence-open").isHidden(), true);
+  }, new Map(), base);
+});
+
 test("Deviations Open in Sequence keeps its highlight through Back, Forward and reload", {timeout:240000}, async () => {
   const {config, base} = deviationsFixture();
   await published(config, async selected => {
@@ -2055,8 +2204,11 @@ test("a stub selects its interface with a visible Selected word, opens the inspe
   assert.match(await band.getAttribute("aria-label"), /client end/, "the selected stub's band says which end it is");
   const content = page.locator("#architecture-inspector-content");
   assert.match(await content.textContent(), /Client end: web-app · client/); assert.match(await content.textContent(), /Server end: srv · server/);
-  await content.getByRole("button", {name:"Open endpoints"}).click(); await settled(page);
-  assert.match(await content.textContent(), /GET \/health · exact · 1 call site/);
+  // #950: no Open endpoints button; the matched routes are listed up front under their heading, before the server-only ones.
+  assert.equal(await content.getByRole("button", {name:"Open endpoints"}).count(), 0);
+  await content.getByText("GET /health · exact · 1 call site").waitFor({state:"visible"});
+  const order = await content.evaluate(node => { const all = node.textContent; return [all.indexOf("Matched routes (1)"), all.indexOf("GET /health · exact · 1 call site"), all.indexOf("◆ Server-only routes: no call matched them")]; });
+  assert.ok(order[0] >= 0 && order[0] < order[1] && order[1] < order[2], `the heading, its row, then the server-only routes: ${order}`);
   assert.match(await content.textContent(), /GET \/unused/); assert.match(await content.textContent(), /unresolved method|\/missing/);
   await content.getByRole("button", {name:"Read handler source"}).first().click();
   await laidOutAt(page, 1100);

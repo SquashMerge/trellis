@@ -664,3 +664,51 @@ test("#824: pinning during an agent read returns to the earlier view; control: u
     assert.equal(view.shown === null, pinNow);
   }
 });
+
+
+test("review939 a pending same-file methods read cannot replace a clicked deviation caller", async () => {
+  const { view, cx, jobs } = bare();
+  view.rootKey = KEY_A; view.serial = 1; view.status = { pin };
+  view.seq = { history: [], expanded: new Set() };
+  const methods = deferred();
+  const selected = { checkout: { rootKey: KEY_A }, path: "src/main.rs" };
+  view.followed = () => selected;
+  view.client = {
+    methods: () => methods.promise,
+    sequence: (_key, _pin, id) => Promise.resolve({ revision: pin, seed: { id, name: id, path: "src/main.rs" }, steps: [], participants: [] }),
+  };
+  view.followSequence(selected, cx);
+  const oldMethods = jobs.at(-1);
+  view.tab = "deviations";
+  view.openLine({ evidence: { callId: "call:1", caller: { syntaxId: "chosen-caller", stableLookupKey: "src/main.rs::chosen", name: "chosen", document: { path: "src/main.rs" } } } }, cx);
+  await jobs.at(-1);
+  assert.equal(view.seq.seed.id, "chosen-caller");
+  methods.resolve({ items: [{ consequential: true, symbol: { id: "first-method", name: "first", path: "src/main.rs" } }] });
+  await oldMethods;
+  await Promise.all(jobs);
+  assert.equal(view.seq.methods[0].id, "first-method", "the Files method list still arrives");
+  assert.equal(view.seq.seed.id, "chosen-caller", "a delayed method list must not replace the explicitly clicked caller");
+});
+
+
+test("review939 revision reload preserves the deviation caller outside the Files method list", async () => {
+  const { view, cx, jobs } = bare();
+  view.rootKey = KEY_A; view.serial = 1; view.status = { pin };
+  view.seq = { file: "src/main.rs", methods: [{ id: "files-first", name: "first", path: "src/main.rs" }], history: [], expanded: new Set() };
+  view.followed = () => ({ checkout: { rootKey: KEY_A }, path: "src/main.rs" });
+  view.client = {
+    methods: () => Promise.resolve({ items: [{ consequential: true, symbol: { id: "files-first", name: "first", path: "src/main.rs" } }] }),
+    sequence: (_key, at, id) => Promise.resolve({ revision: at, seed: { id, name: id, path: id === "chosen-caller" ? "src/util.rs" : "src/main.rs" }, steps: [], participants: [] }),
+  };
+  view.openLine({ evidence: { callId: "call:1", caller: { syntaxId: "chosen-caller", stableLookupKey: "src/util.rs::chosen", name: "chosen", document: { path: "src/util.rs" } } } }, cx);
+  await jobs.at(-1);
+  assert.equal(view.seq.seed.id, "chosen-caller");
+  assert.equal(view.seq.file, "src/main.rs");
+  const newPin = { ...pin, indexRevision: pin.indexRevision + 1 };
+  view.status = { pin: newPin };
+  view.reloadSequence(cx);
+  for (let i = 0; i < jobs.length; i++) await jobs[i];
+  assert.deepEqual(view.seq.data.revision, newPin);
+  assert.equal(view.seq.methods[0].id, "files-first", "Files method list is preserved");
+  assert.equal(view.seq.seed.id, "chosen-caller", "a revision refresh must not replace the explicitly chosen caller with the Files first method");
+});

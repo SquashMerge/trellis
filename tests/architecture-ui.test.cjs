@@ -1742,16 +1742,19 @@ test("AC15 selecting a stub opens the interface inspector from the ends and the 
   assert.deepEqual(grid.children.map(item => item.textContent), ["Matched routes", "4", "Client call sites", "6", "◆ Server-only routes", "2", "◆ Client-only calls", "1",
     "exact", "4", "template", "1", "wrapper-inferred", "1", "unresolved", "0"]);
   assert.equal(grid.children[5].dataset.tone, "warning");
+  // #950 (owner ruling 2026-11-12): the matched routes load up front, with no button, under their heading and first.
   const lists = h.detailCalls.map(call => Object.fromEntries(new URL(call.url, "http://local").searchParams)).filter(query => query.kind === "interfaces");
-  assert.deepEqual(lists.map(query => [query.client, query.server, query.list]), [["web", "daemon", "serverOnly"], ["web", "daemon", "clientOnly"]], "matched waits for Open endpoints");
+  assert.deepEqual(lists.map(query => [query.client, query.server, query.list]), [["web", "daemon", "matched"], ["web", "daemon", "serverOnly"], ["web", "daemon", "clientOnly"]],
+    "one matched request, without a click, then the one-sided lists");
+  assert.equal(descendants(h.get("architecture-inspector-content")).some(item => item.tagName === "button" && item.textContent === "Open endpoints"), false, "no Open endpoints button");
   assert.ok(paragraphs.includes("POST /api/only")); assert.ok(paragraphs.includes("Handler src/http.rs:10"));
   assert.ok(paragraphs.includes("unresolved method (unresolved path)"));
-  await h.button("Open endpoints").fire("click"); await flush();
-  const matched = h.detailCalls.map(call => Object.fromEntries(new URL(call.url, "http://local").searchParams)).filter(query => query.list === "matched");
-  assert.equal(matched.length, 1); assert.equal(matched[0].client, "web");
-  const after = inspectorParagraphs(h);
-  assert.ok(after.includes("GET /api/<b>x</b> · template · 1 call site"), "route text is literal, never markup");
-  assert.equal(h.button("Open endpoints").disabled, true);
+  assert.ok(paragraphs.includes("GET /api/<b>x</b> · template · 1 call site"), "route text is literal, never markup");
+  const heading = paragraphs.indexOf("Matched routes (4)"), row = paragraphs.indexOf("GET /api/<b>x</b> · template · 1 call site");
+  assert.ok(heading >= 0, "the heading counts the interface's matched routes");
+  assert.equal(descendants(h.get("architecture-inspector-content")).find(item => item.tagName === "p" && item.textContent === "Matched routes (4)").className, "detail", "styled as the ◆ headings");
+  assert.ok(heading < row && row < paragraphs.indexOf("◆ Server-only routes: no call matched them") && paragraphs.indexOf("◆ Server-only routes: no call matched them") < paragraphs.indexOf("POST /api/only")
+    && paragraphs.indexOf("POST /api/only") < paragraphs.indexOf("◆ Client-only calls: no route matched them. This does not prove absence."), "matched, then server-only, then client-only");
   await h.button("Read call-site source").fire("click");
   assert.deepEqual(plainStats(h.reads.at(-1).site), {path:"web/app.js", range:{startLine:3, endLine:3, startByte:5, endByte:9}});
   const sources = descendants(h.get("architecture-inspector-content")).filter(item => item.tagName === "button" && item.textContent === "Read handler source");
@@ -1764,7 +1767,6 @@ test("an interface with no matched routes says so, and a missing interface falls
   const h = harness(); h.setResponse(async () => ({payload:dto})); await h.controller.refresh();
   await chooseApp(h, "web · javascript");
   h.renders.at(-1).options.onSelectInterface(statsOf(h, "UI")[0].action); await flush();
-  await h.button("Open endpoints").fire("click"); await flush();
   const text = inspectorParagraphs(h);
   assert.ok(text.includes("No matched routes at this pin.")); assert.ok(text.includes("No server-only routes.")); assert.ok(text.includes("No client-only calls."));
   const saved = {inspection:{kind:"interface", record:{client:"web", server:"nobody"}}, pressed:null, rulesHash:"rules-one", aggregate:"max", role:"production", scope:"web", reviewMode:"rules", reviewScope:null,
@@ -2145,6 +2147,8 @@ test("#911 a line's symbol is its target's qualified name: Type::method from the
   rows[0].instance.evidence[0].target = {syntaxId:"j1",displayKey:"src/Main.java#Outer.Inner.run",document:docId("src/Main.java", "java"),lines:{start:4,end:4}};
   assert.equal(symbolOfLine(model.build(rows, layers), 20), "Outer.Inner.run");
   assert.equal(symbolOfLine(model.build(rows, layers), 30), "x", "a site with no target reads its spelling");
+  rows[0].instance.evidence[0].target = {syntaxId:"a1",displayKey:"src/http/worker.rs#implementation@4",document:docId("src/http/worker.rs"),lines:{start:4,end:9}};
+  assert.equal(symbolOfLine(model.build(rows, layers), 20), "enqueue_generated_semantic_import", "a target with no named segment reads the spelling, never its key (#941)");
 });
 
 test("#911 a line row shows the qualified name on one line, with the full name and both places as its tooltip", async () => {
@@ -2164,6 +2168,29 @@ test("#911 a line row shows the qualified name on one line, with the full name a
   const css = fs.readFileSync(path.join(__dirname, "../web/style.css"), "utf8");
   assert.match(css, /\.deviation-name \{[^}]*flex-wrap: nowrap/, "the name cell never wraps");
   assert.match(css, /\.deviation-name > \.deviation-symbol \{[^}]*text-overflow: ellipsis; white-space: nowrap/, "a long symbol truncates with an ellipsis");
+});
+
+// #941: the inspector's Refers to field reads the line's qualified name and its definition's path:line, never the internal key.
+test("#941 the inspector's Refers to shows the qualified name and path:line, never the internal key", async () => {
+  const h = deviationsHarness({rows:implTargetRows()});
+  h.deps.outline = async path => ({items:path === "src/http/worker.rs" ? workerOutline : [], nextOffset:null});
+  const dev = h.sandbox.window.TrellisDeviations.create(h.deps);
+  await dev.open(h.trigger); await h.expandAll();
+  const refersTo = () => {
+    const nodes = descendants(h.inspections.at(-1).target), dt = nodes.findIndex(item => item.tagName === "dt" && item.textContent === "Refers to");
+    return nodes.slice(dt + 1).find(item => item.tagName === "dd").textContent;
+  };
+  await h.treeRows().find(row => row.dataset.level === "3" && /^Line 20,/.test(row.attrs["aria-label"])).dispatch("click");
+  assert.equal(refersTo(), "DaemonState::enqueue_generated_semantic_import · src/http/worker.rs:88");
+  assert.doesNotMatch(text(h.inspections.at(-1).target), /implementation@4|worker\.rs#/, "the internal key is never shown");
+
+  const bare = deviationsHarness({rows:implTargetRows()});
+  bare.deps.outline = async () => ({items:[], nextOffset:null});
+  const plain = bare.sandbox.window.TrellisDeviations.create(bare.deps);
+  await plain.open(bare.trigger); await bare.expandAll();
+  await bare.treeRows().find(row => row.dataset.level === "3" && /^Line 20,/.test(row.attrs["aria-label"])).dispatch("click");
+  assert.doesNotMatch(text(bare.inspections.at(-1).target), /implementation@4|worker\.rs#/, "without the impl's type the name is unqualified, never the key");
+  assert.match(text(bare.inspections.at(-1).target), /enqueue_generated_semantic_import · src\/http\/worker\.rs:88/);
 });
 
 // ---- #860 review: closure naming takes the nearest named *callable*, and typed stale outline errors are conflicts. ----

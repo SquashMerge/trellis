@@ -177,8 +177,8 @@ A managed `modelPath` records where startup looked even when files were missing.
   whose files were all present but failed the loader's hash/content checks. File presence
   never substitutes for the verified loader.
 - `matrix_not_resident`: no matching resident matrix exists for the admitted head and the
-  background owner has no work for it (memory policy, an eviction no search has rearmed yet,
-  or a head race). While the owner is building that head, the state is `building` instead.
+  background owner has no work for it (memory policy, an eviction no search, describe or
+  status call has rearmed yet, or a head race; #942, owner ruling 2026-11-12). While the owner is building that head, the state is `building` instead.
 - `null`: the state is not `unavailable`. `unavailable` always carries a reason (#777); a null
   reason does not promise vector readiness.
 
@@ -210,6 +210,10 @@ never delays daemon socket acceptance and stops at matrix-cap admission failure 
 evicting matrices for another startup checkout. Search result state remains unavailable while
 the model is not ready, unless the owner is building the head. CLI status and describe report
 only owner-published coverage and measured cache counts; GC does not report search coverage.
+Like search, they first rearm an evicted head and hint the owner, so a describe and a search at
+the same moment agree: `building` with the cached count while the owner reloads it. Unlike
+search, describe and status are not query use and never reset a matrix's idle timer or LRU
+order (#942, owner ruling 2026-11-12).
 A measured count is taken once and reused until the admitted head, the cache epoch or a
 vector-cache write changes it (#806), so repeated calls while the owner builds a large head
 do not rescan it.
