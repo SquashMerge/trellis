@@ -751,7 +751,7 @@ impl CheckoutRegistry {
         }
         runtime
             .pickup
-            .start_watch(&runtime.resources()?.store, &scheduler);
+            .start_watch(&runtime.resources()?.store, scheduler.clone());
         runtime.auto_run.start(
             Arc::new(AutoHost {
                 runtime: Arc::downgrade(&runtime),
@@ -2377,7 +2377,7 @@ impl CheckoutRuntime {
         let reply = self.producer.start_run(
             &crate::producer::run::RunContext {
                 store: &resources.store,
-                scheduler: &resources.scheduler,
+                scheduler: &*resources.scheduler,
                 stub: stub.as_ref(),
             },
             &request,
@@ -2431,7 +2431,7 @@ impl CheckoutRuntime {
         let result = self.producer.start_run(
             &crate::producer::run::RunContext {
                 store: &resources.store,
-                scheduler: &resources.scheduler,
+                scheduler: &*resources.scheduler,
                 stub: stub.as_ref(),
             },
             &run,
@@ -2522,7 +2522,7 @@ impl CheckoutRuntime {
         match &request.artifact {
             Some(artifact) => self.pickup.set(
                 &resources.store,
-                &resources.scheduler,
+                &*resources.scheduler,
                 &request.producer,
                 artifact,
             ),
