@@ -2061,8 +2061,9 @@ test("Deviations Open in Sequence keeps its highlight through Back, Forward and 
     await page.reload({waitUntil:"domcontentloaded"});
     await page.locator("#token").fill(paths.token);
     await page.locator("#connect-form button[type=submit]").click();
-    const message = "Cannot open sequence: Sequence link is stale for the selected index snapshot. Reload or select a current link.";
-    await page.waitForFunction(text => document.querySelector("#sequence-state")?.textContent === text && document.querySelector("#error")?.textContent === text, message);
+    // #951 (owner ruling 2026-11-12): a stale link opens the root view with no error.
+    await page.waitForFunction(() => location.hash === "" && document.querySelector("#view-architecture")?.getAttribute("aria-selected") === "true");
+    assert.equal(await page.locator("#error").isVisible(), false, "a stale link shows no error");
     assert.equal(await highlights(page).count(), 0, "a stale link shows no highlight");
   }, new Map(), base);
 });

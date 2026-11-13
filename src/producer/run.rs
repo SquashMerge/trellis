@@ -580,6 +580,7 @@ impl Run<'_> {
             &prepared.pin,
             &prepared.rules,
             &dir_text,
+            prepared.limits.memory_mib,
         );
         let rules = &prepared.rules;
 

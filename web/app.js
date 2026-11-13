@@ -267,11 +267,26 @@ async function readNavigationLocation(force = false) {
   const context = navigationContext(), current = () => ticket === navigationSerial && navigationCurrent(context);
   const candidate = navigationEntries.get(window.history?.state?.trellisNavigation);
   const entry = candidate?.hash === (window.location?.hash || "") ? candidate : null;
+  // A stale history entry or link strips the URL, adding no entry, and opens the root view
+  // with no error (#951, owner ruling 2026-11-12). Malformed and other-checkout links still error.
+  const openRoot = async () => {
+    window.history?.replaceState?.(null, "", `${window.location?.pathname || ""}${window.location?.search || ""}`);
+    navigationLocation = navigationSignature();
+    $("error").hidden = true; $("error").textContent = "";
+    // Sequence starts empty, as on a fresh load: no selected method, enabled method actions or link error.
+    clearSource(); diagramSequence = null; sequenceBoundary = null; selectedMethod = null;
+    $("method-source").disabled = true; if ($("method-class")) $("method-class").disabled = true;
+    $("sequence-diagram").replaceChildren(); $("sequence-warnings").replaceChildren();
+    $("sequence-state").textContent = "Expand a file and select a method.";
+    renderFiles(); renderSequenceStart();
+    await setSection("diagrams");
+    if (!current()) return;
+    showNavigationView("architecture");
+  };
   try {
     if (entry) {
-      // A Deviations tab entry from another snapshot or checkout opens the root view (#951, #965).
-      if (entry.hash.startsWith("#deviations") && !navigationCurrent(entry)) return await openRootView(current);
-      if (!navigationCurrent(entry)) throw new Error("This history entry is stale. Select source from the current snapshot.");
+      // A stale entry, a Deviations tab entry (#965) included, opens the root view.
+      if (!navigationCurrent(entry)) return await openRoot();
       if (entry.kind === "unavailable") return navigationError("This history entry has no saved source view. The current diagram remains open; use Forward to return to its link.");
       $("error").hidden = true;
       if (entry.kind === "source") return await restoreSourceEntry(entry, current);
@@ -300,11 +315,8 @@ async function readNavigationLocation(force = false) {
     const hash = window.location?.hash || "";
     const oldKey = window.history?.state?.trellisNavigation;
     const deviationsLink = hash === "#deviations" || hash.startsWith("#deviations?");
-    if (typeof oldKey === "string" && oldKey.startsWith(`${navigationScope}:`)) {
-      // A Deviations tab entry the index or checkout change dropped opens the root view (#951, #965).
-      if (deviationsLink) return await openRootView(current);
-      throw new Error("This history entry is stale. Open source from the current snapshot.");
-    }
+    // An entry an index or checkout change dropped, a Deviations tab entry (#965) included, opens the root view.
+    if (typeof oldKey === "string" && oldKey.startsWith(`${navigationScope}:`)) return await openRoot();
     if (!hash) return;
     // A Deviations tab link (#965): the tab at the shown snapshot, on its app and edge.
     if (deviationsLink) {
@@ -314,7 +326,7 @@ async function readNavigationLocation(force = false) {
       return await showDeviationsRoute(filter, current);
     }
     if (!hash.startsWith("#sequence")) {
-      if (hash === "#source" || hash === "#classes" || window.history?.state?.trellisNavigation) throw new Error("This source history is no longer available. Open source from the current snapshot.");
+      if (hash === "#source" || hash === "#classes" || window.history?.state?.trellisNavigation) return await openRoot();
       return;
     }
     if (!hash.startsWith("#sequence?")) throw new Error("Sequence link requires a symbol ID (sid).");
@@ -322,15 +334,17 @@ async function readNavigationLocation(force = false) {
     if (!id || !id.trim() || query.getAll("sid").length !== 1) throw new Error("Sequence link requires one valid symbol ID (sid).");
     if (query.has("rootKey") && query.get("rootKey") !== selectedRootKey) throw new Error("Sequence link belongs to a different checkout. Select its checkout first.");
     const revision = context.revision;
+    let requested = null;
     if (query.has("indexGeneration") || query.has("indexRevision")) {
       const value = query.get("indexRevision");
       if (!/^(0|[1-9][0-9]*)$/.test(value || "")) throw new Error("Sequence link has an invalid index snapshot.");
-      const requested = IndexPin.copy({indexGeneration:query.get("indexGeneration"), indexRevision:Number(value)});
-      if (!IndexPin.equal(requested, revision)) throw new Error("Sequence link is stale for the selected index snapshot. Reload or select a current link.");
+      requested = IndexPin.copy({indexGeneration:query.get("indexGeneration"), indexRevision:Number(value)});
     }
     const callIds = query.getAll("callId");
     if (callIds.length && (callIds.length > SEQUENCE_LINK_CALL_IDS || new Set(callIds).size !== callIds.length || !callIds.every(callId => CALL_ID.test(callId)) ||
         !query.has("rootKey") || !query.has("indexGeneration") || !query.has("indexRevision"))) throw new Error("Sequence link has invalid call IDs.");
+    // Only a well-formed link for this checkout can be stale.
+    if (requested && !IndexPin.equal(requested, revision)) return await openRoot();
     const boundary = callIds.length ? {symbolId:id, callIds} : null;
     clearSource(); diagramSequence = null;
     await setSection("diagrams", "sequence");
@@ -365,16 +379,6 @@ async function showDeviationsRoute(filter, current) {
   $("error").hidden = true;
   showNavigationView("deviations");
   return await architecture?.showDeviations(filter);
-}
-// A stale entry strips the URL, adding no entry, and opens the root view with no error (#951).
-async function openRootView(current) {
-  window.history?.replaceState?.(null, "", `${window.location?.pathname || ""}${window.location?.search || ""}`);
-  navigationLocation = navigationSignature();
-  $("error").hidden = true; $("error").textContent = "";
-  clearSource(); diagramSequence = null; sequenceBoundary = null;
-  await setSection("diagrams");
-  if (!current()) return;
-  showNavigationView("architecture");
 }
 // The entry for what a view shows, written before another view's entry is added.
 function viewEntry(revision, view) {
