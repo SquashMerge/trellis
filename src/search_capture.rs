@@ -1,22 +1,13 @@
 //! Search-only measurements from the native extractor's existing tree and captured bytes.
+pub use crate::search_card_records::CapturedCard;
 use crate::{
     model::SourceFile,
     native_evidence::{Call, Declaration},
     search_card::{self, Ancestor, CardInput, MeasuredFacts, SearchCard},
 };
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::Node;
-
-#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
-pub struct CapturedCard {
-    pub path: String,
-    pub syntax_id: String,
-    pub card: SearchCard,
-    pub ancestors: Vec<Ancestor>,
-    pub facts: search_card::PreparedFacts,
-}
 
 /// Re-render owned captured facts against the declaration's current measured header.
 pub fn render_card(declaration: &Declaration, captured: &CapturedCard) -> SearchCard {

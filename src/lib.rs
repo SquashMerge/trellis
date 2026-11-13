@@ -65,6 +65,7 @@ pub mod scip_raw;
 pub mod scip_vocab;
 pub mod search_capture;
 pub mod search_card;
+pub mod search_card_records;
 pub mod search_config;
 pub mod search_embed;
 pub mod search_lexical;

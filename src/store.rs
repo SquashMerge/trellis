@@ -1170,7 +1170,7 @@ pub struct NativeDocumentRows {
     pub control_regions: Vec<crate::native_evidence::ControlRegion>,
     pub references: Vec<crate::native_evidence::Reference>,
     pub capability_report: crate::native_evidence::CapabilityReport,
-    pub search_cards: Vec<crate::search_capture::CapturedCard>,
+    pub search_cards: Vec<crate::search_card_records::CapturedCard>,
 }
 
 #[derive(Default)]

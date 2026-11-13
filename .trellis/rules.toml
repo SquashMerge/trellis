@@ -82,6 +82,8 @@ paths = [
   "src/semantic_batch/limits.rs", "src/semantic_batch/counters.rs", "src/semantic_batch/origin.rs",
   "src/evidence_limits.rs", "src/diagnostic_markers.rs", "src/diagnostic_markers_tests.rs",
   "src/scip_vocab.rs", "src/jsonc.rs", "src/source_dir.rs", "src/process_info.rs",
+  # The stored search-card records and their eligibility predicate (S1b, #1000).
+  "src/search_card_records.rs",
 ]
 
 # Coarse developer-tool boundary; does not infer internal tooling architecture.

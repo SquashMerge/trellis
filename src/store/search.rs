@@ -10,8 +10,8 @@ pub(crate) const SEARCH_CARD_BATCH_SIZE: usize = 16;
 
 #[derive(serde::Deserialize, Serialize)]
 struct StoredFacts {
-    facts: crate::search_card::PreparedFacts,
-    ancestors: Vec<crate::search_card::Ancestor>,
+    facts: crate::search_card_records::PreparedFacts,
+    ancestors: Vec<crate::search_card_records::Ancestor>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -104,7 +104,7 @@ pub(super) fn write_cards(
     let declarations: BTreeMap<_, _> = artifact
         .declarations
         .iter()
-        .filter(|d| crate::search_card::is_eligible(&d.kind, d.name.as_deref()))
+        .filter(|d| crate::search_card_records::is_eligible(&d.kind, d.name.as_deref()))
         .map(|d| ((d.document.path.as_str(), d.syntax_id.as_str()), d))
         .collect();
     let mut seen = BTreeSet::new();
@@ -154,7 +154,7 @@ pub(super) fn read_cards(
     db: &Connection,
     vid: i64,
     path: &str,
-) -> Result<Vec<crate::search_capture::CapturedCard>> {
+) -> Result<Vec<crate::search_card_records::CapturedCard>> {
     let mut statement = db.prepare(
         "SELECT syntax_id,card_text,card_hash,facts_json FROM native_version_search_cards WHERE vid=?1 ORDER BY syntax_id",
     )?;
@@ -172,10 +172,10 @@ pub(super) fn read_cards(
             let facts: StoredFacts = serde_json::from_str(&facts).context(SelectedIntegrity(
                 "incompatible_index: corrupt captured search facts".into(),
             ))?;
-            Ok(crate::search_capture::CapturedCard {
+            Ok(crate::search_card_records::CapturedCard {
                 path: path.to_owned(),
                 syntax_id: id_codec::decode_sid(&id)?,
-                card: crate::search_card::SearchCard { text, hash },
+                card: crate::search_card_records::SearchCard { text, hash },
                 facts: facts.facts,
                 ancestors: facts.ancestors,
             })
