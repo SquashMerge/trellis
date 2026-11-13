@@ -19,7 +19,7 @@
 use super::profiles::{Generated, Omission, Rules};
 use super::settings::{Origin, Setting, Source, TsProject};
 use super::worktree::{RetainedInputs, RootInput};
-use crate::references::tsconfig::parse_jsonc;
+use crate::jsonc::parse_jsonc;
 use anyhow::Result;
 use serde_json::Value;
 use std::{

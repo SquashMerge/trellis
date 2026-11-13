@@ -3,7 +3,9 @@ use super::witness::{self, OriginalRow, WitnessEligibility};
 use super::*;
 use crate::native_evidence::DocumentKey;
 use crate::semantic_batch::staging::{Stage, WitnessFallback, WitnessStageWriter};
-use crate::semantic_batch::{AdmittedBatch, BatchCounters, BatchLimits, LookupBudget};
+use crate::semantic_batch::{
+    AdmittedBatch, LookupBudget, counters::BatchCounters, limits::BatchLimits,
+};
 use std::collections::VecDeque;
 
 /// Rows (or inventory documents) per preparation step. A page stays bounded by the unit

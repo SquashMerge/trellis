@@ -31,9 +31,8 @@ pub use semantic_display::set_architecture_semantic_rows_for_tests;
 #[cfg(feature = "test-support")]
 pub(crate) use semantic_display::status_semantic_projections_on_thread_for_tests;
 pub use semantic_display::{
-    AutoRunLabels, CallSemantic, CoverageDocument, LANGUAGE_NOTE, LanguagePending, LanguageTier,
-    McpSemantic, NO_PRODUCER_NOTE, ProducerNotPublished, ProducerSelection,
-    multiple_producers_note, relabel_status,
+    AutoRunLabels, CallSemantic, CoverageDocument, LanguagePending, LanguageTier, McpSemantic,
+    ProducerNotPublished, ProducerSelection, relabel_status,
 };
 pub use semantic_retention::AutoRunHead;
 pub(crate) use sequence_hops::{InterfaceEvidence, call_ids as sequence_call_ids};
@@ -1171,7 +1170,7 @@ pub struct NativeDocumentRows {
     pub control_regions: Vec<crate::native_evidence::ControlRegion>,
     pub references: Vec<crate::native_evidence::Reference>,
     pub capability_report: crate::native_evidence::CapabilityReport,
-    pub search_cards: Vec<crate::search_capture::CapturedCard>,
+    pub search_cards: Vec<crate::search_card_records::CapturedCard>,
 }
 
 #[derive(Default)]
@@ -1563,6 +1562,71 @@ impl MetricsOptions {
         }
         Ok(())
     }
+
+    /// `validate`, then the identifier forms a transport accepts. Every
+    /// transport (CLI, daemon request, browser API) validates through this.
+    /// The message names the first failing rule, in a fixed order.
+    pub fn validate_transport(&self, source_set_ids: MetricsSourceSetIds) -> Result<()> {
+        fn lower_hex(text: &str) -> bool {
+            text.bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        }
+        self.validate()?;
+        ensure!(
+            self.source_set_id.as_deref().is_none_or(|id| {
+                let Some(identity) = id.strip_prefix("source-set:v1:") else {
+                    return false;
+                };
+                if let Some(hash) = identity.strip_prefix("path-") {
+                    return hash.len() == 64 && lower_hex(hash);
+                }
+                source_set_ids == MetricsSourceSetIds::Current
+                    && uuid::Uuid::parse_str(identity)
+                        .is_ok_and(|uuid| uuid.to_string() == identity)
+            }),
+            "source set ID"
+        );
+        ensure!(
+            self.sid.as_deref().is_none_or(|sid| {
+                sid.len() == 39 && sid.starts_with("sid:v1:") && lower_hex(&sid[7..])
+            }),
+            "sid"
+        );
+        ensure!(
+            self.path
+                .as_deref()
+                .is_none_or(|path| !path.contains([':', '\\', '\0'])),
+            "path"
+        );
+        ensure!(
+            self.language.as_deref().is_none_or(|language| matches!(
+                language,
+                "java" | "python" | "javascript" | "typescript" | "rust"
+            )),
+            "language"
+        );
+        Ok(())
+    }
+
+    /// How long one metrics read of `scope` may work: revision and directory
+    /// reads aggregate many files, so they get the long budget.
+    pub fn work_budget(scope: &str) -> std::time::Duration {
+        std::time::Duration::from_secs(if matches!(scope, "revision" | "directory") {
+            300
+        } else {
+            30
+        })
+    }
+}
+
+/// Which source-set ID forms a metrics transport accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricsSourceSetIds {
+    /// Every current form: path-derived and UUID. The browser API.
+    Current,
+    /// Only `source-set:v1:path-<hash>`. The CLI and its daemon request
+    /// reject UUID source-set IDs today (#984).
+    PathOnly,
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -4007,7 +4071,7 @@ impl EvidenceResponse {
     pub fn tree_metadata(
         &self,
         root: &Path,
-        items: &mut [crate::file_tree::Entry],
+        items: &mut [crate::source_dir::Entry],
     ) -> Result<(IndexPin, String)> {
         let (revision, workspace_root, overlays) =
             self.store.tree_metadata_in(&self.db, root, items, true)?;
@@ -7191,7 +7255,7 @@ fn authenticate_stored_batch(
         self, AuthenticatedArtifact, AuthenticatedScipDocument, DocumentSource, VecSink,
     };
     use crate::semantic_batch::{
-        BatchCounters,
+        counters::BatchCounters,
         descriptor::{FORMAT_VERSION, SourceManifestHasher},
     };
     let descriptor = &raw.descriptor;
@@ -11529,7 +11593,7 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
     )?;
     let options = options
         .ok_or_else(|| ControlIntegrity("incompatible_index: missing reconcile options".into()))?;
-    let decoded_options: crate::indexer::ReconcileOptions = serde_json::from_str(&options)
+    let decoded_options: crate::model::ReconcileOptions = serde_json::from_str(&options)
         .context(SelectedIntegrity(
             "incompatible_index: stored JSON decode failed".into(),
         ))
@@ -12814,7 +12878,7 @@ impl Store {
     /// Signal waiters after a confirmed terminal request COMMIT.
     pub(crate) fn notify_terminal_waiters(&self) {
         self.publication_gate.notify_terminal();
-        crate::index_coordinator::diagnostic_marker(
+        crate::diagnostic_markers::diagnostic_marker(
             "-",
             "terminal_notify",
             &format!("generation={}", self.terminal_generation()),
@@ -13250,7 +13314,7 @@ impl Store {
             ensure!(revision > 0, "index_not_ready: no published revision");
             let raw_options =
                 raw_options.context("incompatible_index: missing reconcile options")?;
-            let options: crate::indexer::ReconcileOptions = serde_json::from_str(&raw_options)
+            let options: crate::model::ReconcileOptions = serde_json::from_str(&raw_options)
                 .context(SelectedIntegrity(
                     "incompatible_index: stored JSON decode failed".into(),
                 ))
@@ -13511,7 +13575,7 @@ impl Store {
     /// Only an already-classified corrupt index under a fresh exclusive leader may enter.
     pub(crate) fn recreate_index_exclusive(
         &self,
-        options: &crate::indexer::IndexOptions,
+        options: &crate::model::IndexOptions,
         leader: &mut topology::WriterGuard,
         cancel: &CancelFlag,
     ) -> Result<IndexPin> {
@@ -13519,7 +13583,7 @@ impl Store {
     }
     fn recreate_index_exclusive_with_hook(
         &self,
-        options: &crate::indexer::IndexOptions,
+        options: &crate::model::IndexOptions,
         leader: &mut topology::WriterGuard,
         cancel: &CancelFlag,
         mut at: impl FnMut(ActivationStage) -> Result<()>,
@@ -14669,7 +14733,7 @@ impl Store {
     pub fn state_topology(&self) -> (&topology::TopologyRoots, &topology::WorkspaceIdentity) {
         (&self.roots, &self.identity)
     }
-    pub fn recorded_index_options(&self) -> Result<Option<crate::indexer::IndexOptions>> {
+    pub fn recorded_index_options(&self) -> Result<Option<crate::model::IndexOptions>> {
         (|| {
             let mut db = self.cache()?;
             let tx = storage_result(db.transaction())?;
@@ -14706,7 +14770,7 @@ impl Store {
             let payload = payload.ok_or_else(|| {
                 ControlIntegrity("incompatible_index: missing reconcile options".into())
             })?;
-            let options: crate::indexer::ReconcileOptions = serde_json::from_str(&payload)
+            let options: crate::model::ReconcileOptions = serde_json::from_str(&payload)
                 .context(SelectedIntegrity(
                     "incompatible_index: stored JSON decode failed".into(),
                 ))
@@ -14716,7 +14780,7 @@ impl Store {
                 "incompatible_index: unsupported reconcile options"
             );
             let mut result =
-                crate::indexer::IndexOptions::new(Path::new(&self.workspace_root).to_owned());
+                crate::model::IndexOptions::new(Path::new(&self.workspace_root).to_owned());
             result.max_file_bytes = options.max_file_bytes;
             Ok(Some(result))
         })()
@@ -14756,7 +14820,7 @@ impl Store {
     }
     pub(crate) fn recreate_pending_writer_session(
         &self,
-        options: &crate::indexer::IndexOptions,
+        options: &crate::model::IndexOptions,
         cancel: &CancelFlag,
     ) -> Result<(IndexPin, Arc<topology::WriterSession>)> {
         ensure!(
@@ -14920,7 +14984,7 @@ impl Store {
     /// root here; no caller-supplied path is ever a root.
     pub fn producer_generation_dir(
         &self,
-        origin: crate::semantic_batch::descriptor::GenerationOrigin,
+        origin: crate::semantic_batch::origin::GenerationOrigin,
         generation_id: &str,
     ) -> Result<std::path::PathBuf> {
         ensure!(
@@ -15963,7 +16027,7 @@ impl Store {
     #[doc(hidden)]
     pub fn publish_private_stage_semantic_for_tests(
         &self,
-        options: &crate::indexer::IndexOptions,
+        options: &crate::model::IndexOptions,
         capture: &crate::capture::Capture,
         semantic: &crate::semantic_evidence::SemanticPublication,
         captured: &crate::semantic_evidence::CapturedComponents,
@@ -15983,7 +16047,7 @@ impl Store {
     #[doc(hidden)]
     pub fn publish_private_stage_native_for_tests(
         &self,
-        options: &crate::indexer::IndexOptions,
+        options: &crate::model::IndexOptions,
         capture: &crate::capture::Capture,
         cancel: &CancelFlag,
     ) -> Result<PrivateStageObservation> {
@@ -15993,7 +16057,7 @@ impl Store {
     #[cfg(feature = "test-support")]
     fn publish_private_stage_for_tests(
         &self,
-        options: &crate::indexer::IndexOptions,
+        options: &crate::model::IndexOptions,
         capture: &crate::capture::Capture,
         semantic: Option<(
             &crate::semantic_evidence::SemanticPublication,
@@ -16123,7 +16187,7 @@ impl Store {
     #[doc(hidden)]
     pub fn publish_stream_native_only_for_tests(
         &self,
-        options: &crate::indexer::IndexOptions,
+        options: &crate::model::IndexOptions,
         capture: &crate::capture::Capture,
         leader: &topology::WriterGuard,
         cancel: &CancelFlag,
@@ -16152,7 +16216,7 @@ impl Store {
     #[allow(clippy::too_many_arguments)]
     pub fn publish_stream_semantic_for_tests(
         &self,
-        options: &crate::indexer::IndexOptions,
+        options: &crate::model::IndexOptions,
         capture: &crate::capture::Capture,
         semantic: &crate::semantic_evidence::SemanticPublication,
         captured: &crate::semantic_evidence::CapturedComponents,
@@ -16245,7 +16309,7 @@ impl Store {
     #[doc(hidden)]
     pub fn publish_local_for_tests(
         &self,
-        options: &crate::indexer::IndexOptions,
+        options: &crate::model::IndexOptions,
         capture: &crate::capture::Capture,
         leader: &topology::WriterGuard,
         cancel: &CancelFlag,
@@ -16306,7 +16370,7 @@ impl Store {
     #[allow(clippy::too_many_arguments)]
     pub fn publish_local_semantic_for_tests(
         &self,
-        options: &crate::indexer::IndexOptions,
+        options: &crate::model::IndexOptions,
         capture: &crate::capture::Capture,
         semantic: &crate::semantic_evidence::SemanticPublication,
         captured: &crate::semantic_evidence::CapturedComponents,
@@ -17386,7 +17450,7 @@ impl Store {
             // The selected head is a prior validated publication. Do not decode
             // its unchanged fact/projection rows; the changed captured source
             // bytes are checked below.
-            let previous_options: crate::indexer::ReconcileOptions = db.query_row(
+            let previous_options: crate::model::ReconcileOptions = db.query_row(
                 "SELECT reconcile_options FROM index_metadata WHERE singleton=1", [],
                 |r| r.get::<_, String>(0))?.parse::<serde_json::Value>()
                     .and_then(serde_json::from_value).context(SelectedIntegrity("incompatible_index: stored capture decode failed".into()))?;
@@ -17628,7 +17692,7 @@ impl Store {
             }
             // Actual selected reuse is authenticated by selected_reusable_native below;
             // unrelated retained versions must not be decoded.
-            let previous_options:crate::indexer::ReconcileOptions = db.query_row(
+            let previous_options:crate::model::ReconcileOptions = db.query_row(
                 "SELECT reconcile_options FROM index_metadata WHERE singleton=1",[],
                 |r|r.get::<_,String>(0))?.parse::<serde_json::Value>()
                     .and_then(serde_json::from_value).context(SelectedIntegrity("incompatible_index: stored capture decode failed".into()))?;
@@ -19865,18 +19929,18 @@ impl Store {
     /// unknown key is an error.
     pub(crate) fn batch_limits(
         &self,
-    ) -> std::result::Result<crate::semantic_batch::BatchLimits, String> {
+    ) -> std::result::Result<crate::semantic_batch::limits::BatchLimits, String> {
         #[cfg(feature = "test-support")]
         if let Some(text) = self.semantic_test_hooks().semantic_limits {
             return serde_json::from_str(&text).map_err(|_| "test limits".to_string());
         }
-        Ok(crate::semantic_batch::BatchLimits::PRODUCTION)
+        Ok(crate::semantic_batch::limits::BatchLimits::PRODUCTION)
     }
 
     /// Limits the publication measures disk growth against.
-    fn batch_publication_limits(&self) -> crate::semantic_batch::BatchLimits {
+    fn batch_publication_limits(&self) -> crate::semantic_batch::limits::BatchLimits {
         self.batch_limits()
-            .unwrap_or(crate::semantic_batch::BatchLimits::PRODUCTION)
+            .unwrap_or(crate::semantic_batch::limits::BatchLimits::PRODUCTION)
     }
 
     /// The build's key inputs under this store's limits, without the payload-reuse seams.
@@ -20608,7 +20672,7 @@ impl Store {
                 && class_id.len() <= 16 * 1024
                 && (if crate::classes::supports_language(&language) {
                     f_length.is_some_and(|n| {
-                        (0..=crate::evidence_budget::CLASS_EXTRACTION as i64).contains(&n)
+                        (0..=crate::evidence_limits::CLASS_EXTRACTION as i64).contains(&n)
                     })
                 } else {
                     f_length.is_none()
@@ -20635,7 +20699,7 @@ impl Store {
             scope.version_id == version_id && scope.native_revision_id == native_revision_id,
             "incompatible_index: selected native manifest mismatch"
         );
-        let row_limit = crate::evidence_budget::row_limit(bytes);
+        let row_limit = crate::evidence_limits::row_limit(bytes);
         let counts_sql = "SELECT (SELECT count(*) FROM graph_nodes WHERE gid=?1),
             (SELECT count(*) FROM graph_display_labels WHERE gid=?1),
             (SELECT count(*) FROM native_version_calls WHERE vid=?3),
@@ -20673,9 +20737,9 @@ impl Store {
             max_row >= 0
                 && native_bytes >= 0
                 && class_bytes >= 0
-                && max_row <= crate::evidence_budget::max_row(bytes)
-                && native_bytes <= crate::evidence_budget::total(bytes)
-                && class_bytes <= crate::evidence_budget::total(bytes),
+                && max_row <= crate::evidence_limits::max_row(bytes)
+                && native_bytes <= crate::evidence_limits::total(bytes)
+                && class_bytes <= crate::evidence_limits::total(bytes),
             "incompatible_index: selected evidence byte budget exceeded"
         );
         let total_bytes = native_bytes.saturating_add(class_bytes);
@@ -21368,7 +21432,9 @@ impl Store {
                     }
                 }
                 if ids.len() > 1 {
-                    multiple_producers = language.as_deref().map(multiple_producers_note);
+                    multiple_producers = language
+                        .as_deref()
+                        .map(crate::graph_query::multiple_producers_note);
                 }
                 let mut selector = selector.clone();
                 selector.semantic_producer_policy = None;
@@ -22004,14 +22070,14 @@ impl Store {
     pub fn tree_metadata(
         &self,
         root: &Path,
-        items: &mut [crate::file_tree::Entry],
+        items: &mut [crate::source_dir::Entry],
     ) -> Result<(IndexPin, String)> {
         self.tree_metadata_with_finish_hook(root, items, || Ok(()))
     }
     fn tree_metadata_with_finish_hook(
         &self,
         root: &Path,
-        items: &mut [crate::file_tree::Entry],
+        items: &mut [crate::source_dir::Entry],
         before_finish: impl FnOnce() -> Result<()>,
     ) -> Result<(IndexPin, String)> {
         let (revision, workspace_root, overlays) = self.with_evidence_hook(|tx| {
@@ -22043,7 +22109,7 @@ impl Store {
         &self,
         tx: &Connection,
         root: &Path,
-        items: &mut [crate::file_tree::Entry],
+        items: &mut [crate::source_dir::Entry],
         pre_startup: bool,
     ) -> Result<(IndexPin, String, TreeOverlays)> {
         let revision = self.read_status_for(tx, pre_startup)?.revision;
@@ -22595,7 +22661,7 @@ impl Store {
             regions.extend(document.graph_regions);
         }
         nodes.sort_by(|a, b| a.id.cmp(&b.id));
-        calls.sort_by(crate::indexer::compare_reader_calls);
+        calls.sort_by(crate::model::compare_reader_calls);
         regions.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(Graph {
             schema_version: SCHEMA_VERSION,

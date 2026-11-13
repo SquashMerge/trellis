@@ -232,7 +232,7 @@ fn aborted_stage_retries_and_successful_recreations_do_not_accumulate_witnesses(
     // damaging the index; the test still measures only index witnesses.
     let accepted = store
         .enqueue_request(
-            &crate::indexer::IndexOptions::new(workspace.path().to_owned()),
+            &crate::model::IndexOptions::new(workspace.path().to_owned()),
             None,
         )
         .unwrap();
@@ -254,7 +254,7 @@ fn aborted_stage_retries_and_successful_recreations_do_not_accumulate_witnesses(
         let recovering = Store::open_for_tests(state.path(), workspace.path()).unwrap();
         let (_, leader) = recovering
             .recreate_pending_writer_session(
-                &crate::indexer::IndexOptions::new(workspace.path().to_owned()),
+                &crate::model::IndexOptions::new(workspace.path().to_owned()),
                 &Arc::new(AtomicBool::new(false)),
             )
             .unwrap();

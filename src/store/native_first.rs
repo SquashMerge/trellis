@@ -370,8 +370,8 @@ pub(crate) fn endpoint_boundary(
     language: &str,
     path: &str,
     basis_pin: IndexPin,
-) -> Result<Option<crate::graph_query::BoundaryReason>> {
-    use crate::graph_query::BoundaryReason;
+) -> Result<Option<crate::model::BoundaryReason>> {
+    use crate::model::BoundaryReason;
     Ok(
         match semantic_projection_for(db, pin, producer, language, path)? {
             Some(p)

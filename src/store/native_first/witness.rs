@@ -3,8 +3,8 @@
 use super::*;
 use crate::native_evidence::{DocumentKey, Range};
 use crate::semantic_batch::{
-    BatchLimits,
     descriptor::{Descriptor, SourceManifestHasher},
+    limits::BatchLimits,
 };
 use crate::semantic_evidence as sem;
 use crate::store::semantic_payload::TargetScope;
@@ -1572,7 +1572,7 @@ pub(crate) fn selected_version(
         params![semantic_pin_key(pin),key.language,key.path,key.source_set_id], |r| {
             Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?))
         }).optional()?.map(|(vid,version_id,content_hash,length,extraction_context,producer_id,producer_version)| {
-            selected_ensure!(vid>0 && crate::scip_admission::hexhash(&content_hash) && crate::scip_admission::hexhash(&extraction_context), "invalid witness version metadata");
+            selected_ensure!(vid>0 && crate::scip_vocab::hexhash(&content_hash) && crate::scip_vocab::hexhash(&extraction_context), "invalid witness version metadata");
             Ok(SelectedVersion {vid,version_id,content_hash,byte_length:length.try_into().map_err(|_|corrupt("negative document length"))?,extraction_context,producer_id,producer_version})
         }).transpose()
 }
@@ -1624,13 +1624,13 @@ pub(crate) fn source_authority(
         )?;
         let descriptor = Descriptor::parse_admitted(&bytes, &sha, limits)?;
         let pinned = descriptor.check_producer()?;
-        if descriptor.trust_origin == crate::scip_admission::SYNTHETIC_TRUST_ORIGIN {
+        if descriptor.trust_origin == crate::scip_vocab::SYNTHETIC_TRUST_ORIGIN {
             return Ok(AuthorityStep::Full("synthetic_producer"));
         }
         if descriptor.artifacts.len() != 1 {
             return Ok(AuthorityStep::Full("multi_artifact_batch"));
         }
-        if descriptor.trust_origin != crate::scip_admission::REFERENCE_TRUST_ORIGIN {
+        if descriptor.trust_origin != crate::scip_vocab::REFERENCE_TRUST_ORIGIN {
             return Ok(AuthorityStep::Full("unsupported_witness_profile"));
         }
         descriptor.check_pages(limits)?;
@@ -1880,7 +1880,7 @@ pub(crate) fn original_document_begin(
     );
     if let Some((_, digest, capped)) = &raw {
         selected_ensure!(
-            crate::scip_admission::hexhash(digest) && (0..=3).contains(capped),
+            crate::scip_vocab::hexhash(digest) && (0..=3).contains(capped),
             "invalid raw document metadata"
         );
     }

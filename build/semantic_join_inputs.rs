@@ -12,7 +12,8 @@
 ///   resource limits (`limits.rs`), whose caps shape published reasons.
 /// - `semantic_evidence`: the evidence rows' types, canonical forms and validation.
 /// - `scip_raw*`: the decoded claims, document caps and module roots the join reads.
-/// - `scip_admission`: the trust origins and hash helpers the stored basis records.
+/// - `scip_admission`, `scip_vocab`: the trust origins and hash helpers the stored basis
+///   records.
 /// - `store/native_first*`: staged commit, copies, witnessed settlement and context.
 /// - `store/semantic_payload`: the key, dependency set and projection.
 /// - `store/captured_witness`: the captured-version reads the witnessed settlement trusts.
@@ -31,6 +32,7 @@ pub const JOIN_MODULES: &[&str] = &[
     "src/scip_admission.rs",
     "src/scip_raw.rs",
     "src/scip_raw/**",
+    "src/scip_vocab.rs",
     "src/semantic_batch.rs",
     "src/semantic_batch/**",
     "src/semantic_evidence.rs",

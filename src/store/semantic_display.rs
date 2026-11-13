@@ -10,16 +10,14 @@
 use super::*;
 use crate::{
     graph_query::{
-        self as engine, BoundaryReason, DefaultProducers, DocumentFacts, GraphIntegrity,
-        GraphSnapshot, GraphSource, HistoryFacts, SemanticDocument,
+        self as engine, DefaultProducers, DocumentFacts, GraphIntegrity, GraphSnapshot,
+        GraphSource, HistoryFacts, SemanticDocument,
     },
-    model::SemanticState,
+    model::{BoundaryReason, SemanticState},
     native_evidence::DocumentKey,
     semantic_evidence as sem,
 };
 use serde_json::json;
-
-pub use crate::graph_query::{LANGUAGE_NOTE, NO_PRODUCER_NOTE, multiple_producers_note};
 
 /// An explicitly requested producer that the selected revision does not publish.
 #[derive(Debug)]
@@ -65,7 +63,7 @@ impl ProducerSelection {
     pub fn note(&self, language: &str) -> Option<String> {
         match &self.explicit {
             Some((_, languages)) => {
-                (!languages.contains(language)).then(|| LANGUAGE_NOTE.to_string())
+                (!languages.contains(language)).then(|| engine::LANGUAGE_NOTE.to_string())
             }
             None => self.defaults.note(language),
         }
@@ -189,7 +187,7 @@ impl GraphSource for Locate<'_> {
         projection: &crate::model::SemanticProjection,
         producer: &str,
         document: &DocumentKey,
-    ) -> Result<Option<crate::graph_query::BoundaryReason>> {
+    ) -> Result<Option<crate::model::BoundaryReason>> {
         native_first::endpoint_boundary(
             self.db,
             self.selected.pin,
@@ -457,7 +455,7 @@ pub(super) fn status_semantics(
     status.semantic_languages.clear();
     if !defaults.published && reimports.is_empty() {
         status.semantic_producer_id = None;
-        status.semantic_note = Some(NO_PRODUCER_NOTE.into());
+        status.semantic_note = Some(engine::NO_PRODUCER_NOTE.into());
         status.stats.semantic_state = SemanticState::Unavailable;
         return Ok(());
     }
@@ -551,7 +549,7 @@ pub(super) fn status_semantics(
     if selected.is_empty() {
         status.semantic_producer_id = None;
         status.semantic_note = Some(if notes.is_empty() {
-            LANGUAGE_NOTE.into()
+            engine::LANGUAGE_NOTE.into()
         } else {
             notes.join("; ")
         });
@@ -559,7 +557,7 @@ pub(super) fn status_semantics(
         return Ok(());
     }
     // A language no published producer covers is ordinary; only conflicts are noted.
-    notes.retain(|note| note != LANGUAGE_NOTE);
+    notes.retain(|note| note != engine::LANGUAGE_NOTE);
     status.semantic_note = (!notes.is_empty()).then(|| notes.join("; "));
     status.semantic_producer_id = (selected.len() == 1)
         .then(|| selected.pop_first())
@@ -760,7 +758,7 @@ pub(super) fn view_walk(
                 .filter(|call| call.caller == node.id)
                 .cloned()
                 .collect();
-            ordered.sort_by(crate::indexer::compare_reader_calls);
+            ordered.sort_by(crate::model::compare_reader_calls);
             let native: BTreeMap<String, crate::native_evidence::Call> = if bound {
                 let scope = v8_owner_scope_for(db, &node.id, selected)?.ok_or_else(|| {
                     SelectedIntegrity("incompatible_index: selected view node missing".into())
@@ -2142,7 +2140,10 @@ mod reimport_tests {
         let status = response.status().unwrap();
         assert!(status.semantic_languages.is_empty());
         assert_eq!(status.semantic_producer_id, None);
-        assert_eq!(status.semantic_note.as_deref(), Some(NO_PRODUCER_NOTE));
+        assert_eq!(
+            status.semantic_note.as_deref(),
+            Some(engine::NO_PRODUCER_NOTE)
+        );
         assert_eq!(status.stats.semantic_state, SemanticState::Unavailable);
         for tier in response.mcp_language_tiers().unwrap() {
             assert!(tier.reimport.is_none());
