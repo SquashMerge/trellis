@@ -15,7 +15,7 @@ async function published(sourceText,callback,filename="flow.rs") {
  const coldStart=Date.now();await H.connect(page,server,paths.token);const coldAppMs=Date.now()-coldStart;
  const file=page.locator(".file-pick").filter({hasText:filename}).first();await file.waitFor();await file.click();
  const firstSelectionStart=Date.now();const method=page.locator(".method-pick").filter({hasText:"measured"}).first();await method.waitFor();await method.click();
- await page.waitForFunction(()=>document.querySelector("#sequence-state")?.textContent?.includes("Pele rendered")||document.querySelector("#sequence-state")?.textContent?.includes("fell back"));
+ await page.waitForFunction(()=>document.querySelector("#sequence-state")?.textContent?.includes("Pele rendered")||document.querySelector("#sequence-state")?.textContent?.includes("could not be drawn"));
  assert.match(await page.locator("#sequence-state").innerText(),/Pele rendered/);const firstSelectionMs=Date.now()-firstSelectionStart;
  const seed=await H.seedId(server,paths.token,"measured");
  const dto=await H.api(server.base,paths.token,"POST",H.scoped(server.rootKey,"sequence"),{seed,expectedRevision:pin,showAll:false});assert.equal(dto.status,200,JSON.stringify(dto.data));
