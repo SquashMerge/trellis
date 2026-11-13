@@ -8,6 +8,7 @@
 //! - `envdump`: file that receives `{env, argv, cwd, which}`;
 //! - `which`: names searched on the stub's own `PATH`, recorded in the dump;
 //! - `stderr`: number of lines to write to stderr;
+//! - `stderrText`: text to write to stderr as it is;
 //! - `alloc`: MiB to allocate and touch;
 //! - `grow`: bytes to write to the `--output` file;
 //! - `emit`: SCIP file to copy to the `--output` file;
@@ -83,6 +84,9 @@ fn main() {
         for line in 0..lines {
             let _ = writeln!(stderr, "stub stderr line {line}");
         }
+    }
+    if let Some(text) = mode["stderrText"].as_str() {
+        let _ = std::io::stderr().write_all(text.as_bytes());
     }
     let _held = mode["alloc"].as_u64().map(|mib| {
         let block = vec![1_u8; mib as usize * 1024 * 1024];

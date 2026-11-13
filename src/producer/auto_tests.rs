@@ -811,6 +811,7 @@ fn record(
         finished_at: None,
         diagnostics: None,
         group_status: None,
+        failure: None,
         origin,
     }
 }

@@ -275,7 +275,7 @@ trellis producer run --producer rust-analyzer --trust trusted --plan-sha256 "$PL
 
 Every run happens in a private copy of the indexed files. Your checkout isn't touched. The defaults are a 30-minute limit and 8 GiB of memory; change them with `--timeout-secs` and `--memory-mib`, on both commands. For scip-typescript and scip-python, 80% of the memory limit (at least 4 GiB) is Node's heap limit, so raise `--memory-mib` if a run's stderr ends with `JavaScript heap out of memory`.
 
-If a run fails, `.diagnostics.stderrTail` and `.diagnostics.stdoutTail` in its output show why.
+If a run fails, `producer run` prints one line saying why, and `.failure` in its output (and in `producer status`'s `lastRun`) has the exit, the peak memory and the last stderr lines. A `node_heap_exhausted` reason means Node ran out of heap: raise `--memory-mib`. `.diagnostics.stderrTail` and `.diagnostics.stdoutTail` have more.
 
 ### Re-run after edits
 

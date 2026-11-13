@@ -482,6 +482,7 @@ fn last_run(record: &RunRecord) -> Value {
         "origin": record.origin,
         "finishedAt": record.finished_at,
         "groupStatus": record.group_status,
+        "failure": record.failure,
     })
 }
 
