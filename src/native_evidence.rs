@@ -31,7 +31,7 @@ pub(crate) const LANGUAGES: [&str; 5] = ["java", "rust", "python", "javascript",
 pub(crate) const PRODUCER: &str = "trellis.native.syntax";
 /// Native producer descriptor version. Any change that can alter a native measured field or
 /// projection, or that starts reading another input, must change it (Decision 0003).
-pub(crate) const NATIVE_VERSION: &str = "native-v16";
+pub(crate) const NATIVE_VERSION: &str = "native-v17";
 /// The build-time producer hash of this executable's extraction inputs: the
 /// listed extraction modules and crates (`build/extractor_inputs.rs`). Each
 /// revision records it; an executable rebuild with an equal hash keeps the
@@ -2498,6 +2498,48 @@ fn header_with_witnesses(
 #[cfg(feature = "test-support")]
 pub(crate) type FixtureHeaderWitnesses = BTreeMap<String, Vec<(String, Range)>>;
 
+/// tree-sitter-typescript reads `await f<T>(x)` as a call of `await f`: the call's function
+/// is an `await_expression` around the real callee (#958). This is that callee.
+pub(crate) fn awaited_callee(n: Node<'_>) -> Option<Node<'_>> {
+    if n.kind() != "call_expression" {
+        return None;
+    }
+    let function = n.child_by_field_name("function")?;
+    (function.kind() == "await_expression")
+        .then(|| function.named_child(0))
+        .flatten()
+}
+
+/// The measured range of a JavaScript or TypeScript call node. The call that `await f<T>(x)`
+/// awaits is `f<T>(x)`, as it is for `await f(x)`, so its range starts at the callee.
+pub(crate) fn js_call_range(n: Node<'_>) -> Range {
+    Range {
+        start: awaited_callee(n).map_or(n.start_byte(), |callee| callee.start_byte()),
+        end: n.end_byte(),
+    }
+}
+
+/// The JavaScript or TypeScript expression that names a call's callee: the awaited callee of
+/// the `await f<T>(x)` misparse, and a name or member under parentheses (`(f)(x)`,
+/// `(obj.m)(x)`). Any other parenthesized callee stays the written expression.
+fn js_callee<'a>(call: Node<'a>, expr: Node<'a>) -> Node<'a> {
+    if let Some(callee) = awaited_callee(call) {
+        return callee;
+    }
+    let mut inner = expr;
+    while inner.kind() == "parenthesized_expression" && inner.named_child_count() == 1 {
+        let Some(next) = inner.named_child(0) else {
+            break;
+        };
+        inner = next;
+    }
+    if matches!(inner.kind(), "identifier" | "member_expression") {
+        inner
+    } else {
+        expr
+    }
+}
+
 fn callee(n: Node<'_>, f: &SourceFile) -> (Option<String>, Option<Range>) {
     let expr = n
         .child_by_field_name(match f.language.as_str() {
@@ -2510,6 +2552,10 @@ fn callee(n: Node<'_>, f: &SourceFile) -> (Option<String>, Option<Range>) {
         .or_else(|| n.child_by_field_name("constructor"));
     let Some(expr) = expr else {
         return (None, None);
+    };
+    let expr = match f.language.as_str() {
+        "javascript" | "typescript" => js_callee(n, expr),
+        _ => expr,
     };
     let token_expr = if f.language == "rust" && expr.kind() == "generic_function" {
         expr.child_by_field_name("function").unwrap_or(expr)
@@ -3242,7 +3288,10 @@ impl ParserState<'_> {
             let ordinal = *count;
             *count += 1;
             self.saw_call = true;
-            let range = Range::node(n);
+            let range = match self.file.language.as_str() {
+                "javascript" | "typescript" => js_call_range(n),
+                _ => Range::node(n),
+            };
             ensure!(
                 self.seen
                     .insert((owner.clone(), "call".into(), range.start, range.end)),

@@ -1,4 +1,4 @@
-# JavaScript conformance corpus — native-v16 DRAFT
+# JavaScript conformance corpus — native-v17 DRAFT
 
 An independently authored event-processing workbench for #28: ten ES modules
 cover parsing, normalization, stages, editing, history and runtime extensions.
@@ -18,7 +18,7 @@ family, dropped record or artificial tagged-template gap is used to meet a floor
 - 10 production capability reports; every family is available with no gaps.
 - Two independent command runs are byte-identical. Semantic counts remain zero.
 
-The raw capture comes from Trellis's actual `trellis.native.syntax@native-v16`
+The raw capture comes from Trellis's actual `trellis.native.syntax@native-v17`
 extractor through the #95 `native-capture` command. It uses UTF-8 byte coordinates,
 not the old helper's UTF-16 offsets. Native identifier-site candidates carry no
 inferred semantic role or target. Narrow explicit renamed imports have measured
@@ -31,7 +31,20 @@ barrel. Zero calls is not unsupported. Annotations contain native coverage only;
 scenario arrays, semantic artifacts, dispositions, callable negatives and rooted
 answers are empty. `generated/manifest.json` selects the content-addressed bundle.
 
-## Current native-v16 recapture
+## Current native-v17 recapture
+
+#958 measures the TypeScript `await f<T>(x)` misparse (a call of `await f`) as the
+awaited call `f<T>(x)` with callee `f`, and unwraps a parenthesized name or member callee
+(`(f)(x)`). NATIVE_VERSION moves to native-v17. The production `native-capture` command
+re-ran twice on these unchanged snapshots using pinned Rust 1.99.1 and `test-support`.
+Both outputs were byte-identical (SHA-256
+`77c3bb1b0c52a551dc63ca92c7c3ce5af80e90df3f130ef8d497fd686de83a7c`). This corpus has
+neither construct, so only the producer version, extractor hash and occurrence IDs (which
+include the producer version) differ from the native-v16 capture. The compiled native
+extractor hash is `f2999af1ac8ba5c7be7a3e540ac69119395a3ababe740d144c177cec69ff977e`,
+pinned as `trellis-native-v17-javascript-test-support` in the hardware profile.
+
+## Historical native-v16 recapture
 
 The #683 TypeScript work (TypeScript becomes its own native language, with its own
 native constructs and class diagrams) re-ran the production `native-capture`

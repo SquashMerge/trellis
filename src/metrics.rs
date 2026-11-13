@@ -334,13 +334,18 @@ fn unqualified_call(root: Node<'_>, call: &Call, language: &str) -> bool {
         return false;
     };
     while let Some(parent) = node.parent() {
-        if node.start_byte() == call.range.start && node.end_byte() == call.range.end {
+        // The `await f<T>(x)` misparse is measured from its awaited callee (#958).
+        let awaited = matches!(language, "javascript" | "typescript")
+            .then(|| crate::native_evidence::awaited_callee(node))
+            .flatten();
+        let start = awaited.map_or(node.start_byte(), |callee| callee.start_byte());
+        if start == call.range.start && node.end_byte() == call.range.end {
             let field = match language {
                 "java" => "name",
                 "javascript" | "typescript" if node.kind() == "new_expression" => "constructor",
                 _ => "function",
             };
-            let expression = node.child_by_field_name(field);
+            let expression = awaited.or_else(|| node.child_by_field_name(field));
             return expression.is_some_and(|expression| {
                 matches!(expression.kind(), "identifier" | "type_identifier")
                     && expression.start_byte() == callee.start

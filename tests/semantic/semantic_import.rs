@@ -1083,6 +1083,98 @@ fn real_scip_typescript_calls_bind_at_exact_measured_callee_spans() {
     }
 }
 
+/// Real `@sourcegraph/scip-typescript@0.4.0 index --infer-tsconfig` output for TypeScript
+/// calls under `await` (issue #958), with the producer's metadata dropped and every document
+/// kept byte for byte.
+const ISSUE958_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/semantic-import/issue958-typescript-await"
+);
+
+/// #958: `await f()`, `await f<T>()`, `return await f()` and `await c.m()` measure the inner
+/// callee token, so the real scip-typescript occurrence there binds exactly as a plain call
+/// does, with the same dispatch.
+#[test]
+fn real_scip_typescript_awaited_calls_bind_like_plain_calls() {
+    let read = |path: &str| fs::read_to_string(format!("{ISSUE958_FIXTURE}/{path}")).unwrap();
+    let (lib, main) = (read("src/lib.ts"), read("src/main.ts"));
+    let bytes = fs::read(format!("{ISSUE958_FIXTURE}/index.scip")).unwrap();
+    let (_root, native, sources, inventory) = admitted_files_case(
+        "typescript",
+        "scip-typescript",
+        &[
+            ("src/lib.ts", &lib),
+            ("src/main.ts", &main),
+            (
+                "package.json",
+                r#"{"name":"issue958-fixture","version":"1.0.0"}"#,
+            ),
+        ],
+        &bytes,
+    );
+    let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+    // The callee token of the `nth` occurrence of `needle` in `src/main.ts`.
+    let span = |needle: &str, nth: usize| {
+        let (start, _) = main.match_indices(needle).nth(nth).unwrap();
+        let name = needle
+            .trim_start_matches("await ")
+            .split(['<', '('])
+            .next()
+            .unwrap();
+        let start = start + needle.find(name).unwrap();
+        native::Range {
+            start,
+            end: start + name.len(),
+        }
+    };
+    let declaration = |name: &str| {
+        native
+            .declarations
+            .iter()
+            .find(|d| d.document.path == "src/lib.ts" && d.name.as_deref() == Some(name))
+            .unwrap()
+            .syntax_id
+            .clone()
+    };
+    let (api_fetch, get) = (declaration("apiFetch"), declaration("get"));
+    use semantic::Dispatch::{Direct, Dynamic};
+    let expected = [
+        (span("apiFetch<string>(path)", 0), &api_fetch, Direct),
+        (span("apiFetch<string>(path)", 1), &api_fetch, Direct),
+        (span("await apiFetch(path)", 0), &api_fetch, Direct),
+        (span("await apiFetch(path)", 1), &api_fetch, Direct),
+        (span("get(\"x\")", 0), &get, Dynamic),
+    ];
+    for (callee, target, dispatch) in &expected {
+        let calls: Vec<_> = native
+            .calls
+            .iter()
+            .filter(|c| c.document.path == "src/main.ts" && c.callee_range.as_ref() == Some(callee))
+            .collect();
+        assert_eq!(calls.len(), 1, "one measured call at {callee:?}");
+        let binding = output
+            .call_bindings
+            .iter()
+            .find(|b| b.call_id.as_ref() == Some(&calls[0].id))
+            .unwrap_or_else(|| panic!("binding for the call at {callee:?}"));
+        assert_eq!(binding.join.status, semantic::JoinStatus::Exact);
+        assert_eq!(&binding.join.anchor.range, callee);
+        assert_eq!(
+            (binding.resolution, binding.dispatch),
+            (semantic::Resolution::Resolved, *dispatch),
+            "{callee:?}"
+        );
+        assert!(
+            matches!(
+                &binding.declared_target,
+                Some(semantic::Target::Internal { syntax_id, .. }) if syntax_id == *target
+            ),
+            "{callee:?}: {:?}",
+            binding.declared_target
+        );
+    }
+}
+
 /// #473: an unspecified SCIP kind (`0`) defers to the measured native declaration kind, but an
 /// explicit producer kind is still checked against it. On the real #444 bytes, stating SCIP
 /// `Method` (26) for the constructor and `run` agrees with their native `method` declarations.

@@ -852,3 +852,62 @@ const w = import(\"./api\") as Promise<unknown>;
         assert_eq!(calls, ["import", "import"], "only runtime calls: {path}");
     }
 }
+
+/// #958: a call under `await`, `yield`, `void`, `!`, parentheses, `new` or optional
+/// chaining is measured with the inner callee token and its own span.
+#[test]
+fn wrapped_calls_measure_the_inner_callee() {
+    let source = "\
+async function a() { await f(1); }
+async function b() { await obj.m(2); }
+async function c() { return await f(3); }
+async function d() { const x = await g<number>(4); }
+function* e() { yield f(5); }
+function h() { void f(6); }
+function i() { return !f(7); }
+function j() { return (f)(8); }
+function k() { return new C(9); }
+function l() { return f?.(10); }
+function m() { return obj?.m(11); }
+async function n() { return (await f(12)); }
+";
+    let mut wrong = Vec::new();
+    for path in ["a.js", "a.ts", "a.tsx"] {
+        let text = if path == "a.js" {
+            source.replace("g<number>(4)", "g(4)")
+        } else {
+            source.to_owned()
+        };
+        let artifact = index(&[(path, &text)]);
+        no_gap(path, &artifact);
+        let measured: Vec<(String, Option<String>)> = artifact
+            .calls
+            .iter()
+            .map(|c| {
+                (
+                    c.spelling.clone().unwrap_or_default(),
+                    c.callee_range
+                        .as_ref()
+                        .map(|r| text[r.start..r.end].to_owned()),
+                )
+            })
+            .collect();
+        let expected: Vec<(String, Option<String>)> =
+            ["f", "m", "f", "g", "f", "f", "f", "f", "C", "f", "m", "f"]
+                .iter()
+                .map(|name| ((*name).to_owned(), Some((*name).to_owned())))
+                .collect();
+        if measured != expected {
+            wrong.push((path, measured));
+        }
+        // The awaited call is measured without its `await`, generic or not.
+        let awaited = &artifact.calls[3].range;
+        let written = if path == "a.js" {
+            "g(4)"
+        } else {
+            "g<number>(4)"
+        };
+        assert_eq!(&text[awaited.start..awaited.end], written, "{path}");
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
