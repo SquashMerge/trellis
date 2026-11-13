@@ -18,7 +18,7 @@
   const metrics = new Set(["role", "cognitive", "cyclomatic", "maxNesting", "maintainabilityIndex", "halstead.volume", "fanOut"]);
   // `appFilter()` is the page's app choice (#852): null for All apps, else `{name, holds(path)}`.
   // `showApp(path)` makes the choice one that shows an indexed path.
-  function create({request, context, readSource, onConflict = () => {}, onInspect = () => {}, appFilter = () => null, showApp = () => {}}) {
+  function create({request, context, readSource, onConflict = () => {}, onInspect = () => {}, inspector = {}, appFilter = () => null, showApp = () => {}}) {
     let serial = 0, renderSerial = 0, selectionSerial = 0, navigationSerial = 0, view = null, basis = null, selectedKey = null;
     let metric = "cognitive", aggregate = "max", role = "production", relative = false, hideTests = true, path = "", language = "", scope = null;
     let relayout = null, resizeTimer = null;
@@ -73,7 +73,7 @@
     }
     function clearInspection() {
       selectionSerial++; selectedKey = null;
-      window.TrellisShell?.clearTreemapInspector(); markSelection();
+      inspector.clear?.(); markSelection();
     }
     function reset(message = "Open Treemap to read the indexed snapshot.") {
       serial++; renderSerial++; relayout = null; clearInspection(); view = null; basis = null;
@@ -136,7 +136,7 @@
       if (!active()) return;
       clearInspection(); selectedKey = identity(file); const ticket = selectionSerial, c = basis;
       const selectionCurrent = () => active() && usable() && ticket === selectionSerial && selectedKey === identity(file) && !get("treemap-inspector").hidden;
-      onInspect(); window.TrellisShell?.showTreemapInspector(); markSelection();
+      onInspect(); inspector.show?.(); markSelection();
       get("treemap-inspector-title").textContent = file.path;
       const target = get("treemap-inspector-content"); target.replaceChildren();
       paragraph(target, `${file.sourceSetId} · ${file.language} · indexed snapshot ${window.TrellisIndexPin.label(c.pin)}`);

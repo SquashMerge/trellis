@@ -83,12 +83,13 @@ function harness(extra = {}) {
   }
   const get = document.getElementById;
   let renderer = async (_container, view, options) => {renders.push({view,options}); return {status:"ready"};};
-  const window = {TrellisArchitecturePele:{render:(...args) => renderer(...args)},TrellisShell:{
-    clearArchitectureInspector:() => {get("architecture-inspector").hidden=true;get("architecture-inspector-content").replaceChildren();},
-    showArchitectureInspector:() => {get("architecture-inspector").hidden=false;},
-  }};
+  const window = {TrellisArchitecturePele:{render:(...args) => renderer(...args)}};
+  const inspector = {
+    clear:() => {get("architecture-inspector").hidden=true;get("architecture-inspector-content").replaceChildren();},
+    show:() => {get("architecture-inspector").hidden=false;},
+  };
   vm.runInNewContext(pinSource + "\n" + fs.readFileSync(path.join(__dirname, "../web/metric-heat.js"), "utf8") + "\n" + fs.readFileSync(path.join(__dirname, "../web/architecture-apps.js"), "utf8") + "\n" + fs.readFileSync(path.join(__dirname, "../web/architecture-deviations.js"), "utf8") + "\n" + source, {window,document,URLSearchParams,console,setTimeout:(run,delay) => {timers.push({run,delay}); return timers.length;},clearTimeout:id => {if (id) timers[id-1].run = null;}});
-  const controller = window.TrellisArchitecture.create({request:async (url,current,options) => {
+  const controller = window.TrellisArchitecture.create({inspector, request:async (url,current,options) => {
     if (url.startsWith("/api/architecture/details?")) { detailCalls.push({url,current}); if (detailError) throw detailError; if (detailGate) await detailGate; return emulateDetails(full, url, edgePairs); }
     calls.push({url,current,options}); const data = await response(url,options);
     if (!url.startsWith("/api/architecture?") || !data?.payload?.references) return data;

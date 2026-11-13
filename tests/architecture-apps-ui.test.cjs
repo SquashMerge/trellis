@@ -40,7 +40,6 @@ function controller(payload, options = {}) {
   const bands = view => new Map(view.layers.filter(layer => !layer.shared).map((layer, index) => [layer.name, {x:10, y:40 + index * 80, w:options.bandWidth ?? 300, h:60}]));
   let renderer = async (container, view, renderOptions) => { renders.push({view, options:renderOptions}); container.replaceChildren(node("svg")); return {status:"ready", bands:bands(view)}; };
   const window = {TrellisArchitecturePele:{render:(...args) => renderer(...args), edgeWidth:count => 1 + count},
-    TrellisShell:{clearArchitectureInspector() {}, showArchitectureInspector() {}},
     // `drawer`: the page is at the narrow-screen drawer width, the one width at which All apps stacks.
     matchMedia:query => ({matches:query === "(max-width: 900px)" && options.drawer === true})};
   get("architecture-diagram").clientWidth = options.width ?? 1500;

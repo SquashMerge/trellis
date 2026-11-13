@@ -1414,6 +1414,8 @@ async function setSection(name, view = null) {
   if (!filesGitStatus) await refreshGit();
 }
 window.TrellisShell?.setSectionCallback?.(name => { navigationSerial++; diagramSerial++; void setSection(name); });
+// The shell names no view (#1034): a section change drops revision-bound navigation through this.
+window.TrellisShell?.setSectionResetCallback?.(() => { window.TrellisNavigation?.reset(); });
 function appendFilesOutline(li, file) {
   const state = fileStates.get(file.path);
   if (!state?.outlineOpen) return;
@@ -2435,7 +2437,10 @@ async function refreshAppInventory() {
   if (held !== null && Apps.chosen(assigned, held) === null) { appSelection.set(selectedRootKey, null); return; }
   if (assigned) appScopeChanged();
 }
+// The views name no shell (#1034): each is handed the shell's inspector for it here. The shell is
+// read at call time, as the views read it before.
 const viewerMetrics = window.TrellisMetrics?.create({
+  inspector: {show:() => window.TrellisShell?.showMetricInspector(), clear:() => window.TrellisShell?.clearMetricInspector()},
   request: path => revisionRead(path),
   context: () => ({rootKey:selectedRootKey, session:epoch, pin:status?.revision, treeRoot, indexedWorkspace}),
   onConflict: pin => unexpectedPair("Index changed. Refresh status before inspecting metrics.", pin),
@@ -2443,6 +2448,7 @@ const viewerMetrics = window.TrellisMetrics?.create({
   onOpenCallable: (row, pin) => perform(() => openCallableSequence(row, pin)),
 });
 const treemap = window.TrellisTreemap?.create({
+  inspector: {show:() => window.TrellisShell?.showTreemapInspector(), clear:() => window.TrellisShell?.clearTreemapInspector()},
   request: (path, current) => revisionRead(path, current),
   appFilter: appChoice, showApp: showAppOf,
   context: () => ({rootKey:selectedRootKey, session:epoch, pin:status?.revision, workspaceRoot:status?.workspaceRoot}),
@@ -2451,6 +2457,7 @@ const treemap = window.TrellisTreemap?.create({
   onInspect: () => { viewerMetrics?.clearInspection(); architecture?.clearInspection(); clearSource(); },
 });
 const architecture = window.TrellisArchitecture?.create({
+  inspector: {show:options => window.TrellisShell?.showArchitectureInspector(options), clear:() => window.TrellisShell?.clearArchitectureInspector()},
   request: architectureRequest,
   appScope: appSelection && {get:() => appSelection.get(selectedRootKey), set:name => appSelection.set(selectedRootKey, name)},
   context: () => ({rootKey:selectedRootKey, session:epoch, pin:status?.revision, rulesEpoch}),

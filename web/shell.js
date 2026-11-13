@@ -11,10 +11,10 @@
   // explicitly opened view keeps its tab while it is active. Classes stays hidden until
   // the app shows the checkout has code the class catalog supports.
   const unavailableViews = new Set(["classes"]);
-  let openSource = null, targetSelection = null, sourceReturnFocus = null, activeView = "architecture", inspectorClearCallback = null, sectionCallback = null, viewCallback = null;
+  let openSource = null, targetSelection = null, sourceReturnFocus = null, activeView = "architecture", inspectorClearCallback = null, sectionCallback = null, sectionResetCallback = null, viewCallback = null;
   function setSection(name) {
     const files = name === "files";
-    window.TrellisNavigation?.reset(); window.TrellisContextMenu?.closeContextMenu?.();
+    sectionResetCallback?.(); window.TrellisContextMenu?.closeContextMenu?.();
     document.body.classList.toggle("files-section", files);
     document.body.classList.toggle("classes-view", !files && activeView === "classes");
     drawer("explorer", false); drawer("inspector", false);
@@ -39,6 +39,8 @@
     syncInspector();
   }
   function setSectionCallback(callback) { sectionCallback = callback; }
+  // Runs first in every section change, so the app can drop what belongs to the section being left.
+  function setSectionResetCallback(callback) { sectionResetCallback = callback; }
   function showFiles() {
     if (get("workspace")?.hidden) return;
     if (sectionCallback) return sectionCallback("files");
@@ -446,6 +448,6 @@
     else if (mobile && document.body.classList.contains("explorer-open")) { drawer("explorer", false); get("explorer-toggle")?.focus(); }
     else if (get("source-dock") && !get("source-dock").hidden) closeSource();
   });
-  window.TrellisShell = {setIndexAvailable, setViewAvailable, closePopovers, showTreemapInspector, clearTreemapInspector,showArchitectureInspector, clearArchitectureInspector, setViewCallback, setSection, setSectionCallback, setConnected, updateCheckout, formatGit, checkoutLabel, rootName, updateWorkspace, showView, showSource, closeSource, showFiles, showDiagrams, showMetricInspector, clearMetricInspector, setInspectorClearCallback, inspectSymbol, selectStep, resetInspector, reset};
+  window.TrellisShell = {setIndexAvailable, setViewAvailable, closePopovers, showTreemapInspector, clearTreemapInspector,showArchitectureInspector, clearArchitectureInspector, setViewCallback, setSection, setSectionCallback, setSectionResetCallback, setConnected, updateCheckout, formatGit, checkoutLabel, rootName, updateWorkspace, showView, showSource, closeSource, showFiles, showDiagrams, showMetricInspector, clearMetricInspector, setInspectorClearCallback, inspectSymbol, selectStep, resetInspector, reset};
   reset();
 })();
