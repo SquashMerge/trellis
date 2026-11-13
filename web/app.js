@@ -1897,9 +1897,11 @@ async function openArchitectureSequence(caller, sites, pin, saved, active) {
   const mine = () => sequenceOpen === open && open.session === epoch && open.root === selectedRootKey;
   const stop = text => {
     if (!mine()) return;
+    // Retry owns the view as the original open did: a navigation, view, section or source
+    // change made while its read is pending drops it with the note, never a takeover.
     open.retry = () => {
-      const context = navigationContext();
-      return openArchitectureSequence(caller, sites, context.revision, saved, () => navigationCurrent(context));
+      const context = navigationContext(), marks = viewMarks();
+      return openArchitectureSequence(caller, sites, context.revision, saved, () => navigationCurrent(context) && viewMarks() === marks);
     };
     showSequenceOpen(text, open.retry);
   };

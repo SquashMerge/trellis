@@ -1978,10 +1978,16 @@ test("Deviations Open in Sequence whose read fails says so and retries (#940)", 
     // A busy daemon is a stall the page recovers from by refreshing the view behind the open.
     const handler = route => route.fulfill({status:503, contentType:"application/json", body:JSON.stringify({error:{code:"storage_busy", message:"The index is busy."}})});
     await page.route(sequencePattern, handler);
+    // Stall recovery refreshes the view 2 s after the busy answer. Retry is pressed once that has
+    // settled: a refresh during Retry's read is a view change, which drops it with the note.
+    const recovered = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/status"), {timeout:30000});
     try {
       await open.click();
       await page.locator("#sequence-open").filter({hasText:"Open in Sequence failed: The index is busy."}).waitFor({state:"visible"});
     } finally { await page.unroute(sequencePattern, handler); }
+    await recovered;
+    await ready(page);
+    assert.match(await page.locator("#sequence-open").textContent(), /Open in Sequence failed/, "recovery keeps the note");
     await page.locator("#sequence-open-retry").click();
     await page.locator("#sequence-panel").waitFor({state:"visible"});
     await showHighlight(page);
