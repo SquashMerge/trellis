@@ -402,14 +402,15 @@ test("mini Full without visible indexed source marks blank Back history and Forw
   assert.equal(h.requests.length,reads); assert.equal(browser.history.length,2);
 });
 
-test("source history from a previous pin is rejected without rereading source or adopting the successor", async () => {
+test("source history from a previous pin opens the root view without rereading source (#951)", async () => {
   const browser=historyBrowser(), h=harness(browser), item=outline("measured"); indexedNetwork(h,item);
   await h.run('setSection("files")'); await h.run('selectFilesFile(files[0])'); h.context.item=item;
   await h.run('selectFilesSymbol(item)'); await h.run('openFilesFull()');
   h.run('clearNavigationHistory(); status.revision={...status.revision,indexRevision:2}');
   const reads=h.requests.length;
   browser.history.go(-1); await h.run('readNavigationLocation()');
-  assert.equal(h.requests.length,reads); assert.match(h.get("error").textContent,/stale/);
+  assert.equal(h.requests.length,reads); assert.equal(h.get("error").hidden,true);
+  assert.equal(browser.location.hash,""); assert.equal(browser.history.state,null); assert.equal(h.run('section'),"diagrams");
   assert.equal(h.run('status.revision.indexRevision'),2);
 });
 

@@ -537,7 +537,7 @@ test("Sequence URLs wait for authentication and checkout, use the returned seed,
   const seed = await H.seedId(server, paths.token, "transform");
   const sequenceRequests = () => requests.filter(row => row.url.pathname.endsWith("/sequence"));
   const pinned = new URLSearchParams({sid:seed, rootKey:server.rootKey, ...pin});
-  async function authenticateRoute(query, {valid = false, backend = false} = {}) {
+  async function authenticateRoute(query, {valid = false, backend = false, stale = false} = {}) {
     await page.goto("about:blank");
     const before = sequenceRequests().length;
     await page.goto(`${server.base}/#sequence?${query}`, {waitUntil:"domcontentloaded"});
@@ -559,6 +559,11 @@ test("Sequence URLs wait for authentication and checkout, use the returned seed,
       await page.locator("#method-source").click();
       await assertExactSource(page, flowSource);
       assert.deepEqual(await page.locator("#source .highlight .line-number").allTextContents(), [String(dto.seed.range.startLine)]);
+    } else if (stale) {
+      // #951 (owner ruling 2026-11-12): a well-formed link for another snapshot opens the root view.
+      await page.waitForFunction(() => location.hash === "" && document.querySelector("#view-architecture")?.getAttribute("aria-selected") === "true");
+      assert.equal(await page.locator("#error").isVisible(), false, "a stale link shows no error");
+      assert.equal(sequenceRequests().length, before);
     } else {
       if (responsePromise) assert.notEqual((await responsePromise).status(), 200);
       await page.waitForFunction(() => !document.querySelector("#error").hidden && document.querySelector("#sequence-state")?.textContent.length > 0);
@@ -573,7 +578,7 @@ test("Sequence URLs wait for authentication and checkout, use the returned seed,
   for (const patch of [{rootKey:"f".repeat(64)}, {indexGeneration:"00000000-0000-4000-8000-000000000000"}, {indexRevision:String(pin.indexRevision + 1)}]) {
     const query = new URLSearchParams(pinned);
     for (const [key, value] of Object.entries(patch)) query.set(key, value);
-    await authenticateRoute(query);
+    await authenticateRoute(query, {stale:!patch.rootKey});
   }
   await authenticateRoute(new URLSearchParams({sid:"missing-explicit-callable"}), {backend:true});
   await authenticateRoute(new URLSearchParams());
