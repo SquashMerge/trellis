@@ -121,9 +121,8 @@
 .metric-inspector-values dd[data-tone="error"] { color: var(--error); }
 .architecture-mono { font-family: var(--mono); overflow-wrap: anywhere; }
 .architecture-endpoints { overflow-wrap: anywhere; }
-.architecture-open-endpoints { min-height: 44px; background: var(--primary); color: var(--sm-ink); }
 
-/* #790: All apps. One column per app, the interface cards in the 176px gutters, an overlay of lines behind them.
+/* #790: All apps. One column per app, gutters sized to their lines (#949), an overlay of lines behind them; a card floats in a gutter at least 176px wide, else it is listed under the grid.
    Text wraps and never clips; whatever does not fit scrolls the diagram. */
 .architecture-apps-grid { position: relative; display: grid; align-items: start; row-gap: var(--sp-3); }
 .architecture-app-column { min-width: 0; }

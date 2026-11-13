@@ -125,9 +125,20 @@ impl HeadSlot {
     /// A hint, not a query-owned job. Dropping a waiter never withdraws it.
     pub fn request(&self) {
         self.touch();
+        self.rearm_request();
+    }
+    /// Rearm an evicted head and hint the owner, as a search request does, but
+    /// without counting as use: the idle timer and LRU order are unchanged.
+    /// Describe and CLI status use this (#942, owner ruling 2026-11-12).
+    pub fn rearm_request(&self) {
         if let Some(owner) = self.owner.upgrade() {
             owner.request(self.id.load(Ordering::Acquire));
         }
+    }
+    /// The instant the idle timer counts from: the last query use or publication.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn last_used_for_tests(&self) -> Option<std::time::Instant> {
+        self.state.lock().unwrap().used_at
     }
     #[cfg(any(test, feature = "test-support"))]
     pub fn wait_latest(&self, cancel: &AtomicBool, budget: &QueryBudget) -> Result<()> {

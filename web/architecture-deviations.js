@@ -741,7 +741,13 @@
       const primary = items.find(item => item.id === "sequence") || items.find(item => item.id === "call-site");
       const button = item => {
         const node = make("button", item.label, item === primary ? "deviation-primary" : "deviation-secondary"); node.type = "button"; node.dataset.action = item.id;
-        node.addEventListener("click", () => { if (active()) return item.run(); });
+        node.addEventListener("click", async () => {
+          if (!active() || node.disabled) return;
+          if (item.id !== "sequence") return item.run();
+          // Reading a sequence can take seconds: the button says so and takes no second click (#940).
+          node.disabled = true; node.setAttribute("aria-busy", "true"); node.textContent = "Opening sequence…";
+          try { await item.run(); } finally { node.disabled = false; node.setAttribute("aria-busy", "false"); node.textContent = item.label; }
+        });
         return node;
       };
       if (primary) target.append(button(primary));

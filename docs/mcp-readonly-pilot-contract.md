@@ -799,7 +799,8 @@ reasonless `unavailable`. The reason is `model_not_configured` when no model pat
 verification/loading failure, cleared by a successful load. Otherwise it is `model_not_ready`
 when this query got no query vector (the model was loading for another job, or query inference
 failed), or `matrix_not_resident` when there is no matching resident matrix and the owner has
-no work for this head (memory policy, an eviction no request has rearmed, or a head race). Model
+no work for this head (memory policy, an eviction no request has rearmed, or a head race); a
+search, describe or CLI status call is such a request (#942, owner ruling 2026-11-12). Model
 diagnostics and `vector_budget_exceeded` take precedence over `building`. Backend selection is independent: report the
 backend actually selected whenever known, including while loading/building or when the model
 is unavailable; `backend:null` means only that no backend has been selected. With a ready
@@ -938,7 +939,14 @@ precedence follows search without the per-query causes. A model diagnostic gives
 with that reason. Otherwise the matrix the owner published for that pin gives `complete`, or
 `building` while the owner runs for that pin, else `partial`. Otherwise owner work for the head
 gives `building` with the cached count, and no owner work gives `unavailable` with
-`matrix_not_resident`. With these fields, `unavailableReason` is the state's reason, so it can
+`matrix_not_resident`. **Amendment (#942, owner ruling 2026-11-12):** like search, describe and
+CLI status first rearm an evicted head and hint the owner, then sample it, so a describe and a
+search at the same moment report the same state and counts: an evicted head whose owner work
+that request starts is `building` with the cached count, not `unavailable` with `embedded:0`.
+Unlike search, this is not query use: it neither resets the head's 600-second idle timer nor
+changes its LRU order, so describe or status alone never extends residency. A matrix the owner
+publishes after such a request still expires 600 seconds after that publication. With these
+fields, `unavailableReason` is the state's reason, so it can
 also be `matrix_not_resident`, and it is non-null exactly when the state is `unavailable`. The
 fields are omitted without a search service or matrix owner (a standalone registry keeps
 `{backend:null,unavailableReason:null}`) and without an admitted head. The other describe

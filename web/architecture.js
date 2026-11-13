@@ -26,6 +26,8 @@
   const ENTRY_CAP = 40, BOX_CAP = 150;
   // Resize re-layout: the quiet period, and the width change that is worth a new drawing.
   const RESIZE_DEBOUNCE_MS = 150, RESIZE_SLACK = 8;
+  // The narrow-screen drawer width (web/shell.js): the only width at which All apps columns stack (#949/#950).
+  const DRAWER_WIDTH = "(max-width: 900px)";
   const stem = name => { const dot = name.lastIndexOf("."); return dot > 0 ? name.slice(0, dot) : name; };
   // A directory module's own root file: shown first when it opens, never as a "mod" chip.
   const ROOT_FILES = new Set(["mod.rs", "__init__.py"]);
@@ -280,7 +282,9 @@
     // scale spans them.
     function plan(full, scope) {
       const metric = state.metric();
-      const columns = scope === null && full.apps?.length >= 2 ? apps().groups(full) : [], allApps = columns.length >= 2;
+      // All apps columns run in interface order (#949): each server between its clients.
+      const found = scope === null && full.apps?.length >= 2 ? apps().groups(full) : [], allApps = found.length >= 2;
+      const columns = allApps ? apps().columnOrder(full, found.map(group => group.name)).map(name => found.find(group => group.name === name)) : found;
       const payload = scope === null ? full : apps().scoped(full, scope);
       const parts = allApps ? columns.map(group => {
         const slice = apps().scoped(full, group.name);
@@ -309,14 +313,18 @@
           unassigned:{label:`Unassigned / unknown\n${plural(unassigned, "file")} · no layer`, get expanded() { return state.shown().unassigned && budget.left > 0; }}},
       };
     }
-    // Each All apps column's Shared bands sit on the side away from its interface partners (#850).
-    function sides(full, parts, sideBySide) {
+    // Whether a layer of an All apps column is a drawn Shared band (true), a drawn ordered band (false) or none (null).
+    function bandOf(parts) {
       const partOf = new Map(parts.map(part => [part.group.name, part]));
-      return apps().sharedSides(full, parts.map(part => part.group.name), (name, layerName) => {
+      return (name, layerName) => {
         const part = partOf.get(name), layer = part?.slice.layers.find(item => item.name === layerName);
         return layer && part.layout.layers.has(layerName) && part.slice.layers.some(item => !item.shared) ? layer.shared : null;
-      }, sideBySide);
+      };
     }
+    // Each All apps column's Shared bands sit on the side away from its interface partners (#850).
+    const sides = (full, parts, sideBySide) => apps().sharedSides(full, parts.map(part => part.group.name), bandOf(parts), sideBySide);
+    // The lines each gutter between All apps columns carries, which size it (#949).
+    const lanes = (full, parts) => apps().laneCounts(full, parts.map(part => part.group.name), bandOf(parts));
     // An All apps column's header lines.
     function columnHeader(part) {
       const metric = state.metric(), layered = part.slice.layers.some(layer => !layer.shared);
@@ -357,7 +365,7 @@
     const legendText = scale => state.metric() === "layer" ? "Layer membership · neutral chips; no metric heat."
       : `${scale.label} · ${state.metric()} · ${state.aggregate()} · ${state.role() === "all" ? "all indexed callables" : callables()}`;
     return {layerOf, layerNumber, layerTag, layerLabel, layerCounts, layerStats, interfaceStats, hint, expanded, testLayer, flagged, edgeTone, coverageOf, percent,
-      lowerBound, edgeText, summary, worst, level, capped, entries, moduleGroups, summaryChips, plan, options, sides, columnHeader,
+      lowerBound, edgeText, summary, worst, level, capped, entries, moduleGroups, summaryChips, plan, options, sides, lanes, columnHeader,
       coverageRows, coverageSummary, ruleCounts, reviewCounts, legendText, callables};
   }
   const BUILD_PHASES = {reading:"reading indexed files", resolving:"resolving references", evaluating:"evaluating rules", measuring:"measuring code"};
@@ -803,11 +811,15 @@
       pressed = nodeKey(node); syncCards();
     }
     async function drawApps({full, parts, canvas, width, stack, active, layout}) {
-      let plan = apps.layout({width, count:parts.length});
+      // Each gutter is as wide as the lines it carries (#949), so the lanes are counted before any column is drawn.
+      // Columns stack only at the narrow-screen drawer width (#949/#950, owner ruling 2026-11-12); else the canvas scrolls.
+      const laneCounts = shared.lanes(full, parts), drawer = !!window.matchMedia?.(DRAWER_WIDTH)?.matches;
+      let plan = apps.layout({width, count:parts.length, lanes:laneCounts, drawer});
       const pele = window.TrellisArchitecturePele, grid = make("div", undefined, "architecture-apps-grid"), columns = [], boxes = [], bandsOf = new Map();
+      // Side by side, the grid's tracks alternate column and gutter, and column i takes track 2i + 1.
       const place = () => {
         grid.dataset.layout = plan.sideBySide ? "columns" : "stacked";
-        css(grid, {width:`${plan.width}px`, gridTemplateColumns:plan.sideBySide ? plan.widths.map(each => `${each}px`).join(" ") : `${plan.width}px`, columnGap:`${plan.gutter}px`});
+        css(grid, {width:`${plan.width}px`, gridTemplateColumns:plan.sideBySide ? plan.widths.flatMap((each, index) => index ? [`${plan.gutters[index - 1]}px`, `${each}px`] : [`${each}px`]).join(" ") : `${plan.width}px`});
       };
       place();
       // Each column's Shared bands sit on the side away from its interface partners (#850).
@@ -826,6 +838,8 @@
         head.append(make("span", "Selected", "architecture-selected-tag"));
         head.addEventListener("click", () => { if (!active()) return; inspect("app", group); pressOnly(head); });
         column.append(head, box); grid.append(column); columns.push(column); boxes.push(box);
+        // The re-layout below only widens columns, so side by side stays decided and the track is this one.
+        if (plan.sideBySide) css(column, {gridColumn:String(2 * columns.length - 1)});
         if (!layered) {
           const files = group.unassignedFileCount, button = make("button", `◇ ${files} unassigned · listed, never dropped`, "architecture-aside-box");
           button.type = "button"; button.dataset.tone = "warning"; button.addEventListener("click", () => { if (active()) openReview("unassigned"); });
@@ -838,7 +852,7 @@
       }
       canvas.replaceChildren(grid);
       // A drawing wider than its column (an unbreakable name) widens the column; the diagram scrolls.
-      plan = apps.layout({width, count:parts.length, natural:boxes.map(box => Math.ceil(box.scrollWidth || 0))}); place();
+      plan = apps.layout({width, count:parts.length, lanes:laneCounts, drawer, natural:boxes.map(box => Math.ceil(box.scrollWidth || 0))}); place();
       // Frames are in each drawing's own coordinates; the overlay and the cards live in the grid's.
       const rect = node => node.getBoundingClientRect?.() || null, origin = rect(grid), places = new Map();
       parts.forEach((part, index) => {
@@ -852,6 +866,11 @@
       for (const entry of entriesOf) {
         const words = apps.endsText(entry, routed.undrawn.get(entry) || []), button = make("button", undefined, "architecture-interface-card");
         button.type = "button"; button.setAttribute("aria-pressed", "false"); button.setAttribute("data-trellis-action-id", apps.key(entry)); button.setAttribute("data-trellis-card", "interface");
+        const client = places.get(entry.client), server = places.get(entry.server), gutter = Math.min(client.index, server.index);
+        // A gutter narrower than a card (#949) lists the card under the grid, as for columns that are not adjacent;
+        // away from its gutter a card names its interface, as the Herdr pane's cards do.
+        const floats = plan.sideBySide && Math.abs(client.index - server.index) === 1 && apps.cardFits(plan.gutters[gutter]);
+        if (plan.sideBySide && !floats) button.append(make("span", `${entry.client} → ${entry.server}`, "architecture-card-line"));
         for (const row of apps.cardText(entry)) {
           const item = make("span", row.text, "architecture-card-line");
           if (row.strong) item.dataset.strong = "true";
@@ -862,13 +881,12 @@
         button.append(make("span", "Selected", "architecture-selected-tag"));
         button.setAttribute("aria-label", apps.cardName(entry)); cardEntries.set(button, entry);
         button.addEventListener("click", () => { if (!active()) return; inspect("interface", entry); pressOnly(button); });
-        const client = places.get(entry.client), server = places.get(entry.server), gutter = Math.min(client.index, server.index);
         if (!plan.sideBySide) columns[client.index].after(button);
-        else if (Math.abs(client.index - server.index) === 1) {
+        else if (floats) {
           // Below its own lines, so the card never covers a run; later cards in the gutter stack under it.
           const ys = routed.lines.filter(item => item.entry === entry).map(item => item.y), start = ys.length ? Math.max(...ys) + 14 : Math.min(client.top, server.top);
           const top = Math.max(start, floor.get(gutter) || 0);
-          button.dataset.gutter = "true"; css(button, {left:`${plan.columns[gutter].x + plan.columns[gutter].width}px`, top:`${top}px`, width:`${plan.gutter}px`});
+          button.dataset.gutter = "true"; css(button, {left:`${plan.columns[gutter].x + plan.columns[gutter].width}px`, top:`${top}px`, width:`${plan.gutters[gutter]}px`});
           columns[client.index].after(button);
           const height = button.offsetHeight || 96;
           floor.set(gutter, top + height + 8); bottom = Math.max(bottom, top + height);
@@ -1135,7 +1153,7 @@
         list.append(row);
       }
     };
-    // The interface inspector (AC15): its ends, counts and wrappers, the one-sided routes and calls, and Open endpoints for the matched ones.
+    // The interface inspector (AC15): its ends, counts and wrappers, then the matched routes and the one-sided routes and calls.
     function inspectInterface(target, title, entry, active) {
       const facts = apps.interfaceFacts(entry);
       title.textContent = facts.title;
@@ -1146,13 +1164,10 @@
       target.append(grid);
       if (facts.wrappers) paragraph(target, facts.wrappers, "detail architecture-mono");
       const params = list => ({kind:"interfaces", client:entry.client, server:entry.server, list});
-      const matched = make("div", undefined, "architecture-endpoints"), open = make("button", "Open endpoints", "architecture-open-endpoints"); open.type = "button";
-      open.addEventListener("click", () => {
-        if (!active() || open.disabled) return;
-        open.disabled = true; open.setAttribute("aria-expanded", "true");
-        detailList(matched, params("matched"), active, endpointRows(active), "No matched routes at this pin.");
-      });
-      target.append(open, matched);
+      // The matched routes load up front, under their heading, before the one-sided lists (#950; owner ruling 2026-11-12).
+      paragraph(target, facts.matchedHeading, "detail");
+      const matched = make("div", undefined, "architecture-endpoints"); target.append(matched);
+      detailList(matched, params("matched"), active, endpointRows(active), "No matched routes at this pin.");
       paragraph(target, "◆ Server-only routes: no call matched them", "detail");
       detailList(target, params("serverOnly"), active, endpointRows(active), "No server-only routes.");
       paragraph(target, "◆ Client-only calls: no route matched them. This does not prove absence.", "detail");

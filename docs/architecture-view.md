@@ -664,9 +664,22 @@ rest; colour keeps its meaning, the tag and the inspector keep the exact count, 
 key under the drawing shows the width at 1, 10, 100 and ≥1000 sites. The channels count
 toward the fitted width. This is layout only: records, counts and identities are unchanged.
 
-All apps layout (#790, #850; owner decision 2026-11-09). With two or more apps, All apps draws
-one column per app, side by side in **manifest order** when they fit (each at least 352px,
-with a 176px gutter between columns), else stacked. Each column is the same Pele drawing as
+All apps layout (#790, #850; owner decision 2026-11-09, amended by #949/#950, owner ruling 2026-11-12). With two or more apps, All apps draws
+one column per app, side by side in **interface order**, each at least 352px with each gutter
+between them as wide as its lanes need. **Never stack; scroll** (#949/#950, owner ruling
+2026-11-12): with two to four apps the columns always sit side by side, and the canvas scrolls
+horizontally when it is narrower than them. They stack only at the narrow-screen drawer width
+(900px and under, where the Explorer and Inspector become drawers); five or more apps sit side
+by side only when they all fit, else stack. The Herdr pane has no drawer, so it never stacks two to
+four apps and scrolls them sideways. Interface order
+(#949/#950, owner ruling 2026-11-12) starts from manifest order and places each server app
+between its clients: the client with the most matched routes on its left, the next on its
+right, and the rest after them; ties keep manifest order. Servers are taken in manifest order,
+an app already placed beside an earlier server stays where it is, and apps with no interface
+keep their manifest order. A gutter is `max(48, lanes × 6 + 2 × 8 + 8)` px, where `lanes` is the
+number of interface ends it will draw as lines, counted from the drawable ends before any
+column is drawn. An interface card floats in its gutter only when the gutter is at least a
+card (176px) wide; otherwise it is listed under the grid. Each column is the same Pele drawing as
 the one-app view, fitted to its column width (#860's stack span included), with its own
 gutters and side channels. An interface end between **adjacent** side-by-side columns, with
 both of its layers drawn as bands, draws
@@ -765,8 +778,9 @@ read from `interfaces[].ends`: `→ <server> · N routes · M call sites` on the
 `← <client> · N routes` on the server end. Ends with no layer have no band and no stub. Several ends on
 one server band can share a route, so that stub reads `≥N routes`. A stub is a button with
 `aria-pressed`; selecting it opens the interface inspector (the ends, the counts, the wrappers,
-the server-only and client-only lists, and **Open endpoints** for the matched routes, each
-with **Read handler source** and **Read call-site source**) and shows the word `Selected` on the stub; while it is selected, its band's label also says
+the matched routes under a **Matched routes (N)** heading, N from the interface counts, then
+the server-only and client-only lists, all loaded up front with no button, each route with
+**Read handler source** and **Read call-site source**; #949/#950, owner ruling 2026-11-12) and shows the word `Selected` on the stub; while it is selected, its band's label also says
 `client end` or `server end`. The app
 inspector (name, languages and roots, a grid of files, layers, calls to each server app, deviations
 and unassigned files, and the interfaces the app takes part in) is selected from an app column header in All apps (#790).
