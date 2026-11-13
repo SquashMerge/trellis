@@ -284,10 +284,19 @@ fn isolated_filesystem_returns_allocated_blocks_only_after_verified_release() {
             String::from_utf8_lossy(&outcome.stdout),
             String::from_utf8_lossy(&outcome.stderr)
         );
+        // A passing child's output is otherwise dropped: relay its cleanup
+        // note (#1029) with a write that cannot panic.
+        for line in String::from_utf8_lossy(&outcome.stderr).lines() {
+            if line.starts_with(IMAGE_NOT_EJECTED) {
+                use std::io::Write as _;
+                let _ = writeln!(std::io::stderr(), "{line}");
+            }
+        }
         return;
     }
     use std::os::fd::AsRawFd;
     use std::process::Command;
+    const IMAGE_NOT_EJECTED: &str = "note: isolated filesystem test image was not ejected";
     let home = tempfile::tempdir().unwrap();
     let image = home.path().join("witness.sparseimage");
     let mount = home.path().join("mounted");
@@ -314,7 +323,15 @@ fn isolated_filesystem_returns_allocated_blocks_only_after_verified_release() {
         String::from_utf8_lossy(&created.stderr)
     );
     let attached = Command::new("/usr/bin/hdiutil")
-        .args(["attach", "-nobrowse", "-mountpoint"])
+        // No image verification and no automatic fsck: neither is needed for
+        // a fresh image, and fsck opens the device node, which blocks eject.
+        .args([
+            "attach",
+            "-nobrowse",
+            "-noverify",
+            "-noautofsck",
+            "-mountpoint",
+        ])
         .arg(&mount)
         .arg(&image)
         .output()
@@ -337,14 +354,20 @@ fn isolated_filesystem_returns_allocated_blocks_only_after_verified_release() {
         attached: bool,
     }
     impl Mounted {
-        // A system daemon can briefly hold a fresh volume busy (#131):
-        // retry, then force, keeping every attempt's message.
+        // Anything holding the device node open keeps the image busy after
+        // its volume is unmounted, and `-force` does not override that
+        // (#131, #1029). Retry with backoff, forcing after the first
+        // attempts, and keep every attempt's message. The bound is a hang
+        // backstop, not an expectation of how long an eject takes.
         fn detach(&mut self) -> Result<()> {
+            let started = std::time::Instant::now();
+            let bound = std::time::Duration::from_secs(30);
+            let mut delay = std::time::Duration::from_millis(250);
             let mut failures = Vec::new();
-            for attempt in 0..4 {
+            for attempt in 0.. {
                 let mut command = Command::new("/usr/bin/hdiutil");
                 command.arg("detach").arg(&self.device);
-                if attempt == 3 {
+                if attempt >= 3 {
                     command.arg("-force");
                 }
                 let outcome = command.output()?;
@@ -353,7 +376,11 @@ fn isolated_filesystem_returns_allocated_blocks_only_after_verified_release() {
                     return Ok(());
                 }
                 failures.push(String::from_utf8_lossy(&outcome.stderr).trim().to_owned());
-                std::thread::sleep(std::time::Duration::from_millis(500));
+                if started.elapsed() >= bound {
+                    break;
+                }
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(std::time::Duration::from_secs(2));
             }
             anyhow::bail!("hdiutil detach: {failures:?}")
         }
@@ -363,7 +390,11 @@ fn isolated_filesystem_returns_allocated_blocks_only_after_verified_release() {
             if self.attached
                 && let Err(error) = self.detach()
             {
-                eprintln!("isolated filesystem cleanup failed: {error:#}");
+                use std::io::Write as _;
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "isolated filesystem cleanup failed: {error:#}"
+                );
             }
         }
     }
@@ -447,12 +478,27 @@ fn isolated_filesystem_returns_allocated_blocks_only_after_verified_release() {
         "hdiutil unmount: {}",
         String::from_utf8_lossy(&unmounted.stderr)
     );
-    mounted.detach().unwrap();
+    let ejected = mounted.detach();
+    // The volume staying mounted is a real cleanup failure, whatever the
+    // eject said.
     assert_ne!(
         std::fs::metadata(&mount).unwrap().dev(),
         mounted_device,
-        "test image remained mounted after successful detach"
+        "test image remained mounted after detach: {ejected:?}"
     );
+    // An image that is unmounted but still busy after the bound is a host
+    // condition, not a product defect (#1029): report it and pass. The image
+    // file is still removed with its directory; the device keeps the unlinked
+    // file until the host ejects it or restarts, and nothing stays mounted.
+    if let Err(error) = ejected {
+        mounted.attached = false;
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "{IMAGE_NOT_EJECTED}: {} is unmounted but still attached: {error:#}",
+            mounted.device.display()
+        );
+    }
 }
 #[test]
 fn foreign_replacement_stage_refuses_release_and_preserves_foreign_inode() {
