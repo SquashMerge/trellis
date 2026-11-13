@@ -348,7 +348,7 @@ test("AC25 selecting a column header or a card shows the word Selected, presses 
   const line = descendants(h.get("architecture-diagram")).find(item => item.attrs.class === "architecture-apps-line");
   assert.equal(line.attrs["data-selected"], "true");
   assert.ok(descendants(card).some(item => item.className === "architecture-selected-tag" && item.textContent === "Selected"));
-  await h.get("architecture-review").fire("click"); await flush(); await h.get("architecture-deviations-back").fire("click"); await flush();
+  await h.get("architecture-review").fire("click"); await flush(); await h.get("architecture-deviations-diagram").fire("click"); await flush();
   assert.equal(pressedNow().length, 0, "the overview presses nothing");
   assert.equal(card.attrs["aria-label"].endsWith("Selected"), false); assert.equal(line.attrs["data-selected"], "false");
 });

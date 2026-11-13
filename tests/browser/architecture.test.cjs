@@ -156,8 +156,8 @@ async function edgePairs(selected, dto, edge) {
   return pairs;
 }
 
-// #845: a deviating arrow opens the Deviations tree on its edge; Back returns to the arrow.
-test("Architecture deviating arrows open the Deviations tree on their edge, and Back returns to the arrow", {timeout:240000}, async () => published(rules, async selected => {
+// #845, #965: a deviating arrow opens the Deviations tab on its edge; Show on diagram returns to the arrow.
+test("Architecture deviating arrows open the Deviations tab on their edge, and Show on diagram returns to the arrow", {timeout:240000}, async () => published(rules, async selected => {
   const {page, requests} = selected;
   await ready(page);
   const arrows = [
@@ -174,11 +174,14 @@ test("Architecture deviating arrows open the Deviations tree on their edge, and 
     assert.equal(await page.locator("#architecture-deviations-calls").isChecked(), false);
     assert.equal(await page.locator("#architecture-deviations-tree .deviation-row[aria-selected=true]").count(), 0, "no line is selected");
     assert.equal(await page.locator("#architecture-review-panel").isVisible(), false, "no rule-instance review list");
-    assert.equal(await page.locator("#architecture-panel .architecture-toolbar").isVisible(), false, "the tree replaces the toolbar");
+    assert.equal(await page.locator("#architecture-panel .architecture-toolbar").isVisible(), false, "the tree is its own tab");
+    assert.equal(await page.locator("#view-deviations").getAttribute("aria-selected"), "true");
     if (kind === "upward") await capture(page, "architecture-arrow-opens-deviations");
-    await page.locator("#architecture-deviations-back").click();
+    await page.locator("#architecture-deviations-diagram").click();
     await page.locator("#architecture-diagram").waitFor({state:"visible"});
-    assert.equal(await arrow.evaluate(node => node === document.activeElement), true, `Back returns focus to the ${kind} arrow`);
+    await page.waitForFunction(() => document.activeElement?.closest?.("#architecture-diagram"));
+    assert.equal(await arrow.evaluate(node => node === document.activeElement), true, `Show on diagram focuses the ${kind} arrow`);
+    assert.equal(await arrow.getAttribute("aria-pressed"), "true", `and presses it`);
     assert.equal(await page.locator("#architecture-inspector-title").textContent(), "Architecture review");
   }
   assert.equal(requests.some(row => row.url.pathname.endsWith("/architecture/details") && row.url.searchParams.has("sourceLayer")), false, "no per-edge instance list is read");
@@ -190,7 +193,7 @@ test("Architecture authored exceptions reach the same caller and preserve the ex
   await addLineException(page, "low → top", "src/low.rs", 1);
   await page.locator("#architecture-reason").fill("Reviewed boundary for sequence navigation");
   await confirmChange(selected, await previewChange(selected));
-  await page.locator("#architecture-deviations-back").click();
+  await page.locator("#architecture-deviations-diagram").click();
   await page.locator("#architecture-authored").click();
   const entry = page.locator("#architecture-exceptions [data-exception-index='0']");
   await entry.getByRole("button", {name:"Inspect boundary calls", exact:true}).click();
@@ -305,6 +308,11 @@ const summaryKey = edge => JSON.stringify([edge.sourceLayer, edge.destinationLay
 async function ready(page) {
   await page.locator("#architecture-state[data-state=ready]").waitFor({state:"attached"});
   await page.locator("#architecture-diagram svg").first().waitFor({state:"attached"});
+}
+// A rules change made from the Deviations tab (#965) reads the snapshot without drawing it; the drawing waits for Architecture.
+async function shownReady(page) {
+  if (await page.locator("#view-deviations").getAttribute("aria-selected") === "true") await page.locator("#deviations-state[data-state=ready]").waitFor({state:"attached"});
+  else await ready(page);
 }
 // #845: an exception is added from one line of the Deviations tree, for that line's file pair.
 async function addLineException(page, chip, file, line) {
@@ -574,7 +582,7 @@ test("Architecture uses real pinned structural sites, authored native-file layer
   assert.match((await page.locator("#architecture-deviations-edges button[aria-pressed=true]").allTextContents()).join(), /^low → top · \d+$/);
   assert.match(await page.locator("#architecture-deviations-tree").textContent(), /src\/low\.rs/);
   assert.equal(reverse.sites[0].lines.start > 0, true);
-  await page.locator("#architecture-deviations-back").click();
+  await page.locator("#architecture-deviations-diagram").click();
   await ready(page);
   assert.equal(await page.getByRole("button", {name:"Open in Treemap", exact:true}).count(), 0, "An edge/source selection is not a module identity");
   await page.locator("#architecture-color").selectOption("layer");
@@ -786,7 +794,7 @@ test("Architecture draws the full stack, module chips per band, lower-bound coun
   await page.locator("#architecture-review").click();
   assert.equal((await (await read).json()).payload.total, check.counts.deviates, "the deviations chip opens the tree on exactly what it counts");
   await page.locator("#architecture-deviations-tree .deviation-row").first().waitFor({state:"visible"});
-  await page.locator("#architecture-deviations-back").click();
+  await page.locator("#architecture-deviations-diagram").click();
   await ready(page);
   await capture(page, "architecture-modules-default");
 
@@ -898,7 +906,7 @@ async function confirmChange(selected, preview) {
   assert.equal(data.payload.rulesFile.contentHash, preview.proposedHash);
   assert.equal(readFileSync(rulesPath(selected.paths), "utf8"), preview.text, "apply writes exactly the preview text");
   await selected.page.waitForFunction(hash => document.querySelector("#architecture-notice-content")?.textContent.includes(hash), preview.proposedHash);
-  await ready(selected.page);
+  await shownReady(selected.page);
   const refreshed = await architecture(selected);
   assert.equal(refreshed.status, 200, JSON.stringify(refreshed.data));
   assert.equal(refreshed.data.payload.indexGeneration, selected.pin.indexGeneration);
@@ -1031,7 +1039,7 @@ test("Architecture preserves a conflicted draft, reloads explicitly and requires
     const notice = document.querySelector("#architecture-notice-content")?.textContent;
     return notice && !notice.includes(hash);
   }, initial.baseHash);
-  await ready(page);
+  await shownReady(page);
   assert.equal(await page.locator("#architecture-reason").inputValue(), reason, "Reload keeps the reason but invalidates the old preview");
   assert.equal(await page.locator("#architecture-confirm").isVisible(), false);
   const rebased = await previewChange(selected);
@@ -1864,8 +1872,8 @@ test("Deviations inspector Open in Sequence shows the Sequence tab with the call
     await request;
     await page.locator("#sequence-panel").waitFor({state:"visible"});
     assert.equal(await page.locator("#view-sequence").getAttribute("aria-selected"), "true", "the Sequence tab is the active tab");
-    assert.equal(await page.locator("#view-architecture").getAttribute("aria-selected"), "false");
-    assert.equal(await page.locator("#architecture-panel").isHidden(), true, "Deviations is no longer on screen");
+    assert.equal(await page.locator("#view-deviations").getAttribute("aria-selected"), "false");
+    assert.equal(await page.locator("#deviations-panel").isHidden(), true, "Deviations is no longer on screen");
     await showHighlight(page);
     const ids = await hashCallIds(page);
     assert.equal(ids.length, 1);
@@ -1902,7 +1910,7 @@ test("Deviations inspector Open in Sequence shows that it is opening until the S
       assert.equal(await open.isDisabled(), true, "the button takes no second click while it opens");
       assert.equal(await open.getAttribute("aria-busy"), "true");
       assert.equal(await open.textContent(), "Opening sequence…");
-      assert.equal(await page.locator("#view-architecture").getAttribute("aria-selected"), "true", "nothing has moved yet");
+      assert.equal(await page.locator("#view-deviations").getAttribute("aria-selected"), "true", "nothing has moved yet");
       hold.release();
       await page.locator("#sequence-panel").waitFor({state:"visible"});
       await showHighlight(page);
@@ -1935,7 +1943,7 @@ test("Deviations Open in Sequence that the index overtakes says so and retries a
       hold.release();
       const note = page.locator("#sequence-open");
       await note.filter({hasText:"The index moved to a newer revision; Open in Sequence was cancelled."}).waitFor({state:"visible"});
-      assert.equal(await page.locator("#view-architecture").getAttribute("aria-selected"), "true");
+      assert.equal(await page.locator("#view-deviations").getAttribute("aria-selected"), "true", "the Deviations tab stays");
     } finally { hold.release(); await page.unroute(sequencePattern, handler); }
     const retried = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/sequence") && response.request().postDataJSON()?.expectedRevision?.indexRevision === head.indexRevision);
     await page.locator("#sequence-open-retry").click();
@@ -1960,7 +1968,7 @@ test("Deviations Open in Sequence that another view overtakes says so instead of
     try {
       await open.click();
       await hold.seen;
-      await page.locator("#architecture-deviations-back").click();
+      await page.locator("#architecture-deviations-diagram").click();
       hold.release();
       await page.locator("#sequence-open").filter({hasText:"The view changed; Open in Sequence was cancelled."}).waitFor({state:"visible"});
       assert.equal(await page.locator("#view-architecture").getAttribute("aria-selected"), "true", "the view the user chose stays");
@@ -1981,12 +1989,17 @@ test("Deviations Open in Sequence whose read fails says so and retries (#940)", 
     // Stall recovery refreshes the view 2 s after the busy answer. Retry is pressed once that has
     // settled: a refresh during Retry's read is a view change, which drops it with the note.
     const recovered = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/status"), {timeout:30000});
+    // The tab's own refresh after recovery reads the snapshot again; Retry waits for it to settle.
+    const reread = recovered.then(() => page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/architecture") && response.request().method() === "GET", {timeout:30000}));
     try {
       await open.click();
       await page.locator("#sequence-open").filter({hasText:"Open in Sequence failed: The index is busy."}).waitFor({state:"visible"});
     } finally { await page.unroute(sequencePattern, handler); }
     await recovered;
-    await ready(page);
+    // Recovery refreshes the Deviations tab, which reads without drawing (#965).
+    await reread;
+    await shownReady(page);
+    await page.locator("#architecture-deviations-tree .deviation-row").first().waitFor({state:"visible"});
     assert.match(await page.locator("#sequence-open").textContent(), /Open in Sequence failed/, "recovery keeps the note");
     await page.locator("#sequence-open-retry").click();
     await page.locator("#sequence-panel").waitFor({state:"visible"});
@@ -2019,6 +2032,7 @@ test("Deviations Open in Sequence keeps its highlight through Back, Forward and 
 
     await page.goBack();
     await page.locator("#architecture-deviations-tree").waitFor({state:"visible"});
+    assert.equal(await page.locator("#view-deviations").getAttribute("aria-selected"), "true", "Back returns to the Deviations tab (#965)");
     const back = lineRow(page, "src/low.rs", 1);
     await back.waitFor({state:"visible"});
     assert.equal(await chipNamed(page, /low → top/).getAttribute("aria-pressed"), "true", "Back keeps the chip");
@@ -2069,10 +2083,11 @@ test("Deviations Reload reopens the tree after a rules conflict, with the same c
     await expandTree(page);
     await lineRow(page, "src/low.rs", 1).click();
     await page.locator("#architecture-deviations-calls").check();
-    await page.locator("#architecture-deviations-back").click();
+    // Leaving the tab drops the read tree; choosing the tab again reads it on the chip it was left on (#965).
+    await page.locator("#view-treemap").click();
     writeFileSync(rulesPath(paths), `${config}\n# an external editor changed the rules at the same revision\n`);
     const reload = page.locator("#architecture-deviations-reload");
-    await page.locator("#architecture-review").click();
+    await page.locator("#view-deviations").click();
     await reload.waitFor({state:"visible"});
     assert.match(await page.locator("#architecture-deviations-notices").textContent(), /Rules changed since these deviations were loaded\. Reload deviations\./);
     assert.equal(await page.locator("#architecture-deviations-tree .deviation-row").count(), 0, "no partial tree");
@@ -2254,7 +2269,7 @@ test("Deviations: an edge opened while another edge's read is pending shows only
     await up.focus(); await page.keyboard.press("Enter");
     await hold.seen;
     assert.match(await page.locator("#architecture-deviations-state").textContent(), /^Reading deviations/);
-    await page.locator("#architecture-deviations-back").click();
+    await page.locator("#architecture-deviations-diagram").click();
     const peer = page.locator("#architecture-diagram").getByRole("button", {name:/production sites · (?:peer|cross)[^·]*deviation/}).first();
     await peer.focus(); await page.keyboard.press("Enter");
     hold.release();
@@ -2302,9 +2317,163 @@ test("returning from the Deviations tree leaves no stub marked Selected", {timeo
   await stub.focus(); await page.keyboard.press("Enter"); await settled(page);
   await page.waitForFunction(() => document.querySelector('#architecture-diagram [aria-pressed=true] .architecture-selected-tag'));
   await page.locator("#architecture-review").click();
-  await page.locator("#architecture-deviations-back").click();
+  await page.locator("#architecture-deviations-diagram").click();
   assert.equal(await page.locator("#architecture-inspector-title").textContent(), "Architecture review");
   await page.waitForFunction(() => !document.querySelector('#architecture-diagram [aria-pressed=true]'));
   assert.equal(await stub.getAttribute("aria-pressed"), "false");
   assert.equal(await stub.locator("text.architecture-selected-tag").evaluate(node => getComputedStyle(node).visibility), "hidden");
 }, new Map(), httpApps));
+
+// #965 (owner request 2026-11-12): Deviations is a top tab, as in the Herdr mod (#939).
+const deviationsLink = page => page.evaluate(() => {
+  const at = location.hash.indexOf("?"), query = new URLSearchParams(at < 0 ? "" : location.hash.slice(at + 1));
+  return {path:at < 0 ? location.hash : location.hash.slice(0, at), app:query.get("app"), edge:query.get("edge")};
+});
+const pressedChips = page => page.locator("#architecture-deviations-edges button[aria-pressed=true]").allTextContents();
+async function treeShown(page) {
+  await page.locator("#deviations-panel").waitFor({state:"visible"});
+  await page.locator("#architecture-deviations-tree .deviation-row").first().waitFor({state:"visible"});
+  assert.equal(await page.locator("#view-deviations").getAttribute("aria-selected"), "true", "the Deviations tab is the active tab");
+  assert.equal(await page.locator("#architecture-panel").isHidden(), true);
+}
+async function diagramShown(page) {
+  await page.locator("#architecture-panel").waitFor({state:"visible"});
+  await ready(page);
+  assert.equal(await page.locator("#view-architecture").getAttribute("aria-selected"), "true");
+}
+const upwardArrow = page => page.locator("#architecture-diagram").getByRole("button", {name:/^2 production sites · upward\s+deviation(?: · .*)?$/});
+
+test("#965 Deviations is the last top tab; chosen by itself it shows the tree under its link", {timeout:240000}, async () => published(rules, async ({page}) => {
+  await ready(page);
+  assert.deepEqual(await page.locator("#diagram-tabs [role=tab]").evaluateAll(nodes => nodes.map(node => node.textContent)),
+    ["Architecture", "Treemap", "Sequence", "Classes", "Deviations"]);
+  await page.locator("#view-deviations").click();
+  await treeShown(page);
+  assert.deepEqual(await deviationsLink(page), {path:"#deviations", app:null, edge:null});
+  assert.match((await pressedChips(page)).join(), /^All (?:upward|deviations) · \d+$/, "every edge");
+  assert.equal(await page.locator("#architecture-deviations-diagram").textContent(), "Show on diagram");
+  assert.equal(await page.locator("#architecture-deviations-back").count(), 0, "no ← Architecture link");
+  // The line inspector works in the tab.
+  await chipNamed(page, /low → top/).click();
+  assert.deepEqual(await deviationsLink(page), {path:"#deviations", app:null, edge:"low→top"}, "a chip chosen in the tab is in its link");
+  await expandTree(page);
+  await lineRow(page, "src/low.rs", 1).click();
+  assert.equal(await page.locator("#architecture-inspector-title").textContent(), "src/low.rs:1");
+}));
+
+test("#965 the review chip opens Deviations on every edge and a deviating arrow on its edge; Show on diagram presses the arrow", {timeout:240000}, async () => published(rules, async ({page}) => {
+  await ready(page);
+  await page.locator("#architecture-review").click();
+  await treeShown(page);
+  assert.deepEqual(await deviationsLink(page), {path:"#deviations", app:null, edge:null});
+  assert.match((await pressedChips(page)).join(), /^All (?:upward|deviations) · \d+$/, "the review chip opens every edge");
+  await page.locator("#architecture-deviations-diagram").click();
+  await diagramShown(page);
+  assert.equal(await page.evaluate(() => location.hash), "", "Architecture's own entry");
+  assert.equal(await page.locator('#architecture-diagram [aria-pressed="true"]').count(), 0, "every edge highlights no arrow");
+
+  const arrow = upwardArrow(page);
+  await arrow.focus(); await page.keyboard.press("Enter");
+  await treeShown(page);
+  assert.deepEqual(await deviationsLink(page), {path:"#deviations", app:null, edge:"low→top"});
+  assert.deepEqual((await pressedChips(page)).map(text => text.replace(/ · \d+$/, "")), ["low → top"], "the arrow opens its edge");
+  // The review chip in the tab's inspector clears the edge.
+  await page.locator("#architecture-review").click();
+  await page.waitForFunction(() => /^All /.test(document.querySelector("#architecture-deviations-edges button[aria-pressed=true]")?.textContent ?? ""));
+  assert.deepEqual(await deviationsLink(page), {path:"#deviations", app:null, edge:null});
+  await chipNamed(page, /low → top/).click();
+  await page.locator("#architecture-deviations-diagram").click();
+  await diagramShown(page);
+  await page.waitForFunction(() => document.activeElement?.closest?.("#architecture-diagram"));
+  assert.equal(await arrow.getAttribute("aria-pressed"), "true", "Show on diagram presses the edge's arrow");
+  assert.equal(await arrow.evaluate(node => node === document.activeElement), true, "and focuses it");
+}));
+
+test("#965 the tab is in history: Back and Forward move between it and Architecture, and a reload restores it", {timeout:240000}, async () => published(rules, async ({page, paths}) => {
+  await ready(page);
+  const arrow = upwardArrow(page);
+  await arrow.focus(); await page.keyboard.press("Enter");
+  await treeShown(page);
+  await page.locator("#architecture-deviations-diagram").click();
+  await diagramShown(page);
+  await page.goBack();
+  await treeShown(page);
+  assert.deepEqual(await deviationsLink(page), {path:"#deviations", app:null, edge:"low→top"});
+  await page.waitForFunction(() => document.querySelector("#architecture-deviations-edges button[aria-pressed=true]")?.textContent.startsWith("low → top"));
+  await page.goForward();
+  await diagramShown(page);
+  assert.equal(await page.evaluate(() => location.hash), "");
+  await page.goBack();
+  await treeShown(page);
+  // Leaving by a tab is an entry too.
+  await page.locator("#view-treemap").click();
+  await page.locator("#treemap-panel").waitFor({state:"visible"});
+  await page.goBack();
+  await treeShown(page);
+
+  await page.reload({waitUntil:"domcontentloaded"});
+  await page.locator("#token").fill(paths.token);
+  await page.locator("#connect-form button[type=submit]").click();
+  await treeShown(page);
+  assert.deepEqual(await deviationsLink(page), {path:"#deviations", app:null, edge:"low→top"});
+  await page.waitForFunction(() => document.querySelector("#architecture-deviations-edges button[aria-pressed=true]")?.textContent.startsWith("low → top"));
+  assert.equal(await page.locator("#error").isHidden(), true);
+}));
+
+test("#965 a Deviations history entry from an older revision opens the root view with no error (#951)", {timeout:240000}, async () => published(rules, async ({page, paths, pin, server, requests}) => {
+  await ready(page);
+  await page.locator("#architecture-review").click();
+  await treeShown(page);
+  await page.locator("#architecture-deviations-diagram").click();
+  await diagramShown(page);
+  const changed = `${sources.get("src/peer.rs")}pub fn added() {}\n`;
+  writeFileSync(join(paths.workspace, "src/peer.rs"), changed);
+  const head = await H.indexThroughApi(server, paths.token, pin, "src/peer.rs", changed);
+  await H.reveal(page, "#refresh"); await page.locator("#refresh").click();
+  await page.waitForFunction(revision => new RegExp(`Revision [0-9a-f]+:${revision} ·`).test(document.querySelector("#status")?.textContent ?? ""), head.indexRevision);
+  await page.goBack();
+  await page.waitForFunction(() => location.hash === "");
+  await diagramShown(page);
+  assert.equal(await page.locator("#error").isHidden(), true, "no error");
+  assert.equal(await page.locator("#deviations-panel").isHidden(), true);
+  for (let i = requests.length - 1; i >= 0; i--) if (requests[i].url.searchParams.get("indexRevision") && requests[i].url.searchParams.get("indexRevision") !== String(pin.indexRevision)) requests.splice(i, 1);
+}));
+
+// Two apps; alpha's core layer calls up into its ui layer.
+const deviatingApps = new Map([
+  ["a/package.json", '{"name":"alpha"}\n'], ["b/package.json", '{"name":"beta"}\n'],
+  ["a/ui.js", "export function view() { return 1; }\n"],
+  ["a/core.js", 'import { view } from "./ui.js";\nexport function run() { return view(); }\n'],
+  ["b/lib.js", "export function lib() { return 2; }\n"],
+]);
+const deviatingAppRules = `version = 1
+[layers.ui]
+order = 1
+app = "alpha"
+paths = ["a/ui.js"]
+[layers.core]
+order = 2
+app = "alpha"
+paths = ["a/core.js"]
+[layers.lib]
+order = 1
+app = "beta"
+paths = ["b/lib.js"]
+`;
+
+test("#965 an app's deviation count opens Deviations on that app, every edge", {timeout:240000}, async () => published(deviatingAppRules, async ({page}) => {
+  await page.locator("#architecture-state[data-state=ready]").waitFor({state:"attached"});
+  const count = page.locator(".architecture-app-header", {hasText:/^alpha/}).locator(".architecture-app-deviations");
+  await count.waitFor({state:"visible"});
+  assert.match(await count.textContent(), /^\d+ deviations?$/);
+  await count.click();
+  await treeShown(page);
+  assert.deepEqual(await deviationsLink(page), {path:"#deviations", app:"alpha", edge:null});
+  assert.deepEqual(await page.locator("#deviations-apps button[aria-pressed=true]").allTextContents(), ["alpha · javascript"], "the tab's app switcher shows the app");
+  assert.match((await pressedChips(page)).join(), /^All (?:upward|deviations) · \d+$/, "every edge of the app");
+  assert.deepEqual(await page.locator('#architecture-deviations-tree .deviation-row[data-level="1"] .deviation-path').allTextContents(), ["a/core.js"]);
+  // All apps from the tab's switcher replaces the tab's own entry.
+  await page.locator("#deviations-apps").getByRole("button", {name:"All apps"}).click();
+  await page.waitForFunction(() => !location.hash.includes("app="));
+  await page.locator("#architecture-deviations-tree .deviation-row").first().waitFor({state:"visible"});
+}, new Map(), deviatingApps));

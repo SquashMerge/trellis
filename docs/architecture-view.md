@@ -753,7 +753,7 @@ unknown`) and the longer prose live behind the ⓘ.
 
 The inspector opens on the counted review chips, **23 deviations · 156 unassigned ·
 0 exceptions**, and every Architecture inspection keeps them at its head. The deviations
-chip opens the Deviations tree below, the one review path for deviations (#845). The other
+chip opens the Deviations tab (the tree below) on every edge, the one review path for deviations (#845, #965). The other
 chips open the unassigned files and the authored exceptions. Deviations are `rules.counts.deviates`, unassigned files
 are the full native module inventory with no assigned layer (including module-only files),
 and exceptions is `exceptionCount`. The evidence disclosure separately labels
@@ -770,7 +770,7 @@ not excepted, to a layer with a smaller `order`. It reads `↑12 references · e
 lower bound, `↑1 reference · entry` for one): the count is reference sites, the tree's unit after
 #846 (owner ruling 2026-11-09, #845). It sums the summary edges, so the badges of a band add up to its former `↑`
 chip. Each badge is its own focusable control, the next sibling of its band, and opens the
-Deviations tree with that edge's chip pressed, no line selected and Calls only off. The `↓`
+Deviations tab with that edge's chip pressed, no line selected and Calls only off. The `↓`
 chip stays display-only.
 
 In a one-app stack, a band that holds this app's end of an HTTP interface also carries a stub
@@ -791,7 +791,7 @@ snapshot. Opening it again draws that snapshot without a read when nothing it re
 changed: the checkout, the session, the index pin, the aggregation, the metric population
 and the rules epoch (a rules edit applied here, or a `rules_conflict`, advances it). Any
 change re-reads, with the usual loading message. Choosing an app, selecting or clearing a
-selection, and returning from the Deviations tree re-draw the held snapshot and never read.
+selection, and returning from the Deviations tab re-draw the held snapshot and never read.
 The chosen app resets when the checkout changes.
 
 The SPEC §9 size cap applies to chips: at most 40 per band or open module and 150 in
@@ -805,11 +805,11 @@ Click a module or select it with Enter/Space to inspect its identity, layer, cap
 physical file lines, callable count, every metric, and its incident references and rule
 instances (read on demand, [below](#summary-and-detail-reads-448)).
 
-**Arrows and badges open the Deviations tree (#845, owner ruling 2026-11-09).** Selecting an
+**Arrows and badges open the Deviations tab (#845, owner ruling 2026-11-09; #965).** Selecting an
 arrow that the tree lists, a production `$layers` edge with the `deviates` verdict and no
-exception (upward `↑` or peer and shared `⇄`), opens the Deviations tree with that edge's
+exception (upward `↑` or peer and shared `⇄`), opens the Deviations tab with that edge's
 chip pressed, no line selected and Calls only off, exactly as its band's `↑` badge does. The
-tree's back link returns to the drawing and focuses the arrow or badge that opened it. Any
+tab's **Show on diagram** returns to the drawing with that edge's arrow pressed and focused. Any
 other arrow (allowed, excepted, unknown or test-only) opens the edge inspector: its exact
 contributing module pairs, production/test counts, verdict, exception and source-site
 samples. The edge inspector lists no rule instances; the per-edge exception review it used
@@ -842,14 +842,38 @@ from the link. A group of more than 50 calls highlights in memory only; its link
 
 Status: proposed (owner-delegated, run 802).
 
-The deviations chip replaces the diagram with a tree of every production deviation, found
+The Deviations tab shows a tree of every production deviation, found
 without choosing an edge first. It reads `kind=instances`, `rule=$layers`, `status=deviates`,
 `role=production`, `excepted=false` at the view's pin and rules hash, page by page, and
 shows nothing if any page fails. The tree is a flat list of files, each with its functions
 and then its lines, sorted by references; files are not nested under edges. A file row
-carries the edges it reaches up or across, and the edge chips filter the list. The tree
-replaces the drawing and the Architecture toolbar (app switcher, metric controls, ⓘ); its
-header leads back with "← Architecture", or "← <app>" in a one-app stack.
+carries the edges it reaches up or across, and the edge chips filter the list.
+
+**Its own tab (#965, owner request 2026-11-12).** This supersedes the tree replacing the
+drawing and its "← Architecture" link (#845). As in the Herdr mod (#939), Deviations is a top
+tab after Architecture · Treemap · Sequence · Classes. It shows the tree, its edge chips,
+filters and line inspector for the shown pin and the chosen app, with the app switcher above
+it (the page's choice, shared with the other views) and Architecture's read state while the
+snapshot is read; it draws no diagram. The Architecture review panel (exception drafts, the
+unassigned and authored lists) sits above the tree while the tab is shown.
+
+- **Entry points.** The review chip opens the tab on every edge. An app's deviation count in
+  an All apps column header opens it on that app (the page's app choice), every edge. A
+  deviating arrow or `↑` badge opens it on that edge. Each opens with Calls only off and no
+  line selected. The tab chosen by itself shows the tree as it was left.
+- **Show on diagram** replaces "← Architecture". It shows the Architecture tab; when the tree
+  is on one edge, that edge's production deviation arrow (the first column that draws it in
+  All apps) is pressed and focused. An edge with no drawn arrow shows the drawing unselected.
+- **Link and history.** The tab is in the URL: `#deviations`, with `app=<name>` and
+  `edge=<source>→<destination>` when chosen. The link carries no pin, so a reload or a link
+  shows the tab at the shown snapshot; an app or edge the snapshot no longer has falls back to
+  All apps or every edge. Entering or leaving the tab (its tab, an entry point or Show on
+  diagram) adds a history entry, so Back and Forward return to it; a chip or app chosen inside
+  the tab replaces the tab's own entry. A history entry for the tab from another snapshot or
+  checkout is stale: as #951 rules, it strips the URL and opens the root view (Architecture)
+  with no error.
+- **A new snapshot.** A refresh to a new revision or rules file reads the tree again on the
+  same chip.
 
 - **Naming (#816).** A *deviation* is a rule instance, as on the review chip (**23
   deviations**). The tree's chips and Reaches up column count *references* (reference
@@ -906,20 +930,20 @@ header leads back with "← Architecture", or "← <app>" in a one-app stack.
   "Selected line is hidden by this filter." **Clear filter** returns to All deviations with
   Calls only off and selects nothing. A line is never selected for the user.
 - **Unknown.** "N unknown rule instances are not deviations." links to the existing
-  **Inspect same-layer and unassigned references** view, and closes the tree.
-- **Open in Sequence and Back.** The browser history entry keeps whether the tree was open,
-  the chip, Calls only, the expanded rows, the selected line and focus. **Back** reopens the
-  tree and reselects and focuses that line. If the line is gone it says "The selected line is
+  **Inspect same-layer and unassigned references** view in the Architecture tab.
+- **Open in Sequence and Back.** Open in Sequence from the tab keeps #940's opening note and
+  Retry. The browser history entry, under the tab's link, keeps the chip, Calls only, the
+  expanded rows, the selected line and focus. **Back** reopens the Deviations tab and
+  reselects and focuses that line. If the line is gone it says "The selected line is
   no longer listed." and selects nothing.
 - **Refresh and conflicts.** A moved revision (`revision_conflict`, `pin_expired` or
   `root_changed`) is handled like any stale Architecture read: the app reads "Architecture
-  snapshot changed. Refresh status before reopening Architecture.", refreshes status and
-  resets the Architecture view, which closes the tree; open it again from the deviations
-  chip. Changed rules read "Rules changed since these deviations were loaded. Reload
+  snapshot changed. Refresh status before reopening Architecture.", refreshes status, and
+  the tab reads the tree again at the new head, on the same chip. Changed rules read "Rules changed since these deviations were loaded. Reload
   deviations."; a building index reads "Architecture is still building for this revision."
   **Reload deviations** re-reads and reopens the tree with the same chip and Calls only and
   no selection. Applying an exception does the same. A reset for any other reason,
-  such as leaving the tab, drops that request.
+  such as leaving the tab, drops that request; the tab then opens on its own chip.
 
 ## One computation per revision (#556)
 
