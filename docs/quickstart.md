@@ -273,7 +273,7 @@ trellis producer run --producer rust-analyzer --trust trusted --plan-sha256 "$PL
 - `--trust restricted` is the default and runs none of your repository's code. Java build files, `lsif-java.json`, `pyproject.toml` and `pyrightconfig.json` are left out, and Java runs offline. That means calls into third-party dependencies may stay unresolved.
 - `--trust trusted` lets the producer run your repository's build logic, which is not sandboxed. Use it only on code you trust. `rust-analyzer` always needs it, because it can't turn off build scripts and proc macros. Trusted `scip-java` runs your Gradle or Maven build, so that tool must be reachable: the run's `PATH` holds only your JDK's folder, `/usr/bin` and `/bin`.
 
-Every run happens in a private copy of the indexed files. Your checkout isn't touched. The defaults are a 30-minute limit and 8 GiB of memory; change them with `--timeout-secs` and `--memory-mib`, on both commands.
+Every run happens in a private copy of the indexed files. Your checkout isn't touched. The defaults are a 30-minute limit and 8 GiB of memory; change them with `--timeout-secs` and `--memory-mib`, on both commands. For scip-typescript and scip-python, 80% of the memory limit (at least 4 GiB) is Node's heap limit, so raise `--memory-mib` if a run's stderr ends with `JavaScript heap out of memory`.
 
 If a run fails, `.diagnostics.stderrTail` and `.diagnostics.stdoutTail` in its output show why.
 

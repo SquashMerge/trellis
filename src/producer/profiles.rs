@@ -180,9 +180,20 @@ fn lang() -> &'static str {
     }
 }
 
+/// Node's default V8 old-space limit on a 64-bit host, in MiB.
+pub const NODE_DEFAULT_HEAP_MIB: u64 = 4096;
+
+/// The V8 old-space limit a Node-launched producer gets for a `memory_mib` bound (#957): 80% of
+/// it, leaving the rest for code, stacks, buffers and the young generation, and never below
+/// Node's default, which a run already had.
+pub fn node_heap_mib(memory_mib: u64) -> u64 {
+    (memory_mib * 4 / 5).max(NODE_DEFAULT_HEAP_MIB)
+}
+
 /// The command of `row`. `resolution` must come from the same row (the
 /// launcher, `node`, `java`, `rustup` and `python3` each row consumes), and `rules` from the
-/// same plan.
+/// same plan. `memory_mib` is the run's memory bound, which sizes a Node producer's heap.
+#[allow(clippy::too_many_arguments)]
 pub fn command(
     row: &Row,
     resolution: &Resolution,
@@ -191,6 +202,7 @@ pub fn command(
     pin: &PinnedProducer,
     rules: &Rules,
     run: &str,
+    memory_mib: u64,
 ) -> CommandSpec {
     let out = format!("{run}/out/index.scip");
     let mut env = BTreeMap::from([
@@ -201,6 +213,7 @@ pub fn command(
     let launcher = text(&resolution.launcher);
     let mut bin_links = Vec::new();
     let node_dir = resolution.node.as_ref().map(|node| node.dir.as_path());
+    let heap = format!("--max-old-space-size={}", node_heap_mib(memory_mib));
     let argv: Vec<String>;
     let path: String;
     match (row.target, row.trust) {
@@ -215,6 +228,7 @@ pub fn command(
             let node = resolution.node.as_ref().map(|n| text(&n.path));
             argv = vec![
                 node.unwrap_or_default(),
+                heap,
                 launcher,
                 "index".into(),
                 "--output".into(),
@@ -227,6 +241,7 @@ pub fn command(
             let node = resolution.node.as_ref();
             let mut v = vec![
                 node.map(|n| text(&n.path)).unwrap_or_default(),
+                heap,
                 launcher,
                 "index".into(),
                 "--project-name".into(),

@@ -183,6 +183,7 @@ fn env_canaries_absent_per_profile_row() {
             &pin,
             &profiles::rules(row),
             &run_text,
+            8192,
         );
         // The stub takes the row's place as argv[0], keeping every argument.
         let mut argv = vec![
@@ -230,6 +231,7 @@ fn restricted_python_child_cannot_resolve_interpreter() {
         &pin,
         &profiles::rules(&row),
         &run_text,
+        8192,
     );
     assert_eq!(spec.env["PATH"], format!("{run_text}/bin"));
     write_bin_links(&run, &spec.bin_links).unwrap();
