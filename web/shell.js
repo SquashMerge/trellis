@@ -6,7 +6,7 @@
   const hide = (id, value) => { if (get(id)) get(id).hidden = value; };
   const make = (tag, value) => { const node = document.createElement(tag); if (value !== undefined) node.textContent = value; return node; };
   const describe = value => typeof value === "string" ? value : JSON.stringify(value, null, 2);
-  const views = {architecture:"architecture-panel", treemap:"treemap-panel", sequence:"sequence-panel", classes:"classes-panel"};
+  const views = {architecture:"architecture-panel", treemap:"treemap-panel", sequence:"sequence-panel", classes:"classes-panel", deviations:"deviations-panel"};
   // Views whose tab is hidden because the checkout has nothing for them (#450). An
   // explicitly opened view keeps its tab while it is active. Classes stays hidden until
   // the app shows the checkout has code the class catalog supports.
@@ -133,13 +133,14 @@
     if (name === "inspector" && open) inspectorCollapsed = false;
     syncInspector();
   }
-  function showView(name) {
+  // `how.user` marks a choice of tab by the viewer (a click or arrow key), as against a navigation (#965).
+  function showView(name, how = {}) {
     if (!Object.hasOwn(views, name)) return;
     if (document.body.classList.contains("files-section")) showDiagrams();
     activeView = name;
     document.body.classList.toggle("classes-view", name === "classes");
     window.TrellisClasses?.closeContextMenu?.();
-    if (name === "sequence" || name === "classes" || ["architecture", "treemap"].includes(name)) drawer("explorer", false);
+    if (name === "sequence" || name === "classes" || ["architecture", "treemap", "deviations"].includes(name)) drawer("explorer", false);
     for (const [key, panel] of Object.entries(views)) {
       hide(panel, key !== name);
       const tab = get(`view-${key}`);
@@ -150,7 +151,7 @@
     // Focus on another tab moves to the shown one, so no tab but the selected one looks current (#913).
     const focused = document.activeElement;
     if (focused?.closest?.("#diagram-tabs") && focused !== get(`view-${name}`)) get(`view-${name}`)?.focus();
-    viewCallback?.(name);
+    viewCallback?.(name, how);
   }
   function syncViewTabs() {
     for (const key of Object.keys(views)) hide(`view-${key}`, unavailableViews.has(key) && key !== activeView);
@@ -428,7 +429,7 @@
   document.addEventListener("scroll", event => {
     for (const node of placed()) if (event.target?.contains?.(node)) placePopover(node);
   }, true);
-  wireTabs(Object.keys(views), "view-", showView);
+  wireTabs(Object.keys(views), "view-", name => showView(name, {user:true}));
   wireTabs(["workspace", "library"], "dock-", showSource);
   get("inspector-open-source")?.addEventListener("click", () => { if (openSource) return openSource(); });
   get("inspector-clear")?.addEventListener("click", () => { resetInspector(); inspectorClearCallback?.(); });

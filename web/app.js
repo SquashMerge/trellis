@@ -142,20 +142,21 @@ function rememberNavigation(entry, replace, hash) {
   if (!window.history?.pushState || !window.history?.replaceState) return;
   const key = `${navigationScope}:${++navigationKey}`;
   navigationEntries.set(key, {...entry, hash, ...navigationContext()});
-  window.history[replace ? "replaceState" : "pushState"]({trellisNavigation:key}, "", hash);
+  // An entry with no hash names the page itself; an empty URL would keep the current hash.
+  window.history[replace ? "replaceState" : "pushState"]({trellisNavigation:key}, "", hash || `${window.location?.pathname || ""}${window.location?.search || ""}`);
   navigationLocation = navigationSignature();
 }
 function navigationSignature() {
   return `${window.location?.hash || ""}:${window.history?.state?.trellisNavigation || ""}`;
 }
-function captureSourceEntry() {
+function captureSourceEntry(view = currentDiagramView()) {
   if (!workspaceSource || !IndexPin.equal(workspaceSource.data.revision, status?.revision) ||
       $("source-dock")?.hidden || $("workspace-source-panel")?.hidden || (section === "files" && filesBasis !== "indexed")) return null;
   const focus = document.activeElement;
   const action = focus?.closest?.(".source-diagram-action");
   const offsets = id => ({top:$(id)?.scrollTop || 0, left:$(id)?.scrollLeft || 0});
   return {kind:"source", source:workspaceSource, sourceNavigation:workspaceSource.navigation?.snapshot?.(), section, method:selectedMethod, diagram:diagramSequence,
-    view:["sequence", "classes", "architecture", "treemap"].find(name => $("view-" + name)?.getAttribute?.("aria-selected") === "true") || "sequence",
+    view,
     showAll:!!$("all-steps").checked, boundary:sequenceBoundary, inspector:sourceInspector,
     file:filesFile, symbol:filesSymbol, basis:filesBasis, mini:filesMini, matches:filesMatches,
     line:Number($("source").dataset?.navigationLine) || workspaceSource.range?.startLine || 1,
@@ -175,9 +176,11 @@ function rememberCurrent(revision, architectureEntry = null) {
   writeEntry(currentEntry(revision, architectureEntry));
 }
 // What is on screen as a history entry, or null when the current entry already describes it.
-function currentEntry(revision, architectureEntry = null) {
-  const source = captureSourceEntry();
-  if (architectureEntry) return {entry:{kind:"architecture", architecture:architectureEntry}, hash:"#architecture"};
+// A line selected in the Deviations tab is that tab's entry, under its link (#965).
+function currentEntry(revision, architectureEntry = null, view = currentDiagramView()) {
+  const source = captureSourceEntry(view);
+  if (architectureEntry) return {entry:{kind:"architecture", architecture:architectureEntry},
+    hash:architectureEntry.inspection?.kind === "deviation" ? deviationsHash({app:architectureEntry.scope ?? null, edge:architectureEntry.deviations?.chip ?? null}) : "#architecture"};
   if (source) return {entry:source, hash:"#source"};
   if (diagramSequence && selectedMethod?.id === diagramSequence.seed.id && IndexPin.equal(diagramSequence.revision, revision))
     return {entry:{kind:"sequence", symbol:selectedMethod, admitted:diagramSequence, showAll:!!$("all-steps").checked, boundary:sequenceBoundary}, hash:sequenceHash(selectedMethod.id, revision, sequenceBoundary)};
@@ -218,6 +221,8 @@ async function restoreSourceEntry(entry, current) {
     if (!current()) return;
   }
   if (entry.section === "diagrams") showNavigationView(entry.view);
+  // Source opened over the Deviations tab returns to the tab's tree (#965).
+  if (entry.section === "diagrams" && entry.view === "deviations") void architecture?.showDeviations();
   updateFilesBasis(); renderFiles();
   if (entry.section === "files" && filesSymbol) {
     renderFilesSymbolHeader(filesSymbol);
@@ -264,6 +269,8 @@ async function readNavigationLocation(force = false) {
   const entry = candidate?.hash === (window.location?.hash || "") ? candidate : null;
   try {
     if (entry) {
+      // A Deviations tab entry from another snapshot or checkout opens the root view (#951, #965).
+      if (entry.hash.startsWith("#deviations") && !navigationCurrent(entry)) return await openRootView(current);
       if (!navigationCurrent(entry)) throw new Error("This history entry is stale. Select source from the current snapshot.");
       if (entry.kind === "unavailable") return navigationError("This history entry has no saved source view. The current diagram remains open; use Forward to return to its link.");
       $("error").hidden = true;
@@ -275,11 +282,12 @@ async function readNavigationLocation(force = false) {
         if (!current()) return;
         return showNavigationView(entry.view);
       }
+      if (entry.kind === "deviations") return await showDeviationsRoute(entry.filter, current);
       if (entry.kind === "architecture") {
         clearSource(); diagramSequence = null; sequenceBoundary = null;
         await setSection("diagrams");
         if (!current()) return;
-        showNavigationView("architecture");
+        showNavigationView(entry.architecture.inspection?.kind === "deviation" ? "deviations" : "architecture");
         return await architecture.restore(entry.architecture, current);
       }
       clearSource(); diagramSequence = null;
@@ -291,8 +299,20 @@ async function readNavigationLocation(force = false) {
     }
     const hash = window.location?.hash || "";
     const oldKey = window.history?.state?.trellisNavigation;
-    if (typeof oldKey === "string" && oldKey.startsWith(`${navigationScope}:`)) throw new Error("This history entry is stale. Open source from the current snapshot.");
+    const deviationsLink = hash === "#deviations" || hash.startsWith("#deviations?");
+    if (typeof oldKey === "string" && oldKey.startsWith(`${navigationScope}:`)) {
+      // A Deviations tab entry the index or checkout change dropped opens the root view (#951, #965).
+      if (deviationsLink) return await openRootView(current);
+      throw new Error("This history entry is stale. Open source from the current snapshot.");
+    }
     if (!hash) return;
+    // A Deviations tab link (#965): the tab at the shown snapshot, on its app and edge.
+    if (deviationsLink) {
+      const query = new URLSearchParams(hash.slice("#deviations?".length));
+      const filter = {app:query.get("app"), edge:query.get("edge")};
+      rememberNavigation({kind:"deviations", filter}, true, hash);
+      return await showDeviationsRoute(filter, current);
+    }
     if (!hash.startsWith("#sequence")) {
       if (hash === "#source" || hash === "#classes" || window.history?.state?.trellisNavigation) throw new Error("This source history is no longer available. Open source from the current snapshot.");
       return;
@@ -327,6 +347,59 @@ async function readNavigationLocation(force = false) {
   } catch (error) {
     if (current() && error.name !== "AbortError") navigationError(`Cannot open sequence: ${error.message}`);
   }
+}
+// The Deviations tab (#965). Its link names the app and the tree's edge; no pin, so a reload shows the
+// tab at the head. Entering or leaving it by a tab, an entry point or Show on diagram adds a history
+// entry; a filter chosen inside it replaces the tab's own.
+function deviationsHash(filter) {
+  const query = new URLSearchParams();
+  if (typeof filter?.app === "string") query.set("app", filter.app);
+  if (typeof filter?.edge === "string") query.set("edge", filter.edge);
+  const text = String(query);
+  return text ? `#deviations?${text}` : "#deviations";
+}
+async function showDeviationsRoute(filter, current) {
+  clearSource(); diagramSequence = null; sequenceBoundary = null;
+  await setSection("diagrams");
+  if (!current()) return;
+  $("error").hidden = true;
+  showNavigationView("deviations");
+  return await architecture?.showDeviations(filter);
+}
+// A stale entry strips the URL, adding no entry, and opens the root view with no error (#951).
+async function openRootView(current) {
+  window.history?.replaceState?.(null, "", `${window.location?.pathname || ""}${window.location?.search || ""}`);
+  navigationLocation = navigationSignature();
+  $("error").hidden = true; $("error").textContent = "";
+  clearSource(); diagramSequence = null; sequenceBoundary = null;
+  await setSection("diagrams");
+  if (!current()) return;
+  showNavigationView("architecture");
+}
+// The entry for what a view shows, written before another view's entry is added.
+function viewEntry(revision, view) {
+  if (view === "deviations") { const filter = architecture?.deviationsFilter() ?? {app:null, edge:null}; return {entry:{kind:"deviations", filter}, hash:deviationsHash(filter)}; }
+  const saved = visibleEntry(revision, view);
+  return saved?.entry.kind === "unavailable" ? {entry:{kind:"view", view}, hash:""} : saved;
+}
+function openDeviationsTab(filter) {
+  const pin = status?.revision;
+  if (section !== "diagrams" || !pin) return;
+  const from = shownView;
+  navigationSerial++; diagramSerial++;
+  if (from !== "deviations") writeEntry(viewEntry(pin, from));
+  rememberNavigation({kind:"deviations", filter}, from === "deviations", deviationsHash(filter));
+  showNavigationView("deviations");
+  return architecture?.showDeviations(filter);
+}
+function showDiagramTab() {
+  if (section !== "diagrams" || !status?.revision) return;
+  navigationSerial++; diagramSerial++;
+  rememberNavigation({kind:"view", view:"architecture"}, shownView !== "deviations", "");
+  showNavigationView("architecture");
+}
+function deviationsFilterChanged(filter) {
+  if (section === "diagrams" && shownView === "deviations" && status?.revision) rememberNavigation({kind:"deviations", filter}, true, deviationsHash(filter));
 }
 window.addEventListener?.("popstate", () => { void readNavigationLocation(); });
 window.addEventListener?.("hashchange", () => { void readNavigationLocation(); });
@@ -488,18 +561,18 @@ async function applyAgentView(request, pin, context, ticket, owned, claim) {
 // The view visible now as a history entry, so agent Back returns to it rather than to a
 // sequence still held from an earlier visit (#824). Written only when the show publishes.
 let classesSeed = null;
-function visibleEntry(revision) {
-  const visible = currentDiagramView();
-  if (section !== "diagrams" || visible === "sequence") return currentEntry(revision);
-  const source = captureSourceEntry();
+function visibleEntry(revision, visible = currentDiagramView()) {
+  if (section !== "diagrams" || visible === "sequence") return currentEntry(revision, null, visible);
+  const source = captureSourceEntry(visible);
   if (source) return {entry:source, hash:"#source"};
   if (visible === "classes" && classesSeed) return {entry:{kind:"class", symbol:{id:classesSeed}}, hash:"#classes"};
+  if (visible === "deviations") return viewEntry(revision, visible);
   return {entry:{kind:"view", view:visible}, hash:""};
 }
 function rememberVisible(revision) { writeEntry(visibleEntry(revision)); }
-function currentDiagramView() {
-  return ["sequence", "classes", "architecture", "treemap"].find(name => $("view-" + name)?.getAttribute?.("aria-selected") === "true") || "sequence";
-}
+// The tab on screen, as the shell last showed it.
+let shownView = "architecture";
+function currentDiagramView() { return shownView; }
 // The note says the agent moved this view. Back returns to what was shown before; a request
 // from another snapshot instead offers to reload at head and show it.
 function showAgentNote(text, staleRequest, backable) {
@@ -734,7 +807,7 @@ async function refreshStatus(followup = false) {
     updateViewAvailability();
     void viewerMetrics?.refresh();
     void refreshAppInventory();
-    if (section === "diagrams" && !$("architecture-panel").hidden) void architecture?.refresh();
+    if (section === "diagrams" && (!$("architecture-panel").hidden || !$("deviations-panel").hidden)) void architecture?.refresh();
     if (section === "diagrams" && !$("treemap-panel").hidden) void treemap?.refresh();
     await loadTreeRoot();
   }
@@ -1206,7 +1279,7 @@ async function refreshView() {
   }
   if (section !== "files" && !$("treemap-panel").hidden) await treemap?.refresh();
   // Not awaited: Architecture may be building, and this view shows that itself (#556).
-  else if (section !== "files" && !$("architecture-panel").hidden) void architecture?.refresh();
+  else if (section !== "files" && (!$("architecture-panel").hidden || !$("deviations-panel").hidden)) void architecture?.refresh();
   // The view on screen is reloaded, never an earlier Sequence behind it (#906).
   else if (section !== "files" && currentDiagramView() === "classes") await window.TrellisClasses?.retry?.();
   else if (section !== "files" && selectedMethod) await loadSequence();
@@ -1334,6 +1407,7 @@ async function setSection(name, view = null) {
     const current = () => section === "diagrams" && surface === sectionSerial && session === epoch && root === selectedRootKey && sourceAtStart === sourceSerial && IndexPin.equal(cached?.data.revision, status?.revision);
     if (!$("treemap-panel").hidden) await treemap?.refresh();
     else if (!$("architecture-panel").hidden) void architecture?.refresh();
+    else if (!$("deviations-panel").hidden) void architecture?.showDeviations();
     else if (diagramSequence && selectedMethod?.id === diagramSequence.seed.id) await loadSequence(diagramSequence, true);
     if (cached && current()) paintCachedSource(cached.data, cached.range, current, cached.range?.startLine || 1, cached.navigation?.snapshot?.());
     return;
@@ -2322,7 +2396,7 @@ function appFolderFilter() {
   const assigned = appAssignment(), name = chosenApp();
   return name === null ? null : path => Apps.holdsFolder(assigned, name, path);
 }
-const APP_SWITCHERS = ["treemap-apps", "classes-apps", "files-apps"];
+const APP_SWITCHERS = ["treemap-apps", "classes-apps", "files-apps", "deviations-apps"];
 function drawAppSwitchers() {
   const assigned = appAssignment(), name = chosenApp();
   for (const id of APP_SWITCHERS) {
@@ -2414,10 +2488,15 @@ const architecture = window.TrellisArchitecture?.create({
   },
   libraryButton: identity => identity.standardLibrary ? null : libraryButton({ecosystem:identity.language, name:identity.package, origin:"Architecture reference"}),
   onInspect: () => { viewerMetrics?.clearInspection(); clearSource(); },
+  navigate: {deviations:filter => openDeviationsTab(filter), diagram:() => showDiagramTab(), filter:filter => deviationsFilterChanged(filter)},
   // A rules edit can change which layers are application layers (#524).
   onRulesChanged: () => { void viewerMetrics?.refresh(); },
 });
-window.TrellisShell?.setViewCallback?.(name => {
+window.TrellisShell?.setViewCallback?.((name, how = {}) => {
+  const from = shownView, pin = status?.revision;
+  // A tab chosen into or out of Deviations is a history entry (#965); the entry being left is written first.
+  if (how.user && section === "diagrams" && pin && (name === "deviations") !== (from === "deviations")) writeEntry(viewEntry(pin, from));
+  shownView = name;
   if (!routeViewChange && name !== "sequence") {
     navigationSerial++; diagramSerial++;
     if (navigationEntries.get(window.history?.state?.trellisNavigation)?.kind === "class") window.TrellisClasses?.reset();
@@ -2425,7 +2504,14 @@ window.TrellisShell?.setViewCallback?.(name => {
   architecture?.clearInspection(); treemap?.clearInspection();
   // Reopening the tab redraws the held snapshot unless its basis changed; leaving keeps it (#789).
   if (name === "architecture" && section === "diagrams") void architecture?.reopen();
-  else architecture?.suspend();
+  // A navigation to Deviations shows its own filter; a chosen tab shows the tree as it was left.
+  else if (name === "deviations") {
+    if (!routeViewChange && section === "diagrams") void architecture?.showDeviations();
+  } else architecture?.suspend();
+  if (how.user && section === "diagrams" && pin && name !== from && (name === "deviations" || from === "deviations")) {
+    const saved = name === "deviations" ? viewEntry(pin, name) : {entry:{kind:"view", view:name}, hash:""};
+    rememberNavigation(saved.entry, false, saved.hash);
+  }
   if (name === "treemap" && section === "diagrams") void treemap?.refresh();
   else treemap?.reset();
 });

@@ -572,9 +572,8 @@ button:is(.selected, [aria-pressed="true"]) .badge { background: var(--clear); c
 #architecture-deviations p { margin: 0; }
 #architecture-deviations .deviations-header { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--sp-1) var(--sp-3); }
 #architecture-deviations .deviations-header .detail { flex-basis: 100%; }
-#architecture-deviations .deviations-header h2 { margin: 0; flex-basis: 100%; }
+#architecture-deviations .deviations-header h2 { margin: 0; flex: 1 1 auto; }
 #architecture-deviations .deviations-coverage[hidden] { display: none; }
-#architecture-deviations .deviations-back { background: none; border: 0; padding: 0; min-height: 0; color: var(--link); text-decoration: underline; text-underline-offset: 3px; }
 #architecture-deviations .deviations-filters { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2) var(--sp-3); }
 #architecture-deviations .deviations-filters > .detail { margin-left: auto; }
 #architecture-deviations .deviations-edges { display: flex; flex-wrap: wrap; border: 1px solid var(--line-strong); border-radius: var(--radius-card); overflow: hidden; }

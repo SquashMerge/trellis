@@ -1,5 +1,14 @@
 /* Natural-size block diagram: readable text wins over fitting a poster to a pane. */
 #architecture-panel { display: flex; flex-direction: column; overflow: hidden; }
+/* #965: Deviations is its own tab; its app switcher, read state and the review panel sit above the tree. */
+#deviations-panel { display: flex; flex-direction: column; overflow: hidden; }
+#deviations-panel .deviations-toolbar { flex: none; padding: 8px 18px 0; }
+#deviations-panel .deviations-toolbar:not(:has(#deviations-apps:not([hidden]))) { display: none; }
+#deviations-state { flex: none; margin: 4px 18px 8px; font-size: 12px; color: var(--secondary); }
+#deviations-state[data-state="error"], #deviations-state[data-state="stale"] { color: var(--error); }
+#deviations-state:empty { display: none; }
+#architecture-deviations { flex: 1; min-height: 0; }
+.architecture-app-deviations { cursor: pointer; text-decoration: underline; text-underline-offset: 3px; }
 .architecture-controls { display: flex; flex: none; flex-wrap: wrap; align-items: center; gap: 8px; padding: 4px 18px 8px; font-size: 12px; }
 .architecture-controls select { max-width: 100%; }
 .architecture-basis, #architecture-state, .architecture-edge-legend { flex: none; margin: 4px 18px 8px; font-size: 12px; color: var(--secondary); }
