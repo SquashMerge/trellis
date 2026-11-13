@@ -15,6 +15,7 @@ use trellis::{
         BrowserProvisioner,
         registry::{BrowserOptions, CheckoutOptions, CheckoutRegistry},
     },
+    http::WEB_ASSETS,
     store::topology::WorkspaceIdentity,
 };
 
@@ -497,54 +498,29 @@ async fn provisioned_page_serves_all_referenced_assets() {
         .await
         .unwrap();
     let html = include_str!("../../web/index.html");
-    for asset in [
-        "style.css",
-        "classes.css",
-        "navigation.css",
-        "treemap.css",
-        "treemap.js",
-        "treemap-pele.js",
-        "index-pin.js",
-        "source-witness.js",
-        "context-menu.js",
-        "pele-svg.js",
-        "sequence.js",
-        "shell.js",
-        "classes.js",
-        "navigation.js",
-        "architecture-deviations.js",
-        "app.js",
-    ] {
-        assert!(html.contains(&format!("/{asset}")));
-        let reply = response(
-            browser.router().unwrap(),
-            address,
-            &format!("/{asset}"),
-            None,
-        )
-        .await;
-        assert_eq!(reply.status(), StatusCode::OK, "{asset}");
-        assert_eq!(
-            reply.headers()["content-type"],
-            if asset.ends_with(".css") {
-                "text/css; charset=utf-8"
-            } else {
-                "text/javascript; charset=utf-8"
-            }
-        );
+    // Every file the page loads is a row of the one asset table.
+    let mut referenced = 0;
+    for attribute in ["src=\"/", "href=\"/"] {
+        for rest in html.split(attribute).skip(1) {
+            let path = format!("/{}", rest.split('"').next().unwrap());
+            assert!(
+                WEB_ASSETS.iter().any(|asset| asset.path == path),
+                "index.html references {path}, which has no WEB_ASSETS row"
+            );
+            referenced += 1;
+        }
     }
-    for asset in ["sequence-pele.js", "vendor/pele-1.10.0-trellis.2.js"] {
-        let reply = response(
-            browser.router().unwrap(),
-            address,
-            &format!("/{asset}"),
-            None,
-        )
-        .await;
-        assert_eq!(reply.status(), StatusCode::OK, "{asset}");
+    assert!(referenced > 20, "{referenced}");
+    // Every row is served, with the row's content type and bytes, which are the file's.
+    let web = Path::new(env!("CARGO_MANIFEST_DIR")).join("web");
+    for asset in WEB_ASSETS {
+        let reply = response(browser.router().unwrap(), address, asset.path, None).await;
+        assert_eq!(reply.status(), StatusCode::OK, "{}", asset.path);
         assert_eq!(
             reply.headers()["content-type"],
-            "text/javascript; charset=utf-8"
+            asset.content_type,
+            "{}",
+            asset.path
         );
         assert!(
             !reply.headers()["content-security-policy"]
@@ -552,7 +528,68 @@ async fn provisioned_page_serves_all_referenced_assets() {
                 .unwrap()
                 .contains("unsafe-inline")
         );
+        let body = axum::body::to_bytes(reply.into_body(), 64 * 1024 * 1024)
+            .await
+            .unwrap();
+        let file = match asset.path {
+            "/" => "index.html",
+            path => &path[1..],
+        };
+        assert_eq!(body, fs::read(web.join(file)).unwrap(), "{}", asset.path);
     }
+    for unknown in ["/not-an-asset.js", "/vendor/not-an-asset.js"] {
+        let reply = response(browser.router().unwrap(), address, unknown, None).await;
+        assert_eq!(reply.status(), StatusCode::NOT_FOUND, "{unknown}");
+    }
+}
+
+/// Files under `web/` that are deliberately not served: notes, licences kept
+/// beside vendored code, the vendor patch, and the Node package marker.
+const WEB_FILES_NOT_SERVED: &[&str] = &[
+    "brand/README.md",
+    "fonts/Manrope-FONTLOG.txt",
+    "fonts/README.md",
+    "package.json",
+    "vendor/README.md",
+    "vendor/patches/0001-Block-Keep-labels-on-parallel-edges-separate.patch",
+    "vendor/pele-1.10.0-trellis.2.LICENSE",
+];
+
+// A new file under `web/` must get a `WEB_ASSETS` row (or be listed above as
+// not served), so a web file without a route cannot pass.
+#[test]
+fn web_asset_table_covers_the_web_directory() {
+    let web = Path::new(env!("CARGO_MANIFEST_DIR")).join("web");
+    let mut pending = vec![web.clone()];
+    let mut files = Vec::new();
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                let relative = path.strip_prefix(&web).unwrap();
+                files.push(relative.to_str().unwrap().replace('\\', "/"));
+            }
+        }
+    }
+    for file in &files {
+        let route = match file.as_str() {
+            "index.html" => "/".to_string(),
+            file => format!("/{file}"),
+        };
+        let served = WEB_ASSETS.iter().filter(|a| a.path == route).count();
+        let excluded = WEB_FILES_NOT_SERVED.contains(&file.as_str());
+        assert!(
+            (served == 1) != excluded,
+            "web/{file}: add one WEB_ASSETS row in src/http.rs (rows: {served}, listed as not served: {excluded})"
+        );
+    }
+    assert_eq!(
+        files.len(),
+        WEB_ASSETS.len() + WEB_FILES_NOT_SERVED.len(),
+        "a WEB_ASSETS row or a not-served entry names no file under web/"
+    );
 }
 
 #[tokio::test]
