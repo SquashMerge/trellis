@@ -389,7 +389,7 @@
     // The tab this controller shows: "diagram" (Architecture), "tree" (Deviations, #965) or null (neither).
     // A read for the tree tab draws nothing; Architecture draws the held snapshot when it is shown again.
     // `afterDraw` is what Show on diagram asks of the next drawing: an edge to highlight, or an inspection.
-    let tab = "diagram", afterDraw = null, restoring = false, routing = false;
+    let tab = "diagram", afterDraw = null, routing = false;
     // The band that holds the selected stub's end, so its label can say `client end` / `server end` (AC25).
     let endMark = null;
     let reviewMode = "unassigned", draft = null, preview = null, editSerial = 0, editBusy = false, busyOwner = 0;
@@ -1084,7 +1084,8 @@
         else await render();
         if (options.keepDraft === true) { get("architecture-review-panel").hidden = false; renderReview(); }
         settled = true;
-        if (tab === "tree" && payload.state === "ready" && !restoring) void deviations.afterRefresh();
+        // A history restore's own read reopens its saved tree itself; any other read opens the tab's tree.
+        if (tab === "tree" && payload.state === "ready" && options.restoring !== true) void deviations.afterRefresh();
       } catch (error) {
         if (!current(c) || error.name === "AbortError") return;
         const diagnostic = error.diagnostic;
@@ -1490,9 +1491,9 @@
       get("architecture-aggregate").value = aggregate;
       // The saved scope applies to this checkout, and so to every view that shares the choice.
       scopes.set(saved.scope ?? null);
-      // A restored tree reads once, with its saved selection, not first as a fresh tree.
-      restoring = true;
-      try { await refresh(); } finally { restoring = false; }
+      // A restored tree reads once, with its saved selection, not first as a fresh tree. The mark belongs to
+      // this restore's read only, so a superseded restore never holds back a newer visit's tree.
+      await refresh({restoring:true});
       if (!active() || !usable()) return;
       settleScope(view);
       if (basis.rulesHash !== saved.rulesHash) throw new Error("Architecture rules changed. Select the boundary again.");

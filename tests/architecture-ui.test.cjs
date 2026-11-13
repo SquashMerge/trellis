@@ -2312,3 +2312,22 @@ test("review965 an app-and-edge route keeps the edge in navigation when it chang
   assert.equal(h.controller.deviationsFilter().edge, wanted.edge, "the displayed tree keeps the requested edge");
   assert.deepEqual(route, wanted, "the shared-app change must not rewrite the route to every edge");
 });
+
+
+test("review965 an interrupted history restore cannot suppress a newer Deviations tree", async () => {
+  const h = harness(), late = deferred();
+  let owned = true;
+  h.setResponse(() => late.promise);
+  const saved = {aggregate:"max", role:"production", scope:null, rulesHash:"rules-one", inspection:{kind:"deviation", record:{}}, deviations:{chip:null, callsOnly:false, expanded:[], selected:null}};
+  const returning = h.controller.restore(saved, () => owned);
+  await flush();
+  owned = false;
+  h.controller.suspend();
+  h.setResponse(async () => ({payload:edgeRoutingFixture()}));
+  await h.controller.showDeviations({app:null, edge:null});
+  await flush();
+  late.resolve({payload:edgeRoutingFixture()});
+  await returning; await flush();
+  const treeReads = h.detailCalls.filter(call => new URL(call.url, "http://local").searchParams.get("kind") === "instances");
+  assert.equal(treeReads.length, 1, "the newer visit must read its tree after the ready summary");
+});
