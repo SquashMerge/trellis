@@ -335,10 +335,13 @@ meaning changes, and the server response is the same.
   notes it draws, as it validates rows.
 - **No second renderer** (#1007, owner ruling 2026-11-13). When Pele cannot draw a view, the
   diagram area shows "This Sequence could not be drawn: <reason>" in the empty state's
-  styling, and the status line ends with the same sentence. Nothing else is drawn in its
-  place. This covers an unavailable renderer, a presentation limit (Mermaid or SVG bytes,
-  SVG node count, the structural caps) and a render or validation failure, at the first
-  draw and at a later group redraw, in the Sequence view and the Files preview.
+  styling. Nothing else is drawn in its place. This covers an unavailable renderer, a
+  presentation limit (Mermaid or SVG bytes, SVG node count, the structural caps) and a
+  render or validation failure, at the first draw and at a later group redraw.
+  In the Sequence view the status line (`#sequence-state`) also ends with that sentence.
+  In the Files preview a first draw lists it in the ⓘ notes instead, and its status line
+  counts the note; a failed later group redraw appends the sentence to the preview's
+  status line.
 
 ### Interactions bound after filtering (#663)
 
