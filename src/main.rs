@@ -1058,14 +1058,7 @@ fn send_daemon(request: &protocol::Request, read_only: bool) -> Result<serde_jso
         let ingress_window = metrics_test_duration("TRELLIS_TEST_METRICS_CLIENT_INGRESS_MS")
             .unwrap_or(ingress_window);
         let ingress = started + ingress_window;
-        let work = if matches!(
-            request.payload["args"]["scope"].as_str(),
-            Some("revision" | "directory")
-        ) {
-            Duration::from_secs(300)
-        } else {
-            Duration::from_secs(30)
-        };
+        let work = metrics_work_budget(request);
         #[cfg(feature = "test-support")]
         let work = metrics_test_duration("TRELLIS_TEST_METRICS_CLIENT_WORK_MS").unwrap_or(work);
         // The daemon may first wait for the checkout's first head (#842).
@@ -1153,17 +1146,7 @@ fn producer_plan_payload(args: &ProducerPlanArgs) -> Result<serde_json::Value> {
     let executable = args
         .executable
         .as_ref()
-        .map(|path| -> Result<String> {
-            let absolute = if path.is_absolute() {
-                path.clone()
-            } else {
-                std::env::current_dir()?.join(path)
-            };
-            Ok(absolute
-                .to_str()
-                .context("invalid_request: non-UTF8 executable path")?
-                .to_owned())
-        })
+        .map(|path| absolute_utf8(path, "invalid_request: non-UTF8 executable path"))
         .transpose()?;
     let mut settings = serde_json::Map::new();
     if let Some(features) = &args.cargo_features {
@@ -1197,377 +1180,390 @@ fn producer_plan_payload(args: &ProducerPlanArgs) -> Result<serde_json::Value> {
     }))
 }
 
-fn dispatch_cli(command: &Command) -> Result<()> {
-    let (operation, workspace, mut payload, read_only) = match command {
-        Command::Status(args) => ("status", args, serde_json::json!({}), true),
-        #[cfg(feature = "test-support")]
-        Command::TestSettled(args) => {
-            let at = args
-                .at
-                .as_deref()
-                .map(serde_json::from_str::<serde_json::Value>)
-                .transpose()
-                .context("invalid_argument: --at is not a revision")?;
-            (
-                "settled_for_tests",
-                &args.workspace,
-                serde_json::json!({ "at": at }),
-                true,
-            )
+/// One daemon call built from a CLI subcommand.
+struct CliCall<'a> {
+    operation: &'static str,
+    workspace: &'a WorkspaceArgs,
+    /// The request's `args`.
+    payload: serde_json::Value,
+    read_only: bool,
+}
+impl<'a> CliCall<'a> {
+    fn new(
+        operation: &'static str,
+        workspace: &'a WorkspaceArgs,
+        payload: serde_json::Value,
+        read_only: bool,
+    ) -> Self {
+        Self {
+            operation,
+            workspace,
+            payload,
+            read_only,
         }
+    }
+}
+
+fn dispatch_cli(command: &Command) -> Result<()> {
+    let call = cli_call(command)?;
+    let (_roots, identity) = call.workspace.resolve_unattached()?;
+    // Checked only once the workspace has resolved.
+    if let Command::Index(args) = command {
+        ensure!(
+            (1..=16_777_216).contains(&args.max_file_bytes.unwrap_or(2_097_152)),
+            "max-file-bytes must be 1..16777216"
+        );
+    }
+    let request = daemon_request(
+        call.operation,
+        serde_json::json!({
+            "workspace": identity.root, "args": call.payload,
+        }),
+    );
+    let value = send_daemon(&request, call.read_only)?;
+    report_cli_result(command, &value)
+}
+
+/// Validates `command`'s arguments and builds its daemon call.
+fn cli_call(command: &Command) -> Result<CliCall<'_>> {
+    let call = CliCall::new;
+    Ok(match command {
+        Command::Status(args) => call("status", args, serde_json::json!({}), true),
+        #[cfg(feature = "test-support")]
+        Command::TestSettled(args) => call(
+            "settled_for_tests",
+            &args.workspace,
+            test_settled_cli_payload(args)?,
+            true,
+        ),
         Command::Rules(RulesArgs {
             command: RulesCommand::Check(args),
-        }) => (
+        }) => call(
             "rules_check",
             &args.workspace,
             architecture_cli_arguments(args.pin.as_deref(), &args.paths, None)?,
             true,
         ),
-        Command::References(args) => (
+        Command::References(args) => call(
             "references",
             &args.workspace,
             architecture_cli_arguments(args.pin.as_deref(), &args.paths, Some(args.limit))?,
             true,
         ),
         Command::Symbols(args) => {
-            ensure!((1..=150).contains(&args.limit), "limit must be 1..150");
-            (
-                "symbols",
-                &args.workspace,
-                serde_json::json!({"search": args.search, "limit": args.limit}),
-                true,
-            )
+            call("symbols", &args.workspace, symbols_cli_payload(args)?, true)
         }
-        Command::Query(args) => {
-            ViewQuery {
-                seed: args.seed.clone(),
-                depth: args.depth,
-                max_nodes: args.max_nodes,
-                max_calls: args.max_calls,
-                include_callbacks: args.include_callbacks,
-                exclude_paths: args.exclude_path.clone(),
-                semantic_producer_id: args.semantic_producer_id.clone(),
-            }
-            .validate()?;
-            (
-                "query",
-                &args.workspace,
-                serde_json::json!({
-                    "seed": args.seed, "depth": args.depth, "maxNodes": args.max_nodes,
-                    "maxCalls": args.max_calls, "includeCallbacks": args.include_callbacks,
-                    "excludePaths": args.exclude_path,
-                    "semanticProducerId": args.semantic_producer_id
-                }),
-                true,
-            )
-        }
+        Command::Query(args) => call("query", &args.workspace, query_cli_payload(args)?, true),
         Command::Metrics(args) => {
-            let mut options = trellis::store::MetricsOptions {
-                scope: args.scope.clone(),
-                source_set_id: args.source_set_id.clone(),
-                language: args.language.clone(),
-                path: args.path.clone(),
-                sid: args.sid.clone(),
-                aggregate: args.aggregate.clone(),
-                role: args.role.clone(),
-                ..Default::default()
-            };
-            if let Some(names) = &args.metrics {
-                ensure!(
-                    !names.is_empty(),
-                    "invalid_argument: empty metrics selection"
-                );
-                options.metrics = names.split(',').map(str::to_owned).collect();
-            }
-            if let Some(pin) = &args.pin {
-                let (generation, revision) = pin
-                    .rsplit_once(':')
-                    .context("invalid_argument: pin requires generation:revision")?;
-                ensure!(
-                    !revision.is_empty() && revision.bytes().all(|byte| byte.is_ascii_digit()),
-                    "invalid_argument: invalid revision"
-                );
-                let revision = revision
-                    .parse::<u64>()
-                    .map_err(|_| anyhow::anyhow!("invalid_argument: invalid revision"))?;
-                options.pin = Some(
-                    serde_json::from_value(serde_json::json!({
-                        "indexGeneration": generation, "indexRevision": revision
-                    }))
-                    .map_err(|error| anyhow::anyhow!("invalid_argument: invalid pin: {error}"))?,
-                );
-            }
-            options
-                .validate()
-                .map_err(|error| anyhow::anyhow!("invalid_argument: {error}"))?;
-            ensure!(
-                options.source_set_id.as_deref().is_none_or(|id| id
-                    .starts_with("source-set:v1:path-")
-                    && id.len() == 83
-                    && id[19..]
-                        .bytes()
-                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())),
-                "invalid_argument: source set ID"
-            );
-            ensure!(
-                options
-                    .sid
-                    .as_deref()
-                    .is_none_or(|sid| sid.starts_with("sid:v1:")
-                        && sid.len() == 39
-                        && sid[7..]
-                            .bytes()
-                            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())),
-                "invalid_argument: sid"
-            );
-            ensure!(
-                options
-                    .path
-                    .as_deref()
-                    .is_none_or(|path| !path.contains([':', '\\', '\0'])),
-                "invalid_argument: path"
-            );
-            ensure!(
-                options.language.as_deref().is_none_or(|language| matches!(
-                    language,
-                    "java" | "python" | "javascript" | "typescript" | "rust"
-                )),
-                "invalid_argument: language"
-            );
-            (
-                "metrics",
+            call("metrics", &args.workspace, metrics_cli_payload(args)?, true)
+        }
+        Command::Index(args) => call("index", &args.workspace, index_cli_payload(args), false),
+        Command::Producer(ProducerCommand { action }) => match action {
+            ProducerAction::Plan(args) => call(
+                "producer_plan",
                 &args.workspace,
-                serde_json::json!({
-                    "scope": options.scope, "sourceSetId": options.source_set_id,
-                    "language": options.language, "path": options.path,
-                    "sid": options.sid, "aggregate": options.aggregate, "role": options.role,
-                    "metrics": options.metrics, "pin": options.pin
-                }),
+                producer_plan_payload(args)?,
                 true,
-            )
-        }
-        Command::Index(args) => (
-            "index",
-            &args.workspace,
-            serde_json::json!({
-                "maxFileBytes": args.max_file_bytes
-            }),
-            false,
-        ),
-        Command::Producer(ProducerCommand {
-            action: ProducerAction::Plan(args),
-        }) => (
-            "producer_plan",
-            &args.workspace,
-            producer_plan_payload(args)?,
-            true,
-        ),
-        Command::Producer(ProducerCommand {
-            action: ProducerAction::Run(args),
-        }) => {
-            ensure!(
-                args.plan_sha256.len() == 64
-                    && args
-                        .plan_sha256
-                        .bytes()
-                        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
-                "invalid_request: plan digest"
-            );
-            let mut payload = producer_plan_payload(&args.plan)?;
-            payload["planSha256"] = serde_json::json!(args.plan_sha256);
-            ("producer_run", &args.plan.workspace, payload, false)
-        }
-        Command::Producer(ProducerCommand {
-            action: ProducerAction::Cancel(args),
-        }) => (
-            "producer_cancel",
-            &args.workspace,
-            serde_json::json!({"version": 1, "runId": args.run}),
-            false,
-        ),
-        Command::Producer(ProducerCommand {
-            action: ProducerAction::Status(args),
-        }) => (
-            "producer_status",
-            &args.workspace,
-            serde_json::json!({
-                "version": 1,
-                "runId": args.run,
-                "environment": trellis::producer::detect::Environment::from_process()?,
-            }),
-            true,
-        ),
-        Command::Producer(ProducerCommand {
-            action: ProducerAction::Pickup(args),
-        }) => {
-            let artifact = args
-                .artifact
-                .as_ref()
-                .map(|path| -> Result<String> {
-                    let absolute = if path.is_absolute() {
-                        path.clone()
-                    } else {
-                        std::env::current_dir()?.join(path)
-                    };
-                    Ok(absolute
-                        .to_str()
-                        .context("invalid_request: non-UTF8 artifact path")?
-                        .to_owned())
-                })
-                .transpose()?;
-            (
-                "producer_pickup",
+            ),
+            ProducerAction::Run(args) => call(
+                "producer_run",
+                &args.plan.workspace,
+                producer_run_cli_payload(args)?,
+                false,
+            ),
+            ProducerAction::Cancel(args) => call(
+                "producer_cancel",
+                &args.workspace,
+                serde_json::json!({"version": 1, "runId": args.run}),
+                false,
+            ),
+            ProducerAction::Status(args) => call(
+                "producer_status",
                 &args.workspace,
                 serde_json::json!({
                     "version": 1,
-                    "producer": args.producer,
-                    "artifact": artifact,
-                    "clear": args.clear,
+                    "runId": args.run,
+                    "environment": trellis::producer::detect::Environment::from_process()?,
                 }),
+                true,
+            ),
+            ProducerAction::Pickup(args) => call(
+                "producer_pickup",
+                &args.workspace,
+                producer_pickup_cli_payload(args)?,
                 false,
-            )
-        }
+            ),
+            _ => unreachable!(),
+        },
         Command::Semantic(SemanticCommand {
             action: SemanticAction::Import(args),
-        }) => {
-            let anchor = |path: &PathBuf| -> Result<String> {
-                let absolute = if path.is_absolute() {
-                    path.clone()
-                } else {
-                    std::env::current_dir()?.join(path)
-                };
-                Ok(absolute
-                    .to_str()
-                    .context("invalid_request: non-UTF8 input path")?
-                    .to_owned())
-            };
-            ensure!(
-                args.batch_sha256.len() == 64
-                    && args
-                        .batch_sha256
-                        .bytes()
-                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
-                "invalid_request: batch digest"
-            );
-            (
-                "semantic_import",
-                &args.workspace,
-                serde_json::json!({
-                    "version":2,"descriptor":anchor(&args.batch)?,"descriptorSha256":args.batch_sha256
-                }),
-                false,
-            )
-        }
+        }) => call(
+            "semantic_import",
+            &args.workspace,
+            semantic_import_cli_payload(args)?,
+            false,
+        ),
         _ => unreachable!(),
+    })
+}
+
+#[cfg(feature = "test-support")]
+fn test_settled_cli_payload(args: &TestSettledArgs) -> Result<serde_json::Value> {
+    let at = args
+        .at
+        .as_deref()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .transpose()
+        .context("invalid_argument: --at is not a revision")?;
+    Ok(serde_json::json!({ "at": at }))
+}
+
+fn symbols_cli_payload(args: &SymbolsArgs) -> Result<serde_json::Value> {
+    ensure!((1..=150).contains(&args.limit), "limit must be 1..150");
+    Ok(serde_json::json!({"search": args.search, "limit": args.limit}))
+}
+
+fn query_cli_payload(args: &QueryArgs) -> Result<serde_json::Value> {
+    ViewQuery {
+        seed: args.seed.clone(),
+        depth: args.depth,
+        max_nodes: args.max_nodes,
+        max_calls: args.max_calls,
+        include_callbacks: args.include_callbacks,
+        exclude_paths: args.exclude_path.clone(),
+        semantic_producer_id: args.semantic_producer_id.clone(),
+    }
+    .validate()?;
+    Ok(serde_json::json!({
+        "seed": args.seed, "depth": args.depth, "maxNodes": args.max_nodes,
+        "maxCalls": args.max_calls, "includeCallbacks": args.include_callbacks,
+        "excludePaths": args.exclude_path,
+        "semanticProducerId": args.semantic_producer_id
+    }))
+}
+
+fn metrics_cli_payload(args: &MetricsArgs) -> Result<serde_json::Value> {
+    let mut options = trellis::store::MetricsOptions {
+        scope: args.scope.clone(),
+        source_set_id: args.source_set_id.clone(),
+        language: args.language.clone(),
+        path: args.path.clone(),
+        sid: args.sid.clone(),
+        aggregate: args.aggregate.clone(),
+        role: args.role.clone(),
+        ..Default::default()
     };
-    let (_roots, identity) = workspace.resolve_unattached()?;
-    if let Command::Metrics(args) = command
-        && args.metrics.is_none()
-    {
-        payload
-            .as_object_mut()
-            .expect("metrics args object")
-            .remove("metrics");
-    }
-    if let Command::Index(args) = command {
+    if let Some(names) = &args.metrics {
         ensure!(
-            (1..=16_777_216).contains(&args.max_file_bytes.unwrap_or(2_097_152)),
-            "max-file-bytes must be 1..16777216"
+            !names.is_empty(),
+            "invalid_argument: empty metrics selection"
         );
-        if args.max_file_bytes.is_none() {
-            payload
-                .as_object_mut()
-                .expect("index args object")
-                .remove("maxFileBytes");
-        }
+        options.metrics = names.split(',').map(str::to_owned).collect();
     }
-    let request = daemon_request(
-        operation,
-        serde_json::json!({
-            "workspace": identity.root, "args": payload,
-        }),
+    if let Some(pin) = &args.pin {
+        let (generation, revision) = pin
+            .rsplit_once(':')
+            .context("invalid_argument: pin requires generation:revision")?;
+        ensure!(
+            !revision.is_empty() && revision.bytes().all(|byte| byte.is_ascii_digit()),
+            "invalid_argument: invalid revision"
+        );
+        let revision = revision
+            .parse::<u64>()
+            .map_err(|_| anyhow::anyhow!("invalid_argument: invalid revision"))?;
+        options.pin = Some(
+            serde_json::from_value(serde_json::json!({
+                "indexGeneration": generation, "indexRevision": revision
+            }))
+            .map_err(|error| anyhow::anyhow!("invalid_argument: invalid pin: {error}"))?,
+        );
+    }
+    validate_cli_metrics_options(&options)?;
+    let mut payload = serde_json::json!({
+        "scope": options.scope, "sourceSetId": options.source_set_id,
+        "language": options.language, "path": options.path,
+        "sid": options.sid, "aggregate": options.aggregate, "role": options.role,
+        "pin": options.pin
+    });
+    // No `--metrics` means every metric: the request leaves the option out.
+    if args.metrics.is_some() {
+        payload["metrics"] = serde_json::json!(options.metrics);
+    }
+    Ok(payload)
+}
+
+/// The metrics option rules of the CLI and of the daemon request it sends.
+/// Both accept only path-derived source-set IDs (#984).
+fn validate_cli_metrics_options(options: &trellis::store::MetricsOptions) -> Result<()> {
+    options
+        .validate_transport(trellis::store::MetricsSourceSetIds::PathOnly)
+        .map_err(|error| anyhow::anyhow!("invalid_argument: {error}"))
+}
+
+/// The work budget of a metrics request, from its still unvalidated scope.
+fn metrics_work_budget(request: &protocol::Request) -> Duration {
+    trellis::store::MetricsOptions::work_budget(
+        request.payload["args"]["scope"]
+            .as_str()
+            .unwrap_or_default(),
+    )
+}
+
+/// Its range is checked in `dispatch_cli`, after the workspace resolves.
+fn index_cli_payload(args: &IndexArgs) -> serde_json::Value {
+    match args.max_file_bytes {
+        Some(bytes) => serde_json::json!({ "maxFileBytes": bytes }),
+        None => serde_json::json!({}),
+    }
+}
+
+fn producer_run_cli_payload(args: &ProducerRunArgs) -> Result<serde_json::Value> {
+    ensure!(
+        is_lower_hex64(&args.plan_sha256),
+        "invalid_request: plan digest"
     );
-    let value = send_daemon(&request, read_only)?;
-    if let Command::Metrics(args) = command {
-        if args.json {
-            print_json(&value)?;
-        } else {
-            let payload = &value["payload"];
-            println!(
-                "metrics {}:{} ({}, {}, role={}, catchingUp={})",
-                payload["indexGeneration"].as_str().unwrap_or("?"),
-                payload["indexRevision"],
-                payload["scope"].as_str().unwrap_or("?"),
-                payload["aggregate"].as_str().unwrap_or("?"),
-                payload["role"].as_str().unwrap_or("?"),
-                value["catchingUp"]
+    let mut payload = producer_plan_payload(&args.plan)?;
+    payload["planSha256"] = serde_json::json!(args.plan_sha256);
+    Ok(payload)
+}
+
+fn producer_pickup_cli_payload(args: &ProducerPickupArgs) -> Result<serde_json::Value> {
+    let artifact = args
+        .artifact
+        .as_ref()
+        .map(|path| absolute_utf8(path, "invalid_request: non-UTF8 artifact path"))
+        .transpose()?;
+    Ok(serde_json::json!({
+        "version": 1,
+        "producer": args.producer,
+        "artifact": artifact,
+        "clear": args.clear,
+    }))
+}
+
+fn semantic_import_cli_payload(args: &SemanticImportArgs) -> Result<serde_json::Value> {
+    ensure!(
+        is_lower_hex64(&args.batch_sha256),
+        "invalid_request: batch digest"
+    );
+    Ok(serde_json::json!({
+        "version": 2,
+        "descriptor": absolute_utf8(&args.batch, "invalid_request: non-UTF8 input path")?,
+        "descriptorSha256": args.batch_sha256
+    }))
+}
+
+fn is_lower_hex64(text: &str) -> bool {
+    text.len() == 64 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// `path` made absolute against the current directory, as UTF-8; `non_utf8`
+/// is the error when it is not.
+fn absolute_utf8(path: &std::path::Path, non_utf8: &'static str) -> Result<String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    Ok(absolute.to_str().context(non_utf8)?.to_owned())
+}
+
+/// Prints the daemon's reply for `command` and turns a reported failure into
+/// the command's error.
+fn report_cli_result(command: &Command, value: &serde_json::Value) -> Result<()> {
+    match command {
+        Command::Metrics(args) if !args.json => print_metrics_text(value),
+        _ => print_json(value)?,
+    }
+    match command {
+        Command::Producer(ProducerCommand {
+            action: ProducerAction::Pickup(args),
+        }) => report_producer_pickup(args, value),
+        Command::Producer(ProducerCommand {
+            action: ProducerAction::Run(_),
+        }) => report_producer_run(value),
+        Command::Rules(_) => {
+            report_architecture_error(value)?;
+            ensure!(
+                value["payload"]["counts"]["deviates"].as_u64().unwrap_or(0) == 0,
+                "architecture deviations"
             );
-            for kind in ["declarations", "files", "directories"] {
-                if let Some(rows) = payload[kind].as_array() {
-                    for row in rows {
-                        println!(
-                            "{} {} {} {} {}",
-                            kind,
-                            row["sourceSetId"].as_str().unwrap_or("?"),
-                            row["path"].as_str().unwrap_or("?"),
-                            row["sid"].as_str().unwrap_or(""),
-                            row["metrics"]
-                        );
-                    }
-                }
+            Ok(())
+        }
+        Command::References(_) => report_architecture_error(value),
+        _ => Ok(()),
+    }
+}
+
+fn print_metrics_text(value: &serde_json::Value) {
+    let payload = &value["payload"];
+    println!(
+        "metrics {}:{} ({}, {}, role={}, catchingUp={})",
+        payload["indexGeneration"].as_str().unwrap_or("?"),
+        payload["indexRevision"],
+        payload["scope"].as_str().unwrap_or("?"),
+        payload["aggregate"].as_str().unwrap_or("?"),
+        payload["role"].as_str().unwrap_or("?"),
+        value["catchingUp"]
+    );
+    for kind in ["declarations", "files", "directories"] {
+        if let Some(rows) = payload[kind].as_array() {
+            for row in rows {
+                println!(
+                    "{} {} {} {} {}",
+                    kind,
+                    row["sourceSetId"].as_str().unwrap_or("?"),
+                    row["path"].as_str().unwrap_or("?"),
+                    row["sid"].as_str().unwrap_or(""),
+                    row["metrics"]
+                );
             }
         }
-    } else {
-        print_json(&value)?;
     }
-    if let Command::Producer(ProducerCommand {
-        action: ProducerAction::Pickup(args),
-    }) = command
-        && args.artifact.is_some()
-        && value["state"] != "done"
-    {
+}
+
+fn report_producer_pickup(args: &ProducerPickupArgs, value: &serde_json::Value) -> Result<()> {
+    if args.artifact.is_some() && value["state"] != "done" {
         anyhow::bail!(
             "{}: producer pickup {}",
             value["errorCode"].as_str().unwrap_or("index_failed"),
             value["state"].as_str().unwrap_or("failed")
         );
     }
-    if let Command::Producer(ProducerCommand {
-        action: ProducerAction::Run(_),
-    }) = command
-        && value["state"] != "done"
-    {
-        // One line saying why (#967); the reply on stdout has the stderr lines.
-        use std::io::Write;
-        if let Ok(Some(failure)) = serde_json::from_value::<
-            Option<trellis::producer::failure::Failure>,
-        >(value["failure"].clone())
-        {
-            let code = value["errorCode"]
-                .as_str()
-                .or(value["outcome"].as_str())
-                .unwrap_or("producer_failed");
-            let _ = writeln!(
-                std::io::stderr(),
-                "{}",
-                trellis::producer::failure::cli_line(code, &failure)
-            );
-        }
-        anyhow::bail!(
-            "{}: producer run {}",
-            value["errorCode"].as_str().unwrap_or("producer_failed"),
-            value["state"].as_str().unwrap_or("failed")
+    Ok(())
+}
+
+fn report_producer_run(value: &serde_json::Value) -> Result<()> {
+    if value["state"] == "done" {
+        return Ok(());
+    }
+    // One line saying why (#967); the reply on stdout has the stderr lines.
+    use std::io::Write;
+    if let Ok(Some(failure)) = serde_json::from_value::<Option<trellis::producer::failure::Failure>>(
+        value["failure"].clone(),
+    ) {
+        let code = value["errorCode"]
+            .as_str()
+            .or(value["outcome"].as_str())
+            .unwrap_or("producer_failed");
+        let _ = writeln!(
+            std::io::stderr(),
+            "{}",
+            trellis::producer::failure::cli_line(code, &failure)
         );
     }
-    if matches!(command, Command::Rules(_) | Command::References(_)) && value.get("error").is_some()
-    {
-        anyhow::bail!("architecture evaluation failed");
-    }
-    if matches!(command, Command::Rules(_))
-        && value["payload"]["counts"]["deviates"].as_u64().unwrap_or(0) > 0
-    {
-        anyhow::bail!("architecture deviations");
-    }
+    anyhow::bail!(
+        "{}: producer run {}",
+        value["errorCode"].as_str().unwrap_or("producer_failed"),
+        value["state"].as_str().unwrap_or("failed")
+    );
+}
+
+fn report_architecture_error(value: &serde_json::Value) -> Result<()> {
+    ensure!(
+        value.get("error").is_none(),
+        "architecture evaluation failed"
+    );
     Ok(())
 }
 
@@ -2564,14 +2560,7 @@ fn dispatch_connection(
     // wait for startup reconciliation and every SQLite busy wait share it, so
     // they cannot stack. When it passes the read fails typed.
     let metrics = request.operation == "metrics";
-    let metrics_work = if matches!(
-        request.payload["args"]["scope"].as_str(),
-        Some("revision" | "directory")
-    ) {
-        Duration::from_secs(300)
-    } else {
-        Duration::from_secs(30)
-    };
+    let metrics_work = metrics_work_budget(&request);
     #[cfg(feature = "test-support")]
     let metrics_work =
         metrics_test_duration("TRELLIS_TEST_METRICS_WORK_DEADLINE_MS").unwrap_or(metrics_work);
@@ -3440,43 +3429,7 @@ fn metrics_options_from_request(
         pin: field(args, "pin")?,
         top_cognitive: None,
     };
-    options
-        .validate()
-        .map_err(|error| anyhow::anyhow!("invalid_argument: {error}"))?;
-    ensure!(
-        options.source_set_id.as_deref().is_none_or(|id| {
-            id.starts_with("source-set:v1:path-")
-                && id.len() == 83
-                && id[19..]
-                    .bytes()
-                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-        }),
-        "invalid_argument: source set ID"
-    );
-    ensure!(
-        options.sid.as_deref().is_none_or(|sid| {
-            sid.starts_with("sid:v1:")
-                && sid.len() == 39
-                && sid[7..]
-                    .bytes()
-                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-        }),
-        "invalid_argument: sid"
-    );
-    ensure!(
-        options
-            .path
-            .as_deref()
-            .is_none_or(|path| !path.contains([':', '\\', '\0'])),
-        "invalid_argument: path"
-    );
-    ensure!(
-        options.language.as_deref().is_none_or(|language| matches!(
-            language,
-            "java" | "python" | "javascript" | "typescript" | "rust"
-        )),
-        "invalid_argument: language"
-    );
+    validate_cli_metrics_options(&options)?;
     Ok(options)
 }
 
@@ -3611,5 +3564,48 @@ mod metrics_request_tests {
                 .to_string()
                 .contains("unknown metrics option")
         );
+    }
+
+    /// The shared identifier rules, with each transport's source-set forms
+    /// and the first failing rule's message.
+    #[test]
+    fn identifier_rules_are_shared_and_keep_each_transports_source_set_forms() {
+        use trellis::store::MetricsSourceSetIds::{Current, PathOnly};
+        let path_id = format!("source-set:v1:path-{}", "a".repeat(64));
+        let uuid_id = "source-set:v1:6f1f0a52-0d0c-4d6e-9a43-0c1a3e3a8b11";
+        let file = |id: &str| {
+            json!({"scope": "file", "aggregate": "sum", "sourceSetId": id,
+                   "path": "src/a.rs", "language": "rust"})
+        };
+        let options = metrics_options_from_request(&file(&path_id)).unwrap();
+        assert!(options.validate_transport(Current).is_ok());
+        // The CLI and its daemon request accept only the path form (#984).
+        let mut uuid_options = options.clone();
+        uuid_options.source_set_id = Some(uuid_id.into());
+        assert!(uuid_options.validate_transport(Current).is_ok());
+        assert_eq!(
+            uuid_options
+                .validate_transport(PathOnly)
+                .unwrap_err()
+                .to_string(),
+            "source set ID"
+        );
+        let rejected =
+            |args: serde_json::Value| metrics_options_from_request(&args).unwrap_err().to_string();
+        assert_eq!(rejected(file(uuid_id)), "invalid_argument: source set ID");
+        let mut args = file(&path_id);
+        args["path"] = json!("src/a:b.rs");
+        assert_eq!(rejected(args.clone()), "invalid_argument: path");
+        // Source set ID is reported ahead of a bad path or language.
+        args["sourceSetId"] = json!(path_id.to_uppercase());
+        assert_eq!(rejected(args), "invalid_argument: source set ID");
+        let mut args = file(&path_id);
+        args["language"] = json!("go");
+        assert_eq!(rejected(args), "invalid_argument: language");
+        let mut args = file(&path_id);
+        args["scope"] = json!("declaration");
+        args.as_object_mut().unwrap().remove("language");
+        args["sid"] = json!(format!("sid:v1:{}", "A".repeat(32)));
+        assert_eq!(rejected(args), "invalid_argument: sid");
     }
 }

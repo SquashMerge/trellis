@@ -1563,6 +1563,71 @@ impl MetricsOptions {
         }
         Ok(())
     }
+
+    /// `validate`, then the identifier forms a transport accepts. Every
+    /// transport (CLI, daemon request, browser API) validates through this.
+    /// The message names the first failing rule, in a fixed order.
+    pub fn validate_transport(&self, source_set_ids: MetricsSourceSetIds) -> Result<()> {
+        fn lower_hex(text: &str) -> bool {
+            text.bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        }
+        self.validate()?;
+        ensure!(
+            self.source_set_id.as_deref().is_none_or(|id| {
+                let Some(identity) = id.strip_prefix("source-set:v1:") else {
+                    return false;
+                };
+                if let Some(hash) = identity.strip_prefix("path-") {
+                    return hash.len() == 64 && lower_hex(hash);
+                }
+                source_set_ids == MetricsSourceSetIds::Current
+                    && uuid::Uuid::parse_str(identity)
+                        .is_ok_and(|uuid| uuid.to_string() == identity)
+            }),
+            "source set ID"
+        );
+        ensure!(
+            self.sid.as_deref().is_none_or(|sid| {
+                sid.len() == 39 && sid.starts_with("sid:v1:") && lower_hex(&sid[7..])
+            }),
+            "sid"
+        );
+        ensure!(
+            self.path
+                .as_deref()
+                .is_none_or(|path| !path.contains([':', '\\', '\0'])),
+            "path"
+        );
+        ensure!(
+            self.language.as_deref().is_none_or(|language| matches!(
+                language,
+                "java" | "python" | "javascript" | "typescript" | "rust"
+            )),
+            "language"
+        );
+        Ok(())
+    }
+
+    /// How long one metrics read of `scope` may work: revision and directory
+    /// reads aggregate many files, so they get the long budget.
+    pub fn work_budget(scope: &str) -> std::time::Duration {
+        std::time::Duration::from_secs(if matches!(scope, "revision" | "directory") {
+            300
+        } else {
+            30
+        })
+    }
+}
+
+/// Which source-set ID forms a metrics transport accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricsSourceSetIds {
+    /// Every current form: path-derived and UUID. The browser API.
+    Current,
+    /// Only `source-set:v1:path-<hash>`. The CLI and its daemon request
+    /// reject UUID source-set IDs today (#984).
+    PathOnly,
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
