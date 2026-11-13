@@ -1989,12 +1989,17 @@ test("Deviations Open in Sequence whose read fails says so and retries (#940)", 
     // Stall recovery refreshes the view 2 s after the busy answer. Retry is pressed once that has
     // settled: a refresh during Retry's read is a view change, which drops it with the note.
     const recovered = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/status"), {timeout:30000});
+    // The tab's own refresh after recovery reads the snapshot again; Retry waits for it to settle.
+    const reread = recovered.then(() => page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/architecture") && response.request().method() === "GET", {timeout:30000}));
     try {
       await open.click();
       await page.locator("#sequence-open").filter({hasText:"Open in Sequence failed: The index is busy."}).waitFor({state:"visible"});
     } finally { await page.unroute(sequencePattern, handler); }
     await recovered;
-    await ready(page);
+    // Recovery refreshes the Deviations tab, which reads without drawing (#965).
+    await reread;
+    await shownReady(page);
+    await page.locator("#architecture-deviations-tree .deviation-row").first().waitFor({state:"visible"});
     assert.match(await page.locator("#sequence-open").textContent(), /Open in Sequence failed/, "recovery keeps the note");
     await page.locator("#sequence-open-retry").click();
     await page.locator("#sequence-panel").waitFor({state:"visible"});
