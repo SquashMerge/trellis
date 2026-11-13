@@ -1467,7 +1467,7 @@ test("sid routes wait for an admitted checkout, resolve only the requested seed,
 });
 
 for (const hash of ["#sequence", "#sequence?sid=", "#sequence?sid=a&sid=b", `#sequence?sid=a&rootKey=${"b".repeat(64)}`,
-  "#sequence?sid=a&indexGeneration=87654321-1234-4123-8123-123456789abc&indexRevision=1"]) {
+  "#sequence?sid=a&indexGeneration=87654321-1234-4123-8123-123456789abc&indexRevision=x"]) {
   test(`invalid or mismatched route refuses requests: ${hash}`, async () => {
     const h = harness(historyWindow(hash));
     await h.run("readNavigationLocation()");
@@ -1509,10 +1509,48 @@ for (const [name, query] of [
   });
 }
 
-test("the stale-pin check comes before the call-ID check", async () => {
+test("a malformed call-ID link keeps its error even when its pin is stale (#951)", async () => {
   const h = harness(historyWindow(`#sequence?sid=a&rootKey=${ROOT}&indexGeneration=12345678-1234-4123-8123-123456789abc&indexRevision=2&callId=bad`));
   await h.run("readNavigationLocation()");
-  assert.match(h.get("error").textContent, /stale for the selected index snapshot/);
+  assert.equal(h.get("error").textContent, "Cannot open sequence: Sequence link has invalid call IDs.");
+});
+
+// #951 (owner ruling 2026-11-12): a stale entry or link strips the URL, adds no history entry and
+// opens the root view with no error.
+async function assertRoot(h, browser, entries) {
+  assert.equal(h.networkUrls.length, 0);
+  assert.equal(browser.location.hash, "");
+  assert.equal(browser.history.state, null);
+  assert.equal(browser.history.length, entries, "no new history entry");
+  assert.equal(h.get("error").hidden, true);
+  assert.doesNotMatch(h.get("sequence-state").textContent, /Cannot open sequence/);
+  assert.equal(h.run("selectedMethod"), null);
+}
+for (const [name, hash] of [
+  ["a sequence link for an older snapshot", `#sequence?sid=a&rootKey=${ROOT}&indexGeneration=12345678-1234-4123-8123-123456789abc&indexRevision=2`],
+  ["a sequence link for another generation", "#sequence?sid=a&indexGeneration=87654321-1234-4123-8123-123456789abc&indexRevision=1"],
+  ["a #source entry from another page load", "#source"],
+  ["a #classes entry from another page load", "#classes"]]) {
+  test(`${name} opens the root view with no error (#951)`, async () => {
+    const browser = historyWindow(hash), h = harness(browser);
+    await h.run("readNavigationLocation()");
+    await assertRoot(h, browser, 1);
+  });
+}
+
+test("a history key from this page whose entry is gone opens the root view with no error (#951)", async () => {
+  const browser = historyWindow(), h = harness(browser);
+  browser.history.pushState({trellisNavigation:`${h.run("navigationScope")}:99`}, "", "#sequence?sid=a");
+  await h.run("readNavigationLocation()");
+  await assertRoot(h, browser, 2);
+});
+
+test("a held entry for an older snapshot opens the root view with no error (#951)", async () => {
+  const browser = historyWindow(), h = harness(browser);
+  h.run(`rememberNavigation({kind:"view", view:"treemap"}, false, "#view")`);
+  h.run("status = {revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:2}}");
+  await h.run("readNavigationLocation(true)");
+  await assertRoot(h, browser, 2);
 });
 
 test("a valid call-ID link passes its boundary to selectMethod", async () => {
