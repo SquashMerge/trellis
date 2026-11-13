@@ -298,7 +298,7 @@ impl Store {
         producer: &str,
         destination: IndexPin,
     ) -> Result<bool> {
-        if options.origin != crate::semantic_batch::descriptor::GenerationOrigin::TrellisRun {
+        if options.origin != crate::semantic_batch::origin::GenerationOrigin::TrellisRun {
             return Ok(false);
         }
         let db = self.cache_write()?;

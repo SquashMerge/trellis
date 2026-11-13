@@ -59,7 +59,7 @@ paths = [
   "src/scip_admission.rs", "src/semantic_evidence.rs", "src/semantic_import.rs",
   "src/search_capture.rs", "src/search_card.rs",
   "src/native_rust_macros_tests.rs", "src/extractor_inputs_tests.rs", "src/indexer_projection_vectors_tests.rs",
-  "src/semantic_import_complexity_tests.rs", "src/native_rust_macros.rs", "src/producer/**", "src/evidence_budget.rs", "src/skipped_source.rs", "src/skipped_config.rs", "src/semantic_batch.rs", "src/semantic_batch/**",
+  "src/semantic_import_complexity_tests.rs", "src/native_rust_macros.rs", "src/producer/**", "src/evidence_budget.rs", "src/semantic_batch.rs", "src/semantic_batch/**",
   "src/semantic_import/**",
   "src/language_set_tests.rs", "src/native_typescript_tests.rs", "src/semantic_join_inputs_tests.rs",
 ]
@@ -75,6 +75,13 @@ shared = true
 paths = [
   "src/model.rs", "src/testing.rs", "src/native_ids.rs", "src/scip_raw.rs", "src/files_view.rs", "src/parallel.rs", "src/build_info.rs", "src/search_lexical.rs",
   "src/lib.rs", "src/scip_raw/**", "src/test_alloc.rs", "src/syntax_bounds.rs", "src/heap.rs",
+  # Leaf constants, small types and pure helpers that storage and shared code use (S1, #999).
+  # They reference no layer: the skipped-input placeholders, the batch resource policy with
+  # its counters and generated-batch origin, and the vocabulary moved out of indexing and query.
+  "src/skipped_config.rs", "src/skipped_source.rs",
+  "src/semantic_batch/limits.rs", "src/semantic_batch/counters.rs", "src/semantic_batch/origin.rs",
+  "src/evidence_limits.rs", "src/diagnostic_markers.rs", "src/diagnostic_markers_tests.rs",
+  "src/scip_vocab.rs", "src/jsonc.rs", "src/source_dir.rs", "src/process_info.rs",
 ]
 
 # Coarse developer-tool boundary; does not infer internal tooling architecture.

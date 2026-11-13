@@ -77,7 +77,7 @@ const NON_OUTPUT_ITEMS: &[(&str, &str)] = &[
         "the read-time view type, never stored",
     ),
     (
-        "graph_query::BoundaryReason",
+        "model::BoundaryReason",
         "a field of the read-only query view's bindings, never stored",
     ),
     (

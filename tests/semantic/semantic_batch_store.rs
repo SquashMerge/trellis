@@ -7563,7 +7563,7 @@ async fn none_or_multiple_producers_show_syntax_with_a_note() {
         mcp.finish();
     };
     let (none, _) = real_fixture_world("issue444-javascript-calls", &files);
-    check(&none, trellis::store::NO_PRODUCER_NOTE, 469, 0);
+    check(&none, trellis::graph_query::NO_PRODUCER_NOTE, 469, 0);
     let (multiple, _) = real_fixture_world("issue444-javascript-calls", &files);
     publish_real_fixture(&multiple, "issue444-javascript-calls", &files);
     let mut second = multiple.fixture();
@@ -7573,7 +7573,7 @@ async fn none_or_multiple_producers_show_syntax_with_a_note() {
     drop(multiple.publish(&descriptor).unwrap());
     check(
         &multiple,
-        &trellis::store::multiple_producers_note("javascript"),
+        &trellis::graph_query::multiple_producers_note("javascript"),
         470,
         2,
     );
@@ -12518,7 +12518,7 @@ async fn each_language_selects_its_own_published_producer() {
     assert_eq!(view.semantic.producer_id.as_deref(), Some("rust-analyzer"));
     assert_eq!(
         view.semantic.note.as_deref(),
-        Some(trellis::store::LANGUAGE_NOTE)
+        Some(trellis::graph_query::LANGUAGE_NOTE)
     );
     assert!(view.semantic.bindings.is_empty());
     let unpublished = response
@@ -12648,7 +12648,7 @@ async fn two_producers_for_one_language_fall_back_for_that_language_only() {
         .find(|id| *id != "scip-typescript")
         .unwrap()
         .clone();
-    let note = trellis::store::multiple_producers_note("javascript");
+    let note = trellis::graph_query::multiple_producers_note("javascript");
     let run = declaration_in(&world, "run", "src/lib.rs");
     let caller = declaration_in(&world, "caller", "src/main.js");
     let response = world.store.evidence_response().unwrap();

@@ -1,7 +1,9 @@
 //! One checkout-owned, bounded semantic unit. No main-index snapshot survives a return.
 use super::*;
 use crate::semantic_batch::RetainedStageContinuation;
-use crate::semantic_batch::{AdmittedBatch, BatchCounters, BatchLimits, LookupBudget, StageOwner};
+use crate::semantic_batch::{
+    AdmittedBatch, LookupBudget, StageOwner, counters::BatchCounters, limits::BatchLimits,
+};
 use crate::semantic_import::{DestinationMutations, JoinContinuation};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
