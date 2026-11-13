@@ -2054,8 +2054,11 @@ test("a stub selects its interface with a visible Selected word, opens the inspe
   assert.match(await band.getAttribute("aria-label"), /client end/, "the selected stub's band says which end it is");
   const content = page.locator("#architecture-inspector-content");
   assert.match(await content.textContent(), /Client end: web-app · client/); assert.match(await content.textContent(), /Server end: srv · server/);
-  await content.getByRole("button", {name:"Open endpoints"}).click(); await settled(page);
-  assert.match(await content.textContent(), /GET \/health · exact · 1 call site/);
+  // #950: no Open endpoints button; the matched routes are listed up front under their heading, before the server-only ones.
+  assert.equal(await content.getByRole("button", {name:"Open endpoints"}).count(), 0);
+  await content.getByText("GET /health · exact · 1 call site").waitFor({state:"visible"});
+  const order = await content.evaluate(node => { const all = node.textContent; return [all.indexOf("Matched routes (1)"), all.indexOf("GET /health · exact · 1 call site"), all.indexOf("◆ Server-only routes: no call matched them")]; });
+  assert.ok(order[0] >= 0 && order[0] < order[1] && order[1] < order[2], `the heading, its row, then the server-only routes: ${order}`);
   assert.match(await content.textContent(), /GET \/unused/); assert.match(await content.textContent(), /unresolved method|\/missing/);
   await content.getByRole("button", {name:"Read handler source"}).first().click();
   await laidOutAt(page, 1100);

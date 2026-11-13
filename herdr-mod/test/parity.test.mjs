@@ -43,19 +43,31 @@ test("colours: the web app's Color by default, its heat scale and its heat token
   for (const heat of [token("sm-gold"), token("sm-amber"), token("sm-orange")]) assert.ok(!fills(cool.svg).has(heat), `Layer colouring has no heat (${heat})`);
 });
 
-test("apps: the switcher's choices, one column per app, side by side or stacked, and one app's stack", async () => {
+test("apps: the switcher's choices, one column per app, side by side at any width with a sideways scroll, and one app's stack", async () => {
+  const { div } = await import("gpui-kit");
+  const ui = await import("../src/architecture-ui.js");
   const view = twoApps(), summary = summarize(view);
   assert.deepEqual(summary.choices.map((c) => c.text), ["All apps", "srv · rust", "webapp · javascript"]);
   assert.equal(apps.sourceLine(summary.group, view.apps.length), "2 apps · hidden layers and unassigned files grouped below");
-  const stacked = await draw(view, { width: 600, theme, highlight: null, choice: {} });
-  assert.equal(stacked.sideBySide, false);
-  assert.equal(stacked.images.length, 2, "one drawing per app column");
-  assert.match(stacked.images[0].svg, /srv · ordered/);
-  assert.match(stacked.images[1].svg, /webapp · ordered/, "the title wraps at this width");
+  // Interface order (#949), from the shared plan: the client webapp sits left of its server srv.
+  assert.deepEqual(summary.plan.parts.map((part) => part.group.name), ["webapp", "srv"]);
+  // Never stack; scroll (#949/#950, owner ruling 2026-11-12): the pane has no drawer, so 600px keeps the columns
+  // side by side at 352px each, wider than the pane, and the pane scrolls them sideways.
+  const narrow = await draw(view, { width: 600, theme, highlight: null, choice: {} });
+  assert.equal(narrow.sideBySide, true); assert.equal(narrow.images.length, 1, "one composed drawing");
+  assert.deepEqual(narrow.layout.widths, [352, 352]); assert.equal(narrow.images[0].width, 752, "352 + 48 + 352, wider than the 600px pane");
+  assert.match(narrow.images[0].svg, /webapp · ordered[\s\S]*srv · ordered/);
+  const pane = new Trellis();
+  Object.assign(pane, { width: 624, view, inspect: null, drawn: { ...narrow, view, assets: ["probe.svg"] } });
+  const root = div().children(ui.drawing(pane, theme, pane.drawn)), scroll = root.find("app-scroll");
+  assert.equal(scroll?.props.scrollX, true, "the headers and the drawing scroll sideways");
+  assert.ok(scroll.find("app-columns") && scroll.find("diagram"), "together");
   const wide = await draw(view, { width: 1300, theme, highlight: null, choice: {} });
   assert.equal(wide.sideBySide, true);
   assert.equal(wide.images.length, 1, "side by side is one composed drawing");
-  assert.match(wide.images[0].svg, /srv · ordered[\s\S]*webapp · ordered/);
+  assert.match(wide.images[0].svg, /webapp · ordered[\s\S]*srv · ordered/);
+  // One line in the gutter, so the gutter is the least 48px (#949).
+  assert.deepEqual(wide.layout.gutters, [48]); assert.equal(wide.layout.columns[1].x, wide.layout.widths[0] + 48);
   assert.match(wide.images[0].svg, /<path d="M[^"]+" fill="none" stroke="#6a6a78"/, "the interface runs as a line between the columns");
   // One app: its own stack, titled, with no other app's layers.
   const one = await draw(view, { width: 600, theme, highlight: null, choice: { scope: "webapp" } });
@@ -193,7 +205,9 @@ test("the pane: logo, status line, switcher, columns, interface card, deviations
     assert.match(root.find("interface-card-webapp-srv").text(), /HTTP · 1 route 1 call site 1 exact · 1 unresolved ◆ 1 server-only ◆ 1 client-only/);
     assert.match(root.find("inspector").text(), /Architecture review 2 deviations 0 unassigned files 0 exceptions/);
     assert.match(root.find("legend").text(), /Fixed per-callable bands · cognitive · max · production callables/);
-    assert.equal(p.view.drawn.images.length, 2, "900 px stacks the two columns, as the browser does under 880 px of canvas");
+    // 2 x 352 + one 48px gutter (#949) fit 900 px, as in the browser: one composed image, the client on the left.
+    assert.equal(p.view.drawn.sideBySide, true); assert.equal(p.view.drawn.images.length, 1);
+    assert.match(root.find("app-columns").text(), /^webapp[\s\S]*srv/, "the headers follow the columns' interface order");
 
     // The card inspects its interface.
     root = await p.click("interface-card-webapp-srv");
