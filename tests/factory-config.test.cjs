@@ -1,5 +1,5 @@
 const assert = require("node:assert/strict");
-const { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } = require("node:fs");
+const { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } = require("node:fs");
 const { tmpdir } = require("node:os");
 const { delimiter, dirname, join, resolve: resolvePath } = require("node:path");
 const { spawnSync } = require("node:child_process");
@@ -103,6 +103,65 @@ test("verify setup rejects symlinked and writable external caches", () => {
     }
   } finally {
     chmodSync(temp, 0o700);
+    rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+// #1014: one browser download per checkout filled the disk; checkouts share one cache.
+const verifyEnv = () => import(require("node:url").pathToFileURL(join(ROOT, "tools/verify-env.mjs")).href);
+
+test("verify setup gives every checkout the same browser and npm cache", async () => {
+  const { cacheLayout } = await verifyEnv();
+  const one = cacheLayout("/work/trellis-1", {}, "/tmp/t", 501);
+  const two = cacheLayout("/work/trellis-2", {}, "/tmp/t", 501);
+  assert.equal(one.browsers, "/tmp/t/trellis-verify/playwright-browsers");
+  assert.equal(two.browsers, one.browsers);
+  assert.equal(two.npmCache, one.npmCache);
+  assert.equal(one.npmCache, "/tmp/t/trellis-verify/npm-cache");
+  assert.notEqual(two.legacyEntry, one.legacyEntry);
+});
+
+test("verify setup keeps an explicit browser path and run cache", async () => {
+  const { cacheLayout } = await verifyEnv();
+  const ci = cacheLayout("/work/trellis", { PLAYWRIGHT_BROWSERS_PATH: "/runner/pw-browsers" }, "/tmp/t", 501);
+  assert.equal(ci.browsers, "/runner/pw-browsers");
+  assert.equal(ci.npmCache, "/tmp/t/trellis-verify/npm-cache");
+  const pinned = cacheLayout("/work/trellis", { TRELLIS_RUN_CACHE: "/caches/run" }, "/tmp/t", 501);
+  assert.equal(pinned.browsers, "/caches/run/playwright-browsers");
+  assert.equal(pinned.npmCache, "/caches/run/npm-cache");
+  const both = cacheLayout("/work/trellis", { TRELLIS_RUN_CACHE: "/caches/run", PLAYWRIGHT_BROWSERS_PATH: "/runner/pw-browsers" }, "/tmp/t", 501);
+  assert.equal(both.browsers, "/runner/pw-browsers");
+});
+
+test("verify setup removes old per-checkout caches that are its own or idle, and nothing else", async () => {
+  const { LEGACY_IDLE_MS, cacheLayout, pruneLegacyEntries } = await verifyEnv();
+  const temp = mkdtempSync(join(tmpdir(), "trellis-verify-layout-"));
+  try {
+    const layout = cacheLayout("/work/trellis-1", {}, temp, 501);
+    const now = Date.now();
+    const old = new Date(now - LEGACY_IDLE_MS - 60_000);
+    const entry = (name, { idle, browserIdle = idle }) => {
+      const browsers = join(layout.parent, name, "playwright-browsers");
+      mkdirSync(join(browsers, "chromium-1"), { recursive: true });
+      writeFileSync(join(browsers, "chromium-1", "chrome"), "");
+      if (browserIdle) utimesSync(browsers, old, old);
+      if (idle) utimesSync(join(layout.parent, name), old, old);
+    };
+    entry(layout.legacyEntry, { idle: false });
+    entry("a".repeat(24), { idle: true });
+    entry("b".repeat(24), { idle: false });
+    // A running old-layout verify touches only its browser directory.
+    entry("c".repeat(24), { idle: true, browserIdle: false });
+    // Not old-layout names: the shared caches and anything else are left alone.
+    entry("d".repeat(23), { idle: true });
+    entry("playwright-browsers", { idle: true });
+    writeFileSync(join(layout.parent, "e".repeat(24)), "");
+    utimesSync(join(layout.parent, "e".repeat(24)), old, old);
+
+    assert.deepEqual(pruneLegacyEntries(layout.parent, layout.legacyEntry, now).sort(), [layout.legacyEntry, "a".repeat(24)].sort());
+    assert.deepEqual(readdirSync(layout.parent).sort(), ["b".repeat(24), "c".repeat(24), "d".repeat(23), "e".repeat(24), "playwright-browsers"].sort());
+    assert.deepEqual(pruneLegacyEntries(join(temp, "missing"), layout.legacyEntry, now), []);
+  } finally {
     rmSync(temp, { recursive: true, force: true });
   }
 });
