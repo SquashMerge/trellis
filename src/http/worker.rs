@@ -95,36 +95,6 @@ impl RuntimePhase {
     }
 }
 
-/// The producer layer's view of this runtime (`producer::import::ImportScheduler`): each
-/// method is the inherent one of the same name, with the phase reduced to what producers ask.
-impl crate::producer::import::ImportScheduler for DaemonState {
-    fn phase(&self) -> crate::producer::import::SchedulerPhase {
-        use crate::producer::import::SchedulerPhase;
-        match self.runtime_phase() {
-            RuntimePhase::Activating | RuntimePhase::Reconciling { .. } => SchedulerPhase::Starting,
-            RuntimePhase::Ready => SchedulerPhase::Ready,
-            RuntimePhase::RetireRequested => SchedulerPhase::RetireRequested,
-            RuntimePhase::Closing | RuntimePhase::Retired => SchedulerPhase::Stopped,
-        }
-    }
-
-    fn state_version(&self) -> u64 {
-        DaemonState::state_version(self)
-    }
-
-    fn wait_state_change(&self, seen: u64, timeout: Duration) {
-        DaemonState::wait_state_change(self, seen, timeout)
-    }
-
-    fn enqueue_generated_semantic_import(
-        &self,
-        options: &crate::store::requests::GeneratedImportOptions,
-        id: uuid::Uuid,
-    ) -> anyhow::Result<crate::store::requests::Request> {
-        DaemonState::enqueue_generated_semantic_import(self, options, id)
-    }
-}
-
 impl DaemonState {
     pub(super) fn worker_now(&self) -> Instant {
         #[cfg(test)]
