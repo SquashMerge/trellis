@@ -15,6 +15,7 @@ pub mod batch;
 pub mod detect;
 pub mod doctor;
 pub mod exec;
+pub mod failure;
 pub mod import;
 pub mod install;
 pub mod pickup;
