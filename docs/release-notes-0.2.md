@@ -2,10 +2,11 @@
 
 **Version:** `0.2.0`. **Release date:** on tag. These notes cover pull requests merged
 after the [0.1.2 release](release-notes-0.1.2.md) (tag `v0.1.2`) through
-[PR #937](https://github.com/SquashMerge/trellis/pull/937). This is a feature release.
+[PR #974](https://github.com/SquashMerge/trellis/pull/974). This is a feature release.
 Trellis can now re-run an approved producer after you edit, detects the apps in a
 checkout and the HTTP interfaces between them, treats TypeScript as its own language,
-and runs inside the Herdr app. The MCP contract changes: `toolVersion` goes from
+and runs inside the Herdr app. Deviations get their own tab in the web app and the
+Herdr pane. The MCP contract changes: `toolVersion` goes from
 **10 to 30**, with two new tools and a renamed prompt. The index schema goes from 40
 to **43**, so every index is recreated on first use. See
 [Compatibility](#compatibility).
@@ -79,6 +80,25 @@ to **43**, so every index is recreated on first use. See
   (bounded, read-only), instead of failing with TS6053. Without it, the run falls back
   to the generated config and says so under `omitted`.
   ([#808](https://github.com/SquashMerge/trellis/pull/808))
+- **Node producers get a heap sized from `--memory-mib`:** scip-typescript and
+  scip-python now run as `node --max-old-space-size=<H> …`, with
+  `H = max(4096, floor(memoryMiB × 0.8))`, so the default 8192 MiB bound gives a
+  6553 MiB heap instead of Node's 4 GiB default. A project that still runs out needs a
+  larger `--memory-mib`. `NODE_OPTIONS` stays out of the child environment. The flag is
+  in the plan's `command.argv`, so it changes `planSha256`: a `run` from a plan made
+  before upgrading is refused with `plan_changed` until you re-plan. Approvals stay
+  valid, since they hash the limits, not the command.
+  ([#966](https://github.com/SquashMerge/trellis/pull/966))
+- **A failed run says why:** the `producer run` reply, `run.json`, `producer status`'s
+  `lastRun` and the `--run` record gain `failure:{reason, exit, peakRssBytes,
+  stderrLines}`, null unless the run ended `failed` or `cancelled` with diagnostics.
+  `stderrLines` holds the last 10 non-empty stderr lines, each at most 512 bytes. A
+  Node producer that aborts on V8's heap limit gets `reason:"node_heap_exhausted"` and
+  `errorCode` `producer_failed: node_heap_exhausted`; `outcome` stays
+  `producer_failed`, and the automatic re-run backoff code is unchanged. On a failure
+  the CLI also prints one `producer run failed: …` line to stderr, ending
+  `raise --memory-mib` for a heap abort (owner ruling 2026-11-12).
+  ([#968](https://github.com/SquashMerge/trellis/pull/968))
 - **Enqueue errors settle against a known request ID:** a run or pickup chooses its
   import request ID first, so an enqueue error after commit no longer strips inputs
   that an accepted import still reads, or imports the same bytes twice.
@@ -148,6 +168,14 @@ to **43**, so every index is recreated on first use. See
   the Architecture tab gets a Deviations tree with deep links into Sequence.
   ([#814](https://github.com/SquashMerge/trellis/pull/814),
   [#846](https://github.com/SquashMerge/trellis/pull/846))
+- **Deviations is its own tab:** the web app's top tabs are now Architecture ·
+  Treemap · Sequence · Classes · **Deviations**. The tab shows the Deviations tree,
+  with its edge chips, filters, line inspector and the app switcher, and draws no
+  diagram. The review chip opens it on every edge, an app's deviation count in an All
+  apps column header opens it on that app, and a deviating arrow or `↑` badge opens it
+  on that edge. **Show on diagram** replaces "← Architecture" and focuses the edge's
+  arrow. The tab has its own `#deviations` link (with optional `app=` and `edge=`, no
+  pin), so Back, Forward and reload restore it. ([#974](https://github.com/SquashMerge/trellis/pull/974))
 - **Edges open the tree:** a production `$layers` arrow, or an upward-arrow badge,
   opens the Deviations tree on that edge. The per-edge review list and its bulk
   exception actions are retired; exceptions are per file pair from a tree line.
@@ -182,7 +210,19 @@ to **43**, so every index is recreated on first use. See
 - **Deviations tree labels:** a line row shows the definition's qualified name (for
   example `DaemonState::enqueue_generated_semantic_import`), never the internal
   key. Names stay on one line, cut off with an ellipsis, with the full text in a
-  tooltip. ([#924](https://github.com/SquashMerge/trellis/pull/924))
+  tooltip. ([#924](https://github.com/SquashMerge/trellis/pull/924)) The inspector's
+  **Refers to** row shows the same name followed by `path:line`, not the internal key
+  ([#947](https://github.com/SquashMerge/trellis/pull/947)).
+- **All apps keeps apps side by side:** two to four apps are always laid out as
+  columns (each at least 352 px) and the diagram scrolls sideways when they don't fit.
+  They stack only at the narrow-screen drawer width (900 px). Columns follow interface
+  order: each server sits between its clients, with the busiest client on the left.
+  Each gutter is sized to the interface lines it carries, and a card that doesn't fit
+  its gutter is listed under the grid. The Herdr pane uses the same order and scrolls
+  the same way (owner ruling 2026-11-12). ([#955](https://github.com/SquashMerge/trellis/pull/955))
+- **Matched routes up front:** the interface inspector lists **Matched routes (N)**
+  first, then server-only and client-only routes, with no **Open endpoints** button.
+  ([#955](https://github.com/SquashMerge/trellis/pull/955))
 - **Layer numbers and one-app coverage:** a layer's displayed number counts only the
   shown layers of its app, and a revealed hidden layer reads **Hidden · name**.
   Rules still compare the authored `order`. In a one-app view the coverage footnote
@@ -229,6 +269,12 @@ to **43**, so every index is recreated on first use. See
   files are indexed as `typescript` through the TypeScript grammars, with native
   constructs, class diagrams and its own language rows in MCP. The native extractor
   moves to `native-v16`. ([#800](https://github.com/SquashMerge/trellis/pull/800))
+- **Generic awaited calls:** `await f<T>(x)` in TypeScript and TSX is now measured as
+  the call `f<T>(x)` with callee `f`, like `await f(x)`. Before, the parser's reading
+  gave a callee spelled `await f` with no range, so scip-typescript's binding couldn't
+  join and those sites were missing from `trellis_incoming_calls` and
+  `trellis_call_graph`. Endpoint client calls and the unqualified-call metric follow.
+  The native extractor moves to `native-v17`. ([#963](https://github.com/SquashMerge/trellis/pull/963))
 - **Call ownership:** a call is owned by its innermost executable container (module,
   namespace, type, implementation, function and so on), as native measurement
   already did. ([#804](https://github.com/SquashMerge/trellis/pull/804))
@@ -324,7 +370,11 @@ to **43**, so every index is recreated on first use. See
   and describe report `building` with the cached vector count, never a reasonless
   `unavailable` ([#781](https://github.com/SquashMerge/trellis/pull/781)), and
   describe counts that cache once per head, not per call
-  ([#823](https://github.com/SquashMerge/trellis/pull/823)).
+  ([#823](https://github.com/SquashMerge/trellis/pull/823)). After the 600 s idle
+  eviction, describe and `trellis status` rearm the search head as search does, so
+  they report the same `building` state and counts instead of
+  `unavailable · matrix_not_resident · 0`. They are not query use: they don't extend
+  the matrix's residency (owner ruling 2026-11-12). ([#954](https://github.com/SquashMerge/trellis/pull/954))
 - **Typed failures:** an oversized ignore file is a diagnostic, not a failed index
   ([#766](https://github.com/SquashMerge/trellis/pull/766)); a capture input over its
   cap is `limit_exceeded` ([#764](https://github.com/SquashMerge/trellis/pull/764));
@@ -343,6 +393,15 @@ to **43**, so every index is recreated on first use. See
   (`source_forbidden`, `symlink_forbidden`, `directory_forbidden`) no longer
   disconnects the page or forgets the remembered token.
   ([#918](https://github.com/SquashMerge/trellis/pull/918))
+- **Open in Sequence says what it's doing:** from the Deviations inspector, the edge
+  group or a line menu, the button reads "Opening sequence…" while the sequence is
+  read, and a header note names the caller. If the index moves, the view changes or
+  the read fails first, the note says so and offers **Retry** at the current head,
+  instead of the open being dropped silently. ([#959](https://github.com/SquashMerge/trellis/pull/959))
+- **A stale link opens the root view:** a history entry or sequence link from an
+  older snapshot, session or checkout now clears the URL and opens Diagrams ›
+  Architecture with no error, as a fresh load does. Malformed links and links for
+  another checkout keep their errors (owner ruling 2026-11-12). ([#964](https://github.com/SquashMerge/trellis/pull/964))
 - **Dogfooding fixes:** after an agent show and Back, keyboard focus follows the
   selected tab, and the connect footer now reads "index follows file changes ·
   producer re-runs are opt-in". ([#926](https://github.com/SquashMerge/trellis/pull/926))
@@ -365,6 +424,13 @@ to **43**, so every index is recreated on first use. See
   An exec failure that isn't a connection failure is now `exec_failed` with its
   message, not `machine_unreachable`, and a `trellis` without `--gzip` is
   `trellis_outdated`. ([#919](https://github.com/SquashMerge/trellis/pull/919))
+- **Deviations tab and clickable arrows:** the pane's tabs are Architecture ·
+  Sequence · **Deviations**, kept across restarts. The review chip, an app's
+  deviation count and a deviating arrow open the tab with their filter, and **Show on
+  diagram** goes back. An arrow now responds along its whole line and arrowhead, not
+  only on its count label, so a press on the line no longer folds the layer band
+  behind it. A line row opens its caller in Sequence, or shows its `path:line` when it
+  has none. ([#948](https://github.com/SquashMerge/trellis/pull/948))
 
 ## Development / test reliability
 
@@ -414,9 +480,9 @@ Trellis is pre-release; there is no backward compatibility.
   - 30: `trellis_references`, `trellis_rules_check` and `trellis_rules_explain`
     replace `semanticDocuments` with `semanticDocumentStatus`, the same counts.
   - Without a catalog change: `trellis_rules_explain` scopes `unassigned` to its
-    instance, grouped references pages list only their rows' `externalPackages`, and
-    the architecture tools accept `possiblyStale` call and type bindings after
-    catch-up.
+    instance, grouped references pages list only their rows' `externalPackages`, the
+    architecture tools accept `possiblyStale` call and type bindings after catch-up,
+    and describe rearms an evicted search head (#942).
 
   Each change is an amendment in the
   [MCP contract](mcp-readonly-pilot-contract.md).
@@ -424,7 +490,13 @@ Trellis is pre-release; there is no backward compatibility.
   `key`; a new `architecture/details` `edge` kind pages an edge's pairs. `pairs=false`
   is still accepted and changes nothing, and `pairs=true` is `400 invalid_request`.
   `trellis api` gains `--gzip`. See [daemon-v1](daemon-v1.md).
-- **Index schema 40 → 43, native extractor `native-v15` → `native-v16`.** Indexes are
+- **Producer reply and status:** the closed `producer run` reply key set gains
+  `failure`, which also appears in `run.json`, `lastRun` and the `--run` record; a
+  record without it reads as null. A Node heap abort's `errorCode` is
+  `producer_failed: node_heap_exhausted`. Node producers' `command.argv` gains
+  `--max-old-space-size`, so their `planSha256` changes
+  ([local topology](local-topology.md)).
+- **Index schema 40 → 43, native extractor `native-v15` → `native-v17`.** Indexes are
   disposable derived state: an older index is recreated, not migrated, and GC removes
   older-schema indexes. Expect a full re-index of each checkout on first use.
 - **Durable and configuration state:**
@@ -441,9 +513,15 @@ Trellis is pre-release; there is no backward compatibility.
     ([rules.md Amendment #783](rules.md#amendment-783-apps-and-per-app-layers)).
 - **Contract amendments:** contract-v1 (call ownership, TypeScript, interface
   evidence, shared payloads, automatic re-runs), Decision 0020 (TypeScript), Decision
-  0021 (shared semantic payloads), local topology T02–T06 and T09, the
-  [sequence slice contract](sequence-slice-contract.md) (#907 frames) and
-  [rules.md](rules.md) (#912 explain scope, #936 possibly-stale bindings).
+  0021 (shared semantic payloads), local topology T02–T06 and T09 (plus § Bounds for
+  the Node heap, #957, and § Run record and reply for `failure`, #967), the
+  [sequence slice contract](sequence-slice-contract.md) (#907 frames),
+  [rules.md](rules.md) (#912 explain scope, #936 possibly-stale bindings), the
+  [MCP contract](mcp-readonly-pilot-contract.md) and
+  [search cache](semantic-search-local-cache.md) (#942 describe rearm), the
+  [member navigation contract](member-navigation-contract.md) (#951 stale links open
+  the root view) and [architecture view](architecture-view.md) (#949/#950 All apps
+  layout, #965 Deviations tab).
 
 ## Upgrade notes
 
@@ -453,6 +531,12 @@ Retained batches from 0.1.x may be refused (for example JavaScript batches captu
 before TypeScript became its own language), which leaves **needs re-import**: run the
 producer again. If you opt in to automatic re-runs, run each producer once by hand
 after upgrading to write its approval.
+
+The native extractor is now `native-v17`, so each checkout is fully re-indexed on
+first use (as the schema change already requires). For scip-typescript and
+scip-python, run `producer plan` again before `producer run --plan-sha256 …`: the
+plan's command now carries the V8 heap flag, so an old plan hash is refused with
+`plan_changed`. Existing automatic re-run approvals stay valid.
 
 The Herdr pane now passes `--gzip` to `trellis api` on a remote machine, so update
 `trellis` on each remote machine along with the mod (`node build.mjs --install` in
