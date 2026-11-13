@@ -16167,6 +16167,121 @@ async fn mcp_describe_counts_pending_head_cache_once_per_cache_write() {
     session.join().unwrap().unwrap();
 }
 
+/// #942: describe and search report one head state through an evicted
+/// matrix's reload. Describe, like search, rearms the evicted head, so the
+/// first describe already reports `building` with the cached count; unlike
+/// search, describe is not use and never moves the idle timer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_describe_rearms_evicted_head_like_search_without_extending_residency() {
+    let start = std::time::Instant::now();
+    let clock = std::sync::Arc::new(std::sync::Mutex::new(start));
+    let service_clock = clock.clone();
+    let (fixture, service, fill) = SearchMcpFixture::with_search(
+        &[("a.js", "function orchard() {}\nfunction unrelated() {}\n")],
+        |roots| {
+            let mut service = trellis::daemon::search::SearchService::with_embedder_for_tests(
+                roots.clone(),
+                std::sync::Arc::new(McpSearchEmbedderFactory::default()),
+            )
+            .unwrap();
+            service.set_model_clock_for_tests(std::sync::Arc::new(move || {
+                *service_clock.lock().unwrap()
+            }));
+            std::sync::Arc::new(service)
+        },
+        true,
+    )
+    .await;
+    fixture.seed_vectors(&service);
+    fixture.prewarm().await;
+    let fill = fill.unwrap();
+    let waiter = fill.clone();
+    tokio::task::spawn_blocking(move || waiter.wait_until_idle_for_tests())
+        .await
+        .unwrap();
+    let head = fixture.head().await;
+    assert_eq!(head.last_used_for_tests(), Some(start));
+    // Hold the owner before it rebuilds, so every sample below sees it working.
+    let build = ReadGate::default();
+    let _release_on_failure = McpFillRelease([build.clone(), ReadGate::default()]);
+    head.set_before_build_hook_for_tests(build.hook());
+    // The matrix is evicted; both head vectors stay cached.
+    head.clear_for_tests();
+    let reload = start + std::time::Duration::from_secs(100);
+    *clock.lock().unwrap() = reload;
+    let (mut client, mut reader, session) =
+        socket_session(&fixture.identity, &fixture.registry, 211, None);
+    let building = json!({
+        "backend":"cpu","unavailableReason":null,
+        "state":"building","declarations":2,"embedded":2
+    });
+    // Describe before any search rearms the head and reports the cached count.
+    let (described, _) = describe_search_index(&mut client, &mut reader, 1);
+    assert_eq!(described, building, "describe before search");
+    let held = build.clone();
+    tokio::task::spawn_blocking(move || held.await_held(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        head.last_used_for_tests(),
+        Some(start),
+        "describe counted as query use"
+    );
+    let search = |client: &mut std::os::unix::net::UnixStream,
+                  reader: &mut BufReader<std::os::unix::net::UnixStream>,
+                  id| {
+        let reply = search_socket_ask(
+            client,
+            reader,
+            false,
+            id,
+            json!({"schemaVersion":1,"query":"orchard","limit":50}),
+        );
+        tool(&reply, None, true);
+        let index = reply["result"]["structuredContent"]["data"]["searchIndex"].clone();
+        json!({
+            "backend":index["backend"],"unavailableReason":index["unavailableReason"],
+            "state":index["state"],"declarations":index["declarations"],
+            "embedded":index["embedded"]
+        })
+    };
+    assert_eq!(search(&mut client, &mut reader, 2), building, "search");
+    let (described, _) = describe_search_index(&mut client, &mut reader, 3);
+    assert_eq!(described, building, "describe after search");
+    build.open();
+    let waiter = fill.clone();
+    tokio::task::spawn_blocking(move || waiter.wait_until_idle_for_tests())
+        .await
+        .unwrap();
+    // Publication restarts the idle timer.
+    assert_eq!(head.last_used_for_tests(), Some(reload));
+    *clock.lock().unwrap() = reload + std::time::Duration::from_secs(300);
+    let complete = json!({
+        "backend":"cpu","unavailableReason":null,
+        "state":"complete","declarations":2,"embedded":2
+    });
+    let (described, _) = describe_search_index(&mut client, &mut reader, 4);
+    assert_eq!(described, complete, "describe after reload");
+    assert_eq!(
+        head.last_used_for_tests(),
+        Some(reload),
+        "describe extended residency"
+    );
+    assert_eq!(
+        search(&mut client, &mut reader, 5),
+        complete,
+        "search after reload"
+    );
+    // A search is query use.
+    assert_eq!(
+        head.last_used_for_tests(),
+        Some(reload + std::time::Duration::from_secs(300))
+    );
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
 /// #806: the remembered coverage belongs to one admitted head. When the head
 /// advances while the owner is still held, describe counts the new head
 /// (declarations and cached vectors) instead of reusing the old count.

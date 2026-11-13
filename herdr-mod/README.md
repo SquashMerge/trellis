@@ -1,9 +1,10 @@
 # Trellis for Herdr
 
-A [Herdr app](https://herdr.dev) mod that shows Trellis in a pane beside the coding agents (#707). It has two views, drawn the same way the web app draws them:
+A [Herdr app](https://herdr.dev) mod that shows Trellis in a pane beside the coding agents (#707). It has three tabs, drawn the same way the web app draws them:
 
-- **Architecture:** the web app's Architecture view (#886): Color by and Aggregation, the app switcher with one column per app, HTTP interface cards and cross-app lines, the deviation counts and the Deviations tree, the heat legend and the inspector, with the layers and their counts as native rows.
+- **Architecture:** the web app's Architecture view (#886): Color by and Aggregation, the app switcher with one column per app, HTTP interface cards and cross-app lines, the deviation counts, the heat legend and the inspector, with the layers and their counts as native rows.
 - **Sequence:** a method's static call sequence, with its steps as native rows. Clicking a proven call re-centers on that method.
+- **Deviations:** the Deviations tree (#939) with its edge chips. The review chip, an app's deviation count and a deviating arrow (its label, line or head) open it with their filter. A line opens its caller in Sequence, or shows its location when it has none (this pane has no source view).
 
 Both views follow the file selected in the `trellis-files` panel. The pane talks to the Trellis daemon on the machine the shown space lives on.
 
