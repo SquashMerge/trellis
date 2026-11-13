@@ -2490,3 +2490,37 @@ test("Open in Sequence Retry does not replace a view chosen while its sequence r
   assert.match(h.get("sequence-open-label").textContent, /The view changed; Open in Sequence was cancelled/);
   assert.equal(h.get("sequence-open").hidden, false);
 });
+
+
+test("review951 a stale link clears an already selected method and source action at root", async () => {
+  const {h, browser} = await showHarness();
+  assert.equal(h.run("selectedMethod.id"), "old");
+  assert.equal(h.get("method-source").disabled, false);
+  browser.history.pushState(null, "", `#sequence?sid=stale&rootKey=${ROOT}&indexGeneration=12345678-1234-4123-8123-123456789abc&indexRevision=2`);
+  const entries = browser.history.length;
+  await h.run("readNavigationLocation()");
+  assert.equal(browser.location.hash, "");
+  assert.equal(browser.history.state, null);
+  assert.equal(browser.history.length, entries);
+  assert.equal(h.get("error").hidden, true);
+  assert.equal(h.get("architecture-panel").hidden, false);
+  h.run("window.TrellisShell.showView('sequence')");
+  assert.equal(h.get("sequence-panel").hidden, false);
+  assert.equal(h.get("method-source").disabled, true, "root must not leave a source action for the previous selection enabled");
+  assert.equal(h.run("selectedMethod"), null, "the root view must clear the earlier method selection");
+});
+
+
+test("review951 a stale link clears an earlier malformed-link error when returning to root", async () => {
+  const browser = historyWindow("#sequence?sid="), h = harness(browser);
+  await h.run("readNavigationLocation()");
+  assert.match(h.get("sequence-state").textContent, /Cannot open sequence/);
+  browser.history.replaceState(null, "", `#sequence?sid=a&rootKey=${ROOT}&indexGeneration=12345678-1234-4123-8123-123456789abc&indexRevision=2`);
+  await h.run("readNavigationLocation()");
+  assert.equal(browser.location.hash, "");
+  assert.equal(h.get("error").hidden, true);
+  assert.equal(h.get("architecture-panel").hidden, false);
+  h.run("window.TrellisShell.showView('sequence')");
+  assert.equal(h.get("sequence-panel").hidden, false);
+  assert.doesNotMatch(h.get("sequence-state").textContent, /Cannot open sequence/, "the root fallback must not retain the previous link error in Sequence");
+});

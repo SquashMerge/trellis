@@ -268,7 +268,12 @@ async function readNavigationLocation(force = false) {
     window.history?.replaceState?.(null, "", `${window.location?.pathname || ""}${window.location?.search || ""}`);
     navigationLocation = navigationSignature();
     $("error").hidden = true; $("error").textContent = "";
-    clearSource(); diagramSequence = null; sequenceBoundary = null;
+    // Sequence starts empty, as on a fresh load: no selected method, enabled method actions or link error.
+    clearSource(); diagramSequence = null; sequenceBoundary = null; selectedMethod = null;
+    $("method-source").disabled = true; if ($("method-class")) $("method-class").disabled = true;
+    $("sequence-diagram").replaceChildren(); $("sequence-warnings").replaceChildren();
+    $("sequence-state").textContent = "Expand a file and select a method.";
+    renderFiles(); renderSequenceStart();
     await setSection("diagrams");
     if (!current()) return;
     showNavigationView("architecture");
