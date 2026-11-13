@@ -1,6 +1,7 @@
 //! Test-support stand-in for a semantic producer. Its behavior comes from a
 //! JSON mode file named by `--mode-file <abs>`, or by the first argument when
-//! that ends in `.json` (the stub then stands in for `node`). Keys, all
+//! that ends in `.json` (the stub then stands in for `node`, which consumes a leading
+//! `--max-old-space-size=` V8 flag before its script, as the stub does). Keys, all
 //! optional, run in this order:
 //!
 //! - `marker`: file that receives argv before anything else;
@@ -32,8 +33,13 @@ fn main() {
     if args.get(1).map(String::as_str) == Some("--sleep-forever") {
         sleep_forever();
     }
-    let mode_file = match args.get(1).map(String::as_str) {
-        Some("--mode-file") => args.get(2).cloned(),
+    // As `node`, the first argument after a V8 heap flag is the script.
+    let first = 1 + usize::from(
+        args.get(1)
+            .is_some_and(|arg| arg.starts_with("--max-old-space-size=")),
+    );
+    let mode_file = match args.get(first).map(String::as_str) {
+        Some("--mode-file") => args.get(first + 1).cloned(),
         Some(first) if first.ends_with(".json") => Some(first.to_owned()),
         _ => None,
     };

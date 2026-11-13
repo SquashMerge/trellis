@@ -245,6 +245,7 @@ pub fn build(parts: &Parts<'_>) -> Value {
         parts.pin,
         parts.rules,
         run,
+        parts.limits.memory_mib,
     );
     let layout = worktree::layout(&parts.basis.inputs, parts.rules);
     let generation: GenerationTable = profiles::run_generation(row, parts.resolution);
