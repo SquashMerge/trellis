@@ -1596,17 +1596,17 @@ async function renderFilesMini(current) {
   const data = filesMini, revision = data.revision, expanded = window.TrellisSequence.hopGroups(data), container = $("files-mini-sequence");
   const readSource = step => { if (current()) return openFilesLocation(step, revision); };
   const options = {showDetails:false, isCurrent:current, onOpenTarget:sequenceTargetAction(data, current)};
-  options.onUnsupported = reason => { if (current()) { window.TrellisSequence.render(container, data, readSource, expanded, options); $("files-mini-state").textContent += ` · Pele fell back: ${reason}`; } };
+  options.onUnsupported = reason => { if (current()) { window.TrellisSequence.renderError(container, reason); $("files-mini-state").textContent += ` · This Sequence could not be drawn: ${reason}`; } };
   const empty = window.TrellisSequence.emptySummary(data, options);
   const onlyEmpty = empty && !window.TrellisSequence.display(data, options).visible.size;
   const outcome = onlyEmpty ? {status:"empty"} : window.TrellisPeleSequence ? await window.TrellisPeleSequence.render(container, data, readSource, expanded, options) : {status:"unsupported", reason:"Pele asset unavailable"};
   if (!current() || outcome.status === "stale") return;
-  if (outcome.status !== "rendered" && outcome.status !== "empty") window.TrellisSequence.render(container, data, readSource, expanded, options);
+  if (outcome.status !== "rendered" && outcome.status !== "empty") window.TrellisSequence.renderError(container, outcome.reason);
   if (empty) window.TrellisSequence.renderEmpty(container, empty, () => { if (current()) void perform(() => navigateDiagram(data.seed, revision, "sequence", null, true)); }, !onlyEmpty);
   // One short status line; the sequence's caveats and diagnostics live behind the ⓘ (#526).
   const notes = [...(data.warnings || [])];
   if (data.truncated) notes.push("Truncated by sequence limits; Open full loads the sequence again.");
-  if (outcome.status !== "rendered" && !empty) notes.push(`Pele fell back: ${outcome.reason}`);
+  if (outcome.status !== "rendered" && !empty) notes.push(`This Sequence could not be drawn: ${outcome.reason}`);
   $("files-mini-notes").replaceChildren(...notes.map(note => element("li", note, "detail")));
   $("files-mini-state").textContent = `Indexed revision ${IndexPin.label(revision)} · ${data.hiddenSteps} incidental steps hidden${data.truncated ? " · truncated" : ""}${!data.steps.length ? " · No visible behavior steps" : ""}${notes.length ? ` · ${notes.length} ${notes.length === 1 ? "note" : "notes"} in ⓘ` : ""}`;
   fitFilesMini();
@@ -2063,12 +2063,12 @@ async function loadSequence(admitted = null, preserveSource = false, callerCurre
     const options = {showDetails: !!$("all-steps").checked, interactions:true, isCurrent: () => current() && IndexPin.equal(status?.revision, revision)};
     options.onRendered = () => highlightSequenceBoundary(data, options);
     options.onOpenTarget = sequenceTargetAction(data, options.isCurrent);
-    // A later group redraw can fail after the initial load succeeded. Preserve
-    // the whole pinned DTO rather than leaving an inert, silently folded group.
+    // A later group redraw can fail after the initial load succeeded. Say so in place of
+    // the diagram (#1007) rather than leaving an inert, silently folded group.
     options.onUnsupported = reason => {
       if (!options.isCurrent()) return;
-      window.TrellisSequence.render($("sequence-diagram"), data, readSource, expanded, options);
-      $("sequence-state").textContent = $("sequence-state").textContent.replace(/ · Pele rendered$/, ` · Pele fell back: ${reason}`);
+      window.TrellisSequence.renderError($("sequence-diagram"), reason);
+      $("sequence-state").textContent = $("sequence-state").textContent.replace(/ · Pele rendered$/, ` · This Sequence could not be drawn: ${reason}`);
     };
     if (window.TrellisShell) options.onSelect = step => {
       if (!current()) return;
@@ -2099,14 +2099,14 @@ async function loadSequence(admitted = null, preserveSource = false, callerCurre
     if (!current() || !IndexPin.equal(status?.revision, revision)) return;
     if (outcome.status === "stale") return;
     if (outcome.status !== "rendered" && outcome.status !== "empty") {
-      window.TrellisSequence.render(diagram, data, readSource, expanded, options);
+      window.TrellisSequence.renderError(diagram, outcome.reason);
     }
     if (empty) window.TrellisSequence.renderEmpty(diagram, empty, () => { if (options.isCurrent()) { $("all-steps").checked = true; void loadSequence(); } }, !onlyEmpty);
     if ($("sequence-warning-count")) $("sequence-warning-count").textContent = String((data.warnings || []).length);
     renderIncidentalToggle(data, options);
     // Interactions (#636) draw no internal step; the one count of them is in the status line.
     const interactions = window.TrellisSequence.display(data, options);
-    $("sequence-state").textContent = `${symbol.name} · ${symbol.path} · revision ${IndexPin.label(revision)} · ${window.TrellisSequence.evidenceSummary(data)} · ${data.hiddenSteps} incidental steps hidden${interactions.interactions ? ` · Interactions · ${interactions.hiddenSteps} internal steps hidden` : ""}${interactions.omittedInteractions ? ` · truncated: ${interactions.omittedInteractions} later ${interactions.omittedInteractions === 1 ? "interaction" : "interactions"} not shown` : ""}${data.truncated ? " · truncated by sequence limits" : ""}${window.TrellisSequence.interfaceSummary(data) ? ` · ${window.TrellisSequence.interfaceSummary(data)}` : ""}${!data.steps.length ? " · No visible behavior steps. Read method source for context." : ""}${outcome.status === "empty" ? "" : outcome.status !== "rendered" ? ` · Pele fell back: ${outcome.reason}` : " · Pele rendered"}`;
+    $("sequence-state").textContent = `${symbol.name} · ${symbol.path} · revision ${IndexPin.label(revision)} · ${window.TrellisSequence.evidenceSummary(data)} · ${data.hiddenSteps} incidental steps hidden${interactions.interactions ? ` · Interactions · ${interactions.hiddenSteps} internal steps hidden` : ""}${interactions.omittedInteractions ? ` · truncated: ${interactions.omittedInteractions} later ${interactions.omittedInteractions === 1 ? "interaction" : "interactions"} not shown` : ""}${data.truncated ? " · truncated by sequence limits" : ""}${window.TrellisSequence.interfaceSummary(data) ? ` · ${window.TrellisSequence.interfaceSummary(data)}` : ""}${!data.steps.length ? " · No visible behavior steps. Read method source for context." : ""}${outcome.status === "empty" ? "" : outcome.status !== "rendered" ? ` · This Sequence could not be drawn: ${outcome.reason}` : " · Pele rendered"}`;
     for (const warning of data.warnings || []) $("sequence-warnings").append(element("li", warning, "warning"));
     highlightSequenceBoundary(data, options);
     published = true;
@@ -2165,7 +2165,7 @@ function renderSequenceFit() {
   button.setAttribute("aria-pressed", String(fitted));
 }
 // A tall diagram scrolls its headers away; a copy of the column names stays over the panel
-// once they have gone. It reads what either renderer drew, so it needs no renderer's help.
+// once they have gone. It reads what the renderer drew, so it needs no renderer's help.
 let sequenceHeaderEnd = 0;
 function positionSequenceColumns() {
   const diagram = $("sequence-diagram"), strip = $("sequence-columns");
@@ -2177,13 +2177,13 @@ function renderSequenceColumns() {
   const diagram = $("sequence-diagram"), strip = $("sequence-columns");
   if (!strip || !diagram?.getBoundingClientRect) return;
   const box = diagram.getBoundingClientRect();
-  const headers = [...diagram.querySelectorAll(":scope > svg .pele-actor:not(.pele-actor-footer), :scope > svg .sequence-participant-label")];
+  const headers = [...diagram.querySelectorAll(":scope > svg .pele-actor:not(.pele-actor-footer)")];
   sequenceHeaderEnd = 0;
   strip.replaceChildren(...headers.map(header => {
     const rect = header.getBoundingClientRect();
     // A wrapped header (#716) is one line here: its kind, then its name.
     const lines = [...header.querySelectorAll("tspan")].map(line => line.textContent);
-    const name = element("span", lines.length ? lines.join(" ") : header.matches(".pele-actor") ? header.textContent : header.firstChild.textContent);
+    const name = element("span", lines.length ? lines.join(" ") : header.textContent);
     name.style.left = `${rect.left + rect.width / 2 - box.left + diagram.scrollLeft}px`;
     sequenceHeaderEnd = Math.max(sequenceHeaderEnd, rect.bottom - box.top + diagram.scrollTop);
     return name;

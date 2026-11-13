@@ -82,7 +82,7 @@ it adds is read from the same selected snapshot.
   other package) is incidental. `incidentalSteps` counts them; unless `showAll`, they are
   `hidden` and counted in `hiddenSteps`. A chain group whose calls are all hidden is hidden.
 - `callEvidence.semanticBasis` is the selected binding's captured basis, as MCP reports it.
-- Depth 24 bounds the step tree to 24 levels, as the browser renderers already did: a step
+- Depth 24 bounds the step tree to 24 levels, as the browser renderer already did: a step
   on the 24th level that still nests becomes one `boundary` ("Depth limit: behavior
   omitted.") at its own range. The Rust adapter bounds its syntax
   recursion separately, at 96 levels, so deep syntax that adds no steps keeps its calls.
@@ -249,11 +249,11 @@ and #542's "any other guard is unchanged".
 - **Bound.** The 20-participant bound counts drawn columns (`MAX_COLUMNS`), the seed's included.
   A target in a drawn column always fits, so `participants` may hold more than 20 entries;
   a target needing a 21st column is `nodeLimit` as before, typed `participants`.
-- **Arrow labels.** In both renderers the compact diagram labels an arrow with its row number
+- **Arrow labels.** The compact diagram labels an arrow with its row number
   and the target declaration's name, not the call's source spelling. Rows and frame headers
   use the compact labels, at most 72 characters; a collapsed chain whose entry call draws no
-  arrow keeps its entry call ID and may run longer. The #594 calls-first display projects both
-  renderers from original DTO objects: standalone writes/bindings, return text and deferred-definition
+  arrow keeps its entry call ID and may run longer. The #594 calls-first display projects the
+  diagram from original DTO objects: standalone writes/bindings, return text and deferred-definition
   leaves stay hidden by default. Admitted measured calls, enclosing branch/alternative/loop/try
   frames, unknown/protocol boundaries and concise early-exit context remain visible. No call list
   replaces conditional scope. Options → Show all steps restores admitted non-call rows and exact
@@ -263,7 +263,7 @@ and #542's "any other guard is unchanged".
   "Fit to width", offered only while the diagram is wider than the panel, shrinks it on
   request, for that method and its redraws. The Files preview keeps fitting its column.
   Once a tall diagram has scrolled its headers away, a copy of the column names stays over
-  the panel, whichever renderer drew it.
+  the panel.
 - **Folded guards after `if` and `match`.** An "only if the preceding path continues normally"
   guard also folds into the nearest `if` or `match` before it, in every language, provided
   only plain calls come between them and that step's own frame draws an exit: a `return` or
@@ -329,10 +329,16 @@ meaning changes, and the server response is the same.
   exact target; "All resolved calls stay within <seed column>; N calls have no exact
   target." when some do not; "None of the N calls has an exact target, so no arrow is drawn
   between columns." (or "The one call has no exact target, …") when none does.
-- **Renderers.** Both renderers draw the same arrows, returns, activations and loop, branch
-  and callee frames. Pele draws a callee frame as a shaded region whose first statement is a
+- **Renderer.** Pele draws the arrows, returns, activations and loop, branch and callee
+  frames. It draws a callee frame as a shaded region whose first statement is a
   note naming the callee (#907). Pele validates the returns, activation count, frames and
   notes it draws, as it validates rows.
+- **No second renderer** (#1007, owner ruling 2026-11-13). When Pele cannot draw a view, the
+  diagram area shows "This Sequence could not be drawn: <reason>" in the empty state's
+  styling, and the status line ends with the same sentence. Nothing else is drawn in its
+  place. This covers an unavailable renderer, a presentation limit (Mermaid or SVG bytes,
+  SVG node count, the structural caps) and a render or validation failure, at the first
+  draw and at a later group redraw, in the Sequence view and the Files preview.
 
 ### Interactions bound after filtering (#663)
 
@@ -420,15 +426,15 @@ is drawn as a labelled boundary hop into that route's handler. The evidence mean
   participants describe only the steps kept. The work, depth and arrow bounds are unchanged.
 - **Show all.** Show all steps keeps the source text and adds the hop's route: its evidence
   label is `HTTP interface hop · <method> <path template> · <confidence> · structural match,
-  not proof` in both renderers.
+  not proof`.
 - **Chains.** A hop inside a call-chain group whose calls were all hidden (a Rust
   `client.get(..).header(..).send()` with external bindings) reveals the group around it too,
   before the shown-step cap, so the hop is reachable (Prime2 second review on #885). The
   chain's other calls stay hidden incidental calls. Because a collapsed chain previews its
   first call only when every member is shown, the browser opens a chain that holds a hop
   expanded, as #646 opens highlighted chains. The drawn hops equal the status line's count.
-- **Wrapper lane.** A wrapper whose call is a hop keeps its own lane for its expanded body in
-  both renderers, so the body's arrows start from the wrapper's column.
+- **Wrapper lane.** A wrapper whose call is a hop keeps its own lane for its expanded body,
+  so the body's arrows start from the wrapper's column.
 - **MCP.** No MCP tool returns a Sequence; `trellis_show` opens this browser view, which
   draws its hops. No MCP output changes.
 
@@ -464,8 +470,8 @@ always a boundary, so `loadSequence`'s hop into the daemon was never reached.
   path, puts the call under a guard). Its steps run on the boundary's lane: a callback runs
   in the column of what defines it (#558). Nested callbacks are decided first; an outer
   callback is shown when an inner one is.
-- **Drawn.** Calls-first and Show all draw the block as a frame (legacy tab "callback"; Pele
-  a plain frame with the block's own numbered row). Interactions draw no frame for the block
+- **Drawn.** Calls-first and Show all draw the block as a plain frame with the
+  block's own numbered row. Interactions draw no frame for the block
   itself: its arrows draw in its place, as for a chain (#636). A same-column call it sits
   under is a callee frame around them when that call has an exact target (#907, owner ruling
   2026-11-11).

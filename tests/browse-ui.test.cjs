@@ -5,7 +5,9 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
-const source = ["sequence.js", "shell.js", "files.js", "app.js"].map(file => fs.readFileSync(path.join(__dirname, "../web", file), "utf8")).join("\n");
+// No DOM parser here: the adapter double keeps the real Pele projection and installs one
+// selectable node per projected row (tests/support/sequence-adapter-double.js).
+const source = ["../web/sequence.js", "../web/sequence-pele.js", "support/sequence-adapter-double.js", "../web/shell.js", "../web/files.js", "../web/app.js"].map(file => fs.readFileSync(path.join(__dirname, file), "utf8")).join("\n");
 
 function deferred() {
   let resolve, reject;
@@ -174,26 +176,73 @@ test("sequence selection sends no query or provider calls; Show all steps is exp
   assert.deepEqual(requests[0][1].expectedRevision,JSON.parse(JSON.stringify(h.run("status.revision"))));
 });
 
-test("native SVG preserves nested branch loop try, safe labels, unknown lifelines and keyboard source",()=>{
-  const h=harness(), dto=view("<img src=x onerror=boom>"), selected=[];
-  const step=(id,kind,children=[],alternate=[])=>({id,kind,label:id,path:"src/a.js",range:{startLine:2,endLine:2},target:"unknown",children,alternate});
-  dto.steps=[step("condition","branch",[step("repeat","loop",[step("<script>bad</script>","call")])],[step("attempt","try",[step("write","effect")],[step("finally","boundary",[step("cleanup","call")])])])];
-  dto.steps.push({...step("hidden-log", "call"), hidden:true});
-  h.context.dto=dto; h.context.readSource=s=>selected.push(s);
-  h.run("renderSequence($('sequence-diagram'), dto, readSource)");
-  const all=descendants(h.get("sequence-diagram")), branch=all.find(n=>n.attrs?.["data-kind"]==="branch");
-  assert.ok(descendants(branch).some(n=>n.attrs?.["data-kind"]==="loop"));
-  const attempt=all.find(n=>n.attrs?.["data-kind"]==="try");
-  assert.ok(descendants(attempt).some(n=>n.attrs?.["data-step-id"]==="cleanup"));
-  assert.ok(all.some(n=>n.tagName==="svg")); assert.equal(all.filter(n=>n.attrs?.class==="sequence-arrow").length,0);
-  assert.ok(!all.some(n=>n.attrs?.["data-step-id"]==="write"), "standalone writes wait for Show all");
-  assert.ok(all.every(n=>!["script","img"].includes(n.tagName)));
-  assert.doesNotMatch(text(h.get("sequence-diagram")), /hidden-log/);
-  assert.doesNotMatch(text(h.get("sequence-diagram")), /Unknown target/);
-  assert.match(text(h.get("sequence-diagram")), /<script>bad<\/script>/);
-  const control=all.find(n=>n.attrs?.role==="button"); let prevented=false;
-  control.listeners.keydown({key:"Enter",preventDefault(){prevented=true;}});
-  assert.ok(prevented); assert.equal(selected[0].id,"condition");
+// #1007: no second renderer. When Pele cannot draw, the diagram area says so and why.
+const SEQUENCE_ERROR = "This Sequence could not be drawn: ";
+const drawnCall = id => ({id,callId:id,kind:"call",label:id,path:"src/a.js",range:{startLine:2,endLine:2},children:[],alternate:[],hidden:false});
+const sequenceError = container => container.children.filter(n => n.className === "sequence-empty").map(n => n.textContent);
+test("a Sequence the renderer cannot draw shows its reason in the diagram area and the status line", async () => {
+  const deep = levels => { let step = drawnCall(`level-${levels - 1}`); for (let n = levels - 2; n >= 0; n--) step = {...drawnCall(`level-${n}`), kind:"note", children:[step]}; return step; };
+  for (const [name, reason, setup, steps] of [
+    ["the renderer is unavailable", "Pele asset unavailable", "delete window.TrellisPeleSequence", [drawnCall("call")]],
+    ["a presentation limit is passed", "Unsupported sequence depth", "", [deep(25)]],
+    ["the view fails validation", "Duplicate sequence identity", "", [drawnCall("same"), drawnCall("same")]],
+  ]) {
+    const h = harness(), dto = {...view("root"), steps};
+    h.context.fetch = async () => response(dto);
+    if (setup) h.run(setup);
+    await h.run(`selectMethod(${JSON.stringify(symbol("root"))})`);
+    const diagram = h.get("sequence-diagram");
+    assert.deepEqual(sequenceError(diagram), [SEQUENCE_ERROR + reason], name);
+    assert.equal(diagram.children.length, 1, `${name}: nothing else is drawn`);
+    assert.equal(descendants(diagram).some(n => n.tagName === "svg" || n.attrs?.role === "button"), false, `${name}: no diagram, no controls`);
+    assert.ok(h.get("sequence-state").textContent.endsWith(` · ${SEQUENCE_ERROR}${reason}`), `${name}: ${h.get("sequence-state").textContent}`);
+    assert.doesNotMatch(h.get("sequence-state").textContent, /Pele rendered|fell back/);
+  }
+});
+test("a group redraw the renderer cannot draw replaces the diagram with its reason, only while current", async () => {
+  for (const current of [true, false]) {
+    const h = harness(), dto = {...view("root"), steps:[drawnCall("call")]};
+    h.context.fetch = async () => response(dto);
+    h.run("{ const adapter = window.TrellisPeleSequence; window.TrellisPeleSequence = {...adapter, render:(...args) => { window.drawnWith = args[4]; return adapter.render(...args); }}; }");
+    await h.run(`selectMethod(${JSON.stringify(symbol("root"))})`);
+    const diagram = h.get("sequence-diagram"), drawn = diagram.children[0], state = h.get("sequence-state");
+    assert.equal(drawn.tagName, "svg"); assert.match(state.textContent, / · Pele rendered$/);
+    if (!current) h.run("status.revision = {...status.revision, indexRevision:2}");
+    h.run("window.drawnWith.onUnsupported('Unsupported sequence step')");
+    if (current) {
+      assert.deepEqual(sequenceError(diagram), [SEQUENCE_ERROR + "Unsupported sequence step"]);
+      assert.equal(diagram.children.length, 1);
+      assert.ok(state.textContent.endsWith(` · ${SEQUENCE_ERROR}Unsupported sequence step`), state.textContent);
+      // The replaced diagram's rows are inert: the error state owns the container.
+      h.context.window.TrellisShell.selectStep = () => assert.fail("a replaced row selected");
+      drawn.children[0].listeners.click();
+    } else {
+      assert.equal(diagram.children[0], drawn, "an obsolete redraw changes nothing");
+      assert.match(state.textContent, / · Pele rendered$/);
+    }
+  }
+});
+test("the Files preview shows the same reason in place of a Sequence it cannot draw", async () => {
+  const h = harness();
+  h.context.dto = {...view("root"), steps:[drawnCall("same"), drawnCall("same")]};
+  h.run("filesMini=dto; filesSymbol=dto.seed; fitFilesMini=()=>{}");
+  await h.run("renderFilesMini(()=>true)");
+  const mini = h.get("files-mini-sequence");
+  assert.deepEqual(sequenceError(mini), [SEQUENCE_ERROR + "Duplicate sequence identity"]);
+  assert.equal(mini.children.length, 1);
+  assert.match(text(h.get("files-mini-notes")), /This Sequence could not be drawn: Duplicate sequence identity/);
+  assert.match(h.get("files-mini-state").textContent, /1 note in ⓘ/);
+  // A later group redraw that fails says so too, and only for the preview still shown.
+  h.context.dto = {...view("root"), steps:[drawnCall("call")]};
+  h.run("{ const adapter = window.TrellisPeleSequence; window.TrellisPeleSequence = {...adapter, render:(...args) => { window.drawnWith = args[4]; return adapter.render(...args); }}; }");
+  h.run("filesMini=dto; filesSymbol=dto.seed; window.miniCurrent=true");
+  await h.run("renderFilesMini(()=>window.miniCurrent)");
+  const drawn = mini.children[0]; assert.equal(drawn.tagName, "svg");
+  h.run("window.miniCurrent=false; window.drawnWith.onUnsupported('Unsupported sequence step')");
+  assert.equal(mini.children[0], drawn, "an obsolete redraw changes nothing");
+  h.run("window.miniCurrent=true; window.drawnWith.onUnsupported('Unsupported sequence step')");
+  assert.deepEqual(sequenceError(mini), [SEQUENCE_ERROR + "Unsupported sequence step"]);
+  assert.ok(h.get("files-mini-state").textContent.endsWith(` · ${SEQUENCE_ERROR}Unsupported sequence step`));
 });
 
 test("current sequence errors replace loading state and mismatch never paints",async()=>{
@@ -1053,7 +1102,7 @@ const metricsResponse = (scope, {files = [metricFile], directories = [], pin = m
 
 test("selecting a sequence step fences an already pending file metrics inspection", async () => {
   const h = harness({}, true), pending = deferred();
-  const step = {id:"selected-call",kind:"call",label:"Selected call",path:"src/a.js",range:{startLine:2,endLine:2},target:"unknown",children:[],alternate:[]};
+  const step = {id:"selected-call",kind:"call",label:"Selected call",path:"src/a.js",range:{startLine:2,endLine:2},children:[],alternate:[],hidden:false};
   const data = {...view("root"),steps:[step]};
   h.context.fetch = async request => {
     if (request === "/api/sequence") return response(data);
@@ -1067,7 +1116,7 @@ test("selecting a sequence step fences an already pending file metrics inspectio
   const file = descendants(h.get("file-tree")).find(node => node.tagName === "button" && node.title === "src/a.js");
   await file.listeners.click();
   assert.equal(h.get("metric-inspector").hidden, false);
-  const pick = descendants(h.get("sequence-diagram")).find(node => node.attrs?.class?.split(" ").includes("sequence-source"));
+  const pick = descendants(h.get("sequence-diagram")).find(node => node.attrs?.["data-trellis-step-id"]);
   pick.listeners.click();
   assert.equal(h.get("inspector-title").textContent, "Selected call");
   assert.equal(h.get("metric-inspector").hidden, true);
@@ -1722,7 +1771,7 @@ test("selected Git starts while index status is still pending", async () => {
 // #450: in-context library entry from a sequence step, Sequence starting points and
 // the Classes tab gate.
 const libraryCatalog = {state:"ready",catalogId:"catalog-1",workspaceRevision:metricPin,packages:[{id:"cargo:thing@1",ecosystem:"cargo",name:"thing",version:"1.0.0",source:"registry",aliases:["thing"],sourceState:"present",indexState:"complete",warnings:[]}],symbolCount:1,warnings:[]};
-const externalStep = (id, evidence) => ({id,callId:id,kind:"call",label:`${id}()`,path:"src/a.js",range:{startLine:2,endLine:2},children:[],alternate:[],callEvidence:evidence});
+const externalStep = (id, evidence) => ({id,callId:id,kind:"call",label:`${id}()`,path:"src/a.js",range:{startLine:2,endLine:2},children:[],alternate:[],hidden:false,callEvidence:evidence});
 async function selectStepWith(evidence) {
   const h = harness({}, true);
   const data = {...view("root"),steps:[externalStep("call", evidence)]};
@@ -1734,7 +1783,7 @@ async function selectStepWith(evidence) {
   };
   await h.run("refreshDependencies()");
   await h.run(`selectMethod(${JSON.stringify(symbol("root"))})`);
-  const pick = descendants(h.get("sequence-diagram")).find(node => node.attrs?.class?.split(" ").includes("sequence-source"));
+  const pick = descendants(h.get("sequence-diagram")).find(node => node.attrs?.["data-trellis-step-id"]);
   pick.listeners.click();
   return h;
 }
@@ -1935,7 +1984,7 @@ test("calls-first detail shortcut restores non-call rows and shares Options stat
   const dto={...view("root"),steps:[write,unknown]};
   h.context.fetch=async(path,options)=>{requests.push(JSON.parse(options.body));return response(dto);};
   await h.run(`selectMethod(${JSON.stringify(symbol("root"))})`);
-  const rows=()=>descendants(h.get("sequence-diagram")).filter(n=>n.attrs?.["data-source-step-id"]).map(n=>n.attrs["data-source-step-id"]);
+  const rows=()=>descendants(h.get("sequence-diagram")).filter(n=>n.attrs?.["data-trellis-step-id"]).map(n=>n.attrs["data-trellis-step-id"]);
   assert.deepEqual(rows(),["unknown"]);
   assert.match(text(h.get("sequence-diagram")),/No measured calls.*non-call behavior/i);
   assert.equal(h.get("sequence-incidental").hidden,false);

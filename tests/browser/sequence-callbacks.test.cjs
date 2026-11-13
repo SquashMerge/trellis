@@ -82,11 +82,6 @@ async function render(view, options = {interactions:true}) {
     return {status:result.status, reason:result.reason};
   }, {view, options});
 }
-function legacy(view, options = {interactions:true}) {
-  return page.evaluate(({view, options}) => {
-    TrellisSequence.render(document.getElementById("sequence-diagram"), view, null, new Set(), options);
-  }, {view, options});
-}
 const box = locator => locator.evaluate(node => { const box = node.getBoundingClientRect(); return {x:box.left + box.width / 2, left:box.left, right:box.right, top:box.top, bottom:box.bottom}; });
 const headers = selector => page.locator(selector).evaluateAll(nodes => nodes.map(node => {
   const lines = [...node.querySelectorAll("tspan")].map(line => line.textContent);
@@ -123,55 +118,25 @@ test("the hop arrow inside a callback ends on the app lane's lifeline under a cl
   assert.ok(label.left >= svg.left - 1 && label.right <= svg.right + 1, JSON.stringify({label, svg}));
 });
 
-test("the legacy renderer draws the same hop, and frames the callback under its call", async () => {
-  for (const [name, options] of PROJECTIONS) {
-    await legacy(callbackView(), options);
-    assert.deepEqual(await headers("#sequence-diagram .sequence-participant-label"), ["«module» app", "«app» trellis"], name);
-    const arrows = await page.locator('#sequence-diagram .sequence-arrow[data-trellis-call-id="callid:api"]').count();
-    assert.ok(arrows >= 1, name);
-    const frame = page.locator('#sequence-diagram g[data-kind="call"] g[data-kind="callback"]');
-    if (name === "Interactions") {
-      // Interactions draw the callback's arrows in its place, with no frame of its own (#636).
-      assert.equal(await frame.count(), 0, name);
-    } else {
-      assert.equal(await frame.count(), 1, name);
-      assert.equal(await frame.locator(".sequence-fragment-operator").first().textContent(), "callback", name);
-      assert.match(await frame.locator(".sequence-source").first().textContent(), /callback passed to browseRequest/, name);
-    }
-  }
-  // The arrow starts on the seed's lane: the callback runs in its definer's column.
-  await legacy(callbackView());
-  const geometry = await page.evaluate(() => {
-    const label = [...document.querySelectorAll("#sequence-diagram .sequence-participant-label")].find(node => node.textContent.includes("app"));
-    const arrow = document.querySelector('#sequence-diagram .sequence-arrow[data-trellis-call-id="callid:api"]');
-    return {app:Number(label.getAttribute("x")), from:Number(/^M ([\d.]+)/.exec(arrow.getAttribute("d"))[1])};
-  });
-  assert.equal(geometry.from, geometry.app, JSON.stringify(geometry));
-});
-
 test("a syntax-only view (calls-first) draws the hop inside the callback too", async () => {
   const view = callbackView({tier:"syntax"});
   assert.equal((await render(view, {})).status, "rendered");
   // Calls-first numbers every row: `browseRequest` and the callback's own come first.
   assert.deepEqual(await page.locator("#sequence-diagram .pele-edge-label").allTextContents(), [HOP.replace("[001]", "[003]")]);
-  await legacy(view, {});
-  assert.equal(await page.locator('#sequence-diagram .sequence-arrow[data-trellis-call-id="callid:api"]').count(), 1);
   assert.equal(await page.evaluate(view => TrellisSequence.interfaceSummary(view), view), "1 HTTP interface hop (structural matches, not proof)");
 });
 
-test("negative control: a callback the daemon did not show stays the boundary it was, in both renderers", async () => {
+test("negative control: a callback the daemon did not show stays the boundary it was", async () => {
   const view = callbackView({shown:false});
   for (const [name, options] of PROJECTIONS) {
     assert.equal((await render(view, options)).status, "rendered", name);
     assert.deepEqual(await headers("#sequence-diagram .pele-actor:not(.pele-actor-footer)"), ["«module» app"], name);
     assert.equal(await page.locator("#sequence-diagram .pele-edge-label").filter({hasText:"structural match"}).count(), 0, name);
     assert.equal(await page.locator("#sequence-diagram .pele-note").filter({hasText:"callback passed to"}).count(), 0, name);
-    await legacy(view, options);
-    assert.equal(await page.locator('#sequence-diagram g[data-kind="callback"]').count(), 0, name);
-    assert.equal(await page.locator('#sequence-diagram .sequence-arrow[data-trellis-target-id^="interface:"]').count(), 0, name);
-    assert.equal(await page.locator('#sequence-diagram .sequence-arrow[data-trellis-call-id="callid:api"]').count(), 0, name);
+    assert.equal(await page.locator('#sequence-diagram [data-trellis-target-id^="interface:"]').count(), 0, name);
+    assert.equal(await page.locator('#sequence-diagram [data-trellis-call-id="callid:api"]').count(), 0, name);
   }
   // Calls-first shows the boundary row exactly as before #888.
-  await legacy(view, {});
-  assert.equal(await page.locator('#sequence-diagram g[data-kind="boundary"]').count(), 1);
+  assert.equal((await render(view, {})).status, "rendered");
+  assert.equal(await page.locator('#sequence-diagram .pele-note[data-trellis-step-id="callback"]').count(), 1);
 });

@@ -81,11 +81,6 @@ async function render(view, options = {interactions:true}) {
     return {status:result.status, reason:result.reason};
   }, {view, options});
 }
-function legacy(view, options = {interactions:true}) {
-  return page.evaluate(({view, options}) => {
-    TrellisSequence.render(document.getElementById("sequence-diagram"), view, null, new Set(), options);
-  }, {view, options});
-}
 const ids = (selector, attribute) => page.locator(selector).evaluateAll((nodes, attribute) => nodes.map(node => node.getAttribute(attribute)), attribute);
 const box = locator => locator.evaluate(node => { const box = node.getBoundingClientRect(); return {x:box.left + box.width / 2, y:box.top + box.height / 2, left:box.left, right:box.right, top:box.top, bottom:box.bottom}; });
 const headers = selector => page.locator(selector).evaluateAll(nodes => nodes.map(node => {
@@ -177,18 +172,6 @@ test("negative control: without interface evidence the same calls draw exactly a
   }
 });
 
-test("the legacy renderer draws the same hops, labels and returns", async () => {
-  const view = hopView();
-  assert.equal((await render(view)).status, "rendered");
-  const pele = await page.locator("#sequence-diagram .pele-edge-label").allTextContents();
-  await legacy(view);
-  assert.deepEqual(await headers("#sequence-diagram .sequence-participant-label"), ["«module» app", "«app» daemon"]);
-  assert.deepEqual(await ids("#sequence-diagram .sequence-arrow[data-trellis-call-id]", "data-trellis-call-id"), Object.keys(HOPS).map(id => `callid:${id}`));
-  const rows = await page.locator("#sequence-diagram .sequence-source").evaluateAll(nodes => nodes.map(node => node.querySelector("text").firstChild.textContent));
-  assert.deepEqual(rows, pele, "the same arrow labels in both renderers");
-  assert.deepEqual(await ids("#sequence-diagram .sequence-return[data-trellis-return-step-id]", "data-trellis-return-step-id").then(list => [...new Set(list)]), Object.keys(HOPS));
-});
-
 test("calls-first (a syntax-only view) draws the same hops as arrows and keeps unresolved calls as rows", async () => {
   const view = hopView();
   view.semantic = {tier:"syntax", reason:"no producer"};
@@ -199,8 +182,8 @@ test("calls-first (a syntax-only view) draws the same hops as arrows and keeps u
   for (const id of ["c-dynamic", "c-nowhere"]) assert.equal(await page.locator(`#sequence-diagram .pele-note[data-trellis-call-id="callid:${id}"]`).count(), 1);
 });
 
-// Prime2 review on #885: Show all steps keeps the matched route on the hop, in both renderers.
-test("Show all keeps the matched method and path template on every hop, in both renderers", async () => {
+// Prime2 review on #885: Show all steps keeps the matched route on the hop.
+test("Show all keeps the matched method and path template on every hop", async () => {
   const view = hopView();
   view.semantic = {tier:"syntax", reason:"no producer"};
   for (const step of view.steps) { delete step.callEvidence; delete step.target; }
@@ -210,16 +193,10 @@ test("Show all keeps the matched method and path template on every hop, in both 
   const pele = await page.locator("#sequence-diagram .pele-edge-label").allTextContents();
   assert.equal(pele.length, 3, JSON.stringify(pele));
   pele.forEach((text, at) => assert.ok(text.includes(routes[at]) && /structural match, not proof/.test(text), text));
-  await legacy(view, {showDetails:true});
-  const rows = await page.locator("#sequence-diagram .sequence-source[data-trellis-call-id]").evaluateAll(nodes => nodes.map(node => [node.getAttribute("data-trellis-call-id"), node.querySelector("text").textContent]));
-  for (const [at, id] of Object.keys(HOPS).entries()) {
-    const row = rows.find(([callId]) => callId === `callid:${id}`);
-    assert.ok(row && row[1].includes(routes[at]), JSON.stringify(rows));
-  }
 });
 
 // Prime2 review on #885: a wrapper in its own column keeps its lane when its call hops, so its
-// expanded body's arrows start from the wrapper, in both renderers.
+// expanded body's arrows start from the wrapper.
 function wrapperView() {
   const view = hopView();
   view.steps = view.steps.filter(step => step.id === "c-exact");
@@ -234,7 +211,7 @@ function wrapperView() {
   view.interfaces = {state:"ready", hops:1, unresolved:0};
   return view;
 }
-test("an expanded wrapper in its own column keeps its lane: its body's arrow starts there, in both renderers", async () => {
+test("an expanded wrapper in its own column keeps its lane: its body's arrow starts there and its return ends there", async () => {
   const view = wrapperView();
   assert.equal((await render(view)).status, "rendered");
   const peleHeaders = await headers("#sequence-diagram .pele-actor:not(.pele-actor-footer)");
@@ -246,18 +223,9 @@ test("an expanded wrapper in its own column keeps its lane: its body's arrow sta
   const trace = await box(page.locator("#sequence-diagram .pele-actor:not(.pele-actor-footer)").filter({hasText:/trace$/}));
   const ends = [peleChild.left, peleChild.right].sort((a, b) => Math.abs(a - client.x) - Math.abs(b - client.x));
   assert.ok(Math.abs(ends[0] - client.x) <= 13 && Math.abs(ends[1] - trace.x) <= 13 && Math.abs(peleChild.left - seedX) > 20, `Pele child client → trace: ${JSON.stringify({peleChild, client, trace, seedX})}`);
-  await legacy(view);
-  const legacyHeaders = await headers("#sequence-diagram .sequence-participant-label");
-  assert.ok(legacyHeaders.includes("«module» client"), JSON.stringify(legacyHeaders));
-  const geometry = await page.evaluate(() => {
-    const label = [...document.querySelectorAll("#sequence-diagram .sequence-participant-label")].find(node => node.textContent.includes("client"));
-    const arrow = document.querySelector('#sequence-diagram .sequence-arrow[data-trellis-call-id="callid:c-exact>trace"]');
-    const back = document.querySelector('#sequence-diagram .sequence-return[data-trellis-return-step-id="c-exact>trace"]');
-    const start = d => Number(/^M ([\d.]+)/.exec(d)[1]);
-    return {client:Number(label.getAttribute("x")), from:start(arrow.getAttribute("d")), backTo:back ? Number(/H ([\d.]+)/.exec(back.getAttribute("d"))[1]) : null};
-  });
-  assert.equal(geometry.from, geometry.client, JSON.stringify(geometry));
-  assert.equal(geometry.backTo, geometry.client, JSON.stringify(geometry));
+  const back = await box(page.locator('#sequence-diagram .pele-message[data-trellis-return-step-id="c-exact>trace"] path').first());
+  const backEnds = [back.left, back.right].sort((a, b) => Math.abs(a - client.x) - Math.abs(b - client.x));
+  assert.ok(Math.abs(backEnds[0] - client.x) <= 13 && Math.abs(backEnds[1] - trace.x) <= 13, `Pele return trace → client: ${JSON.stringify({back, client, trace})}`);
 });
 
 // Prime2 second review on #885: `client.get("/health").header("x", "v").send().await` is one
@@ -287,12 +255,10 @@ test("a hop inside a call-chain group is drawn in every projection, as many as t
       const container = document.getElementById("sequence-diagram");
       const result = await TrellisPeleSequence.render(container, view, null, new Set(expanded), options);
       const pele = [...container.querySelectorAll(".pele-edge-label")].filter(node => /structural match, not proof/.test(node.textContent)).length;
-      TrellisSequence.render(container, view, null, new Set(expanded), options);
-      const legacy = [...container.querySelectorAll(".sequence-arrow[data-trellis-target-id]")].filter(node => node.getAttribute("data-trellis-target-id").startsWith("interface:")).length;
-      return {status:result.status, reason:result.reason, pele, legacy, summary:TrellisSequence.interfaceSummary(view)};
+      return {status:result.status, reason:result.reason, pele, summary:TrellisSequence.interfaceSummary(view)};
     }, {view, options, expanded});
     assert.equal(drawn.status, "rendered", drawn.reason);
-    assert.deepEqual([drawn.pele, drawn.legacy], [view.interfaces.hops, view.interfaces.hops], JSON.stringify({options, expanded, drawn}));
+    assert.equal(drawn.pele, view.interfaces.hops, JSON.stringify({options, expanded, drawn}));
     assert.equal(drawn.summary, "1 HTTP interface hop (structural matches, not proof)");
   }
 });

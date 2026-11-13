@@ -301,8 +301,8 @@ test("Fit stays with its method and the next method opens at its own size",{time
  assert.ok(Math.abs(opened.scale-1)<.001,JSON.stringify(opened));assert.ok(opened.smallest>=12,JSON.stringify(opened));
 }));
 
-// #558: once a tall diagram scrolls its headers away the column names stay, over either renderer.
-test("the column names stay in view down a tall diagram, in both renderers",{timeout:240000},async()=>published(longSource,async({page,dto})=>{
+// #558: once a tall diagram scrolls its headers away the column names stay.
+test("the column names stay in view down a tall diagram",{timeout:240000},async()=>published(longSource,async({page})=>{
  const strip=page.locator("#sequence-columns"),diagram=page.locator("#sequence-diagram");
  assert.equal(await strip.isVisible(),false,"the diagram's own headers show at the top");
  const check=async header=>{
@@ -315,8 +315,6 @@ test("the column names stay in view down a tall diagram, in both renderers",{tim
   await page.waitForFunction(()=>document.querySelector("#sequence-columns").hidden);
  };
  await check("#sequence-diagram .pele-actor");
- await page.evaluate(view=>TrellisSequence.render(document.querySelector("#sequence-diagram"),view,null,new Set(),{}),dto);
- await check("#sequence-diagram .sequence-participant-label");
 }));
 
 // #558: the guard after an `if` that returns folds into it. The suffix follows at one level,
@@ -354,34 +352,31 @@ test("published truncated producer shows bound while retaining original call wit
  assert.match(await page.locator("#source").innerText(),/observed_0\(\)/);
 },"flow.js"));
 
-// Exercise the app's own unsupported branch, not a test-side legacy render.
+// #1007: exercise the app's own unsupported branch. There is no second renderer: the diagram
+// area and the status line say that the Sequence could not be drawn, and why.
 // The response is based on a real published SequenceView and keeps its pin/seed.
-test("published app visibly falls back for malformed target evidence, depth, Mermaid, SVG and renderer failures",{timeout:240000},async()=>published(source,async({page,dto,pin})=>{
+test("published app shows the error state for malformed target evidence, depth, Mermaid, SVG, renderer failure and a missing renderer",{timeout:240000},async()=>published(source,async({page,dto,pin})=>{
  const original=structuredClone(dto),leaf=original.steps.find(s=>s.kind==="call");
  assert.ok(leaf,"published call witness required");
- const cases=["dangling-target","depth","mermaid","svg","renderer-failure"];
+ const cases=["dangling-target","depth","mermaid","svg","renderer-failure","renderer-missing"];
  for(const scenario of cases) {
    const changed=structuredClone(original);
-   const ids=[];
    if(scenario==="dangling-target") {
-     changed.steps=[{...structuredClone(leaf),id:"fallback-target",label:"measured target evidence",
+     changed.steps=[{...structuredClone(leaf),id:"refused-target",label:"measured target evidence",
        target:"missing:declaration",callEvidence:{boundaryReason:"none",resolution:"resolved",dispatch:"direct",freshness:"fresh",provenanceId:"fixture:proof"},children:[],alternate:[],hidden:false}];
-     ids.push(changed.steps[0].id);
    } else if(scenario==="depth") {
-     let child={...structuredClone(leaf),id:"fallback-depth-24",label:"deep original evidence",children:[],alternate:[],hidden:false};
-     ids.push(child.id);
+     let child={...structuredClone(leaf),id:"refused-depth-24",label:"deep original evidence",children:[],alternate:[],hidden:false};
      for(let n=23;n>=0;n--) {
-       child={...structuredClone(leaf),id:`fallback-depth-${n}`,kind:"note",label:`depth evidence ${n}`,
+       child={...structuredClone(leaf),id:`refused-depth-${n}`,kind:"note",label:`depth evidence ${n}`,
          children:[child],alternate:[],hidden:false};
-       ids.push(child.id);
      }
      changed.steps=[child];
    } else if(scenario==="mermaid") {
-     changed.steps=[{...structuredClone(leaf),id:"fallback-large-source",label:"M".repeat(512*1024),
-       children:[],alternate:[],hidden:false}];ids.push(changed.steps[0].id);
+     changed.steps=[{...structuredClone(leaf),id:"refused-large-source",label:"M".repeat(512*1024),
+       children:[],alternate:[],hidden:false}];
    } else {
-     changed.steps=[{...structuredClone(leaf),id:`fallback-${scenario}`,label:`${scenario} measured evidence`,
-       children:[],alternate:[],hidden:false}];ids.push(changed.steps[0].id);
+     changed.steps=[{...structuredClone(leaf),id:`refused-${scenario}`,label:`${scenario} measured evidence`,
+       children:[],alternate:[],hidden:false}];
    }
    assert.deepEqual(changed.revision,pin);
    assert.equal(changed.seed.id,original.seed.id);
@@ -408,6 +403,7 @@ test("published app visibly falls back for malformed target evidence, depth, Mer
          return {...result,svg:modified};
        }};
        if(scenario==="renderer-failure") window.pele={render:()=>{throw new Error("Pele renderer failed");}};
+       if(scenario==="renderer-missing") window.pele=undefined;
      },scenario);
      // This actual app control invokes loadSequence and consumes the routed,
      // published-pinned response. Show all is required to retain large labels.
@@ -418,21 +414,23 @@ test("published app visibly falls back for malformed target evidence, depth, Mer
      if(scenario==="mermaid" && !await page.locator("#all-steps").isChecked()){
        await H.reveal(page, "#all-steps"); await page.locator("#all-steps").check();
      }
-     await page.waitForFunction(()=>document.querySelector("#sequence-state")?.textContent?.includes("Pele fell back:"),null,{timeout:15000})
+     await page.waitForFunction(()=>document.querySelector("#sequence-state")?.textContent?.includes("This Sequence could not be drawn:"),null,{timeout:15000})
        .catch(async error=>{throw new Error(`${scenario}: ${error.message}; state=${await page.locator("#sequence-state").textContent()}; responses=${JSON.stringify(responseRequests)}; pageErrors=${JSON.stringify(await page.evaluate(()=>({text:document.querySelector("#sequence-diagram")?.textContent?.slice(0,500),nodes:window.__testPeleNodes})))}`);});
      const state=await page.locator("#sequence-state").textContent();
-     assert.match(state,/Pele fell back:/,scenario);
-     const reason={"dangling-target":/target|evidence|declaration/i,depth:/depth/,mermaid:/Mermaid source too large/,svg:/SVG element/,"renderer-failure":/Pele renderer failed/}[scenario];
+     const reason={"dangling-target":/target|evidence|declaration/i,depth:/depth/,mermaid:/Mermaid source too large/,svg:/SVG element/,"renderer-failure":/Pele renderer failed/,"renderer-missing":/Pele asset unavailable/}[scenario];
      assert.match(state,reason,scenario);
+     assert.doesNotMatch(state,/Pele rendered|fell back/,scenario);
      assert.ok(responseRequests.length>=1,`${scenario}: app did not fetch sequence`);
-     assert.equal(await page.locator("#sequence-diagram svg.pele").count(),0,scenario);
-     assert.equal(await page.locator("#sequence-diagram svg:not(.pele)").count(),1,scenario);
-     const visible=await page.locator("#sequence-diagram [data-source-step-id]").evaluateAll(rows=>rows.map(n=>n.dataset.sourceStepId));
-     for(const id of ids) assert.ok(visible.includes(id),`${scenario}: lost original ${id}`);
-     if(scenario==="dangling-target") {
-       assert.equal(await page.locator("#sequence-diagram .sequence-arrow").count(),0);
-       assert.equal(await page.locator("#sequence-diagram .sequence-participant-label").count(),1);
-     }
+     // The diagram area holds the one plain line and nothing drawn; the same sentence ends the
+     // status line, which is the live region that announces it.
+     const note=page.locator("#sequence-diagram > p.sequence-empty");
+     assert.equal(await page.locator("#sequence-diagram > *").count(),1,scenario);
+     assert.ok(await note.isVisible(),scenario);
+     const message=await note.textContent();
+     assert.match(message,/^This Sequence could not be drawn: /,scenario);assert.match(message,reason,scenario);
+     assert.ok(state.endsWith(` · ${message}`),`${scenario}: ${state.slice(-200)}`);
+     assert.equal(await page.locator("#sequence-state").getAttribute("role"),"status",scenario);
+     assert.equal(await page.locator("#sequence-diagram svg, #sequence-diagram [data-trellis-step-id], #sequence-diagram [role=button], #sequence-diagram button").count(),0,scenario);
      assert.equal(sourceRequests.length,0,`${scenario}: source fetched without action`);
      assert.equal(await page.locator("#source .source-line").count(),0,scenario);
    } finally {
@@ -452,7 +450,7 @@ def protocol_loop(items):
     for item in items:
         pass
 `;
-test("published Python setter and call-free loop retain concise uncertainty in both renderers", {timeout:240000}, async () => published(pythonUncertaintySource, async ({page,dto,pin,server,paths}) => {
+test("published Python setter and call-free loop retain concise uncertainty", {timeout:240000}, async () => published(pythonUncertaintySource, async ({page,dto,pin,server,paths}) => {
  const setter=dto.steps.find(step=>step.kind==="effect"&&step.label.endsWith(" (implicit setters/unpacking unresolved)"));
  assert.ok(setter,"Python extractor must emit the unresolved setter effect");
  assert.ok(dto.steps.some(step=>step.kind==="effect"&&step.label==="bind name: local"));
@@ -465,19 +463,19 @@ test("published Python setter and call-free loop retain concise uncertainty in b
   const walk=roots=>roots.flatMap(step=>[step,...walk(step.children||[]),...walk(step.alternate||[])]),originals=walk(view.steps),before=JSON.stringify(view);
   const freeze=value=>{if(value&&typeof value==="object"){Object.freeze(value);Object.values(value).forEach(freeze);}return value;};freeze(view);
   const results=[];
-  for(const renderer of [TrellisSequence,TrellisPeleSequence]) {
-   const container=document.createElement("div");document.body.append(container);
+  {
+   const renderer=TrellisPeleSequence,container=document.createElement("div");document.body.append(container);
    const selected=[],options={onSelect:step=>selected.push(step)};
    const result=await renderer.render(container,view,null,new Set(),options);
-   if(renderer===TrellisPeleSequence&&result.status!=="rendered")throw Error(result.reason);
-   const selector=renderer===TrellisSequence?"[data-source-step-id]":".pele-note[data-trellis-step-id],.pele-edge-label[data-trellis-step-id]";
-   const rows=[...container.querySelectorAll(selector)],ids=rows.map(row=>row.dataset.sourceStepId||row.dataset.trellisStepId),compact=rows.map(row=>{
+   if(result.status!=="rendered")throw Error(result.reason);
+   const selector=".pele-note[data-trellis-step-id],.pele-edge-label[data-trellis-step-id]";
+   const rows=[...container.querySelectorAll(selector)],ids=rows.map(row=>row.dataset.trellisStepId),compact=rows.map(row=>{
     const copy=row.cloneNode(true);copy.querySelectorAll("title").forEach(title=>title.remove());return copy.textContent;
    }).join(" ");
    for(const row of rows)row.dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",bubbles:true}));
    const exact=selected.length===ids.length&&selected.every((step,i)=>step===originals.find(original=>original.id===ids[i]));
    await renderer.render(container,view,null,new Set(),{...options,showDetails:true});
-   const restored=[...container.querySelectorAll(selector)].map(row=>row.dataset.sourceStepId||row.dataset.trellisStepId);
+   const restored=[...container.querySelectorAll(selector)].map(row=>row.dataset.trellisStepId);
    results.push({ids,compact,exact,restored,unchanged:JSON.stringify(view)===before});container.remove();
   }
   return {results,originals:originals.map(step=>step.id),summary:TrellisSequence.emptySummary(view)};

@@ -75,7 +75,7 @@ test("a web app Sequence hops into the daemon at matched routes and opens the ha
     await H.connect(page, server, paths.token);
     // A Sequence link opens `load` in the web app.
     await page.evaluate(id => { location.hash = `#sequence?sid=${encodeURIComponent(id)}`; }, seed);
-    await page.waitForFunction(() => /Pele rendered|fell back/.test(document.querySelector("#sequence-state")?.textContent || ""));
+    await page.waitForFunction(() => /Pele rendered|could not be drawn/.test(document.querySelector("#sequence-state")?.textContent || ""));
     const state = await page.locator("#sequence-state").innerText();
     assert.match(state, /Pele rendered/);
     assert.match(state, /3 HTTP interface hops \(structural matches, not proof\) · 2 unresolved HTTP calls/);

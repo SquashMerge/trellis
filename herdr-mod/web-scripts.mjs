@@ -22,7 +22,7 @@ const WEB = {
   // Only the pure Deviations tree model is used; its DOM view is not.
   "architecture-deviations": { file: "architecture-deviations.js", params: "window, document", result: "window.TrellisDeviations" },
   "architecture-pele": { file: "architecture-pele.js", params: "window, document, DOMParser, TextEncoder", result: "window.TrellisArchitecturePele" },
-  // The language-neutral Sequence helpers (labels, lanes, display); its own SVG renderer is unused.
+  // The language-neutral Sequence helpers (labels, lanes, display). It draws nothing itself (#1007).
   sequence: { file: "sequence.js", params: "window, document", result: "window.TrellisSequence" },
   "sequence-pele": { file: "sequence-pele.js", params: "window, document, DOMParser, TextEncoder", result: "window.TrellisPeleSequence" },
 };

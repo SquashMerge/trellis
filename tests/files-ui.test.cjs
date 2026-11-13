@@ -6,7 +6,9 @@ const vm = require("node:vm");
 const path = require("node:path");
 const ROOT = "a".repeat(64);
 const pin = {indexGeneration:"12345678-1234-4123-8123-123456789abc", indexRevision:1};
-const source = ["sequence.js", "shell.js", "files.js", "app.js"].map(file => fs.readFileSync(path.join(__dirname, "../web", file), "utf8")).join("\n");
+// No DOM parser here: the adapter double keeps the real Pele projection and installs one
+// selectable node per projected row (tests/support/sequence-adapter-double.js).
+const source = ["../web/sequence.js", "../web/sequence-pele.js", "support/sequence-adapter-double.js", "../web/shell.js", "../web/files.js", "../web/app.js"].map(file => fs.readFileSync(path.join(__dirname, file), "utf8")).join("\n");
 const response = data => ({ok:true,status:200,json:async () => data});
 function deferred() { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return {promise, resolve, reject}; }
 const all = node => [node, ...(node.children || []).flatMap(all)];
