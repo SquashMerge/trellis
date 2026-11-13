@@ -3448,82 +3448,6 @@ fn direct_script_types(
     })
 }
 
-fn reuse_captured_source_associations(
-    captured: &JoinedFacts,
-    reusable: &BTreeSet<native::DocumentKey>,
-    inventory: &crate::scip_raw::ProofInventory,
-    source_set_id: &str,
-    revision: &str,
-) -> JoinedFacts {
-    let mut facts = captured.clone();
-    let is_reused = |doc: &native::DocumentKey| reusable.contains(doc);
-    let proof_documents: BTreeMap<_, _> = inventory
-        .claims
-        .iter()
-        .map(|claim| {
-            (
-                claim.proof_id.as_str(),
-                native::DocumentKey {
-                    source_set_id: source_set_id.to_owned(),
-                    language: claim.language.clone(),
-                    path: claim.path.clone(),
-                },
-            )
-        })
-        .collect();
-    facts.symbols.retain(|row| {
-        proof_documents
-            .get(row.provenance_id.as_str())
-            .is_some_and(is_reused)
-    });
-    facts
-        .declaration_bindings
-        .retain(|row| is_reused(&row.join.anchor.document));
-    facts.references.retain(|row| is_reused(&row.document));
-    facts
-        .reference_claims
-        .retain(|_, row| is_reused(&row.document));
-    facts
-        .call_bindings
-        .retain(|row| is_reused(&row.join.anchor.document));
-    // A reused row is no destination classification of a target outside the reused documents:
-    // the rejoin takes the captured one under its own rule, as a full rejoin would (#557).
-    for row in &mut facts.call_bindings {
-        if matches!(
-            &row.declared_target,
-            Some(semantic::Target::Internal { document, .. }) if !is_reused(document)
-        ) {
-            row.declared_target = None;
-        }
-    }
-    facts.type_relationships.retain(|row| {
-        proof_documents
-            .get(row.provenance_id.as_str())
-            .is_some_and(is_reused)
-    });
-    facts
-        .joins
-        .retain(|(_, join)| is_reused(&join.anchor.document));
-    facts.diagnostics.retain(|doc, _| is_reused(doc));
-    for (_, join) in &mut facts.joins {
-        join.anchor.revision_id = revision.to_owned();
-    }
-    for binding in &mut facts.declaration_bindings {
-        binding.join.anchor.revision_id = revision.to_owned();
-    }
-    for call in &mut facts.call_bindings {
-        call.join.anchor.revision_id = revision.to_owned();
-    }
-    for reference in facts
-        .references
-        .iter_mut()
-        .chain(facts.reference_claims.values_mut())
-    {
-        reference.revision_id = revision.to_owned();
-    }
-    facts
-}
-
 /// Publication-time rejoin uses only retained, authenticated source and measured snapshots.
 /// The Store validates the returned publication and its raw links before its paired-pin CAS.
 #[derive(Debug)]
@@ -3543,59 +3467,8 @@ pub fn rejoin_inventory(
     basis: &BTreeMap<native::DocumentKey, semantic::SemanticBasis>,
     admitted_encoding: u8,
 ) -> Result<RejoinResult> {
+    // The destination facts are measured first, as before: their error precedes the rest.
     let r2 = MeasuredFacts::new(destination_native, destination_sources)?;
-    rejoin_inventory_with_destination(
-        inventory,
-        captured_native,
-        captured_sources,
-        destination_native,
-        destination_sources,
-        producer,
-        basis,
-        admitted_encoding,
-        &r2,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn rejoin_inventory_with_destination(
-    inventory: &CapturedScipInventory,
-    captured_native: &native::Artifact,
-    captured_sources: &BTreeMap<native::DocumentKey, Vec<u8>>,
-    destination_native: &native::Artifact,
-    destination_sources: &BTreeMap<native::DocumentKey, Vec<u8>>,
-    producer: semantic::Producer,
-    basis: &BTreeMap<native::DocumentKey, semantic::SemanticBasis>,
-    admitted_encoding: u8,
-    r2: &MeasuredFacts<'_>,
-) -> Result<RejoinResult> {
-    rejoin_inventory_with_reuse(
-        inventory,
-        captured_native,
-        captured_sources,
-        destination_native,
-        destination_sources,
-        producer,
-        basis,
-        admitted_encoding,
-        r2,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn rejoin_inventory_with_reuse(
-    inventory: &CapturedScipInventory,
-    captured_native: &native::Artifact,
-    captured_sources: &BTreeMap<native::DocumentKey, Vec<u8>>,
-    destination_native: &native::Artifact,
-    destination_sources: &BTreeMap<native::DocumentKey, Vec<u8>>,
-    producer: semantic::Producer,
-    basis: &BTreeMap<native::DocumentKey, semantic::SemanticBasis>,
-    admitted_encoding: u8,
-    r2: &MeasuredFacts<'_>,
-    reusable: Option<&BTreeSet<native::DocumentKey>>,
-) -> Result<RejoinResult> {
     ensure!(
         inventory.source_manifest_hash == manifest_hash(&captured_native.revision)
             && captured_native.revision.source_set_id == destination_native.revision.source_set_id,
@@ -3610,7 +3483,8 @@ pub(crate) fn rejoin_inventory_with_reuse(
         admitted_encoding,
     )?;
     let captured_store = MemoryJoinStore::new(&raw_index, &coordinates, &r1, captured_sources);
-    let destination_store = MemoryJoinStore::new(&raw_index, &coordinates, r2, destination_sources);
+    let destination_store =
+        MemoryJoinStore::new(&raw_index, &coordinates, &r2, destination_sources);
     rejoin_with_stores(
         inventory,
         captured_native,
@@ -3620,7 +3494,6 @@ pub(crate) fn rejoin_inventory_with_reuse(
         admitted_encoding,
         &captured_store,
         &destination_store,
-        reusable,
     )
 }
 
@@ -3634,7 +3507,6 @@ fn rejoin_with_stores<S: IndexedJoinStore + NativeFacts>(
     admitted_encoding: u8,
     captured_store: &S,
     destination_store: &S,
-    reusable: Option<&BTreeSet<native::DocumentKey>>,
 ) -> Result<RejoinResult> {
     let captured = join_into_facts(admitted_encoding, captured_store)?;
     let captured_declaration_proofs: BTreeSet<_> = captured
@@ -3752,21 +3624,9 @@ fn rejoin_with_stores<S: IndexedJoinStore + NativeFacts>(
             } else {
                 semantic::JoinKind::Reference
             };
-            let reused_source = reusable.is_some_and(|docs| docs.contains(&doc));
-            let measured = if reused_source {
-                // The authenticated selected version witnesses the same measured
-                // source association; only targets still consult the current r2.
-                captured_store
-            } else {
-                destination_store
-            };
-            let mut measured_operation = measured.operation()?;
+            let mut measured_operation = destination_store.operation()?;
             let first = captured_store.join(&doc, range.clone(), required)?;
-            let second = if reused_source {
-                first.clone()
-            } else {
-                measured.join(&doc, range, required)?
-            };
+            let second = destination_store.join(&doc, range, required)?;
             // Only claims without a captured semantic association may keep their
             // unavailable outcome without failing the caller tuple.
             let authored_association =
@@ -3796,15 +3656,11 @@ fn rejoin_with_stores<S: IndexedJoinStore + NativeFacts>(
                     first.anchor.range.clone(),
                     semantic::JoinKind::Reference,
                 )?;
-                let second_reference = if reused_source {
-                    first_reference.clone()
-                } else {
-                    measured.join(
-                        &doc,
-                        first.anchor.range.clone(),
-                        semantic::JoinKind::Reference,
-                    )?
-                };
+                let second_reference = destination_store.join(
+                    &doc,
+                    first.anchor.range.clone(),
+                    semantic::JoinKind::Reference,
+                )?;
                 exact &= first_reference.status == semantic::JoinStatus::Exact
                     && second_reference.status == semantic::JoinStatus::Exact;
             }
@@ -3812,20 +3668,16 @@ fn rejoin_with_stores<S: IndexedJoinStore + NativeFacts>(
                 .get(claim.captured_proof_id.as_str())
                 .copied();
             if let Some(binding) = captured_call {
-                let call = measured.join(
+                let call = destination_store.join(
                     &doc,
                     binding.join.anchor.range.clone(),
                     binding.join.anchor.kind,
                 )?;
-                let first_call = if reused_source {
-                    call.clone()
-                } else {
-                    captured_store.join(
-                        &doc,
-                        binding.join.anchor.range.clone(),
-                        binding.join.anchor.kind,
-                    )?
-                };
+                let first_call = captured_store.join(
+                    &doc,
+                    binding.join.anchor.range.clone(),
+                    binding.join.anchor.kind,
+                )?;
                 exact &= call.status == semantic::JoinStatus::Exact
                     && first_call.status == semantic::JoinStatus::Exact
                     && first_call.candidate_ids == binding.join.candidate_ids;
@@ -3834,12 +3686,14 @@ fn rejoin_with_stores<S: IndexedJoinStore + NativeFacts>(
                 let mut same_call = false;
                 if let Some(id) = second.candidate_ids.first() {
                     let calls = match call.candidate_ids.first() {
-                        Some(call_id) => {
-                            measured.calls_with_id(&doc, call_id, &mut measured_operation)?
-                        }
+                        Some(call_id) => destination_store.calls_with_id(
+                            &doc,
+                            call_id,
+                            &mut measured_operation,
+                        )?,
                         None => vec![],
                     };
-                    same_call = measured
+                    same_call = destination_store
                         .references_with_id(&doc, id, &mut measured_operation)?
                         .iter()
                         .any(|reference| {
@@ -3875,55 +3729,7 @@ fn rejoin_with_stores<S: IndexedJoinStore + NativeFacts>(
             .any(|doc| doc.language == claim.language && doc.path == claim.envelope.relative_path)
     });
     let filtered_store = destination_store.restrict(&filtered)?;
-    let destination = if let Some(reusable) = reusable {
-        let metadata = inventory.proof_identities();
-        let mut facts = reuse_captured_source_associations(
-            &captured,
-            reusable,
-            &metadata,
-            &destination_native.revision.source_set_id,
-            &destination_native.revision.id,
-        );
-        let mut delta = filtered.clone();
-        delta.claims.retain(|claim| {
-            !reusable.iter().any(|doc| {
-                doc.language == claim.language && doc.path == claim.envelope.relative_path
-            })
-        });
-        if !delta.claims.is_empty() {
-            let delta_store = destination_store.restrict(&delta)?;
-            let joined = join_into_facts(admitted_encoding, &delta_store)?;
-            facts.symbols.extend(joined.symbols);
-            facts
-                .declaration_bindings
-                .extend(joined.declaration_bindings);
-            facts.references.extend(joined.references);
-            facts.reference_claims.extend(joined.reference_claims);
-            facts.call_bindings.extend(joined.call_bindings);
-            facts.type_relationships.extend(joined.type_relationships);
-            facts.joins.extend(joined.joins);
-            facts.diagnostics.extend(joined.diagnostics);
-        }
-        let mut order = BTreeMap::new();
-        for (ordinal, claim) in captured_store.claims().enumerate() {
-            order.insert(claim?.captured_proof_id.clone(), ordinal);
-        }
-        facts
-            .symbols
-            .sort_by_key(|row| order.get(row.provenance_id.as_str()).copied());
-        facts
-            .declaration_bindings
-            .sort_by_key(|row| order.get(row.provenance_id.as_str()).copied());
-        facts
-            .call_bindings
-            .sort_by_key(|row| order.get(row.provenance_id.as_str()).copied());
-        facts
-            .type_relationships
-            .sort_by_key(|row| order.get(row.provenance_id.as_str()).copied());
-        facts
-    } else {
-        join_into_facts(admitted_encoding, &filtered_store)?
-    };
+    let destination = join_into_facts(admitted_encoding, &filtered_store)?;
     let metadata = inventory.proof_identities();
     let filtered_metadata = filtered.proof_identities();
     let mut publication = empty_publication(&producer);
