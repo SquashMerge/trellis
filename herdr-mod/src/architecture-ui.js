@@ -46,7 +46,7 @@ export function switcher(pane, t, summary, view) {
 }
 
 // An All apps column header: name, languages · roots · files · max, and its deviations in the
-// error tone. Pressing it inspects the app.
+// error tone. Pressing it inspects the app; pressing its deviations opens them (#939).
 function columnHeader(pane, t, part, width) {
   const info = pane.drawn.summary.columnHeader(part);
   return v_flex().id(`app-header-${part.group.name}`).flex_none().w(width).gap(2).p(8).rounded(8).border_1().cursor_pointer()
@@ -55,7 +55,8 @@ function columnHeader(pane, t, part, width) {
     .child(div().font_semibold().child(info.name))
     .child(h_flex().gap(0).flex_wrap().text_size(12)
       .child(div().text_color(t.muted).child(info.deviations ? `${info.detail} · ` : info.detail))
-      .when(Boolean(info.deviations), (el) => el.child(div().id(`app-deviations-${part.group.name}`).text_color(ERROR).child(info.deviations))))
+      .when(Boolean(info.deviations), (el) => el.child(div().id(`app-deviations-${part.group.name}`).text_color(ERROR).cursor_pointer().rounded(3).hover((s) => s.bg(t.hover))
+        .on_click((_e, cx) => { cx.stop_propagation(); pane.openAppDeviations(part.group.name, cx); }).child(info.deviations))))
     .when(Boolean(info.manifests), (el) => el.child(div().text_size(12).text_color(t.dim).child(`Detected from ${info.manifests}`)));
 }
 
@@ -87,9 +88,14 @@ export function drawing(pane, t, drawn) {
   if (!plan.allApps) { out.push(picture(0)); return out; }
   const parts = plan.parts, cards = drawn.cards.map((item) => card(pane, t, item));
   if (drawn.sideBySide) {
-    out.push(h_flex().id("app-columns").flex_none().gap(drawn.layout.gutter).items_start()
-      .children(parts.map((part, index) => columnHeader(pane, t, part, drawn.layout.widths[index]))));
-    out.push(picture(0));
+    // Never stack; scroll (#949/#950, owner ruling 2026-11-12): the pane has no drawer, so the columns stay side by
+    // side and the headers and the drawing scroll sideways together when they are wider than the pane. Each gutter
+    // has its own width (#949), so a spacer of that width sits between two headers.
+    out.push(div().id("app-scroll").w_full().flex_none().overflow_x_scrollbar()
+      .child(v_flex().flex_none().w(drawn.layout.width).gap(12)
+        .child(h_flex().id("app-columns").flex_none().items_start()
+          .children(parts.flatMap((part, index) => [...(index ? [div().flex_none().w(drawn.layout.gutters[index - 1])] : []), columnHeader(pane, t, part, drawn.layout.widths[index])])))
+        .child(picture(0))));
     // The browser floats a card in the gutter between its two columns; the pane lists them under the drawing.
     if (cards.length) out.push(h_flex().id("interface-cards").flex_none().gap(8).flex_wrap().items_start().children(cards));
     parts.forEach((part, index) => { if (!part.slice.layers.some((l) => !l.shared)) out.push(unassignedBox(t, `app-unlayered-${index}`, part.group.name, part.group.unassignedFileCount)); });
@@ -137,7 +143,7 @@ const factsGrid = (t, rows) => v_flex().gap(2).children(rows.map(([name, value, 
 /**
  * The inspector, below the drawing (the panel is too narrow for the browser's side column):
  * "Architecture review" with its counted review chips, or the selected app, interface or
- * control. Deviations open the Deviations tree.
+ * control. Deviations open the Deviations tab.
  */
 export function inspector(pane, t, summary, view) {
   const counts = summary.reviewCounts, chips = [];
@@ -166,7 +172,7 @@ export function inspector(pane, t, summary, view) {
       .child(div().text_size(12).text_color(t.dim).child(facts.basis))
       .children(facts.ends.map((text) => div().text_size(12).child(text))).child(factsGrid(t, facts.rows))
       .when(Boolean(facts.wrappers), (el) => el.child(div().text_size(12).text_color(t.dim).font_family("JetBrains Mono").whitespace_normal().child(facts.wrappers)))
-      .child(div().text_size(12).text_color(t.dim).child("The routes and call sites are listed in the browser's inspector (Open endpoints)."));
+      .child(div().text_size(12).text_color(t.dim).child("The routes and call sites are listed in the browser's inspector."));
   } else if (inspect?.kind === "label") {
     box.child(title(inspect.title)).child(h_flex().gap(6).flex_wrap().children(chips))
       .child(div().whitespace_normal().child(inspect.text.replace(/\n/g, " · ")));
@@ -178,12 +184,16 @@ export function inspector(pane, t, summary, view) {
   return [box];
 }
 
-/** The Deviations tree (#786, #845): the browser's own model, as native rows. */
+/**
+ * The Deviations tab's tree (#786, #845, #939): the browser's own model, as native rows. A line
+ * opens its caller in Sequence, or shows where it is.
+ */
 export function deviations(pane, t, summary, view) {
   const devs = pane.devs, s = devs;
-  const back = button(t, "deviations-back", summary.group ? `← ${summary.group.name}` : "← Architecture", (_e, cx) => { pane.devs = null; cx.notify(); });
-  const head = h_flex().flex_none().gap(8).items_center().child(back).child(div().font_semibold().text_size(14).child("Deviations"))
-    .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.dim).child(devs.tree ? `${plural(devs.tree.totals.files, "file")} · ${plural(devs.tree.totals.references, "deviating reference")} · ${plural(devs.tree.totals.calls, "call")}` : ""));
+  const diagram = button(t, "deviations-show-diagram", "Show on diagram", (_e, cx) => pane.setTab("architecture", cx));
+  const head = h_flex().flex_none().gap(8).items_center().child(div().font_semibold().text_size(14).child("Deviations"))
+    .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.dim).child(devs.tree ? `${plural(devs.tree.totals.files, "file")} · ${plural(devs.tree.totals.references, "deviating reference")} · ${plural(devs.tree.totals.calls, "call")}` : ""))
+    .child(diagram);
   const out = [head];
   if (devs.error) return [...out, pane.problem(t, devs.error, "Deviations")];
   if (!devs.base) return [...out, pane.note(t, devs.progress || `Reading deviations at ${pane.pinText()}…`)];
@@ -197,6 +207,7 @@ export function deviations(pane, t, summary, view) {
     .children(chips.edges.map((entry) => chip(entry.key, `${entry.sourceLayer} → ${entry.destinationLayer}`, entry.direction !== "up", entry))));
   const unknown = tree?.rules?.counts?.unknown;
   if (Number.isSafeInteger(unknown) && unknown > 0) out.push(div().flex_none().text_size(12).text_color(t.dim).child(unknown === 1 ? "1 unknown rule instance is not a deviation." : `${num(unknown)} unknown rule instances are not deviations.`));
+  if (devs.notice) out.push(div().id("deviation-notice").flex_none().text_size(12).text_color(t.muted).whitespace_normal().child(devs.notice));
   if (!devs.base.rows.length) return [...out, pane.note(t, `No production deviations at ${pane.pinText()}.`)];
   if (!devs.tree.files.length) return [...out, pane.note(t, `No deviations on this edge at ${pane.pinText()}.`)];
   const rows = [];
@@ -224,7 +235,7 @@ export function deviations(pane, t, summary, view) {
       if (fnOpen) for (const line of fn.lines) {
         if (rows.length >= MAX_TREE_ROWS) break;
         const e = line.evidence, target = e.target;
-        rows.push(row(`deviation-line-${rows.length}`, 2, null)
+        rows.push(row(`deviation-line-${rows.length}`, 2, (_e, cx) => pane.openLine(line, cx))
           .child(div().w(44).flex_none().text_size(12).text_color(t.dim).child(`L${e.lines?.start ?? "—"}`))
           .child(div().flex_1().min_w(0).truncate().font_family("JetBrains Mono").text_size(12).child(line.symbol))
           .child(div().flex_none().px(4).rounded(3).border_1().border_color(t.border).text_size(11).text_color(t.muted).child(TAGS[line.kind] ?? line.kind))

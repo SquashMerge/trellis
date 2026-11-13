@@ -43,19 +43,31 @@ test("colours: the web app's Color by default, its heat scale and its heat token
   for (const heat of [token("sm-gold"), token("sm-amber"), token("sm-orange")]) assert.ok(!fills(cool.svg).has(heat), `Layer colouring has no heat (${heat})`);
 });
 
-test("apps: the switcher's choices, one column per app, side by side or stacked, and one app's stack", async () => {
+test("apps: the switcher's choices, one column per app, side by side at any width with a sideways scroll, and one app's stack", async () => {
+  const { div } = await import("gpui-kit");
+  const ui = await import("../src/architecture-ui.js");
   const view = twoApps(), summary = summarize(view);
   assert.deepEqual(summary.choices.map((c) => c.text), ["All apps", "srv · rust", "webapp · javascript"]);
   assert.equal(apps.sourceLine(summary.group, view.apps.length), "2 apps · hidden layers and unassigned files grouped below");
-  const stacked = await draw(view, { width: 600, theme, highlight: null, choice: {} });
-  assert.equal(stacked.sideBySide, false);
-  assert.equal(stacked.images.length, 2, "one drawing per app column");
-  assert.match(stacked.images[0].svg, /srv · ordered/);
-  assert.match(stacked.images[1].svg, /webapp · ordered/, "the title wraps at this width");
+  // Interface order (#949), from the shared plan: the client webapp sits left of its server srv.
+  assert.deepEqual(summary.plan.parts.map((part) => part.group.name), ["webapp", "srv"]);
+  // Never stack; scroll (#949/#950, owner ruling 2026-11-12): the pane has no drawer, so 600px keeps the columns
+  // side by side at 352px each, wider than the pane, and the pane scrolls them sideways.
+  const narrow = await draw(view, { width: 600, theme, highlight: null, choice: {} });
+  assert.equal(narrow.sideBySide, true); assert.equal(narrow.images.length, 1, "one composed drawing");
+  assert.deepEqual(narrow.layout.widths, [352, 352]); assert.equal(narrow.images[0].width, 752, "352 + 48 + 352, wider than the 600px pane");
+  assert.match(narrow.images[0].svg, /webapp · ordered[\s\S]*srv · ordered/);
+  const pane = new Trellis();
+  Object.assign(pane, { width: 624, view, inspect: null, drawn: { ...narrow, view, assets: ["probe.svg"] } });
+  const root = div().children(ui.drawing(pane, theme, pane.drawn)), scroll = root.find("app-scroll");
+  assert.equal(scroll?.props.scrollX, true, "the headers and the drawing scroll sideways");
+  assert.ok(scroll.find("app-columns") && scroll.find("diagram"), "together");
   const wide = await draw(view, { width: 1300, theme, highlight: null, choice: {} });
   assert.equal(wide.sideBySide, true);
   assert.equal(wide.images.length, 1, "side by side is one composed drawing");
-  assert.match(wide.images[0].svg, /srv · ordered[\s\S]*webapp · ordered/);
+  assert.match(wide.images[0].svg, /webapp · ordered[\s\S]*srv · ordered/);
+  // One line in the gutter, so the gutter is the least 48px (#949).
+  assert.deepEqual(wide.layout.gutters, [48]); assert.equal(wide.layout.columns[1].x, wide.layout.widths[0] + 48);
   assert.match(wide.images[0].svg, /<path d="M[^"]+" fill="none" stroke="#6a6a78"/, "the interface runs as a line between the columns");
   // One app: its own stack, titled, with no other app's layers.
   const one = await draw(view, { width: 600, theme, highlight: null, choice: { scope: "webapp" } });
@@ -143,6 +155,8 @@ async function pane(payload, options) {
       const id = setTimeout(() => { end(); fn(cx); }, ms); return { cancel() { clearTimeout(id); end(); } };
     } },
     sleep: (ms = 0) => new Promise((r) => setTimeout(r, ms)), notify() {},
+    // GPUI's: a handler stops the press reaching the handlers of the elements around it.
+    stopped: 0, stop_propagation() { cx.stopped++; },
   };
   const settle = async () => {
     for (let quiet = 0, rounds = 0; quiet < 3; rounds++) {
@@ -191,7 +205,9 @@ test("the pane: logo, status line, switcher, columns, interface card, deviations
     assert.match(root.find("interface-card-webapp-srv").text(), /HTTP · 1 route 1 call site 1 exact · 1 unresolved ◆ 1 server-only ◆ 1 client-only/);
     assert.match(root.find("inspector").text(), /Architecture review 2 deviations 0 unassigned files 0 exceptions/);
     assert.match(root.find("legend").text(), /Fixed per-callable bands · cognitive · max · production callables/);
-    assert.equal(p.view.drawn.images.length, 2, "900 px stacks the two columns, as the browser does under 880 px of canvas");
+    // 2 x 352 + one 48px gutter (#949) fit 900 px, as in the browser: one composed image, the client on the left.
+    assert.equal(p.view.drawn.sideBySide, true); assert.equal(p.view.drawn.images.length, 1);
+    assert.match(root.find("app-columns").text(), /^webapp[\s\S]*srv/, "the headers follow the columns' interface order");
 
     // The card inspects its interface.
     root = await p.click("interface-card-webapp-srv");
@@ -203,8 +219,8 @@ test("the pane: logo, status line, switcher, columns, interface card, deviations
     assert.match(root.find("deviation-chips").text(), /All upward · 3 core → server · 3/);
     root = await p.click("deviation-file-0");
     assert.match(root.find("deviation-tree").text(), /src\/util\.rs ▲ server 3 2 3 .* shared/);
-    root = await p.click("deviations-back");
-    assert.ok(root.find("diagram"), "Back returns to the drawing");
+    root = await p.click("deviations-show-diagram");
+    assert.ok(root.find("diagram"), "Show on diagram returns to the drawing");
 
     // One app: the switcher re-draws the held snapshot without reading again.
     const reads = p.seen.filter((u) => u.includes("/architecture?")).length;
@@ -318,4 +334,105 @@ test("#913 coverage: one app counts its own layers' reference sites, All apps th
   assert.match(summarize(view).coverageSummary(view), /^4 of 5 reference sites mapped to a module/);
   assert.match(summarize(view, { scope: "srv" }).coverageSummary(view), /^4 of 5 reference sites from srv's layers mapped to a module/);
   assert.match(summarize(view, { scope: "webapp" }).coverageSummary(view), /^0 of 0 reference sites from webapp's layers mapped to a module \(—\)$/);
+});
+
+// --- #939: Deviations as a top tab, and the deviation arrows and lines that act ---
+
+// A stand-in for the host's localStorage, where the pane keeps its tab.
+function withStorage(entries = {}) {
+  const store = new Map(Object.entries(entries)), prior = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+  Object.defineProperty(globalThis, "localStorage", { configurable: true, writable: true,
+    value: { getItem: (k) => store.get(k) ?? null, setItem: (k, v) => { store.set(k, String(v)); } } });
+  return { store, restore() { if (prior) Object.defineProperty(globalThis, "localStorage", prior); else delete globalThis.localStorage; } };
+}
+
+test("#939 Deviations is a third top tab: it shows the tree, keeps the choice, and Show on diagram returns", async () => {
+  const storage = withStorage();
+  const p = await pane(twoApps());
+  try {
+    let root = await p.settle();
+    assert.deepEqual(root.all((el) => /^tab-/.test(el.props.id ?? "")).map((el) => el.text()), ["Architecture", "Sequence", "Deviations"]);
+    root = await p.click("tab-deviations");
+    assert.equal(p.view.tab, "deviations");
+    assert.equal(storage.store.get("trellis.tab"), "deviations", "the tab persists like the others");
+    assert.match(root.text(), /Deviations 1 file · 3 deviating references · 2 calls/);
+    assert.match(root.find("deviation-chips").text(), /All upward · 3 core → server · 3/, "the edge chips stay in the tab");
+    assert.equal(root.find("diagram"), null, "the tab shows the tree, not the drawing");
+    assert.equal(root.find("deviations-back"), null, "no back button");
+    root = await p.click("deviation-chip-core→server");
+    assert.equal(p.view.devs.edge, "core→server");
+    root = await p.click("deviations-show-diagram");
+    assert.equal(p.view.tab, "architecture");
+    assert.equal(storage.store.get("trellis.tab"), "architecture");
+    assert.ok(root.find("diagram"));
+  } finally { await p.close(); storage.restore(); }
+});
+
+test("#939 a kept Deviations tab opens on it and reads the tree without a click", async () => {
+  const storage = withStorage({ "trellis.tab": "deviations" });
+  const p = await pane(twoApps());
+  try {
+    const root = await p.settle();
+    assert.equal(p.view.tab, "deviations");
+    assert.match(root.find("deviation-chips").text(), /All upward/);
+    assert.ok(p.seen.some((u) => u.includes("/architecture/details?")));
+  } finally { await p.close(); storage.restore(); }
+});
+
+test("#939 the review chip, an app's deviation count and a deviating arrow open the Deviations tab with their filter", async () => {
+  const storage = withStorage();
+  const p = await pane(twoApps());
+  try {
+    await p.settle();
+    let root = await p.click("review-deviations");
+    assert.equal(p.view.tab, "deviations");
+    assert.equal(p.view.devs.edge, null, "the review chip shows every deviation");
+    assert.match(root.find("deviation-chips").text(), /All upward/);
+
+    await p.click("tab-architecture");
+    p.cx.stopped = 0;
+    root = await p.click("app-deviations-srv");
+    assert.equal(p.view.tab, "deviations");
+    assert.equal(p.view.scope, "srv", "the app's count filters to that app");
+    assert.equal(p.cx.stopped, 1, "the count's press doesn't also inspect the app header");
+    assert.ok(p.seen.some((u) => u.includes("/architecture/details?") && u.includes("app=srv")));
+    assert.match(root.find("app-switcher").text(), /srv · rust/, "the switcher shows the filter");
+
+    root = await p.click("tab-architecture");
+    const boxes = p.view.current().images[0].boxes.filter((b) => b.kind === "E" && b.record.status === "deviates");
+    assert.ok(boxes.length >= 2, "a deviating arrow has its label's box and its line's");
+    const line = boxes[boxes.length - 1];
+    p.view.press({ local_position: { x: line.x + line.w / 2, y: line.y + line.h / 2 } }, 0, p.cx);
+    root = await p.settle();
+    assert.equal(p.view.tab, "deviations");
+    assert.equal(p.view.devs.edge, "core→server", "the arrow filters to its edge");
+    assert.equal(root.find("deviation-chip-core→server").text(), "core → server · 3");
+  } finally { await p.close(); storage.restore(); }
+});
+
+test("#939 a deviation line opens its caller in Sequence; a line with no caller shows its location", async () => {
+  const storage = withStorage();
+  const p = await pane(twoApps());
+  try {
+    await p.settle();
+    await p.click("review-deviations");
+    for (const file of p.view.devs.tree.files) { p.view.devs.expanded.add(file.key); for (const fn of file.functions) p.view.devs.expanded.add(fn.id); }
+    let root = await p.settle();
+    const lineRow = (start) => root.all((el) => /^deviation-line-/.test(el.props.id ?? "") && el.text().startsWith(`L${start} `))[0];
+    // No caller: the location, and the pane's note that it has no source view.
+    assert.ok(lineRow(1)?.props.click, "a line row acts");
+    lineRow(1).props.click({}, p.cx);
+    root = await p.settle();
+    assert.equal(p.view.tab, "deviations");
+    assert.equal(root.find("deviation-notice").text(), "src/util.rs:1 · This pane has no source view; open it in the browser.");
+    // A caller: its sequence, as the browser's Open in Sequence. A file selected in Files keeps
+    // its method list, and following it doesn't replace the caller's sequence.
+    state.shared["trellis.selectedFile"] = { root: "/work/apps", path: "src/main.rs", on: null };
+    lineRow(2).props.click({}, p.cx);
+    root = await p.settle();
+    assert.equal(p.view.tab, "sequence");
+    assert.equal(p.view.seq.file, "src/main.rs");
+    assert.equal(p.view.seq.seed.id, "sid:v1:f0f918a5d0e11e7f3ed4125ae69c4db0");
+    assert.ok(p.seen.some((u) => u.endsWith("/sequence")), "the caller's sequence is read");
+  } finally { await p.close(); storage.restore(); }
 });

@@ -1467,7 +1467,7 @@ test("sid routes wait for an admitted checkout, resolve only the requested seed,
 });
 
 for (const hash of ["#sequence", "#sequence?sid=", "#sequence?sid=a&sid=b", `#sequence?sid=a&rootKey=${"b".repeat(64)}`,
-  "#sequence?sid=a&indexGeneration=87654321-1234-4123-8123-123456789abc&indexRevision=1"]) {
+  "#sequence?sid=a&indexGeneration=87654321-1234-4123-8123-123456789abc&indexRevision=x"]) {
   test(`invalid or mismatched route refuses requests: ${hash}`, async () => {
     const h = harness(historyWindow(hash));
     await h.run("readNavigationLocation()");
@@ -1509,10 +1509,48 @@ for (const [name, query] of [
   });
 }
 
-test("the stale-pin check comes before the call-ID check", async () => {
+test("a malformed call-ID link keeps its error even when its pin is stale (#951)", async () => {
   const h = harness(historyWindow(`#sequence?sid=a&rootKey=${ROOT}&indexGeneration=12345678-1234-4123-8123-123456789abc&indexRevision=2&callId=bad`));
   await h.run("readNavigationLocation()");
-  assert.match(h.get("error").textContent, /stale for the selected index snapshot/);
+  assert.equal(h.get("error").textContent, "Cannot open sequence: Sequence link has invalid call IDs.");
+});
+
+// #951 (owner ruling 2026-11-12): a stale entry or link strips the URL, adds no history entry and
+// opens the root view with no error.
+async function assertRoot(h, browser, entries) {
+  assert.equal(h.networkUrls.length, 0);
+  assert.equal(browser.location.hash, "");
+  assert.equal(browser.history.state, null);
+  assert.equal(browser.history.length, entries, "no new history entry");
+  assert.equal(h.get("error").hidden, true);
+  assert.doesNotMatch(h.get("sequence-state").textContent, /Cannot open sequence/);
+  assert.equal(h.run("selectedMethod"), null);
+}
+for (const [name, hash] of [
+  ["a sequence link for an older snapshot", `#sequence?sid=a&rootKey=${ROOT}&indexGeneration=12345678-1234-4123-8123-123456789abc&indexRevision=2`],
+  ["a sequence link for another generation", "#sequence?sid=a&indexGeneration=87654321-1234-4123-8123-123456789abc&indexRevision=1"],
+  ["a #source entry from another page load", "#source"],
+  ["a #classes entry from another page load", "#classes"]]) {
+  test(`${name} opens the root view with no error (#951)`, async () => {
+    const browser = historyWindow(hash), h = harness(browser);
+    await h.run("readNavigationLocation()");
+    await assertRoot(h, browser, 1);
+  });
+}
+
+test("a history key from this page whose entry is gone opens the root view with no error (#951)", async () => {
+  const browser = historyWindow(), h = harness(browser);
+  browser.history.pushState({trellisNavigation:`${h.run("navigationScope")}:99`}, "", "#sequence?sid=a");
+  await h.run("readNavigationLocation()");
+  await assertRoot(h, browser, 2);
+});
+
+test("a held entry for an older snapshot opens the root view with no error (#951)", async () => {
+  const browser = historyWindow(), h = harness(browser);
+  h.run(`rememberNavigation({kind:"view", view:"treemap"}, false, "#view")`);
+  h.run("status = {revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:2}}");
+  await h.run("readNavigationLocation(true)");
+  await assertRoot(h, browser, 2);
 });
 
 test("a valid call-ID link passes its boundary to selectMethod", async () => {
@@ -2430,4 +2468,59 @@ test("a user navigation during a Classes show's read wins, even when an unrelate
   assert.equal(opens.length, 1, "no second class read");
   assert.equal(h.run("selectedMethod.id"), "user");
   assert.equal(h.get("agent-shown").hidden, true);
+});
+
+// #940 review: Retry owns the view as the original open does.
+test("Open in Sequence Retry does not replace a view chosen while its sequence read is pending (#940)", async () => {
+  const {h} = await showHarness();
+  h.get("sequence-open").dataset = {};
+  h.context.fetch = async () => ({ok:false,status:503,json:async()=>({error:{code:"storage_busy",message:"The index is busy."}})});
+  await h.run("openArchitectureSequence({syntaxId:'caller',name:'caller'}, [{callId:'call-1'}], status.revision, {}, () => true)");
+  assert.match(h.get("sequence-open-label").textContent, /Open in Sequence failed: The index is busy/);
+  const read = deferred();
+  h.context.fetch = () => read.promise;
+  const retry = h.run("sequenceOpen.retry()");
+  assert.match(h.get("sequence-open-label").textContent, /Opening sequence for caller/);
+  h.run("window.TrellisShell.showView('classes')");
+  assert.equal(h.get("classes-panel").hidden, false, "the user's newly chosen view is shown");
+  read.resolve(response(view("caller")));
+  await retry;
+  assert.equal(h.run("selectedMethod.id"), "old", "the retry must not navigate after the user chose another view");
+  assert.equal(h.get("classes-panel").hidden, false);
+  assert.match(h.get("sequence-open-label").textContent, /The view changed; Open in Sequence was cancelled/);
+  assert.equal(h.get("sequence-open").hidden, false);
+});
+
+
+test("review951 a stale link clears an already selected method and source action at root", async () => {
+  const {h, browser} = await showHarness();
+  assert.equal(h.run("selectedMethod.id"), "old");
+  assert.equal(h.get("method-source").disabled, false);
+  browser.history.pushState(null, "", `#sequence?sid=stale&rootKey=${ROOT}&indexGeneration=12345678-1234-4123-8123-123456789abc&indexRevision=2`);
+  const entries = browser.history.length;
+  await h.run("readNavigationLocation()");
+  assert.equal(browser.location.hash, "");
+  assert.equal(browser.history.state, null);
+  assert.equal(browser.history.length, entries);
+  assert.equal(h.get("error").hidden, true);
+  assert.equal(h.get("architecture-panel").hidden, false);
+  h.run("window.TrellisShell.showView('sequence')");
+  assert.equal(h.get("sequence-panel").hidden, false);
+  assert.equal(h.get("method-source").disabled, true, "root must not leave a source action for the previous selection enabled");
+  assert.equal(h.run("selectedMethod"), null, "the root view must clear the earlier method selection");
+});
+
+
+test("review951 a stale link clears an earlier malformed-link error when returning to root", async () => {
+  const browser = historyWindow("#sequence?sid="), h = harness(browser);
+  await h.run("readNavigationLocation()");
+  assert.match(h.get("sequence-state").textContent, /Cannot open sequence/);
+  browser.history.replaceState(null, "", `#sequence?sid=a&rootKey=${ROOT}&indexGeneration=12345678-1234-4123-8123-123456789abc&indexRevision=2`);
+  await h.run("readNavigationLocation()");
+  assert.equal(browser.location.hash, "");
+  assert.equal(h.get("error").hidden, true);
+  assert.equal(h.get("architecture-panel").hidden, false);
+  h.run("window.TrellisShell.showView('sequence')");
+  assert.equal(h.get("sequence-panel").hidden, false);
+  assert.doesNotMatch(h.get("sequence-state").textContent, /Cannot open sequence/, "the root fallback must not retain the previous link error in Sequence");
 });

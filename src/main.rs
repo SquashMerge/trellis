@@ -1537,6 +1537,22 @@ fn dispatch_cli(command: &Command) -> Result<()> {
     }) = command
         && value["state"] != "done"
     {
+        // One line saying why (#967); the reply on stdout has the stderr lines.
+        use std::io::Write;
+        if let Ok(Some(failure)) = serde_json::from_value::<
+            Option<trellis::producer::failure::Failure>,
+        >(value["failure"].clone())
+        {
+            let code = value["errorCode"]
+                .as_str()
+                .or(value["outcome"].as_str())
+                .unwrap_or("producer_failed");
+            let _ = writeln!(
+                std::io::stderr(),
+                "{}",
+                trellis::producer::failure::cli_line(code, &failure)
+            );
+        }
         anyhow::bail!(
             "{}: producer run {}",
             value["errorCode"].as_str().unwrap_or("producer_failed"),

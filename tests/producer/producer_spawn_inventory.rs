@@ -554,14 +554,23 @@ fn store_and_import_reach_only_nonexecuting_producer_retention() {
         }
     }
     for (file, text) in production(
-        |f| matches!(f, "src/producer/retention.rs" | "src/producer/state.rs"),
+        |f| {
+            matches!(
+                f,
+                "src/producer/retention.rs" | "src/producer/state.rs" | "src/producer/failure.rs"
+            )
+        },
         false,
     ) {
         let reached = sibling_references(&text, &siblings);
         assert!(
             reached
                 .iter()
-                .all(|name| matches!(name.as_str(), "retention" | "state" | "process_info")),
+                // `failure` is the record's pure failure summary (#967).
+                .all(|name| matches!(
+                    name.as_str(),
+                    "retention" | "state" | "process_info" | "failure"
+                )),
             "{file} reaches execution: {reached:?}"
         );
         for word in [

@@ -1,12 +1,14 @@
 //! Test-support stand-in for a semantic producer. Its behavior comes from a
 //! JSON mode file named by `--mode-file <abs>`, or by the first argument when
-//! that ends in `.json` (the stub then stands in for `node`). Keys, all
+//! that ends in `.json` (the stub then stands in for `node`, which consumes a leading
+//! `--max-old-space-size=` V8 flag before its script, as the stub does). Keys, all
 //! optional, run in this order:
 //!
 //! - `marker`: file that receives argv before anything else;
 //! - `envdump`: file that receives `{env, argv, cwd, which}`;
 //! - `which`: names searched on the stub's own `PATH`, recorded in the dump;
 //! - `stderr`: number of lines to write to stderr;
+//! - `stderrText`: text to write to stderr as it is;
 //! - `alloc`: MiB to allocate and touch;
 //! - `grow`: bytes to write to the `--output` file;
 //! - `emit`: SCIP file to copy to the `--output` file;
@@ -32,8 +34,13 @@ fn main() {
     if args.get(1).map(String::as_str) == Some("--sleep-forever") {
         sleep_forever();
     }
-    let mode_file = match args.get(1).map(String::as_str) {
-        Some("--mode-file") => args.get(2).cloned(),
+    // As `node`, the first argument after a V8 heap flag is the script.
+    let first = 1 + usize::from(
+        args.get(1)
+            .is_some_and(|arg| arg.starts_with("--max-old-space-size=")),
+    );
+    let mode_file = match args.get(first).map(String::as_str) {
+        Some("--mode-file") => args.get(first + 1).cloned(),
         Some(first) if first.ends_with(".json") => Some(first.to_owned()),
         _ => None,
     };
@@ -77,6 +84,9 @@ fn main() {
         for line in 0..lines {
             let _ = writeln!(stderr, "stub stderr line {line}");
         }
+    }
+    if let Some(text) = mode["stderrText"].as_str() {
+        let _ = std::io::stderr().write_all(text.as_bytes());
     }
     let _held = mode["alloc"].as_u64().map(|mib| {
         let block = vec![1_u8; mib as usize * 1024 * 1024];

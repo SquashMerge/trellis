@@ -7006,9 +7006,19 @@ fn real_fixture_world(fixture: &str, files: &[&str]) -> (World, Vec<String>) {
 
 /// Publish the fixture's real `index.scip` as a scip-typescript import.
 fn publish_real_fixture(world: &World, fixture: &str, files: &[&str]) -> (IndexPin, String) {
+    publish_real_fixture_as(world, fixture, files, "javascript")
+}
+
+/// Publish the fixture's real `index.scip` as a scip-typescript import for `language`.
+fn publish_real_fixture_as(
+    world: &World,
+    fixture: &str,
+    files: &[&str],
+    language: &str,
+) -> (IndexPin, String) {
     let mut batch = world.fixture().reference("scip-typescript");
     let ordinal = batch.artifact(
-        "javascript",
+        language,
         files.iter().map(|path| DocSpec::new(path)).collect(),
     );
     let index = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -7461,6 +7471,42 @@ async fn real_typescript_ambiguous_bindings_show_in_query_mcp_and_status() {
     assert_eq!(outgoing["partial"], true);
     mcp.finish();
     assert!(!world.store.recovery_pending_for_tests());
+}
+
+/// #958: real scip-typescript 0.4.0 calls under `await`, including `await f<T>()`, which the
+/// TypeScript grammar reads as a call of `await f`, count among the callee's incoming calls
+/// like the plain `return f<T>()` call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_typescript_awaited_calls_count_in_incoming_calls() {
+    let files = ["src/lib.ts", "src/main.ts"];
+    let (world, _) = real_fixture_world("issue958-typescript-await", &files);
+    publish_real_fixture_as(&world, "issue958-typescript-await", &files, "typescript");
+    let ids = declaration_ids(&world);
+    let mut mcp = McpSession::start(&world, 958);
+    let incoming = mcp.call(
+        "trellis_incoming_calls",
+        json!({"schemaVersion":1,"symbolId":ids["apiFetch"]}),
+    );
+    let callers = incoming["data"]["callers"].as_array().unwrap();
+    let mut owners: Vec<_> = callers
+        .iter()
+        .map(|caller| {
+            assert_eq!(caller["targetId"], ids["apiFetch"], "{caller}");
+            assert_eq!(caller["disposition"], "resolved", "{caller}");
+            assert_eq!(caller["evidenceTier"], "semantic", "{caller}");
+            caller["ownerSyntaxId"].as_str().unwrap().to_owned()
+        })
+        .collect();
+    owners.sort();
+    let mut expected = vec![
+        ids["plain"].clone(),
+        ids["awaited"].clone(),
+        ids["awaited"].clone(),
+        ids["returned"].clone(),
+    ];
+    expected.sort();
+    assert_eq!(owners, expected, "{incoming}");
+    mcp.finish();
 }
 
 /// #467: with no published producer, and then with two, every read shows syntax only and

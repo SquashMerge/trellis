@@ -134,7 +134,9 @@ export async function draw(view, { width, theme, highlight, pause, choice }) {
   }
 
   // All apps (#790): web/architecture.js drawApps, with the grid composed into one SVG.
-  let layout = apps.layout({ width, count: plan.parts.length });
+  // Each gutter is as wide as the lines it carries (#949), counted before any column is drawn.
+  const lanes = summary.lanes(view, plan.parts);
+  let layout = apps.layout({ width, count: plan.parts.length, lanes });
   const sides = summary.sides(view, plan.parts, layout.sideBySide);
   const drawings = [];
   for (const [index, part] of plan.parts.entries()) {
@@ -143,7 +145,7 @@ export async function draw(view, { width, theme, highlight, pause, choice }) {
     if (pause) await pause();
   }
   // A drawing wider than its column (an unbreakable name) widens the column.
-  layout = apps.layout({ width, count: plan.parts.length, natural: drawings.map((d) => d?.width ?? 0) });
+  layout = apps.layout({ width, count: plan.parts.length, lanes, natural: drawings.map((d) => d?.width ?? 0) });
   const places = new Map(plan.parts.map((part, index) => {
     const x = layout.sideBySide ? layout.columns[index].x : 0, frames = drawings[index]?.bands ?? new Map();
     return [part.group.name, { index, top: 0, bands: new Map([...frames].filter(([, f]) => f).map(([name, f]) => [name, { x: f.x + x, y: f.y, w: f.w, h: f.h }])) }];
@@ -196,19 +198,34 @@ function finish(drawn, override, part) {
 // Each drawn control's box in SVG units, which are the image's logical pixels: a click on the
 // image is hit-tested against these (the smallest box under the pointer wins). Stat chips that
 // act (an upward deviation, an HTTP interface stub) are boxes of kind "A" with their action.
+// An arrow acts along its drawn line and arrowhead too, not only on its count label (#939):
+// each piece of its `g.pele-edge` paths (the label's `data-id`) is a box for the same arrow.
 function boxes(root, projection, part) {
   const out = [];
-  const place = (node, rect) => {
-    let x = Number(rect.getAttribute("x") || 0), y = Number(rect.getAttribute("y") || 0);
+  const shift = (node) => {
     const at = /translate\(\s*(-?[\d.]+)[ ,]+(-?[\d.]+)\s*\)/.exec(node.getAttribute("transform") || "");
-    if (at) { x += Number(at[1]); y += Number(at[2]); }
-    return { x, y, w: Number(rect.getAttribute("width")), h: Number(rect.getAttribute("height")) };
+    return at ? [Number(at[1]), Number(at[2])] : [0, 0];
   };
+  const place = (node, rect) => {
+    const [dx, dy] = shift(node);
+    return { x: Number(rect.getAttribute("x") || 0) + dx, y: Number(rect.getAttribute("y") || 0) + dy,
+      w: Number(rect.getAttribute("width")), h: Number(rect.getAttribute("height")) };
+  };
+  const lines = new Map();
+  for (const node of root.querySelectorAll("g.pele-edge[data-id]")) lines.set(node.getAttribute("data-id"), node);
   for (const node of root.querySelectorAll("[data-trellis-architecture-id]")) {
     const id = node.getAttribute("data-trellis-architecture-id"), item = projection.nodes.get(id) || projection.edges.get(id);
+    if (!item) continue;
     const rect = node.querySelector(":scope > rect") || node.querySelector("rect");
-    if (!item || !rect) continue;
-    out.push({ id, kind: item.kind, ...place(node, rect), record: item.record, label: item.full, part });
+    const box = { id, kind: item.kind, record: item.record, label: item.full, part };
+    if (rect) out.push({ ...box, ...place(node, rect) });
+    const line = item.kind === "E" ? lines.get(node.getAttribute("data-id")) : null;
+    if (!line) continue;
+    const [dx, dy] = shift(line);
+    for (const path of line.querySelectorAll("path")) {
+      const pad = Math.max(EDGE_HIT_PAD, Number(path.getAttribute("stroke-width") || 0) / 2 + 2);
+      for (const s of segments(path.getAttribute("d") || "")) out.push({ ...box, x: s.x0 + dx - pad, y: s.y0 + dy - pad, w: s.x1 - s.x0 + 2 * pad, h: s.y1 - s.y0 + 2 * pad });
+    }
   }
   for (const node of root.querySelectorAll("[data-trellis-action-id]")) {
     const rect = node.querySelector("rect");
@@ -216,6 +233,41 @@ function boxes(root, projection, part) {
     try { action = JSON.parse(node.getAttribute("data-trellis-action-id")); } catch { continue; }
     if (!rect || !Array.isArray(action)) continue;
     out.push({ id: node.getAttribute("data-trellis-action-id"), kind: "A", ...place(node, rect), action, label: node.getAttribute("aria-label"), part });
+  }
+  return out;
+}
+
+// How far an arrow's hit band reaches beyond its drawn line, in logical px.
+const EDGE_HIT_PAD = 5;
+
+// The bounding box of each drawn piece of an SVG path: one per line or curve (its ends and
+// control points), in absolute units. Relative commands are resolved; a malformed or unknown
+// command ends the walk, so a path never throws.
+export function segments(d) {
+  const tokens = d.match(/[a-zA-Z]|-?(?:\d+\.?\d*|\.\d+)(?:e-?\d+)?/g) || [];
+  const out = [], arity = { M: 2, L: 2, H: 1, V: 1, C: 6, S: 4, Q: 4, T: 2, A: 7, Z: 0 };
+  let i = 0, cmd = null, x = 0, y = 0, sx = 0, sy = 0;
+  const add = (points) => {
+    const xs = points.map((p) => p[0]), ys = points.map((p) => p[1]);
+    out.push({ x0: Math.min(...xs), y0: Math.min(...ys), x1: Math.max(...xs), y1: Math.max(...ys) });
+  };
+  while (i < tokens.length) {
+    if (/^[a-zA-Z]$/.test(tokens[i])) cmd = tokens[i++];
+    const upper = cmd?.toUpperCase(), n = arity[upper];
+    if (n === undefined) break;
+    if (upper === "Z") { add([[x, y], [sx, sy]]); x = sx; y = sy; cmd = null; continue; }
+    const args = tokens.slice(i, i + n).map(Number);
+    if (args.length < n || args.some((v) => !Number.isFinite(v))) break;
+    i += n;
+    const rel = cmd !== upper, ox = rel ? x : 0, oy = rel ? y : 0, points = [];
+    if (upper === "H") points.push([args[0] + ox, y]);
+    else if (upper === "V") points.push([x, args[0] + oy]);
+    else if (upper === "A") points.push([args[5] + ox, args[6] + oy]);
+    else for (let k = 0; k < n; k += 2) points.push([args[k] + ox, args[k + 1] + oy]);
+    const [ex, ey] = points[points.length - 1];
+    // Pairs after a moveto are linetos.
+    if (upper === "M") { sx = ex; sy = ey; cmd = rel ? "l" : "L"; } else add([[x, y], ...points]);
+    x = ex; y = ey;
   }
   return out;
 }

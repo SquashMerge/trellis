@@ -26,6 +26,8 @@
   const ENTRY_CAP = 40, BOX_CAP = 150;
   // Resize re-layout: the quiet period, and the width change that is worth a new drawing.
   const RESIZE_DEBOUNCE_MS = 150, RESIZE_SLACK = 8;
+  // The narrow-screen drawer width (web/shell.js): the only width at which All apps columns stack (#949/#950).
+  const DRAWER_WIDTH = "(max-width: 900px)";
   const stem = name => { const dot = name.lastIndexOf("."); return dot > 0 ? name.slice(0, dot) : name; };
   // A directory module's own root file: shown first when it opens, never as a "mod" chip.
   const ROOT_FILES = new Set(["mod.rs", "__init__.py"]);
@@ -280,7 +282,9 @@
     // scale spans them.
     function plan(full, scope) {
       const metric = state.metric();
-      const columns = scope === null && full.apps?.length >= 2 ? apps().groups(full) : [], allApps = columns.length >= 2;
+      // All apps columns run in interface order (#949): each server between its clients.
+      const found = scope === null && full.apps?.length >= 2 ? apps().groups(full) : [], allApps = found.length >= 2;
+      const columns = allApps ? apps().columnOrder(full, found.map(group => group.name)).map(name => found.find(group => group.name === name)) : found;
       const payload = scope === null ? full : apps().scoped(full, scope);
       const parts = allApps ? columns.map(group => {
         const slice = apps().scoped(full, group.name);
@@ -309,14 +313,18 @@
           unassigned:{label:`Unassigned / unknown\n${plural(unassigned, "file")} · no layer`, get expanded() { return state.shown().unassigned && budget.left > 0; }}},
       };
     }
-    // Each All apps column's Shared bands sit on the side away from its interface partners (#850).
-    function sides(full, parts, sideBySide) {
+    // Whether a layer of an All apps column is a drawn Shared band (true), a drawn ordered band (false) or none (null).
+    function bandOf(parts) {
       const partOf = new Map(parts.map(part => [part.group.name, part]));
-      return apps().sharedSides(full, parts.map(part => part.group.name), (name, layerName) => {
+      return (name, layerName) => {
         const part = partOf.get(name), layer = part?.slice.layers.find(item => item.name === layerName);
         return layer && part.layout.layers.has(layerName) && part.slice.layers.some(item => !item.shared) ? layer.shared : null;
-      }, sideBySide);
+      };
     }
+    // Each All apps column's Shared bands sit on the side away from its interface partners (#850).
+    const sides = (full, parts, sideBySide) => apps().sharedSides(full, parts.map(part => part.group.name), bandOf(parts), sideBySide);
+    // The lines each gutter between All apps columns carries, which size it (#949).
+    const lanes = (full, parts) => apps().laneCounts(full, parts.map(part => part.group.name), bandOf(parts));
     // An All apps column's header lines.
     function columnHeader(part) {
       const metric = state.metric(), layered = part.slice.layers.some(layer => !layer.shared);
@@ -357,7 +365,7 @@
     const legendText = scale => state.metric() === "layer" ? "Layer membership · neutral chips; no metric heat."
       : `${scale.label} · ${state.metric()} · ${state.aggregate()} · ${state.role() === "all" ? "all indexed callables" : callables()}`;
     return {layerOf, layerNumber, layerTag, layerLabel, layerCounts, layerStats, interfaceStats, hint, expanded, testLayer, flagged, edgeTone, coverageOf, percent,
-      lowerBound, edgeText, summary, worst, level, capped, entries, moduleGroups, summaryChips, plan, options, sides, columnHeader,
+      lowerBound, edgeText, summary, worst, level, capped, entries, moduleGroups, summaryChips, plan, options, sides, lanes, columnHeader,
       coverageRows, coverageSummary, ruleCounts, reviewCounts, legendText, callables};
   }
   const BUILD_PHASES = {reading:"reading indexed files", resolving:"resolving references", evaluating:"evaluating rules", measuring:"measuring code"};
@@ -366,7 +374,10 @@
     let root = null, name = null;
     return {get:() => root === context().rootKey ? name : null, set:next => { root = context().rootKey; name = next; }};
   }
-  function create({request, context, readSource, openTreemap, openSequence, libraryButton = () => null, onConflict = () => {}, onInspect = () => {}, onRulesChanged = () => {}, appScope = null}) {
+  // `navigate` moves between the Architecture and Deviations tabs (#965): `deviations({app, edge})` shows the
+  // Deviations tab on that filter, `diagram()` shows Architecture, and `filter({app, edge})` reports a filter
+  // chosen inside the tab, so the page's link follows it. Without one, both tabs are this controller's own.
+  function create({request, context, readSource, openTreemap, openSequence, libraryButton = () => null, onConflict = () => {}, onInspect = () => {}, onRulesChanged = () => {}, appScope = null, navigate = null}) {
     let serial = 0, renderSerial = 0, selectionSerial = 0, view = null, basis = null, buildingTimer = null, buildingWake = null;
     let metric = "cognitive", aggregate = "max", role = "production", relative = false, showTests = false;
     // The app whose stack is drawn: null for all apps, else an app name (never compared with a literal). Memory only; a new checkout starts at "all".
@@ -375,6 +386,10 @@
     // `drawn` is the view the last render laid out (the scoped slice, or `view` itself).
     const scopes = appScope || ownScope(context);
     let drawn = null, drawnScope = null;
+    // The tab this controller shows: "diagram" (Architecture), "tree" (Deviations, #965) or null (neither).
+    // A read for the tree tab draws nothing; Architecture draws the held snapshot when it is shown again.
+    // `afterDraw` is what Show on diagram asks of the next drawing: an edge to highlight, or an inspection.
+    let tab = "diagram", afterDraw = null, routing = false;
     // The band that holds the selected stub's end, so its label can say `client end` / `server end` (AC25).
     let endMark = null;
     let reviewMode = "unassigned", draft = null, preview = null, editSerial = 0, editBusy = false, busyOwner = 0;
@@ -391,8 +406,8 @@
     const {layerLabel, expanded, edgeText, coverageSummary, ruleCounts} = shared;
     const deviations = window.TrellisDeviations.create({details:(params, active, offset) => details(appFilter(params), active, offset), current:() => usable(),
       basis:() => basis, view:() => deviationsView(), targetLabel, eligible, portable, beginDraft:(operation, scope) => beginDraft(operation, scope), reviewChips,
-      edgeText, inspectLine:(record, render) => inspectLine(record, render), overview:() => overview(), inspectUnknown:() => { if (usable()) inspect("unknown", null); },
-      backLabel:() => scopeGroup() ? `← ${scopeGroup().name}` : "← Architecture",
+      edgeText, inspectLine:(record, render) => inspectLine(record, render), overview:() => overview(), inspectUnknown:() => { if (usable()) showDiagram({unknown:true}); },
+      showDiagram:chip => { if (usable()) showDiagram({edge:chip ?? null}); }, onFilter:chip => navigate?.filter({app:scopeName(), edge:chip ?? null}),
       onConflict:() => onConflict(), refresh:() => refresh(), readSource:(site, pin, active) => readSource(site, pin, active),
       openSequence:(...args) => openSequence(...args), snapshot:() => snapshot(),
       // One page of the Files outline at the view's pin; it names a closure's enclosing callable (#845).
@@ -404,7 +419,10 @@
         }
         return data;
       }});
-    const state = (message, kind = "ready") => { get("architecture-state").textContent = message; get("architecture-state").dataset.state = kind; };
+    // The Deviations tab shows the same read state while its snapshot is read (#965).
+    const state = (message, kind = "ready") => {
+      for (const id of ["architecture-state", "deviations-state"]) { const node = get(id); if (node) { node.textContent = message; node.dataset.state = kind; } }
+    };
     function capture() {
       const c = context();
       return {rootKey:c.rootKey, session:c.session, pin:c.pin && window.TrellisIndexPin.copy(c.pin), aggregate, role, serial, rulesEpoch:c.rulesEpoch};
@@ -443,7 +461,7 @@
       selectionSerial++; pressed = null; inspection = null;
       window.TrellisShell?.clearArchitectureInspector();
       // Leaving a stub drops its band's word; the drawing is swapped in place, keeping what else is selected.
-      if (endMark) { endMark = null; if (usable() && view.state === "ready") void render({keepSelection:true}); }
+      if (endMark) { endMark = null; if (tab === "diagram" && usable() && view.state === "ready") void render({keepSelection:true}); }
     }
     function reset(message = "Open Architecture to read the indexed snapshot and reviewed rules.", keepDraft = false, keepReopen = false) {
       drawn = null; get("architecture-apps").hidden = true; get("architecture-source-line").hidden = true; get("architecture-key-interface").hidden = true; get("architecture-footnote").hidden = true;
@@ -451,7 +469,10 @@
       if (!keepDraft) setBusy(false);
       if (!keepDraft) { draft = null; get("architecture-review-panel").hidden = true; get("architecture-editor").hidden = true; }
       get("architecture-preview-result").hidden = true;
-      serial++; renderSerial++; clearInspection(); deviations.reset(keepReopen); view = null; basis = null;
+      // The Deviations tab's open tree reopens on its chip at the next snapshot (#965).
+      const reopen = tab === "tree" && deviations.isOpen();
+      if (reopen) deviations.reopenAfterRefresh();
+      serial++; renderSerial++; clearInspection(); deviations.reset(keepReopen || reopen); view = null; basis = null;
       clearTimeout(buildingTimer); buildingWake?.(); buildingTimer = buildingWake = null;
       get("architecture-diagram").replaceChildren(); get("architecture-diagram").setAttribute("aria-busy", "false");
       get("architecture-legend").replaceChildren(); get("architecture-notice-content").replaceChildren();
@@ -625,12 +646,65 @@
       line.append(make("span", apps.sourceLine(group, payload.apps.length)));
       if (group?.duplicate) line.append(make("span", apps.duplicateNotice(group), "architecture-app-notice"));
     }
-    // A `↑` badge or a deviating arrow opens 802's Deviations tree on its edge, unselected and with
-    // Calls only off (AC10, #845). Back returns focus to the control that opened it.
-    function openDeviations(action, trigger = null) {
+    // A `↑` badge or a deviating arrow opens the Deviations tab on its edge, unselected and with
+    // Calls only off (AC10, #845, #965).
+    function openDeviations(action) {
       if (!usable() || view.state !== "ready" || editBusy) return;
-      return deviations.openEdge(action.sourceLayer, action.destinationLayer, trigger);
+      return openTab({app:scopeName(), edge:`${action.sourceLayer}→${action.destinationLayer}`});
     }
+    // The Deviations tab on a filter: the review chip's (every edge), an arrow's (its edge) or an app's
+    // deviation count (that app, every edge). The page moves the tab and its link; alone, this controller does.
+    function openTab(filter) {
+      if (!usable() || editBusy) return;
+      return navigate ? navigate.deviations(filter) : showDeviations(filter);
+    }
+    // Show on diagram (#965): Architecture, with the tree's edge pressed and focused where it is drawn.
+    function showDiagram(next) {
+      afterDraw = next;
+      return navigate ? navigate.diagram() : reopen();
+    }
+    // What Show on diagram asked of this drawing. An edge on the tree's chip is the production deviation
+    // arrow between its layers; in All apps the first column that draws it.
+    function settleDraw() {
+      const next = afterDraw;
+      afterDraw = null;
+      if (next?.unknown) return inspect("unknown", null);
+      if (typeof next?.edge !== "string") return;
+      const node = [...(get("architecture-diagram").querySelectorAll?.("[data-trellis-edge-id]") || [])].find(item => {
+        try {
+          const [source, destination, role, status, excepted] = JSON.parse(item.getAttribute("data-trellis-edge-id"));
+          return `${source}→${destination}` === next.edge && role === "production" && status === "deviates" && excepted === false;
+        } catch { return false; }
+      });
+      if (!node) return;
+      pressOnly(node); node.focus?.(); node.scrollIntoView?.({block:"nearest", inline:"nearest"});
+    }
+    // The review panel (exception drafts, unassigned and authored lists) sits above the shown tab's content.
+    function placeReview() {
+      const panel = get("architecture-review-panel"), tree = tab === "tree";
+      const host = get(tree ? "deviations-panel" : "architecture-panel");
+      const before = tree ? get("architecture-deviations") : host?.querySelector?.(".architecture-status");
+      if (panel && host?.insertBefore && before && panel.parentNode !== host) host.insertBefore(panel, before);
+    }
+    // The Deviations tab (#965): the held snapshot when nothing it rests on changed, else a read that
+    // draws nothing. `filter.app` chooses the app for every view (undefined keeps it); `filter.edge` is
+    // the tree's chip (undefined keeps the tree's own). The tree reads once per snapshot and app.
+    function showDeviations(filter = {}) {
+      tab = "tree"; afterDraw = null; placeReview();
+      // The caller's route already names this app and edge; the app change it makes must not rewrite it to every edge.
+      if (filter.app !== undefined && filter.app !== scopes.get()) {
+        routing = true;
+        try { scopes.set(filter.app); } finally { routing = false; }
+      }
+      if (!held()) {
+        if (filter.edge !== undefined) deviations.want(filter.edge);
+        return refresh();
+      }
+      basis = {...basis, serial}; coverage(); state("", "ready"); overview();
+      return deviations.show(filter.edge);
+    }
+    // The tree's filter, as the Deviations tab's link names it.
+    const deviationsFilter = () => ({app:scopeName(), edge:deviations.filter() ?? null});
     // The arrows the tree lists: production deviations that no exception covers.
     const treeEdge = edge => edge?.role === "production" && edge.status === "deviates" && !edge.excepted;
     function setScope(next) {
@@ -643,7 +717,15 @@
     // never reads; a hidden or busy one draws it when it next renders.
     let following = null;
     function scopeChanged() {
-      if (settling || !usable() || view.state !== "ready" || editBusy || scopeName() === drawnScope) return following;
+      if (settling || !usable() || view.state !== "ready" || editBusy) return following;
+      // The Deviations tab reads the new app's tree, on every edge, and its link follows (#965).
+      if (tab === "tree") {
+        deviations.reset(); coverage(); overview();
+        if (!get("architecture-review-panel").hidden) renderReview();
+        if (!routing) navigate?.filter({app:scopeName(), edge:null});
+        return deviations.show(null);
+      }
+      if (scopeName() === drawnScope) return following;
       deviations.reset(); coverage();
       if (!get("architecture-review-panel").hidden) renderReview();
       return following = render();
@@ -773,6 +855,7 @@
         get("architecture-summary").textContent = `${payload.modules.length} file modules · ${production} production / ${tests} test-only cross-layer sites${showTests ? "" : " (tests hidden)"}${truncated ? ` · ${plural(truncated, "file")} not drawn (size cap ${BOX_CAP} chips)` : ""} · Metrics: ${aggregate}, ${population()}.`;
         state("", "ready");
         get("architecture-exclusions").textContent = `Heat: ${exclusions(payload.modules)}.`;
+        if (!keepSelection) settleDraw();
         return true;
       } catch (error) {
         if (!active()) return false;
@@ -803,11 +886,15 @@
       pressed = nodeKey(node); syncCards();
     }
     async function drawApps({full, parts, canvas, width, stack, active, layout}) {
-      let plan = apps.layout({width, count:parts.length});
+      // Each gutter is as wide as the lines it carries (#949), so the lanes are counted before any column is drawn.
+      // Columns stack only at the narrow-screen drawer width (#949/#950, owner ruling 2026-11-12); else the canvas scrolls.
+      const laneCounts = shared.lanes(full, parts), drawer = !!window.matchMedia?.(DRAWER_WIDTH)?.matches;
+      let plan = apps.layout({width, count:parts.length, lanes:laneCounts, drawer});
       const pele = window.TrellisArchitecturePele, grid = make("div", undefined, "architecture-apps-grid"), columns = [], boxes = [], bandsOf = new Map();
+      // Side by side, the grid's tracks alternate column and gutter, and column i takes track 2i + 1.
       const place = () => {
         grid.dataset.layout = plan.sideBySide ? "columns" : "stacked";
-        css(grid, {width:`${plan.width}px`, gridTemplateColumns:plan.sideBySide ? plan.widths.map(each => `${each}px`).join(" ") : `${plan.width}px`, columnGap:`${plan.gutter}px`});
+        css(grid, {width:`${plan.width}px`, gridTemplateColumns:plan.sideBySide ? plan.widths.flatMap((each, index) => index ? [`${plan.gutters[index - 1]}px`, `${each}px`] : [`${each}px`]).join(" ") : `${plan.width}px`});
       };
       place();
       // Each column's Shared bands sit on the side away from its interface partners (#850).
@@ -820,12 +907,20 @@
         const head = make("button", undefined, "architecture-app-header"); head.type = "button"; head.setAttribute("aria-pressed", "false");
         head.setAttribute("data-trellis-action-id", JSON.stringify(["app", group.name]));
         const line = make("span", info.deviations ? `${info.detail} · ` : info.detail, "architecture-app-line");
-        if (info.deviations) { const tone = make("span", info.deviations); tone.dataset.tone = "error"; line.append(tone); }
+        // The count opens the Deviations tab on this app (#965); the rest of the header inspects the app.
+        if (info.deviations) {
+          const tone = make("span", info.deviations, "architecture-app-deviations"); tone.dataset.tone = "error";
+          tone.setAttribute("title", `Open ${info.deviations} in Deviations`);
+          tone.addEventListener("click", event => { event?.stopPropagation?.(); if (active()) openTab({app:group.name, edge:null}); });
+          line.append(tone);
+        }
         head.append(make("span", info.name, "architecture-app-name"), line);
         if (info.manifests) head.append(make("span", `Detected from ${info.manifests}`, "architecture-app-line"));
         head.append(make("span", "Selected", "architecture-selected-tag"));
         head.addEventListener("click", () => { if (!active()) return; inspect("app", group); pressOnly(head); });
         column.append(head, box); grid.append(column); columns.push(column); boxes.push(box);
+        // The re-layout below only widens columns, so side by side stays decided and the track is this one.
+        if (plan.sideBySide) css(column, {gridColumn:String(2 * columns.length - 1)});
         if (!layered) {
           const files = group.unassignedFileCount, button = make("button", `◇ ${files} unassigned · listed, never dropped`, "architecture-aside-box");
           button.type = "button"; button.dataset.tone = "warning"; button.addEventListener("click", () => { if (active()) openReview("unassigned"); });
@@ -838,7 +933,7 @@
       }
       canvas.replaceChildren(grid);
       // A drawing wider than its column (an unbreakable name) widens the column; the diagram scrolls.
-      plan = apps.layout({width, count:parts.length, natural:boxes.map(box => Math.ceil(box.scrollWidth || 0))}); place();
+      plan = apps.layout({width, count:parts.length, lanes:laneCounts, drawer, natural:boxes.map(box => Math.ceil(box.scrollWidth || 0))}); place();
       // Frames are in each drawing's own coordinates; the overlay and the cards live in the grid's.
       const rect = node => node.getBoundingClientRect?.() || null, origin = rect(grid), places = new Map();
       parts.forEach((part, index) => {
@@ -852,6 +947,11 @@
       for (const entry of entriesOf) {
         const words = apps.endsText(entry, routed.undrawn.get(entry) || []), button = make("button", undefined, "architecture-interface-card");
         button.type = "button"; button.setAttribute("aria-pressed", "false"); button.setAttribute("data-trellis-action-id", apps.key(entry)); button.setAttribute("data-trellis-card", "interface");
+        const client = places.get(entry.client), server = places.get(entry.server), gutter = Math.min(client.index, server.index);
+        // A gutter narrower than a card (#949) lists the card under the grid, as for columns that are not adjacent;
+        // away from its gutter a card names its interface, as the Herdr pane's cards do.
+        const floats = plan.sideBySide && Math.abs(client.index - server.index) === 1 && apps.cardFits(plan.gutters[gutter]);
+        if (plan.sideBySide && !floats) button.append(make("span", `${entry.client} → ${entry.server}`, "architecture-card-line"));
         for (const row of apps.cardText(entry)) {
           const item = make("span", row.text, "architecture-card-line");
           if (row.strong) item.dataset.strong = "true";
@@ -862,13 +962,12 @@
         button.append(make("span", "Selected", "architecture-selected-tag"));
         button.setAttribute("aria-label", apps.cardName(entry)); cardEntries.set(button, entry);
         button.addEventListener("click", () => { if (!active()) return; inspect("interface", entry); pressOnly(button); });
-        const client = places.get(entry.client), server = places.get(entry.server), gutter = Math.min(client.index, server.index);
         if (!plan.sideBySide) columns[client.index].after(button);
-        else if (Math.abs(client.index - server.index) === 1) {
+        else if (floats) {
           // Below its own lines, so the card never covers a run; later cards in the gutter stack under it.
           const ys = routed.lines.filter(item => item.entry === entry).map(item => item.y), start = ys.length ? Math.max(...ys) + 14 : Math.min(client.top, server.top);
           const top = Math.max(start, floor.get(gutter) || 0);
-          button.dataset.gutter = "true"; css(button, {left:`${plan.columns[gutter].x + plan.columns[gutter].width}px`, top:`${top}px`, width:`${plan.gutter}px`});
+          button.dataset.gutter = "true"; css(button, {left:`${plan.columns[gutter].x + plan.columns[gutter].width}px`, top:`${top}px`, width:`${plan.gutters[gutter]}px`});
           columns[client.index].after(button);
           const height = button.offsetHeight || 96;
           floor.set(gutter, top + height + 8); bottom = Math.max(bottom, top + height);
@@ -940,19 +1039,23 @@
     // session, pin, aggregate, role and the rules epoch (a rules edit or conflict advances it).
     // Anything else reads again. A stale serial never revives: `suspend` bumped it, and the held
     // basis only adopts the current one here.
-    function reopen() {
+    function held() {
       const now = context();
-      const same = !!view && view.state === "ready" && !!basis && basis.rootKey === now.rootKey && basis.session === now.session &&
+      return !!view && view.state === "ready" && !!basis && basis.rootKey === now.rootKey && basis.session === now.session &&
         !!now.pin && window.TrellisIndexPin.equal(basis.pin, now.pin) && basis.aggregate === aggregate && basis.role === role &&
         basis.rulesEpoch === now.rulesEpoch;
-      if (!same) return refresh();
+    }
+    function reopen() {
+      tab = "diagram"; placeReview();
+      if (!held()) return refresh();
       basis = {...basis, serial}; coverage();
       return render();
     }
     function suspend() {
-      const held = {view, basis};
+      const kept = {view, basis};
+      tab = null; afterDraw = null;
       reset(undefined, false, false);
-      view = held.view; basis = held.basis;
+      view = kept.view; basis = kept.basis;
     }
     function pause(delay) {
       return new Promise(resolve => { buildingWake = resolve; buildingTimer = setTimeout(resolve, delay); });
@@ -976,9 +1079,13 @@
         }
         view = payload; basis = {...c, rulesHash:payload.rulesFile.contentHash}; settleScope(payload); coverage();
         if (payload.state === "no_layers") { state("No authored layers are configured. Existing authored exceptions can still be edited or removed. Review .trellis/rules.toml to configure layers.", "empty"); overview(); }
+        // The Deviations tab draws nothing; Architecture draws this snapshot when it is shown (#965).
+        else if (tab === "tree") { state("", "ready"); overview(); }
         else await render();
         if (options.keepDraft === true) { get("architecture-review-panel").hidden = false; renderReview(); }
-        settled = true; void deviations.afterRefresh();
+        settled = true;
+        // A history restore's own read reopens its saved tree itself; any other read opens the tab's tree.
+        if (tab === "tree" && payload.state === "ready" && options.restoring !== true) void deviations.afterRefresh();
       } catch (error) {
         if (!current(c) || error.name === "AbortError") return;
         const diagnostic = error.diagnostic;
@@ -1077,7 +1184,7 @@
         if (tone) button.dataset.tone = tone;
         button.addEventListener("click", () => { if (usable() && !editBusy) return open(button); }); chips.append(button);
       };
-      if (counts.deviates !== null) chip("architecture-review", counts.deviates, counts.deviates === 1 ? "deviation" : "deviations", button => deviations.open(button), counts.deviates ? "error" : null);
+      if (counts.deviates !== null) chip("architecture-review", counts.deviates, counts.deviates === 1 ? "deviation" : "deviations", () => openTab({app:scopeName(), edge:null}), counts.deviates ? "error" : null);
       if (counts.unassigned !== null) chip("architecture-unassigned", counts.unassigned, counts.unassigned === 1 ? "unassigned file" : "unassigned files", () => openReview("unassigned"));
       if (counts.exceptions !== null) chip("architecture-authored", counts.exceptions, counts.exceptions === 1 ? "exception" : "exceptions", showAuthored);
       target.append(chips);
@@ -1135,7 +1242,7 @@
         list.append(row);
       }
     };
-    // The interface inspector (AC15): its ends, counts and wrappers, the one-sided routes and calls, and Open endpoints for the matched ones.
+    // The interface inspector (AC15): its ends, counts and wrappers, then the matched routes and the one-sided routes and calls.
     function inspectInterface(target, title, entry, active) {
       const facts = apps.interfaceFacts(entry);
       title.textContent = facts.title;
@@ -1146,13 +1253,10 @@
       target.append(grid);
       if (facts.wrappers) paragraph(target, facts.wrappers, "detail architecture-mono");
       const params = list => ({kind:"interfaces", client:entry.client, server:entry.server, list});
-      const matched = make("div", undefined, "architecture-endpoints"), open = make("button", "Open endpoints", "architecture-open-endpoints"); open.type = "button";
-      open.addEventListener("click", () => {
-        if (!active() || open.disabled) return;
-        open.disabled = true; open.setAttribute("aria-expanded", "true");
-        detailList(matched, params("matched"), active, endpointRows(active), "No matched routes at this pin.");
-      });
-      target.append(open, matched);
+      // The matched routes load up front, under their heading, before the one-sided lists (#950; owner ruling 2026-11-12).
+      paragraph(target, facts.matchedHeading, "detail");
+      const matched = make("div", undefined, "architecture-endpoints"); target.append(matched);
+      detailList(matched, params("matched"), active, endpointRows(active), "No matched routes at this pin.");
       paragraph(target, "◆ Server-only routes: no call matched them", "detail");
       detailList(target, params("serverOnly"), active, endpointRows(active), "No server-only routes.");
       paragraph(target, "◆ Client-only calls: no route matched them. This does not prove absence.", "detail");
@@ -1381,11 +1485,15 @@
         aggregate, role, scope:scopeName(), reviewMode, reviewOpen:!get("architecture-review-panel").hidden, deviations:deviations.snapshot()} : null;
     }
     async function restore(saved, active) {
+      // A line selected in the Deviations tab returns to that tab (#965); anything else to Architecture.
+      tab = saved.inspection?.kind === "deviation" ? "tree" : "diagram"; afterDraw = null; placeReview();
       aggregate = saved.aggregate; role = saved.role;
       get("architecture-aggregate").value = aggregate;
       // The saved scope applies to this checkout, and so to every view that shares the choice.
       scopes.set(saved.scope ?? null);
-      await refresh();
+      // A restored tree reads once, with its saved selection, not first as a fresh tree. The mark belongs to
+      // this restore's read only, so a superseded restore never holds back a newer visit's tree.
+      await refresh({restoring:true});
       if (!active() || !usable()) return;
       settleScope(view);
       if (basis.rulesHash !== saved.rulesHash) throw new Error("Architecture rules changed. Select the boundary again.");
@@ -1450,7 +1558,7 @@
         invalidatePreview(); draft = null; get("architecture-editor").hidden = true;
         // Written rules can hide or show layers at the same code pin; other views re-read their population.
         onRulesChanged();
-        if (deviations.isOpen()) deviations.reopenAfterRefresh();
+        if (tab === "tree") deviations.reopenAfterRefresh();
         await refresh();
         const now = context();
         if (now.rootKey !== c.rootKey || now.session !== c.session || !window.TrellisIndexPin.equal(now.pin, c.pin)) return;
@@ -1531,7 +1639,7 @@
       if (!["max", "sum", "mean"].includes(event.target.value) || event.target.value === aggregate) return;
       aggregate = event.target.value; return refresh();
     });
-    return {refresh, reset, clearInspection, restore, reopen, suspend, scopeChanged};
+    return {refresh, reset, clearInspection, restore, reopen, suspend, scopeChanged, showDeviations, deviationsFilter};
   }
   window.TrellisArchitecture = {create, createDisplay, moduleKey, quartiles, band, metricValue, commonDirectory, groupModules};
 })();

@@ -61,7 +61,7 @@ test("without a usable index the view tabs and Files are greyed out and inert", 
   const h = harness();
   h.shell.setConnected(true);
   h.shell.setIndexAvailable(false);
-  for (const view of ["architecture", "treemap", "sequence", "classes"]) assert.equal(h.get(`view-${view}`).disabled, true, view);
+  for (const view of ["architecture", "treemap", "sequence", "classes", "deviations"]) assert.equal(h.get(`view-${view}`).disabled, true, view);
   assert.equal(h.get("section-files").disabled, true);
   h.get("view-sequence").listeners.click();
   assert.equal(h.get("sequence-panel").hidden, true, "a greyed tab cannot be clicked through");
@@ -72,30 +72,34 @@ test("without a usable index the view tabs and Files are greyed out and inert", 
   assert.equal(h.get("sequence-panel").hidden, false);
 });
 
-test("four workspace tabs have roving keyboard focus, skip a hidden Classes tab and never request source",()=>{
+test("five workspace tabs have roving keyboard focus, skip a hidden Classes tab and never request source",()=>{
   const h=harness();
   assert.equal(h.get("architecture-panel").hidden,false);assert.equal(h.get("sequence-panel").hidden,true);
   assert.equal(h.get("view-classes").hidden,true,"Classes starts hidden until the checkout is shown to have class-catalog code");
   h.shell.showView("sequence");
   assert.equal(key(h.get("view-sequence"),"ArrowRight"),true);
-  assert.equal(h.get("architecture-panel").hidden,false,"a hidden Classes tab is skipped");assert.ok(h.get("view-architecture").focused);
-  key(h.get("view-architecture"),"ArrowLeft");assert.equal(h.get("sequence-panel").hidden,false);
-  key(h.get("view-sequence"),"End");assert.equal(h.get("sequence-panel").hidden,false,"End is the last shown tab");
+  assert.equal(h.get("deviations-panel").hidden,false,"a hidden Classes tab is skipped");assert.ok(h.get("view-deviations").focused);
+  key(h.get("view-deviations"),"ArrowRight");assert.equal(h.get("architecture-panel").hidden,false,"the last tab wraps to the first");
+  key(h.get("view-architecture"),"ArrowLeft");assert.equal(h.get("deviations-panel").hidden,false);
+  key(h.get("view-deviations"),"ArrowLeft");assert.equal(h.get("sequence-panel").hidden,false);
+  key(h.get("view-sequence"),"End");assert.equal(h.get("deviations-panel").hidden,false,"End is the last shown tab, Deviations (#965)");
+  key(h.get("view-deviations"),"ArrowLeft");assert.equal(h.get("sequence-panel").hidden,false);
   h.shell.setViewAvailable("classes",true);assert.equal(h.get("view-classes").hidden,false);
   assert.equal(key(h.get("view-sequence"),"ArrowRight"),true);
   assert.equal(h.get("view-classes").attrs["aria-selected"],"true");
   assert.equal(h.get("classes-panel").hidden,false);
   assert.ok(h.get("view-classes").focused);
   assert.equal(h.get("view-classes").tabIndex,0);assert.equal(h.get("view-sequence").tabIndex,-1);
-  key(h.get("view-classes"),"ArrowRight");assert.equal(h.get("architecture-panel").hidden,false);assert.ok(h.get("view-architecture").focused);
+  key(h.get("view-classes"),"ArrowRight");assert.equal(h.get("deviations-panel").hidden,false);assert.ok(h.get("view-deviations").focused);
+  key(h.get("view-deviations"),"ArrowRight");assert.equal(h.get("architecture-panel").hidden,false);assert.ok(h.get("view-architecture").focused);
   key(h.get("view-architecture"),"ArrowRight");assert.equal(h.get("treemap-panel").hidden,false);
   key(h.get("view-treemap"),"ArrowRight");assert.equal(h.get("sequence-panel").hidden,false);
   key(h.get("view-sequence"),"ArrowLeft");assert.equal(h.get("treemap-panel").hidden,false);
-  key(h.get("view-treemap"),"End");assert.equal(h.get("classes-panel").hidden,false);
-  key(h.get("view-classes"),"Home");assert.equal(h.get("architecture-panel").hidden,false);
+  key(h.get("view-treemap"),"End");assert.equal(h.get("deviations-panel").hidden,false);
+  key(h.get("view-deviations"),"Home");assert.equal(h.get("architecture-panel").hidden,false);
   for (const name of ["tools", "terminal", "libraries"]) h.shell.showView(name);
   assert.equal(h.get("architecture-panel").hidden,false,"retired views are not routes");
-  for (const name of ["architecture", "treemap", "sequence", "classes"]) {
+  for (const name of ["architecture", "treemap", "sequence", "classes", "deviations"]) {
     assert.equal(h.get(`view-${name}`).attrs["aria-selected"],String(name === "architecture"));
     assert.equal(h.get(`view-${name}`).tabIndex,name === "architecture" ? 0 : -1);
   }
@@ -112,10 +116,10 @@ test("an explicitly opened unavailable view keeps its tab only while active",()=
   h.shell.setViewAvailable("classes",false);assert.equal(h.get("view-classes").hidden,true);
   h.shell.setViewAvailable("libraries",true);assert.equal(h.get("view-libraries").hidden,false,"unknown names are ignored");
 });
-test("workspace tabs have exactly four valid ARIA panel relationships",()=>{
+test("workspace tabs have exactly five valid ARIA panel relationships",()=>{
   const html=fs.readFileSync(path.join(__dirname,"../web/index.html"),"utf8");
   const tabs=[...html.matchAll(/<button id="view-([^"]+)" role="tab"[^>]*aria-controls="([^"]+)"/g)];
-  assert.deepEqual(tabs.map(match=>match[1]),["architecture","treemap","sequence","classes"]);
+  assert.deepEqual(tabs.map(match=>match[1]),["architecture","treemap","sequence","classes","deviations"],"Deviations is the last tab (#965)");
   assert.match(html,/<button id="view-classes"[^>]*\bhidden/);
   for(const [,name,panel] of tabs) {
     assert.match(html,new RegExp(`<section id="${panel}"[^>]*role="tabpanel"[^>]*aria-labelledby="view-${name}"`));

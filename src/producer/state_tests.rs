@@ -69,6 +69,7 @@ fn record(n: u32, state: RunState, daemon: DaemonIdentity) -> RunRecord {
         finished_at: None,
         diagnostics: None,
         group_status: None,
+        failure: None,
         origin: RunOrigin::Manual,
     }
 }

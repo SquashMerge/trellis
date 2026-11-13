@@ -537,7 +537,7 @@ test("Sequence URLs wait for authentication and checkout, use the returned seed,
   const seed = await H.seedId(server, paths.token, "transform");
   const sequenceRequests = () => requests.filter(row => row.url.pathname.endsWith("/sequence"));
   const pinned = new URLSearchParams({sid:seed, rootKey:server.rootKey, ...pin});
-  async function authenticateRoute(query, {valid = false, backend = false} = {}) {
+  async function authenticateRoute(query, {valid = false, backend = false, stale = false} = {}) {
     await page.goto("about:blank");
     const before = sequenceRequests().length;
     await page.goto(`${server.base}/#sequence?${query}`, {waitUntil:"domcontentloaded"});
@@ -559,6 +559,11 @@ test("Sequence URLs wait for authentication and checkout, use the returned seed,
       await page.locator("#method-source").click();
       await assertExactSource(page, flowSource);
       assert.deepEqual(await page.locator("#source .highlight .line-number").allTextContents(), [String(dto.seed.range.startLine)]);
+    } else if (stale) {
+      // #951 (owner ruling 2026-11-12): a well-formed link for another snapshot opens the root view.
+      await page.waitForFunction(() => location.hash === "" && document.querySelector("#view-architecture")?.getAttribute("aria-selected") === "true");
+      assert.equal(await page.locator("#error").isVisible(), false, "a stale link shows no error");
+      assert.equal(sequenceRequests().length, before);
     } else {
       if (responsePromise) assert.notEqual((await responsePromise).status(), 200);
       await page.waitForFunction(() => !document.querySelector("#error").hidden && document.querySelector("#sequence-state")?.textContent.length > 0);
@@ -573,7 +578,7 @@ test("Sequence URLs wait for authentication and checkout, use the returned seed,
   for (const patch of [{rootKey:"f".repeat(64)}, {indexGeneration:"00000000-0000-4000-8000-000000000000"}, {indexRevision:String(pin.indexRevision + 1)}]) {
     const query = new URLSearchParams(pinned);
     for (const [key, value] of Object.entries(patch)) query.set(key, value);
-    await authenticateRoute(query);
+    await authenticateRoute(query, {stale:!patch.rootKey});
   }
   await authenticateRoute(new URLSearchParams({sid:"missing-explicit-callable"}), {backend:true});
   await authenticateRoute(new URLSearchParams());
@@ -722,6 +727,56 @@ test("retained Files and diagram evidence names the newer head until explicit ke
   assert.equal(requests.some(row => row.method === "POST" && row.url.pathname.endsWith("/index")), false, "comparison and reload never index automatically");
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, "390px Files has no page overflow");
   await capture(page, "viewer-reloaded-head-mobile");
+  return head;
+}, t.signal));
+
+// #951 (owner ruling 2026-11-12): a stale link or history entry strips the URL, adds no history
+// entry and lands on the root view (Architecture) with no error.
+async function openMeasuredSequence(page) {
+  await expandSources(page);
+  await page.locator('.file-pick[title="src/flow.js"]').click();
+  // The metric inspector's callable opens a Sequence through the history-owning route.
+  const measured = page.locator("#metric-inspector-top button.metric-top-open").filter({hasText:/^measured$/});
+  await measured.waitFor();
+  await measured.click();
+  await page.waitForFunction(() => location.hash.startsWith("#sequence?sid=") && /Pele rendered/.test(document.querySelector("#sequence-state")?.textContent || ""));
+}
+async function moveHead(server, paths, pin) {
+  const flowQ = flowSource.replace("value + 1", "value + 20");
+  writeFileSync(join(paths.workspace, "src", "flow.js"), flowQ);
+  return H.indexThroughApi(server, paths.token, pin, "src/flow.js", flowQ);
+}
+async function assertStaleRoot(page, entries) {
+  await page.waitForFunction(() => location.hash === "" && history.state === null &&
+    document.querySelector("#view-architecture")?.getAttribute("aria-selected") === "true");
+  assert.equal(await page.evaluate(() => history.length), entries, "no history entry is added");
+  assert.equal(await page.locator("#error").isVisible(), false, "a stale entry shows no error");
+  assert.doesNotMatch(await page.locator("#sequence-state").textContent(), /Cannot open sequence/);
+  assert.equal(await page.locator("#architecture-panel").isVisible(), true);
+}
+
+test("#951 a reload after the index head moves opens the root view, not a stale-link error", {timeout:240000}, async t => published(async ({page, paths, server, pin}) => {
+  await openMeasuredSequence(page);
+  const head = await moveHead(server, paths, pin);
+  const entries = await page.evaluate(() => history.length);
+  await page.reload({waitUntil:"domcontentloaded"});
+  await page.locator("#token").fill(paths.token);
+  await page.locator("#connect-form button[type=submit]").click();
+  await page.locator("#workspace").waitFor({state:"visible"});
+  await assertStaleRoot(page, entries);
+  return head;
+}, t.signal));
+
+test("#951 Back to an entry from before the head moved opens the root view, not a stale-entry error", {timeout:240000}, async t => published(async ({page, paths, server, pin}) => {
+  await openMeasuredSequence(page);
+  const head = await moveHead(server, paths, pin);
+  await page.locator("#retained-pin-status").waitFor({state:"visible"});
+  await page.locator("#reload-head").click();
+  await page.waitForFunction(expected => new RegExp(`rev(?:ision)? ${expected}`).test(document.querySelector("#workspace-index-label")?.textContent || ""),
+    `${head.indexGeneration.slice(0, 8)}:${head.indexRevision}`);
+  const entries = await page.evaluate(() => history.length);
+  await page.goBack();
+  await assertStaleRoot(page, entries);
   return head;
 }, t.signal));
 

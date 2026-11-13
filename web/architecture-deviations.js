@@ -18,8 +18,6 @@
   const PARAMS = {kind:"instances", rule:"$layers", status:"deviates", role:"production", excepted:"false", limit:"500"};
   const CONFLICTS = ["revision_conflict", "pin_expired", "root_changed"];
   const INVALID = "Invalid Architecture detail response. Nothing displayed.";
-  // The tree replaces the drawing and its toolbar (app switcher, metric controls, ⓘ); its own header leads back (#845).
-  const HIDDEN = ["#architecture-diagram", "#architecture-legend", ".architecture-edge-legend", "#architecture-panel .architecture-toolbar"];
   const MODULE = "(module)";
   // Unnamed owners (closures) are named after their nearest named callable from the Files outline,
   // read for at most this many files, and pages of 200 symbols per file, per tree (#845).
@@ -72,7 +70,8 @@
     };
     // A line's symbol is its resolved target's written name without its path, qualified by its named ancestors
     // (`Type::method` in Rust, `Class.method` elsewhere). An unnamed Rust impl block reads its type from `impls`
-    // (from `implNames`, the Files outline) and is otherwise left out. A site with no target reads its spelling (#911).
+    // (from `implNames`, the Files outline) and is otherwise left out. A site with no target, or whose target has no named
+    // segment, reads its spelling (#911, #941).
     const ANONYMOUS = /^[A-Za-z_]+@\d+$/, IMPL = /^implementation@\d+$/;
     const segmentsOf = target => {
       const key = target.displayKey, path = target.document?.path;
@@ -86,7 +85,7 @@
       const types = impls?.get(t.syntaxId) ?? [];
       let next = 0;
       const parts = segmentsOf(t).map(part => !ANONYMOUS.test(part) ? part : IMPL.test(part) ? types[next++] ?? null : null).filter(Boolean);
-      return parts.join(t.document?.language === "rust" ? "::" : ".") || t.displayKey;
+      return parts.join(t.document?.language === "rust" ? "::" : ".") || (typeof evidence.spelling === "string" && evidence.spelling) || t.displayKey;
     };
     // `names` maps an unnamed owner's syntax ID to its nearest named enclosing callable (from `closureNames`);
     // `impls` maps a target's syntax ID to the types of its unnamed impl blocks (from `implNames`).
@@ -249,8 +248,8 @@
 
   function create(deps) {
     const states = new Map(), nodes = new Map();
-    let opened = false, trigger = null, ticket = 0, chrome = null, base = null, tree = null, phase = "idle", progress = "", errorInfo = null,
-      hiddenNotice = false, feedback = null, pending = null, lineActive = null, activeKey = null, visible = [], hiddenNodes = [], loadedKey = null;
+    let opened = false, ticket = 0, chrome = null, base = null, tree = null, phase = "idle", progress = "", errorInfo = null,
+      hiddenNotice = false, feedback = null, pending = null, lineActive = null, activeKey = null, visible = [], loadedKey = null;
     const basisKey = () => {
       const basis = deps.basis();
       return basis ? JSON.stringify([basis.pin.indexGeneration, basis.pin.indexRevision, basis.rulesHash]) : "none";
@@ -264,27 +263,16 @@
     const fallbackActive = () => opened && deps.current() && basisKey() === loadedKey;
     const isActive = () => (lineActive || fallbackActive)();
 
-    function hide() {
-      if (hiddenNodes.length) return;
-      for (const selector of HIDDEN) {
-        const node = document.querySelector(selector);
-        if (node) { hiddenNodes.push([node, node.hidden]); node.hidden = true; }
-      }
-    }
-    function showHidden() {
-      for (const [node, was] of hiddenNodes) node.hidden = was;
-      hiddenNodes = [];
-    }
-
     function ensureChrome() {
       if (chrome) return;
       const root = get("architecture-deviations");
-      const back = make("button", deps.backLabel?.() ?? "← Architecture", "deviations-back"); back.type = "button"; back.id = "architecture-deviations-back";
-      back.addEventListener("click", () => close());
+      // The tree is its own tab (#965); Show on diagram returns to Architecture with the chosen edge highlighted.
+      const back = make("button", "Show on diagram", "deviations-show"); back.type = "button"; back.id = "architecture-deviations-diagram";
+      back.addEventListener("click", () => deps.showDiagram?.(state().chip));
       const title = make("h2", "Deviations"); title.id = "architecture-deviations-title";
       const summary = make("p", "", "detail"); summary.id = "architecture-deviations-summary";
       const help = make("p", "Expand a file to see its functions and lines. Select a line for its actions, or open its menu with ⋯, right-click or Shift+F10.", "detail");
-      const header = make("div", undefined, "deviations-header"); header.append(back, title, summary, help);
+      const header = make("div", undefined, "deviations-header"); header.append(title, back, summary, help);
       const edges = make("div", undefined, "deviations-edges"); edges.id = "architecture-deviations-edges";
       edges.setAttribute("role", "group"); edges.setAttribute("aria-label", "Deviation edge");
       const calls = make("input"); calls.type = "checkbox"; calls.id = "architecture-deviations-calls";
@@ -396,51 +384,47 @@
       render();
     }
 
-    function close() {
-      if (!opened) return;
-      opened = false; ticket++; showHidden();
-      if (chrome) chrome.root.hidden = true;
-      deps.overview();
-      // Back returns to the arrow or badge that opened the tree, else to the review chip or the drawing.
-      const target = (trigger && trigger.isConnected !== false && !trigger.closest?.("[hidden]") ? trigger : null) || get("architecture-review") || get("architecture-diagram");
-      target?.focus?.();
-    }
-    function open(next) {
+    // Shows the tree, read once per basis. `chip` is the filter to open on: an edge key, null for every edge,
+    // or undefined to keep the remembered one (the tab chosen by itself). A filter opens with nothing selected
+    // and Calls only off (AC10, #845). An already read tree only switches filter; a new one reads under the
+    // state set here, so the chip applies once loaded.
+    function show(chip = undefined) {
       if (!deps.current()) return;
-      if (next) trigger = next;
-      if (opened && chrome && loadedKey === basisKey() && phase !== "error") { (nodes.get(activeKey)?.el || chrome.box).focus(); return; }
-      opened = true; hide(); ensureChrome(); chrome.root.hidden = false;
-      const reading = load();
-      chrome.back.focus();
-      return reading;
+      if (chip !== undefined) Object.assign(state(), {chip, callsOnly:false, selected:null});
+      if (opened && chrome && loadedKey === basisKey() && phase !== "error") {
+        if (chip !== undefined) { hiddenNotice = false; refilter(); deps.overview(); render(); }
+        return;
+      }
+      opened = true; ensureChrome(); chrome.root.hidden = false;
+      return load();
     }
-    // Opens on one layer pair's chip with nothing selected and Calls only off. An already open tree
-    // just switches filter. A new tree reads under the state set here, so the chip applies once loaded.
-    function openEdge(sourceLayer, destinationLayer, next) {
-      if (!deps.current()) return;
-      Object.assign(state(), {chip:edgeKey(sourceLayer, destinationLayer), callsOnly:false, selected:null});
-      if (!opened || !base) return open(next);
-      hiddenNotice = false; refilter(); deps.overview(); render();
-    }
+    const open = () => show(null);
+    const openEdge = (sourceLayer, destinationLayer) => show(edgeKey(sourceLayer, destinationLayer));
     function reset(keepReopen = false) {
       if (!keepReopen) pending = null;
-      ticket++; opened = false; showHidden(); lineActive = null;
+      ticket++; opened = false; lineActive = null;
       base = tree = null; phase = "idle"; progress = ""; errorInfo = null; hiddenNotice = false; feedback = null; activeKey = null; visible = []; nodes.clear();
       state().selected = null;
       if (chrome) { chrome.root.replaceChildren(); chrome.root.hidden = true; chrome = null; }
     }
     function reopenAfterRefresh() {
       const s = state();
-      pending = {chip:s.chip, callsOnly:s.callsOnly, trigger};
+      pending ??= {chip:s.chip, callsOnly:s.callsOnly};
     }
+    // Once a refresh has read the snapshot, the tab's tree opens again: on the remembered chip after a
+    // Reload or a rules change, else on its own state.
     function afterRefresh() {
-      if (!pending) return;
-      const {chip, callsOnly, trigger:was} = pending;
+      const was = pending;
       pending = null;
       if (!deps.current()) return;
-      Object.assign(state(), {chip, callsOnly, expanded:new Set(), selected:null});
-      return open(was);
+      if (!was) return show();
+      Object.assign(state(), {chip:was.chip, callsOnly:was.callsOnly, expanded:new Set(), selected:null});
+      return show();
     }
+    // The chip a tree read by the next refresh opens on.
+    function want(chip) { pending = {chip, callsOnly:false}; }
+    // The tree's filter, for the tab's link.
+    const filter = () => state().chip;
     const snapshot = () => {
       if (!opened) return null;
       const s = state();
@@ -448,8 +432,9 @@
     };
     async function restore(saved, active) {
       if (!saved || !deps.current() || (active && !active())) return;
+      pending = null;
       Object.assign(state(), {chip:saved.chip ?? null, callsOnly:!!saved.callsOnly, expanded:new Set(saved.expanded || []), selected:saved.selected ?? null});
-      opened = true; hide(); ensureChrome(); chrome.root.hidden = false;
+      opened = true; ensureChrome(); chrome.root.hidden = false;
       return load(active, true);
     }
 
@@ -458,12 +443,12 @@
       const s = state();
       Object.assign(s, change); refilter();
       if (s.selected && !findLine(s.selected)) { s.selected = null; hiddenNotice = true; deps.overview(); }
-      render(); focus();
+      render(); focus(); deps.onFilter?.(s.chip);
     }
     function clearFilter() {
       const s = state();
       Object.assign(s, {chip:null, callsOnly:false, selected:null}); hiddenNotice = false; refilter(); render();
-      chrome.edges.children[0]?.focus();
+      chrome.edges.children[0]?.focus(); deps.onFilter?.(null);
     }
 
     function render() {
@@ -506,7 +491,7 @@
       }
       if (Number.isSafeInteger(unknown) && unknown > 0) {
         const inspect = make("button", "Inspect same-layer and unassigned references"); inspect.type = "button"; inspect.id = "architecture-deviations-inspect";
-        inspect.addEventListener("click", () => { close(); deps.inspectUnknown(); });
+        inspect.addEventListener("click", () => deps.inspectUnknown());
         slots.unknown.append(make("span", unknown === 1 ? "1 unknown rule instance is not a deviation." : `${num(unknown)} unknown rule instances are not deviations.`), inspect);
       }
       if (errorInfo) {
@@ -725,7 +710,9 @@
       target.append(make("p", labels[line.kind], "detail"), make("p", `in ${line.fn}${line.closure ? " (in a closure)" : ""}`));
       const list = make("dl");
       const row = (term, value, tone) => { const dd = make("dd", value); if (tone) dd.dataset.tone = tone; list.append(make("dt", term), dd); };
-      row("Refers to", t ? t.displayKey : `${e.spelling ?? ""} (spelling, not a resolved symbol)`);
+      // The line's qualified name (#911) and where it is defined; the target's internal key is never shown (#941).
+      row("Refers to", t ? (validLines(t.lines) && typeof t.document?.path === "string" ? `${line.symbol} · ${t.document.path}:${t.lines.start}` : line.symbol)
+        : `${e.spelling ?? ""} (spelling, not a resolved symbol)`);
       row("Defined at", t ? `${t.document.path}:${t.lines.start}` : REASONS[e.targetReason] ?? "no binding");
       row("Layers", `${up ? "↑" : "⇄"} ${i.sourceLayer} → ${i.destinationLayer} ${up ? "upward " : ""}deviation`, "error");
       row("File pair", `${i.target.path} → ${i.destination.path}`);
@@ -738,7 +725,13 @@
       const primary = items.find(item => item.id === "sequence") || items.find(item => item.id === "call-site");
       const button = item => {
         const node = make("button", item.label, item === primary ? "deviation-primary" : "deviation-secondary"); node.type = "button"; node.dataset.action = item.id;
-        node.addEventListener("click", () => { if (active()) return item.run(); });
+        node.addEventListener("click", async () => {
+          if (!active() || node.disabled) return;
+          if (item.id !== "sequence") return item.run();
+          // Reading a sequence can take seconds: the button says so and takes no second click (#940).
+          node.disabled = true; node.setAttribute("aria-busy", "true"); node.textContent = "Opening sequence…";
+          try { await item.run(); } finally { node.disabled = false; node.setAttribute("aria-busy", "false"); node.textContent = item.label; }
+        });
         return node;
       };
       if (primary) target.append(button(primary));
@@ -746,7 +739,7 @@
       if (exception) target.append(button(exception), make("p", model.exceptionNote(i.referenceCount, i.target.path, i.destination.path), "detail"));
     }
 
-    return {open, openEdge, close, reset, reopenAfterRefresh, afterRefresh, snapshot, restore, isOpen:() => opened};
+    return {show, open, openEdge, reset, reopenAfterRefresh, afterRefresh, snapshot, restore, filter, want, isOpen:() => opened};
   }
 
   window.TrellisDeviations = Object.freeze({create, model});

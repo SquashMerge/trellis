@@ -274,13 +274,20 @@ impl<'w> Document<'w, '_> {
         })
     }
 
-    /// The call expression whose span is exactly `range`. A native call over an `await` spans
-    /// the awaited expression, so that one reaches the call it awaits.
+    /// The call expression measured at exactly `range`. A native call over an `await` spans
+    /// the awaited expression, so that one reaches the call it awaits; the `await f<T>(x)`
+    /// misparse is measured from its callee (#958).
     fn call_node(&self, range: &Range) -> Option<Node<'w>> {
         let mut node = self
             .root
             .descendant_for_byte_range(range.start, range.end)?;
         loop {
+            if node.kind() == "call_expression"
+                && crate::native_evidence::awaited_callee(node).is_some()
+                && crate::native_evidence::js_call_range(node) == *range
+            {
+                return Some(node);
+            }
             if node.start_byte() == range.start && node.end_byte() == range.end {
                 match node.kind() {
                     "call_expression" => return Some(node),
@@ -993,7 +1000,9 @@ async fn h() {}
             serde_json::to_value(Confidence::Unresolved).unwrap(),
             "unresolved"
         );
-        assert_eq!((call.range.start, call.range.end), (56, 84));
+        // The awaited call `api<string>("/health")`, without its `await`, as for a call
+        // without type arguments (#958).
+        assert_eq!((call.range.start, call.range.end), (62, 84));
         assert_eq!(call.lines.start, 2);
         assert!(call.call_id.is_some());
         let caller = serde_json::to_value(call.caller.as_ref().unwrap()).unwrap();
