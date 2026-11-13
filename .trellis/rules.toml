@@ -62,6 +62,10 @@ paths = [
   "src/native_evidence_occurrence_identity_tests.rs",
   "src/native_evidence_parallel_extraction_tests.rs",
   "src/native_evidence_revision_digest_tests.rs",
+  # In-file test modules moved out of src/semantic_evidence.rs (R1, #1004).
+  "src/semantic_evidence_coverage_reason_tests.rs",
+  "src/semantic_evidence_native_index_tests.rs",
+  "src/semantic_evidence_witness_tests.rs",
 ]
 
 [layers.storage]
