@@ -835,7 +835,7 @@ function resetCheckout() {
   classSupport = null;
   for (const controller of pendingRequests) controller.abort();
   clearTimeout(pollTimer); pollTimer = null; statusSerial++;
-  clearTimeout(followTimer); followTimer = null; followSeen = null; hideAgentNote(); clearRecovery();
+  clearTimeout(followTimer); followTimer = null; followSeen = null; hideAgentNote(); clearSequenceOpen(); clearRecovery();
   pairRefreshPending = false; pairRefreshQueued = null;
   clearDependencyCatalog(); clearExternalSources(); clearBrowse(); clearSource(); sourceCache.clear();
   status = null; statusUnavailable = false; jobUnavailable = false; indexNotReady = false; staleMessage = ""; job = null; waitingForJob = false;
@@ -1871,13 +1871,61 @@ function renderIncidentalToggle(data, options) {
 }
 // The method Fit was asked for: a redraw of it keeps Fit, another opens at its own size (#558).
 let sequenceFitted = null;
+// Open in Sequence from Architecture (#940). Its read can take seconds, so the header says a
+// sequence is opening until the Sequence tab shows it. An open that the index or another view
+// supersedes, or that fails, is never dropped silently: the note says why and offers Retry,
+// which opens the same caller and calls at the head shown then. A newer open replaces the note.
+let sequenceOpen = null;
+function showSequenceOpen(text, retry = null) {
+  $("sequence-open-label").textContent = text;
+  $("sequence-open-retry").hidden = !retry; $("sequence-open-close").hidden = !retry;
+  $("sequence-open").dataset.state = retry ? "stopped" : "opening";
+  $("sequence-open").hidden = false;
+}
+function clearSequenceOpen() {
+  sequenceOpen = null;
+  $("sequence-open").hidden = true; $("sequence-open-label").textContent = "";
+}
+$("sequence-open-retry").addEventListener("click", () => {
+  const retry = sequenceOpen?.retry;
+  if (retry) void perform(retry);
+});
+$("sequence-open-close").addEventListener("click", clearSequenceOpen);
 async function openArchitectureSequence(caller, sites, pin, saved, active) {
-  if (!active() || !saved || !IndexPin.equal(pin, status?.revision)) return;
-  const data = await api("/api/sequence", "POST", {seed:caller.syntaxId, expectedRevision:pin, showAll:false, interactions:true}, active);
-  if (!active()) return;
-  if (!IndexPin.equal(data?.revision, pin) || data?.seed?.id !== caller.syntaxId) throw new Error("Sequence provenance mismatch. Nothing displayed.");
+  const open = {session:epoch, root:selectedRootKey, retry:null};
+  sequenceOpen = open;
+  const mine = () => sequenceOpen === open && open.session === epoch && open.root === selectedRootKey;
+  const stop = text => {
+    if (!mine()) return;
+    // Retry owns the view as the original open did: a navigation, view, section or source
+    // change made while its read is pending drops it with the note, never a takeover.
+    open.retry = () => {
+      const context = navigationContext(), marks = viewMarks();
+      return openArchitectureSequence(caller, sites, context.revision, saved, () => navigationCurrent(context) && viewMarks() === marks);
+    };
+    showSequenceOpen(text, open.retry);
+  };
+  const cancelled = () => stop(pin && status?.revision && !IndexPin.equal(pin, status.revision)
+    ? "The index moved to a newer revision; Open in Sequence was cancelled." : "The view changed; Open in Sequence was cancelled.");
+  if (!active() || !saved || !pin || !IndexPin.equal(pin, status?.revision)) return cancelled();
+  showSequenceOpen(`Opening sequence for ${caller.name || "the caller"}…`);
+  let data;
+  try {
+    data = await api("/api/sequence", "POST", {seed:caller.syntaxId, expectedRevision:pin, showAll:false, interactions:true}, () => active() && mine());
+  } catch (error) {
+    if (error.name === "AbortError") return cancelled();
+    stop(`Open in Sequence failed: ${error.message}`);
+    // A revision conflict still refreshes status, as any pinned read's does.
+    if (IndexPin.isConflict(error)) throw error;
+    return;
+  }
+  if (!active() || !mine()) return cancelled();
+  if (!IndexPin.equal(data?.revision, pin) || data?.seed?.id !== caller.syntaxId) {
+    stop("Open in Sequence failed: Sequence provenance mismatch. Nothing displayed."); return;
+  }
   const boundary = {symbolId:caller.syntaxId, callIds:sites.map(site => site.callId)};
-  await navigateDiagram(data.seed, pin, "sequence", data, false, boundary, saved);
+  try { await navigateDiagram(data.seed, pin, "sequence", data, false, boundary, saved); }
+  finally { if (mine()) clearSequenceOpen(); }
 }
 function highlightSequenceBoundary(data, options) {
   const notice = $("sequence-boundary-status"), focus = sequenceBoundary;
