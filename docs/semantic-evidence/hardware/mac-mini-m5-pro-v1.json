@@ -62,9 +62,9 @@
       "version": "native-v17",
       "installedAtCapture": true,
       "capturedOn": "2026-11-12",
-      "installMethod": "cargo build --locked --features test-support --bin trellis; #958 extractor (TypeScript `await f<T>(x)` measured as the awaited call with callee `f`, parenthesized name callees unwrapped) on main c3ad7e15; JavaScript draft corpus captured twice byte-identical; descriptor and both captures reproducible from the README commands",
-      "artifactDigest": "sha256:f2999af1ac8ba5c7be7a3e540ac69119395a3ababe740d144c177cec69ff977e",
-      "executableHash": "f2999af1ac8ba5c7be7a3e540ac69119395a3ababe740d144c177cec69ff977e",
+      "installMethod": "cargo build --locked --features test-support --bin trellis; #958 extractor (TypeScript `await f<T>(x)` measured as the awaited call with callee `f`) on main c3ad7e15; JavaScript draft corpus captured twice byte-identical; descriptor and both captures reproducible from the README commands",
+      "artifactDigest": "sha256:0881e7bbc1ff94d807f12c9962cfc1ec1fa0a63448e6aeb8fde5373d94b42967",
+      "executableHash": "0881e7bbc1ff94d807f12c9962cfc1ec1fa0a63448e6aeb8fde5373d94b42967",
       "runtime": "trellis.native.syntax@native-v17 test-support capture build; nativeExtractor hash includes capture adapter and test-support feature flag; tree-sitter 0.27.1; tree-sitter-typescript 0.23.2; UTF-8; source-only extractionInputs []."
     },
     {
@@ -84,9 +84,9 @@
       "version": "native-v17",
       "installedAtCapture": true,
       "capturedOn": "2026-11-12",
-      "installMethod": "cargo build --locked --features test-support --bin trellis; #958 extractor (TypeScript `await f<T>(x)` measured as the awaited call with callee `f`, parenthesized name callees unwrapped) on main c3ad7e15; TypeScript draft corpus captured twice byte-identical; descriptor and both captures reproducible from the README commands",
-      "artifactDigest": "sha256:f2999af1ac8ba5c7be7a3e540ac69119395a3ababe740d144c177cec69ff977e",
-      "executableHash": "f2999af1ac8ba5c7be7a3e540ac69119395a3ababe740d144c177cec69ff977e",
+      "installMethod": "cargo build --locked --features test-support --bin trellis; #958 extractor (TypeScript `await f<T>(x)` measured as the awaited call with callee `f`) on main c3ad7e15; TypeScript draft corpus captured twice byte-identical; descriptor and both captures reproducible from the README commands",
+      "artifactDigest": "sha256:0881e7bbc1ff94d807f12c9962cfc1ec1fa0a63448e6aeb8fde5373d94b42967",
+      "executableHash": "0881e7bbc1ff94d807f12c9962cfc1ec1fa0a63448e6aeb8fde5373d94b42967",
       "runtime": "trellis.native.syntax@native-v17 test-support capture build; nativeExtractor hash includes capture adapter and test-support feature flag; tree-sitter 0.27.1; tree-sitter-typescript 0.23.2; UTF-8; source-only extractionInputs []."
     },
     {

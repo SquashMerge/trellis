@@ -38,12 +38,11 @@ Native measurement does no type checking, so `tsconfig.json` (`allowJs:false`,
 `captures/native.json` has SHA-256
 `3ef07c12b0fb72b65e4f543ea80f840c39c2f838ecb55c699c50776e844a2534`. The compiled
 native extractor hash is
-`f2999af1ac8ba5c7be7a3e540ac69119395a3ababe740d144c177cec69ff977e`, pinned as
+`0881e7bbc1ff94d807f12c9962cfc1ec1fa0a63448e6aeb8fde5373d94b42967`, pinned as
 `trellis-native-v17-typescript-test-support` in
 `docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json`. #958 moved the extractor to
 native-v17: the TypeScript `await f<T>(x)` misparse (a call of `await f`) is measured as the
-awaited call `f<T>(x)` with callee `f`, and a parenthesized name or member callee
-(`(f)(x)`) is unwrapped. This corpus has neither construct; two recaptures are
+awaited call `f<T>(x)` with callee `f`. This corpus has no such call; two recaptures are
 byte-identical and differ from the native-v16 capture only in occurrence IDs, which
 include the producer version. The native anchors below are the native-v17 IDs.
 

@@ -853,8 +853,9 @@ const w = import(\"./api\") as Promise<unknown>;
     }
 }
 
-/// #958: a call under `await`, `yield`, `void`, `!`, parentheses, `new` or optional
-/// chaining is measured with the inner callee token and its own span.
+/// #958: a call under `await`, `yield`, `void`, `!`, `new` or optional chaining is measured
+/// with the inner callee token and its own span. A parenthesized callee stays a compound
+/// expression with no token.
 #[test]
 fn wrapped_calls_measure_the_inner_callee() {
     let source = "\
@@ -897,6 +898,8 @@ async function n() { return (await f(12)); }
                 .iter()
                 .map(|name| ((*name).to_owned(), Some((*name).to_owned())))
                 .collect();
+        let mut expected = expected;
+        expected[7] = ("(f)".to_owned(), None);
         if measured != expected {
             wrong.push((path, measured));
         }

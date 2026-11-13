@@ -34,14 +34,13 @@ answers are empty. `generated/manifest.json` selects the content-addressed bundl
 ## Current native-v17 recapture
 
 #958 measures the TypeScript `await f<T>(x)` misparse (a call of `await f`) as the
-awaited call `f<T>(x)` with callee `f`, and unwraps a parenthesized name or member callee
-(`(f)(x)`). NATIVE_VERSION moves to native-v17. The production `native-capture` command
+awaited call `f<T>(x)` with callee `f`. NATIVE_VERSION moves to native-v17. The production `native-capture` command
 re-ran twice on these unchanged snapshots using pinned Rust 1.99.1 and `test-support`.
 Both outputs were byte-identical (SHA-256
 `77c3bb1b0c52a551dc63ca92c7c3ce5af80e90df3f130ef8d497fd686de83a7c`). This corpus has
-neither construct, so only the producer version, extractor hash and occurrence IDs (which
+no such call, so only the producer version, extractor hash and occurrence IDs (which
 include the producer version) differ from the native-v16 capture. The compiled native
-extractor hash is `f2999af1ac8ba5c7be7a3e540ac69119395a3ababe740d144c177cec69ff977e`,
+extractor hash is `0881e7bbc1ff94d807f12c9962cfc1ec1fa0a63448e6aeb8fde5373d94b42967`,
 pinned as `trellis-native-v17-javascript-test-support` in the hardware profile.
 
 ## Historical native-v16 recapture

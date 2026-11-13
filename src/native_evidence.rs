@@ -2519,27 +2519,6 @@ pub(crate) fn js_call_range(n: Node<'_>) -> Range {
     }
 }
 
-/// The JavaScript or TypeScript expression that names a call's callee: the awaited callee of
-/// the `await f<T>(x)` misparse, and a name or member under parentheses (`(f)(x)`,
-/// `(obj.m)(x)`). Any other parenthesized callee stays the written expression.
-fn js_callee<'a>(call: Node<'a>, expr: Node<'a>) -> Node<'a> {
-    if let Some(callee) = awaited_callee(call) {
-        return callee;
-    }
-    let mut inner = expr;
-    while inner.kind() == "parenthesized_expression" && inner.named_child_count() == 1 {
-        let Some(next) = inner.named_child(0) else {
-            break;
-        };
-        inner = next;
-    }
-    if matches!(inner.kind(), "identifier" | "member_expression") {
-        inner
-    } else {
-        expr
-    }
-}
-
 fn callee(n: Node<'_>, f: &SourceFile) -> (Option<String>, Option<Range>) {
     let expr = n
         .child_by_field_name(match f.language.as_str() {
@@ -2553,8 +2532,9 @@ fn callee(n: Node<'_>, f: &SourceFile) -> (Option<String>, Option<Range>) {
     let Some(expr) = expr else {
         return (None, None);
     };
+    // The `await f<T>(x)` misparse names the awaited callee `f` (#958).
     let expr = match f.language.as_str() {
-        "javascript" | "typescript" => js_callee(n, expr),
+        "javascript" | "typescript" => awaited_callee(n).unwrap_or(expr),
         _ => expr,
     };
     let token_expr = if f.language == "rust" && expr.kind() == "generic_function" {
@@ -4420,7 +4400,7 @@ mod borrowed_witness_tests {
         let expected = digest(b"trellis.native-version-witness.v1\0", &bytes);
         assert_eq!(
             expected,
-            "862fed7c9c4da4d0188771aaac49de5be193a3bccf7b55be58d416c98c49cc31"
+            "a4f7f63d363a2d45699ce8c8e85e12248c7d878551769bf64f2e0885e78c973c"
         );
         assert_eq!(witness(&f).unwrap(), expected);
         let declarations: Vec<_> = f.declarations.iter().collect();
