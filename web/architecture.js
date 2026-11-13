@@ -389,7 +389,7 @@
     // The tab this controller shows: "diagram" (Architecture), "tree" (Deviations, #965) or null (neither).
     // A read for the tree tab draws nothing; Architecture draws the held snapshot when it is shown again.
     // `afterDraw` is what Show on diagram asks of the next drawing: an edge to highlight, or an inspection.
-    let tab = "diagram", afterDraw = null, restoring = false;
+    let tab = "diagram", afterDraw = null, restoring = false, routing = false;
     // The band that holds the selected stub's end, so its label can say `client end` / `server end` (AC25).
     let endMark = null;
     let reviewMode = "unassigned", draft = null, preview = null, editSerial = 0, editBusy = false, busyOwner = 0;
@@ -691,7 +691,11 @@
     // the tree's chip (undefined keeps the tree's own). The tree reads once per snapshot and app.
     function showDeviations(filter = {}) {
       tab = "tree"; afterDraw = null; placeReview();
-      if (filter.app !== undefined && filter.app !== scopes.get()) scopes.set(filter.app);
+      // The caller's route already names this app and edge; the app change it makes must not rewrite it to every edge.
+      if (filter.app !== undefined && filter.app !== scopes.get()) {
+        routing = true;
+        try { scopes.set(filter.app); } finally { routing = false; }
+      }
       if (!held()) {
         if (filter.edge !== undefined) deviations.want(filter.edge);
         return refresh();
@@ -718,7 +722,7 @@
       if (tab === "tree") {
         deviations.reset(); coverage(); overview();
         if (!get("architecture-review-panel").hidden) renderReview();
-        navigate?.filter({app:scopeName(), edge:null});
+        if (!routing) navigate?.filter({app:scopeName(), edge:null});
         return deviations.show(null);
       }
       if (scopeName() === drawnScope) return following;

@@ -63,7 +63,7 @@ function emulateDetails(full, url, edgePairs) {
     rulesFile:{contentHash:query.get("rulesHash")}, kind, offset, total:items.length,
     nextOffset:offset + limit < items.length ? offset + limit : null, items:items.slice(offset, offset + limit)}};
 }
-function harness() {
+function harness(extra = {}) {
   const elements = new Map(), calls = [], detailCalls = [], renders = [], reads = [], conflicts = [], timers = [], edgePairs = new Map(), sequences = [];
   let context = {rootKey:"checkout-one",session:1,pin}, response = async () => ({payload:fixture(),catchingUp:false}), full = null, detailError = null, detailGate = null;
   // Created nodes with an id (the inspector's review chips, #449) resolve by that id; the newest wins.
@@ -104,7 +104,7 @@ function harness() {
     }
     return {...data, payload:{...full, references, rules}};
   },context:() => context,
-    readSource:(site,revision,current) => reads.push({site,revision,current}),openSequence:(...args) => sequences.push(args),onConflict:() => conflicts.push(true)});
+    readSource:(site,revision,current) => reads.push({site,revision,current}),openSequence:(...args) => sequences.push(args),onConflict:() => conflicts.push(true), ...extra});
   const button = label => {const found = descendants(get("architecture-inspector-content")).find(item => item.tagName === "button" && item.textContent === label);assert.ok(found, `Missing ${label}`);return found;};
   return {timers,window,controller,calls,detailCalls,renders,sequences,reads,conflicts,get,button,setContext:value => {context=value;},setResponse:fn => {response=fn;},setRenderer:fn => {renderer=fn;},setDetailError:error => {detailError=error;},setDetailGate:gate => {detailGate=gate;}};
 }
@@ -2289,4 +2289,26 @@ test("#860 a module-level closure joins its file's module row: one (module level
   const [row] = modules;
   deq(row.lines.map(line => [line.evidence.lines.start, line.closure]), [[10, false], [30, true]], "both lines, the closure still marked");
   deq([row.calls, row.references], [1, 2], "counts are combined");
+});
+
+
+test("review965 an app-and-edge route keeps the edge in navigation when it changes the shared app", async () => {
+  let choice, h;
+  const wanted = {app:"web", edge:"UI→Common"};
+  let route = {...wanted};
+  h = harness({
+    appScope: {get:() => choice.get("checkout-one"), set:next => choice.set("checkout-one", next)},
+    navigate: {filter:filter => { route = {...filter}; }},
+  });
+  choice = h.window.TrellisArchitectureApps.selection();
+  choice.subscribe(() => { void h.controller.scopeChanged(); });
+  const dto = appsFixture();
+  dto.edges.push({sourceLayer:"UI", destinationLayer:"Common", role:"production", count:1, status:"deviates", excepted:false, exceptionReason:null, pairs:[]});
+  h.setResponse(async () => ({payload:dto}));
+  await h.controller.refresh();
+  assert.equal(choice.get("checkout-one"), null);
+  await h.controller.showDeviations(wanted);
+  await flush(); await flush();
+  assert.equal(h.controller.deviationsFilter().edge, wanted.edge, "the displayed tree keeps the requested edge");
+  assert.deepEqual(route, wanted, "the shared-app change must not rewrite the route to every edge");
 });
