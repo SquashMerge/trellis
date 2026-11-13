@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 // Report whether the pinned Chromium that verify-env.mjs downloaded can load
-// on this Linux host without installing system packages. tools/verify runs
-// `playwright install-deps` (apt) only when this exits non-zero, so CI does not
-// depend on the apt mirrors when the runner image already has the libraries.
+// and lay text out as the browser suite expects on this Linux host without
+// installing system packages. tools/verify runs `playwright install-deps`
+// (apt) only when this exits non-zero, so CI does not depend on the apt
+// mirrors when the runner image already has what that install provides.
 //
-// Exit 0: every shared library of both Chromium builds resolves (ldd).
-// Exit 1: a library is missing, or the check itself could not run; either way
-// verify falls back to installing the system packages.
+// Exit 0: every shared library of both Chromium builds resolves (ldd) and the
+// font the layout tests measure text in is installed (fc-list).
+// Exit 1: a library or the font is missing, or a check itself could not run;
+// either way verify falls back to installing the system packages.
 import { spawnSync } from "node:child_process";
 import { readdirSync, realpathSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -23,6 +25,19 @@ function missingLibraries(file, directory) {
   return result.stdout.split("\n").map((line) => line.trim())
     .filter((line) => line.includes("=>") && line.endsWith("not found"))
     .map((line) => line.split("=>")[0].trim());
+}
+
+// `playwright install-deps` also installs fonts. The browser suite's layout
+// tests measure text in the host's default sans-serif, and their bounds hold
+// for Liberation Sans (fonts-liberation); a runner image with the libraries
+// but without that font lays diagrams out wider and fails them (#1010).
+const FONT = "Liberation Sans";
+
+// Whether fontconfig lists the font, or null when fc-list cannot run.
+function fontInstalled() {
+  const result = spawnSync("fc-list", [":", "family"], { encoding: "utf8" });
+  if (result.error || result.status !== 0) return null;
+  return result.stdout.split("\n").some((line) => line.split(",").some((family) => family.trim() === FONT));
 }
 
 function main() {
@@ -52,6 +67,16 @@ function main() {
     return 1;
   }
   console.log("verify browser libraries: every shared library resolves");
+  const font = fontInstalled();
+  if (font === null) throw new Error("fc-list could not list the installed fonts");
+  if (!font) {
+    // Best effort, for the log: what the layout tests would have measured in.
+    const fallback = spawnSync("fc-match", ["sans-serif", "family"], { encoding: "utf8" });
+    const resolved = fallback.status === 0 && fallback.stdout.trim() ? fallback.stdout.trim() : "unknown";
+    console.log(`verify browser libraries: missing font ${FONT} (sans-serif resolves to ${resolved})`);
+    return 1;
+  }
+  console.log(`verify browser libraries: font ${FONT} is installed`);
   return 0;
 }
 
