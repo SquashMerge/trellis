@@ -4,7 +4,8 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const vm = require("node:vm");
 // web/sequence.js after the script it reads the source witness from, as index.html loads them.
-const sequenceSource = ["web/source-witness.js", "web/sequence.js"].map(file => fs.readFileSync(file, "utf8")).join("\n");
+// Then web/pele-svg.js, which web/sequence-pele.js reads its shared helpers from.
+const sequenceSource = ["web/source-witness.js", "web/sequence.js", "web/pele-svg.js"].map(file => fs.readFileSync(file, "utf8")).join("\n");
 class Element {
   constructor(tag) { this.tag = tag; this.children = []; this.attrs = {}; this.textContent = ""; this.listeners = {}; }
   setAttribute(key, value) { this.attrs[key] = value; }
@@ -225,6 +226,31 @@ test("Pele rejects changed inline style and oversized SVG before DOMParser", asy
   assert.equal(stale.status, "stale");
 });
 
+// #1018: Sequence rejects active or resource markup before DOMParser, as the other Pele adapters
+// do. The element allowlist rejected these elements already, but only after parsing them.
+test("Pele rejects active and resource markup before DOMParser, and still parses what Pele draws", () => {
+  const vendor = {};
+  vm.runInNewContext(fs.readFileSync("web/vendor/pele-1.10.0-trellis.2.js", "utf8"), vendor);
+  let parses = 0;
+  const sandbox = {window:{}, TextEncoder, DOMParser:class { parseFromString() { parses++; throw Error("parsed"); } }};
+  vm.runInNewContext(sequenceSource, sandbox);
+  vm.runInNewContext(fs.readFileSync("web/sequence-pele.js", "utf8"), sandbox);
+  const adapter = sandbox.window.TrellisPeleSequence;
+  for (const language of ["javascript", "rust", "java", "python"]) {
+    const projection = adapter.project(peleFixture(language)), raw = vendor.pele.render(projection.source, {}).svg;
+    for (const markup of ["<script>1</script>", "<foreignObject></foreignObject>", '<image href="x"/>', '<a href="x"></a>', "</script>", "<!-- <script -->"]) {
+      parses = 0;
+      assert.throws(() => adapter.validatedSvg(raw.replace("</svg>", `${markup}</svg>`), projection),
+        error => error.code === "unsupported" && error.message === "Unexpected SVG element", `${language} ${markup}`);
+      assert.equal(parses, 0, `${language} ${markup}`);
+    }
+    // What Pele really draws passes the check and reaches the parser.
+    parses = 0;
+    assert.throws(() => adapter.validatedSvg(raw, projection), /^Error: parsed$/, language);
+    assert.equal(parses, 1, language);
+  }
+});
+
 test("real Chromium validates pinned SVG and source note identity under unchanged CSP", async t => {
   if (!process.env.PLAYWRIGHT_BROWSERS_PATH) { t.skip("Playwright browser is provisioned by ./tools/verify"); return; }
   const {chromium} = require("./browser/node_modules/playwright");
@@ -235,11 +261,11 @@ test("real Chromium validates pinned SVG and source note identity under unchange
     page.on("pageerror", error => errors.push(error.message));
     await page.route("http://127.0.0.1:43987/**", route => {
       const path = new URL(route.request().url()).pathname;
-      const assets = {"/vendor/pele-1.10.0-trellis.2.js":"web/vendor/pele-1.10.0-trellis.2.js", "/source-witness.js":"web/source-witness.js", "/sequence.js":"web/sequence.js", "/sequence-pele.js":"web/sequence-pele.js"};
+      const assets = {"/vendor/pele-1.10.0-trellis.2.js":"web/vendor/pele-1.10.0-trellis.2.js", "/source-witness.js":"web/source-witness.js", "/sequence.js":"web/sequence.js", "/pele-svg.js":"web/pele-svg.js", "/sequence-pele.js":"web/sequence-pele.js"};
       if (assets[path]) return route.fulfill({status:200, contentType:"text/javascript; charset=utf-8", body:fs.readFileSync(assets[path])});
       if (path === "/test.css") return route.fulfill({status:200, contentType:"text/css", body:"#diagram { width:240px; height:110px; overflow:auto }"});
       return route.fulfill({status:200, contentType:"text/html; charset=utf-8", body:
-        `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'"><script src="/vendor/pele-1.10.0-trellis.2.js"></script><script src="/source-witness.js"></script><script src="/sequence.js"></script><script src="/sequence-pele.js"></script><link rel="stylesheet" href="/test.css"><div id="diagram"></div>`});
+        `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'"><script src="/vendor/pele-1.10.0-trellis.2.js"></script><script src="/source-witness.js"></script><script src="/sequence.js"></script><script src="/pele-svg.js"></script><script src="/sequence-pele.js"></script><link rel="stylesheet" href="/test.css"><div id="diagram"></div>`});
     });
     await page.goto("http://127.0.0.1:43987/");
     await page.evaluate(() => document.addEventListener("securitypolicyviolation", event =>

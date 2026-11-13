@@ -6,8 +6,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const source = fs.readFileSync(path.join(__dirname, "../web/classes.js"), "utf8");
-// The scripts index.html loads before the views: the pin, the source witness (for navigation.js) and the context menu.
-const sharedSource = ["index-pin.js", "source-witness.js", "context-menu.js"].map(file => fs.readFileSync(path.join(__dirname, "../web", file), "utf8")).join("\n");
+// The scripts index.html loads before the views: the pin, the source witness (for navigation.js), the context menu and the shared Pele helpers.
+const sharedSource = ["index-pin.js", "source-witness.js", "context-menu.js", "pele-svg.js"].map(file => fs.readFileSync(path.join(__dirname, "../web", file), "utf8")).join("\n");
 const descendants = node => [node, ...node.children.flatMap(descendants)];
 const text = node => descendants(node).map(item => item.textContent).join(" ");
 const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => {resolve = yes; reject = no;}); return {promise, resolve, reject}; };

@@ -3,17 +3,16 @@
 // node and member line to the original DTO object; no relation is ever drawn.
 (() => {
   "use strict";
-  const SVG_NS = "http://www.w3.org/2000/svg";
-  const ROOT_STYLE = "--_bg:var(--pele-bg,#fff);--_fg:var(--pele-fg,#1f1f1f);--_m:var(--pele-muted,#6e6e6e);--_l:var(--pele-line,#1f1f1f);--_s:var(--pele-surface,#f3f3f3);--_a:var(--pele-surface-alt,#e6e6e6);--_b:var(--pele-border,#8a8a8a);--_c:var(--pele-accent,#5b7bd5);color:var(--_fg);--_r:var(--pele-radius,4px);--_hw:var(--pele-heading-weight,bold);--_fm:var(--pele-font-mono,monospace);font:14px sans-serif;letter-spacing:normal;word-spacing:normal;text-transform:none;direction:ltr;font-family:var(--pele-font,sans-serif)";
+  const {unsupported, encode, themeOnce} = window.TrellisPeleSvg;
+  const ROOT_STYLE = window.TrellisPeleSvg.rootStyle(14, {heading:true});
   const tags = new Set(["svg", "g", "path", "rect", "text", "tspan"]);
   const attrs = new Set(["xmlns", "class", "viewBox", "width", "height", "fill", "role", "aria-roledescription", "transform", "stroke", "font-size", "data-id", "d", "x", "y", "rx", "text-anchor", "font-weight", "xml:space"]);
   // Bounds match the card view: 24 classes and 200 members per compartment.
   // Pele itself rejects sources over 50,000 characters.
   const MAX_CLASSES = 24, MAX_MEMBERS = 200, MAX_SOURCE = 50000, LABEL = 60, MEMBER = 96;
-  function unsupported(reason) { const error = new Error(reason); error.code = "unsupported"; throw error; }
-  // Pele decodes numeric entities into SVG text. Escape everything outside a
-  // small literal alphabet so repository text cannot become Mermaid grammar.
-  const encode = value => Array.from(String(value)).map(c => /[A-Za-z0-9 ._-]/.test(c) ? c : `#${c.codePointAt(0)};`).join("");
+  const ADMISSION = {kind:"class", mark:true, theme:raw => themeOnce(raw, ROOT_STYLE), active:/<\/?(?:script|foreignObject|image|a)\b/i, tags, attrs, words:{
+    large:"Class SVG output too large", root:"Changed Pele class root/theme", theme:"Changed Pele class root/theme", style:"Unexpected inline class style",
+    active:"Unexpected class SVG element", invalid:"Invalid class SVG", element:"Unexpected class SVG element", attribute:"Unexpected class SVG attribute"}};
   // Display text only: control characters and whitespace runs become one space.
   const tidy = value => String(value).replace(/[\u0000-\u001f\u007f\s]+/g, " ").trim();
   const clip = (value, max) => { const chars = Array.from(value); return chars.length > max ? chars.slice(0, max - 1).join("") + "…" : value; };
@@ -72,22 +71,7 @@
     return new Set(open);
   }
   function validatedSvg(raw, projection) {
-    if (typeof raw !== "string" || new TextEncoder().encode(raw).length > 8 * 1024 * 1024) unsupported("Class SVG output too large");
-    const start = /^<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg" class="pele pele-class"/;
-    const signature = ` style="${ROOT_STYLE}"`;
-    if (!start.test(raw) || raw.split(signature).length !== 2) unsupported("Changed Pele class root/theme");
-    const safe = raw.replace(signature, "").replace(start, '<svg xmlns="http://www.w3.org/2000/svg" class="pele pele-class trellis-pele"')
-      .replaceAll(' style="rx:var(--_r)"', ' rx="var(--_r)"');
-    if (/\sstyle\s*=|<style\b/i.test(safe)) unsupported("Unexpected inline class style");
-    // Reject active/resource markup before DOM parsing.
-    if (/<\/?(?:script|foreignObject|image|a)\b/i.test(safe)) unsupported("Unexpected class SVG element");
-    const root = new DOMParser().parseFromString(safe, "image/svg+xml").documentElement;
-    if (root.localName !== "svg" || root.namespaceURI !== SVG_NS || root.querySelector("parsererror")) unsupported("Invalid class SVG");
-    let count = 0;
-    for (const node of [root, ...root.querySelectorAll("*")]) {
-      if (++count > 12000 || node.namespaceURI !== SVG_NS || !tags.has(node.localName)) unsupported("Unexpected class SVG element");
-      for (const a of node.attributes) if (!attrs.has(a.name) || /url\s*\(|javascript:|<|>|[\u0000-\u001f]/i.test(a.value)) unsupported("Unexpected class SVG attribute");
-    }
+    const {root} = window.TrellisPeleSvg.admit(raw, ADMISSION);
     const groups = [...root.querySelectorAll(".pele-node")];
     if (groups.length !== projection.classes.length || root.querySelectorAll("[data-id]").length !== projection.classes.length ||
         root.querySelectorAll(".pele-edge, .pele-edge-label, .pele-cluster, .pele-note, .pele-note-edge").length) unsupported("Missing, extra or related Pele class node");

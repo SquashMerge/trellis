@@ -1,16 +1,16 @@
 "use strict";
 // Pele is presentation only. Statement positions bind notes and messages to original DTO objects.
 (() => {
-  const ROOT_STYLE = "max-width:100%;height:auto;--_bg:var(--pele-bg,#fff);--_fg:var(--pele-fg,#1f1f1f);--_m:var(--pele-muted,#6e6e6e);--_l:var(--pele-line,#1f1f1f);--_s:var(--pele-surface,#f3f3f3);--_a:var(--pele-surface-alt,#e6e6e6);--_b:var(--pele-border,#8a8a8a);--_c:var(--pele-accent,#5b7bd5);color:var(--_fg);--_r:var(--pele-radius,4px);--_hw:var(--pele-heading-weight,bold);--_fm:var(--pele-font-mono,monospace);font:16px sans-serif;letter-spacing:normal;word-spacing:normal;text-transform:none;direction:ltr;font-family:var(--pele-font,sans-serif)";
-  const SVG_NS = "http://www.w3.org/2000/svg";
+  const {unsupported, encode, rootStyle, themeOnce, asButton, NS:SVG_NS} = window.TrellisPeleSvg;
   const LAYOUT = '%%{init: {"sequence": {"actorMargin": 12}}}%%';
   const kinds = new Set(["call", "group", "branch", "loop", "try", "effect", "return", "throw", "exit", "await", "note", "boundary", "definition", "callback"]);
   const tags = new Set(["svg", "g", "path", "rect", "text", "tspan"]);
   const attrs = new Set(["xmlns", "class", "viewBox", "width", "height", "fill", "fill-opacity", "role", "aria-roledescription", "transform", "stroke", "font-size", "data-id", "d", "x", "y", "rx", "text-anchor", "font-weight", "stroke-dasharray", "stroke-linecap", "xml:space"]);
-  function unsupported(reason) { const error = new Error(reason); error.code = "unsupported"; throw error; }
-  // Pele decodes numeric entities into SVG text. Escape everything outside
-  // a small literal alphabet so repository text cannot become Mermaid grammar.
-  const encode = value => Array.from(String(value)).map(c => /[A-Za-z0-9 ._-]/.test(c) ? c : `#${c.codePointAt(0)};`).join("");
+  // Pele omits the heading-weight variable when no opt/alt/loop frame exists.
+  const THEME = {prefix:"max-width:100%;height:auto;"}, PLAIN_STYLE = rootStyle(16, THEME), FRAMED_STYLE = rootStyle(16, {...THEME, heading:true});
+  const ADMISSION = {kind:"sequence", mark:true, active:/<\/?(?:script|foreignObject|image|a)\b/i, tags, attrs, words:{
+    large:"SVG output too large", root:"Unexpected Pele root", theme:"Unexpected Pele theme", style:"Unexpected inline Pele style",
+    active:"Unexpected SVG element", invalid:"Invalid SVG", element:"Unexpected SVG element", attribute:"Unexpected SVG attribute"}};
   const witness = window.TrellisSourceWitness;
   function project(view, expanded = new Set(), options = {}) {
     if (!view || !view.seed || !Array.isArray(view.steps) || !Array.isArray(view.participants) || !view.revision) unsupported("Invalid sequence view");
@@ -199,26 +199,8 @@
   }
 
   function validatedSvg(raw, projection) {
-    if (typeof raw !== "string" || new TextEncoder().encode(raw).length > 8 * 1024 * 1024) unsupported("SVG output too large");
-    const start = /^<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg" class="pele pele-sequence"/;
-    if (!start.test(raw)) unsupported("Unexpected Pele root");
-    // Pele omits the heading-weight variable when no opt/alt/loop frame exists.
-    const rootStyle = projection.frames.some(frame => frame !== "rect")
-      ? ROOT_STYLE : ROOT_STYLE.replace("--_hw:var(--pele-heading-weight,bold);", "");
-    const signature = ` style="${rootStyle}"`;
-    if (raw.split(signature).length !== 2) unsupported("Unexpected Pele theme");
-    let safe = raw.replace(signature, "").replace(start, '<svg xmlns="http://www.w3.org/2000/svg" class="pele pele-sequence trellis-pele"');
-    safe = safe.replaceAll(' style="rx:var(--_r)"', ' rx="var(--_r)"');
-    if (/\sstyle\s*=|<style\b/i.test(safe)) unsupported("Unexpected inline Pele style");
-    const root = new DOMParser().parseFromString(safe, "image/svg+xml").documentElement;
-    if (root.tagName !== "svg" || root.namespaceURI !== SVG_NS || root.querySelector("parsererror")) unsupported("Invalid SVG");
-    let nodes = 0;
-    for (const node of [root, ...root.querySelectorAll("*")]) {
-      if (++nodes > 12000 || node.namespaceURI !== SVG_NS || !tags.has(node.localName)) unsupported("Unexpected SVG element");
-      for (const a of node.attributes) {
-        if (!attrs.has(a.name) || /url\s*\(|javascript:|<|>|[\u0000-\u001f]/i.test(a.value)) unsupported("Unexpected SVG attribute");
-      }
-    }
+    const theme = raw => themeOnce(raw, projection.frames.some(frame => frame !== "rect") ? FRAMED_STYLE : PLAIN_STYLE);
+    const {root} = window.TrellisPeleSvg.admit(raw, {...ADMISSION, theme});
     const notes = [...root.querySelectorAll(".pele-note")];
     if (notes.length !== projection.noteIds.length) unsupported("Missing Pele note");
     const ids = new Set();
@@ -290,14 +272,10 @@
         const [{participant, proof} = {}] = lane.targets.size === 1 ? lane.targets.values() : [];
         if (!proof || typeof options.onOpenTarget !== "function") continue;
         for (const actor of actors.filter(node => node.getAttribute("data-id") === lane.alias)) {
-          actor.setAttribute("role", "button"); actor.setAttribute("tabindex", "0");
-          actor.setAttribute("data-trellis-target-id", participant.id);
-          actor.setAttribute("aria-label", `${window.TrellisSequence.targetActionLabel(participant.declaration, participant)}: ${participant.declaration.name}`);
-          const open = () => {
+          asButton(actor, `${window.TrellisSequence.targetActionLabel(participant.declaration, participant)}: ${participant.declaration.name}`, () => {
             if (active() && window.TrellisSequence.target(view, proof) === participant) options.onOpenTarget(participant.declaration, proof);
-          };
-          actor.addEventListener("click", open);
-          actor.addEventListener("keydown", event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); open(); } });
+          });
+          actor.setAttribute("data-trellis-target-id", participant.id);
         }
       }
       const selected = {id:options.selectedId || null};
@@ -314,17 +292,13 @@
           arrow.setAttribute("data-trellis-target-id", row.target.id);
         }
         if (row.previewEntryCallId) note.setAttribute("data-trellis-preview-call-id", row.previewEntryCallId);
-        note.setAttribute("tabindex", "0"); note.setAttribute("role", "button");
-        note.setAttribute("aria-label", `Inspect ${step.kind}: ${step.label}${row.previewEntryCallId ? `; first measured entry ${row.preview.label}, call ${row.previewEntryCallId}; remaining calls collapsed` : ""} (${step.path}:${step.range.startLine})`);
-        note.setAttribute("aria-pressed", String(selected.id === row.id));
-        const select = () => {
+        asButton(note, `Inspect ${step.kind}: ${step.label}${row.previewEntryCallId ? `; first measured entry ${row.preview.label}, call ${row.previewEntryCallId}; remaining calls collapsed` : ""} (${step.path}:${step.range.startLine})`, () => {
           if (!active() || !witness(step) || row.id !== step.id || row.callId !== step.callId || row.path !== step.path || row.range !== step.range || projection.rows[i] !== row) return;
           selected.id = row.id;
           for (const n of rowNodes) n.setAttribute("aria-pressed", String(n.getAttribute("data-trellis-step-id") === row.id));
           if (options.onSelect) options.onSelect(step); else if (readSource) readSource(step);
-        };
-        note.addEventListener("click", select);
-        note.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); select(); } });
+        });
+        note.setAttribute("aria-pressed", String(selected.id === row.id));
         if (step.kind === "group") {
           // Attach the HTML action to its already verified SVG note. Geometry
           // places it only; ordinal/original-object witnesses own identity.

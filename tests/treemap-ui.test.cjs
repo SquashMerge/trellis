@@ -294,7 +294,7 @@ function resizeHarness() {
   const observers = [], timers = [], painted = [], held = [];
   const h = harness({ResizeObserver:class { constructor(callback) { observers.push(callback); } observe() {} },
     setTimeout:callback => { timers.push(callback); return timers.length; }, clearTimeout:() => {}, getComputedStyle:() => ({})});
-  const adapter = {}; vm.runInNewContext(fs.readFileSync(path.join(__dirname, "../web/treemap-pele.js"), "utf8"), {window:adapter, TextEncoder});
+  const adapter = {}; vm.runInNewContext(["pele-svg.js", "treemap-pele.js"].map(file => fs.readFileSync(path.join(__dirname, "../web", file), "utf8")).join("\n"), {window:adapter, TextEncoder});
   h.window.TrellisTreemapPele.layoutSize = adapter.TrellisTreemapPele.layoutSize;
   const box = h.get("treemap-diagram");
   let hold = () => false;

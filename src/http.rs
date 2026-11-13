@@ -2594,6 +2594,15 @@ pub fn router(state: Arc<DaemonState>) -> Router {
             }),
         )
         .route(
+            "/pele-svg.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../web/pele-svg.js"),
+                )
+            }),
+        )
+        .route(
             "/sequence.js",
             get(|| async {
                 (
@@ -3937,6 +3946,15 @@ impl ProvisionedBrowser {
                     (
                         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
                         include_str!("../web/context-menu.js"),
+                    )
+                }),
+            )
+            .route(
+                "/pele-svg.js",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                        include_str!("../web/pele-svg.js"),
                     )
                 }),
             )

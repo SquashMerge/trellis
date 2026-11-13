@@ -4,8 +4,8 @@ const {chromium}=require("playwright");
 const {fixture}=require("../fixtures/pele-1.10.0-trellis.2/architecture-fixture.cjs");
 const root=path.resolve(__dirname,"../..");
 test("Architecture patched Pele admission is atomic, non-positional and CSP-safe",async()=>{
- const routes={"/vendor.js":"web/vendor/pele-1.10.0-trellis.2.js","/adapter.js":"web/architecture-pele.js"};
- const server=http.createServer((req,res)=>{res.setHeader("Content-Security-Policy","default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; connect-src 'self'; img-src 'self'");if(routes[req.url]){res.setHeader("Content-Type","text/javascript; charset=utf-8");res.end(fs.readFileSync(path.join(root,routes[req.url])));}else{res.setHeader("Content-Type","text/html; charset=utf-8");res.end('<!doctype html><div id="canvas"></div><script src="/vendor.js"></script><script src="/adapter.js"></script>');}});
+ const routes={"/vendor.js":"web/vendor/pele-1.10.0-trellis.2.js","/pele-svg.js":"web/pele-svg.js","/adapter.js":"web/architecture-pele.js"};
+ const server=http.createServer((req,res)=>{res.setHeader("Content-Security-Policy","default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; connect-src 'self'; img-src 'self'");if(routes[req.url]){res.setHeader("Content-Type","text/javascript; charset=utf-8");res.end(fs.readFileSync(path.join(root,routes[req.url])));}else{res.setHeader("Content-Type","text/html; charset=utf-8");res.end('<!doctype html><div id="canvas"></div><script src="/vendor.js"></script><script src="/pele-svg.js"></script><script src="/adapter.js"></script>');}});
  await new Promise(resolve=>server.listen(0,"127.0.0.1",resolve));let browser;
  try{browser=await chromium.launch();const page=await browser.newPage({viewport:{width:1440,height:1000}});const errors=[];page.on("pageerror",error=>errors.push(error.message));await page.goto(`http://127.0.0.1:${server.address().port}`);
  const view=fixture();view.edges.push({...view.edges[0],status:"deviates",excepted:true,exceptionReason:"Reviewed fixture exception"});
@@ -53,8 +53,8 @@ test("Architecture patched Pele admission is atomic, non-positional and CSP-safe
  }finally{if(browser)await browser.close();await new Promise(resolve=>server.close(resolve));}
 });
 test("AC9, AC10: an action stat is a focusable sibling of its band, moves with it and activates the callback",async()=>{
- const routes={"/vendor.js":"web/vendor/pele-1.10.0-trellis.2.js","/adapter.js":"web/architecture-pele.js"};
- const server=http.createServer((req,res)=>{if(routes[req.url]){res.setHeader("Content-Type","text/javascript; charset=utf-8");res.end(fs.readFileSync(path.join(root,routes[req.url])));}else{res.setHeader("Content-Type","text/html; charset=utf-8");res.end('<!doctype html><div id="canvas"></div><script src="/vendor.js"></script><script src="/adapter.js"></script>');}});
+ const routes={"/vendor.js":"web/vendor/pele-1.10.0-trellis.2.js","/pele-svg.js":"web/pele-svg.js","/adapter.js":"web/architecture-pele.js"};
+ const server=http.createServer((req,res)=>{if(routes[req.url]){res.setHeader("Content-Type","text/javascript; charset=utf-8");res.end(fs.readFileSync(path.join(root,routes[req.url])));}else{res.setHeader("Content-Type","text/html; charset=utf-8");res.end('<!doctype html><div id="canvas"></div><script src="/vendor.js"></script><script src="/pele-svg.js"></script><script src="/adapter.js"></script>');}});
  await new Promise(resolve=>server.listen(0,"127.0.0.1",resolve));let browser;
  try{browser=await chromium.launch();const page=await browser.newPage({viewport:{width:1440,height:1000}});await page.goto(`http://127.0.0.1:${server.address().port}`);
  const result=await page.evaluate(async view=>{
