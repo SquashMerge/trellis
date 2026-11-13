@@ -78,6 +78,7 @@ pub mod semantic_evidence;
 pub mod semantic_import;
 #[cfg(test)]
 mod semantic_join_inputs_tests;
+pub mod semantic_records;
 pub mod skipped_config;
 pub(crate) mod skipped_source;
 pub mod source_dir;

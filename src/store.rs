@@ -503,7 +503,7 @@ pub type RetentionStateForTests = ((String, i64, i64), (i64, i64));
 #[doc(hidden)]
 pub struct PrivateStageObservation {
     pub pin: IndexPin,
-    pub semantic: crate::semantic_evidence::SemanticSnapshot,
+    pub semantic: crate::semantic_records::SemanticSnapshot,
     pub native_revision: crate::native_records::Revision,
     pub declarations: Vec<crate::native_records::Declaration>,
     pub calls: Vec<crate::native_records::Call>,
@@ -513,9 +513,9 @@ pub struct PrivateStageObservation {
 /// separate comparison with the requested pin; captured provenance is unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SemanticHistory {
-    pub coverage: crate::semantic_evidence::Coverage,
-    pub provenance: Vec<crate::semantic_evidence::Provenance>,
-    pub presentation_freshness: crate::semantic_evidence::Freshness,
+    pub coverage: crate::semantic_records::Coverage,
+    pub provenance: Vec<crate::semantic_records::Provenance>,
+    pub presentation_freshness: crate::semantic_records::Freshness,
 }
 
 /// Test-support switches for one store's semantic publication (#893): the file S writes its
@@ -2255,7 +2255,7 @@ impl EvidenceResponse {
                 serde_json::json!({
                     "name": app.name, "source": app.source, "kind": app.kind,
                     "manifest": app.manifest, "roots": app.roots, "entries": app.entries,
-                    "languages": crate::semantic_evidence::LANGUAGE_ORDER
+                    "languages": crate::semantic_records::LANGUAGE_ORDER
                         .iter()
                         .filter(|language| languages.contains(**language))
                         .collect::<Vec<_>>(),
@@ -2797,7 +2797,7 @@ impl EvidenceResponse {
                 serde_json::json!({
                     "name": app.name, "kind": app.kind, "manifest": app.manifest,
                     "roots": app.roots, "entries": app.entries,
-                    "languages": crate::semantic_evidence::LANGUAGE_ORDER
+                    "languages": crate::semantic_records::LANGUAGE_ORDER
                         .iter()
                         .filter(|language| languages.contains(**language))
                         .collect::<Vec<_>>(),
@@ -7029,10 +7029,10 @@ fn semantic_variant<T: Serialize>(value: &T) -> Result<String> {
 /// The stored columns of a target. An internal target at the writing revision stores NULL,
 /// which reads as the reading revision's native revision (D1).
 fn semantic_target_values(
-    target: &crate::semantic_evidence::Target,
+    target: &crate::semantic_records::Target,
     writing: &str,
 ) -> Result<Vec<rusqlite::types::Value>> {
-    use crate::semantic_evidence::Target;
+    use crate::semantic_records::Target;
     use rusqlite::types::Value;
     Ok(match target {
         Target::Internal {
@@ -7106,7 +7106,7 @@ fn insert_semantic_target(
     db: &Connection,
     table: &str,
     parent: &[rusqlite::types::Value],
-    target: &crate::semantic_evidence::Target,
+    target: &crate::semantic_records::Target,
     writing: &str,
 ) -> Result<()> {
     let mut values = parent.to_vec();
@@ -7129,15 +7129,15 @@ pub(crate) struct AttestedProfileProducer {
     id: String,
     version: String,
     executable_hash: String,
-    position_encoding: crate::semantic_evidence::PositionEncoding,
-    languages: Vec<crate::semantic_evidence::Language>,
+    position_encoding: crate::semantic_records::PositionEncoding,
+    languages: Vec<crate::semantic_records::Language>,
 }
 
 impl AttestedProfileProducer {
     /// The profile pin of `producer`, for tests that run the whole-publication validator over a
     /// publication without a stored raw batch.
     #[cfg(feature = "test-support")]
-    pub(crate) fn pinned_for_tests(producer: &crate::semantic_evidence::Producer) -> Self {
+    pub(crate) fn pinned_for_tests(producer: &crate::semantic_records::Producer) -> Self {
         Self {
             id: producer.id.clone(),
             version: producer.version.clone(),
@@ -7147,12 +7147,12 @@ impl AttestedProfileProducer {
         }
     }
 
-    pub(crate) fn matches(&self, producer: &crate::semantic_evidence::Producer) -> bool {
+    pub(crate) fn matches(&self, producer: &crate::semantic_records::Producer) -> bool {
         producer.id == self.id
             && producer.version == self.version
             && producer.executable_hash == self.executable_hash
             && producer.position_encoding == self.position_encoding
-            && producer.kind == crate::semantic_evidence::SemanticKind::Semantic
+            && producer.kind == crate::semantic_records::SemanticKind::Semantic
             && producer.languages == self.languages
     }
 }
@@ -7178,7 +7178,7 @@ fn captured_artifacts(raw: &SelectedRawBatch) -> BTreeMap<(String, String), Vec<
 fn authenticate_stored_batch(
     raw: &SelectedRawBatch,
     inventory: &crate::scip_raw::CapturedScipInventory,
-    captured: &crate::semantic_evidence::CapturedComponents,
+    captured: &crate::semantic_records::CapturedComponents,
     r1: &crate::native_records::Artifact,
     sources: &BTreeMap<crate::native_records::DocumentKey, Vec<u8>>,
     store: &Store,
@@ -7411,7 +7411,7 @@ pub struct SelectedRawCapture {
 /// the original capture, not the subset that contributed selected provenance.
 #[derive(Debug, Clone)]
 pub struct SelectedRawBatch {
-    pub producer: crate::semantic_evidence::Producer,
+    pub producer: crate::semantic_records::Producer,
     pub requested_documents: Vec<crate::native_records::DocumentKey>,
     pub producer_id: String,
     pub source_set_id: String,
@@ -7458,7 +7458,7 @@ impl SelectedRawBatch {
 }
 
 type SelectedRawBatchResult = (
-    crate::semantic_evidence::Producer,
+    crate::semantic_records::Producer,
     Vec<crate::native_records::DocumentKey>,
     Result<SelectedRawBatch>,
 );
@@ -7633,9 +7633,9 @@ fn semantic_target_read(
     row: &rusqlite::Row<'_>,
     start: usize,
     scope: &semantic_payload::TargetScope<'_>,
-) -> Result<Option<crate::semantic_evidence::Target>> {
+) -> Result<Option<crate::semantic_records::Target>> {
     let source_set = scope.source_set;
-    use crate::semantic_evidence as sem;
+    use crate::semantic_records as sem;
     let kind: Option<String> = row.get(start)?;
     Ok(match kind.as_deref() {
         None => {
@@ -7707,7 +7707,7 @@ fn semantic_targets(
     start: usize,
     values: &[&dyn rusqlite::ToSql],
     scope: &semantic_payload::TargetScope<'_>,
-) -> Result<Vec<crate::semantic_evidence::Target>> {
+) -> Result<Vec<crate::semantic_records::Target>> {
     let rows = stmt
         .query_map(values, |row| {
             let target = semantic_target_read(row, start, scope).map_err(|e| {
@@ -7777,8 +7777,8 @@ fn semantic_symbol_key_read(
     language: Option<String>,
     path: Option<String>,
     source_set: &str,
-) -> Result<crate::semantic_evidence::SymbolKey> {
-    use crate::semantic_evidence as sem;
+) -> Result<crate::semantic_records::SymbolKey> {
+    use crate::semantic_records as sem;
     let scope = semantic_enum(scope)?;
     let document = match (scope, language, path) {
         (sem::SymbolScope::Global, None, None) => None,
@@ -7807,7 +7807,7 @@ fn semantic_symbol_keys(
     stmt: &mut rusqlite::Statement<'_>,
     id: i64,
     source_set: &str,
-) -> Result<Vec<crate::semantic_evidence::SymbolKey>> {
+) -> Result<Vec<crate::semantic_records::SymbolKey>> {
     let rows = stmt
         .query_map([id], |row| {
             Ok((
@@ -7867,7 +7867,7 @@ fn read_coverage_reasons(
     db: &Connection,
     payload: Option<i64>,
     tuple: i64,
-) -> Result<Option<crate::semantic_evidence::CoverageReasons>> {
+) -> Result<Option<crate::semantic_records::CoverageReasons>> {
     let row: Option<([i64; 4], [bool; 3])> = db
         .prepare_cached(
             "SELECT macro_invocation,attribute_item,macro_definition,other,capped,omitted,captured_diagnostics
@@ -7887,7 +7887,7 @@ fn read_coverage_reasons(
                 "incompatible_index: invalid stored coverage reason count".into(),
             ))?;
         }
-        Ok(crate::semantic_evidence::CoverageReasons::new(
+        Ok(crate::semantic_records::CoverageReasons::new(
             counts,
             capped,
             omitted,
@@ -7897,7 +7897,7 @@ fn read_coverage_reasons(
     .transpose()
 }
 
-fn read_semantic(db: &Connection, key: &str) -> Result<crate::semantic_evidence::SemanticSnapshot> {
+fn read_semantic(db: &Connection, key: &str) -> Result<crate::semantic_records::SemanticSnapshot> {
     read_semantic_tuple(db, key, None, None, false)
 }
 
@@ -7907,7 +7907,7 @@ fn read_semantic_tuple(
     selected_tuple: Option<i64>,
     history_syntax: Option<&str>,
     trusted_admitted_raw: bool,
-) -> Result<crate::semantic_evidence::SemanticSnapshot> {
+) -> Result<crate::semantic_records::SemanticSnapshot> {
     read_semantic_tuple_for_call(
         db,
         key,
@@ -7925,7 +7925,7 @@ fn read_semantic_tuple_for_call(
     history_syntax: Option<&str>,
     trusted_admitted_raw: bool,
     call_id: Option<&[u8]>,
-) -> Result<crate::semantic_evidence::SemanticSnapshot> {
+) -> Result<crate::semantic_records::SemanticSnapshot> {
     let source_set: String = db.query_row(
         "SELECT source_set_id FROM native_revisions WHERE id=?1",
         [key],
@@ -7949,7 +7949,7 @@ fn read_semantic_tuple_for_call(
 #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
 struct ReadAs<'a> {
     native: &'a str,
-    freshness: &'a BTreeMap<i64, crate::semantic_evidence::Freshness>,
+    freshness: &'a BTreeMap<i64, crate::semantic_records::Freshness>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7963,9 +7963,9 @@ fn read_semantic_tuple_with_reasons(
     with_reasons: bool,
     source_set: String,
     read_as: Option<ReadAs<'_>>,
-) -> Result<crate::semantic_evidence::SemanticSnapshot> {
+) -> Result<crate::semantic_records::SemanticSnapshot> {
     use crate::native_records::DocumentKey;
-    use crate::semantic_evidence as sem;
+    use crate::semantic_records as sem;
     let mut result = sem::SemanticSnapshot {
         producers: vec![],
         coverage: vec![],
@@ -8211,7 +8211,7 @@ fn read_semantic_history(
     document: &crate::native_records::DocumentKey,
     syntax_id: &str,
 ) -> Result<Option<SemanticHistory>> {
-    use crate::semantic_evidence::{CoverageState, Freshness};
+    use crate::semantic_records::{CoverageState, Freshness};
     let source_set: String = db.query_row(
         "SELECT source_set_id FROM native_revisions WHERE id=?1",
         [key],
@@ -8355,10 +8355,10 @@ fn read_semantic_facts(
     db: &Connection,
     projection: &semantic_payload::PayloadProjection<'_>,
     document: &crate::native_records::DocumentKey,
-    result: &mut crate::semantic_evidence::SemanticSnapshot,
+    result: &mut crate::semantic_records::SemanticSnapshot,
     selected_call: Option<&[u8]>,
 ) -> Result<()> {
-    use crate::semantic_evidence as sem;
+    use crate::semantic_records as sem;
     let source_set = &document.source_set_id;
     let Some(tuple) = projection.payload_id else {
         return Ok(());
@@ -8590,10 +8590,10 @@ fn read_semantic_call_facts(
     db: &Connection,
     projection: &semantic_payload::PayloadProjection<'_>,
     document: &crate::native_records::DocumentKey,
-    result: &mut crate::semantic_evidence::SemanticSnapshot,
+    result: &mut crate::semantic_records::SemanticSnapshot,
     selected_call: Option<&[u8]>,
 ) -> Result<()> {
-    use crate::semantic_evidence as sem;
+    use crate::semantic_records as sem;
     let source_set = &document.source_set_id;
     let Some(tuple) = projection.payload_id else {
         return Ok(());
@@ -8743,7 +8743,7 @@ fn insert_coverage_reasons(
     db: &Connection,
     payload: Option<i64>,
     tuple: Option<i64>,
-    reasons: &crate::semantic_evidence::CoverageReasons,
+    reasons: &crate::semantic_records::CoverageReasons,
 ) -> Result<()> {
     let gaps = reasons.gaps();
     execute_cached(
@@ -8765,7 +8765,7 @@ fn insert_coverage_reasons(
 }
 
 /// The columns that identify a basis, plus its lookup dependencies.
-fn basis_identity(basis: &crate::semantic_evidence::SemanticBasis) -> Result<Vec<String>> {
+fn basis_identity(basis: &crate::semantic_records::SemanticBasis) -> Result<Vec<String>> {
     let mut identity = vec![
         basis.producer_id.clone(),
         basis.producer_version.clone(),
@@ -8790,11 +8790,11 @@ fn basis_identity(basis: &crate::semantic_evidence::SemanticBasis) -> Result<Vec
 fn write_import_coverage(
     db: &Connection,
     key: &str,
-    publication: &crate::semantic_evidence::SemanticPublication,
+    publication: &crate::semantic_records::SemanticPublication,
     batch: Option<(i64, &str)>,
     inputs: &semantic_payload::KeyInputs,
 ) -> Result<()> {
-    use crate::semantic_evidence as sem;
+    use crate::semantic_records as sem;
     let native: String = query_row_cached(
         db,
         "SELECT native_revision_id FROM native_revisions WHERE id=?1",
@@ -9215,7 +9215,7 @@ fn write_staged_raw_rows(
 fn write_staged_semantic(
     db: &Connection,
     key: &str,
-    producer: &crate::semantic_evidence::Producer,
+    producer: &crate::semantic_records::Producer,
     batch: i64,
     captured_pin: &str,
     inputs: &semantic_payload::KeyInputs,
@@ -9249,7 +9249,7 @@ impl std::error::Error for RejoinOracleMismatch {}
 /// document, FULL in whole-publication order.
 #[cfg(feature = "test-support")]
 fn sorted_publication_rows(
-    publication: &crate::semantic_evidence::SemanticPublication,
+    publication: &crate::semantic_records::SemanticPublication,
 ) -> Result<Vec<Vec<Vec<u8>>>> {
     fn sorted<T: serde::Serialize>(rows: &[T]) -> Result<Vec<Vec<u8>>> {
         let mut rows = rows
@@ -9359,7 +9359,7 @@ fn decoded_selected_inventory(
 fn write_producer_descriptor(
     db: &Connection,
     key: &str,
-    producer: &crate::semantic_evidence::Producer,
+    producer: &crate::semantic_records::Producer,
 ) -> Result<()> {
     db.execute(
         "INSERT OR IGNORE INTO semantic_producers VALUES(?1,?2,?3,?4,?5,?6)",
@@ -9424,8 +9424,8 @@ fn write_semantic(
     prior: Option<IndexPin>,
     pin: IndexPin,
     supplied: Option<(
-        &crate::semantic_evidence::SemanticPublication,
-        &crate::semantic_evidence::CapturedComponents,
+        &crate::semantic_records::SemanticPublication,
+        &crate::semantic_records::CapturedComponents,
     )>,
     inputs: &semantic_payload::KeyInputs,
 ) -> Result<()> {
@@ -9508,8 +9508,8 @@ fn write_semantic_tuple(
     db: &Connection,
     payload: i64,
     native: &str,
-    coverage: &crate::semantic_evidence::Coverage,
-    publication: &crate::semantic_evidence::SemanticPublication,
+    coverage: &crate::semantic_records::Coverage,
+    publication: &crate::semantic_records::SemanticPublication,
     owns: &BTreeSet<&str>,
     dependencies: &[semantic_payload::DependencyRecord],
 ) -> Result<BTreeMap<String, i64>> {
@@ -15679,8 +15679,8 @@ impl Store {
         graph: &Graph,
         capture: &crate::capture::Capture,
         native: &crate::native_records::Artifact,
-        semantic: &crate::semantic_evidence::SemanticPublication,
-        captured: &crate::semantic_evidence::CapturedComponents,
+        semantic: &crate::semantic_records::SemanticPublication,
+        captured: &crate::semantic_records::CapturedComponents,
         leader: &topology::WriterGuard,
         expected_revision: IndexPin,
         cancel: &CancelFlag,
@@ -15706,8 +15706,8 @@ impl Store {
             &Graph,
             &crate::capture::Capture,
             &crate::native_records::Artifact,
-            &crate::semantic_evidence::SemanticPublication,
-            &crate::semantic_evidence::CapturedComponents,
+            &crate::semantic_records::SemanticPublication,
+            &crate::semantic_records::CapturedComponents,
         ),
         leader: &topology::WriterGuard,
         expected_revision: IndexPin,
@@ -15741,8 +15741,8 @@ impl Store {
             &Graph,
             &crate::capture::Capture,
             &crate::native_records::Artifact,
-            &crate::semantic_evidence::SemanticPublication,
-            &crate::semantic_evidence::CapturedComponents,
+            &crate::semantic_records::SemanticPublication,
+            &crate::semantic_records::CapturedComponents,
         ),
         leader: &topology::WriterGuard,
         expected_revision: IndexPin,
@@ -15771,8 +15771,8 @@ impl Store {
         graph: &Graph,
         capture: &crate::capture::Capture,
         native: &crate::native_records::Artifact,
-        semantic: &crate::semantic_evidence::SemanticPublication,
-        captured: &crate::semantic_evidence::CapturedComponents,
+        semantic: &crate::semantic_records::SemanticPublication,
+        captured: &crate::semantic_records::CapturedComponents,
         leader: &topology::WriterGuard,
         expected_revision: IndexPin,
         cancel: &CancelFlag,
@@ -15886,8 +15886,8 @@ impl Store {
         target: PublicationTarget<'_>,
         cancel: &CancelFlag,
         semantic: Option<(
-            &crate::semantic_evidence::SemanticPublication,
-            &crate::semantic_evidence::CapturedComponents,
+            &crate::semantic_records::SemanticPublication,
+            &crate::semantic_records::CapturedComponents,
         )>,
         during_tx: impl FnMut(PublishStage, &Connection) -> Result<()>,
     ) -> Result<IndexPin> {
@@ -15964,8 +15964,8 @@ impl Store {
         &self,
         options: &crate::model::IndexOptions,
         capture: &crate::capture::Capture,
-        semantic: &crate::semantic_evidence::SemanticPublication,
-        captured: &crate::semantic_evidence::CapturedComponents,
+        semantic: &crate::semantic_records::SemanticPublication,
+        captured: &crate::semantic_records::CapturedComponents,
         cancel: &CancelFlag,
         fail_before_commit: bool,
     ) -> Result<PrivateStageObservation> {
@@ -15995,8 +15995,8 @@ impl Store {
         options: &crate::model::IndexOptions,
         capture: &crate::capture::Capture,
         semantic: Option<(
-            &crate::semantic_evidence::SemanticPublication,
-            &crate::semantic_evidence::CapturedComponents,
+            &crate::semantic_records::SemanticPublication,
+            &crate::semantic_records::CapturedComponents,
         )>,
         cancel: &CancelFlag,
         fail_before_commit: bool,
@@ -16153,8 +16153,8 @@ impl Store {
         &self,
         options: &crate::model::IndexOptions,
         capture: &crate::capture::Capture,
-        semantic: &crate::semantic_evidence::SemanticPublication,
-        captured: &crate::semantic_evidence::CapturedComponents,
+        semantic: &crate::semantic_records::SemanticPublication,
+        captured: &crate::semantic_records::CapturedComponents,
         leader: &topology::WriterGuard,
         cancel: &CancelFlag,
         fail_before_commit: bool,
@@ -16209,8 +16209,8 @@ impl Store {
         graph: &Graph,
         capture: &crate::capture::Capture,
         native: &crate::native_records::Artifact,
-        semantic: &crate::semantic_evidence::SemanticPublication,
-        captured: &crate::semantic_evidence::CapturedComponents,
+        semantic: &crate::semantic_records::SemanticPublication,
+        captured: &crate::semantic_records::CapturedComponents,
         leader: &topology::WriterGuard,
         cancel: &CancelFlag,
         fail_before_commit: bool,
@@ -16307,8 +16307,8 @@ impl Store {
         &self,
         options: &crate::model::IndexOptions,
         capture: &crate::capture::Capture,
-        semantic: &crate::semantic_evidence::SemanticPublication,
-        captured: &crate::semantic_evidence::CapturedComponents,
+        semantic: &crate::semantic_records::SemanticPublication,
+        captured: &crate::semantic_records::CapturedComponents,
         leader: &topology::WriterGuard,
         cancel: &CancelFlag,
         fail_before_commit: bool,
@@ -16382,8 +16382,8 @@ impl Store {
         expected: RecoveryBaseline,
         cancel: &CancelFlag,
         semantic: Option<(
-            &crate::semantic_evidence::SemanticPublication,
-            &crate::semantic_evidence::CapturedComponents,
+            &crate::semantic_records::SemanticPublication,
+            &crate::semantic_records::CapturedComponents,
         )>,
         fail_before_commit: bool,
     ) -> Result<IndexPin> {
@@ -18311,8 +18311,8 @@ impl Store {
         ),
         mut during_tx: impl FnMut(PublishStage, &Connection) -> Result<()>,
         semantic: Option<(
-            &crate::semantic_evidence::SemanticPublication,
-            &crate::semantic_evidence::CapturedComponents,
+            &crate::semantic_records::SemanticPublication,
+            &crate::semantic_records::CapturedComponents,
         )>,
     ) -> Result<IndexPin> {
         let PublicationPlan { expected, target } = plan;
@@ -19445,7 +19445,7 @@ impl Store {
                 "SELECT ordinal,language FROM semantic_requested_producer_languages WHERE revision_id=?1 AND id=?2 ORDER BY ordinal",
                 &[&selected.key, &producer_id],
             )?;
-            let producer = crate::semantic_evidence::Producer {
+            let producer = crate::semantic_records::Producer {
                 id: producer_id.clone(),
                 version,
                 executable_hash,
@@ -19586,7 +19586,7 @@ impl Store {
     }
 
     /// Materialize the complete normalized semantic tree owned by this selected pin.
-    pub fn semantic_at(&self, pin: IndexPin) -> Result<crate::semantic_evidence::SemanticSnapshot> {
+    pub fn semantic_at(&self, pin: IndexPin) -> Result<crate::semantic_records::SemanticSnapshot> {
         self.native_at(pin, |db, selected| {
             let projected: bool = db.query_row(
                 "SELECT EXISTS(SELECT 1 FROM semantic_projection_origins WHERE revision_id=?1)",

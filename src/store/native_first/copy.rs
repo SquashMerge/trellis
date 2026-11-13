@@ -13,7 +13,7 @@
 //! by the read path as a typed integrity failure that schedules a re-index.
 use super::*;
 use crate::native_records::DocumentKey;
-use crate::semantic_evidence as sem;
+use crate::semantic_records as sem;
 
 /// What a copied row takes from the destination native revision.
 pub(crate) struct CopyDestination {
