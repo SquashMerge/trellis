@@ -528,7 +528,36 @@ fn target_valid(t: &ConfigTarget) -> bool {
 pub(crate) fn languages(s: &str) -> bool {
     matches!(s, "java" | "rust" | "python" | "javascript" | "typescript")
 }
+/// Parses `rules.toml`. Sections are parsed in a fixed order, which decides the first error
+/// reported and how the one glob and selector budget (`PATTERN_LIMIT`) is consumed.
 pub fn parse(text: &str) -> Result<Config> {
+    let raw = decode(text)?;
+    let peers = parse_policy(text, raw.layer_policy.peers)?;
+    let shared_outbound = parse_policy(text, raw.layer_policy.shared_outbound)?;
+    let mut patterns = 0;
+    let external_deny = external_selectors(text, &raw.external_policy.deny, &mut patterns)?;
+    let layers = parse_layers(text, raw.layers, &mut patterns)?;
+    let apps = authored_apps(text, raw.apps)?;
+    let wrappers = interface_wrappers(text, raw.interfaces)?;
+    let roles = parse_roles(text, raw.roles, &mut patterns)?;
+    let (rules, ids) = parse_rules(text, raw.rules, &roles)?;
+    let exceptions = parse_exceptions(text, raw.exceptions, &ids)?;
+    Ok(Config {
+        text: text.into(),
+        content_hash: hex::encode(Sha256::digest(text.as_bytes())),
+        layers,
+        roles,
+        rules,
+        exceptions,
+        peers,
+        shared_outbound,
+        external_deny,
+        apps,
+        wrappers,
+    })
+}
+/// The size bound, the TOML and schema decode, the version and the named collection bounds.
+fn decode(text: &str) -> Result<Raw> {
     if text.len() > CONFIG_BYTES {
         return Err(error(
             text,
@@ -577,8 +606,12 @@ pub fn parse(text: &str) -> Result<Config> {
             "named collection exceeds 1024 entries",
         ));
     }
-    let policy = |v: Option<Spanned<String>>| -> Result<Option<String>> {
-        v.map(|v| {
+    Ok(raw)
+}
+/// One `[layer_policy]` value.
+fn parse_policy(text: &str, value: Option<Spanned<String>>) -> Result<Option<String>> {
+    value
+        .map(|v| {
             if matches!(v.get_ref().as_str(), "allow" | "forbid") {
                 Ok(v.into_inner())
             } else {
@@ -592,81 +625,19 @@ pub fn parse(text: &str) -> Result<Config> {
             }
         })
         .transpose()
-    };
-    let peers = policy(raw.layer_policy.peers)?;
-    let shared_outbound = policy(raw.layer_policy.shared_outbound)?;
-    let mut patterns = 0;
-    let external_deny = external_selectors(text, &raw.external_policy.deny, &mut patterns)?;
+}
+/// The `[layers.<name>]` tables. An external package belongs to at most one layer.
+fn parse_layers(
+    text: &str,
+    raw: BTreeMap<String, Spanned<RawLayer>>,
+    patterns: &mut usize,
+) -> Result<BTreeMap<String, Layer>> {
     let mut layers = BTreeMap::new();
     let mut external_owners = BTreeMap::new();
-    for (name, raw) in raw.layers {
+    for (name, raw) in raw {
         let span = raw.span();
-        let layer = raw.into_inner();
-        if name.trim().is_empty()
-            || (layer.paths.is_empty() && layer.external.is_empty())
-            || !matches!(
-                (layer.order, layer.shared),
-                (Some(_), None) | (None, Some(true))
-            )
-        {
-            return Err(error(
-                text,
-                span,
-                "schema",
-                "token",
-                "layer requires nonempty paths or external and exactly one integer order or shared=true",
-            ));
-        }
-        let display = layer
-            .display
-            .map(|v| {
-                if matches!(v.get_ref().as_str(), "expanded" | "collapsed" | "hidden") {
-                    Ok(v.into_inner())
-                } else {
-                    Err(error(
-                        text,
-                        v.span(),
-                        "schema",
-                        "token",
-                        "layer display must be expanded, collapsed or hidden",
-                    ))
-                }
-            })
-            .transpose()?;
-        let app = layer.app.map(|v| app_name(text, v)).transpose()?;
-        if let (Some((_, span)), None) = (&app, layer.order) {
-            return Err(error(
-                text,
-                span.clone(),
-                "schema",
-                "token",
-                "app belongs on an ordered layer; a shared layer lists apps",
-            ));
-        }
-        let apps = layer.apps.map(|v| app_names(text, v)).transpose()?;
-        if let (Some(apps), Some(_)) = (&apps, layer.order) {
-            return Err(error(
-                text,
-                apps.first().map_or(span.clone(), |(_, s)| s.clone()),
-                "schema",
-                "token",
-                "apps belongs on a shared layer; an ordered layer names one app",
-            ));
-        }
-        let mut globs = layer
-            .paths
-            .iter()
-            .map(|v| {
-                Ok(LayerPattern {
-                    text: v.get_ref().clone(),
-                    matcher: pattern(text, v, true, &mut patterns)?,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        globs.sort_by(|a, b| a.text.cmp(&b.text));
-        globs.dedup_by(|a, b| a.text == b.text);
-        let external = external_selectors(text, &layer.external, &mut patterns)?;
-        for selector in &external {
+        let layer = parse_layer(text, &name, raw, patterns)?;
+        for selector in &layer.external {
             if let Some(previous) = external_owners.insert(selector.clone(), name.clone()) {
                 return Err(error(
                     text,
@@ -680,264 +651,377 @@ pub fn parse(text: &str) -> Result<Config> {
                 ));
             }
         }
-        layers.insert(
-            name,
-            Layer {
-                order: layer.order,
-                display,
-                app,
-                apps,
-                patterns: globs,
-                external,
-                span,
-            },
-        );
+        layers.insert(name, layer);
     }
-    let apps = authored_apps(text, raw.apps)?;
-    let wrappers = interface_wrappers(text, raw.interfaces)?;
+    Ok(layers)
+}
+/// One layer: its shape, display hint, app scope, path globs and external selectors.
+fn parse_layer(
+    text: &str,
+    name: &str,
+    raw: Spanned<RawLayer>,
+    patterns: &mut usize,
+) -> Result<Layer> {
+    let span = raw.span();
+    let layer = raw.into_inner();
+    if name.trim().is_empty()
+        || (layer.paths.is_empty() && layer.external.is_empty())
+        || !matches!(
+            (layer.order, layer.shared),
+            (Some(_), None) | (None, Some(true))
+        )
+    {
+        return Err(error(
+            text,
+            span,
+            "schema",
+            "token",
+            "layer requires nonempty paths or external and exactly one integer order or shared=true",
+        ));
+    }
+    let display = layer
+        .display
+        .map(|v| {
+            if matches!(v.get_ref().as_str(), "expanded" | "collapsed" | "hidden") {
+                Ok(v.into_inner())
+            } else {
+                Err(error(
+                    text,
+                    v.span(),
+                    "schema",
+                    "token",
+                    "layer display must be expanded, collapsed or hidden",
+                ))
+            }
+        })
+        .transpose()?;
+    let app = layer.app.map(|v| app_name(text, v)).transpose()?;
+    if let (Some((_, span)), None) = (&app, layer.order) {
+        return Err(error(
+            text,
+            span.clone(),
+            "schema",
+            "token",
+            "app belongs on an ordered layer; a shared layer lists apps",
+        ));
+    }
+    let apps = layer.apps.map(|v| app_names(text, v)).transpose()?;
+    if let (Some(apps), Some(_)) = (&apps, layer.order) {
+        return Err(error(
+            text,
+            apps.first().map_or(span.clone(), |(_, s)| s.clone()),
+            "schema",
+            "token",
+            "apps belongs on a shared layer; an ordered layer names one app",
+        ));
+    }
+    let mut globs = layer
+        .paths
+        .iter()
+        .map(|v| {
+            Ok(LayerPattern {
+                text: v.get_ref().clone(),
+                matcher: pattern(text, v, true, patterns)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    globs.sort_by(|a, b| a.text.cmp(&b.text));
+    globs.dedup_by(|a, b| a.text == b.text);
+    let external = external_selectors(text, &layer.external, patterns)?;
+    Ok(Layer {
+        order: layer.order,
+        display,
+        app,
+        apps,
+        patterns: globs,
+        external,
+        span,
+    })
+}
+/// The `[roles.<name>]` tables.
+fn parse_roles(
+    text: &str,
+    raw: BTreeMap<String, Spanned<RawRole>>,
+    patterns: &mut usize,
+) -> Result<BTreeMap<String, Selector>> {
     let mut roles = BTreeMap::new();
-    for (name, raw) in raw.roles {
-        let selector = raw.get_ref();
-        let s = selector.select.get_ref();
-        if name.trim().is_empty()
-            || (s.paths.is_none()
-                && s.name.is_none()
-                && s.language.is_none()
-                && s.extends.is_none()
-                && s.implements.is_none())
-        {
-            return Err(error(
-                text,
-                selector.select.span(),
-                "selector",
-                "token",
-                "selector requires at least one field",
-            ));
-        }
-        if s.paths.as_ref().is_some_and(Vec::is_empty)
-            || s.language.as_ref().is_some_and(Vec::is_empty)
-        {
-            return Err(error(
-                text,
-                selector.select.span(),
-                "selector",
-                "token",
-                "selector list must not be empty",
-            ));
-        }
-        for language in s.language.iter().flatten() {
-            if !languages(language.get_ref()) {
-                return Err(error(
-                    text,
-                    language.span(),
-                    "selector",
-                    "token",
-                    "unsupported language",
-                ));
-            }
-        }
-        for base in [s.extends.as_ref(), s.implements.as_ref()]
-            .into_iter()
-            .flatten()
-        {
-            if base.get_ref().trim().is_empty() {
-                return Err(error(
-                    text,
-                    base.span(),
-                    "selector",
-                    "token",
-                    "base spelling must not be blank",
-                ));
-            }
-        }
-        roles.insert(
-            name,
-            Selector {
-                paths: s
-                    .paths
-                    .iter()
-                    .flatten()
-                    .map(|p| pattern(text, p, true, &mut patterns))
-                    .collect::<Result<_>>()?,
-                name: s
-                    .name
-                    .as_ref()
-                    .map(|p| pattern(text, p, false, &mut patterns))
-                    .transpose()?,
-                language: s
-                    .language
-                    .iter()
-                    .flatten()
-                    .map(|l| l.get_ref().clone())
-                    .collect(),
-                extends: s.extends.as_ref().map(|s| s.get_ref().clone()),
-                implements: s.implements.as_ref().map(|s| s.get_ref().clone()),
-            },
-        );
+    for (name, raw) in raw {
+        let selector = parse_role(text, &name, raw.get_ref(), patterns)?;
+        roles.insert(name, selector);
     }
+    Ok(roles)
+}
+/// One role selector: its shape first, then its globs.
+fn parse_role(
+    text: &str,
+    name: &str,
+    selector: &RawRole,
+    patterns: &mut usize,
+) -> Result<Selector> {
+    let s = selector.select.get_ref();
+    if name.trim().is_empty()
+        || (s.paths.is_none()
+            && s.name.is_none()
+            && s.language.is_none()
+            && s.extends.is_none()
+            && s.implements.is_none())
+    {
+        return Err(error(
+            text,
+            selector.select.span(),
+            "selector",
+            "token",
+            "selector requires at least one field",
+        ));
+    }
+    if s.paths.as_ref().is_some_and(Vec::is_empty) || s.language.as_ref().is_some_and(Vec::is_empty)
+    {
+        return Err(error(
+            text,
+            selector.select.span(),
+            "selector",
+            "token",
+            "selector list must not be empty",
+        ));
+    }
+    for language in s.language.iter().flatten() {
+        if !languages(language.get_ref()) {
+            return Err(error(
+                text,
+                language.span(),
+                "selector",
+                "token",
+                "unsupported language",
+            ));
+        }
+    }
+    for base in [s.extends.as_ref(), s.implements.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        if base.get_ref().trim().is_empty() {
+            return Err(error(
+                text,
+                base.span(),
+                "selector",
+                "token",
+                "base spelling must not be blank",
+            ));
+        }
+    }
+    Ok(Selector {
+        paths: s
+            .paths
+            .iter()
+            .flatten()
+            .map(|p| pattern(text, p, true, patterns))
+            .collect::<Result<_>>()?,
+        name: s
+            .name
+            .as_ref()
+            .map(|p| pattern(text, p, false, patterns))
+            .transpose()?,
+        language: s
+            .language
+            .iter()
+            .flatten()
+            .map(|l| l.get_ref().clone())
+            .collect(),
+        extends: s.extends.as_ref().map(|s| s.get_ref().clone()),
+        implements: s.implements.as_ref().map(|s| s.get_ref().clone()),
+    })
+}
+/// The `[[rules]]` entries, and the ids they define.
+fn parse_rules(
+    text: &str,
+    raw: Vec<Spanned<RawRule>>,
+    roles: &BTreeMap<String, Selector>,
+) -> Result<(Vec<Rule>, BTreeSet<String>)> {
     let mut rules = Vec::new();
     let mut ids = BTreeSet::new();
-    for raw in raw.rules {
-        let r = raw.get_ref();
-        let id = r.id.get_ref();
-        if id.trim().is_empty()
-            || matches!(id.as_str(), "$layers" | "$external")
-            || !ids.insert(id.clone())
-        {
-            return Err(error(
-                text,
-                r.id.span(),
-                "reference",
-                "token",
-                "duplicate, reserved or blank rule id",
-            ));
-        }
-        if !roles.contains_key(r.for_each.get_ref()) {
-            return Err(error(
-                text,
-                r.for_each.span(),
-                "reference",
-                "token",
-                "unknown for_each role",
-            ));
-        }
-        if r.require.is_empty() && r.forbid.is_empty() {
-            return Err(error(
-                text,
-                raw.span(),
-                "constraint",
-                "token",
-                "rule requires a constraint",
-            ));
-        }
-        let mut constraints = Vec::new();
-        for (mode, items) in [("require", &r.require), ("forbid", &r.forbid)] {
-            for value in items {
-                let c = value.get_ref();
-                if c.len() != 1 {
-                    return Err(error(
-                        text,
-                        value.span(),
-                        "constraint",
-                        "token",
-                        "constraint must contain exactly one edge kind",
-                    ));
-                }
-                let (kind, role) = c.iter().next().expect("one checked constraint");
-                if !matches!(kind.as_str(), "calls" | "extends" | "implements") {
-                    return Err(error(
-                        text,
-                        value.span(),
-                        "constraint",
-                        "token",
-                        "unknown edge constraint",
-                    ));
-                }
-                if !roles.contains_key(role) {
-                    return Err(error(
-                        text,
-                        value.span(),
-                        "reference",
-                        "token",
-                        "unknown constraint role",
-                    ));
-                }
-                constraints.push(Constraint {
-                    mode,
-                    kind: kind.clone(),
-                    role: role.clone(),
-                });
-            }
-        }
-        rules.push(Rule {
-            id: id.clone(),
-            role: r.for_each.get_ref().clone(),
-            constraints,
-        });
+    for raw in raw {
+        rules.push(parse_rule(text, &raw, roles, &mut ids)?);
     }
+    Ok((rules, ids))
+}
+fn parse_rule(
+    text: &str,
+    raw: &Spanned<RawRule>,
+    roles: &BTreeMap<String, Selector>,
+    ids: &mut BTreeSet<String>,
+) -> Result<Rule> {
+    let r = raw.get_ref();
+    let id = r.id.get_ref();
+    if id.trim().is_empty()
+        || matches!(id.as_str(), "$layers" | "$external")
+        || !ids.insert(id.clone())
+    {
+        return Err(error(
+            text,
+            r.id.span(),
+            "reference",
+            "token",
+            "duplicate, reserved or blank rule id",
+        ));
+    }
+    if !roles.contains_key(r.for_each.get_ref()) {
+        return Err(error(
+            text,
+            r.for_each.span(),
+            "reference",
+            "token",
+            "unknown for_each role",
+        ));
+    }
+    if r.require.is_empty() && r.forbid.is_empty() {
+        return Err(error(
+            text,
+            raw.span(),
+            "constraint",
+            "token",
+            "rule requires a constraint",
+        ));
+    }
+    let mut constraints = Vec::new();
+    for (mode, items) in [("require", &r.require), ("forbid", &r.forbid)] {
+        for value in items {
+            constraints.push(parse_constraint(text, mode, value, roles)?);
+        }
+    }
+    Ok(Rule {
+        id: id.clone(),
+        role: r.for_each.get_ref().clone(),
+        constraints,
+    })
+}
+fn parse_constraint(
+    text: &str,
+    mode: &'static str,
+    value: &Spanned<BTreeMap<String, String>>,
+    roles: &BTreeMap<String, Selector>,
+) -> Result<Constraint> {
+    let c = value.get_ref();
+    if c.len() != 1 {
+        return Err(error(
+            text,
+            value.span(),
+            "constraint",
+            "token",
+            "constraint must contain exactly one edge kind",
+        ));
+    }
+    let (kind, role) = c.iter().next().expect("one checked constraint");
+    if !matches!(kind.as_str(), "calls" | "extends" | "implements") {
+        return Err(error(
+            text,
+            value.span(),
+            "constraint",
+            "token",
+            "unknown edge constraint",
+        ));
+    }
+    if !roles.contains_key(role) {
+        return Err(error(
+            text,
+            value.span(),
+            "reference",
+            "token",
+            "unknown constraint role",
+        ));
+    }
+    Ok(Constraint {
+        mode,
+        kind: kind.clone(),
+        role: role.clone(),
+    })
+}
+/// What makes an exception a duplicate: its rule, target and destination.
+type ExceptionKey = (String, ExceptionTarget, Option<ExceptionTarget>);
+/// The `[[exceptions]]` entries, each naming `$layers` or one of the rule `ids`.
+fn parse_exceptions(
+    text: &str,
+    raw: Vec<Spanned<RawException>>,
+    ids: &BTreeSet<String>,
+) -> Result<Vec<Exception>> {
     let mut exceptions = Vec::new();
     let mut exception_keys = BTreeSet::new();
-    for raw in raw.exceptions {
-        let e = raw.get_ref();
-        if !(ids.contains(e.rule.get_ref()) || e.rule.get_ref() == "$layers") {
-            return Err(error(
-                text,
-                e.rule.span(),
-                "reference",
-                "token",
-                "unknown exception rule",
-            ));
+    for raw in raw {
+        exceptions.push(parse_exception(text, &raw, ids, &mut exception_keys)?);
+    }
+    Ok(exceptions)
+}
+fn parse_exception(
+    text: &str,
+    raw: &Spanned<RawException>,
+    ids: &BTreeSet<String>,
+    exception_keys: &mut BTreeSet<ExceptionKey>,
+) -> Result<Exception> {
+    let e = raw.get_ref();
+    if !(ids.contains(e.rule.get_ref()) || e.rule.get_ref() == "$layers") {
+        return Err(error(
+            text,
+            e.rule.span(),
+            "reference",
+            "token",
+            "unknown exception rule",
+        ));
+    }
+    let kind = match (
+        e.rule.get_ref().as_str(),
+        e.target.get_ref(),
+        e.destination.as_ref().map(Spanned::get_ref),
+    ) {
+        (
+            "$layers",
+            ExceptionTarget::ModulePath(source),
+            Some(ExceptionTarget::ModulePath(destination)),
+        ) if source.valid() && destination.valid() => ExceptionKind::ModulePair {
+            source: source.clone(),
+            destination: destination.clone(),
+            span: raw.span(),
+        },
+        (rule, ExceptionTarget::Native(target), None)
+            if rule != "$layers" && target_valid(target) =>
+        {
+            ExceptionKind::Declaration(target.wire())
         }
-        let kind = match (
-            e.rule.get_ref().as_str(),
-            e.target.get_ref(),
-            e.destination.as_ref().map(Spanned::get_ref),
-        ) {
-            (
-                "$layers",
-                ExceptionTarget::ModulePath(source),
-                Some(ExceptionTarget::ModulePath(destination)),
-            ) if source.valid() && destination.valid() => ExceptionKind::ModulePair {
-                source: source.clone(),
-                destination: destination.clone(),
-                span: raw.span(),
-            },
-            (rule, ExceptionTarget::Native(target), None)
-                if rule != "$layers" && target_valid(target) =>
-            {
-                ExceptionKind::Declaration(target.wire())
-            }
-            _ => {
-                return Err(error(
-                    text,
-                    raw.span(),
-                    "reference",
-                    "token",
-                    "layer exceptions require two literal language/path endpoints; declaration exceptions require one native identity",
-                ));
-            }
-        };
-        if e.reason.get_ref().trim().is_empty() {
-            return Err(error(
-                text,
-                e.reason.span(),
-                "schema",
-                "token",
-                "exception reason must not be blank",
-            ));
-        }
-        let key = (
-            e.rule.get_ref().clone(),
-            e.target.get_ref().clone(),
-            e.destination.as_ref().map(|d| d.get_ref().clone()),
-        );
-        if !exception_keys.insert(key) {
+        _ => {
             return Err(error(
                 text,
                 raw.span(),
                 "reference",
                 "token",
-                "duplicate exception",
+                "layer exceptions require two literal language/path endpoints; declaration exceptions require one native identity",
             ));
         }
-        exceptions.push(Exception {
-            rule: e.rule.get_ref().clone(),
-            kind,
-            reason: e.reason.get_ref().clone(),
-        });
+    };
+    if e.reason.get_ref().trim().is_empty() {
+        return Err(error(
+            text,
+            e.reason.span(),
+            "schema",
+            "token",
+            "exception reason must not be blank",
+        ));
     }
-    Ok(Config {
-        text: text.into(),
-        content_hash: hex::encode(Sha256::digest(text.as_bytes())),
-        layers,
-        roles,
-        rules,
-        exceptions,
-        peers,
-        shared_outbound,
-        external_deny,
-        apps,
-        wrappers,
+    let key = (
+        e.rule.get_ref().clone(),
+        e.target.get_ref().clone(),
+        e.destination.as_ref().map(|d| d.get_ref().clone()),
+    );
+    if !exception_keys.insert(key) {
+        return Err(error(
+            text,
+            raw.span(),
+            "reference",
+            "token",
+            "duplicate exception",
+        ));
+    }
+    Ok(Exception {
+        rule: e.rule.get_ref().clone(),
+        kind,
+        reason: e.reason.get_ref().clone(),
     })
 }
 
