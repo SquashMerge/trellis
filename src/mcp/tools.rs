@@ -122,174 +122,279 @@ pub struct Rejection {
 }
 /// The message of an argument naming no field this tool accepts.
 const UNKNOWN_FIELD: &str = "Invalid tool arguments: a field is not in this tool's inputSchema";
-/// The accepted and required argument fields of each known tool.
-fn fields(name: &str) -> (&'static [&'static str], &'static [&'static str]) {
-    match name {
-        "trellis_workspace_describe" => (
-            &["schemaVersion", "workspace", "coverageDocuments"],
-            &["schemaVersion"],
-        ),
-        "trellis_references" => (
-            &[
-                "schemaVersion",
-                "workspace",
-                "expectedBasis",
-                "paths",
-                "limit",
-                "offset",
-                "groupBy",
-                "depth",
-                "prefix",
-                "app",
-            ],
-            &["schemaVersion"],
-        ),
-        "trellis_rules_check" => (
-            &[
-                "schemaVersion",
-                "workspace",
-                "expectedBasis",
-                "paths",
-                "limit",
-                "offset",
-                "status",
-                "app",
-            ],
-            &["schemaVersion"],
-        ),
-        "trellis_endpoints" => (
-            &[
-                "schemaVersion",
-                "workspace",
-                "expectedBasis",
-                "app",
-                "method",
-                "pathTemplate",
-                "limit",
-                "offset",
-            ],
-            &["schemaVersion"],
-        ),
-        "trellis_rules_explain" => (
-            &[
-                "schemaVersion",
-                "workspace",
-                "expectedBasis",
-                "rule",
-                "target",
-                "destination",
-                "limit",
-                "offset",
-            ],
-            &["schemaVersion", "rule", "target"],
-        ),
-        "trellis_find_symbols" => (
-            &[
-                "schemaVersion",
-                "query",
-                "lookupKey",
-                "limit",
-                "compact",
-                "expectedBasis",
-                "workspace",
-                "app",
-            ],
-            &["schemaVersion"],
-        ),
-        "trellis_search_symbols" => (
-            &[
-                "schemaVersion",
-                "query",
-                "limit",
-                "role",
-                "compact",
-                "expectedBasis",
-                "workspace",
-                "app",
-            ],
-            &["schemaVersion", "query"],
-        ),
-        "trellis_declaration" => (
-            &[
-                "schemaVersion",
-                "symbolId",
-                "lookupKey",
-                "expectedBasis",
-                "workspace",
-            ],
-            &["schemaVersion"],
-        ),
-        "trellis_outgoing_calls" => (
-            &[
-                "schemaVersion",
-                "symbolId",
-                "lookupKey",
-                "limit",
-                "semanticProducerId",
-                "compact",
-                "includeExternal",
-                "expectedBasis",
-                "workspace",
-            ],
-            &["schemaVersion"],
-        ),
-        "trellis_incoming_calls" => (
-            &[
-                "schemaVersion",
-                "symbolId",
-                "lookupKey",
-                "limit",
-                "semanticProducerId",
-                "compact",
-                "expectedBasis",
-                "workspace",
-            ],
-            &["schemaVersion"],
-        ),
-        "trellis_show" => (
-            &[
-                "schemaVersion",
-                "view",
-                "symbolId",
-                "lookupKey",
-                "path",
-                "line",
-                "expectedBasis",
-                "workspace",
-            ],
-            &["schemaVersion", "view"],
-        ),
-        "trellis_call_graph" => (
-            &[
-                "schemaVersion",
-                "symbolId",
-                "lookupKey",
-                "semanticProducerId",
-                "depth",
-                "maxNodes",
-                "maxCalls",
-                "includeExternal",
-                "includeTests",
-                "compact",
-                "expectedBasis",
-                "workspace",
-                "app",
-            ],
-            &["schemaVersion"],
-        ),
-        _ => (
-            &[
-                "schemaVersion",
-                "path",
-                "startLine",
-                "endLine",
-                "expectedBasis",
-                "expectedContentHash",
-                "workspace",
-            ],
-            &["schemaVersion", "path", "startLine", "endLine"],
-        ),
+type Args = serde_json::Map<String, Value>;
+/// How a successful result is counted in its text summary: the count and its plural noun.
+enum Summary {
+    /// Always one item.
+    One(&'static str),
+    /// The summed lengths of arrays under `data`, each a path and what it holds.
+    Count(
+        &'static [(&'static [&'static str], &'static str)],
+        &'static str,
+    ),
+    /// A count computed from the envelope.
+    Custom(fn(&Value) -> usize, &'static str),
+}
+impl Summary {
+    fn count(&self, envelope: &Value) -> (usize, &'static str) {
+        match self {
+            Summary::One(noun) => (1, noun),
+            Summary::Count(arrays, noun) => (
+                arrays
+                    .iter()
+                    .map(|(path, what)| {
+                        path.iter()
+                            .fold(&envelope["data"], |value, key| &value[*key])
+                            .as_array()
+                            .expect(what)
+                            .len()
+                    })
+                    .sum(),
+                noun,
+            ),
+            Summary::Custom(count, noun) => (count(envelope), noun),
+        }
     }
+}
+fn source_lines(envelope: &Value) -> usize {
+    (envelope["data"]["endLine"]
+        .as_u64()
+        .expect("source end line")
+        - envelope["data"]["startLine"]
+            .as_u64()
+            .expect("source start line")
+        + 1) as usize
+}
+/// One known tool: its accepted and required argument fields, the validator of its own
+/// fields, and how its result is summarized.
+struct ToolSpec {
+    name: &'static str,
+    fields: &'static [&'static str],
+    required: &'static [&'static str],
+    validate: fn(&Args, &Reject) -> Result<(), Rejection>,
+    summary: Summary,
+}
+/// Every tool of the catalog, in catalog order.
+const SPECS: [ToolSpec; TOOLS.len()] = [
+    ToolSpec {
+        name: "trellis_workspace_describe",
+        fields: &["schemaVersion", "workspace", "coverageDocuments"],
+        required: &["schemaVersion"],
+        validate: describe_args,
+        summary: Summary::One("workspace"),
+    },
+    ToolSpec {
+        name: "trellis_find_symbols",
+        fields: &[
+            "schemaVersion",
+            "query",
+            "lookupKey",
+            "limit",
+            "compact",
+            "expectedBasis",
+            "workspace",
+            "app",
+        ],
+        required: &["schemaVersion"],
+        validate: find_args,
+        summary: Summary::Count(&[(&["symbols"], "find symbols")], "symbols"),
+    },
+    ToolSpec {
+        name: "trellis_search_symbols",
+        fields: &[
+            "schemaVersion",
+            "query",
+            "limit",
+            "role",
+            "compact",
+            "expectedBasis",
+            "workspace",
+            "app",
+        ],
+        required: &["schemaVersion", "query"],
+        validate: search_args,
+        summary: Summary::Count(&[(&["hits"], "search hits")], "hits"),
+    },
+    ToolSpec {
+        name: "trellis_declaration",
+        fields: &[
+            "schemaVersion",
+            "symbolId",
+            "lookupKey",
+            "expectedBasis",
+            "workspace",
+        ],
+        required: &["schemaVersion"],
+        validate: declaration_args,
+        summary: Summary::One("declaration"),
+    },
+    ToolSpec {
+        name: "trellis_outgoing_calls",
+        fields: &[
+            "schemaVersion",
+            "symbolId",
+            "lookupKey",
+            "limit",
+            "semanticProducerId",
+            "compact",
+            "includeExternal",
+            "expectedBasis",
+            "workspace",
+        ],
+        required: &["schemaVersion"],
+        validate: calls_args,
+        summary: Summary::Count(&[(&["calls"], "outgoing calls")], "calls"),
+    },
+    ToolSpec {
+        name: "trellis_incoming_calls",
+        fields: &[
+            "schemaVersion",
+            "symbolId",
+            "lookupKey",
+            "limit",
+            "semanticProducerId",
+            "compact",
+            "expectedBasis",
+            "workspace",
+        ],
+        required: &["schemaVersion"],
+        validate: calls_args,
+        summary: Summary::Count(&[(&["callers"], "incoming callers")], "calls"),
+    },
+    ToolSpec {
+        name: "trellis_read_source",
+        fields: &[
+            "schemaVersion",
+            "path",
+            "startLine",
+            "endLine",
+            "expectedBasis",
+            "expectedContentHash",
+            "workspace",
+        ],
+        required: &["schemaVersion", "path", "startLine", "endLine"],
+        validate: source_args,
+        summary: Summary::Custom(source_lines, "lines"),
+    },
+    ToolSpec {
+        name: "trellis_call_graph",
+        fields: &[
+            "schemaVersion",
+            "symbolId",
+            "lookupKey",
+            "semanticProducerId",
+            "depth",
+            "maxNodes",
+            "maxCalls",
+            "includeExternal",
+            "includeTests",
+            "compact",
+            "expectedBasis",
+            "workspace",
+            "app",
+        ],
+        required: &["schemaVersion"],
+        validate: call_graph_args,
+        summary: Summary::Count(&[(&["result", "edges"], "call graph edges")], "edges"),
+    },
+    ToolSpec {
+        name: "trellis_references",
+        fields: &[
+            "schemaVersion",
+            "workspace",
+            "expectedBasis",
+            "paths",
+            "limit",
+            "offset",
+            "groupBy",
+            "depth",
+            "prefix",
+            "app",
+        ],
+        required: &["schemaVersion"],
+        validate: reference_args,
+        summary: Summary::Count(
+            &[
+                (&["production"], "production edges"),
+                (&["tests"], "test edges"),
+            ],
+            "edges",
+        ),
+    },
+    ToolSpec {
+        name: "trellis_rules_check",
+        fields: &[
+            "schemaVersion",
+            "workspace",
+            "expectedBasis",
+            "paths",
+            "limit",
+            "offset",
+            "status",
+            "app",
+        ],
+        required: &["schemaVersion"],
+        validate: reference_args,
+        summary: Summary::Count(&[(&["instances"], "rule instances")], "instances"),
+    },
+    ToolSpec {
+        name: "trellis_rules_explain",
+        fields: &[
+            "schemaVersion",
+            "workspace",
+            "expectedBasis",
+            "rule",
+            "target",
+            "destination",
+            "limit",
+            "offset",
+        ],
+        required: &["schemaVersion", "rule", "target"],
+        validate: explain_args,
+        summary: Summary::Count(&[(&["instances"], "rule instances")], "instances"),
+    },
+    ToolSpec {
+        name: "trellis_show",
+        fields: &[
+            "schemaVersion",
+            "view",
+            "symbolId",
+            "lookupKey",
+            "path",
+            "line",
+            "expectedBasis",
+            "workspace",
+        ],
+        required: &["schemaVersion", "view"],
+        validate: show_args,
+        // Its summary names the outcome instead (`show::summary`).
+        summary: Summary::Count(&[], "targets"),
+    },
+    ToolSpec {
+        name: "trellis_endpoints",
+        fields: &[
+            "schemaVersion",
+            "workspace",
+            "expectedBasis",
+            "app",
+            "method",
+            "pathTemplate",
+            "limit",
+            "offset",
+        ],
+        required: &["schemaVersion"],
+        validate: endpoint_args,
+        summary: Summary::Count(&[(&["endpoints"], "endpoint rows")], "endpoints"),
+    },
+];
+fn spec(name: &str) -> Option<&'static ToolSpec> {
+    SPECS.iter().find(|spec| spec.name == name)
+}
+/// The accepted and required argument fields of a known tool.
+#[cfg(test)]
+fn fields(name: &str) -> (&'static [&'static str], &'static [&'static str]) {
+    let spec = spec(name).expect("known tool name");
+    (spec.fields, spec.required)
 }
 /// The static `invalid_request` message for one failing field of `name` (#769). Server
 /// text only: it never echoes the caller's arguments or repository content.
@@ -410,263 +515,292 @@ fn field_message(name: &str, field: &str) -> &'static str {
 pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
     check(name, args).map_err(|rejection| rejection.code)
 }
-/// [`validate`], with the failing field's message (#769).
+/// The tool and arguments under validation, for building its rejections.
+struct Reject<'a> {
+    name: &'a str,
+    args: Option<&'a Value>,
+}
+impl Reject<'_> {
+    /// An `invalid_request` names its field.
+    fn bad(&self, field: &str) -> Rejection {
+        Rejection {
+            code: "invalid_request",
+            message: Some(field_message(self.name, field)),
+        }
+    }
+    /// An object field that arrived as a string says so (#769).
+    fn object(&self, field: &'static str, stringified: &'static str) -> Rejection {
+        if string_field(self.args, field) {
+            self.bad(stringified)
+        } else {
+            self.bad(field)
+        }
+    }
+    /// An `invalid_request` names its field; another code keeps its own message.
+    fn coded(&self, field: &'static str, code: &'static str) -> Rejection {
+        if code == "invalid_request" {
+            self.bad(field)
+        } else {
+            Rejection {
+                code,
+                message: None,
+            }
+        }
+    }
+}
+/// [`validate`], with the failing field's message (#769). The order is the contract:
+/// unknown field, missing field, the shared fields, the tool's own, then `workspace`.
 pub fn check(name: &str, args: Option<&Value>) -> Result<(), Rejection> {
-    if !TOOLS.contains(&name) {
+    let Some(spec) = spec(name) else {
         return Err(Rejection {
             code: "invalid_request",
             message: None,
         });
-    }
-    // An `invalid_request` names its field; another code keeps its own message.
-    let bad = |field: &str| Rejection {
-        code: "invalid_request",
-        message: Some(field_message(name, field)),
     };
-    // An object field that arrived as a string says so (#769).
-    let object = |field: &'static str, stringified: &'static str| {
-        if string_field(args, field) {
-            bad(stringified)
-        } else {
-            bad(field)
-        }
-    };
-    let coded = |field: &'static str| {
-        move |code: &'static str| {
-            if code == "invalid_request" {
-                bad(field)
-            } else {
-                Rejection {
-                    code,
-                    message: None,
-                }
-            }
-        }
-    };
+    let r = Reject { name, args };
     let Some(o) = args.and_then(Value::as_object) else {
-        return Err(bad("arguments"));
+        return Err(r.bad("arguments"));
     };
-    let (fields, required) = fields(name);
     // An unknown field fails even once a missing one is added, so it is named first.
-    if !o.keys().all(|key| fields.contains(&key.as_str())) {
-        return Err(bad(""));
+    if !o.keys().all(|key| spec.fields.contains(&key.as_str())) {
+        return Err(r.bad(""));
     }
-    if let Some(missing) = required.iter().find(|field| !o.contains_key(**field)) {
-        return Err(bad(missing));
+    if let Some(missing) = spec.required.iter().find(|field| !o.contains_key(**field)) {
+        return Err(r.bad(missing));
     }
+    common_fields(o, &r)?;
+    (spec.validate)(o, &r)?;
+    if workspace_field(o).is_err() {
+        return Err(r.bad("workspace"));
+    }
+    Ok(())
+}
+/// The fields that mean the same wherever a tool accepts them.
+fn common_fields(o: &Args, r: &Reject) -> Result<(), Rejection> {
     if o.get("schemaVersion").and_then(wire::uint) != Some(1) {
-        return Err(bad("schemaVersion"));
+        return Err(r.bad("schemaVersion"));
     }
     if !expected_basis(o) {
-        return Err(object("expectedBasis", "expectedBasis:string"));
+        return Err(r.object("expectedBasis", "expectedBasis:string"));
     }
     // `compact` (#528, #665, #715) is a closed boolean wherever a tool accepts it.
     if o.get("compact").is_some_and(|value| !value.is_boolean()) {
-        return Err(bad("compact"));
+        return Err(r.bad("compact"));
     }
     // #851: `app` is one nonempty string wherever a tool accepts it.
     if !o.get("app").is_none_or(|app| bounded_text(Some(app))) {
-        return Err(bad("app"));
+        return Err(r.bad("app"));
     }
-    match name {
-        "trellis_workspace_describe" => {
-            if let Some(request) = o.get("coverageDocuments") {
-                let request = request
-                    .as_object()
-                    .ok_or_else(|| bad("coverageDocuments"))?;
-                if !request
-                    .keys()
-                    .all(|key| matches!(key.as_str(), "language" | "limit" | "offset"))
-                    || !request.get("language").is_none_or(|language| {
-                        language.as_str().is_some_and(|language| {
-                            crate::semantic_evidence::LANGUAGE_ORDER.contains(&language)
-                        })
-                    })
-                {
-                    return Err(bad("coverageDocuments"));
-                }
-                limit(request).map_err(coded("coverageDocuments"))?;
-                offset(request).map_err(coded("coverageDocuments"))?;
-            }
-        }
-        "trellis_references" | "trellis_rules_check" => {
-            group_by(o).map_err(coded("groupBy"))?;
-            // #837: a checkout-relative directory, normalized but for one trailing `/`.
-            if !o.get("prefix").is_none_or(|prefix| {
-                prefix
-                    .as_str()
-                    .and_then(crate::references::directory_prefix)
-                    .is_some()
-            }) {
-                return Err(bad("prefix"));
-            }
-            if !o.get("paths").is_none_or(|value| {
-                value.as_array().is_some_and(|paths| {
-                    paths.iter().all(|path| {
-                        path.as_str().is_some_and(|path| {
-                            path.len() <= 4096 && crate::references::valid_path_glob(path)
-                        })
-                    })
+    Ok(())
+}
+/// `limit`, then `offset`.
+fn page(o: &Args, r: &Reject) -> Result<(), Rejection> {
+    limit(o).map_err(|code| r.coded("limit", code))?;
+    offset(o).map_err(|code| r.coded("offset", code))
+}
+fn describe_args(o: &Args, r: &Reject) -> Result<(), Rejection> {
+    let Some(request) = o.get("coverageDocuments") else {
+        return Ok(());
+    };
+    let request = request
+        .as_object()
+        .ok_or_else(|| r.bad("coverageDocuments"))?;
+    if !request
+        .keys()
+        .all(|key| matches!(key.as_str(), "language" | "limit" | "offset"))
+        || !request.get("language").is_none_or(|language| {
+            language.as_str().is_some_and(|language| {
+                crate::semantic_evidence::LANGUAGE_ORDER.contains(&language)
+            })
+        })
+    {
+        return Err(r.bad("coverageDocuments"));
+    }
+    limit(request).map_err(|code| r.coded("coverageDocuments", code))?;
+    offset(request).map_err(|code| r.coded("coverageDocuments", code))
+}
+/// `trellis_references` and `trellis_rules_check`: each accepts a subset of these fields.
+fn reference_args(o: &Args, r: &Reject) -> Result<(), Rejection> {
+    group_by(o).map_err(|code| r.coded("groupBy", code))?;
+    // #837: a checkout-relative directory, normalized but for one trailing `/`.
+    if !o.get("prefix").is_none_or(|prefix| {
+        prefix
+            .as_str()
+            .and_then(crate::references::directory_prefix)
+            .is_some()
+    }) {
+        return Err(r.bad("prefix"));
+    }
+    if !o.get("paths").is_none_or(|value| {
+        value.as_array().is_some_and(|paths| {
+            paths.iter().all(|path| {
+                path.as_str().is_some_and(|path| {
+                    path.len() <= 4096 && crate::references::valid_path_glob(path)
                 })
-            }) {
-                return Err(bad("paths"));
-            }
-            if !status_filter(o) {
-                return Err(bad("status"));
-            }
-            limit(o).map_err(coded("limit"))?;
-            offset(o).map_err(coded("offset"))?;
+            })
+        })
+    }) {
+        return Err(r.bad("paths"));
+    }
+    if !status_filter(o) {
+        return Err(r.bad("status"));
+    }
+    page(o, r)
+}
+fn endpoint_args(o: &Args, r: &Reject) -> Result<(), Rejection> {
+    if !o.get("method").is_none_or(|method| {
+        string(Some(method)).is_some_and(|method| {
+            matches!(
+                method,
+                "GET" | "POST" | "PUT" | "DELETE" | "PATCH" | "HEAD" | "OPTIONS"
+            )
+        })
+    }) {
+        return Err(r.bad("method"));
+    }
+    if !o
+        .get("pathTemplate")
+        .is_none_or(|template| bounded_text(Some(template)))
+    {
+        return Err(r.bad("pathTemplate"));
+    }
+    page(o, r)
+}
+fn explain_args(o: &Args, r: &Reject) -> Result<(), Rejection> {
+    let rule = string(o.get("rule")).ok_or_else(|| r.bad("rule"))?;
+    if rule.is_empty() || rule.len() > 256 {
+        return Err(r.bad("rule"));
+    }
+    if !o
+        .get("target")
+        .is_some_and(super::architecture::valid_identity)
+    {
+        return Err(r.object("target", "target:string"));
+    }
+    if !o
+        .get("destination")
+        .is_none_or(super::architecture::valid_destination)
+        || (!matches!(rule, "$layers" | "$external") && o.contains_key("destination"))
+    {
+        return Err(r.object("destination", "destination:string"));
+    }
+    page(o, r)
+}
+/// A present `query` of 1 to `max_bytes` bytes.
+fn query(o: &Args, r: &Reject, max_bytes: usize) -> Result<(), Rejection> {
+    let q = string(o.get("query")).ok_or_else(|| r.bad("query"))?;
+    if q.is_empty() || q.len() > max_bytes {
+        return Err(r.bad("query"));
+    }
+    Ok(())
+}
+fn find_args(o: &Args, r: &Reject) -> Result<(), Rejection> {
+    if o.contains_key("lookupKey") {
+        if o.contains_key("query") {
+            return Err(r.bad("query|lookupKey"));
         }
-        "trellis_endpoints" => {
-            if !o.get("method").is_none_or(|method| {
-                string(Some(method)).is_some_and(|method| {
-                    matches!(
-                        method,
-                        "GET" | "POST" | "PUT" | "DELETE" | "PATCH" | "HEAD" | "OPTIONS"
-                    )
-                })
-            }) {
-                return Err(bad("method"));
-            }
-            if !o
-                .get("pathTemplate")
-                .is_none_or(|template| bounded_text(Some(template)))
+        if !valid_lookup_key(o.get("lookupKey")) {
+            return Err(r.bad("lookupKey"));
+        }
+    } else {
+        query(o, r, 256)?;
+    }
+    limit(o).map_err(|code| r.coded("limit", code))
+}
+fn search_args(o: &Args, r: &Reject) -> Result<(), Rejection> {
+    query(o, r, 1024)?;
+    if !o
+        .get("role")
+        .is_none_or(|role| matches!(role.as_str(), Some("any" | "production" | "test")))
+    {
+        return Err(r.bad("role"));
+    }
+    limit(o).map_err(|code| r.coded("limit", code))
+}
+fn show_args(o: &Args, r: &Reject) -> Result<(), Rejection> {
+    match string(o.get("view")) {
+        Some("sequence" | "class") => {
+            if o.contains_key("path")
+                || o.contains_key("line")
+                || o.contains_key("symbolId") == o.contains_key("lookupKey")
             {
-                return Err(bad("pathTemplate"));
+                return Err(r.bad("view:symbol"));
             }
-            limit(o).map_err(coded("limit"))?;
-            offset(o).map_err(coded("offset"))?;
+            selector(o).map_err(|field| r.bad(field))
         }
-        "trellis_rules_explain" => {
-            let rule = string(o.get("rule")).ok_or_else(|| bad("rule"))?;
-            if rule.is_empty() || rule.len() > 256 {
-                return Err(bad("rule"));
+        Some("source") => {
+            if o.contains_key("symbolId") || o.contains_key("lookupKey") {
+                return Err(r.bad("view:source"));
             }
-            if !o
-                .get("target")
-                .is_some_and(super::architecture::valid_identity)
-            {
-                return Err(object("target", "target:string"));
-            }
-            if !o
-                .get("destination")
-                .is_none_or(super::architecture::valid_destination)
-                || (!matches!(rule, "$layers" | "$external") && o.contains_key("destination"))
-            {
-                return Err(object("destination", "destination:string"));
-            }
-            limit(o).map_err(coded("limit"))?;
-            offset(o).map_err(coded("offset"))?;
-        }
-        "trellis_find_symbols" if o.contains_key("lookupKey") => {
-            if o.contains_key("query") {
-                return Err(bad("query|lookupKey"));
-            }
-            if !valid_lookup_key(o.get("lookupKey")) {
-                return Err(bad("lookupKey"));
-            }
-            limit(o).map_err(coded("limit"))?;
-        }
-        "trellis_find_symbols" | "trellis_search_symbols" => {
-            let q = string(o.get("query")).ok_or_else(|| bad("query"))?;
-            let max_bytes = if name == "trellis_search_symbols" {
-                1024
-            } else {
-                256
-            };
-            if q.is_empty() || q.len() > max_bytes {
-                return Err(bad("query"));
-            }
-            if name == "trellis_search_symbols"
-                && !o
-                    .get("role")
-                    .is_none_or(|role| matches!(role.as_str(), Some("any" | "production" | "test")))
-            {
-                return Err(bad("role"));
-            }
-            limit(o).map_err(coded("limit"))?;
-        }
-        "trellis_show" => match string(o.get("view")) {
-            Some("sequence" | "class") => {
-                if o.contains_key("path")
-                    || o.contains_key("line")
-                    || o.contains_key("symbolId") == o.contains_key("lookupKey")
-                {
-                    return Err(bad("view:symbol"));
-                }
-                selector(o).map_err(bad)?;
-            }
-            Some("source") => {
-                if o.contains_key("symbolId") || o.contains_key("lookupKey") {
-                    return Err(bad("view:source"));
-                }
-                let path = string(o.get("path")).ok_or_else(|| bad("path"))?;
-                if !valid_path(path) {
-                    return Err(bad("path"));
-                }
-                if !o
-                    .get("line")
-                    .and_then(wire::uint)
-                    .is_some_and(|line| line >= 1)
-                {
-                    return Err(bad("line"));
-                }
-            }
-            _ => return Err(bad("view")),
-        },
-        "trellis_declaration"
-        | "trellis_outgoing_calls"
-        | "trellis_incoming_calls"
-        | "trellis_call_graph" => {
-            if o.contains_key("symbolId") == o.contains_key("lookupKey") {
-                return Err(bad("symbolId|lookupKey"));
-            }
-            selector(o).map_err(bad)?;
-            if name == "trellis_call_graph" {
-                call_graph_arguments(o).map_err(bad)?;
-            } else if name != "trellis_declaration" {
-                semantic_producer(o).map_err(coded("semanticProducerId"))?;
-                if let Some(field) = ["compact", "includeExternal"]
-                    .into_iter()
-                    .find(|field| o.get(*field).is_some_and(|value| !value.is_boolean()))
-                {
-                    return Err(bad(field));
-                }
-                limit(o).map_err(coded("limit"))?;
-            }
-        }
-        _ => {
-            let path = string(o.get("path")).ok_or_else(|| bad("path"))?;
+            let path = string(o.get("path")).ok_or_else(|| r.bad("path"))?;
             if !valid_path(path) {
-                return Err(bad("path"));
+                return Err(r.bad("path"));
             }
             if !o
-                .get("expectedContentHash")
-                .is_none_or(|v| string(Some(v)).is_some_and(hash))
+                .get("line")
+                .and_then(wire::uint)
+                .is_some_and(|line| line >= 1)
             {
-                return Err(bad("expectedContentHash"));
+                return Err(r.bad("line"));
             }
-            let start = o
-                .get("startLine")
-                .and_then(wire::uint)
-                .ok_or_else(|| bad("startLine"))?;
-            let end = o
-                .get("endLine")
-                .and_then(wire::uint)
-                .ok_or_else(|| bad("endLine"))?;
-            if start == 0 || end == 0 || end < start {
-                return Err(bad("endLine"));
-            }
-            if end - start >= 200 {
-                return Err(Rejection {
-                    code: "range_too_large",
-                    message: None,
-                });
-            }
+            Ok(())
         }
+        _ => Err(r.bad("view")),
     }
-    if workspace_field(o).is_err() {
-        return Err(bad("workspace"));
+}
+/// Exactly one of `symbolId` and `lookupKey`, and that one valid.
+fn one_selector(o: &Args, r: &Reject) -> Result<(), Rejection> {
+    if o.contains_key("symbolId") == o.contains_key("lookupKey") {
+        return Err(r.bad("symbolId|lookupKey"));
+    }
+    selector(o).map_err(|field| r.bad(field))
+}
+fn declaration_args(o: &Args, r: &Reject) -> Result<(), Rejection> {
+    one_selector(o, r)
+}
+/// `trellis_outgoing_calls` and `trellis_incoming_calls`.
+fn calls_args(o: &Args, r: &Reject) -> Result<(), Rejection> {
+    one_selector(o, r)?;
+    semantic_producer(o).map_err(|code| r.coded("semanticProducerId", code))?;
+    if let Some(field) = ["compact", "includeExternal"]
+        .into_iter()
+        .find(|field| o.get(*field).is_some_and(|value| !value.is_boolean()))
+    {
+        return Err(r.bad(field));
+    }
+    limit(o).map_err(|code| r.coded("limit", code))
+}
+fn call_graph_args(o: &Args, r: &Reject) -> Result<(), Rejection> {
+    one_selector(o, r)?;
+    call_graph_arguments(o).map_err(|field| r.bad(field))
+}
+fn source_args(o: &Args, r: &Reject) -> Result<(), Rejection> {
+    let path = string(o.get("path")).ok_or_else(|| r.bad("path"))?;
+    if !valid_path(path) {
+        return Err(r.bad("path"));
+    }
+    if !o
+        .get("expectedContentHash")
+        .is_none_or(|v| string(Some(v)).is_some_and(hash))
+    {
+        return Err(r.bad("expectedContentHash"));
+    }
+    let start = o
+        .get("startLine")
+        .and_then(wire::uint)
+        .ok_or_else(|| r.bad("startLine"))?;
+    let end = o
+        .get("endLine")
+        .and_then(wire::uint)
+        .ok_or_else(|| r.bad("endLine"))?;
+    if start == 0 || end == 0 || end < start {
+        return Err(r.bad("endLine"));
+    }
+    if end - start >= 200 {
+        return Err(Rejection {
+            code: "range_too_large",
+            message: None,
+        });
     }
     Ok(())
 }
@@ -924,83 +1058,10 @@ pub fn result(name: &str, envelope: Value, modern: bool) -> Value {
         let (count, items) = if let Some(candidates) = envelope["data"]["candidates"].as_array() {
             (candidates.len(), "candidates")
         } else {
-            match name {
-                "trellis_workspace_describe" => (1, "workspace"),
-                "trellis_find_symbols" => (
-                    envelope["data"]["symbols"]
-                        .as_array()
-                        .expect("find symbols")
-                        .len(),
-                    "symbols",
-                ),
-                "trellis_search_symbols" => (
-                    envelope["data"]["hits"]
-                        .as_array()
-                        .expect("search hits")
-                        .len(),
-                    "hits",
-                ),
-                "trellis_declaration" => (1, "declaration"),
-                "trellis_references" => (
-                    envelope["data"]["production"]
-                        .as_array()
-                        .expect("production edges")
-                        .len()
-                        + envelope["data"]["tests"]
-                            .as_array()
-                            .expect("test edges")
-                            .len(),
-                    "edges",
-                ),
-                "trellis_rules_check" | "trellis_rules_explain" => (
-                    envelope["data"]["instances"]
-                        .as_array()
-                        .expect("rule instances")
-                        .len(),
-                    "instances",
-                ),
-                "trellis_incoming_calls" => (
-                    envelope["data"]["callers"]
-                        .as_array()
-                        .expect("incoming callers")
-                        .len(),
-                    "calls",
-                ),
-                "trellis_outgoing_calls" => (
-                    envelope["data"]["calls"]
-                        .as_array()
-                        .expect("outgoing calls")
-                        .len(),
-                    "calls",
-                ),
-                "trellis_call_graph" => (
-                    envelope["data"]["result"]["edges"]
-                        .as_array()
-                        .expect("call graph edges")
-                        .len(),
-                    "edges",
-                ),
-                "trellis_read_source" => (
-                    (envelope["data"]["endLine"]
-                        .as_u64()
-                        .expect("source end line")
-                        - envelope["data"]["startLine"]
-                            .as_u64()
-                            .expect("source start line")
-                        + 1) as usize,
-                    "lines",
-                ),
-                // Its summary names the outcome instead (below).
-                "trellis_show" => (0, "targets"),
-                "trellis_endpoints" => (
-                    envelope["data"]["endpoints"]
-                        .as_array()
-                        .expect("endpoint rows")
-                        .len(),
-                    "endpoints",
-                ),
-                _ => unreachable!("known tool name"),
-            }
+            spec(name)
+                .expect("known tool name")
+                .summary
+                .count(&envelope)
         };
         let truncation = if envelope["truncated"] == true {
             let reason = envelope["truncationReason"]

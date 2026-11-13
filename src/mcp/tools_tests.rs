@@ -1167,3 +1167,8 @@ fn references_prefix_is_a_relative_directory() {
         Err("invalid_request")
     );
 }
+/// The spec table is the catalog's tools, in catalog order.
+#[test]
+fn spec_table_names_are_the_catalog_names() {
+    assert_eq!(SPECS.map(|spec| spec.name), crate::mcp::catalog::NAMES);
+}
