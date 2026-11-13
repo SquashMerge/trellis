@@ -124,19 +124,21 @@ test("real shell loads local brand fonts, preserves Connect and source, and rend
       const panel=page.locator(`#${await tab.getAttribute("aria-controls")}`);
       assert.equal(await panel.isVisible(),true);
       assert.equal(await panel.getAttribute("aria-labelledby"),await tab.getAttribute("id"));
-      assert.equal(await tabs.evaluateAll(nodes=>nodes.filter(node=>node.getAttribute("aria-selected")==="false").length),3);
+      assert.equal(await tabs.evaluateAll(nodes=>nodes.filter(node=>node.getAttribute("aria-selected")==="false").length),4);
       assert.equal(await tabs.evaluateAll(nodes=>nodes.filter(node=>node.tabIndex===0).length),1);
     }
     await page.locator("#view-sequence").focus();
     await page.keyboard.press("ArrowRight");await activeTab("Classes");
+    await page.keyboard.press("ArrowRight");await activeTab("Deviations");
     await page.keyboard.press("ArrowRight");await activeTab("Architecture");
     await page.keyboard.press("ArrowRight");await activeTab("Treemap");
     await page.keyboard.press("ArrowRight");await activeTab("Sequence");
     await page.keyboard.press("ArrowLeft");await activeTab("Treemap");
     await page.keyboard.press("ArrowLeft");await activeTab("Architecture");
+    await page.keyboard.press("ArrowLeft");await activeTab("Deviations");
     await page.keyboard.press("ArrowLeft");await activeTab("Classes");
     await page.keyboard.press("Home");await activeTab("Architecture");
-    await page.keyboard.press("End");await activeTab("Classes");
+    await page.keyboard.press("End");await activeTab("Deviations");
     await page.keyboard.press("Home");await activeTab("Architecture");
     await page.locator("#view-sequence").click();await activeTab("Sequence");
     await H.reveal(page, "#refresh"); await page.locator("#refresh").click();
