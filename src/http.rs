@@ -2576,6 +2576,24 @@ pub fn router(state: Arc<DaemonState>) -> Router {
             }),
         )
         .route(
+            "/source-witness.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../web/source-witness.js"),
+                )
+            }),
+        )
+        .route(
+            "/context-menu.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../web/context-menu.js"),
+                )
+            }),
+        )
+        .route(
             "/sequence.js",
             get(|| async {
                 (
@@ -3901,6 +3919,24 @@ impl ProvisionedBrowser {
                     (
                         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
                         include_str!("../web/index-pin.js"),
+                    )
+                }),
+            )
+            .route(
+                "/source-witness.js",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                        include_str!("../web/source-witness.js"),
+                    )
+                }),
+            )
+            .route(
+                "/context-menu.js",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                        include_str!("../web/context-menu.js"),
                     )
                 }),
             )

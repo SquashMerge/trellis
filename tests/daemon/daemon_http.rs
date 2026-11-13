@@ -505,6 +505,8 @@ async fn provisioned_page_serves_all_referenced_assets() {
         "treemap.js",
         "treemap-pele.js",
         "index-pin.js",
+        "source-witness.js",
+        "context-menu.js",
         "sequence.js",
         "shell.js",
         "classes.js",

@@ -945,7 +945,7 @@ function deviationsHarness(options = {}) {
     querySelector:selector => statics.has(selector) ? statics.get(selector) : statics.set(selector, track(dnode("static"))).get(selector)};
   const rows = options.rows || deviationRows(), state = {stale:false,usable:true,pages:options.pages || [[0, 2], [2, 3]],failAt:options.failAt ?? null,error:options.error ?? null,
     readError:null,eligible:true,view:options.view || deviationView()};
-  const sandbox = {document,console,navigator:{clipboard:{writeText:async value => {sandbox.copied = value;}}},window:{TrellisClasses:{showContextMenu(event, actions, opts) {
+  const sandbox = {document,console,navigator:{clipboard:{writeText:async value => {sandbox.copied = value;}}},window:{TrellisContextMenu:{showContextMenu(event, actions, opts) {
     menus.push({target:event.currentTarget,actions,options:opts});event.stopPropagation();}}}};
   vm.createContext(sandbox);
   vm.runInContext(pinSource, sandbox);

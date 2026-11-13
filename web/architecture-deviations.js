@@ -663,9 +663,9 @@
       lineActive = deps.inspectLine(line, (target, title, active) => panel(target, title, line, active)) || fallbackActive;
     }
     function openMenu(event, line) {
-      if (!window.TrellisClasses?.showContextMenu) return;
+      if (!window.TrellisContextMenu?.showContextMenu) return;
       select(line);
-      window.TrellisClasses.showContextMenu(event, actions(line), {label:"Line actions"});
+      window.TrellisContextMenu.showContextMenu(event, actions(line), {label:"Line actions"});
     }
 
     const location = line => {

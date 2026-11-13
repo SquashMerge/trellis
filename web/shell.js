@@ -14,7 +14,7 @@
   let openSource = null, targetSelection = null, sourceReturnFocus = null, activeView = "architecture", inspectorClearCallback = null, sectionCallback = null, viewCallback = null;
   function setSection(name) {
     const files = name === "files";
-    window.TrellisNavigation?.reset(); window.TrellisClasses?.closeContextMenu?.();
+    window.TrellisNavigation?.reset(); window.TrellisContextMenu?.closeContextMenu?.();
     document.body.classList.toggle("files-section", files);
     document.body.classList.toggle("classes-view", !files && activeView === "classes");
     drawer("explorer", false); drawer("inspector", false);
@@ -139,7 +139,7 @@
     if (document.body.classList.contains("files-section")) showDiagrams();
     activeView = name;
     document.body.classList.toggle("classes-view", name === "classes");
-    window.TrellisClasses?.closeContextMenu?.();
+    window.TrellisContextMenu?.closeContextMenu?.();
     if (name === "sequence" || name === "classes" || ["architecture", "treemap", "deviations"].includes(name)) drawer("explorer", false);
     for (const [key, panel] of Object.entries(views)) {
       hide(panel, key !== name);
@@ -231,17 +231,7 @@
     if (declared) return `${step.callEvidence.dispatch} dispatch · declaration ${declared.name || declared.kind} · ${declared.path}`;
     return step?.callEvidence ? window.TrellisSequence.evidenceLabel(step, view) : "Terminal syntax only · no verified target";
   }
-  function sourceWitness(item) {
-    const r = item?.range;
-    return typeof item?.path === "string" && !!item.path.trim() && !!r &&
-      Number.isSafeInteger(r.startLine) && r.startLine > 0 &&
-      Number.isSafeInteger(r.endLine) && r.endLine >= r.startLine &&
-      (r.startColumn == null || (Number.isSafeInteger(r.startColumn) && r.startColumn > 0)) &&
-      (r.endColumn == null || (Number.isSafeInteger(r.endColumn) && r.endColumn > 0)) &&
-      (r.startLine !== r.endLine || r.startColumn == null || r.endColumn == null || r.endColumn >= r.startColumn) &&
-      (r.startByte == null || (Number.isSafeInteger(r.startByte) && r.startByte >= 0)) &&
-      (r.endByte == null || (Number.isSafeInteger(r.endByte) && r.endByte > (r.startByte ?? -1)));
-  }
+  const sourceWitness = window.TrellisSourceWitness;
   function location(step) {
     if (!sourceWitness(step)) return "Source range unavailable";
     const r = step.range;
