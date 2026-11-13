@@ -74,22 +74,27 @@
   }
   function callable(symbol) { return ["function", "method"].includes(symbol?.kind); }
   const sourceWitness = window.TrellisSourceWitness;
-  async function open(event, selector, {isCurrent} = {}) {
-    const anchor = capture(event), owner = api, ticket = ++serial;
+  const STALE = "Navigation is stale. Refresh the indexed view and try again.";
+  const notice = label => ({label: text(label), disabled: true, run() {}});
+  // The scroll offsets of the anchor's ancestors when its menu opens: only a scroll away from these ends the lookup.
+  function rememberScroll(anchor) {
     menuScroll.clear();
     for (let node = anchor.currentTarget, depth = 0; node && depth < 64; node = node.parentNode, depth++) {
       if (typeof node.scrollTop === "number" && typeof node.scrollLeft === "number") menuScroll.set(node, [node.scrollTop, node.scrollLeft]);
     }
-    if (!owner?.currentRevision?.()) return;
-    const revision = window.TrellisIndexPin.copy(owner.currentRevision()), session = owner.currentSession();
-    const current = () => {
+  }
+  // Whether one lookup (`ticket`) still owns the menu: same owner, revision and session, and the caller's own guard.
+  function lookupGuard(owner, ticket, revision, session, isCurrent) {
+    return () => {
       try { return owner === api && ticket === serial && window.TrellisIndexPin.equal(revision, owner.currentRevision()) &&
         session === owner.currentSession() && (!isCurrent || isCurrent()); }
       catch (_) { return false; }
     };
-    if (!current()) return;
+  }
+  // Shows a menu for one lookup (`ticket`) while it is current.
+  function menuDisplay(owner, anchor, ticket, current) {
     let replacing = false;
-    const display = actions => {
+    return actions => {
       if (!current()) return;
       replacing = true;
       try {
@@ -100,78 +105,100 @@
         }});
       } finally { replacing = false; }
     };
+  }
+  // Focus dismissal and another non-navigation menu do not necessarily produce
+  // pointer/keyboard events. A reply may replace only the loading menu it owns.
+  // Do not use connectivity in action guards: the shared helper intentionally
+  // closes its menu and restores focus before calling an action.
+  function publishGuard(current) {
+    const loadingMenu = document.querySelector(".classes-context-menu");
+    return () => current() && (!loadingMenu ||
+      (loadingMenu.isConnected && document.querySelector(".classes-context-menu") === loadingMenu));
+  }
+  // Whether a reply's target may be offered for the request `body` (a source line or a class member).
+  const admitted = body => target => {
+    if (!sourceWitness(target?.symbol) || typeof target.symbol.id !== "string" || !target.symbol.id) return false;
+    if (target.reason === "call") return target.matchKind === "resolved" && target.action === "sequence" && callable(target.symbol);
+    if (target.matchKind !== "measured" || !["declaration", "enclosing"].includes(target.reason)) return false;
+    if (!body.path) return target.reason === "declaration";
+    if (target.symbol.path !== body.path) return false;
+    const range = target.symbol.range;
+    return target.reason === "declaration" ? range.startLine === body.line :
+      range.startLine <= body.line && (range.endLine > body.line ||
+        (range.endLine === body.line && range.endColumn > 1));
+  };
+  function targetLabel(target) {
+    const range = target.range;
+    const callsite = target.reason === "call" && natural(range?.start) && natural(range?.end) && range.end > range.start
+      ? ` · call bytes ${range.start}–${range.end}` : "";
+    return `${text(target.symbol.name)} · ${text(target.symbol.path)}:${target.symbol.range.startLine}${callsite}`;
+  }
+  // Targets that share a label are told apart by their call ID, or by their bytes and symbol ID.
+  function duplicateSuffix(labels, index, target) {
+    const symbol = target.symbol, r = symbol.range;
+    return labels.indexOf(labels[index]) !== labels.lastIndexOf(labels[index])
+      ? target.reason === "call" && typeof target.callId === "string" && target.callId
+        ? ` · call ${text(target.callId)}`
+        : ` · bytes ${r.startByte ?? "?"}–${r.endByte ?? "?"} · ${text(symbol.id)}` : "";
+  }
+  // The menu actions one target offers, in menu order; `run(callback)` is the guarded action for this target's symbol.
+  function targetActions(target, label, owner, run) {
+    const symbol = target.symbol, actions = [];
+    if (target.reason === "declaration" && typeof owner.openSource === "function")
+      actions.push({label: `Read declaration source · measured declaration · ${label}`, run: run(owner.openSource)});
+    if (callable(symbol) && typeof owner.selectMethod === "function") {
+      // The target is a measured declaration (#664): the sequence it opens may be enriched,
+      // so the action names the target's identity, not an evidence tier.
+      const prefix = target.reason === "enclosing" ? "Sequence · enclosing · measured declaration" : target.reason === "call" ? "Sequence of callee · resolved" : "Sequence · measured declaration";
+      actions.push({label: `${prefix} · ${label}`, run: run(owner.selectMethod)});
+    }
+    if (symbol.kind === "class" && target.action === "class" && /\.(?:java|py|js|mjs|cjs|rs|ts|tsx|mts|cts)$/i.test(symbol.path) && typeof owner.openClass === "function")
+      actions.push({label: `Class diagram · syntax · ${label}`, run: run(owner.openClass)});
+    if (["declaration", "enclosing"].includes(target.reason) && typeof owner.inspectSymbol === "function")
+      actions.push({label: `Inspect${target.reason === "enclosing" ? " enclosing declaration" : ""} · measured declaration · ${label}`, run: run(owner.inspectSymbol)});
+    return actions;
+  }
+  // Every menu entry for a valid reply except the closing one: the targets' actions, then the notices.
+  function resultActions(data, body, owner, runFor) {
+    const actions = [], candidates = data.targets.slice(0, MAX_TARGETS).filter(admitted(body));
+    const labels = candidates.map(target => targetLabel(target));
+    for (const [index, target] of candidates.entries()) {
+      actions.push(...targetActions(target, labels[index] + duplicateSuffix(labels, index, target), owner, runFor(target.symbol)));
+    }
+    if (!actions.length) actions.push(notice("No measured declaration or resolved callee on this line. Candidate type and call targets cannot be opened as navigation."));
+    actions.push(notice("Call graph · not available yet"));
+    if (data.requireIndex) actions.push(notice("Index the workspace to populate cached class declarations."));
+    for (const warning of (Array.isArray(data.warnings) ? data.warnings : []).slice(0, MAX_NOTICES)) actions.push(notice(warning));
+    if (data.truncated || data.targets.length > MAX_TARGETS || data.warnings?.length > MAX_NOTICES) actions.push(notice("Partial index or navigation results; see notices."));
+    return actions;
+  }
+  async function open(event, selector, {isCurrent} = {}) {
+    const anchor = capture(event), owner = api, ticket = ++serial;
+    rememberScroll(anchor);
+    if (!owner?.currentRevision?.()) return;
+    const revision = window.TrellisIndexPin.copy(owner.currentRevision()), session = owner.currentSession();
+    const current = lookupGuard(owner, ticket, revision, session, isCurrent);
+    if (!current()) return;
+    const display = menuDisplay(owner, anchor, ticket, current);
     const close = {label: "Close navigation", run: () => { if (current()) serial++; }};
-    const notice = label => ({label: text(label), disabled: true, run() {}});
     const body = selectorBody(selector, revision);
     const retry = {label: "Try navigation again", run: () => {
       if (current()) return open(anchor, body?.path ? {expectedRevision: revision, path: body.path, line: body.line} : body, {isCurrent});
     }};
     if (!body) { display([notice("Navigation unavailable: select a current indexed line or member."), close]); return; }
     display([notice("Finding cached navigation targets…"), close]);
-    // Focus dismissal and another non-navigation menu do not necessarily produce
-    // pointer/keyboard events. A reply may replace only the loading menu it owns.
-    // Do not use connectivity in action guards: the shared helper intentionally
-    // closes its menu and restores focus before calling an action.
-    const loadingMenu = document.querySelector(".classes-context-menu");
-    const mayPublish = () => current() && (!loadingMenu ||
-      (loadingMenu.isConnected && document.querySelector(".classes-context-menu") === loadingMenu));
+    const mayPublish = publishGuard(current);
     try {
       const data = await owner.request("/api/navigation", {method: "POST", body});
       if (!mayPublish()) return;
-      if (!data || !window.TrellisIndexPin.equal(data.revision, revision)) {
-        display([notice("Navigation is stale. Refresh the indexed view and try again."), close]);
-        owner.onStale?.("Navigation is stale. Refresh the indexed view and try again."); return;
-      }
+      if (!data || !window.TrellisIndexPin.equal(data.revision, revision)) { display([notice(STALE), close]); owner.onStale?.(STALE); return; }
       if (!Array.isArray(data.targets)) throw new Error("Invalid navigation response.");
-      const actions = [];
-      const candidates = data.targets.slice(0, MAX_TARGETS).filter(target => {
-        if (!sourceWitness(target?.symbol) || typeof target.symbol.id !== "string" || !target.symbol.id) return false;
-        if (target.reason === "call") return target.matchKind === "resolved" && target.action === "sequence" && callable(target.symbol);
-        if (target.matchKind !== "measured" || !["declaration", "enclosing"].includes(target.reason)) return false;
-        if (!body.path) return target.reason === "declaration";
-        if (target.symbol.path !== body.path) return false;
-        const range = target.symbol.range;
-        return target.reason === "declaration" ? range.startLine === body.line :
-          range.startLine <= body.line && (range.endLine > body.line ||
-            (range.endLine === body.line && range.endColumn > 1));
-      });
-      const labels = candidates.map(target => {
-        const range = target.range;
-        const callsite = target.reason === "call" && natural(range?.start) && natural(range?.end) && range.end > range.start
-          ? ` · call bytes ${range.start}–${range.end}` : "";
-        return `${text(target.symbol.name)} · ${text(target.symbol.path)}:${target.symbol.range.startLine}${callsite}`;
-      });
-      for (const [index, target] of candidates.entries()) {
-        const symbol = target.symbol, r = symbol.range;
-        const suffix = labels.indexOf(labels[index]) !== labels.lastIndexOf(labels[index])
-          ? target.reason === "call" && typeof target.callId === "string" && target.callId
-            ? ` · call ${text(target.callId)}`
-            : ` · bytes ${r.startByte ?? "?"}–${r.endByte ?? "?"} · ${text(symbol.id)}` : "";
-        const label = labels[index] + suffix;
-        const run = callback => () => { if (current()) { serial++; return callback(symbol, revision); } };
-        if (target.reason === "declaration" && typeof owner.openSource === "function")
-          actions.push({label: `Read declaration source · measured declaration · ${label}`, run: run(owner.openSource)});
-        if (callable(symbol) && typeof owner.selectMethod === "function") {
-          // The target is a measured declaration (#664): the sequence it opens may be enriched,
-          // so the action names the target's identity, not an evidence tier.
-          const prefix = target.reason === "enclosing" ? "Sequence · enclosing · measured declaration" : target.reason === "call" ? "Sequence of callee · resolved" : "Sequence · measured declaration";
-          actions.push({label: `${prefix} · ${label}`, run: run(owner.selectMethod)});
-        }
-        if (symbol.kind === "class" && target.action === "class" && /\.(?:java|py|js|mjs|cjs|rs|ts|tsx|mts|cts)$/i.test(symbol.path) && typeof owner.openClass === "function")
-          actions.push({label: `Class diagram · syntax · ${label}`, run: run(owner.openClass)});
-        if (["declaration", "enclosing"].includes(target.reason) && typeof owner.inspectSymbol === "function")
-          actions.push({label: `Inspect${target.reason === "enclosing" ? " enclosing declaration" : ""} · measured declaration · ${label}`, run: run(owner.inspectSymbol)});
-      }
-      if (!actions.length) actions.push(notice("No measured declaration or resolved callee on this line. Candidate type and call targets cannot be opened as navigation."));
-      actions.push(notice("Call graph · not available yet"));
-      if (data.requireIndex) actions.push(notice("Index the workspace to populate cached class declarations."));
-      for (const warning of (Array.isArray(data.warnings) ? data.warnings : []).slice(0, MAX_NOTICES)) actions.push(notice(warning));
-      if (data.truncated || data.targets.length > MAX_TARGETS || data.warnings?.length > MAX_NOTICES) actions.push(notice("Partial index or navigation results; see notices."));
-      actions.push(close); display(actions);
+      const runFor = symbol => callback => () => { if (current()) { serial++; return callback(symbol, revision); } };
+      display([...resultActions(data, body, owner, runFor), close]);
     } catch (error) {
       if (!mayPublish()) return;
       display([notice(`Navigation failed: ${text(error?.message || "Request unavailable.")}`), retry, close]);
-      if (window.TrellisIndexPin.isConflict(error)) owner.onStale?.("Navigation is stale. Refresh the indexed view and try again.");
+      if (window.TrellisIndexPin.isConflict(error)) owner.onStale?.(STALE);
     }
   }
   function attachSource(container, {path, revision, startLine = 1, isCurrent, metadataSnapshot} = {}) {
