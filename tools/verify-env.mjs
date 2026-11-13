@@ -47,15 +47,31 @@ export function cacheLayout(checkout, env, temp, uid) {
 // directory), so an idle entry is not in use by a running verify, and an old
 // verify that finds its entry gone simply provisions again. Best effort: a
 // failure here must not fail verify. Nothing outside `parent` is touched.
-export function pruneLegacyEntries(parent, ownEntry, now = Date.now()) {
+// An entry that is, or contains, a directory this run selected (`selected`:
+// an explicit PLAYWRIGHT_BROWSERS_PATH may point into one) is never removed,
+// whatever its age; paths are compared physically, so a symlinked spelling
+// of the same directory still protects it. Nor is an entry whose browser
+// directory holds a recent Playwright `__dirlock`: an install is running there.
+// These checks run just before the removal, but they are not a lock: an old
+// verify that starts in an idle entry in that instant fails setup and
+// succeeds when run again.
+export function pruneLegacyEntries(parent, ownEntry, selected = [], now = Date.now()) {
   let names;
-  try { names = readdirSync(parent); } catch { return []; }
+  let inUse;
+  try {
+    names = readdirSync(parent);
+    inUse = selected.map((path) => realpathSync(path));
+  } catch { return []; }
   const removed = [];
   for (const name of names) {
     if (!LEGACY_ENTRY.test(name)) continue;
     const entry = join(parent, name);
     try {
       if (!lstatSync(entry).isDirectory()) continue;
+      const physical = realpathSync(entry);
+      if (inUse.some((path) => path === physical || path.startsWith(physical + sep))) continue;
+      const lock = lstatSync(join(entry, "playwright-browsers", "__dirlock"), { throwIfNoEntry: false });
+      if (lock && now - lock.mtimeMs < LEGACY_IDLE_MS) continue;
       if (name !== ownEntry) {
         const paths = [entry, ...readdirSync(entry).map((child) => join(entry, child))];
         if (paths.some((path) => now - lstatSync(path).mtimeMs < LEGACY_IDLE_MS)) continue;
@@ -135,7 +151,7 @@ function main() {
   const cache = externalDirectory(layout.cache, "TRELLIS_RUN_CACHE", process.env.TRELLIS_RUN_CACHE === undefined);
   const browsers = externalDirectory(layout.browsers, "PLAYWRIGHT_BROWSERS_PATH", process.env.PLAYWRIGHT_BROWSERS_PATH === undefined);
   const npmCache = externalDirectory(layout.npmCache, "npm cache", true);
-  if (cache === physicalCandidate(layout.parent)) pruneLegacyEntries(cache, layout.legacyEntry);
+  if (cache === physicalCandidate(layout.parent)) pruneLegacyEntries(cache, layout.legacyEntry, [cache, browsers, npmCache]);
   process.env.PLAYWRIGHT_BROWSERS_PATH = browsers;
   const env = { ...process.env, npm_config_cache: npmCache, PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1" };
   ensureLockedPackage("tests/mcp", ["@modelcontextprotocol/sdk", "ajv"], env);

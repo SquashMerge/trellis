@@ -158,9 +158,59 @@ test("verify setup removes old per-checkout caches that are its own or idle, and
     writeFileSync(join(layout.parent, "e".repeat(24)), "");
     utimesSync(join(layout.parent, "e".repeat(24)), old, old);
 
-    assert.deepEqual(pruneLegacyEntries(layout.parent, layout.legacyEntry, now).sort(), [layout.legacyEntry, "a".repeat(24)].sort());
+    assert.deepEqual(pruneLegacyEntries(layout.parent, layout.legacyEntry, [], now).sort(), [layout.legacyEntry, "a".repeat(24)].sort());
     assert.deepEqual(readdirSync(layout.parent).sort(), ["b".repeat(24), "c".repeat(24), "d".repeat(23), "e".repeat(24), "playwright-browsers"].sort());
-    assert.deepEqual(pruneLegacyEntries(join(temp, "missing"), layout.legacyEntry, now), []);
+    assert.deepEqual(pruneLegacyEntries(join(temp, "missing"), layout.legacyEntry, [], now), []);
+
+    // An installer's lock in the browser directory keeps an otherwise idle entry,
+    // and this checkout's own; a lock left by a crash long ago does not.
+    const locked = (name, lockIdle) => {
+      entry(name, { idle: true });
+      const browsers = join(layout.parent, name, "playwright-browsers");
+      mkdirSync(join(browsers, "__dirlock"));
+      if (lockIdle) utimesSync(join(browsers, "__dirlock"), old, old);
+      utimesSync(browsers, old, old);
+    };
+    locked(layout.legacyEntry, false);
+    locked("f".repeat(24), false);
+    locked("0".repeat(24), true);
+    assert.deepEqual(pruneLegacyEntries(layout.parent, layout.legacyEntry, [], now), ["0".repeat(24)]);
+    assert.equal(existsSync(join(layout.parent, layout.legacyEntry)), true);
+    assert.equal(existsSync(join(layout.parent, "f".repeat(24))), true);
+  } finally {
+    rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test("verify setup never removes an old per-checkout cache that holds a directory this run selected", async () => {
+  const { LEGACY_IDLE_MS, cacheLayout, pruneLegacyEntries } = await verifyEnv();
+  const temp = mkdtempSync(join(tmpdir(), "trellis-verify-selected-"));
+  try {
+    const layout = cacheLayout("/work/trellis-1", {}, temp, 501);
+    const now = Date.now();
+    const old = new Date(now - LEGACY_IDLE_MS - 60_000);
+    const other = "a".repeat(24);
+    const idle = "b".repeat(24);
+    for (const name of [layout.legacyEntry, other, idle]) {
+      const browsers = join(layout.parent, name, "playwright-browsers");
+      mkdirSync(join(browsers, "chromium-1"), { recursive: true });
+      utimesSync(browsers, old, old);
+      utimesSync(join(layout.parent, name), old, old);
+    }
+    // The explicit paths are spelled through a symlink to the parent; they are still the same directories.
+    const alias = join(temp, "alias");
+    symlinkSync(layout.parent, alias, "dir");
+    const explicit = (name) => cacheLayout("/work/trellis-1", { PLAYWRIGHT_BROWSERS_PATH: join(alias, name, "playwright-browsers") }, temp, 501).browsers;
+
+    // Inside this checkout's own old entry: kept, while the unrelated idle entries go.
+    assert.deepEqual(pruneLegacyEntries(layout.parent, layout.legacyEntry, [explicit(layout.legacyEntry)], now).sort(), [other, idle].sort());
+    assert.equal(existsSync(join(layout.parent, layout.legacyEntry, "playwright-browsers", "chromium-1")), true);
+
+    // Inside another checkout's idle entry, or the entry itself: kept.
+    for (const name of [other, idle]) mkdirSync(join(layout.parent, name, "playwright-browsers"), { recursive: true });
+    for (const name of [other, idle]) for (const path of [join(layout.parent, name, "playwright-browsers"), join(layout.parent, name)]) utimesSync(path, old, old);
+    assert.deepEqual(pruneLegacyEntries(layout.parent, layout.legacyEntry, [explicit(other), join(alias, idle)], now), [layout.legacyEntry]);
+    assert.deepEqual(readdirSync(layout.parent).sort(), [other, idle].sort());
   } finally {
     rmSync(temp, { recursive: true, force: true });
   }
