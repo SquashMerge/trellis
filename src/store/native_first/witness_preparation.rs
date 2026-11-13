@@ -1,7 +1,7 @@
 //! Bounded staging of original associations under one exact pending target.
 use super::witness::{self, OriginalRow, WitnessEligibility};
 use super::*;
-use crate::native_evidence::DocumentKey;
+use crate::native_records::DocumentKey;
 use crate::semantic_batch::staging::{Stage, WitnessFallback, WitnessStageWriter};
 use crate::semantic_batch::{
     AdmittedBatch, LookupBudget, counters::BatchCounters, limits::BatchLimits,

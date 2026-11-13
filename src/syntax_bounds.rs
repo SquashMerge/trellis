@@ -5,7 +5,7 @@
 //! parser could not recognize. [`scan`] reports that file once as a [`PartialFile`] row of the
 //! result. Skipped syntax proves nothing: resolution keeps every name it could have bound
 //! unknown.
-use crate::native_evidence::{DocumentKey, Range};
+use crate::native_records::{DocumentKey, Range};
 use anyhow::Result;
 use serde::Serialize;
 use tree_sitter::Node;

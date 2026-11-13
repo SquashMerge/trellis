@@ -697,7 +697,7 @@ fn exact_policy_and_lexical_plans_use_indexed_candidate_joins() {
 
 #[test]
 fn candidate_roles_follow_selected_declarations_in_head_and_delta() {
-    use crate::native_evidence::DeclarationRole;
+    use crate::native_records::DeclarationRole;
     let fixture = Fixture::new();
     let first = fixture.publish();
     let original = fixture.head(first);
@@ -772,7 +772,7 @@ fn invalid_selected_role_fails_whole_head_and_delta() {
 #[test]
 fn exact_lookup_prefilter_includes_raw_javascript_fallback() {
     let query = r"invalid\uQQQQ";
-    assert!(crate::native_evidence::lookup("javascript", query).is_err());
+    assert!(crate::native_records::lookup("javascript", query).is_err());
     assert!(search_exact_lookup_keys(query).contains(query));
     assert!(search_exact_lookup_keys("r#type").contains("type"));
     assert!(search_exact_lookup_keys("Kelvin").contains("Kelvin"));
@@ -783,8 +783,8 @@ fn exact_lookup_prefilter_includes_raw_javascript_fallback() {
 fn exact_lookup_prefilter_derives_every_native_language_key() {
     for query in ["Kelvin", "r#type", r"café", r"abc", "caf\u{e9}"] {
         let keys = search_exact_lookup_keys(query);
-        for language in crate::native_evidence::LANGUAGES {
-            if let Ok(key) = crate::native_evidence::lookup(language, query) {
+        for language in crate::native_records::LANGUAGES {
+            if let Ok(key) = crate::native_records::lookup(language, query) {
                 assert!(keys.contains(&key), "{language} key of {query:?}");
             }
         }

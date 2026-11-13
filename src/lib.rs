@@ -49,6 +49,7 @@ pub mod model_management;
 pub mod native_capture;
 pub mod native_evidence;
 pub mod native_ids;
+pub mod native_records;
 mod native_rust_macros;
 #[cfg(test)]
 mod native_typescript_tests;

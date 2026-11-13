@@ -57,7 +57,7 @@ paths = [
   "src/index_coordinator.rs", "src/index_coordinator/**", "src/capture.rs", "src/watch.rs",
   "src/native_evidence.rs", "src/native_capture.rs",
   "src/scip_admission.rs", "src/semantic_evidence.rs", "src/semantic_import.rs",
-  "src/search_capture.rs", "src/search_card.rs",
+  "src/search_capture.rs",
   "src/native_rust_macros_tests.rs", "src/extractor_inputs_tests.rs", "src/indexer_projection_vectors_tests.rs",
   "src/semantic_import_complexity_tests.rs", "src/native_rust_macros.rs", "src/producer/**", "src/evidence_budget.rs", "src/semantic_batch.rs", "src/semantic_batch/**",
   "src/semantic_import/**",
@@ -96,6 +96,12 @@ paths = [
   "src/scip_vocab.rs", "src/jsonc.rs", "src/source_dir.rs", "src/process_info.rs",
   # The stored search-card records and their eligibility predicate (S1b, #1000).
   "src/search_card_records.rs",
+  # The persisted native evidence records, the producer constants and the pure lookup-key
+  # functions (S2, #1001). Extraction, validation and the spool stay in native_evidence.rs.
+  "src/native_records.rs",
+  # Card preparation and serialization over shared records and native_ids only; storage
+  # renders stored cards with it (S2, #1001). Capture stays in search_capture.rs.
+  "src/search_card.rs",
 ]
 
 # Coarse developer-tool boundary; does not infer internal tooling architecture.

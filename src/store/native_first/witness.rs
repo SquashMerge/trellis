@@ -1,7 +1,7 @@
 //! Bounded original-admission authority for LOCAL source-association reuse.
 //! Every call uses the owner's fresh exact-target snapshot; no SQLite handle survives it.
 use super::*;
-use crate::native_evidence::{DocumentKey, Range};
+use crate::native_records::{DocumentKey, Range};
 use crate::semantic_batch::{
     descriptor::{Descriptor, SourceManifestHasher},
     limits::BatchLimits,

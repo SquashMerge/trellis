@@ -14,7 +14,7 @@ use crate::{
         GraphSource, HistoryFacts, SemanticDocument,
     },
     model::{BoundaryReason, SemanticState},
-    native_evidence::DocumentKey,
+    native_records::DocumentKey,
     semantic_evidence as sem,
 };
 use serde_json::json;
@@ -281,7 +281,7 @@ impl<'a> SemanticCalls<'a> {
     /// The selected binding of one measured call, or `None` for syntax-only evidence.
     pub(super) fn call(
         &mut self,
-        call: &crate::native_evidence::Call,
+        call: &crate::native_records::Call,
     ) -> Result<Option<CallSemantic>> {
         let Some(tuple) = self.tuple(&call.document.language, &call.document.path)? else {
             return Ok(None);
@@ -759,7 +759,7 @@ pub(super) fn view_walk(
                 .cloned()
                 .collect();
             ordered.sort_by(crate::model::compare_reader_calls);
-            let native: BTreeMap<String, crate::native_evidence::Call> = if bound {
+            let native: BTreeMap<String, crate::native_records::Call> = if bound {
                 let scope = v8_owner_scope_for(db, &node.id, selected)?.ok_or_else(|| {
                     SelectedIntegrity("incompatible_index: selected view node missing".into())
                 })?;
@@ -1387,8 +1387,8 @@ impl EvidenceResponse {
     pub(crate) fn mcp_call_semantics<'c>(
         &self,
         explicit: Option<&str>,
-        owner_document: &crate::native_evidence::DocumentKey,
-        calls: impl IntoIterator<Item = &'c crate::native_evidence::Call>,
+        owner_document: &crate::native_records::DocumentKey,
+        calls: impl IntoIterator<Item = &'c crate::native_records::Call>,
     ) -> Result<McpSemantic> {
         let selected = self.selected(None)?;
         let mut reader = SemanticCalls::new(&self.db, &selected, explicit)?;
@@ -1556,11 +1556,9 @@ pub(super) fn architecture_semantic(
             .transpose()
     };
     // Stored offsets are nonnegative and ordered; anything else is a corrupt row.
-    let range = |start: i64, end: i64| -> Result<crate::native_evidence::Range> {
+    let range = |start: i64, end: i64| -> Result<crate::native_records::Range> {
         match (usize::try_from(start), usize::try_from(end)) {
-            (Ok(start), Ok(end)) if start <= end => {
-                Ok(crate::native_evidence::Range { start, end })
-            }
+            (Ok(start), Ok(end)) if start <= end => Ok(crate::native_records::Range { start, end }),
             _ => Err(SelectedIntegrity("corrupt semantic offset".into()).into()),
         }
     };

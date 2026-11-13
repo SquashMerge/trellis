@@ -1,7 +1,7 @@
 //! Pinned Files outline and same-spelling syntax evidence. No binding is inferred.
 use crate::{
     model::{IndexPin, SourceFile, SourceRange, Symbol},
-    native_evidence::Header,
+    native_records::Header,
 };
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};

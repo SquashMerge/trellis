@@ -1,14 +1,16 @@
 //! Exact, search-only form-c card preparation and serialization.
 //!
 //! Inputs are measured during the existing native parse. This module neither reads
-//! source files nor parses source, and has no dependency on display keys.
+//! source files nor parses source, and has no dependency on display keys. It uses only
+//! shared records and `native_ids`, so storage can render a stored card with it.
 
 use std::collections::BTreeSet;
 
 use serde_json::{Value, json};
 
-use crate::native_evidence::Header;
 use crate::native_ids::{canonical, digest};
+use crate::native_records::{Declaration, Header};
+use crate::search_card_records::CapturedCard;
 pub use crate::search_card_records::{
     Ancestor, PreparedFacts, SearchCard, is_container, is_eligible,
 };
@@ -45,6 +47,18 @@ pub struct MeasuredFacts<'a> {
     pub strings: &'a [String],
     pub members: &'a [String],
     pub head: &'a str,
+}
+
+/// Re-render owned captured facts against the declaration's current measured header.
+pub fn render_card(declaration: &Declaration, captured: &CapturedCard) -> SearchCard {
+    serialize(&CardInput {
+        kind: &declaration.kind,
+        name: declaration.name.as_deref().unwrap_or(""),
+        ancestors: &captured.ancestors,
+        path: &captured.path,
+        header: &declaration.header,
+        facts: &captured.facts,
+    })
 }
 
 pub struct CardInput<'a> {

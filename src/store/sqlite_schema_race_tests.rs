@@ -8,7 +8,7 @@ fn ready() -> (
     Store,
     Graph,
     crate::capture::Capture,
-    crate::native_evidence::Artifact,
+    crate::native_records::Artifact,
     IndexPin,
     CancelFlag,
     Arc<topology::WriterSession>,
