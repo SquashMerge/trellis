@@ -28,7 +28,8 @@ fn in_place_rebuild_captures_after_the_downgrade_and_before_publication() {
     fs::write(work.path().join("a.js"), "function a() { return 1; }\n").unwrap();
     let options = IndexOptions::new(work.path().to_owned());
     let cancel = Arc::new(AtomicBool::new(false));
-    let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let store =
+        crate::testing::retry_admission(|| Store::open_for_tests(state.path(), work.path()));
     let first = IndexJobCoordinator::prepare(&store, None)
         .unwrap()
         .run(&options, &cancel, |_| {})
@@ -38,7 +39,8 @@ fn in_place_rebuild_captures_after_the_downgrade_and_before_publication() {
     let inode = fs::metadata(&index).unwrap().ino();
     // Classified for recreation, but the file is sound: the exclusive probe finds no
     // file-level damage and recreation rebuilds in place.
-    let recovering = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let recovering =
+        crate::testing::retry_admission(|| Store::open_for_tests(state.path(), work.path()));
     recovering.mark_recovery(RecoveryDisposition::RecreatePending);
     let exclusive = recovering
         .roots
@@ -81,12 +83,14 @@ fn replacement_captures_under_exclusive_use_before_the_index_is_replaced() {
     fs::write(work.path().join("a.js"), "function a() { return 1; }\n").unwrap();
     let options = IndexOptions::new(work.path().to_owned());
     let cancel = Arc::new(AtomicBool::new(false));
-    let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let store =
+        crate::testing::retry_admission(|| Store::open_for_tests(state.path(), work.path()));
     let index = store.roots.index_db(&store.identity);
     let dir = store.roots.index_dir(&store.identity);
     drop(store);
     fs::write(&index, b"short").unwrap();
-    let recovering = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let recovering =
+        crate::testing::retry_admission(|| Store::open_for_tests(state.path(), work.path()));
     assert_eq!(
         recovering.disposition(),
         RecoveryDisposition::RecreatePending
