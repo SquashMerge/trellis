@@ -15,9 +15,15 @@ Only first-party references are counted. `rules check` gives every instance a
 with an `externalPackage` destination are left out of every figure, so a new
 `import json` in a tool changes nothing here.
 
+The run fails when deviating pairs, deviating references, unknown references or partial
+files rise above the record. Coverage is judged on unknown references (the references
+of the instances whose status is `unknown`), not on pair counts: a pair is one source
+file's aggregate, so splitting, merging or renaming a file moves pair counts without
+changing what is known. The pair totals are recorded as information and never fail.
+
 Known gap: a bare JavaScript import the tool leaves unresolved (`destination` null, such
 as `node:crypto` or `esbuild`) is not classified `externalPackage`. It stays in the
-population as an unknown pair, so a new one can fail as lost coverage (see #1088).
+population as unknown references, so a new one can fail as lost coverage (see #1088).
 
 The measurement runs through a daemon of its own under a private HOME, on a fresh index
 of this checkout with fresh rust-analyzer and scip-typescript evidence; it never touches
@@ -46,11 +52,11 @@ ROOT = Path(__file__).resolve().parent.parent
 RECORD = ROOT / "docs/refactoring/0.2.x/rules-ratchet.json"
 # The producers the spec's baseline was measured with, and the profile each runs under.
 PRODUCERS = (("rust-analyzer", "trusted"), ("scip-typescript", "restricted"))
-# Record keys, in file order. The first two are the ratchet; the rest are the
-# comparison population they were counted on.
-KEYS = ("deviatingPairs", "deviatingReferences", "comparablePairs", "conformingPairs",
-        "unknownPairs", "partialFiles")
-SCHEMA_VERSION = 2
+# Record keys, in file order. A rise in any of RATCHETED fails; the pair totals after
+# them describe the population and are information only.
+RATCHETED = ("deviatingPairs", "deviatingReferences", "unknownReferences", "partialFiles")
+KEYS = (*RATCHETED, "comparablePairs", "conformingPairs", "unknownPairs")
+SCHEMA_VERSION = 3
 # What the record's figures count and how they were measured, written into the record
 # so it can be read without this script.
 DESCRIPTION = {
@@ -61,6 +67,12 @@ DESCRIPTION = {
                   "unresolved (destination null, such as node:crypto or esbuild) is "
                   "not an externalPackage, so it stays in the population and a new "
                   "one can fail as lost coverage (see #1088).",
+    "rule": "A run fails when deviatingPairs, deviatingReferences, unknownReferences or "
+            "partialFiles is above this record. unknownReferences is the sum of "
+            "referenceCount over the population's instances with status unknown. "
+            "comparablePairs, conformingPairs and unknownPairs are information only: "
+            "a pair is one source file's aggregate, so a file split, merge, rename "
+            "or deletion moves them without changing coverage.",
     "measurement": "`python3 tools/rules-ratchet.py --update`: a debug build of this "
                    "checkout, its own daemon under a private HOME, a fresh index, then "
                    "rust-analyzer (trusted) and scip-typescript (restricted) imported.",
@@ -151,35 +163,34 @@ def summarize(payload):
             for status, key in (("deviates", "deviates"), ("unknown", "unknown"))):
         raise Failed("rules check counts disagree with its instances")
     first_party = [row for row in instances if not is_external(row)]
-    deviating = having(first_party, "deviates")
+    deviating, unknown = having(first_party, "deviates"), having(first_party, "unknown")
     return {
         "deviatingPairs": len(deviating),
         "deviatingReferences": sum(row["referenceCount"] for row in deviating),
+        "unknownReferences": sum(row["referenceCount"] for row in unknown),
+        "partialFiles": len(payload["partialFiles"]),
         "comparablePairs": len(first_party),
         "conformingPairs": len(having(first_party, "conforms")),
-        "unknownPairs": len(having(first_party, "unknown")),
-        "partialFiles": len(payload["partialFiles"]),
+        "unknownPairs": len(unknown),
     }, len(instances) - len(first_party)
 
 
 def compare(record, measured):
     """Returns (verdict, lines); verdict is `fail`, `lower` or `equal`.
 
-    A rise in deviating pairs or references fails. So does worse coverage (fewer
-    comparable pairs, more unknown pairs or more partial files), because the check
-    reports observed references, not absence: fewer deviations on less evidence is not
-    progress. Anything else that differs is only a notice that the record can be updated.
+    A rise in deviating pairs or references fails. So does worse coverage: more
+    unknown references or more partial files, because the check reports observed
+    references, not absence, so fewer deviations on less evidence is not progress.
+    Pair totals never fail: they move when a file is split, merged, renamed or deleted.
+    Anything else that differs is only a notice that the record can be updated.
     """
     def change(key):
         return f"{key}: recorded {record[key]}, measured {measured[key]}"
 
     rises = [change(key) for key in ("deviatingPairs", "deviatingReferences")
              if measured[key] > record[key]]
-    lost = [change(key) for key, worse in (
-        ("comparablePairs", measured["comparablePairs"] < record["comparablePairs"]),
-        ("unknownPairs", measured["unknownPairs"] > record["unknownPairs"]),
-        ("partialFiles", measured["partialFiles"] > record["partialFiles"]),
-    ) if worse]
+    lost = [change(key) for key in ("unknownReferences", "partialFiles")
+            if measured[key] > record[key]]
     if rises or lost:
         lines = []
         if rises:
@@ -195,7 +206,7 @@ def compare(record, measured):
     if differs:
         return "lower", (["rules ratchet NOTICE: the record can be updated"]
                          + [f"  {line}" for line in differs]
-                         + [f"  Lower it in this change: {UPDATE}"])
+                         + [f"  Update it: {UPDATE}"])
     return "equal", ["rules ratchet: " + ", ".join(f"{key} {measured[key]}" for key in KEYS)]
 
 

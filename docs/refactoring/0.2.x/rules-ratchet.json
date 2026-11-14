@@ -1,11 +1,13 @@
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "population": "Production instances of `trellis rules check` whose destination is not an externalPackage: first-party sources to first-party or unresolved destinations. Standard-library and external packages are not counted. Known gap: a bare JavaScript import the tool leaves unresolved (destination null, such as node:crypto or esbuild) is not an externalPackage, so it stays in the population and a new one can fail as lost coverage (see #1088).",
+  "rule": "A run fails when deviatingPairs, deviatingReferences, unknownReferences or partialFiles is above this record. unknownReferences is the sum of referenceCount over the population's instances with status unknown. comparablePairs, conformingPairs and unknownPairs are information only: a pair is one source file's aggregate, so a file split, merge, rename or deletion moves them without changing coverage.",
   "measurement": "`python3 tools/rules-ratchet.py --update`: a debug build of this checkout, its own daemon under a private HOME, a fresh index, then rust-analyzer (trusted) and scip-typescript (restricted) imported.",
-  "deviatingPairs": 56,
-  "deviatingReferences": 358,
-  "comparablePairs": 1860,
-  "conformingPairs": 1560,
-  "unknownPairs": 244,
-  "partialFiles": 0
+  "deviatingPairs": 51,
+  "deviatingReferences": 348,
+  "unknownReferences": 7188,
+  "partialFiles": 0,
+  "comparablePairs": 1865,
+  "conformingPairs": 1569,
+  "unknownPairs": 245
 }

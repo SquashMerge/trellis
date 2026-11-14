@@ -13,8 +13,8 @@ SPEC = importlib.util.spec_from_file_location(
 RR = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(RR)
 
-RECORD = {"deviatingPairs": 3, "deviatingReferences": 10, "comparablePairs": 40,
-          "conformingPairs": 30, "unknownPairs": 7, "partialFiles": 1}
+RECORD = {"deviatingPairs": 3, "deviatingReferences": 10, "unknownReferences": 50,
+          "partialFiles": 1, "comparablePairs": 40, "conformingPairs": 30, "unknownPairs": 7}
 
 
 NATIVE = {"sourceSetId": "source-set:v1:0", "language": "rust", "path": "src/storage.rs",
@@ -69,17 +69,36 @@ class Ratchet(unittest.TestCase):
             self.assertIn(f"{key}: recorded {RECORD[key]}, measured {RECORD[key] + 1}", lines[1])
 
     def test_fewer_deviations_on_lost_coverage_fail(self):
-        for key, value in (("comparablePairs", 39), ("unknownPairs", 8), ("partialFiles", 2)):
+        for key, value in (("unknownReferences", 51), ("partialFiles", 2)):
             verdict, lines = self.verdict(deviatingPairs=2, deviatingReferences=5, **{key: value})
             self.assertEqual(verdict, "fail", key)
             self.assertIn("lost coverage", lines[0])
+            self.assertIn(f"{key}: recorded {RECORD[key]}, measured {value}", lines[1])
 
-    def test_fewer_deviations_on_no_worse_coverage_are_only_a_notice(self):
-        verdict, lines = self.verdict(deviatingPairs=2, deviatingReferences=5,
-                                      conformingPairs=31, comparablePairs=41, unknownPairs=7)
-        self.assertEqual(verdict, "lower")
-        self.assertIn("NOTICE", lines[0])
-        self.assertIn(RR.UPDATE, lines[-1])
+    def test_a_rise_in_unknown_references_fails(self):
+        verdict, lines = self.verdict(unknownReferences=51)
+        self.assertEqual(verdict, "fail")
+        self.assertEqual(lines[:2], ["rules ratchet FAILED: the comparison population lost coverage",
+                                     "  unknownReferences: recorded 50, measured 51"])
+
+    def test_pair_totals_never_fail(self):
+        # Fewer comparable or conforming pairs (code deleted, files merged) and more
+        # unknown pairs (a file split) are notices while unknown references do not rise.
+        for changed in ({"comparablePairs": 39}, {"conformingPairs": 29}, {"unknownPairs": 8},
+                        {"comparablePairs": 35, "conformingPairs": 26, "unknownPairs": 9}):
+            verdict, lines = self.verdict(**changed)
+            self.assertEqual(verdict, "lower", changed)
+            self.assertIn("NOTICE", lines[0])
+
+    def test_improvements_are_only_a_notice(self):
+        for changed in ({"deviatingPairs": 2, "deviatingReferences": 5},
+                        {"unknownReferences": 40, "unknownPairs": 6}, {"partialFiles": 0},
+                        {"deviatingPairs": 2, "deviatingReferences": 5, "conformingPairs": 31,
+                         "comparablePairs": 41, "unknownReferences": 49}):
+            verdict, lines = self.verdict(**changed)
+            self.assertEqual(verdict, "lower", changed)
+            self.assertIn("NOTICE", lines[0])
+            self.assertIn(RR.UPDATE, lines[-1])
 
     def test_a_payload_is_summarized_without_its_external_destinations(self):
         measured = payload(
@@ -89,8 +108,9 @@ class Ratchet(unittest.TestCase):
             row("unknown", 3, destination={**stdlib("serde", "rust"), "standardLibrary": False}))
         measured["partialFiles"] = [{"path": "a.rs"}]
         self.assertEqual(RR.summarize(measured), ({
-            "deviatingPairs": 2, "deviatingReferences": 10, "comparablePairs": 6,
-            "conformingPairs": 2, "unknownPairs": 1, "partialFiles": 1}, 2))
+            "deviatingPairs": 2, "deviatingReferences": 10, "unknownReferences": 2,
+            "partialFiles": 1, "comparablePairs": 6, "conformingPairs": 2,
+            "unknownPairs": 1}, 2))
 
     def test_counts_that_disagree_with_the_instances_are_refused(self):
         measured = payload(*TREE)
@@ -122,7 +142,19 @@ class Ratchet(unittest.TestCase):
         measured, _ = RR.summarize(payload(*TREE, row("unknown", 1, destination=None)))
         verdict, lines = RR.compare(record, measured)
         self.assertEqual(verdict, "fail")
-        self.assertIn("unknownPairs: recorded 1, measured 2", lines[1])
+        self.assertIn("unknownReferences: recorded 2, measured 3", lines[1])
+
+    def test_a_file_split_that_adds_an_unknown_pair_passes(self):
+        # One source's unresolved references become two sources' (#1087): one more
+        # unknown pair, the same unknown references.
+        whole = row("unknown", 22, destination=None, source="src/scip_admission.rs")
+        halves = (row("unknown", 17, destination=None, source="src/producer_pin.rs"),
+                  row("unknown", 5, destination=None, source="src/scip_admission.rs"))
+        record, _ = RR.summarize(payload(*TREE, whole))
+        measured, _ = RR.summarize(payload(*TREE, *halves))
+        self.assertEqual(measured["unknownPairs"], record["unknownPairs"] + 1)
+        self.assertEqual(measured["unknownReferences"], record["unknownReferences"])
+        self.assertEqual(RR.compare(record, measured)[0], "lower")
 
     def test_the_record_round_trips_byte_for_byte(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -138,10 +170,11 @@ class Ratchet(unittest.TestCase):
             path = Path(directory) / "record.json"
             RR.write_record(path, RECORD)
             written = json.loads(path.read_text())
-            self.assertEqual(list(written), ["schemaVersion", "population", "measurement", *RR.KEYS])
+            self.assertEqual(list(written), ["schemaVersion", "population", "rule", "measurement", *RR.KEYS])
             self.assertIn("externalPackage", written["population"])
-            # A record of the earlier population, which counted external packages, is refused.
-            path.write_text(json.dumps({"schemaVersion": 1, **RECORD}))
+            self.assertIn("unknownReferences", written["rule"])
+            # A record of an earlier version, with another population or rule, is refused.
+            path.write_text(json.dumps({"schemaVersion": 2, **RECORD}))
             with self.assertRaisesRegex(RR.Failed, "--update"):
                 RR.read_record(path)
 
