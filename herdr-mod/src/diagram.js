@@ -11,7 +11,7 @@ import makeApps from "trellis-web:architecture-apps";
 import makeArchitecture from "trellis-web:architecture";
 import makePeleSvg from "trellis-web:pele-svg";
 import makeArchitecturePele from "trellis-web:architecture-pele";
-import makeDeviations from "trellis-web:architecture-deviations";
+import makeDeviationsModel from "trellis-web:deviations-model";
 import TOKENS from "trellis-web:tokens";
 import CONTROLS from "trellis-web:controls";
 import { DOMParser, TextEncoder, serialize } from "./dom.js";
@@ -26,8 +26,8 @@ const helpers = makeArchitecture({ TrellisMetricHeat: heat, TrellisArchitectureA
 const env = { pele };
 makePeleSvg(env, document, DOMParser, TextEncoder);
 const adapter = makeArchitecturePele(env, document, DOMParser, TextEncoder);
-/** The Deviations tree's pure model (web/architecture-deviations.js). */
-export const deviationModel = makeDeviations({}, document).model;
+/** The Deviations tree's pure model (web/deviations-model.js). */
+export const deviationModel = makeDeviationsModel({}).model;
 export { TOKENS, CONTROLS };
 
 // The browser's defaults are the selects' own: the `selected` option, else the first.

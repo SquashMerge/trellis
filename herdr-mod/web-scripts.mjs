@@ -19,8 +19,8 @@ const WEB = {
   architecture: { file: "architecture.js", params: "window, document", result: "window.TrellisArchitecture" },
   // Apps, All apps layout, interface cards and inspector facts (pure).
   "architecture-apps": { file: "architecture-apps.js", params: "window", result: "window.TrellisArchitectureApps" },
-  // Only the pure Deviations tree model is used; its DOM view is not.
-  "architecture-deviations": { file: "architecture-deviations.js", params: "window, document", result: "window.TrellisDeviations" },
+  // The Deviations tree model (pure); its DOM view is not bundled.
+  "deviations-model": { file: "deviations-model.js", params: "window", result: "window.TrellisDeviationsModel" },
   // What the Pele adapters share (SVG admission, button semantics, the text measurer); they read it from `window`, so load it first.
   "pele-svg": { file: "pele-svg.js", params: "window, document, DOMParser, TextEncoder", result: "window.TrellisPeleSvg" },
   "architecture-pele": { file: "architecture-pele.js", params: "window, document, DOMParser, TextEncoder", result: "window.TrellisArchitecturePele" },

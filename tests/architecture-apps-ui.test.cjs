@@ -43,7 +43,7 @@ function controller(payload, options = {}) {
     // `drawer`: the page is at the narrow-screen drawer width, the one width at which All apps stacks.
     matchMedia:query => ({matches:query === "(max-width: 900px)" && options.drawer === true})};
   get("architecture-diagram").clientWidth = options.width ?? 1500;
-  vm.runInNewContext([pinSource, read("web/metric-heat.js"), read("web/architecture-apps.js"), read("web/architecture-deviations.js"), read("web/architecture.js")].join("\n"),
+  vm.runInNewContext([pinSource, read("web/metric-heat.js"), read("web/architecture-apps.js"), read("web/deviations-model.js"), read("web/architecture-deviations.js"), read("web/architecture.js")].join("\n"),
     {window, document, URLSearchParams, console, setTimeout, clearTimeout});
   const architecture = window.TrellisArchitecture.create({
     request:async url => { calls.push(url); return {payload}; }, onInspect:() => inspected.push(true),

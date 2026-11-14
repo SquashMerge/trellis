@@ -31,7 +31,7 @@ The mod now draws Architecture from the browser's own modules, so the two can't 
 
 - **Summary display.** `web/architecture.js` exports `createDisplay(state)`: the band labels and stat chips, the module chips and their budget, the per-app parts of All apps, the heat scale, the legend words and the review counts. The browser's `create()` and the mod both call it. The mod's earlier port of these functions is gone.
 - **Apps.** `web/architecture-apps.js` (pure) gives the switcher's choices, the source line, the All apps column layout, column headers, interface cards, cross-app lines and the inspector facts (`appFacts`, `interfaceFacts`, `footnote`, new and used by the browser too).
-- **Deviations.** The Deviations tree is `web/architecture-deviations.js`'s pure `model`, over pages of `architecture/details`, shown as native rows.
+- **Deviations.** The Deviations tree is `web/deviations-model.js`'s pure `model`, over pages of `architecture/details`, shown as native rows.
 - **Colours and controls.** `web-scripts.mjs` reads the `--sm-*` tokens from `web/style.css` and the Color by and Aggregation options (and their default) from `web/index.html` at build time. Heat fills, the error tone and ink on heat keep the web colours; surfaces, text and lines use the Herdr theme.
 - **Logo and status line.** The header shows `web/brand/trellis-mark-transparent-v1.png` (copied as `trellis-mark.png` by `build.mjs`) and "Trellis by SquashMerge". The status line adds the web app's "Last re-index failed · code: reason" from `jobs/current`.
 - **`trellis api`.** It now also serves `GET …/architecture/details` and `GET …/jobs/current`, so the remote transport has the same features.
