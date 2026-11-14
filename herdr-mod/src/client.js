@@ -174,7 +174,7 @@ export function architecturePayload(data, pin, aggregate = "max") {
   return payload;
 }
 
-/** web/app-checkout.js checkoutIndexLabel: a checkout's index state as words and a shape. */
+/** web/app.js checkoutIndexLabel: a checkout's index state as words and a shape. */
 export function indexLabel(row) {
   if (!row || row.state !== "available") return { text: row?.state === "storage_busy" ? "Busy" : `Unavailable${row?.indexError ? ` · ${row.indexError}` : ""}`, state: "failed", shape: "□" };
   if (row.indexError && row.indexError !== "index_not_ready") return { text: `Index unavailable · ${row.indexError}`, state: "failed", shape: "□" };
@@ -198,7 +198,7 @@ export function detailPage(data, pin, rulesHash, kind, offset) {
   return page;
 }
 
-/** web/app-checkout.js jobCause: the recorded failure code and reason, never the generic job message. */
+/** web/app.js jobCause: the recorded failure code and reason, never the generic job message. */
 export function jobCause(job) {
   const code = typeof job?.error?.code === "string" && job.error.code ? job.error.code : "cause not recorded";
   const reason = typeof job?.error?.reason === "string" && job.error.reason ? `: ${job.error.reason}` : "";

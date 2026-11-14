@@ -482,7 +482,7 @@ fn trellis_real_router_and_client() {
         "web/app-api.js",
         "web/app-agent.js",
         "web/app-navigation.js",
-        "web/app-checkout.js",
+        "web/app-status.js",
         "web/app-source.js",
         "web/app-files.js",
         "web/app-tree.js",
@@ -533,7 +533,7 @@ fn trellis_real_router_and_client() {
         .as_array()
         .unwrap()
         .iter()
-        .filter(|site| site["document"]["path"] == "web/app-checkout.js")
+        .filter(|site| site["document"]["path"] == "web/app-status.js")
         .collect();
     assert!(!through_prefix.is_empty());
     assert!(through_prefix.iter().all(|site| site["layer"] == "web"));

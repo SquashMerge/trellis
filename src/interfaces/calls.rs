@@ -1885,7 +1885,7 @@ fn run(client: &Client) {
             "api",
             "agent",
             "navigation",
-            "checkout",
+            "status",
             "source",
             "files",
             "tree",

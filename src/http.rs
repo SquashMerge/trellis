@@ -2324,11 +2324,7 @@ pub const WEB_ASSETS: &[WebAsset] = &[
         JS,
         include_bytes!("../web/app-navigation.js"),
     ),
-    web_asset(
-        "/app-checkout.js",
-        JS,
-        include_bytes!("../web/app-checkout.js"),
-    ),
+    web_asset("/app-status.js", JS, include_bytes!("../web/app-status.js")),
     web_asset("/app-source.js", JS, include_bytes!("../web/app-source.js")),
     web_asset("/app-files.js", JS, include_bytes!("../web/app-files.js")),
     web_asset("/app-tree.js", JS, include_bytes!("../web/app-tree.js")),

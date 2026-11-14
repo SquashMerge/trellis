@@ -333,7 +333,7 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
         ["node", "--check", "web/app-api.js"],
         ["node", "--check", "web/app-agent.js"],
         ["node", "--check", "web/app-navigation.js"],
-        ["node", "--check", "web/app-checkout.js"],
+        ["node", "--check", "web/app-status.js"],
         ["node", "--check", "web/app-source.js"],
         ["node", "--check", "web/app-files.js"],
         ["node", "--check", "web/app-tree.js"],
