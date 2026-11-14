@@ -56,6 +56,9 @@ paths = [
   "src/graph_read.rs", "src/graph_read/**", "src/sequence_hops.rs",
   "src/sequence_hops_tests.rs", "src/sequence_callback_hops_tests.rs",
   "src/navigation_read.rs", "src/sequence_read.rs", "src/view_read.rs",
+  # The class reads, moved up from storage (S7, #1052): the class page and class diagram read
+  # bodies, their forwarding methods and the presentation helpers. SQL until S14, as above.
+  "src/class_read.rs",
 ]
 
 [layers.indexing]
