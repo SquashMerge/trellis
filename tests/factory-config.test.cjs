@@ -428,6 +428,7 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
       checks: [
         ["python3", "tools/flaky-patterns-test.py"],
         ["python3", "tools/flaky-patterns.py"],
+        ["python3", "tools/rules-ratchet-test.py"],
         ["node", "--test", "tests/mcp-catalog-sdk.test.mjs", "tests/mcp-smoke.test.mjs"],
         ["python3", "tools/stage3-watcher-runner-test.py"],
         ["python3", "tools/verify-67-mixed-performance-test.py"],
@@ -462,6 +463,9 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
         ["node", "--test", "tests/browse-ui.test.cjs", "tests/sequence-ui.test.cjs", "tests/token-ui.test.cjs", "tests/external-source-ui.test.cjs", "tests/dependency-ui.test.cjs", "tests/shell-ui.test.cjs", "tests/classes-ui.test.cjs", "tests/navigation-ui.test.cjs", "tests/metric-heat.test.cjs", "tests/viewer-metrics-ui.test.cjs", "tests/files-ui.test.cjs", "tests/architecture-ui.test.cjs", "tests/architecture-pele-ui.test.cjs", "tests/treemap-ui.test.cjs", "tests/treemap-pele.test.cjs", "tests/architecture-apps-ui.test.cjs", "tests/app-switcher-ui.test.cjs", "tests/architecture-routing.test.cjs"],
       ],
     };
+    // The rules-check ratchet (#1008) builds and measures inside its one command.
+    // It is not a default lane: it runs only when named.
+    const ratchet = [["python3", "tools/rules-ratchet.py"]];
     function assertRan(commands, expected) {
       const key = (command) => JSON.stringify(command);
       assert.deepEqual(commands.map(key).sort(), Object.values(expected).flat().map(key).sort());
@@ -478,6 +482,16 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
     const success = runVerify();
     assert.equal(success.result.status, 0, success.output);
     assertRan(success.commands, lanes);
+    assert.doesNotMatch(success.output, /verify lane ratchet/);
+    rmSync(log);
+    const ratchetOnly = runVerify({}, undefined, ["--lane", "ratchet"]);
+    assert.equal(ratchetOnly.result.status, 0, ratchetOnly.output);
+    assertRan(ratchetOnly.commands, { setup: lanes.setup, ratchet });
+    assert.match(ratchetOnly.output, /==> verify lane ratchet \(exit 0\)/);
+    rmSync(log);
+    const withRatchet = runVerify({}, undefined, ["--lane", "checks", "--lane", "ratchet"]);
+    assert.equal(withRatchet.result.status, 0, withRatchet.output);
+    assertRan(withRatchet.commands, { setup: lanes.setup, checks: lanes.checks, ratchet });
     rmSync(log);
     // With TRELLIS_BROWSER_SYSTEM_DEPS set, the system packages are checked
     // and, only if a library or the layout font is missing, installed in the background; the
@@ -558,7 +572,7 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
     assert.equal(testsOnly.result.status, 0, testsOnly.output);
     // No browser suite, so no system package install.
     assertRan(testsOnly.commands, { setup: lanes.setup, tests: lanes.tests });
-    assert.doesNotMatch(testsOnly.output, /==> verify lane (rust|semantic|cohorts|checks)/);
+    assert.doesNotMatch(testsOnly.output, /==> verify lane (rust|semantic|cohorts|checks|ratchet)/);
     rmSync(log);
     const split = runVerify({}, undefined, ["--lane", "lint", "--lane=semantic", "--lane", "cohorts", "--lane", "checks"]);
     assert.equal(split.result.status, 0, split.output);
@@ -582,6 +596,20 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
   } finally {
     rmSync(fakeDir, { recursive: true, force: true });
   }
+});
+
+// Owner ruling 8 on #1008: the rules-check ratchet is not in PR CI. It is not a
+// default verify lane, so a pull-request workflow runs it only by naming it.
+test("no pull-request workflow runs the ratchet lane", () => {
+  const directory = join(ROOT, ".github/workflows");
+  const triggered = [];
+  for (const name of readdirSync(directory).filter((file) => /\.ya?ml$/.test(file))) {
+    const lines = readFileSync(join(directory, name), "utf8").split("\n").filter((line) => !/^\s*#/.test(line));
+    if (!lines.some((line) => /^\s*pull_request(_target)?:/.test(line))) continue;
+    triggered.push(name);
+    assert.ok(!lines.some((line) => /\bratchet\b/.test(line)), `${name} names the ratchet lane`);
+  }
+  assert.deepEqual(triggered, ["release-candidates.yml", "rust.yml"]);
 });
 
 test("verify cancellation rechecks recorded identities after descending, without PID fallback", () => {
