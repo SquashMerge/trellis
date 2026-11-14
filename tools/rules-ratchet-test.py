@@ -115,7 +115,10 @@ class DeadlineRetry(unittest.TestCase):
 class ShutDown(unittest.TestCase):
     def setUp(self):
         self.home = Path(tempfile.mkdtemp())
-        self.daemon = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+        # A stand-in daemon that runs until its stdin closes, then exits 0.
+        self.daemon = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
+                                       stdin=subprocess.PIPE)
+        self.addCleanup(self.daemon.stdin.close)
         self.addCleanup(self.daemon.wait)
         self.addCleanup(self.daemon.kill)
 
@@ -131,18 +134,41 @@ class ShutDown(unittest.TestCase):
         self.assertEqual(seen, [(True, True)])
         self.assertIn("daemon stop failed (exit 1)", problems[0])
         self.assertIn(f"daemon {self.daemon.pid} was still running; sent SIGTERM", problems[1])
-        self.assertIsNotNone(self.daemon.poll())
+        self.assertEqual(problems[2], f"daemon {self.daemon.pid} was ended by SIGTERM")
+        self.assertEqual(self.daemon.poll(), -15)
         self.assertFalse(self.home.exists())
 
-    def test_a_stopped_daemon_leaves_no_problem(self):
+    def test_a_daemon_that_exits_0_after_the_stop_leaves_no_problem(self):
         class Stops(Stub):
             def run(inner, *args, timeout=None):
-                self.daemon.terminate()
+                self.daemon.stdin.close()
                 return super().run(*args, timeout=timeout)
 
         self.assertEqual(RR.shut_down(Stops(done(0, '{"stopped": true}')), self.daemon, self.home), [])
-        self.assertEqual(self.daemon.poll() is None, False)
+        self.assertEqual(self.daemon.poll(), 0)
         self.assertFalse(self.home.exists())
+
+    def test_a_daemon_that_died_abnormally_is_a_problem_though_the_stop_succeeds(self):
+        self.daemon.terminate()
+        self.daemon.wait()
+        seen = []
+
+        class Watched(Stub):
+            def run(inner, *args, timeout=None):
+                seen.append(self.home.exists())
+                return super().run(*args, timeout=timeout)
+
+        problems = RR.shut_down(Watched(done(0, '{"stopped": false}')), self.daemon, self.home)
+        self.assertEqual(problems, [f"daemon {self.daemon.pid} was ended by SIGTERM"])
+        self.assertEqual(seen, [True])
+        self.assertFalse(self.home.exists())
+
+    def test_a_daemon_that_exits_nonzero_is_a_problem(self):
+        self.daemon.stdin.close()
+        self.daemon.wait()
+        self.daemon.returncode = 3
+        problems = RR.shut_down(Stub(done(0, '{"stopped": false}')), self.daemon, self.home)
+        self.assertEqual(problems, [f"daemon {self.daemon.pid} exited with code 3"])
 
     def test_without_a_daemon_only_the_home_goes(self):
         self.assertEqual(RR.shut_down(None, None, self.home), [])

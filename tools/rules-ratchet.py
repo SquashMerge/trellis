@@ -294,9 +294,11 @@ def build(target_dir):
 def shut_down(trellis, daemon, home):
     """Stops the daemon this run started and removes its HOME; returns the problems.
 
-    `daemon stop` succeeds only once the daemon has retired. Whatever it says, the
-    process is waited for by its PID, then terminated, then killed; the HOME, which
-    holds its lock and state, goes only when the process is gone."""
+    `daemon stop` succeeds only once the daemon has retired, and also when it finds no
+    daemon. Whatever it says, the process is waited for by its PID, then terminated,
+    then killed; the HOME, which holds its lock and state, goes only when the process
+    is gone. A stopped daemon exits 0: any other exit status, or a signal, is a problem
+    even when the stop command reported success."""
     problems = []
     if daemon is not None:
         stop = trellis.run("daemon", "stop", timeout=STOP_SECS)
@@ -316,6 +318,11 @@ def shut_down(trellis, daemon, home):
                     return problems
                 problems.append(f"daemon {daemon.pid} was still running; sent {name}")
                 escalate()
+        if daemon.returncode < 0:
+            problems.append(f"daemon {daemon.pid} was ended by "
+                            f"{signal.Signals(-daemon.returncode).name}")
+        elif daemon.returncode > 0:
+            problems.append(f"daemon {daemon.pid} exited with code {daemon.returncode}")
     shutil.rmtree(home, ignore_errors=True)
     return problems
 
