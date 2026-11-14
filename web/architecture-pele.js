@@ -86,203 +86,241 @@
     if (source.shared) return "shared outbound";
     return destination.order > source.order ? "downward" : destination.order < source.order ? "upward" : "peer";
   }
-  function project(view, options = {}) {
+  // ---- The projection: a payload and the caller's display, as Pele block source and the records
+  // its boxes stand for. `project` runs the payload checks and the emit steps below in one fixed
+  // order: a check runs just before the first step that needs what it checked, so a payload that
+  // is wrong in two places is refused for the same one as ever.
+  function validateView(view) {
     if (view?.state !== "ready" || !Array.isArray(view.layers) || !Array.isArray(view.modules) || !Array.isArray(view.edges)) unsupported("Invalid Architecture projection");
-    const nodes = new Map(), edges = new Map(), layers = new Map(), native = new Set();
-    const measure = options.measureText || (text => Array.from(text).length * 14);
-    const chip = Number.isFinite(options.chipWidth) ? Math.max(MIN_CHIP, Math.min(MAX_CHIP, Math.floor(options.chipWidth))) : CHIP_WIDTH;
-    let serial = 0;
-    const clean = text => String(text).replace(/[\u0000-\u0009\u000b-\u001f\u007f]/g, " ");
-    // `shown` is the drawn text when it is shorter than the accessible `text`.
-    function label(kind, record, text, pad = false, shown = text, width = null) {
-      const id = kind + (serial++).toString(36), value = clean(text);
-      // Uniform safe placeholders reserve width before repository text is inserted.
-      // A line wraps at separators to the reserved width (#525); the accessible name keeps the full label.
-      const lineWidth = width ?? (kind === "L" || kind === "U" ? 380 : kind === "M" ? 150 : kind === "E" ? 150 : kind === "N" ? 260 : 200);
-      // Edge counts are one line, sized to their text, so they never wrap.
-      const lines = clean(shown).split("\n");
-      const full = pad && kind === "E" ? [lines.join(" ")] : lines;
-      const display = (pad && kind === "E" ? full : full.flatMap(line => wrap(line, lineWidth, measure, MAX_LINES))).map(line => line || " ");
-      const reserve = "W".repeat(Math.ceil(lineWidth / measure("W")));
-      const firstReserve = "W".repeat(Math.max(1,Math.ceil((lineWidth - measure(id + "_")) / measure("W"))));
-      const placeholders = display.map((_, i) => i === 0 ? id + "_" + firstReserve : reserve);
-      return {id,kind,record,display,lineWidth,full:value,placeholder:placeholders.join("<br/>"),expected:placeholders.join("")};
-    }
-    // `host` is the band (layer or unassigned row) a node is drawn in; routing moves it with that band.
-    let host = null;
-    function addNode(kind, record, text, pad, shown, width) { const item = label(kind,record,text,pad,shown,width); item.host = host; nodes.set(item.id,item); return item; }
-    const source = ["block-beta","columns 1"];
-    function open(item, columns, span = 1) { item.composite = true; source.push(`block:${item.id}["${item.placeholder}"]:${span}`, `columns ${columns}`); }
-    const outer = options.display ? null : addNode("B",null,"Architecture · structural references");
-    const shownShared = view.layers.filter(l => l.shared && (!options.display || options.display.layers.has(l.name))).length;
-    const COLUMNS = options.display ? options.columns ?? chipColumns(options.width, shownShared) : CHIP_COLUMNS;
-    options.display?.reset?.();
-    // The stack title reserves no more than one chip, so it never sets the stack's width.
-    const orderedStack = addNode("B",null,options.title ?? "Ordered layers",false,options.title ?? "Ordered layers",options.display ? chip : null);
-    // Optional summary display: the caller chooses drawn layers, expansion and
-    // directory entries. Without it every layer is expanded to file chips.
-    const display = options.display || null;
+  }
+  // Returns the layer names.
+  function validateLayers(view) {
     const names = new Set();
     for (const layer of view.layers) {
       if (typeof layer.name !== "string" || names.has(layer.name) || typeof layer.shared !== "boolean" || (!layer.shared && !Number.isSafeInteger(layer.order))) unsupported("Invalid or duplicate Architecture layer");
       names.add(layer.name);
     }
-    const drawn = view.layers.filter(l => !display || display.layers.has(l.name));
-    const ordered = drawn.filter(l => !l.shared).sort((a,b) => a.order-b.order || a.name.localeCompare(b.name));
-    const shared = drawn.filter(l => l.shared).sort((a,b) => a.name.localeCompare(b.name));
-    // Peers share one band row; a band header is clipped to its band's chip columns.
-    const peerCount = order => ordered.filter(l => l.order === order).length;
-    const width = display ? Math.max(1, ...ordered.map(l => peerCount(l.order))) : 1;
-    const bandColumns = layer => Math.max(1, Math.floor(COLUMNS * Math.floor(width / peerCount(layer.order)) / width));
-    // A header wraps within its band's chip row, so it never widens or clips the band.
-    const rowWidth = columns => columns * (chip + NODE_PAD) + (columns - 1) * GRID_GAP - NODE_PAD;
-    const headerWidth = layer => !display ? null : layer.shared ? chip : Math.max(chip, rowWidth(bandColumns(layer)));
-    for (const layer of drawn) {
-      const header = options.layerLabel?.(layer) ?? `${layer.name}\n${layer.shared ? "Shared" : `Order ${options.layerNumber?.(layer) ?? layer.order}`}`;
-      // Non-zero reference counts become compact chips on their own header lines.
-      const stats = display ? (options.layerStats?.(layer) || []).filter(stat => typeof stat?.text === "string" && stat.text) : [];
-      const widest = stats.reduce((most, stat) => Math.max(most, statWidth(stat, measure)), 0);
-      const lineWidth = Math.max(headerWidth(layer) ?? 380, widest), groups = statLines(stats, lineWidth, measure);
-      const item = addNode("L",layer,stats.length ? `${header}\n${stats.map(stat => stat.label || stat.text).join(" · ")}` : header,
-        false,[header, ...groups.map(group => group.map(stat => stat.text).join(STAT_GAP))].join("\n"),lineWidth);
-      // The stat lines are the last lines; each fits its width, so wrapping leaves them whole.
-      item.statLines = groups.map((group, i) => ({stats:group, line:item.display.length - groups.length + i}));
-      item.host = item.id; layers.set(layer.name,item);
-    }
-    const moduleRows = new Map(view.layers.map(l => [l.name,[]])); moduleRows.set(null,[]);
+    return names;
+  }
+  // Returns each layer's modules in payload order; the key null holds the unassigned ones.
+  function validateModules(view) {
+    const native = new Set(), moduleRows = new Map(view.layers.map(l => [l.name,[]])); moduleRows.set(null,[]);
     for (const module of view.modules) {
       if (!module.identity || !["sourceSetId","language","path","sid"].every(k => typeof module.identity[k] === "string") || native.has(identity(module)) || !moduleRows.has(module.layer)) unsupported("Invalid or duplicate Architecture module");
       native.add(identity(module)); moduleRows.get(module.layer).push(module);
     }
-    const heat = band => Number.isInteger(band) && band >= 0 && band < 4 ? band : null;
-    function leaf(item, span = 1) { source.push(`${item.id}["${item.placeholder}"]${span > 1 ? `:${span}` : ""}`); }
-    // A named chip draws its short module or file name; the accessible label keeps the path.
-    function moduleNode(module, name) {
-      const value = options.metric === "layer" ? undefined : options.moduleValue?.(module);
-      const full = `${module.identity.path}${value === null ? "\nUnavailable" : value === undefined ? "" : `\n${value}`}`;
-      const item = typeof name === "string" ? addNode("M",module,full,false,`${name}${value === null ? "\n—" : value === undefined ? "" : `\n${value}`}`,chip) : addNode("M",module,full);
-      item.band = heat(options.moduleBand?.(module)); leaf(item);
+    return moduleRows;
+  }
+  // One edge, checked just before it is projected; `seenEdges` holds the keys of those before it.
+  function validateEdge(edge, names, seenEdges) {
+    if (!names.has(edge.sourceLayer) || !names.has(edge.destinationLayer) || edge.sourceLayer === edge.destinationLayer || !["production","test"].includes(edge.role) || !["conforms","deviates","unknown"].includes(edge.status) || !Number.isSafeInteger(edge.count) || edge.count <= 0 || typeof edge.excepted !== "boolean" || seenEdges.has(edgeKey(edge))) unsupported("Invalid or duplicate Architecture edge");
+    seenEdges.add(edgeKey(edge));
+  }
+  const clean = text => String(text).replace(/[\u0000-\u0009\u000b-\u001f\u007f]/g, " ");
+  const heat = band => Number.isInteger(band) && band >= 0 && band < 4 ? band : null;
+  // What the emit steps share: the block source under construction and the labelled nodes it
+  // names. A node's id is its kind and a serial in the order nodes are made, so the steps must
+  // run in drawing order. The steps add what later ones read (see `project`).
+  function sheet(view, options, display) {
+    const measure = options.measureText || (text => Array.from(text).length * 14);
+    const chip = Number.isFinite(options.chipWidth) ? Math.max(MIN_CHIP, Math.min(MAX_CHIP, Math.floor(options.chipWidth))) : CHIP_WIDTH;
+    const nodes = new Map(), source = ["block-beta","columns 1"];
+    let serial = 0;
+    // `shown` is the drawn text when it is shorter than the accessible `text`.
+    function label(kind, record, text, shown = text, width = null) {
+      const id = kind + (serial++).toString(36), value = clean(text);
+      // Uniform safe placeholders reserve width before repository text is inserted.
+      // A line wraps at separators to the reserved width (#525); the accessible name keeps the full label.
+      const lineWidth = width ?? (kind === "M" ? 150 : 200);
+      // Edge counts are one line, sized to their text, so they never wrap.
+      const lines = clean(shown).split("\n");
+      const drawn = (kind === "E" ? [lines.join(" ")] : lines.flatMap(line => wrap(line, lineWidth, measure, MAX_LINES))).map(line => line || " ");
+      const reserve = "W".repeat(Math.ceil(lineWidth / measure("W")));
+      const firstReserve = "W".repeat(Math.max(1,Math.ceil((lineWidth - measure(id + "_")) / measure("W"))));
+      const placeholders = drawn.map((_, i) => i === 0 ? id + "_" + firstReserve : reserve);
+      return {id,kind,record,display:drawn,lineWidth,full:value,placeholder:placeholders.join("<br/>"),expected:placeholders.join("")};
     }
-    function emitEntries(entries, span) {
-      if (!entries.length) leaf(addNode("B",null,"No files shown",false,"No files shown",chip));
-      for (const entry of entries) {
-        if (entry.type === "module") moduleNode(entry.module, entry.name);
-        else if (entry.type === "directory") {
-          const item = addNode("D",entry,entry.label,false,entry.open ? entry.label : entry.shown ?? entry.label,entry.open ? rowWidth(span) : chip);
-          item.band = entry.open ? null : heat(entry.band);
-          if (entry.open) { open(item,span,span); emitEntries(entry.entries,span); source.push("end"); } else leaf(item);
-        } else if (entry.type === "note") leaf(addNode("N",entry,entry.label,false,entry.shown ?? entry.label,chip));
-        else if (entry.type === "chip") { const item = addNode("C",entry,entry.label,false,entry.shown ?? entry.label,chip); item.band = heat(entry.band); leaf(item); }
-        else unsupported("Invalid Architecture display entry");
-      }
+    const c = {view, options, display, measure, chip, nodes, source, label,
+      // `host` is the band (layer or unassigned row) a node is drawn in; routing moves it with that band.
+      host:null,
+      add(kind, record, text, shown, width) { const item = label(kind,record,text,shown,width); item.host = c.host; nodes.set(item.id,item); return item; },
+      open(item, columns, span = 1) { item.composite = true; source.push(`block:${item.id}["${item.placeholder}"]:${span}`, `columns ${columns}`); },
+      leaf(item, span = 1) { source.push(`${item.id}["${item.placeholder}"]${span > 1 ? `:${span}` : ""}`); },
+      // A header wraps within its band's chip row, so it never widens or clips the band.
+      rowWidth:columns => columns * (chip + NODE_PAD) + (columns - 1) * GRID_GAP - NODE_PAD};
+    return c;
+  }
+  // The drawn layers in drawing order, and how one band row's chip columns divide among peers.
+  function bandGeometry({view, display, COLUMNS, chip, rowWidth}) {
+    const drawn = view.layers.filter(l => display.layers.has(l.name));
+    const ordered = drawn.filter(l => !l.shared).sort((a,b) => a.order-b.order || a.name.localeCompare(b.name));
+    const shared = drawn.filter(l => l.shared).sort((a,b) => a.name.localeCompare(b.name));
+    // Peers share one band row; a band header is clipped to its band's chip columns.
+    const peerCount = order => ordered.filter(l => l.order === order).length;
+    const width = Math.max(1, ...ordered.map(l => peerCount(l.order)));
+    const bandColumns = layer => Math.max(1, Math.floor(COLUMNS * Math.floor(width / peerCount(layer.order)) / width));
+    const headerWidth = layer => layer.shared ? chip : Math.max(chip, rowWidth(bandColumns(layer)));
+    return {drawn, ordered, shared, orders:[...new Set(ordered.map(l => l.order))], width, bandColumns, headerWidth};
+  }
+  // One header node per drawn layer, in payload order. Returns them by layer name.
+  function emitHeaders(c) {
+    const {options, measure} = c, layers = new Map();
+    for (const layer of c.drawn) {
+      const header = options.layerLabel?.(layer) ?? `${layer.name}\n${layer.shared ? "Shared" : `Order ${options.layerNumber?.(layer) ?? layer.order}`}`;
+      // Non-zero reference counts become compact chips on their own header lines.
+      const stats = (options.layerStats?.(layer) || []).filter(stat => typeof stat?.text === "string" && stat.text);
+      const widest = stats.reduce((most, stat) => Math.max(most, statWidth(stat, measure)), 0);
+      const lineWidth = Math.max(c.headerWidth(layer), widest), groups = statLines(stats, lineWidth, measure);
+      const item = c.add("L",layer,stats.length ? `${header}\n${stats.map(stat => stat.label || stat.text).join(" · ")}` : header,
+        [header, ...groups.map(group => group.map(stat => stat.text).join(STAT_GAP))].join("\n"),lineWidth);
+      // The stat lines are the last lines; each fits its width, so wrapping leaves them whole.
+      item.statLines = groups.map((group, i) => ({stats:group, line:item.display.length - groups.length + i}));
+      item.host = item.id; layers.set(layer.name,item);
     }
-    // Pele gives a leaf row the height of its tallest sibling, so a folded band is a composite
-    // whose header is the one toggle, over a short non-interactive file count.
-    function folded(item, record, text, span) {
-      open(item,1,span);
-      const summary = addNode("S",record,text,false,text,chip); summary.owner = item; leaf(summary);
-      source.push("end");
-    }
-    function emitLayer(layer, span = 1) { host = layers.get(layer.name).id; emitBand(layer, span); host = null; }
-    function emitBand(layer, span) {
-      // Peers split the chip columns of one band row, so the stack keeps one width.
-      const item = layers.get(layer.name), columns = layer.shared ? 1 : display ? bandColumns(layer) : 4;
-      const members = moduleRows.get(layer.name).sort((a,b) => identity(a).localeCompare(identity(b)));
-      if (display) {
-        // A collapsed band shows one row of module chips coloured by metric (#449), not a file count.
-        if (!item.expanded) {
-          const chips = display.summary ? display.summary(layer.name,members,layer.shared ? SHARED_ROWS : columns) : [];
-          if (!chips.length) { folded(item,layer,`${members.length} files folded`,span); return; }
-          open(item,columns,span); emitEntries(chips,columns); source.push("end"); return;
-        }
-        open(item,columns,span); emitEntries(opened.get(layer.name),columns); source.push("end"); return;
-      }
-      open(item,columns);
-      if (!members.length) leaf(addNode("B",null,"No indexed modules"));
-      for (const m of members) moduleNode(m);
-      source.push("end");
-    }
-    // Open bands and an open unassigned row charge the chip budget first, in drawing order,
-    // so collapsed summary rows only use what remains and never fold a band the viewer opened.
+    return layers;
+  }
+  // Open bands and an open unassigned row charge the chip budget first, in drawing order,
+  // so collapsed summary rows only use what remains and never fold a band the viewer opened.
+  // Returns the entries of each open band (key null: the unassigned row).
+  function chargeOpened({display, ordered, shared, layers, moduleRows}) {
     const opened = new Map(), unassigned = moduleRows.get(null);
-    if (display) {
-      for (const layer of [...ordered, ...shared]) {
-        const item = layers.get(layer.name); item.expanded = !!display.expanded(layer.name);
-        if (item.expanded) opened.set(layer.name, display.entries(layer.name,moduleRows.get(layer.name).sort((a,b) => identity(a).localeCompare(identity(b)))));
-      }
-      if (display.unassigned && unassigned.length && display.unassigned.expanded) opened.set(null, display.entries(null,unassigned));
+    for (const layer of [...ordered, ...shared]) {
+      const item = layers.get(layer.name); item.expanded = !!display.expanded(layer.name);
+      if (item.expanded) opened.set(layer.name, display.entries(layer.name,moduleRows.get(layer.name).sort((a,b) => identity(a).localeCompare(identity(b)))));
     }
-    // Pele stretches a composite's children to equal grid columns, so the stack spans
-    // several columns and each shared box one, keeping the shared boxes narrow. At one chip
-    // column the fit may ask the stack to span more grid columns than it has chip columns
-    // (`stackSpan`), so the widest band header no longer sets every shared box's width (#860).
-    const stackSpan = display ? Math.max(COLUMNS, Number.isSafeInteger(options.stackSpan) ? options.stackSpan : 0) : 4, orders = [...new Set(ordered.map(l => l.order))];
-    if (display) source[1] = `columns ${stackSpan + shared.length}`; else open(outer,stackSpan + shared.length);
+    if (display.unassigned && unassigned.length && display.unassigned.expanded) opened.set(null, display.entries(null,unassigned));
+    return opened;
+  }
+  // A named chip draws its short module or file name; the accessible label keeps the path.
+  function emitModule(c, module, name) {
+    const {options} = c;
+    const value = options.metric === "layer" ? undefined : options.moduleValue?.(module);
+    const full = `${module.identity.path}${value === null ? "\nUnavailable" : value === undefined ? "" : `\n${value}`}`;
+    const item = typeof name === "string" ? c.add("M",module,full,`${name}${value === null ? "\n—" : value === undefined ? "" : `\n${value}`}`,c.chip) : c.add("M",module,full);
+    item.band = heat(options.moduleBand?.(module)); c.leaf(item);
+  }
+  function emitEntries(c, entries, span) {
+    const {chip} = c;
+    if (!entries.length) c.leaf(c.add("B",null,"No files shown","No files shown",chip));
+    for (const entry of entries) {
+      if (entry.type === "module") emitModule(c, entry.module, entry.name);
+      else if (entry.type === "directory") {
+        const item = c.add("D",entry,entry.label,entry.open ? entry.label : entry.shown ?? entry.label,entry.open ? c.rowWidth(span) : chip);
+        item.band = entry.open ? null : heat(entry.band);
+        if (entry.open) { c.open(item,span,span); emitEntries(c,entry.entries,span); c.source.push("end"); } else c.leaf(item);
+      } else if (entry.type === "note") c.leaf(c.add("N",entry,entry.label,entry.shown ?? entry.label,chip));
+      else if (entry.type === "chip") { const item = c.add("C",entry,entry.label,entry.shown ?? entry.label,chip); item.band = heat(entry.band); c.leaf(item); }
+      else unsupported("Invalid Architecture display entry");
+    }
+  }
+  // Pele gives a leaf row the height of its tallest sibling, so a folded band is a composite
+  // whose header is the one toggle, over a short non-interactive file count.
+  function emitFolded(c, item, record, text, span) {
+    c.open(item,1,span);
+    const summary = c.add("S",record,text,text,c.chip); summary.owner = item; c.leaf(summary);
+    c.source.push("end");
+  }
+  function emitBand(c, layer, span = 1) {
+    const {display} = c;
+    // Peers split the chip columns of one band row, so the stack keeps one width.
+    const item = c.layers.get(layer.name), columns = layer.shared ? 1 : c.bandColumns(layer);
+    c.host = item.id;
+    const members = c.moduleRows.get(layer.name).sort((a,b) => identity(a).localeCompare(identity(b)));
+    // A collapsed band shows one row of module chips coloured by metric (#449), not a file count.
+    const chips = item.expanded ? c.opened.get(layer.name) : display.summary ? display.summary(layer.name,members,layer.shared ? SHARED_ROWS : columns) : [];
+    if (!item.expanded && !chips.length) emitFolded(c,item,layer,`${members.length} files folded`,span);
+    else { c.open(item,columns,span); emitEntries(c,chips,columns); c.source.push("end"); }
+    c.host = null;
+  }
+  // The ordered stack, then the shared boxes. Pele stretches a composite's children to equal grid
+  // columns, so the stack spans several columns and each shared box one, keeping the shared boxes
+  // narrow. At one chip column the fit may ask the stack to span more grid columns than it has
+  // chip columns (`stackSpan`), so the widest band header no longer sets every shared box's width (#860).
+  function emitStack(c) {
+    const {options, COLUMNS, ordered, shared, orders, width, source} = c;
+    const stackSpan = c.stackSpan = Math.max(COLUMNS, Number.isSafeInteger(options.stackSpan) ? options.stackSpan : 0);
+    source[1] = `columns ${stackSpan + shared.length}`;
     // All apps (#850) may put the shared boxes left of the stack, nearest box first beside it. They are
     // still projected after the stack, so chip budgets charge in the same order; only their source moves.
-    const sharedLeft = !!display && options.sharedSide === "left" && shared.length > 0, stackAt = source.length;
-    open(orderedStack,width,stackSpan);
-    if (!ordered.length) leaf(addNode("B",null,display ? "No ordered layers shown" : "No ordered layers"));
+    const sharedLeft = c.sharedLeft = options.sharedSide === "left" && shared.length > 0, stackAt = source.length;
+    c.open(c.orderedStack,width,stackSpan);
+    if (!ordered.length) c.leaf(c.add("B",null,"No ordered layers shown"));
     for (const order of orders) {
-      const peers = ordered.filter(l => l.order === order);
-      if (display) {
-        const span = Math.floor(width / peers.length);
-        peers.forEach(layer => emitLayer(layer,span));
-        if (width > span * peers.length) source.push(`space:${width - span * peers.length}`);
-        continue;
-      }
-      if (peers.length > 1) open(addNode("B",null,`Peer layers · order ${options.layerNumber?.(peers[0]) ?? order}`),peers.length);
-      peers.forEach(layer => emitLayer(layer)); if (peers.length > 1) source.push("end");
+      const peers = ordered.filter(l => l.order === order), span = Math.floor(width / peers.length);
+      peers.forEach(layer => emitBand(c,layer,span));
+      if (width > span * peers.length) source.push(`space:${width - span * peers.length}`);
     }
     source.push("end");
-    const boxes = shared.map(layer => { const at = source.length; emitLayer(layer); return source.slice(at); });
+    const boxes = shared.map(layer => { const at = source.length; emitBand(c,layer); return source.slice(at); });
     if (sharedLeft) { const tail = source.splice(stackAt), lines = boxes.flat().length; source.push(...boxes.reverse().flat(), ...tail.slice(0, tail.length - lines)); }
-    if (!display) source.push("end");
-    let unassignedId = null;
-    if (display?.unassigned && unassigned.length) {
-      const item = addNode("U",display.unassigned,display.unassigned.label,false,display.unassigned.label,rowWidth(COLUMNS + shared.length)); item.expanded = opened.has(null);
-      item.host = unassignedId = host = item.id;
-      if (item.expanded) { open(item,COLUMNS + shared.length,stackSpan + shared.length); emitEntries(opened.get(null),COLUMNS + shared.length); source.push("end"); }
-      else {
-        const chips = display.summary ? display.summary(null,unassigned,COLUMNS + shared.length) : [];
-        if (chips.length) { open(item,COLUMNS + shared.length,stackSpan + shared.length); emitEntries(chips,COLUMNS + shared.length); source.push("end"); }
-        else folded(item,display.unassigned,`${unassigned.length} files folded`,stackSpan + shared.length);
-      }
-      host = null;
-    } else if (!display && unassigned.length) {
-      open(addNode("B",null,"Unassigned / unknown"),4);
-      for (const m of unassigned) moduleNode(m);
-      source.push("end");
+  }
+  // The unassigned row, under the stack and the shared boxes. Returns its id, or null when not drawn.
+  function emitUnassigned(c) {
+    const {display, COLUMNS, shared, stackSpan, opened} = c, unassigned = c.moduleRows.get(null);
+    if (!(display.unassigned && unassigned.length)) return null;
+    const item = c.add("U",display.unassigned,display.unassigned.label,display.unassigned.label,c.rowWidth(COLUMNS + shared.length)); item.expanded = opened.has(null);
+    item.host = c.host = item.id;
+    if (item.expanded) { c.open(item,COLUMNS + shared.length,stackSpan + shared.length); emitEntries(c,opened.get(null),COLUMNS + shared.length); c.source.push("end"); }
+    else {
+      const chips = display.summary ? display.summary(null,unassigned,COLUMNS + shared.length) : [];
+      if (chips.length) { c.open(item,COLUMNS + shared.length,stackSpan + shared.length); emitEntries(c,chips,COLUMNS + shared.length); c.source.push("end"); }
+      else emitFolded(c,item,display.unassigned,`${unassigned.length} files folded`,stackSpan + shared.length);
     }
-    const byName = new Map(view.layers.map(layer => [layer.name,layer])), seenEdges = new Set();
+    c.host = null;
+    return item.id;
+  }
+  // The arrows, in payload order; each edge is checked, then projected. The adapter draws and
+  // routes them itself (#637), so none goes into the block source. Returns them by id.
+  function emitEdges(c) {
+    const {view, options, display, layers, measure, sharedLeft} = c;
+    const edges = new Map(), byName = new Map(view.layers.map(layer => [layer.name,layer])), seenEdges = new Set();
     for (const edge of view.edges) {
-      if (!names.has(edge.sourceLayer) || !names.has(edge.destinationLayer) || edge.sourceLayer === edge.destinationLayer || !["production","test"].includes(edge.role) || !["conforms","deviates","unknown"].includes(edge.status) || !Number.isSafeInteger(edge.count) || edge.count <= 0 || typeof edge.excepted !== "boolean" || seenEdges.has(edgeKey(edge))) unsupported("Invalid or duplicate Architecture edge");
-      seenEdges.add(edgeKey(edge));
+      validateEdge(edge, c.names, seenEdges);
       if (edge.role === "test" && !options.showTests) continue;
-      if (!layers.has(edge.sourceLayer) || !layers.has(edge.destinationLayer) || (display && !display.edge(edge))) continue;
+      if (!layers.has(edge.sourceLayer) || !layers.has(edge.destinationLayer) || !display.edge(edge)) continue;
       const from = layers.get(edge.sourceLayer).id, to = layers.get(edge.destinationLayer).id;
       const state = edge.status === "deviates" ? "deviation" : edge.status, way = direction(byName.get(edge.sourceLayer),byName.get(edge.destinationLayer));
-      // Summary arrows draw a compact count; the accessible label keeps the words. The caller
+      // Arrows draw a compact count; the accessible label keeps the words. The caller
       // may qualify both: a lower bound and the source layer's mapped-site coverage (#449).
       const words = options.edgeText?.(edge, way) || {};
       const full = `${edge.count} ${edge.role} sites · ${way}\n${state}${edge.excepted ? " · exception" : ""}${words.label ? ` · ${words.label}` : ""}`;
       // A shared box left of the stack (#850) mirrors the two shared glyphs, so a tag points the way its arrow runs.
       const glyph = sharedLeft && MIRRORED[way] ? MIRRORED[way] : ARROWS[way];
       const shown = `${glyph}${words.bound ? "≥" : ""}${edge.count}${edge.excepted ? " excepted" : ""}${edge.role === "test" ? " test" : ""}${words.note ? ` · ${words.note}` : ""}`;
-      const item = display ? label("E",edge,full,true,shown,Math.ceil(measure(`${shown}…`)) + 2) : label("E",edge,full);
+      const item = c.label("E",edge,full,shown,Math.ceil(measure(`${shown}…`)) + 2);
       Object.assign(item,{from,to,tone:options.edgeTone?.(edge) || null}); edges.set(item.id,item);
-      // The summary display routes its own arrows (#637): Pele lays out the boxes only, so its
-      // edge-label placement never widens the drawing. A tag is its 12px text plus padding.
-      if (display) { item.tagWidth = Math.ceil(measure(item.display[0]) * 12 / 14) + 12; continue; }
-      source.push(`${from} ${edge.role === "test" ? "-." : "--"} "${item.placeholder}" ${edge.role === "test" ? ".->" : "-->"} ${to}`);
+      // Pele lays out the boxes only, so its edge-label placement never widens the drawing.
+      // A tag is its 12px text plus padding.
+      item.tagWidth = Math.ceil(measure(item.display[0]) * 12 / 14) + 12;
     }
-    const text = source.join("\n") + "\n";
+    return edges;
+  }
+  // The band rows (peers share a row), shared boxes in drawing order, the ordered stack and
+  // the unassigned row: what arrow routing needs (#637).
+  const layoutOf = ({orders, ordered, shared, layers, orderedStack, unassignedId, sharedLeft}) => ({rows:orders.map(order => ordered.filter(l => l.order === order).map(l => layers.get(l.name).id)),
+    shared:shared.map(l => layers.get(l.name).id), stack:orderedStack.id, unassigned:unassignedId, sharedLeft});
+  function project(view, options = {}) {
+    // The summary display is the caller's: drawn layers, expansion, directory entries and chips.
+    const display = options.display;
+    if (!display) unsupported("Architecture display unavailable");
+    validateView(view);
+    const c = sheet(view, options, display);
+    const shownShared = view.layers.filter(l => l.shared && display.layers.has(l.name)).length;
+    c.COLUMNS = options.columns ?? chipColumns(options.width, shownShared);
+    display.reset?.();
+    // The stack title reserves no more than one chip, so it never sets the stack's width.
+    c.orderedStack = c.add("B",null,options.title ?? "Ordered layers",options.title ?? "Ordered layers",c.chip);
+    c.names = validateLayers(view);
+    Object.assign(c, bandGeometry(c));
+    c.layers = emitHeaders(c);
+    c.moduleRows = validateModules(view);
+    c.opened = chargeOpened(c);
+    emitStack(c);
+    c.unassignedId = emitUnassigned(c);
+    const edges = emitEdges(c);
+    const text = c.source.join("\n") + "\n";
     if (bytes(text) > 512 * 1024) unsupported("Architecture Mermaid source too large");
-    // The summary display's band rows (peers share a row), shared boxes in drawing order,
-    // the ordered stack and the unassigned row: what arrow routing needs (#637).
-    const layout = display ? {rows:orders.map(order => ordered.filter(l => l.order === order).map(l => layers.get(l.name).id)),
-      shared:shared.map(l => layers.get(l.name).id), stack:orderedStack.id, unassigned:unassignedId, sharedLeft} : null;
-    return {source:text,nodes,edges,view,layout};
+    return {source:text,nodes:c.nodes,edges,view,layout:layoutOf(c)};
   }
   function validatedSvg(raw, projection) {
     const {root} = window.TrellisPeleSvg.admit(raw, ADMISSION);
@@ -298,34 +336,14 @@
       controls.set(id,{node,label,item:expected});
     }
     if (seen.size !== projection.nodes.size) unsupported("Missing Architecture node");
-    const paths = new Map();
-    for (const path of root.querySelectorAll(".pele-edge")) {
-      const id = path.getAttribute("data-id");
-      if (path.getAttribute("class") !== "pele-edge" || path.children.length !== 2 || [...path.children].some(child => child.localName !== "path")) unsupported("Changed Architecture connector structure");
-      if (!id || paths.has(id)) unsupported("Duplicate Architecture connector"); paths.set(id,path);
-    }
-    const seenEdges = new Set(), pairedPaths = new Set();
-    for (const node of root.querySelectorAll(".pele-edge-label")) {
-      if (node.getAttribute("class") !== "pele-edge-label" || node.children.length !== 2 || node.children[0].localName !== "rect" || node.children[1].localName !== "text") unsupported("Changed Architecture count box structure");
-      const label = node.querySelector("text"), expected = [...projection.edges.values()].find(e => e.expected === label?.textContent);
-      const nativeId = node.getAttribute("data-id"), path = paths.get(nativeId);
-      // The occurrence prefix is not evidence identity. Exact app-owned label
-      // tokens identify records; this association verifies declared endpoints.
-      if (!expected || seenEdges.has(expected.id) || !path || pairedPaths.has(nativeId) || !new RegExp(`^[1-9][0-9]*-${expected.from}-${expected.to}$`).test(nativeId)) unsupported("Changed Architecture edge identity or endpoints");
-      const segments = [...path.querySelectorAll("path")];
-      if (segments.length !== 2 || segments[0].hasAttribute("class") || segments[1].getAttribute("class") !== "pele-marker") unsupported("Changed Architecture connector shape");
-      const dashed = segments[0].getAttribute("stroke-dasharray");
-      if ((expected.record.role === "test" ? dashed !== "3 4" : dashed !== null)) unsupported("Changed Architecture edge role stroke");
-      seenEdges.add(expected.id); pairedPaths.add(nativeId); controls.set(expected.id,{node,label,item:expected,path});
-    }
-    // A summary display's arrows are drawn by the adapter, so Pele must draw none of them.
-    const drawnEdges = projection.layout ? 0 : projection.edges.size;
-    if (seenEdges.size !== drawnEdges || paths.size !== drawnEdges || root.querySelectorAll("[data-id]").length !== projection.nodes.size + 2 * drawnEdges) unsupported("Missing or unexpected Architecture edge");
-    if (root.querySelectorAll("text").length !== projection.nodes.size + drawnEdges || root.querySelectorAll("rect").length !== projection.nodes.size + drawnEdges || root.querySelectorAll("path").length !== 2 * drawnEdges) unsupported("Unexpected Architecture SVG decoration");
-    if (projection.layout) arrowShapes(root, controls, projection);
+    // Pele draws the boxes only: the arrows are the adapter's own (#637), so a connector or a
+    // count box in Pele's output is refused, whatever its shape.
+    if (root.querySelector(".pele-edge, .pele-edge-label") || root.querySelectorAll("[data-id]").length !== projection.nodes.size) unsupported("Missing or unexpected Architecture edge");
+    if (root.querySelectorAll("text").length !== projection.nodes.size || root.querySelectorAll("rect").length !== projection.nodes.size || root.querySelectorAll("path").length !== 0) unsupported("Unexpected Architecture SVG decoration");
+    arrowShapes(root, controls, projection);
     return {root,controls};
   }
-  // The adapter's own connector and count tag for each summary arrow (#637), in Pele's shape:
+  // The adapter's own connector and count tag for each arrow (#637), in Pele's shape:
   // a connector line and arrowhead, and a tag box with its text. Routing gives them geometry.
   function arrowShapes(root, controls, projection) {
     const make = (name, attributes) => { const node = document.createElementNS(NS, name); for (const [key, value] of Object.entries(attributes)) node.setAttribute(key, String(value)); return node; };
@@ -419,7 +437,6 @@
   // It counts lanes with routing's own relations, so routing never draws wider.
   function channelReserve(projection) {
     const layout = projection.layout;
-    if (!layout) return 0;
     const lanes = countLanes(layout, projection.edges.values());
     // The channel between the stack and the shared boxes already has the grid gap (#850: on either side).
     const gap = layout.shared.length ? GRID_GAP : 0;
@@ -506,10 +523,10 @@
   // shared boxes then spans more grid columns (up to MAX_STACK_SPAN), which narrows the equal
   // grid cells the shared boxes take; the narrowest layout wins when none fits.
   function* fitLayout(view, options, measure) {
-    const sharedCount = options.display ? view.layers.filter(l => l.shared && options.display.layers.has(l.name)).length : 0;
-    const s = {columns:options.display ? chipColumns(options.width, sharedCount) : undefined, chipWidth:CHIP_WIDTH, stackSpan:0, low:null, high:null};
+    const sharedCount = view.layers.filter(l => l.shared && options.display.layers.has(l.name)).length;
+    const s = {columns:chipColumns(options.width, sharedCount), chipWidth:CHIP_WIDTH, stackSpan:0, low:null, high:null};
     let projection, raw, best = null;
-    const fit = options.display && options.width > 0;
+    const fit = options.width > 0;
     // The side channels routing adds (#637) depend only on the arrows and their tags, never on
     // chip sizes: they are taken off the width before chip columns are chosen.
     let target = options.width;
@@ -574,7 +591,7 @@
     U:({item}, {options}) => ({callback:options.onToggleUnassigned, expanded:item.expanded}),
     N:(control, {options}) => ({callback:options.onSelectNote, expanded:null}),
     L({node,label,item}, {options, measure, current, actions}) {
-      const callback = options.display ? options.onToggleLayer : options.onSelectLayer, expanded = options.display ? item.expanded : null;
+      const callback = options.onToggleLayer;
       if (item.statLines?.length) {
         const handlers = {onOpenDeviation:options.onOpenDeviation, onSelectInterface:options.onSelectInterface, isCurrent:current};
         statChips(node,label,item,measure,handlers).reduce((previous,{node:button}) => {
@@ -582,7 +599,7 @@
           return button;
         },node);
       }
-      return {callback, expanded};
+      return {callback, expanded:item.expanded};
     },
     E({node,label,item,path}, {options}) {
       // Deviations are highlighted; allowed (conforming or excepted) arrows are dimmed, not dropped (#449).
@@ -639,6 +656,7 @@
     const measure = textMeasurer("14px Inter, sans-serif");
     if (!measure) unsupported("Architecture text measurement unavailable");
     if (typeof window.pele?.render !== "function") unsupported("Pele asset unavailable");
+    if (!options.display) unsupported("Architecture display unavailable");
     const {projection, raw} = yield* fitLayout(view, options, measure);
     yield PAUSE;
     yield CHECK;
@@ -648,7 +666,7 @@
     const actions = decorate(controls, projection, options, measure, current);
     yield PAUSE;
     for (const control of actions) controls.set(control.item.id,control);
-    if (options.display) route(root,controls,projection);
+    route(root,controls,projection);
     yield CHECK;
     return {root, projection, bands:bandFrames(controls)};
   }

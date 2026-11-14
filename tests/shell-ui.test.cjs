@@ -5,6 +5,7 @@ const SCOPED = `/api/checkouts/${ROOT}`;
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
+const {APP_SCRIPTS, LOAD_TIME_NEEDS} = require("./support/app-scripts.js");
 const vm = require("node:vm");
 function harness(withApp = false) {
   const elements = new Map(), requests = [], timers = new Map(); let timer = 0;
@@ -30,7 +31,7 @@ function harness(withApp = false) {
     // No DOM parser here: the adapter double keeps the real Pele projection and installs one
     // selectable node per projected row.
     run(fs.readFileSync("web/pele-svg.js","utf8"));run(fs.readFileSync("web/sequence-pele.js","utf8"));run(fs.readFileSync("tests/support/sequence-adapter-double.js","utf8"));
-    run(fs.readFileSync("web/files.js","utf8"));run(fs.readFileSync("web/index-pin.js","utf8"));run(fs.readFileSync("web/app.js","utf8"));run(`token="synthetic";selectedRootKey="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";checkouts=[{rootKey:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",workspaceRoot:"/repo",state:"available"}];status={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},workspaceRoot:"/repo"};`);}
+    run(fs.readFileSync("web/files.js","utf8"));run(fs.readFileSync("web/index-pin.js","utf8"));for(const file of APP_SCRIPTS)run(fs.readFileSync("web/"+file,"utf8"));run(`token="synthetic";selectedRootKey="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";checkouts=[{rootKey:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",workspaceRoot:"/repo",state:"available"}];status={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},workspaceRoot:"/repo"};`);}
   if (withApp) {
     let handler = context.fetch;
     Object.defineProperty(context,"fetch",{configurable:true,get:()=>request,set(fn){handler=fn;}});
@@ -727,4 +728,27 @@ test("semantic document projections prevent a fresh index badge", () => {
   assert.match(h.get("workspace-index-label").textContent, /^Older semantic basis · native rev /);
   h.run(`status.semanticLanguages[0].documents[0].projection.semanticStatus="catchingUp";renderIndexStatus();`);
   assert.match(h.get("workspace-index-label").textContent, /^Semantic catching up · native rev /);
+});
+
+// The app is split into classic scripts that share the page's global scope (#1069). Top-level
+// let and const are in a dead zone until their script has run, and a function declared by a
+// later script does not exist yet, so load order is part of the contract.
+test("index.html loads the app scripts in dependency order, and only app.js runs code at load", () => {
+  const web = path.join(__dirname, "../web");
+  const html = fs.readFileSync(path.join(web, "index.html"), "utf8");
+  const loaded = [...html.matchAll(/<script src="\/([^"]+)" defer><\/script>/g)].map(match => match[1]);
+  assert.equal([...html.matchAll(/<script\b/g)].length, loaded.length, "every script is a deferred classic script, so they run in document order");
+  assert.deepEqual(fs.readdirSync(web).filter(file => /^app(-[a-z]+)?\.js$/.test(file)).sort(), [...APP_SCRIPTS].sort(), "every app script is in the harness list");
+  assert.deepEqual(loaded.slice(-APP_SCRIPTS.length), APP_SCRIPTS, "the app scripts load last, in this order, app.js at the end");
+  for (const [file, needs] of Object.entries(LOAD_TIME_NEEDS)) for (const need of needs) {
+    assert.ok(loaded.includes(need) && loaded.indexOf(need) < loaded.indexOf(file), `${need} loads before ${file}`);
+  }
+  // Every script but app.js only declares: its top level is functions, let, const and comments.
+  // So no listener, observer or view exists until app.js runs, after every name is defined.
+  for (const file of APP_SCRIPTS.slice(0, -1)) {
+    const top = fs.readFileSync(path.join(web, file), "utf8").split("\n").filter(line => /^[^\s}]/.test(line));
+    assert.equal(top[0], '"use strict";', file);
+    assert.deepEqual(top.filter(line => !/^(?:"use strict";$|\/\/|(?:async )?function [A-Za-z]|(?:let|const) )/.test(line)), [], `${file} runs a statement at load`);
+  }
+  assert.equal(fs.readFileSync(path.join(web, "app.js"), "utf8").split("\n")[0], '"use strict";');
 });
