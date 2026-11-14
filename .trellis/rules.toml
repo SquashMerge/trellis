@@ -128,6 +128,12 @@ paths = [
   # source-extension input tables and the per-source read counters (S4b, #1003).
   # Admission, the walk and `Capture` stay in capture.rs.
   "src/capture_records.rs",
+  # The batch descriptor and page grammar: the serde types, the format version, the checks
+  # over bytes, limits and the captured revision, the row order and the source-manifest hash
+  # (S8, #1071). Producers write it, admission and storage read it. The checks that consult
+  # the producer registry, the producer profiles or the filesystem stay in
+  # semantic_batch/descriptor.rs.
+  "src/batch_descriptor.rs",
 ]
 
 # Coarse developer-tool boundary; does not infer internal tooling architecture.

@@ -5,7 +5,6 @@ use super::{
     descriptor::{
         ArtifactEntry, Descriptor, PageEntry, SourceManifestHasher, basis_artifact_ordinal,
     },
-    staging::Stage,
 };
 use crate::{
     capture::Capture,
@@ -18,7 +17,7 @@ use crate::{
     },
     semantic_evidence as semantic,
     semantic_import::{DestinationMutations, join_staged},
-    store::Store,
+    store::{Store, staging::Stage},
 };
 use anyhow::{Result, anyhow};
 use rusqlite::Connection;

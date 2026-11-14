@@ -9,7 +9,6 @@ use super::{
         PageKind, RowOrder, SourceManifestHasher, SourceRow, check_page_bytes, parse_page,
     },
     limits::STAGE_CHECK_COPIED_BYTES,
-    staging::{Stage, StageBudget, StageClaimSink, artifact_file, lookup_assigned},
 };
 use crate::{
     index_coordinator::{CopiedInput, copy_semantic_input_to_stage, open_semantic_input},
@@ -17,7 +16,10 @@ use crate::{
     native_evidence as native,
     scip_admission::{PinnedProducer, admission, file_uri, order},
     scip_raw::{self, AuthenticatedArtifact, DocumentSource, ScipCaptureError},
-    store::{InventoryStream, NativeReader, Store},
+    store::{
+        InventoryStream, NativeReader, Store,
+        staging::{Stage, StageBudget, StageClaimSink, artifact_file, lookup_assigned},
+    },
 };
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
@@ -180,7 +182,7 @@ impl Passes<'_> {
         {
             check_cancel(self.cancel)?;
             let page = read_page::<SourceRow>(inputs, entry, counters)?;
-            conn.execute_batch(super::staging::UNIT_BEGIN)?;
+            conn.execute_batch(crate::store::staging::UNIT_BEGIN)?;
             for row in &page.rows {
                 row.check(&descriptor.source_set.languages)?;
                 rows_order.push(&row.language, &row.relative_path)?;
@@ -209,7 +211,7 @@ impl Passes<'_> {
                 self.stage_source(conn, native, &retained, ord, &mut cargo, &mut hasher)?;
                 ord += 1;
             }
-            conn.execute_batch(super::staging::UNIT_COMMIT)?;
+            conn.execute_batch(crate::store::staging::UNIT_COMMIT)?;
             self.budget.check()?;
         }
         if native.next_inventory()?.is_some() {
@@ -278,7 +280,7 @@ impl Passes<'_> {
         {
             check_cancel(self.cancel)?;
             let page = read_page::<super::descriptor::CoverageRow>(inputs, entry, counters)?;
-            conn.execute_batch(super::staging::UNIT_BEGIN)?;
+            conn.execute_batch(crate::store::staging::UNIT_BEGIN)?;
             for row in &page.rows {
                 rows_order.push(&row.language, &row.relative_path)?;
                 let disposition = row.disposition()?;
@@ -316,7 +318,7 @@ impl Passes<'_> {
                 )?
                 .execute(params![source, artifact, exclusion])?;
             }
-            conn.execute_batch(super::staging::UNIT_COMMIT)?;
+            conn.execute_batch(crate::store::staging::UNIT_COMMIT)?;
             self.budget.check()?;
         }
         let mut requested = 0u64;
@@ -461,7 +463,7 @@ impl Passes<'_> {
                         "unlisted document".into(),
                     ));
                 }
-                Err(super::staging::StageLookupError::Ambiguous) => {
+                Err(crate::store::staging::StageLookupError::Ambiguous) => {
                     return Err(ScipCaptureError::InvalidArtifact(
                         "ambiguous document path".into(),
                     ));

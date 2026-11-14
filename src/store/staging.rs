@@ -1,7 +1,7 @@
 //! The per-operation stage: a private directory beside `index.db` holding `stage.db` and the
 //! copied artifacts. The claiming worker owns it; it is derived, disposable state.
-use super::limits::{BatchLimits, STAGE_CACHE_KIB, STAGE_CHECK_ROWS};
 use crate::scip_raw::{CapturedClaim, ClaimSink, ScipCaptureError, UnitDocument};
+use crate::semantic_batch::limits::{BatchLimits, STAGE_CACHE_KIB, STAGE_CHECK_ROWS};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, ErrorCode, OptionalExtension, params};
 use std::{
@@ -473,7 +473,7 @@ pub(crate) struct WitnessStageWriter<'a> {
     conn: &'a Connection,
     budget: StageBudget,
     limits: &'a BatchLimits,
-    counters: &'a mut super::BatchCounters,
+    counters: &'a mut crate::semantic_batch::counters::BatchCounters,
     changes_before: u64,
     /// Reserved bytes staged since the last directory-size check.
     unchecked: u64,
@@ -490,7 +490,7 @@ impl<'a> WitnessStageWriter<'a> {
     pub(crate) fn new(
         stage: &'a mut Stage,
         limits: &'a BatchLimits,
-        counters: &'a mut super::BatchCounters,
+        counters: &'a mut crate::semantic_batch::counters::BatchCounters,
     ) -> Result<Self> {
         let budget = stage.budget(limits);
         budget.check()?;
@@ -617,13 +617,13 @@ impl<'a> WitnessStageWriter<'a> {
 
     pub(crate) fn stage_internal_symbol(
         &mut self,
-        key: &crate::semantic_evidence::SymbolKey,
+        key: &crate::semantic_records::SymbolKey,
     ) -> Result<()> {
         // Scopes are represented exactly as in the original semantic SymbolKey.
         let scope = match key.scope {
-            crate::semantic_evidence::SymbolScope::Global => 0,
-            crate::semantic_evidence::SymbolScope::Document => 1,
-            crate::semantic_evidence::SymbolScope::Target => 2,
+            crate::semantic_records::SymbolScope::Global => 0,
+            crate::semantic_records::SymbolScope::Document => 1,
+            crate::semantic_records::SymbolScope::Target => 2,
         };
         let (language, path) = key
             .document

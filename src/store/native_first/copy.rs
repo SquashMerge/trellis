@@ -56,8 +56,7 @@ impl CopyDestination {
             db,
             selected: &read,
         };
-        let mut manifest =
-            crate::semantic_batch::descriptor::SourceManifestHasher::new(&source_set_id);
+        let mut manifest = crate::batch_descriptor::SourceManifestHasher::new(&source_set_id);
         let mut cursor = CanonicalInventoryCursor::default();
         loop {
             let page = reader.canonical_inventory_page(&mut cursor, 256)?;

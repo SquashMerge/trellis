@@ -16,6 +16,7 @@ mod search_startup;
 pub(crate) mod semantic_display;
 pub(crate) mod semantic_payload;
 mod semantic_retention;
+pub mod staging;
 pub(crate) use search::SEARCH_CARD_BATCH_SIZE;
 pub use search::{
     HeadSearchCard, HeadSearchCards, McpSearchCandidates, SearchDeltaColdRebuild,
@@ -1185,7 +1186,7 @@ impl NativeReader<'_> {
 
     pub(crate) fn reuse_project_roots(
         &self,
-        descriptor: &crate::semantic_batch::descriptor::Descriptor,
+        descriptor: &crate::batch_descriptor::Descriptor,
     ) -> Result<Vec<String>> {
         let workspace_uri = crate::scip_admission::file_uri(&self.store.identity.root)?;
         Ok(descriptor.reuse_project_roots(&workspace_uri, &self.store.identity.root_key))
@@ -4954,14 +4955,12 @@ fn authenticate_stored_batch(
     cancel: &CancelFlag,
 ) -> Result<AttestedProfileProducer> {
     let identity = &*store.identity;
+    use crate::batch_descriptor::{FORMAT_VERSION, SourceManifestHasher};
     use crate::native_ids::digest;
     use crate::scip_raw::{
         self, AuthenticatedArtifact, AuthenticatedScipDocument, DocumentSource, VecSink,
     };
-    use crate::semantic_batch::{
-        counters::BatchCounters,
-        descriptor::{FORMAT_VERSION, SourceManifestHasher},
-    };
+    use crate::semantic_batch::counters::BatchCounters;
     let descriptor = &raw.descriptor;
     ensure!(
         descriptor.format_version == FORMAT_VERSION
@@ -5186,7 +5185,7 @@ pub struct SelectedRawBatch {
     pub source_set_id: String,
     pub captured_revision: String,
     pub batch_id: i64,
-    pub descriptor: crate::semantic_batch::descriptor::Descriptor,
+    pub descriptor: crate::batch_descriptor::Descriptor,
     pub source_manifest_hash: String,
     pub decoder_version: String,
     /// In ordinal order.
@@ -5213,7 +5212,7 @@ impl SelectedRawBatch {
                     .find(|capture| capture.capture_id == *capture_id)
             })
             .map(|capture| capture.ordinal);
-        let ordinal = crate::semantic_batch::descriptor::basis_artifact_ordinal(
+        let ordinal = crate::batch_descriptor::basis_artifact_ordinal(
             &self.descriptor.artifacts,
             &doc.language,
             assigned,
@@ -6489,7 +6488,7 @@ fn read_semantic_call_facts(
 fn producer_identity_kind(producer_id: &str) -> &'static str {
     crate::scip_admission::pinned_producer_by_id(producer_id)
         .map_or(
-            crate::semantic_batch::descriptor::IdentityKind::Executable,
+            crate::batch_descriptor::IdentityKind::Executable,
             |pinned| pinned.identity_kind,
         )
         .as_str()
@@ -6911,8 +6910,8 @@ pub fn batch_publication_statements_for_tests() -> Vec<String> {
 /// batch id.
 fn write_staged_raw_rows(
     db: &Connection,
-    stage: &crate::semantic_batch::staging::Stage,
-    descriptor: &crate::semantic_batch::descriptor::Descriptor,
+    stage: &crate::store::staging::Stage,
+    descriptor: &crate::batch_descriptor::Descriptor,
     descriptor_bytes: &[u8],
     descriptor_sha256: &str,
     gate: &dyn Fn() -> Result<()>,
@@ -12985,7 +12984,7 @@ impl Store {
     pub fn publish_semantic_batch(
         &self,
         joined: &crate::semantic_batch::JoinedBatch,
-        stage: &mut crate::semantic_batch::staging::Stage,
+        stage: &mut crate::store::staging::Stage,
         expected: IndexPin,
         leader: &topology::WriterGuard,
         cancel: &CancelFlag,
@@ -12998,7 +12997,7 @@ impl Store {
     pub fn publish_semantic_batch_with_fault_for_tests(
         &self,
         joined: &crate::semantic_batch::JoinedBatch,
-        stage: &mut crate::semantic_batch::staging::Stage,
+        stage: &mut crate::store::staging::Stage,
         expected: IndexPin,
         leader: &topology::WriterGuard,
         cancel: &CancelFlag,
@@ -13053,7 +13052,7 @@ impl Store {
     pub fn publish_semantic_batch_observing_for_tests(
         &self,
         joined: &crate::semantic_batch::JoinedBatch,
-        stage: &mut crate::semantic_batch::staging::Stage,
+        stage: &mut crate::store::staging::Stage,
         expected: IndexPin,
         leader: &topology::WriterGuard,
         cancel: &CancelFlag,
@@ -13075,7 +13074,7 @@ impl Store {
     fn publish_semantic_batch_inner(
         &self,
         joined: &crate::semantic_batch::JoinedBatch,
-        stage: &mut crate::semantic_batch::staging::Stage,
+        stage: &mut crate::store::staging::Stage,
         expected: IndexPin,
         leader: &topology::WriterGuard,
         cancel: &CancelFlag,
@@ -13098,14 +13097,14 @@ impl Store {
     fn publish_semantic_batch_statements(
         &self,
         joined: &crate::semantic_batch::JoinedBatch,
-        stage: &mut crate::semantic_batch::staging::Stage,
+        stage: &mut crate::store::staging::Stage,
         expected: IndexPin,
         leader: &topology::WriterGuard,
         cancel: &CancelFlag,
         mut before_commit: impl FnMut(&Connection) -> Result<()>,
         commit_loss: Option<CommitLoss>,
     ) -> Result<IndexPin> {
-        use crate::semantic_batch::{descriptor::Descriptor, limits};
+        use crate::{batch_descriptor::Descriptor, semantic_batch::limits};
         leader.belongs_to(&self.identity)?;
         self.identity.verify()?;
         check_cancel(cancel)?;
@@ -17285,13 +17284,10 @@ impl Store {
                     raw_producer == producer_id,
                     "incompatible_index: selected batch producer mismatch"
                 );
-                let descriptor =
-                    crate::semantic_batch::descriptor::Descriptor::parse(&descriptor_bytes)
-                        .map_err(|_| {
-                            SelectedIntegrity(
-                                "incompatible_index: selected batch descriptor".into(),
-                            )
-                        })?;
+                let descriptor = crate::batch_descriptor::Descriptor::parse(&descriptor_bytes)
+                    .map_err(|_| {
+                        SelectedIntegrity("incompatible_index: selected batch descriptor".into())
+                    })?;
                 let captures = db.prepare(
                     if omit_binary {
                         "SELECT capture_id,ordinal,languages,artifact_hash,X'' FROM semantic_raw_captures WHERE batch_id=?1 ORDER BY ordinal"

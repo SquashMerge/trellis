@@ -309,7 +309,7 @@ impl RetainedStageContinuation {
                     self.trusted =
                         self.trusted && self.inventory_count == descriptor.totals.covered_documents;
                     if self.witnessed && !self.trusted {
-                        return Err(super::super::staging::WitnessFallback(
+                        return Err(crate::store::staging::WitnessFallback(
                             "original admission or document inventory incomplete",
                         )
                         .into());
@@ -451,7 +451,7 @@ impl RetainedStageContinuation {
                             }
                             [] => {
                                 if self.witnessed {
-                                    return Err(super::super::staging::WitnessFallback(
+                                    return Err(crate::store::staging::WitnessFallback(
                                         "required raw document missing",
                                     )
                                     .into());
@@ -770,7 +770,7 @@ impl RetainedStageContinuation {
             }
             Phase::Done => {
                 if self.witnessed {
-                    super::super::staging::check_proof_identity_closure(conn)?;
+                    crate::store::staging::check_proof_identity_closure(conn)?;
                 }
                 return Ok(Some(AdmittedBatch::new(
                     self.stage.take().expect("stage"),
@@ -903,7 +903,7 @@ fn advance_witness_proof(
                 None
             }
             None => {
-                let source = super::super::staging::lookup_assigned(conn, entry.ordinal, &path)?
+                let source = crate::store::staging::lookup_assigned(conn, entry.ordinal, &path)?
                     .ok_or_else(|| admission("retained unlisted proof"))?;
                 ensure!(source.language == language, "retained proof language");
                 let present: bool = conn
@@ -937,7 +937,7 @@ fn advance_witness_proof(
         .checked_sub(1)
         .ok_or_else(|| admission("witness proof identity exhausted"))?;
         identity = Some(next);
-        super::super::staging::charge_witness_row(conn, limits)?;
+        crate::store::staging::charge_witness_row(conn, limits)?;
         insert.execute(params![
             next,
             entry.ordinal,
@@ -975,7 +975,7 @@ fn advance_document(
             entry.languages.contains(&language),
             "retained document language"
         );
-        let source = super::super::staging::lookup_assigned(conn, entry.ordinal, &path)?
+        let source = crate::store::staging::lookup_assigned(conn, entry.ordinal, &path)?
             .ok_or_else(|| admission("retained unlisted document"))?;
         ensure!(source.language == language, "retained document language");
         ensure!(source.content_hash == hash, "retained document source");
@@ -1026,7 +1026,7 @@ fn advance_proof(
             entry.languages.contains(&language),
             "retained proof language"
         );
-        let source = super::super::staging::lookup_assigned(conn, entry.ordinal, &path)?
+        let source = crate::store::staging::lookup_assigned(conn, entry.ordinal, &path)?
             .ok_or_else(|| admission("retained unlisted proof"))?;
         ensure!(source.language == language, "retained proof language");
         let present: bool = conn
@@ -1035,14 +1035,14 @@ fn advance_proof(
             )?
             .query_row(params![source.ord, entry.ordinal], |row| row.get(0))?;
         ensure!(present, "retained proof document");
-        let claim = super::super::staging::claim_from_stage(
+        let claim = crate::store::staging::claim_from_stage(
             &bytes,
             digest.clone(),
             proof.clone(),
             language.clone(),
             entry.sha256.clone(),
         )?;
-        let (symbol, presence) = super::super::staging::claim_presence(&claim);
+        let (symbol, presence) = crate::store::staging::claim_presence(&claim);
         let target = claim.envelope.cargo_target.as_ref();
         conn.execute("INSERT INTO claims(artifact,source_ord,record_kind,fact_digest,proof_id,canonical_bytes,symbol,presence,target_root,target_lib,target_package,target_version) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,CASE WHEN ?9 IS NULL THEN NULL ELSE (SELECT ord FROM sources WHERE language=?10 AND path=?9) END,?11,?12,?13)",
             params![entry.ordinal, source.ord, kind, digest, proof, bytes, symbol, presence,

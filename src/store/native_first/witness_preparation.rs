@@ -2,10 +2,10 @@
 use super::witness::{self, OriginalRow, WitnessEligibility};
 use super::*;
 use crate::native_records::DocumentKey;
-use crate::semantic_batch::staging::{Stage, WitnessFallback, WitnessStageWriter};
 use crate::semantic_batch::{
     AdmittedBatch, LookupBudget, counters::BatchCounters, limits::BatchLimits,
 };
+use crate::store::staging::{Stage, WitnessFallback, WitnessStageWriter};
 use std::collections::VecDeque;
 
 /// Rows (or inventory documents) per preparation step. A page stays bounded by the unit
@@ -221,7 +221,7 @@ impl WitnessPreparation {
                         let encoded = id_codec::encode_sid(&syntax_id)
                             .context("invalid witnessed target syntax ID")?;
                         let named = row.name_range.is_some();
-                        crate::semantic_batch::staging::charge_witness_row(conn, limits)?;
+                        crate::store::staging::charge_witness_row(conn, limits)?;
                         conn.prepare_cached(
                             "INSERT INTO witness_target_status VALUES(?1,?2,?3,?4,0,?5,?6,?7)",
                         )?
@@ -321,7 +321,7 @@ fn stage_target(
                 crate::scip_raw::ScipCaptureError::LimitExceeded("candidates".into()).into(),
             );
         }
-        crate::semantic_batch::staging::charge_witness_row(conn, limits)?;
+        crate::store::staging::charge_witness_row(conn, limits)?;
         conn.prepare_cached(
             "INSERT INTO witness_required_targets(language,path,syntax_id) VALUES(?1,?2,?3)",
         )?

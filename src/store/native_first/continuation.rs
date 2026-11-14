@@ -52,7 +52,7 @@ pub(crate) struct SemanticContinuation {
     next: usize,
     current: Option<ProducerContinuation>,
     prepared: Vec<PreparedSemantic>,
-    target_stage: Option<crate::semantic_batch::staging::Stage>,
+    target_stage: Option<crate::store::staging::Stage>,
     /// Test-support cost counters of this operation only, carried across yields so work
     /// another owner does between units (an import, a native publication) is never counted.
     #[cfg(feature = "test-support")]
@@ -81,7 +81,7 @@ struct ProducerContinuation {
 }
 
 impl SemanticContinuation {
-    fn stages(&mut self) -> impl Iterator<Item = &mut crate::semantic_batch::staging::Stage> {
+    fn stages(&mut self) -> impl Iterator<Item = &mut crate::store::staging::Stage> {
         let (admission, admitted) = match self.current.as_mut() {
             Some(current) => (
                 current.admission.as_mut().and_then(|a| a.stage_mut()),
@@ -496,7 +496,7 @@ impl Store {
                     }
                     if !current.full && !current.target_index_done {
                         if state.target_stage.is_none() {
-                            let mut stage = crate::semantic_batch::staging::Stage::create(
+                            let mut stage = crate::store::staging::Stage::create(
                                 &stage_parent,
                                 &format!("native-target-{}", uuid::Uuid::new_v4()),
                                 &session.incarnation().to_string(),
@@ -765,7 +765,7 @@ impl Store {
                 // FULL fallback, as an ineligible witness does. Only FULL's own failure is the
                 // producer's terminal unavailable disposition below.
                 let fallback = error
-                    .downcast_ref::<crate::semantic_batch::staging::WitnessFallback>()
+                    .downcast_ref::<crate::store::staging::WitnessFallback>()
                     .map(|fallback| fallback.0)
                     .or_else(|| resource_limit(&error).then_some(WITNESS_LIMIT_FALLBACK));
                 if let Some(reason) = fallback {

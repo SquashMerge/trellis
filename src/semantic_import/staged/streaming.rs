@@ -291,7 +291,7 @@ impl GlobalJoinReads for CompletedGlobal<'_> {
         code.map_or(Ok(TargetCallable::Other), TargetCallable::from_code)
     }
     fn presence(&self, symbol: &str, target: Option<&native::DocumentKey>) -> Result<(bool, bool)> {
-        use crate::semantic_batch::staging::{PRESENCE_DECLARED, PRESENCE_INFORMATION};
+        use crate::store::staging::{PRESENCE_DECLARED, PRESENCE_INFORMATION};
         // Side 1 is always the eligible claim set.
         let filtered = self.filtered || self.side == 1;
         let sql = match target {
