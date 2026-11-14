@@ -1879,16 +1879,36 @@ fn run(client: &Client) {
     fn trellis_own_client_reaches_the_status_handler_and_its_test_only_route_is_excluded() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let read = |path: &str| std::fs::read_to_string(dir.join(path)).unwrap();
-        let (http, app, cli) = (
-            read("src/http.rs"),
-            read("web/app-checkout.js"),
-            read("tests/daemon/cli.rs"),
+        // The browser client is app.js and the app-*.js scripts it was split into (#1069).
+        let app: Vec<(String, String)> = [
+            "state",
+            "api",
+            "agent",
+            "navigation",
+            "checkout",
+            "source",
+            "files",
+            "tree",
+            "sequence",
+            "libraries",
+            "views",
+        ]
+        .iter()
+        .map(|part| format!("web/app-{part}.js"))
+        .chain(["web/app.js".to_owned()])
+        .map(|path| {
+            let text = read(&path);
+            (path, text)
+        })
+        .collect();
+        let (http, cli) = (read("src/http.rs"), read("tests/daemon/cli.rs"));
+        let mut files = vec![("src/http.rs", http.as_str())];
+        files.extend(
+            app.iter()
+                .map(|(path, text)| (path.as_str(), text.as_str())),
         );
-        let found = run(&[
-            ("src/http.rs", &http),
-            ("web/app-checkout.js", &app),
-            ("tests/daemon/cli.rs", &cli),
-        ]);
+        files.push(("tests/daemon/cli.rs", &cli));
+        let found = run(&files);
         let reached = |path: &str| {
             let call = found
                 .calls
