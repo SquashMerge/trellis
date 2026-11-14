@@ -14,7 +14,7 @@ fn incoming_carries_semantic_status_for_the_answers_languages() {
         incoming(
             &json!(1),
             fixture(1, false, 0),
-            &crate::store::McpSemantic::syntax_only(crate::store::NO_PRODUCER_NOTE, 0),
+            &crate::store::McpSemantic::syntax_only(crate::graph_query::NO_PRODUCER_NOTE, 0),
             tiers,
             false,
             std::path::Path::new("/workspace"),
@@ -73,7 +73,7 @@ fn project(result: McpIncomingWithLines, modern: bool) -> Option<Value> {
     incoming(
         &json!(1),
         result,
-        &crate::store::McpSemantic::syntax_only(crate::store::NO_PRODUCER_NOTE, 0),
+        &crate::store::McpSemantic::syntax_only(crate::graph_query::NO_PRODUCER_NOTE, 0),
         &Default::default(),
         false,
         std::path::Path::new("/workspace"),

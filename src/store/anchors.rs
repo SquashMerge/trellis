@@ -1,6 +1,6 @@
 use crate::{
     model::{AnchorReason, AnchorResult, DurableAnchor},
-    native_evidence::{Declaration, Header},
+    native_records::{Declaration, Header},
 };
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};

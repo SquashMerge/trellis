@@ -179,7 +179,7 @@ fn header_and_changing_manifest_plan_avoid_wide_revision_scans() {
 #[test]
 fn first_publication_creates_epoch_and_attests_selected_producer() {
     use crate::index_coordinator::IndexJobCoordinator;
-    use crate::indexer::IndexOptions;
+    use crate::model::IndexOptions;
     use std::{fs, sync::atomic::AtomicBool};
 
     let state = tempfile::tempdir().unwrap();
@@ -223,7 +223,7 @@ fn first_publication_creates_epoch_and_attests_selected_producer() {
 #[test]
 fn writer_session_serves_valid_prior_head_through_reconciliation() {
     use crate::index_coordinator::IndexJobCoordinator;
-    use crate::indexer::IndexOptions;
+    use crate::model::IndexOptions;
     use std::{fs, sync::atomic::AtomicBool};
 
     let state = tempfile::tempdir().unwrap();
@@ -337,7 +337,7 @@ fn writer_session_serves_valid_prior_head_through_reconciliation() {
 #[test]
 fn routine_publication_keeps_prior_pinned_and_unpinned_reads_available() {
     use crate::index_coordinator::IndexJobCoordinator;
-    use crate::indexer::IndexOptions;
+    use crate::model::IndexOptions;
     use std::{fs, sync::atomic::AtomicBool};
 
     let state = tempfile::tempdir().unwrap();
@@ -400,7 +400,7 @@ fn routine_publication_keeps_prior_pinned_and_unpinned_reads_available() {
 #[test]
 fn hot_pair_check_skips_stable_history_but_admission_checks_it() {
     use crate::index_coordinator::IndexJobCoordinator;
-    use crate::indexer::IndexOptions;
+    use crate::model::IndexOptions;
     use std::{fs, sync::atomic::AtomicBool};
 
     let state = tempfile::tempdir().unwrap();

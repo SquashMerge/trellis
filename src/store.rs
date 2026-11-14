@@ -31,16 +31,15 @@ pub use semantic_display::set_architecture_semantic_rows_for_tests;
 #[cfg(feature = "test-support")]
 pub(crate) use semantic_display::status_semantic_projections_on_thread_for_tests;
 pub use semantic_display::{
-    AutoRunLabels, CallSemantic, CoverageDocument, LANGUAGE_NOTE, LanguagePending, LanguageTier,
-    McpSemantic, NO_PRODUCER_NOTE, ProducerNotPublished, ProducerSelection,
-    multiple_producers_note, relabel_status,
+    AutoRunLabels, CallSemantic, CoverageDocument, LanguagePending, LanguageTier, McpSemantic,
+    ProducerNotPublished, ProducerSelection, relabel_status,
 };
 pub use semantic_retention::AutoRunHead;
 pub(crate) use sequence_hops::{InterfaceEvidence, call_ids as sequence_call_ids};
 pub(crate) mod symbol_trigrams;
 pub mod topology;
 use crate::model::*;
-use crate::native_evidence::DeclarationRole;
+use crate::native_records::DeclarationRole;
 use anyhow::{Context, Result, ensure};
 pub(crate) use architecture_core::{
     ArchitectureArguments, ArchitectureCore, ArchitectureMetrics, ArchitectureProgress,
@@ -505,9 +504,9 @@ pub type RetentionStateForTests = ((String, i64, i64), (i64, i64));
 pub struct PrivateStageObservation {
     pub pin: IndexPin,
     pub semantic: crate::semantic_evidence::SemanticSnapshot,
-    pub native_revision: crate::native_evidence::Revision,
-    pub declarations: Vec<crate::native_evidence::Declaration>,
-    pub calls: Vec<crate::native_evidence::Call>,
+    pub native_revision: crate::native_records::Revision,
+    pub declarations: Vec<crate::native_records::Declaration>,
+    pub calls: Vec<crate::native_records::Call>,
 }
 
 /// A retained tuple is presented at its own native revision. Freshness is a
@@ -1148,30 +1147,30 @@ struct SelectedHeader {
 /// reads trust them (owner ruling 2026-10-23, #261).
 struct FetchedDocument {
     file: SourceFile,
-    declarations: Vec<crate::native_evidence::Declaration>,
-    calls: Vec<crate::native_evidence::Call>,
-    regions: Vec<crate::native_evidence::ControlRegion>,
+    declarations: Vec<crate::native_records::Declaration>,
+    calls: Vec<crate::native_records::Call>,
+    regions: Vec<crate::native_records::ControlRegion>,
     stored_bytes: u64,
 }
 
 /// Header of a retained native revision: everything but the document inventory.
 pub struct NativeHeader {
-    pub source_set: crate::native_evidence::SourceSet,
-    pub revision: crate::native_evidence::Revision,
-    pub producer: crate::native_evidence::Producer,
+    pub source_set: crate::native_records::SourceSet,
+    pub revision: crate::native_records::Revision,
+    pub producer: crate::native_records::Producer,
 }
 
 /// One retained native document: its exact source bytes and measured native rows.
 pub struct NativeDocumentRows {
     pub source: Vec<u8>,
-    pub coverage: crate::native_evidence::Coverage,
-    pub provenance: crate::native_evidence::Provenance,
-    pub declarations: Vec<crate::native_evidence::Declaration>,
-    pub calls: Vec<crate::native_evidence::Call>,
-    pub control_regions: Vec<crate::native_evidence::ControlRegion>,
-    pub references: Vec<crate::native_evidence::Reference>,
-    pub capability_report: crate::native_evidence::CapabilityReport,
-    pub search_cards: Vec<crate::search_capture::CapturedCard>,
+    pub coverage: crate::native_records::Coverage,
+    pub provenance: crate::native_records::Provenance,
+    pub declarations: Vec<crate::native_records::Declaration>,
+    pub calls: Vec<crate::native_records::Call>,
+    pub control_regions: Vec<crate::native_records::ControlRegion>,
+    pub references: Vec<crate::native_records::Reference>,
+    pub capability_report: crate::native_records::CapabilityReport,
+    pub search_cards: Vec<crate::search_card_records::CapturedCard>,
 }
 
 #[derive(Default)]
@@ -1226,14 +1225,14 @@ impl NativeReader<'_> {
     }
 
     /// The retained source bytes of one inventory entry, checked against its identity.
-    pub fn source_bytes(&self, document: &crate::native_evidence::Document) -> Result<Vec<u8>> {
+    pub fn source_bytes(&self, document: &crate::native_records::Document) -> Result<Vec<u8>> {
         self.store
             .read_native_source(self.db, self.selected, document)
     }
 
     pub fn document(
         &self,
-        document: &crate::native_evidence::Document,
+        document: &crate::native_records::Document,
     ) -> Result<NativeDocumentRows> {
         self.store
             .read_native_document(self.db, self.selected, document)
@@ -1243,7 +1242,7 @@ impl NativeReader<'_> {
     /// never reads control regions or search cards, so they are not loaded (left empty).
     pub(crate) fn join_document(
         &self,
-        document: &crate::native_evidence::Document,
+        document: &crate::native_records::Document,
     ) -> Result<NativeDocumentRows> {
         self.store
             .read_native_document_rows(self.db, self.selected, document, false)
@@ -1252,7 +1251,7 @@ impl NativeReader<'_> {
     /// Logical peak estimate for native document loading, before owning its row bodies.
     pub(crate) fn document_reservation_bytes(
         &self,
-        document: &crate::native_evidence::Document,
+        document: &crate::native_records::Document,
     ) -> Result<u64> {
         native_join_budget::document_bytes(self.db, self.selected, document)
     }
@@ -1262,7 +1261,7 @@ impl NativeReader<'_> {
         &self,
         cursor: &mut CanonicalInventoryCursor,
         limit: usize,
-    ) -> Result<Vec<crate::native_evidence::Document>> {
+    ) -> Result<Vec<crate::native_records::Document>> {
         ensure!(limit > 0, "inventory page limit must be positive");
         let header = self.header()?;
         let mut documents = Vec::new();
@@ -1297,8 +1296,8 @@ impl NativeReader<'_> {
             let exhausted = rows.len() < remaining;
             for (path, content_hash, byte_length) in rows {
                 cursor.after_path.clone_from(&path);
-                documents.push(crate::native_evidence::Document {
-                    key: crate::native_evidence::DocumentKey {
+                documents.push(crate::native_records::Document {
+                    key: crate::native_records::DocumentKey {
                         source_set_id: header.source_set.id.clone(),
                         language: language.clone(),
                         path,
@@ -1370,7 +1369,7 @@ impl InventoryStream<'_> {
         }
     }
 
-    pub fn next_document(&mut self) -> Result<Option<crate::native_evidence::Document>> {
+    pub fn next_document(&mut self) -> Result<Option<crate::native_records::Document>> {
         loop {
             match self.state {
                 InventoryState::Done => return Ok(None),
@@ -1563,7 +1562,62 @@ impl MetricsOptions {
         }
         Ok(())
     }
+
+    /// `validate`, then the identifier forms every transport (CLI, daemon
+    /// request, browser API) accepts. A source-set ID is either form the
+    /// index publishes: `source-set:v1:path-<hash>` or `source-set:v1:<UUID>`.
+    /// The message names the first failing rule, in a fixed order.
+    pub fn validate_transport(&self) -> Result<()> {
+        fn lower_hex(text: &str) -> bool {
+            text.bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        }
+        self.validate()?;
+        ensure!(
+            self.source_set_id.as_deref().is_none_or(|id| {
+                let Some(identity) = id.strip_prefix("source-set:v1:") else {
+                    return false;
+                };
+                if let Some(hash) = identity.strip_prefix("path-") {
+                    return hash.len() == 64 && lower_hex(hash);
+                }
+                uuid::Uuid::parse_str(identity).is_ok_and(|uuid| uuid.to_string() == identity)
+            }),
+            "source set ID"
+        );
+        ensure!(
+            self.sid.as_deref().is_none_or(|sid| {
+                sid.len() == 39 && sid.starts_with("sid:v1:") && lower_hex(&sid[7..])
+            }),
+            "sid"
+        );
+        ensure!(
+            self.path
+                .as_deref()
+                .is_none_or(|path| !path.contains([':', '\\', '\0'])),
+            "path"
+        );
+        ensure!(
+            self.language.as_deref().is_none_or(|language| matches!(
+                language,
+                "java" | "python" | "javascript" | "typescript" | "rust"
+            )),
+            "language"
+        );
+        Ok(())
+    }
+
+    /// How long one metrics read of `scope` may work: revision and directory
+    /// reads aggregate many files, so they get the long budget.
+    pub fn work_budget(scope: &str) -> std::time::Duration {
+        std::time::Duration::from_secs(if matches!(scope, "revision" | "directory") {
+            300
+        } else {
+            30
+        })
+    }
 }
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MetricsFileRow {
@@ -1600,7 +1654,7 @@ pub struct MetricsDeclarationRow {
     pub language: String,
     pub path: String,
     pub sid: String,
-    pub range: crate::native_evidence::Range,
+    pub range: crate::native_records::Range,
     pub metrics: serde_json::Value,
 }
 #[derive(Debug, Serialize)]
@@ -1611,7 +1665,7 @@ pub struct MetricsTopCognitiveRow {
     pub language: String,
     pub path: String,
     pub sid: String,
-    pub range: crate::native_evidence::Range,
+    pub range: crate::native_records::Range,
     pub name: Option<String>,
     pub kind: String,
     pub metrics: MetricsTopCognitiveScore,
@@ -1664,7 +1718,7 @@ pub struct EvidenceResponse {
     fence: ReadFence,
     optional_recovery: OptionalRecovery,
     stable_lookup_keys: std::cell::RefCell<
-        BTreeMap<crate::native_evidence::DocumentKey, Arc<BTreeMap<String, String>>>,
+        BTreeMap<crate::native_records::DocumentKey, Arc<BTreeMap<String, String>>>,
     >,
     /// Runtime labels for automatic producer re-runs (#660); empty unless the daemon sets them.
     auto_run: AutoRunLabels,
@@ -1801,11 +1855,11 @@ impl Store {
     /// Metrics of one document's stored source and native rows.
     fn metrics_document(
         &self,
-        key: &crate::native_evidence::DocumentKey,
+        key: &crate::native_records::DocumentKey,
         file: &SourceFile,
-        declarations: &[crate::native_evidence::Declaration],
-        calls: &[crate::native_evidence::Call],
-        regions: &[crate::native_evidence::ControlRegion],
+        declarations: &[crate::native_records::Declaration],
+        calls: &[crate::native_records::Call],
+        regions: &[crate::native_records::ControlRegion],
         expired: &dyn Fn() -> bool,
     ) -> std::result::Result<MetricsComputedDocument, MetricsDocumentFailure> {
         // Metrics use the stored source and native rows as fetched.
@@ -2945,9 +2999,9 @@ impl EvidenceResponse {
         progress: &dyn Fn(usize, usize),
     ) -> Result<(
         crate::references::Snapshot,
-        Vec<Vec<crate::native_evidence::ControlRegion>>,
+        Vec<Vec<crate::native_records::ControlRegion>>,
     )> {
-        use crate::native_evidence::DocumentKey;
+        use crate::native_records::DocumentKey;
         check()?;
         let selected = self.selected(pin)?;
         let total = self.db.query_row(
@@ -3393,7 +3447,7 @@ impl EvidenceResponse {
             .map(|name| (*name).to_owned())
             .collect();
         let names: Vec<&str> = selected_metrics.iter().map(String::as_str).collect();
-        use crate::native_evidence::DocumentKey;
+        use crate::native_records::DocumentKey;
         let mut stmt = self.db.prepare(
             "SELECT r.source_set_id,m.language,m.path,m.coverage_diagnostic
             FROM revision_documents m
@@ -4007,7 +4061,7 @@ impl EvidenceResponse {
     pub fn tree_metadata(
         &self,
         root: &Path,
-        items: &mut [crate::file_tree::Entry],
+        items: &mut [crate::source_dir::Entry],
     ) -> Result<(IndexPin, String)> {
         let (revision, workspace_root, overlays) =
             self.store.tree_metadata_in(&self.db, root, items, true)?;
@@ -6178,16 +6232,16 @@ struct PublicationRows<'a> {
     regions: Vec<&'a ControlRegion>,
     classes: Vec<&'a crate::model::ClassDefinition>,
     relations: Vec<&'a crate::model::ClassRelation>,
-    native_declarations: Vec<&'a crate::native_evidence::Declaration>,
-    native_calls: Vec<&'a crate::native_evidence::Call>,
-    native_regions: Vec<&'a crate::native_evidence::ControlRegion>,
-    native_references: Vec<&'a crate::native_evidence::Reference>,
-    capability_report: Option<&'a crate::native_evidence::CapabilityReport>,
+    native_declarations: Vec<&'a crate::native_records::Declaration>,
+    native_calls: Vec<&'a crate::native_records::Call>,
+    native_regions: Vec<&'a crate::native_records::ControlRegion>,
+    native_references: Vec<&'a crate::native_records::Reference>,
+    capability_report: Option<&'a crate::native_records::CapabilityReport>,
 }
 fn publication_native_witness(
-    document: &crate::native_evidence::Document,
-    producer: &crate::native_evidence::Producer,
-    coverage: &crate::native_evidence::Coverage,
+    document: &crate::native_records::Document,
+    producer: &crate::native_records::Producer,
+    coverage: &crate::native_records::Coverage,
     grouped: &PublicationRows<'_>,
 ) -> Result<String> {
     crate::native_evidence::document_witness(
@@ -6207,7 +6261,7 @@ fn publication_native_witness(
 #[cfg(test)]
 #[test]
 fn publication_witness_requires_capability_report() {
-    use crate::native_evidence::{Coverage, Document, DocumentKey, Producer};
+    use crate::native_records::{Coverage, Document, DocumentKey, Producer};
 
     let document = Document {
         key: DocumentKey {
@@ -6220,8 +6274,8 @@ fn publication_witness_requires_capability_report() {
         byte_length: 0,
     };
     let producer = Producer {
-        id: crate::native_evidence::PRODUCER.into(),
-        version: crate::native_evidence::NATIVE_VERSION.into(),
+        id: crate::native_records::PRODUCER.into(),
+        version: crate::native_records::NATIVE_VERSION.into(),
         executable_hash: "e".repeat(64),
         kind: "native".into(),
         languages: vec!["javascript".into()],
@@ -6248,7 +6302,7 @@ fn publication_witness_requires_capability_report() {
 
 fn publication_rows<'a>(
     graph: &'a Graph,
-    native: &'a crate::native_evidence::Artifact,
+    native: &'a crate::native_records::Artifact,
     classes: &'a crate::classes::Catalog,
 ) -> Result<BTreeMap<&'a str, PublicationRows<'a>>> {
     let mut rows = BTreeMap::<&str, PublicationRows>::new();
@@ -6409,7 +6463,7 @@ fn v8_class_projection(graph_id: &str, grouped: &PublicationRows<'_>) -> (String
 
 fn v8_document_projection(
     file: &SourceFile,
-    native: &crate::native_evidence::Artifact,
+    native: &crate::native_records::Artifact,
     grouped: &PublicationRows<'_>,
 ) -> Result<V8DocumentProjection> {
     let context = crate::native_evidence::native_extraction_context(
@@ -6473,10 +6527,10 @@ struct PreflightReuse {
 pub(crate) struct LocalPrepared {
     pub(crate) changed_paths: BTreeSet<String>,
     removed_paths: BTreeSet<String>,
-    pub(crate) native: crate::native_evidence::Artifact,
+    pub(crate) native: crate::native_records::Artifact,
     prior_pin: IndexPin,
     prior_ids: BTreeMap<String, V8DocumentProjection>,
-    prior_coverage: BTreeMap<String, crate::native_evidence::Coverage>,
+    prior_coverage: BTreeMap<String, crate::native_records::Coverage>,
     prior_summaries: BTreeMap<String, crate::classes::FileSummary>,
     prior_class_complete: BTreeMap<String, bool>,
     old_stats: IndexStats,
@@ -6981,10 +7035,10 @@ type PrecomputedDocument = (Option<Result<V8DocumentProjection>>, Option<Result<
 /// One document's projection and witness, under write_native's reuse conditions.
 fn precompute_document(
     file: &SourceFile,
-    native: &crate::native_evidence::Artifact,
+    native: &crate::native_records::Artifact,
     grouped: Option<&PublicationRows<'_>>,
-    document: Option<&crate::native_evidence::Document>,
-    coverage: Option<&crate::native_evidence::Coverage>,
+    document: Option<&crate::native_records::Document>,
+    coverage: Option<&crate::native_records::Coverage>,
     reuse: &PreflightReuse,
 ) -> PrecomputedDocument {
     let projection = if reuse.existing_ids.contains_key(&file.path) {
@@ -7180,8 +7234,8 @@ fn authenticate_stored_batch(
     raw: &SelectedRawBatch,
     inventory: &crate::scip_raw::CapturedScipInventory,
     captured: &crate::semantic_evidence::CapturedComponents,
-    r1: &crate::native_evidence::Artifact,
-    sources: &BTreeMap<crate::native_evidence::DocumentKey, Vec<u8>>,
+    r1: &crate::native_records::Artifact,
+    sources: &BTreeMap<crate::native_records::DocumentKey, Vec<u8>>,
     store: &Store,
     cancel: &CancelFlag,
 ) -> Result<AttestedProfileProducer> {
@@ -7191,7 +7245,7 @@ fn authenticate_stored_batch(
         self, AuthenticatedArtifact, AuthenticatedScipDocument, DocumentSource, VecSink,
     };
     use crate::semantic_batch::{
-        BatchCounters,
+        counters::BatchCounters,
         descriptor::{FORMAT_VERSION, SourceManifestHasher},
     };
     let descriptor = &raw.descriptor;
@@ -7413,7 +7467,7 @@ pub struct SelectedRawCapture {
 #[derive(Debug, Clone)]
 pub struct SelectedRawBatch {
     pub producer: crate::semantic_evidence::Producer,
-    pub requested_documents: Vec<crate::native_evidence::DocumentKey>,
+    pub requested_documents: Vec<crate::native_records::DocumentKey>,
     pub producer_id: String,
     pub source_set_id: String,
     pub captured_revision: String,
@@ -7435,7 +7489,7 @@ pub struct SelectedRawBatch {
 impl SelectedRawBatch {
     /// The artifact that carries a document's basis (§4.4 e): its assigned artifact when
     /// covered, otherwise the lowest-ordinal artifact of its language, otherwise artifact 0.
-    pub fn artifact_hash_for(&self, doc: &crate::native_evidence::DocumentKey) -> &str {
+    pub fn artifact_hash_for(&self, doc: &crate::native_records::DocumentKey) -> &str {
         let assigned = self
             .documents
             .get(&(doc.language.clone(), doc.path.clone()))
@@ -7460,7 +7514,7 @@ impl SelectedRawBatch {
 
 type SelectedRawBatchResult = (
     crate::semantic_evidence::Producer,
-    Vec<crate::native_evidence::DocumentKey>,
+    Vec<crate::native_records::DocumentKey>,
     Result<SelectedRawBatch>,
 );
 
@@ -7655,7 +7709,7 @@ fn semantic_target_read(
                 syntax_id: id_codec::decode_sid(&id).context(SelectedIntegrity(
                     "incompatible_index: corrupt semantic internal ID".into(),
                 ))?,
-                document: crate::native_evidence::DocumentKey {
+                document: crate::native_records::DocumentKey {
                     source_set_id: source_set.into(),
                     language: row.get(start + 2)?,
                     path: row.get(start + 3)?,
@@ -7674,7 +7728,7 @@ fn semantic_target_read(
                     symbol: row.get(start + 6)?,
                     scope: semantic_enum(row.get(start + 7)?)?,
                     document: match (language, path) {
-                        (Some(language), Some(path)) => Some(crate::native_evidence::DocumentKey {
+                        (Some(language), Some(path)) => Some(crate::native_records::DocumentKey {
                             source_set_id: source_set.into(),
                             language,
                             path,
@@ -7784,7 +7838,7 @@ fn semantic_symbol_key_read(
     let document = match (scope, language, path) {
         (sem::SymbolScope::Global, None, None) => None,
         (sem::SymbolScope::Document | sem::SymbolScope::Target, Some(language), Some(path)) => {
-            Some(crate::native_evidence::DocumentKey {
+            Some(crate::native_records::DocumentKey {
                 source_set_id: source_set.into(),
                 language,
                 path,
@@ -7965,7 +8019,7 @@ fn read_semantic_tuple_with_reasons(
     source_set: String,
     read_as: Option<ReadAs<'_>>,
 ) -> Result<crate::semantic_evidence::SemanticSnapshot> {
-    use crate::native_evidence::DocumentKey;
+    use crate::native_records::DocumentKey;
     use crate::semantic_evidence as sem;
     let mut result = sem::SemanticSnapshot {
         producers: vec![],
@@ -8209,7 +8263,7 @@ fn read_semantic_history(
     key: &str,
     index_revision: u64,
     producer_id: &str,
-    document: &crate::native_evidence::DocumentKey,
+    document: &crate::native_records::DocumentKey,
     syntax_id: &str,
 ) -> Result<Option<SemanticHistory>> {
     use crate::semantic_evidence::{CoverageState, Freshness};
@@ -8355,7 +8409,7 @@ fn read_semantic_history(
 fn read_semantic_facts(
     db: &Connection,
     projection: &semantic_payload::PayloadProjection<'_>,
-    document: &crate::native_evidence::DocumentKey,
+    document: &crate::native_records::DocumentKey,
     result: &mut crate::semantic_evidence::SemanticSnapshot,
     selected_call: Option<&[u8]>,
 ) -> Result<()> {
@@ -8429,14 +8483,14 @@ fn read_semantic_facts(
             symbols: semantic_symbol_keys(&mut declaration_symbols, id, source_set)?,
             join: sem::Join {
                 anchor: sem::MeasuredAnchor {
-                    document: crate::native_evidence::DocumentKey {
+                    document: crate::native_records::DocumentKey {
                         source_set_id: source_set.clone(),
                         language,
                         path,
                     },
                     revision_id: projection.revision(revision_id),
                     content_hash,
-                    range: crate::native_evidence::Range {
+                    range: crate::native_records::Range {
                         start: start.try_into().context(SelectedIntegrity(
                             "incompatible_index: invalid semantic start".into(),
                         ))?,
@@ -8521,7 +8575,7 @@ fn read_semantic_facts(
             ))?,
             document: document.clone(),
             revision_id: projection.native().to_owned(),
-            range: crate::native_evidence::Range {
+            range: crate::native_records::Range {
                 start: start.try_into().context(SelectedIntegrity(
                     "incompatible_index: invalid semantic start".into(),
                 ))?,
@@ -8590,7 +8644,7 @@ fn read_semantic_facts(
 fn read_semantic_call_facts(
     db: &Connection,
     projection: &semantic_payload::PayloadProjection<'_>,
-    document: &crate::native_evidence::DocumentKey,
+    document: &crate::native_records::DocumentKey,
     result: &mut crate::semantic_evidence::SemanticSnapshot,
     selected_call: Option<&[u8]>,
 ) -> Result<()> {
@@ -8678,14 +8732,14 @@ fn read_semantic_call_facts(
                 .transpose()?,
             join: sem::Join {
                 anchor: sem::MeasuredAnchor {
-                    document: crate::native_evidence::DocumentKey {
+                    document: crate::native_records::DocumentKey {
                         source_set_id: source_set.clone(),
                         language,
                         path,
                     },
                     revision_id: projection.revision(revision_id),
                     content_hash,
-                    range: crate::native_evidence::Range {
+                    range: crate::native_records::Range {
                         start: start.try_into().context(SelectedIntegrity(
                             "incompatible_index: invalid semantic start".into(),
                         ))?,
@@ -9421,7 +9475,7 @@ fn write_producer_descriptor(
 
 fn write_semantic(
     db: &Connection,
-    native: &crate::native_evidence::Artifact,
+    native: &crate::native_records::Artifact,
     prior: Option<IndexPin>,
     pin: IndexPin,
     supplied: Option<(
@@ -10037,7 +10091,7 @@ fn release_semantic_tuple(db: &Connection, revision: &str) -> Result<bool> {
 fn write_native(
     db: &Connection,
     bundle: (
-        &crate::native_evidence::Artifact,
+        &crate::native_records::Artifact,
         &crate::capture::Capture,
         &Graph,
         &crate::classes::Catalog,
@@ -10639,7 +10693,7 @@ fn write_native(
             }
         };
         let callee_lookup_key =
-            crate::native_evidence::verified_callee_lookup(&document.key.language, c, source);
+            crate::native_records::verified_callee_lookup(&document.key.language, c, source);
         immutable.insert(
             db,
             "INSERT INTO native_version_calls VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
@@ -10835,8 +10889,8 @@ fn revision_producer_binding(db: &Connection, revision_key: &str) -> Result<(Str
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
     )?;
     selected_ensure!(
-        producer_id == crate::native_evidence::PRODUCER
-            && producer_version == crate::native_evidence::NATIVE_VERSION
+        producer_id == crate::native_records::PRODUCER
+            && producer_version == crate::native_records::NATIVE_VERSION
             && kind == "native"
             && encoding == "utf8",
         "incompatible_index: selected native producer descriptor differs"
@@ -11075,7 +11129,7 @@ fn validate_paired_metadata(
     let producer_version = one_row(db, "SELECT id,version FROM native_producers LIMIT 2")?;
     if producer_version
         .as_ref()
-        .is_some_and(|(_, version)| version != crate::native_evidence::NATIVE_VERSION)
+        .is_some_and(|(_, version)| version != crate::native_records::NATIVE_VERSION)
     {
         return Err(NativeProducerIncompatible.into());
     }
@@ -11473,8 +11527,8 @@ fn compare_capture_snapshot_inner(
             selected_ensure!(
                 graph.as_deref() == Some("ready")
                     && class.as_deref() == Some("ready")
-                    && producer == crate::native_evidence::PRODUCER
-                    && version == crate::native_evidence::NATIVE_VERSION
+                    && producer == crate::native_records::PRODUCER
+                    && version == crate::native_records::NATIVE_VERSION
                     && context
                         == &crate::native_evidence::declared_selected_extraction_context(
                             producer,
@@ -11529,7 +11583,7 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
     )?;
     let options = options
         .ok_or_else(|| ControlIntegrity("incompatible_index: missing reconcile options".into()))?;
-    let decoded_options: crate::indexer::ReconcileOptions = serde_json::from_str(&options)
+    let decoded_options: crate::model::ReconcileOptions = serde_json::from_str(&options)
         .context(SelectedIntegrity(
             "incompatible_index: stored JSON decode failed".into(),
         ))
@@ -11835,7 +11889,7 @@ struct V8NativeScope {
     revision_key: String, // internal pin:v1 generation/revision key
     version_id: String,
     vid: i64,
-    key: crate::native_evidence::DocumentKey,
+    key: crate::native_records::DocumentKey,
     native_revision_id: String,
     producer_id: String,
 }
@@ -11890,7 +11944,7 @@ fn optional_stored_id_row(
 
 fn v8_native_scope_for(
     db: &Connection,
-    key: &crate::native_evidence::DocumentKey,
+    key: &crate::native_records::DocumentKey,
     selected: &ReadRevision,
 ) -> Result<Option<V8NativeScope>> {
     let mut stmt = db.prepare_cached(
@@ -11935,7 +11989,7 @@ fn v8_owner_scope_for(
     owner: &str,
     selected: &ReadRevision,
 ) -> Result<Option<V8NativeScope>> {
-    use crate::native_evidence::DocumentKey;
+    use crate::native_records::DocumentKey;
     let mut stmt = db.prepare_cached(
         "SELECT r.source_set_id,m.language,m.path
         FROM native_version_declarations d JOIN revision_documents m
@@ -11990,7 +12044,7 @@ fn decode_signature(
     present: bool,
     count: Option<i64>,
     variadic: Option<bool>,
-) -> Result<Option<crate::native_evidence::Signature>> {
+) -> Result<Option<crate::native_records::Signature>> {
     let values = types.remove(id).unwrap_or_default();
     if !present {
         selected_ensure!(
@@ -11999,7 +12053,7 @@ fn decode_signature(
         );
         return Ok(None);
     }
-    Ok(Some(crate::native_evidence::Signature {
+    Ok(Some(crate::native_records::Signature {
         parameter_types: values,
         type_parameter_count: usize::try_from(
             count.ok_or_else(|| SelectedIntegrity("missing native signature count".into()))?,
@@ -12016,7 +12070,7 @@ fn read_native_declarations_v8(
     scope: &V8NativeScope,
     lookup_key: Option<&str>,
     all_lookup_keys: bool,
-) -> Result<Vec<crate::native_evidence::Declaration>> {
+) -> Result<Vec<crate::native_records::Declaration>> {
     read_native_declarations_v8_inner(db, scope, lookup_key, all_lookup_keys, None)
 }
 
@@ -12026,7 +12080,7 @@ fn read_native_declarations_v8_optional(
     lookup_key: Option<&str>,
     all_lookup_keys: bool,
     expired: &dyn Fn() -> bool,
-) -> Result<Vec<crate::native_evidence::Declaration>> {
+) -> Result<Vec<crate::native_records::Declaration>> {
     read_native_declarations_v8_inner(db, scope, lookup_key, all_lookup_keys, Some(expired))
 }
 
@@ -12036,7 +12090,7 @@ fn fetch_native_declarations_v8(
     db: &Connection,
     scope: &V8NativeScope,
     progress: Option<&dyn Fn() -> bool>,
-) -> Result<impl Decode<Vec<crate::native_evidence::Declaration>> + use<>> {
+) -> Result<impl Decode<Vec<crate::native_records::Declaration>> + use<>> {
     optional_hint_check(progress)?;
     let v = &scope.vid;
     let rows0 = db.prepare_cached("SELECT syntax_id,ordinal,type_name FROM native_version_own_signature_types WHERE vid=?1 ORDER BY syntax_id,ordinal")?
@@ -12090,7 +12144,7 @@ fn fetch_native_declarations_v8(
         .collect::<Result<Vec<_>>>()?;
     let scope = scope.clone();
     Ok(decoder(move |progress| {
-        use crate::native_evidence::{Declaration, Header, Key, Parameter, Range};
+        use crate::native_records::{Declaration, Header, Key, Parameter, Range};
         optional_hint_check(progress)?;
         let mut own_types: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for row in rows0 {
@@ -12203,7 +12257,7 @@ fn fetch_native_declarations_v8(
                 name_start,
                 name_end,
             ) = row;
-            let role = crate::native_evidence::DeclarationRole::from_stored(&role)
+            let role = crate::native_records::DeclarationRole::from_stored(&role)
                 .map_err(|error| SelectedIntegrity(error.to_string()))?;
             selected_ensure!(
                 recorded_owners.insert(id.clone(), owner).is_none(),
@@ -12228,7 +12282,7 @@ fn fetch_native_declarations_v8(
                     selected_ensure!(sig_types.is_empty(), "orphan ancestor signature types");
                 }
                 let signature = if present {
-                    Some(crate::native_evidence::Signature {
+                    Some(crate::native_records::Signature {
                         parameter_types: sig_types,
                         type_parameter_count: usize::try_from(count.ok_or_else(|| {
                             SelectedIntegrity("missing ancestor signature count".into())
@@ -12339,7 +12393,7 @@ fn read_native_declarations_v8_inner(
     lookup_key: Option<&str>,
     all_lookup_keys: bool,
     progress: Option<&dyn Fn() -> bool>,
-) -> Result<Vec<crate::native_evidence::Declaration>> {
+) -> Result<Vec<crate::native_records::Declaration>> {
     let mut result = fetch_native_declarations_v8(db, scope, progress)?(progress)?;
     if !all_lookup_keys {
         result.retain(|d| d.lookup_key.as_deref() == lookup_key);
@@ -12350,8 +12404,8 @@ fn read_native_declarations_v8_inner(
 fn read_native_coverage_v8(
     db: &Connection,
     scope: &V8NativeScope,
-) -> Result<crate::native_evidence::Coverage> {
-    use crate::native_evidence::Coverage;
+) -> Result<crate::native_records::Coverage> {
+    use crate::native_records::Coverage;
     let (requested,selected,state,diagnostic):(bool,bool,String,Option<String>)=
         db.query_row("SELECT coverage_requested,coverage_selected,coverage_state,coverage_diagnostic FROM revision_documents WHERE revision_id=?1 AND language=?2 AND path=?3 AND vid=?4",
             params![scope.revision_key,scope.key.language,scope.key.path,scope.vid],
@@ -12382,7 +12436,7 @@ fn read_native_calls_v8(
     db: &Connection,
     scope: &V8NativeScope,
     owner: Option<&str>,
-) -> Result<Vec<crate::native_evidence::Call>> {
+) -> Result<Vec<crate::native_records::Call>> {
     read_native_calls_v8_inner(db, scope, owner, None)
 }
 /// Read every row of one selected version; the returned decoder checks and
@@ -12391,7 +12445,7 @@ fn fetch_native_calls_v8(
     db: &Connection,
     scope: &V8NativeScope,
     progress: Option<&dyn Fn() -> bool>,
-) -> Result<impl Decode<Vec<crate::native_evidence::Call>> + use<>> {
+) -> Result<impl Decode<Vec<crate::native_records::Call>> + use<>> {
     optional_hint_check(progress)?;
     let version = &scope.vid;
     let rows0 = db
@@ -12431,7 +12485,7 @@ fn fetch_native_calls_v8(
     let scope = scope.clone();
     Ok(decoder(move |progress| {
         optional_hint_check(progress)?;
-        use crate::native_evidence::{Call, Range};
+        use crate::native_records::{Call, Range};
         let mut known = BTreeSet::new();
         for row in rows0 {
             optional_hint_check(progress)?;
@@ -12532,7 +12586,7 @@ fn read_native_calls_v8_inner(
     scope: &V8NativeScope,
     owner: Option<&str>,
     progress: Option<&dyn Fn() -> bool>,
-) -> Result<Vec<crate::native_evidence::Call>> {
+) -> Result<Vec<crate::native_records::Call>> {
     let calls = fetch_native_calls_v8(db, scope, progress)?(progress)?;
     if owner.is_none() {
         optional_hint_check(progress)?;
@@ -12551,7 +12605,7 @@ fn read_native_control_regions_v8(
     db: &Connection,
     scope: &V8NativeScope,
     owner: Option<&str>,
-) -> Result<Vec<crate::native_evidence::ControlRegion>> {
+) -> Result<Vec<crate::native_records::ControlRegion>> {
     read_native_control_regions_v8_inner(db, scope, owner, None)
 }
 /// Read every row of one selected version; the returned decoder checks and
@@ -12560,7 +12614,7 @@ fn fetch_native_control_regions_v8(
     db: &Connection,
     scope: &V8NativeScope,
     progress: Option<&dyn Fn() -> bool>,
-) -> Result<impl Decode<Vec<crate::native_evidence::ControlRegion>> + use<>> {
+) -> Result<impl Decode<Vec<crate::native_records::ControlRegion>> + use<>> {
     optional_hint_check(progress)?;
     let rows0 = db
         .prepare_cached("SELECT syntax_id FROM native_version_declarations WHERE vid=?1")?
@@ -12580,7 +12634,7 @@ fn fetch_native_control_regions_v8(
     let scope = scope.clone();
     Ok(decoder(move |progress| {
         optional_hint_check(progress)?;
-        use crate::native_evidence::{ControlRegion, Range};
+        use crate::native_records::{ControlRegion, Range};
         let mut known = BTreeSet::new();
         for row in rows0 {
             optional_hint_check(progress)?;
@@ -12642,7 +12696,7 @@ fn read_native_control_regions_v8_inner(
     scope: &V8NativeScope,
     owner: Option<&str>,
     progress: Option<&dyn Fn() -> bool>,
-) -> Result<Vec<crate::native_evidence::ControlRegion>> {
+) -> Result<Vec<crate::native_records::ControlRegion>> {
     let regions = fetch_native_control_regions_v8(db, scope, progress)?(progress)?;
     if owner.is_none() {
         optional_hint_check(progress)?;
@@ -12662,8 +12716,8 @@ fn read_native_references(
     db: &Connection,
     scope: &V8NativeScope,
     owner: Option<&str>,
-) -> Result<Vec<crate::native_evidence::Reference>> {
-    use crate::native_evidence::{Range, Reference};
+) -> Result<Vec<crate::native_records::Reference>> {
+    use crate::native_records::{Range, Reference};
     let mut known = BTreeSet::new();
     for row in db
         .prepare("SELECT syntax_id FROM native_version_declarations WHERE vid=?1")?
@@ -12700,8 +12754,8 @@ fn read_native_references(
 fn read_native_capability_report(
     db: &Connection,
     scope: &V8NativeScope,
-) -> Result<crate::native_evidence::CapabilityReport> {
-    use crate::native_evidence::{
+) -> Result<crate::native_records::CapabilityReport> {
+    use crate::native_records::{
         CapabilityReport, MeasurementGap, MeasurementKind, MeasurementSupport, Range,
     };
     let mut families = vec![];
@@ -12814,7 +12868,7 @@ impl Store {
     /// Signal waiters after a confirmed terminal request COMMIT.
     pub(crate) fn notify_terminal_waiters(&self) {
         self.publication_gate.notify_terminal();
-        crate::index_coordinator::diagnostic_marker(
+        crate::diagnostic_markers::diagnostic_marker(
             "-",
             "terminal_notify",
             &format!("generation={}", self.terminal_generation()),
@@ -13250,7 +13304,7 @@ impl Store {
             ensure!(revision > 0, "index_not_ready: no published revision");
             let raw_options =
                 raw_options.context("incompatible_index: missing reconcile options")?;
-            let options: crate::indexer::ReconcileOptions = serde_json::from_str(&raw_options)
+            let options: crate::model::ReconcileOptions = serde_json::from_str(&raw_options)
                 .context(SelectedIntegrity(
                     "incompatible_index: stored JSON decode failed".into(),
                 ))
@@ -13511,7 +13565,7 @@ impl Store {
     /// Only an already-classified corrupt index under a fresh exclusive leader may enter.
     pub(crate) fn recreate_index_exclusive(
         &self,
-        options: &crate::indexer::IndexOptions,
+        options: &crate::model::IndexOptions,
         leader: &mut topology::WriterGuard,
         cancel: &CancelFlag,
     ) -> Result<IndexPin> {
@@ -13519,7 +13573,7 @@ impl Store {
     }
     fn recreate_index_exclusive_with_hook(
         &self,
-        options: &crate::indexer::IndexOptions,
+        options: &crate::model::IndexOptions,
         leader: &mut topology::WriterGuard,
         cancel: &CancelFlag,
         mut at: impl FnMut(ActivationStage) -> Result<()>,
@@ -14669,7 +14723,7 @@ impl Store {
     pub fn state_topology(&self) -> (&topology::TopologyRoots, &topology::WorkspaceIdentity) {
         (&self.roots, &self.identity)
     }
-    pub fn recorded_index_options(&self) -> Result<Option<crate::indexer::IndexOptions>> {
+    pub fn recorded_index_options(&self) -> Result<Option<crate::model::IndexOptions>> {
         (|| {
             let mut db = self.cache()?;
             let tx = storage_result(db.transaction())?;
@@ -14706,7 +14760,7 @@ impl Store {
             let payload = payload.ok_or_else(|| {
                 ControlIntegrity("incompatible_index: missing reconcile options".into())
             })?;
-            let options: crate::indexer::ReconcileOptions = serde_json::from_str(&payload)
+            let options: crate::model::ReconcileOptions = serde_json::from_str(&payload)
                 .context(SelectedIntegrity(
                     "incompatible_index: stored JSON decode failed".into(),
                 ))
@@ -14716,7 +14770,7 @@ impl Store {
                 "incompatible_index: unsupported reconcile options"
             );
             let mut result =
-                crate::indexer::IndexOptions::new(Path::new(&self.workspace_root).to_owned());
+                crate::model::IndexOptions::new(Path::new(&self.workspace_root).to_owned());
             result.max_file_bytes = options.max_file_bytes;
             Ok(Some(result))
         })()
@@ -14756,7 +14810,7 @@ impl Store {
     }
     pub(crate) fn recreate_pending_writer_session(
         &self,
-        options: &crate::indexer::IndexOptions,
+        options: &crate::model::IndexOptions,
         cancel: &CancelFlag,
     ) -> Result<(IndexPin, Arc<topology::WriterSession>)> {
         ensure!(
@@ -14920,7 +14974,7 @@ impl Store {
     /// root here; no caller-supplied path is ever a root.
     pub fn producer_generation_dir(
         &self,
-        origin: crate::semantic_batch::descriptor::GenerationOrigin,
+        origin: crate::semantic_batch::origin::GenerationOrigin,
         generation_id: &str,
     ) -> Result<std::path::PathBuf> {
         ensure!(
@@ -15136,7 +15190,7 @@ impl Store {
         &self,
         graph: &Graph,
         capture: &crate::capture::Capture,
-        native: &crate::native_evidence::Artifact,
+        native: &crate::native_records::Artifact,
         leader: &topology::WriterGuard,
         expected_revision: IndexPin,
         cancel: &CancelFlag,
@@ -15160,7 +15214,7 @@ impl Store {
         &self,
         graph: &Graph,
         capture: &crate::capture::Capture,
-        native: &crate::native_evidence::Artifact,
+        native: &crate::native_records::Artifact,
         leader: &topology::WriterGuard,
         cancel: &CancelFlag,
     ) -> Result<IndexPin> {
@@ -15679,7 +15733,7 @@ impl Store {
         &self,
         graph: &Graph,
         capture: &crate::capture::Capture,
-        native: &crate::native_evidence::Artifact,
+        native: &crate::native_records::Artifact,
         semantic: &crate::semantic_evidence::SemanticPublication,
         captured: &crate::semantic_evidence::CapturedComponents,
         leader: &topology::WriterGuard,
@@ -15706,7 +15760,7 @@ impl Store {
         evidence: (
             &Graph,
             &crate::capture::Capture,
-            &crate::native_evidence::Artifact,
+            &crate::native_records::Artifact,
             &crate::semantic_evidence::SemanticPublication,
             &crate::semantic_evidence::CapturedComponents,
         ),
@@ -15741,7 +15795,7 @@ impl Store {
         evidence: (
             &Graph,
             &crate::capture::Capture,
-            &crate::native_evidence::Artifact,
+            &crate::native_records::Artifact,
             &crate::semantic_evidence::SemanticPublication,
             &crate::semantic_evidence::CapturedComponents,
         ),
@@ -15771,7 +15825,7 @@ impl Store {
         &self,
         graph: &Graph,
         capture: &crate::capture::Capture,
-        native: &crate::native_evidence::Artifact,
+        native: &crate::native_records::Artifact,
         semantic: &crate::semantic_evidence::SemanticPublication,
         captured: &crate::semantic_evidence::CapturedComponents,
         leader: &topology::WriterGuard,
@@ -15963,7 +16017,7 @@ impl Store {
     #[doc(hidden)]
     pub fn publish_private_stage_semantic_for_tests(
         &self,
-        options: &crate::indexer::IndexOptions,
+        options: &crate::model::IndexOptions,
         capture: &crate::capture::Capture,
         semantic: &crate::semantic_evidence::SemanticPublication,
         captured: &crate::semantic_evidence::CapturedComponents,
@@ -15983,7 +16037,7 @@ impl Store {
     #[doc(hidden)]
     pub fn publish_private_stage_native_for_tests(
         &self,
-        options: &crate::indexer::IndexOptions,
+        options: &crate::model::IndexOptions,
         capture: &crate::capture::Capture,
         cancel: &CancelFlag,
     ) -> Result<PrivateStageObservation> {
@@ -15993,7 +16047,7 @@ impl Store {
     #[cfg(feature = "test-support")]
     fn publish_private_stage_for_tests(
         &self,
-        options: &crate::indexer::IndexOptions,
+        options: &crate::model::IndexOptions,
         capture: &crate::capture::Capture,
         semantic: Option<(
             &crate::semantic_evidence::SemanticPublication,
@@ -16078,8 +16132,8 @@ impl Store {
                  WHERE m.revision_id=?1 ORDER BY m.language,m.path",
                 )?
                 .query_map([&key], |row| {
-                    Ok(crate::native_evidence::Document {
-                        key: crate::native_evidence::DocumentKey {
+                    Ok(crate::native_records::Document {
+                        key: crate::native_records::DocumentKey {
                             source_set_id: source_set_id.clone(),
                             language: row.get(0)?,
                             path: row.get(1)?,
@@ -16099,7 +16153,7 @@ impl Store {
                 declarations.extend(read_native_declarations_v8(&staged, &scope, None, true)?);
                 calls.extend(read_native_calls_v8(&staged, &scope, None)?);
             }
-            let revision = crate::native_evidence::Revision {
+            let revision = crate::native_records::Revision {
                 id: native_revision_id,
                 source_set_id,
                 documents,
@@ -16123,7 +16177,7 @@ impl Store {
     #[doc(hidden)]
     pub fn publish_stream_native_only_for_tests(
         &self,
-        options: &crate::indexer::IndexOptions,
+        options: &crate::model::IndexOptions,
         capture: &crate::capture::Capture,
         leader: &topology::WriterGuard,
         cancel: &CancelFlag,
@@ -16152,7 +16206,7 @@ impl Store {
     #[allow(clippy::too_many_arguments)]
     pub fn publish_stream_semantic_for_tests(
         &self,
-        options: &crate::indexer::IndexOptions,
+        options: &crate::model::IndexOptions,
         capture: &crate::capture::Capture,
         semantic: &crate::semantic_evidence::SemanticPublication,
         captured: &crate::semantic_evidence::CapturedComponents,
@@ -16194,7 +16248,7 @@ impl Store {
         &self,
         graph: &Graph,
         capture: &crate::capture::Capture,
-        native: &crate::native_evidence::Artifact,
+        native: &crate::native_records::Artifact,
         leader: &topology::WriterGuard,
         cancel: &CancelFlag,
     ) -> Result<IndexPin> {
@@ -16209,7 +16263,7 @@ impl Store {
         &self,
         graph: &Graph,
         capture: &crate::capture::Capture,
-        native: &crate::native_evidence::Artifact,
+        native: &crate::native_records::Artifact,
         semantic: &crate::semantic_evidence::SemanticPublication,
         captured: &crate::semantic_evidence::CapturedComponents,
         leader: &topology::WriterGuard,
@@ -16245,7 +16299,7 @@ impl Store {
     #[doc(hidden)]
     pub fn publish_local_for_tests(
         &self,
-        options: &crate::indexer::IndexOptions,
+        options: &crate::model::IndexOptions,
         capture: &crate::capture::Capture,
         leader: &topology::WriterGuard,
         cancel: &CancelFlag,
@@ -16306,7 +16360,7 @@ impl Store {
     #[allow(clippy::too_many_arguments)]
     pub fn publish_local_semantic_for_tests(
         &self,
-        options: &crate::indexer::IndexOptions,
+        options: &crate::model::IndexOptions,
         capture: &crate::capture::Capture,
         semantic: &crate::semantic_evidence::SemanticPublication,
         captured: &crate::semantic_evidence::CapturedComponents,
@@ -16344,7 +16398,7 @@ impl Store {
         &self,
         graph: &Graph,
         capture: &crate::capture::Capture,
-        native: &crate::native_evidence::Artifact,
+        native: &crate::native_records::Artifact,
         leader: &topology::WriterGuard,
         expected: RecoveryBaseline,
         cancel: &CancelFlag,
@@ -16503,7 +16557,7 @@ impl Store {
         &self,
         graph: &Graph,
         capture: &crate::capture::Capture,
-        native: &crate::native_evidence::Artifact,
+        native: &crate::native_records::Artifact,
         leader: &topology::WriterGuard,
         expected: ExpectedPublication,
         cancel: &CancelFlag,
@@ -16516,7 +16570,7 @@ impl Store {
         &self,
         graph: &Graph,
         capture: &crate::capture::Capture,
-        native: &crate::native_evidence::Artifact,
+        native: &crate::native_records::Artifact,
         cancel: &CancelFlag,
     ) -> Result<()> {
         self.validate_native_bundle_with_mode(graph, capture, native, cancel, false)
@@ -16525,7 +16579,7 @@ impl Store {
         &self,
         graph: &Graph,
         capture: &crate::capture::Capture,
-        native: &crate::native_evidence::Artifact,
+        native: &crate::native_records::Artifact,
         cancel: &CancelFlag,
         selective: bool,
     ) -> Result<()> {
@@ -16550,7 +16604,7 @@ impl Store {
         &self,
         graph: &Graph,
         capture: &crate::capture::Capture,
-        native: &crate::native_evidence::Artifact,
+        native: &crate::native_records::Artifact,
         cancel: &CancelFlag,
     ) -> Result<()> {
         ensure!(
@@ -16576,7 +16630,7 @@ impl Store {
         bundle: (
             &Graph,
             &crate::capture::Capture,
-            &crate::native_evidence::Artifact,
+            &crate::native_records::Artifact,
         ),
         stage: &StagedIndex,
         leader: &topology::WriterGuard,
@@ -16633,7 +16687,7 @@ impl Store {
         &self,
         graph: &Graph,
         capture: &crate::capture::Capture,
-        native: &crate::native_evidence::Artifact,
+        native: &crate::native_records::Artifact,
         leader: &topology::WriterGuard,
         expected: ExpectedPublication,
         cancel: &CancelFlag,
@@ -16751,7 +16805,7 @@ impl Store {
         bundle: (
             &Graph,
             &crate::capture::Capture,
-            &crate::native_evidence::Artifact,
+            &crate::native_records::Artifact,
         ),
         leader: &topology::WriterGuard,
         expected_revision: IndexPin,
@@ -16775,7 +16829,7 @@ impl Store {
         bundle: (
             &Graph,
             &crate::capture::Capture,
-            &crate::native_evidence::Artifact,
+            &crate::native_records::Artifact,
         ),
         leader: &topology::WriterGuard,
         expected_revision: IndexPin,
@@ -16797,7 +16851,7 @@ impl Store {
         bundle: (
             &Graph,
             &crate::capture::Capture,
-            &crate::native_evidence::Artifact,
+            &crate::native_records::Artifact,
         ),
         leader: &topology::WriterGuard,
         expected: ExpectedPublication,
@@ -16854,8 +16908,9 @@ impl Store {
         selected: &ReadRevision,
         file: &SourceFile,
     ) -> Result<crate::native_evidence::SelectedDocument> {
-        use crate::native_evidence::{
-            Document, DocumentKey, Producer, Provenance, Revision, SelectedDocument, SourceSet,
+        use crate::native_evidence::SelectedDocument;
+        use crate::native_records::{
+            Document, DocumentKey, Producer, Provenance, Revision, SourceSet,
         };
         use sha2::{Digest, Sha256};
         let key = DocumentKey {
@@ -16903,7 +16958,7 @@ impl Store {
                         &file.language,
                     )?
                 && producer_id == scope.producer_id
-                && producer_version == crate::native_evidence::NATIVE_VERSION,
+                && producer_version == crate::native_records::NATIVE_VERSION,
             "incompatible_index: reusable native source/context differs from capture"
         );
         let (_origin, kind, position_encoding): (String, String, String) = db.query_row(
@@ -16915,7 +16970,7 @@ impl Store {
         let executable_hash = selected_producer_hash(db, selected)?;
         let producer = Producer { id:producer_id,version:producer_version,executable_hash,
             kind,languages:db.prepare("SELECT language FROM native_producer_languages WHERE producer_id=?1 AND producer_version=?2 ORDER BY ordinal")?
-                .query_map(params![scope.producer_id,crate::native_evidence::NATIVE_VERSION],|r|r.get(0))?
+                .query_map(params![scope.producer_id,crate::native_records::NATIVE_VERSION],|r|r.get(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?,position_encoding };
         let source_set = SourceSet { id:key.source_set_id.clone(),root_id:self.root_id().to_owned(),
             languages:db.prepare("SELECT language FROM native_source_set_languages WHERE source_set_id=?1 ORDER BY ordinal")?
@@ -17386,7 +17441,7 @@ impl Store {
             // The selected head is a prior validated publication. Do not decode
             // its unchanged fact/projection rows; the changed captured source
             // bytes are checked below.
-            let previous_options: crate::indexer::ReconcileOptions = db.query_row(
+            let previous_options: crate::model::ReconcileOptions = db.query_row(
                 "SELECT reconcile_options FROM index_metadata WHERE singleton=1", [],
                 |r| r.get::<_, String>(0))?.parse::<serde_json::Value>()
                     .and_then(serde_json::from_value).context(SelectedIntegrity("incompatible_index: stored capture decode failed".into()))?;
@@ -17412,8 +17467,8 @@ impl Store {
             let mut prior_summaries = BTreeMap::new();
             let mut prior_class_complete = BTreeMap::new();
             let source_set_id = format!("source-set:v1:{}", self.root_id());
-            let producer_id = crate::native_evidence::PRODUCER;
-            let producer_version = crate::native_evidence::NATIVE_VERSION;
+            let producer_id = crate::native_records::PRODUCER;
+            let producer_version = crate::native_records::NATIVE_VERSION;
             // Unchanged prior documents are trusted by their stored, validated
             // content hash (owner ruling, #141): their bytes are not read,
             // re-hashed or decoded here. Only the changed document's bytes are
@@ -17456,7 +17511,7 @@ impl Store {
                     version_id:version_id.clone(), graph_id, class_id:class_id.context(SelectedIntegrity("class projection missing".into()))?,
                     graph_hash,class_hash:class_hash.context(SelectedIntegrity("class hash missing".into()))?,
                 }).is_none(),"incompatible_index: duplicate local manifest path");
-                prior_coverage.insert(path.clone(), native_evidence::Coverage {
+                prior_coverage.insert(path.clone(), crate::native_records::Coverage {
                     producer_id:producer_id.to_owned(),language:language.clone(),
                     source_set_id:source_set_id.clone(),document_path:path.clone(),
                     revision_id:String::new(),requested,selected:covered,state,diagnostic,
@@ -17607,7 +17662,7 @@ impl Store {
         capture: &crate::capture::Capture,
         expected: &RecoveryBaseline,
         cancel: &CancelFlag,
-    ) -> Result<Option<crate::native_evidence::Artifact>> {
+    ) -> Result<Option<crate::native_records::Artifact>> {
         use crate::native_evidence;
         if !expected.compatible
             || self.disposition() != RecoveryDisposition::Ready
@@ -17628,7 +17683,7 @@ impl Store {
             }
             // Actual selected reuse is authenticated by selected_reusable_native below;
             // unrelated retained versions must not be decoded.
-            let previous_options:crate::indexer::ReconcileOptions = db.query_row(
+            let previous_options:crate::model::ReconcileOptions = db.query_row(
                 "SELECT reconcile_options FROM index_metadata WHERE singleton=1",[],
                 |r|r.get::<_,String>(0))?.parse::<serde_json::Value>()
                     .and_then(serde_json::from_value).context(SelectedIntegrity("incompatible_index: stored capture decode failed".into()))?;
@@ -17871,7 +17926,7 @@ impl Store {
     fn preflight_reuse(
         &self,
         graph: &Graph,
-        native: &crate::native_evidence::Artifact,
+        native: &crate::native_records::Artifact,
         extractions: &BTreeMap<String, crate::model::FileExtraction>,
         expected: &ExpectedPublication,
         rows: &BTreeMap<&str, PublicationRows<'_>>,
@@ -18274,7 +18329,7 @@ impl Store {
         bundle: (
             &Graph,
             &crate::capture::Capture,
-            &crate::native_evidence::Artifact,
+            &crate::native_records::Artifact,
         ),
         leader: &topology::WriterGuard,
         plan: PublicationPlan<'_>,
@@ -18299,7 +18354,7 @@ impl Store {
         bundle: (
             &Graph,
             &crate::capture::Capture,
-            &crate::native_evidence::Artifact,
+            &crate::native_records::Artifact,
         ),
         leader: &topology::WriterGuard,
         plan: PublicationPlan<'_>,
@@ -19460,7 +19515,7 @@ impl Store {
             )?;
             let requested_documents = db.prepare(
                 "SELECT language,path FROM semantic_coverage WHERE revision_id=?1 AND producer_id=?2 AND requested=1 ORDER BY language,path"
-            )?.query_map(params![selected.key,producer_id], |r| Ok(crate::native_evidence::DocumentKey { source_set_id:selected_source_set.clone(), language:r.get(0)?, path:r.get(1)? }))?
+            )?.query_map(params![selected.key,producer_id], |r| Ok(crate::native_records::DocumentKey { source_set_id:selected_source_set.clone(), language:r.get(0)?, path:r.get(1)? }))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             let input = (|| -> Result<SelectedRawBatch> {
                 let batch = db.query_row(
@@ -19609,7 +19664,7 @@ impl Store {
         &self,
         pin: IndexPin,
         producer_id: &str,
-        document: &crate::native_evidence::DocumentKey,
+        document: &crate::native_records::DocumentKey,
         syntax_id: &str,
     ) -> Result<Option<SemanticHistory>> {
         ensure!(
@@ -19865,18 +19920,18 @@ impl Store {
     /// unknown key is an error.
     pub(crate) fn batch_limits(
         &self,
-    ) -> std::result::Result<crate::semantic_batch::BatchLimits, String> {
+    ) -> std::result::Result<crate::semantic_batch::limits::BatchLimits, String> {
         #[cfg(feature = "test-support")]
         if let Some(text) = self.semantic_test_hooks().semantic_limits {
             return serde_json::from_str(&text).map_err(|_| "test limits".to_string());
         }
-        Ok(crate::semantic_batch::BatchLimits::PRODUCTION)
+        Ok(crate::semantic_batch::limits::BatchLimits::PRODUCTION)
     }
 
     /// Limits the publication measures disk growth against.
-    fn batch_publication_limits(&self) -> crate::semantic_batch::BatchLimits {
+    fn batch_publication_limits(&self) -> crate::semantic_batch::limits::BatchLimits {
         self.batch_limits()
-            .unwrap_or(crate::semantic_batch::BatchLimits::PRODUCTION)
+            .unwrap_or(crate::semantic_batch::limits::BatchLimits::PRODUCTION)
     }
 
     /// The build's key inputs under this store's limits, without the payload-reuse seams.
@@ -20511,7 +20566,7 @@ impl Store {
     ) -> Result<SelectedHeader> {
         #[cfg(test)]
         count_selected_read(|counts| counts.document_reads += 1);
-        use crate::native_evidence::DocumentKey;
+        use crate::native_records::DocumentKey;
         optional_hint_check(progress)?;
         let sql = "SELECT r.source_set_id,m.language,m.path,d.id,g.graph_hash,
             c.content_hash,d.content_hash,d.byte_length,length(d.source_bytes),
@@ -20608,7 +20663,7 @@ impl Store {
                 && class_id.len() <= 16 * 1024
                 && (if crate::classes::supports_language(&language) {
                     f_length.is_some_and(|n| {
-                        (0..=crate::evidence_budget::CLASS_EXTRACTION as i64).contains(&n)
+                        (0..=crate::evidence_limits::CLASS_EXTRACTION as i64).contains(&n)
                     })
                 } else {
                     f_length.is_none()
@@ -20635,7 +20690,7 @@ impl Store {
             scope.version_id == version_id && scope.native_revision_id == native_revision_id,
             "incompatible_index: selected native manifest mismatch"
         );
-        let row_limit = crate::evidence_budget::row_limit(bytes);
+        let row_limit = crate::evidence_limits::row_limit(bytes);
         let counts_sql = "SELECT (SELECT count(*) FROM graph_nodes WHERE gid=?1),
             (SELECT count(*) FROM graph_display_labels WHERE gid=?1),
             (SELECT count(*) FROM native_version_calls WHERE vid=?3),
@@ -20673,9 +20728,9 @@ impl Store {
             max_row >= 0
                 && native_bytes >= 0
                 && class_bytes >= 0
-                && max_row <= crate::evidence_budget::max_row(bytes)
-                && native_bytes <= crate::evidence_budget::total(bytes)
-                && class_bytes <= crate::evidence_budget::total(bytes),
+                && max_row <= crate::evidence_limits::max_row(bytes)
+                && native_bytes <= crate::evidence_limits::total(bytes)
+                && class_bytes <= crate::evidence_limits::total(bytes),
             "incompatible_index: selected evidence byte budget exceeded"
         );
         let total_bytes = native_bytes.saturating_add(class_bytes);
@@ -20801,7 +20856,7 @@ impl Store {
         pin: IndexPin,
         language: &str,
         lookup_key: &str,
-    ) -> Result<Vec<crate::native_evidence::Declaration>> {
+    ) -> Result<Vec<crate::native_records::Declaration>> {
         self.native_at(pin, |db, selected| {
             Self::read_native_declarations_for(
                 db,
@@ -20820,8 +20875,8 @@ impl Store {
         selected_path: Option<&str>,
         all_lookup_keys: bool,
         selected: &ReadRevision,
-    ) -> Result<Vec<crate::native_evidence::Declaration>> {
-        use crate::native_evidence::DocumentKey;
+    ) -> Result<Vec<crate::native_records::Declaration>> {
+        use crate::native_records::DocumentKey;
         let mut stmt = db.prepare(
             "SELECT DISTINCT r.source_set_id,m.language,m.path
             FROM revision_documents m JOIN native_revisions r ON r.id=m.revision_id
@@ -20944,8 +20999,8 @@ impl Store {
         &self,
         pin: IndexPin,
     ) -> Result<(
-        crate::native_evidence::Artifact,
-        BTreeMap<crate::native_evidence::DocumentKey, Vec<u8>>,
+        crate::native_records::Artifact,
+        BTreeMap<crate::native_records::DocumentKey, Vec<u8>>,
     )> {
         self.retained_native_snapshot_at_with(pin, false)
     }
@@ -20955,8 +21010,8 @@ impl Store {
         pin: IndexPin,
         reconciling: bool,
     ) -> Result<(
-        crate::native_evidence::Artifact,
-        BTreeMap<crate::native_evidence::DocumentKey, Vec<u8>>,
+        crate::native_records::Artifact,
+        BTreeMap<crate::native_records::DocumentKey, Vec<u8>>,
     )> {
         self.retained_native_snapshot_selected_at_with(pin, reconciling, None)
     }
@@ -20965,10 +21020,10 @@ impl Store {
         &self,
         pin: IndexPin,
         reconciling: bool,
-        loaded_docs: Option<&BTreeSet<crate::native_evidence::DocumentKey>>,
+        loaded_docs: Option<&BTreeSet<crate::native_records::DocumentKey>>,
     ) -> Result<(
-        crate::native_evidence::Artifact,
-        BTreeMap<crate::native_evidence::DocumentKey, Vec<u8>>,
+        crate::native_records::Artifact,
+        BTreeMap<crate::native_records::DocumentKey, Vec<u8>>,
     )> {
         let read = |db: &Connection, selected: &ReadRevision| {
             self.retained_native_snapshot_from_db(db, selected, loaded_docs)
@@ -20984,12 +21039,12 @@ impl Store {
         &self,
         db: &Connection,
         selected: &ReadRevision,
-        loaded_docs: Option<&BTreeSet<crate::native_evidence::DocumentKey>>,
+        loaded_docs: Option<&BTreeSet<crate::native_records::DocumentKey>>,
     ) -> Result<(
-        crate::native_evidence::Artifact,
-        BTreeMap<crate::native_evidence::DocumentKey, Vec<u8>>,
+        crate::native_records::Artifact,
+        BTreeMap<crate::native_records::DocumentKey, Vec<u8>>,
     )> {
-        use crate::native_evidence as n;
+        use crate::native_records as n;
         #[cfg(feature = "test-support")]
         crate::semantic_batch::testing::note_whole_snapshot_read();
         let inventory: String = db.query_row(
@@ -21061,7 +21116,7 @@ impl Store {
 
     /// Header rows of a retained native revision. The document inventory is not read.
     fn read_native_header(db: &Connection, selected: &ReadRevision) -> Result<NativeHeader> {
-        use crate::native_evidence as n;
+        use crate::native_records as n;
         let (source_set_id, native_id, toolchain_hash, config_hash, dependency_hash): (String,String,String,String,String) = db.query_row("SELECT source_set_id,native_revision_id,toolchain_hash,config_hash,dependency_hash FROM native_revisions WHERE id=?1",[&selected.key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
         let producer_id = n::PRODUCER.to_owned();
         let producer_version = n::NATIVE_VERSION.to_owned();
@@ -21114,7 +21169,7 @@ impl Store {
         &self,
         db: &Connection,
         selected: &ReadRevision,
-        document: &crate::native_evidence::Document,
+        document: &crate::native_records::Document,
     ) -> Result<NativeDocumentRows> {
         self.read_native_document_rows(db, selected, document, true)
     }
@@ -21125,10 +21180,10 @@ impl Store {
         &self,
         db: &Connection,
         selected: &ReadRevision,
-        document: &crate::native_evidence::Document,
+        document: &crate::native_records::Document,
         complete: bool,
     ) -> Result<NativeDocumentRows> {
-        use crate::native_evidence as n;
+        use crate::native_records as n;
         #[cfg(feature = "test-support")]
         crate::semantic_import::note_selected_original_native_row(&document.key);
         #[cfg(feature = "test-support")]
@@ -21173,7 +21228,7 @@ impl Store {
         &self,
         db: &Connection,
         selected: &ReadRevision,
-        document: &crate::native_evidence::Document,
+        document: &crate::native_records::Document,
     ) -> Result<Vec<u8>> {
         let source = self
             .selected_source_row_for(db, &document.key.path, selected)?
@@ -21197,9 +21252,9 @@ impl Store {
     pub fn native_source_at(
         &self,
         pin: IndexPin,
-        key: &crate::native_evidence::DocumentKey,
-    ) -> Result<Option<(crate::native_evidence::Document, Vec<u8>)>> {
-        use crate::native_evidence::Document;
+        key: &crate::native_records::DocumentKey,
+    ) -> Result<Option<(crate::native_records::Document, Vec<u8>)>> {
+        use crate::native_records::Document;
         self.native_at(pin, |db, selected| {
             let Some(scope) = v8_native_scope_for(db, key, selected)? else {
                 let path_exists: bool = db.query_row(
@@ -21234,17 +21289,17 @@ impl Store {
     pub fn native_coverage_at(
         &self,
         pin: IndexPin,
-        key: &crate::native_evidence::DocumentKey,
-    ) -> Result<Option<crate::native_evidence::Coverage>> {
+        key: &crate::native_records::DocumentKey,
+    ) -> Result<Option<crate::native_records::Coverage>> {
         self.native_at(pin, |db, selected| {
             Self::read_native_coverage_for(db, key, selected)
         })
     }
     fn read_native_coverage_for(
         db: &Connection,
-        key: &crate::native_evidence::DocumentKey,
+        key: &crate::native_records::DocumentKey,
         selected: &ReadRevision,
-    ) -> Result<Option<crate::native_evidence::Coverage>> {
+    ) -> Result<Option<crate::native_records::Coverage>> {
         v8_native_scope_for(db, key, selected)?
             .map(|scope| read_native_coverage_v8(db, &scope))
             .transpose()
@@ -21255,8 +21310,8 @@ impl Store {
     pub fn native_capability_report_at(
         &self,
         pin: IndexPin,
-        key: &crate::native_evidence::DocumentKey,
-    ) -> Result<Option<crate::native_evidence::CapabilityReport>> {
+        key: &crate::native_records::DocumentKey,
+    ) -> Result<Option<crate::native_records::CapabilityReport>> {
         self.native_at(pin, |db, selected| {
             v8_native_scope_for(db, key, selected)?
                 .map(|scope| read_native_capability_report(db, &scope))
@@ -21270,7 +21325,7 @@ impl Store {
         &self,
         pin: IndexPin,
         owner: &str,
-    ) -> Result<Vec<crate::native_evidence::Reference>> {
+    ) -> Result<Vec<crate::native_records::Reference>> {
         self.native_at(pin, |db, selected| {
             if let Some(scope) = v8_owner_scope_for(db, owner, selected)? {
                 read_native_references(db, &scope, Some(owner))
@@ -21288,7 +21343,7 @@ impl Store {
         &self,
         pin: IndexPin,
         owner: &str,
-    ) -> Result<Vec<crate::native_evidence::Call>> {
+    ) -> Result<Vec<crate::native_records::Call>> {
         self.native_at(pin, |db, selected| {
             if let Some(scope) = v8_owner_scope_for(db, owner, selected)? {
                 read_native_calls_v8(db, &scope, Some(owner))
@@ -21307,7 +21362,7 @@ impl Store {
         &self,
         pin: IndexPin,
         owner: &str,
-    ) -> Result<Vec<crate::native_evidence::ControlRegion>> {
+    ) -> Result<Vec<crate::native_records::ControlRegion>> {
         self.native_at(pin, |db, selected| {
             if let Some(scope)=v8_owner_scope_for(db,owner,selected)? {
                 read_native_control_regions_v8(db,&scope,Some(owner))
@@ -21368,7 +21423,9 @@ impl Store {
                     }
                 }
                 if ids.len() > 1 {
-                    multiple_producers = language.as_deref().map(multiple_producers_note);
+                    multiple_producers = language
+                        .as_deref()
+                        .map(crate::graph_query::multiple_producers_note);
                 }
                 let mut selector = selector.clone();
                 selector.semantic_producer_policy = None;
@@ -22004,14 +22061,14 @@ impl Store {
     pub fn tree_metadata(
         &self,
         root: &Path,
-        items: &mut [crate::file_tree::Entry],
+        items: &mut [crate::source_dir::Entry],
     ) -> Result<(IndexPin, String)> {
         self.tree_metadata_with_finish_hook(root, items, || Ok(()))
     }
     fn tree_metadata_with_finish_hook(
         &self,
         root: &Path,
-        items: &mut [crate::file_tree::Entry],
+        items: &mut [crate::source_dir::Entry],
         before_finish: impl FnOnce() -> Result<()>,
     ) -> Result<(IndexPin, String)> {
         let (revision, workspace_root, overlays) = self.with_evidence_hook(|tx| {
@@ -22043,7 +22100,7 @@ impl Store {
         &self,
         tx: &Connection,
         root: &Path,
-        items: &mut [crate::file_tree::Entry],
+        items: &mut [crate::source_dir::Entry],
         pre_startup: bool,
     ) -> Result<(IndexPin, String, TreeOverlays)> {
         let revision = self.read_status_for(tx, pre_startup)?.revision;
@@ -22595,7 +22652,7 @@ impl Store {
             regions.extend(document.graph_regions);
         }
         nodes.sort_by(|a, b| a.id.cmp(&b.id));
-        calls.sort_by(crate::indexer::compare_reader_calls);
+        calls.sort_by(crate::model::compare_reader_calls);
         regions.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(Graph {
             schema_version: SCHEMA_VERSION,

@@ -10,16 +10,14 @@
 use super::*;
 use crate::{
     graph_query::{
-        self as engine, BoundaryReason, DefaultProducers, DocumentFacts, GraphIntegrity,
-        GraphSnapshot, GraphSource, HistoryFacts, SemanticDocument,
+        self as engine, DefaultProducers, DocumentFacts, GraphIntegrity, GraphSnapshot,
+        GraphSource, HistoryFacts, SemanticDocument,
     },
-    model::SemanticState,
-    native_evidence::DocumentKey,
+    model::{BoundaryReason, SemanticState},
+    native_records::DocumentKey,
     semantic_evidence as sem,
 };
 use serde_json::json;
-
-pub use crate::graph_query::{LANGUAGE_NOTE, NO_PRODUCER_NOTE, multiple_producers_note};
 
 /// An explicitly requested producer that the selected revision does not publish.
 #[derive(Debug)]
@@ -65,7 +63,7 @@ impl ProducerSelection {
     pub fn note(&self, language: &str) -> Option<String> {
         match &self.explicit {
             Some((_, languages)) => {
-                (!languages.contains(language)).then(|| LANGUAGE_NOTE.to_string())
+                (!languages.contains(language)).then(|| engine::LANGUAGE_NOTE.to_string())
             }
             None => self.defaults.note(language),
         }
@@ -189,7 +187,7 @@ impl GraphSource for Locate<'_> {
         projection: &crate::model::SemanticProjection,
         producer: &str,
         document: &DocumentKey,
-    ) -> Result<Option<crate::graph_query::BoundaryReason>> {
+    ) -> Result<Option<crate::model::BoundaryReason>> {
         native_first::endpoint_boundary(
             self.db,
             self.selected.pin,
@@ -283,7 +281,7 @@ impl<'a> SemanticCalls<'a> {
     /// The selected binding of one measured call, or `None` for syntax-only evidence.
     pub(super) fn call(
         &mut self,
-        call: &crate::native_evidence::Call,
+        call: &crate::native_records::Call,
     ) -> Result<Option<CallSemantic>> {
         let Some(tuple) = self.tuple(&call.document.language, &call.document.path)? else {
             return Ok(None);
@@ -457,7 +455,7 @@ pub(super) fn status_semantics(
     status.semantic_languages.clear();
     if !defaults.published && reimports.is_empty() {
         status.semantic_producer_id = None;
-        status.semantic_note = Some(NO_PRODUCER_NOTE.into());
+        status.semantic_note = Some(engine::NO_PRODUCER_NOTE.into());
         status.stats.semantic_state = SemanticState::Unavailable;
         return Ok(());
     }
@@ -551,7 +549,7 @@ pub(super) fn status_semantics(
     if selected.is_empty() {
         status.semantic_producer_id = None;
         status.semantic_note = Some(if notes.is_empty() {
-            LANGUAGE_NOTE.into()
+            engine::LANGUAGE_NOTE.into()
         } else {
             notes.join("; ")
         });
@@ -559,7 +557,7 @@ pub(super) fn status_semantics(
         return Ok(());
     }
     // A language no published producer covers is ordinary; only conflicts are noted.
-    notes.retain(|note| note != LANGUAGE_NOTE);
+    notes.retain(|note| note != engine::LANGUAGE_NOTE);
     status.semantic_note = (!notes.is_empty()).then(|| notes.join("; "));
     status.semantic_producer_id = (selected.len() == 1)
         .then(|| selected.pop_first())
@@ -760,8 +758,8 @@ pub(super) fn view_walk(
                 .filter(|call| call.caller == node.id)
                 .cloned()
                 .collect();
-            ordered.sort_by(crate::indexer::compare_reader_calls);
-            let native: BTreeMap<String, crate::native_evidence::Call> = if bound {
+            ordered.sort_by(crate::model::compare_reader_calls);
+            let native: BTreeMap<String, crate::native_records::Call> = if bound {
                 let scope = v8_owner_scope_for(db, &node.id, selected)?.ok_or_else(|| {
                     SelectedIntegrity("incompatible_index: selected view node missing".into())
                 })?;
@@ -1389,8 +1387,8 @@ impl EvidenceResponse {
     pub(crate) fn mcp_call_semantics<'c>(
         &self,
         explicit: Option<&str>,
-        owner_document: &crate::native_evidence::DocumentKey,
-        calls: impl IntoIterator<Item = &'c crate::native_evidence::Call>,
+        owner_document: &crate::native_records::DocumentKey,
+        calls: impl IntoIterator<Item = &'c crate::native_records::Call>,
     ) -> Result<McpSemantic> {
         let selected = self.selected(None)?;
         let mut reader = SemanticCalls::new(&self.db, &selected, explicit)?;
@@ -1558,11 +1556,9 @@ pub(super) fn architecture_semantic(
             .transpose()
     };
     // Stored offsets are nonnegative and ordered; anything else is a corrupt row.
-    let range = |start: i64, end: i64| -> Result<crate::native_evidence::Range> {
+    let range = |start: i64, end: i64| -> Result<crate::native_records::Range> {
         match (usize::try_from(start), usize::try_from(end)) {
-            (Ok(start), Ok(end)) if start <= end => {
-                Ok(crate::native_evidence::Range { start, end })
-            }
+            (Ok(start), Ok(end)) if start <= end => Ok(crate::native_records::Range { start, end }),
             _ => Err(SelectedIntegrity("corrupt semantic offset".into()).into()),
         }
     };
@@ -2142,7 +2138,10 @@ mod reimport_tests {
         let status = response.status().unwrap();
         assert!(status.semantic_languages.is_empty());
         assert_eq!(status.semantic_producer_id, None);
-        assert_eq!(status.semantic_note.as_deref(), Some(NO_PRODUCER_NOTE));
+        assert_eq!(
+            status.semantic_note.as_deref(),
+            Some(engine::NO_PRODUCER_NOTE)
+        );
         assert_eq!(status.stats.semantic_state, SemanticState::Unavailable);
         for tier in response.mcp_language_tiers().unwrap() {
             assert!(tier.reimport.is_none());

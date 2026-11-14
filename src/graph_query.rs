@@ -18,6 +18,8 @@ use std::{
     sync::Arc,
 };
 
+pub use crate::model::BoundaryReason;
+
 pub const DEFAULT_DEPTH: u64 = 2;
 pub const MAX_DEPTH: u64 = 5;
 pub const DEFAULT_MAX_NODES: u64 = 150;
@@ -39,33 +41,6 @@ pub enum Visit {
     New,
     Seen,
     Boundary,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum BoundaryReason {
-    None,
-    External,
-    Unresolved,
-    Ambiguous,
-    Dispatch,
-    Stale,
-    NodeLimit,
-    MissingEvidence,
-    CatchingUp,
-    /// No retained raw input will catch the document up; its language needs re-import.
-    NeedsReimport,
-}
-
-impl BoundaryReason {
-    /// The boundary a pending (`catchingUp` or `needsReimport`) document imposes.
-    pub fn pending(status: crate::model::SemanticStatus) -> Self {
-        if status == crate::model::SemanticStatus::NeedsReimport {
-            Self::NeedsReimport
-        } else {
-            Self::CatchingUp
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

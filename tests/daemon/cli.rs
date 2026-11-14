@@ -4300,6 +4300,111 @@ async fn read_under_index_use_contention(
     Some((indexed, output))
 }
 
+/// #984: a Git checkout's source-set ID is `source-set:v1:<UUID>`. The CLI
+/// takes the ID the revision read reports for every located scope.
+#[test]
+fn metrics_located_scopes_accept_the_source_set_id_a_git_checkout_reports() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("source");
+    let home = temp.path().join("home");
+    let _daemon = FixtureDaemon::new(&home);
+    fs::create_dir_all(root.join("src")).unwrap();
+    let init = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "git init failed");
+    fs::write(
+        root.join("src/flow.js"),
+        "function start(x) { if (x) { return 1; } return 2; }\n",
+    )
+    .unwrap();
+    let indexed = command(&root, &home, "index").output().unwrap();
+    crate::child::assert_cli_success(&indexed, "indexed");
+    let metrics = |phase: &str, args: &[&str]| -> Value {
+        let output = command(&root, &home, "metrics")
+            .arg("--json")
+            .args(args)
+            .output()
+            .unwrap();
+        crate::child::assert_cli_success(&output, phase);
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    let revision = metrics("revision", &[]);
+    let file_row = &revision["payload"]["files"][0];
+    let source_set = file_row["sourceSetId"].as_str().unwrap();
+    let identity = source_set.strip_prefix("source-set:v1:").unwrap();
+    assert_eq!(
+        uuid::Uuid::parse_str(identity).unwrap().to_string(),
+        identity,
+        "{revision}"
+    );
+    let located = ["--source-set-id", source_set];
+
+    let file = metrics(
+        "file",
+        &[
+            &["--scope", "file", "--language", "javascript"][..],
+            &["--path", "src/flow.js"],
+            &located,
+        ]
+        .concat(),
+    );
+    assert_eq!(file["payload"]["files"][0], *file_row, "{file}");
+    assert_eq!(file["payload"]["files"][0]["metrics"]["cyclomatic"], 2);
+    let declaration_row = &file["payload"]["declarations"][0];
+    let sid = declaration_row["sid"].as_str().unwrap();
+
+    let directory = metrics(
+        "directory",
+        &[&["--scope", "directory", "--path", "src"][..], &located].concat(),
+    );
+    let subtree = directory["payload"]["directories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["path"] == "src")
+        .unwrap_or_else(|| panic!("no src directory: {directory}"));
+    assert_eq!(subtree["sourceSetId"], source_set);
+    assert_eq!(subtree["declarationCount"], 1);
+    assert_eq!(subtree["metrics"]["cyclomatic"], 2);
+
+    let declaration = metrics(
+        "declaration",
+        &[
+            &["--scope", "declaration", "--path", "src/flow.js"][..],
+            &["--sid", sid],
+            &located,
+        ]
+        .concat(),
+    );
+    assert_eq!(
+        declaration["payload"]["declarations"],
+        serde_json::json!([declaration_row]),
+        "{declaration}"
+    );
+
+    // A malformed ID is still refused before any read.
+    for invalid in [
+        "garbage",
+        "source-set:v2:6f1f0a52-0d0c-4d6e-9a43-0c1a3e3a8b11",
+        &source_set.to_uppercase(),
+    ] {
+        let mut rejected = command(&root, &home, "metrics");
+        rejected
+            .args(["--json", "--scope", "directory", "--path", "src"])
+            .args(["--source-set-id", invalid]);
+        let rejected = bounded_invalid_cli(temp.path(), "source-set", &mut rejected);
+        assert!(!rejected.status.success(), "{invalid}");
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr).contains("invalid_argument: source set ID"),
+            "{invalid}: {}",
+            String::from_utf8_lossy(&rejected.stderr)
+        );
+    }
+}
+
 #[test]
 fn metrics_language_filter_accepts_typescript_and_rejects_other_spellings() {
     let temp = TempDir::new().unwrap();

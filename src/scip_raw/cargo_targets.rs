@@ -1345,7 +1345,7 @@ mod tests {
         std::fs::write(root.path().join("a/Cargo.toml"), manifest).unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
         for cap in [4096, 256] {
-            let mut options = crate::indexer::IndexOptions::new(root.path().to_owned());
+            let mut options = crate::model::IndexOptions::new(root.path().to_owned());
             options.max_config_bytes = cap;
             let capture = crate::capture::Capture::admit(&options, &cancel, &|_| {}).unwrap();
             let config = crate::native_evidence::captured_components(&capture, "")

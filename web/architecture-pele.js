@@ -2,13 +2,16 @@
 // Pele supplies layout only. Native DTO records remain the evidence owner.
 (() => {
   const NS = "http://www.w3.org/2000/svg";
-  const ROOT_STYLE = "--_bg:var(--pele-bg,#fff);--_fg:var(--pele-fg,#1f1f1f);--_m:var(--pele-muted,#6e6e6e);--_l:var(--pele-line,#1f1f1f);--_s:var(--pele-surface,#f3f3f3);--_a:var(--pele-surface-alt,#e6e6e6);--_b:var(--pele-border,#8a8a8a);--_c:var(--pele-accent,#5b7bd5);color:var(--_fg);--_r:var(--pele-radius,4px);--_fm:var(--pele-font-mono,monospace);font:14px sans-serif;letter-spacing:normal;word-spacing:normal;text-transform:none;direction:ltr;font-family:var(--pele-font,sans-serif)";
+  const {unsupported, bytes, themeOnce, asButton, textMeasurer} = window.TrellisPeleSvg;
+  const ROOT_STYLE = window.TrellisPeleSvg.rootStyle(14);
   const tags = new Set(["svg","g","path","rect","text","tspan"]);
   const attrs = new Set(["xmlns","class","viewBox","width","height","fill","fill-opacity","role","aria-roledescription","transform","stroke","font-size","data-id","d","x","y","rx","text-anchor","font-weight","stroke-dasharray","stroke-linecap","stroke-width","xml:space"]);
+  const ADMISSION = {kind:"block", theme:raw => themeOnce(raw, ROOT_STYLE), active:/<\/?(?:script|style|foreignObject|image|a)\b/i, tags, attrs, words:{
+    large:"Architecture SVG too large", root:"Changed Pele block root/theme", theme:"Changed Pele block root/theme", style:"Unexpected inline Architecture style",
+    active:"Unexpected Architecture SVG element", invalid:"Invalid Architecture SVG", element:"Unexpected Architecture SVG element", attribute:"Unexpected Architecture SVG attribute"}};
   const colors = ["#343644","#FFC20A","#FFAA10","#FF7A00"];
   const identity = module => JSON.stringify([module.identity?.sourceSetId,module.identity?.language,module.identity?.path,module.identity?.sid]);
   const edgeKey = edge => JSON.stringify([edge.sourceLayer,edge.destinationLayer,edge.role,edge.status,edge.excepted,edge.exceptionReason]);
-  const bytes = value => new TextEncoder().encode(value).length;
   // Display chips: compact module/file chips, more per band row, and a narrow shared box.
   // CHIP_CELL is one drawn chip column (chip, padding and grid gap) at 14px Inter; the
   // summary display fits as many columns as the canvas width holds (#449). The chip text
@@ -86,7 +89,6 @@
     if (source.shared) return "shared outbound";
     return destination.order > source.order ? "downward" : destination.order < source.order ? "upward" : "peer";
   }
-  function unsupported(message) { const e = new Error(message); e.code = "unsupported"; throw e; }
   function project(view, options = {}) {
     if (view?.state !== "ready" || !Array.isArray(view.layers) || !Array.isArray(view.modules) || !Array.isArray(view.edges)) unsupported("Invalid Architecture projection");
     const nodes = new Map(), edges = new Map(), layers = new Map(), native = new Set();
@@ -286,21 +288,7 @@
     return {source:text,nodes,edges,view,layout};
   }
   function validatedSvg(raw, projection) {
-    if (typeof raw !== "string" || bytes(raw) > 8 * 1024 * 1024) unsupported("Architecture SVG too large");
-    const signature = ` style="${ROOT_STYLE}"`;
-    if (!raw.startsWith('<svg xmlns="http://www.w3.org/2000/svg" class="pele pele-block"') || raw.split(signature).length !== 2) unsupported("Changed Pele block root/theme");
-    const safe = raw.replace(signature,"").replaceAll(' style="rx:var(--_r)"',' rx="var(--_r)"');
-    if (/\sstyle\s*=|<style\b/i.test(safe)) unsupported("Unexpected inline Architecture style");
-    // Reject active/resource markup before DOM parsing: even detached parsing
-    // can report CSP violations for active elements in some browsers.
-    if (/<\/?(?:script|style|foreignObject|image|a)\b/i.test(safe)) unsupported("Unexpected Architecture SVG element");
-    const root = new DOMParser().parseFromString(safe,"image/svg+xml").documentElement;
-    if (root.localName !== "svg" || root.namespaceURI !== NS || root.querySelector("parsererror")) unsupported("Invalid Architecture SVG");
-    let count = 0;
-    for (const node of [root,...root.querySelectorAll("*")]) {
-      if (++count > 12000 || node.namespaceURI !== NS || !tags.has(node.localName)) unsupported("Unexpected Architecture SVG element");
-      for (const attr of node.attributes) if (!attrs.has(attr.name) || /url\s*\(|javascript:|<|>|[\u0000-\u001f]/i.test(attr.value)) unsupported("Unexpected Architecture SVG attribute");
-    }
+    const {root} = window.TrellisPeleSvg.admit(raw, ADMISSION);
     const controls = new Map(), seen = new Set();
     for (const node of root.querySelectorAll(".pele-cluster, .pele-node")) {
       const id = node.getAttribute("data-id"), expected = projection.nodes.get(id);
@@ -390,8 +378,9 @@
         const callback = stat.action ? (stat.action.interface !== undefined ? handlers.onSelectInterface : handlers.onOpenDeviation) : null;
         if (!callback) { node.append(chip,text); return; }
         const button = document.createElementNS(NS,"g");
-        button.setAttribute("class","trellis-architecture-stat-action"); button.setAttribute("role","button"); button.setAttribute("tabindex","0");
-        button.setAttribute("aria-label",stat.label || stat.text); button.setAttribute("data-trellis-layer-action",item.record.name);
+        button.setAttribute("class","trellis-architecture-stat-action");
+        asButton(button,stat.label || stat.text,event => { event?.stopPropagation(); if (handlers.isCurrent?.() !== false) callback(stat.action); });
+        button.setAttribute("data-trellis-layer-action",item.record.name);
         button.append(chip,text); actions.push({node:button,stat});
         if (typeof stat.id === "string") button.setAttribute("data-trellis-action-id",stat.id);
         if (stat.tag) {
@@ -403,9 +392,6 @@
           tag.textContent = stat.tag;
           button.setAttribute("aria-pressed","false"); button.append(back,tag);
         }
-        const activate = event => { event?.stopPropagation(); if (handlers.isCurrent?.() !== false) callback(stat.action); };
-        button.addEventListener("click",activate);
-        button.addEventListener("keydown",event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); activate(event); } });
       });
     }
     return actions;
@@ -672,10 +658,8 @@
     try {
       if (document.fonts?.ready) await document.fonts.ready;
       if (!current()) return {status:"stale"};
-      const canvas = document.createElement("canvas"), ctx = canvas.getContext("2d");
-      if (!ctx) unsupported("Architecture text measurement unavailable");
-      ctx.font = "14px Inter, sans-serif";
-      const measure = text => ctx.measureText(text).width;
+      const measure = textMeasurer("14px Inter, sans-serif");
+      if (!measure) unsupported("Architecture text measurement unavailable");
       if (typeof window.pele?.render !== "function") unsupported("Pele asset unavailable");
       // Fit the canvas width (#449, #525): start from the estimated chip columns, then size the
       // chips so Pele's natural layout fills the canvas without passing it. Once a fitting and
@@ -785,7 +769,13 @@
           callback = options.onSelectEdge;
         }
         if (!callback) continue;
-        node.setAttribute("role","button"); node.setAttribute("tabindex","0"); node.setAttribute("aria-label",item.full); node.setAttribute("data-trellis-architecture-id",item.id);
+        asButton(node,item.full,event => {
+          event?.stopPropagation();
+          if (!current()) return;
+          if (expanded === null) for (const control of controls.values()) if (control.node.hasAttribute("aria-pressed")) control.node.setAttribute("aria-pressed",String(control.node === node));
+          callback(item.record);
+        });
+        node.setAttribute("data-trellis-architecture-id",item.id);
         // Disclosure nodes report expansion; selectable evidence reports selection.
         if (expanded === null) node.setAttribute("aria-pressed","false"); else node.setAttribute("aria-expanded",String(expanded));
         if (item.kind === "M") node.setAttribute("data-trellis-module-id",identity(item.record));
@@ -794,13 +784,6 @@
         if (item.kind === "U") node.setAttribute("data-trellis-unassigned","true");
         if (item.kind === "N") node.setAttribute("data-trellis-note-id",noteIds.get(item.id));
         if (item.kind === "E") node.setAttribute("data-trellis-edge-id",edgeKey(item.record));
-        const select = event => {
-          event?.stopPropagation();
-          if (!current()) return;
-          if (expanded === null) for (const control of controls.values()) if (control.node.hasAttribute("aria-pressed")) control.node.setAttribute("aria-pressed",String(control.node === node));
-          callback(item.record);
-        };
-        node.addEventListener("click",select); node.addEventListener("keydown",event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); select(event); } });
       }
       if (pause && !(await breathe())) return {status:"stale"};
       for (const control of actionControls) controls.set(control.item.id,control);

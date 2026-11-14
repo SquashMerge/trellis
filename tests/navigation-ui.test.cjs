@@ -6,7 +6,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const source = fs.readFileSync(path.join(__dirname, "../web/navigation.js"), "utf8");
-const pinSource = fs.readFileSync(path.join(__dirname, "../web/app.js"), "utf8").match(/const IndexPin = Object.freeze\(\{[\s\S]*?\n\}\);\nwindow.TrellisIndexPin = IndexPin;/)[0];
+const pinSource = fs.readFileSync(path.join(__dirname, "../web/index-pin.js"), "utf8");
+const witnessSource = fs.readFileSync(path.join(__dirname, "../web/source-witness.js"), "utf8");
 const deferred = () => { let resolve, reject; const promise = new Promise((a,b) => {resolve=a;reject=b;}); return {promise,resolve,reject}; };
 const symbol = (id="A.run", name="run") => ({id,name,path:"src/A.java",range:{startLine:4,endLine:7,startByte:10,endByte:60},qualifiedName:`sample.${id}`});
 const target = (action="sequence", reason="declaration", id="A.run") => ({symbol:symbol(id),action,reason,matchKind:"syntaxCandidate"});
@@ -47,7 +48,7 @@ function harness({openSource = false} = {}) {
   }
   document.body=element("body");document.createElement=element;
   document.querySelector=selector=>document.body.querySelector(selector);
-  const window={listeners:{},addEventListener(type,fn){(this.listeners[type] ||= []).push(fn);}}; vm.runInNewContext(pinSource + "\n" + source,{window,document,console});
+  const window={listeners:{},addEventListener(type,fn){(this.listeners[type] ||= []).push(fn);}}; vm.runInNewContext(pinSource + "\n" + witnessSource + "\n" + source,{window,document,console});
   const nav=window.TrellisNavigation;
   function showMenu(event,actions,{onClose}={}) {
     activeMenu?.close("replace");

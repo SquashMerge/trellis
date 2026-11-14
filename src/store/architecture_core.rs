@@ -10,7 +10,7 @@ use super::{
 };
 use crate::metrics::DeclarationMetrics;
 use crate::model::IndexPin;
-use crate::native_evidence::{DeclarationRole, DocumentKey};
+use crate::native_records::{DeclarationRole, DocumentKey};
 use crate::references::{Projection, ReferenceBase};
 use crate::rules::{Config, RuleError, RulesBase};
 use anyhow::Result;
@@ -236,7 +236,7 @@ impl ArchitectureCore {
 /// One revision's documents, read once in one admitted transaction.
 pub(crate) struct ArchitectureInput {
     snapshot: crate::references::Snapshot,
-    regions: Vec<Vec<crate::native_evidence::ControlRegion>>,
+    regions: Vec<Vec<crate::native_records::ControlRegion>>,
 }
 
 impl EvidenceResponse {
@@ -423,7 +423,7 @@ fn detected_apps(candidates: &crate::apps::Candidates) -> usize {
 fn measure_documents(
     store: &Store,
     snapshot: &crate::references::Snapshot,
-    regions: &[Vec<crate::native_evidence::ControlRegion>],
+    regions: &[Vec<crate::native_records::ControlRegion>],
     check: &mut (impl FnMut() -> Result<()> + Send),
     report: &(dyn Fn(ArchitectureProgress) + Sync),
 ) -> Result<ArchitectureMetrics> {

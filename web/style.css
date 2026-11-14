@@ -324,41 +324,9 @@ body:not(.daemon-connected) .connection-footer-brand { margin-right: auto; }
 .sequence-scroll:empty { min-height: 100px; }
 .sequence-scroll svg { display: block; font: 12px var(--mono); color: var(--ink); }
 .sequence-scroll text { fill: var(--ink); }
-.participant { fill: var(--node); stroke: var(--line-strong); }
-.sequence-participant-label { font-size: 13px; }
-.sequence-lifelines line { stroke: var(--line-strong); stroke-dasharray: 3 6; }
-.sequence-arrow { fill: none; stroke: var(--link); stroke-width: 1.5; }
-.sequence-arrow[data-provenance=syntax] { stroke: var(--secondary); }
-.sequence-arrow[data-provenance=candidate] { stroke: var(--warning); }
-.sequence-fragment { fill: none; stroke: var(--line-strong); }
-.sequence-fragment-tab { fill: var(--node); stroke: var(--line-strong); stroke-width: 1; }
-.sequence-scroll .sequence-fragment-operator { fill: var(--secondary); font-size: 12px; font-weight: 700; }
-.sequence-source:hover .sequence-fragment-tab { stroke: var(--link); }
-.sequence-source:focus-visible .sequence-fragment-tab { stroke: var(--focus); }
-.sequence-source[aria-pressed=true] .sequence-fragment-tab { fill: var(--selected); stroke: var(--selected); }
-.sequence-source:hover .sequence-fragment-operator, .sequence-source:focus-visible .sequence-fragment-operator { fill: var(--link); }
-.sequence-source[aria-pressed=true] .sequence-fragment-operator { fill: var(--on-selected); }
-.sequence-divider { stroke: var(--line-strong); stroke-dasharray: 4 4; }
-.sequence-note { fill: var(--card); stroke: var(--line); }
-.sequence-scroll .sequence-meta, .sequence-scroll .sequence-provenance { font-size: 12px; fill: var(--secondary); }
-.sequence-scroll .sequence-control-label { fill: var(--secondary); font-size: 13px; }
-.sequence-label { font-size: 13px; }
-/* Analysis is an ordered, selectable row, not another full-width card. The
-   neutral rail marks the exact conditional scope of a generated guard. */
-.sequence-scroll [data-presentation=quiet-note] .sequence-label { fill: var(--secondary); }
-.sequence-guard-rail { stroke: var(--secondary); stroke-width: 1; }
-.sequence-scroll [data-presentation=quiet-note] .sequence-source:hover .sequence-label { fill: var(--link); }
-.sequence-scroll [data-presentation=quiet-note] .sequence-source[aria-pressed=true] .sequence-label { fill: var(--on-selected); }
-.sequence-row-hit { fill: var(--clear); stroke: var(--clear); }
-.sequence-participant-label[role="button"], .trellis-pele .pele-actor[role="button"] { cursor: pointer; }
-.sequence-participant-label[role="button"]:focus, .trellis-pele .pele-actor[role="button"]:focus { outline: 2px solid var(--focus); outline-offset: 3px; }
-.sequence-source { cursor: pointer; }
-.sequence-source:hover .sequence-row-hit { fill: var(--node); stroke: var(--line-strong); }
-.sequence-source[aria-pressed=true] .sequence-row-hit { fill: var(--selected); stroke: var(--selected); }
-.sequence-source:focus-visible, .sequence-group-control:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
-.sequence-source:focus-visible .sequence-row-hit { stroke: var(--focus); stroke-width: 2; }
-.sequence-source:hover .sequence-label { fill: var(--link); }
-.sequence-source[aria-pressed=true] :is(.sequence-label, .sequence-meta, .sequence-provenance, .sequence-control-label) { fill: var(--on-selected); }
+.trellis-pele .pele-actor[role="button"] { cursor: pointer; }
+.trellis-pele .pele-actor[role="button"]:focus { outline: 2px solid var(--focus); outline-offset: 3px; }
+.sequence-group-control:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
 .sequence-group-control { cursor: pointer; }
 .sequence-group-control:hover text, .sequence-group-control:focus-visible text { fill: var(--link); }
 .sequence-group-control:focus-visible rect { stroke: var(--focus); stroke-width: 2; }
@@ -529,9 +497,6 @@ footer details > p { position: absolute; bottom: 30px; right: 12px; width: min(5
 #sequence-columns { position: relative; flex: none; height: 0; z-index: 2; pointer-events: none; }
 #sequence-columns span { position: absolute; top: 4px; transform: translateX(-50%); padding: 2px 8px; white-space: nowrap; font-size: 13px; color: var(--ink); background: var(--node); border: 1px solid var(--line-strong); border-radius: 4px; }
 .sequence-empty { margin: 12px 10px; color: var(--secondary); font-size: 14px; }
-/* Interactions (#636): dashed returns and activation bars. */
-.sequence-return { stroke-dasharray: 4 4; }
-.sequence-activation { fill: var(--node); stroke: var(--line-strong); }
 
 /* Selection owns its nested labels too, including package metadata and badges. */
 button:is(.selected, [aria-pressed="true"]),

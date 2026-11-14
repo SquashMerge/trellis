@@ -61,7 +61,7 @@ fn outgoing_fixture(
     .unwrap()
 }
 pub(super) fn syntax_only() -> crate::store::McpSemantic {
-    crate::store::McpSemantic::syntax_only(crate::store::NO_PRODUCER_NOTE, 0)
+    crate::store::McpSemantic::syntax_only(crate::graph_query::NO_PRODUCER_NOTE, 0)
 }
 
 /// `src/a.ts` sorts before `src/b.js` by path bytes, so only the #22 language rank puts

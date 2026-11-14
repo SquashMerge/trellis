@@ -228,7 +228,7 @@ impl KeyInputs {
 
     /// The running build's digest: the hash of its join modules (`build/semantic_join_inputs.rs`)
     /// and of the join `limits` this operation applies.
-    pub(in crate::store) fn current(limits: &crate::semantic_batch::BatchLimits) -> Self {
+    pub(in crate::store) fn current(limits: &crate::semantic_batch::limits::BatchLimits) -> Self {
         Self {
             join_inputs: crate::native_ids::digest(
                 b"trellis.semantic-join-inputs.v1\0",
@@ -549,7 +549,7 @@ pub(in crate::store) fn cleanup_payload_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::native_evidence::{DocumentKey, Range};
+    use crate::native_records::{DocumentKey, Range};
 
     fn document(path: &str) -> DocumentKey {
         DocumentKey {
@@ -596,11 +596,11 @@ mod tests {
         let key = |inputs: &KeyInputs| {
             payload_key(inputs, &producer, "d", "c", "javascript", "a.js", "v", &[])
         };
-        let current = KeyInputs::current(&crate::semantic_batch::BatchLimits::PRODUCTION);
+        let current = KeyInputs::current(&crate::semantic_batch::limits::BatchLimits::PRODUCTION);
         assert_eq!(
             key(&current),
             key(&KeyInputs::current(
-                &crate::semantic_batch::BatchLimits::PRODUCTION
+                &crate::semantic_batch::limits::BatchLimits::PRODUCTION
             ))
         );
         assert_ne!(
@@ -771,7 +771,7 @@ mod tests {
             "key",
             &publication,
             None,
-            &KeyInputs::current(&crate::semantic_batch::BatchLimits::PRODUCTION),
+            &KeyInputs::current(&crate::semantic_batch::limits::BatchLimits::PRODUCTION),
         )
         .unwrap_err();
         assert!(
@@ -817,7 +817,7 @@ mod tests {
             "key",
             &publication,
             None,
-            &KeyInputs::current(&crate::semantic_batch::BatchLimits::PRODUCTION),
+            &KeyInputs::current(&crate::semantic_batch::limits::BatchLimits::PRODUCTION),
         )
         .unwrap();
         let (rows, terms, targets): (i64, i64, i64) = db

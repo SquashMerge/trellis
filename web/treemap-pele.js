@@ -2,76 +2,75 @@
 // Exact vendored Pele .2 owns layout. Indexed records own identity and evidence.
 (() => {
   const NS = "http://www.w3.org/2000/svg";
-  const THEME = "--_bg:var(--pele-bg,#fff);--_fg:var(--pele-fg,#1f1f1f);--_m:var(--pele-muted,#6e6e6e);--_l:var(--pele-line,#1f1f1f);--_s:var(--pele-surface,#f3f3f3);--_a:var(--pele-surface-alt,#e6e6e6);--_b:var(--pele-border,#8a8a8a);--_c:var(--pele-accent,#5b7bd5);color:var(--_fg)";
-  const FONT = ";--_fm:var(--pele-font-mono,monospace);font:14px sans-serif;letter-spacing:normal;word-spacing:normal;text-transform:none;direction:ltr;font-family:var(--pele-font,sans-serif)";
+  const {unsupported, bytes, rootStyle, asButton, textMeasurer} = window.TrellisPeleSvg;
+  // Pele writes the radius and heading-weight variables only for the treemaps that use them.
+  const THEMES = [rootStyle(14,{radius:false}), rootStyle(14), rootStyle(14,{heading:true})];
+  // The first style attribute must be one of those themes; a second one fails the inline-style check.
+  const theme = raw => { const found = raw.match(/ style="([^"]*)"/); return found && THEMES.includes(found[1]) ? found[0] : null; };
+  const ADMISSION = {kind:"treemap", theme, active:/<\/?(?:script|style|foreignObject|image|a)\b|<!/i,
+    tags:new Set(["svg","g","rect","text","title"]),
+    attrs:new Set(["xmlns","class","viewBox","width","height","fill","fill-opacity","role","aria-roledescription","stroke","font-size","data-id","x","y","rx","text-anchor","font-weight"]),
+    words:{large:"Treemap SVG too large", root:"Changed Pele Treemap root", theme:"Changed Pele Treemap theme", style:"Unexpected Treemap SVG markup", active:"Unexpected Treemap SVG markup",
+      invalid:"Invalid Treemap SVG", element:"Unexpected Treemap SVG element", attribute:"Unexpected Treemap SVG attribute"}};
   const colors = ["#343644","#FFC20A","#FFAA10","#FF7A00"];
   const classifications = {production:"#ABA5FF",mixed:"#FFAA10",test:"#85C7FF",none:"#343644"};
   const selections = new WeakMap();
   const MIN_WIDTH = 640, MIN_HEIGHT = 360;
   const identity = file => JSON.stringify([file.sourceSetId,file.language,file.path]);
   const directoryKey = directory => JSON.stringify([directory.sourceSetId,directory.path]);
-  const bytes = value => new TextEncoder().encode(value).length;
   const compare = (a,b) => a < b ? -1 : a > b ? 1 : 0;
-  function unsupported(message) { const error = new Error(message); error.code = "unsupported"; throw error; }
-  function project(files, options = {}) {
-    if (!Array.isArray(files)) unsupported("Invalid Treemap files");
-    const nodes = new Map(), directories = new Map(), seen = new Set(), zeroArea = [];
-    let serial = 0, total = 0;
-    for (const file of files) if (!file || !["sourceSetId","language","path"].every(k => typeof file[k] === "string") || !file.path || !Number.isSafeInteger(file.physicalLines) || file.physicalLines < 0) unsupported("Invalid Treemap file");
-    const ordered = [...files].sort((a,b) => compare(identity(a),identity(b)));
-    function directory(sourceSetId,path) {
-      const key = directoryKey({sourceSetId,path});
-      if (directories.has(key)) return directories.get(key);
-      const missing = []; let cursor = path;
-      while (!directories.has(directoryKey({sourceSetId,path:cursor}))) {
-        missing.push(cursor);
-        if (!cursor) break;
-        const slash = cursor.lastIndexOf("/"); cursor = slash < 0 ? "" : cursor.slice(0,slash);
-      }
-      for (let i=missing.length-1;i>=0;i--) {
-        const value = missing[i], record = {sourceSetId,path:value}, itemKey = directoryKey(record);
-        const item = {id:"D"+(serial++).toString(36),kind:"directory",record,key:itemKey,total:0,children:[]};
-        directories.set(itemKey,item); nodes.set(item.id,item);
-        if (nodes.size > 12000) unsupported("Treemap has too many nodes");
-        if (value) {
-          const slash = value.lastIndexOf("/"), parentPath = slash < 0 ? "" : value.slice(0,slash);
-          directories.get(directoryKey({sourceSetId,path:parentPath})).children.push(item);
-        }
-      }
-      return directories.get(key);
+  const validFile = file => !!file && ["sourceSetId","language","path"].every(k => typeof file[k] === "string") && !!file.path && Number.isSafeInteger(file.physicalLines) && file.physicalLines >= 0;
+  const parentOf = path => { const slash = path.lastIndexOf("/"); return slash < 0 ? "" : path.slice(0,slash); };
+  // `tree` is one projection's {nodes, directories, serial}: the directory item for a path, created with
+  // its missing ancestors outermost first, so IDs follow the path.
+  function ensureDirectory(tree,sourceSetId,path) {
+    const {nodes,directories} = tree, key = directoryKey({sourceSetId,path});
+    if (directories.has(key)) return directories.get(key);
+    const missing = []; let cursor = path;
+    while (!directories.has(directoryKey({sourceSetId,path:cursor}))) {
+      missing.push(cursor);
+      if (!cursor) break;
+      cursor = parentOf(cursor);
     }
-    for (const file of ordered) {
-      if (!file || !["sourceSetId","language","path"].every(k => typeof file[k] === "string") || !file.path || !Number.isSafeInteger(file.physicalLines) || file.physicalLines < 0 || seen.has(identity(file))) unsupported("Invalid or duplicate Treemap file");
-      seen.add(identity(file));
-      if (!file.physicalLines) { zeroArea.push(file); continue; }
-      total += file.physicalLines;
-      if (!Number.isSafeInteger(total)) unsupported("Treemap area exceeds integer precision");
-      const parts = file.path.split("/"); parts.pop();
-      const parent = directory(file.sourceSetId,parts.join("/"));
-      const value = (options.fileValue || options.moduleValue)?.(file);
-      const label = file.path.slice(file.path.lastIndexOf("/")+1) + (value == null ? "" : ` · ${value}`);
-      const item = {id:"F"+(serial++).toString(36),kind:"file",record:file,key:identity(file),total:file.physicalLines,label,full:`${file.sourceSetId} · ${file.language} · ${file.path} · ${file.physicalLines} physical file lines`,band:options.fileBand?.(file)};
-      nodes.set(item.id,item); parent.children.push(item);
-      // Totals count each included file exactly once at each ancestor.
-      let path = parts.join("/");
-      for (;;) {
-        directory(file.sourceSetId,path).total += file.physicalLines;
-        if (!path) break;
-        const slash = path.lastIndexOf("/"); path = slash < 0 ? "" : path.slice(0,slash);
-      }
+    for (let i=missing.length-1;i>=0;i--) {
+      const value = missing[i], record = {sourceSetId,path:value}, itemKey = directoryKey(record);
+      const item = {id:"D"+(tree.serial++).toString(36),kind:"directory",record,key:itemKey,total:0,children:[]};
+      directories.set(itemKey,item); nodes.set(item.id,item);
+      if (nodes.size > 12000) unsupported("Treemap has too many nodes");
+      if (value) directories.get(directoryKey({sourceSetId,path:parentOf(value)})).children.push(item);
     }
+    return directories.get(key);
+  }
+  // One file with area: its item under its directory, and its lines added to every ancestor.
+  function addFile(tree,file,options) {
+    const parts = file.path.split("/"); parts.pop();
+    const parent = ensureDirectory(tree,file.sourceSetId,parts.join("/"));
+    const value = (options.fileValue || options.moduleValue)?.(file);
+    const label = file.path.slice(file.path.lastIndexOf("/")+1) + (value == null ? "" : ` · ${value}`);
+    const item = {id:"F"+(tree.serial++).toString(36),kind:"file",record:file,key:identity(file),total:file.physicalLines,label,full:`${file.sourceSetId} · ${file.language} · ${file.path} · ${file.physicalLines} physical file lines`,band:options.fileBand?.(file)};
+    tree.nodes.set(item.id,item); parent.children.push(item);
+    // Totals count each included file exactly once at each ancestor.
+    let path = parts.join("/");
+    for (;;) {
+      ensureDirectory(tree,file.sourceSetId,path).total += file.physicalLines;
+      if (!path) break;
+      path = parentOf(path);
+    }
+  }
+  // The root shows the caller's observed checkout name; the exact source set stays in the full label.
+  function labelDirectory(item,options) {
+    const root = item.record.path ? "" : rootName(item.record.sourceSetId,options);
+    item.label = `${item.record.path ? item.record.path.slice(item.record.path.lastIndexOf("/")+1) : root} · ${item.total} lines`;
+    item.full = `${root && root !== item.record.sourceSetId ? root+" · " : ""}${item.record.sourceSetId} · ${item.record.path || "/"} · ${item.total} physical file lines`;
+  }
+  // The Mermaid source: one line per node, depth first in key order. Labels each directory and sorts its children on the way.
+  function mermaidSource(directories,options) {
     const source = ["treemap-beta"]; let sourceBytes = bytes("treemap-beta\n");
-    const {width,height} = layoutSize(files.length-zeroArea.length,options.viewport);
     const roots = [...directories.values()].filter(item => !item.record.path).sort((a,b) => compare(a.key,b.key));
     const stack = roots.slice().reverse().map(item => ({item,depth:0}));
     while (stack.length) {
       const {item,depth} = stack.pop();
-      if (item.kind === "directory") {
-        // The root shows the caller's observed checkout name; the exact source set stays in the full label.
-        const root = item.record.path ? "" : rootName(item.record.sourceSetId,options);
-        item.label = `${item.record.path ? item.record.path.slice(item.record.path.lastIndexOf("/")+1) : root} · ${item.total} lines`;
-        item.full = `${root && root !== item.record.sourceSetId ? root+" · " : ""}${item.record.sourceSetId} · ${item.record.path || "/"} · ${item.total} physical file lines`;
-      }
+      if (item.kind === "directory") labelDirectory(item,options);
       const line = `${"  ".repeat(depth)}"${item.id}"${item.kind === "file" ? `: ${item.total}` : ""}`;
       sourceBytes += bytes(line)+1;
       if (sourceBytes > 512*1024) unsupported("Treemap Mermaid source too large");
@@ -84,7 +83,25 @@
     }
     const text = source.join("\n")+"\n";
     if (bytes(text) > 512*1024) unsupported("Treemap Mermaid source too large");
-    return {source:text,nodes,files:ordered,zeroArea,total,config:{treemap:{nodeWidth:width/10,nodeHeight:height/10,showValues:false}},width,height,size:Math.max(width,height)};
+    return text;
+  }
+  function project(files, options = {}) {
+    if (!Array.isArray(files)) unsupported("Invalid Treemap files");
+    const tree = {nodes:new Map(), directories:new Map(), serial:0}, seen = new Set(), zeroArea = [];
+    let total = 0;
+    for (const file of files) if (!validFile(file)) unsupported("Invalid Treemap file");
+    const ordered = [...files].sort((a,b) => compare(identity(a),identity(b)));
+    for (const file of ordered) {
+      if (!validFile(file) || seen.has(identity(file))) unsupported("Invalid or duplicate Treemap file");
+      seen.add(identity(file));
+      if (!file.physicalLines) { zeroArea.push(file); continue; }
+      total += file.physicalLines;
+      if (!Number.isSafeInteger(total)) unsupported("Treemap area exceeds integer precision");
+      addFile(tree,file,options);
+    }
+    const {width,height} = layoutSize(files.length-zeroArea.length,options.viewport);
+    const source = mermaidSource(tree.directories,options);
+    return {source,nodes:tree.nodes,files:ordered,zeroArea,total,config:{treemap:{nodeWidth:width/10,nodeHeight:height/10,showValues:false}},width,height,size:Math.max(width,height)};
   }
   function rootName(sourceSetId,options) {
     const name = options.rootLabel?.(sourceSetId);
@@ -101,52 +118,52 @@
     const height = Math.max(MIN_HEIGHT,Math.floor(viewport.height),Math.ceil(count*2500/width));
     return {width,height:Math.min(4000,height)};
   }
+  function checkViewport(root,outer) {
+    if (root.getAttribute("class") !== "pele pele-treemap" || root.getAttribute("width") !== String(outer.width) || root.getAttribute("height") !== String(outer.height) || root.getAttribute("viewBox") !== `0 0 ${outer.width} ${outer.height}`) unsupported("Changed Treemap viewport");
+  }
+  // One top-level group: the sections or the leaves, each at most once (`seen` counts them). Returns its kind.
+  function checkGroup(group,seen) {
+    const kind = group.getAttribute("class");
+    if (group.localName !== "g" || !["pele-sections","pele-leaves"].includes(kind) || group.hasAttribute("data-id")) unsupported("Changed Treemap root structure");
+    if (++seen[kind] > 1) unsupported("Duplicate Treemap group");
+    if (kind === "pele-sections" && group.getAttribute("font-size") !== "12") unsupported("Changed Treemap header font");
+    return kind;
+  }
+  // One drawn node against its projected item: type, structure, placeholders and geometry inside `outer`. Returns its control.
+  function checkTile(node,id,item,kind,outer) {
+    const section = item.kind === "directory";
+    if (node.localName !== "g" || node.getAttribute("class") !== `pele-node pele-${section ? "section" : "leaf"}` || kind !== (section ? "pele-sections" : "pele-leaves")) unsupported("Changed Treemap node type");
+    const children = [...node.children], title = children[0]?.localName === "title" ? children.shift() : null, rect = children.shift(), label = children.shift();
+    if (rect?.localName !== "rect" || children.length || (label && label.localName !== "text") || rect.children.length || title?.children.length || label?.children.length) unsupported("Changed Treemap node structure");
+    if (title && title.textContent !== id) unsupported("Changed Treemap title placeholder");
+    if (label && !(label.textContent === id || (label.textContent.endsWith("…") && label.textContent.length > 1 && id.startsWith(label.textContent.slice(0,-1))))) unsupported("Changed Treemap label placeholder");
+    const geometry = Object.fromEntries(["x","y","width","height"].map(key => [key,Number(rect.getAttribute(key))]));
+    if (!["x","y","width","height"].every(key => rect.hasAttribute(key) && Number.isFinite(geometry[key]) && geometry[key] >= 0) || geometry.x+geometry.width > outer.width || geometry.y+geometry.height > outer.height) unsupported("Invalid Treemap geometry");
+    if (label) checkLabel(label,geometry,section);
+    return {node,rect,label,title,item,geometry};
+  }
+  function checkLabel(label,geometry,section) {
+    const fontSize = Number(label.getAttribute("font-size") || (section ? 12 : 14));
+    const x = Number(label.getAttribute("x")), y = Number(label.getAttribute("y"));
+    if (!Number.isFinite(x) || !Number.isFinite(y) || x < geometry.x || x > geometry.x+geometry.width || y < geometry.y || y > geometry.y+geometry.height || (section ? fontSize !== 12 : !Number.isInteger(fontSize) || fontSize < 8 || fontSize > 14)) unsupported("Invalid Treemap label geometry");
+  }
+  function checkTotals(root,controls,projection) {
+    if (controls.size !== projection.nodes.size || root.querySelectorAll("[data-id]").length !== controls.size || root.querySelectorAll("rect").length !== controls.size || root.querySelectorAll("text").length !== [...controls.values()].filter(c => c.label).length || root.querySelectorAll("title").length !== [...controls.values()].filter(c => c.title).length) unsupported("Incomplete Treemap native map");
+  }
   function validatedSvg(raw, projection) {
-    if (typeof raw !== "string" || bytes(raw) > 8*1024*1024) unsupported("Treemap SVG too large");
-    if (!raw.startsWith('<svg xmlns="http://www.w3.org/2000/svg" class="pele pele-treemap"')) unsupported("Changed Pele Treemap root");
-    const theme = raw.match(/ style="([^"]*)"/);
-    const style = THEME+";--_r:var(--pele-radius,4px)";
-    if (!theme || ![THEME+FONT,style+FONT,style+";--_hw:var(--pele-heading-weight,bold)"+FONT].includes(theme[1])) unsupported("Changed Pele Treemap theme");
-    const safe = raw.replace(theme[0],"").replaceAll(' style="rx:var(--_r)"',' rx="var(--_r)"');
-    if (/\sstyle\s*=|<\/?(?:script|style|foreignObject|image|a)\b|<!/i.test(safe)) unsupported("Unexpected Treemap SVG markup");
-    const root = new DOMParser().parseFromString(safe,"image/svg+xml").documentElement;
-    if (root.localName !== "svg" || root.namespaceURI !== NS || root.querySelector("parsererror")) unsupported("Invalid Treemap SVG");
-    const tags = new Set(["svg","g","rect","text","title"]);
-    const attrs = new Set(["xmlns","class","viewBox","width","height","fill","fill-opacity","role","aria-roledescription","stroke","font-size","data-id","x","y","rx","text-anchor","font-weight"]);
-    let count = 0;
-    for (const node of [root,...root.querySelectorAll("*")]) {
-      if (++count > 12000 || node.namespaceURI !== NS || !tags.has(node.localName)) unsupported("Unexpected Treemap SVG element");
-      for (const attr of node.attributes) if (!attrs.has(attr.name) || /url\s*\(|javascript:|<|>|[\u0000-\u001f]/i.test(attr.value)) unsupported("Unexpected Treemap SVG attribute");
-    }
-    const outerWidth = projection.width+16, outerHeight = projection.height+16;
-    if (root.getAttribute("class") !== "pele pele-treemap" || root.getAttribute("width") !== String(outerWidth) || root.getAttribute("height") !== String(outerHeight) || root.getAttribute("viewBox") !== `0 0 ${outerWidth} ${outerHeight}`) unsupported("Changed Treemap viewport");
-    const controls = new Map();
-    let sections = 0, leaves = 0;
+    const {root, count} = window.TrellisPeleSvg.admit(raw, ADMISSION);
+    const outer = {width:projection.width+16, height:projection.height+16};
+    checkViewport(root,outer);
+    const controls = new Map(), seen = {"pele-sections":0, "pele-leaves":0};
     for (const group of root.children) {
-      const kind = group.getAttribute("class");
-      if (group.localName !== "g" || !["pele-sections","pele-leaves"].includes(kind) || group.hasAttribute("data-id")) unsupported("Changed Treemap root structure");
-      if (kind === "pele-sections" ? ++sections > 1 : ++leaves > 1) unsupported("Duplicate Treemap group");
-      if (kind === "pele-sections" && group.getAttribute("font-size") !== "12") unsupported("Changed Treemap header font");
+      const kind = checkGroup(group,seen);
       for (const node of group.children) {
         const id = node.getAttribute("data-id"), item = projection.nodes.get(id);
         if (!item || controls.has(id)) unsupported("Missing, extra or duplicate Treemap identity");
-        const section = item.kind === "directory";
-        if (node.localName !== "g" || node.getAttribute("class") !== `pele-node pele-${section ? "section" : "leaf"}` || kind !== (section ? "pele-sections" : "pele-leaves")) unsupported("Changed Treemap node type");
-        const children = [...node.children], title = children[0]?.localName === "title" ? children.shift() : null, rect = children.shift(), label = children.shift();
-        if (rect?.localName !== "rect" || children.length || (label && label.localName !== "text") || rect.children.length || title?.children.length || label?.children.length) unsupported("Changed Treemap node structure");
-        if (title && title.textContent !== id) unsupported("Changed Treemap title placeholder");
-        if (label && !(label.textContent === id || (label.textContent.endsWith("…") && label.textContent.length > 1 && id.startsWith(label.textContent.slice(0,-1))))) unsupported("Changed Treemap label placeholder");
-        const geometry = Object.fromEntries(["x","y","width","height"].map(key => [key,Number(rect.getAttribute(key))]));
-        if (!["x","y","width","height"].every(key => rect.hasAttribute(key) && Number.isFinite(geometry[key]) && geometry[key] >= 0) || geometry.x+geometry.width > outerWidth || geometry.y+geometry.height > outerHeight) unsupported("Invalid Treemap geometry");
-        if (label) {
-          const fontSize = Number(label.getAttribute("font-size") || (section ? 12 : 14));
-          const x = Number(label.getAttribute("x")), y = Number(label.getAttribute("y"));
-          if (!Number.isFinite(x) || !Number.isFinite(y) || x < geometry.x || x > geometry.x+geometry.width || y < geometry.y || y > geometry.y+geometry.height || (section ? fontSize !== 12 : !Number.isInteger(fontSize) || fontSize < 8 || fontSize > 14)) unsupported("Invalid Treemap label geometry");
-        }
-        controls.set(id,{node,rect,label,title,item,geometry});
+        controls.set(id,checkTile(node,id,item,kind,outer));
       }
     }
-    if (controls.size !== projection.nodes.size || root.querySelectorAll("[data-id]").length !== controls.size || root.querySelectorAll("rect").length !== controls.size || root.querySelectorAll("text").length !== [...controls.values()].filter(c => c.label).length || root.querySelectorAll("title").length !== [...controls.values()].filter(c => c.title).length) unsupported("Incomplete Treemap native map");
+    checkTotals(root,controls,projection);
     // Full-path accessibility adds one SVG title to every native node that
     // lacks one. Admit that final detached DOM before decoration or handlers.
     const addedTitles = [...controls.values()].filter(control => !control.title).length;
@@ -169,8 +186,8 @@
     try {
       if (document.fonts?.ready) await document.fonts.ready;
       if (!current()) return {status:"stale"};
-      const ctx = document.createElement("canvas").getContext("2d");
-      if (!ctx) unsupported("Treemap text measurement unavailable");
+      const measure = textMeasurer();
+      if (!measure) unsupported("Treemap text measurement unavailable");
       const projection = project(files,options);
       if (typeof window.pele?.render !== "function") unsupported("Pele asset unavailable");
       const result = await window.pele.render(projection.source,{config:projection.config,fontSize:14,padding:8,responsive:false,links:false,images:false});
@@ -181,10 +198,10 @@
         const section = item.kind === "directory";
         if (label) {
           const size = Number(label.getAttribute("font-size") || (section ? 12 : 14));
-          ctx.font = `${section ? "bold " : ""}${size}px Inter, sans-serif`;
+          measure.font(`${section ? "bold " : ""}${size}px Inter, sans-serif`);
           const x = Number(label.getAttribute("x"));
           const width = section ? geometry.x+geometry.width-8-x : 2*Math.max(0,Math.min(x-geometry.x-4,geometry.x+geometry.width-4-x));
-          label.textContent = fit(item.label,Math.max(0,width),text => ctx.measureText(text).width);
+          label.textContent = fit(item.label,Math.max(0,width),measure);
           if (section) label.setAttribute("font-weight","bold");
           label.setAttribute("fill",section || item.band === 0 || item.band == null || item.band === "none" ? "#F7F7FB" : "#0B0C10");
         }
@@ -195,16 +212,13 @@
         if (section) { rect.setAttribute("fill-opacity","1"); rect.setAttribute("stroke","#777A8E"); }
         const testOnly = !section && (item.record.fileRole === "test" || (item.record.roleCounts?.production === 0 && item.record.roleCounts?.test > 0));
         if (testOnly) { rect.setAttribute("stroke-dasharray","4 3"); rect.setAttribute("stroke","#B8BAC8"); }
-        node.setAttribute("role","button"); node.setAttribute("tabindex","0"); node.setAttribute("aria-label",item.full);
-        node.setAttribute("aria-pressed",String(options.selectedKey === item.key));
-        node.setAttribute(section ? "data-trellis-directory-id" : "data-trellis-file-id",item.key);
-        const select = event => {
+        asButton(node,item.full,event => {
           event.stopPropagation(); if (!current()) return;
           for (const control of controls.values()) control.node.setAttribute("aria-pressed",String(control.node === node));
           (section ? options.onSelectDirectory : options.onSelectFile)?.(item.record);
-        };
-        node.addEventListener("click",select);
-        node.addEventListener("keydown",event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); select(event); } });
+        });
+        node.setAttribute("aria-pressed",String(options.selectedKey === item.key));
+        node.setAttribute(section ? "data-trellis-directory-id" : "data-trellis-file-id",item.key);
       }
       if (!current()) return {status:"stale"};
       container.replaceChildren(root);
