@@ -213,14 +213,14 @@ pub struct DaemonState {
     step_progress: AtomicBool,
     /// Published watcher intent; readers never take the watcher's lock.
     /// The watcher's published status. This lock is also the publication lock of
-    /// `fifo_pending`: both are written under it, so the quiet read sees one state (#1082).
+    /// `fifo`: both are written under it, so the quiet read sees one state (#1082).
     /// A leaf lock: nothing else is taken while it is held.
     watch_status: Arc<Mutex<Option<worker::WatchStatus>>>,
     /// Read and enqueue admission leases held against release.
     leases: Arc<std::sync::atomic::AtomicUsize>,
     /// Published by the worker after each step (and set by the enqueue gate):
     /// accepted FIFO work keeps the runtime from retiring.
-    fifo_pending: Arc<AtomicBool>,
+    fifo: Arc<worker::FifoPublication>,
     /// The registry's lifecycle wake (Decision 0009 §5).
     lifecycle: Arc<std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>>,
     /// The runtime closed because its captured root was lost.
@@ -433,14 +433,14 @@ pub fn new_with_config(
     #[cfg(feature = "test-support")]
     let origins = hosts.iter().map(|h| format!("http://{h}")).collect();
     let inbox = Arc::new(worker::WorkerInbox::default());
-    let fifo_pending = Arc::new(AtomicBool::new(false));
+    let fifo = Arc::new(worker::FifoPublication::default());
     let watch_status = Arc::new(Mutex::new(None));
     let queue_waker: Arc<dyn Fn() + Send + Sync> = {
         let inbox = inbox.clone();
-        let fifo_pending = fifo_pending.clone();
+        let fifo = fifo.clone();
         let watch_status = watch_status.clone();
         Arc::new(move || {
-            worker::publish_fifo(&watch_status, &fifo_pending, true);
+            fifo.accept(&watch_status);
             inbox.wake();
         })
     };
@@ -459,7 +459,7 @@ pub fn new_with_config(
         step_progress: AtomicBool::new(false),
         watch_status,
         leases: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        fifo_pending,
+        fifo,
         lifecycle: Arc::new(std::sync::OnceLock::new()),
         root_lost: AtomicBool::new(false),
         state_version: AtomicU64::new(0),
@@ -997,7 +997,7 @@ impl DaemonState {
         if self.store.root_path_replaced().unwrap_or(true) || session.verify().is_err() {
             return Some("root_or_writer");
         }
-        if self.fifo_pending.load(Ordering::Acquire)
+        if self.fifo.pending.load(Ordering::Acquire)
             || !self.pending_requests.lock().unwrap().is_empty()
         {
             return Some("local_fifo");

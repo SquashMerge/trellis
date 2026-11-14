@@ -7,7 +7,7 @@
 use super::DaemonState;
 use crate::indexer::IndexOptions;
 use crate::store::topology::WriterSession;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -515,16 +515,48 @@ pub(super) struct WatchStatus {
     pub(super) capturing: Arc<std::sync::atomic::AtomicBool>,
 }
 
-/// Publish whether accepted FIFO work is pending, and return what was published before.
-/// Written under the watch status lock, which the quiet read holds across its read of this
-/// flag and of the status (#1082). The flag stays an atomic for its lock-free readers.
-pub(super) fn publish_fifo(
-    watch_status: &Mutex<Option<WatchStatus>>,
-    fifo_pending: &AtomicBool,
-    pending: bool,
-) -> bool {
-    let _published = watch_status.lock().unwrap();
-    fifo_pending.swap(pending, Ordering::AcqRel)
+/// The published "accepted FIFO work is pending" flag. It is written only under the watch
+/// status lock, which the quiet read holds across its read of this flag and of the status
+/// (#1082). The flag stays an atomic for its lock-free readers.
+#[derive(Default)]
+pub(super) struct FifoPublication {
+    pub(super) pending: AtomicBool,
+    /// Counts accepted-work publications. An observation of the queue is only as new as the
+    /// count it was made at.
+    accepted: AtomicU64,
+}
+
+impl FifoPublication {
+    /// A request was accepted, or may have been: publish pending.
+    pub(super) fn accept(&self, watch_status: &Mutex<Option<WatchStatus>>) {
+        let _published = watch_status.lock().unwrap();
+        self.accepted.fetch_add(1, Ordering::AcqRel);
+        self.pending.store(true, Ordering::Release);
+    }
+
+    /// The count to observe the queue at. Read it before the observation.
+    pub(super) fn observe(&self) -> u64 {
+        self.accepted.load(Ordering::Acquire)
+    }
+
+    /// Publish what an observation of the queue made at `observed` found, and return what
+    /// was published before. An empty queue is published only if nothing was accepted since:
+    /// otherwise the accepted request's own publication is newer and stands (`None`), and the
+    /// wake it sent has the worker observe again. `observed: None` is unconditional.
+    pub(super) fn publish(
+        &self,
+        watch_status: &Mutex<Option<WatchStatus>>,
+        observed: Option<u64>,
+        pending: bool,
+    ) -> Option<bool> {
+        let _published = watch_status.lock().unwrap();
+        if !pending
+            && observed.is_some_and(|observed| observed != self.accepted.load(Ordering::Acquire))
+        {
+            return None;
+        }
+        Some(self.pending.swap(pending, Ordering::AcqRel))
+    }
 }
 
 impl WatchStatus {
@@ -601,7 +633,7 @@ impl DaemonState {
         }
         // An accepted head that made no progress (and set no deferral) is
         // retried rather than left until the next inventory.
-        if self.fifo_pending.load(Ordering::Acquire) {
+        if self.fifo.pending.load(Ordering::Acquire) {
             return Some(now + STEP_RETRY);
         }
         let watcher_due = match &*self.watcher_work.lock().unwrap() {
@@ -668,24 +700,27 @@ impl DaemonState {
     /// as pending). When it drains, wake the lifecycle: a declined release
     /// may now proceed.
     pub(super) fn publish_fifo_pending(&self) {
-        let pending = if matches!(
+        // Read before the queue: a request accepted after this is newer than what is seen.
+        let observed = self.fifo.observe();
+        let (pending, observed) = if matches!(
             *self.runtime.lock().unwrap(),
             RuntimeState::Closing | RuntimeState::Retired
         ) {
-            false
+            (false, None)
         } else {
             // A deletion can race the step. Never recreate the directory in
             // this publication probe, even when an admitted read delays close.
-            match self.close_if_index_missing() {
+            let pending = match self.close_if_index_missing() {
                 Ok(true) => !self.retired(),
                 Ok(false) => !matches!(self.store.earliest_unfinished_request(), Ok(None)),
                 Err(_) => true,
-            }
+            };
+            (pending, Some(observed))
         };
         #[cfg(test)]
         self.test_fifo_between_observation_and_publication.run();
-        let was = publish_fifo(&self.watch_status, &self.fifo_pending, pending);
-        if was
+        let was = self.fifo.publish(&self.watch_status, observed, pending);
+        if was == Some(true)
             && !pending
             && let Some(lifecycle) = self.lifecycle.get()
         {
@@ -732,7 +767,7 @@ impl DaemonState {
     ) -> anyhow::Result<crate::store::requests::Request> {
         let lease = self.admission_lease()?;
         let row = self.store.enqueue_request(options, expected)?;
-        publish_fifo(&self.watch_status, &self.fifo_pending, true);
+        self.fifo.accept(&self.watch_status);
         drop(lease);
         self.pending_requests.lock().unwrap().push(row.id.clone());
         *self.recovery_retry_after.lock().unwrap() = None;
@@ -749,7 +784,7 @@ impl DaemonState {
         let row = self
             .store
             .enqueue_semantic_import(std::path::Path::new(self.store.workspace_root()), options)?;
-        publish_fifo(&self.watch_status, &self.fifo_pending, true);
+        self.fifo.accept(&self.watch_status);
         drop(lease);
         self.pending_requests.lock().unwrap().push(row.id.clone());
         *self.recovery_retry_after.lock().unwrap() = None;
@@ -774,13 +809,13 @@ impl DaemonState {
             Err(error) => {
                 // An error after COMMIT may still have accepted the row, unwoken: the worker
                 // re-reads the queue and publishes whether FIFO work really remains (#629).
-                publish_fifo(&self.watch_status, &self.fifo_pending, true);
+                self.fifo.accept(&self.watch_status);
                 drop(lease);
                 self.inbox.wake();
                 return Err(error);
             }
         };
-        publish_fifo(&self.watch_status, &self.fifo_pending, true);
+        self.fifo.accept(&self.watch_status);
         drop(lease);
         self.pending_requests.lock().unwrap().push(row.id.clone());
         *self.recovery_retry_after.lock().unwrap() = None;
@@ -855,7 +890,7 @@ impl DaemonState {
             RuntimeState::Activating | RuntimeState::Reconciling { waiting: true, .. } => None,
         };
         if self.leases.load(Ordering::Acquire) != 0
-            || self.fifo_pending.load(Ordering::Acquire)
+            || self.fifo.pending.load(Ordering::Acquire)
             || !idle(RuntimePhase::of(&state))
         {
             return RetireOutcome::Declined;
@@ -913,7 +948,7 @@ impl DaemonState {
             if !matches!(*state, RuntimeState::RetireRequested { .. }) {
                 return Ok(());
             }
-            if self.fifo_pending.load(Ordering::Acquire) || !self.store.try_begin_closing() {
+            if self.fifo.pending.load(Ordering::Acquire) || !self.store.try_begin_closing() {
                 self.cancel_retirement(state);
                 return Ok(());
             }
@@ -1083,7 +1118,7 @@ impl DaemonState {
     }
 
     pub(crate) fn fifo_pending(&self) -> bool {
-        self.fifo_pending.load(Ordering::Acquire)
+        self.fifo.pending.load(Ordering::Acquire)
     }
 
     pub(crate) fn leases(&self) -> usize {
