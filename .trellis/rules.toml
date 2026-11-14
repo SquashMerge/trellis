@@ -134,6 +134,13 @@ paths = [
   # the producer registry, the producer profiles or the filesystem stay in
   # semantic_batch/descriptor.rs.
   "src/batch_descriptor.rs",
+  # The checked-in producer pin and its registry (S8, #1071; owner ruling 2026-11-14: the
+  # pin is vocabulary). `PinnedProducer`, the lookups by declaration and by id, and the table
+  # they read: two checked-in JSON profiles compiled in with `include_str!`, the reference
+  # producers' language table and the compile-time host target. No I/O, environment or
+  # configuration read. Storage checks the pin at publish time through
+  # `Descriptor::check_producer`, which is in the grammar file above.
+  "src/producer_pin.rs",
 ]
 
 # Coarse developer-tool boundary; does not infer internal tooling architecture.

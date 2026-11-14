@@ -7,7 +7,7 @@ fn batch() -> SelectedRawBatch {
 }
 
 fn batch_of(artifact_languages: &[&[&str]], assigned_path: &str) -> SelectedRawBatch {
-    let pinned = crate::scip_admission::pinned_producer_by_id("trellis-synthetic-scip").unwrap();
+    let pinned = crate::producer_pin::pinned_producer_by_id("trellis-synthetic-scip").unwrap();
     let hex = |c: char| c.to_string().repeat(64);
     let artifacts: Vec<_> = artifact_languages
         .iter()
