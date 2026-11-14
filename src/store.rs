@@ -10920,8 +10920,8 @@ fn revision_producer_binding(db: &Connection, revision_key: &str) -> Result<(Str
             key.len() <= 8192 && raw.len() <= 8192,
             "incompatible_index: selected producer input byte budget exceeded"
         );
-        let observation: crate::capture::CaptureInputObservation = serde_json::from_str(&raw)
-            .context(SelectedIntegrity(
+        let observation: crate::capture_records::CaptureInputObservation =
+            serde_json::from_str(&raw).context(SelectedIntegrity(
                 "incompatible_index: stored JSON decode failed".into(),
             ))?;
         selected_ensure!(
@@ -10930,17 +10930,18 @@ fn revision_producer_binding(db: &Connection, revision_key: &str) -> Result<(Str
         );
         if let Some(relative) = key.strip_prefix("toolchain:") {
             selected_ensure!(
-                crate::capture::is_root_toolchain_input(relative)
+                crate::capture_records::is_root_toolchain_input(relative)
                     && selectors.insert(relative.to_owned())
                     && matches!(
                         observation,
-                        crate::capture::CaptureInputObservation::Present { .. }
-                            | crate::capture::CaptureInputObservation::Absent
+                        crate::capture_records::CaptureInputObservation::Present { .. }
+                            | crate::capture_records::CaptureInputObservation::Absent
                     ),
                 "incompatible_index: selected producer selector role differs"
             );
         } else if let Some(path) = key.strip_prefix("executable:") {
-            let crate::capture::CaptureInputObservation::Present { ref hash, .. } = observation
+            let crate::capture_records::CaptureInputObservation::Present { ref hash, .. } =
+                observation
             else {
                 return Err(SelectedIntegrity(
                     "incompatible_index: selected executable input absent".into(),
@@ -10965,7 +10966,7 @@ fn revision_producer_binding(db: &Connection, revision_key: &str) -> Result<(Str
         identities.push(serde_json::json!({"key":key,"observation":observation}));
     }
     selected_ensure!(
-        selectors.len() == crate::capture::ROOT_TOOLCHAIN_INPUTS.len()
+        selectors.len() == crate::capture_records::ROOT_TOOLCHAIN_INPUTS.len()
             && identities.len() == selectors.len() + 1,
         "incompatible_index: selected producer input inventory incomplete"
     );
@@ -11274,11 +11275,11 @@ fn skipped_config_diagnostics(db: &Connection, status: &mut IndexStatus) -> Resu
     while let Some(row) = rows.next()? {
         let key: String = row.get(0)?;
         let payload: String = row.get(1)?;
-        let observation: crate::capture::CaptureInputObservation = serde_json::from_str(&payload)
-            .context(SelectedIntegrity(
-            "incompatible_index: stored JSON decode failed".into(),
-        ))?;
-        if let crate::capture::CaptureInputObservation::Present { hash, .. } = observation
+        let observation: crate::capture_records::CaptureInputObservation =
+            serde_json::from_str(&payload).context(SelectedIntegrity(
+                "incompatible_index: stored JSON decode failed".into(),
+            ))?;
+        if let crate::capture_records::CaptureInputObservation::Present { hash, .. } = observation
             && hash == placeholder
         {
             let (code, message) = if key.starts_with("ignore:") {
@@ -11302,8 +11303,10 @@ fn skipped_config_diagnostics(db: &Connection, status: &mut IndexStatus) -> Resu
     Ok(())
 }
 
-pub(crate) type SourceObservations = BTreeMap<String, (String, crate::capture::CaptureStat)>;
-pub(crate) type InputObservations = BTreeMap<String, crate::capture::CaptureInputObservation>;
+pub(crate) type SourceObservations =
+    BTreeMap<String, (String, crate::capture_records::CaptureStat)>;
+pub(crate) type InputObservations =
+    BTreeMap<String, crate::capture_records::CaptureInputObservation>;
 
 pub(crate) fn compare_capture_observations(
     previous_sources: &SourceObservations,
@@ -11311,7 +11314,7 @@ pub(crate) fn compare_capture_observations(
     previous_inputs: &InputObservations,
     current_inputs: &InputObservations,
 ) -> ScanComparison {
-    let uncertain = |stat: &crate::capture::CaptureStat| {
+    let uncertain = |stat: &crate::capture_records::CaptureStat| {
         stat.mtime_seconds.is_none()
             || stat.mtime_nanoseconds.is_none()
             || stat.ctime_seconds.is_none()
@@ -11358,11 +11361,11 @@ pub(crate) fn compare_capture_observations(
             (Some(_), None) => comparison.deleted += 1,
             (Some(old), Some(new)) => match (old, new) {
                 (
-                    crate::capture::CaptureInputObservation::Present {
+                    crate::capture_records::CaptureInputObservation::Present {
                         stat: old_stat,
                         hash: old_hash,
                     },
-                    crate::capture::CaptureInputObservation::Present {
+                    crate::capture_records::CaptureInputObservation::Present {
                         stat: new_stat,
                         hash: new_hash,
                     },
@@ -11375,20 +11378,20 @@ pub(crate) fn compare_capture_observations(
                         usize::from(uncertain(old_stat) || uncertain(new_stat));
                 }
                 (
-                    crate::capture::CaptureInputObservation::Directory { stat: old },
-                    crate::capture::CaptureInputObservation::Directory { stat: new },
+                    crate::capture_records::CaptureInputObservation::Directory { stat: old },
+                    crate::capture_records::CaptureInputObservation::Directory { stat: new },
                 )
                 | (
-                    crate::capture::CaptureInputObservation::Root { stat: old },
-                    crate::capture::CaptureInputObservation::Root { stat: new },
+                    crate::capture_records::CaptureInputObservation::Root { stat: old },
+                    crate::capture_records::CaptureInputObservation::Root { stat: new },
                 ) => comparison.stat_changed += usize::from(old != new),
                 (
-                    crate::capture::CaptureInputObservation::Absent,
-                    crate::capture::CaptureInputObservation::Absent,
+                    crate::capture_records::CaptureInputObservation::Absent,
+                    crate::capture_records::CaptureInputObservation::Absent,
                 ) => {}
                 (
-                    crate::capture::CaptureInputObservation::Extractor { hash: old },
-                    crate::capture::CaptureInputObservation::Extractor { hash: new },
+                    crate::capture_records::CaptureInputObservation::Extractor { hash: old },
+                    crate::capture_records::CaptureInputObservation::Extractor { hash: new },
                 ) => comparison.hash_changed += usize::from(old != new),
                 _ => comparison.stat_changed += 1,
             },
@@ -11460,7 +11463,7 @@ fn compare_capture_snapshot_inner(
             SelectedIntegrity("incompatible_index: selected reused source missing".into())
         })?;
         let stat: String = row.get(2)?;
-        let stat: crate::capture::CaptureStat = serde_json::from_str(&stat).context(
+        let stat: crate::capture_records::CaptureStat = serde_json::from_str(&stat).context(
             SelectedIntegrity("incompatible_index: stored JSON decode failed".into()),
         )?;
         if unchanged.is_some() {
@@ -11499,10 +11502,10 @@ fn compare_capture_snapshot_inner(
     })?;
     for row in rows {
         let (key, payload) = row?;
-        let observation: crate::capture::CaptureInputObservation = serde_json::from_str(&payload)
-            .context(SelectedIntegrity(
-            "incompatible_index: stored JSON decode failed".into(),
-        ))?;
+        let observation: crate::capture_records::CaptureInputObservation =
+            serde_json::from_str(&payload).context(SelectedIntegrity(
+                "incompatible_index: stored JSON decode failed".into(),
+            ))?;
         selected_ensure!(
             previous_inputs.insert(key, observation).is_none(),
             "incompatible_index: duplicate captured input observation"
@@ -11552,7 +11555,10 @@ fn compare_capture_snapshot_inner(
     Ok(comparison)
 }
 
-fn validate_capture_stat(stat: &crate::capture::CaptureStat, expected_kind: &str) -> Result<()> {
+fn validate_capture_stat(
+    stat: &crate::capture_records::CaptureStat,
+    expected_kind: &str,
+) -> Result<()> {
     let nanos = |value: Option<i64>| value.is_some_and(|n| (0..1_000_000_000).contains(&n));
     control_ensure!(
         stat.version == 1
@@ -11622,7 +11628,7 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
             "incompatible_index: duplicate captured source path"
         );
         let payload: String = row.get(1)?;
-        let decoded: crate::capture::CaptureStat = serde_json::from_str(&payload)
+        let decoded: crate::capture_records::CaptureStat = serde_json::from_str(&payload)
             .context(SelectedIntegrity(
                 "incompatible_index: stored JSON decode failed".into(),
             ))
@@ -11647,20 +11653,21 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
             !key.is_empty() && key.len() <= 8192 && actual.insert(key.clone()),
             "incompatible_index: invalid capture input key"
         );
-        let observation: crate::capture::CaptureInputObservation = serde_json::from_str(&payload)
-            .context(SelectedIntegrity(
-                "incompatible_index: stored JSON decode failed".into(),
-            ))
-            .context("incompatible_index: invalid capture input")?;
+        let observation: crate::capture_records::CaptureInputObservation =
+            serde_json::from_str(&payload)
+                .context(SelectedIntegrity(
+                    "incompatible_index: stored JSON decode failed".into(),
+                ))
+                .context("incompatible_index: invalid capture input")?;
         control_ensure!(
             json(&observation)? == payload,
             "incompatible_index: noncanonical capture input"
         );
         match (&key[..], &observation) {
-            ("root:.", crate::capture::CaptureInputObservation::Root { stat }) => {
+            ("root:.", crate::capture_records::CaptureInputObservation::Root { stat }) => {
                 validate_capture_stat(stat, "directory")?;
             }
-            (key, crate::capture::CaptureInputObservation::Directory { stat })
+            (key, crate::capture_records::CaptureInputObservation::Directory { stat })
                 if key.starts_with("directory:") =>
             {
                 validate_capture_stat(stat, "directory")?;
@@ -11675,7 +11682,7 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
                 );
                 directories.insert(relative.to_owned());
             }
-            (key, crate::capture::CaptureInputObservation::Present { stat, hash })
+            (key, crate::capture_records::CaptureInputObservation::Present { stat, hash })
                 if key.starts_with("config:")
                     || key.starts_with("toolchain:")
                     || key.starts_with("ignore:")
@@ -11696,8 +11703,8 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
                     );
                 }
             }
-            (key, crate::capture::CaptureInputObservation::Extractor { hash })
-                if key == crate::capture::EXTRACTOR_INPUT_KEY =>
+            (key, crate::capture_records::CaptureInputObservation::Extractor { hash })
+                if key == crate::capture_records::EXTRACTOR_INPUT_KEY =>
             {
                 control_ensure!(
                     hash.len() == 64
@@ -11707,7 +11714,7 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
                     "incompatible_index: invalid extractor producer hash"
                 );
             }
-            (key, crate::capture::CaptureInputObservation::Absent)
+            (key, crate::capture_records::CaptureInputObservation::Absent)
                 if key.starts_with("config:")
                     || key.starts_with("toolchain:")
                     || key.starts_with("ignore:") => {}
@@ -11741,10 +11748,10 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
         }
     }
     let mut expected = BTreeSet::from(["root:.".to_owned()]);
-    for name in crate::capture::ROOT_CONFIG_INPUTS {
+    for name in crate::capture_records::ROOT_CONFIG_INPUTS {
         expected.insert(format!("config:{name}"));
     }
-    for name in crate::capture::ROOT_TOOLCHAIN_INPUTS {
+    for name in crate::capture_records::ROOT_TOOLCHAIN_INPUTS {
         expected.insert(format!("toolchain:{name}"));
     }
     for directory in &directories {
@@ -11757,13 +11764,13 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
         }
         expected.insert(format!("directory:{directory}"));
     }
-    // The nested config inputs above each source (`capture::NESTED_CONFIG_INPUTS`); a
+    // The nested config inputs above each source (`capture_records::NESTED_CONFIG_INPUTS`); a
     // non-regular one is not admitted.
     for source in &source_paths {
         let Some(extension) = Path::new(source).extension().and_then(|x| x.to_str()) else {
             continue;
         };
-        for manifest in crate::capture::nested_config_names(extension) {
+        for manifest in crate::capture_records::nested_config_names(extension) {
             for dir in Path::new(source).ancestors().skip(1) {
                 let key = format!("config:{}/{manifest}", dir.to_string_lossy());
                 if !dir.as_os_str().is_empty() && actual.contains(&key) {
@@ -11779,8 +11786,8 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
     );
     // Revisions published before the extractor producer hash lack it; they
     // stay readable and simply never qualify for rebuilt-executable reuse.
-    if actual.contains(crate::capture::EXTRACTOR_INPUT_KEY) {
-        expected.insert(crate::capture::EXTRACTOR_INPUT_KEY.to_owned());
+    if actual.contains(crate::capture_records::EXTRACTOR_INPUT_KEY) {
+        expected.insert(crate::capture_records::EXTRACTOR_INPUT_KEY.to_owned());
     }
     control_ensure!(
         actual == expected,
@@ -15966,7 +15973,7 @@ impl Store {
                 && capture
                     .source_operations
                     .values()
-                    .all(crate::capture::SourceOperations::read_once),
+                    .all(crate::capture_records::SourceOperations::read_once),
             "native_evidence_required: each source must open and read at most once, and hash once"
         );
         ensure!(
@@ -16463,7 +16470,7 @@ impl Store {
                 && capture
                     .source_operations
                     .values()
-                    .all(crate::capture::SourceOperations::read_once),
+                    .all(crate::capture_records::SourceOperations::read_once),
             "native_evidence_required: incomplete selected capture"
         );
         let mut native = prepared.native.clone();
@@ -16626,7 +16633,7 @@ impl Store {
                 && capture
                     .source_operations
                     .values()
-                    .all(crate::capture::SourceOperations::read_once),
+                    .all(crate::capture_records::SourceOperations::read_once),
             "native_evidence_required: each source must open and read at most once, and hash once"
         );
         crate::indexer::validate_native_graph(graph, capture, native, cancel)?;
@@ -17090,7 +17097,7 @@ impl Store {
                 && capture
                     .source_operations
                     .values()
-                    .all(crate::capture::SourceOperations::read_once),
+                    .all(crate::capture_records::SourceOperations::read_once),
             "native_evidence_required: final inventory must freshly read and hash every admitted source"
         );
         leader.belongs_to(&self.identity)?;
@@ -17164,7 +17171,7 @@ impl Store {
                 && capture
                     .source_operations
                     .values()
-                    .all(crate::capture::SourceOperations::read_once),
+                    .all(crate::capture_records::SourceOperations::read_once),
             "native_evidence_required: every unchanged source must be read and hashed"
         );
         let db = self.cache_write()?;
@@ -21656,7 +21663,7 @@ impl Store {
         }
         let truncated = truncated || byte_limited;
         if let Some(path) = path
-            && !crate::capture::language_of_path(Path::new(path))
+            && !crate::capture_records::language_of_path(Path::new(path))
                 .is_some_and(crate::classes::supports_language)
         {
             warnings.push(

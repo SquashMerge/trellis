@@ -109,6 +109,10 @@ paths = [
   # exact-match policy, the query budget and its error, the vector width and the phase
   # timer (S4, #1003). Ranking, the embedder and model ownership stay in the query layer.
   "src/search_vocab.rs",
+  # The capture records storage persists and compares, the root, nested-config and
+  # source-extension input tables and the per-source read counters (S4b, #1003).
+  # Admission, the walk and `Capture` stay in capture.rs.
+  "src/capture_records.rs",
 ]
 
 # Coarse developer-tool boundary; does not infer internal tooling architecture.
