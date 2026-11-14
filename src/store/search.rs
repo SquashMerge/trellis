@@ -211,7 +211,7 @@ pub(super) fn publish_head(db: &Connection, revision: &str) -> Result<()> {
 pub struct SearchHeadDelta {
     pub pin: IndexPin,
     pub removed_version_ids: Vec<i64>,
-    pub added: std::sync::Arc<[crate::search_rank::SearchCandidate]>,
+    pub added: std::sync::Arc<[crate::search_vocab::SearchCandidate]>,
     /// Required head corpus count; callers validate their patched membership
     /// against it before publishing a new in-memory matrix.
     pub head_card_count: usize,
@@ -232,12 +232,12 @@ impl std::error::Error for SearchDeltaColdRebuild {}
 #[derive(Debug)]
 pub struct McpSearchCandidates {
     pub pin: IndexPin,
-    pub cards: Vec<crate::search_rank::SearchCandidate>,
-    pub lexical: Vec<crate::search_rank::SearchCandidateKey>,
+    pub cards: Vec<crate::search_vocab::SearchCandidate>,
+    pub lexical: Vec<crate::search_vocab::SearchCandidateKey>,
 }
 
-fn search_candidate(row: &rusqlite::Row<'_>) -> Result<crate::search_rank::SearchCandidate> {
-    use crate::search_rank::{SearchCandidate, SearchCandidateKey};
+fn search_candidate(row: &rusqlite::Row<'_>) -> Result<crate::search_vocab::SearchCandidate> {
+    use crate::search_vocab::{SearchCandidate, SearchCandidateKey};
     let card_hash: String = row.get(2)?;
     ensure!(
         card_hash.len() == 64
@@ -302,8 +302,8 @@ fn search_lexical_sql(has_expression: bool) -> String {
     )
 }
 
-fn search_role_filter(role: crate::search_rank::SearchRole) -> Option<&'static str> {
-    use crate::search_rank::SearchRole;
+fn search_role_filter(role: crate::search_vocab::SearchRole) -> Option<&'static str> {
+    use crate::search_vocab::SearchRole;
     match role {
         SearchRole::Any => None,
         SearchRole::Production => Some("production"),
@@ -399,7 +399,7 @@ impl EvidenceResponse {
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<(
         IndexPin,
-        std::sync::Arc<[crate::search_rank::SearchCandidate]>,
+        std::sync::Arc<[crate::search_vocab::SearchCandidate]>,
     )> {
         self.mcp_search_head_admitted(expected, check, &mut |_| Ok(()))
     }
@@ -411,7 +411,7 @@ impl EvidenceResponse {
         admit: &mut dyn FnMut(usize) -> Result<()>,
     ) -> Result<(
         IndexPin,
-        std::sync::Arc<[crate::search_rank::SearchCandidate]>,
+        std::sync::Arc<[crate::search_vocab::SearchCandidate]>,
     )> {
         self.search_read(check, |check| {
             let selected = self.store.read_revision_for(&self.db, None, true)?;
@@ -431,7 +431,7 @@ impl EvidenceResponse {
                 "store_unavailable: invalid head search count".into(),
             ))?;
             admit(count)?;
-            let _phase = crate::search_model::SearchPhaseTimer::start("head_candidates");
+            let _phase = crate::search_vocab::SearchPhaseTimer::start("head_candidates");
             let mut statement = self.db.prepare(
                 "SELECT c.vid,c.syntax_id,c.card_hash,d.role
                  FROM native_version_search_cards c
@@ -524,7 +524,7 @@ impl EvidenceResponse {
             // still an integrity failure, never permission for a cold fallback.
             self.store
                 .read_revision_for(&self.db, Some(previous), true)?;
-            let _phase = crate::search_model::SearchPhaseTimer::start("head_delta");
+            let _phase = crate::search_vocab::SearchPhaseTimer::start("head_delta");
             let added_count: i64 = self.db.query_row(
                 "WITH added(vid) AS (SELECT vid FROM revision_documents WHERE revision_id=?1
                  EXCEPT SELECT vid FROM revision_documents WHERE revision_id=?2)
@@ -661,16 +661,16 @@ impl EvidenceResponse {
         &self,
         query: &str,
         expected: IndexPin,
-        role: crate::search_rank::SearchRole,
+        role: crate::search_vocab::SearchRole,
         check: &mut impl FnMut() -> Result<()>,
-    ) -> Result<crate::search_rank::SearchPolicy> {
+    ) -> Result<crate::search_vocab::SearchPolicy> {
         self.search_read(check, |check| {
             let selected = self.store.read_revision_for(&self.db, None, true)?;
             ensure!(
                 selected.pin == expected,
                 "revision conflict: expected basis differs from admitted head"
             );
-            let mut policy = crate::search_rank::SearchPolicy {
+            let mut policy = crate::search_vocab::SearchPolicy {
                 exact: BTreeMap::new(),
                 role,
             };
@@ -684,7 +684,7 @@ impl EvidenceResponse {
             ])?;
             while let Some(row) = rows.next()? {
                 check()?;
-                let key = crate::search_rank::SearchCandidateKey {
+                let key = crate::search_vocab::SearchCandidateKey {
                     version_id: row.get(0)?,
                     syntax_id: stored_id_row(row, 1, false)?,
                 };
@@ -705,10 +705,10 @@ impl EvidenceResponse {
         query: &str,
         expected: IndexPin,
         expected_cards: usize,
-        policy: &crate::search_rank::SearchPolicy,
+        policy: &crate::search_vocab::SearchPolicy,
         check: &mut impl FnMut() -> Result<()>,
-    ) -> Result<Vec<crate::search_rank::SearchCandidateKey>> {
-        use crate::search_rank::{CANDIDATE_DEPTH, SearchCandidateKey};
+    ) -> Result<Vec<crate::search_vocab::SearchCandidateKey>> {
+        use crate::search_vocab::{CANDIDATE_DEPTH, SearchCandidateKey};
         self.search_read(check, |check| {
             let selected = self.store.read_revision_for(&self.db, None, true)?;
             ensure!(
@@ -719,7 +719,7 @@ impl EvidenceResponse {
                 search_head_count(&self.db)? == expected_cards,
                 SelectedIntegrity("store_unavailable: head search corpus mismatch".into())
             );
-            let _phase = crate::search_model::SearchPhaseTimer::start("lexical_search");
+            let _phase = crate::search_vocab::SearchPhaseTimer::start("lexical_search");
             let expression = crate::search_lexical::query_expression(&self.db, query)?;
             let sql = search_lexical_sql(expression.is_some());
             let mut statement = self.db.prepare(&sql)?;
@@ -785,7 +785,7 @@ impl EvidenceResponse {
         &self,
         query: &str,
         expected: Option<IndexPin>,
-        policy: &crate::search_rank::SearchPolicy,
+        policy: &crate::search_vocab::SearchPolicy,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<McpSearchCandidates> {
         let (pin, cards) = self.mcp_search_head(expected, check)?;
@@ -801,11 +801,11 @@ impl EvidenceResponse {
     /// The caller sets has_more from the complete fused arm union before clipping.
     pub fn mcp_search_hydrate(
         &self,
-        keys: &[crate::search_rank::SearchCandidateKey],
+        keys: &[crate::search_vocab::SearchCandidateKey],
         expected: IndexPin,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<super::mcp_read::McpFindWithLines> {
-        let _phase = crate::search_model::SearchPhaseTimer::start("search_hydration");
+        let _phase = crate::search_vocab::SearchPhaseTimer::start("search_hydration");
         ensure!(keys.len() <= 50, "invalid_request: search hydration limit");
         self.search_read(check, |check| {
             let selected = self.store.read_revision_for(&self.db, None, true)?;
