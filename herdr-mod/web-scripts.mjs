@@ -23,6 +23,8 @@ const WEB = {
   "architecture-deviations": { file: "architecture-deviations.js", params: "window, document", result: "window.TrellisDeviations" },
   // What the Pele adapters share (SVG admission, button semantics, the text measurer); they read it from `window`, so load it first.
   "pele-svg": { file: "pele-svg.js", params: "window, document, DOMParser, TextEncoder", result: "window.TrellisPeleSvg" },
+  // The arrow routing arithmetic the Architecture adapter reads from `window` (pure); load it first.
+  "architecture-routing": { file: "architecture-routing.js", params: "window", result: "window.TrellisArchitectureRouting" },
   "architecture-pele": { file: "architecture-pele.js", params: "window, document, DOMParser, TextEncoder", result: "window.TrellisArchitecturePele" },
   // The shared source-range check the two Sequence scripts read from `window`; load it first.
   "source-witness": { file: "source-witness.js", params: "window", result: "window.TrellisSourceWitness" },

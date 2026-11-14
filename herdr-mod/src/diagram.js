@@ -10,6 +10,7 @@ import makeMetricHeat from "trellis-web:metric-heat";
 import makeApps from "trellis-web:architecture-apps";
 import makeArchitecture from "trellis-web:architecture";
 import makePeleSvg from "trellis-web:pele-svg";
+import makeArchitectureRouting from "trellis-web:architecture-routing";
 import makeArchitecturePele from "trellis-web:architecture-pele";
 import makeDeviations from "trellis-web:architecture-deviations";
 import TOKENS from "trellis-web:tokens";
@@ -22,9 +23,10 @@ export { measure } from "./runtime.js";
 export const heat = makeMetricHeat({});
 export const apps = makeApps({});
 const helpers = makeArchitecture({ TrellisMetricHeat: heat, TrellisArchitectureApps: apps }, document);
-// The adapter reads the shared Pele helpers from its window.
+// The adapter reads the shared Pele helpers and the arrow routing from its window.
 const env = { pele };
 makePeleSvg(env, document, DOMParser, TextEncoder);
+makeArchitectureRouting(env);
 const adapter = makeArchitecturePele(env, document, DOMParser, TextEncoder);
 /** The Deviations tree's pure model (web/architecture-deviations.js). */
 export const deviationModel = makeDeviations({}, document).model;

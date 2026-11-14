@@ -2350,6 +2350,11 @@ pub const WEB_ASSETS: &[WebAsset] = &[
         include_bytes!("../web/architecture.js"),
     ),
     web_asset(
+        "/architecture-routing.js",
+        JS,
+        include_bytes!("../web/architecture-routing.js"),
+    ),
+    web_asset(
         "/architecture-pele.js",
         JS,
         include_bytes!("../web/architecture-pele.js"),

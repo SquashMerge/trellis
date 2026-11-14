@@ -10,11 +10,11 @@ const root = path.resolve(__dirname, "../..");
 const summary = JSON.parse(fs.readFileSync(path.join(root, "tests/fixtures/architecture/trellis-summary.json"), "utf8"));
 
 async function withPage(callback) {
-  const routes = {"/vendor.js":"web/vendor/pele-1.10.0-trellis.2.js", "/pele-svg.js":"web/pele-svg.js", "/adapter.js":"web/architecture-pele.js"};
+  const routes = {"/vendor.js":"web/vendor/pele-1.10.0-trellis.2.js", "/pele-svg.js":"web/pele-svg.js", "/routing.js":"web/architecture-routing.js", "/adapter.js":"web/architecture-pele.js"};
   const server = http.createServer((req, res) => {
     res.setHeader("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; connect-src 'self'; img-src 'self'");
     if (routes[req.url]) { res.setHeader("Content-Type", "text/javascript; charset=utf-8"); res.end(fs.readFileSync(path.join(root, routes[req.url]))); }
-    else { res.setHeader("Content-Type", "text/html; charset=utf-8"); res.end('<!doctype html><div id="canvas"></div><script src="/vendor.js"></script><script src="/pele-svg.js"></script><script src="/adapter.js"></script>'); }
+    else { res.setHeader("Content-Type", "text/html; charset=utf-8"); res.end('<!doctype html><div id="canvas"></div><script src="/vendor.js"></script><script src="/pele-svg.js"></script><script src="/routing.js"></script><script src="/adapter.js"></script>'); }
   });
   await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
   let browser;

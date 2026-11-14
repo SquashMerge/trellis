@@ -2,7 +2,7 @@
 const test = require("node:test"), assert = require("node:assert/strict"), fs = require("node:fs"), vm = require("node:vm");
 function setup() {
   const window = {};
-  vm.runInNewContext(["web/pele-svg.js","web/architecture-pele.js"].map(file=>fs.readFileSync(file,"utf8")).join("\n"),{window,TextEncoder});
+  vm.runInNewContext(["web/pele-svg.js","web/architecture-routing.js","web/architecture-pele.js"].map(file=>fs.readFileSync(file,"utf8")).join("\n"),{window,TextEncoder});
   const vendor = vm.createContext({}); vm.runInContext(fs.readFileSync("web/vendor/pele-1.10.0-trellis.2.js","utf8"),vendor);
   return {adapter:window.TrellisArchitecturePele,pele:vendor.pele};
 }
