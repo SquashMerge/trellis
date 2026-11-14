@@ -1,7 +1,6 @@
 //! SQLite index snapshots and request queues. Connections are never shared between threads.
 pub mod anchors;
 pub(crate) mod captured_witness;
-mod graph_read;
 pub(crate) mod id_codec;
 pub(crate) mod mcp_read;
 mod native_join_budget;
@@ -14,10 +13,9 @@ mod published_admission;
 pub mod requests;
 mod search;
 mod search_startup;
-mod semantic_display;
-mod semantic_payload;
+pub(crate) mod semantic_display;
+pub(crate) mod semantic_payload;
 mod semantic_retention;
-mod sequence_hops;
 pub(crate) use search::SEARCH_CARD_BATCH_SIZE;
 pub use search::{
     HeadSearchCard, HeadSearchCards, McpSearchCandidates, SearchDeltaColdRebuild,
@@ -34,7 +32,6 @@ pub use semantic_display::{
     ProducerNotPublished, ProducerSelection, relabel_status,
 };
 pub use semantic_retention::AutoRunHead;
-pub(crate) use sequence_hops::{InterfaceEvidence, call_ids as sequence_call_ids};
 pub(crate) mod symbol_trigrams;
 pub mod topology;
 use crate::model::*;
@@ -1414,10 +1411,10 @@ impl InventoryStream<'_> {
 
 /// One selected document's source and native rows with the graph projected
 /// from them once.
-struct SelectedDocument {
-    file: SourceFile,
-    nodes: Vec<Symbol>,
-    graph_calls: Vec<CallSite>,
+pub(crate) struct SelectedDocument {
+    pub(crate) file: SourceFile,
+    pub(crate) nodes: Vec<Symbol>,
+    pub(crate) graph_calls: Vec<CallSite>,
     graph_regions: Vec<ControlRegion>,
 }
 
@@ -1441,6 +1438,11 @@ impl ReadRevision {
             key,
             headers: Arc::default(),
         }
+    }
+    /// [`Self::new`] for the query-layer tests that read through a selected revision.
+    #[cfg(test)]
+    pub(crate) fn for_tests(pin: IndexPin, key: String) -> Self {
+        Self::new(pin, key)
     }
     /// `selected_producer_hash`, computed once for this selected revision.
     /// A failure is not memoized: it fails the read and is recomputed if retried.
@@ -2003,18 +2005,6 @@ impl EvidenceResponse {
             .selected_source_row_for(&self.db, path, &selected)?;
         Ok(source.map(|source| (selected.pin, source)))
     }
-    pub fn query_view(&self, query: &ViewQuery) -> Result<Option<ViewResult>> {
-        self.query_view_at(query, None)
-    }
-    pub fn query_view_at(
-        &self,
-        query: &ViewQuery,
-        expected: Option<&IndexPin>,
-    ) -> Result<Option<ViewResult>> {
-        query.validate()?;
-        self.store
-            .query_view_in_for(&self.db, query, expected, true)
-    }
     pub fn tree_metadata(
         &self,
         root: &Path,
@@ -2072,47 +2062,6 @@ impl EvidenceResponse {
         request: &crate::files_view::SyntaxMatchesRequest,
     ) -> Result<Option<crate::files_view::SyntaxMatches>> {
         self.store.syntax_matches_in(&self.db, request, true)
-    }
-    pub fn sequence_at(
-        &self,
-        seed: &str,
-        expected: IndexPin,
-        show_all: bool,
-    ) -> Result<Option<crate::behavior::SequenceView>> {
-        self.store
-            .sequence_in(&self.db, seed, expected, show_all, false, true)
-    }
-    /// The candidates of the browser's Interactions view (#663): see [`Store::sequence_interactions_at`].
-    pub fn sequence_interactions_at(
-        &self,
-        seed: &str,
-        expected: IndexPin,
-    ) -> Result<Option<crate::behavior::SequenceView>> {
-        self.store
-            .sequence_in(&self.db, seed, expected, false, true, true)
-    }
-    pub fn classes_at(
-        &self,
-        path: Option<&str>,
-        query: &str,
-        expected: Option<IndexPin>,
-        offset: usize,
-        limit: usize,
-    ) -> Result<crate::class_diagram::ClassPage> {
-        self.store
-            .classes_in(&self.db, path, query, expected, (offset, limit), true)
-    }
-    pub fn navigation_at(
-        &self,
-        request: &crate::navigation::NavigationRequest,
-    ) -> Result<crate::navigation::NavigationResult> {
-        self.store.navigation_in(&self.db, request, true)
-    }
-    pub fn class_diagram_at(
-        &self,
-        request: &crate::class_diagram::ClassDiagramRequest,
-    ) -> Result<crate::class_diagram::ClassDiagram> {
-        self.store.class_diagram_in(&self.db, request, true)
     }
     pub fn symbols_at(&self, query: &str, limit: usize) -> Result<(IndexPin, Vec<Symbol>)> {
         self.store.symbols_in(&self.db, query, limit, true)
@@ -3545,10 +3494,6 @@ mod admit_once_tests;
 #[cfg(test)]
 mod published_admission_tests;
 #[cfg(test)]
-mod sequence_callback_hops_tests;
-#[cfg(test)]
-mod sequence_hops_tests;
-#[cfg(test)]
 mod terminal_status_contention_tests;
 #[cfg(test)]
 thread_local! {
@@ -3942,7 +3887,10 @@ fn validate_graph(graph: &Graph, cancel: &CancelFlag) -> Result<IndexStats> {
     Ok(stats)
 }
 
-fn class_metadata(db: &Connection, selected: &ReadRevision) -> Result<(Vec<String>, bool)> {
+pub(crate) fn class_metadata(
+    db: &Connection,
+    selected: &ReadRevision,
+) -> Result<(Vec<String>, bool)> {
     let length: i64 = db.query_row(
         "SELECT length(CAST(class_warnings AS BLOB)) FROM native_revisions WHERE id=?1",
         [&selected.key],
@@ -3972,195 +3920,6 @@ fn class_metadata(db: &Connection, selected: &ReadRevision) -> Result<(Vec<Strin
         visible.push(warning);
     }
     Ok((visible, truncated))
-}
-/// Read at most 64 KiB of class JSON into Rust. Large member arrays are
-/// clipped in SQLite, without materializing their full strings in the API.
-/// IDs, class metadata, and source ranges remain exact; only member arrays shrink.
-fn presentation_class(
-    store: &Store,
-    db: &Connection,
-    id: &str,
-    selected: &ReadRevision,
-) -> Result<Option<(crate::model::ClassDefinition, usize, bool)>> {
-    use crate::class_diagram::CLASS_BYTES;
-    let size: Option<i64> = db
-        .query_row(
-            "SELECT length(CAST(payload AS BLOB)) FROM classes JOIN revision_documents m ON m.revision_id=?2 AND m.cid=classes.cid WHERE classes.id=?1",
-            params![id_codec::encode_sid(id), selected.key],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(|error| store.report_index_failure(error.into()))?;
-    let Some(size) = size else {
-        return Ok(None);
-    };
-    let valid: bool = db
-        .query_row(
-            "SELECT json_valid(payload) FROM classes JOIN revision_documents m ON m.revision_id=?2 AND m.cid=classes.cid WHERE classes.id=?1",
-            params![id_codec::encode_sid(id), selected.key],
-            |r| r.get(0),
-        )
-        .map_err(|error| store.report_index_failure(error.into()))?;
-    if !valid {
-        return Err(store.report_index_failure(
-            SelectedIntegrity("incompatible_index: selected class JSON invalid".into()).into(),
-        ));
-    }
-    if size <= CLASS_BYTES as i64 {
-        let payload: String = db
-            .query_row("SELECT payload FROM classes JOIN revision_documents m ON m.revision_id=?2 AND m.cid=classes.cid WHERE classes.id=?1", params![id_codec::encode_sid(id), selected.key], |r| {
-                r.get(0)
-            })
-            .map_err(|error| store.report_index_failure(error.into()))?;
-        let class = serde_json::from_str(&payload)
-            .context(SelectedIntegrity(
-                "incompatible_index: stored JSON decode failed".into(),
-            ))
-            .map_err(|error| store.report_index_failure(error))?;
-        return Ok(Some((class, payload.len(), false)));
-    }
-    let clip_shape: bool = db
-        .query_row(
-            "SELECT json_type(payload,'$.fields')='array'
-                AND json_type(payload,'$.methods')='array'
-                AND NOT EXISTS(SELECT 1 FROM json_each(payload,'$.fields') WHERE type!='object')
-                AND NOT EXISTS(SELECT 1 FROM json_each(payload,'$.methods') WHERE type!='object')
-             FROM classes JOIN revision_documents m ON m.revision_id=?2 AND m.cid=classes.cid WHERE classes.id=?1",
-            params![id_codec::encode_sid(id), selected.key],
-            |r| r.get(0),
-        )
-        .map_err(|error| store.report_index_failure(error.into()))?;
-    if !clip_shape {
-        return Err(store.report_index_failure(
-            SelectedIntegrity("incompatible_index: selected class member JSON invalid".into())
-                .into(),
-        ));
-    }
-    for count in [32, 16, 8, 4, 2, 1, 0] {
-        let payload: Option<String> = db.query_row("WITH clipped AS (
-            SELECT json_set(payload,
-                '$.fields',(SELECT json_group_array(json(value)) FROM json_each(classes.payload,'$.fields') WHERE key < ?2),
-                '$.methods',(SELECT json_group_array(json(value)) FROM json_each(classes.payload,'$.methods') WHERE key < ?2),
-                '$.truncated',json('true')) AS payload FROM classes JOIN revision_documents m ON m.revision_id=?4 AND m.cid=classes.cid WHERE classes.id=?1)
-            SELECT CASE WHEN length(CAST(payload AS BLOB)) <= ?3 THEN payload ELSE NULL END FROM clipped",
-            params![id_codec::encode_sid(id), count, CLASS_BYTES as i64, selected.key], |r| r.get(0))
-            .map_err(|error| store.report_index_failure(error.into()))?;
-        if let Some(payload) = payload {
-            let class = serde_json::from_str(&payload)
-                .context(SelectedIntegrity(
-                    "incompatible_index: stored JSON decode failed".into(),
-                ))
-                .map_err(|error| store.report_index_failure(error))?;
-            return Ok(Some((class, payload.len(), true)));
-        }
-    }
-    // Pathological non-member metadata cannot fit without changing identity.
-    Ok(None)
-}
-fn resolve_class_id(
-    store: &Store,
-    db: &Connection,
-    id: &str,
-    selected: &ReadRevision,
-) -> Result<String> {
-    let lexical = lexical_class_id(store, db, id, selected);
-    match &lexical {
-        Ok(_) => return lexical,
-        // Only a missing class ancestor falls back; storage and integrity
-        // failures stay what they are.
-        Err(error)
-            if error
-                .downcast_ref::<crate::class_diagram::InvalidRequest>()
-                .is_none() =>
-        {
-            return lexical;
-        }
-        Err(_) => {}
-    }
-    // A Rust method's measured parent is its `impl` block, which is not a class.
-    // Composition recorded the method on exactly one class (#452): use it.
-    let owners: Vec<Vec<u8>> = db
-        .prepare(
-            "SELECT DISTINCT c.id FROM classes c JOIN revision_documents m ON m.revision_id=?2 AND m.cid=c.cid,
-             json_each(c.payload,'$.methods') j WHERE m.language='rust' AND json_extract(j.value,'$.symbolId')=?1 LIMIT 2",
-        )
-        .map_err(|error| store.report_index_failure(error.into()))?
-        .query_map(params![id, selected.key], |r| r.get(0))
-        .map_err(|error| store.report_index_failure(error.into()))?
-        .collect::<rusqlite::Result<_>>()
-        .map_err(|error| store.report_index_failure(error.into()))?;
-    match owners.as_slice() {
-        [owner] => id_codec::decode_sid(owner).context(SelectedIntegrity(
-            "incompatible_index: stored class id decode failed".into(),
-        )),
-        _ => lexical,
-    }
-}
-fn lexical_class_id(
-    store: &Store,
-    db: &Connection,
-    id: &str,
-    selected: &ReadRevision,
-) -> Result<String> {
-    use crate::class_diagram::InvalidRequest;
-    let mut current = id.to_owned();
-    let mut seen = BTreeSet::new();
-    let mut document: Option<SelectedDocument> = None;
-    for depth in 0..64 {
-        ensure!(
-            seen.insert(current.clone()),
-            InvalidRequest("The selected symbol has a cyclic class ancestry.")
-        );
-        if depth > 0 {
-            ensure!(
-                document
-                    .as_ref()
-                    .is_some_and(|doc| doc.nodes.iter().any(|node| node.id == current)),
-                InvalidRequest("Choose an indexed class or method.")
-            );
-        }
-        if db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM classes c JOIN revision_documents m ON m.revision_id=?2 AND m.cid=c.cid WHERE c.id=?1)",
-            params![id_codec::encode_sid(&current), selected.key],
-            |r| r.get::<_, bool>(0),
-        )? {
-            return Ok(current);
-        }
-        if document.is_none() {
-            let path: Option<String> = db.query_row(
-                "SELECT m.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.gid=n.gid WHERE n.id=?1",
-                params![id_codec::encode_sid(&current), selected.key], |r| r.get(0),
-            ).optional().map_err(|error| store.report_index_failure(error.into()))?;
-            document = path
-                .map(|path| store.selected_graph_document_for(db, &path, selected))
-                .transpose()?;
-        }
-        let symbol = document
-            .as_ref()
-            .and_then(|doc| doc.nodes.iter().find(|node| node.id == current))
-            .ok_or(InvalidRequest("Choose an indexed class or method."))?;
-        ensure!(
-            depth > 0 || matches!(symbol.kind, SymbolKind::Method | SymbolKind::Function),
-            InvalidRequest("Choose an indexed class or method.")
-        );
-        current = symbol.parent.clone().ok_or(InvalidRequest(
-            "The selected method has no supported enclosing class.",
-        ))?;
-    }
-    Err(InvalidRequest("The selected symbol exceeds the class ancestry limit.").into())
-}
-
-fn resolve_class(
-    store: &Store,
-    db: &Connection,
-    id: &str,
-    selected: &ReadRevision,
-) -> Result<(crate::model::ClassDefinition, bool)> {
-    let id = resolve_class_id(store, db, id, selected)?;
-    let (class, _, clipped) = presentation_class(store, db, &id, selected)?.ok_or(
-        crate::class_diagram::InvalidRequest("Class metadata exceeds the presentation byte limit."),
-    )?;
-    Ok((class, clipped))
 }
 
 fn v8_id(prefix: &str, domain: &[u8], value: serde_json::Value) -> String {
@@ -5542,7 +5301,7 @@ fn pending_release_reheld(db: &Connection, revision: &str) -> Result<bool> {
     )?)
 }
 
-fn semantic_pin_key(pin: IndexPin) -> String {
+pub(crate) fn semantic_pin_key(pin: IndexPin) -> String {
     format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision)
 }
 
@@ -5911,7 +5670,7 @@ fn read_semantic(db: &Connection, key: &str) -> Result<crate::semantic_records::
     read_semantic_tuple(db, key, None, None, false)
 }
 
-fn read_semantic_tuple(
+pub(crate) fn read_semantic_tuple(
     db: &Connection,
     key: &str,
     selected_tuple: Option<i64>,
@@ -5928,7 +5687,7 @@ fn read_semantic_tuple(
     )
 }
 
-fn read_semantic_tuple_for_call(
+pub(crate) fn read_semantic_tuple_for_call(
     db: &Connection,
     key: &str,
     selected_tuple: Option<i64>,
@@ -6213,7 +5972,7 @@ fn read_semantic_tuple_with_reasons(
     Ok(result)
 }
 
-fn read_semantic_history(
+pub(crate) fn read_semantic_history(
     db: &Connection,
     key: &str,
     index_revision: u64,
@@ -9847,16 +9606,35 @@ fn validate_paired_rows(db: &Connection) -> Result<()> {
 }
 
 #[derive(Clone)]
-struct V8NativeScope {
+pub(crate) struct V8NativeScope {
     revision_key: String, // internal pin:v1 generation/revision key
-    version_id: String,
-    vid: i64,
-    key: crate::native_records::DocumentKey,
-    native_revision_id: String,
-    producer_id: String,
+    pub(crate) version_id: String,
+    pub(crate) vid: i64,
+    pub(crate) key: crate::native_records::DocumentKey,
+    pub(crate) native_revision_id: String,
+    pub(crate) producer_id: String,
 }
 impl V8NativeScope {
-    fn proof_id(&self) -> String {
+    /// A scope built field by field, for the query-layer tests that read through one.
+    #[cfg(test)]
+    pub(crate) fn for_tests(
+        revision_key: String,
+        version_id: String,
+        vid: i64,
+        key: crate::native_records::DocumentKey,
+        native_revision_id: String,
+        producer_id: String,
+    ) -> Self {
+        Self {
+            revision_key,
+            version_id,
+            vid,
+            key,
+            native_revision_id,
+            producer_id,
+        }
+    }
+    pub(crate) fn proof_id(&self) -> String {
         format!(
             "native-proof:v1:{}",
             crate::native_ids::digest(
@@ -9871,7 +9649,7 @@ impl V8NativeScope {
 }
 // Decode compact ID columns at the SQLite row boundary. A malformed stored
 // BLOB is a corrupt index, not a malformed caller selector.
-fn stored_id_row(
+pub(crate) fn stored_id_row(
     row: &rusqlite::Row<'_>,
     index: usize,
     occurrence: bool,
@@ -9904,7 +9682,7 @@ fn optional_stored_id_row(
     stored_id_row(row, index, occurrence).map(Some)
 }
 
-fn v8_native_scope_for(
+pub(crate) fn v8_native_scope_for(
     db: &Connection,
     key: &crate::native_records::DocumentKey,
     selected: &ReadRevision,
@@ -9946,7 +9724,7 @@ fn v8_native_scope_for(
     ))
 }
 
-fn v8_owner_scope_for(
+pub(crate) fn v8_owner_scope_for(
     db: &Connection,
     owner: &str,
     selected: &ReadRevision,
@@ -10027,7 +9805,7 @@ fn decode_signature(
 }
 // This reads the WHOLE selected version, checks every child, THEN filters lookup keys.
 // It cannot accidentally skip bad children attached to a declaration outside a lookup filter.
-fn read_native_declarations_v8(
+pub(crate) fn read_native_declarations_v8(
     db: &Connection,
     scope: &V8NativeScope,
     lookup_key: Option<&str>,
@@ -10363,7 +10141,7 @@ fn read_native_declarations_v8_inner(
     Ok(result)
 }
 
-fn read_native_coverage_v8(
+pub(crate) fn read_native_coverage_v8(
     db: &Connection,
     scope: &V8NativeScope,
 ) -> Result<crate::native_records::Coverage> {
@@ -10394,7 +10172,7 @@ fn read_native_coverage_v8(
     })
 }
 // Reads all version rows, verifies all child edges, then selects the requested owner.
-fn read_native_calls_v8(
+pub(crate) fn read_native_calls_v8(
     db: &Connection,
     scope: &V8NativeScope,
     owner: Option<&str>,
@@ -13060,7 +12838,10 @@ impl Store {
         self.metrics_memo.lock().unwrap().len()
     }
 
-    fn with_evidence<T>(&self, read: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    pub(crate) fn with_evidence<T>(
+        &self,
+        read: impl FnOnce(&Connection) -> Result<T>,
+    ) -> Result<T> {
         self.with_evidence_hook(read, || Ok(()))
     }
     fn with_evidence_hook<T>(
@@ -17219,7 +17000,7 @@ impl Store {
     fn read_revision(&self, db: &Connection, expected: Option<IndexPin>) -> Result<ReadRevision> {
         self.read_revision_for(db, expected, false)
     }
-    fn read_revision_for(
+    pub(crate) fn read_revision_for(
         &self,
         db: &Connection,
         expected: Option<IndexPin>,
@@ -18510,7 +18291,7 @@ impl Store {
     }
     /// Read one selected document and project its graph once from the stored
     /// native rows.
-    fn selected_graph_document_for(
+    pub(crate) fn selected_graph_document_for(
         &self,
         db: &Connection,
         path: &str,
@@ -19344,343 +19125,6 @@ impl Store {
             }
         })
     }
-    /// Search only the persisted projection. Wildcards are literal user text.
-    /// One read snapshot and revision guard; no source reads or catalog rebuilds.
-    pub fn navigation_at(
-        &self,
-        request: &crate::navigation::NavigationRequest,
-    ) -> Result<crate::navigation::NavigationResult> {
-        self.with_evidence(|tx| self.navigation_in(tx, request, false))
-    }
-    fn navigation_in(
-        &self,
-        tx: &Connection,
-        request: &crate::navigation::NavigationRequest,
-        pre_startup: bool,
-    ) -> Result<crate::navigation::NavigationResult> {
-        request.validate()?;
-        let selected =
-            self.read_revision_for(tx, Some(request.expected_revision()), pre_startup)?;
-        let revision = selected.pin;
-        // Policy selection is local to this exact selected snapshot, never the head.
-        // The policy selects the source document language's sole covering producer (#483).
-        let mut producer_bytes = Vec::new();
-        let mut multiple_producers = None;
-        let effective_request = match request {
-            crate::navigation::NavigationRequest::Source(selector)
-                if selector.semantic_producer_policy.is_some() =>
-            {
-                let language: Option<String> = tx
-                    .query_row(
-                        "SELECT language FROM revision_documents WHERE revision_id=?1 AND path=?2 ORDER BY language LIMIT 1",
-                        params![selected.key, selector.path],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                let mut ids = Vec::new();
-                if let Some(language) = &language {
-                    let selection = semantic_display::select_producers(tx, &selected.key, None)?;
-                    for producer in selection.covering(language).iter().take(2) {
-                        let bytes = serde_json::to_vec(producer)?.len();
-                        selected_ensure!(
-                            bytes <= crate::navigation::RECORD_BYTES as usize,
-                            "selected semantic producer exceeds navigation budget"
-                        );
-                        producer_bytes.push(bytes);
-                        ids.push(producer.clone());
-                    }
-                }
-                if ids.len() > 1 {
-                    multiple_producers = language
-                        .as_deref()
-                        .map(crate::graph_query::multiple_producers_note);
-                }
-                let mut selector = selector.clone();
-                selector.semantic_producer_policy = None;
-                selector.semantic_producer_id = if ids.len() == 1 { ids.pop() } else { None };
-                Some(crate::navigation::NavigationRequest::Source(selector))
-            }
-            _ => None,
-        };
-        let request = effective_request.as_ref().unwrap_or(request);
-        // Navigation's source selector counts lines from the stored source BLOB,
-        // and its member selector reads versioned class/node rows. Before either
-        // consumes a selected document, authenticate it against that source BLOB
-        // in this same read transaction. Never scan the entire workspace here.
-        let selected_path: Option<String> = match request {
-            crate::navigation::NavigationRequest::Source(s) => Some(s.path.clone()),
-            crate::navigation::NavigationRequest::Member(s) => {
-                // The member's measured declaration lives in the member's own
-                // document, which a Rust impl merge (#452) can make another file
-                // than the class's. Read it from the one recorded member row.
-                let paths: Vec<String> = tx
-                    .prepare(
-                        "SELECT DISTINCT json_extract(m.value,'$.path') FROM classes c
-                         JOIN revision_documents d ON d.revision_id=?5 AND d.cid=c.cid,
-                         json_each(c.payload) a, json_each(a.value) m
-                         WHERE c.id=?1 AND a.key IN ('fields','methods')
-                         AND json_extract(m.value,'$.name')=?2
-                         AND json_extract(m.value,'$.range.startByte')=?3 AND json_extract(m.value,'$.range.endByte')=?4
-                         AND (?6 IS NULL OR json_extract(m.value,'$.path')=?6) LIMIT 2",
-                    )?
-                    .query_map(
-                        params![
-                            id_codec::encode_sid(&s.class_id),
-                            s.member_name,
-                            s.start_byte as i64,
-                            s.end_byte as i64,
-                            selected.key,
-                            s.member_path
-                        ],
-                        |row| row.get::<_, Option<String>>(0),
-                    )?
-                    .filter_map(|row| row.transpose())
-                    .collect::<rusqlite::Result<_>>()?;
-                if let [path] = paths.as_slice() {
-                    Some(path.clone())
-                } else {
-                    // Locate the class document by identity, not the
-                    // materialized kind; `member` then refuses an absent or
-                    // ambiguous selector.
-                    tx.query_row(
-                        "SELECT m.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.gid=n.gid WHERE n.id=?1 LIMIT 1",
-                        params![id_codec::encode_sid(&s.class_id), selected.key],
-                        |row| row.get(0),
-                    )
-                    .optional()?
-                }
-            }
-        };
-        let mut selected_document = None;
-        if let Some(path) = selected_path {
-            // Gate allocation of the selected JSON/BLOB before decoding either.
-            // This reads only SQLite byte lengths, not every workspace document.
-            let sizes: Option<(i64, i64)> = tx
-                .query_row(
-                    "SELECT length(d.source_bytes),length(d.source_bytes) FROM revision_documents m
-                 JOIN document_versions d ON d.vid=m.vid
-                 WHERE m.revision_id=?2 AND m.path=?1",
-                    params![path, selected.key],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
-            if let Some((graph_len, native_len)) = sizes {
-                if graph_len > 2 * 1024 * 1024 || native_len > 2 * 1024 * 1024 {
-                    return Err(self.report_index_failure(
-                        SelectedIntegrity(
-                            "incompatible_index: selected navigation source exceeds budget".into(),
-                        )
-                        .into(),
-                    ));
-                }
-                selected_document = Some(self.selected_graph_document_for(tx, &path, &selected)?);
-            } else {
-                let graph_file: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM revision_documents WHERE revision_id=?2 AND path=?1)",
-                    params![path, selected.key],
-                    |row| row.get(0),
-                )?;
-                if graph_file {
-                    return Err(self.report_index_failure(
-                        SelectedIntegrity(
-                            "incompatible_index: selected native document missing".into(),
-                        )
-                        .into(),
-                    ));
-                }
-            }
-        }
-        crate::navigation::navigate(
-            tx,
-            request,
-            revision,
-            &selected.key,
-            selected_document
-                .as_ref()
-                .map(|document| document.nodes.as_slice()),
-            &mut |reader, selector| {
-                if let Some(note) = &multiple_producers {
-                    reader.warn(note);
-                }
-                for bytes in &producer_bytes {
-                    if !reader.charge(*bytes) {
-                        return Ok(());
-                    }
-                }
-                graph_read::navigation_calls(
-                    self,
-                    tx,
-                    &selected,
-                    selected_document.as_ref(),
-                    selector,
-                    reader,
-                )
-            },
-        )
-    }
-
-    pub fn classes_at(
-        &self,
-        path: Option<&str>,
-        query: &str,
-        expected: Option<IndexPin>,
-        offset: usize,
-        limit: usize,
-    ) -> Result<crate::class_diagram::ClassPage> {
-        self.with_evidence(|tx| self.classes_in(tx, path, query, expected, (offset, limit), false))
-    }
-    fn classes_in(
-        &self,
-        tx: &Connection,
-        path: Option<&str>,
-        query: &str,
-        expected: Option<IndexPin>,
-        pagination: (usize, usize),
-        pre_startup: bool,
-    ) -> Result<crate::class_diagram::ClassPage> {
-        use crate::class_diagram::ClassPage;
-        let (offset, limit) = pagination;
-        use crate::class_diagram::InvalidRequest;
-        let path = path.filter(|path| !path.is_empty());
-        ensure!(
-            (1..=100).contains(&limit)
-                && offset <= 1_000_000
-                && query.len() <= 512
-                && !query.contains('\0'),
-            InvalidRequest("Class search allows 1–100 results and a query of at most 512 bytes.")
-        );
-        if let Some(path) = path {
-            ensure!(
-                !path.is_empty()
-                    && path.len() <= 8192
-                    && !path.contains(['\0', '\\', ':'])
-                    && !path
-                        .split('/')
-                        .any(|part| part.is_empty() || part == "." || part == ".."),
-                InvalidRequest("Choose a workspace-relative class source path.")
-            );
-        }
-        let selected_revision = self.read_revision_for(tx, expected, pre_startup)?;
-        let revision = selected_revision.pin;
-        let (mut warnings, truncated) = class_metadata(tx, &selected_revision)?;
-        let pattern = format!(
-            "%{}%",
-            query
-                .replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_")
-        );
-        let mut stmt = tx.prepare("SELECT c.id FROM classes c JOIN revision_documents m ON m.revision_id=?6 AND m.cid=c.cid WHERE (?1 IS NULL OR c.path=?1)
-            AND (c.name LIKE ?2 ESCAPE '\\' OR c.qualified_name LIKE ?2 ESCAPE '\\' OR ('sid:v1:'||lower(hex(c.id)))=?3)
-            ORDER BY CASE WHEN lower(c.name)=lower(?3) THEN 0 ELSE 1 END,c.qualified_name,c.path,c.id LIMIT ?4 OFFSET ?5")?;
-        let ids = stmt
-            .query_map(
-                params![
-                    path,
-                    pattern,
-                    query,
-                    (limit + 1) as i64,
-                    offset as i64,
-                    selected_revision.key
-                ],
-                |r| stored_id_row(r, 0, false),
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut items = Vec::new();
-        let mut consumed = 0;
-        let mut bytes = 0;
-        let mut byte_limited = false;
-        for id in ids.iter().take(limit) {
-            let Some((class, size, clipped)) =
-                presentation_class(self, tx, id, &selected_revision)?
-            else {
-                // Consume an individually oversized row so pagination always progresses.
-                consumed += 1;
-                byte_limited = true;
-                continue;
-            };
-            if bytes + size > crate::class_diagram::PAGE_BYTES {
-                byte_limited = true;
-                break;
-            }
-            bytes += size;
-            consumed += 1;
-            byte_limited |= clipped;
-            items.push(class);
-        }
-        let next_offset = (consumed < ids.len()).then_some(offset + consumed);
-        if byte_limited {
-            warnings.push(crate::class_diagram::BYTE_NOTICE.into());
-        }
-        let truncated = truncated || byte_limited;
-        if let Some(path) = path
-            && !crate::capture_records::language_of_path(Path::new(path))
-                .is_some_and(crate::classes::supports_language)
-        {
-            warnings.push(
-                "Class diagrams currently support Java, Python, JavaScript, TypeScript and Rust declarations only."
-                    .into(),
-            );
-        }
-        Ok(ClassPage {
-            revision,
-            items,
-            next_offset,
-            truncated,
-            warnings,
-            require_index: false,
-            supported_languages: crate::classes::SUPPORTED_LANGUAGES
-                .iter()
-                .map(|language| (*language).to_owned())
-                .collect(),
-        })
-    }
-
-    /// Bounded one-hop relation reads and seed resolution share a revision-pinned
-    /// read transaction. No filesystem access or graph/provider augmentation.
-    pub fn class_diagram_at(
-        &self,
-        request: &crate::class_diagram::ClassDiagramRequest,
-    ) -> Result<crate::class_diagram::ClassDiagram> {
-        request.validate()?;
-        self.with_evidence(|tx| self.class_diagram_in(tx, request, false))
-    }
-    fn class_diagram_in(
-        &self,
-        tx: &Connection,
-        request: &crate::class_diagram::ClassDiagramRequest,
-        pre_startup: bool,
-    ) -> Result<crate::class_diagram::ClassDiagram> {
-        use crate::class_diagram::{self, InvalidRequest};
-        let selected = self.read_revision_for(tx, Some(request.expected_revision), pre_startup)?;
-        let revision = selected.pin;
-        let (warnings, truncated) = class_metadata(tx, &selected)?;
-        let (seed, clipped) = resolve_class(self, tx, &request.seed, &selected)?;
-        // Explicitly selected measured declarations are independent roots, never
-        // connected by lexical type-name matches or candidate relationships.
-        let mut seeds = vec![seed.symbol.id.clone()];
-        let mut classes = BTreeMap::from([(seed.symbol.id.clone(), seed)]);
-        for expanded in &request.expanded {
-            let (class, _) = resolve_class(self, tx, expanded, &selected)?;
-            if !classes.contains_key(&class.symbol.id) {
-                ensure!(
-                    classes.len() < class_diagram::MAX_NODES,
-                    InvalidRequest("Too many selected classes.")
-                );
-                seeds.push(class.symbol.id.clone());
-                classes.insert(class.symbol.id.clone(), class);
-            }
-        }
-        class_diagram::project(
-            revision,
-            &seeds,
-            &classes,
-            vec![],
-            vec![],
-            warnings,
-            truncated || clipped,
-        )
-    }
 
     pub fn symbols(&self, query: &str, limit: usize) -> Result<Vec<Symbol>> {
         Ok(self.symbols_at(query, limit)?.1)
@@ -20501,79 +19945,6 @@ impl Store {
         Ok(Some(result))
     }
 
-    /// Only cached source and measured calls from the same snapshot are used.
-    pub fn sequence_at(
-        &self,
-        seed: &str,
-        expected: IndexPin,
-        show_all: bool,
-    ) -> Result<Option<crate::behavior::SequenceView>> {
-        self.with_evidence(|tx| self.sequence_in(tx, seed, expected, show_all, false, false))
-    }
-    /// The candidates of the browser's Interactions view (#663): an enriched view with a
-    /// shown call is kept within the work, depth and participant bounds but not yet the
-    /// visible step bound, which counts internal steps Interactions never draw. The browser
-    /// bounds the arrows it draws after filtering. Any other view is [`Self::sequence_at`].
-    pub fn sequence_interactions_at(
-        &self,
-        seed: &str,
-        expected: IndexPin,
-    ) -> Result<Option<crate::behavior::SequenceView>> {
-        self.with_evidence(|tx| self.sequence_in(tx, seed, expected, false, true, false))
-    }
-    fn sequence_in(
-        &self,
-        tx: &Connection,
-        seed: &str,
-        expected: IndexPin,
-        show_all: bool,
-        interactions: bool,
-        pre_startup: bool,
-    ) -> Result<Option<crate::behavior::SequenceView>> {
-        let selected_revision = self.read_revision_for(tx, Some(expected), pre_startup)?;
-        let revision = selected_revision.pin;
-        let path: Option<String> = tx
-            .query_row(
-                "SELECT m.path FROM graph_nodes n JOIN revision_documents m
-             ON m.revision_id=?2 AND m.gid=n.gid WHERE n.id=?1",
-                params![id_codec::encode_sid(seed), selected_revision.key],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let Some(path) = path else { return Ok(None) };
-        let document = self.selected_graph_document_for(tx, &path, &selected_revision)?;
-        let symbol = document
-            .nodes
-            .iter()
-            .find(|node| node.id == seed)
-            .ok_or_else(|| {
-                SelectedIntegrity("incompatible_index: selected sequence seed missing".into())
-            })?;
-        ensure!(
-            matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method),
-            "invalid sequence symbol kind"
-        );
-        let mut calls = document.graph_calls;
-        calls.sort_by(|a, b| (a.range.start_byte, &a.id).cmp(&(b.range.start_byte, &b.id)));
-        let file = document.file;
-        // Enrichment applies the visible step bound once incidental calls are hidden (#536).
-        let mut view =
-            crate::behavior::build_sequence_work(revision, symbol, &file, &calls, show_all)?;
-        graph_read::sequence_calls(
-            self,
-            tx,
-            &selected_revision,
-            &mut view,
-            show_all,
-            interactions,
-        )?;
-        // #888: a syntax-only view's callbacks can hold only a hop, decided by the read.
-        if view.semantic.tier == crate::behavior::EvidenceTier::Syntax {
-            graph_read::syntax_callbacks(self, tx, &selected_revision, &mut view, show_all)?;
-        }
-        Ok(Some(view))
-    }
-
     fn read_graph_for(&self, db: &Connection, selected: &ReadRevision) -> Result<Graph> {
         let (stats_type, stats_len, diagnostics_type, diagnostics_len): (String, i64, String, i64) =
             db.query_row(
@@ -20663,73 +20034,6 @@ impl Store {
             ))?;
             Ok((revision, pending))
         })
-    }
-
-    pub fn query_view(&self, query: &ViewQuery) -> Result<Option<ViewResult>> {
-        self.query_view_at(query, None)
-    }
-
-    pub fn query_view_at(
-        &self,
-        query: &ViewQuery,
-        expected_pin: Option<&IndexPin>,
-    ) -> Result<Option<ViewResult>> {
-        query.validate()?;
-        self.with_evidence(|tx| self.query_view_in(tx, query, expected_pin))
-    }
-    fn query_view_in(
-        &self,
-        tx: &Connection,
-        query: &ViewQuery,
-        expected_pin: Option<&IndexPin>,
-    ) -> Result<Option<ViewResult>> {
-        self.query_view_in_for(tx, query, expected_pin, false)
-    }
-    fn query_view_in_for(
-        &self,
-        tx: &Connection,
-        query: &ViewQuery,
-        expected_pin: Option<&IndexPin>,
-        pre_startup: bool,
-    ) -> Result<Option<ViewResult>> {
-        let selected = self.read_revision_for(tx, expected_pin.copied(), pre_startup)?;
-        let revision = selected.pin;
-        let selected_path: Option<String> = tx
-            .query_row("SELECT m.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.gid=n.gid WHERE n.id=?1", params![id_codec::encode_sid(&query.seed), selected.key], |r| {
-                r.get(0)
-            })
-            .optional()?;
-        let Some(path) = selected_path else {
-            return Ok(None);
-        };
-        let seed_document = self.selected_graph_document_for(tx, &path, &selected)?;
-        let seed = seed_document
-            .nodes
-            .iter()
-            .find(|symbol| symbol.id == query.seed)
-            .cloned()
-            .ok_or_else(|| {
-                SelectedIntegrity("incompatible_index: selected view seed missing".into())
-            })?;
-        let walk = semantic_display::view_walk(self, tx, &selected, query, seed_document, seed)?;
-        let mut warnings = Vec::new();
-        if walk.truncated {
-            warnings.push("Measured calls truncated at the request limit.".into());
-        }
-        if walk.omitted_nodes > 0 {
-            warnings.push("Node limit reached; additional targets are not shown.".into());
-        }
-        Ok(Some(ViewResult {
-            revision,
-            query: query.clone(),
-            nodes: walk.nodes,
-            calls: walk.calls,
-            regions: walk.regions,
-            truncated: walk.truncated || walk.omitted_nodes > 0,
-            omitted_nodes: walk.omitted_nodes,
-            warnings,
-            semantic: walk.semantic,
-        }))
     }
 }
 

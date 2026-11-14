@@ -2,13 +2,13 @@
 //! view's own revision. A call matched to a route of another app gets a labelled boundary hop
 //! into the handler's app; a call matched to no route stays a boundary and only says so.
 //! Interface evidence is structural (#788): never proof that a request is sent.
-use super::EvidenceResponse;
 use crate::architecture_core::ArchitectureCore;
 use crate::behavior::{
     InterfaceHop, InterfacesState, Participant, SequenceColumn, SequenceInterfaces, SequenceStep,
     SequenceView,
 };
 use crate::interfaces::{Confidence, SequenceHop};
+use crate::store::EvidenceResponse;
 use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -116,7 +116,7 @@ impl EvidenceResponse {
         }
         let assignment = match Self::app_assignment_at(config, core, check) {
             Ok((assignment, _)) => assignment,
-            Err(error) if super::cli_read_retryable_contention(&error) => return Err(error),
+            Err(error) if crate::store::cli_read_retryable_contention(&error) => return Err(error),
             Err(error) if error.to_string().starts_with("deadline_exceeded") => {
                 return Err(error);
             }
@@ -285,3 +285,10 @@ impl EvidenceResponse {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "sequence_callback_hops_tests.rs"]
+mod sequence_callback_hops_tests;
+#[cfg(test)]
+#[path = "sequence_hops_tests.rs"]
+mod sequence_hops_tests;

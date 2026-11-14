@@ -1103,6 +1103,12 @@ fn router() -> Router {
         let handler = &find(&found, "POST", "/api/checkouts/{root_key}/tree").handler;
         let answer = declaration(&shot, "answer");
         assert_eq!(handler.kind, HandlerKind::DispatchArm);
+        // The published spelling: no route of Trellis's own router is an inline arm any
+        // more (#1046), so this fixture is what pins it.
+        assert_eq!(
+            serde_json::to_value(handler.kind).unwrap(),
+            serde_json::json!("dispatchArm")
+        );
         assert_eq!(
             handler.syntax_id.as_deref(),
             Some(answer.syntax_id.as_str())
