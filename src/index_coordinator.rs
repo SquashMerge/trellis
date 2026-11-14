@@ -2342,6 +2342,9 @@ fn sweep_abandoned_semantic_stages(store: &Store) {
     crate::producer::run::sweep_state(store, false);
 }
 
+#[cfg(feature = "test-support")]
+mod semantic_fixture;
+
 #[cfg(test)]
 mod tests;
 
