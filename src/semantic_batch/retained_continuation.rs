@@ -773,6 +773,7 @@ impl RetainedStageContinuation {
                     crate::store::staging::check_proof_identity_closure(conn)?;
                 }
                 return Ok(Some(AdmittedBatch::new(
+                    AdmissionProof::admitted(),
                     self.stage.take().expect("stage"),
                     self.descriptor.take().expect("descriptor"),
                     self.sha.clone(),

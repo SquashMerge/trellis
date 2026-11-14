@@ -141,6 +141,11 @@ paths = [
   # configuration read. Storage checks the pin at publish time through
   # `Descriptor::check_producer`, which is in the grammar file above.
   "src/producer_pin.rs",
+  # The proof that batch admission ran (S8, #1071): one zero-sized type with no dependency.
+  # Admission creates it and the storage-owned `AdmittedBatch` (store/batch_input.rs) is
+  # built from it. It is a module of `semantic_batch` because Rust privacy is by module
+  # tree: that is what restricts its constructor to admission.
+  "src/semantic_batch/admission_proof.rs",
 ]
 
 # Coarse developer-tool boundary; does not infer internal tooling architecture.

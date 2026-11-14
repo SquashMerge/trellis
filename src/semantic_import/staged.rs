@@ -27,12 +27,13 @@ use crate::{
     native_evidence as native,
     scip_raw::{CapturedClaim, ScipCaptureError},
     semantic_batch::{
-        AdmittedBatch, BatchCounters, BatchLimits, JoinParts, JoinedBatch, LookupBudget,
+        AdmittedBatch, BatchCounters, BatchLimits, JoinedBatch, LookupBudget,
         descriptor::{Descriptor, SourceManifestHasher, basis_artifact_ordinal},
     },
     semantic_evidence::{self as semantic, EmissionHeader, EmissionValidator, RawClaimDocument},
     store::{
         NativeHeader, NativeReader, Store,
+        batch_input::JoinParts,
         staging::{JOIN_TABLES, claim_from_stage},
     },
 };

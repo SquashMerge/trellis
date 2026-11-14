@@ -1,5 +1,6 @@
 //! SQLite index snapshots and request queues. Connections are never shared between threads.
 pub mod anchors;
+pub(crate) mod batch_input;
 pub(crate) mod captured_witness;
 pub(crate) mod id_codec;
 pub(crate) mod mcp_read;
@@ -12983,7 +12984,7 @@ impl Store {
     /// report in a single transaction against `expected`.
     pub fn publish_semantic_batch(
         &self,
-        joined: &crate::semantic_batch::JoinedBatch,
+        joined: &batch_input::JoinedBatch,
         stage: &mut crate::store::staging::Stage,
         expected: IndexPin,
         leader: &topology::WriterGuard,
@@ -12996,7 +12997,7 @@ impl Store {
     #[doc(hidden)]
     pub fn publish_semantic_batch_with_fault_for_tests(
         &self,
-        joined: &crate::semantic_batch::JoinedBatch,
+        joined: &batch_input::JoinedBatch,
         stage: &mut crate::store::staging::Stage,
         expected: IndexPin,
         leader: &topology::WriterGuard,
@@ -13051,7 +13052,7 @@ impl Store {
     #[doc(hidden)]
     pub fn publish_semantic_batch_observing_for_tests(
         &self,
-        joined: &crate::semantic_batch::JoinedBatch,
+        joined: &batch_input::JoinedBatch,
         stage: &mut crate::store::staging::Stage,
         expected: IndexPin,
         leader: &topology::WriterGuard,
@@ -13073,7 +13074,7 @@ impl Store {
     #[allow(clippy::too_many_arguments)]
     fn publish_semantic_batch_inner(
         &self,
-        joined: &crate::semantic_batch::JoinedBatch,
+        joined: &batch_input::JoinedBatch,
         stage: &mut crate::store::staging::Stage,
         expected: IndexPin,
         leader: &topology::WriterGuard,
@@ -13096,7 +13097,7 @@ impl Store {
     #[allow(clippy::too_many_arguments)]
     fn publish_semantic_batch_statements(
         &self,
-        joined: &crate::semantic_batch::JoinedBatch,
+        joined: &batch_input::JoinedBatch,
         stage: &mut crate::store::staging::Stage,
         expected: IndexPin,
         leader: &topology::WriterGuard,

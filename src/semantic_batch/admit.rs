@@ -4,6 +4,7 @@
 //! in-memory test admission run the same passes.
 use super::{
     AdmittedBatch, BatchCounters, BatchLimits,
+    admission_proof::AdmissionProof,
     descriptor::{
         ArtifactEntry, Descriptor, Disposition, GenerationOrigin, ImportOrigin, PageEntry,
         PageKind, RowOrder, SourceManifestHasher, SourceRow, check_page_bytes, parse_page,
@@ -735,6 +736,7 @@ pub fn stage_batch(
         )
     })?;
     Ok(AdmittedBatch::new(
+        AdmissionProof::admitted(),
         stage,
         descriptor,
         descriptor_sha256.to_owned(),

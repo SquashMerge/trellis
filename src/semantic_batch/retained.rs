@@ -3,6 +3,7 @@
 mod continuation;
 use super::{
     AdmittedBatch, BatchCounters, BatchLimits,
+    admission_proof::AdmissionProof,
     admit::{Passes, ReaderSource, StageOwner, check_cancel},
     descriptor::{Descriptor, RowOrder, SourceManifestHasher, SourceRow},
     limits::IO_BUFFER_BYTES,
