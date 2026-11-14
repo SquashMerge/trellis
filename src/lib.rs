@@ -3,6 +3,7 @@ mod architecture_core;
 pub mod architecture_details;
 mod architecture_read;
 pub mod auth;
+pub mod batch_descriptor;
 pub mod behavior;
 mod behavior_bindings;
 mod behavior_columns;

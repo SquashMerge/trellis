@@ -4,7 +4,7 @@ pub use crate::scip_raw::{
     ScipCaptureError,
 };
 use crate::{
-    semantic_batch::descriptor::{DescriptorProducer, IdentityKind},
+    batch_descriptor::{DescriptorProducer, IdentityKind},
     semantic_evidence::{self, Language, PositionEncoding, SemanticKind},
 };
 use serde::Deserialize;
@@ -53,8 +53,8 @@ struct SyntheticGenerator {
     languages: Vec<String>,
 }
 
-pub(crate) use crate::scip_vocab::hexhash;
 pub use crate::scip_vocab::{REFERENCE_TRUST_ORIGIN, SYNTHETIC_TRUST_ORIGIN};
+pub(crate) use crate::scip_vocab::{admission, hexhash, order, path};
 
 /// A producer identity fixed by a checked-in profile, never by the descriptor that names it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -317,15 +317,6 @@ pub fn pinned_producer(
     Ok(pinned.clone())
 }
 
-pub(crate) fn admission(s: &str) -> ScipCaptureError {
-    ScipCaptureError::InvalidAdmission(s.into())
-}
-pub(crate) fn path(s: &str) -> bool {
-    !s.is_empty()
-        && !s.starts_with('/')
-        && !s.contains(['\\', '\0'])
-        && s.split('/').all(|p| !p.is_empty() && p != "." && p != "..")
-}
 pub(crate) fn validate_selected_role(root: &Path, p: &Path) -> Result<String, ScipCaptureError> {
     if !p.is_absolute() {
         return Err(admission("selected role is not absolute"));
@@ -366,9 +357,6 @@ pub(crate) fn file_uri(root: &Path) -> Result<String, ScipCaptureError> {
         }
     }
     Ok(out)
-}
-pub(crate) fn order(language: &str) -> usize {
-    crate::semantic_evidence::language_order(language).unwrap_or(usize::MAX)
 }
 #[cfg(test)]
 mod tests {

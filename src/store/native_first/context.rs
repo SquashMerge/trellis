@@ -166,7 +166,7 @@ pub(in crate::store) fn publish(
     db: &Connection,
     key: &str,
     producer: &str,
-    descriptor: &crate::semantic_batch::descriptor::Descriptor,
+    descriptor: &crate::batch_descriptor::Descriptor,
     cancel: &CancelFlag,
 ) -> Result<()> {
     let Some(row) = descriptor.context_profile()? else {

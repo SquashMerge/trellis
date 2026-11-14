@@ -21,6 +21,8 @@
 /// - `store/captured_witness`: the captured-version reads the witnessed settlement trusts.
 /// - `store/staging`: the stage database, its schema and its claim and witness writers, moved
 ///   out of `semantic_batch`.
+/// - `batch_descriptor`: the batch descriptor and page grammar and the source-manifest hash,
+///   moved out of `semantic_batch`.
 /// - `native_ids`: canonical JSON, digests and the rejoined ID derivation.
 /// - `skipped_source`, `skipped_config`: placeholder hashes that enter the settled basis.
 /// - `indexer_ts`, `native_rust_macros`: the parsers the join uses on source it binds.
@@ -30,6 +32,7 @@
 /// modules, and `Cargo.lock` (a decoder change is `DECODER_VERSION`, which blocks batch
 /// selection).
 pub const JOIN_MODULES: &[&str] = &[
+    "src/batch_descriptor.rs",
     "src/indexer_ts.rs",
     "src/native_ids.rs",
     "src/native_rust_macros.rs",
