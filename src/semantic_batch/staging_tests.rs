@@ -1,11 +1,9 @@
-use super::{
-    BatchLimits,
-    staging::{
-        Stage, StageClaimSink, lookup_assigned, remove_abandoned_semantic_stages, stage_dir_name,
-    },
-};
+use super::BatchLimits;
 use crate::scip_raw::{
     CapturedClaim, CapturedScipFactV1, ClaimSink, ScipCaptureError, UnitDocument,
+};
+use crate::store::staging::{
+    Stage, StageClaimSink, lookup_assigned, remove_abandoned_semantic_stages, stage_dir_name,
 };
 use rusqlite::params;
 
@@ -246,7 +244,7 @@ fn only_documents_assigned_to_the_artifact_resolve() {
 
 #[test]
 fn an_assigned_path_resolves_to_its_source_language_and_a_shared_path_is_ambiguous() {
-    use super::staging::StageLookupError;
+    use crate::store::staging::StageLookupError;
     let parent = tempfile::tempdir().unwrap();
     let mut stage = seeded(parent.path(), "language");
     let conn = stage.conn().unwrap();
@@ -308,7 +306,7 @@ fn coverage_insert_storage_fault_propagates_typed() {
 
 #[test]
 fn admitted_claims_record_the_symbol_presence_discovery_reads() {
-    use super::staging::{PRESENCE_DECLARED, PRESENCE_INFORMATION, claim_presence};
+    use crate::store::staging::{PRESENCE_DECLARED, PRESENCE_INFORMATION, claim_presence};
     let with = |kind: &str, raw: serde_json::Value| {
         let mut row = claim(b"{}", "d", "p");
         row.envelope.record_kind = kind.into();
