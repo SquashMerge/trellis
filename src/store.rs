@@ -11,6 +11,8 @@ pub(crate) use native_first::{
     SemanticContinuation, SemanticUnitOutcome, step_slice as semantic_step_slice,
 };
 mod published_admission;
+#[cfg(feature = "test-support")]
+pub(crate) mod read_counters;
 pub mod requests;
 mod search;
 mod search_startup;
@@ -18792,7 +18794,7 @@ impl Store {
     )> {
         use crate::native_records as n;
         #[cfg(feature = "test-support")]
-        crate::semantic_batch::testing::note_whole_snapshot_read();
+        read_counters::note_whole_snapshot_read();
         let inventory: String = db.query_row(
             "SELECT source_inventory FROM native_revisions WHERE id=?1",
             [&selected.key],
@@ -18933,7 +18935,7 @@ impl Store {
         #[cfg(feature = "test-support")]
         crate::semantic_import::note_selected_original_native_row(&document.key);
         #[cfg(feature = "test-support")]
-        crate::semantic_batch::testing::note_native_document_load();
+        read_counters::note_native_document_load();
         let scope = v8_native_scope_for(db, &document.key, selected)?.context(
             SelectedIntegrity("incompatible_index: retained native document absent".into()),
         )?;
