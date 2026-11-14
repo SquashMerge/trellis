@@ -5,13 +5,12 @@
 
 mod qwen3;
 
-use std::fmt;
 use std::io::Read;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
 
+pub(crate) use crate::search_vocab::DIMENSIONS;
+pub use crate::search_vocab::{EmbedError, QueryBudget};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use sha2::{Digest, Sha256};
@@ -19,35 +18,6 @@ use tokenizers::{
     PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer, TruncationDirection,
     TruncationParams,
 };
-
-/// Absolute query cutoff using the request's clock; never mutates global cancellation.
-#[derive(Clone)]
-pub struct QueryBudget {
-    cutoff: Instant,
-    clock: Arc<dyn Fn() -> Instant + Send + Sync>,
-}
-
-impl QueryBudget {
-    pub fn new(cutoff: Instant, clock: Arc<dyn Fn() -> Instant + Send + Sync>) -> Self {
-        Self { cutoff, clock }
-    }
-
-    pub fn now(&self) -> Instant {
-        (self.clock)()
-    }
-
-    pub fn remaining(&self) -> std::time::Duration {
-        self.cutoff.saturating_duration_since(self.now())
-    }
-
-    pub fn check(&self) -> Result<(), EmbedError> {
-        if self.now() >= self.cutoff {
-            Err(EmbedError::BudgetExceeded)
-        } else {
-            Ok(())
-        }
-    }
-}
 
 pub struct EmbeddingControl<'a> {
     cancel: &'a AtomicBool,
@@ -89,7 +59,6 @@ const MAX_TOKENS: usize = 512;
 // Bounds text tokenization work before adding the fixed retrieval prompt.
 const MAX_INPUT_BYTES: usize = 16_384;
 const FULL_DIMENSIONS: usize = 2048;
-pub(crate) const DIMENSIONS: usize = 1024;
 const QUERY_PROMPT: &str = "Represent the query for retrieving supporting documents: ";
 const DOCUMENT_PROMPT: &str = "Represent the document for retrieval: ";
 
@@ -362,29 +331,6 @@ pub enum InputKind {
     Query,
     Document,
 }
-
-#[derive(Debug)]
-pub enum EmbedError {
-    ModelUnavailable(String),
-    InvalidInput(String),
-    Cancelled,
-    BudgetExceeded,
-    Runtime(String),
-}
-
-impl fmt::Display for EmbedError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ModelUnavailable(message) => write!(f, "model unavailable: {message}"),
-            Self::InvalidInput(message) => write!(f, "invalid embedding input: {message}"),
-            Self::Cancelled => f.write_str("embedding cancelled"),
-            Self::BudgetExceeded => f.write_str("query embedding budget exceeded"),
-            Self::Runtime(message) => write!(f, "embedding runtime: {message}"),
-        }
-    }
-}
-
-impl std::error::Error for EmbedError {}
 
 impl From<candle_core::Error> for EmbedError {
     fn from(error: candle_core::Error) -> Self {
@@ -934,6 +880,8 @@ pub fn quantize(vector: &[f32]) -> Result<QuantizedVector, EmbedError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::time::Instant;
 
     fn test_tokenizer() -> Tokenizer {
         let mut tokenizer = Tokenizer::from_bytes(

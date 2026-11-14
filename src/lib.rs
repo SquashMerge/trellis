@@ -73,6 +73,7 @@ pub mod search_lexical;
 pub mod search_model;
 pub mod search_rank;
 pub mod search_vectors;
+pub mod search_vocab;
 pub mod semantic_batch;
 pub mod semantic_evidence;
 pub mod semantic_import;
