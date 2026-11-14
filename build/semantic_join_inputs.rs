@@ -10,7 +10,9 @@
 /// - `semantic_import*`: the join and its settlement, staged rows and provenance IDs.
 /// - `semantic_batch*`: document inventory, staging, retained inputs and the production
 ///   resource limits (`limits.rs`), whose caps shape published reasons.
-/// - `semantic_evidence`: the evidence rows' types, canonical forms and validation.
+/// - `semantic_evidence`: the evidence rows' canonical forms and validation.
+/// - `semantic_records`: the evidence rows' types, whose serde shape is the stored row and
+///   payload encoding, moved out of `semantic_evidence`.
 /// - `scip_raw*`: the decoded claims, document caps and module roots the join reads.
 /// - `scip_admission`, `scip_vocab`: the trust origins and hash helpers the stored basis
 ///   records.
@@ -38,6 +40,7 @@ pub const JOIN_MODULES: &[&str] = &[
     "src/semantic_evidence.rs",
     "src/semantic_import.rs",
     "src/semantic_import/**",
+    "src/semantic_records.rs",
     "src/skipped_config.rs",
     "src/skipped_source.rs",
     "src/store/captured_witness.rs",

@@ -102,6 +102,9 @@ paths = [
   # Card preparation and serialization over shared records and native_ids only; storage
   # renders stored cards with it (S2, #1001). Capture stays in search_capture.rs.
   "src/search_card.rs",
+  # The persisted semantic evidence records, their closed vocabularies and the language
+  # order (S3, #1002). Validation and the emission validator stay in semantic_evidence.rs.
+  "src/semantic_records.rs",
 ]
 
 # Coarse developer-tool boundary; does not infer internal tooling architecture.
