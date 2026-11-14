@@ -10,7 +10,7 @@ const ROOT = "a".repeat(64), OTHER = "b".repeat(64);
 const pin = {indexGeneration:"12345678-1234-4123-8123-123456789abc", indexRevision:1};
 const pin2 = {...pin, indexRevision:2};
 const read = file => fs.readFileSync(path.join(__dirname, "../web", file), "utf8");
-const source = ["index-pin.js", "source-witness.js", "sequence.js", "shell.js", "files.js", "architecture-apps.js", "app.js"].map(read).join("\n");
+const source = ["index-pin.js", "source-witness.js", "sequence-model.js", "sequence.js", "shell.js", "files.js", "architecture-apps.js", "app.js"].map(read).join("\n");
 const response = data => ({ok:true, status:200, json:async () => data});
 function deferred() { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return {promise, resolve, reject}; }
 const all = node => [node, ...(node.children || []).flatMap(all)];
