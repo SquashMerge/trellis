@@ -300,7 +300,7 @@ pub(in crate::store) fn payload_key(
 }
 
 /// Where a projection takes provenance freshness from.
-pub(in crate::store) enum FreshnessSource<'a> {
+pub(crate) enum FreshnessSource<'a> {
     /// The freshness rows stored for the reading revision.
     Stored,
     /// Freshness a publication supplies before its rows are stored.
@@ -315,17 +315,17 @@ pub(in crate::store) struct TargetScope<'a> {
 }
 
 /// How one payload is read as evidence of one revision (C).
-pub(in crate::store) struct PayloadProjection<'a> {
+pub(crate) struct PayloadProjection<'a> {
     db: &'a Connection,
     native: String,
     pub(in crate::store) source_set: String,
-    pub(in crate::store) payload_id: Option<i64>,
+    pub(crate) payload_id: Option<i64>,
     freshness: BTreeMap<i64, sem::Freshness>,
     ids: RefCell<BTreeMap<i64, String>>,
 }
 
 /// The projection of the payload named by manifest row `tuple_id` of `revision_key`.
-pub(in crate::store) fn project_payload<'a>(
+pub(crate) fn project_payload<'a>(
     db: &'a Connection,
     revision_key: &str,
     tuple_id: i64,
@@ -384,7 +384,7 @@ impl PayloadProjection<'_> {
     }
 
     /// The reading revision's native revision.
-    pub(in crate::store) fn native(&self) -> &str {
+    pub(crate) fn native(&self) -> &str {
         &self.native
     }
 

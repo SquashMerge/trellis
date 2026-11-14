@@ -79,7 +79,7 @@ impl ProducerSelection {
 }
 
 /// Every published producer of the revision with the languages its profile declares.
-pub(super) fn default_producers(db: &Connection, revision_key: &str) -> Result<DefaultProducers> {
+pub(crate) fn default_producers(db: &Connection, revision_key: &str) -> Result<DefaultProducers> {
     let rows = db
         .prepare_cached(
             "SELECT p.id,l.language FROM semantic_revision_producers p
@@ -99,7 +99,7 @@ pub(super) fn default_producers(db: &Connection, revision_key: &str) -> Result<D
 /// The one producer selection every read surface uses (#483). An explicit producer must
 /// be published at this revision and applies to the languages it covers; another language
 /// shows syntax only. Without one, each language uses its sole covering producer.
-pub(super) fn select_producers(
+pub(crate) fn select_producers(
     db: &Connection,
     revision_key: &str,
     explicit: Option<&str>,
@@ -703,7 +703,7 @@ pub(super) fn coverage_summary(
 }
 
 /// A CLI query's traversal: its nodes, calls, regions and selected bindings.
-pub(super) struct ViewWalk {
+pub(crate) struct ViewWalk {
     pub nodes: Vec<crate::model::Symbol>,
     pub calls: Vec<crate::model::CallSite>,
     pub regions: Vec<crate::model::ControlRegion>,
@@ -716,7 +716,7 @@ pub(super) struct ViewWalk {
 /// returned. Below the query depth, a call whose selected binding the call graph would
 /// traverse (`boundaryReason: none`) adds its exact target as a node, whose own calls are
 /// inspected while the depth allows. Each document uses its language's selected producer.
-pub(super) fn view_walk(
+pub(crate) fn view_walk(
     store: &Store,
     db: &Connection,
     selected: &ReadRevision,

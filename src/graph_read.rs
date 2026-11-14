@@ -2,8 +2,15 @@
 //!
 //! The pure engine in `graph_query` asks a [`SnapshotGraphSource`] for facts; every fact it
 //! reads is recorded so a byte-reduced answer can be re-evaluated without SQL (#40).
-use super::*;
 mod sequence_callbacks;
+use crate::model::*;
+use crate::store::{
+    EvidenceResponse, ReadRevision, SelectedDocument, SelectedIntegrity, Store, V8NativeScope,
+    id_codec, native_first, read_native_calls_v8, read_native_coverage_v8,
+    read_native_declarations_v8, read_semantic_history, read_semantic_tuple,
+    read_semantic_tuple_for_call, semantic_display, semantic_payload, semantic_pin_key,
+    v8_native_scope_for, v8_owner_scope_for,
+};
 use crate::{
     graph_query::{
         DefaultProducers, DocumentFacts, GraphAnswer, GraphFacts, GraphIntegrity, GraphQuery,
@@ -12,7 +19,13 @@ use crate::{
     native_records::DocumentKey,
     semantic_records as sem,
 };
+use anyhow::{Context, Result, ensure};
+use rusqlite::{Connection, OptionalExtension, params};
 pub(super) use sequence_callbacks::syntax_callbacks;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 /// Corruption found by the engine fails like any other selected-read corruption (#261).
 fn engine_error(error: anyhow::Error) -> anyhow::Error {
