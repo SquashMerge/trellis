@@ -9,10 +9,17 @@ The measurement runs through a daemon of its own under a private HOME, on a fres
 of this checkout with fresh rust-analyzer and scip-typescript evidence; it never touches
 the user's daemon or index. It runs only when `trellis producer doctor` reports both
 producers `ready`; otherwise it prints a notice and exits 0.
+
+The script starts that daemon itself, so it knows its PID, and on every exit it stops
+it, waits for the process to be gone and only then removes the HOME. A stop that fails
+fails the run. SIGINT and SIGTERM are recorded and acted on between commands, never as
+an exception in the middle of one, so they cannot skip or interrupt that cleanup.
 """
 import argparse
+import contextlib
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -33,11 +40,65 @@ UPDATE = "python3 tools/rules-ratchet.py --update"
 # Each `trellis status` waits a bounded time for the first index; this many calls is a
 # backstop against a hang, not a speed expectation.
 INDEX_ATTEMPTS = 20
+# `trellis rules check` waits 30 s for the architecture build, so 20 reads are at most
+# 10 minutes of waiting.
 RULES_ATTEMPTS = 20
+# The CLI prints a failure as `Error: <code>: <message>` and exits 1; this is the code.
+ERROR_CODE = re.compile(r"^Error: ([a-z_]+)(?::|$)", re.MULTILINE)
+# Hang backstops for the cleanup: `daemon stop` and the daemon's exit after it, then
+# after SIGTERM, then after SIGKILL.
+STOP_SECS, TERM_SECS, KILL_SECS = 120, 15, 15
 
 
 class Failed(Exception):
     """The measurement could not be made; the lane fails with this message."""
+
+
+class Interrupted(Exception):
+    """SIGINT or SIGTERM arrived; the run ends through the ordinary cleanup."""
+
+
+class Signals:
+    """SIGINT and SIGTERM without asynchronous exceptions: the handler records the
+    signal and ends the command in progress, and `run` raises `Interrupted` at its own
+    boundaries. During cleanup the signal is only recorded."""
+    received = None
+    current = None
+    cleaning = False
+
+    @classmethod
+    def handle(cls, signum, _frame):
+        cls.received = signum
+        if cls.current is not None and not cls.cleaning:
+            with contextlib.suppress(OSError):
+                cls.current.terminate()
+
+    @classmethod
+    def check(cls):
+        if cls.received is not None and not cls.cleaning:
+            raise Interrupted(signal.Signals(cls.received).name)
+
+
+def run(argv, timeout=None, **options):
+    """One command to completion, as `subprocess.run` with captured text output."""
+    Signals.check()
+    process = subprocess.Popen(argv, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, **options)
+    Signals.current = process
+    try:
+        # A signal that arrived before `current` was set has ended nothing yet.
+        if Signals.received is not None and not Signals.cleaning:
+            process.terminate()
+        try:
+            out, err = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            out, err = process.communicate()
+            err += f"\n(killed after {timeout} s)"
+    finally:
+        Signals.current = None
+    Signals.check()
+    return subprocess.CompletedProcess(argv, process.returncode, out, err)
 
 
 def summarize(payload):
@@ -130,9 +191,15 @@ class Trellis:
     def __init__(self, binary, env):
         self.binary, self.env = str(binary), env
 
-    def run(self, *args):
-        return subprocess.run([self.binary, *args], cwd=ROOT, env=self.env,
-                              capture_output=True, text=True)
+    def run(self, *args, timeout=None):
+        return run([self.binary, *args], timeout=timeout, env=self.env)
+
+    def start_daemon(self):
+        """The daemon as this script's own child, in its own session so a terminal's
+        Ctrl-C reaches it only through the cleanup. The CLI attaches to it."""
+        return subprocess.Popen([self.binary, "daemon"], cwd=ROOT, env=self.env,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, start_new_session=True)
 
     def json(self, *args):
         done = self.run(*args)
@@ -156,14 +223,42 @@ def missing_producers(trellis):
     return reasons
 
 
-def measure(trellis):
-    # The first read starts the daemon and indexes; it waits a bounded time per call.
+def error_code(done):
+    """The typed code of a failed CLI command that printed no reply, else None."""
+    if done.returncode != 1 or done.stdout.strip():
+        return None
+    codes = ERROR_CODE.findall(done.stderr)
+    return codes[-1] if codes else None
+
+
+def rules_check(trellis):
+    """The `rules check` reply. After an import the daemon computes the architecture
+    for the new revision; a read waits 30 s for it and then fails with the typed
+    `deadline_exceeded` (docs/architecture-view.md). Only that is asked again."""
+    for attempt in range(RULES_ATTEMPTS):
+        check = trellis.run("rules", "check")
+        if error_code(check) != "deadline_exceeded":
+            break
+    # Exit 1 with a reply only says deviations exist.
+    try:
+        return json.loads(check.stdout)
+    except ValueError:
+        raise Failed(f"rules check (exit {check.returncode}): "
+                     f"{check.stderr.strip()[-2000:]}") from None
+
+
+def measure(trellis, daemon):
+    # The first read indexes; it waits a bounded time per call.
     for attempt in range(INDEX_ATTEMPTS):
         status = trellis.run("status")
         if status.returncode == 0:
             break
     else:
         raise Failed(f"the index was not ready: {status.stderr.strip()[-2000:]}")
+    # A CLI command that found no listener yet starts a daemon too; the daemon's lock
+    # elects one and the loser exits. Only our own child may be the one that answered.
+    if daemon.poll() is not None:
+        raise Failed("the daemon this run started is not the one serving it")
     for name, trust in PRODUCERS:
         plan = trellis.json("producer", "plan", "--producer", name, "--trust", trust)
         if "planSha256" not in plan:
@@ -173,19 +268,7 @@ def measure(trellis):
         if run.get("outcome") != "imported":
             raise Failed(f"producer run {name}: state {run.get('state')}, outcome "
                          f"{run.get('outcome')}, {run.get('errorCode')}")
-    # After an import the daemon computes the architecture for the new revision. A read
-    # waits 30 s for it and then fails with the typed `deadline_exceeded`
-    # (docs/architecture-view.md); only that is asked again, a bounded number of times.
-    for attempt in range(RULES_ATTEMPTS):
-        check = trellis.run("rules", "check")
-        if "deadline_exceeded" not in check.stderr:
-            break
-    # Exit 1 with a reply only says deviations exist.
-    try:
-        reply = json.loads(check.stdout)
-    except ValueError:
-        raise Failed(f"rules check (exit {check.returncode}): "
-                     f"{check.stderr.strip()[-2000:]}") from None
+    reply = rules_check(trellis)
     payload = reply.get("payload")
     if payload is None:
         raise Failed(f"rules check: {json.dumps(reply)[:2000]}")
@@ -193,16 +276,48 @@ def measure(trellis):
     if reply.get("catchingUp") or payload["partial"] or stale:
         raise Failed(f"rules check did not run on fresh, whole evidence: catchingUp "
                      f"{reply.get('catchingUp')}, partial {payload['partial']}, {stale}")
-    return summarize(payload)
+    return payload
 
 
 def build(target_dir):
-    """Builds the binary and takes a copy: the rust lane rebuilds `debug/trellis` with
-    other features in the same target directory while this lane runs."""
-    subprocess.run(["cargo", "build", "--locked", "--bin", "trellis"], cwd=ROOT, check=True)
-    copy = target_dir / "debug" / "trellis-rules-ratchet"
-    shutil.copy2(target_dir / "debug" / "trellis", copy)
-    return copy
+    """Builds the binary in a target directory only this script writes, next to the one
+    verify's rust lane owns, as the tests lane has its own: no other build can replace
+    this binary, and this build cannot replace the one the browser suite copies."""
+    own = Path(f"{target_dir}-ratchet")
+    done = run(["cargo", "build", "--locked", "--bin", "trellis"],
+               env={**os.environ, "CARGO_TARGET_DIR": str(own)})
+    if done.returncode != 0:
+        raise Failed(f"cargo build (exit {done.returncode}): {done.stderr.strip()[-4000:]}")
+    return own / "debug" / "trellis"
+
+
+def shut_down(trellis, daemon, home):
+    """Stops the daemon this run started and removes its HOME; returns the problems.
+
+    `daemon stop` succeeds only once the daemon has retired. Whatever it says, the
+    process is waited for by its PID, then terminated, then killed; the HOME, which
+    holds its lock and state, goes only when the process is gone."""
+    problems = []
+    if daemon is not None:
+        stop = trellis.run("daemon", "stop", timeout=STOP_SECS)
+        if stop.returncode != 0:
+            problems.append(f"daemon stop failed (exit {stop.returncode}): "
+                            f"{stop.stderr.strip()[-2000:]}")
+        for wait, name, escalate in (
+                (STOP_SECS if stop.returncode == 0 else 0, "SIGTERM", daemon.terminate),
+                (TERM_SECS, "SIGKILL", daemon.kill), (KILL_SECS, None, None)):
+            try:
+                daemon.wait(timeout=wait)
+                break
+            except subprocess.TimeoutExpired:
+                if escalate is None:
+                    problems.append(f"daemon {daemon.pid} is still running; its HOME is "
+                                    f"left at {home}")
+                    return problems
+                problems.append(f"daemon {daemon.pid} was still running; sent {name}")
+                escalate()
+    shutil.rmtree(home, ignore_errors=True)
+    return problems
 
 
 def main():
@@ -213,37 +328,50 @@ def main():
     args = parser.parse_args()
     target_dir = ROOT / os.environ.get("CARGO_TARGET_DIR", "target")
     started = time.monotonic()
-    # So a terminated lane still stops its daemon and removes its HOME.
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(signum, Signals.handle)
     home = Path(tempfile.mkdtemp(prefix="trellis-ratchet-"))
-    trellis = None
+    owned = []  # [trellis, daemon] once this run has started its daemon
+    code = 1
     try:
-        record = None if args.update else read_record(args.record)
-        binary = args.binary.resolve() if args.binary else build(target_dir)
-        trellis = Trellis(binary, private_env(home))
-        missing = missing_producers(trellis)
-        if missing:
-            print("rules ratchet NOT RUN: it needs both semantic producers, and "
-                  + "; ".join(missing) + ". Run `trellis producer doctor` for the install "
-                  "commands. Deviations added by this change are not checked.")
-            return 0
-        measured = measure(trellis)
-        if args.update:
-            write_record(args.record, measured)
-            print(f"rules ratchet: wrote {args.record}: "
-                  + ", ".join(f"{key} {measured[key]}" for key in KEYS))
-            return 0
-        verdict, lines = compare(record, measured)
-        print("\n".join(lines))
-        return 1 if verdict == "fail" else 0
+        code = check(args, target_dir, home, owned)
     except Failed as error:
         print(f"rules ratchet FAILED: {error}", file=sys.stderr)
-        return 1
+        code = 1
+    except Interrupted as error:
+        print(f"rules ratchet interrupted by {error}", file=sys.stderr)
+        code = 128 + Signals.received
     finally:
-        if trellis is not None:
-            trellis.run("daemon", "stop")
-        shutil.rmtree(home, ignore_errors=True)
+        Signals.cleaning = True
+        problems = shut_down(*(owned or (None, None)), home)
+        for problem in problems:
+            print(f"rules ratchet FAILED: cleanup: {problem}", file=sys.stderr)
         print(f"rules ratchet took {int(time.monotonic() - started)} s")
+    return code or (1 if problems else 0)
+
+
+def check(args, target_dir, home, owned):
+    record = None if args.update else read_record(args.record)
+    binary = args.binary.resolve() if args.binary else build(target_dir)
+    trellis = Trellis(binary, private_env(home))
+    missing = missing_producers(trellis)
+    if missing:
+        print("rules ratchet NOT RUN: it needs both semantic producers, and "
+              + "; ".join(missing) + ". Run `trellis producer doctor` for the install "
+              "commands. Deviations added by this change are not checked.")
+        return 0
+    Signals.check()
+    daemon = trellis.start_daemon()
+    owned += [trellis, daemon]
+    measured = summarize(measure(trellis, daemon))
+    if args.update:
+        write_record(args.record, measured)
+        print(f"rules ratchet: wrote {args.record}: "
+              + ", ".join(f"{key} {measured[key]}" for key in KEYS))
+        return 0
+    verdict, lines = compare(record, measured)
+    print("\n".join(lines))
+    return 1 if verdict == "fail" else 0
 
 
 if __name__ == "__main__":

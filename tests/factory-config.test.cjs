@@ -1,5 +1,5 @@
 const assert = require("node:assert/strict");
-const { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } = require("node:fs");
+const { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } = require("node:fs");
 const { tmpdir } = require("node:os");
 const { delimiter, dirname, join, resolve: resolvePath } = require("node:path");
 const { spawnSync } = require("node:child_process");
@@ -461,6 +461,23 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
   } finally {
     rmSync(fakeDir, { recursive: true, force: true });
   }
+});
+
+// Owner ruling 8 on #1008: the rules-check ratchet is not in PR CI. A bare
+// ./tools/verify runs every lane, so a pull-request workflow must name its lanes.
+test("no pull-request workflow runs the ratchet lane", () => {
+  const directory = join(ROOT, ".github/workflows");
+  const triggered = [];
+  for (const name of readdirSync(directory).filter((file) => /\.ya?ml$/.test(file))) {
+    const lines = readFileSync(join(directory, name), "utf8").split("\n").filter((line) => !/^\s*#/.test(line));
+    if (!lines.some((line) => /^\s*pull_request(_target)?:/.test(line))) continue;
+    triggered.push(name);
+    assert.ok(!lines.some((line) => /\bratchet\b/.test(line)), `${name} names the ratchet lane`);
+    for (const line of lines.filter((text) => text.includes("tools/verify"))) {
+      assert.match(line, /tools\/verify (--lane \w+|\$\{\{ matrix\.lanes \}\})/, `${name} runs verify without naming lanes: ${line.trim()}`);
+    }
+  }
+  assert.deepEqual(triggered, ["release-candidates.yml", "rust.yml"]);
 });
 
 test("verify cancellation rechecks recorded identities after descending, without PID fallback", () => {

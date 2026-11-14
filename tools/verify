@@ -234,8 +234,8 @@ checks() {
 }
 # The rules-check ratchet (#1008): deviating pairs and references may only fall.
 # It measures through its own daemon under a private HOME, with both semantic
-# producers, and prints a notice instead when either is not installed. It builds
-# in `target`, taking turns with the rust lane on its build lock.
+# producers, and prints a notice instead when either is not installed. It owns
+# `target-ratchet`, so it neither waits on nor writes the rust lane's `target`.
 ratchet() {
   python3 tools/rules-ratchet.py
 }
