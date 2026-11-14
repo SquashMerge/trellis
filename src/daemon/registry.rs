@@ -3076,7 +3076,7 @@ impl CheckoutRuntime {
 
     pub fn metrics_response(
         &self,
-        options: &crate::store::MetricsOptions,
+        options: &crate::metrics_read::MetricsOptions,
         check: &mut (impl FnMut() -> anyhow::Result<()> + Send),
         hooks: MetricsResponseHooks<'_>,
         max_bytes: usize,
@@ -3185,7 +3185,7 @@ impl CheckoutRuntime {
 
     pub fn architecture_response(
         &self,
-        options: &crate::store::MetricsOptions,
+        options: &crate::metrics_read::MetricsOptions,
         check: &mut (impl FnMut() -> anyhow::Result<()> + Send),
         hooks: MetricsResponseHooks<'_>,
         max_bytes: usize,
@@ -3200,11 +3200,11 @@ impl CheckoutRuntime {
             let resources = self.resources()?;
             let root = Path::new(resources.store.workspace_root());
             let config = crate::rules::load(root)?;
-            use crate::store::ArchitectureSummary;
+            use crate::architecture_core::ArchitectureSummary;
             let view = response.architecture_view_head(options, config.as_ref())?;
             let pin = match &view {
-                crate::store::ArchitectureView::Ready { pin, .. } => *pin,
-                crate::store::ArchitectureView::Done(payload) => {
+                crate::architecture_core::ArchitectureView::Ready { pin, .. } => *pin,
+                crate::architecture_core::ArchitectureView::Done(payload) => {
                     return Ok(ArchitectureSummary(Arc::new(payload.clone())));
                 }
             };
@@ -3342,7 +3342,7 @@ impl CheckoutRuntime {
         config: Option<&crate::rules::Config>,
         needs: CoreNeeds,
         check: &mut (impl FnMut() -> anyhow::Result<()> + Send),
-    ) -> anyhow::Result<Arc<crate::store::ArchitectureCore>> {
+    ) -> anyhow::Result<Arc<crate::architecture_core::ArchitectureCore>> {
         // #851: a read that needs the rules needs exactly the current file's, or a core built
         // without one when there is none; a core built under a removed file never answers it.
         let rules = if needs.rules {
@@ -3434,7 +3434,7 @@ impl CheckoutRuntime {
         check: &mut (impl FnMut() -> anyhow::Result<()> + Send),
     ) -> anyhow::Result<(
         Option<crate::rules::Config>,
-        Arc<crate::store::ArchitectureCore>,
+        Arc<crate::architecture_core::ArchitectureCore>,
     )> {
         let parsed =
             crate::store::EvidenceResponse::architecture_arguments("apps", &serde_json::json!({}))?;

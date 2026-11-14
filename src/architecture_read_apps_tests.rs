@@ -1,6 +1,8 @@
 use super::*;
 use crate::apps::Outcome;
 use crate::indexer::{IndexOptions, index_workspace_bundle};
+use crate::store::{SelectedIntegrity, Store};
+use rusqlite::Connection;
 use std::{fs, sync::atomic::AtomicBool};
 
 fn write(root: &std::path::Path, path: &str, text: &str) {
@@ -139,7 +141,7 @@ fn an_absent_root_package_json_is_not_an_app() {
 #[test]
 fn a_corrupt_retained_nested_entry_is_a_typed_selected_integrity_failure() {
     let (_state, _root, store) = published(true);
-    let db = Connection::open(store.roots.index_db(&store.identity)).unwrap();
+    let db = Connection::open(store.index_db_path_for_tests()).unwrap();
     let retained: String = db
         .query_row("SELECT retained_config FROM native_revisions", [], |row| {
             row.get(0)
@@ -175,7 +177,7 @@ fn a_corrupt_retained_nested_entry_is_a_typed_selected_integrity_failure() {
 #[test]
 fn a_duplicated_retained_nested_manifest_is_a_typed_selected_integrity_failure() {
     let (_state, _root, store) = published(true);
-    let db = Connection::open(store.roots.index_db(&store.identity)).unwrap();
+    let db = Connection::open(store.index_db_path_for_tests()).unwrap();
     let retained: String = db
         .query_row("SELECT retained_config FROM native_revisions", [], |row| {
             row.get(0)

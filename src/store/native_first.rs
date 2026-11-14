@@ -33,13 +33,13 @@ pub(crate) struct PendingSemanticTarget {
 }
 
 pub(crate) struct PreparedSemantic {
-    pub producer: crate::semantic_evidence::Producer,
+    pub producer: crate::semantic_records::Producer,
     pub output: PreparedOutput,
     /// A below-capture batch whose staged capture witness this S publishes.
     pub capture_witness: Option<i64>,
     /// The FULL rejoin the pre-commit oracle computed, kept for the post-commit head oracle.
     #[cfg(feature = "test-support")]
-    pub oracle_full: Option<crate::semantic_evidence::SemanticPublication>,
+    pub oracle_full: Option<crate::semantic_records::SemanticPublication>,
 }
 
 pub(crate) enum PreparedOutput {
@@ -823,7 +823,7 @@ impl Store {
 
 /// A document S publishes at commit: settled and staged, or copied from its basis row.
 enum CommitDocument<'a> {
-    Staged(&'a crate::semantic_evidence::SemanticPublication),
+    Staged(&'a crate::semantic_records::SemanticPublication),
     Copied(&'a crate::native_records::DocumentKey),
 }
 
@@ -837,7 +837,7 @@ pub(crate) fn projected_semantic_document(
 ) -> Result<
     Option<(
         SemanticProjection,
-        Option<crate::semantic_evidence::SemanticSnapshot>,
+        Option<crate::semantic_records::SemanticSnapshot>,
     )>,
 > {
     let Some(projection) = semantic_projection_for(db, pin, producer, language, path)? else {
@@ -908,7 +908,7 @@ impl Store {
     ) -> Result<
         Option<(
             SemanticProjection,
-            Option<crate::semantic_evidence::SemanticSnapshot>,
+            Option<crate::semantic_records::SemanticSnapshot>,
         )>,
     > {
         self.native_at(pin, |db, _| {

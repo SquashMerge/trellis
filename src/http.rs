@@ -4162,7 +4162,9 @@ fn selected_mutation_error(error: ApiError, outcome: &str) -> Response {
 /// The Architecture options. Edges never carry their per-file pairs: the details route's
 /// `edge` kind pages them (#917, owner 2026-11-11). `pairs=false`, which asked for that
 /// answer under #915, stays accepted once and changes nothing; `pairs=true` is refused.
-fn architecture_query(uri: &axum::http::Uri) -> Result<crate::store::MetricsOptions, ApiError> {
+fn architecture_query(
+    uri: &axum::http::Uri,
+) -> Result<crate::metrics_read::MetricsOptions, ApiError> {
     let mut pairs = false;
     let mut rest = Vec::new();
     for pair in uri.query().into_iter().flat_map(|query| query.split('&')) {
@@ -4257,7 +4259,7 @@ fn decode_query(value: &str) -> Result<String, ApiError> {
     String::from_utf8(bytes).map_err(|_| invalid())
 }
 
-fn metrics_query(uri: &axum::http::Uri) -> Result<crate::store::MetricsOptions, ApiError> {
+fn metrics_query(uri: &axum::http::Uri) -> Result<crate::metrics_read::MetricsOptions, ApiError> {
     use std::collections::BTreeMap;
     let mut fields = BTreeMap::new();
     if let Some(query) = uri.query() {
@@ -4287,7 +4289,7 @@ fn metrics_query(uri: &axum::http::Uri) -> Result<crate::store::MetricsOptions, 
             }
         }
     }
-    let mut options = crate::store::MetricsOptions::default();
+    let mut options = crate::metrics_read::MetricsOptions::default();
     if let Some(value) = fields.remove("scope") {
         options.scope = value;
     }
@@ -4427,7 +4429,7 @@ async fn provisioned_core_answer(
             let detail_read = details.is_some();
             let options = if detail_read {
                 // A detail page evaluates the whole revision, like the summary.
-                crate::store::MetricsOptions::default()
+                crate::metrics_read::MetricsOptions::default()
             } else if architecture {
                 architecture_query(uri)?
             } else {
@@ -4447,7 +4449,7 @@ async fn provisioned_core_answer(
                 let duration = if metrics.deadline_ms != 0 {
                     Duration::from_millis(metrics.deadline_ms)
                 } else {
-                    crate::store::MetricsOptions::work_budget(&options.scope)
+                    crate::metrics_read::MetricsOptions::work_budget(&options.scope)
                 };
                 let deadline = metrics.now() + duration;
                 let work_hook = hook.clone();

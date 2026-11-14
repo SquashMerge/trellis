@@ -537,7 +537,7 @@ mod tests {
         };
         let building = anyhow::Error::new(crate::http::architecture::ArchitectureBuilding {
             pin,
-            progress: Some(crate::store::ArchitectureProgress {
+            progress: Some(crate::architecture_core::ArchitectureProgress {
                 phase: "measuring",
                 completed: 1,
                 total: 3,
