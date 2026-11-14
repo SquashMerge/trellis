@@ -470,151 +470,202 @@
     rect.setAttribute("x", String(x)); rect.setAttribute("y", String(y));
     text.setAttribute("x", String(round(num(text,"x") + moveX))); text.setAttribute("y", String(round(num(text,"y") + moveY)));
   }
+  // Where a render may be superseded. A phase yields PAUSE where a host's optional async pause
+  // runs first (hosts that cap one synchronous run: the Herdr mod, #707) and CHECK where only
+  // currency is asked; `render` answers both at its one stale checkpoint. The phases are
+  // generators, not async functions, so they add no await of their own: without a pause nothing
+  // here awaits more than the browser did.
+  const PAUSE = "pause", CHECK = "check";
+  // One step of the width fit: from the last attempt's drawn width, the next chip width to try,
+  // moving `s` (columns, chipWidth, stackSpan and the fitting `low` and overflowing `high` chip
+  // widths). False ends the search.
+  function nextFit(s, fits, drawnWidth, target, sharedCount) {
+    const cells = s.columns + sharedCount;
+    let next;
+    if (fits) {
+      s.low = s.chipWidth;
+      const slack = target - drawnWidth;
+      if (slack < 2 * cells || s.chipWidth >= MAX_CHIP) return false;
+      next = s.high === null ? Math.min(MAX_CHIP, s.chipWidth + Math.max(2, Math.floor(slack / cells))) : Math.floor((s.low + s.high) / 2);
+    } else {
+      s.high = s.chipWidth;
+      if (s.low !== null) next = Math.floor((s.low + s.high) / 2);
+      else if (s.chipWidth > MIN_CHIP) next = Math.max(MIN_CHIP, s.chipWidth - Math.ceil((drawnWidth - target) / cells) - 1);
+      else if (s.columns > 1) { s.columns--; s.high = null; next = CHIP_WIDTH; }
+      else if (sharedCount && Math.max(s.columns, s.stackSpan) < MAX_STACK_SPAN) { s.stackSpan = Math.max(s.columns, s.stackSpan) + 1; s.high = null; next = MIN_CHIP; }
+      else return false;
+    }
+    if (s.low !== null && s.high !== null && s.high - s.low <= 1) return false;
+    s.chipWidth = next;
+    return true;
+  }
+  // Fit the canvas width (#449, #525): start from the estimated chip columns, then size the
+  // chips so Pele's natural layout fills the canvas without passing it. Once a fitting and
+  // an overflowing chip width are known, bisect between them. Too wide with no fit shrinks
+  // the chips, then drops a column. At one column with the narrowest chips, a stack beside
+  // shared boxes then spans more grid columns (up to MAX_STACK_SPAN), which narrows the equal
+  // grid cells the shared boxes take; the narrowest layout wins when none fits.
+  function* fitLayout(view, options, measure) {
+    const sharedCount = options.display ? view.layers.filter(l => l.shared && options.display.layers.has(l.name)).length : 0;
+    const s = {columns:options.display ? chipColumns(options.width, sharedCount) : undefined, chipWidth:CHIP_WIDTH, stackSpan:0, low:null, high:null};
+    let projection, raw, best = null;
+    const fit = options.display && options.width > 0;
+    // The side channels routing adds (#637) depend only on the arrows and their tags, never on
+    // chip sizes: they are taken off the width before chip columns are chosen.
+    let target = options.width;
+    yield PAUSE;
+    if (fit) { target -= channelReserve(project(view,{...options,columns:s.columns,chipWidth:s.chipWidth,measureText:measure})); s.columns = chipColumns(target, sharedCount); }
+    for (let attempt = 0; ; attempt++) {
+      yield PAUSE;
+      projection = project(view,{...options,columns:s.columns,chipWidth:s.chipWidth,stackSpan:s.stackSpan,measureText:measure});
+      yield PAUSE;
+      raw = window.pele.render(projection.source,{fontSize:14,padding:8,responsive:false,links:false,images:false}).svg;
+      if (!fit) break;
+      const drawnWidth = Number(/^<svg\b[^>]*?\swidth="([0-9.]+)"/.exec(raw)?.[1]), fits = drawnWidth <= target;
+      if (!best || (fits && (!best.fits || drawnWidth > best.drawnWidth)) || (!fits && !best.fits && drawnWidth < best.drawnWidth)) best = {fits,drawnWidth,projection,raw,columns:s.columns,chipWidth:s.chipWidth,stackSpan:s.stackSpan};
+      if (attempt >= 12 || !nextFit(s, fits, drawnWidth, target, sharedCount)) break;
+    }
+    // Projecting charges the caller's chip budget, so the chosen layout is projected again
+    // when it was not the last attempt; the same inputs give the same source and ids.
+    if (best && best.projection !== projection) {
+      yield PAUSE;
+      projection = project(view,{...options,columns:best.columns,chipWidth:best.chipWidth,stackSpan:best.stackSpan,measureText:measure});
+      raw = best.raw;
+    }
+    return {projection, raw};
+  }
+  const PALETTE = {"var(--_bg)":"#0B0C10","var(--_fg)":"#F7F7FB","var(--_m)":"#B8BAC8","var(--_l)":"#777A8E","var(--_s)":"#14151D","var(--_a)":"#1D1E2A","var(--_b)":"#777A8E"};
+  function applyPalette(root) {
+    root.classList.add("trellis-architecture-svg"); root.setAttribute("font-size","14"); root.setAttribute("font-family","Inter, sans-serif");
+    for (const node of [root,...root.querySelectorAll("*")]) for (const attr of [...node.attributes]) {
+      if (PALETTE[attr.value]) node.setAttribute(attr.name,PALETTE[attr.value]);
+      if (attr.name === "rx" && attr.value === "var(--_r)") node.setAttribute("rx","4");
+    }
+  }
+  // A note's stable identity across re-layouts: its layer (null when unassigned) and its
+  // ordinal among that layer's notes in projection order.
+  function noteIdentities(projection) {
+    const noteIds = new Map(), noteCounts = new Map();
+    for (const item of [...projection.nodes.values()].filter(node => node.kind === "N").sort((a,b) => parseInt(a.id.slice(1),36) - parseInt(b.id.slice(1),36))) {
+      const layer = typeof item.record?.layerKey === "string" ? item.record.layerKey : null, n = noteCounts.get(layer) || 0;
+      noteCounts.set(layer, n + 1); noteIds.set(item.id, JSON.stringify([layer, n]));
+    }
+    return noteIds;
+  }
+  // A module or closed directory chip: metric colour, and its own callback.
+  function tile({node,label,item}, {options}) {
+    const fill = item.band === null ? "#14151D" : colors[item.band];
+    node.querySelector("rect")?.setAttribute("fill",fill); label.setAttribute("fill",item.band > 0 ? "#0B0C10" : "#F7F7FB");
+    return item.kind === "M" ? {callback:options.onSelectModule, expanded:null} : {callback:options.onToggleDirectory, expanded:false};
+  }
+  // The decorator table: how each kind of drawn control is styled, and the callback and
+  // disclosure state (`expanded`; null for a selectable control) that make it a button. A kind
+  // with no row, or a row with no callback, stays plain drawing.
+  const DECORATE = {
+    __proto__:null,
+    // A summary chip: metric colour and name only; its band header is the one toggle.
+    C({node,label,item}) {
+      node.querySelector("rect")?.setAttribute("fill",item.band === null ? "#14151D" : colors[item.band]);
+      label.setAttribute("fill",item.band > 0 ? "#0B0C10" : "#F7F7FB");
+      node.setAttribute("data-trellis-summary-chip",typeof item.record.layerKey === "string" ? item.record.layerKey : "");
+    },
+    M:tile,
+    D:(control, context) => control.item.composite ? {callback:context.options.onToggleDirectory, expanded:true} : tile(control, context),
+    U:({item}, {options}) => ({callback:options.onToggleUnassigned, expanded:item.expanded}),
+    N:(control, {options}) => ({callback:options.onSelectNote, expanded:null}),
+    L({node,label,item}, {options, measure, current, actions}) {
+      const callback = options.display ? options.onToggleLayer : options.onSelectLayer, expanded = options.display ? item.expanded : null;
+      if (item.statLines?.length) {
+        const handlers = {onOpenDeviation:options.onOpenDeviation, onSelectInterface:options.onSelectInterface, isCurrent:current};
+        statChips(node,label,item,measure,handlers).reduce((previous,{node:button}) => {
+          previous.after(button); actions.push({node:button,label:null,item:{kind:"A",id:`${item.id}.a${actions.length}`,host:item.host}});
+          return button;
+        },node);
+      }
+      return {callback, expanded};
+    },
+    E({node,label,item,path}, {options}) {
+      // Deviations are highlighted; allowed (conforming or excepted) arrows are dimmed, not dropped (#449).
+      const danger = item.record.role === "production" && item.record.status === "deviates" && !item.record.excepted;
+      const tone = item.tone || (danger ? "deviation" : "neutral");
+      const color = tone === "deviation" ? "#FF8E9A" : tone === "allowed" ? "#777A8E" : "#B8BAC8";
+      for (const p of path.querySelectorAll("path")) {
+        p.setAttribute("stroke",color);
+        if (p.classList.contains("pele-marker")) p.setAttribute("fill",color);
+      }
+      const rect = node.querySelector("rect"); rect?.setAttribute("stroke",color); rect?.setAttribute("fill","#14151D"); label.setAttribute("fill",color);
+      if (tone === "allowed") { path.setAttribute("opacity","0.45"); node.setAttribute("opacity","0.75"); }
+      node.setAttribute("data-trellis-edge-tone",tone);
+      return {callback:options.onSelectEdge, expanded:null};
+    },
+  };
+  // Make one decorated control a button, with the identity its kind is found by.
+  function bindControl({node,item}, callback, expanded, {controls, current, noteIds}) {
+    asButton(node,item.full,event => {
+      event?.stopPropagation();
+      if (!current()) return;
+      if (expanded === null) for (const control of controls.values()) if (control.node.hasAttribute("aria-pressed")) control.node.setAttribute("aria-pressed",String(control.node === node));
+      callback(item.record);
+    });
+    node.setAttribute("data-trellis-architecture-id",item.id);
+    // Disclosure nodes report expansion; selectable evidence reports selection.
+    if (expanded === null) node.setAttribute("aria-pressed","false"); else node.setAttribute("aria-expanded",String(expanded));
+    if (item.kind === "M") node.setAttribute("data-trellis-module-id",identity(item.record));
+    if (item.kind === "L") node.setAttribute("data-trellis-layer-id",item.record.name);
+    if (item.kind === "D") node.setAttribute("data-trellis-directory-id",item.record.key);
+    if (item.kind === "U") node.setAttribute("data-trellis-unassigned","true");
+    if (item.kind === "N") node.setAttribute("data-trellis-note-id",noteIds.get(item.id));
+    if (item.kind === "E") node.setAttribute("data-trellis-edge-id",edgeKey(item.record));
+  }
+  // Label, style and bind every control, in drawing order. Returns the stat-chip buttons made
+  // on the way; they join `controls` only after the pause that follows.
+  function decorate(controls, projection, options, measure, current) {
+    const context = {options, measure, current, controls, noteIds:noteIdentities(projection), actions:[]};
+    for (const control of controls.values()) {
+      replaceLabel(control.label,control.item);
+      const made = DECORATE[control.item.kind]?.(control, context);
+      if (made?.callback) bindControl(control, made.callback, made.expanded, context);
+    }
+    return context.actions;
+  }
+  function bandFrames(controls) {
+    const bands = new Map();
+    for (const control of controls.values()) if (control.item.kind === "L") bands.set(control.item.record.name,frame(control));
+    return bands;
+  }
+  // One render's phases, in order, up to the finished drawing. Nothing here touches the page.
+  function* phases(view, options, current) {
+    yield CHECK;
+    const measure = textMeasurer("14px Inter, sans-serif");
+    if (!measure) unsupported("Architecture text measurement unavailable");
+    if (typeof window.pele?.render !== "function") unsupported("Pele asset unavailable");
+    const {projection, raw} = yield* fitLayout(view, options, measure);
+    yield PAUSE;
+    yield CHECK;
+    const {root,controls} = validatedSvg(raw,projection);
+    yield PAUSE;
+    applyPalette(root);
+    const actions = decorate(controls, projection, options, measure, current);
+    yield PAUSE;
+    for (const control of actions) controls.set(control.item.id,control);
+    if (options.display) route(root,controls,projection);
+    yield CHECK;
+    return {root, projection, bands:bandFrames(controls)};
+  }
   async function render(container, view, options = {}) {
     const current = () => !options.isCurrent || options.isCurrent();
     if (!current()) return {status:"stale"};
-    // An optional async yield between heavy phases, for hosts that cap one synchronous run
-    // (the Herdr mod, #707). Without it nothing here awaits more than the browser did.
     const pause = typeof options.pause === "function" ? options.pause : null;
     const breathe = async () => { await pause(); return current(); };
     try {
       if (document.fonts?.ready) await document.fonts.ready;
-      if (!current()) return {status:"stale"};
-      const measure = textMeasurer("14px Inter, sans-serif");
-      if (!measure) unsupported("Architecture text measurement unavailable");
-      if (typeof window.pele?.render !== "function") unsupported("Pele asset unavailable");
-      // Fit the canvas width (#449, #525): start from the estimated chip columns, then size the
-      // chips so Pele's natural layout fills the canvas without passing it. Once a fitting and
-      // an overflowing chip width are known, bisect between them. Too wide with no fit shrinks
-      // the chips, then drops a column. At one column with the narrowest chips, a stack beside
-      // shared boxes then spans more grid columns (up to MAX_STACK_SPAN), which narrows the equal
-      // grid cells the shared boxes take; the narrowest layout wins when none fits.
-      const sharedCount = options.display ? view.layers.filter(l => l.shared && options.display.layers.has(l.name)).length : 0;
-      let columns = options.display ? chipColumns(options.width, sharedCount) : undefined, chipWidth = CHIP_WIDTH, stackSpan = 0;
-      let projection, raw, best = null, low = null, high = null;
-      const fit = options.display && options.width > 0;
-      // The side channels routing adds (#637) depend only on the arrows and their tags, never on
-      // chip sizes: they are taken off the width before chip columns are chosen.
-      let target = options.width;
-      if (pause && !(await breathe())) return {status:"stale"};
-      if (fit) { target -= channelReserve(project(view,{...options,columns,chipWidth,measureText:measure})); columns = chipColumns(target, sharedCount); }
-      for (let attempt = 0; ; attempt++) {
-        if (pause && !(await breathe())) return {status:"stale"};
-        projection = project(view,{...options,columns,chipWidth,stackSpan,measureText:measure});
-        if (pause && !(await breathe())) return {status:"stale"};
-        raw = window.pele.render(projection.source,{fontSize:14,padding:8,responsive:false,links:false,images:false}).svg;
-        if (!fit) break;
-        const drawnWidth = Number(/^<svg\b[^>]*?\swidth="([0-9.]+)"/.exec(raw)?.[1]), cells = columns + sharedCount;
-        const fits = drawnWidth <= target;
-        if (!best || (fits && (!best.fits || drawnWidth > best.drawnWidth)) || (!fits && !best.fits && drawnWidth < best.drawnWidth)) best = {fits,drawnWidth,projection,raw,columns,chipWidth,stackSpan};
-        if (attempt >= 12) break;
-        let next;
-        if (fits) {
-          low = chipWidth;
-          const slack = target - drawnWidth;
-          if (slack < 2 * cells || chipWidth >= MAX_CHIP) break;
-          next = high === null ? Math.min(MAX_CHIP, chipWidth + Math.max(2, Math.floor(slack / cells))) : Math.floor((low + high) / 2);
-        } else {
-          high = chipWidth;
-          if (low !== null) next = Math.floor((low + high) / 2);
-          else if (chipWidth > MIN_CHIP) next = Math.max(MIN_CHIP, chipWidth - Math.ceil((drawnWidth - target) / cells) - 1);
-          else if (columns > 1) { columns--; high = null; next = CHIP_WIDTH; }
-          else if (sharedCount && Math.max(columns, stackSpan) < MAX_STACK_SPAN) { stackSpan = Math.max(columns, stackSpan) + 1; high = null; next = MIN_CHIP; }
-          else break;
-        }
-        if (low !== null && high !== null && high - low <= 1) break;
-        chipWidth = next;
-      }
-      // Projecting charges the caller's chip budget, so the chosen layout is projected again
-      // when it was not the last attempt; the same inputs give the same source and ids.
-      if (best && best.projection !== projection) {
-        if (pause && !(await breathe())) return {status:"stale"};
-        projection = project(view,{...options,columns:best.columns,chipWidth:best.chipWidth,stackSpan:best.stackSpan,measureText:measure});
-        raw = best.raw;
-      }
-      if (pause && !(await breathe())) return {status:"stale"};
-      if (!current()) return {status:"stale"};
-      const {root,controls} = validatedSvg(raw,projection);
-      if (pause && !(await breathe())) return {status:"stale"};
-      root.classList.add("trellis-architecture-svg"); root.setAttribute("font-size","14"); root.setAttribute("font-family","Inter, sans-serif");
-      const palette = {"var(--_bg)":"#0B0C10","var(--_fg)":"#F7F7FB","var(--_m)":"#B8BAC8","var(--_l)":"#777A8E","var(--_s)":"#14151D","var(--_a)":"#1D1E2A","var(--_b)":"#777A8E"};
-      for (const node of [root,...root.querySelectorAll("*")]) for (const attr of [...node.attributes]) {
-        if (palette[attr.value]) node.setAttribute(attr.name,palette[attr.value]);
-        if (attr.name === "rx" && attr.value === "var(--_r)") node.setAttribute("rx","4");
-      }
-      // A note's stable identity across re-layouts: its layer (null when unassigned) and its
-      // ordinal among that layer's notes in projection order.
-      const noteIds = new Map(), noteCounts = new Map();
-      for (const item of [...projection.nodes.values()].filter(node => node.kind === "N").sort((a,b) => parseInt(a.id.slice(1),36) - parseInt(b.id.slice(1),36))) {
-        const layer = typeof item.record?.layerKey === "string" ? item.record.layerKey : null, n = noteCounts.get(layer) || 0;
-        noteCounts.set(layer, n + 1); noteIds.set(item.id, JSON.stringify([layer, n]));
-      }
-      const actionControls = [];
-      for (const {node,label,item,path} of controls.values()) {
-        replaceLabel(label,item);
-        let callback, expanded = null;
-        if (item.kind === "C") {
-          // A summary chip: metric colour and name only; its band header is the one toggle.
-          node.querySelector("rect")?.setAttribute("fill",item.band === null ? "#14151D" : colors[item.band]);
-          label.setAttribute("fill",item.band > 0 ? "#0B0C10" : "#F7F7FB");
-          node.setAttribute("data-trellis-summary-chip",typeof item.record.layerKey === "string" ? item.record.layerKey : "");
-        } else if (item.kind === "M" || (item.kind === "D" && !item.composite)) {
-          const fill = item.band === null ? "#14151D" : colors[item.band];
-          node.querySelector("rect")?.setAttribute("fill",fill); label.setAttribute("fill",item.band > 0 ? "#0B0C10" : "#F7F7FB");
-          callback = item.kind === "M" ? options.onSelectModule : options.onToggleDirectory;
-          if (item.kind === "D") expanded = false;
-        } else if (item.kind === "D") { callback = options.onToggleDirectory; expanded = true; }
-        else if (item.kind === "U") { callback = options.onToggleUnassigned; expanded = item.expanded; }
-        else if (item.kind === "N") callback = options.onSelectNote;
-        else if (item.kind === "L") {
-          callback = options.display ? options.onToggleLayer : options.onSelectLayer;
-          if (options.display) expanded = item.expanded;
-          if (item.statLines?.length) {
-            const handlers = {onOpenDeviation:options.onOpenDeviation, onSelectInterface:options.onSelectInterface, isCurrent:current};
-            statChips(node,label,item,measure,handlers).reduce((previous,{node:button}) => {
-              previous.after(button); actionControls.push({node:button,label:null,item:{kind:"A",id:`${item.id}.a${actionControls.length}`,host:item.host}});
-              return button;
-            },node);
-          }
-        } else if (item.kind === "E") {
-          // Deviations are highlighted; allowed (conforming or excepted) arrows are dimmed, not dropped (#449).
-          const danger = item.record.role === "production" && item.record.status === "deviates" && !item.record.excepted;
-          const tone = item.tone || (danger ? "deviation" : "neutral");
-          const color = tone === "deviation" ? "#FF8E9A" : tone === "allowed" ? "#777A8E" : "#B8BAC8";
-          for (const p of path.querySelectorAll("path")) {
-            p.setAttribute("stroke",color);
-            if (p.classList.contains("pele-marker")) p.setAttribute("fill",color);
-          }
-          const rect = node.querySelector("rect"); rect?.setAttribute("stroke",color); rect?.setAttribute("fill","#14151D"); label.setAttribute("fill",color);
-          if (tone === "allowed") { path.setAttribute("opacity","0.45"); node.setAttribute("opacity","0.75"); }
-          node.setAttribute("data-trellis-edge-tone",tone);
-          callback = options.onSelectEdge;
-        }
-        if (!callback) continue;
-        asButton(node,item.full,event => {
-          event?.stopPropagation();
-          if (!current()) return;
-          if (expanded === null) for (const control of controls.values()) if (control.node.hasAttribute("aria-pressed")) control.node.setAttribute("aria-pressed",String(control.node === node));
-          callback(item.record);
-        });
-        node.setAttribute("data-trellis-architecture-id",item.id);
-        // Disclosure nodes report expansion; selectable evidence reports selection.
-        if (expanded === null) node.setAttribute("aria-pressed","false"); else node.setAttribute("aria-expanded",String(expanded));
-        if (item.kind === "M") node.setAttribute("data-trellis-module-id",identity(item.record));
-        if (item.kind === "L") node.setAttribute("data-trellis-layer-id",item.record.name);
-        if (item.kind === "D") node.setAttribute("data-trellis-directory-id",item.record.key);
-        if (item.kind === "U") node.setAttribute("data-trellis-unassigned","true");
-        if (item.kind === "N") node.setAttribute("data-trellis-note-id",noteIds.get(item.id));
-        if (item.kind === "E") node.setAttribute("data-trellis-edge-id",edgeKey(item.record));
-      }
-      if (pause && !(await breathe())) return {status:"stale"};
-      for (const control of actionControls) controls.set(control.item.id,control);
-      if (options.display) route(root,controls,projection);
-      if (!current()) return {status:"stale"};
-      const bands = new Map();
-      for (const control of controls.values()) if (control.item.kind === "L") bands.set(control.item.record.name,frame(control));
-      container.replaceChildren(root);
-      return {status:"ready",projection,bands};
+      const steps = phases(view, options, current);
+      let step = steps.next();
+      // The one stale checkpoint: a superseded render stops here, between two phases, and
+      // leaves the page as it found it.
+      for (; !step.done; step = steps.next()) if (step.value === PAUSE ? pause && !(await breathe()) : !current()) return {status:"stale"};
+      container.replaceChildren(step.value.root);
+      return {status:"ready",projection:step.value.projection,bands:step.value.bands};
     } catch (error) {
       if (!current()) return {status:"stale"};
       const message = document.createElement("p"); message.className = "architecture-render-error";
