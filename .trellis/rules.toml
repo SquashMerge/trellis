@@ -49,6 +49,13 @@ paths = [
   # that moved with them. Storage keeps the read they start from.
   "src/architecture_core.rs", "src/architecture_read.rs", "src/architecture_read_apps_tests.rs",
   "src/metrics_read.rs", "src/metrics_read_parallel_tests.rs",
+  # The Sequence, graph and navigation reads, moved up from storage (S6, #1048): the snapshot
+  # graph source and Sequence enrichment, the Sequence boundary hops, and the read bodies and
+  # forwarding methods of each view, with the tests that moved with them. They contain SQL
+  # until the read API is narrowed (S14).
+  "src/graph_read.rs", "src/graph_read/**", "src/sequence_hops.rs",
+  "src/sequence_hops_tests.rs", "src/sequence_callback_hops_tests.rs",
+  "src/navigation_read.rs", "src/sequence_read.rs", "src/view_read.rs",
 ]
 
 [layers.indexing]

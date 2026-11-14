@@ -3483,7 +3483,7 @@ impl CheckoutRuntime {
         visible_bound: bool,
     ) -> anyhow::Result<()> {
         let mut check = || Ok(());
-        if crate::store::sequence_call_ids(&view.steps).is_empty() {
+        if crate::sequence_hops::call_ids(&view.steps).is_empty() {
             return Ok(());
         }
         let parsed =
@@ -3494,7 +3494,7 @@ impl CheckoutRuntime {
             Err(_) => {
                 return response.annotate_sequence_interfaces(
                     view,
-                    crate::store::InterfaceEvidence::Unavailable,
+                    crate::sequence_hops::InterfaceEvidence::Unavailable,
                     visible_bound,
                     &mut check,
                 );
@@ -3509,11 +3509,11 @@ impl CheckoutRuntime {
             .architecture_core_if_available(view.revision, Duration::ZERO, &mut check)
             .filter(|core| rules.admits(core.rules_hash()));
         let evidence = match &core {
-            Some(core) => crate::store::InterfaceEvidence::Core {
+            Some(core) => crate::sequence_hops::InterfaceEvidence::Core {
                 config: config.as_ref(),
                 core,
             },
-            None => crate::store::InterfaceEvidence::NotMeasured,
+            None => crate::sequence_hops::InterfaceEvidence::NotMeasured,
         };
         response.annotate_sequence_interfaces(view, evidence, visible_bound, &mut check)
     }

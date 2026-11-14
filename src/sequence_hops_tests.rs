@@ -4,7 +4,11 @@ use super::*;
 use crate::architecture_core::{ArchitectureCore, ArchitectureProgress};
 use crate::behavior::{InterfaceHop, InterfacesState, SequenceStep, SequenceView};
 use crate::indexer::{IndexOptions, index_workspace_bundle};
-use std::{fs, sync::atomic::AtomicBool};
+use crate::store::Store;
+use std::{
+    fs,
+    sync::{Arc, atomic::AtomicBool},
+};
 
 pub(super) fn write(root: &std::path::Path, path: &str, text: &str) {
     let path = root.join(path);
@@ -164,7 +168,7 @@ fn client_calls_cross_to_the_daemon_with_their_confidence_or_stay_boundaries() {
         .iter()
         .map(|participant| {
             let column = participant.column.as_ref().unwrap();
-            assert_eq!(participant.kind, crate::store::sequence_hops::HANDLER_KIND);
+            assert_eq!(participant.kind, crate::sequence_hops::HANDLER_KIND);
             assert_eq!(
                 Some(participant.id.as_str()),
                 found
@@ -523,7 +527,7 @@ fn a_revealed_hop_stays_within_the_shown_step_bound() {
     assert!(
         view.participants
             .iter()
-            .filter(|participant| participant.kind == crate::store::sequence_hops::HANDLER_KIND)
+            .filter(|participant| participant.kind == crate::sequence_hops::HANDLER_KIND)
             .all(|participant| drawn.contains(&participant.id.as_str()))
     );
 }
