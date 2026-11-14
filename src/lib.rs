@@ -65,6 +65,7 @@ mod navigation_read;
 mod parallel;
 pub mod process_info;
 pub mod producer;
+pub mod producer_pin;
 pub mod references;
 pub mod rules;
 mod rules_edit;

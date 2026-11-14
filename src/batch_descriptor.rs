@@ -3,13 +3,15 @@
 //!
 //! Parsing is serde only and never admits: native rejoin re-parses stored `descriptor_bytes`
 //! through the same type. Admission is the separate `check_*` family, run in wire-format order.
-//! The checks here need only the bytes, the limits and the captured revision. The ones that
-//! consult the producer registry, the producer profiles or the filesystem (`check_producer`,
-//! `context_profile`, `check_origin`, `check_paths`) are in `semantic_batch::descriptor`.
+//! The checks here need only the bytes, the limits, the captured revision and the checked-in
+//! producer pin (`crate::producer_pin`). The ones that consult the producer profiles or the
+//! filesystem (`context_profile`, `check_origin`, `check_paths`) are in
+//! `semantic_batch::descriptor`.
 pub use crate::semantic_batch::origin::GenerationOrigin;
 use crate::{
     native_ids::canonical_into,
     native_records as native,
+    producer_pin::{PinnedProducer, pinned_producer},
     scip_raw::{self, Completion, ScipCaptureError},
     scip_vocab::{admission, hexhash, order, path},
     semantic_batch::limits::BatchLimits,
@@ -249,6 +251,11 @@ impl Descriptor {
             return Err(admission("descriptor decoder version"));
         }
         Ok(descriptor)
+    }
+
+    /// Check 2: the declared producer must equal the checked-in pin exactly.
+    pub fn check_producer(&self) -> Result<PinnedProducer> {
+        pinned_producer(&self.trust_origin, &self.profile_id, &self.producer)
     }
 
     /// The project-root spellings a stored batch may bind to on store reuse. Every spelling
