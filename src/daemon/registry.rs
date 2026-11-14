@@ -751,7 +751,7 @@ impl CheckoutRegistry {
         }
         runtime
             .pickup
-            .start_watch(&runtime.resources()?.store, &scheduler);
+            .start_watch(&runtime.resources()?.store, scheduler.clone());
         runtime.auto_run.start(
             Arc::new(AutoHost {
                 runtime: Arc::downgrade(&runtime),
@@ -1843,6 +1843,36 @@ impl std::ops::Deref for CheckoutEvidence {
     }
 }
 
+/// The producer layer's view of this runtime (`producer::import::ImportScheduler`): each
+/// method is the inherent one of the same name, with the phase reduced to what producers ask.
+impl crate::producer::import::ImportScheduler for http::DaemonState {
+    fn phase(&self) -> crate::producer::import::SchedulerPhase {
+        use crate::producer::import::SchedulerPhase;
+        match self.runtime_phase() {
+            RuntimePhase::Activating | RuntimePhase::Reconciling { .. } => SchedulerPhase::Starting,
+            RuntimePhase::Ready => SchedulerPhase::Ready,
+            RuntimePhase::RetireRequested => SchedulerPhase::RetireRequested,
+            RuntimePhase::Closing | RuntimePhase::Retired => SchedulerPhase::Stopped,
+        }
+    }
+
+    fn state_version(&self) -> u64 {
+        http::DaemonState::state_version(self)
+    }
+
+    fn wait_state_change(&self, seen: u64, timeout: Duration) {
+        http::DaemonState::wait_state_change(self, seen, timeout)
+    }
+
+    fn enqueue_generated_semantic_import(
+        &self,
+        options: &crate::store::requests::GeneratedImportOptions,
+        id: uuid::Uuid,
+    ) -> anyhow::Result<crate::store::requests::Request> {
+        http::DaemonState::enqueue_generated_semantic_import(self, options, id)
+    }
+}
+
 /// Resources are removed from the slot on release, even if a client retains
 /// the inert CheckoutRuntime handle after disconnect.
 struct ActiveResources {
@@ -2377,7 +2407,7 @@ impl CheckoutRuntime {
         let reply = self.producer.start_run(
             &crate::producer::run::RunContext {
                 store: &resources.store,
-                scheduler: &resources.scheduler,
+                scheduler: &*resources.scheduler,
                 stub: stub.as_ref(),
             },
             &request,
@@ -2431,7 +2461,7 @@ impl CheckoutRuntime {
         let result = self.producer.start_run(
             &crate::producer::run::RunContext {
                 store: &resources.store,
-                scheduler: &resources.scheduler,
+                scheduler: &*resources.scheduler,
                 stub: stub.as_ref(),
             },
             &run,
@@ -2522,7 +2552,7 @@ impl CheckoutRuntime {
         match &request.artifact {
             Some(artifact) => self.pickup.set(
                 &resources.store,
-                &resources.scheduler,
+                &*resources.scheduler,
                 &request.producer,
                 artifact,
             ),
