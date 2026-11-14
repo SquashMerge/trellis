@@ -327,6 +327,14 @@ pub struct DaemonState {
     test_queue_after_watcher_reconcile: crate::store::TestOneShotHook,
     #[cfg(test)]
     test_queue_current_phase: std::sync::atomic::AtomicU8,
+    /// Runs in a session change, which holds the runtime state, before it clears the
+    /// published watch status.
+    #[cfg(test)]
+    test_session_change_before_watch_status: crate::store::TestOneShotHook,
+    /// Runs in a watcher-intent read that found no published status, before it reads the
+    /// runtime state.
+    #[cfg(test)]
+    test_watch_pending_before_state: crate::store::TestOneShotHook,
 }
 impl Drop for DaemonState {
     /// A lossless shutdown: an idle worker waiting without a deadline exits.
@@ -547,6 +555,10 @@ pub fn new_with_config(
         test_queue_after_watcher_reconcile: crate::store::TestOneShotHook::default(),
         #[cfg(test)]
         test_queue_current_phase: std::sync::atomic::AtomicU8::new(0),
+        #[cfg(test)]
+        test_session_change_before_watch_status: crate::store::TestOneShotHook::default(),
+        #[cfg(test)]
+        test_watch_pending_before_state: crate::store::TestOneShotHook::default(),
         jobs: Mutex::new(Jobs {
             current: None,
             jobs: BTreeMap::new(),
@@ -722,15 +734,21 @@ impl DaemonState {
     /// acknowledges it. Reads the published status only (#138 item 2): ingress
     /// increments the live generation before the worker drains it.
     pub fn checkout_watch_pending(&self) -> bool {
-        match &*self.watch_status.lock().unwrap() {
-            Some(status) => {
-                status.other_intent
-                    || status.capturing.load(Ordering::SeqCst)
-                    || status.generation.load(Ordering::SeqCst) != status.acknowledged
-            }
-            // A serving session's first watcher has not run its full inventory.
-            None => self.runtime.lock().unwrap().session().is_some(),
+        // The status lock is released before the runtime state is read. A session change
+        // holds the state while it clears this status, so a reader that kept the status
+        // while it waited for the state would deadlock with the worker (#1078).
+        let published = self.watch_status.lock().unwrap().as_ref().map(|status| {
+            status.other_intent
+                || status.capturing.load(Ordering::SeqCst)
+                || status.generation.load(Ordering::SeqCst) != status.acknowledged
+        });
+        if let Some(pending) = published {
+            return pending;
         }
+        #[cfg(test)]
+        self.test_watch_pending_before_state.run();
+        // A serving session's first watcher has not run its full inventory.
+        self.runtime.lock().unwrap().session().is_some()
     }
 
     /// A deterministic fixture can submit an accepted source hint through the
@@ -864,6 +882,8 @@ impl DaemonState {
         if changed {
             let mut work = self.watcher_work.lock().unwrap();
             *work = None;
+            #[cfg(test)]
+            self.test_session_change_before_watch_status.run();
             *self.watch_status.lock().unwrap() = None;
             // The replaced watcher is gone; a new one publishes its own state.
             self.watcher_health.reset();
