@@ -4,6 +4,16 @@ pairs and references may only fall.
 
     python3 tools/rules-ratchet.py            # check against the record
     python3 tools/rules-ratchet.py --update   # rewrite the record from a fresh measurement
+    ./tools/verify --lane ratchet             # the check, as verify's opt-in lane
+
+It runs on request and nightly, not in a default `./tools/verify` (owner ruling,
+2026-11-14): the measurement takes minutes.
+
+Only first-party references are counted. `rules check` gives every instance a
+`destination`: a native module, null when the reference is unresolved, or
+`{kind: "externalPackage", ...}` for a standard-library or external package. Instances
+with an `externalPackage` destination are left out of every figure, so a new
+`import json` in a tool changes nothing here.
 
 The measurement runs through a daemon of its own under a private HOME, on a fresh index
 of this checkout with fresh rust-analyzer and scip-typescript evidence; it never touches
@@ -36,6 +46,18 @@ PRODUCERS = (("rust-analyzer", "trusted"), ("scip-typescript", "restricted"))
 # comparison population they were counted on.
 KEYS = ("deviatingPairs", "deviatingReferences", "comparablePairs", "conformingPairs",
         "unknownPairs", "partialFiles")
+SCHEMA_VERSION = 2
+# What the record's figures count and how they were measured, written into the record
+# so it can be read without this script.
+DESCRIPTION = {
+    "population": "Production instances of `trellis rules check` whose destination is "
+                  "not an externalPackage: first-party sources to first-party or "
+                  "unresolved destinations. Standard-library and external packages are "
+                  "not counted.",
+    "measurement": "`python3 tools/rules-ratchet.py --update`: a debug build of this "
+                   "checkout, its own daemon under a private HOME, a fresh index, then "
+                   "rust-analyzer (trusted) and scip-typescript (restricted) imported.",
+}
 UPDATE = "python3 tools/rules-ratchet.py --update"
 # Each `trellis status` waits a bounded time for the first index; this many calls is a
 # backstop against a hang, not a speed expectation.
@@ -101,21 +123,36 @@ def run(argv, timeout=None, **options):
     return subprocess.CompletedProcess(argv, process.returncode, out, err)
 
 
+def is_external(row):
+    """Whether the instance's destination is a standard-library or external package,
+    by the tool's own typed destination (the closed union in docs/rules.md)."""
+    destination = row["destination"]
+    return destination is not None and destination.get("kind") == "externalPackage"
+
+
 def summarize(payload):
-    """The record's figures from one `trellis rules check` payload."""
-    counts = payload["counts"]
-    deviating = [row for row in payload["instances"]
-                 if row["status"] == "deviates" and not row["excepted"]]
-    if len(deviating) != counts["deviates"]:
+    """The record's figures from one `trellis rules check` payload, and the number of
+    instances left out because their destination is an external package."""
+    counts, instances = payload["counts"], payload["instances"]
+
+    def having(rows, status):
+        return [row for row in rows if row["status"] == status and not row["excepted"]]
+
+    # The instance list must be the whole population the tool counted.
+    if len(instances) != counts["comparable"] or any(
+            len(having(instances, status)) != counts[key]
+            for status, key in (("deviates", "deviates"), ("unknown", "unknown"))):
         raise Failed("rules check counts disagree with its instances")
+    first_party = [row for row in instances if not is_external(row)]
+    deviating = having(first_party, "deviates")
     return {
-        "deviatingPairs": counts["deviates"],
+        "deviatingPairs": len(deviating),
         "deviatingReferences": sum(row["referenceCount"] for row in deviating),
-        "comparablePairs": counts["comparable"],
-        "conformingPairs": counts["conforms"],
-        "unknownPairs": counts["unknown"],
+        "comparablePairs": len(first_party),
+        "conformingPairs": len(having(first_party, "conforms")),
+        "unknownPairs": len(having(first_party, "unknown")),
         "partialFiles": len(payload["partialFiles"]),
-    }
+    }, len(instances) - len(first_party)
 
 
 def compare(record, measured):
@@ -157,15 +194,17 @@ def compare(record, measured):
 
 def read_record(path):
     record = json.loads(path.read_text())
-    if record.get("schemaVersion") != 1 or any(
-            not isinstance(record.get(key), int) for key in KEYS):
-        raise Failed(f"{path}: not a rules-ratchet record")
+    if (record.get("schemaVersion") != SCHEMA_VERSION
+            or any(record.get(key) != text for key, text in DESCRIPTION.items())
+            or any(not isinstance(record.get(key), int) for key in KEYS)):
+        raise Failed(f"{path}: not a version {SCHEMA_VERSION} rules-ratchet record; "
+                     f"rewrite it with {UPDATE}")
     return record
 
 
 def write_record(path, measured):
-    path.write_text(json.dumps({"schemaVersion": 1, **{key: measured[key] for key in KEYS}},
-                               indent=2) + "\n")
+    path.write_text(json.dumps({"schemaVersion": SCHEMA_VERSION, **DESCRIPTION,
+                                **{key: measured[key] for key in KEYS}}, indent=2) + "\n")
 
 
 def private_env(home):
@@ -332,6 +371,8 @@ def main():
     parser.add_argument("--update", action="store_true", help="rewrite the record")
     parser.add_argument("--binary", type=Path, help="a built trellis; default: build one")
     parser.add_argument("--record", type=Path, default=RECORD)
+    parser.add_argument("--save-payload", type=Path,
+                        help="also write the measured `rules check` payload here")
     args = parser.parse_args()
     target_dir = ROOT / os.environ.get("CARGO_TARGET_DIR", "target")
     started = time.monotonic()
@@ -370,7 +411,12 @@ def check(args, target_dir, home, owned):
     Signals.check()
     daemon = trellis.start_daemon()
     owned += [trellis, daemon]
-    measured = summarize(measure(trellis, daemon))
+    payload = measure(trellis, daemon)
+    if args.save_payload:
+        args.save_payload.write_text(json.dumps(payload, indent=1) + "\n")
+    measured, external = summarize(payload)
+    print(f"rules ratchet: {external} pairs with a standard-library or external package "
+          "destination are not counted")
     if args.update:
         write_record(args.record, measured)
         print(f"rules ratchet: wrote {args.record}: "

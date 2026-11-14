@@ -462,9 +462,10 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
         ["node", "--import", "./herdr-mod/test/register.mjs", "--test", "herdr-mod/test/mod.test.mjs", "herdr-mod/test/view.test.mjs", "herdr-mod/test/parity.test.mjs", "herdr-mod/test/setup.test.mjs"],
         ["node", "--test", "tests/browse-ui.test.cjs", "tests/sequence-ui.test.cjs", "tests/token-ui.test.cjs", "tests/external-source-ui.test.cjs", "tests/dependency-ui.test.cjs", "tests/shell-ui.test.cjs", "tests/classes-ui.test.cjs", "tests/navigation-ui.test.cjs", "tests/metric-heat.test.cjs", "tests/viewer-metrics-ui.test.cjs", "tests/files-ui.test.cjs", "tests/architecture-ui.test.cjs", "tests/architecture-pele-ui.test.cjs", "tests/treemap-ui.test.cjs", "tests/treemap-pele.test.cjs", "tests/architecture-apps-ui.test.cjs", "tests/app-switcher-ui.test.cjs", "tests/architecture-routing.test.cjs"],
       ],
-      // The rules-check ratchet (#1008) builds and measures inside its one command.
-      ratchet: [["python3", "tools/rules-ratchet.py"]],
     };
+    // The rules-check ratchet (#1008) builds and measures inside its one command.
+    // It is not a default lane: it runs only when named.
+    const ratchet = [["python3", "tools/rules-ratchet.py"]];
     function assertRan(commands, expected) {
       const key = (command) => JSON.stringify(command);
       assert.deepEqual(commands.map(key).sort(), Object.values(expected).flat().map(key).sort());
@@ -481,6 +482,16 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
     const success = runVerify();
     assert.equal(success.result.status, 0, success.output);
     assertRan(success.commands, lanes);
+    assert.doesNotMatch(success.output, /verify lane ratchet/);
+    rmSync(log);
+    const ratchetOnly = runVerify({}, undefined, ["--lane", "ratchet"]);
+    assert.equal(ratchetOnly.result.status, 0, ratchetOnly.output);
+    assertRan(ratchetOnly.commands, { setup: lanes.setup, ratchet });
+    assert.match(ratchetOnly.output, /==> verify lane ratchet \(exit 0\)/);
+    rmSync(log);
+    const withRatchet = runVerify({}, undefined, ["--lane", "checks", "--lane", "ratchet"]);
+    assert.equal(withRatchet.result.status, 0, withRatchet.output);
+    assertRan(withRatchet.commands, { setup: lanes.setup, checks: lanes.checks, ratchet });
     rmSync(log);
     // With TRELLIS_BROWSER_SYSTEM_DEPS set, the system packages are checked
     // and, only if a library or the layout font is missing, installed in the background; the
@@ -587,8 +598,8 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
   }
 });
 
-// Owner ruling 8 on #1008: the rules-check ratchet is not in PR CI. A bare
-// ./tools/verify runs every lane, so a pull-request workflow must name its lanes.
+// Owner ruling 8 on #1008: the rules-check ratchet is not in PR CI. It is not a
+// default verify lane, so a pull-request workflow runs it only by naming it.
 test("no pull-request workflow runs the ratchet lane", () => {
   const directory = join(ROOT, ".github/workflows");
   const triggered = [];
@@ -597,9 +608,6 @@ test("no pull-request workflow runs the ratchet lane", () => {
     if (!lines.some((line) => /^\s*pull_request(_target)?:/.test(line))) continue;
     triggered.push(name);
     assert.ok(!lines.some((line) => /\bratchet\b/.test(line)), `${name} names the ratchet lane`);
-    for (const line of lines.filter((text) => text.includes("tools/verify"))) {
-      assert.match(line, /tools\/verify (--lane \w+|\$\{\{ matrix\.lanes \}\})/, `${name} runs verify without naming lanes: ${line.trim()}`);
-    }
   }
   assert.deepEqual(triggered, ["release-candidates.yml", "rust.yml"]);
 });

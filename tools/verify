@@ -5,13 +5,14 @@
 # first failed lane's status.
 #
 # Usage: ./tools/verify [--lane NAME]...
-# With no --lane, every lane runs: rust tests semantic cohorts checks ratchet. CI
+# With no --lane, the default lanes run: rust tests semantic cohorts checks. CI
 # runs lanes as separate jobs by naming them. The rust lane is lint then browser;
 # each half is also a lane of its own, so CI can run them on separate runners.
-# PR CI does not name the ratchet lane (owner ruling, #1008).
+# The ratchet lane runs only when it is named (owner ruling, #1008):
+#   ./tools/verify --lane ratchet
 set -eu
 
-all_lanes="rust tests semantic cohorts checks ratchet"
+default_lanes="rust tests semantic cohorts checks"
 lanes=""
 while [ "$#" -gt 0 ]; do
   case $1 in
@@ -52,7 +53,7 @@ case " $lanes " in
     esac
     ;;
 esac
-[ -n "$lanes" ] || lanes=$all_lanes
+[ -n "$lanes" ] || lanes=$default_lanes
 
 # User daemon settings must not make tests load local models or change diagnostics.
 # Tests that need these settings set them explicitly on their own child commands.
@@ -248,6 +249,7 @@ checks() {
   node --test tests/browse-ui.test.cjs tests/sequence-ui.test.cjs tests/token-ui.test.cjs tests/external-source-ui.test.cjs tests/dependency-ui.test.cjs tests/shell-ui.test.cjs tests/classes-ui.test.cjs tests/navigation-ui.test.cjs tests/metric-heat.test.cjs tests/viewer-metrics-ui.test.cjs tests/files-ui.test.cjs tests/architecture-ui.test.cjs tests/architecture-pele-ui.test.cjs tests/treemap-ui.test.cjs tests/treemap-pele.test.cjs tests/architecture-apps-ui.test.cjs tests/app-switcher-ui.test.cjs tests/architecture-routing.test.cjs
 }
 # The rules-check ratchet (#1008): deviating pairs and references may only fall.
+# On request only, never a default lane: the measurement takes minutes.
 # It measures through its own daemon under a private HOME, with both semantic
 # producers, and prints a notice instead when either is not installed. It owns
 # `target-ratchet`, so it neither waits on nor writes the rust lane's `target`.

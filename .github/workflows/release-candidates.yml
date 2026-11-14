@@ -84,9 +84,8 @@ jobs:
           echo "TRELLIS_BUILD_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
           echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
           python3 -c 'import tomllib; print("RELEASE_VERSION=" + tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])' >> "$GITHUB_ENV"
-      # Lanes are named so a pull request never runs the ratchet lane (#1008).
       - name: Native suite
-        run: ./tools/verify --lane rust --lane tests --lane semantic --lane cohorts --lane checks
+        run: ./tools/verify
         env:
           PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/pw-browsers
           TRELLIS_BROWSER_SYSTEM_DEPS: ${{ runner.os == 'Linux' && '1' || '' }}

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline checks of tools/rules-ratchet.py's comparison and record (#1008)."""
 import importlib.util
+import json
 import subprocess
 import sys
 import tempfile
@@ -16,8 +17,39 @@ RECORD = {"deviatingPairs": 3, "deviatingReferences": 10, "comparablePairs": 40,
           "conformingPairs": 30, "unknownPairs": 7, "partialFiles": 1}
 
 
-def row(status, references, excepted=False):
-    return {"status": status, "referenceCount": references, "excepted": excepted}
+NATIVE = {"sourceSetId": "source-set:v1:0", "language": "rust", "path": "src/storage.rs",
+          "sid": "sid:v1:0"}
+
+
+def stdlib(package, language="python"):
+    """A standard-library destination, as `rules check` emits it."""
+    return {"kind": "externalPackage", "sourceSetId": "source-set:v1:0",
+            "language": language, "package": package, "standardLibrary": True}
+
+
+def row(status, references, excepted=False, destination=NATIVE, source="src/http.rs"):
+    return {"status": status, "referenceCount": references, "excepted": excepted,
+            "target": {**NATIVE, "path": source}, "destination": destination}
+
+
+def payload(*instances):
+    """A `rules check` payload whose counts agree with its instances."""
+    def count(status):
+        return sum(1 for each in instances if each["status"] == status and not each["excepted"])
+    return {
+        "counts": {"comparable": len(instances), "conforms": count("conforms"),
+                   "deviates": count("deviates"), "unknown": count("unknown"),
+                   "excepted": sum(1 for each in instances if each["excepted"])},
+        "instances": list(instances),
+        "partialFiles": [],
+    }
+
+
+# A small measured tree: one deviation, two conforming pairs, one unresolved reference
+# and one standard-library import of a tool.
+TREE = (row("deviates", 4), row("conforms", 9), row("conforms", 1),
+        row("unknown", 2, destination=None),
+        row("unknown", 1, destination=stdlib("os"), source="tools/rules-ratchet.py"))
 
 
 class Ratchet(unittest.TestCase):
@@ -49,16 +81,48 @@ class Ratchet(unittest.TestCase):
         self.assertIn("NOTICE", lines[0])
         self.assertIn(RR.UPDATE, lines[-1])
 
-    def test_a_payload_is_summarized(self):
-        payload = {
-            "counts": {"comparable": 5, "conforms": 2, "deviates": 2, "unknown": 1, "excepted": 0},
-            "instances": [row("deviates", 4), row("deviates", 6), row("conforms", 9),
-                          row("conforms", 1), row("unknown", 2)],
-            "partialFiles": [{"path": "a.rs"}],
-        }
-        self.assertEqual(RR.summarize(payload), {
-            "deviatingPairs": 2, "deviatingReferences": 10, "comparablePairs": 5,
-            "conformingPairs": 2, "unknownPairs": 1, "partialFiles": 1})
+    def test_a_payload_is_summarized_without_its_external_destinations(self):
+        measured = payload(
+            row("deviates", 4), row("deviates", 6), row("conforms", 9), row("conforms", 1),
+            row("unknown", 2, destination=None), row("deviates", 5, excepted=True),
+            row("unknown", 1, destination=stdlib("os")),
+            row("unknown", 3, destination={**stdlib("serde", "rust"), "standardLibrary": False}))
+        measured["partialFiles"] = [{"path": "a.rs"}]
+        self.assertEqual(RR.summarize(measured), ({
+            "deviatingPairs": 2, "deviatingReferences": 10, "comparablePairs": 6,
+            "conformingPairs": 2, "unknownPairs": 1, "partialFiles": 1}, 2))
+
+    def test_counts_that_disagree_with_the_instances_are_refused(self):
+        measured = payload(*TREE)
+        measured["counts"]["comparable"] += 1
+        with self.assertRaisesRegex(RR.Failed, "counts disagree"):
+            RR.summarize(measured)
+
+    def test_a_new_standard_library_import_in_a_tool_does_not_fail(self):
+        record, _ = RR.summarize(payload(*TREE))
+        added = row("unknown", 1, destination=stdlib("json"), source="tools/rules-ratchet.py")
+        measured, external = RR.summarize(payload(*TREE, added))
+        self.assertEqual(external, 2)
+        self.assertEqual(measured, record)
+        self.assertEqual(RR.compare(record, measured)[0], "equal")
+
+    def test_a_new_first_party_upward_reference_fails(self):
+        record, _ = RR.summarize(payload(*TREE))
+        upward = row("deviates", 1, source="src/storage.rs",
+                     destination={**NATIVE, "path": "src/http.rs"})
+        measured, _ = RR.summarize(payload(*TREE, upward))
+        verdict, lines = RR.compare(record, measured)
+        self.assertEqual(verdict, "fail")
+        self.assertIn("deviations rose", lines[0])
+        self.assertIn("deviatingPairs: recorded 1, measured 2", lines[1])
+        self.assertIn("deviatingReferences: recorded 4, measured 5", lines[2])
+
+    def test_a_new_unresolved_first_party_reference_is_lost_coverage(self):
+        record, _ = RR.summarize(payload(*TREE))
+        measured, _ = RR.summarize(payload(*TREE, row("unknown", 1, destination=None)))
+        verdict, lines = RR.compare(record, measured)
+        self.assertEqual(verdict, "fail")
+        self.assertIn("unknownPairs: recorded 1, measured 2", lines[1])
 
     def test_the_record_round_trips_byte_for_byte(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -68,6 +132,18 @@ class Ratchet(unittest.TestCase):
             self.assertEqual({key: RR.read_record(path)[key] for key in RR.KEYS}, RECORD)
             RR.write_record(path, RR.read_record(path))
             self.assertEqual(path.read_bytes(), first)
+
+    def test_the_record_says_what_it_counts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "record.json"
+            RR.write_record(path, RECORD)
+            written = json.loads(path.read_text())
+            self.assertEqual(list(written), ["schemaVersion", "population", "measurement", *RR.KEYS])
+            self.assertIn("externalPackage", written["population"])
+            # A record of the earlier population, which counted external packages, is refused.
+            path.write_text(json.dumps({"schemaVersion": 1, **RECORD}))
+            with self.assertRaisesRegex(RR.Failed, "--update"):
+                RR.read_record(path)
 
     def test_the_checked_in_record_is_well_formed(self):
         record = RR.read_record(RR.RECORD)
