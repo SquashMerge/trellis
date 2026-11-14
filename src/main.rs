@@ -1343,7 +1343,7 @@ fn query_cli_payload(args: &QueryArgs) -> Result<serde_json::Value> {
 }
 
 fn metrics_cli_payload(args: &MetricsArgs) -> Result<serde_json::Value> {
-    let mut options = trellis::store::MetricsOptions {
+    let mut options = trellis::metrics_read::MetricsOptions {
         scope: args.scope.clone(),
         source_set_id: args.source_set_id.clone(),
         language: args.language.clone(),
@@ -1394,7 +1394,7 @@ fn metrics_cli_payload(args: &MetricsArgs) -> Result<serde_json::Value> {
 
 /// The metrics option rules of the CLI and of the daemon request it sends:
 /// the shared transport rules, as `invalid_argument`.
-fn validate_cli_metrics_options(options: &trellis::store::MetricsOptions) -> Result<()> {
+fn validate_cli_metrics_options(options: &trellis::metrics_read::MetricsOptions) -> Result<()> {
     options
         .validate_transport()
         .map_err(|error| anyhow::anyhow!("invalid_argument: {error}"))
@@ -1402,7 +1402,7 @@ fn validate_cli_metrics_options(options: &trellis::store::MetricsOptions) -> Res
 
 /// The work budget of a metrics request, from its still unvalidated scope.
 fn metrics_work_budget(request: &protocol::Request) -> Duration {
-    trellis::store::MetricsOptions::work_budget(
+    trellis::metrics_read::MetricsOptions::work_budget(
         request.payload["args"]["scope"]
             .as_str()
             .unwrap_or_default(),
@@ -3373,7 +3373,7 @@ fn result_is_deadline(payload: &serde_json::Value) -> bool {
 
 fn metrics_options_from_request(
     args: &serde_json::Value,
-) -> Result<trellis::store::MetricsOptions> {
+) -> Result<trellis::metrics_read::MetricsOptions> {
     fn field<T: serde::de::DeserializeOwned>(args: &serde_json::Value, name: &str) -> Result<T> {
         serde_json::from_value(args[name].clone())
             .map_err(|error| anyhow::anyhow!("invalid_argument: {name}: {error}"))
@@ -3402,7 +3402,7 @@ fn metrics_options_from_request(
             .is_none_or(|value| value.as_array().is_some_and(|names| !names.is_empty())),
         "invalid_argument: empty metrics selection"
     );
-    let options = trellis::store::MetricsOptions {
+    let options = trellis::metrics_read::MetricsOptions {
         workbench: false,
         scope: args["scope"]
             .as_str()

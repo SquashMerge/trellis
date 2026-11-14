@@ -28,7 +28,7 @@ impl EvidenceResponse {
         })?;
         for record in records {
             let (language, chosen, state) = record?;
-            let Some(bucket) = crate::semantic_evidence::language_order(&language) else {
+            let Some(bucket) = crate::semantic_records::language_order(&language) else {
                 return Err(self.corrupt_evidence("store_unavailable: invalid selected language"));
             };
             let category = if chosen {
@@ -836,7 +836,7 @@ impl EvidenceResponse {
             };
             let chosen: bool = row.get(3)?;
             let state: String = row.get(4)?;
-            let Some(language) = crate::semantic_evidence::language_order(&key.language) else {
+            let Some(language) = crate::semantic_records::language_order(&key.language) else {
                 return Err(
                     self.corrupt_evidence("store_unavailable: invalid native coverage language")
                 );
@@ -1423,7 +1423,7 @@ impl EvidenceResponse {
             let mut index = 0;
             measured.retain(|_| {
                 let external = semantic.call(index).is_some_and(|call| {
-                    call.binding.resolution == crate::semantic_evidence::Resolution::External
+                    call.binding.resolution == crate::semantic_records::Resolution::External
                 });
                 index += 1;
                 external_omitted += usize::from(external);
@@ -2006,7 +2006,7 @@ impl EvidenceResponse {
         };
         let selected_key = &owner.declaration.document;
         let mut scope_counts = [[0_u64; 5]; 5];
-        let Some(language_index) = crate::semantic_evidence::language_order(&selected_key.language)
+        let Some(language_index) = crate::semantic_records::language_order(&selected_key.language)
         else {
             return Err(self.corrupt_evidence("store_unavailable: invalid selected language"));
         };
@@ -3816,7 +3816,7 @@ mod find_scope_tests {
                 .unwrap()
                 .unwrap();
             let row = read_native_coverage_v8(&read.db, &scope).unwrap();
-            let language = crate::semantic_evidence::language_order(&row.language).unwrap();
+            let language = crate::semantic_records::language_order(&row.language).unwrap();
             if row.selected {
                 counts[language][0] += 1;
                 counts[language][match row.state.as_str() {

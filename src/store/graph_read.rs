@@ -10,7 +10,7 @@ use crate::{
         GraphRequest, GraphSnapshot, GraphSource, HistoryFacts, SemanticDocument, evaluate,
     },
     native_records::DocumentKey,
-    semantic_evidence as sem,
+    semantic_records as sem,
 };
 pub(super) use sequence_callbacks::syntax_callbacks;
 

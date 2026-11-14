@@ -59,7 +59,7 @@ pub(crate) struct SemanticContinuation {
     work: crate::semantic_import::PublicationWork,
 }
 struct ProducerContinuation {
-    producer: crate::semantic_evidence::Producer,
+    producer: crate::semantic_records::Producer,
     admission: Option<RetainedStageContinuation>,
     admitted: Option<AdmittedBatch>,
     join: Option<JoinContinuation>,
@@ -77,7 +77,7 @@ struct ProducerContinuation {
     capture_join: Option<JoinContinuation>,
     /// The independent FULL rejoin the pre-commit oracle computed, for the post-commit check.
     #[cfg(feature = "test-support")]
-    oracle_full: Option<crate::semantic_evidence::SemanticPublication>,
+    oracle_full: Option<crate::semantic_records::SemanticPublication>,
 }
 
 impl SemanticContinuation {
@@ -883,7 +883,7 @@ fn pending_producer(
     db: &Connection,
     target: &PendingSemanticTarget,
     id: &str,
-) -> Result<crate::semantic_evidence::Producer> {
+) -> Result<crate::semantic_records::Producer> {
     let key = semantic_pin_key(target.pin);
     let (version,hash,kind,encoding):(String,String,String,String)=db.query_row(
         "SELECT p.version,p.executable_hash,p.kind,p.position_encoding FROM semantic_revision_producers s JOIN semantic_producers p ON p.id=s.id AND p.version=s.version WHERE s.revision_id=?1 AND s.id=?2",
@@ -893,7 +893,7 @@ fn pending_producer(
         "SELECT ordinal,language FROM semantic_producer_languages WHERE id=?1 AND version=?2 ORDER BY ordinal",
         &[&id, &version],
     )?;
-    Ok(crate::semantic_evidence::Producer {
+    Ok(crate::semantic_records::Producer {
         id: id.to_owned(),
         version,
         executable_hash: hash,
