@@ -9,7 +9,7 @@ use crate::{
         DefaultProducers, DocumentFacts, GraphAnswer, GraphFacts, GraphIntegrity, GraphQuery,
         GraphRequest, GraphSnapshot, GraphSource, HistoryFacts, SemanticDocument, evaluate,
     },
-    native_evidence::DocumentKey,
+    native_records::DocumentKey,
     semantic_evidence as sem,
 };
 pub(super) use sequence_callbacks::syntax_callbacks;
@@ -35,7 +35,7 @@ struct SnapshotGraphSource<'a> {
     producer: Option<String>,
     snapshot: GraphSnapshot,
     scopes: BTreeMap<DocumentKey, V8NativeScope>,
-    declaration_roles: BTreeMap<(DocumentKey, String), crate::native_evidence::DeclarationRole>,
+    declaration_roles: BTreeMap<(DocumentKey, String), crate::native_records::DeclarationRole>,
     facts: GraphFacts,
     check: &'a mut dyn FnMut() -> Result<()>,
 }
@@ -83,7 +83,7 @@ impl SnapshotGraphSource<'_> {
             .into_iter()
             .map(|declaration| (declaration.syntax_id.clone(), declaration))
             .collect();
-        let mut calls: BTreeMap<String, Vec<crate::native_evidence::Call>> = BTreeMap::new();
+        let mut calls: BTreeMap<String, Vec<crate::native_records::Call>> = BTreeMap::new();
         for call in read_native_calls_v8(self.db, &scope, None)? {
             calls
                 .entry(call.owner_syntax_id.clone())
@@ -96,7 +96,7 @@ impl SnapshotGraphSource<'_> {
             params![scope.version_id, scope.key.source_set_id, scope.key.language, scope.key.path],
             |r| r.get(0),
         )?;
-        let native_provenance = native_to_semantic(&crate::native_evidence::Provenance {
+        let native_provenance = native_to_semantic(&crate::native_records::Provenance {
             id: scope.proof_id(),
             producer_id: scope.producer_id.clone(),
             document: scope.key.clone(),
@@ -231,7 +231,7 @@ impl GraphSource for SnapshotGraphSource<'_> {
         projection: &crate::model::SemanticProjection,
         producer: &str,
         document: &DocumentKey,
-    ) -> Result<Option<crate::graph_query::BoundaryReason>> {
+    ) -> Result<Option<crate::model::BoundaryReason>> {
         let eligible = native_first::endpoint_boundary(
             self.db,
             self.selected.pin,
@@ -255,7 +255,7 @@ impl GraphSource for SnapshotGraphSource<'_> {
         &mut self,
         key: &DocumentKey,
         syntax_id: &str,
-    ) -> Result<crate::native_evidence::DeclarationRole> {
+    ) -> Result<crate::native_records::DeclarationRole> {
         let cache_key = (key.clone(), syntax_id.to_string());
         if let Some(role) = self.declaration_roles.get(&cache_key) {
             return Ok(*role);
@@ -275,7 +275,7 @@ impl GraphSource for SnapshotGraphSource<'_> {
             .ok_or_else(|| {
                 SelectedIntegrity("store_unavailable: graph declaration role missing".into())
             })?;
-        let role = crate::native_evidence::DeclarationRole::from_stored(&stored)
+        let role = crate::native_records::DeclarationRole::from_stored(&stored)
             .map_err(|error| SelectedIntegrity(error.to_string()))?;
         self.declaration_roles.insert(cache_key, role);
         Ok(role)
@@ -321,7 +321,7 @@ impl GraphSource for SnapshotGraphSource<'_> {
         Ok(history)
     }
 
-    fn names_declaration(&mut self, call: &crate::native_evidence::Call) -> Result<bool> {
+    fn names_declaration(&mut self, call: &crate::native_records::Call) -> Result<bool> {
         if let Some(named) = self.facts.named_calls.get(&call.id) {
             return Ok(*named);
         }
@@ -425,7 +425,7 @@ pub(super) fn navigation_calls(
     selector: &crate::navigation::SourceSelector,
     reader: &mut crate::navigation::Reader<'_>,
 ) -> Result<()> {
-    use crate::native_evidence::{Call, Range};
+    use crate::native_records::{Call, Range};
     let Some(producer) = selector.semantic_producer_id.as_deref() else {
         return Ok(());
     };
@@ -552,7 +552,7 @@ pub(super) fn navigation_calls(
         };
         let disposition = crate::graph_query::call_disposition(Some(&semantic), &call, &mut source)
             .map_err(engine_error)?;
-        if disposition.boundary_reason != crate::graph_query::BoundaryReason::None {
+        if disposition.boundary_reason != crate::model::BoundaryReason::None {
             continue;
         }
         let Some((id, target_key)) = disposition.exact_target else {
@@ -673,7 +673,7 @@ pub(super) fn sequence_calls(
                         step.call_evidence = Some(crate::behavior::CallEvidence {
                             projection: Some(projection.clone()),
                             historical_freshness: None,
-                            boundary_reason: crate::graph_query::BoundaryReason::pending(
+                            boundary_reason: crate::model::BoundaryReason::pending(
                                 projection.semantic_status,
                             ),
                             resolution: None,
@@ -855,7 +855,7 @@ pub(super) fn sequence_calls(
 /// is enough to enrich; the others then keep their own stale or missing boundaries.
 fn syntax_fallback(
     semantic: &SemanticDocument,
-    calls: &[crate::native_evidence::Call],
+    calls: &[crate::native_records::Call],
     path: &str,
     source: &mut dyn GraphSource,
 ) -> Result<Option<String>> {
@@ -1041,7 +1041,7 @@ fn hide_incidental(
     accessor: &mut dyn FnMut(&str, &DocumentKey) -> Result<bool>,
 ) -> Result<()> {
     use crate::behavior::IncidentalReason;
-    use crate::graph_query::{self as engine, BoundaryReason};
+    use crate::{graph_query as engine, model::BoundaryReason};
     let semantic = engine::semantic(Some(languages), document).map_err(engine_error)?;
     for at in 0..steps.len() {
         let step = &mut steps[at];
@@ -1172,9 +1172,9 @@ fn shown_within(
 /// source-hint lanes were full) is still a call here: those hint lanes are not drawn.
 fn is_incidental(
     step: &crate::behavior::SequenceStep,
-    reason: crate::graph_query::BoundaryReason,
+    reason: crate::model::BoundaryReason,
 ) -> bool {
-    reason == crate::graph_query::BoundaryReason::External
+    reason == crate::model::BoundaryReason::External
         && matches!(step.kind.as_str(), "call" | "boundary")
         && step.children.is_empty()
         && step.alternate.is_empty()
@@ -1196,7 +1196,10 @@ impl Enrichment<'_, '_> {
         owner: &str,
         depth: usize,
     ) -> Result<()> {
-        use crate::graph_query::{self as engine, BoundaryReason, GraphEdge, Visit};
+        use crate::{
+            graph_query::{self as engine, GraphEdge, Visit},
+            model::BoundaryReason,
+        };
         let semantic = engine::semantic(Some(self.languages), document).map_err(engine_error)?;
         for step in steps {
             self.source.check_work()?;
@@ -1316,7 +1319,7 @@ impl Enrichment<'_, '_> {
         &mut self,
         target: Symbol,
         column: crate::behavior::SequenceColumn,
-        key: &crate::native_evidence::DocumentKey,
+        key: &crate::native_records::DocumentKey,
     ) -> Result<()> {
         let declaration = self
             .source
@@ -1574,7 +1577,7 @@ mod tests {
         };
         assert_eq!(
             source.declaration_role(&key, &id).unwrap(),
-            crate::native_evidence::DeclarationRole::Test
+            crate::native_records::DeclarationRole::Test
         );
         assert!(source.facts.documents.is_empty());
         source.declaration_roles.clear();

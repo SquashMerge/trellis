@@ -53,8 +53,8 @@ struct SyntheticGenerator {
     languages: Vec<String>,
 }
 
-pub const REFERENCE_TRUST_ORIGIN: &str = "referenceProfile";
-pub const SYNTHETIC_TRUST_ORIGIN: &str = "syntheticProfile";
+pub(crate) use crate::scip_vocab::hexhash;
+pub use crate::scip_vocab::{REFERENCE_TRUST_ORIGIN, SYNTHETIC_TRUST_ORIGIN};
 
 /// A producer identity fixed by a checked-in profile, never by the descriptor that names it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -319,11 +319,6 @@ pub fn pinned_producer(
 
 pub(crate) fn admission(s: &str) -> ScipCaptureError {
     ScipCaptureError::InvalidAdmission(s.into())
-}
-pub(crate) fn hexhash(s: &str) -> bool {
-    s.len() == 64
-        && s.bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 pub(crate) fn path(s: &str) -> bool {
     !s.is_empty()

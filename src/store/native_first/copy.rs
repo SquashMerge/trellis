@@ -12,7 +12,7 @@
 //! that re-keying, so S neither reads nor writes the payload's rows; corruption in them is found
 //! by the read path as a typed integrity failure that schedules a re-index.
 use super::*;
-use crate::native_evidence::DocumentKey;
+use crate::native_records::DocumentKey;
 use crate::semantic_evidence as sem;
 
 /// What a copied row takes from the destination native revision.

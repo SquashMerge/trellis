@@ -4337,44 +4337,7 @@ fn metrics_query(uri: &axum::http::Uri) -> Result<crate::store::MetricsOptions, 
         }
         options.metrics = names.split(',').map(str::to_owned).collect();
     }
-    options.validate().map_err(|_| invalid())?;
-    for value in [
-        options.source_set_id.as_deref(),
-        options.path.as_deref(),
-        options.sid.as_deref(),
-    ] {
-        if value.is_some_and(|v| v.contains(['\\', '\0'])) {
-            return Err(invalid());
-        }
-    }
-    if options.source_set_id.as_ref().is_some_and(|id| {
-        let Some(identity) = id.strip_prefix("source-set:v1:") else {
-            return true;
-        };
-        if let Some(hash) = identity.strip_prefix("path-") {
-            return hash.len() != 64
-                || !hash
-                    .bytes()
-                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase());
-        }
-        !uuid::Uuid::parse_str(identity).is_ok_and(|uuid| uuid.to_string() == identity)
-    }) || options.path.as_ref().is_some_and(|path| path.contains(':'))
-        || options.sid.as_ref().is_some_and(|v| {
-            v.len() != 39
-                || !v.starts_with("sid:v1:")
-                || !v[7..]
-                    .bytes()
-                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-        })
-        || options.language.as_ref().is_some_and(|v| {
-            !matches!(
-                v.as_str(),
-                "java" | "python" | "javascript" | "typescript" | "rust"
-            )
-        })
-    {
-        return Err(invalid());
-    }
+    options.validate_transport().map_err(|_| invalid())?;
     Ok(options)
 }
 
@@ -4483,10 +4446,8 @@ async fn provisioned_core_answer(
             let result = tokio::task::spawn_blocking(move || {
                 let duration = if metrics.deadline_ms != 0 {
                     Duration::from_millis(metrics.deadline_ms)
-                } else if matches!(options.scope.as_str(), "revision" | "directory") {
-                    Duration::from_secs(300)
                 } else {
-                    Duration::from_secs(30)
+                    crate::store::MetricsOptions::work_budget(&options.scope)
                 };
                 let deadline = metrics.now() + duration;
                 let work_hook = hook.clone();

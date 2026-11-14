@@ -107,9 +107,10 @@ trap cleanup EXIT
 
 # Linux CI sets TRELLIS_BROWSER_SYSTEM_DEPS to make sure Chromium's system
 # packages are present while the lanes build. If every shared library of the
-# pinned Chromium already resolves (GitHub's images ship most of them), apt is
-# skipped, so an apt mirror or DNS outage cannot fail the job; otherwise the
-# packages are installed with apt. Only the browser suite at the end of the
+# pinned Chromium already resolves (GitHub's images ship most of them) and the
+# font the layout tests measure in is installed, apt is skipped, so an apt
+# mirror or DNS outage cannot fail the job; otherwise the packages are
+# installed with apt. Only the browser suite at the end of the
 # rust lane needs them, and a slow apt mirror would otherwise hold up the
 # whole run (#244). The lane polls for the status file because it is a
 # subshell and cannot `wait` on its sibling. Only a run that includes the
@@ -147,7 +148,7 @@ browser_system_deps() {
   read -r code took route <"$logs/browser-deps.status"
   cat "$logs/browser-libs.log"
   if [ "$route" = present ]; then
-    echo "verify: Chromium's shared libraries all resolve; skipped the system package install (no apt); the browser suite waited $waited s"
+    echo "verify: Chromium's shared libraries all resolve and its layout font is installed; skipped the system package install (no apt); the browser suite waited $waited s"
     return 0
   fi
   echo "verify: Chromium system package install (apt) finished in $took s (exit $code); the browser suite waited $waited s"

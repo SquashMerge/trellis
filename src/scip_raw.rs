@@ -2,7 +2,7 @@
 use crate::{
     model::CancelFlag,
     native_ids::{canonical, digest},
-    semantic_batch::{BatchCounters, BatchLimits},
+    semantic_batch::{counters::BatchCounters, limits::BatchLimits},
 };
 use protobuf::Message;
 use scip::types::{self, occurrence};

@@ -107,7 +107,7 @@ fn changed_documents_without_retained_input_need_reimport() {
     }
     assert_eq!(
         endpoint_boundary(&db, pin(2), "producer", "javascript", "c.js", pin(1)).unwrap(),
-        Some(crate::graph_query::BoundaryReason::NeedsReimport)
+        Some(crate::model::BoundaryReason::NeedsReimport)
     );
 }
 

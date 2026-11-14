@@ -8,7 +8,7 @@ fn ready() -> (
     Store,
     Graph,
     crate::capture::Capture,
-    crate::native_evidence::Artifact,
+    crate::native_records::Artifact,
     IndexPin,
     CancelFlag,
     Arc<topology::WriterSession>,
@@ -308,7 +308,7 @@ fn response_fences_root_and_error_results_before_release() {
 #[test]
 fn tree_metadata_applies_no_overlay_before_post_fence() {
     let (_state, work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
-    let mut entries = vec![crate::file_tree::Entry {
+    let mut entries = vec![crate::source_dir::Entry {
         name: "flow.js".into(),
         path: "flow.js".into(),
         kind: "file",

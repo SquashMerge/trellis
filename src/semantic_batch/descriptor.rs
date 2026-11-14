@@ -4,6 +4,7 @@
 //! Parsing is serde only and never admits: native rejoin re-parses stored `descriptor_bytes`
 //! through the same type. Admission is the separate `check_*` family, run in wire-format order.
 use super::BatchLimits;
+pub use super::origin::GenerationOrigin;
 use crate::{
     native_evidence as native,
     native_ids::canonical_into,
@@ -148,26 +149,6 @@ pub struct Descriptor {
     /// means an external batch.
     #[serde(deserialize_with = "nullable")]
     pub generation: Option<Generation>,
-}
-
-/// Which Trellis-owned flow wrote a generated batch. It names the private directory the
-/// batch is read from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum GenerationOrigin {
-    #[serde(rename = "trellisRun")]
-    TrellisRun,
-    #[serde(rename = "ownerPickup")]
-    OwnerPickup,
-}
-
-impl GenerationOrigin {
-    /// The directory under the producer state directory that holds this origin's batches.
-    pub fn subdir(self) -> &'static str {
-        match self {
-            Self::TrellisRun => "runs",
-            Self::OwnerPickup => "pickups",
-        }
-    }
 }
 
 /// The origin of an import as the worker sees it: external, or one of the generated origins.

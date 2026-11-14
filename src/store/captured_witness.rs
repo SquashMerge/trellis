@@ -7,7 +7,7 @@
 //! its private stage, and publishes them with the S commit. Later witnessed catch-ups use them
 //! as the batch's original source associations.
 use super::*;
-use crate::native_evidence::DocumentKey;
+use crate::native_records::DocumentKey;
 use crate::semantic_evidence as sem;
 
 const STAGE_TABLE: &str = "CREATE TABLE IF NOT EXISTS capture_witness_documents(language TEXT NOT NULL,path TEXT NOT NULL,snapshot_json TEXT NOT NULL,PRIMARY KEY(language,path))";

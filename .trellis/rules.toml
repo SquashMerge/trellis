@@ -15,7 +15,10 @@ paths = ["web/**"]
 app = "trellis-web"
 display = "hidden"
 order = 0
-paths = ["tests/browser/**"]
+paths = [
+  "tests/browser/**", "tests/*-ui.test.cjs", "tests/metric-heat.test.cjs",
+  "tests/treemap-pele.test.cjs",
+]
 
 [layers.entry]
 app = "trellis"
@@ -29,7 +32,7 @@ paths = [
 app = "trellis"
 order = 3
 paths = [
-  "src/navigation.rs", "src/classes.rs", "src/class_diagram.rs",
+  "src/navigation.rs", "src/class_diagram.rs",
   "src/behavior.rs", "src/behavior_bindings.rs", "src/behavior_java.rs",
   "src/behavior_js.rs", "src/behavior_python.rs", "src/behavior_rust.rs",
   "src/dependencies.rs", "src/dependency_links.rs", "src/dependency_rust.rs",
@@ -37,9 +40,10 @@ paths = [
   "src/git_status.rs", "src/metrics.rs", "src/references.rs", "src/references/**",
   "src/rules.rs", "src/rust_sources.rs", "src/search_embed/**",
   "src/search_model.rs", "src/search_rank.rs",
-  "src/architecture_details.rs", "src/behavior_incidental.rs", "src/classes/**",
+  "src/architecture_details.rs", "src/behavior_incidental.rs",
   "src/graph_query.rs", "src/rules/**", "src/rules_edit.rs", "src/behavior_columns.rs",
-  "src/apps.rs", "src/interfaces.rs", "src/interfaces/**",
+  "src/apps.rs", "src/apps/**", "src/interfaces.rs", "src/interfaces/**",
+  "src/model_management.rs", "src/search_config.rs", "src/symbol_lookup.rs",
 ]
 
 [layers.indexing]
@@ -47,26 +51,57 @@ app = "trellis"
 order = 4
 paths = [
   "src/indexer.rs", "src/indexer_java.rs", "src/indexer_python.rs", "src/indexer_rust.rs",
+  "src/indexer_ts.rs",
+  # A tree-sitter extractor run at capture time, plus the persisted Catalog record (#998).
+  "src/classes.rs", "src/classes/**",
   "src/index_coordinator.rs", "src/index_coordinator/**", "src/capture.rs", "src/watch.rs",
   "src/native_evidence.rs", "src/native_capture.rs",
   "src/scip_admission.rs", "src/semantic_evidence.rs", "src/semantic_import.rs",
-  "src/search_capture.rs", "src/search_card.rs",
+  "src/search_capture.rs",
   "src/native_rust_macros_tests.rs", "src/extractor_inputs_tests.rs", "src/indexer_projection_vectors_tests.rs",
-  "src/semantic_import_complexity_tests.rs", "src/native_rust_macros.rs", "src/producer/**", "src/evidence_budget.rs", "src/skipped_source.rs", "src/skipped_config.rs", "src/semantic_batch.rs", "src/semantic_batch/**",
+  "src/semantic_import_complexity_tests.rs", "src/native_rust_macros.rs", "src/producer/**", "src/evidence_budget.rs", "src/semantic_batch.rs", "src/semantic_batch/**",
   "src/semantic_import/**",
+  "src/language_set_tests.rs", "src/native_typescript_tests.rs", "src/semantic_join_inputs_tests.rs",
+  # In-file test modules moved out of src/native_evidence.rs (R1, #1004).
+  "src/native_evidence_borrowed_witness_tests.rs",
+  "src/native_evidence_cached_executable_digest_tests.rs",
+  "src/native_evidence_declaration_role_tests.rs",
+  "src/native_evidence_full_document_spool_tests.rs",
+  "src/native_evidence_occurrence_identity_tests.rs",
+  "src/native_evidence_parallel_extraction_tests.rs",
+  "src/native_evidence_revision_digest_tests.rs",
+  # In-file test modules moved out of src/semantic_evidence.rs (R1, #1004).
+  "src/semantic_evidence_coverage_reason_tests.rs",
+  "src/semantic_evidence_native_index_tests.rs",
+  "src/semantic_evidence_witness_tests.rs",
 ]
 
 [layers.storage]
 app = "trellis"
 order = 5
-paths = ["src/store.rs", "src/store/**", "src/search_vectors.rs"]
+paths = ["src/store.rs", "src/store/**", "src/search_vectors.rs", "src/sqlite_config.rs"]
 
 [layers.shared]
 apps = ["trellis"]
 shared = true
 paths = [
   "src/model.rs", "src/testing.rs", "src/native_ids.rs", "src/scip_raw.rs", "src/files_view.rs", "src/parallel.rs", "src/build_info.rs", "src/search_lexical.rs",
-  "src/lib.rs", "src/scip_raw/**", "src/test_alloc.rs", "src/syntax_bounds.rs",
+  "src/lib.rs", "src/scip_raw/**", "src/test_alloc.rs", "src/syntax_bounds.rs", "src/heap.rs",
+  # Leaf constants, small types and pure helpers that storage and shared code use (S1, #999).
+  # They reference no layer: the skipped-input placeholders, the batch resource policy with
+  # its counters and generated-batch origin, and the vocabulary moved out of indexing and query.
+  "src/skipped_config.rs", "src/skipped_source.rs",
+  "src/semantic_batch/limits.rs", "src/semantic_batch/counters.rs", "src/semantic_batch/origin.rs",
+  "src/evidence_limits.rs", "src/diagnostic_markers.rs", "src/diagnostic_markers_tests.rs",
+  "src/scip_vocab.rs", "src/jsonc.rs", "src/source_dir.rs", "src/process_info.rs",
+  # The stored search-card records and their eligibility predicate (S1b, #1000).
+  "src/search_card_records.rs",
+  # The persisted native evidence records, the producer constants and the pure lookup-key
+  # functions (S2, #1001). Extraction, validation and the spool stay in native_evidence.rs.
+  "src/native_records.rs",
+  # Card preparation and serialization over shared records and native_ids only; storage
+  # renders stored cards with it (S2, #1001). Capture stays in search_capture.rs.
+  "src/search_card.rs",
 ]
 
 # Coarse developer-tool boundary; does not infer internal tooling architecture.
@@ -75,7 +110,7 @@ app = "trellis"
 display = "hidden"
 order = 1
 paths = [
-  "tools/*.py", "tools/verify-env.mjs", "src/bin/**", "src/native_navigation_fixture.rs", "tools/release/**",
+  "tools/*.py", "tools/*.mjs", "src/bin/**", "src/native_navigation_fixture.rs", "tools/release/**",
   "tools/semantic-contract/**", "tools/extraction/**", "tools/selection/**",
   "tools/metrics-oracle/**", "tools/metrics-bench/**", "tools/semantic-search/**",
   "tools/synthetic-cohorts/generate.mjs", "tools/synthetic-cohorts/test/**",
@@ -84,16 +119,34 @@ paths = [
 ]
 
 # --- app "trellis-herdr-mod" (herdr-mod/package.json): the Herdr app mod (#707, #909).
-[layers.herdr-mod]
-app = "trellis-herdr-mod"
-order = 1
-paths = ["herdr-mod/**"]
-
+# Three layers by import direction (#998): the view, the adapters over the shared web
+# scripts and the daemon client, and the DOM and runtime stand-ins they run on.
 [layers.herdr-mod-tests]
 app = "trellis-herdr-mod"
 display = "hidden"
 order = 0
 paths = ["herdr-mod/test/**"]
+
+[layers.herdr-mod-tooling]
+app = "trellis-herdr-mod"
+display = "hidden"
+order = 1
+paths = ["herdr-mod/build.mjs", "herdr-mod/web-plugin.mjs", "herdr-mod/web-scripts.mjs"]
+
+[layers.herdr-ui]
+app = "trellis-herdr-mod"
+order = 2
+paths = ["herdr-mod/src/main.js", "herdr-mod/src/architecture-ui.js", "herdr-mod/src/panels.js"]
+
+[layers.herdr-adapters]
+app = "trellis-herdr-mod"
+order = 3
+paths = ["herdr-mod/src/diagram.js", "herdr-mod/src/sequence.js", "herdr-mod/src/client.js"]
+
+[layers.herdr-platform]
+app = "trellis-herdr-mod"
+order = 4
+paths = ["herdr-mod/src/runtime.js", "herdr-mod/src/dom.js"]
 
 # Captured sample programs are inputs, not Trellis runtime implementations.
 [layers.fixture-inputs]
@@ -102,8 +155,21 @@ display = "hidden"
 order = 0
 paths = ["tests/fixtures/**", "tools/synthetic-cohorts/templates/**"]
 
+# Test harnesses sit above the helpers they share and above tooling (#998).
 [layers.mcp-tests]
 app = "trellis"
 display = "hidden"
+order = 0
+paths = ["tests/mcp/**", "tests/mcp-*.test.mjs"]
+
+[layers.tests]
+app = "trellis"
+display = "hidden"
+order = 0
+paths = ["tests/**"]
+
+[layers.test-support]
+app = "trellis"
+display = "hidden"
 order = 1
-paths = ["tests/mcp/**"]
+paths = ["tests/common/**", "tests/support/**"]

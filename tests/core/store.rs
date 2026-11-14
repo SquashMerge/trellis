@@ -720,7 +720,7 @@ fn query_view_structurally_sorts_then_limits_then_excludes() {
     let method = source.split_once("fn view_walk(").unwrap().1;
     let method = method.split_once("\n}\n").unwrap().0;
     let sort = method
-        .find("ordered.sort_by(crate::indexer::compare_reader_calls)")
+        .find("ordered.sort_by(crate::model::compare_reader_calls)")
         .unwrap();
     let limit = method
         .find("ordered.into_iter().take(remaining + 1)")

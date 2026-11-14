@@ -158,10 +158,11 @@ test("recognized issue lookup failures remain failures", () => {
   }
 });
 
-// verify skips apt only when this helper proves Chromium's libraries resolve;
-// any library ldd cannot inspect must send verify back to apt.
+// verify skips apt only when this helper proves Chromium's libraries resolve
+// and the font the layout tests measure in is installed; any library ldd
+// cannot inspect, or a missing or uncheckable font, must send verify back to apt.
 const BROWSER_PACKAGES = join(ROOT, "tests/browser/node_modules/playwright-core");
-test("browser library check fails when ldd cannot inspect a bundled library", { skip: !existsSync(BROWSER_PACKAGES) && "tests/browser packages are not installed" }, () => {
+test("browser library check fails when ldd cannot inspect a bundled library or the layout font is absent", { skip: !existsSync(BROWSER_PACKAGES) && "tests/browser packages are not installed" }, () => {
   const fakeDir = mkdtempSync(join(tmpdir(), "trellis-browser-libs-"));
   try {
     const browsers = join(fakeDir, "browsers");
@@ -188,15 +189,40 @@ if [ "$FAKE_LDD" = spawn ]; then /bin/rm -f "$0"; fi
 `);
       chmodSync(ldd, 0o755);
     };
-    const check = (mode) => {
+    // The fake fontconfig lists one family per line, as `fc-list : family` does.
+    const fcList = join(fakeDir, "bin", "fc-list");
+    const installFonts = () => {
+      writeFileSync(fcList, `#!/bin/sh
+if [ "$FAKE_FONTS" = fail ]; then exit 1; fi
+echo "DejaVu Sans Mono"
+if [ "$FAKE_FONTS" != missing ]; then echo "Liberation Sans Narrow"; echo "Liberation Sans,Liberation Sans Regular"; fi
+`);
+      chmodSync(fcList, 0o755);
+      writeFileSync(join(fakeDir, "bin", "fc-match"), "#!/bin/sh\necho 'DejaVu Sans Mono'\n");
+      chmodSync(join(fakeDir, "bin", "fc-match"), 0o755);
+    };
+    const check = (mode, fonts = "ok") => {
       install();
+      if (fonts === "absent") rmSync(fcList, { force: true });
+      else installFonts();
       return spawnSync(process.execPath, ["tools/verify-browser-libs.mjs"], {
-        cwd: ROOT, encoding: "utf8", env: { ...env, PATH: dirname(ldd), FAKE_LDD: mode },
+        cwd: ROOT, encoding: "utf8", env: { ...env, PATH: dirname(ldd), FAKE_LDD: mode, FAKE_FONTS: fonts },
       });
     };
     const resolved = check("ok");
     assert.equal(resolved.status, 0, resolved.stdout + resolved.stderr);
     assert.match(resolved.stdout, /every shared library resolves/);
+    assert.match(resolved.stdout, /^verify browser libraries: font Liberation Sans is installed$/m);
+    // Libraries present but the font is not (#1010): verify must take the apt route.
+    const noFont = check("ok", "missing");
+    assert.equal(noFont.status, 1, noFont.stdout + noFont.stderr);
+    assert.match(noFont.stdout, /every shared library resolves/);
+    assert.match(noFont.stdout, /^verify browser libraries: missing font Liberation Sans \(sans-serif resolves to DejaVu Sans Mono\)$/m);
+    for (const fonts of ["fail", "absent"]) {
+      const unchecked = check("ok", fonts);
+      assert.equal(unchecked.status, 1, `${fonts}: ${unchecked.stdout}${unchecked.stderr}`);
+      assert.match(unchecked.stdout, /cannot check \(fc-list could not list the installed fonts\)/, fonts);
+    }
     for (const mode of ["nonzero", "spawn"]) {
       const failed = check(mode);
       assert.equal(failed.status, 1, `${mode}: ${failed.stdout}${failed.stderr}`);
@@ -333,14 +359,14 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
     assertRan(success.commands, lanes);
     rmSync(log);
     // With TRELLIS_BROWSER_SYSTEM_DEPS set, the system packages are checked
-    // and, only if a library is missing, installed in the background; the
+    // and, only if a library or the layout font is missing, installed in the background; the
     // browser suite runs only after that succeeds (#244).
     const libs = ["node", "tools/verify-browser-libs.mjs"];
     const deps = ["node", "tests/browser/node_modules/playwright/cli.js", "install-deps", "chromium"];
     const present = runVerify({ TRELLIS_BROWSER_SYSTEM_DEPS: "1" });
     assert.equal(present.result.status, 0, present.output);
     assertRan(present.commands, { ...lanes, deps: [libs] });
-    assert.match(present.result.stdout, /^verify: Chromium's shared libraries all resolve; skipped the system package install \(no apt\)/m);
+    assert.match(present.result.stdout, /^verify: Chromium's shared libraries all resolve and its layout font is installed; skipped the system package install \(no apt\)/m);
     rmSync(log);
     const withDeps = runVerify({ TRELLIS_BROWSER_SYSTEM_DEPS: "1", FAKE_VERIFY_MISSING_LIBS: "1" });
     assert.equal(withDeps.result.status, 0, withDeps.output);
