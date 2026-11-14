@@ -1353,43 +1353,48 @@ function filesFailure(error, target, current) {
   if (["revision_conflict", "pin_expired", "root_changed"].includes(error.code)) { unexpectedPair("Indexed evidence is stale. Refresh status before selecting again."); return; }
   if ($(target)) $(target).textContent = error.message;
 }
-async function setSection(name, view = null) {
-  if (!["files", "diagrams"].includes(name) || !selectedRootKey) return;
-  if (section === name) {
-    // Already in Diagrams: focus the tab of the view on screen, never a fixed one (#913).
-    const target = name === "files" ? filesBasis === "working" ? $("files-diff") : workspaceSource ? $("source") : $("file-filter") : $(`view-${view || currentDiagramView()}`);
-    target?.focus(); return;
-  }
-  architecture?.reset();
-  treemap?.reset();
-  section = name; sectionSerial++; sourceSerial++; filesDiffSerial++;
+// Already in the section: focus what is on screen. In Diagrams that is the tab of the view on screen, never a fixed one (#913).
+function focusSection(name, view) {
+  const target = name === "files" ? filesBasis === "working" ? $("files-diff") : workspaceSource ? $("source") : $("file-filter") : $(`view-${view || currentDiagramView()}`);
+  target?.focus();
+}
+function interruptOutlineReads() {
   for (const state of fileStates.values()) if (state.outlineLoading) {
     state.serial++; state.outlineLoading = false; state.outlineError = "Symbol read interrupted. Retry to read this indexed outline.";
   }
+}
+// Leaves the section on screen for `name`. False when there is nothing to enter: an unknown name, no root, or the same section.
+function switchSection(name, view) {
+  if (!["files", "diagrams"].includes(name) || !selectedRootKey) return false;
+  if (section === name) { focusSection(name, view); return false; }
+  architecture?.reset();
+  treemap?.reset();
+  section = name; sectionSerial++; sourceSerial++; filesDiffSerial++;
+  interruptOutlineReads();
   window.TrellisNavigation?.reset(); window.TrellisContextMenu?.closeContextMenu?.();
   window.TrellisShell?.setSection(name);
-  if (name !== "files") {
-    // A navigation names its target view: the last-used tab neither shows nor refreshes (#451).
-    if (view) {
-      // The shell focused the last-used tab on entry; keep focus on the tab that is now shown.
-      const tabFocused = document.activeElement?.closest?.("#diagram-tabs");
-      showNavigationView(view);
-      if (tabFocused) $(`view-${view}`)?.focus();
-    }
-    $("source").hidden = false; $("files-diff").hidden = true;
-    if (!workspaceSource) window.TrellisShell?.closeSource();
-    renderFiles();
-    const cached = workspaceSource, surface = sectionSerial, session = epoch, root = selectedRootKey, sourceAtStart = sourceSerial;
-    const current = () => section === "diagrams" && surface === sectionSerial && session === epoch && root === selectedRootKey && sourceAtStart === sourceSerial && IndexPin.equal(cached?.data.revision, status?.revision);
-    if (!$("treemap-panel").hidden) await treemap?.refresh();
-    else if (!$("architecture-panel").hidden) void architecture?.refresh();
-    else if (!$("deviations-panel").hidden) void architecture?.showDeviations();
-    else if (diagramSequence && selectedMethod?.id === diagramSequence.seed.id) await loadSequence(diagramSequence, true);
-    if (cached && current()) paintCachedSource(cached.data, cached.range, current, cached.range?.startLine || 1, cached.navigation?.snapshot?.());
-    return;
+  return true;
+}
+// The Diagrams surface before its view refreshes. Returns the repaint of the cached source, which runs after the
+// refresh and only if this entry is still the one on screen.
+function showDiagrams(view) {
+  // A navigation names its target view: the last-used tab neither shows nor refreshes (#451).
+  if (view) {
+    // The shell focused the last-used tab on entry; keep focus on the tab that is now shown.
+    const tabFocused = document.activeElement?.closest?.("#diagram-tabs");
+    showNavigationView(view);
+    if (tabFocused) $(`view-${view}`)?.focus();
   }
+  $("source").hidden = false; $("files-diff").hidden = true;
+  if (!workspaceSource) window.TrellisShell?.closeSource();
+  renderFiles();
+  const cached = workspaceSource, surface = sectionSerial, session = epoch, root = selectedRootKey, sourceAtStart = sourceSerial;
+  const current = () => section === "diagrams" && surface === sectionSerial && session === epoch && root === selectedRootKey && sourceAtStart === sourceSerial && IndexPin.equal(cached?.data.revision, status?.revision);
+  return () => { if (cached && current()) paintCachedSource(cached.data, cached.range, current, cached.range?.startLine || 1, cached.navigation?.snapshot?.()); };
+}
+// Section changes keep validated evidence but never choose or read a file.
+function showFilesSource() {
   viewerMetrics?.clearInspection();
-  // Section changes keep validated evidence but never choose or read a file.
   updateFilesBasis(); renderFiles();
   if (!workspaceSource && filesFile && !filesFile.changeOnly && status?.revision) {
     const cached = sourceCache.get(`${IndexPin.key(status.revision)}:${filesFile.path}`);
@@ -1399,17 +1404,34 @@ async function setSection(name, view = null) {
     const source = workspaceSource;
     paintCachedSource(source.data, source.range, filesGuard({basis:true}), source.range?.startLine || 1, source.navigation?.snapshot?.());
   }
+}
+// What a section change interrupted in Files: the source read, or the working-tree diff.
+function showFilesInterrupted() {
+  if (!workspaceSource && filesFile && filesBasis === "indexed") $("source-path").textContent = "Source read interrupted. Select the file again to read its cached snapshot.";
+  if (filesBasis === "working") {
+    if (filesDiff) window.TrellisFiles?.diff($("files-diff"), filesDiff);
+    else $("files-diff").textContent = "Diff read interrupted. Select Working tree again to measure it.";
+  }
+}
+async function setSection(name, view = null) {
+  if (!switchSection(name, view)) return;
+  if (name !== "files") {
+    const repaintSource = showDiagrams(view);
+    if (!$("treemap-panel").hidden) await treemap?.refresh();
+    else if (!$("architecture-panel").hidden) void architecture?.refresh();
+    else if (!$("deviations-panel").hidden) void architecture?.showDeviations();
+    else if (diagramSequence && selectedMethod?.id === diagramSequence.seed.id) await loadSequence(diagramSequence, true);
+    repaintSource();
+    return;
+  }
+  showFilesSource();
   if (filesSymbol) {
     const current = filesGuard({symbol:true});
     if (filesMatches) renderFilesMatches(); else void loadFilesMatches();
     if (filesMini) await renderFilesMini(current);
     else if (["function", "method"].includes(filesSymbol.symbol.kind)) void loadFilesMini(current);
   }
-  if (!workspaceSource && filesFile && filesBasis === "indexed") $("source-path").textContent = "Source read interrupted. Select the file again to read its cached snapshot.";
-  if (filesBasis === "working") {
-    if (filesDiff) window.TrellisFiles?.diff($("files-diff"), filesDiff);
-    else $("files-diff").textContent = "Diff read interrupted. Select Working tree again to measure it.";
-  }
+  showFilesInterrupted();
   if (!filesCatalogLoaded && status?.revision) await loadFiles(true);
   if (!filesGitStatus) await refreshGit();
 }

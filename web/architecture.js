@@ -1278,6 +1278,73 @@
         button.addEventListener("click", () => { if (active()) inspect("interface", entry); }); target.append(button);
       }
     }
+    // One inspector per kind (`inspectors` below). Each fills the cleared inspector for its record.
+    function inspectModule({target, title, record, c, active}) {
+      title.textContent = record.identity.path;
+      paragraph(target, `Layer: ${record.layer ?? "Unassigned / unknown"} · ${record.physicalLines} physical file lines · ${record.declarationCount} ${callables()}.`);
+      paragraph(target, `${aggregate} · metrics:v1 · ${population()}. Callable-range LOC may overlap; it is not physical file lines.`);
+      disclosure(target, "Native file-module identity and captured source", {identity:record.identity, revisionId:record.revisionId, contentHash:record.contentHash, provenanceId:record.provenanceId});
+      if (record.excludedReason) paragraph(target, `Excluded from heat: ${record.excludedReason} · ${exclusions([record])}`);
+      else if (record.declarationCount === 0) paragraph(target, `No ${callables()}. Numeric aggregates are unavailable, not zero.`);
+      values(target, record.metrics);
+      if (record.physicalLines > 0) {
+        const button = make("button", "Read indexed file source"); button.type = "button";
+        button.addEventListener("click", () => { if (active()) return readSource({path:record.identity.path, range:{startLine:1,endLine:record.physicalLines}}, c.pin, active); }); target.append(button);
+      }
+      if (typeof openTreemap === "function") {
+        const button = make("button", "Open in Treemap"); button.type = "button";
+        button.addEventListener("click", () => { if (active()) openTreemap(record.identity, c.pin); }); target.append(button);
+      }
+      paragraph(target, "Reference pairs from or to this file", "detail");
+      detailList(target, {kind:"pairs", path:record.identity.path}, active, pairItems(active), NO_PAIRS);
+      paragraph(target, "Rule evaluation for this file (including exceptions and test-only outcomes)", "detail");
+      detailList(target, {kind:"instances", path:record.identity.path}, active, instanceItems(active), "No rule instances name this file.");
+    }
+    function inspectEdge({target, title, record, active}) {
+      title.textContent = `${record.sourceLayer} → ${record.destinationLayer}`;
+      paragraph(target, `${record.count} exact ${record.role} ${edgeSites(record)} · ${record.status}${record.excepted ? ` · excepted: ${record.exceptionReason}` : " · not excepted"}${record.role === "test" ? " · hypothetical policy only; never a production violation" : ""}.`);
+      edgePairs(target, record, active);
+    }
+    function inspectLayer({target, title, record, payload, references, active}) {
+      title.textContent = record.name; paragraph(target, layerLabel(record));
+      for (const module of payload.modules.filter(item => item.layer === record.name)) {
+        const button = make("button", module.identity.path); button.type = "button"; button.addEventListener("click", () => { if (active()) inspect("module", module); }); target.append(button);
+      }
+      const packages = (references.externalPackages || []).filter(item => item.layer === record.name);
+      if (packages.length) disclosure(target, "External packages (no native source or metrics)", packages);
+      paragraph(target, "Reference pairs from or to this layer", "detail");
+      detailList(target, {kind:"pairs", layer:record.name}, active, pairItems(active), NO_PAIRS);
+      paragraph(target, "Layer policy and exceptions", "detail");
+      detailList(target, appFilter({kind:"instances", layer:record.name}), active, instanceItems(active), "No rule instances name this layer.");
+    }
+    // An interface or an app that the payload no longer has returns to the overview; `false` tells `inspect` to stop there.
+    function inspectFound({kind, target, title, record, payload, active}) {
+      const found = kind === "interface" ? apps.link(payload, record?.client, record?.server) : apps.group(payload, record?.name);
+      if (!found) { overview(); return false; }
+      if (kind === "interface") inspectInterface(target, title, found, active); else inspectApp(target, title, found, payload, active);
+    }
+    function inspectUnresolved({target, title, references, active}) {
+      title.textContent = "Unresolved structural references";
+      paragraph(target, `${references.counts?.unresolvedSites ?? 0} unresolved sites.`);
+      detailList(target, {kind:"unresolved"}, active, (list, items) => {
+        for (const item of items) {
+          const entry = make("details"); entry.append(make("summary", `${item.source.path} · ${item.reason}`), make("pre", JSON.stringify(item, null, 2)));
+          inspectorSource(entry, item.source, item.site, active); list.append(entry);
+        }
+      }, "No unresolved sites.");
+    }
+    function inspectExternal({target, title, active}) {
+      title.textContent = "External policy results";
+      paragraph(target, "Production and test-only $external results.", "detail");
+      detailList(target, {kind:"instances", rule:"$external"}, active, instanceItems(active), "No external policy results.");
+    }
+    function inspectUnlayered({target, title, payload, active}) {
+      title.textContent = "Same-layer and unassigned references";
+      detailList(target, {kind:"pairs", unlayered:"true"}, active, pairItems(active), NO_PAIRS);
+      disclosure(target, "Unassigned native file modules", payload.modules.filter(module => module.layer === null));
+    }
+    // Any other kind (the callers pass "unknown") is the same-layer and unassigned inspector.
+    const inspectors = {module:inspectModule, edge:inspectEdge, layer:inspectLayer, interface:inspectFound, app:inspectFound, unresolved:inspectUnresolved, external:inspectExternal};
     function inspect(kind, record) {
       if (!usable() || view.state !== "ready") return;
       clearInspection(); inspection = {kind, record}; const ticket = selectionSerial, payload = view, c = basis;
@@ -1287,63 +1354,8 @@
       reviewChips(target);
       paragraph(target, `${evidenceSummary(payload)} · code ${window.TrellisIndexPin.label(payload)} · rules ${c.rulesHash}.`);
       const references = payload.references;
-      if (kind === "module") {
-        title.textContent = record.identity.path;
-        paragraph(target, `Layer: ${record.layer ?? "Unassigned / unknown"} · ${record.physicalLines} physical file lines · ${record.declarationCount} ${callables()}.`);
-        paragraph(target, `${aggregate} · metrics:v1 · ${population()}. Callable-range LOC may overlap; it is not physical file lines.`);
-        disclosure(target, "Native file-module identity and captured source", {identity:record.identity, revisionId:record.revisionId, contentHash:record.contentHash, provenanceId:record.provenanceId});
-        if (record.excludedReason) paragraph(target, `Excluded from heat: ${record.excludedReason} · ${exclusions([record])}`);
-        else if (record.declarationCount === 0) paragraph(target, `No ${callables()}. Numeric aggregates are unavailable, not zero.`);
-        values(target, record.metrics);
-        if (record.physicalLines > 0) {
-          const button = make("button", "Read indexed file source"); button.type = "button";
-          button.addEventListener("click", () => { if (active()) return readSource({path:record.identity.path, range:{startLine:1,endLine:record.physicalLines}}, c.pin, active); }); target.append(button);
-        }
-        if (typeof openTreemap === "function") {
-          const button = make("button", "Open in Treemap"); button.type = "button";
-          button.addEventListener("click", () => { if (active()) openTreemap(record.identity, c.pin); }); target.append(button);
-        }
-        paragraph(target, "Reference pairs from or to this file", "detail");
-        detailList(target, {kind:"pairs", path:record.identity.path}, active, pairItems(active), NO_PAIRS);
-        paragraph(target, "Rule evaluation for this file (including exceptions and test-only outcomes)", "detail");
-        detailList(target, {kind:"instances", path:record.identity.path}, active, instanceItems(active), "No rule instances name this file.");
-      } else if (kind === "edge") {
-        title.textContent = `${record.sourceLayer} → ${record.destinationLayer}`;
-        paragraph(target, `${record.count} exact ${record.role} ${edgeSites(record)} · ${record.status}${record.excepted ? ` · excepted: ${record.exceptionReason}` : " · not excepted"}${record.role === "test" ? " · hypothetical policy only; never a production violation" : ""}.`);
-        edgePairs(target, record, active);
-      } else if (kind === "layer") {
-        title.textContent = record.name; paragraph(target, layerLabel(record));
-        for (const module of payload.modules.filter(item => item.layer === record.name)) {
-          const button = make("button", module.identity.path); button.type = "button"; button.addEventListener("click", () => { if (active()) inspect("module", module); }); target.append(button);
-        }
-        const packages = (references.externalPackages || []).filter(item => item.layer === record.name);
-        if (packages.length) disclosure(target, "External packages (no native source or metrics)", packages);
-        paragraph(target, "Reference pairs from or to this layer", "detail");
-        detailList(target, {kind:"pairs", layer:record.name}, active, pairItems(active), NO_PAIRS);
-        paragraph(target, "Layer policy and exceptions", "detail");
-        detailList(target, appFilter({kind:"instances", layer:record.name}), active, instanceItems(active), "No rule instances name this layer.");
-      } else if (kind === "interface" || kind === "app") {
-        const found = kind === "interface" ? apps.link(payload, record?.client, record?.server) : apps.group(payload, record?.name);
-        if (!found) { overview(); return; }
-        if (kind === "interface") inspectInterface(target, title, found, active); else inspectApp(target, title, found, payload, active);
-      } else if (kind === "unresolved") {
-        title.textContent = "Unresolved structural references";
-        paragraph(target, `${references.counts?.unresolvedSites ?? 0} unresolved sites.`);
-        detailList(target, {kind:"unresolved"}, active, (list, items) => {
-          for (const item of items) {
-            const entry = make("details"); entry.append(make("summary", `${item.source.path} · ${item.reason}`), make("pre", JSON.stringify(item, null, 2)));
-            inspectorSource(entry, item.source, item.site, active); list.append(entry);
-          }
-        }, "No unresolved sites.");
-      } else if (kind === "external") {
-        title.textContent = "External policy results";
-        paragraph(target, "Production and test-only $external results.", "detail");
-        detailList(target, {kind:"instances", rule:"$external"}, active, instanceItems(active), "No external policy results.");
-      } else {
-        title.textContent = "Same-layer and unassigned references";
-        detailList(target, {kind:"pairs", unlayered:"true"}, active, pairItems(active), NO_PAIRS);
-        disclosure(target, "Unassigned native file modules", payload.modules.filter(module => module.layer === null));
-      }
+      const draw = Object.hasOwn(inspectors, kind) ? inspectors[kind] : inspectUnlayered;
+      if (draw({kind, record, target, title, payload, c, active, references}) === false) return;
       for (const limitation of references.limitations || []) paragraph(target, limitation, "detail");
     }
     function portable(identity) { return {language:identity.language, path:identity.path}; }
