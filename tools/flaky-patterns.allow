@@ -14,7 +14,9 @@ store-open src/http/worker/semantic.rs * -- no daemon, registry or Trellis child
 store-open src/index_coordinator/queue_completion_retry_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
 store-open src/index_coordinator/tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
 store-open src/mcp/find_trigram_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
-store-open src/native_evidence.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/native_evidence_cached_executable_digest_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/native_evidence_full_document_spool_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/native_evidence_parallel_extraction_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
 store-open src/producer/batch_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
 store-open src/producer/plan_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
 store-open src/producer/retention.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
