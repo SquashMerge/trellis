@@ -1443,3 +1443,46 @@ mod missing_index_tests {
         assert!(!index_dir.exists());
     }
 }
+
+#[cfg(test)]
+mod lock_order_tests {
+    use crate::http::exceptional_recovery_tests::fixture;
+    use crate::testing::HANG_BACKSTOP;
+    use std::sync::mpsc;
+
+    /// #1078: a session change holds the runtime state and then clears the published watch
+    /// status. A watcher-intent read (the automatic re-run decider makes one on every state
+    /// change) that found no status used to keep that lock while it waited for the state, so
+    /// the two waited on each other, and every later reader of the state behind them.
+    #[test]
+    fn a_watch_intent_read_releases_the_watch_status_before_it_reads_the_runtime_state() {
+        let (_tmp, _store, state, _roots, _identity) = fixture();
+        let (at_state, reader_at_state) = mpsc::channel();
+        state.test_watch_pending_before_state.set(move || {
+            let _ = at_state.send(());
+        });
+        let (answered, answer) = mpsc::channel();
+        let (reader, worker) = (state.clone(), state.clone());
+        state.test_session_change_before_watch_status.set(move || {
+            // The worker holds the runtime state here, as the first serving session commits.
+            std::thread::spawn(move || {
+                let _ = answered.send(reader.checkout_watch_pending());
+            });
+            reader_at_state
+                .recv_timeout(HANG_BACKSTOP)
+                .expect("the read never reached the runtime state");
+            assert!(
+                worker.watch_status.try_lock().is_ok(),
+                "the read holds the watch status while it waits for the runtime state, \
+                 which the session change holds while it waits for that status"
+            );
+        });
+        state.worker_step().unwrap();
+        assert!(
+            answer
+                .recv_timeout(HANG_BACKSTOP)
+                .expect("the read never answered"),
+            "a new serving session's first inventory is pending"
+        );
+    }
+}
