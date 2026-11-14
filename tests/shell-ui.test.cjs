@@ -28,7 +28,7 @@ function harness(withApp = false) {
     // No DOM parser here: the adapter double keeps the real Pele projection and installs one
     // selectable node per projected row.
     run(fs.readFileSync("web/sequence-pele.js","utf8"));run(fs.readFileSync("tests/support/sequence-adapter-double.js","utf8"));
-    run(fs.readFileSync("web/files.js","utf8"));run(fs.readFileSync("web/app.js","utf8"));run(`token="synthetic";selectedRootKey="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";checkouts=[{rootKey:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",workspaceRoot:"/repo",state:"available"}];status={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},workspaceRoot:"/repo"};`);}
+    run(fs.readFileSync("web/files.js","utf8"));run(fs.readFileSync("web/index-pin.js","utf8"));run(fs.readFileSync("web/app.js","utf8"));run(`token="synthetic";selectedRootKey="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";checkouts=[{rootKey:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",workspaceRoot:"/repo",state:"available"}];status={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},workspaceRoot:"/repo"};`);}
   if (withApp) {
     let handler = context.fetch;
     Object.defineProperty(context,"fetch",{configurable:true,get:()=>request,set(fn){handler=fn;}});

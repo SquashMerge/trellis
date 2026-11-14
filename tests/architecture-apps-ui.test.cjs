@@ -5,7 +5,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const read = file => fs.readFileSync(path.join(__dirname, "..", file), "utf8");
-const pinSource = read("web/app.js").match(/const IndexPin = Object.freeze\(\{[\s\S]*?\n\}\);\nwindow.TrellisIndexPin = IndexPin;/)[0];
+const pinSource = read("web/index-pin.js");
 const pin = {indexGeneration:"12345678-1234-4123-8123-123456789abc",indexRevision:1};
 const descendants = node => [node, ...node.children.flatMap(descendants)];
 const text = node => descendants(node).map(item => item.textContent).join(" ");

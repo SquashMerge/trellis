@@ -9,10 +9,10 @@ const {createServer} = require("node:http");
 const {resolve, join} = require("node:path");
 const {chromium} = require("playwright");
 const ROOT = resolve(__dirname, "../..");
-const pin = readFileSync(join(ROOT, "web/app.js"), "utf8").match(/const IndexPin = Object.freeze\(\{[\s\S]*?\n\}\);\nwindow.TrellisIndexPin = IndexPin;/)[0];
+const pin = readFileSync(join(ROOT, "web/index-pin.js"), "utf8");
 const files = {"/vendor/pele-1.10.0-trellis.2.js": "web/vendor/pele-1.10.0-trellis.2.js", "/classes.js": "web/classes.js", "/style.css": "web/style.css", "/classes.css": "web/classes.css"};
 const html = `<!doctype html><html><head><link rel="stylesheet" href="/style.css"><link rel="stylesheet" href="/classes.css">
-<script src="/pin.js" defer></script><script src="/vendor/pele-1.10.0-trellis.2.js" defer></script><script src="/classes.js" defer></script></head>
+<script src="/index-pin.js" defer></script><script src="/vendor/pele-1.10.0-trellis.2.js" defer></script><script src="/classes.js" defer></script></head>
 <body><section id="classes-panel"><p id="classes-state"></p><input id="classes-query"><button id="classes-search">Search</button><input id="classes-unmatched" type="checkbox">
 <div id="classes-results"></div><div id="classes-diagram"></div></section></body></html>`;
 const policy = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
@@ -20,7 +20,7 @@ let server, base, browser, page, errors;
 test.before(async () => {
   server = createServer((req, res) => {
     res.setHeader("Content-Security-Policy", policy);
-    if (req.url === "/pin.js") { res.setHeader("Content-Type", "text/javascript; charset=utf-8"); res.end(pin); return; }
+    if (req.url === "/index-pin.js") { res.setHeader("Content-Type", "text/javascript; charset=utf-8"); res.end(pin); return; }
     const font = req.url.match(/^\/fonts\/(inter-variable|manrope-variable|jetbrains-mono-latin)\.woff2$/);
     if (font) { res.setHeader("Content-Type", "font/woff2"); res.end(readFileSync(join(ROOT, "web", req.url))); return; }
     const file = files[req.url];
