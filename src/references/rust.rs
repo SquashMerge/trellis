@@ -1624,8 +1624,10 @@ impl Catalog {
             return Ok(false);
         }
         self.charge(names.names.len(), check)?;
+        // `r#name` and `name` are one identifier, whichever side spells the prefix.
+        let plain = |name: &str| name.strip_prefix("r#").unwrap_or(name).to_owned();
         let mut unseen: BTreeSet<String> =
-            names.names.keys().map(|(_, name)| name.clone()).collect();
+            names.names.keys().map(|(_, name)| plain(name)).collect();
         let mut stack = vec![(root, 0)];
         let mut visits = 0;
         while let Some((node, depth)) = stack.pop() {
@@ -1644,8 +1646,7 @@ impl Catalog {
                 node.kind(),
                 "identifier" | "type_identifier" | "shorthand_field_identifier"
             ) {
-                let spelling = text(doc, node);
-                unseen.remove(spelling.strip_prefix("r#").unwrap_or(spelling));
+                unseen.remove(&plain(text(doc, node)));
                 continue;
             }
             let mut cursor = node.walk();
@@ -1653,7 +1654,9 @@ impl Catalog {
                 stack.push((child, depth + 1));
             }
         }
-        names.names.retain(|(_, name), _| !unseen.contains(name));
+        names
+            .names
+            .retain(|(_, name), _| !unseen.contains(&plain(name)));
         Ok(!unseen.is_empty())
     }
     #[allow(clippy::too_many_arguments)] // Captured inputs and the site's own tree stay explicit.

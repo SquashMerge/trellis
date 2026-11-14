@@ -355,6 +355,62 @@ fn references_rust_private_glob_maps_only_the_names_its_scope_uses() {
     );
 }
 
+/// #986 review: `r#name` and `name` are one identifier on both sides of the comparison, so a
+/// raw-identifier export reached through a private glob is used however its use spells it,
+/// in a macro's arguments too. A path keyword is never a use of a name.
+#[test]
+fn references_rust_private_glob_matches_raw_identifiers_either_way() {
+    let input = snapshot(&[
+        (
+            "src/lib.rs",
+            "mod upper; mod raw; mod raw_macro; mod raw_use; mod plain_use; mod keywords;",
+        ),
+        ("src/raw.rs", "use crate::upper::*; fn f() { r#type(); }"),
+        (
+            "src/raw_macro.rs",
+            "use crate::upper::*; fn f() { let _ = format!(\"{:?}\", r#type()); }",
+        ),
+        (
+            "src/raw_use.rs",
+            "use crate::upper::*; fn f() { r#tight(); }",
+        ),
+        (
+            "src/plain_use.rs",
+            "use crate::upper::*; fn f() { loose(); }",
+        ),
+        (
+            "src/keywords.rs",
+            "use crate::upper::*; struct S; impl S { fn f(&self) -> Self { let _ = self; crate::m!(self, Self, crate, super) } }",
+        ),
+        (
+            "src/upper.rs",
+            "pub fn r#type() {} pub fn r#loose() {} pub fn tight() {}",
+        ),
+    ]);
+    let data = project(&input);
+    for (source, upper) in [
+        ("src/raw.rs", true),
+        ("src/raw_macro.rs", true),
+        ("src/raw_use.rs", true),
+        ("src/plain_use.rs", true),
+        ("src/keywords.rs", false),
+    ] {
+        assert_eq!(
+            has_edge(&data, source, "src/upper.rs"),
+            upper,
+            "{source}: {data}"
+        );
+    }
+    let unused: Vec<_> = data["unresolved"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|unknown| unknown["reason"] == "rust_wildcard_unused")
+        .map(|unknown| unknown["source"]["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(unused, ["src/keywords.rs"], "{data}");
+}
+
 #[test]
 fn references_count_maximal_paths_and_use_stored_roles() {
     let input = snapshot(&[
