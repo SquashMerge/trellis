@@ -1128,6 +1128,40 @@ mod selection_commit_tests {
     }
 }
 
+/// The checkout a call answers from: the worktree its `workspace` argument names, selected
+/// for this session, or `None` for the launch checkout once its identity is rechecked. The
+/// probe's registry guard is released before `prepare`; `commit_selection` takes its own.
+fn select_checkout(
+    workspace: &OpenedWorkspace,
+    registry: &Registry,
+    selection: Option<&serde_json::Value>,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<
+    Option<crate::daemon::registry::SelectedCheckout>,
+    crate::daemon::registry::SelectionError,
+> {
+    if let Some((registry, session_id)) = registry {
+        match selection.and_then(serde_json::Value::as_str) {
+            Some(path) => {
+                let probe = registry.blocking_lock().selection_probe();
+                probe
+                    .prepare(workspace.identity(), std::path::Path::new(path))
+                    .and_then(|prepared| commit_selection(registry, *session_id, prepared, cancel))
+                    .map(Some)
+            }
+            None => workspace
+                .check()
+                .map(|_| None)
+                .map_err(|_| crate::daemon::registry::SelectionError::IdentityChanged),
+        }
+    } else {
+        workspace
+            .check()
+            .map(|_| None)
+            .map_err(|_| crate::daemon::registry::SelectionError::IdentityChanged)
+    }
+}
+
 /// One admitted call, run whole on its worker: selection, readiness, the
 /// read and the response. The connection decides whether to send it.
 fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
@@ -1148,26 +1182,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
         .as_ref()
         .and_then(|v| v.as_object())
         .and_then(|o| o.get("workspace"));
-    let selected = if let Some((registry, session_id)) = &registry {
-        match selection.and_then(serde_json::Value::as_str) {
-            Some(path) => {
-                let probe = registry.blocking_lock().selection_probe();
-                probe
-                    .prepare(workspace.identity(), std::path::Path::new(path))
-                    .and_then(|prepared| commit_selection(registry, *session_id, prepared, &cancel))
-                    .map(Some)
-            }
-            None => workspace
-                .check()
-                .map(|_| None)
-                .map_err(|_| crate::daemon::registry::SelectionError::IdentityChanged),
-        }
-    } else {
-        workspace
-            .check()
-            .map(|_| None)
-            .map_err(|_| crate::daemon::registry::SelectionError::IdentityChanged)
-    };
+    let selected = select_checkout(&workspace, &registry, selection, &cancel);
     match selected {
         Ok(selected) => {
             if selected.is_some() {
@@ -1202,106 +1217,19 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                 && tool.valid_arguments
                 && let Some((registry, _)) = &registry
             {
-                // #780: the failed and partial document page the call asked for.
-                let coverage_request = arguments
-                    .as_ref()
-                    .and_then(|arguments| arguments.get("coverageDocuments"));
-                let answering_root = answering.root().to_owned();
-                let publish = |catching_up: bool| {
-                    *resolved.lock().unwrap() = Some((answering_root.clone(), catching_up));
-                };
-                match describe(
+                (envelope, sampled_catching_up, pending_coverage) = describe_envelope(
                     registry,
                     key,
-                    DescribeTarget {
-                        selected: selected.as_ref(),
-                        coverage_documents: coverage_request
-                            .map(|request| request["language"].as_str()),
-                    },
-                    daemon_handle.as_ref(),
+                    &selected,
+                    &arguments,
+                    answering,
+                    &daemon_handle,
                     deadline,
                     &cancel,
-                    &publish,
-                ) {
-                    Ok(DescribeResult {
-                        read,
-                        degraded,
-                        search_availability,
-                    }) => {
-                        let mut search_head = None;
-                        match read {
-                            Ok(DescribedSnapshot {
-                                data: Some((status, counts)),
-                                coverage_documents,
-                                search_head: head,
-                                catching_up: sampled,
-                                state,
-                                progress,
-                                apps,
-                            }) => {
-                                search_head = head;
-                                sampled_catching_up = sampled;
-                                envelope = projection::describe(
-                                    &id,
-                                    answering.label(),
-                                    state,
-                                    progress,
-                                    Some(counts),
-                                    Some(serde_json::json!({
-                                        "indexGeneration": status.revision.index_generation.to_string(),
-                                        "indexRevision": status.revision.index_revision
-                                    })),
-                                    false,
-                                );
-                                if let Some(apps) = apps {
-                                    envelope["data"]["apps"] = apps;
-                                }
-                                // Paged last, against the final answer (#780).
-                                if let (Some(request), Some(documents)) =
-                                    (coverage_request, coverage_documents)
-                                {
-                                    pending_coverage = Some((documents, request));
-                                }
-                            }
-                            Ok(DescribedSnapshot {
-                                data: None,
-                                coverage_documents: _,
-                                search_head: _,
-                                catching_up: sampled,
-                                state,
-                                progress,
-                                apps: _,
-                            }) => {
-                                sampled_catching_up = sampled;
-                                envelope = projection::describe(
-                                    &id,
-                                    answering.label(),
-                                    state,
-                                    progress,
-                                    None,
-                                    None,
-                                    false,
-                                );
-                            }
-                            Err(error) => {
-                                envelope = tools::failure(&id, mcp_read_error(&error));
-                            }
-                        }
-                        match degraded {
-                            Ok(degraded) if envelope.get("data").is_some() => {
-                                envelope["data"]["watcherDegraded"] = serde_json::json!(degraded);
-                                envelope["data"]["searchIndex"] = serde_json::to_value(
-                                    search_availability.with_head(search_head),
-                                )?;
-                            }
-                            Err(error) => envelope = tools::failure(&id, mcp_read_error(&error)),
-                            _ => {}
-                        }
-                    }
-                    Err(error) => {
-                        envelope = tools::failure(&id, mcp_read_error(&error));
-                    }
-                }
+                    &resolved,
+                    &id,
+                    catching_up,
+                )?;
             }
             let args = arguments.as_ref().and_then(serde_json::Value::as_object);
             let root = answering.root();
@@ -1447,30 +1375,17 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     }
                 }
             }
-            *resolved.lock().unwrap() = Some((answering.root().to_owned(), sampled_catching_up));
-            envelope["workspace"] = serde_json::json!(answering.root());
-            envelope["catchingUp"] = serde_json::json!(sampled_catching_up);
-            if let Some((documents, request)) = pending_coverage
-                && envelope.get("data").is_some()
-            {
-                envelope = projection::coverage_documents(id, envelope, documents, request, modern);
-            }
-            // #930: describe fits its final answer like the other tools; one over the
-            // response cap is that call's typed failure.
-            if name == "trellis_workspace_describe"
-                && envelope.get("data").is_some()
-                && projection::line_bytes(id, &envelope, modern) > wire::RESPONSE_BYTES
-            {
-                envelope = tools::response_too_large(id, &envelope);
-            }
-            tool.response = if architecture::is_tool(&name) || name == architecture::PROMPT_NAME {
-                // Tools page their arrays into the response cap; the prompt never pages.
-                let paging = architecture::is_tool(&name)
-                    .then(|| architecture::Paging::from_arguments(&name, arguments.as_ref()));
-                architecture::capped(id, &name, envelope, paging, modern)
-            } else {
-                tools::result(&name, envelope, modern)
-            };
+            tool.response = finish_envelope(
+                &resolved,
+                answering,
+                &name,
+                &arguments,
+                id,
+                modern,
+                envelope,
+                sampled_catching_up,
+                pending_coverage,
+            );
             let finals = match selected {
                 Some(witness) => Finals::Selected {
                     witness,
@@ -1486,48 +1401,9 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                 show: pending_show,
             })
         }
-        Err(crate::daemon::registry::SelectionError::CheckoutCapacity) => {
-            let Some(path) = selection.and_then(serde_json::Value::as_str) else {
-                unreachable!("validated capacity requires explicit selection")
-            };
-            let checked_capacity =
-                crate::daemon::registry::CheckoutRegistry::capacity_witness_unlocked(
-                    workspace.identity(),
-                    std::path::Path::new(path),
-                );
-            match checked_capacity {
-                Ok(witness) => {
-                    let catching_up = catching_up(&registry, &witness.identity.root_key);
-                    *resolved.lock().unwrap() = Some((witness.identity.root.clone(), catching_up));
-                    let result = tools::result(
-                        &name,
-                        tools::attributed_root(
-                            tools::failure(&id, "checkout_capacity"),
-                            &witness.identity.root,
-                            catching_up,
-                        ),
-                        modern,
-                    );
-                    Ok(CallOutcome {
-                        result,
-                        finals: Finals::Capacity {
-                            witness,
-                            catching_up,
-                        },
-                        show: None,
-                    })
-                }
-                Err(error) => Ok(CallOutcome {
-                    result: tools::result(
-                        &name,
-                        tools::selection_failure(&id, error, &serde_json::json!(path)),
-                        modern,
-                    ),
-                    finals: Finals::None,
-                    show: None,
-                }),
-            }
-        }
+        Err(crate::daemon::registry::SelectionError::CheckoutCapacity) => capacity_outcome(
+            &workspace, &registry, &resolved, selection, &name, &id, modern,
+        ),
         Err(error) => {
             let attempted = selection
                 .cloned()
@@ -1542,6 +1418,98 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                 show: None,
             })
         }
+    }
+}
+
+/// A resolved call's result: publish the answering root, stamp it on the envelope, page
+/// describe's coverage documents, apply describe's response cap, and build the tool result.
+#[allow(clippy::too_many_arguments)]
+fn finish_envelope(
+    resolved: &Resolved,
+    answering: &OpenedWorkspace,
+    name: &str,
+    arguments: &Option<serde_json::Value>,
+    id: &serde_json::Value,
+    modern: bool,
+    mut envelope: serde_json::Value,
+    sampled_catching_up: bool,
+    pending_coverage: PendingCoverage<'_>,
+) -> serde_json::Value {
+    *resolved.lock().unwrap() = Some((answering.root().to_owned(), sampled_catching_up));
+    envelope["workspace"] = serde_json::json!(answering.root());
+    envelope["catchingUp"] = serde_json::json!(sampled_catching_up);
+    if let Some((documents, request)) = pending_coverage
+        && envelope.get("data").is_some()
+    {
+        envelope = projection::coverage_documents(id, envelope, documents, request, modern);
+    }
+    // #930: describe fits its final answer like the other tools; one over the
+    // response cap is that call's typed failure.
+    if name == "trellis_workspace_describe"
+        && envelope.get("data").is_some()
+        && projection::line_bytes(id, &envelope, modern) > wire::RESPONSE_BYTES
+    {
+        envelope = tools::response_too_large(id, &envelope);
+    }
+    if architecture::is_tool(name) || name == architecture::PROMPT_NAME {
+        // Tools page their arrays into the response cap; the prompt never pages.
+        let paging = architecture::is_tool(name)
+            .then(|| architecture::Paging::from_arguments(name, arguments.as_ref()));
+        architecture::capped(id, name, envelope, paging, modern)
+    } else {
+        tools::result(name, envelope, modern)
+    }
+}
+
+/// A selection refused for capacity: `checkout_capacity` attributed to the root its
+/// capacity witness names, or the selection failure when that witness cannot be taken.
+fn capacity_outcome(
+    workspace: &OpenedWorkspace,
+    registry: &Registry,
+    resolved: &Resolved,
+    selection: Option<&serde_json::Value>,
+    name: &str,
+    id: &serde_json::Value,
+    modern: bool,
+) -> std::io::Result<CallOutcome> {
+    let Some(path) = selection.and_then(serde_json::Value::as_str) else {
+        unreachable!("validated capacity requires explicit selection")
+    };
+    let checked_capacity = crate::daemon::registry::CheckoutRegistry::capacity_witness_unlocked(
+        workspace.identity(),
+        std::path::Path::new(path),
+    );
+    match checked_capacity {
+        Ok(witness) => {
+            let catching_up = catching_up(registry, &witness.identity.root_key);
+            *resolved.lock().unwrap() = Some((witness.identity.root.clone(), catching_up));
+            let result = tools::result(
+                name,
+                tools::attributed_root(
+                    tools::failure(id, "checkout_capacity"),
+                    &witness.identity.root,
+                    catching_up,
+                ),
+                modern,
+            );
+            Ok(CallOutcome {
+                result,
+                finals: Finals::Capacity {
+                    witness,
+                    catching_up,
+                },
+                show: None,
+            })
+        }
+        Err(error) => Ok(CallOutcome {
+            result: tools::result(
+                name,
+                tools::selection_failure(id, error, &serde_json::json!(path)),
+                modern,
+            ),
+            finals: Finals::None,
+            show: None,
+        }),
     }
 }
 
@@ -1590,6 +1558,130 @@ fn describe(
         degraded: runtime.mcp_watcher_degraded(),
         search_availability: runtime.search_availability(),
     })
+}
+
+/// What describe still pages into its final answer: the failed and partial documents and
+/// the call's `coverageDocuments` request (#780).
+type PendingCoverage<'a> = Option<(Vec<crate::store::CoverageDocument>, &'a serde_json::Value)>;
+
+/// `trellis_workspace_describe` on a daemon checkout: its envelope, the `catchingUp` its
+/// read sampled (else the caller's) and the coverage documents to page last.
+#[allow(clippy::too_many_arguments)]
+fn describe_envelope<'a>(
+    registry: &std::sync::Arc<tokio::sync::Mutex<crate::daemon::registry::CheckoutRegistry>>,
+    key: &str,
+    selected: &Option<crate::daemon::registry::SelectedCheckout>,
+    arguments: &'a Option<serde_json::Value>,
+    answering: &OpenedWorkspace,
+    daemon_handle: &Option<tokio::runtime::Handle>,
+    deadline: std::time::Instant,
+    cancel: &std::sync::atomic::AtomicBool,
+    resolved: &Resolved,
+    id: &serde_json::Value,
+    catching_up: bool,
+) -> std::io::Result<(serde_json::Value, bool, PendingCoverage<'a>)> {
+    let mut sampled_catching_up = catching_up;
+    // Declared without a value: every path below assigns it.
+    let mut envelope;
+    let mut pending_coverage = None;
+    // #780: the failed and partial document page the call asked for.
+    let coverage_request = arguments
+        .as_ref()
+        .and_then(|arguments| arguments.get("coverageDocuments"));
+    let answering_root = answering.root().to_owned();
+    let publish = |catching_up: bool| {
+        *resolved.lock().unwrap() = Some((answering_root.clone(), catching_up));
+    };
+    match describe(
+        registry,
+        key,
+        DescribeTarget {
+            selected: selected.as_ref(),
+            coverage_documents: coverage_request.map(|request| request["language"].as_str()),
+        },
+        daemon_handle.as_ref(),
+        deadline,
+        cancel,
+        &publish,
+    ) {
+        Ok(DescribeResult {
+            read,
+            degraded,
+            search_availability,
+        }) => {
+            let mut search_head = None;
+            match read {
+                Ok(DescribedSnapshot {
+                    data: Some((status, counts)),
+                    coverage_documents,
+                    search_head: head,
+                    catching_up: sampled,
+                    state,
+                    progress,
+                    apps,
+                }) => {
+                    search_head = head;
+                    sampled_catching_up = sampled;
+                    envelope = projection::describe(
+                        id,
+                        answering.label(),
+                        state,
+                        progress,
+                        Some(counts),
+                        Some(serde_json::json!({
+                            "indexGeneration": status.revision.index_generation.to_string(),
+                            "indexRevision": status.revision.index_revision
+                        })),
+                        false,
+                    );
+                    if let Some(apps) = apps {
+                        envelope["data"]["apps"] = apps;
+                    }
+                    // Paged last, against the final answer (#780).
+                    if let (Some(request), Some(documents)) = (coverage_request, coverage_documents)
+                    {
+                        pending_coverage = Some((documents, request));
+                    }
+                }
+                Ok(DescribedSnapshot {
+                    data: None,
+                    coverage_documents: _,
+                    search_head: _,
+                    catching_up: sampled,
+                    state,
+                    progress,
+                    apps: _,
+                }) => {
+                    sampled_catching_up = sampled;
+                    envelope = projection::describe(
+                        id,
+                        answering.label(),
+                        state,
+                        progress,
+                        None,
+                        None,
+                        false,
+                    );
+                }
+                Err(error) => {
+                    envelope = tools::failure(id, mcp_read_error(&error));
+                }
+            }
+            match degraded {
+                Ok(degraded) if envelope.get("data").is_some() => {
+                    envelope["data"]["watcherDegraded"] = serde_json::json!(degraded);
+                    envelope["data"]["searchIndex"] =
+                        serde_json::to_value(search_availability.with_head(search_head))?;
+                }
+                Err(error) => envelope = tools::failure(id, mcp_read_error(&error)),
+                _ => {}
+            }
+        }
+        Err(error) => {
+            envelope = tools::failure(id, mcp_read_error(&error));
+        }
+    }
+    Ok((envelope, sampled_catching_up, pending_coverage))
 }
 
 /// Outstanding non-call requests per connection; more are refused at once
