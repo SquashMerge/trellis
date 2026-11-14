@@ -990,10 +990,13 @@ A site's role comes from its innermost enclosing **stored** native declaration,
 falling back to the stored file-module owner. Ambiguous ownership is unknown.
 There is no read-time path classifier. One read-time cfg rule applies (#988, owner
 ruling 2026-11-14, recorded in Decision 0011): a Rust site whose stored role is
-production is test when it, or syntax enclosing it, carries an outer attribute that
+production is test when it, or syntax enclosing it, carries an attribute that
 marks test code under Decision 0011 point 3. This covers what is no declaration and
-so has no stored role of its own: a statement, a block, a match arm, a `use` item or
-a field under `#[cfg(test)]` or `#[cfg(all(test, …))]`. `cfg(any(test, …))` and
+so has no stored role of its own, under `#[cfg(test)]` or `#[cfg(all(test, …))]`: a
+statement, a block, a match arm, a `use` item, a field of a struct, tuple struct or
+struct expression, an enum variant, a parameter, a generic parameter, and an element
+of an argument list, array or tuple. A block or function body that starts with
+`#![cfg(test)]` is covered too. `cfg(any(test, …))` and
 `cfg(not(test))` do not mark. The rule changes reference-site roles only; declaration
 roles stay stored, and the call tools' `callerRole` is the caller declaration's
 stored role as before.

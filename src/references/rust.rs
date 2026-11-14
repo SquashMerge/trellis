@@ -1957,9 +1957,15 @@ pub(super) fn extract(
     Ok(result)
 }
 
-/// Whether the syntax at `start..end`, or anything enclosing it, carries an outer attribute
-/// that marks test code under Decision 0011 (#988). Attributes are a node's preceding
-/// siblings, or its leading children for a match arm, which owns its own.
+/// Whether the syntax at `start..end`, or anything enclosing it, carries an attribute that
+/// marks test code under Decision 0011 (#988). The pinned grammar attaches an attribute in
+/// one of three shapes, and every enclosing node is checked for all of them:
+///
+/// - an outer attribute is a preceding sibling of what it applies to: an item or statement,
+///   a field, an enum variant, a parameter, a generic parameter, or an element of an argument
+///   list, array or tuple. A tuple-struct field's visibility lies between the two;
+/// - a match arm and a struct-expression field own their outer attributes as leading children;
+/// - an inner attribute leads the block or module body it applies to.
 pub(super) fn under_test_attribute(
     doc: &DocumentInput,
     tree: &Tree,
@@ -1968,40 +1974,36 @@ pub(super) fn under_test_attribute(
     work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<bool> {
-    let marks = |node: Node<'_>| {
-        node.kind() == "attribute_item"
-            && crate::native_evidence::rust_test_attribute(node, &doc.file)
-    };
-    let passes = |node: Node<'_>| {
-        matches!(
-            node.kind(),
-            "attribute_item" | "line_comment" | "block_comment"
-        )
-    };
+    let marks = |node: Node<'_>| crate::native_evidence::rust_test_attribute(node, &doc.file);
+    let comment = |node: Node<'_>| matches!(node.kind(), "line_comment" | "block_comment");
     let mut current = tree.root_node().descendant_for_byte_range(start, end);
     while let Some(node) = current {
         owner_step(work, check)?;
-        let mut previous = node.prev_named_sibling();
+        // Any token but these, a separating comma included, ends the node's own attributes.
+        let mut previous = node.prev_sibling();
         while let Some(sibling) = previous {
             owner_step(work, check)?;
-            if marks(sibling) {
-                return Ok(true);
+            match sibling.kind() {
+                "attribute_item" if marks(sibling) => return Ok(true),
+                "attribute_item" | "inner_attribute_item" | "visibility_modifier" => {}
+                _ if comment(sibling) => {}
+                _ => break,
             }
-            if !passes(sibling) {
-                break;
-            }
-            previous = sibling.prev_named_sibling();
+            previous = sibling.prev_sibling();
         }
-        if node.kind() == "match_arm" {
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                owner_step(work, check)?;
-                if marks(child) {
-                    return Ok(true);
-                }
-                if !passes(child) {
-                    break;
-                }
+        let owns = matches!(
+            node.kind(),
+            "match_arm" | "field_initializer" | "shorthand_field_initializer"
+        );
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            owner_step(work, check)?;
+            match child.kind() {
+                "inner_attribute_item" if marks(child) => return Ok(true),
+                "attribute_item" if owns && marks(child) => return Ok(true),
+                "attribute_item" | "inner_attribute_item" => {}
+                _ if comment(child) => {}
+                _ => break,
             }
         }
         current = node.parent();
