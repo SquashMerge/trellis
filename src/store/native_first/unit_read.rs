@@ -3,11 +3,11 @@
 //! snapshot's connection and never hands it out, and is never opened on a caller's pin.
 use super::continuation::HeldIndexRead;
 use super::local_targets::{TargetAdvance, TargetIndexCursor};
+use super::retained_batch::RetainedBatchRows;
 use super::witness::{AuthorityStep, OriginalAdmissionCursor, SourceAuthority};
 use super::witness_preparation::WitnessPreparation;
 use super::*;
 use crate::semantic_batch::{
-    RetainedStageContinuation, StageOwner,
     counters::{BatchCounters, LookupBudget},
     limits::BatchLimits,
 };
@@ -362,48 +362,13 @@ impl PendingSemanticRead<'_> {
         )
     }
 
-    /// Starts retained admission of the selected batch on this snapshot. Until the retained
-    /// raw-batch statements are storage's (S14b), admission reads them on this connection.
-    pub(super) fn start_admission(
-        &self,
-        witnessed: bool,
-        stage_parent: &Path,
-        owner: StageOwner<'_>,
-        limits: &BatchLimits,
-        cancel: &CancelFlag,
-    ) -> Result<RetainedStageContinuation> {
-        let (db, captured, batch) = (self.db, self.captured(), self.selection.batch_id);
-        if witnessed {
-            RetainedStageContinuation::new_witnessed(
-                db,
-                &captured,
-                batch,
-                stage_parent,
-                owner,
-                limits,
-                cancel,
-            )
-        } else {
-            RetainedStageContinuation::new(
-                db,
-                &captured,
-                batch,
-                stage_parent,
-                owner,
-                limits,
-                cancel,
-            )
-        }
-    }
-
-    /// One retained admission unit on this snapshot (see [`Self::start_admission`]).
-    pub(super) fn advance_admission(
-        &self,
-        admission: &mut RetainedStageContinuation,
-        counters: &mut BatchCounters,
-        cancel: &CancelFlag,
-    ) -> Result<Option<AdmittedBatch>> {
-        admission.advance(self.db, &self.captured(), counters, cancel)
+    /// The selected retained raw batch, as typed rows of this snapshot.
+    pub(crate) fn retained_batch(&self) -> RetainedBatchRows<'_> {
+        RetainedBatchRows::new(
+            self.db,
+            self.selection.batch_id,
+            self.selection.captured_pin,
+        )
     }
 
     /// The test-support switch that makes every S step fail with a content error.

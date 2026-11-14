@@ -14,6 +14,9 @@ use crate::{
     scip_raw::{self, ScipCaptureError},
     store::{
         NativeReader,
+        native_first::retained_batch::{
+            BatchMetadata, CaptureKey, RetainedBatchRows, RetainedDocument, RetainedProof,
+        },
         staging::{Stage, artifact_file},
     },
 };
@@ -21,7 +24,4 @@ use anyhow::{Result, ensure};
 pub(crate) use continuation::RetainedStageContinuation;
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
-use std::{
-    io::{Read, Write},
-    path::Path,
-};
+use std::{io::Write, path::Path};

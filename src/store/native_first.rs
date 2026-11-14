@@ -6,6 +6,9 @@ pub(crate) mod copy;
 mod local_targets;
 #[cfg(feature = "test-support")]
 pub(in crate::store) mod oracle;
+pub(crate) mod retained_batch;
+#[cfg(test)]
+mod retained_batch_tests;
 #[cfg(test)]
 mod tests;
 mod unit_read;
