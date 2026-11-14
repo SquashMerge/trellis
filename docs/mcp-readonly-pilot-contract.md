@@ -1407,3 +1407,12 @@ An independently returned projected proof wrapper is `{evidence:T,projection:Sem
 - **Items keep their labels.** A references edge with semantic sites keeps its #620 `projection`. A grouped answer (#775) keeps `semanticDocumentStatus` as it kept the list.
 - **Catalog.** The three output schemas replace `semanticDocuments` with the required `semanticDocumentStatus` and drop their now-unreferenced `DocumentSemanticStatus` definition. `SemanticProjection` stays. The measured sizes at `toolVersion` 30 are: modern `tools/list` frame 210,850 bytes and legacy 210,793 bytes, 897 bytes less than at `toolVersion` 29 (211,747 and 211,690), against the unchanged 235,520-byte compacted-frame limit.
 - **Unchanged:** the call and graph tools' `semanticDocuments`, which already name only the answer's own documents; the CLI, the browser, every other field and every bound; no MCP budget changes.
+
+## Amendment (#988): the proposal prompt's closed grammar accepts `test_features`
+
+**Status: owner ruling 2026-11-14 ([#988](https://github.com/SquashMerge/trellis/issues/988)), recorded in [Decision 0011](semantic-evidence/decisions/0011-test-production-declaration-role.md).** A workspace may declare the Cargo features that gate its test support in `.trellis/rules.toml`. `toolVersion` is **31** (previously 30, #932). As for #855, the bump records the prompt text change below.
+
+- **Prompt.** The proposal prompt's closed TOML grammar lists `test_features` among the accepted top-level keys. One sentence says that the optional list names Cargo features that gate test support, and that Rust reference sites under `#[cfg(feature="name")]` or `#[cfg(any(test, feature="name"))]` count as test, not production. The key's rules are in [rules.md](rules.md#amendment-988-test-features).
+- **References.** `trellis_references`, and the rules check, explain, view and details that read the same projection, report a production Rust site under a named feature's gate with `role:"test"`, in `tests` instead of `production`. No field is added or removed. A references read takes only this key from the rules file, leniently, as line 5 of this document states.
+- **Catalog.** Only the `toolVersion` constant changes, from 30 to 31, which has the same width. The prompt text is not part of the tool catalog, so the `tools/list` frame size is unchanged.
+- **Unchanged:** declaration roles, `callerRole`, find, search, metrics, the treemap, every schema and every bound.

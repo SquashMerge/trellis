@@ -713,10 +713,16 @@ for the site or for syntax enclosing it:
 - its file, inline module or block starts with the inner attribute
   `#![cfg(feature = "<name>")]` or `#![cfg(any(test, feature = "<name>"))]`.
 
-The condition is matched exactly, whitespace aside. `not(...)`, `all(...)`, an `any` with
-other operands and `cfg_attr` do not match, and neither does a `mod` item's own gate reach a
-file it declares. Each name is 1 to 64 bytes of ASCII letters, digits, `_`, `-`, `+` and `.`,
-and starts with a letter, a digit or `_`. A value that is not a list of such names, a
+The gate's whole condition must be one of those two forms. Whitespace between tokens is
+ignored, and the name is the string literal's exact value, so `feature = "test support"` or
+`" test-support"` does not match `test-support`. A literal with an escape, a raw literal and
+an attribute with a comment inside are not interpreted. These do not match: `not(...)`;
+`all(...)`, although such code also needs the feature; an `any` with any other or further
+operand, because that code is also built without the feature; and `cfg_attr`. A `mod` item's
+own gate does not reach a file it declares.
+
+Each name is 1 to 64 bytes of ASCII letters, digits, `_`, `-`, `+` and `.`, and starts with
+a letter, a digit or `_`. A value that is not a list of such names, a
 repeated name and more than 64 names are each a located `invalid_rules` error.
 
 The key applies to the whole checkout, not to one app: a file's app is itself computed from

@@ -644,6 +644,82 @@ fn references_rust_named_test_feature_gates_reach_owned_and_field_attributes() {
     }
 }
 
+/// #988 review: a gate names its feature by the literal's exact value. Whitespace inside the
+/// quotes is part of the value, so such a gate stays production beside the valid one.
+#[test]
+fn references_rust_test_feature_literal_is_matched_exactly() {
+    let source = r#"
+mod store;
+fn f() {
+    #[cfg(feature = "test-support")]
+    crate::store::direct();
+    #[cfg( any( test , feature="test-support" ) )]
+    crate::store::any_form();
+    #[cfg(feature = "test -support")]
+    crate::store::inner_space();
+    #[cfg(feature = " test-support")]
+    crate::store::leading_space();
+    #[cfg(feature = "test-support ")]
+    crate::store::trailing_space();
+    #[cfg(any(test, feature = "test -support"))]
+    crate::store::any_inner_space();
+    #[cfg(any(feature = " test-support", test))]
+    crate::store::any_leading_space();
+    #[cfg(any(test, feature = "test-support "))]
+    crate::store::any_trailing_space();
+    #[cfg(not(feature = "test-support"))]
+    crate::store::negated();
+}
+"#;
+    let input = snapshot(&[
+        ("src/lib.rs", source),
+        (
+            "src/store.rs",
+            "pub fn direct() {} pub fn any_form() {} pub fn inner_space() {} \
+             pub fn leading_space() {} pub fn trailing_space() {} pub fn any_inner_space() {} \
+             pub fn any_leading_space() {} pub fn any_trailing_space() {} pub fn negated() {}",
+        ),
+    ]);
+    let data = references::project_where(
+        &input,
+        &[],
+        None,
+        None,
+        &["test-support".to_owned()],
+        20,
+        &mut || Ok(()),
+    )
+    .unwrap()
+    .data;
+    let spellings = |role: &str| -> Vec<&str> {
+        edge(&data, role, "src/lib.rs", "src/store.rs")["sites"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|site| {
+                site["spelling"]
+                    .as_str()
+                    .unwrap()
+                    .trim_start_matches("crate::store::")
+            })
+            .collect()
+    };
+    assert_eq!(spellings("tests"), ["direct", "any_form"], "{data}");
+    assert_eq!(
+        spellings("production"),
+        [
+            "inner_space",
+            "leading_space",
+            "trailing_space",
+            "any_inner_space",
+            "any_leading_space",
+            "any_trailing_space",
+            "negated"
+        ],
+        "{data}"
+    );
+}
+
 #[test]
 fn references_count_maximal_paths_and_use_stored_roles() {
     let input = snapshot(&[

@@ -1976,27 +1976,96 @@ pub(crate) fn feature_name(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+' | '.'))
 }
 
-/// The feature of a gate that is exactly `cfg(feature = "name")` or `cfg(any(test, feature =
-/// "name"))`, whitespace aside, as an outer or inner attribute. Any other condition names none.
+/// One token of a `cfg` attribute: a word, a plain string literal's exact value, or a
+/// punctuation character.
+#[derive(Clone, Copy, PartialEq)]
+enum GateToken<'a> {
+    Word(&'a str),
+    Text(&'a str),
+    Mark(char),
+}
+
+/// The tokens of an attribute, with whitespace between tokens dropped and a string literal's
+/// value kept exactly. `None` for what this reader does not interpret: a comment, an escape,
+/// an unterminated or raw literal, or more tokens than any gate it accepts has.
+fn gate_tokens(attribute: &str) -> Option<Vec<GateToken<'_>>> {
+    const MOST: usize = 20;
+    let mut tokens = Vec::new();
+    let mut rest = attribute;
+    while let Some(first) = rest.chars().next() {
+        if tokens.len() == MOST {
+            return None;
+        }
+        if first.is_whitespace() {
+            rest = &rest[first.len_utf8()..];
+        } else if first == '"' {
+            let end = rest[1..].find('"')?;
+            let value = &rest[1..1 + end];
+            if value.contains('\\') {
+                return None;
+            }
+            tokens.push(GateToken::Text(value));
+            rest = &rest[end + 2..];
+        } else if first.is_ascii_alphabetic() || first == '_' {
+            let end = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            // `r"…"`, `r#"…"#`, `b"…"` and `c"…"` are literals this reader does not interpret.
+            if rest[end..].starts_with(['"', '#']) {
+                return None;
+            }
+            tokens.push(GateToken::Word(&rest[..end]));
+            rest = &rest[end..];
+        } else if first == '/' {
+            return None;
+        } else {
+            tokens.push(GateToken::Mark(first));
+            rest = &rest[first.len_utf8()..];
+        }
+    }
+    Some(tokens)
+}
+
+/// The feature of a gate whose whole condition is `feature = "name"` or `any(test, feature =
+/// "name")`, the two operands in either order, as an outer or inner `cfg` attribute. The
+/// name is the literal's exact value; only whitespace between tokens is ignored. Any other
+/// condition names none: `not(..)`, `all(..)`, an `any` with other or more operands, and
+/// `cfg_attr`.
 fn feature_gate(attribute: &str) -> Option<String> {
+    use GateToken::{Mark, Text, Word};
     if !attribute.contains("feature") {
         return None;
     }
-    let compact: String = attribute.chars().filter(|c| !c.is_whitespace()).collect();
-    let condition = compact
-        .strip_prefix("#![cfg(")
-        .or_else(|| compact.strip_prefix("#[cfg("))?
-        .strip_suffix(")]")?;
-    let operand = match condition
-        .strip_prefix("any(")
-        .and_then(|rest| rest.strip_suffix(')'))
-    {
-        Some(list) => list
-            .strip_prefix("test,")
-            .or_else(|| list.strip_suffix(",test"))?,
-        None => condition,
+    let tokens = gate_tokens(attribute)?;
+    let tokens = tokens.strip_prefix(&[Mark('#')])?;
+    let tokens = tokens.strip_prefix(&[Mark('!')]).unwrap_or(tokens);
+    let condition = tokens
+        .strip_prefix(&[Mark('['), Word("cfg"), Mark('(')])?
+        .strip_suffix(&[Mark(')'), Mark(']')])?;
+    let name = match condition {
+        [Word("feature"), Mark('='), Text(name)]
+        | [
+            Word("any"),
+            Mark('('),
+            Word("test"),
+            Mark(','),
+            Word("feature"),
+            Mark('='),
+            Text(name),
+            Mark(')'),
+        ]
+        | [
+            Word("any"),
+            Mark('('),
+            Word("feature"),
+            Mark('='),
+            Text(name),
+            Mark(','),
+            Word("test"),
+            Mark(')'),
+        ] => *name,
+        _ => return None,
     };
-    let name = operand.strip_prefix("feature=\"")?.strip_suffix('"')?;
     feature_name(name).then(|| name.to_owned())
 }
 
@@ -2409,5 +2478,50 @@ mod cache_tests {
             index.enclosing(101, 102, &mut work, &mut check).unwrap(),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod feature_gate_tests {
+    use super::feature_gate;
+
+    #[test]
+    fn a_gate_names_its_feature_by_the_literals_exact_value() {
+        for (attribute, feature) in [
+            ("#[cfg(feature=\"x\")]", Some("x")),
+            ("#[cfg(feature = \"x\")]", Some("x")),
+            ("#[ cfg ( feature\n=\t\"x\" ) ]", Some("x")),
+            ("#![cfg(feature = \"test-support\")]", Some("test-support")),
+            ("#[cfg(any(test, feature = \"x\"))]", Some("x")),
+            ("#[cfg(any(feature = \"x\", test))]", Some("x")),
+            // The value is compared as written: whitespace inside the quotes is part of it.
+            ("#[cfg(feature = \"x y\")]", None),
+            ("#[cfg(feature = \" x\")]", None),
+            ("#[cfg(feature = \"x \")]", None),
+            ("#[cfg(feature = \"test -support\")]", None),
+            ("#[cfg(feature = \"\")]", None),
+            // An escape, a raw literal and a comment are not interpreted.
+            ("#[cfg(feature = \"\\u{78}\")]", None),
+            ("#[cfg(feature = r\"x\")]", None),
+            ("#[cfg(feature = r#\"x\"#)]", None),
+            ("#[cfg(/* test */ feature = \"x\")]", None),
+            // Only the two whole-condition forms count.
+            ("#[cfg(not(feature = \"x\"))]", None),
+            ("#[cfg(all(feature = \"x\"))]", None),
+            ("#[cfg(all(test, feature = \"x\"))]", None),
+            ("#[cfg(all(feature = \"x\", unix))]", None),
+            ("#[cfg(any(feature = \"x\"))]", None),
+            ("#[cfg(any(feature = \"x\", unix))]", None),
+            ("#[cfg(any(test, feature = \"x\", unix))]", None),
+            ("#[cfg(any(test, not(feature = \"x\")))]", None),
+            ("#[cfg(any(feature = \"x\", feature = \"y\"))]", None),
+            ("#[cfg(feature = \"x\", unix)]", None),
+            ("#[cfg_attr(feature = \"x\", inline)]", None),
+            ("#[cfg(target_feature = \"x\")]", None),
+            ("#[cfg(feature = \"x\"", None),
+            ("#[doc = \"feature = x\"]", None),
+        ] {
+            assert_eq!(feature_gate(attribute).as_deref(), feature, "{attribute}");
+        }
     }
 }
