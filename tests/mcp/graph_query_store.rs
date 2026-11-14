@@ -582,7 +582,7 @@ fn sequence_zero_and_multiple_producers_are_syntax_only() {
         assert_eq!(
             view.warnings
                 .iter()
-                .any(|warning| *warning == trellis::store::multiple_producers_note("rust")),
+                .any(|warning| *warning == trellis::graph_query::multiple_producers_note("rust")),
             multiple
         );
     }

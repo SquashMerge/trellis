@@ -57,11 +57,23 @@ paths = [
   "src/index_coordinator.rs", "src/index_coordinator/**", "src/capture.rs", "src/watch.rs",
   "src/native_evidence.rs", "src/native_capture.rs",
   "src/scip_admission.rs", "src/semantic_evidence.rs", "src/semantic_import.rs",
-  "src/search_capture.rs", "src/search_card.rs",
+  "src/search_capture.rs",
   "src/native_rust_macros_tests.rs", "src/extractor_inputs_tests.rs", "src/indexer_projection_vectors_tests.rs",
-  "src/semantic_import_complexity_tests.rs", "src/native_rust_macros.rs", "src/producer/**", "src/evidence_budget.rs", "src/skipped_source.rs", "src/skipped_config.rs", "src/semantic_batch.rs", "src/semantic_batch/**",
+  "src/semantic_import_complexity_tests.rs", "src/native_rust_macros.rs", "src/producer/**", "src/evidence_budget.rs", "src/semantic_batch.rs", "src/semantic_batch/**",
   "src/semantic_import/**",
   "src/language_set_tests.rs", "src/native_typescript_tests.rs", "src/semantic_join_inputs_tests.rs",
+  # In-file test modules moved out of src/native_evidence.rs (R1, #1004).
+  "src/native_evidence_borrowed_witness_tests.rs",
+  "src/native_evidence_cached_executable_digest_tests.rs",
+  "src/native_evidence_declaration_role_tests.rs",
+  "src/native_evidence_full_document_spool_tests.rs",
+  "src/native_evidence_occurrence_identity_tests.rs",
+  "src/native_evidence_parallel_extraction_tests.rs",
+  "src/native_evidence_revision_digest_tests.rs",
+  # In-file test modules moved out of src/semantic_evidence.rs (R1, #1004).
+  "src/semantic_evidence_coverage_reason_tests.rs",
+  "src/semantic_evidence_native_index_tests.rs",
+  "src/semantic_evidence_witness_tests.rs",
 ]
 
 [layers.storage]
@@ -75,6 +87,21 @@ shared = true
 paths = [
   "src/model.rs", "src/testing.rs", "src/native_ids.rs", "src/scip_raw.rs", "src/files_view.rs", "src/parallel.rs", "src/build_info.rs", "src/search_lexical.rs",
   "src/lib.rs", "src/scip_raw/**", "src/test_alloc.rs", "src/syntax_bounds.rs", "src/heap.rs",
+  # Leaf constants, small types and pure helpers that storage and shared code use (S1, #999).
+  # They reference no layer: the skipped-input placeholders, the batch resource policy with
+  # its counters and generated-batch origin, and the vocabulary moved out of indexing and query.
+  "src/skipped_config.rs", "src/skipped_source.rs",
+  "src/semantic_batch/limits.rs", "src/semantic_batch/counters.rs", "src/semantic_batch/origin.rs",
+  "src/evidence_limits.rs", "src/diagnostic_markers.rs", "src/diagnostic_markers_tests.rs",
+  "src/scip_vocab.rs", "src/jsonc.rs", "src/source_dir.rs", "src/process_info.rs",
+  # The stored search-card records and their eligibility predicate (S1b, #1000).
+  "src/search_card_records.rs",
+  # The persisted native evidence records, the producer constants and the pure lookup-key
+  # functions (S2, #1001). Extraction, validation and the spool stay in native_evidence.rs.
+  "src/native_records.rs",
+  # Card preparation and serialization over shared records and native_ids only; storage
+  # renders stored cards with it (S2, #1001). Capture stays in search_capture.rs.
+  "src/search_card.rs",
 ]
 
 # Coarse developer-tool boundary; does not infer internal tooling architecture.

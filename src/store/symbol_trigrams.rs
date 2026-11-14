@@ -1214,7 +1214,7 @@ mod tests {
         let store = super::super::Store::open_for_tests(state.path(), workspace.path()).unwrap();
         crate::index_coordinator::reconcile_workspace(
             &store,
-            &crate::indexer::IndexOptions::new(workspace.path().to_owned()),
+            &crate::model::IndexOptions::new(workspace.path().to_owned()),
             &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             |_| {},
         )
@@ -1247,7 +1247,7 @@ mod tests {
         let store = super::super::Store::open_for_tests(state.path(), workspace.path()).unwrap();
         crate::index_coordinator::reconcile_workspace(
             &store,
-            &crate::indexer::IndexOptions::new(workspace.path().to_owned()),
+            &crate::model::IndexOptions::new(workspace.path().to_owned()),
             &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             |_| {},
         )

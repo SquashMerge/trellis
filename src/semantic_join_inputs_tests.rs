@@ -77,12 +77,17 @@ const NON_OUTPUT_ITEMS: &[(&str, &str)] = &[
         "the read-time view type, never stored",
     ),
     (
-        "graph_query::BoundaryReason",
+        "model::BoundaryReason",
         "a field of the read-only query view's bindings, never stored",
     ),
     (
         "native_evidence",
         "native facts the join reads; native extraction has its own hash",
+    ),
+    (
+        "native_records",
+        "the native record types and constants moved out of `native_evidence`; native \
+         extraction has its own hash, which lists the file",
     ),
     (
         "capture",

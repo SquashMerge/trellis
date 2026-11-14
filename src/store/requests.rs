@@ -3,9 +3,8 @@ use super::Store;
 #[cfg(any(test, feature = "test-support"))]
 use super::TestTerminalNotify;
 use crate::{
-    indexer::{IndexOptions, ReconcileOptions},
-    model::IndexPin,
-    semantic_batch::descriptor::GenerationOrigin,
+    model::{IndexOptions, IndexPin, ReconcileOptions},
+    semantic_batch::origin::GenerationOrigin,
     store::topology::{UseGuard, WriterSession},
 };
 use anyhow::{Result, ensure};
@@ -1487,7 +1486,7 @@ impl Store {
         #[cfg(feature = "test-support")]
         self.run_after_enqueue_commit_hook();
         after_commit()?;
-        crate::index_coordinator::diagnostic_marker("-", "request_enqueued", &format!("id={id}"));
+        crate::diagnostic_markers::diagnostic_marker("-", "request_enqueued", &format!("id={id}"));
         // The row is durable: wake the checkout's worker, which re-reads the queue.
         self.wake_queue_workers();
         self.identity.verify()?;
@@ -1964,7 +1963,7 @@ impl Store {
             read,
         )?;
         tx.commit()?;
-        crate::index_coordinator::diagnostic_marker(
+        crate::diagnostic_markers::diagnostic_marker(
             "-",
             "request_claimed",
             &format!("id={}", claimed.id),
@@ -2263,7 +2262,7 @@ impl Store {
         {
             anyhow::bail!("storage_busy: injected ambiguous completion COMMIT");
         }
-        crate::index_coordinator::diagnostic_marker(
+        crate::diagnostic_markers::diagnostic_marker(
             "-",
             "request_terminal",
             &format!("id={} failed={}", request.id, code.is_some()),

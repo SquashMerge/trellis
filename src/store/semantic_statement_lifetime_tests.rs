@@ -19,7 +19,7 @@ fn semantic_fact_children_reuse_statement_without_reprepare_per_symbol() {
             params![id, format!("target-{id}")],
         ).unwrap();
     }
-    let document = crate::native_evidence::DocumentKey {
+    let document = crate::native_records::DocumentKey {
         source_set_id: "source-set".into(),
         language: "rust".into(),
         path: "main.rs".into(),
