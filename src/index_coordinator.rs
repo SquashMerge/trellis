@@ -1225,6 +1225,28 @@ impl WatcherWork {
     }
 }
 
+/// The full capture and document spool an exceptional recreation publishes. Storage calls it
+/// at its own point under the recovery lock (`Store::recreate_index_exclusive`); no facts or
+/// projections from the old index are used.
+pub(crate) fn recreate_capture(
+    store: &Store,
+    options: &IndexOptions,
+    cancel: &CancelFlag,
+) -> Result<(Capture, crate::native_evidence::FullDocumentSpool)> {
+    let capture = Capture::admit(options, cancel, &|_| {})?;
+    let spool = crate::native_evidence::spool_full_capture(
+        options,
+        &capture,
+        &store.state_topology().1.root,
+        store.root_id(),
+        cancel,
+        &|_| {},
+        |_, _| {},
+        &store.native_spool_dir()?,
+    )?;
+    Ok((capture, spool))
+}
+
 /// One explicit index command returns the owner that published its one full capture.
 /// Exceptional recovery cannot take the live-baseline path or upgrade shared use.
 pub fn reconcile_workspace(
@@ -1237,7 +1259,9 @@ pub fn reconcile_workspace(
     // activation: confirm old-root terminal rows before ANY startup reconciliation publication.
     store.settle_foreign_root_requests()?;
     if store.is_recreate_pending() {
-        return store.recreate_pending_writer_session(options, cancel);
+        return store.recreate_pending_writer_session(options, cancel, &mut || {
+            recreate_capture(store, options, cancel)
+        });
     }
     let coordinator = IndexJobCoordinator::prepare(store, None)?;
     let session = coordinator.session();
@@ -2266,7 +2290,9 @@ pub fn establish_serving_session(
                 "recovery_required: index options unavailable; run explicit trellis index"
             )
         })?;
-        let (_, session) = store.recreate_pending_writer_session(options, cancel)?;
+        let (_, session) = store.recreate_pending_writer_session(options, cancel, &mut || {
+            recreate_capture(store, options, cancel)
+        })?;
         session.verify()?;
         sweep_abandoned_semantic_stages(store);
         return Ok(session);
