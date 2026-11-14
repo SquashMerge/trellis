@@ -422,6 +422,16 @@ test("Git header uses measured counts independently of branch, upstream and inde
   assert.deepEqual(h.requests,[]);
 });
 
+test("a section change runs the registered reset before the shell changes anything, and the app registers Navigation's", () => {
+  const h = harness(); let seen = [];
+  h.shell.setSectionResetCallback(() => seen.push(h.document.body.classList.contains("files-section")));
+  h.shell.setSection("files"); h.get("section-diagrams").listeners.click();
+  assert.deepEqual(seen, [false, true]);
+  const app = harness(true); let resets = 0;
+  app.context.window.TrellisNavigation = {reset() { resets++; }};
+  app.shell.setSection("files");
+  assert.equal(resets, 1);
+});
 test("Files is a primary source section without automatic reads or drawers and preserves the diagram view", () => {
   const h = harness();
   h.context.window.matchMedia = () => ({matches:true});

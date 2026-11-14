@@ -46,12 +46,13 @@ function harness(globals = {}, options = {}) {
   };
   const window = {TrellisTreemapPele:{render:(...args) => renderer(...args), select:(container, key) => {
     for (const tile of container.querySelectorAll("[data-trellis-file-id]")) tile.setAttribute("aria-pressed", String(tile.getAttribute("data-trellis-file-id") === key));
-  }}, TrellisShell:{
-    clearTreemapInspector:() => { get("treemap-inspector").hidden = true; get("treemap-inspector-content").replaceChildren(); },
-    showTreemapInspector:() => { get("treemap-inspector").hidden = false; },
-  }};
+  }}};
+  const inspector = {
+    clear:() => { get("treemap-inspector").hidden = true; get("treemap-inspector-content").replaceChildren(); },
+    show:() => { get("treemap-inspector").hidden = false; },
+  };
   vm.runInNewContext(pinSource + "\n" + fs.readFileSync(path.join(__dirname, "../web/metric-heat.js"), "utf8") + "\n" + source, {window, document, URLSearchParams, console, ...globals});
-  const controller = window.TrellisTreemap.create({request:(url, current) => { calls.push({url, current}); return response(url); }, context:() => context,
+  const controller = window.TrellisTreemap.create({inspector, request:(url, current) => { calls.push({url, current}); return response(url); }, context:() => context,
     readSource:(site, revision, current) => reads.push({site, revision, current}), onConflict:error => conflicts.push(error), ...options});
   const button = label => { const result = descendants(get("treemap-inspector-content")).find(item => item.tagName === "button" && item.textContent === label); assert.ok(result, `Missing ${label}`); return result; };
   return {window, controller, calls, renders, reads, conflicts, get, button, setContext:value => {context = value;}, setResponse:fn => {response = fn;}, setRenderer:fn => {renderer = fn;}};

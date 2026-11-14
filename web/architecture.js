@@ -377,7 +377,7 @@
   // `navigate` moves between the Architecture and Deviations tabs (#965): `deviations({app, edge})` shows the
   // Deviations tab on that filter, `diagram()` shows Architecture, and `filter({app, edge})` reports a filter
   // chosen inside the tab, so the page's link follows it. Without one, both tabs are this controller's own.
-  function create({request, context, readSource, openTreemap, openSequence, libraryButton = () => null, onConflict = () => {}, onInspect = () => {}, onRulesChanged = () => {}, appScope = null, navigate = null}) {
+  function create({request, context, readSource, openTreemap, openSequence, libraryButton = () => null, onConflict = () => {}, onInspect = () => {}, inspector = {}, onRulesChanged = () => {}, appScope = null, navigate = null}) {
     let serial = 0, renderSerial = 0, selectionSerial = 0, view = null, basis = null, buildingTimer = null, buildingWake = null;
     let metric = "cognitive", aggregate = "max", role = "production", relative = false, showTests = false;
     // The app whose stack is drawn: null for all apps, else an app name (never compared with a literal). Memory only; a new checkout starts at "all".
@@ -459,7 +459,7 @@
     const appFilter = params => { const group = scopeGroup(); return group && params.kind === "instances" ? {...params, app:group.name} : params; };
     function clearInspection() {
       selectionSerial++; pressed = null; inspection = null;
-      window.TrellisShell?.clearArchitectureInspector();
+      inspector.clear?.();
       // Leaving a stub drops its band's word; the drawing is swapped in place, keeping what else is selected.
       if (endMark) { endMark = null; if (tab === "diagram" && usable() && view.state === "ready") void render({keepSelection:true}); }
     }
@@ -1193,7 +1193,7 @@
     // It opens the desktop column but never the narrow-screen drawer.
     function overview() {
       if (!usable() || !["ready", "no_layers"].includes(view.state)) return;
-      clearInspection(); window.TrellisShell?.showArchitectureInspector({drawer:false});
+      clearInspection(); inspector.show?.({drawer:false});
       // Nothing is selected any more, so no drawn node may say it is (a stub shows the word Selected).
       for (const node of get("architecture-diagram").querySelectorAll?.('[aria-pressed="true"]') || []) node.setAttribute("aria-pressed", "false");
       syncCards();
@@ -1282,7 +1282,7 @@
       if (!usable() || view.state !== "ready") return;
       clearInspection(); inspection = {kind, record}; const ticket = selectionSerial, payload = view, c = basis;
       const active = () => usable() && current(c) && view === payload && ticket === selectionSerial && !get("architecture-inspector").hidden;
-      onInspect(); window.TrellisShell?.showArchitectureInspector();
+      onInspect(); inspector.show?.();
       const target = get("architecture-inspector-content"), title = get("architecture-inspector-title"); target.replaceChildren();
       reviewChips(target);
       paragraph(target, `${evidenceSummary(payload)} · code ${window.TrellisIndexPin.label(payload)} · rules ${c.rulesHash}.`);
@@ -1373,7 +1373,7 @@
       clearInspection(); inspection = {kind:"deviation", record};
       const ticket = selectionSerial, payload = view, c = basis;
       const active = () => usable() && view === payload && current(c) && ticket === selectionSerial && !get("architecture-inspector").hidden;
-      onInspect(); window.TrellisShell?.showArchitectureInspector();
+      onInspect(); inspector.show?.();
       const target = get("architecture-inspector-content"); target.replaceChildren(); reviewChips(target);
       render(target, get("architecture-inspector-title"), active);
       return active;
@@ -1382,7 +1382,7 @@
       if (!usable()) return;
       clearInspection(); inspection = {kind:"rule", record:row}; const ticket = selectionSerial, payload = view, c = basis;
       const active = () => usable() && view === payload && current(c) && ticket === selectionSerial && !get("architecture-inspector").hidden;
-      onInspect(); window.TrellisShell?.showArchitectureInspector();
+      onInspect(); inspector.show?.();
       const r = row.instance, target = get("architecture-inspector-content"); target.replaceChildren();
       get("architecture-inspector-title").textContent = `${r.rule} · ${targetLabel(r.target)}${r.destination ? ` → ${targetLabel(r.destination)}` : ""}`;
       reviewChips(target);
@@ -1466,7 +1466,7 @@
       clearInspection(); inspection = {kind:"authored", record:entry};
       const c = basis, ticket = selectionSerial;
       const active = () => usable() && current(c) && ticket === selectionSerial && !get("architecture-inspector").hidden;
-      onInspect(); window.TrellisShell?.showArchitectureInspector();
+      onInspect(); inspector.show?.();
       get("architecture-inspector-title").textContent = `${entry.target.path} → ${entry.destination.path}`;
       const target = get("architecture-inspector-content"); target.replaceChildren(); reviewChips(target);
       paragraph(target, `Authored exception · ${entry.reason}`);
