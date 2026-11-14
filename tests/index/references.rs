@@ -289,6 +289,93 @@ fn references_rust_direct_wildcard_expands_public_declaration_owner() {
     assert!(data["unresolved"].as_array().unwrap().is_empty());
 }
 
+/// #988: a site under a `#[cfg(test)]` statement, block, match arm or `use` item is test even
+/// though no stored declaration covers it. Only the Decision 0011 markers count.
+#[test]
+fn references_rust_cfg_test_syntax_without_a_declaration_is_test() {
+    let source = r#"
+mod store;
+#[cfg(test)]
+use crate::store::imported;
+fn production() {
+    #[cfg(test)]
+    let _fault = crate::store::statement();
+    // A comment or another attribute between the marker and its item changes nothing.
+    #[cfg(all(test, unix))]
+    #[allow(unused)]
+    { crate::store::block(); }
+    match 1 { #[cfg(test)] 2 => crate::store::arm(), _ => crate::store::plain_arm() }
+    #[cfg(any(test, unix))]
+    crate::store::any_test();
+    #[cfg(not(test))]
+    crate::store::not_test();
+    #[cfg(feature = "test-support")]
+    crate::store::feature();
+    crate::store::after();
+}
+struct Fields {
+    #[cfg(test)]
+    hook: crate::store::Hook,
+    plain: crate::store::Plain,
+}
+"#;
+    let input = snapshot(&[
+        ("src/lib.rs", source),
+        (
+            "src/store.rs",
+            "pub fn imported() {} pub fn statement() {} pub fn block() {} pub fn arm() {} \
+             pub fn plain_arm() {} pub fn any_test() {} pub fn not_test() {} pub fn feature() {} \
+             pub fn after() {} pub struct Hook; pub struct Plain;",
+        ),
+    ]);
+    let data = project(&input);
+    let spellings = |role: &str| -> Vec<String> {
+        let mut found: Vec<_> = edge(&data, role, "src/lib.rs", "src/store.rs")["sites"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|site| {
+                assert_eq!(
+                    site["role"],
+                    if role == "tests" {
+                        "test"
+                    } else {
+                        "production"
+                    }
+                );
+                site["spelling"].as_str().unwrap().to_owned()
+            })
+            .collect();
+        found.sort();
+        found
+    };
+    assert_eq!(
+        spellings("tests"),
+        [
+            "crate::store::Hook",
+            "crate::store::arm",
+            "crate::store::block",
+            "crate::store::statement"
+        ]
+    );
+    assert_eq!(
+        spellings("production"),
+        [
+            "crate::store::Plain",
+            "crate::store::after",
+            "crate::store::any_test",
+            "crate::store::feature",
+            "crate::store::not_test",
+            "crate::store::plain_arm"
+        ]
+    );
+    // The conditional `use` stays unresolved, now as a test site.
+    let unresolved = data["unresolved"].as_array().unwrap();
+    assert_eq!(unresolved.len(), 1, "{data}");
+    assert_eq!(unresolved[0]["site"]["spelling"], "crate::store::imported");
+    assert_eq!(unresolved[0]["site"]["role"], "test");
+}
+
 #[test]
 fn references_count_maximal_paths_and_use_stored_roles() {
     let input = snapshot(&[

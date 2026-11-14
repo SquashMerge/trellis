@@ -17,3 +17,9 @@
 `find.includeTests` (default true), test-filtered `scopeCoverage`, and production-first ranking within a match tier are later work. #120, #129 and #163 production-only metrics/references using role, and #172, are separate follow-ups after #168. Semantic test discovery (runner configuration, `harness = false`) and frameworks beyond those listed are out of scope.
 
 The later [#389 amendment in Decision 0018](0018-semantic-symbol-retrieval.md) ratifies exact-name and production-first lexical ranking, plus the stored-role filter, for `trellis_search_symbols` only. The deferred find and coverage behavior above is unchanged.
+
+## Amendment (#988, owner ruling 2026-11-14): reference-site roles under `cfg(test)`
+
+A reference site's role may be derived at view time. The architecture reference projection, and the rules check that reads it, treat a Rust site whose enclosing stored declaration is production as `test` when the site, or syntax enclosing it, carries an outer attribute that point 3 accepts as a test marker (`#[cfg(test)]`, a direct `test` operand of `#[cfg(all(test, …))]`, `#[test]` or a final-path test attribute). This reaches syntax that is no declaration and so has no stored role: a statement, a block, a match arm, a `use` item, a field. It uses the point 3 grammar unchanged: `cfg(any(test, …))`, `cfg(not(test))` and, under point 2, `cfg(feature = "test-support")` do not mark.
+
+Nothing else changes. Declaration roles stay stored and are still classified only by the producer; there is no producer, index or wire-shape change and no rebuild. Find, search, metrics, the treemap, outgoing hints and the call tools' `callerRole` read stored declaration roles as before, so a call under a `#[cfg(test)]` statement in a production function still reports a production caller.

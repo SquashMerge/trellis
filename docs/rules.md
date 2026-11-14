@@ -725,7 +725,7 @@ These arrays share existing configuration collection/work bounds.
 external bans. Every positively observed matching external edge emits a reserved
 `$external` instance with `status:"deviates"`, even if its source has no layer.
 Nonmatches emit no `$external` row; absent edges do not prove absence. Aggregate
-by source module, external identity and stored production/test role with the
+by source module, external identity and production/test site role with the
 existing exact counts and bounded samples. Test-only instances never fail the
 production CLI check. Unproved roots stay unknown, never guessed to match a ban.
 
@@ -988,7 +988,15 @@ unknown under the ratified literal-list-only rule.
 
 A site's role comes from its innermost enclosing **stored** native declaration,
 falling back to the stored file-module owner. Ambiguous ownership is unknown.
-There is no read-time path or cfg classifier.
+There is no read-time path classifier. One read-time cfg rule applies (#988, owner
+ruling 2026-11-14, recorded in Decision 0011): a Rust site whose stored role is
+production is test when it, or syntax enclosing it, carries an outer attribute that
+marks test code under Decision 0011 point 3. This covers what is no declaration and
+so has no stored role of its own: a statement, a block, a match arm, a `use` item or
+a field under `#[cfg(test)]` or `#[cfg(all(test, …))]`. `cfg(any(test, …))` and
+`cfg(not(test))` do not mark. The rule changes reference-site roles only; declaration
+roles stay stored, and the call tools' `callerRole` is the caller declaration's
+stored role as before.
 [Decision 0011](semantic-evidence/decisions/0011-test-production-declaration-role.md)
 governs the role: Rust `cfg(test)` and inherited positive test markers are test;
 `cfg(feature = "test-support")` is **production**, not a third role. A filename
@@ -1369,7 +1377,7 @@ Workspace member crates themselves resolve as in-repo modules (#772, see above).
 bindings distinguish upstream package names from Cargo keys/renames (including
 hyphen normalization). Conflicting normalized bindings and local path dependencies
 are not guessed external packages. Sections, optional and target qualifiers do
-not prove installation/activation or change stored site roles. In particular,
+not prove installation/activation or change site roles. In particular,
 `build-dependencies` and `dev-dependencies` are retained declaration evidence,
 not a claim that Cargo exposes them to a production lib/bin target. Conflicting
 identities across sections stay unknown; target-applicable Cargo bindings would

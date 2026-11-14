@@ -1957,6 +1957,58 @@ pub(super) fn extract(
     Ok(result)
 }
 
+/// Whether the syntax at `start..end`, or anything enclosing it, carries an outer attribute
+/// that marks test code under Decision 0011 (#988). Attributes are a node's preceding
+/// siblings, or its leading children for a match arm, which owns its own.
+pub(super) fn under_test_attribute(
+    doc: &DocumentInput,
+    tree: &Tree,
+    start: usize,
+    end: usize,
+    work: &mut Work,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<bool> {
+    let marks = |node: Node<'_>| {
+        node.kind() == "attribute_item"
+            && crate::native_evidence::rust_test_attribute(node, &doc.file)
+    };
+    let passes = |node: Node<'_>| {
+        matches!(
+            node.kind(),
+            "attribute_item" | "line_comment" | "block_comment"
+        )
+    };
+    let mut current = tree.root_node().descendant_for_byte_range(start, end);
+    while let Some(node) = current {
+        owner_step(work, check)?;
+        let mut previous = node.prev_named_sibling();
+        while let Some(sibling) = previous {
+            owner_step(work, check)?;
+            if marks(sibling) {
+                return Ok(true);
+            }
+            if !passes(sibling) {
+                break;
+            }
+            previous = sibling.prev_named_sibling();
+        }
+        if node.kind() == "match_arm" {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                owner_step(work, check)?;
+                if marks(child) {
+                    return Ok(true);
+                }
+                if !passes(child) {
+                    break;
+                }
+            }
+        }
+        current = node.parent();
+    }
+    Ok(false)
+}
+
 /// The path of module `name` in module directory `directory` (`""` is the checkout's).
 fn child_path(directory: &str, name: &str) -> String {
     if directory.is_empty() {
