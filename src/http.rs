@@ -737,11 +737,12 @@ impl DaemonState {
         // The status lock is released before the runtime state is read. A session change
         // holds the state while it clears this status, so a reader that kept the status
         // while it waited for the state would deadlock with the worker (#1078).
-        let published = self.watch_status.lock().unwrap().as_ref().map(|status| {
-            status.other_intent
-                || status.capturing.load(Ordering::SeqCst)
-                || status.generation.load(Ordering::SeqCst) != status.acknowledged
-        });
+        let published = self
+            .watch_status
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(worker::WatchStatus::pending);
         if let Some(pending) = published {
             return pending;
         }
@@ -749,6 +750,28 @@ impl DaemonState {
         self.test_watch_pending_before_state.run();
         // A serving session's first watcher has not run its full inventory.
         self.runtime.lock().unwrap().session().is_some()
+    }
+
+    /// Whether the checkout is `Ready` with nothing pending: no accepted FIFO work, and a
+    /// watcher of the current serving session whose published status holds no
+    /// unacknowledged intent. It is the admission condition of an automatic producer run
+    /// (#1082).
+    ///
+    /// Unlike a phase sample followed by [`Self::checkout_watch_pending`], this is one
+    /// coherent read. The runtime state is held while the status is read, and a session
+    /// change clears the status under that same lock, so a published status always belongs
+    /// to the session seen here. A runtime with no serving session, or a session whose
+    /// watcher has not published yet, has an inventory ahead of it and is never quiet.
+    ///
+    /// Lock order: the runtime state, then the watch status, as `set_runtime_state` and
+    /// `request_retire` take them. Never the reverse (#1078).
+    pub(crate) fn ready_and_quiet(&self) -> bool {
+        let state = self.runtime.lock().unwrap();
+        if !matches!(*state, RuntimeState::Ready(_)) || self.fifo_pending() {
+            return false;
+        }
+        let status = self.watch_status.lock().unwrap();
+        status.as_ref().is_some_and(|status| !status.pending())
     }
 
     /// A deterministic fixture can submit an accepted source hint through the

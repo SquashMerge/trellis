@@ -515,6 +515,15 @@ pub(super) struct WatchStatus {
     pub(super) capturing: Arc<std::sync::atomic::AtomicBool>,
 }
 
+impl WatchStatus {
+    /// The watcher holds intent the worker has not acknowledged.
+    pub(super) fn pending(&self) -> bool {
+        self.other_intent
+            || self.capturing.load(Ordering::SeqCst)
+            || self.generation.load(Ordering::SeqCst) != self.acknowledged
+    }
+}
+
 /// A failed or panicked step is retried after this delay.
 const STEP_RETRY: Duration = Duration::from_millis(250);
 /// Retention runs at most this often while idle (a deferral shortens it).

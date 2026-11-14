@@ -2024,7 +2024,9 @@ impl crate::producer::auto::AutoRunRuntime for AutoHost {
         let Some(Ok(resources)) = self.runtime.upgrade().map(|runtime| runtime.resources()) else {
             return true;
         };
-        resources.scheduler.fifo_pending() || resources.scheduler.checkout_watch_pending()
+        // One coherent read (#1082). A checkout with no serving session has its
+        // reconciliation and the next watcher's first inventory ahead of it.
+        !resources.scheduler.ready_and_quiet()
     }
 
     fn active_origin(&self) -> Option<crate::producer::state::RunOrigin> {
@@ -2419,7 +2421,9 @@ impl CheckoutRuntime {
 
     /// Run the approved automatic re-run `request` for this checkout's `AutoRunOwner`, and map
     /// how it ended. The lease is the background kind: it never cancels a retirement, and it is
-    /// held only while the run is.
+    /// held only while the run is. A run is admitted only while the checkout is `Ready` with
+    /// no FIFO work or watcher intent pending; intent accepted after admission is the worker's
+    /// to publish, and a head it moves supersedes the run.
     fn auto_launch(&self, request: crate::producer::auto::LaunchRequest) -> LaunchOutcome {
         use crate::producer::approval::{self, Refusal};
         use crate::producer::auto::{AutoOutcome, failure_code, is_failure};
@@ -2429,9 +2433,11 @@ impl CheckoutRuntime {
         let Some(_lease) = resources.scheduler.background_lease() else {
             return LaunchOutcome::NotReady;
         };
-        if resources.scheduler.runtime_phase() != RuntimePhase::Ready
-            || resources.store.verify_root().is_err()
-        {
+        // The owning transition (#1082). The decider's sample of the phase and of pending
+        // intent is older than this call: the serving session may have been replaced since,
+        // or a hint accepted. The run is admitted on the runtime's state now, under its
+        // lock, and a refusal is retried at the decider's next state-signal wake.
+        if !resources.scheduler.ready_and_quiet() || resources.store.verify_root().is_err() {
             return LaunchOutcome::NotReady;
         }
         let expected = request.expected_revision.clone();
