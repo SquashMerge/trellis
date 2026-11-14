@@ -8,9 +8,10 @@ use std::{
 };
 use trellis::{
     indexer::{IndexOptions, index_workspace_bundle},
+    metrics_read::MetricsOptions,
     model::{CancelFlag, IndexPin},
     rules,
-    store::{MetricsOptions, Store},
+    store::Store,
 };
 
 fn publish(files: &[(&str, &str)]) -> (tempfile::TempDir, tempfile::TempDir, Store, IndexPin) {
@@ -187,9 +188,7 @@ fn trellis_layout_detects_daemon_herdr_mod_and_web_apps() {
             ("trellis-web", "web/package.json")
         ]
     );
-    // The stubs carry no references, so the inventory has no rule instances to count. The
-    // expected storage -> query deviations from src/store/architecture_core.rs to src/apps.rs and
-    // src/interfaces.rs are not asserted: inline `crate::` paths are unresolved (#828).
+    // The stubs carry no references, so the inventory has no rule instances to count.
     assert_eq!(data["counts"]["comparable"], 0);
     assert_eq!(data["noApp"]["counts"], data["counts"]);
 }

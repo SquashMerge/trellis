@@ -15,7 +15,7 @@ use crate::{
     },
     model::{BoundaryReason, SemanticState},
     native_records::DocumentKey,
-    semantic_evidence as sem,
+    semantic_records as sem,
 };
 use serde_json::json;
 
@@ -1131,7 +1131,7 @@ pub(crate) fn partial_reasons(reasons: [Option<bool>; 4]) -> Vec<&'static str> {
 }
 
 /// The five MCP languages in #22 order.
-pub const MCP_LANGUAGES: [&str; 5] = crate::semantic_evidence::LANGUAGE_ORDER;
+pub const MCP_LANGUAGES: [&str; 5] = crate::semantic_records::LANGUAGE_ORDER;
 
 impl EvidenceResponse {
     /// Advisory work status from the admitted pin, not a publication eligibility proof.
@@ -1261,7 +1261,7 @@ impl EvidenceResponse {
         }
         let selection = select_producers(&self.db, &selected.key, None)?;
         for document in document_projections(&self.db, selected.pin, &selection)? {
-            if let Some(at) = crate::semantic_evidence::language_order(&document.language) {
+            if let Some(at) = crate::semantic_records::language_order(&document.language) {
                 if document.projection.semantic_status == crate::model::SemanticStatus::OlderBasis {
                     let basis = semantic_pin_key(document.projection.semantic_basis_pin);
                     let tuple: Option<(bool,String)> = self.db.query_row(
@@ -1368,12 +1368,12 @@ impl EvidenceResponse {
         }
         documents.sort_by(|a, b| {
             (
-                crate::semantic_evidence::language_order(a.language),
+                crate::semantic_records::language_order(a.language),
                 !a.failed,
                 &a.path,
             )
                 .cmp(&(
-                    crate::semantic_evidence::language_order(b.language),
+                    crate::semantic_records::language_order(b.language),
                     !b.failed,
                     &b.path,
                 ))
@@ -2346,7 +2346,7 @@ mod mcp_languages_tests {
         );
         assert_eq!(
             super::MCP_LANGUAGES,
-            crate::semantic_evidence::LANGUAGE_ORDER
+            crate::semantic_records::LANGUAGE_ORDER
         );
     }
 

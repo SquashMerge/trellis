@@ -10,8 +10,9 @@ use std::{
 use trellis::{
     architecture_details::Query,
     indexer::{IndexOptions, index_workspace_bundle},
+    metrics_read::MetricsOptions,
     model::CancelFlag,
-    store::{MetricsOptions, Store},
+    store::Store,
 };
 
 struct Published {

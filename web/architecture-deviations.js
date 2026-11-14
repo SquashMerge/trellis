@@ -156,26 +156,41 @@
     // otherwise a method reads `Type::name` from its Rust impl block, as stable keys do. A chain that reaches
     // the root without a callable is module level; one that breaks (a missing parent, the hop limit) stays unnamed.
     function closureNames(rows, ids, outline, names = new Map()) {
-      const known = new Map();
-      for (const {instance:i} of rows) for (const evidence of i.evidence) if (evidence.owner && (evidence.owner.stableLookupKey || evidence.owner.name)) known.set(evidence.owner.syntaxId, evidence.owner);
-      const byId = new Map();
-      for (const item of Array.isArray(outline) ? outline : []) if (record(item?.symbol) && typeof item.symbol.id === "string") byId.set(item.symbol.id, item);
+      const known = knownOwners(rows), byId = outlineById(outline);
       for (const id of ids) {
-        let item = byId.get(id), hops = 0;
-        if (!item) continue;
-        for (item = byId.get(item.symbol.parent); item && !callable(item) && hops < 64; hops++) item = byId.get(item.symbol.parent);
-        if (!item) {
-          // The walk left the outline: at the root (`parent: null`) it is module level, otherwise unknown.
-          let last = byId.get(id), steps = 0;
-          while (last && last.symbol.parent != null && byId.has(last.symbol.parent) && steps++ < 64) last = byId.get(last.symbol.parent);
-          if (last && last.symbol.parent == null) names.set(id, MODULE_LEVEL);
-          continue;
-        }
-        if (!callable(item)) continue;
-        const parent = byId.get(item.symbol.parent), type = typeof parent?.implTarget === "string" && parent.implTarget ? parent.implTarget : null;
-        names.set(id, known.get(item.symbol.id) ?? {syntaxId:item.symbol.id, name:type ? `${type}::${item.symbol.name}` : item.symbol.name, stableLookupKey:null});
+        if (!byId.get(id)) continue;
+        const item = enclosingItem(byId, id);
+        if (!item) { if (reachesRoot(byId, id)) names.set(id, MODULE_LEVEL); continue; }
+        if (callable(item)) names.set(id, ownerRecord(item, byId, known));
       }
       return names;
+    }
+    // The owners the rows already name, by syntax ID.
+    function knownOwners(rows) {
+      const known = new Map();
+      for (const {instance:i} of rows) for (const evidence of i.evidence) if (evidence.owner && (evidence.owner.stableLookupKey || evidence.owner.name)) known.set(evidence.owner.syntaxId, evidence.owner);
+      return known;
+    }
+    function outlineById(outline) {
+      const byId = new Map();
+      for (const item of Array.isArray(outline) ? outline : []) if (record(item?.symbol) && typeof item.symbol.id === "string") byId.set(item.symbol.id, item);
+      return byId;
+    }
+    // The first callable above `id`; undefined when the chain leaves the outline; a non-callable item at the hop limit.
+    function enclosingItem(byId, id) {
+      let item = byId.get(byId.get(id).symbol.parent), hops = 0;
+      for (; item && !callable(item) && hops < 64; hops++) item = byId.get(item.symbol.parent);
+      return item;
+    }
+    // The walk left the outline: at the root (`parent: null`) it is module level, otherwise unknown.
+    function reachesRoot(byId, id) {
+      let last = byId.get(id), steps = 0;
+      while (last && last.symbol.parent != null && byId.has(last.symbol.parent) && steps++ < 64) last = byId.get(last.symbol.parent);
+      return !!last && last.symbol.parent == null;
+    }
+    function ownerRecord(item, byId, known) {
+      const parent = byId.get(item.symbol.parent), type = typeof parent?.implTarget === "string" && parent.implTarget ? parent.implTarget : null;
+      return known.get(item.symbol.id) ?? {syntaxId:item.symbol.id, name:type ? `${type}::${item.symbol.name}` : item.symbol.name, stableLookupKey:null};
     }
     // The Rust targets whose written key passes through an unnamed impl block, by file: their type is in the outline.
     function implSites(rows) {
@@ -663,9 +678,9 @@
       lineActive = deps.inspectLine(line, (target, title, active) => panel(target, title, line, active)) || fallbackActive;
     }
     function openMenu(event, line) {
-      if (!window.TrellisClasses?.showContextMenu) return;
+      if (!window.TrellisContextMenu?.showContextMenu) return;
       select(line);
-      window.TrellisClasses.showContextMenu(event, actions(line), {label:"Line actions"});
+      window.TrellisContextMenu.showContextMenu(event, actions(line), {label:"Line actions"});
     }
 
     const location = line => {

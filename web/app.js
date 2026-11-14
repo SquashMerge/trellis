@@ -9,24 +9,7 @@ let status = null, statusUnavailable = false, jobUnavailable = false, jobObserva
 let statusSerial = 0, statusRefreshDepth = 0, pairRefreshPending = false, pairRefreshObserved = null;
 let pairRefreshQueued = null, pairRefreshFollowup = false;
 let job = null, pollTimer = null, waitingForJob = false;
-const IndexPin = Object.freeze({
-  copy(value) {
-    if (!value || typeof value !== "object" || Array.isArray(value) ||
-        !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value.indexGeneration) ||
-        !Number.isSafeInteger(value.indexRevision) || value.indexRevision < 0) throw new Error("Invalid index snapshot pair. Refresh status.");
-    return Object.freeze({indexGeneration:value.indexGeneration, indexRevision:value.indexRevision});
-  },
-  equal(a, b) {
-    return (a == null && b == null) || (!!a && !!b && typeof a.indexGeneration === "string" && typeof b.indexGeneration === "string" &&
-      Number.isSafeInteger(a.indexRevision) && Number.isSafeInteger(b.indexRevision) &&
-      a.indexGeneration === b.indexGeneration && a.indexRevision === b.indexRevision);
-  },
-  key(value) { const pin = this.copy(value); return `${pin.indexGeneration}:${pin.indexRevision}`; },
-  query(value) { const pin = this.copy(value); return `indexGeneration=${encodeURIComponent(pin.indexGeneration)}&indexRevision=${pin.indexRevision}`; },
-  label(value) { const pin = this.copy(value); return `${pin.indexGeneration.slice(0, 8)}:${pin.indexRevision}`; },
-  isConflict(error) { return error?.status === 409 && error.code === "revision_conflict"; },
-});
-window.TrellisIndexPin = IndexPin;
+const IndexPin = window.TrellisIndexPin;
 const objectValue = value => !!value && typeof value === "object" && !Array.isArray(value);
 const sourceCache = new Map();
 let headObservation = null;
@@ -1191,19 +1174,8 @@ form("connect-form", async () => {
 });
 $("logout").addEventListener("click", () => disconnect());
 
-function sourceWitness(item) {
-  const r = item?.range;
-  return typeof item?.path === "string" && !!item.path.trim() && !!r &&
-    Number.isSafeInteger(r.startLine) && r.startLine > 0 &&
-    Number.isSafeInteger(r.endLine) && r.endLine >= r.startLine &&
-    (r.startColumn == null || (Number.isSafeInteger(r.startColumn) && r.startColumn > 0)) &&
-    (r.endColumn == null || (Number.isSafeInteger(r.endColumn) && r.endColumn > 0)) &&
-    (r.startLine !== r.endLine || r.startColumn == null || r.endColumn == null || r.endColumn >= r.startColumn) &&
-    (r.startByte == null || (Number.isSafeInteger(r.startByte) && r.startByte >= 0)) &&
-    (r.endByte == null || (Number.isSafeInteger(r.endByte) && r.endByte > (r.startByte ?? -1)));
-}
 async function showSource(item, revision) {
-  if (!sourceWitness(item)) throw new Error("Measured source path and range unavailable.");
+  if (!window.TrellisSourceWitness(item)) throw new Error("Measured source path and range unavailable.");
   return showCachedSource(item.path, item.range, revision);
 }
 let workspaceSource = null;
@@ -1381,43 +1353,48 @@ function filesFailure(error, target, current) {
   if (["revision_conflict", "pin_expired", "root_changed"].includes(error.code)) { unexpectedPair("Indexed evidence is stale. Refresh status before selecting again."); return; }
   if ($(target)) $(target).textContent = error.message;
 }
-async function setSection(name, view = null) {
-  if (!["files", "diagrams"].includes(name) || !selectedRootKey) return;
-  if (section === name) {
-    // Already in Diagrams: focus the tab of the view on screen, never a fixed one (#913).
-    const target = name === "files" ? filesBasis === "working" ? $("files-diff") : workspaceSource ? $("source") : $("file-filter") : $(`view-${view || currentDiagramView()}`);
-    target?.focus(); return;
-  }
-  architecture?.reset();
-  treemap?.reset();
-  section = name; sectionSerial++; sourceSerial++; filesDiffSerial++;
+// Already in the section: focus what is on screen. In Diagrams that is the tab of the view on screen, never a fixed one (#913).
+function focusSection(name, view) {
+  const target = name === "files" ? filesBasis === "working" ? $("files-diff") : workspaceSource ? $("source") : $("file-filter") : $(`view-${view || currentDiagramView()}`);
+  target?.focus();
+}
+function interruptOutlineReads() {
   for (const state of fileStates.values()) if (state.outlineLoading) {
     state.serial++; state.outlineLoading = false; state.outlineError = "Symbol read interrupted. Retry to read this indexed outline.";
   }
-  window.TrellisNavigation?.reset(); window.TrellisClasses?.closeContextMenu?.();
+}
+// Leaves the section on screen for `name`. False when there is nothing to enter: an unknown name, no root, or the same section.
+function switchSection(name, view) {
+  if (!["files", "diagrams"].includes(name) || !selectedRootKey) return false;
+  if (section === name) { focusSection(name, view); return false; }
+  architecture?.reset();
+  treemap?.reset();
+  section = name; sectionSerial++; sourceSerial++; filesDiffSerial++;
+  interruptOutlineReads();
+  window.TrellisNavigation?.reset(); window.TrellisContextMenu?.closeContextMenu?.();
   window.TrellisShell?.setSection(name);
-  if (name !== "files") {
-    // A navigation names its target view: the last-used tab neither shows nor refreshes (#451).
-    if (view) {
-      // The shell focused the last-used tab on entry; keep focus on the tab that is now shown.
-      const tabFocused = document.activeElement?.closest?.("#diagram-tabs");
-      showNavigationView(view);
-      if (tabFocused) $(`view-${view}`)?.focus();
-    }
-    $("source").hidden = false; $("files-diff").hidden = true;
-    if (!workspaceSource) window.TrellisShell?.closeSource();
-    renderFiles();
-    const cached = workspaceSource, surface = sectionSerial, session = epoch, root = selectedRootKey, sourceAtStart = sourceSerial;
-    const current = () => section === "diagrams" && surface === sectionSerial && session === epoch && root === selectedRootKey && sourceAtStart === sourceSerial && IndexPin.equal(cached?.data.revision, status?.revision);
-    if (!$("treemap-panel").hidden) await treemap?.refresh();
-    else if (!$("architecture-panel").hidden) void architecture?.refresh();
-    else if (!$("deviations-panel").hidden) void architecture?.showDeviations();
-    else if (diagramSequence && selectedMethod?.id === diagramSequence.seed.id) await loadSequence(diagramSequence, true);
-    if (cached && current()) paintCachedSource(cached.data, cached.range, current, cached.range?.startLine || 1, cached.navigation?.snapshot?.());
-    return;
+  return true;
+}
+// The Diagrams surface before its view refreshes. Returns the repaint of the cached source, which runs after the
+// refresh and only if this entry is still the one on screen.
+function showDiagrams(view) {
+  // A navigation names its target view: the last-used tab neither shows nor refreshes (#451).
+  if (view) {
+    // The shell focused the last-used tab on entry; keep focus on the tab that is now shown.
+    const tabFocused = document.activeElement?.closest?.("#diagram-tabs");
+    showNavigationView(view);
+    if (tabFocused) $(`view-${view}`)?.focus();
   }
+  $("source").hidden = false; $("files-diff").hidden = true;
+  if (!workspaceSource) window.TrellisShell?.closeSource();
+  renderFiles();
+  const cached = workspaceSource, surface = sectionSerial, session = epoch, root = selectedRootKey, sourceAtStart = sourceSerial;
+  const current = () => section === "diagrams" && surface === sectionSerial && session === epoch && root === selectedRootKey && sourceAtStart === sourceSerial && IndexPin.equal(cached?.data.revision, status?.revision);
+  return () => { if (cached && current()) paintCachedSource(cached.data, cached.range, current, cached.range?.startLine || 1, cached.navigation?.snapshot?.()); };
+}
+// Section changes keep validated evidence but never choose or read a file.
+function showFilesSource() {
   viewerMetrics?.clearInspection();
-  // Section changes keep validated evidence but never choose or read a file.
   updateFilesBasis(); renderFiles();
   if (!workspaceSource && filesFile && !filesFile.changeOnly && status?.revision) {
     const cached = sourceCache.get(`${IndexPin.key(status.revision)}:${filesFile.path}`);
@@ -1427,21 +1404,40 @@ async function setSection(name, view = null) {
     const source = workspaceSource;
     paintCachedSource(source.data, source.range, filesGuard({basis:true}), source.range?.startLine || 1, source.navigation?.snapshot?.());
   }
+}
+// What a section change interrupted in Files: the source read, or the working-tree diff.
+function showFilesInterrupted() {
+  if (!workspaceSource && filesFile && filesBasis === "indexed") $("source-path").textContent = "Source read interrupted. Select the file again to read its cached snapshot.";
+  if (filesBasis === "working") {
+    if (filesDiff) window.TrellisFiles?.diff($("files-diff"), filesDiff);
+    else $("files-diff").textContent = "Diff read interrupted. Select Working tree again to measure it.";
+  }
+}
+async function setSection(name, view = null) {
+  if (!switchSection(name, view)) return;
+  if (name !== "files") {
+    const repaintSource = showDiagrams(view);
+    if (!$("treemap-panel").hidden) await treemap?.refresh();
+    else if (!$("architecture-panel").hidden) void architecture?.refresh();
+    else if (!$("deviations-panel").hidden) void architecture?.showDeviations();
+    else if (diagramSequence && selectedMethod?.id === diagramSequence.seed.id) await loadSequence(diagramSequence, true);
+    repaintSource();
+    return;
+  }
+  showFilesSource();
   if (filesSymbol) {
     const current = filesGuard({symbol:true});
     if (filesMatches) renderFilesMatches(); else void loadFilesMatches();
     if (filesMini) await renderFilesMini(current);
     else if (["function", "method"].includes(filesSymbol.symbol.kind)) void loadFilesMini(current);
   }
-  if (!workspaceSource && filesFile && filesBasis === "indexed") $("source-path").textContent = "Source read interrupted. Select the file again to read its cached snapshot.";
-  if (filesBasis === "working") {
-    if (filesDiff) window.TrellisFiles?.diff($("files-diff"), filesDiff);
-    else $("files-diff").textContent = "Diff read interrupted. Select Working tree again to measure it.";
-  }
+  showFilesInterrupted();
   if (!filesCatalogLoaded && status?.revision) await loadFiles(true);
   if (!filesGitStatus) await refreshGit();
 }
 window.TrellisShell?.setSectionCallback?.(name => { navigationSerial++; diagramSerial++; void setSection(name); });
+// The shell names no view (#1034): a section change drops revision-bound navigation through this.
+window.TrellisShell?.setSectionResetCallback?.(() => { window.TrellisNavigation?.reset(); });
 function appendFilesOutline(li, file) {
   const state = fileStates.get(file.path);
   if (!state?.outlineOpen) return;
@@ -1596,17 +1592,17 @@ async function renderFilesMini(current) {
   const data = filesMini, revision = data.revision, expanded = window.TrellisSequence.hopGroups(data), container = $("files-mini-sequence");
   const readSource = step => { if (current()) return openFilesLocation(step, revision); };
   const options = {showDetails:false, isCurrent:current, onOpenTarget:sequenceTargetAction(data, current)};
-  options.onUnsupported = reason => { if (current()) { window.TrellisSequence.render(container, data, readSource, expanded, options); $("files-mini-state").textContent += ` · Pele fell back: ${reason}`; } };
+  options.onUnsupported = reason => { if (current()) { window.TrellisSequence.renderError(container, reason); $("files-mini-state").textContent += ` · This Sequence could not be drawn: ${reason}`; } };
   const empty = window.TrellisSequence.emptySummary(data, options);
   const onlyEmpty = empty && !window.TrellisSequence.display(data, options).visible.size;
   const outcome = onlyEmpty ? {status:"empty"} : window.TrellisPeleSequence ? await window.TrellisPeleSequence.render(container, data, readSource, expanded, options) : {status:"unsupported", reason:"Pele asset unavailable"};
   if (!current() || outcome.status === "stale") return;
-  if (outcome.status !== "rendered" && outcome.status !== "empty") window.TrellisSequence.render(container, data, readSource, expanded, options);
+  if (outcome.status !== "rendered" && outcome.status !== "empty") window.TrellisSequence.renderError(container, outcome.reason);
   if (empty) window.TrellisSequence.renderEmpty(container, empty, () => { if (current()) void perform(() => navigateDiagram(data.seed, revision, "sequence", null, true)); }, !onlyEmpty);
   // One short status line; the sequence's caveats and diagnostics live behind the ⓘ (#526).
   const notes = [...(data.warnings || [])];
   if (data.truncated) notes.push("Truncated by sequence limits; Open full loads the sequence again.");
-  if (outcome.status !== "rendered" && !empty) notes.push(`Pele fell back: ${outcome.reason}`);
+  if (outcome.status !== "rendered" && !empty) notes.push(`This Sequence could not be drawn: ${outcome.reason}`);
   $("files-mini-notes").replaceChildren(...notes.map(note => element("li", note, "detail")));
   $("files-mini-state").textContent = `Indexed revision ${IndexPin.label(revision)} · ${data.hiddenSteps} incidental steps hidden${data.truncated ? " · truncated" : ""}${!data.steps.length ? " · No visible behavior steps" : ""}${notes.length ? ` · ${notes.length} ${notes.length === 1 ? "note" : "notes"} in ⓘ` : ""}`;
   fitFilesMini();
@@ -2063,12 +2059,12 @@ async function loadSequence(admitted = null, preserveSource = false, callerCurre
     const options = {showDetails: !!$("all-steps").checked, interactions:true, isCurrent: () => current() && IndexPin.equal(status?.revision, revision)};
     options.onRendered = () => highlightSequenceBoundary(data, options);
     options.onOpenTarget = sequenceTargetAction(data, options.isCurrent);
-    // A later group redraw can fail after the initial load succeeded. Preserve
-    // the whole pinned DTO rather than leaving an inert, silently folded group.
+    // A later group redraw can fail after the initial load succeeded. Say so in place of
+    // the diagram (#1007) rather than leaving an inert, silently folded group.
     options.onUnsupported = reason => {
       if (!options.isCurrent()) return;
-      window.TrellisSequence.render($("sequence-diagram"), data, readSource, expanded, options);
-      $("sequence-state").textContent = $("sequence-state").textContent.replace(/ · Pele rendered$/, ` · Pele fell back: ${reason}`);
+      window.TrellisSequence.renderError($("sequence-diagram"), reason);
+      $("sequence-state").textContent = $("sequence-state").textContent.replace(/ · Pele rendered$/, ` · This Sequence could not be drawn: ${reason}`);
     };
     if (window.TrellisShell) options.onSelect = step => {
       if (!current()) return;
@@ -2099,14 +2095,14 @@ async function loadSequence(admitted = null, preserveSource = false, callerCurre
     if (!current() || !IndexPin.equal(status?.revision, revision)) return;
     if (outcome.status === "stale") return;
     if (outcome.status !== "rendered" && outcome.status !== "empty") {
-      window.TrellisSequence.render(diagram, data, readSource, expanded, options);
+      window.TrellisSequence.renderError(diagram, outcome.reason);
     }
     if (empty) window.TrellisSequence.renderEmpty(diagram, empty, () => { if (options.isCurrent()) { $("all-steps").checked = true; void loadSequence(); } }, !onlyEmpty);
     if ($("sequence-warning-count")) $("sequence-warning-count").textContent = String((data.warnings || []).length);
     renderIncidentalToggle(data, options);
     // Interactions (#636) draw no internal step; the one count of them is in the status line.
     const interactions = window.TrellisSequence.display(data, options);
-    $("sequence-state").textContent = `${symbol.name} · ${symbol.path} · revision ${IndexPin.label(revision)} · ${window.TrellisSequence.evidenceSummary(data)} · ${data.hiddenSteps} incidental steps hidden${interactions.interactions ? ` · Interactions · ${interactions.hiddenSteps} internal steps hidden` : ""}${interactions.omittedInteractions ? ` · truncated: ${interactions.omittedInteractions} later ${interactions.omittedInteractions === 1 ? "interaction" : "interactions"} not shown` : ""}${data.truncated ? " · truncated by sequence limits" : ""}${window.TrellisSequence.interfaceSummary(data) ? ` · ${window.TrellisSequence.interfaceSummary(data)}` : ""}${!data.steps.length ? " · No visible behavior steps. Read method source for context." : ""}${outcome.status === "empty" ? "" : outcome.status !== "rendered" ? ` · Pele fell back: ${outcome.reason}` : " · Pele rendered"}`;
+    $("sequence-state").textContent = `${symbol.name} · ${symbol.path} · revision ${IndexPin.label(revision)} · ${window.TrellisSequence.evidenceSummary(data)} · ${data.hiddenSteps} incidental steps hidden${interactions.interactions ? ` · Interactions · ${interactions.hiddenSteps} internal steps hidden` : ""}${interactions.omittedInteractions ? ` · truncated: ${interactions.omittedInteractions} later ${interactions.omittedInteractions === 1 ? "interaction" : "interactions"} not shown` : ""}${data.truncated ? " · truncated by sequence limits" : ""}${window.TrellisSequence.interfaceSummary(data) ? ` · ${window.TrellisSequence.interfaceSummary(data)}` : ""}${!data.steps.length ? " · No visible behavior steps. Read method source for context." : ""}${outcome.status === "empty" ? "" : outcome.status !== "rendered" ? ` · This Sequence could not be drawn: ${outcome.reason}` : " · Pele rendered"}`;
     for (const warning of data.warnings || []) $("sequence-warnings").append(element("li", warning, "warning"));
     highlightSequenceBoundary(data, options);
     published = true;
@@ -2165,7 +2161,7 @@ function renderSequenceFit() {
   button.setAttribute("aria-pressed", String(fitted));
 }
 // A tall diagram scrolls its headers away; a copy of the column names stays over the panel
-// once they have gone. It reads what either renderer drew, so it needs no renderer's help.
+// once they have gone. It reads what the renderer drew, so it needs no renderer's help.
 let sequenceHeaderEnd = 0;
 function positionSequenceColumns() {
   const diagram = $("sequence-diagram"), strip = $("sequence-columns");
@@ -2177,13 +2173,13 @@ function renderSequenceColumns() {
   const diagram = $("sequence-diagram"), strip = $("sequence-columns");
   if (!strip || !diagram?.getBoundingClientRect) return;
   const box = diagram.getBoundingClientRect();
-  const headers = [...diagram.querySelectorAll(":scope > svg .pele-actor:not(.pele-actor-footer), :scope > svg .sequence-participant-label")];
+  const headers = [...diagram.querySelectorAll(":scope > svg .pele-actor:not(.pele-actor-footer)")];
   sequenceHeaderEnd = 0;
   strip.replaceChildren(...headers.map(header => {
     const rect = header.getBoundingClientRect();
     // A wrapped header (#716) is one line here: its kind, then its name.
     const lines = [...header.querySelectorAll("tspan")].map(line => line.textContent);
-    const name = element("span", lines.length ? lines.join(" ") : header.matches(".pele-actor") ? header.textContent : header.firstChild.textContent);
+    const name = element("span", lines.length ? lines.join(" ") : header.textContent);
     name.style.left = `${rect.left + rect.width / 2 - box.left + diagram.scrollLeft}px`;
     sequenceHeaderEnd = Math.max(sequenceHeaderEnd, rect.bottom - box.top + diagram.scrollTop);
     return name;
@@ -2463,7 +2459,10 @@ async function refreshAppInventory() {
   if (held !== null && Apps.chosen(assigned, held) === null) { appSelection.set(selectedRootKey, null); return; }
   if (assigned) appScopeChanged();
 }
+// The views name no shell (#1034): each is handed the shell's inspector for it here. The shell is
+// read at call time, as the views read it before.
 const viewerMetrics = window.TrellisMetrics?.create({
+  inspector: {show:() => window.TrellisShell?.showMetricInspector(), clear:() => window.TrellisShell?.clearMetricInspector()},
   request: path => revisionRead(path),
   context: () => ({rootKey:selectedRootKey, session:epoch, pin:status?.revision, treeRoot, indexedWorkspace}),
   onConflict: pin => unexpectedPair("Index changed. Refresh status before inspecting metrics.", pin),
@@ -2471,6 +2470,7 @@ const viewerMetrics = window.TrellisMetrics?.create({
   onOpenCallable: (row, pin) => perform(() => openCallableSequence(row, pin)),
 });
 const treemap = window.TrellisTreemap?.create({
+  inspector: {show:() => window.TrellisShell?.showTreemapInspector(), clear:() => window.TrellisShell?.clearTreemapInspector()},
   request: (path, current) => revisionRead(path, current),
   appFilter: appChoice, showApp: showAppOf,
   context: () => ({rootKey:selectedRootKey, session:epoch, pin:status?.revision, workspaceRoot:status?.workspaceRoot}),
@@ -2479,6 +2479,7 @@ const treemap = window.TrellisTreemap?.create({
   onInspect: () => { viewerMetrics?.clearInspection(); architecture?.clearInspection(); clearSource(); },
 });
 const architecture = window.TrellisArchitecture?.create({
+  inspector: {show:options => window.TrellisShell?.showArchitectureInspector(options), clear:() => window.TrellisShell?.clearArchitectureInspector()},
   request: architectureRequest,
   appScope: appSelection && {get:() => appSelection.get(selectedRootKey), set:name => appSelection.set(selectedRootKey, name)},
   context: () => ({rootKey:selectedRootKey, session:epoch, pin:status?.revision, rulesEpoch}),
@@ -3125,12 +3126,12 @@ async function openClasses(options = {}) {
   return window.TrellisClasses.open(options.seed ? {seed:options.seed} : options);
 }
 function attachClassMenu(node, options) {
-  if (!classLanguage(options.path) || !window.TrellisClasses?.showContextMenu) return;
+  if (!classLanguage(options.path) || !window.TrellisContextMenu?.showContextMenu) return;
   const current = browseGuard();
   const show = event => {
     if (!current() || !token || !status) return;
     event.preventDefault();
-    window.TrellisClasses.showContextMenu(event, [{
+    window.TrellisContextMenu.showContextMenu(event, [{
       label: options.seed ? "Show enclosing class diagram" : "Show class diagram",
       run: () => { if (current()) return perform(() => openClasses(options)); },
     }]);
@@ -3141,7 +3142,7 @@ function attachClassMenu(node, options) {
   });
 }
 function inspectSourceSymbol(symbol, revision) {
-  if (!sourceWitness(symbol) || !IndexPin.equal(revision, status?.revision)) throw new Error("Source inspection is stale. Refresh the indexed view.");
+  if (!window.TrellisSourceWitness(symbol) || !IndexPin.equal(revision, status?.revision)) throw new Error("Source inspection is stale. Refresh the indexed view.");
   const context = navigationContext(), serial = sourceSerial;
   const inspector = {symbol}; sourceInspector = inspector;
   const current = () => navigationCurrent(context) && sourceInspector === inspector && sourceSerial === serial;
@@ -3158,7 +3159,7 @@ window.TrellisNavigation?.init({
   selectMethod: (symbol, revision) => perform(() => navigateDiagram(symbol, revision)),
   inspectSymbol: (symbol, revision) => perform(() => inspectSourceSymbol(symbol, revision)),
   openSource: (symbol, revision) => perform(() => section === "files" ? openFilesLocation(symbol, revision) : showSource(symbol, revision)),
-  showMenu: (event, actions, options) => window.TrellisClasses?.showContextMenu(event, actions, options),
+  showMenu: (event, actions, options) => window.TrellisContextMenu?.showContextMenu(event, actions, options),
 });
 function initClassView() {
   window.TrellisClasses?.init({

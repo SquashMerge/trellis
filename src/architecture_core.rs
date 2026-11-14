@@ -4,15 +4,15 @@
 //! and keeps only what later reads select from: no source text, syntax trees or semantic rows.
 //! `crate::http::architecture` owns building one per head; reads project from it. Only the
 //! read itself holds a SQLite transaction, so the longer computing never delays a publication.
-use super::{
-    EvidenceResponse, METRICS_WORKER_CHECK_EVERY, MetricsComputedDocument, MetricsDocumentFailure,
-    MetricsReadCheck, SelectedIntegrity, Store,
-};
 use crate::metrics::DeclarationMetrics;
+use crate::metrics_read::{
+    METRICS_WORKER_CHECK_EVERY, MetricsComputedDocument, MetricsDocumentFailure, MetricsReadCheck,
+};
 use crate::model::IndexPin;
 use crate::native_records::{DeclarationRole, DocumentKey};
 use crate::references::{Projection, ReferenceBase};
 use crate::rules::{Config, RuleError, RulesBase};
+use crate::store::{EvidenceResponse, SelectedIntegrity, Store};
 use anyhow::Result;
 use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;
@@ -20,18 +20,18 @@ use std::sync::{Arc, Mutex};
 
 /// The checked arguments of one architecture operation.
 pub(crate) struct ArchitectureArguments {
-    pub(super) pin: Option<IndexPin>,
-    pub(super) paths: Vec<String>,
+    pub(crate) pin: Option<IndexPin>,
+    pub(crate) paths: Vec<String>,
     /// References only (#837): the normalized directory every source lies under.
-    pub(super) prefix: Option<String>,
+    pub(crate) prefix: Option<String>,
     /// References only (#837): `groupBy:"package"`, which needs each file's app.
-    pub(super) apps: bool,
+    pub(crate) apps: bool,
     /// #851: the `app` filter of references, check and endpoints, an app name or manifest path.
-    pub(super) app: Option<String>,
+    pub(crate) app: Option<String>,
     /// Endpoints only (#851): the method and exact path template a read keeps.
-    pub(super) method: Option<String>,
-    pub(super) path_template: Option<String>,
-    pub(super) sample_limit: usize,
+    pub(crate) method: Option<String>,
+    pub(crate) path_template: Option<String>,
+    pub(crate) sample_limit: usize,
 }
 
 impl ArchitectureArguments {
@@ -67,11 +67,11 @@ pub(crate) enum ArchitectureView {
 
 /// One document's metrics rows for every role.
 pub(crate) struct MetricsDocument {
-    pub(super) rows: Vec<DeclarationMetrics>,
-    pub(super) gap: Option<crate::syntax_bounds::SyntaxGap>,
-    pub(super) physical_lines: usize,
-    pub(super) physical_bytes: usize,
-    pub(super) file_role: DeclarationRole,
+    pub(crate) rows: Vec<DeclarationMetrics>,
+    pub(crate) gap: Option<crate::syntax_bounds::SyntaxGap>,
+    pub(crate) physical_lines: usize,
+    pub(crate) physical_bytes: usize,
+    pub(crate) file_role: DeclarationRole,
 }
 pub(crate) type ArchitectureMetrics = BTreeMap<DocumentKey, MetricsDocument>;
 
@@ -212,14 +212,14 @@ impl ArchitectureCore {
     pub(crate) fn rules_hash(&self) -> Option<&str> {
         self.rules.as_ref().map(|part| part.content_hash.as_str())
     }
-    pub(super) fn summary(&self, key: &SummaryKey) -> Option<Arc<serde_json::Value>> {
+    pub(crate) fn summary(&self, key: &SummaryKey) -> Option<Arc<serde_json::Value>> {
         self.summaries
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(key)
             .cloned()
     }
-    pub(super) fn remember_summary(
+    pub(crate) fn remember_summary(
         &self,
         key: SummaryKey,
         summary: serde_json::Value,

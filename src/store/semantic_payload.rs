@@ -5,7 +5,7 @@
 //! revision r goes through [`project_payload`], the single projection, which supplies r's
 //! native revision, r's rejoined provenance IDs and r's freshness.
 use super::*;
-use crate::semantic_evidence as sem;
+use crate::semantic_records as sem;
 use std::cell::RefCell;
 
 /// The provenance IDs of `coverage`'s own tuple: the rows the tuple owns in `publication`.

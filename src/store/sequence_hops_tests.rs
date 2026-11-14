@@ -1,6 +1,7 @@
 //! #853: a Sequence's client calls read against the HTTP interfaces of a published two-app
 //! checkout: a Rust axum daemon (`alpha`) and a JavaScript web app (`web-app`).
 use super::*;
+use crate::architecture_core::{ArchitectureCore, ArchitectureProgress};
 use crate::behavior::{InterfaceHop, InterfacesState, SequenceStep, SequenceView};
 use crate::indexer::{IndexOptions, index_workspace_bundle};
 use std::{fs, sync::atomic::AtomicBool};

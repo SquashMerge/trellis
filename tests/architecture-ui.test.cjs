@@ -5,7 +5,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const source = fs.readFileSync(path.join(__dirname, "../web/architecture.js"), "utf8");
-const pinSource = fs.readFileSync(path.join(__dirname, "../web/app.js"), "utf8").match(/const IndexPin = Object.freeze\(\{[\s\S]*?\n\}\);\nwindow.TrellisIndexPin = IndexPin;/)[0];
+const pinSource = fs.readFileSync(path.join(__dirname, "../web/index-pin.js"), "utf8");
 const pin = {indexGeneration:"12345678-1234-4123-8123-123456789abc",indexRevision:1};
 const descendants = node => [node, ...node.children.flatMap(descendants)];
 const text = node => descendants(node).map(item => item.textContent).join(" ");
@@ -83,12 +83,13 @@ function harness(extra = {}) {
   }
   const get = document.getElementById;
   let renderer = async (_container, view, options) => {renders.push({view,options}); return {status:"ready"};};
-  const window = {TrellisArchitecturePele:{render:(...args) => renderer(...args)},TrellisShell:{
-    clearArchitectureInspector:() => {get("architecture-inspector").hidden=true;get("architecture-inspector-content").replaceChildren();},
-    showArchitectureInspector:() => {get("architecture-inspector").hidden=false;},
-  }};
+  const window = {TrellisArchitecturePele:{render:(...args) => renderer(...args)}};
+  const inspector = {
+    clear:() => {get("architecture-inspector").hidden=true;get("architecture-inspector-content").replaceChildren();},
+    show:() => {get("architecture-inspector").hidden=false;},
+  };
   vm.runInNewContext(pinSource + "\n" + fs.readFileSync(path.join(__dirname, "../web/metric-heat.js"), "utf8") + "\n" + fs.readFileSync(path.join(__dirname, "../web/architecture-apps.js"), "utf8") + "\n" + fs.readFileSync(path.join(__dirname, "../web/architecture-deviations.js"), "utf8") + "\n" + source, {window,document,URLSearchParams,console,setTimeout:(run,delay) => {timers.push({run,delay}); return timers.length;},clearTimeout:id => {if (id) timers[id-1].run = null;}});
-  const controller = window.TrellisArchitecture.create({request:async (url,current,options) => {
+  const controller = window.TrellisArchitecture.create({inspector, request:async (url,current,options) => {
     if (url.startsWith("/api/architecture/details?")) { detailCalls.push({url,current}); if (detailError) throw detailError; if (detailGate) await detailGate; return emulateDetails(full, url, edgePairs); }
     calls.push({url,current,options}); const data = await response(url,options);
     if (!url.startsWith("/api/architecture?") || !data?.payload?.references) return data;
@@ -945,7 +946,7 @@ function deviationsHarness(options = {}) {
     querySelector:selector => statics.has(selector) ? statics.get(selector) : statics.set(selector, track(dnode("static"))).get(selector)};
   const rows = options.rows || deviationRows(), state = {stale:false,usable:true,pages:options.pages || [[0, 2], [2, 3]],failAt:options.failAt ?? null,error:options.error ?? null,
     readError:null,eligible:true,view:options.view || deviationView()};
-  const sandbox = {document,console,navigator:{clipboard:{writeText:async value => {sandbox.copied = value;}}},window:{TrellisClasses:{showContextMenu(event, actions, opts) {
+  const sandbox = {document,console,navigator:{clipboard:{writeText:async value => {sandbox.copied = value;}}},window:{TrellisContextMenu:{showContextMenu(event, actions, opts) {
     menus.push({target:event.currentTarget,actions,options:opts});event.stopPropagation();}}}};
   vm.createContext(sandbox);
   vm.runInContext(pinSource, sandbox);

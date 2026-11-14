@@ -44,6 +44,11 @@ paths = [
   "src/graph_query.rs", "src/rules/**", "src/rules_edit.rs", "src/behavior_columns.rs",
   "src/apps.rs", "src/apps/**", "src/interfaces.rs", "src/interfaces/**",
   "src/model_management.rs", "src/search_config.rs", "src/symbol_lookup.rs",
+  # The Architecture and metrics read service, moved up from storage (S5, #1045): the
+  # per-revision core, the Architecture operations and the metrics projection, with the tests
+  # that moved with them. Storage keeps the read they start from.
+  "src/architecture_core.rs", "src/architecture_read.rs", "src/architecture_read_apps_tests.rs",
+  "src/metrics_read.rs", "src/metrics_read_parallel_tests.rs",
 ]
 
 [layers.indexing]
@@ -102,6 +107,17 @@ paths = [
   # Card preparation and serialization over shared records and native_ids only; storage
   # renders stored cards with it (S2, #1001). Capture stays in search_capture.rs.
   "src/search_card.rs",
+  # The persisted semantic evidence records, their closed vocabularies and the language
+  # order (S3, #1002). Validation and the emission validator stay in semantic_evidence.rs.
+  "src/semantic_records.rs",
+  # The search vocabulary storage reads and ranks with: candidate rows, the role filter and
+  # exact-match policy, the query budget and its error, the vector width and the phase
+  # timer (S4, #1003). Ranking, the embedder and model ownership stay in the query layer.
+  "src/search_vocab.rs",
+  # The capture records storage persists and compares, the root, nested-config and
+  # source-extension input tables and the per-source read counters (S4b, #1003).
+  # Admission, the walk and `Capture` stay in capture.rs.
+  "src/capture_records.rs",
 ]
 
 # Coarse developer-tool boundary; does not infer internal tooling architecture.

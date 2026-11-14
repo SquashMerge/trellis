@@ -528,7 +528,36 @@ fn target_valid(t: &ConfigTarget) -> bool {
 pub(crate) fn languages(s: &str) -> bool {
     matches!(s, "java" | "rust" | "python" | "javascript" | "typescript")
 }
+/// Parses `rules.toml`. Sections are parsed in a fixed order, which decides the first error
+/// reported and how the one glob and selector budget (`PATTERN_LIMIT`) is consumed.
 pub fn parse(text: &str) -> Result<Config> {
+    let raw = decode(text)?;
+    let peers = parse_policy(text, raw.layer_policy.peers)?;
+    let shared_outbound = parse_policy(text, raw.layer_policy.shared_outbound)?;
+    let mut patterns = 0;
+    let external_deny = external_selectors(text, &raw.external_policy.deny, &mut patterns)?;
+    let layers = parse_layers(text, raw.layers, &mut patterns)?;
+    let apps = authored_apps(text, raw.apps)?;
+    let wrappers = interface_wrappers(text, raw.interfaces)?;
+    let roles = parse_roles(text, raw.roles, &mut patterns)?;
+    let (rules, ids) = parse_rules(text, raw.rules, &roles)?;
+    let exceptions = parse_exceptions(text, raw.exceptions, &ids)?;
+    Ok(Config {
+        text: text.into(),
+        content_hash: hex::encode(Sha256::digest(text.as_bytes())),
+        layers,
+        roles,
+        rules,
+        exceptions,
+        peers,
+        shared_outbound,
+        external_deny,
+        apps,
+        wrappers,
+    })
+}
+/// The size bound, the TOML and schema decode, the version and the named collection bounds.
+fn decode(text: &str) -> Result<Raw> {
     if text.len() > CONFIG_BYTES {
         return Err(error(
             text,
@@ -577,8 +606,12 @@ pub fn parse(text: &str) -> Result<Config> {
             "named collection exceeds 1024 entries",
         ));
     }
-    let policy = |v: Option<Spanned<String>>| -> Result<Option<String>> {
-        v.map(|v| {
+    Ok(raw)
+}
+/// One `[layer_policy]` value.
+fn parse_policy(text: &str, value: Option<Spanned<String>>) -> Result<Option<String>> {
+    value
+        .map(|v| {
             if matches!(v.get_ref().as_str(), "allow" | "forbid") {
                 Ok(v.into_inner())
             } else {
@@ -592,81 +625,19 @@ pub fn parse(text: &str) -> Result<Config> {
             }
         })
         .transpose()
-    };
-    let peers = policy(raw.layer_policy.peers)?;
-    let shared_outbound = policy(raw.layer_policy.shared_outbound)?;
-    let mut patterns = 0;
-    let external_deny = external_selectors(text, &raw.external_policy.deny, &mut patterns)?;
+}
+/// The `[layers.<name>]` tables. An external package belongs to at most one layer.
+fn parse_layers(
+    text: &str,
+    raw: BTreeMap<String, Spanned<RawLayer>>,
+    patterns: &mut usize,
+) -> Result<BTreeMap<String, Layer>> {
     let mut layers = BTreeMap::new();
     let mut external_owners = BTreeMap::new();
-    for (name, raw) in raw.layers {
+    for (name, raw) in raw {
         let span = raw.span();
-        let layer = raw.into_inner();
-        if name.trim().is_empty()
-            || (layer.paths.is_empty() && layer.external.is_empty())
-            || !matches!(
-                (layer.order, layer.shared),
-                (Some(_), None) | (None, Some(true))
-            )
-        {
-            return Err(error(
-                text,
-                span,
-                "schema",
-                "token",
-                "layer requires nonempty paths or external and exactly one integer order or shared=true",
-            ));
-        }
-        let display = layer
-            .display
-            .map(|v| {
-                if matches!(v.get_ref().as_str(), "expanded" | "collapsed" | "hidden") {
-                    Ok(v.into_inner())
-                } else {
-                    Err(error(
-                        text,
-                        v.span(),
-                        "schema",
-                        "token",
-                        "layer display must be expanded, collapsed or hidden",
-                    ))
-                }
-            })
-            .transpose()?;
-        let app = layer.app.map(|v| app_name(text, v)).transpose()?;
-        if let (Some((_, span)), None) = (&app, layer.order) {
-            return Err(error(
-                text,
-                span.clone(),
-                "schema",
-                "token",
-                "app belongs on an ordered layer; a shared layer lists apps",
-            ));
-        }
-        let apps = layer.apps.map(|v| app_names(text, v)).transpose()?;
-        if let (Some(apps), Some(_)) = (&apps, layer.order) {
-            return Err(error(
-                text,
-                apps.first().map_or(span.clone(), |(_, s)| s.clone()),
-                "schema",
-                "token",
-                "apps belongs on a shared layer; an ordered layer names one app",
-            ));
-        }
-        let mut globs = layer
-            .paths
-            .iter()
-            .map(|v| {
-                Ok(LayerPattern {
-                    text: v.get_ref().clone(),
-                    matcher: pattern(text, v, true, &mut patterns)?,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        globs.sort_by(|a, b| a.text.cmp(&b.text));
-        globs.dedup_by(|a, b| a.text == b.text);
-        let external = external_selectors(text, &layer.external, &mut patterns)?;
-        for selector in &external {
+        let layer = parse_layer(text, &name, raw, patterns)?;
+        for selector in &layer.external {
             if let Some(previous) = external_owners.insert(selector.clone(), name.clone()) {
                 return Err(error(
                     text,
@@ -680,264 +651,377 @@ pub fn parse(text: &str) -> Result<Config> {
                 ));
             }
         }
-        layers.insert(
-            name,
-            Layer {
-                order: layer.order,
-                display,
-                app,
-                apps,
-                patterns: globs,
-                external,
-                span,
-            },
-        );
+        layers.insert(name, layer);
     }
-    let apps = authored_apps(text, raw.apps)?;
-    let wrappers = interface_wrappers(text, raw.interfaces)?;
+    Ok(layers)
+}
+/// One layer: its shape, display hint, app scope, path globs and external selectors.
+fn parse_layer(
+    text: &str,
+    name: &str,
+    raw: Spanned<RawLayer>,
+    patterns: &mut usize,
+) -> Result<Layer> {
+    let span = raw.span();
+    let layer = raw.into_inner();
+    if name.trim().is_empty()
+        || (layer.paths.is_empty() && layer.external.is_empty())
+        || !matches!(
+            (layer.order, layer.shared),
+            (Some(_), None) | (None, Some(true))
+        )
+    {
+        return Err(error(
+            text,
+            span,
+            "schema",
+            "token",
+            "layer requires nonempty paths or external and exactly one integer order or shared=true",
+        ));
+    }
+    let display = layer
+        .display
+        .map(|v| {
+            if matches!(v.get_ref().as_str(), "expanded" | "collapsed" | "hidden") {
+                Ok(v.into_inner())
+            } else {
+                Err(error(
+                    text,
+                    v.span(),
+                    "schema",
+                    "token",
+                    "layer display must be expanded, collapsed or hidden",
+                ))
+            }
+        })
+        .transpose()?;
+    let app = layer.app.map(|v| app_name(text, v)).transpose()?;
+    if let (Some((_, span)), None) = (&app, layer.order) {
+        return Err(error(
+            text,
+            span.clone(),
+            "schema",
+            "token",
+            "app belongs on an ordered layer; a shared layer lists apps",
+        ));
+    }
+    let apps = layer.apps.map(|v| app_names(text, v)).transpose()?;
+    if let (Some(apps), Some(_)) = (&apps, layer.order) {
+        return Err(error(
+            text,
+            apps.first().map_or(span.clone(), |(_, s)| s.clone()),
+            "schema",
+            "token",
+            "apps belongs on a shared layer; an ordered layer names one app",
+        ));
+    }
+    let mut globs = layer
+        .paths
+        .iter()
+        .map(|v| {
+            Ok(LayerPattern {
+                text: v.get_ref().clone(),
+                matcher: pattern(text, v, true, patterns)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    globs.sort_by(|a, b| a.text.cmp(&b.text));
+    globs.dedup_by(|a, b| a.text == b.text);
+    let external = external_selectors(text, &layer.external, patterns)?;
+    Ok(Layer {
+        order: layer.order,
+        display,
+        app,
+        apps,
+        patterns: globs,
+        external,
+        span,
+    })
+}
+/// The `[roles.<name>]` tables.
+fn parse_roles(
+    text: &str,
+    raw: BTreeMap<String, Spanned<RawRole>>,
+    patterns: &mut usize,
+) -> Result<BTreeMap<String, Selector>> {
     let mut roles = BTreeMap::new();
-    for (name, raw) in raw.roles {
-        let selector = raw.get_ref();
-        let s = selector.select.get_ref();
-        if name.trim().is_empty()
-            || (s.paths.is_none()
-                && s.name.is_none()
-                && s.language.is_none()
-                && s.extends.is_none()
-                && s.implements.is_none())
-        {
-            return Err(error(
-                text,
-                selector.select.span(),
-                "selector",
-                "token",
-                "selector requires at least one field",
-            ));
-        }
-        if s.paths.as_ref().is_some_and(Vec::is_empty)
-            || s.language.as_ref().is_some_and(Vec::is_empty)
-        {
-            return Err(error(
-                text,
-                selector.select.span(),
-                "selector",
-                "token",
-                "selector list must not be empty",
-            ));
-        }
-        for language in s.language.iter().flatten() {
-            if !languages(language.get_ref()) {
-                return Err(error(
-                    text,
-                    language.span(),
-                    "selector",
-                    "token",
-                    "unsupported language",
-                ));
-            }
-        }
-        for base in [s.extends.as_ref(), s.implements.as_ref()]
-            .into_iter()
-            .flatten()
-        {
-            if base.get_ref().trim().is_empty() {
-                return Err(error(
-                    text,
-                    base.span(),
-                    "selector",
-                    "token",
-                    "base spelling must not be blank",
-                ));
-            }
-        }
-        roles.insert(
-            name,
-            Selector {
-                paths: s
-                    .paths
-                    .iter()
-                    .flatten()
-                    .map(|p| pattern(text, p, true, &mut patterns))
-                    .collect::<Result<_>>()?,
-                name: s
-                    .name
-                    .as_ref()
-                    .map(|p| pattern(text, p, false, &mut patterns))
-                    .transpose()?,
-                language: s
-                    .language
-                    .iter()
-                    .flatten()
-                    .map(|l| l.get_ref().clone())
-                    .collect(),
-                extends: s.extends.as_ref().map(|s| s.get_ref().clone()),
-                implements: s.implements.as_ref().map(|s| s.get_ref().clone()),
-            },
-        );
+    for (name, raw) in raw {
+        let selector = parse_role(text, &name, raw.get_ref(), patterns)?;
+        roles.insert(name, selector);
     }
+    Ok(roles)
+}
+/// One role selector: its shape first, then its globs.
+fn parse_role(
+    text: &str,
+    name: &str,
+    selector: &RawRole,
+    patterns: &mut usize,
+) -> Result<Selector> {
+    let s = selector.select.get_ref();
+    if name.trim().is_empty()
+        || (s.paths.is_none()
+            && s.name.is_none()
+            && s.language.is_none()
+            && s.extends.is_none()
+            && s.implements.is_none())
+    {
+        return Err(error(
+            text,
+            selector.select.span(),
+            "selector",
+            "token",
+            "selector requires at least one field",
+        ));
+    }
+    if s.paths.as_ref().is_some_and(Vec::is_empty) || s.language.as_ref().is_some_and(Vec::is_empty)
+    {
+        return Err(error(
+            text,
+            selector.select.span(),
+            "selector",
+            "token",
+            "selector list must not be empty",
+        ));
+    }
+    for language in s.language.iter().flatten() {
+        if !languages(language.get_ref()) {
+            return Err(error(
+                text,
+                language.span(),
+                "selector",
+                "token",
+                "unsupported language",
+            ));
+        }
+    }
+    for base in [s.extends.as_ref(), s.implements.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        if base.get_ref().trim().is_empty() {
+            return Err(error(
+                text,
+                base.span(),
+                "selector",
+                "token",
+                "base spelling must not be blank",
+            ));
+        }
+    }
+    Ok(Selector {
+        paths: s
+            .paths
+            .iter()
+            .flatten()
+            .map(|p| pattern(text, p, true, patterns))
+            .collect::<Result<_>>()?,
+        name: s
+            .name
+            .as_ref()
+            .map(|p| pattern(text, p, false, patterns))
+            .transpose()?,
+        language: s
+            .language
+            .iter()
+            .flatten()
+            .map(|l| l.get_ref().clone())
+            .collect(),
+        extends: s.extends.as_ref().map(|s| s.get_ref().clone()),
+        implements: s.implements.as_ref().map(|s| s.get_ref().clone()),
+    })
+}
+/// The `[[rules]]` entries, and the ids they define.
+fn parse_rules(
+    text: &str,
+    raw: Vec<Spanned<RawRule>>,
+    roles: &BTreeMap<String, Selector>,
+) -> Result<(Vec<Rule>, BTreeSet<String>)> {
     let mut rules = Vec::new();
     let mut ids = BTreeSet::new();
-    for raw in raw.rules {
-        let r = raw.get_ref();
-        let id = r.id.get_ref();
-        if id.trim().is_empty()
-            || matches!(id.as_str(), "$layers" | "$external")
-            || !ids.insert(id.clone())
-        {
-            return Err(error(
-                text,
-                r.id.span(),
-                "reference",
-                "token",
-                "duplicate, reserved or blank rule id",
-            ));
-        }
-        if !roles.contains_key(r.for_each.get_ref()) {
-            return Err(error(
-                text,
-                r.for_each.span(),
-                "reference",
-                "token",
-                "unknown for_each role",
-            ));
-        }
-        if r.require.is_empty() && r.forbid.is_empty() {
-            return Err(error(
-                text,
-                raw.span(),
-                "constraint",
-                "token",
-                "rule requires a constraint",
-            ));
-        }
-        let mut constraints = Vec::new();
-        for (mode, items) in [("require", &r.require), ("forbid", &r.forbid)] {
-            for value in items {
-                let c = value.get_ref();
-                if c.len() != 1 {
-                    return Err(error(
-                        text,
-                        value.span(),
-                        "constraint",
-                        "token",
-                        "constraint must contain exactly one edge kind",
-                    ));
-                }
-                let (kind, role) = c.iter().next().expect("one checked constraint");
-                if !matches!(kind.as_str(), "calls" | "extends" | "implements") {
-                    return Err(error(
-                        text,
-                        value.span(),
-                        "constraint",
-                        "token",
-                        "unknown edge constraint",
-                    ));
-                }
-                if !roles.contains_key(role) {
-                    return Err(error(
-                        text,
-                        value.span(),
-                        "reference",
-                        "token",
-                        "unknown constraint role",
-                    ));
-                }
-                constraints.push(Constraint {
-                    mode,
-                    kind: kind.clone(),
-                    role: role.clone(),
-                });
-            }
-        }
-        rules.push(Rule {
-            id: id.clone(),
-            role: r.for_each.get_ref().clone(),
-            constraints,
-        });
+    for raw in raw {
+        rules.push(parse_rule(text, &raw, roles, &mut ids)?);
     }
+    Ok((rules, ids))
+}
+fn parse_rule(
+    text: &str,
+    raw: &Spanned<RawRule>,
+    roles: &BTreeMap<String, Selector>,
+    ids: &mut BTreeSet<String>,
+) -> Result<Rule> {
+    let r = raw.get_ref();
+    let id = r.id.get_ref();
+    if id.trim().is_empty()
+        || matches!(id.as_str(), "$layers" | "$external")
+        || !ids.insert(id.clone())
+    {
+        return Err(error(
+            text,
+            r.id.span(),
+            "reference",
+            "token",
+            "duplicate, reserved or blank rule id",
+        ));
+    }
+    if !roles.contains_key(r.for_each.get_ref()) {
+        return Err(error(
+            text,
+            r.for_each.span(),
+            "reference",
+            "token",
+            "unknown for_each role",
+        ));
+    }
+    if r.require.is_empty() && r.forbid.is_empty() {
+        return Err(error(
+            text,
+            raw.span(),
+            "constraint",
+            "token",
+            "rule requires a constraint",
+        ));
+    }
+    let mut constraints = Vec::new();
+    for (mode, items) in [("require", &r.require), ("forbid", &r.forbid)] {
+        for value in items {
+            constraints.push(parse_constraint(text, mode, value, roles)?);
+        }
+    }
+    Ok(Rule {
+        id: id.clone(),
+        role: r.for_each.get_ref().clone(),
+        constraints,
+    })
+}
+fn parse_constraint(
+    text: &str,
+    mode: &'static str,
+    value: &Spanned<BTreeMap<String, String>>,
+    roles: &BTreeMap<String, Selector>,
+) -> Result<Constraint> {
+    let c = value.get_ref();
+    if c.len() != 1 {
+        return Err(error(
+            text,
+            value.span(),
+            "constraint",
+            "token",
+            "constraint must contain exactly one edge kind",
+        ));
+    }
+    let (kind, role) = c.iter().next().expect("one checked constraint");
+    if !matches!(kind.as_str(), "calls" | "extends" | "implements") {
+        return Err(error(
+            text,
+            value.span(),
+            "constraint",
+            "token",
+            "unknown edge constraint",
+        ));
+    }
+    if !roles.contains_key(role) {
+        return Err(error(
+            text,
+            value.span(),
+            "reference",
+            "token",
+            "unknown constraint role",
+        ));
+    }
+    Ok(Constraint {
+        mode,
+        kind: kind.clone(),
+        role: role.clone(),
+    })
+}
+/// What makes an exception a duplicate: its rule, target and destination.
+type ExceptionKey = (String, ExceptionTarget, Option<ExceptionTarget>);
+/// The `[[exceptions]]` entries, each naming `$layers` or one of the rule `ids`.
+fn parse_exceptions(
+    text: &str,
+    raw: Vec<Spanned<RawException>>,
+    ids: &BTreeSet<String>,
+) -> Result<Vec<Exception>> {
     let mut exceptions = Vec::new();
     let mut exception_keys = BTreeSet::new();
-    for raw in raw.exceptions {
-        let e = raw.get_ref();
-        if !(ids.contains(e.rule.get_ref()) || e.rule.get_ref() == "$layers") {
-            return Err(error(
-                text,
-                e.rule.span(),
-                "reference",
-                "token",
-                "unknown exception rule",
-            ));
+    for raw in raw {
+        exceptions.push(parse_exception(text, &raw, ids, &mut exception_keys)?);
+    }
+    Ok(exceptions)
+}
+fn parse_exception(
+    text: &str,
+    raw: &Spanned<RawException>,
+    ids: &BTreeSet<String>,
+    exception_keys: &mut BTreeSet<ExceptionKey>,
+) -> Result<Exception> {
+    let e = raw.get_ref();
+    if !(ids.contains(e.rule.get_ref()) || e.rule.get_ref() == "$layers") {
+        return Err(error(
+            text,
+            e.rule.span(),
+            "reference",
+            "token",
+            "unknown exception rule",
+        ));
+    }
+    let kind = match (
+        e.rule.get_ref().as_str(),
+        e.target.get_ref(),
+        e.destination.as_ref().map(Spanned::get_ref),
+    ) {
+        (
+            "$layers",
+            ExceptionTarget::ModulePath(source),
+            Some(ExceptionTarget::ModulePath(destination)),
+        ) if source.valid() && destination.valid() => ExceptionKind::ModulePair {
+            source: source.clone(),
+            destination: destination.clone(),
+            span: raw.span(),
+        },
+        (rule, ExceptionTarget::Native(target), None)
+            if rule != "$layers" && target_valid(target) =>
+        {
+            ExceptionKind::Declaration(target.wire())
         }
-        let kind = match (
-            e.rule.get_ref().as_str(),
-            e.target.get_ref(),
-            e.destination.as_ref().map(Spanned::get_ref),
-        ) {
-            (
-                "$layers",
-                ExceptionTarget::ModulePath(source),
-                Some(ExceptionTarget::ModulePath(destination)),
-            ) if source.valid() && destination.valid() => ExceptionKind::ModulePair {
-                source: source.clone(),
-                destination: destination.clone(),
-                span: raw.span(),
-            },
-            (rule, ExceptionTarget::Native(target), None)
-                if rule != "$layers" && target_valid(target) =>
-            {
-                ExceptionKind::Declaration(target.wire())
-            }
-            _ => {
-                return Err(error(
-                    text,
-                    raw.span(),
-                    "reference",
-                    "token",
-                    "layer exceptions require two literal language/path endpoints; declaration exceptions require one native identity",
-                ));
-            }
-        };
-        if e.reason.get_ref().trim().is_empty() {
-            return Err(error(
-                text,
-                e.reason.span(),
-                "schema",
-                "token",
-                "exception reason must not be blank",
-            ));
-        }
-        let key = (
-            e.rule.get_ref().clone(),
-            e.target.get_ref().clone(),
-            e.destination.as_ref().map(|d| d.get_ref().clone()),
-        );
-        if !exception_keys.insert(key) {
+        _ => {
             return Err(error(
                 text,
                 raw.span(),
                 "reference",
                 "token",
-                "duplicate exception",
+                "layer exceptions require two literal language/path endpoints; declaration exceptions require one native identity",
             ));
         }
-        exceptions.push(Exception {
-            rule: e.rule.get_ref().clone(),
-            kind,
-            reason: e.reason.get_ref().clone(),
-        });
+    };
+    if e.reason.get_ref().trim().is_empty() {
+        return Err(error(
+            text,
+            e.reason.span(),
+            "schema",
+            "token",
+            "exception reason must not be blank",
+        ));
     }
-    Ok(Config {
-        text: text.into(),
-        content_hash: hex::encode(Sha256::digest(text.as_bytes())),
-        layers,
-        roles,
-        rules,
-        exceptions,
-        peers,
-        shared_outbound,
-        external_deny,
-        apps,
-        wrappers,
+    let key = (
+        e.rule.get_ref().clone(),
+        e.target.get_ref().clone(),
+        e.destination.as_ref().map(|d| d.get_ref().clone()),
+    );
+    if !exception_keys.insert(key) {
+        return Err(error(
+            text,
+            raw.span(),
+            "reference",
+            "token",
+            "duplicate exception",
+        ));
+    }
+    Ok(Exception {
+        rule: e.rule.get_ref().clone(),
+        kind,
+        reason: e.reason.get_ref().clone(),
     })
 }
 
@@ -3187,1024 +3271,16 @@ pub fn explain(
 }
 
 #[cfg(test)]
-mod specificity_tests {
-    use super::*;
-
-    #[test]
-    fn global_minima_and_cached_comparisons_share_work_and_cancellation() {
-        let config = parse("version=1\n[layers.alpha]\norder=1\npaths=['src/a*.rs']\n[layers.beta]\norder=2\npaths=['src/*a.rs']\n[layers.winner]\norder=3\npaths=['src/a*a.rs']\n").unwrap();
-        let mut matcher = LayerMatcher::new(&config);
-        let mut work = Work::new(work::rules_limit(0, 0));
-        assert_eq!(
-            matcher
-                .select("src/aa.rs", &mut work, &mut || Ok(()))
-                .unwrap(),
-            Some("winner")
-        );
-        assert_eq!(matcher.relations.len(), 3);
-        let compiled_work = work.used;
-        assert_eq!(
-            matcher
-                .select("src/aaa.rs", &mut work, &mut || Ok(()))
-                .unwrap(),
-            Some("winner")
-        );
-        assert_eq!(work.used - compiled_work, 3);
-        // The first three checks inspect matches; the fourth visits a cached pair.
-        let mut checks = 0;
-        let error = matcher
-            .select("src/aa.rs", &mut work, &mut || {
-                checks += 1;
-                ensure!(checks < 4, "cancelled");
-                Ok(())
-            })
-            .unwrap_err();
-        assert_eq!(error.to_string(), "cancelled");
-        let error = matcher
-            .select("src/aa.rs", &mut Work::new(0), &mut || Ok(()))
-            .unwrap_err();
-        assert!(error.to_string().contains("bounded_work"));
-    }
-}
+mod specificity_tests;
 
 #[cfg(test)]
-mod portable_exception_tests {
-    use super::*;
-
-    #[test]
-    fn portable_scope_scan_is_cancellable_and_shares_existing_work_limit() {
-        let config = parse("version=1\n[[exceptions]]\nrule='$layers'\ntarget={language='rust',path='a.rs'}\ndestination={language='rust',path='b.rs'}\nreason='Reviewed'").unwrap();
-        let snapshot = Snapshot {
-            pin: crate::model::IndexPin {
-                index_generation: uuid::Uuid::nil(),
-                index_revision: 1,
-            },
-            documents: Vec::new(),
-            manifests: vec![crate::references::external::ManifestInput {
-                source_set_id: "one".into(),
-                native_revision_id: "revision".into(),
-                dependency_hash: "hash".into(),
-                path: "Cargo.toml".into(),
-                content_hash: None,
-                bytes: None,
-            }],
-            root_tsconfig: None,
-            evidence_gaps: Default::default(),
-        };
-        let error = portable_source_set(
-            &config,
-            &snapshot,
-            &mut Work::new(work::rules_limit(0, 0)),
-            &mut || anyhow::bail!("cancelled"),
-        )
-        .unwrap_err();
-        assert_eq!(error.to_string(), "cancelled");
-        let error =
-            portable_source_set(&config, &snapshot, &mut Work::new(0), &mut || Ok(())).unwrap_err();
-        assert!(error.to_string().contains("bounded_work"));
-        let mut work = Work {
-            used: 17,
-            limit: work::rules_limit(0, 0),
-        };
-        assert_eq!(
-            portable_source_set(&config, &snapshot, &mut work, &mut || Ok(())).unwrap(),
-            Some("one")
-        );
-        assert_eq!(work.used, 18);
-        let declarations_only = parse("version=1").unwrap();
-        assert_eq!(
-            portable_source_set(
-                &declarations_only,
-                &snapshot,
-                &mut work,
-                &mut || anyhow::bail!("should not scan")
-            )
-            .unwrap(),
-            None
-        );
-        assert_eq!(work.used, 18);
-    }
-}
+mod portable_exception_tests;
 
 #[cfg(test)]
-mod document_parallel_tests {
-    use super::*;
-    use crate::references::DocumentInput;
-    use std::sync::{Arc, Mutex, atomic::AtomicBool};
-
-    fn snapshot(files: &[(&str, &str)]) -> Snapshot {
-        let root = tempfile::tempdir().unwrap();
-        for (path, text) in files {
-            let path = root.path().join(path);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, text).unwrap();
-        }
-        let identity =
-            crate::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
-                .unwrap();
-        let (graph, native) = crate::indexer::index_workspace_with_native(
-            &crate::indexer::IndexOptions::new(root.path().to_owned()),
-            &identity.record_id,
-            &Arc::new(AtomicBool::new(false)),
-            |_| {},
-        )
-        .unwrap();
-        let documents = graph
-            .files
-            .into_iter()
-            .map(|file| {
-                let key = native
-                    .revision
-                    .documents
-                    .iter()
-                    .find(|d| d.key.path == file.path)
-                    .unwrap()
-                    .key
-                    .clone();
-                let declarations = native
-                    .declarations
-                    .iter()
-                    .filter(|d| d.document == key)
-                    .cloned()
-                    .collect();
-                let calls = native
-                    .calls
-                    .iter()
-                    .filter(|c| c.document == key)
-                    .cloned()
-                    .collect();
-                DocumentInput {
-                    semantic: Default::default(),
-                    key,
-                    file,
-                    declarations,
-                    calls,
-                }
-            })
-            .collect();
-        Snapshot {
-            pin: crate::model::IndexPin {
-                index_generation: uuid::Uuid::new_v4(),
-                index_revision: 4,
-            },
-            documents,
-            manifests: vec![],
-            root_tsconfig: None,
-            evidence_gaps: Default::default(),
-        }
-    }
-
-    fn fixture() -> (Config, Snapshot) {
-        let config = parse("version=1\n[roles.child]\nselect={name='Child',extends='Base'}\n[[rules]]\nid='inheritance'\nfor_each='child'\nrequire=[{calls='child'}]\n").unwrap();
-        let snapshot = snapshot(&[
-            ("A.java", "class Child extends Base { void run() {} }"),
-            ("B.java", "class Child extends Base { void run() {} }"),
-        ]);
-        assert_eq!(snapshot.documents.len(), 2);
-        (config, snapshot)
-    }
-
-    #[test]
-    fn detached_rule_proof_retains_historical_basis_and_revision() {
-        let metadata = BTreeMap::from([
-            (
-                "projection".into(),
-                json!({"currentPin":{"indexRevision":4},"semanticBasisPin":{"indexRevision":3},"basisNativeRevisionId":"basis-native","semanticStatus":"olderBasis"}),
-            ),
-            ("historicalFreshness".into(), json!("fresh")),
-            ("freshness".into(), json!("possiblyStale")),
-            (
-                "basis".into(),
-                json!({"artifactHash":"artifact","revisionId":"capture-native"}),
-            ),
-        ]);
-        let proof = semantic_evidence(
-            json!({"revisionId":"current-native","kind":"semanticBinding"}),
-            &metadata,
-        );
-        assert_eq!(proof["revisionId"], "basis-native");
-        assert_eq!(proof["freshness"], "possiblyStale");
-        assert_eq!(proof["historicalFreshness"], "fresh");
-        assert_eq!(proof["basis"]["revisionId"], "capture-native");
-    }
-
-    #[test]
-    fn historical_complete_coverage_never_proves_forbidden_call_absence() {
-        let config = parse("version=1\n[roles.all]\nselect={name='*'}\n[[rules]]\nid='no-calls'\nfor_each='all'\nforbid=[{calls='all'}]\n").unwrap();
-        let mut snapshot = snapshot(&[("src/lib.rs", "pub fn run() {}")]);
-        let doc = &mut snapshot.documents[0];
-        doc.semantic.producer_id = Some("producer".into());
-        doc.semantic.complete = true;
-        doc.semantic.projection = Some(crate::model::SemanticProjection {
-            current_pin: snapshot.pin,
-            semantic_basis_pin: crate::model::IndexPin {
-                index_revision: snapshot.pin.index_revision - 1,
-                ..snapshot.pin
-            },
-            basis_native_revision_id: "basis-native".into(),
-            semantic_status: crate::model::SemanticStatus::OlderBasis,
-        });
-        let base = prepare(&config, &snapshot, &mut || Ok(())).unwrap();
-        assert!(!base.declarations.is_empty());
-        for row in &base.declarations {
-            assert_eq!(row["status"], "unknown");
-            assert_eq!(
-                row["constraints"][0]["unresolved"][0],
-                "historical_semantic_absence_unproven"
-            );
-            assert_eq!(
-                row["constraints"][0]["projection"]["semanticStatus"],
-                "olderBasis"
-            );
-        }
-    }
-
-    /// #556: rows prepared for every document select what a scoped evaluation returns.
-    #[test]
-    fn prepared_rows_select_what_a_scoped_evaluation_returns() {
-        let snapshot = snapshot(&[
-            ("src/lib.rs", "mod a; mod b;"),
-            ("src/a.rs", "pub fn a() {}"),
-            ("src/b.rs", "pub fn b() { crate::a::a(); }"),
-        ]);
-        let config = parse(
-            "version=1\n[layers.high]\norder=1\npaths=['src/b.rs']\n\
-             [layers.low]\norder=2\npaths=['src/a.rs']\n\
-             [roles.handler]\nselect={paths=['src/**'],name='*'}\n\
-             [roles.target]\nselect={paths=['src/a.rs']}\n\
-             [[rules]]\nid='calls'\nfor_each='handler'\nrequire=[{calls='target'}]\n",
-        )
-        .unwrap();
-        let prepared = prepare(&config, &snapshot, &mut || Ok(())).unwrap();
-        assert!(!prepared.declarations.is_empty());
-        for paths in [
-            vec![],
-            vec!["src/a.rs".to_owned()],
-            vec!["src/b.rs".to_owned()],
-            vec!["missing/**".to_owned()],
-        ] {
-            let refs = crate::references::project(&snapshot, &paths, 5, &mut || Ok(())).unwrap();
-            let scoped = evaluate(&config, &snapshot, &refs, &paths, &mut || Ok(())).unwrap();
-            let selected = evaluate_prepared(&config, &prepared, &refs, &paths, &mut || Ok(()))
-                .unwrap()
-                .data;
-            assert_eq!(scoped, selected, "{paths:?}");
-        }
-    }
-
-    #[test]
-    fn document_work_overlaps_but_rows_and_counts_are_admitted_in_order() {
-        let (config, snapshot) = fixture();
-        let documents: Vec<_> = snapshot.documents.iter().collect();
-        let targets = Targets::new();
-        let evaluation = DocumentEvaluation {
-            config: &config,
-            targets: &targets,
-            inheritance: true,
-            source_set: None,
-            before_document: None,
-        };
-        let mut serial_work = Work::new(work::rules_limit(2, 0));
-        let serial = evaluation
-            .run(&documents, &mut serial_work, 1, &mut || Ok(()))
-            .unwrap();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let rx = Mutex::new(rx);
-        let first = &documents[0].key.path;
-        let mut parallel_work = Work::new(serial_work.limit);
-        let hook = |doc: &DocumentInput| {
-            if &doc.key.path == first {
-                rx.lock().unwrap().recv().unwrap();
-            } else {
-                tx.send(()).unwrap();
-            }
-        };
-        let parallel = DocumentEvaluation {
-            before_document: Some(&hook),
-            ..evaluation
-        }
-        .run(&documents, &mut parallel_work, 4, &mut || Ok(()))
-        .unwrap();
-        assert!(!serial.0.is_empty());
-        assert_eq!(
-            serde_json::to_vec(&serial).unwrap(),
-            serde_json::to_vec(&parallel).unwrap()
-        );
-        assert_eq!(serial_work.used, parallel_work.used);
-        assert!(serial_work.used > 0);
-
-        // Each file fits locally, but the sum exceeds the single request allowance.
-        let per_file = evaluate_document(
-            &config,
-            &targets,
-            documents[0],
-            true,
-            None,
-            serial_work.limit,
-            &mut || Ok(()),
-        )
-        .unwrap();
-        assert!(per_file.work.used > 0 && per_file.work.used < serial_work.used);
-        for workers in [1, 4] {
-            let mut work = Work::new(serial_work.used - 1);
-            let error = evaluation
-                .run(&documents, &mut work, workers, &mut || Ok(()))
-                .unwrap_err();
-            assert!(error.to_string().starts_with("bounded_work:"));
-        }
-    }
-
-    #[derive(Debug)]
-    struct Deadline;
-    impl std::fmt::Display for Deadline {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("deadline_exceeded")
-        }
-    }
-    impl std::error::Error for Deadline {}
-
-    #[test]
-    fn worker_callback_error_is_preserved_without_rows() {
-        let (config, snapshot) = fixture();
-        let documents: Vec<_> = snapshot.documents.iter().collect();
-        let targets = Targets::new();
-        let evaluation = DocumentEvaluation {
-            config: &config,
-            targets: &targets,
-            inheritance: true,
-            source_set: None,
-            before_document: None,
-        };
-        let stopped = AtomicBool::new(false);
-        let mut callback = || {
-            if stopped.load(std::sync::atomic::Ordering::Acquire) {
-                Err(Deadline.into())
-            } else {
-                Ok(())
-            }
-        };
-        let hook = |_: &DocumentInput| {
-            stopped.store(true, std::sync::atomic::Ordering::Release);
-        };
-        let error = DocumentEvaluation {
-            before_document: Some(&hook),
-            ..evaluation
-        }
-        .run(
-            &documents,
-            &mut Work::new(work::rules_limit(2, 0)),
-            2,
-            &mut callback,
-        )
-        .unwrap_err();
-        assert!(error.downcast_ref::<Deadline>().is_some());
-    }
-}
+mod document_parallel_tests;
 
 #[cfg(test)]
-mod display_tests {
-    use super::*;
-
-    #[test]
-    fn layer_display_hint_is_optional_and_passed_to_the_browser_inventory() {
-        let config = parse("version=1\n[layers.a]\norder=1\npaths=['a/**']\ndisplay='expanded'\n[layers.b]\norder=2\npaths=['b/**']\ndisplay='collapsed'\n[layers.c]\nshared=true\npaths=['c/**']\ndisplay='hidden'\n[layers.d]\norder=3\npaths=['d/**']\n").unwrap();
-        let layers = view_layers(&config);
-        let display: Vec<_> = layers.iter().map(|l| l["display"].clone()).collect();
-        assert_eq!(
-            display,
-            [
-                json!("expanded"),
-                json!("collapsed"),
-                json!("hidden"),
-                Value::Null
-            ]
-        );
-    }
-
-    #[test]
-    fn view_layers_carry_the_authored_app_and_apps_or_null() {
-        let config = parse("version=1\n[layers.a]\napp='svc'\norder=1\npaths=['a/**']\n[layers.b]\napps=['svc','ui']\nshared=true\npaths=['b/**']\n[layers.c]\norder=2\npaths=['c/**']\n").unwrap();
-        let layers = view_layers(&config);
-        let field = |key: &str| -> Vec<Value> { layers.iter().map(|l| l[key].clone()).collect() };
-        assert_eq!(field("app"), [json!("svc"), Value::Null, Value::Null]);
-        assert_eq!(
-            field("apps"),
-            [Value::Null, json!(["svc", "ui"]), Value::Null]
-        );
-    }
-
-    #[test]
-    fn layer_display_hint_leaves_assignment_inputs_unchanged() {
-        let plain = parse("version=1\n[layers.a]\norder=1\npaths=['a/**']\n").unwrap();
-        let hinted =
-            parse("version=1\n[layers.a]\norder=1\npaths=['a/**']\ndisplay='hidden'\n").unwrap();
-        let shape = |c: &Config| {
-            c.layers
-                .iter()
-                .map(|(n, l)| (n.clone(), l.order, l.patterns.len(), l.external.len()))
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(shape(&plain), shape(&hinted));
-    }
-
-    #[test]
-    fn unknown_layer_display_value_is_a_located_typed_error() {
-        let text = "version=1\n[layers.a]\norder=1\npaths=['a/**']\ndisplay='folded'\n";
-        let Err(error) = parse(text) else {
-            panic!("unknown display value must be refused")
-        };
-        let found = diagnostic(&error).expect("typed rules diagnostic");
-        assert_eq!(found["code"], "invalid_rules");
-        assert_eq!(found["kind"], "schema");
-        assert_eq!(found["line"], 5);
-        assert_eq!(
-            found["message"],
-            "layer display must be expanded, collapsed or hidden"
-        );
-        let Err(error) = parse("version=1\n[layers.a]\norder=1\npaths=['a/**']\ndisplay=true\n")
-        else {
-            panic!("non-string display value must be refused")
-        };
-        assert_eq!(diagnostic(&error).expect("typed")["code"], "invalid_rules");
-    }
-}
+mod display_tests;
 
 #[cfg(test)]
-mod app_scope_tests {
-    use super::*;
-    use crate::apps::{App, AppKind, Candidates, Outcome};
-
-    fn app(name: &str, kind: AppKind, root: &str) -> App {
-        App::detected(name.into(), kind, &format!("{root}/manifest"), vec![])
-    }
-
-    const TWO_APPS: &str = "version=1\n[layers.up]\napp='svc'\norder=1\npaths=['svc/**']\n[layers.web]\napp='ui'\norder=1\npaths=['ui/**']\n[layers.base]\nshared=true\napps=['svc']\npaths=['base/**']\n";
-
-    #[test]
-    fn a_python_app_validates() {
-        let config = parse(TWO_APPS).unwrap();
-        let apps = [
-            app("svc", AppKind::Python, "svc"),
-            app("ui", AppKind::Npm, "ui"),
-        ];
-        validate_apps(&config, &apps).unwrap();
-    }
-
-    #[test]
-    fn scope_layer_share_and_file() {
-        let config = parse(TWO_APPS).unwrap();
-        let apps = [
-            app("svc", AppKind::Cargo, "svc"),
-            app("ui", AppKind::Npm, "ui"),
-        ];
-        let scope = AppScope::new(&config, &apps);
-        assert_eq!(scope.layer("up"), BTreeSet::from([0]));
-        assert_eq!(scope.layer("base"), BTreeSet::from([0]));
-        assert!(scope.share("up", "base"));
-        assert!(!scope.share("web", "base"));
-        assert!(!scope.share("up", "web"));
-        assert_eq!(scope.file("ui/x.js", Some("up")), Some(0));
-        assert_eq!(scope.file("ui/x.js", None), Some(1));
-        assert_eq!(scope.file("other/x", None), None);
-        let none = AppScope::new(&config, &[]);
-        assert_eq!(none.file("ui/x.js", None), None);
-        assert!(none.share("up", "web"));
-    }
-
-    #[test]
-    fn a_repeated_app_is_located_at_the_repeat() {
-        let text = "version=1\n[layers.s]\nshared=true\napps=[\n'x',\n'x'\n]\npaths=['a']\n";
-        let d = diagnostic(&parse(text).err().unwrap()).unwrap();
-        assert_eq!(d["kind"], "schema");
-        assert_eq!(d["line"], 6);
-    }
-
-    #[test]
-    fn too_many_apps_are_too_large_at_the_extra_entry() {
-        let entries: String = (0..=COLLECTION_LIMIT)
-            .map(|i| format!("'a{i}',\n"))
-            .collect();
-        let text = format!("version=1\n[layers.s]\nshared=true\napps=[\n{entries}]\npaths=['a']\n");
-        let d = diagnostic(&parse(&text).err().unwrap()).unwrap();
-        assert_eq!(d["kind"], "too_large");
-        assert_eq!(d["line"], 5 + COLLECTION_LIMIT);
-    }
-
-    /// #855: a wrapper's `app` names an effective app. A known app validates; an unknown or
-    /// shared name is a located error at the `app` value, checked where apps are resolved.
-    #[test]
-    fn a_wrapper_app_names_an_effective_app() {
-        let apps = [
-            app("svc", AppKind::Cargo, "svc"),
-            app("ui", AppKind::Npm, "ui"),
-        ];
-        let known = parse(&format!(
-            "{TWO_APPS}[[interfaces.wrappers]]\ncallee='api2'\napp='ui'\n"
-        ))
-        .unwrap();
-        assert_eq!(
-            known.interface_wrappers()[0]
-                .app
-                .as_ref()
-                .map(|(name, _)| name.as_str()),
-            Some("ui")
-        );
-        assert_eq!(known.interface_wrappers()[0].root, ".");
-        validate_apps(&known, &apps).unwrap();
-        let unknown = parse(&format!(
-            "{TWO_APPS}[[interfaces.wrappers]]\ncallee='api2'\napp='admin'\n"
-        ))
-        .unwrap();
-        let d = diagnostic(&validate_apps(&unknown, &apps).unwrap_err()).unwrap();
-        assert_eq!(d["kind"], "reference");
-        assert_eq!(d["line"], 16, "{d}");
-        assert!(
-            d["message"]
-                .as_str()
-                .unwrap()
-                .contains("names app admin, which is not detected or authored (apps: svc, ui)"),
-            "{d}"
-        );
-        let twins = [
-            app("ui", AppKind::Npm, "ui"),
-            app("ui", AppKind::Npm, "other"),
-            app("svc", AppKind::Cargo, "svc"),
-        ];
-        let d = diagnostic(&validate_apps(&known, &twins).unwrap_err()).unwrap();
-        assert_eq!(d["kind"], "ambiguity", "{d}");
-    }
-
-    /// #855 review: assigning files to apps for app-scoped wrappers charges every path's scan
-    /// of the layer patterns, so a budget below paths x patterns fails typed `bounded_work`.
-    #[test]
-    fn file_apps_charges_each_path_pattern_scan() {
-        let config = parse(TWO_APPS).unwrap();
-        let base = RulesBase {
-            apps: vec![
-                app("svc", AppKind::Cargo, "svc"),
-                app("ui", AppKind::Npm, "ui"),
-            ],
-            limit: 0,
-            source_set: None,
-            semantic: false,
-            declarations: vec![],
-            test_declarations: vec![],
-            work_used: 0,
-            unread_manifests: 0,
-        };
-        let paths = ["ui/a.js", "svc/b.js", "other/c.js"];
-        let scans = paths.len() * 3;
-        for limit in [0, scans - 1] {
-            let error = file_apps(&config, &base, paths, &mut Work::new(limit), &mut || Ok(()))
-                .unwrap_err();
-            assert_eq!(
-                error.to_string(),
-                "bounded_work: layer assignment pattern budget",
-                "{limit}"
-            );
-        }
-        let mut work = Work::new(scans);
-        let assigned = file_apps(&config, &base, paths, &mut work, &mut || Ok(())).unwrap();
-        assert_eq!(assigned.get("ui/a.js").map(String::as_str), Some("ui"));
-        assert_eq!(assigned.get("svc/b.js").map(String::as_str), Some("svc"));
-        assert_eq!(work.used, scans);
-    }
-
-    /// #855: `root` and `app` are exclusive, a blank app is invalid, and a callee is authored
-    /// once per app.
-    #[test]
-    fn a_wrapper_scope_is_root_or_app() {
-        for (body, kind, line, needle) in [
-            (
-                "[[interfaces.wrappers]]\ncallee='a'\nroot='web'\napp='web'\n",
-                "schema",
-                5,
-                "either root or app",
-            ),
-            (
-                "[[interfaces.wrappers]]\ncallee='a'\napp=' '\n",
-                "schema",
-                4,
-                "blank",
-            ),
-            (
-                "[[interfaces.wrappers]]\ncallee='a'\napp='web'\n[[interfaces.wrappers]]\ncallee='a'\napp='web'\n",
-                "ambiguity",
-                6,
-                "twice for app web",
-            ),
-        ] {
-            let d = located(&format!("version=1\n{body}"));
-            assert_eq!(d["kind"], kind, "{body}: {d}");
-            assert_eq!(d["line"], line, "{body}: {d}");
-            assert!(
-                d["message"].as_str().unwrap().contains(needle),
-                "{body}: {d}"
-            );
-        }
-        parse("version=1\n[[interfaces.wrappers]]\ncallee='a'\napp='web'\n[[interfaces.wrappers]]\ncallee='a'\nroot='web'\n[[interfaces.wrappers]]\ncallee='a'\n").unwrap();
-    }
-
-    #[test]
-    fn the_first_bad_layer_in_name_order_wins() {
-        let text = "version=1\n[layers.zeta]\napp='nope'\norder=1\npaths=['z']\n[layers.alpha]\napp='nada'\norder=2\npaths=['a']\n";
-        let config = parse(text).unwrap();
-        let apps = [app("svc", AppKind::Cargo, "svc")];
-        let d = diagnostic(&validate_apps(&config, &apps).unwrap_err()).unwrap();
-        assert_eq!(d["kind"], "reference");
-        assert_eq!(d["line"], 7);
-    }
-
-    #[test]
-    fn scope_names_the_app_of_a_file_index() {
-        let config = parse(TWO_APPS).unwrap();
-        let apps = [
-            app("svc", AppKind::Cargo, "svc"),
-            app("ui", AppKind::Npm, "ui"),
-        ];
-        let scope = AppScope::new(&config, &apps);
-        let index = scope.file("ui/x.js", None).unwrap();
-        assert_eq!(scope.name(index), Some("ui"));
-        assert_eq!(scope.name(2), None);
-    }
-
-    #[test]
-    fn app_keys_are_checked_syntactically() {
-        for (extra, line) in [
-            ("[layers.s]\nshared=true\napp='x'\npaths=['a']\n", 4),
-            ("[layers.s]\norder=1\napps=['x']\npaths=['a']\n", 4),
-            ("[layers.s]\norder=1\napp=' '\npaths=['a']\n", 4),
-            ("[layers.s]\nshared=true\napps=[]\npaths=['a']\n", 4),
-        ] {
-            let error = parse(&format!("version=1\n{extra}")).err().unwrap();
-            let d = diagnostic(&error).unwrap();
-            assert_eq!(d["kind"], "schema", "{extra}");
-            assert_eq!(d["line"], line, "{extra}");
-        }
-    }
-
-    fn located(text: &str) -> Value {
-        diagnostic(&parse(text).err().expect("invalid rules")).unwrap()
-    }
-
-    /// #855: `[[interfaces.wrappers]]` parse in written order, with their defaults and an
-    /// optional root.
-    #[test]
-    fn interface_wrappers_parse_with_defaults_and_roots() {
-        let config = parse(
-            "version=1\n[[interfaces.wrappers]]\ncallee='apiFetch'\nprefix='/api'\nroot='web'\n\
-             [[interfaces.wrappers]]\ncallee='client.send'\nmethod='argument'\nat=2\n",
-        )
-        .unwrap();
-        assert_eq!(
-            config.interface_wrappers(),
-            [
-                InterfaceWrapper {
-                    callee: "apiFetch".into(),
-                    method: WrapperMethod::Options(1),
-                    prefix: Some("/api".into()),
-                    root: "web".into(),
-                    app: None,
-                },
-                InterfaceWrapper {
-                    callee: "client.send".into(),
-                    method: WrapperMethod::Argument(2),
-                    prefix: None,
-                    root: ".".into(),
-                    app: None,
-                },
-            ]
-        );
-        // The same callee may be authored once per root.
-        parse("version=1\n[[interfaces.wrappers]]\ncallee='api2'\n[[interfaces.wrappers]]\ncallee='api2'\nroot='web'\n").unwrap();
-        assert!(
-            parse("version=1\n")
-                .unwrap()
-                .interface_wrappers()
-                .is_empty()
-        );
-        assert!(
-            parse("version=1\n[interfaces]\n")
-                .unwrap()
-                .interface_wrappers()
-                .is_empty()
-        );
-    }
-
-    /// #855: an invalid wrapper is a located rules error, never a silent omission.
-    #[test]
-    fn interface_wrapper_errors_are_located() {
-        for (body, kind, line, needle) in [
-            (
-                "[[interfaces.wrappers]]\nprefix='/api'\n",
-                "schema",
-                2,
-                "requires callee",
-            ),
-            (
-                "[[interfaces.wrappers]]\ncallee='a.b.c'\n",
-                "schema",
-                3,
-                "identifier",
-            ),
-            (
-                "[[interfaces.wrappers]]\ncallee='9a'\n",
-                "schema",
-                3,
-                "identifier",
-            ),
-            (
-                "[[interfaces.wrappers]]\ncallee='a'\nmethod='body'\n",
-                "schema",
-                4,
-                "options",
-            ),
-            (
-                "[[interfaces.wrappers]]\ncallee='a'\nat=0\n",
-                "schema",
-                4,
-                "1 to 8",
-            ),
-            (
-                "[[interfaces.wrappers]]\ncallee='a'\nat=9\n",
-                "schema",
-                4,
-                "1 to 8",
-            ),
-            (
-                "[[interfaces.wrappers]]\ncallee='a'\nprefix='api'\n",
-                "schema",
-                4,
-                "prefix",
-            ),
-            (
-                "[[interfaces.wrappers]]\ncallee='a'\nprefix='/a?b'\n",
-                "schema",
-                4,
-                "prefix",
-            ),
-            (
-                "[[interfaces.wrappers]]\ncallee='a'\nroot='../web'\n",
-                "schema",
-                4,
-                "wrapper root",
-            ),
-            (
-                "[[interfaces.wrappers]]\ncallee='a'\nkind='x'\n",
-                "schema",
-                4,
-                "kind",
-            ),
-            ("[interfaces]\ncallees=['a']\n", "schema", 3, "callees"),
-            (
-                "[[interfaces.wrappers]]\ncallee='a'\n[[interfaces.wrappers]]\ncallee='a'\n",
-                "ambiguity",
-                5,
-                "twice",
-            ),
-        ] {
-            let d = located(&format!("version=1\n{body}"));
-            assert_eq!(d["kind"], kind, "{body}: {d}");
-            assert_eq!(d["line"], line, "{body}: {d}");
-            assert!(
-                d["message"].as_str().unwrap().contains(needle),
-                "{body}: {d}"
-            );
-        }
-        let many: String = (0..65)
-            .map(|at| format!("[[interfaces.wrappers]]\ncallee='w{at}'\n"))
-            .collect();
-        assert_eq!(located(&format!("version=1\n{many}"))["kind"], "too_large");
-    }
-
-    /// #794: `[apps.<name>]` tables parse in name order, each with its roots.
-    #[test]
-    fn authored_apps_parse_in_name_order() {
-        let config = parse(
-            "version=1\n[apps.web]\nroots=['client', 'shared/ui']\n[apps.backend]\nroots=['.']\n",
-        )
-        .unwrap();
-        assert_eq!(config.authored_app_count(), 2);
-        let apps = config.authored_apps();
-        assert_eq!(apps[0].name, "backend");
-        assert_eq!(apps[0].roots, ["."]);
-        assert_eq!(apps[1].name, "web");
-        assert_eq!(apps[1].roots, ["client", "shared/ui"]);
-        assert_eq!(apps[1].source, crate::apps::AppSource::Override);
-        assert_eq!(parse("version=1\n").unwrap().authored_app_count(), 0);
-    }
-
-    /// #794: each schema error of an authored app is located at its token.
-    #[test]
-    fn authored_app_schema_errors_are_located() {
-        for (body, line, needle) in [
-            ("[apps.api]\n", 2, "requires roots"),
-            ("[apps.api]\nroots=[]\n", 3, "at least one root"),
-            ("[apps.api]\nroots='server'\n", 3, ""),
-            ("[apps.api]\nroots=[\n1\n]\n", 4, ""),
-            ("[apps.api]\nroots=['server']\nkind='npm'\n", 4, "kind"),
-            (
-                "[apps.api]\nroots=['server']\nentries=['main']\n",
-                4,
-                "entries",
-            ),
-            ("[apps.\" \"]\nroots=['server']\n", 2, "blank"),
-            ("[apps.api]\nroots=[\n'server',\n'server'\n]\n", 5, "twice"),
-        ] {
-            let d = located(&format!("version=1\n{body}"));
-            assert_eq!(d["kind"], "schema", "{body}");
-            assert_eq!(d["line"], line, "{body}: {d}");
-            assert!(
-                d["message"].as_str().unwrap().contains(needle),
-                "{body}: {d}"
-            );
-        }
-    }
-
-    /// #794: a root must be `.` or a literal checkout-relative directory; one outside the
-    /// checkout, absolute, globbed or unnormalised is a located schema error.
-    #[test]
-    fn an_invalid_root_is_a_schema_error_at_the_root() {
-        for root in [
-            "", "/srv", "srv/", "../srv", "srv/../x", "./srv", "srv/./x", "a//b", "srv/*",
-            "srv/**", "s?v", "[s]rv", "{a,b}", "!srv", "srv\\\\x", "c:/srv", "..",
-        ] {
-            let text = format!(
-                "version=1\n[apps.api]\nroots=[\n'ok',\n{}\n]\n",
-                toml::Value::String(root.into())
-            );
-            let d = located(&text);
-            assert_eq!(d["kind"], "schema", "{root:?}");
-            assert_eq!(d["line"], 5, "{root:?}");
-            assert!(
-                d["message"].as_str().unwrap().contains("app root"),
-                "{root:?}"
-            );
-        }
-    }
-
-    /// #794 D3: the same root in two authored apps is an ambiguity at its second occurrence;
-    /// nested roots are allowed.
-    #[test]
-    fn an_identical_root_in_two_apps_is_an_ambiguity_and_nesting_is_not() {
-        let d =
-            located("version=1\n[apps.api]\nroots=['srv']\n[apps.web]\nroots=[\n'ui',\n'srv'\n]\n");
-        assert_eq!(d["kind"], "ambiguity");
-        assert_eq!(d["line"], 7);
-        assert!(
-            d["message"].as_str().unwrap().contains("api and web"),
-            "{d}"
-        );
-        parse("version=1\n[apps.api]\nroots=['.']\n[apps.web]\nroots=['ui', 'ui/inner']\n[apps.inner]\nroots=['ui/inner/x']\n").unwrap();
-    }
-
-    #[test]
-    fn too_many_authored_apps_or_roots_are_too_large() {
-        let roots: String = (0..=COLLECTION_LIMIT)
-            .map(|i| format!("'r{i}',\n"))
-            .collect();
-        let d = located(&format!("version=1\n[apps.api]\nroots=[\n{roots}]\n"));
-        assert_eq!(d["kind"], "too_large");
-        assert_eq!(d["line"], 4 + COLLECTION_LIMIT);
-        let apps: String = (0..=COLLECTION_LIMIT)
-            .map(|i| format!("[apps.a{i}]\nroots=['r{i}']\n"))
-            .collect();
-        let d = located(&format!("version=1\n{apps}"));
-        assert_eq!(d["kind"], "too_large");
-    }
-
-    fn documents<'a>(paths: &[&'a str]) -> BTreeSet<&'a str> {
-        paths.iter().copied().collect()
-    }
-
-    /// #794 D6: a root with no indexed document under it is a located reference error.
-    #[test]
-    fn an_authored_root_without_documents_is_a_reference_error() {
-        let config = parse("version=1\n[apps.api]\nroots=[\n'server',\n'gone'\n]\n").unwrap();
-        let d = diagnostic(
-            &effective_apps(&config, vec![], &documents(&["server/a.js", "gonex/b.js"]))
-                .unwrap_err(),
-        )
-        .unwrap();
-        assert_eq!(d["kind"], "reference");
-        assert_eq!(d["line"], 5);
-        assert!(d["message"].as_str().unwrap().contains("gone"), "{d}");
-        let apps =
-            effective_apps(&config, vec![], &documents(&["server/a.js", "gone/b.js"])).unwrap();
-        assert_eq!(apps.len(), 1);
-        let root = parse("version=1\n[apps.all]\nroots=['.']\n").unwrap();
-        assert!(effective_apps(&root, vec![], &documents(&[])).is_err());
-        effective_apps(&root, vec![], &documents(&["a.rs"])).unwrap();
-    }
-
-    /// #794 D4: an authored name equal to a detected app that survives is an ambiguity at the
-    /// authored table; the same name on a shadowed app is a rename.
-    #[test]
-    fn an_authored_name_clashing_with_a_surviving_detected_app_is_an_ambiguity() {
-        let detected = vec![
-            app("svc", AppKind::Cargo, "svc"),
-            app("ui", AppKind::Npm, "ui"),
-        ];
-        let docs = documents(&["svc/main.rs", "ui/a.js", "cli/a.rs"]);
-        let clash = parse("version=1\n[apps.svc]\nroots=['cli']\n").unwrap();
-        let d = diagnostic(&effective_apps(&clash, detected.clone(), &docs).unwrap_err()).unwrap();
-        assert_eq!(d["kind"], "ambiguity");
-        assert_eq!(d["line"], 2);
-        assert!(
-            d["message"].as_str().unwrap().contains("svc/manifest"),
-            "{d}"
-        );
-        let rename =
-            parse("version=1\n[apps.service]\nroots=['svc']\n[apps.ui]\nroots=['ui']\n").unwrap();
-        let apps = effective_apps(&rename, detected, &docs).unwrap();
-        let names: Vec<&str> = apps.iter().map(|app| app.name.as_str()).collect();
-        assert_eq!(names, ["service", "ui"]);
-        assert!(
-            apps.iter()
-                .all(|app| app.source == crate::apps::AppSource::Override)
-        );
-    }
-
-    /// #794: a layer names an effective app; a detected app an authored root shadows can no
-    /// longer be named.
-    #[test]
-    fn layers_name_effective_apps_only() {
-        let text = "version=1\n[apps.service]\nroots=['svc']\n[layers.up]\napp='svc'\norder=1\npaths=['svc/**']\n[layers.web]\napp='ui'\norder=1\npaths=['ui/**']\n";
-        let config = parse(text).unwrap();
-        let detected = vec![
-            app("svc", AppKind::Cargo, "svc"),
-            app("ui", AppKind::Npm, "ui"),
-        ];
-        let apps =
-            effective_apps(&config, detected, &documents(&["svc/main.rs", "ui/a.js"])).unwrap();
-        let d = diagnostic(&validate_apps(&config, &apps).unwrap_err()).unwrap();
-        assert_eq!(d["kind"], "reference");
-        assert_eq!(d["line"], 5);
-        assert!(
-            d["message"].as_str().unwrap().contains("service, ui"),
-            "{d}"
-        );
-    }
-
-    /// #794: with a rules file the prompt lists the effective inventory, unchecked against
-    /// the snapshot.
-    #[test]
-    fn prompt_apps_list_authored_apps_first_and_drop_shadowed_ones() {
-        let candidates = Candidates {
-            manifests: vec![
-                candidate("svc", AppKind::Cargo, "svc/Cargo.toml"),
-                candidate("ui", AppKind::Npm, "ui/package.json"),
-            ],
-        };
-        let config = parse("version=1\n[apps.web]\nroots=['ui', 'gone']\n").unwrap();
-        let rows = prompt_apps(Some(&config), &candidates, &mut || Ok(())).unwrap();
-        assert_eq!(
-            rows,
-            vec![
-                json!({"name":"web","source":"override","kind":null,"manifest":null,"roots":["ui","gone"],"entries":[]}),
-                json!({"name":"svc","source":"manifest","kind":"cargo","manifest":"svc/Cargo.toml","roots":["svc"],"entries":["src/main.rs"]}),
-            ]
-        );
-    }
-
-    fn candidate(name: &str, kind: AppKind, manifest: &str) -> (String, Outcome) {
-        let app = App::detected(name.into(), kind, manifest, vec!["src/main.rs".into()]);
-        (manifest.into(), Outcome::App(app))
-    }
-
-    #[test]
-    fn prompt_apps_list_every_manifest_without_rules() {
-        let candidates = Candidates {
-            manifests: vec![
-                candidate("svc", AppKind::Cargo, "svc/Cargo.toml"),
-                ("tools/package.json".into(), Outcome::NotApp),
-                candidate("ui", AppKind::Npm, "ui/package.json"),
-                ("bad/package.json".into(), Outcome::Unread),
-            ],
-        };
-        let rows = prompt_apps(None, &candidates, &mut || Ok(())).unwrap();
-        assert_eq!(
-            rows,
-            vec![
-                json!({"name":"svc","source":"manifest","kind":"cargo","manifest":"svc/Cargo.toml","roots":["svc"],"entries":["src/main.rs"]}),
-                json!({"name":"ui","source":"manifest","kind":"npm","manifest":"ui/package.json","roots":["ui"],"entries":["src/main.rs"]}),
-            ]
-        );
-    }
-
-    #[test]
-    fn prompt_apps_leave_out_a_manifest_a_hidden_layer_selects() {
-        let candidates = Candidates {
-            manifests: vec![
-                candidate("svc", AppKind::Cargo, "svc/Cargo.toml"),
-                candidate("fixture", AppKind::Npm, "fixtures/package.json"),
-            ],
-        };
-        let config =
-            parse("version=1\n[layers.fix]\norder=1\ndisplay='hidden'\npaths=['fixtures/**']\n")
-                .unwrap();
-        let rows = prompt_apps(Some(&config), &candidates, &mut || Ok(())).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["name"], "svc");
-    }
-}
+mod app_scope_tests;

@@ -10,8 +10,8 @@
 //! A read waits on the owner's signal, and its wait is bounded by what the caller can afford.
 //! When that runs out it gets a typed [`ArchitectureBuilding`] with the progress so far.
 use super::DaemonState;
+use crate::architecture_core::{ArchitectureCore, ArchitectureProgress, CoreFailure};
 use crate::model::IndexPin;
-use crate::store::{ArchitectureCore, ArchitectureProgress, CoreFailure};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};

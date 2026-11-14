@@ -6,9 +6,9 @@ const {createServer} = require("node:http");
 const {resolve,join} = require("node:path");
 const {chromium} = require("playwright");
 const ROOT = resolve(__dirname,"../..");
-const files = {"/vendor/pele-1.10.0-trellis.2.js":"web/vendor/pele-1.10.0-trellis.2.js","/sequence-pele.js":"web/sequence-pele.js","/sequence.js":"web/sequence.js","/style.css":"web/style.css"};
+const files = {"/vendor/pele-1.10.0-trellis.2.js":"web/vendor/pele-1.10.0-trellis.2.js","/sequence-pele.js":"web/sequence-pele.js","/source-witness.js":"web/source-witness.js", "/sequence.js":"web/sequence.js", "/pele-svg.js":"web/pele-svg.js","/style.css":"web/style.css"};
 const fixture = language => JSON.parse(readFileSync(join(ROOT,`tests/fixtures/sequence-pele/${language}.json`)));
-const html = '<!doctype html><html><head><link rel="stylesheet" href="/style.css"><script src="/vendor/pele-1.10.0-trellis.2.js" defer></script><script src="/sequence.js" defer></script><script src="/sequence-pele.js" defer></script></head><body><p id="state"></p><div id="sequence-diagram" class="sequence-scroll"></div></body></html>';
+const html = '<!doctype html><html><head><link rel="stylesheet" href="/style.css"><script src="/vendor/pele-1.10.0-trellis.2.js" defer></script><script src="/source-witness.js" defer></script><script src="/sequence.js" defer></script><script src="/pele-svg.js" defer></script><script src="/sequence-pele.js" defer></script></head><body><p id="state"></p><div id="sequence-diagram" class="sequence-scroll"></div></body></html>';
 const policy = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'";
 let server,base,browser,page,violations;
 test.before(async()=>{
@@ -127,7 +127,7 @@ test("self targets reuse seed lane and same-name declarations keep separate exac
    [first,other].map(item=>({id:item.id,path:item.declaration.path})));
 });
 
-test("malformed, contradictory and dangling target evidence refuses Pele without fabricated legacy targets",async()=>{
+test("malformed, contradictory and dangling target evidence refuses Pele and shows the error state, with no fabricated target",async()=>{
  const cases=[
    view=>{delete view.steps[0].callEvidence;},
    view=>{delete view.steps[0].target;},
@@ -143,12 +143,9 @@ test("malformed, contradictory and dangling target evidence refuses Pele without
  ];
  for(const change of cases) {
    const view=resolvedView();change(view);
-   const outcome=await renderWithVisibleFallback(view);
-   assertVisibleFallback(outcome,[view.steps[0].id],view.steps[0].label);
-   assert.match(outcome.reason,/target|evidence|declaration/i);
-   assert.equal(await page.locator(".sequence-arrow").count(),0);
-   assert.equal(await page.locator("[data-trellis-target-id]").count(),0);
-   assert.equal(await page.locator(".sequence-participant-label").count(),1);
+   const outcome=await renderWithErrorState(view);
+   assertErrorState(outcome,/target|evidence|declaration/i);
+   assert.equal(await page.locator("[data-trellis-target-id],[data-trellis-step-id]").count(),0);
  }
  for(const enclosing of ["hidden","branch","group"]) {
    const view=resolvedView(),leaf=view.steps[0];leaf.target="not-a-participant";
@@ -172,23 +169,25 @@ test("engine boundary states remain labelled source notes without navigation tar
  assert.equal(await page.locator(".pele-actor:not(.pele-actor-footer)").count(),1);
 });
 
-test("legacy fallback preserves resolved arrows, declaration actions and original source selection",async()=>{
+// #1007: there is no second renderer. The error state is the empty state's plain line.
+test("the error state replaces a drawn diagram with one plain line and leaves the old controls inert",async()=>{
  const view=resolvedView();
- await page.evaluate(view=>{
-   const container=document.querySelector("#sequence-diagram");window.current=true;window.picks=[];window.targetPicks=[];
-   TrellisSequence.render(container,view,null,new Set(),{isCurrent:()=>window.current,onSelect:step=>window.picks.push(step),
-     onOpenTarget:(declaration,step)=>window.targetPicks.push({declaration,step,exact:declaration===view.participants.at(-1).declaration&&step===view.steps[0]})});
- },view);
- assert.equal(await page.locator(".sequence-arrow[data-trellis-call-id]").count(),1);
- assert.equal(await page.locator(".sequence-participant-label").count(),2);
- const action=page.locator(`.sequence-participant-label[data-trellis-target-id="${view.steps[0].target}"]`);
- await action.focus();await page.keyboard.press("Enter");await page.keyboard.press("Space");
- assert.equal(await page.evaluate(()=>window.targetPicks.length),2);
- assert.equal(await page.evaluate(()=>window.targetPicks.every(item=>item.exact)),true);
- const row=page.locator(`[data-source-step-id="${view.steps[0].id}"]`);await row.focus();await page.keyboard.press("Enter");
- assert.equal(await page.evaluate(()=>window.picks[0]?.callId),view.steps[0].callId);
- await page.evaluate(()=>window.current=false);await action.click({force:true});
- assert.equal(await page.evaluate(()=>window.targetPicks.length),2);
+ assert.equal((await render(view)).status,"rendered");
+ const result=await page.evaluate(()=>{
+   const container=document.querySelector("#sequence-diagram");
+   const old=[container.querySelector(".pele-edge-label[data-trellis-step-id]"),container.querySelector(".pele-actor[data-trellis-target-id]")];
+   TrellisSequence.renderError(container,'Unsupported <b>sequence</b> step');
+   for(const node of old) for(const event of [new MouseEvent("click",{bubbles:true}),new KeyboardEvent("keydown",{key:"Enter",bubbles:true}),new KeyboardEvent("keydown",{key:" ",bubbles:true})]) node.dispatchEvent(event);
+   const note=container.firstElementChild,empty=document.createElement("p");empty.className="sequence-empty";empty.textContent="reference";container.append(empty);
+   const look=node=>{const style=getComputedStyle(node);return [style.color,style.fontSize,style.marginTop,style.marginLeft].join("|");};
+   const seen={children:container.childElementCount-1,tag:note.tagName,cls:note.className,text:note.textContent,elements:note.childElementCount,
+     visible:note.getBoundingClientRect().height>0,sameLook:look(note)===look(empty),svg:container.querySelectorAll("svg").length,
+     controls:container.querySelectorAll("button,[role=button],[tabindex]").length,picks:window.picks.length,targets:window.targetPicks.length};
+   empty.remove();return seen;
+ });
+ assert.deepEqual(result,{children:1,tag:"P",cls:"sequence-empty",text:"This Sequence could not be drawn: Unsupported <b>sequence</b> step",elements:0,
+   visible:true,sameLook:true,svg:0,controls:0,picks:0,targets:0});
+ assert.deepEqual(violations.filter(error=>/Content Security Policy|CSP/.test(error)),[]);
 });
 
 test("changed resolved message or participant mapping refuses all target and source actions",async()=>{
@@ -243,7 +242,7 @@ test("detached resolved lane and message actions cannot act on a newer pinned vi
  assert.equal(result.targets+result.selections+result.sources,0);
 });
 
-test("malformed SVG and duplicate IDs fall back without partial diagram",async()=>{
+test("malformed SVG and duplicate IDs are refused without partial diagram",async()=>{
  const view=fixture("rust");const duplicate=structuredClone(view);duplicate.steps.push(structuredClone(duplicate.steps[0]));
  assert.equal((await render(duplicate)).status,"unsupported");
  const result=await page.evaluate(async view=>{const original=window.pele;window.pele={render:()=>({svg:'<svg onload="alert(1)"></svg>'})};
@@ -317,27 +316,28 @@ test("changed visible positional note text with intact IDs refuses source action
  assert.equal(await page.evaluate(()=>window.picks.length),0);
  assert.equal(await page.evaluate(()=>window.sourceActions.length),0);
 });
-test("failed group expansion visibly installs complete legacy DTO",async()=>{
+test("failed group expansion shows the error state with the adapter's reason",async()=>{
  const view=fixture("rust"),group=structuredClone(view.steps[0]),entry=structuredClone(view.steps[0]);
  group.id="unsupported-group";group.kind="group";group.callId=null;group.label="original complete group";
  entry.id="unsupported-child";delete entry.hidden;group.children=[entry];view.steps=[group];
  const initial=await page.evaluate(async view=>{
    const container=document.querySelector("#sequence-diagram");container.replaceChildren();
    const expanded=new Set();document.querySelector("#state").textContent="Pele rendered";
+   // The app's own redraw handler (web/app.js): the error state, and the reason in the status line.
    const options={isCurrent:()=>true,onUnsupported:reason=>{
-     TrellisSequence.render(container,view,null,expanded,options);
-     document.querySelector("#state").textContent=`Pele fell back: ${reason}`;
+     TrellisSequence.renderError(container,reason);
+     document.querySelector("#state").textContent=`This Sequence could not be drawn: ${reason}`;
    }};
    return (await TrellisPeleSequence.render(container,view,null,expanded,options)).status;
  },view);
  assert.equal(initial,"rendered");
  await page.locator('.trellis-pele button.sequence-group-control').click();
- await page.waitForFunction(()=>document.querySelector("#state")?.textContent?.includes("Pele fell back"));
+ await page.waitForFunction(()=>document.querySelector("#state")?.textContent?.includes("could not be drawn"));
  assert.match(await page.locator("#state").textContent(),/Unsupported sequence step/);
- assert.equal(await page.locator("#sequence-diagram svg.pele").count(),0);
- assert.equal(await page.locator("#sequence-diagram svg").count(),1);
- assert.match(await page.locator("#sequence-diagram").innerText(),/original complete group/);
- assert.ok(await page.locator('[data-source-step-id="unsupported-child"]').count(),"expanded legacy view retains original child");
+ assert.equal(await page.locator("#sequence-diagram svg").count(),0,"neither the folded diagram nor a second drawing stays");
+ assert.equal(await page.locator("#sequence-diagram > *").count(),1);
+ assert.equal(await page.locator("#sequence-diagram > p.sequence-empty").textContent(),"This Sequence could not be drawn: Unsupported sequence step");
+ assert.equal(await page.locator("#sequence-diagram button, #sequence-diagram [role=button]").count(),0);
 });
 
 // AC4: obsolete renderer outcomes and detached notes cannot affect a newer pin.
@@ -399,10 +399,9 @@ test("stale synchronous Pele success and failure leave the newer pinned diagram 
  }
 });
 
-// The app's unsupported branch receives the same complete pinned DTO. Use its
-// actual legacy renderer and visible status rather than treating retained Pele
-// markup from a prior pin as a fallback.
-async function renderWithVisibleFallback(view, options={}) {
+// The app's unsupported branch (web/app.js): the error state in the diagram area and the
+// adapter's reason in the status line. Nothing of the refused view is drawn.
+async function renderWithErrorState(view, options={}) {
  return page.evaluate(async ({view,options})=>{
    const container=document.querySelector("#sequence-diagram"),state=document.querySelector("#state");
    container.replaceChildren();state.textContent="Pele pending";
@@ -410,24 +409,25 @@ async function renderWithVisibleFallback(view, options={}) {
    const expanded=new Set(),callbacks={...options,isCurrent:()=>true,onSelect:()=>selections++};
    const outcome=await TrellisPeleSequence.render(container,view,()=>sources++,expanded,callbacks);
    if(outcome.status==="unsupported") {
-     TrellisSequence.render(container,view,()=>sources++,expanded,callbacks);
-     state.textContent=`Pele fell back: ${outcome.reason}`;
+     TrellisSequence.renderError(container,outcome.reason);
+     state.textContent=`This Sequence could not be drawn: ${outcome.reason}`;
    }
+   for(const node of container.querySelectorAll("*")) for(const event of [new MouseEvent("click",{bubbles:true}),new KeyboardEvent("keydown",{key:"Enter",bubbles:true})]) node.dispatchEvent(event);
    return {status:outcome.status,reason:outcome.reason,state:state.textContent,
-     pele:container.querySelectorAll("svg.pele").length,legacy:container.querySelectorAll("svg:not(.pele)").length,
-     rows:[...container.querySelectorAll("[data-source-step-id]")].map(row=>row.dataset.sourceStepId),
-     text:container.textContent,selections,sources};
+     svg:container.querySelectorAll("svg").length,children:container.childElementCount,
+     note:container.querySelector(":scope > p.sequence-empty")?.textContent,
+     controls:container.querySelectorAll("button,[role=button],[tabindex]").length,selections,sources};
  },{view,options});
 }
-function assertVisibleFallback(result,ids,marker) {
- assert.equal(result.status,"unsupported");assert.match(result.state,/Pele fell back:/);
- assert.equal(result.pele,0);assert.equal(result.legacy,1);
- for(const id of ids) assert.ok(result.rows.includes(id),`missing original step ${id}`);
- assert.ok(result.text.includes(marker),`missing evidence ${marker}`);
+function assertErrorState(result,reason) {
+ assert.equal(result.status,"unsupported");assert.match(result.reason,reason);
+ assert.equal(result.note,`This Sequence could not be drawn: ${result.reason}`);
+ assert.equal(result.state,result.note);
+ assert.equal(result.svg,0);assert.equal(result.children,1);assert.equal(result.controls,0);
  assert.equal(result.selections,0);assert.equal(result.sources,0);
 }
 
-test("24 levels render; rejected 25th level and over-512 KiB source visibly fall back whole", async()=>{
+test("24 levels render; a rejected 25th level and an over-512 KiB source show the error state", async()=>{
  const view=fixture("rust"),leaf=structuredClone(view.steps[0]);
  const depth=levels=>{let node={...leaf,id:`depth-${levels-1}`,children:[]};
    for(let n=levels-2;n>=0;n--) node={...leaf,id:`depth-${n}`,kind:"note",children:[node]};
@@ -436,16 +436,50 @@ test("24 levels render; rejected 25th level and over-512 KiB source visibly fall
  const allowable=await render(view);
  assert.equal(allowable.status,"rendered",allowable.reason);
  view.steps=[depth(25)];
- const tooDeep=await renderWithVisibleFallback(view);
- assert.match(tooDeep.reason,/depth/);
- assertVisibleFallback(tooDeep,Array.from({length:25},(_,i)=>`depth-${i}`),leaf.label);
+ assertErrorState(await renderWithErrorState(view),/depth/);
  const sourceView=fixture("rust");sourceView.steps=[{...leaf,label:"L".repeat(512*1024),id:"large-source"}];
- const oversized=await renderWithVisibleFallback(sourceView,{showDetails:true});
- assert.match(oversized.reason,/Mermaid source too large/);
- assertVisibleFallback(oversized,["large-source"],"LLLLLLLL");
+ assertErrorState(await renderWithErrorState(sourceView,{showDetails:true}),/Mermaid source too large/);
 });
 
-test("12,000 SVG nodes allowed and 12,001 reject with no partial SVG or selection",async()=>{
+// #1007: with no second renderer, a view at the server's structural caps (20 participant
+// columns, step depth 24, 200 shown steps: docs/sequence-slice-contract.md) must draw.
+function structuralCapsView({columns=20,depth=24,shown=200}={}) {
+ const view=resolvedView(),call=view.steps[0],target=view.participants.at(-1);
+ view.participants.length=1;view.semantic={tier:"semantic"};
+ for(let n=0;n<columns-1;n++) {
+   const declaration={...structuredClone(target.declaration),id:`cap:target:${n}`,name:`target_${n}`,path:`target_${n}.rs`};
+   view.participants.push({...structuredClone(target),id:declaration.id,label:declaration.name,declaration});
+ }
+ const measured=n=>({...structuredClone(call),id:`cap:call:${n}`,callId:`cap:occurrence:${n}`,label:`call_${n}`,target:`cap:target:${n%(columns-1)}`,
+   callEvidence:{...call.callEvidence,provenanceId:`proof:${n}`}});
+ // depth-1 nested branches, each a shown step, around the deepest call; the rest follow at the top.
+ let nested=[measured(0)];
+ for(let level=depth-2;level>=0;level--) nested=[{...structuredClone(call),id:`cap:branch:${level}`,kind:"branch",label:`guard_${level}`,callId:null,target:null,callEvidence:null,children:nested,alternate:[]}];
+ view.steps=[...nested,...Array.from({length:shown-depth},(_,n)=>measured(n+1))];
+ return view;
+}
+test("a view at the structural caps (20 columns, depth 24, 200 shown steps) renders in Pele, in every display",async()=>{
+ const view=structuralCapsView(),count=roots=>roots.reduce((sum,step)=>sum+1+count(step.children),0);
+ const levels=roots=>roots.length?1+Math.max(...roots.map(step=>levels(step.children))):0;
+ assert.equal(count(view.steps),200);assert.equal(levels(view.steps),24);assert.equal(view.participants.length,20);
+ for(const [name,options,arrows] of [["Show all steps",{showDetails:true},177],["calls first",{},177],["Interactions",{interactions:true},177]]) {
+   const result=await render(view,options);
+   assert.equal(result.status,"rendered",`${name}: ${result.reason}`);
+   assert.equal(await page.locator("#sequence-diagram svg.pele.trellis-pele").count(),1,name);
+   assert.equal(await page.locator(".pele-actor:not(.pele-actor-footer)").count(),20,`${name}: every column is drawn`);
+   assert.equal(await page.locator(".pele-edge-label[data-trellis-step-id]").count(),arrows,`${name}: every call is an arrow`);
+   assert.equal(await page.locator("#sequence-diagram > p.sequence-empty").count(),0,name);
+   const projected=await page.evaluate(({view,options})=>{const p=TrellisPeleSequence.project(view,new Set(),options);return {rows:p.rows.length,lanes:p.lanes.length,frames:p.closeFrames.length};},{view,options});
+   // Interactions draw arrows and frames only; the other displays give every shown step a row.
+   assert.deepEqual(projected,{rows:options.interactions?177:200,lanes:20,frames:23},name);
+ }
+ // One more column, level or shown step is past a cap, so the view above is at each of them.
+ for(const [over,reason] of [[{columns:21},/Too many sequence participants/],[{depth:25},/Unsupported sequence depth/],[{shown:201},/Too many source notes/]])
+   assert.match((await render(structuralCapsView(over),{showDetails:true})).reason||"",reason);
+ assert.deepEqual(violations.filter(error=>/Content Security Policy|CSP/.test(error)),[]);
+});
+
+test("12,000 SVG nodes allowed; 12,001 reject with no partial SVG or selection, then the error state",async()=>{
  const view=fixture("rust"),result=await page.evaluate(async view=>{
    const container=document.querySelector("#sequence-diagram"),original=window.pele;
    const first=await TrellisPeleSequence.render(container,view,null,new Set(),{});
@@ -460,57 +494,48 @@ test("12,000 SVG nodes allowed and 12,001 reject with no partial SVG or selectio
    let selections=0,sources=0;
    try {
      window.pele={render:()=>({svg:make(12000)})};
-     const boundary=await TrellisPeleSequence.render(container,view,null,new Set(),{onSelect:()=>selections++});
+     const boundary=await TrellisPeleSequence.render(container,view,()=>sources++,new Set(),{onSelect:()=>selections++});
      const installed=container.firstElementChild;
      const noteIds=[...container.querySelectorAll('.pele-note[data-trellis-step-id]')].map(n=>n.dataset.trellisStepId);
      window.pele={render:()=>({svg:make(12001)})};
-     const overflow=await TrellisPeleSequence.render(container,view,null,new Set(),{onSelect:()=>selections++});
+     const overflow=await TrellisPeleSequence.render(container,view,()=>sources++,new Set(),{onSelect:()=>selections++});
      const kept=installed===container.firstElementChild;
-     TrellisSequence.render(container,view,()=>sources++,new Set(),{onSelect:()=>selections++});
-     document.querySelector("#state").textContent=`Pele fell back: ${overflow.reason}`;
+     TrellisSequence.renderError(container,overflow.reason);
      return {boundary:boundary.status,overflow:overflow.status,reason:overflow.reason,
        kept,notOld:installed!==prior,nodes:installed.querySelectorAll('*').length+1,
-       noteIds,selections,sources,legacy:container.querySelectorAll("svg:not(.pele)").length,
-       pele:container.querySelectorAll("svg.pele").length,
-       rows:[...container.querySelectorAll("[data-source-step-id]")].map(n=>n.dataset.sourceStepId),
-       text:container.textContent,state:document.querySelector("#state").textContent};
+       noteIds,selections,sources,svg:container.querySelectorAll("svg").length,
+       children:container.childElementCount,text:container.textContent};
    }finally{window.pele=original;}
  },view);
  assert.equal(result.boundary,"rendered");assert.equal(result.nodes,12000);
  assert.equal(result.overflow,"unsupported");assert.match(result.reason,/SVG element/);
  assert.equal(result.kept,true);assert.equal(result.notOld,true);
  assert.deepEqual(result.noteIds,steps(view.steps).map(step=>step.id));
- assert.equal(result.legacy,1);assert.equal(result.pele,0);
- assert.match(result.state,/Pele fell back:/);
- for(const step of steps(view.steps)) assert.ok(result.rows.includes(step.id),step.id);
- assert.ok(result.text.includes(view.steps[0].label));
+ assert.equal(result.svg,0);assert.equal(result.children,1);
+ assert.equal(result.text,`This Sequence could not be drawn: ${result.reason}`);
  assert.equal(result.selections,0);assert.equal(result.sources,0);
 });
 
-test("currently pinned synchronous Pele failure visibly falls back to complete legacy evidence",async()=>{
- const view=fixture("rust"),result=await page.evaluate(async view=>{
-   const container=document.querySelector("#sequence-diagram"),state=document.querySelector("#state"),original=window.pele;
-   container.replaceChildren();state.textContent="Pele pending";
-   let selections=0,sources=0,started=false;
-   window.pele={render:()=>{started=true;throw new Error("Pele renderer failed");}};
-   try {
-     const outcome=await TrellisPeleSequence.render(container,view,()=>sources++,new Set(),
-       {isCurrent:()=>true,onSelect:()=>selections++});
-     if(outcome.status==="unsupported") {
-       TrellisSequence.render(container,view,()=>sources++,new Set(),{onSelect:()=>selections++});
-       state.textContent=`Pele fell back: ${outcome.reason}`;
-     }
-     return {started,status:outcome.status,reason:outcome.reason,state:state.textContent,
-       pele:container.querySelectorAll("svg.pele").length,legacy:container.querySelectorAll("svg:not(.pele)").length,
-       rows:[...container.querySelectorAll("[data-source-step-id]")].map(n=>n.dataset.sourceStepId),
-       text:container.textContent,selections,sources};
-   }finally{window.pele=original;}
- },view);
- assert.equal(result.started,true);assert.match(result.reason,/Pele renderer failed/);
- assertVisibleFallback(result,steps(view.steps).map(step=>step.id),view.steps[0].label);
+test("a currently pinned synchronous Pele failure shows the error state with its reason",async()=>{
+ const view=fixture("rust"),original=await page.evaluateHandle(()=>window.pele);
+ await page.evaluate(()=>{window.peleStarted=false;window.pele={render:()=>{window.peleStarted=true;throw new Error("Pele renderer failed");}};});
+ try {
+   const result=await renderWithErrorState(view);
+   assert.equal(await page.evaluate(()=>window.peleStarted),true);
+   assertErrorState(result,/^Pele renderer failed$/);
+ } finally { await page.evaluate(original=>{window.pele=original;},original); }
 });
 
-test("calls-first keeps conditional and unknown context, exact selection and admitted detail in both renderers", async () => {
+test("an unavailable Pele asset shows the error state, and the next render with it draws again",async()=>{
+ const view=fixture("rust"),original=await page.evaluateHandle(()=>window.pele);
+ await page.evaluate(()=>{window.pele=undefined;});
+ try { assertErrorState(await renderWithErrorState(view),/^Pele asset unavailable$/); }
+ finally { await page.evaluate(original=>{window.pele=original;},original); }
+ const again=await render(view);assert.equal(again.status,"rendered",again.reason);
+ assert.equal(await page.locator("#sequence-diagram > p.sequence-empty").count(),0);
+});
+
+test("calls-first keeps conditional and unknown context, exact selection and admitted detail", async () => {
  const view=fixture("rust"),template=view.steps[0];
  const leaf=(id,kind,label=id,extra={})=>({...structuredClone(template),id,kind,label,callId:null,target:undefined,callEvidence:undefined,children:[],alternate:[],hidden:false,...extra});
  const call=id=>leaf(id,"call",id,{callId:id});
@@ -524,17 +549,17 @@ test("calls-first keeps conditional and unknown context, exact selection and adm
   const walk=roots=>roots.flatMap(step=>[step,...walk(step.children),...walk(step.alternate)]),original=walk(view.steps),before=JSON.stringify(view);
   const freeze=value=>{if(value&&typeof value==="object"){Object.freeze(value);Object.values(value).forEach(freeze);}return value;};freeze(view);
   const container=document.querySelector("#sequence-diagram"),results=[];
-  for(const renderer of [TrellisSequence,TrellisPeleSequence]) {
-   const selected=[],options={onSelect:step=>selected.push(step)},expanded=new Set();
+  {
+   const renderer=TrellisPeleSequence,selected=[],options={onSelect:step=>selected.push(step)},expanded=new Set();
    const outcome=await renderer.render(container,view,null,expanded,options);
-   if(renderer===TrellisPeleSequence&&outcome.status!=="rendered")throw Error(outcome.reason);
-   const selector=renderer===TrellisSequence?"[data-source-step-id]":".pele-note[data-trellis-step-id],.pele-edge-label[data-trellis-step-id]";
-   const nodes=[...container.querySelectorAll(selector)],ids=nodes.map(node=>node.dataset.sourceStepId||node.dataset.trellisStepId);
+   if(outcome.status!=="rendered")throw Error(outcome.reason);
+   const selector=".pele-note[data-trellis-step-id],.pele-edge-label[data-trellis-step-id]";
+   const nodes=[...container.querySelectorAll(selector)],ids=nodes.map(node=>node.dataset.trellisStepId);
    for(const node of nodes)node.dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",bubbles:true}));
    const exact=selected.every((step,i)=>step===original.find(original=>original.id===ids[i]));
    const unknown=container.textContent.includes("behavior unknown"),exit=container.textContent.includes("may exit early");
    await renderer.render(container,view,null,expanded,{...options,showDetails:true});
-   const restored=[...container.querySelectorAll(selector)].map(node=>node.dataset.sourceStepId||node.dataset.trellisStepId);
+   const restored=[...container.querySelectorAll(selector)].map(node=>node.dataset.trellisStepId);
    results.push({ids,exact,unknown,exit,restored,fullWrite:container.textContent.includes("write: state = ready"),unchanged:JSON.stringify(view)===before});
   }
   return {results,original:original.map(step=>step.id)};

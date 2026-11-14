@@ -365,7 +365,7 @@ impl VectorCacheReader {
     /// Actual storage failures take precedence over a subsequent budget check.
     pub fn open_existing_with_budget(
         path: &Path,
-        budget: &crate::search_embed::QueryBudget,
+        budget: &crate::search_vocab::QueryBudget,
     ) -> Result<Option<Self>> {
         budget.check()?;
         if !unavailable(present(path))? {
@@ -389,7 +389,7 @@ impl VectorCacheReader {
 
     pub fn snapshot_with_budget(
         &mut self,
-        budget: &crate::search_embed::QueryBudget,
+        budget: &crate::search_vocab::QueryBudget,
     ) -> Result<VectorSnapshot<'_>> {
         budget.check()?;
         storage(self.db.busy_timeout(BUSY_WAIT.min(budget.remaining())))?;
@@ -529,7 +529,7 @@ mod tests {
 
     #[test]
     fn cache_still_being_created_reads_as_absent_and_the_writer_initializes_it() {
-        use crate::search_embed::QueryBudget;
+        use crate::search_vocab::QueryBudget;
         use std::sync::Arc;
         use std::time::{Duration, Instant};
 
@@ -559,7 +559,7 @@ mod tests {
 
     #[test]
     fn query_reader_budget_bounds_wait_without_changing_storage_errors() {
-        use crate::search_embed::{EmbedError, QueryBudget};
+        use crate::search_vocab::{EmbedError, QueryBudget};
         use std::sync::Arc;
         use std::time::Instant;
 
@@ -729,8 +729,8 @@ mod tests {
         let (_directory, mut writer) = cache(128 * 1024);
         let model = key(1);
         let candidates: Vec<_> = (2..8)
-            .map(|card| crate::search_rank::SearchCandidate {
-                key: crate::search_rank::SearchCandidateKey {
+            .map(|card| crate::search_vocab::SearchCandidate {
+                key: crate::search_vocab::SearchCandidateKey {
                     version_id: i64::from(card),
                     syntax_id: format!("sid:v1:{card:032x}"),
                 },
@@ -738,7 +738,7 @@ mod tests {
                 role: crate::native_records::DeclarationRole::Production,
             })
             .collect();
-        let mut vector = vec![0; crate::search_embed::DIMENSIONS];
+        let mut vector = vec![0; crate::search_vocab::DIMENSIONS];
         vector[0] = -128;
         vector[1] = 127;
         for card in 2..7 {
@@ -746,8 +746,8 @@ mod tests {
         }
         for (card, value) in [
             (3, Value::Text("bad".into())),
-            (4, Value::Blob(vec![0; crate::search_embed::DIMENSIONS])),
-            (5, Value::Blob(vec![1; crate::search_embed::DIMENSIONS - 1])),
+            (4, Value::Blob(vec![0; crate::search_vocab::DIMENSIONS])),
+            (5, Value::Blob(vec![1; crate::search_vocab::DIMENSIONS - 1])),
             (6, Value::Blob(vec![])),
         ] {
             writer
@@ -768,7 +768,7 @@ mod tests {
             Some(&snapshot),
             Some(&model),
             Some(&vector),
-            &crate::search_rank::SearchPolicy::default(),
+            &crate::search_vocab::SearchPolicy::default(),
             &mut || {
                 checks.set(checks.get() + 1);
                 Ok(())
@@ -794,7 +794,7 @@ mod tests {
             Some(&snapshot),
             Some(&model),
             Some(&vector),
-            &crate::search_rank::SearchPolicy::default(),
+            &crate::search_vocab::SearchPolicy::default(),
             &mut || {
                 checks.set(checks.get() + 1);
                 if checks.get() == final_check {

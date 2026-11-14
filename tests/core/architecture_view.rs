@@ -6,8 +6,9 @@ use std::{
 };
 use trellis::{
     indexer::{IndexOptions, index_workspace_bundle},
+    metrics_read::MetricsOptions,
     model::{CancelFlag, IndexPin},
-    store::{MetricsOptions, Store},
+    store::Store,
 };
 
 fn fixture() -> (tempfile::TempDir, tempfile::TempDir, Store, IndexPin) {
