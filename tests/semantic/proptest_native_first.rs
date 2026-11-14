@@ -140,7 +140,7 @@ impl World {
                 entries
                     .filter_map(Result::ok)
                     .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                    .filter(|name| name.starts_with(trellis::semantic_batch::staging::STAGE_PREFIX))
+                    .filter(|name| name.starts_with(trellis::store::staging::STAGE_PREFIX))
                     .collect()
             })
             .unwrap_or_default()

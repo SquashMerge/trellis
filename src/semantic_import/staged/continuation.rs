@@ -840,8 +840,7 @@ mod tests {
     fn output_reset_keeps_the_next_page_on_disk() {
         let parent = tempfile::tempdir().unwrap();
         let mut stage =
-            crate::semantic_batch::staging::Stage::create(parent.path(), "cursor", "reset")
-                .unwrap();
+            crate::store::staging::Stage::create(parent.path(), "cursor", "reset").unwrap();
         {
             let conn = stage.conn().unwrap();
             for ord in 0..129 {

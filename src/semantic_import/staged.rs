@@ -29,10 +29,12 @@ use crate::{
     semantic_batch::{
         AdmittedBatch, BatchCounters, BatchLimits, JoinedBatch, LookupBudget,
         descriptor::{Descriptor, SourceManifestHasher, basis_artifact_ordinal},
-        staging::{JOIN_TABLES, claim_from_stage},
     },
     semantic_evidence::{self as semantic, EmissionHeader, EmissionValidator, RawClaimDocument},
-    store::{NativeHeader, NativeReader, Store},
+    store::{
+        NativeHeader, NativeReader, Store,
+        staging::{JOIN_TABLES, claim_from_stage},
+    },
 };
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -1517,7 +1519,7 @@ fn native_pass(ctx: &JoinCtx<'_>, reader: &NativeReader<'_>, rev: u8) -> Result<
     for table in ["nat_docs", "nat_done"] {
         conn.execute(&format!("DELETE FROM {table} WHERE rev=?1"), [rev])?;
     }
-    conn.execute_batch(crate::semantic_batch::staging::UNIT_BEGIN)?;
+    conn.execute_batch(crate::store::staging::UNIT_BEGIN)?;
     let outcome = (|| -> Result<()> {
         let mut stream = reader.inventory()?;
         let mut ord = 0i64;
@@ -1540,11 +1542,11 @@ fn native_pass(ctx: &JoinCtx<'_>, reader: &NativeReader<'_>, rev: u8) -> Result<
     })();
     match outcome {
         Ok(()) => {
-            conn.execute_batch(crate::semantic_batch::staging::UNIT_COMMIT)?;
+            conn.execute_batch(crate::store::staging::UNIT_COMMIT)?;
             Ok(())
         }
         Err(error) => {
-            let _ = conn.execute_batch(crate::semantic_batch::staging::UNIT_ROLLBACK);
+            let _ = conn.execute_batch(crate::store::staging::UNIT_ROLLBACK);
             for table in ["nat_docs", "nat_done"] {
                 let _ = conn.execute(&format!("DELETE FROM {table} WHERE rev=?1"), [rev]);
             }
@@ -1556,11 +1558,11 @@ fn native_pass(ctx: &JoinCtx<'_>, reader: &NativeReader<'_>, rev: u8) -> Result<
 /// Runs one pass in a single stage transaction. The stage has no journal, so a failed pass
 /// commits what it wrote rather than rolling back; the next attempt clears every join table.
 fn in_transaction<T>(conn: &Connection, pass: impl FnOnce() -> Result<T>) -> Result<T> {
-    conn.execute_batch(crate::semantic_batch::staging::UNIT_BEGIN)?;
+    conn.execute_batch(crate::store::staging::UNIT_BEGIN)?;
     let result = pass();
-    let committed = conn.execute_batch(crate::semantic_batch::staging::UNIT_COMMIT);
+    let committed = conn.execute_batch(crate::store::staging::UNIT_COMMIT);
     if committed.is_err() {
-        let _ = conn.execute_batch(crate::semantic_batch::staging::UNIT_ROLLBACK);
+        let _ = conn.execute_batch(crate::store::staging::UNIT_ROLLBACK);
     }
     let value = result?;
     committed?;

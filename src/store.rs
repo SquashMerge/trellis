@@ -16,6 +16,7 @@ mod search_startup;
 pub(crate) mod semantic_display;
 pub(crate) mod semantic_payload;
 mod semantic_retention;
+pub mod staging;
 pub(crate) use search::SEARCH_CARD_BATCH_SIZE;
 pub use search::{
     HeadSearchCard, HeadSearchCards, McpSearchCandidates, SearchDeltaColdRebuild,
@@ -6911,7 +6912,7 @@ pub fn batch_publication_statements_for_tests() -> Vec<String> {
 /// batch id.
 fn write_staged_raw_rows(
     db: &Connection,
-    stage: &crate::semantic_batch::staging::Stage,
+    stage: &crate::store::staging::Stage,
     descriptor: &crate::semantic_batch::descriptor::Descriptor,
     descriptor_bytes: &[u8],
     descriptor_sha256: &str,
@@ -12985,7 +12986,7 @@ impl Store {
     pub fn publish_semantic_batch(
         &self,
         joined: &crate::semantic_batch::JoinedBatch,
-        stage: &mut crate::semantic_batch::staging::Stage,
+        stage: &mut crate::store::staging::Stage,
         expected: IndexPin,
         leader: &topology::WriterGuard,
         cancel: &CancelFlag,
@@ -12998,7 +12999,7 @@ impl Store {
     pub fn publish_semantic_batch_with_fault_for_tests(
         &self,
         joined: &crate::semantic_batch::JoinedBatch,
-        stage: &mut crate::semantic_batch::staging::Stage,
+        stage: &mut crate::store::staging::Stage,
         expected: IndexPin,
         leader: &topology::WriterGuard,
         cancel: &CancelFlag,
@@ -13053,7 +13054,7 @@ impl Store {
     pub fn publish_semantic_batch_observing_for_tests(
         &self,
         joined: &crate::semantic_batch::JoinedBatch,
-        stage: &mut crate::semantic_batch::staging::Stage,
+        stage: &mut crate::store::staging::Stage,
         expected: IndexPin,
         leader: &topology::WriterGuard,
         cancel: &CancelFlag,
@@ -13075,7 +13076,7 @@ impl Store {
     fn publish_semantic_batch_inner(
         &self,
         joined: &crate::semantic_batch::JoinedBatch,
-        stage: &mut crate::semantic_batch::staging::Stage,
+        stage: &mut crate::store::staging::Stage,
         expected: IndexPin,
         leader: &topology::WriterGuard,
         cancel: &CancelFlag,
@@ -13098,7 +13099,7 @@ impl Store {
     fn publish_semantic_batch_statements(
         &self,
         joined: &crate::semantic_batch::JoinedBatch,
-        stage: &mut crate::semantic_batch::staging::Stage,
+        stage: &mut crate::store::staging::Stage,
         expected: IndexPin,
         leader: &topology::WriterGuard,
         cancel: &CancelFlag,
