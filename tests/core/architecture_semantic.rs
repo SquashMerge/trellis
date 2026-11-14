@@ -7,9 +7,10 @@ use crate::graph_fixtures::{
 use serde_json::{Value, json};
 use std::fs;
 use trellis::{
+    metrics_read::MetricsOptions,
     model::IndexPin,
     semantic_evidence::{self as s, CoverageState, Dispatch, Resolution},
-    store::{MetricsOptions, Store},
+    store::Store,
 };
 
 // `orphan.rs` is not declared by `lib.rs`, so its structural sites are unresolved; `t.go()`

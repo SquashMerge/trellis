@@ -373,7 +373,7 @@ impl Enrichment<'_, '_> {
 /// The callbacks of a syntax-only view (#888): no call has an exact target, so none holds
 /// an interaction. A callback that holds a measured call keeps its built block as a
 /// candidate for the read that has interface evidence; nothing else changes.
-pub(in crate::store) fn syntax_callbacks(
+pub(crate) fn syntax_callbacks(
     store: &Store,
     db: &Connection,
     selected: &ReadRevision,

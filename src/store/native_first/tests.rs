@@ -156,8 +156,8 @@ fn pending_uses_recorded_endpoints_not_transitive_call_paths() {
     assert_eq!(a.semantic_basis_pin, pin(1));
     assert_eq!(a.basis_native_revision_id, "native-1");
     assert_eq!(
-        a.effective_freshness(crate::semantic_evidence::Freshness::Fresh),
-        crate::semantic_evidence::Freshness::PossiblyStale
+        a.effective_freshness(crate::semantic_records::Freshness::Fresh),
+        crate::semantic_records::Freshness::PossiblyStale
     );
 }
 

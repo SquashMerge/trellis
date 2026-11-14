@@ -6,7 +6,7 @@ use crate::semantic_batch::{
     descriptor::{Descriptor, SourceManifestHasher},
     limits::BatchLimits,
 };
-use crate::semantic_evidence as sem;
+use crate::semantic_records as sem;
 use crate::store::semantic_payload::TargetScope;
 
 pub(crate) type Reserve<'a> = dyn FnMut(u64) -> Result<()> + 'a;

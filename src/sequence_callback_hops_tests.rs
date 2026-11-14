@@ -4,6 +4,7 @@
 use super::sequence_hops_tests::{SERVER, annotate, core, hops, publish, sequence, shown, write};
 use super::*;
 use crate::behavior::{CALLBACK_KIND, SequenceLimit, SequenceStep, SequenceView};
+use crate::store::Store;
 
 /// `load` calls `api` inside the callback it passes to `browseRequest`, as `loadSequence` in
 /// Trellis's own web app does; `quiet` passes a callback that makes no client call.
@@ -187,7 +188,7 @@ fn a_callback_hop_never_takes_a_view_past_its_shown_step_bound() {
     assert!(
         view.participants
             .iter()
-            .all(|p| p.kind != crate::store::sequence_hops::HANDLER_KIND)
+            .all(|p| p.kind != crate::sequence_hops::HANDLER_KIND)
     );
 
     // The Interactions candidates (#663) are not bound by shown steps.
