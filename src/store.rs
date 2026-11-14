@@ -39,11 +39,6 @@ pub(crate) mod symbol_trigrams;
 pub mod topology;
 use crate::model::*;
 use anyhow::{Context, Result, ensure};
-// The metrics transport options and rows keep their public `store::` paths (S5, #1045).
-pub use crate::metrics_read::{
-    MetricsDeclarationRow, MetricsDirectoryRow, MetricsFileRow, MetricsOptions, MetricsPayload,
-    MetricsRoleCounts, MetricsSourceSetIds, MetricsTopCognitiveRow, MetricsTopCognitiveScore,
-};
 pub use requests::{MaintenanceQueueProbe, MaintenanceQueueState, QueueProbeAdmission};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;

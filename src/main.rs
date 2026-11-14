@@ -1343,7 +1343,7 @@ fn query_cli_payload(args: &QueryArgs) -> Result<serde_json::Value> {
 }
 
 fn metrics_cli_payload(args: &MetricsArgs) -> Result<serde_json::Value> {
-    let mut options = trellis::store::MetricsOptions {
+    let mut options = trellis::metrics_read::MetricsOptions {
         scope: args.scope.clone(),
         source_set_id: args.source_set_id.clone(),
         language: args.language.clone(),
@@ -1394,15 +1394,15 @@ fn metrics_cli_payload(args: &MetricsArgs) -> Result<serde_json::Value> {
 
 /// The metrics option rules of the CLI and of the daemon request it sends.
 /// Both accept only path-derived source-set IDs (#984).
-fn validate_cli_metrics_options(options: &trellis::store::MetricsOptions) -> Result<()> {
+fn validate_cli_metrics_options(options: &trellis::metrics_read::MetricsOptions) -> Result<()> {
     options
-        .validate_transport(trellis::store::MetricsSourceSetIds::PathOnly)
+        .validate_transport(trellis::metrics_read::MetricsSourceSetIds::PathOnly)
         .map_err(|error| anyhow::anyhow!("invalid_argument: {error}"))
 }
 
 /// The work budget of a metrics request, from its still unvalidated scope.
 fn metrics_work_budget(request: &protocol::Request) -> Duration {
-    trellis::store::MetricsOptions::work_budget(
+    trellis::metrics_read::MetricsOptions::work_budget(
         request.payload["args"]["scope"]
             .as_str()
             .unwrap_or_default(),
@@ -3373,7 +3373,7 @@ fn result_is_deadline(payload: &serde_json::Value) -> bool {
 
 fn metrics_options_from_request(
     args: &serde_json::Value,
-) -> Result<trellis::store::MetricsOptions> {
+) -> Result<trellis::metrics_read::MetricsOptions> {
     fn field<T: serde::de::DeserializeOwned>(args: &serde_json::Value, name: &str) -> Result<T> {
         serde_json::from_value(args[name].clone())
             .map_err(|error| anyhow::anyhow!("invalid_argument: {name}: {error}"))
@@ -3402,7 +3402,7 @@ fn metrics_options_from_request(
             .is_none_or(|value| value.as_array().is_some_and(|names| !names.is_empty())),
         "invalid_argument: empty metrics selection"
     );
-    let options = trellis::store::MetricsOptions {
+    let options = trellis::metrics_read::MetricsOptions {
         workbench: false,
         scope: args["scope"]
             .as_str()
@@ -3570,7 +3570,7 @@ mod metrics_request_tests {
     /// and the first failing rule's message.
     #[test]
     fn identifier_rules_are_shared_and_keep_each_transports_source_set_forms() {
-        use trellis::store::MetricsSourceSetIds::{Current, PathOnly};
+        use trellis::metrics_read::MetricsSourceSetIds::{Current, PathOnly};
         let path_id = format!("source-set:v1:path-{}", "a".repeat(64));
         let uuid_id = "source-set:v1:6f1f0a52-0d0c-4d6e-9a43-0c1a3e3a8b11";
         let file = |id: &str| {

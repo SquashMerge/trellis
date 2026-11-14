@@ -46,7 +46,7 @@ pub(crate) mod jsonc;
 mod language_set_tests;
 pub mod mcp;
 pub mod metrics;
-mod metrics_read;
+pub mod metrics_read;
 pub mod model;
 pub mod model_management;
 #[cfg(feature = "test-support")]

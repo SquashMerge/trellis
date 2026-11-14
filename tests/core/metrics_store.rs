@@ -8,8 +8,9 @@ use std::{
 };
 use trellis::{
     indexer::{IndexOptions, index_workspace_bundle},
+    metrics_read::MetricsOptions,
     model::{CancelFlag, IndexPin},
-    store::{MetricsOptions, Store},
+    store::Store,
 };
 
 fn fixture() -> (tempfile::TempDir, tempfile::TempDir, Store, IndexPin) {
@@ -64,7 +65,7 @@ fn unavailable_fan_in() -> serde_json::Value {
 fn assert_owned_calls(
     db: &rusqlite::Connection,
     path: &str,
-    rows: &[trellis::store::MetricsDeclarationRow],
+    rows: &[trellis::metrics_read::MetricsDeclarationRow],
 ) {
     let source =
         "function first() { return 1; }\nfunction second() { first(); first(); return 2; }\n";
@@ -1488,7 +1489,7 @@ fn workbench_exclusion_does_not_skip_corrupt_vendor_validation() {
     response.finish(()).unwrap();
 }
 
-fn macro_rows(source: &str) -> Vec<trellis::store::MetricsDeclarationRow> {
+fn macro_rows(source: &str) -> Vec<trellis::metrics_read::MetricsDeclarationRow> {
     let (_state, _root, store, _pin) = fixture_with_sources(&[("src/lib.rs", source)]);
     let response = store.evidence_response().unwrap();
     let payload = response
@@ -1578,7 +1579,7 @@ fn callables_outside_macros_score_the_same_beside_macro_callables() {
     let isolated = format!("{positive}{outside}");
     let alone = macro_rows(&isolated);
     let beside = macro_rows(source);
-    let same_text = |row: &trellis::store::MetricsDeclarationRow| {
+    let same_text = |row: &trellis::metrics_read::MetricsDeclarationRow| {
         let text = &isolated[row.range.start..row.range.end];
         beside
             .iter()

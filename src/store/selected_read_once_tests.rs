@@ -1,5 +1,6 @@
 use super::*;
 use crate::indexer::{IndexOptions, index_workspace_bundle};
+use crate::metrics_read::MetricsOptions;
 use std::{fs, sync::atomic::AtomicBool};
 
 pub(crate) fn published_store(files: usize) -> (tempfile::TempDir, tempfile::TempDir, Store) {

@@ -8,9 +8,10 @@ use std::{
 };
 use trellis::{
     indexer::{IndexOptions, index_workspace_bundle},
+    metrics_read::MetricsOptions,
     model::{CancelFlag, IndexPin},
     rules,
-    store::{MetricsOptions, Store},
+    store::Store,
 };
 
 fn publish(files: &[(&str, &str)]) -> (tempfile::TempDir, tempfile::TempDir, Store, IndexPin) {

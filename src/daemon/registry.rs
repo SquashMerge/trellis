@@ -3076,7 +3076,7 @@ impl CheckoutRuntime {
 
     pub fn metrics_response(
         &self,
-        options: &crate::store::MetricsOptions,
+        options: &crate::metrics_read::MetricsOptions,
         check: &mut (impl FnMut() -> anyhow::Result<()> + Send),
         hooks: MetricsResponseHooks<'_>,
         max_bytes: usize,
@@ -3185,7 +3185,7 @@ impl CheckoutRuntime {
 
     pub fn architecture_response(
         &self,
-        options: &crate::store::MetricsOptions,
+        options: &crate::metrics_read::MetricsOptions,
         check: &mut (impl FnMut() -> anyhow::Result<()> + Send),
         hooks: MetricsResponseHooks<'_>,
         max_bytes: usize,
