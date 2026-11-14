@@ -2,7 +2,8 @@
 //! view's own revision. A call matched to a route of another app gets a labelled boundary hop
 //! into the handler's app; a call matched to no route stays a boundary and only says so.
 //! Interface evidence is structural (#788): never proof that a request is sent.
-use super::{ArchitectureCore, EvidenceResponse};
+use super::EvidenceResponse;
+use crate::architecture_core::ArchitectureCore;
 use crate::behavior::{
     InterfaceHop, InterfacesState, Participant, SequenceColumn, SequenceInterfaces, SequenceStep,
     SequenceView,
@@ -96,7 +97,7 @@ impl EvidenceResponse {
             return Ok(());
         };
         // Fewer than two apps: no interface is extracted, and there is nothing to say.
-        if !super::architecture_core::interfaces_extracted(config, candidates) {
+        if !crate::architecture_core::interfaces_extracted(config, candidates) {
             return Ok(());
         }
         let Ok(extraction) = core.interfaces() else {

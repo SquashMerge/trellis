@@ -1,5 +1,7 @@
 pub(crate) mod apps;
+mod architecture_core;
 pub mod architecture_details;
+mod architecture_read;
 pub mod auth;
 pub mod behavior;
 mod behavior_bindings;
@@ -44,6 +46,7 @@ pub(crate) mod jsonc;
 mod language_set_tests;
 pub mod mcp;
 pub mod metrics;
+mod metrics_read;
 pub mod model;
 pub mod model_management;
 #[cfg(feature = "test-support")]

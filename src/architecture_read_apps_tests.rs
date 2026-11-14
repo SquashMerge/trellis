@@ -1,6 +1,8 @@
 use super::*;
 use crate::apps::Outcome;
 use crate::indexer::{IndexOptions, index_workspace_bundle};
+use crate::store::{SelectedIntegrity, Store};
+use rusqlite::Connection;
 use std::{fs, sync::atomic::AtomicBool};
 
 fn write(root: &std::path::Path, path: &str, text: &str) {

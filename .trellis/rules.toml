@@ -44,6 +44,11 @@ paths = [
   "src/graph_query.rs", "src/rules/**", "src/rules_edit.rs", "src/behavior_columns.rs",
   "src/apps.rs", "src/apps/**", "src/interfaces.rs", "src/interfaces/**",
   "src/model_management.rs", "src/search_config.rs", "src/symbol_lookup.rs",
+  # The Architecture and metrics read service, moved up from storage (S5, #1045): the
+  # per-revision core, the Architecture operations and the metrics projection, with the tests
+  # that moved with them. Storage keeps the read they start from.
+  "src/architecture_core.rs", "src/architecture_read.rs", "src/architecture_read_apps_tests.rs",
+  "src/metrics_read.rs", "src/metrics_read_parallel_tests.rs",
 ]
 
 [layers.indexing]
