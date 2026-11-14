@@ -1454,6 +1454,79 @@ mod missing_index_tests {
 }
 
 #[cfg(test)]
+mod quiet_read_tests {
+    use crate::http::exceptional_recovery_tests::serving_queue_watch_fixture;
+    use crate::testing::HANG_BACKSTOP;
+    use std::sync::mpsc;
+
+    /// #1082: the quiet read is one decision from two publications, the FIFO flag and the
+    /// watch status. Here it has read "no FIFO work" while a watcher hint is pending. Before
+    /// it reads the watch status, a request is accepted and the hint is acknowledged. FIFO
+    /// work or watcher intent was pending at every instant, so the read must not answer quiet
+    /// from the old FIFO flag and the new watch status.
+    #[test]
+    fn the_quiet_read_never_pairs_an_old_fifo_flag_with_a_newer_watch_status() {
+        let (_tmp, store, state, options) = serving_queue_watch_fixture();
+        state.worker_step().unwrap();
+        assert!(state.ready_and_quiet(), "the fixture settles");
+        {
+            let guard = state.watcher_work.lock().unwrap();
+            let watcher = &guard.as_ref().unwrap().1;
+            watcher.submit_watch_event_for_tests(Ok(notify::Event::new(
+                notify::EventKind::Modify(notify::event::ModifyKind::Any),
+            )
+            .add_path(options.workspace_root.join("a.js"))));
+        }
+        assert!(state.checkout_watch_pending());
+        assert!(!state.fifo_pending());
+
+        // Taken before the read: the read holds the runtime state at its pause.
+        let owner = state.retained_serving_session().unwrap();
+        let (crossed, crossing) = mpsc::channel();
+        let (started, worker_thread) = mpsc::channel();
+        let (worker, reader) = (state.clone(), state.clone());
+        state.test_quiet_between_reads.set(move || {
+            // Publication is possible between the two reads only if the read does not hold
+            // the lock both are published under. If it is possible, it happens here.
+            let publishable = reader.watch_status.try_lock().is_ok();
+            let thread = std::thread::spawn(move || {
+                // An enqueue that holds its admission lease: the COMMIT and its wake.
+                store.enqueue_request(&options, None).unwrap();
+                // The worker acknowledges the hint and publishes the watch status.
+                let mut guard = worker.watcher_work.lock().unwrap();
+                let watcher = &mut guard.as_mut().unwrap().1;
+                watcher
+                    .reconcile_due(&store, &owner, &options, &worker.watcher_cancel, true)
+                    .unwrap();
+                worker.publish_watch_status(watcher, &options);
+                drop(guard);
+                let _ = crossed.send(());
+            });
+            if publishable {
+                crossing
+                    .recv_timeout(HANG_BACKSTOP)
+                    .expect("the enqueue and the acknowledgement never finished");
+            }
+            let _ = started.send(thread);
+        });
+        let quiet = state.ready_and_quiet();
+        worker_thread
+            .recv_timeout(HANG_BACKSTOP)
+            .expect("the read never reached the point between its two reads")
+            .join()
+            .unwrap();
+        assert!(state.fifo_pending(), "the accepted request is pending");
+        assert!(!state.checkout_watch_pending(), "the hint was acknowledged");
+        assert!(
+            !quiet,
+            "the read answered quiet from the FIFO flag before the enqueue and the watch \
+             status after the acknowledgement"
+        );
+        assert!(!state.ready_and_quiet());
+    }
+}
+
+#[cfg(test)]
 mod lock_order_tests {
     use crate::http::exceptional_recovery_tests::fixture;
     use crate::testing::HANG_BACKSTOP;

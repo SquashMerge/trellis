@@ -335,6 +335,10 @@ pub struct DaemonState {
     /// runtime state.
     #[cfg(test)]
     test_watch_pending_before_state: crate::store::TestOneShotHook,
+    /// Runs in the quiet read, between its read of the FIFO flag and its read of the watch
+    /// status.
+    #[cfg(test)]
+    test_quiet_between_reads: crate::store::TestOneShotHook,
 }
 impl Drop for DaemonState {
     /// A lossless shutdown: an idle worker waiting without a deadline exits.
@@ -559,6 +563,8 @@ pub fn new_with_config(
         test_session_change_before_watch_status: crate::store::TestOneShotHook::default(),
         #[cfg(test)]
         test_watch_pending_before_state: crate::store::TestOneShotHook::default(),
+        #[cfg(test)]
+        test_quiet_between_reads: crate::store::TestOneShotHook::default(),
         jobs: Mutex::new(Jobs {
             current: None,
             jobs: BTreeMap::new(),
@@ -770,6 +776,8 @@ impl DaemonState {
         if !matches!(*state, RuntimeState::Ready(_)) || self.fifo_pending() {
             return false;
         }
+        #[cfg(test)]
+        self.test_quiet_between_reads.run();
         let status = self.watch_status.lock().unwrap();
         status.as_ref().is_some_and(|status| !status.pending())
     }
