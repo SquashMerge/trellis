@@ -15,6 +15,10 @@ Only first-party references are counted. `rules check` gives every instance a
 with an `externalPackage` destination are left out of every figure, so a new
 `import json` in a tool changes nothing here.
 
+Known gap: a bare JavaScript import the tool leaves unresolved (`destination` null, such
+as `node:crypto` or `esbuild`) is not classified `externalPackage`. It stays in the
+population as an unknown pair, so a new one can fail as lost coverage (see #1088).
+
 The measurement runs through a daemon of its own under a private HOME, on a fresh index
 of this checkout with fresh rust-analyzer and scip-typescript evidence; it never touches
 the user's daemon or index. It runs only when `trellis producer doctor` reports both
@@ -53,7 +57,10 @@ DESCRIPTION = {
     "population": "Production instances of `trellis rules check` whose destination is "
                   "not an externalPackage: first-party sources to first-party or "
                   "unresolved destinations. Standard-library and external packages are "
-                  "not counted.",
+                  "not counted. Known gap: a bare JavaScript import the tool leaves "
+                  "unresolved (destination null, such as node:crypto or esbuild) is "
+                  "not an externalPackage, so it stays in the population and a new "
+                  "one can fail as lost coverage (see #1088).",
     "measurement": "`python3 tools/rules-ratchet.py --update`: a debug build of this "
                    "checkout, its own daemon under a private HOME, a fresh index, then "
                    "rust-analyzer (trusted) and scip-typescript (restricted) imported.",

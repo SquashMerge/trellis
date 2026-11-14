@@ -1,6 +1,6 @@
 {
   "schemaVersion": 2,
-  "population": "Production instances of `trellis rules check` whose destination is not an externalPackage: first-party sources to first-party or unresolved destinations. Standard-library and external packages are not counted.",
+  "population": "Production instances of `trellis rules check` whose destination is not an externalPackage: first-party sources to first-party or unresolved destinations. Standard-library and external packages are not counted. Known gap: a bare JavaScript import the tool leaves unresolved (destination null, such as node:crypto or esbuild) is not an externalPackage, so it stays in the population and a new one can fail as lost coverage (see #1088).",
   "measurement": "`python3 tools/rules-ratchet.py --update`: a debug build of this checkout, its own daemon under a private HOME, a fresh index, then rust-analyzer (trusted) and scip-typescript (restricted) imported.",
   "deviatingPairs": 56,
   "deviatingReferences": 358,
