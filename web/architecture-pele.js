@@ -3,6 +3,7 @@
 (() => {
   const NS = "http://www.w3.org/2000/svg";
   const {unsupported, bytes, themeOnce, asButton, textMeasurer} = window.TrellisPeleSvg;
+  const {plan:planRoutes, paths:routePaths, placement, countLanes, channelWidth, round} = window.TrellisArchitectureRouting;
   const ROOT_STYLE = window.TrellisPeleSvg.rootStyle(14);
   const tags = new Set(["svg","g","path","rect","text","tspan"]);
   const attrs = new Set(["xmlns","class","viewBox","width","height","fill","fill-opacity","role","aria-roledescription","transform","stroke","font-size","data-id","d","x","y","rx","text-anchor","font-weight","stroke-dasharray","stroke-linecap","stroke-width","xml:space"]);
@@ -24,10 +25,6 @@
   // Lines one wrapped label line may take before its last is clipped: a bound for
   // pathological repository names only; ordinary paths and layer names wrap whole.
   const MAX_LINES = 12;
-  // Arrow routing (#637): a gutter under each band row holds count tags (rows of TAG_H plus
-  // TAG_GAP), then one TRACK per horizontal run; DROP is the least vertical run that ends at a
-  // band, so an arrowhead always fits. Long arrows run in side-channel lanes LANE apart.
-  const GUTTER_PAD = 4, TAG_GAP = 4, TRACK = 10, LANE = 10, DROP = 18, MIN_GUTTER = 24, CHANNEL_PAD = 8, INSET = 10, SLOT_GAP = 6;
   // Arrow stroke width by reference-site count (#637): log scale from WIDTH_MIN at one site to
   // WIDTH_MAX at WIDTH_SPAN or more sites, so one large edge never swamps the rest.
   const WIDTH_MIN = 1.5, WIDTH_MAX = 7, WIDTH_SPAN = 1000;
@@ -396,18 +393,14 @@
     }
     return actions;
   }
-  // Arrow routing (#637). Pele lays out the bands; the adapter then opens a gutter under each
-  // band row and routes every arrow orthogonally through gutters, a left side channel (long
-  // upward arrows), a right channel (long downward arrows, and runs to a farther shared box)
-  // and, when needed, a strip under the drawing. No arrow segment enters a band or a chip:
-  // arrows leave and reach bands only at their borders. Each count tag sits in a gutter's tag
-  // rows, on its own arrow's vertical run. Layout only: no record, count or identity changes.
+  // Arrow routing (#637) is architecture-routing.js's: it plans every arrow from the frames Pele
+  // drew and says how far each band moves. The adapter reads those frames, moves the drawing
+  // and draws the polylines. Layout only: no record, count or identity changes.
   const num = (node, name) => Number(node.getAttribute(name));
   function frame(control) {
     const rect = control?.node.querySelector(":scope > rect");
     return rect ? {x:num(rect,"x"), y:num(rect,"y"), w:num(rect,"width"), h:num(rect,"height")} : null;
   }
-  const round = value => Math.round(value * 100) / 100;
   // Move one drawn cluster or node, and the chips and text it owns.
   function shift(node, dx, dy) {
     if (!dx && !dy) return;
@@ -422,220 +415,49 @@
       if (part.hasAttribute("y")) part.setAttribute("y", String(round(num(part,"y") + dy)));
     }
   }
-  // Place vertical runs (and the tags on them) across one gutter edge, left to right.
-  // Each run is a LANE-wide line through every tag row; a tagged run also holds its tag in one
-  // row. Runs scan outward from their preferred x within their band's span.
-  function slots(items) {
-    const boxes = [], lines = [];
-    const clear = (list, l, r) => !list.some(([a, b]) => l < b && a < r);
-    const candidates = item => {
-      const half = item.tag ? item.tag.w / 2 : LANE / 2, lo = item.lo + half, hi = item.hi - half;
-      if (hi < lo) return [(item.lo + item.hi) / 2];
-      const pref = Math.min(hi, Math.max(lo, item.pref)), list = [pref];
-      for (let d = 2; pref - d >= lo || pref + d <= hi; d += 2) { if (pref - d >= lo) list.push(pref - d); if (pref + d <= hi) list.push(pref + d); }
-      return list;
-    };
-    let rows = 0;
-    for (const item of items) {
-      const line = x => [x - LANE / 2 - SLOT_GAP / 2, x + LANE / 2 + SLOT_GAP / 2];
-      const lineFree = (x, skip) => clear(lines, ...line(x)) && boxes.every(([row, l, r]) => row === skip || !(line(x)[0] < r && l < line(x)[1]));
-      let placed = false;
-      if (item.tag) {
-        for (let row = 0; row < 8 && !placed; row++) for (const x of candidates(item)) {
-          const l = x - item.tag.w / 2 - SLOT_GAP / 2, r = x + item.tag.w / 2 + SLOT_GAP / 2;
-          if (lineFree(x, row) && clear(boxes.filter(box => box[0] === row).map(box => [box[1], box[2]]), l, r) && clear(lines, l, r)) {
-            Object.assign(item, {x, row}); boxes.push([row, l, r]); rows = Math.max(rows, row + 1); placed = true; break;
-          }
-        }
-        if (!placed) { item.x = candidates(item)[0]; item.row = rows; boxes.push([rows, item.x - item.tag.w / 2, item.x + item.tag.w / 2]); rows++; }
-      } else {
-        for (const x of candidates(item)) if (lineFree(x, -1)) { item.x = x; placed = true; break; }
-        if (!placed) item.x = candidates(item)[0];
-      }
-      lines.push(line(item.x));
-    }
-    return rows;
-  }
-  // A side channel's width: its lanes and their padding. Tags stay in the gutters.
-  const channelWidth = lanes => lanes ? lanes * LANE + 2 * CHANNEL_PAD : 0;
   // The width the side channels will add to Pele's drawing, so the fit leaves room for them.
-  // It counts lanes exactly as routing does, so routing never draws wider.
+  // It counts lanes with routing's own relations, so routing never draws wider.
   function channelReserve(projection) {
     const layout = projection.layout;
     if (!layout) return 0;
-    const rowOf = new Map(), sharedOf = new Map();
-    layout.rows.forEach((ids, row) => ids.forEach(id => rowOf.set(id, row)));
-    layout.shared.forEach((id, index) => sharedOf.set(id, index));
-    let lanesLeft = 0, lanesRight = 0;
-    for (const edge of projection.edges.values()) {
-      const rs = rowOf.get(edge.from), rd = rowOf.get(edge.to);
-      if (rs !== undefined && rd !== undefined && Math.abs(rs - rd) > 1) { if (rd < rs) lanesLeft++; else lanesRight++; }
-      else if ((rs === undefined) !== (rd === undefined) && sharedOf.get(rs === undefined ? edge.from : edge.to) > 0) lanesRight++;
-    }
+    const lanes = countLanes(layout, projection.edges.values());
     // The channel between the stack and the shared boxes already has the grid gap (#850: on either side).
     const gap = layout.shared.length ? GRID_GAP : 0;
-    return layout.sharedLeft ? Math.max(0, channelWidth(lanesLeft) - gap) + channelWidth(lanesRight)
-      : channelWidth(lanesLeft) + Math.max(0, channelWidth(lanesRight) - gap);
+    return layout.sharedLeft ? Math.max(0, channelWidth(lanes.left) - gap) + channelWidth(lanes.right)
+      : channelWidth(lanes.left) + Math.max(0, channelWidth(lanes.right) - gap);
+  }
+  // Move every band, chip and header with its row; widen the stack and shared boxes to match.
+  function shiftBands(controls, routing) {
+    const {layout, stack, total, inner} = routing;
+    for (const control of controls.values()) {
+      if (control.item.kind === "E") continue;
+      const owner = control.item.host, id = control.item.id, at = placement(routing, owner);
+      shift(control.node, at.dx, at.dy);
+      // Only a part's own box grows: a shared box, the unassigned row or the stack.
+      if (at.part === "row" || id !== (at.part === "stack" ? layout.stack : owner)) continue;
+      const rect = control.node.querySelector(":scope > rect");
+      // A shared box spans the whole grown stack, so every gutter's track meets its side.
+      if (at.part === "shared") rect.setAttribute("height", String(round(Math.max(num(rect,"height") + total, stack.y + stack.h + total - num(rect,"y")))));
+      else if (at.part === "unassigned") rect.setAttribute("width", String(round(num(rect,"width") + inner)));
+      else rect.setAttribute("height", String(round(num(rect,"height") + total)));
+    }
   }
   function route(root, controls, projection) {
     const layout = projection.layout;
     const stack = frame(controls.get(layout.stack));
     if (!stack) return;
-    const edges = [...controls.values()].filter(control => control.item.kind === "E" && control.path);
-    const rowOf = new Map(), sharedOf = new Map();
-    layout.rows.forEach((ids, row) => ids.forEach(id => rowOf.set(id, row)));
-    layout.shared.forEach((id, index) => sharedOf.set(id, index));
+    const edges = new Map([...controls.values()].filter(control => control.item.kind === "E" && control.path).map(control => [control.item, control]));
     const band = id => frame(controls.get(id));
-    const rows = layout.rows.map(ids => { const frames = ids.map(band); return {top:Math.min(...frames.map(f => f.y)), bottom:Math.max(...frames.map(f => f.y + f.h))}; });
-    // Gutter r lies under band row r; "strip" lies under the stack and shared boxes.
-    const gutters = new Map(), gutter = key => { if (!gutters.has(key)) gutters.set(key, {tops:[], bottoms:[], tracks:[]}); return gutters.get(key); };
-    const left = [], right = [], plans = [];
-    const span = (id, inset = INSET) => { const f = band(id); return {lo:f.x + inset, hi:f.x + f.w - inset, mid:f.x + f.w / 2}; };
-    for (const control of edges) {
-      const {item} = control, tagRect = control.node.querySelector("rect");
-      const tag = {w:num(tagRect,"width"), h:num(tagRect,"height")}, plan = {control, tag, width:edgeWidth(item.record.count)};
-      const from = item.from, to = item.to, rs = rowOf.get(from), rd = rowOf.get(to), ks = sharedOf.get(from), kd = sharedOf.get(to);
-      const top = (key, id, extra) => { const s = span(id), entry = {plan, id, lo:s.lo, hi:s.hi, pref:s.mid, ...extra}; gutter(key).tops.push(entry); return entry; };
-      const bottom = (key, id, extra) => { const s = span(id), entry = {plan, id, lo:s.lo, hi:s.hi, pref:s.mid, ...extra}; gutter(key).bottoms.push(entry); return entry; };
-      const track = key => { const list = gutter(key).tracks; list.push(plan); return {key, index:list.length - 1}; };
-      plans.push(plan);
-      if (rs !== undefined && rd !== undefined) {
-        if (Math.abs(rs - rd) === 1) {
-          // Adjacent rows share one gutter: straight down or up when the bands overlap, else one jog.
-          const upper = rs < rd ? from : to, lower = rs < rd ? to : from, key = Math.min(rs, rd), u = span(upper), l = span(lower);
-          const lo = Math.max(u.lo, l.lo), hi = Math.min(u.hi, l.hi);
-          if (hi - lo >= tag.w) { plan.kind = "straight"; plan.lower = lower; plan.top = top(key, upper, {lo, hi, pref:(lo + hi) / 2, tag, straight:true}); gutter(key).bottoms.push(plan.top); }
-          else { plan.kind = "jog"; plan.top = top(key, upper, {tag, pref:l.mid}); plan.bottom = bottom(key, lower, {pref:u.mid}); plan.track = track(key); }
-          plan.down = rs < rd; plan.key = key;
-        } else if (rs === rd) {
-          // Peers: down into the gutter under their row, across, and back up.
-          const s = span(from), d = span(to);
-          plan.kind = "peer"; plan.key = rs;
-          plan.top = top(rs, from, {tag, pref:s.mid < d.mid ? s.hi : s.lo}); plan.end = top(rs, to, {pref:s.mid < d.mid ? d.lo : d.hi}); plan.track = track(rs);
-        } else if (rs < rd) {
-          // Long downward: under the source row (its tag there), through the right channel, into the target from above.
-          plan.kind = "right"; plan.channel = right; right.push(plan); plan.key = rs;
-          plan.top = top(rs, from, {tag, pref:span(from).hi}); plan.first = track(rs);
-          plan.bottom = bottom(rd - 1, to, {pref:span(to).hi}); plan.last = track(rd - 1);
-        } else {
-          // Long upward: above the source row, through the left side channel, into the target from
-          // below; its tag sits in the gutter under the target, on the arrow's last run.
-          plan.kind = "left"; plan.channel = left; left.push(plan); plan.key = rd;
-          plan.bottom = bottom(rs - 1, from, {pref:span(from).lo}); plan.first = track(rs - 1);
-          plan.top = top(rd, to, {tag, pref:span(to).lo}); plan.last = track(rd);
-        }
-      } else if (rs !== undefined || rd !== undefined) {
-        // An ordered band and a shared box: through the gutter under the band's row, across to the
-        // nearest shared box's side (right or, #850, left), or by the right channel and the strip to a farther one.
-        const ordered = rs !== undefined ? from : to, box = rs !== undefined ? to : from, row = rowOf.get(ordered), k = sharedOf.get(box);
-        plan.kind = k === 0 ? "shared" : "far"; plan.toShared = rs !== undefined; plan.box = box; plan.key = row;
-        plan.top = top(row, ordered, {tag, pref:layout.sharedLeft ? span(ordered).lo : span(ordered).hi}); plan.first = track(row);
-        if (k > 0) { right.push(plan); plan.channel = right; plan.end = top("strip", box, {}); plan.last = track("strip"); }
-      } else if (ks !== undefined && kd !== undefined) {
-        // Two shared boxes: down into the strip under them, across, and back up.
-        plan.kind = "boxes"; plan.key = "strip";
-        plan.top = top("strip", from, {tag}); plan.end = top("strip", to, {}); plan.track = track("strip");
-      }
-    }
-    // Horizontal placement, then each gutter's height: tag rows, tracks and arrowhead room.
-    for (const [key, g] of gutters) {
-      const order = list => [...list].sort((a, b) => (b.tag ? 1 : 0) - (a.tag ? 1 : 0) || a.plan.control.item.id.localeCompare(b.plan.control.item.id));
-      g.tagRows = slots(order(g.tops));
-      const bottoms = g.bottoms.filter(entry => !entry.straight);
-      // Bottom runs only meet the lower edge, under the tag rows: they avoid other runs, not tags.
-      const lines = g.bottoms.filter(entry => entry.straight).map(entry => entry.x);
-      for (const entry of order(bottoms)) {
-        const options = [entry.pref]; for (let d = 2; entry.pref - d >= entry.lo || entry.pref + d <= entry.hi; d += 2) options.push(entry.pref - d, entry.pref + d);
-        entry.x = options.find(x => x >= entry.lo && x <= entry.hi && lines.every(other => Math.abs(other - x) >= LANE + SLOT_GAP)) ?? Math.min(entry.hi, Math.max(entry.lo, entry.pref));
-        lines.push(entry.x);
-      }
-      const tagH = Math.max(0, ...g.tops.filter(entry => entry.tag).map(entry => entry.tag.h));
-      g.zone = g.tops.length ? Math.max(DROP, g.tagRows * (tagH + TAG_GAP)) : 0;
-      g.tagH = tagH;
-      g.height = GUTTER_PAD + g.zone + g.tracks.length * TRACK + (g.bottoms.length || g.tracks.length ? DROP : GUTTER_PAD);
-      if (typeof key === "number" && key < rows.length - 1) g.height = Math.max(MIN_GUTTER, g.height);
-    }
-    // Space between rows that Pele already leaves, and what each gutter adds to it.
-    const gap = r => (r + 1 < rows.length ? rows[r + 1].top : stack.y + stack.h) - rows[r].bottom;
-    const extra = rows.map((_, r) => Math.max(0, (gutters.get(r)?.height ?? (r < rows.length - 1 ? MIN_GUTTER : 0)) - gap(r)));
-    const below = r => extra.slice(0, r).reduce((sum, value) => sum + value, 0), total = below(rows.length);
-    const LW = channelWidth(left.length), CW = channelWidth(right.length), sharedFrames = layout.shared.map(band);
-    // The channel between the stack and the shared boxes widens only past the gap already there: the
-    // right one when the boxes are right of the stack, the left one when they are left of it (#850).
-    // `stackDx` moves the stack and its rows, `sharedDx` the shared boxes, `baseDx` the unassigned row.
-    let inner, stackDx, sharedDx, baseDx, grow;
-    if (layout.sharedLeft) {
-      inner = Math.max(0, LW - (stack.x - Math.max(...sharedFrames.map(f => f.x + f.w))));
-      stackDx = inner; sharedDx = 0; baseDx = 0; grow = inner + CW;
-    } else {
-      const firstShared = sharedFrames.length ? Math.min(...sharedFrames.map(f => f.x)) : null;
-      inner = Math.max(0, CW - (firstShared === null ? 0 : firstShared - (stack.x + stack.w)));
-      stackDx = LW; sharedDx = LW + inner; baseDx = LW; grow = LW + inner;
-    }
-    const strip = gutters.get("strip");
-    const rootBottom = Math.max(stack.y + stack.h, ...sharedFrames.map(f => f.y + f.h));
-    const stripH = strip ? strip.height : 0;
-    // Move every band, chip and header with its row; widen the stack and shared boxes to match.
-    const rowOfHost = new Map(); layout.rows.forEach((ids, row) => ids.forEach(id => rowOfHost.set(id, row)));
-    for (const control of controls.values()) {
-      if (control.item.kind === "E") continue;
-      const owner = control.item.host, id = control.item.id;
-      if (rowOfHost.has(owner)) shift(control.node, stackDx, below(rowOfHost.get(owner)));
-      else if (sharedOf.has(owner)) {
-        shift(control.node, sharedDx, 0);
-        // A shared box spans the whole grown stack, so every gutter's track meets its side.
-        if (id === owner) { const rect = control.node.querySelector(":scope > rect"); rect.setAttribute("height", String(round(Math.max(num(rect,"height") + total, stack.y + stack.h + total - num(rect,"y"))))); }
-      } else if (owner && owner === layout.unassigned) {
-        shift(control.node, baseDx, total + stripH);
-        if (id === owner) { const rect = control.node.querySelector(":scope > rect"); rect.setAttribute("width", String(round(num(rect,"width") + inner))); }
-      } else {
-        shift(control.node, stackDx, 0);
-        if (id === layout.stack) { const rect = control.node.querySelector(":scope > rect"); rect.setAttribute("height", String(round(num(rect,"height") + total))); }
-      }
-    }
-    const width = num(root,"width") + grow, height = num(root,"height") + total + stripH;
+    const tag = item => { const rect = edges.get(item).node.querySelector("rect"); return {w:num(rect,"width"), h:num(rect,"height")}; };
+    const routing = planRoutes({layout, stack, edges:[...edges.keys()], band, tag});
+    shiftBands(controls, routing);
+    const width = num(root,"width") + routing.grow, height = num(root,"height") + routing.total + routing.stripH;
     root.setAttribute("width", String(round(width))); root.setAttribute("height", String(round(height))); root.setAttribute("viewBox", `0 0 ${round(width)} ${round(height)}`);
-    // Final coordinates: x moves with the channels left of each box.
-    const dx = id => sharedOf.has(id) ? sharedDx : stackDx, f = id => { const b = band(id); return {x:b.x, y:b.y, w:b.w, h:b.h, bottom:b.y + b.h}; };
-    const X = entry => round(entry.x + dx(entry.id));
-    const gutterTop = key => key === "strip" ? rootBottom + total : rows[key].bottom + below(key);
-    const trackY = ({key, index}) => round(gutterTop(key) + GUTTER_PAD + gutters.get(key).zone + (index + 0.5) * TRACK);
-    const tagAt = (entry, key) => { const g = gutters.get(key); return {cx:X(entry), cy:round(gutterTop(key) + GUTTER_PAD + entry.row * (g.tagH + TAG_GAP) + entry.tag.h / 2)}; };
-    const stackLeft = stack.x + stackDx, stackRight = stack.x + stack.w + stackDx;
-    const laneX = (list, plan) => {
-      const sorted = [...list].sort((a, b) => a.reach - b.reach || a.control.item.id.localeCompare(b.control.item.id)), i = sorted.indexOf(plan);
-      return list === left ? round(stackLeft - CHANNEL_PAD - (i + 0.5) * LANE) : round(stackRight + CHANNEL_PAD + (i + 0.5) * LANE);
-    };
-    for (const plan of [...left, ...right]) plan.reach = Math.abs(trackY(plan.first) - trackY(plan.last ?? plan.first));
-    for (const plan of plans) {
-      const {item} = plan.control;
-      let points, tag;
-      if (plan.kind === "straight") {
-        const x = X(plan.top), upper = f(plan.top.id).bottom, lower = f(plan.lower).y;
-        points = plan.down ? [[x, upper], [x, lower]] : [[x, lower], [x, upper]]; tag = tagAt(plan.top, plan.key);
-      } else if (plan.kind === "jog") {
-        const xt = X(plan.top), xb = X(plan.bottom), y = trackY(plan.track), upper = f(plan.top.id).bottom, lower = f(plan.bottom.id).y;
-        points = plan.down ? [[xt, upper], [xt, y], [xb, y], [xb, lower]] : [[xb, lower], [xb, y], [xt, y], [xt, upper]]; tag = tagAt(plan.top, plan.key);
-      } else if (plan.kind === "peer" || plan.kind === "boxes") {
-        const y = trackY(plan.track), xs = X(plan.top), xd = X(plan.end);
-        points = [[xs, f(plan.top.id).bottom], [xs, y], [xd, y], [xd, f(plan.end.id).bottom]]; tag = tagAt(plan.top, plan.key);
-      } else if (plan.kind === "left" || plan.kind === "right") {
-        const lane = laneX(plan.channel, plan), y1 = trackY(plan.first), y2 = trackY(plan.last), xs = X(plan.kind === "left" ? plan.bottom : plan.top), xd = X(plan.kind === "left" ? plan.top : plan.bottom);
-        const start = plan.kind === "left" ? f(item.from).y : f(item.from).bottom, end = plan.kind === "left" ? f(item.to).bottom : f(item.to).y;
-        points = [[xs, start], [xs, y1], [lane, y1], [lane, y2], [xd, y2], [xd, end]]; tag = tagAt(plan.top, plan.key);
-      } else if (plan.kind === "shared" || plan.kind === "far") {
-        const xs = X(plan.top), y1 = trackY(plan.first), band = f(plan.top.id).bottom;
-        let run;
-        if (plan.kind === "shared") run = [[xs, band], [xs, y1], [layout.sharedLeft ? f(plan.box).x + f(plan.box).w : f(plan.box).x, y1]];
-        else { const lane = laneX(right, plan), y2 = trackY(plan.last), xk = X(plan.end); run = [[xs, band], [xs, y1], [lane, y1], [lane, y2], [xk, y2], [xk, f(plan.box).bottom]]; }
-        points = plan.toShared ? run : run.reverse(); tag = tagAt(plan.top, plan.key);
-      } else continue;
-      draw(plan, points, tag);
-    }
+    routePaths(routing, band, (item, points, at) => draw(edges.get(item), points, at));
   }
   // One routed arrow: a polyline ending at an arrowhead sized to its stroke, and its tag.
-  function draw(plan, points, tag) {
-    const {control, width} = plan, [line, marker] = control.path.querySelectorAll("path");
+  function draw(control, points, tag) {
+    const width = edgeWidth(control.item.record.count), [line, marker] = control.path.querySelectorAll("path");
     const [tip, before] = [points[points.length - 1], points[points.length - 2]];
     const length = Math.hypot(tip[0] - before[0], tip[1] - before[1]) || 1, ux = (tip[0] - before[0]) / length, uy = (tip[1] - before[1]) / length;
     const head = 6 + 1.2 * width, half = 3 + 0.9 * width, base = [tip[0] - ux * head, tip[1] - uy * head];
