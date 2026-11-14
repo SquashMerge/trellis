@@ -24,7 +24,11 @@ function harness(withApp = false) {
   const run = code => vm.runInContext(code,context);
   run(fs.readFileSync("web/sequence.js","utf8"));
   run(fs.readFileSync("web/shell.js","utf8"));
-  if(withApp){run(fs.readFileSync("web/files.js","utf8"));run(fs.readFileSync("web/app.js","utf8"));run(`token="synthetic";selectedRootKey="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";checkouts=[{rootKey:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",workspaceRoot:"/repo",state:"available"}];status={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},workspaceRoot:"/repo"};`);}
+  if(withApp){
+    // No DOM parser here: the adapter double keeps the real Pele projection and installs one
+    // selectable node per projected row.
+    run(fs.readFileSync("web/sequence-pele.js","utf8"));run(fs.readFileSync("tests/support/sequence-adapter-double.js","utf8"));
+    run(fs.readFileSync("web/files.js","utf8"));run(fs.readFileSync("web/app.js","utf8"));run(`token="synthetic";selectedRootKey="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";checkouts=[{rootKey:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",workspaceRoot:"/repo",state:"available"}];status={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},workspaceRoot:"/repo"};`);}
   if (withApp) {
     let handler = context.fetch;
     Object.defineProperty(context,"fetch",{configurable:true,get:()=>request,set(fn){handler=fn;}});
@@ -40,6 +44,8 @@ const text = node => all(node).map(n=>n.textContent).join(" ");
 const range={startLine:3,startColumn:2,endLine:9,endColumn:7};
 const call=(id="entry",target="candidate")=>({id,callId:id,kind:"call",label:`Call full::${id} <script>`,path:"main.rs",range,target,resolution:"unresolved",children:[],alternate:[]});
 const view=(steps=[])=>({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},seed:{id:"root",name:"root",path:"main.rs",range},participants:[{id:"root",kind:"method",label:"root"},{id:"candidate",kind:"externalCandidate",label:"Builder",identification:"Lexical type candidate, not resolved dispatch"},{id:"other",kind:"unresolvedReceiver",label:"Chain result"}],steps,warnings:[],hiddenSteps:0});
+// A step as the server sends it to the diagram: no target without resolved evidence, and an explicit `hidden`.
+const drawn=step=>({...step,target:null,hidden:false});
 const response=data=>({ok:true,status:200,json:async()=>data});
 const key=(element,value)=>{let prevented=false;element.listeners.keydown({key:value,preventDefault(){prevented=true;}});return prevented;};
 
@@ -261,10 +267,10 @@ test("Architecture's resting overview shows the inspector without opening the na
   assert.equal(h.document.body.classList.contains("inspector-open"),true,"a selection still opens the drawer");
 });
 async function selectedHarness() {
-  const h=harness(true),step=call(),data=view([step]);
+  const h=harness(true),step=drawn(call()),data=view([step]);
   h.context.fetch=async path=>{h.requests.push(path);if(path==="/api/sequence")return response(data);if(path==="/api/status/head")return response({revision:data.revision,workspaceRoot:"/repo"});if(path.startsWith("/api/source?"))return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},file:{path:"main.rs",text:"line1\nline2\nline3"}});throw new Error("Unexpected "+path);};
   await h.run(`selectMethod(${JSON.stringify(data.seed)})`);
-  const pick=all(h.get("sequence-diagram")).find(n=>n.attrs.class?.split(" ").includes("sequence-source"));assert.ok(pick);
+  const pick=all(h.get("sequence-diagram")).find(n=>n.attrs["data-trellis-step-id"]);assert.ok(pick);
   pick.listeners.click();
   return h;
 }
@@ -286,8 +292,8 @@ for(const change of ["method","revision","disconnect","index"] ) test(`app inval
 test("captured app source callback rejects revision/session changes even without a shell reset",async()=>{
   const h=harness(true);let callback;
   h.context.window.TrellisShell.selectStep=(_,__,source)=>{callback=source;};
-  h.context.fetch=async path=>{if(path==="/api/status/head")return response({revision:view().revision,workspaceRoot:"/repo"});assert.equal(path,"/api/sequence");return response(view([call()]));};await h.run(`selectMethod(${JSON.stringify(view().seed)})`);
-  all(h.get("sequence-diagram")).find(n=>n.attrs.class?.split(" ").includes("sequence-source")).listeners.click();
+  h.context.fetch=async path=>{if(path==="/api/status/head")return response({revision:view().revision,workspaceRoot:"/repo"});assert.equal(path,"/api/sequence");return response(view([drawn(call())]));};await h.run(`selectMethod(${JSON.stringify(view().seed)})`);
+  all(h.get("sequence-diagram")).find(n=>n.attrs["data-trellis-step-id"]).listeners.click();
   h.context.fetch=()=>{throw new Error("Stale source fetch");};h.run("status.revision=2;epoch++;");
   await callback();assert.equal(h.get("source-dock").hidden,true);
 });
@@ -490,7 +496,7 @@ test("Treemap owns its controls and inspector across view and Files transitions"
 });
 
 function resolvedView() {
-  const step = call("bound", "actual"), data = view([step]);
+  const step = {...call("bound", "actual"), hidden:false}, data = view([step]);
   const declaration = {id:"actual",name:"actual_target",kind:"function",path:"target.rs",range};
   data.participants.push({id:declaration.id,label:declaration.name,kind:"internal",declaration});
   step.callEvidence = {boundaryReason:"none",resolution:"resolved",dispatch:"direct",freshness:"fresh",provenanceId:"proof"};
@@ -525,7 +531,7 @@ test("app target callback binds original call object and declaration; same-pin s
     h.context.window.TrellisShell.selectStep = (_,__,___,target)=>{targetAction=target;};
     h.context.fetch = async path => response(path === "/api/status/head" ? {revision:data.revision,workspaceRoot:"/repo"} : data);
     await h.run(`selectMethod(${JSON.stringify(data.seed)})`);
-    all(h.get("sequence-diagram")).find(n=>n.attrs["data-source-step-id"]===step.id).listeners.click();
+    all(h.get("sequence-diagram")).find(n=>n.attrs["data-trellis-step-id"]===step.id).listeners.click();
     assert.equal(typeof targetAction,"function");
     h.run(change);
     h.context.fetch = ()=>assert.fail("obsolete target fetched");
@@ -546,7 +552,7 @@ test("noncallable resolved target reads exact declaration source instead of requ
     return response({revision:data.revision,file:{path:"target.rs",text:"class actual_target {}"}});
   };
   await h.run(`selectMethod(${JSON.stringify(data.seed)})`);
-  all(h.get("sequence-diagram")).find(n=>n.attrs["data-source-step-id"]===step.id).listeners.click();
+  all(h.get("sequence-diagram")).find(n=>n.attrs["data-trellis-step-id"]===step.id).listeners.click();
   const action = all(h.get("inspector-detail")).find(n=>n.attrs["data-trellis-target-id"]===declaration.id);
   assert.equal(action.textContent,"Read declaration source");
   await action.listeners.click();

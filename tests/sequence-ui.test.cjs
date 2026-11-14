@@ -9,115 +9,12 @@ class Element {
   append(...nodes) { this.children.push(...nodes); }
   replaceChildren(...nodes) { this.children = nodes; }
   addEventListener(name, handler) { this.listeners[name] = handler; }
-  focus() { this.focused = true; }
 }
-function render(participants) {
+// web/sequence.js with a document that only makes elements: the model and the two plain states.
+function sequenceModel() {
   const window = {};
-  vm.runInNewContext(fs.readFileSync("web/sequence.js", "utf8"), {
-    window, document: { createElementNS: (_, tag) => new Element(tag) }
-  });
-  const container = new Element("div");
-  const steps = participants.filter(p=>p.id !== "seed").map(p=>({id:`call-${p.id}`,kind:"call",label:"sample",target:p.id,path:"main.rs",range:{startLine:1,endLine:1}}));
-  window.TrellisSequence.render(container, {revision:{indexGeneration:"12345678-1234-4123-8123-123456789abc",indexRevision:1},seed: {id:"seed",name:"sample"},participants,steps}, () => {});
-  function all(node) { return [node, ...node.children.flatMap(all)]; }
-  return all(container);
-}
-test("terminal sequence guard 1: external participant provenance and labels remain plain text, not resolution claims",()=>{
-  const window={};
-  vm.runInNewContext(fs.readFileSync("web/sequence.js","utf8"),{window,document:{createElementNS:(_,tag)=>new Element(tag)}});
-  const container=new Element("div"), opened=[];
-  const candidate={id:"candidate-0",label:"guessed-0",kind:"internal",identification:"old lexical match"};
-  const step={id:"call-0",kind:"call",label:"measured call",target:candidate.id,resolution:"internal",path:"main.rs",range:{startLine:1,endLine:1}};
-  window.TrellisSequence.render(container,{seed:{id:"seed",name:"measured"},participants:[{id:"seed",label:"measured",kind:"method"},candidate],steps:[step]},item=>opened.push(item));
-  const all=node=>[node,...node.children.flatMap(all)], nodes=all(container);
-  assert.equal(nodes.filter(node=>node.attrs.class==="sequence-arrow").length,0);
-  assert.equal(nodes.filter(node=>node.attrs.class==="sequence-participant-label").length,1);
-  assert.ok(!nodes.some(node=>node.textContent==="guessed-0"));
-  const source=nodes.find(node=>node.attrs.class==="sequence-source");
-  assert.ok(source);source.listeners.click();assert.equal(opened[0],step);
-});
-
-test("terminal sequence guard 2: older participant DTOs still render without identification",()=>{
-  const window={};
-  vm.runInNewContext(fs.readFileSync("web/sequence.js","utf8"),{window,document:{createElementNS:(_,tag)=>new Element(tag)}});
-  const container=new Element("div"), opened=[];
-  const candidate={id:"candidate-1",label:"guessed-1",kind:"internal",identification:"old lexical match"};
-  const step={id:"call-1",kind:"call",label:"measured call",target:candidate.id,resolution:"internal",path:"main.rs",range:{startLine:1,endLine:1}};
-  window.TrellisSequence.render(container,{seed:{id:"seed",name:"measured"},participants:[{id:"seed",label:"measured",kind:"method"},candidate],steps:[step]},item=>opened.push(item));
-  const all=node=>[node,...node.children.flatMap(all)], nodes=all(container);
-  assert.equal(nodes.filter(node=>node.attrs.class==="sequence-arrow").length,0);
-  assert.equal(nodes.filter(node=>node.attrs.class==="sequence-participant-label").length,1);
-  assert.ok(!nodes.some(node=>node.textContent==="guessed-1"));
-  const source=nodes.find(node=>node.attrs.class==="sequence-source");
-  assert.ok(source);source.listeners.click();assert.equal(opened[0],step);
-});
-
-test("call groups collapse, expand by keyboard, preserve source and scroll, and reset for new views", () => {
-  const window = {};
-  vm.runInNewContext(fs.readFileSync("web/sequence.js", "utf8"), {window, document:{createElementNS:(_,tag)=>new Element(tag)}});
-  const container = new Element("div"); container.scrollTop=30; container.scrollLeft=12;
-  const source=[]; const range={startLine:1,endLine:2};
-  const leaf=id=>({id,kind:"call",label:id,path:"main.rs",range,target:"other",callId:id});
-  const group={id:"chain",kind:"group",label:"Builder::new → open (3 calls)",path:"main.rs",range,children:[leaf("one"),leaf("two"),leaf("three")]};
-  const view={seed:{id:"seed",name:"sample"},participants:[{id:"seed",label:"sample",kind:"method"},{id:"other",label:"other",kind:"boundary"}],steps:[group]};
-  const all=n=>[n,...n.children.flatMap(all)];
-  const nodes=()=>all(container);
-  const count=()=>nodes().filter(n=>n.attrs["data-kind"]==="call").length;
-  const control=()=>nodes().find(n=>n.attrs.class==="sequence-group-control");
-  window.TrellisSequence.render(container,view,s=>source.push(s));
-  assert.equal(count(),0); assert.equal(control().attrs["aria-expanded"],"false");
-  nodes().find(n=>n.attrs.class==="sequence-source").listeners.click(); assert.equal(source[0],group);
-  let prevented=false;
-  control().listeners.keydown({key:"Enter",preventDefault(){prevented=true;}});
-  assert.ok(prevented); assert.equal(count(),3); assert.equal(control().attrs["aria-expanded"],"true");
-  assert.ok(control().focused); assert.equal(container.scrollTop,30); assert.equal(container.scrollLeft,12);
-  nodes().filter(n=>n.attrs.class==="sequence-source")[1].listeners.click(); assert.equal(source[1].callId,"one");
-  control().listeners.click(); assert.equal(count(),0);
-  control().listeners.keydown({key:" ",preventDefault(){}}); assert.equal(count(),3);
-  window.TrellisSequence.render(container,view,s=>source.push(s)); assert.equal(count(),0);
-});
-
-
-test("terminal sequence guard 3: collapsed chain previews the first measured arrow, hides ghost lanes and never attributes all calls to its type",()=>{
-  const window={};
-  vm.runInNewContext(fs.readFileSync("web/sequence.js","utf8"),{window,document:{createElementNS:(_,tag)=>new Element(tag)}});
-  const container=new Element("div"), opened=[];
-  const candidate={id:"candidate-2",label:"guessed-2",kind:"internal",identification:"old lexical match"};
-  const step={id:"call-2",kind:"call",label:"measured call",target:candidate.id,resolution:"internal",path:"main.rs",range:{startLine:1,endLine:1}};
-  window.TrellisSequence.render(container,{seed:{id:"seed",name:"measured"},participants:[{id:"seed",label:"measured",kind:"method"},candidate],steps:[step]},item=>opened.push(item));
-  const all=node=>[node,...node.children.flatMap(all)], nodes=all(container);
-  assert.equal(nodes.filter(node=>node.attrs.class==="sequence-arrow").length,0);
-  assert.equal(nodes.filter(node=>node.attrs.class==="sequence-participant-label").length,1);
-  assert.ok(!nodes.some(node=>node.textContent==="guessed-2"));
-  const source=nodes.find(node=>node.attrs.class==="sequence-source");
-  assert.ok(source);source.listeners.click();assert.equal(opened[0],step);
-});
-
-test("terminal sequence guard 4: groups without a flat, visible, targeted entry call do not fabricate arrows",()=>{
-  const window={};
-  vm.runInNewContext(fs.readFileSync("web/sequence.js","utf8"),{window,document:{createElementNS:(_,tag)=>new Element(tag)}});
-  const container=new Element("div"), opened=[];
-  const candidate={id:"candidate-3",label:"guessed-3",kind:"internal",identification:"old lexical match"};
-  const step={id:"call-3",kind:"call",label:"measured call",target:candidate.id,resolution:"internal",path:"main.rs",range:{startLine:1,endLine:1}};
-  window.TrellisSequence.render(container,{seed:{id:"seed",name:"measured"},participants:[{id:"seed",label:"measured",kind:"method"},candidate],steps:[step]},item=>opened.push(item));
-  const all=node=>[node,...node.children.flatMap(all)], nodes=all(container);
-  assert.equal(nodes.filter(node=>node.attrs.class==="sequence-arrow").length,0);
-  assert.equal(nodes.filter(node=>node.attrs.class==="sequence-participant-label").length,1);
-  assert.ok(!nodes.some(node=>node.textContent==="guessed-3"));
-  const source=nodes.find(node=>node.attrs.class==="sequence-source");
-  assert.ok(source);source.listeners.click();assert.equal(opened[0],step);
-});
-
-function diagram(view, options = {}, expanded = new Set()) {
-  const window = {}, selected = [], sources = [];
-  vm.runInNewContext(fs.readFileSync("web/sequence.js", "utf8"), {window, document:{createElementNS:(_, tag)=>new Element(tag)}});
-  const container = new Element("div"); container.scrollTop = 71; container.scrollLeft = 19;
-  const all = n => [n, ...n.children.flatMap(all)];
-  const render = (nextOptions = options, nextView = view) => window.TrellisSequence.render(container, nextView, step=>sources.push(step), expanded, nextOptions);
-  render();
-  return {container, sources, selected, render, nodes:()=>all(container),
-    row:id=>all(container).find(n=>n.attrs["data-source-step-id"] === id),
-    toggle:()=>all(container).find(n=>n.attrs.class === "sequence-group-control")};
+  vm.runInNewContext(fs.readFileSync("web/sequence.js", "utf8"), {window, document:{createElement:tag => new Element(tag)}});
+  return window.TrellisSequence;
 }
 const range = {startLine:3, startColumn:2, endLine:7, endColumn:9};
 const call = (id, target = "type", resolution = "unresolved") => ({id, kind:"call", label:id, path:"main.rs", range, callId:id, target, resolution, children:[], alternate:[]});
@@ -128,332 +25,51 @@ const viewWith = steps => ({seed:{id:"seed", name:"sample"}, participants:[
   {id:"unknown", label:"Unknown", kind:"unresolvedReceiver"}
 ], steps});
 const freeze = value => { if (value && typeof value === "object") { Object.freeze(value); Object.values(value).forEach(freeze); } return value; };
-const visibleText = nodes => nodes.filter(n=>n.tag !== "title").map(n=>n.textContent).filter(Boolean);
 
-test("selection uses original steps, not source fetches, and survives keyboard group toggles without mutating DTO/options", () => {
-  const first = call("Builder::new"), second = call("open", "unknown");
-  const group = {id:"chain", kind:"group", label:"Builder chain", path:"main.rs", range, children:[first, second]};
-  const view = freeze(viewWith([group])), selected = [];
-  const options = Object.freeze({onSelect:step=>selected.push(step), showDetails:false});
-  const before = JSON.stringify(view), d = diagram(view, options);
-  d.row("chain").listeners.click();
-  assert.equal(selected[0], group); assert.equal(d.sources.length, 0);
-  assert.equal(d.row("chain").attrs["aria-pressed"], "true");
-  assert.match(d.row("chain").attrs["aria-label"], /Inspect: group: Builder chain/);
-  assert.match(d.row("chain").attrs["aria-label"], /main.rs:3:2–7:9/);
-  for (const key of ["Enter", " "]) {
-    let prevented = false;
-    d.toggle().listeners.keydown({key, preventDefault(){prevented=true;}});
-    assert.ok(prevented); assert.ok(d.toggle().focused);
-    assert.equal(d.container.scrollTop, 71); assert.equal(d.container.scrollLeft, 19);
-    assert.equal(d.row("chain").attrs["aria-pressed"], "true");
-  }
-  d.toggle().listeners.click();
-  for (const key of ["Enter", " "]) {
-    let prevented = false;
-    d.row(first.id).listeners.keydown({key, preventDefault(){prevented=true;}});
-    assert.ok(prevented); assert.equal(selected.at(-1), first);
-  }
-  assert.equal(d.row("chain").attrs["aria-pressed"], "false");
-  assert.equal(d.row(first.id).attrs["aria-pressed"], "true");
-  d.toggle().listeners.click(); d.toggle().listeners.click();
-  assert.equal(d.row(first.id).attrs["aria-pressed"], "true");
-  d.row(second.id).listeners.keydown({key:"Escape", preventDefault(){assert.fail("unrelated key prevented");}});
-  assert.equal(selected.at(-1), first);
-  assert.equal(d.sources.length, 0); assert.equal(JSON.stringify(view), before);
-  d.render(); assert.equal(d.row(first.id).attrs["aria-pressed"], "false");
+// #1007: web/sequence.js draws no diagram. When Pele cannot draw, the caller shows this state.
+test("a Sequence that could not be drawn is one plain line with the reason as text, and nothing else", () => {
+  const sequence = sequenceModel(), container = new Element("div");
+  assert.equal(sequence.render, undefined, "there is no second renderer to fall back to");
+  container.append(new Element("svg"));
+  sequence.renderError(container, "Unsupported sequence depth");
+  assert.equal(container.children.length, 1, "the previous diagram is replaced");
+  const [note] = container.children;
+  assert.equal(note.tag, "p"); assert.equal(note.className, "sequence-empty", "the empty state's own styling");
+  assert.equal(note.textContent, "This Sequence could not be drawn: Unsupported sequence depth");
+  assert.deepEqual(note.children, [], "no control, no partial diagram");
+  sequence.renderError(container, '<img src=x onerror="boom()">');
+  assert.equal(container.children.length, 1);
+  assert.equal(container.children[0].textContent, 'This Sequence could not be drawn: <img src=x onerror="boom()">', "repository text stays text");
+  assert.deepEqual(container.children[0].children, []);
+});
+test("the error state takes the container's render ownership, so an older render cannot install over it", () => {
+  const sequence = sequenceModel(), container = new Element("div"), other = new Element("div");
+  const older = sequence.beginRender(container), elsewhere = sequence.beginRender(other);
+  assert.equal(older(), true);
+  sequence.renderError(container, "Pele asset unavailable");
+  assert.equal(older(), false, "the render it replaced is no longer current");
+  assert.equal(elsewhere(), true, "another container's render is untouched");
+  const newer = sequence.beginRender(container);
+  assert.equal(newer(), true, "a later render owns the container again");
 });
 
-test("legacy source callback still works with keyboard and omitted fifth argument", () => {
-  const step = call("open"), d = diagram(viewWith([step]));
-  for (const key of ["Enter", " "]) d.row(step.id).listeners.keydown({key, preventDefault(){}});
-  assert.deepEqual(d.sources, [step, step]);
-  assert.match(d.row(step.id).attrs["aria-label"], /^Read source:/);
-});
-
-test("compact control summaries preserve every guard, alternate and exit; Show all restores full original labels", () => {
-  const label = "only if the preceding path continues normally; this guard has a distinct original source range and a long predicate <unsafe>";
-  const exit = {id:"exit", kind:"return", label:"?: early return on residual; conversion not expanded", path:"main.rs", range};
-  const alternate = {id:"alternate", kind:"throw", label:"throw different_error", path:"main.rs", range};
-  const inner = {id:"second-guard", kind:"branch", label, path:"main.rs", range:{...range,startLine:5}, children:[call("checked"), exit], alternate:[alternate]};
-  const guard = {id:"first-guard", kind:"branch", label, path:"main.rs", range, children:[inner], alternate:[]};
-  const selected = [], view = freeze(viewWith([guard])), before = JSON.stringify(view);
-  const d = diagram(view, {onSelect:step=>selected.push(step)});
-  const ids = () => d.nodes().filter(n=>n.attrs["data-step-id"]).map(n=>n.attrs["data-step-id"]);
-  assert.deepEqual(ids(), ["first-guard", "second-guard", "checked"]);
-  assert.ok(visibleText(d.nodes()).includes("Compact labels · select for details"));
-  const compactGuards = d.nodes().filter(n=>n.attrs.class === "sequence-control-label").flatMap(n=>n.children.filter(c=>c.tag === "tspan").map(c=>c.textContent));
-  assert.equal(compactGuards.length, 2);
-  assert.ok(compactGuards.every(t=>t.startsWith("[") && t.includes("…") && t.endsWith("may exit early]") && !t.includes("branch ·") && !t.includes("summary")));
-  assert.ok(visibleText(d.nodes()).includes("else / alternate"));
-  assert.ok(d.nodes().filter(n=>n.tag === "title" && n.textContent.includes(label)).length >= 2);
-  d.row(inner.id).listeners.click(); assert.equal(selected[0], inner); assert.equal(selected[0].range.startLine, 5);
-  const compactHeight = Number(d.nodes().find(n=>n.tag === "svg").attrs.height);
-  d.render({showDetails:true, onSelect:step=>selected.push(step)});
-  assert.deepEqual(ids(), ["first-guard", "second-guard", "checked", "exit", "alternate"]);
-  assert.equal(visibleText(d.nodes()).filter(t=>t.includes("summary")).length, 0);
-  for (const id of [guard.id, inner.id]) {
-    const text = d.row(id).children.find(n=>n.attrs.class === "sequence-control-label");
-    const restored = text.children.filter(n=>n.tag === "tspan").map(n=>n.textContent).join(" ");
-    assert.equal(restored, `[${label}]`);
-  }
-  assert.ok(Number(d.nodes().find(n=>n.tag === "svg").attrs.height) > compactHeight);
-  assert.equal(JSON.stringify(view), before);
-  assert.equal(d.nodes().some(n=>n.tag === "unsafe"), false);
-});
-
-test("terminal sequence guard 5: call provenance has distinct strokes and labels, without invented confidence, return arrows or activation bars",()=>{
-  const window={};
-  vm.runInNewContext(fs.readFileSync("web/sequence.js","utf8"),{window,document:{createElementNS:(_,tag)=>new Element(tag)}});
-  const container=new Element("div"), opened=[];
-  const candidate={id:"candidate-4",label:"guessed-4",kind:"internal",identification:"old lexical match"};
-  const step={id:"call-4",kind:"call",label:"measured call",target:candidate.id,resolution:"internal",path:"main.rs",range:{startLine:1,endLine:1}};
-  window.TrellisSequence.render(container,{seed:{id:"seed",name:"measured"},participants:[{id:"seed",label:"measured",kind:"method"},candidate],steps:[step]},item=>opened.push(item));
-  const all=node=>[node,...node.children.flatMap(all)], nodes=all(container);
-  assert.equal(nodes.filter(node=>node.attrs.class==="sequence-arrow").length,0);
-  assert.equal(nodes.filter(node=>node.attrs.class==="sequence-participant-label").length,1);
-  assert.ok(!nodes.some(node=>node.textContent==="guessed-4"));
-  const source=nodes.find(node=>node.attrs.class==="sequence-source");
-  assert.ok(source);source.listeners.click();assert.equal(opened[0],step);
-});
-
-test("terminal sequence guard 6: long chain entry names keep the measured arrow, collapsed count, full tooltip and original group callback",()=>{
-  const window={};
-  vm.runInNewContext(fs.readFileSync("web/sequence.js","utf8"),{window,document:{createElementNS:(_,tag)=>new Element(tag)}});
-  const container=new Element("div"), opened=[];
-  const candidate={id:"candidate-5",label:"guessed-5",kind:"internal",identification:"old lexical match"};
-  const step={id:"call-5",kind:"call",label:"measured call",target:candidate.id,resolution:"internal",path:"main.rs",range:{startLine:1,endLine:1}};
-  window.TrellisSequence.render(container,{seed:{id:"seed",name:"measured"},participants:[{id:"seed",label:"measured",kind:"method"},candidate],steps:[step]},item=>opened.push(item));
-  const all=node=>[node,...node.children.flatMap(all)], nodes=all(container);
-  assert.equal(nodes.filter(node=>node.attrs.class==="sequence-arrow").length,0);
-  assert.equal(nodes.filter(node=>node.attrs.class==="sequence-participant-label").length,1);
-  assert.ok(!nodes.some(node=>node.textContent==="guessed-5"));
-  const source=nodes.find(node=>node.attrs.class==="sequence-source");
-  assert.ok(source);source.listeners.click();assert.equal(opened[0],step);
-});
-
-test("terminal sequence guard 7: hidden-only lanes are omitted and visible lanes follow first measured appearance",()=>{
-  const window={};
-  vm.runInNewContext(fs.readFileSync("web/sequence.js","utf8"),{window,document:{createElementNS:(_,tag)=>new Element(tag)}});
-  const container=new Element("div"), opened=[];
-  const candidate={id:"candidate-6",label:"guessed-6",kind:"internal",identification:"old lexical match"};
-  const step={id:"call-6",kind:"call",label:"measured call",target:candidate.id,resolution:"internal",path:"main.rs",range:{startLine:1,endLine:1}};
-  window.TrellisSequence.render(container,{seed:{id:"seed",name:"measured"},participants:[{id:"seed",label:"measured",kind:"method"},candidate],steps:[step]},item=>opened.push(item));
-  const all=node=>[node,...node.children.flatMap(all)], nodes=all(container);
-  assert.equal(nodes.filter(node=>node.attrs.class==="sequence-arrow").length,0);
-  assert.equal(nodes.filter(node=>node.attrs.class==="sequence-participant-label").length,1);
-  assert.ok(!nodes.some(node=>node.textContent==="guessed-6"));
-  const source=nodes.find(node=>node.attrs.class==="sequence-source");
-  assert.ok(source);source.listeners.click();assert.equal(opened[0],step);
-});
-
-test("empty and fully hidden views keep only the selected method lane", () => {
-  for (const steps of [[], [{...call("hidden"), hidden:true}]]) {
-    const d = diagram(viewWith(steps));
-    assert.deepEqual(d.nodes().filter(n=>n.attrs.class === "sequence-participant-label").map(n=>n.textContent), ["sample"]);
-    assert.equal(d.nodes().filter(n=>n.attrs.class === "sequence-arrow").length, 0);
-  }
-});
-
-
-test("known guard prose becomes concise display text without merging nodes or losing original evidence", () => {
-  const continuation = "only if the preceding path continues normally";
-  const residual = "?: early return on residual; conversion not expanded";
-  const success = "?: continue only on success; otherwise early return";
-  const exit = {id:"residual",kind:"return",label:residual,path:"option.rs",range};
-  const check = {id:"check",kind:"branch",label:success,path:"option.rs",range,children:[],alternate:[exit]};
-  const guard2 = {id:"guard2",kind:"branch",label:continuation,path:"option.rs",range:{...range,startLine:5},children:[check]};
-  const guard1 = {id:"guard1",kind:"branch",label:continuation,path:"option.rs",range,children:[guard2]};
-  const view = freeze(viewWith([guard1])), before = JSON.stringify(view), selected = [];
-  const d = diagram(view, {onSelect:step=>selected.push(step)});
-  const rowText = id => d.row(id).children.find(n=>n.tag === "text" && n.attrs.class !== "sequence-fragment-operator").children.filter(n=>n.tag === "tspan").map(n=>n.textContent).join(" ");
-  assert.equal(rowText("guard1"), "[if prior path continues] · may exit early"); assert.equal(rowText("guard2"), "[if prior path continues] · may exit early");
-  assert.equal(d.nodes().filter(n=>n.attrs.class === "sequence-guard-rail").length, 2);
-  assert.equal(rowText("check"), "[success / early return · may exit early]");
-  assert.equal(d.row("residual"), undefined);
-  assert.ok(!visibleText(d.nodes()).some(t=>/summary|branch ·|return · (?!may exit early)|error/i.test(t)));
-  for (const step of [guard1, guard2, check]) {
-    assert.ok(d.row(step.id).attrs["aria-label"].includes(step.label));
-    assert.ok(d.row(step.id).children.some(n=>n.tag === "text" && n.children.some(n=>n.tag === "title" && n.textContent.includes(step.label))));
-    const hit = d.row(step.id).children.find(n=>n.attrs.class === "sequence-row-hit");
-    assert.ok(Number(hit.attrs.height) >= 24);
-    d.row(step.id).listeners.click(); assert.equal(selected.at(-1), step);
-  }
-  d.render({showDetails:true});
-  for (const step of [guard1, guard2, check, exit]) assert.equal(rowText(step.id), step.kind === "branch" ? `[${step.label}]` : `${step.kind} · ${step.label}`);
-  assert.equal(JSON.stringify(view), before);
-});
-
-
-test("control frames have clipped operator tabs and bracketed original guards with accessible source selection", () => {
-  const branch = {id:"conditional",kind:"branch",label:"total > 0 <unsafe>",path:"main.rs",range,children:[call("authorize")],alternate:[call("decline")]};
-  const loop = {id:"iteration",kind:"loop",label:"for each line",path:"main.rs",range,children:[branch]};
-  const attempt = {id:"attempt",kind:"try",label:"read storage",path:"main.rs",range,children:[call("read")],alternate:[]};
-  const block = {id:"opaque-container",kind:"note",label:"explicit container",path:"main.rs",range,children:[call("contained")]};
-  const view = freeze(viewWith([loop, attempt, block])), before = JSON.stringify(view), selected = [];
-  const d = diagram(view, {onSelect:step=>selected.push(step)});
-  assert.deepEqual(d.nodes().filter(n=>n.attrs.class === "sequence-fragment-operator").map(n=>n.textContent), ["loop","alt","try","block"]);
-  for (const step of [loop,branch,attempt,block]) {
-    const row = d.row(step.id), tab = row.children.find(n=>n.attrs.class === "sequence-fragment-tab");
-    assert.equal(tab.tag, "path"); assert.match(tab.attrs.d, /^M [\d.]+ [\d.]+ H [\d.]+ V [\d.]+ L [\d.]+ [\d.]+ H [\d.]+ Z$/);
-    assert.equal(row.attrs.role, "button"); assert.equal(row.attrs.tabindex, "0");
-    assert.ok(row.attrs["aria-label"].includes(step.label));
-    assert.ok(visibleText(d.nodes()).includes(`[${step.label}]`));
-    for (const key of ["Enter", " "]) { let prevented=false;row.listeners.keydown({key,preventDefault(){prevented=true;}});assert.ok(prevented);assert.equal(selected.at(-1), step); }
-    assert.equal(row.attrs["aria-pressed"], "true");
-  }
-  assert.deepEqual(d.nodes().filter(n=>n.attrs["data-step-id"]).map(n=>n.attrs["data-step-id"]), ["iteration","conditional","authorize","decline","attempt","read","opaque-container","contained"]);
-  assert.equal(d.sources.length,0); assert.equal(JSON.stringify(view),before);
-  assert.equal(d.nodes().some(n=>n.tag === "unsafe"),false);
-});
-
-test("long nested guards wrap beside tabs and adjacent control frames do not overlap", () => {
-  let nested = call("deepest");
-  for (let i=0;i<50;i++) nested={id:`nested-${i}`,kind:"loop",label:"condition with long source text ".repeat(10).trim(),path:"main.rs",range,children:[nested]};
-  const tail={id:"last",kind:"branch",label:"next predicate",path:"main.rs",range,children:[]};
-  const d=diagram(freeze(viewWith([nested,tail])),{showDetails:true});
-  const topFrames = [nested.id,tail.id].map(id=>d.nodes().find(n=>n.attrs["data-step-id"]===id).children.find(n=>n.attrs.class==="sequence-fragment"));
-  assert.ok(Number(topFrames[1].attrs.y)>Number(topFrames[0].attrs.y)+Number(topFrames[0].attrs.height));
-  for(const row of d.nodes().filter(n=>n.attrs.class==="sequence-source" && n.children.some(c=>c.attrs.class==="sequence-fragment-tab"))) {
-    const op=row.children.find(n=>n.attrs.class==="sequence-fragment-operator");
-    const guard=row.children.find(n=>n.attrs.class==="sequence-control-label");
-    assert.ok(Number(guard.attrs.x)>Number(op.attrs.x)+60);
-    const spans=guard.children.filter(n=>n.tag==="tspan");
-    assert.ok(spans.every(n=>Number(n.attrs.x)===Number(guard.attrs.x)));
-    const canvasWidth = Number(d.nodes().find(n=>n.tag==="svg").attrs.width);
-    assert.ok(spans.every(n=>Number(n.attrs.x)+n.textContent.length*7.8 < canvasWidth-18));
-    assert.ok(spans.map(n=>n.textContent).join(" ").startsWith("["));
-    assert.ok(spans.at(-1).textContent.endsWith("]"));
-    const hit=row.children.find(n=>n.attrs.class==="sequence-row-hit");
-    assert.ok(Number(hit.attrs.height)>=30+(spans.length-1)*16);
-  }
-  assert.ok(d.nodes().filter(n=>n.attrs.class==="sequence-control-label").some(n=>n.children.filter(c=>c.tag==="tspan").length>1));
-});
-
-
-test("loop tabs abbreviate parser prose without inventing an iteration predicate", () => {
-  for(const [kind,caption] of [["for","for · possible iterations"],["while","while · possible iterations"],["loop","loop · termination unknown"]]) {
-    const label=`${kind}_expression: possible iterations, not unrolled; exit/termination unknown`;
-    const step={id:kind,kind:"loop",label,path:"main.rs",range,children:[call("work")]};
-    const d=diagram(freeze(viewWith([step])));
-    assert.ok(visibleText(d.nodes()).includes(`[${caption}]`));
-    assert.ok(d.row(kind).attrs["aria-label"].includes(label));
-    d.render({showDetails:true});
-    const guard=d.row(kind).children.find(n=>n.attrs.class==="sequence-control-label");
-    assert.equal(guard.children.filter(n=>n.tag==="tspan").map(n=>n.textContent).join(" "),`[${label}]`);
-  }
-});
-
-
-const rowLabel = row => row.children.filter(n=>n.tag === "text" && n.attrs.class !== "sequence-fragment-operator")
-  .flatMap(n=>n.children.filter(c=>c.tag === "tspan").map(c=>c.textContent)).join(" ");
-
-test("terminal sequence guard 8: workflow-shaped sequence keeps all measured calls, analysis rows and conditional scope with full-detail restoration",()=>{
-  const window={};
-  vm.runInNewContext(fs.readFileSync("web/sequence.js","utf8"),{window,document:{createElementNS:(_,tag)=>new Element(tag)}});
-  const container=new Element("div"), opened=[];
-  const candidate={id:"candidate-7",label:"guessed-7",kind:"internal",identification:"old lexical match"};
-  const step={id:"call-7",kind:"call",label:"measured call",target:candidate.id,resolution:"internal",path:"main.rs",range:{startLine:1,endLine:1}};
-  window.TrellisSequence.render(container,{seed:{id:"seed",name:"measured"},participants:[{id:"seed",label:"measured",kind:"method"},candidate],steps:[step]},item=>opened.push(item));
-  const all=node=>[node,...node.children.flatMap(all)], nodes=all(container);
-  assert.equal(nodes.filter(node=>node.attrs.class==="sequence-arrow").length,0);
-  assert.equal(nodes.filter(node=>node.attrs.class==="sequence-participant-label").length,1);
-  assert.ok(!nodes.some(node=>node.textContent==="guessed-7"));
-  const source=nodes.find(node=>node.attrs.class==="sequence-source");
-  assert.ok(source);source.listeners.click();assert.equal(opened[0],step);
-});
-
-test("only the exact generated continuation guard without alternatives uses a conditional rail", () => {
-  const label = "only if the preceding path continues normally";
-  const variants = [
-    {id:"exact",kind:"branch",label,children:[call("a")]},
-    {id:"with-alternate",kind:"branch",label,children:[call("b")],alternate:[call("c")]},
-    {id:"different",kind:"branch",label:`${label}; extra condition`,children:[call("d")]},
-    {id:"space",kind:"branch",label:`${label} `,children:[call("e")]},
-    {id:"loop",kind:"loop",label,children:[call("f")]},
-    {id:"try",kind:"try",label,children:[call("g")]}
-  ].map(s=>({...s,path:"main.rs",range}));
-  const d=diagram(freeze(viewWith(variants)));
-  assert.deepEqual(d.nodes().filter(n=>n.attrs["data-presentation"] === "continuation-guard").map(n=>n.attrs["data-step-id"]),["exact"]);
-  assert.deepEqual(d.nodes().filter(n=>n.attrs.class === "sequence-fragment-operator").map(n=>n.textContent),["alt","alt","alt","loop","try"]);
-  assert.ok(visibleText(d.nodes()).includes("else / alternate"));
-  assert.equal(d.nodes().filter(n=>n.attrs["data-kind"] === "call").length,7);
-  d.render({showDetails:true});
-  assert.equal(d.nodes().filter(n=>n.attrs.class === "sequence-guard-rail").length,0);
-  assert.equal(d.nodes().filter(n=>n.attrs.class === "sequence-fragment").length,6);
-});
-
-test("quiet protocol and unsupported boundaries remain individual evidence controls", () => {
-  const labels = [
-    ["Nested function/callback/class boundary: bodies are not executed here; class definition effects (base, computed keys, static initialization) are not expanded.","nested definition · effects not expanded"],
-    ["Argument unpacking boundary: iteration/mapping protocol not expanded.","argument unpacking · protocol not expanded"],
-    ["Formatted string boundary: interpolation and formatting protocol not expanded.","formatted string · protocol not expanded"],
-    ["Unsupported custom behavior: evaluation remains unknown.","Unsupported custom behavior: evaluation remains unknown."]
-  ];
-  const steps=labels.map(([label],i)=>({id:`boundary-${i}`,kind:"boundary",label,path:"main.rs",range}));
-  const d=diagram(freeze(viewWith(steps)));
-  assert.deepEqual(steps.map(s=>rowLabel(d.row(s.id))),labels.map(([,compact])=>compact));
-  assert.equal(d.nodes().filter(n=>n.attrs["data-presentation"] === "quiet-note").length,steps.length);
-  for(const step of steps) { d.row(step.id).listeners.keydown({key:"Enter",preventDefault(){}}); assert.equal(d.sources.at(-1),step); }
-  d.render({showDetails:true});
-  assert.deepEqual(steps.map(s=>rowLabel(d.row(s.id))),labels.map(([label])=>`boundary · ${label}`));
-});
-
-
-test("proven name bindings and deferred definitions stay available in Show all without invented guards", () => {
-  const binding = {id:"binding",kind:"effect",label:"bind name: agent",path:"factory.py",range};
-  const definition = {id:"definition",kind:"definition",label:"define _executor · async body deferred",path:"factory.py",range};
-  const steps = [call("make_agent"),binding,definition,call("Step"),call("Workflow"),{id:"return",kind:"return",label:"return Workflow(steps=[Step(executor=_executor)])",path:"factory.py",range}];
-  const view = freeze(viewWith(steps)), before = JSON.stringify(view), selected = [];
-  const d = diagram(view,{onSelect:step=>selected.push(step)});
-  assert.equal(d.row(binding.id),undefined);
-  assert.equal(d.row(definition.id),undefined);
-  assert.equal(d.nodes().filter(n=>n.attrs.class === "sequence-guard-rail" || n.attrs.class === "sequence-fragment").length,0);
-  assert.equal(d.nodes().filter(n=>n.attrs["data-kind"] === "call").length,3);
-  assert.equal(d.sources.length,0);
-  d.render({showDetails:true,onSelect:step=>selected.push(step)});
-  for(const step of [binding,definition]) {
-    d.row(step.id).listeners.keydown({key:"Enter",preventDefault(){}});
-    assert.equal(selected.at(-1),step);
-    assert.ok(d.row(step.id).attrs["aria-label"].includes(step.label));
-  }
-  assert.equal(rowLabel(d.row(binding.id)),`effect · ${binding.label}`);
-  assert.equal(rowLabel(d.row(definition.id)),`definition · ${definition.label}`);
-  assert.equal(JSON.stringify(view),before);
-});
-
-test("sequence SVG describes both snapshot identity fields without making a request", () => {
-  const nodes = render([{id:"seed",label:"sample",kind:"method"}]);
-  assert.ok(nodes.some(node => node.tag === "title" && /revision 12345678:1/.test(node.textContent)));
-});
-
-test("future terminal DTO without target keeps call text and source action",()=>{
-  const window={};vm.runInNewContext(fs.readFileSync("web/sequence.js","utf8"),{window,document:{createElementNS:(_,tag)=>new Element(tag)}});
-  const container=new Element("div"),opened=[];
-  const call={id:"future",kind:"call",label:"open",path:"main.rs",range:{startLine:3,endLine:3}};
-  window.TrellisSequence.render(container,{seed:{id:"seed",name:"measured"},participants:[{id:"seed",label:"measured",kind:"method"}],steps:[call]},step=>opened.push(step));
-  const all=node=>[node,...node.children.flatMap(all)],nodes=all(container);
-  assert.equal(nodes.filter(node=>node.attrs.class==="sequence-arrow").length,0);
-  assert.ok(nodes.some(node=>node.textContent==="open"));
-  nodes.find(node=>node.attrs.class==="sequence-source").listeners.click();
-  assert.equal(opened[0],call);
-});
-
-test("malformed group preview and source rows remain inert despite onSelect",()=>{
- const group={id:"group",kind:"group",label:"chain",path:"main.rs",range:{startLine:2,endLine:1},children:[{id:"entry",kind:"call",label:"open",path:"main.rs",range:{startLine:2,endLine:2}}]};
- const d=diagram(viewWith([group]),{onSelect:()=>{throw Error("unwitnessed selection");}});
- assert.equal(d.nodes().filter(node=>node.attrs["data-kind"]==="call-preview").length,0);
- assert.ok(!d.row("group")?.attrs.role);
- const malformed={id:"bad",kind:"call",label:"bad",path:"",range:{startLine:1,endLine:2}};
- const more=diagram(viewWith([malformed]),{onSelect:()=>{throw Error("unwitnessed selection");}});
- assert.ok(!more.row("bad")?.attrs.role);
-});
-
-test("sequence actions recheck matched snapshot at click time",()=>{
- let current=true, selected=0;const call={id:"call",kind:"call",label:"open",path:"main.rs",range:{startLine:1,endLine:2}};
- const d=diagram(viewWith([call]),{isCurrent:()=>current,onSelect:()=>selected++});
- const row=d.row("call");assert.equal(row.attrs.role,"button");current=false;
- row.listeners.click();assert.equal(selected,0);
+// The compact text both the diagram rows and the inspector start from. The full label stays on
+// the original step.
+test("compact labels shorten known parser prose and leave unknown text as measured", () => {
+  const sequence = sequenceModel();
+  const step = (kind, label) => freeze({id:"step", kind, label, path:"main.rs", range, children:[], alternate:[]});
+  for (const [kind, label, compact] of [
+    ["boundary", "Nested function/callback/class boundary: bodies are not executed here; class definition effects (base, computed keys, static initialization) are not expanded.", "nested definition · effects not expanded"],
+    ["boundary", "Argument unpacking boundary: iteration/mapping protocol not expanded.", "argument unpacking · protocol not expanded"],
+    ["boundary", "Formatted string boundary: interpolation and formatting protocol not expanded.", "formatted string · protocol not expanded"],
+    ["boundary", "Unsupported custom behavior: evaluation remains unknown.", "Unsupported custom behavior: evaluation remains unknown."],
+    ["loop", "for_expression: possible iterations, not unrolled; exit/termination unknown", "for · possible iterations"],
+    ["loop", "while_expression: possible iterations, not unrolled; exit/termination unknown", "while · possible iterations"],
+    ["loop", "loop_expression: possible iterations, not unrolled; exit/termination unknown", "loop · termination unknown"],
+    ["branch", "?: continue only on success; otherwise early return", "success / early return"],
+    ["effect", "write: obj.value = prepare() (implicit setters/unpacking unresolved)", "write · setters/unpacking unresolved"],
+    ["branch", "total > 0 <unsafe>", "total > 0 <unsafe>"],
+  ]) assert.equal(sequence.compactLabel(step(kind, label)), compact, label);
 });
 
 // Pele projection tests use the real adapter, not a reconstructed prototype DTO.
@@ -853,28 +469,6 @@ test("nonresolved engine boundaries keep honest labels and never gain target lan
     assert.match(result.rows[0].display,/Unresolved|Ambiguous|Stale|Dispatch|External|Unbound|participant limit/);
   }
 });
-test("legacy resolved lanes and arrows preserve exact target navigation and stale callbacks", () => {
-  const {view,call,target} = resolvedSequence(), opened = [];
-  let current = true;
-  const d = diagram(view,{isCurrent:()=>current,onOpenTarget:(symbol,step)=>opened.push({symbol,step})});
-  assert.equal(d.nodes().filter(n=>n.attrs.class==="sequence-participant-label").length,2);
-  assert.ok(d.nodes().some(n=>n.attrs.class==="sequence-arrow" && n.attrs["data-trellis-call-id"]===call.callId));
-  const lane = d.nodes().find(n=>n.attrs["data-trellis-target-id"]===target.id && n.attrs.role==="button");
-  lane.listeners.click(); lane.listeners.keydown({key:"Enter",preventDefault(){}}); lane.listeners.keydown({key:" ",preventDefault(){}});
-  assert.equal(opened.length,3); assert.equal(opened[0].symbol,target); assert.equal(opened[0].step,call);
-  current=false; lane.listeners.click(); assert.equal(opened.length,3);
-});
-
-test("detached legacy lane actions cannot navigate after same-container redraw", () => {
-  const {view,target} = resolvedSequence(), opened = [];
-  const d = diagram(view,{onOpenTarget:symbol=>opened.push(symbol)});
-  const old = d.nodes().find(n=>n.attrs["data-trellis-target-id"]===target.id && n.attrs.role==="button");
-  d.render(); old.listeners.click(); old.listeners.keydown({key:"Enter",preventDefault(){}});
-  assert.equal(opened.length,0);
-  d.nodes().find(n=>n.attrs["data-trellis-target-id"]===target.id && n.attrs.role==="button").listeners.click();
-  assert.equal(opened[0],target);
-});
-
 test("long repository call labels cannot hide nonresolved state words", () => {
   const adapter = peleProjector(), {view,call} = resolvedSequence();
   for (const boundaryReason of ["unresolved","ambiguous","stale"]) {
@@ -882,7 +476,6 @@ test("long repository call labels cannot hide nonresolved state words", () => {
     view.steps = [step];
     const label = boundaryReason[0].toUpperCase()+boundaryReason.slice(1);
     assert.match(adapter.project(view).rows[0].display,new RegExp(label));
-    assert.ok(visibleText(diagram(view).nodes()).some(text=>text.includes(label)));
   }
 });
 
@@ -890,25 +483,23 @@ test("measured boundary calls retain their control-flow context and exact engine
   const {view,call,target} = resolvedSequence();
   const boundary = {...call,kind:"boundary",label:"Optional-chain call: conditional argument evaluation"};
   view.steps = [boundary];
-  const row = peleProjector().project(view).rows[0];
+  const projection = peleProjector().project(view), row = projection.rows[0];
   assert.equal(row.step,boundary); assert.equal(row.target.declaration,target); assert.equal(row.type,"note");
   assert.match(row.display,/Resolved declaration - Optional-chain/);
-  const nodes = diagram(view,{onOpenTarget:()=>{}}).nodes();
-  assert.ok(nodes.some(n=>n.attrs["data-trellis-target-id"]===target.id));
-  assert.equal(nodes.filter(n=>n.attrs.class === "sequence-arrow").length,0);
+  assert.equal(projection.lanes[1].targets.get(target.id).participant.declaration,target,"the target keeps its lane");
+  assert.equal(projection.messageIds.length,0,"a boundary draws no arrow");
 });
 
-test("resolved noncallable declaration keeps lane and source action, not a callee-sequence label", () => {
-  const {view,target} = resolvedSequence(); target.kind = "class";
-  const opened = [], d = diagram(view,{onOpenTarget:symbol=>opened.push(symbol)});
-  const lane = d.nodes().find(n=>n.attrs["data-trellis-target-id"]===target.id && n.attrs.role==="button");
-  assert.equal(lane.attrs["aria-label"],"Read declaration source: actual_target");
-  lane.listeners.click(); assert.equal(opened[0],target);
+test("resolved noncallable declaration keeps its lane and reads source, not a callee sequence", () => {
+  const {view,target} = resolvedSequence(), sequence = sequenceModel();
+  assert.equal(sequence.targetActionLabel(target, view.participants.at(-1)),"Open callee sequence");
+  target.kind = "class";
+  assert.equal(sequence.targetActionLabel(target, view.participants.at(-1)),"Read declaration source");
   assert.equal(peleProjector().project(view).lanes.length,2);
 });
 
-// #522: a resolved call's expanded body is drawn by both renderers, on the callee's lane.
-test("both renderers draw a resolved call's expanded body on the callee lane", () => {
+// #522: a resolved call's expanded body is drawn on the callee's lane.
+test("a resolved call's expanded body is drawn on the callee lane", () => {
   const {view, call, target} = resolvedSequence();
   const inner = {id:"inner-declaration", name:"helper", kind:"function", path:"target.rs", range:{startLine:5,endLine:5}};
   view.participants.push({id:inner.id, label:inner.name, kind:"function", declaration:inner});
@@ -917,23 +508,19 @@ test("both renderers draw a resolved call's expanded body on the callee lane", (
   const projection = peleProjector().project(view);
   assert.ok(projection.rows.some(row => row.id === child.id && row.type === "message"));
   assert.match(projection.source, /^P1->>P2: /m);
-  const d = diagram(view, {onSelect:()=>{}});
-  assert.ok(d.row(child.id), "SVG draws the expanded child");
-  const arrow = d.nodes().find(n => n.attrs.class === "sequence-arrow" && n.attrs["data-trellis-call-id"] === "inner-occurrence");
-  assert.ok(arrow.attrs.d.startsWith("M 340 "), arrow.attrs.d);
 });
 
 // #546 review: a collapsed chain whose last call may return early (#542) keeps the marker in
-// its compact SVG label, as Pele, the tooltip and the expanded rows already do.
+// its compact row.
 test("collapsed chain retains the early-return marker in its compact row", () => {
-  const first = call("Builder::new");
-  const second = {...call("open"), folded:[{id:"try", kind:"branch", label:"?: continue only on success; otherwise early return", path:"main.rs", range,
+  const measured = id => ({...call(id), target:null, hidden:false});
+  const second = {...measured("open"), folded:[{id:"try", kind:"branch", label:"?: continue only on success; otherwise early return", path:"main.rs", range,
     alternate:[{id:"return", kind:"return", label:"?: early return on residual", path:"main.rs", range}]}]};
-  const group = {id:"chain", kind:"group", label:"Builder chain", path:"main.rs", range, children:[first, second]};
-  const d = diagram(viewWith([group]), {showDetails:false});
-  const text = d.nodes().filter(n => n.tag === "tspan").map(n => n.textContent).join(" ");
-  assert.match(text, /calls collapsed \(entry preview\) · may return early/);
-  assert.match(d.row("chain").attrs["aria-label"], /may return early/);
+  const group = {id:"chain", kind:"group", label:"Builder chain", path:"main.rs", range, children:[measured("Builder::new"), second], alternate:[], hidden:false};
+  const view = {...viewWith([group]), revision:{indexGeneration:"pin", indexRevision:1}};
+  const [row] = peleProjector().project(view).rows;
+  assert.equal(row.step, group);
+  assert.match(row.display, /calls collapsed \(entry preview\) · may return early$/);
 });
 
 // Normal-size admitted source tree: the display must not rewrite this evidence.
@@ -951,29 +538,23 @@ function callsFirstView() {
     leaf("last-return", "return", "return final_value")
   ]), revision:{indexGeneration:"12345678-1234-4123-8123-123456789abc", indexRevision:1}};
 }
-test("calls-first shares original ordered calls, conditional/unknown context and reversible detail in both renderers", () => {
-  const view = freeze(callsFirstView()), before = JSON.stringify(view), selected = [];
-  const d = diagram(view, {onSelect:step=>selected.push(step)}), adapter = peleProjector();
+test("calls-first keeps original ordered calls, conditional/unknown context and reversible detail", () => {
+  const view = freeze(callsFirstView()), before = JSON.stringify(view), adapter = peleProjector();
   const projection = adapter.project(view);
   const retained = ["prepare","condition","ready","fallback","loop","repeat","unknown","continuation","finish"];
-  assert.deepEqual(d.nodes().filter(n=>n.attrs["data-source-step-id"]).map(n=>n.attrs["data-source-step-id"]),retained);
   assert.deepEqual(Array.from(projection.rows,row=>row.id),retained);
   const originals = view.steps.flatMap(function walk(step) {return [step,...(step.children||[]).flatMap(walk),...(step.alternate||[]).flatMap(walk)];});
   assert.equal(originals.length,16);
   for (const row of projection.rows) {
     const original = originals.find(step=>step.id===row.id);
     assert.equal(row.step,original); assert.equal(row.range,original.range);
-    d.row(row.id).listeners.click(); assert.equal(selected.at(-1),original);
   }
-  assert.match(rowLabel(d.row("condition")),/may exit early/);
   assert.match(projection.rows.find(row=>row.id==="condition").display,/may exit early/);
   assert.match(projection.source,/alt if ready/); assert.match(projection.source,/else alternate path/);
   assert.match(projection.source,/loop loop/); assert.match(projection.source,/unknown/);
-  d.render({showDetails:true});
   const all = adapter.project(view,new Set(),{showDetails:true});
-  assert.deepEqual(d.nodes().filter(n=>n.attrs["data-source-step-id"]).map(n=>n.attrs["data-source-step-id"]),originals.map(step=>step.id));
   assert.deepEqual(Array.from(all.rows,row=>row.id),originals.map(step=>step.id));
-  assert.match(rowLabel(d.row("write")),/write: state = ready/);
+  assert.match(all.rows.find(row=>row.id==="write").display,/write: state = ready/);
   assert.equal(JSON.stringify(view),before);
 });
 test("calls-first zero-call summary never claims that a method has no behavior", () => {
@@ -992,11 +573,9 @@ test("calls-first hides deferred callables but keeps unexpanded initialization e
     "Nested function/callback/class boundary: bodies are not executed here; class definition effects (base, computed keys, static initialization) are not expanded."
   ];
   const steps = labels.map((label,i)=>({id:`deferred-${i}`,kind:"boundary",label,path:"main.rs",range,children:[],alternate:[],hidden:false}));
-  const view = freeze(viewWith(steps)), d = diagram(view);
-  assert.deepEqual(d.nodes().filter(n=>n.attrs["data-source-step-id"]).map(n=>n.attrs["data-source-step-id"]),["deferred-2","deferred-3"]);
-  assert.deepEqual(Array.from(peleProjector().project({...view,revision:{indexGeneration:"pin",indexRevision:1}}).rows,row=>row.id),["deferred-2","deferred-3"]);
-  d.render({showDetails:true});
-  assert.deepEqual(d.nodes().filter(n=>n.attrs["data-source-step-id"]).map(n=>n.attrs["data-source-step-id"]),steps.map(step=>step.id));
+  const view = freeze({...viewWith(steps),revision:{indexGeneration:"pin",indexRevision:1}}), adapter = peleProjector();
+  assert.deepEqual(Array.from(adapter.project(view).rows,row=>row.id),["deferred-2","deferred-3"]);
+  assert.deepEqual(Array.from(adapter.project(view,new Set(),{showDetails:true}).rows,row=>row.id),steps.map(step=>step.id));
 });
 
 test("calls-first preserves extractor-labelled uncertainty outside boundaries only", () => {
@@ -1011,14 +590,14 @@ test("calls-first preserves extractor-labelled uncertainty outside boundaries on
     ...["for_expression","while_expression","loop_expression"].map(kind=>make(kind,"loop",`${kind}: possible iterations, not unrolled; exit/termination unknown`)),
     make("js-try","try","try; exception behavior unknown")
   ];
-  const view=freeze({...viewWith([...ordinary,...uncertain]),revision:{indexGeneration:"pin",indexRevision:1}}),before=JSON.stringify(view),d=diagram(view);
-  const ids=()=>d.nodes().filter(n=>n.attrs["data-source-step-id"]).map(n=>n.attrs["data-source-step-id"]);
-  assert.deepEqual(ids(),uncertain.map(step=>step.id));
-  assert.deepEqual(Array.from(peleProjector().project(view).rows,row=>row.id),uncertain.map(step=>step.id));
-  assert.equal(rowLabel(d.row("setter")),"write · setters/unpacking unresolved");
-  d.render({showDetails:true});assert.deepEqual(ids(),view.steps.map(step=>step.id));
+  const view=freeze({...viewWith([...ordinary,...uncertain]),revision:{indexGeneration:"pin",indexRevision:1}}),before=JSON.stringify(view),adapter=peleProjector();
+  const compact=adapter.project(view);
+  assert.deepEqual(Array.from(compact.rows,row=>row.id),uncertain.map(step=>step.id));
+  assert.match(compact.rows.find(row=>row.id==="setter").display,/write · setters\/unpacking unresolved/);
+  assert.deepEqual(Array.from(adapter.project(view,new Set(),{showDetails:true}).rows,row=>row.id),view.steps.map(step=>step.id));
   assert.equal(JSON.stringify(view),before);
 });
+
 
 test("older-basis sequence evidence keeps historical identity and is not labelled fresh", () => {
   const window = {};
@@ -1097,29 +676,4 @@ test("#716: a lane name breaks after a separator or before a capital, never insi
   assert.deepEqual(lines("fmt::Error"), ["fmt::Error"], "a short name stays on one line");
   assert.deepEqual(lines("sequence-pele.js"), ["sequence-", "pele.js"]);
   assert.deepEqual(lines("averyveryverylongunbrokenname"), ["averyveryverylongunbrokenname"], "a word is never cut");
-});
-test("#716: the legacy renderer shows the same kinds and never clips a lane name", () => {
-  const window = {};
-  vm.runInNewContext(fs.readFileSync("web/sequence.js", "utf8"), {window, document:{createElementNS:(_, tag) => new Element(tag)}});
-  const container = new Element("div");
-  window.TrellisSequence.render(container, namedColumns(), () => {});
-  const all = node => [node, ...node.children.flatMap(all)];
-  const headers = all(container).filter(node => node.attrs.class === "sequence-participant-label")
-    .map(node => node.children.filter(child => child.tag === "tspan").map(child => child.textContent).join(" ") || node.textContent);
-  assert.deepEqual(headers, ["run", "«type» Session", "«module» session", "«class» SemanticEvidence Projection"]);
-});
-test("#716 review: the legacy renderer keeps a word longer than a line whole and widens its boxes", () => {
-  const window = {};
-  vm.runInNewContext(fs.readFileSync("web/sequence.js", "utf8"), {window, document:{createElementNS:(_, tag) => new Element(tag)}});
-  const view = namedColumns();
-  view.participants.find(p => p.id === "class").column.label = "authenticationconfiguration";
-  const container = new Element("div");
-  window.TrellisSequence.render(container, view, () => {});
-  const all = node => [node, ...node.children.flatMap(all)];
-  const nodes = all(container);
-  const header = nodes.filter(node => node.attrs.class === "sequence-participant-label").at(-1);
-  assert.deepEqual(header.children.filter(child => child.tag === "tspan").map(child => child.textContent), ["«class»", "authenticationconfiguration"], "Pele's lines, never cut inside a word");
-  const boxes = nodes.filter(node => node.attrs.class === "participant").map(node => ({x:Number(node.attrs.x), width:Number(node.attrs.width)}));
-  for (const box of boxes) assert.ok(box.width >= "authenticationconfiguration".length * 7.8, `box ${box.width} holds the word`);
-  for (const [i, box] of boxes.slice(1).entries()) assert.ok(boxes[i].x + boxes[i].width < box.x, "boxes never overlap");
 });
