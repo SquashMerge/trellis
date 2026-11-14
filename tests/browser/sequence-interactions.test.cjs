@@ -11,8 +11,8 @@ const {createServer} = require("node:http");
 const {resolve, join} = require("node:path");
 const {chromium} = require("playwright");
 const ROOT = resolve(__dirname, "../..");
-const files = {"/vendor/pele-1.10.0-trellis.2.js":"web/vendor/pele-1.10.0-trellis.2.js", "/sequence-pele.js":"web/sequence-pele.js", "/sequence.js":"web/sequence.js", "/style.css":"web/style.css"};
-const html = '<!doctype html><html><head><link rel="stylesheet" href="/style.css"><script src="/vendor/pele-1.10.0-trellis.2.js" defer></script><script src="/sequence.js" defer></script><script src="/sequence-pele.js" defer></script></head><body><div id="sequence-diagram" class="sequence-scroll" style="flex:none;width:1200px;height:700px"></div></body></html>';
+const files = {"/vendor/pele-1.10.0-trellis.2.js":"web/vendor/pele-1.10.0-trellis.2.js", "/sequence-pele.js":"web/sequence-pele.js", "/source-witness.js":"web/source-witness.js", "/sequence.js":"web/sequence.js", "/pele-svg.js":"web/pele-svg.js", "/style.css":"web/style.css"};
+const html = '<!doctype html><html><head><link rel="stylesheet" href="/style.css"><script src="/vendor/pele-1.10.0-trellis.2.js" defer></script><script src="/source-witness.js" defer></script><script src="/sequence.js" defer></script><script src="/pele-svg.js" defer></script><script src="/sequence-pele.js" defer></script></head><body><div id="sequence-diagram" class="sequence-scroll" style="flex:none;width:1200px;height:700px"></div></body></html>';
 let server, browser, page;
 
 test.before(async () => {
@@ -88,13 +88,6 @@ async function render(view, options = INTERACTIONS) {
     return {status:result.status, reason:result.reason};
   }, {view, options});
 }
-function legacy(view, options = INTERACTIONS) {
-  return page.evaluate(({view, options}) => {
-    const container = document.getElementById("sequence-diagram");
-    window.view = view; window.picks = [];
-    TrellisSequence.render(container, view, null, new Set(), {...options, onSelect:step => window.picks.push(step)});
-  }, {view, options});
-}
 const ids = (selector, attribute) => page.locator(selector).evaluateAll((nodes, attribute) => nodes.map(node => node.getAttribute(attribute)), attribute);
 const box = locator => locator.evaluate(node => { const box = node.getBoundingClientRect(); return {x:box.left + box.width / 2, y:box.top + box.height / 2, top:box.top, bottom:box.bottom, left:box.left, right:box.right}; });
 // Each lane's header, its lines joined by a space (#716): the kind, then the wrapped name.
@@ -147,8 +140,6 @@ test("a loop around arrows is one labelled UML frame around exactly them, with n
   assert.equal((await render(plain)).status, "rendered");
   assert.equal(await page.locator("#sequence-diagram .pele-frame-loop .pele-frame-kind").textContent(), "loop");
   assert.equal(await page.locator("#sequence-diagram .pele-frame-loop .pele-frame-label").count(), 0, "no [loop] guard");
-  await legacy(plain);
-  assert.equal(await page.locator('#sequence-diagram [data-presentation="interaction-loop"] .sequence-control-label').count(), 0);
   loop.children[1].folded = [{...structuredClone(loop.children[0]), id:"q", kind:"branch", label:"?: continue only on success; otherwise early return", callId:null}];
   assert.equal(await page.evaluate(view => { const d = TrellisSequence.display(view, {interactions:true}); return d.loopLabel(view.steps[3]); }, plain), "may exit early");
 });
@@ -190,12 +181,6 @@ test("#907: a same-column call's body around an arrow is a frame named for its c
   const region = await box(page.locator("#sequence-diagram .pele-rect"));
   assert.ok(region.top < (await box(label("lease>wake"))).y && (await box(label("lease>wake"))).y < region.bottom, "the lease's wake is inside its frame");
   for (const id of ["enqueue", "err>wake", "wake"]) assert.ok((await box(label(id))).y > region.bottom, `${id} after the frame`);
-  await legacy(view);
-  const callee = page.locator('#sequence-diagram [data-presentation="interaction-callee"]');
-  assert.equal(await callee.count(), 1);
-  assert.equal(await callee.locator(":scope > .sequence-fragment-operator").evaluate(n => n.firstChild.textContent), "admission_lease");
-  assert.deepEqual(await callee.locator(".sequence-source").evaluateAll(nodes => nodes.map(n => n.getAttribute("data-source-step-id"))), ["lease>wake"]);
-  assert.deepEqual(await ids("#sequence-diagram .sequence-source", "data-source-step-id"), ["lease>wake", "enqueue", "err>wake", "wake"], "frames are not rows");
   // A same-column call whose body draws no arrow is still nothing.
   const quiet = enqueueView(); quiet.steps[0].children = [];
   assert.equal(await page.evaluate(view => TrellisSequence.display(view, {interactions:true}).callees.size, quiet), 0);
@@ -221,15 +206,6 @@ test("#907: a branch around an arrow is an alt frame, an arm an opt frame, and a
   assert.ok(await inside(err, "err>wake") && await inside(match, "err>wake"), "the Err arm's wake is in its arm and its match");
   for (const id of ["enqueue", "wake"]) assert.ok(!(await inside(match, id)), `${id} outside the match`);
   assert.ok((await box(label("enqueue"))).y < match.top, "the scrutinee call comes before its match");
-  await legacy(view);
-  const branches = page.locator('#sequence-diagram [data-presentation="interaction-branch"]');
-  assert.deepEqual(await branches.evaluateAll(nodes => nodes.map(n => n.querySelector(":scope > .sequence-fragment-operator").firstChild.textContent)), ["alt", "opt", "alt", "opt"]);
-  // The legacy heading is cut to the width left at its depth; its title keeps the whole text.
-  const legacyHeadings = await branches.evaluateAll(nodes => nodes.map(n => { const text = n.querySelector(":scope > .sequence-control-label"); return [text.firstChild.textContent, text.querySelector("title").textContent]; }));
-  assert.deepEqual(legacyHeadings.map(([, title]) => title), [
-    "[match · first matching arm]", "[only if no earlier arm selected and pattern matches: RuntimeState::RetireRequested { session, .. }]",
-    "[match · first matching arm]", "[only if no earlier arm selected and pattern matches: Err(error)]"]);
-  for (const [shown, title] of legacyHeadings) assert.ok(shown === title || shown.endsWith("…]") && title.startsWith(shown.slice(0, -2)), JSON.stringify({shown, title}));
   // An if with an else around an arrow is alt; the coordinate view's if6 holds c-refresh.
   const display = await page.evaluate(view => { const d = TrellisSequence.display(view, {interactions:true}); return [...d.branches].map(s => [s.id, d.frameKind(s), d.frameLabel(s)]); }, coordinateView());
   assert.deepEqual(display, [["if6", "alt", "if refresh"]]);
@@ -240,44 +216,6 @@ test("#907: a branch around an arrow is an alt frame, an arm an opt frame, and a
   assert.deepEqual(await page.evaluate(view => { const d = TrellisSequence.display(view, {interactions:true}); return [...d.branches].map(s => d.frameKind(s)); }, tried), ["opt", "alt"]);
   assert.equal((await render(tried)).status, "rendered");
   assert.deepEqual(await page.locator("#sequence-diagram .pele-frame .pele-frame-kind").allTextContents(), ["opt", "alt"]);
-});
-
-test("#907: deeply nested legacy frame headings are cut to the width left at their depth, and keep their full text", async () => {
-  const view = enqueueView(), wake = view.steps[3];
-  const pattern = "RuntimeState::RetireRequested { session, attempts, waiting, .. }";
-  // Twelve levels: alternating same-column helpers and match arms, around one arrow.
-  const helper = view.participants.find(p => p.id === "admission_lease");
-  helper.declaration.name = helper.label = "admission_lease_for_a_very_long_named_runtime_helper";
-  let inner = {...structuredClone(wake), id:"deep>wake"};
-  for (let level = 12; level > 0; level--) {
-    const id = `level-${level}`;
-    inner = level % 2
-      ? {...structuredClone(view.steps[0]), id, callId:`callid:${id}`, children:[inner]}
-      : {...structuredClone(view.steps[2].alternate[1]), id, label:`only if no earlier arm selected and pattern matches: ${pattern}`, children:[inner], alternate:[]};
-  }
-  view.steps = [inner];
-  await legacy(view, INTERACTIONS);
-  const measured = await page.evaluate(() => {
-    const svg = document.querySelector("#sequence-diagram svg"), width = Number(svg.getAttribute("viewBox").split(" ")[2]);
-    const frames = [...svg.querySelectorAll('[data-presentation="interaction-branch"], [data-presentation="interaction-callee"]')];
-    return {width, frames:frames.map(frame => {
-      const box = frame.querySelector(":scope > .sequence-fragment").getBBox();
-      return {right:box.x + box.width, texts:[...frame.querySelectorAll(":scope > .sequence-fragment-operator, :scope > .sequence-control-label")]
-        .map(text => ({right:text.getBBox().x + text.getBBox().width, shown:text.firstChild.textContent, title:text.querySelector("title").textContent}))};
-    })};
-  });
-  assert.equal(measured.frames.length, 12);
-  for (const frame of measured.frames) {
-    assert.ok(frame.right <= measured.width, JSON.stringify(frame));
-    for (const text of frame.texts) {
-      assert.ok(text.right <= frame.right && text.right <= measured.width, `heading inside its frame: ${JSON.stringify({text, frame:frame.right, width:measured.width})}`);
-      assert.ok(text.title === text.shown || text.title.startsWith(text.shown.replace(/…\]?$/, "")), JSON.stringify(text));
-    }
-  }
-  // The deepest headings were cut, and their titles keep the whole text.
-  const deepest = measured.frames.at(-1).texts, callee = measured.frames.at(-2).texts[0];
-  assert.match(deepest[1].shown, /…\]$/); assert.equal(deepest[1].title, `[only if no earlier arm selected and pattern matches: ${pattern}]`);
-  assert.equal(callee.title, "admission_lease_for_a_very_long_named_runtime_helper");
 });
 
 test("a nested chain starts on its callee's column and returns before its caller does", async () => {
@@ -313,34 +251,6 @@ test("selecting an arrow hands the inspector the original step and evidence", as
   assert.equal(await page.evaluate(() => TrellisSequence.evidenceLabel(window.view.steps[6].children[1], window.view)), "Resolved declaration");
   await label("c-loop-start").click();
   assert.deepEqual(await page.evaluate(() => window.picks[1]), view.steps[3].children[3]);
-});
-
-test("the legacy renderer draws the same arrows, returns and loop frame, and nothing else", async () => {
-  const view = coordinateView();
-  assert.equal((await render(view)).status, "rendered");
-  const pele = await page.locator("#sequence-diagram .pele-edge-label").allTextContents();
-  await legacy(view);
-  assert.deepEqual(await headers("#sequence-diagram .sequence-participant-label"), ["«module» mcp", "«type» OpenedWorkspace", "«type» Session", "«type» Inbox", "«type» FrameWindow", "«type» tools"]);
-  assert.deepEqual(await ids("#sequence-diagram .sequence-arrow[data-trellis-call-id]", "data-trellis-call-id"), ARROWS.map(id => `callid:${id}`));
-  assert.deepEqual(await ids("#sequence-diagram .sequence-source", "data-source-step-id"), ARROWS, "no other row");
-  const rows = await page.locator("#sequence-diagram .sequence-source").evaluateAll(nodes => nodes.map(node => node.querySelector("text").firstChild.textContent));
-  assert.deepEqual(rows, pele, "the same arrow labels in both renderers");
-  assert.deepEqual(await ids("#sequence-diagram .sequence-return[data-trellis-return-step-id]", "data-trellis-return-step-id"), RETURNS);
-  assert.equal(await page.locator("#sequence-diagram .sequence-activation").count(), RETURNS.length);
-  const loop = page.locator('#sequence-diagram [data-presentation="interaction-loop"]');
-  assert.equal(await loop.count(), 1);
-  assert.equal(await loop.locator(".sequence-fragment-operator").textContent(), "loop");
-  assert.equal(await loop.locator(".sequence-control-label").textContent(), "[may exit early]");
-  const frame = await box(loop.locator(".sequence-fragment"));
-  for (const id of ["c-loop-open", "c-loop-start"]) {
-    const arrow = await box(page.locator(`#sequence-diagram [data-source-step-id="${id}"]`));
-    assert.ok(frame.top < arrow.y && arrow.y < frame.bottom, `${id} inside the frame`);
-  }
-  // Geometry: the nested call leaves Inbox's lifeline.
-  const inbox = await page.locator("#sequence-diagram .sequence-participant-label").evaluateAll(nodes => nodes.find(node => node.textContent.startsWith("«type»Inbox")).getAttribute("x"));
-  assert.match(await page.locator('#sequence-diagram .sequence-arrow[data-trellis-call-id="callid:c-deliver>show"]').getAttribute("d"), new RegExp(`^M ${inbox} `));
-  await page.locator('#sequence-diagram [data-source-step-id="c-refresh"]').click();
-  assert.deepEqual(await page.evaluate(() => window.picks.at(-1)), view.steps[5].children[0]);
 });
 
 test("a seed with no arrow says why; a view with no call, Show all steps and syntax views are unchanged", async () => {
@@ -381,8 +291,6 @@ test("an arrow inside a call chain draws without the chain; its other members dr
   assert.deepEqual(await page.locator("#sequence-diagram .pele-edge-label").allTextContents(), ["[001] start"]);
   assert.equal(await page.locator("#sequence-diagram .pele-note").count(), 1);
   assert.equal(await page.locator("#sequence-diagram .sequence-group-control").count(), 0, "the chain draws no row of its own");
-  await legacy(view);
-  assert.deepEqual(await ids("#sequence-diagram .sequence-source", "data-source-step-id"), ["chain:start"]);
 });
 
 test("a large interactions diagram keeps readable text and the panel scrolls", async () => {

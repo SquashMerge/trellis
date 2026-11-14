@@ -8,8 +8,8 @@ const {createServer} = require("node:http");
 const {resolve, join} = require("node:path");
 const {chromium} = require("playwright");
 const ROOT = resolve(__dirname, "../..");
-const files = {"/vendor/pele-1.10.0-trellis.2.js":"web/vendor/pele-1.10.0-trellis.2.js", "/sequence-pele.js":"web/sequence-pele.js", "/sequence.js":"web/sequence.js", "/style.css":"web/style.css"};
-const html = '<!doctype html><html><head><link rel="stylesheet" href="/style.css"><script src="/vendor/pele-1.10.0-trellis.2.js" defer></script><script src="/sequence.js" defer></script><script src="/sequence-pele.js" defer></script></head><body><div id="sequence-diagram" class="sequence-scroll" style="flex:none;width:900px;height:500px"></div><div id="files-mini-sequence" class="sequence-scroll" style="flex:none;width:300px;height:200px"></div></body></html>';
+const files = {"/vendor/pele-1.10.0-trellis.2.js":"web/vendor/pele-1.10.0-trellis.2.js", "/sequence-pele.js":"web/sequence-pele.js", "/source-witness.js":"web/source-witness.js", "/sequence.js":"web/sequence.js", "/pele-svg.js":"web/pele-svg.js", "/style.css":"web/style.css"};
+const html = '<!doctype html><html><head><link rel="stylesheet" href="/style.css"><script src="/vendor/pele-1.10.0-trellis.2.js" defer></script><script src="/source-witness.js" defer></script><script src="/sequence.js" defer></script><script src="/pele-svg.js" defer></script><script src="/sequence-pele.js" defer></script></head><body><div id="sequence-diagram" class="sequence-scroll" style="flex:none;width:900px;height:500px"></div><div id="files-mini-sequence" class="sequence-scroll" style="flex:none;width:300px;height:200px"></div></body></html>';
 const baseView = () => JSON.parse(readFileSync(join(ROOT, "tests/fixtures/sequence-pele/rust.json")));
 let server, browser, page;
 
@@ -147,59 +147,28 @@ test("a lane of several methods opens none; a lane of one method keeps its actio
   assert.deepEqual(await page.evaluate(() => window.opens), ["exact:1:0"]);
 });
 
-// #716 review: a word longer than a header line stays whole in both renderers, inside its box.
-test("both renderers keep a lane word longer than a line whole, and the legacy box holds it", async () => {
+// #716 review: a word longer than a header line stays whole.
+test("a lane word longer than a line stays whole", async () => {
   const view = coordinateView({types:2, methods:1, steps:6});
   view.participants.find(p => p.column.label === "Type1").column.label = "authenticationconfiguration";
   assert.equal((await render(view)).status, "rendered");
   assert.ok((await headers("#sequence-diagram .pele-actor:not(.pele-actor-footer)")).includes("«type» authenticationconfiguration"));
-  const legacy = await page.evaluate(view => {
-    const box = document.getElementById("sequence-diagram");
-    TrellisSequence.render(box, view, null, new Set(), {});
-    const rects = [...box.querySelectorAll("rect.participant")].map(rect => rect.getBoundingClientRect());
-    const texts = [...box.querySelectorAll(".sequence-participant-label")].map(text => text.getBoundingClientRect());
-    return {rects:rects.map(r => [r.left, r.right]), texts:texts.map(r => [r.left, r.right])};
-  }, view);
-  assert.ok((await headers("#sequence-diagram .sequence-participant-label")).includes("«type» authenticationconfiguration"), "never cut inside a word");
-  for (const [i, [left, right]] of legacy.texts.entries()) assert.ok(legacy.rects[i][0] <= left && right <= legacy.rects[i][1], `header ${i} inside its box: ${JSON.stringify(legacy)}`);
-  for (let i = 1; i < legacy.rects.length; i++) assert.ok(legacy.rects[i - 1][1] < legacy.rects[i][0], "boxes never overlap");
 });
 
-test("the legacy renderer draws the same columns", async () => {
-  const view = coordinateView({types:2, methods:3, steps:20});
-  const positions = await page.evaluate(view => {
-    const box = document.getElementById("sequence-diagram");
-    TrellisSequence.render(box, view, null, new Set(), {});
-    const ends = [...box.querySelectorAll(".sequence-arrow[data-trellis-target-id]")].map(arrow => [arrow.getAttribute("data-trellis-target-id"), arrow.getAttribute("d")]);
-    return {ends};
-  }, view);
-  assert.deepEqual(await headers("#sequence-diagram .sequence-participant-label"), ["«type» Coordinator", "«type» Type0", "«type» Type1"]);
-  const end = id => positions.ends.find(([target]) => target === id)[1];
-  const x = id => end(id).match(/H (\d+)/)[1];
-  assert.equal(x("exact:0:0"), x("exact:0:2"), "two methods of one type end on one lifeline");
-  assert.notEqual(x("exact:0:0"), x("exact:1:0"));
-});
-
-test("both renderers number each arrow and name its exact target", async () => {
+test("each arrow is numbered and names its exact target", async () => {
   const view = coordinateView({types:2, methods:3, steps:20});
   const arrows = view.steps.flatMap(step => [step, ...step.children]).filter(step => step.kind === "call");
   assert.equal((await render(view)).status, "rendered");
   const pele = await page.locator("#sequence-diagram .pele-edge-label[data-trellis-step-id]").evaluateAll(nodes => nodes.map(node => [node.dataset.trellisStepId, node.textContent]));
-  const legacy = options => page.evaluate(({view, options}) => {
-    const box = document.getElementById("sequence-diagram");
-    TrellisSequence.render(box, view, null, new Set(), options);
-    return Object.fromEntries([...box.querySelectorAll(".sequence-source")].map(node => [node.dataset.sourceStepId, node.querySelector("text").firstChild.textContent]));
-  }, {view, options});
-  const compact = await legacy({});
   assert.equal(pele.length, arrows.length);
-  for (const [id, text] of pele) assert.equal(compact[id], text, id);
   const first = arrows[0], name = view.participants.find(p => p.id === first.target).declaration.name;
-  assert.equal(compact[first.id], `[001] ${name}`);
+  assert.deepEqual(pele[0], [first.id, `[001] ${name}`]);
   // Show all keeps the source spelling and the evidence.
-  assert.match((await legacy({showDetails:true}))[first.id], /Resolved declaration · self\.lexical_spelling_0/);
+  assert.equal((await render(view, {showDetails:true})).status, "rendered");
+  assert.match(await page.locator(`#sequence-diagram .pele-edge-label[data-trellis-step-id="${first.id}"]`).textContent(), /Resolved declaration.*self\.lexical_spelling_0|self\.lexical_spelling_0.*Resolved declaration/);
 });
 
-test("both renderers cap a long name, and a collapsed chain's arrow names its entry", async () => {
+test("a long name is capped, and a collapsed chain's arrow names its entry", async () => {
   const view = coordinateView({types:1, methods:2, steps:3});
   const call = view.steps[0], target = view.participants.find(p => p.id === call.target);
   target.declaration.name = "a_declaration_name_".repeat(8);
@@ -210,12 +179,6 @@ test("both renderers cap a long name, and a collapsed chain's arrow names its en
   view.steps[0] = {...call, folded:[{label:"?: continue only on success; otherwise early return"}]};
   assert.equal((await render(view)).status, "rendered");
   const texts = await page.locator("#sequence-diagram .pele-edge-label").evaluateAll(nodes => nodes.map(node => node.querySelector("text").textContent));
-  const drawn = await page.evaluate(view => {
-    const box = document.getElementById("sequence-diagram");
-    TrellisSequence.render(box, view, null, new Set(), {});
-    return [...box.querySelectorAll(".sequence-source")].map(node => [...node.querySelector("text").childNodes].filter(item => item.nodeName === "tspan").map(item => item.textContent).join(" "));
-  }, view);
-  assert.deepEqual(drawn, texts, "the same rows in both renderers");
   for (const text of texts) assert.ok(text.length <= 72, `${text.length}: ${text}`);
   assert.match(texts[0], /^\[001\] a_declaration_name_.*… · may return early$/);
   assert.match(texts[1], /^\[002\] a_declaration_name_.*… \+1 calls collapsed \(entry preview\)$/);

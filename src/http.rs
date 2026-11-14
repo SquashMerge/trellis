@@ -2284,226 +2284,171 @@ async fn guard_common(
         .insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
     response
 }
+/// One embedded web app file: the route path, its `Content-Type`, and the bytes.
+pub struct WebAsset {
+    pub path: &'static str,
+    pub content_type: &'static str,
+    pub body: &'static [u8],
+}
+
+const fn web_asset(
+    path: &'static str,
+    content_type: &'static str,
+    body: &'static [u8],
+) -> WebAsset {
+    WebAsset {
+        path,
+        content_type,
+        body,
+    }
+}
+
+const HTML: &str = "text/html; charset=utf-8";
+const JS: &str = "text/javascript; charset=utf-8";
+const CSS: &str = "text/css; charset=utf-8";
+const TEXT: &str = "text/plain; charset=utf-8";
+const WOFF2: &str = "font/woff2";
+
+/// Every embedded web app file. The checkout router and the provisioned browser
+/// router both serve exactly these rows, with no per-router difference in a row.
+/// A new file under `web/` needs one line here;
+/// `web_asset_table_covers_the_web_directory` fails without it.
+pub const WEB_ASSETS: &[WebAsset] = &[
+    web_asset("/", HTML, include_bytes!("../web/index.html")),
+    web_asset("/app.js", JS, include_bytes!("../web/app.js")),
+    web_asset(
+        "/viewer-metrics.js",
+        JS,
+        include_bytes!("../web/viewer-metrics.js"),
+    ),
+    web_asset(
+        "/metric-heat.js",
+        JS,
+        include_bytes!("../web/metric-heat.js"),
+    ),
+    web_asset("/files.js", JS, include_bytes!("../web/files.js")),
+    web_asset("/treemap.js", JS, include_bytes!("../web/treemap.js")),
+    web_asset(
+        "/treemap-pele.js",
+        JS,
+        include_bytes!("../web/treemap-pele.js"),
+    ),
+    web_asset("/treemap.css", CSS, include_bytes!("../web/treemap.css")),
+    web_asset(
+        "/architecture-apps.js",
+        JS,
+        include_bytes!("../web/architecture-apps.js"),
+    ),
+    web_asset(
+        "/architecture-deviations.js",
+        JS,
+        include_bytes!("../web/architecture-deviations.js"),
+    ),
+    web_asset(
+        "/architecture.js",
+        JS,
+        include_bytes!("../web/architecture.js"),
+    ),
+    web_asset(
+        "/architecture-pele.js",
+        JS,
+        include_bytes!("../web/architecture-pele.js"),
+    ),
+    web_asset(
+        "/architecture.css",
+        CSS,
+        include_bytes!("../web/architecture.css"),
+    ),
+    web_asset("/files.css", CSS, include_bytes!("../web/files.css")),
+    web_asset("/shell.js", JS, include_bytes!("../web/shell.js")),
+    web_asset(
+        "/fonts/jetbrains-mono-latin.woff2",
+        WOFF2,
+        include_bytes!("../web/fonts/jetbrains-mono-latin.woff2"),
+    ),
+    web_asset(
+        "/fonts/inter-variable.woff2",
+        WOFF2,
+        include_bytes!("../web/fonts/inter-variable.woff2"),
+    ),
+    web_asset(
+        "/fonts/manrope-variable.woff2",
+        WOFF2,
+        include_bytes!("../web/fonts/manrope-variable.woff2"),
+    ),
+    web_asset(
+        "/fonts/JetBrainsMono-OFL.txt",
+        TEXT,
+        include_bytes!("../web/fonts/JetBrainsMono-OFL.txt"),
+    ),
+    web_asset(
+        "/fonts/Inter-OFL.txt",
+        TEXT,
+        include_bytes!("../web/fonts/Inter-OFL.txt"),
+    ),
+    web_asset(
+        "/fonts/Manrope-OFL.txt",
+        TEXT,
+        include_bytes!("../web/fonts/Manrope-OFL.txt"),
+    ),
+    web_asset(
+        "/brand/trellis-mark-transparent-v1.png",
+        "image/png",
+        include_bytes!("../web/brand/trellis-mark-transparent-v1.png"),
+    ),
+    web_asset(
+        "/brand/trellis-logo-dark-v1.webp",
+        "image/webp",
+        include_bytes!("../web/brand/trellis-logo-dark-v1.webp"),
+    ),
+    web_asset("/style.css", CSS, include_bytes!("../web/style.css")),
+    web_asset("/classes.js", JS, include_bytes!("../web/classes.js")),
+    web_asset("/classes.css", CSS, include_bytes!("../web/classes.css")),
+    web_asset("/navigation.js", JS, include_bytes!("../web/navigation.js")),
+    web_asset(
+        "/navigation.css",
+        CSS,
+        include_bytes!("../web/navigation.css"),
+    ),
+    web_asset("/index-pin.js", JS, include_bytes!("../web/index-pin.js")),
+    web_asset(
+        "/source-witness.js",
+        JS,
+        include_bytes!("../web/source-witness.js"),
+    ),
+    web_asset(
+        "/context-menu.js",
+        JS,
+        include_bytes!("../web/context-menu.js"),
+    ),
+    web_asset("/pele-svg.js", JS, include_bytes!("../web/pele-svg.js")),
+    web_asset("/sequence.js", JS, include_bytes!("../web/sequence.js")),
+    web_asset(
+        "/sequence-pele.js",
+        JS,
+        include_bytes!("../web/sequence-pele.js"),
+    ),
+    web_asset(
+        "/vendor/pele-1.10.0-trellis.2.js",
+        JS,
+        include_bytes!("../web/vendor/pele-1.10.0-trellis.2.js"),
+    ),
+];
+
+/// Adds one GET route per `WEB_ASSETS` row. Each router keeps its own layers
+/// and its own answer for unknown paths.
+fn web_asset_routes<S: Clone + Send + Sync + 'static>(mut router: Router<S>) -> Router<S> {
+    for asset in WEB_ASSETS {
+        router = router.route(
+            asset.path,
+            get(move || async move { ([(header::CONTENT_TYPE, asset.content_type)], asset.body) }),
+        );
+    }
+    router
+}
 #[cfg(feature = "test-support")]
 pub fn router(state: Arc<DaemonState>) -> Router {
-    let router = Router::new()
-        .route(
-            "/",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-                    include_str!("../web/index.html"),
-                )
-            }),
-        )
-        .route(
-            "/app.js",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                    include_str!("../web/app.js"),
-                )
-            }),
-        )
-        .route(
-            "/viewer-metrics.js",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                    include_str!("../web/viewer-metrics.js"),
-                )
-            }),
-        )
-        .route(
-            "/metric-heat.js",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                    include_str!("../web/metric-heat.js"),
-                )
-            }),
-        )
-        .route(
-            "/files.js",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                    include_str!("../web/files.js"),
-                )
-            }),
-        )
-        .route(
-            "/treemap.js",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                    include_str!("../web/treemap.js"),
-                )
-            }),
-        )
-        .route(
-            "/treemap-pele.js",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                    include_str!("../web/treemap-pele.js"),
-                )
-            }),
-        )
-        .route(
-            "/treemap.css",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-                    include_str!("../web/treemap.css"),
-                )
-            }),
-        )
-        .route(
-            "/architecture-apps.js",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                    include_str!("../web/architecture-apps.js"),
-                )
-            }),
-        )
-        .route(
-            "/architecture-deviations.js",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                    include_str!("../web/architecture-deviations.js"),
-                )
-            }),
-        )
-        .route(
-            "/architecture.js",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                    include_str!("../web/architecture.js"),
-                )
-            }),
-        )
-        .route(
-            "/architecture-pele.js",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                    include_str!("../web/architecture-pele.js"),
-                )
-            }),
-        )
-        .route(
-            "/architecture.css",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-                    include_str!("../web/architecture.css"),
-                )
-            }),
-        )
-        .route(
-            "/files.css",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-                    include_str!("../web/files.css"),
-                )
-            }),
-        )
-        .route(
-            "/shell.js",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                    include_str!("../web/shell.js"),
-                )
-            }),
-        )
-        .route(
-            "/fonts/jetbrains-mono-latin.woff2",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "font/woff2")],
-                    &include_bytes!("../web/fonts/jetbrains-mono-latin.woff2")[..],
-                )
-            }),
-        )
-        .route(
-            "/fonts/inter-variable.woff2",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "font/woff2")],
-                    &include_bytes!("../web/fonts/inter-variable.woff2")[..],
-                )
-            }),
-        )
-        .route(
-            "/fonts/manrope-variable.woff2",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "font/woff2")],
-                    &include_bytes!("../web/fonts/manrope-variable.woff2")[..],
-                )
-            }),
-        )
-        .route(
-            "/fonts/JetBrainsMono-OFL.txt",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-                    include_str!("../web/fonts/JetBrainsMono-OFL.txt"),
-                )
-            }),
-        )
-        .route(
-            "/fonts/Inter-OFL.txt",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-                    include_str!("../web/fonts/Inter-OFL.txt"),
-                )
-            }),
-        )
-        .route(
-            "/fonts/Manrope-OFL.txt",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-                    include_str!("../web/fonts/Manrope-OFL.txt"),
-                )
-            }),
-        )
-        .route(
-            "/brand/trellis-mark-transparent-v1.png",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "image/png")],
-                    &include_bytes!("../web/brand/trellis-mark-transparent-v1.png")[..],
-                )
-            }),
-        )
-        .route(
-            "/brand/trellis-logo-dark-v1.webp",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "image/webp")],
-                    &include_bytes!("../web/brand/trellis-logo-dark-v1.webp")[..],
-                )
-            }),
-        )
-        .route(
-            "/style.css",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-                    include_str!("../web/style.css"),
-                )
-            }),
-        );
-    router
+    web_asset_routes(Router::new())
         .route(
             "/healthz",
             get(|| async { Json(json!({"ok":true,"version":env!("CARGO_PKG_VERSION")})) }),
@@ -2530,69 +2475,6 @@ pub fn router(state: Arc<DaemonState>) -> Router {
         .route("/api/classes", get(classes))
         .route("/api/class-diagram", post(class_diagram))
         .route("/api/navigation", post(navigation))
-        .route(
-            "/classes.js",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                    include_str!("../web/classes.js"),
-                )
-            }),
-        )
-        .route(
-            "/classes.css",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-                    include_str!("../web/classes.css"),
-                )
-            }),
-        )
-        .route(
-            "/navigation.js",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                    include_str!("../web/navigation.js"),
-                )
-            }),
-        )
-        .route(
-            "/navigation.css",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-                    include_str!("../web/navigation.css"),
-                )
-            }),
-        )
-        .route(
-            "/sequence.js",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                    include_str!("../web/sequence.js"),
-                )
-            }),
-        )
-        .route(
-            "/sequence-pele.js",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                    include_str!("../web/sequence-pele.js"),
-                )
-            }),
-        )
-        .route(
-            "/vendor/pele-1.10.0-trellis.2.js",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                    include_bytes!("../web/vendor/pele-1.10.0-trellis.2.js"),
-                )
-            }),
-        )
         .route("/api/source", get(source))
         .fallback(|| async { missing().into_response() })
         .layer(DefaultBodyLimit::max(1024 * 1024))
@@ -3705,287 +3587,7 @@ impl ProvisionedBrowser {
 
     pub fn router(self) -> Router {
         let state = Arc::new(self);
-        let router = Router::new()
-            .route(
-                "/",
-                get(|| async {
-                    (
-                        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-                        include_str!("../web/index.html"),
-                    )
-                }),
-            )
-            .route(
-                "/app.js",
-                get(|| async {
-                    (
-                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                        include_str!("../web/app.js"),
-                    )
-                }),
-            )
-            .route(
-                "/viewer-metrics.js",
-                get(|| async {
-                    (
-                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                        include_str!("../web/viewer-metrics.js"),
-                    )
-                }),
-            )
-            .route(
-                "/metric-heat.js",
-                get(|| async {
-                    (
-                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                        include_str!("../web/metric-heat.js"),
-                    )
-                }),
-            )
-            .route(
-                "/files.js",
-                get(|| async {
-                    (
-                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                        include_str!("../web/files.js"),
-                    )
-                }),
-            )
-            .route(
-                "/treemap.js",
-                get(|| async {
-                    (
-                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                        include_str!("../web/treemap.js"),
-                    )
-                }),
-            )
-            .route(
-                "/treemap-pele.js",
-                get(|| async {
-                    (
-                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                        include_str!("../web/treemap-pele.js"),
-                    )
-                }),
-            )
-            .route(
-                "/treemap.css",
-                get(|| async {
-                    (
-                        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-                        include_str!("../web/treemap.css"),
-                    )
-                }),
-            )
-            .route(
-                "/architecture-apps.js",
-                get(|| async {
-                    (
-                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                        include_str!("../web/architecture-apps.js"),
-                    )
-                }),
-            )
-            .route(
-                "/architecture-deviations.js",
-                get(|| async {
-                    (
-                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                        include_str!("../web/architecture-deviations.js"),
-                    )
-                }),
-            )
-            .route(
-                "/architecture.js",
-                get(|| async {
-                    (
-                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                        include_str!("../web/architecture.js"),
-                    )
-                }),
-            )
-            .route(
-                "/architecture-pele.js",
-                get(|| async {
-                    (
-                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                        include_str!("../web/architecture-pele.js"),
-                    )
-                }),
-            )
-            .route(
-                "/architecture.css",
-                get(|| async {
-                    (
-                        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-                        include_str!("../web/architecture.css"),
-                    )
-                }),
-            )
-            .route(
-                "/files.css",
-                get(|| async {
-                    (
-                        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-                        include_str!("../web/files.css"),
-                    )
-                }),
-            )
-            .route(
-                "/shell.js",
-                get(|| async {
-                    (
-                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                        include_str!("../web/shell.js"),
-                    )
-                }),
-            )
-            .route(
-                "/style.css",
-                get(|| async {
-                    (
-                        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-                        include_str!("../web/style.css"),
-                    )
-                }),
-            )
-            .route(
-                "/classes.js",
-                get(|| async {
-                    (
-                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                        include_str!("../web/classes.js"),
-                    )
-                }),
-            )
-            .route(
-                "/classes.css",
-                get(|| async {
-                    (
-                        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-                        include_str!("../web/classes.css"),
-                    )
-                }),
-            )
-            .route(
-                "/navigation.css",
-                get(|| async {
-                    (
-                        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-                        include_str!("../web/navigation.css"),
-                    )
-                }),
-            )
-            .route(
-                "/navigation.js",
-                get(|| async {
-                    (
-                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                        include_str!("../web/navigation.js"),
-                    )
-                }),
-            )
-            .route(
-                "/sequence.js",
-                get(|| async {
-                    (
-                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                        include_str!("../web/sequence.js"),
-                    )
-                }),
-            )
-            .route(
-                "/sequence-pele.js",
-                get(|| async {
-                    (
-                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                        include_str!("../web/sequence-pele.js"),
-                    )
-                }),
-            )
-            .route(
-                "/vendor/pele-1.10.0-trellis.2.js",
-                get(|| async {
-                    (
-                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                        include_bytes!("../web/vendor/pele-1.10.0-trellis.2.js"),
-                    )
-                }),
-            )
-            .route(
-                "/fonts/jetbrains-mono-latin.woff2",
-                get(|| async {
-                    (
-                        [(header::CONTENT_TYPE, "font/woff2")],
-                        &include_bytes!("../web/fonts/jetbrains-mono-latin.woff2")[..],
-                    )
-                }),
-            )
-            .route(
-                "/fonts/inter-variable.woff2",
-                get(|| async {
-                    (
-                        [(header::CONTENT_TYPE, "font/woff2")],
-                        &include_bytes!("../web/fonts/inter-variable.woff2")[..],
-                    )
-                }),
-            )
-            .route(
-                "/fonts/manrope-variable.woff2",
-                get(|| async {
-                    (
-                        [(header::CONTENT_TYPE, "font/woff2")],
-                        &include_bytes!("../web/fonts/manrope-variable.woff2")[..],
-                    )
-                }),
-            )
-            .route(
-                "/fonts/JetBrainsMono-OFL.txt",
-                get(|| async {
-                    (
-                        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-                        include_str!("../web/fonts/JetBrainsMono-OFL.txt"),
-                    )
-                }),
-            )
-            .route(
-                "/fonts/Inter-OFL.txt",
-                get(|| async {
-                    (
-                        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-                        include_str!("../web/fonts/Inter-OFL.txt"),
-                    )
-                }),
-            )
-            .route(
-                "/fonts/Manrope-OFL.txt",
-                get(|| async {
-                    (
-                        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-                        include_str!("../web/fonts/Manrope-OFL.txt"),
-                    )
-                }),
-            )
-            .route(
-                "/brand/trellis-mark-transparent-v1.png",
-                get(|| async {
-                    (
-                        [(header::CONTENT_TYPE, "image/png")],
-                        &include_bytes!("../web/brand/trellis-mark-transparent-v1.png")[..],
-                    )
-                }),
-            )
-            .route(
-                "/brand/trellis-logo-dark-v1.webp",
-                get(|| async {
-                    (
-                        [(header::CONTENT_TYPE, "image/webp")],
-                        &include_bytes!("../web/brand/trellis-logo-dark-v1.webp")[..],
-                    )
-                }),
-            );
-        router
+        web_asset_routes(Router::new())
             .route("/favicon.ico", get(|| async { StatusCode::NO_CONTENT }))
             .route(
                 "/healthz",

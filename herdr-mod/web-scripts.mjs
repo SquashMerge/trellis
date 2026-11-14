@@ -21,8 +21,12 @@ const WEB = {
   "architecture-apps": { file: "architecture-apps.js", params: "window", result: "window.TrellisArchitectureApps" },
   // Only the pure Deviations tree model is used; its DOM view is not.
   "architecture-deviations": { file: "architecture-deviations.js", params: "window, document", result: "window.TrellisDeviations" },
+  // What the Pele adapters share (SVG admission, button semantics, the text measurer); they read it from `window`, so load it first.
+  "pele-svg": { file: "pele-svg.js", params: "window, document, DOMParser, TextEncoder", result: "window.TrellisPeleSvg" },
   "architecture-pele": { file: "architecture-pele.js", params: "window, document, DOMParser, TextEncoder", result: "window.TrellisArchitecturePele" },
-  // The language-neutral Sequence helpers (labels, lanes, display); its own SVG renderer is unused.
+  // The shared source-range check the two Sequence scripts read from `window`; load it first.
+  "source-witness": { file: "source-witness.js", params: "window", result: "window.TrellisSourceWitness" },
+  // The language-neutral Sequence helpers (labels, lanes, display). It draws nothing itself (#1007).
   sequence: { file: "sequence.js", params: "window, document", result: "window.TrellisSequence" },
   "sequence-pele": { file: "sequence-pele.js", params: "window, document, DOMParser, TextEncoder", result: "window.TrellisPeleSequence" },
 };

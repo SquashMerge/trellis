@@ -5,7 +5,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const source = fs.readFileSync(path.join(__dirname, "../web/treemap.js"), "utf8");
-const pinSource = fs.readFileSync(path.join(__dirname, "../web/app.js"), "utf8").match(/const IndexPin = Object.freeze\(\{[\s\S]*?\n\}\);\nwindow.TrellisIndexPin = IndexPin;/)[0];
+const pinSource = fs.readFileSync(path.join(__dirname, "../web/index-pin.js"), "utf8");
 const pin = {indexGeneration:"12345678-1234-4123-8123-123456789abc", indexRevision:1};
 const descendants = node => [node, ...node.children.flatMap(descendants)];
 const text = node => descendants(node).map(item => item.textContent).join(" ");
@@ -46,12 +46,13 @@ function harness(globals = {}, options = {}) {
   };
   const window = {TrellisTreemapPele:{render:(...args) => renderer(...args), select:(container, key) => {
     for (const tile of container.querySelectorAll("[data-trellis-file-id]")) tile.setAttribute("aria-pressed", String(tile.getAttribute("data-trellis-file-id") === key));
-  }}, TrellisShell:{
-    clearTreemapInspector:() => { get("treemap-inspector").hidden = true; get("treemap-inspector-content").replaceChildren(); },
-    showTreemapInspector:() => { get("treemap-inspector").hidden = false; },
-  }};
+  }}};
+  const inspector = {
+    clear:() => { get("treemap-inspector").hidden = true; get("treemap-inspector-content").replaceChildren(); },
+    show:() => { get("treemap-inspector").hidden = false; },
+  };
   vm.runInNewContext(pinSource + "\n" + fs.readFileSync(path.join(__dirname, "../web/metric-heat.js"), "utf8") + "\n" + source, {window, document, URLSearchParams, console, ...globals});
-  const controller = window.TrellisTreemap.create({request:(url, current) => { calls.push({url, current}); return response(url); }, context:() => context,
+  const controller = window.TrellisTreemap.create({inspector, request:(url, current) => { calls.push({url, current}); return response(url); }, context:() => context,
     readSource:(site, revision, current) => reads.push({site, revision, current}), onConflict:error => conflicts.push(error), ...options});
   const button = label => { const result = descendants(get("treemap-inspector-content")).find(item => item.tagName === "button" && item.textContent === label); assert.ok(result, `Missing ${label}`); return result; };
   return {window, controller, calls, renders, reads, conflicts, get, button, setContext:value => {context = value;}, setResponse:fn => {response = fn;}, setRenderer:fn => {renderer = fn;}};
@@ -294,7 +295,7 @@ function resizeHarness() {
   const observers = [], timers = [], painted = [], held = [];
   const h = harness({ResizeObserver:class { constructor(callback) { observers.push(callback); } observe() {} },
     setTimeout:callback => { timers.push(callback); return timers.length; }, clearTimeout:() => {}, getComputedStyle:() => ({})});
-  const adapter = {}; vm.runInNewContext(fs.readFileSync(path.join(__dirname, "../web/treemap-pele.js"), "utf8"), {window:adapter, TextEncoder});
+  const adapter = {}; vm.runInNewContext(["pele-svg.js", "treemap-pele.js"].map(file => fs.readFileSync(path.join(__dirname, "../web", file), "utf8")).join("\n"), {window:adapter, TextEncoder});
   h.window.TrellisTreemapPele.layoutSize = adapter.TrellisTreemapPele.layoutSize;
   const box = h.get("treemap-diagram");
   let hold = () => false;

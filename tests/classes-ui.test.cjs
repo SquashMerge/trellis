@@ -6,7 +6,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const source = fs.readFileSync(path.join(__dirname, "../web/classes.js"), "utf8");
-const pinSource = fs.readFileSync(path.join(__dirname, "../web/app.js"), "utf8").match(/const IndexPin = Object.freeze\(\{[\s\S]*?\n\}\);\nwindow.TrellisIndexPin = IndexPin;/)[0];
+// The scripts index.html loads before the views: the pin, the source witness (for navigation.js), the context menu and the shared Pele helpers.
+const sharedSource = ["index-pin.js", "source-witness.js", "context-menu.js", "pele-svg.js"].map(file => fs.readFileSync(path.join(__dirname, "../web", file), "utf8")).join("\n");
 const descendants = node => [node, ...node.children.flatMap(descendants)];
 const text = node => descendants(node).map(item => item.textContent).join(" ");
 const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => {resolve = yes; reject = no;}); return {promise, resolve, reject}; };
@@ -51,9 +52,10 @@ function harness({navigation = false, appFilter = null} = {}) {
   document.querySelector=selector=>document.body.querySelector(selector);
   document.getElementById=id=>{if(!elements.has(id)){const item=element(id);elements.set(id,item);document.body.append(item);}return elements.get(id);};
   const window = {innerWidth:390,innerHeight:600,addEventListener(type,fn){(winListeners[type] ||= []).push(fn);}};
-  vm.runInNewContext(pinSource + "\n" + source,{window,document,URLSearchParams,console,getComputedStyle:()=>({getPropertyValue:token=>token==="--mono"?"monospace":"sans-serif"})});
+  vm.runInNewContext(sharedSource + "\n" + source,{window,document,URLSearchParams,console,getComputedStyle:()=>({getPropertyValue:token=>token==="--mono"?"monospace":"sans-serif"})});
   window.TrellisClasses.init({...(navigation ? {navigateMember:(...args)=>navigate(...args)} : {}),...(appFilter ? {appFilter} : {}),request:(url,options)=>{calls.push({url,options});return request(url,options);},readSource:(step,rev)=>reads.push({step,revision:rev}),selectMethod:symbol=>methods.push(symbol),currentRevision:()=>revision,currentSession:()=>session,onChange:()=>changes.push(true),onStale:message=>stale.push(message)});
-  return {controller:window.TrellisClasses,document,window,calls,reads,methods,changes,navigations,stale,get:document.getElementById,
+  // The context menu is its own script; the tests reach it beside the controller it serves.
+  return {controller:{...window.TrellisClasses,showContextMenu:window.TrellisContextMenu.showContextMenu,closeContextMenu:window.TrellisContextMenu.closeContextMenu},document,window,calls,reads,methods,changes,navigations,stale,get:document.getElementById,
     setNavigate(fn){navigate=fn;},setRequest(fn){request=fn;},setRevision(value){revision=value;},setSession(value){session=value;},
     async event(type,target){for(const fn of docListeners[type]||[]) await fn({target});},
     menu(){return document.body.querySelector(".classes-context-menu");},
