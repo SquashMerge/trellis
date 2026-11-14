@@ -1,4 +1,7 @@
 //! One checkout-owned, bounded semantic unit. No main-index snapshot survives a return.
+use super::unit_read::{
+    AuthorityOutcome, HeldRead, UnitFailure, WitnessAuthority, WitnessProgress,
+};
 use super::*;
 use crate::semantic_batch::RetainedStageContinuation;
 use crate::semantic_batch::{
@@ -51,7 +54,7 @@ pub(crate) struct HeldIndexRead(Mutex<Option<IndexConnection>>);
 
 pub(crate) struct SemanticContinuation {
     target: PendingSemanticTarget,
-    read: Arc<HeldIndexRead>,
+    read: HeldRead,
     next: usize,
     current: Option<ProducerContinuation>,
     prepared: Vec<PreparedSemantic>,
@@ -68,12 +71,11 @@ struct ProducerContinuation {
     join: Option<JoinContinuation>,
     counters: BatchCounters,
     budget: LookupBudget,
-    authority_cursor: super::witness::OriginalAdmissionCursor,
-    authority: Option<Box<super::witness::SourceAuthority>>,
+    /// Storage's cursors of the witnessed route: authority, LOCAL targets, preparation.
+    witness: WitnessProgress,
+    authority: Option<WitnessAuthority>,
     full: bool,
-    target_cursor: super::local_targets::TargetIndexCursor,
     target_index_done: bool,
-    witness_preparation: super::witness_preparation::WitnessPreparation,
     witness_ready: bool,
     /// FULL for a batch with no original import: first join it against its own capture.
     capture_witness: bool,
@@ -206,28 +208,6 @@ impl Store {
         result
     }
 
-    /// `pending_semantic_target` on a continuation's held connection.
-    fn pending_semantic_target_held(
-        &self,
-        held: &HeldIndexRead,
-    ) -> Result<Option<PendingSemanticTarget>> {
-        if self.disposition() == RecoveryDisposition::UpgradePending || self.is_recreate_pending() {
-            return Err(
-                topology::IndexNotReady::new("exceptional index reconciliation pending").into(),
-            );
-        }
-        self.with_held_read(held, |db| {
-            let target = pending_target(db)?;
-            if let Some(target) = &target {
-                selected_ensure!(
-                    target.root_id == self.identity.root_key,
-                    "incompatible_index: pending semantic root differs"
-                );
-            }
-            Ok(target)
-        })
-    }
-
     pub(crate) fn semantic_maintenance_unit(
         &self,
         session: &topology::WriterSession,
@@ -308,18 +288,12 @@ impl Store {
         continuation: &mut Option<SemanticContinuation>,
         cancel: &CancelFlag,
     ) -> Result<SemanticUnitOutcome> {
-        if let Err(error) = self
-            .verify_writer_session(session)
-            .and_then(|_| self.identity.verify())
-            .and_then(|_| check_cancel(cancel))
-        {
+        if let Err(error) = self.begin_semantic_unit(session, cancel) {
             *continuation = None;
             return Err(error);
         }
-        let target = match continuation.as_ref() {
-            Some(state) => self.pending_semantic_target_held(&state.read),
-            None => self.pending_semantic_target(),
-        };
+        let target =
+            self.pending_semantic_target_on(continuation.as_ref().map(|state| &state.read));
         let target = match target {
             Ok(target) => target,
             Err(error) => {
@@ -343,12 +317,7 @@ impl Store {
                 &target.native_revision_id,
                 BTreeSet::new(),
             );
-            let read = Arc::new(HeldIndexRead::default());
-            {
-                let mut reads = self.semantic_reads.lock().unwrap();
-                reads.retain(|read| read.strong_count() > 0);
-                reads.push(Arc::downgrade(&read));
-            }
+            let read = self.open_semantic_read();
             *continuation = Some(SemanticContinuation {
                 #[cfg(feature = "test-support")]
                 work: crate::semantic_import::publication_work_checkpoint(),
@@ -378,21 +347,12 @@ impl Store {
             };
             if let Some(_published_pin) = published {
                 #[cfg(feature = "test-support")]
-                if super::oracle::enabled(self) {
-                    let durable = self.cache()?;
-                    for prepared in &state.prepared {
-                        if let Some(full) = &prepared.oracle_full
-                            && let Err(error) = super::oracle::check_published(
-                                &durable,
-                                _published_pin,
-                                &prepared.producer,
-                                full,
-                            )
-                        {
-                            *continuation = None;
-                            return Err(error.context(RejoinOracleMismatch));
-                        }
-                    }
+                if self.semantic_oracle_enabled()
+                    && let Err(mismatch) =
+                        self.semantic_oracle_check_published(_published_pin, &state.prepared)?
+                {
+                    *continuation = None;
+                    return Err(mismatch);
                 }
                 #[cfg(feature = "test-support")]
                 let counts_result = write_semantic_work_counts(
@@ -409,10 +369,10 @@ impl Store {
         }
         let selection = state.target.selections[state.next].clone();
         let stage_parent = self.semantic_stage_parent()?;
-        let limits = self.batch_publication_limits();
+        let limits = self.semantic_unit_limits();
         let target = state.target.clone();
         let held = state.read.clone();
-        let result = self.with_pending_semantic_inputs(&target, &held, |db, destination_read| {
+        let result = self.with_pending_semantic_read(&target, &selection, &held, |read| {
             // One coherent snapshot serves several bounded steps; it never survives a return
             // to worker selection, and the slice keeps foreground work waiting briefly.
             let started = std::time::Instant::now();
@@ -420,26 +380,11 @@ impl Store {
             loop {
                 let step = (|| {
                     #[cfg(feature = "test-support")]
-                    anyhow::ensure!(
-                        !TEST_SEMANTIC_CONTENT_FAULT.get(),
-                        "test-support semantic content fault"
-                    );
-                    let captured_read = ReadRevision::new(
-                        selection.captured_pin,
-                        semantic_pin_key(selection.captured_pin),
-                    );
-                    let captured = NativeReader {
-                        store: self,
-                        db,
-                        selected: &captured_read,
-                    };
-                    let destination = NativeReader {
-                        store: self,
-                        db,
-                        selected: destination_read,
-                    };
+                    read.content_fault()?;
+                    let captured = read.captured();
+                    let destination = read.destination();
                     if state.current.is_none() {
-                        let producer = pending_producer(db, &target, &selection.producer_id)?;
+                        let producer = read.producer()?;
                         #[cfg(feature = "test-support")]
                         crate::semantic_import::note_producer_attempt();
                         state.current = Some(ProducerContinuation {
@@ -449,17 +394,14 @@ impl Store {
                             join: None,
                             counters: BatchCounters::default(),
                             budget: LookupBudget::new(&limits),
-                            authority_cursor: super::witness::OriginalAdmissionCursor::default(),
+                            witness: WitnessProgress::default(),
                             authority: None,
                             // Test-support switch: take the bounded FULL path without a witness attempt.
                             #[cfg(feature = "test-support")]
                             full: self.semantic_test_hooks().force_full_rejoin,
                             #[cfg(not(feature = "test-support"))]
                             full: false,
-                            target_cursor: super::local_targets::TargetIndexCursor::default(),
                             target_index_done: false,
-                            witness_preparation:
-                                super::witness_preparation::WitnessPreparation::default(),
                             witness_ready: false,
                             capture_witness: false,
                             capture_join: None,
@@ -469,25 +411,17 @@ impl Store {
                     }
                     let current = state.current.as_mut().unwrap();
                     if !current.full && current.authority.is_none() {
-                        match super::witness::source_authority(
-                            db,
-                            &target,
-                            &selection,
-                            &mut current.authority_cursor,
-                            self.payload_key_inputs().join_inputs(),
-                            &limits,
-                            cancel,
-                        )? {
-                            super::witness::AuthorityStep::Progress => return Ok(None),
-                            super::witness::AuthorityStep::Eligible(authority) => {
+                        match read.source_authority(&mut current.witness, &limits, cancel)? {
+                            AuthorityOutcome::Progress => return Ok(None),
+                            AuthorityOutcome::Eligible(authority) => {
                                 Self::semantic_phase_diagnostic("authority", "witnessed");
                                 current.authority = Some(authority)
                             }
-                            super::witness::AuthorityStep::Ineligible => {
+                            AuthorityOutcome::Ineligible => {
                                 Self::semantic_phase_diagnostic("authority", "ineligible");
                                 current.full = true
                             }
-                            super::witness::AuthorityStep::Full(reason) => {
+                            AuthorityOutcome::Full(reason) => {
                                 Self::semantic_phase_diagnostic("authority", reason);
                                 current.full = true;
                                 current.capture_witness = reason == "original_import_missing";
@@ -509,12 +443,9 @@ impl Store {
                             return Ok(None);
                         }
                         let stage = state.target_stage.as_mut().unwrap();
-                        let advanced = super::local_targets::advance(
-                            db,
-                            &target,
-                            selection.captured_pin,
+                        let advanced = read.advance_local_targets(
                             stage,
-                            &mut current.target_cursor,
+                            &mut current.witness,
                             &limits,
                             cancel,
                         );
@@ -539,39 +470,17 @@ impl Store {
                             incarnation: &incarnation,
                         };
                         current.admission = Some(if current.full {
-                            RetainedStageContinuation::new(
-                                db,
-                                &captured,
-                                selection.batch_id,
-                                &stage_parent,
-                                owner,
-                                &limits,
-                                cancel,
-                            )?
-                            .authenticated()
+                            read.start_admission(false, &stage_parent, owner, &limits, cancel)?
+                                .authenticated()
                         } else {
-                            RetainedStageContinuation::new_witnessed(
-                                db,
-                                &captured,
-                                selection.batch_id,
-                                &stage_parent,
-                                owner,
-                                &limits,
-                                cancel,
-                            )?
-                            .copying(super::copy::CopyFilter {
-                                target: target.clone(),
-                                captured_pin: selection.captured_pin,
-                                producer: selection.producer_id.clone(),
-                                batch_id: selection.batch_id,
-                                join_inputs: self.payload_key_inputs().join_inputs().to_owned(),
-                            })
+                            read.start_admission(true, &stage_parent, owner, &limits, cancel)?
+                                .copying(read.copy_filter())
                         });
                         return Ok(None);
                     }
                     if let Some(admission) = current.admission.as_mut() {
                         if let Some(admitted) =
-                            admission.advance(db, &captured, &mut current.counters, cancel)?
+                            read.advance_admission(admission, &mut current.counters, cancel)?
                         {
                             Self::semantic_phase_diagnostic(
                                 "admitted",
@@ -605,14 +514,12 @@ impl Store {
                             .target_stage
                             .as_mut()
                             .context("missing LOCAL target index")?;
-                        let result = current.witness_preparation.advance(
-                            db,
-                            &target,
+                        let result = read.prepare_witness(
+                            &mut current.witness,
                             current
                                 .authority
-                                .as_deref()
+                                .as_ref()
                                 .context("missing original witness authority")?,
-                            &destination,
                             admitted,
                             stage,
                             &limits,
@@ -680,21 +587,11 @@ impl Store {
                             "semantic continuation destination identity mismatch"
                         );
                         #[cfg(feature = "test-support")]
-                        if super::oracle::enabled(self) {
-                            let comparison = super::oracle::check(
-                                self,
-                                db,
-                                &target,
-                                &selection,
-                                &current.producer,
-                                admitted,
-                                cancel,
-                            );
+                        if self.semantic_oracle_enabled() {
+                            let comparison = read.oracle_check(&current.producer, admitted, cancel);
                             admitted.stage_mut().release_connection();
                             // Oracle failures are test failures, never producer unavailability.
-                            current.oracle_full = Some(
-                                comparison.map_err(|error| error.context(RejoinOracleMismatch))?,
-                            );
+                            current.oracle_full = Some(comparison?);
                         }
                     }
                     Ok(joined)
@@ -702,7 +599,8 @@ impl Store {
                 // Private stage connections outlive the step and the slice: reopening one
                 // (schema load, pragmas, a cold page cache) cost more than the step.
                 let step = match step {
-                    Ok(None) if started.elapsed() < step_slice() => match check_cancel(cancel) {
+                    Ok(None) if started.elapsed() < step_slice() => match read.check_cancel(cancel)
+                    {
                         Ok(()) => continue,
                         Err(error) => Err(error),
                     },
@@ -746,23 +644,13 @@ impl Store {
             }
             Ok(Some(None)) => Ok(SemanticUnitOutcome::Progress),
             Err(error) => {
-                if let Err(cancelled) = check_cancel(cancel) {
-                    *continuation = None;
-                    return Err(cancelled);
-                }
-                if rejoin_storage_failure(&error) {
-                    *continuation = None;
-                    return Err(rejoin_storage_error(error));
-                }
-                #[cfg(feature = "test-support")]
-                if error.is::<RejoinOracleMismatch>() {
-                    *continuation = None;
-                    return Err(error);
-                }
-                if error.is::<SelectedIntegrity>() {
-                    *continuation = None;
-                    return Err(error);
-                }
+                let error = match UnitFailure::of(error, cancel) {
+                    UnitFailure::Terminal(error) => {
+                        *continuation = None;
+                        return Err(error);
+                    }
+                    UnitFailure::Content(error) => error,
+                };
                 // A witnessed attempt that cannot complete within its bounds (#826: the
                 // witness's conservative reservation for a large pending dependent) takes the
                 // FULL fallback, as an ineligible witness does. Only FULL's own failure is the
@@ -796,20 +684,17 @@ impl Store {
                 let producer = if let Some(current) = state.current.take() {
                     current.producer
                 } else {
-                    self.native_at_reconcile(target.pin, |db, _| {
-                        pending_producer(db, &target, &selection.producer_id)
-                    })?
+                    self.pending_producer_at(&target, &selection)?
                 };
                 // FULL's own resource bound is the contract's typed outcome, which the
                 // unbounded in-memory oracle cannot model; every other unavailable S must
                 // be one the independent FULL rejoin also fails (#826).
                 #[cfg(feature = "test-support")]
-                if super::oracle::enabled(self) && !(_full && resource_limit(&error)) {
-                    let checked = self.with_pending_semantic_inputs(&target, &held, |db, _| {
-                        super::oracle::check_unavailable(
-                            self, db, &target, &selection, &producer, cancel,
-                        )
-                    });
+                if self.semantic_oracle_enabled() && !(_full && resource_limit(&error)) {
+                    let checked =
+                        self.with_pending_semantic_read(&target, &selection, &held, |read| {
+                            read.oracle_check_unavailable(&producer, cancel)
+                        });
                     // A mismatch, cancellation or storage failure ends the continuation.
                     if let Err(error) = checked {
                         *continuation = None;
@@ -880,28 +765,4 @@ fn write_semantic_work_counts(
         std::fs::write(file, serde_json::to_vec(&work)?)?;
     }
     Ok(())
-}
-
-fn pending_producer(
-    db: &Connection,
-    target: &PendingSemanticTarget,
-    id: &str,
-) -> Result<crate::semantic_records::Producer> {
-    let key = semantic_pin_key(target.pin);
-    let (version,hash,kind,encoding):(String,String,String,String)=db.query_row(
-        "SELECT p.version,p.executable_hash,p.kind,p.position_encoding FROM semantic_revision_producers s JOIN semantic_producers p ON p.id=s.id AND p.version=s.version WHERE s.revision_id=?1 AND s.id=?2",
-        params![key,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
-    let languages = semantic_ordered(
-        db,
-        "SELECT ordinal,language FROM semantic_producer_languages WHERE id=?1 AND version=?2 ORDER BY ordinal",
-        &[&id, &version],
-    )?;
-    Ok(crate::semantic_records::Producer {
-        id: id.to_owned(),
-        version,
-        executable_hash: hash,
-        kind: semantic_enum(kind)?,
-        position_encoding: semantic_enum(encoding)?,
-        languages,
-    })
 }
