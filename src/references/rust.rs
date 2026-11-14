@@ -1656,6 +1656,7 @@ impl Catalog {
         names.names.retain(|(_, name), _| !unseen.contains(name));
         Ok(!unseen.is_empty())
     }
+    #[allow(clippy::too_many_arguments)] // Captured inputs and the site's own tree stay explicit.
     pub(super) fn resolve(
         &mut self,
         document: usize,
