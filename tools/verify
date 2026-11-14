@@ -222,6 +222,8 @@ checks() {
   node docs/semantic-evidence/check-policy.mjs --self-test
   node --check web/app.js
   node --check web/index-pin.js
+  node --check web/source-witness.js
+  node --check web/context-menu.js
   node --check web/architecture-apps.js
   # The Herdr mod's logic over the browser's own Architecture adapter (#707); no install needed.
   node --import ./herdr-mod/test/register.mjs --test herdr-mod/test/mod.test.mjs herdr-mod/test/view.test.mjs herdr-mod/test/parity.test.mjs herdr-mod/test/setup.test.mjs

@@ -73,17 +73,7 @@
       startByte: selector.startByte, endByte: selector.endByte, ...(selector.memberPath ? {memberPath: selector.memberPath} : {})};
   }
   function callable(symbol) { return ["function", "method"].includes(symbol?.kind); }
-  function sourceWitness(item) {
-    const r = item?.range;
-    return typeof item?.path === "string" && !!item.path.trim() && !!r &&
-      Number.isSafeInteger(r.startLine) && r.startLine > 0 &&
-      Number.isSafeInteger(r.endLine) && r.endLine >= r.startLine &&
-      (r.startColumn == null || (Number.isSafeInteger(r.startColumn) && r.startColumn > 0)) &&
-      (r.endColumn == null || (Number.isSafeInteger(r.endColumn) && r.endColumn > 0)) &&
-      (r.startLine !== r.endLine || r.startColumn == null || r.endColumn == null || r.endColumn >= r.startColumn) &&
-      (r.startByte == null || (Number.isSafeInteger(r.startByte) && r.startByte >= 0)) &&
-      (r.endByte == null || (Number.isSafeInteger(r.endByte) && r.endByte > (r.startByte ?? -1)));
-  }
+  const sourceWitness = window.TrellisSourceWitness;
   async function open(event, selector, {isCurrent} = {}) {
     const anchor = capture(event), owner = api, ticket = ++serial;
     menuScroll.clear();

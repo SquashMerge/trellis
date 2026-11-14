@@ -7,7 +7,7 @@ const path = require("node:path");
 const vm = require("node:vm");
 // No DOM parser here: the adapter double keeps the real Pele projection and installs one
 // selectable node per projected row (tests/support/sequence-adapter-double.js).
-const source = ["../web/index-pin.js", "../web/sequence.js", "../web/sequence-pele.js", "support/sequence-adapter-double.js", "../web/shell.js", "../web/files.js", "../web/app.js"].map(file => fs.readFileSync(path.join(__dirname, file), "utf8")).join("\n");
+const source = ["../web/index-pin.js", "../web/source-witness.js", "../web/sequence.js", "../web/sequence-pele.js", "support/sequence-adapter-double.js", "../web/shell.js", "../web/files.js", "../web/app.js"].map(file => fs.readFileSync(path.join(__dirname, file), "utf8")).join("\n");
 
 function deferred() {
   let resolve, reject;
@@ -754,7 +754,7 @@ test("workspace change invalidates selections and source even when revision stay
 
 test("class context actions use cached file/method identity and never fetch source automatically", async () => {
   const h = harness(), opened = [], menus = [];
-  h.context.window.TrellisClasses = {showContextMenu: (event, actions) => menus.push(actions), open: opts => opened.push(opts)};
+  h.context.window.TrellisContextMenu = {showContextMenu: (event, actions) => menus.push(actions)}; h.context.window.TrellisClasses = {open: opts => opened.push(opts)};
   h.run(`attachClassMenu($('class-file'), {path:'src/Thing.java'}); attachClassMenu($('class-method'), {path:'src/Thing.java',seed:'method'});`);
   let prevented = false;
   h.get("class-file").listeners.contextmenu({preventDefault(){prevented=true;}});
@@ -766,7 +766,7 @@ test("class context actions use cached file/method identity and never fetch sour
 
 test("obsolete class context actions cannot cross revision or session changes", async () => {
   const h = harness(), menus = [], opened = [];
-  h.context.window.TrellisClasses = {showContextMenu: (e,a)=>menus.push(a),open:opts=>opened.push(opts)};
+  h.context.window.TrellisContextMenu = {showContextMenu: (e,a)=>menus.push(a)}; h.context.window.TrellisClasses = {open:opts=>opened.push(opts)};
   h.run(`attachClassMenu($('class-file'), {path:'Thing.py'});`);
   h.get("class-file").listeners.contextmenu({preventDefault(){}});
   h.run("status={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:2}}"); await menus[0][0].run();
@@ -790,7 +790,7 @@ test("class controller uses authenticated API and clears pending source on navig
 });
 
 test("unsupported class languages keep their ordinary file and method interactions", () => {
-  const h=harness();h.context.window.TrellisClasses={showContextMenu(){throw new Error('unexpected menu');}};
+  const h=harness();h.context.window.TrellisContextMenu={showContextMenu(){throw new Error('unexpected menu');}};
   h.run(`attachClassMenu($('go-file'),{path:'src/main.go'}); attachClassMenu($('rust-file'),{path:'src/main.rs'}); attachClassMenu($('js-file'),{path:'app.js'}); attachClassMenu($('mjs-file'),{path:'web/a.mjs'}); attachClassMenu($('ts-file'),{path:'src/a.ts'}); attachClassMenu($('tsx-file'),{path:'ui/a.tsx'}); attachClassMenu($('mts-file'),{path:'src/a.mts'}); attachClassMenu($('cts-file'),{path:'src/a.cts'});`);
   assert.equal(h.get('go-file').listeners.contextmenu,undefined);
   // JavaScript and Rust declarations are catalogued (#452): their files offer the class menu.

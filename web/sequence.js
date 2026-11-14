@@ -1,17 +1,6 @@
 "use strict";
 // Language-neutral DTO model and display projection. It draws no diagram: Pele does (sequence-pele.js).
 
-function sourceWitness(item) {
-  const r = item?.range;
-  return typeof item?.path === "string" && !!item.path.trim() && !!r &&
-    Number.isSafeInteger(r.startLine) && r.startLine > 0 &&
-    Number.isSafeInteger(r.endLine) && r.endLine >= r.startLine &&
-    (r.startColumn == null || (Number.isSafeInteger(r.startColumn) && r.startColumn > 0)) &&
-    (r.endColumn == null || (Number.isSafeInteger(r.endColumn) && r.endColumn > 0)) &&
-    (r.startLine !== r.endLine || r.startColumn == null || r.endColumn == null || r.endColumn >= r.startColumn) &&
-    (r.startByte == null || (Number.isSafeInteger(r.startByte) && r.startByte >= 0)) &&
-    (r.endByte == null || (Number.isSafeInteger(r.endByte) && r.endByte > (r.startByte ?? -1)));
-}
 // HTTP interface hops (#853). A client call that interface evidence matches to a route of
 // another app targets that route's handler, drawn in its app's column (`app:<name>`). The
 // match is structural, by method and path; its confidence stays on the arrow and in the
@@ -19,12 +8,12 @@ function sourceWitness(item) {
 const SEQUENCE_HOP_CONFIDENCE = {exact:"exact", template:"template", wrapperInferred:"wrapper-inferred"};
 function sequenceHop(view, step) {
   const hop = step?.interface;
-  if (!["call", "boundary"].includes(step?.kind) || !step.callId || !sourceWitness(step) || hop?.kind !== "http" ||
+  if (!["call", "boundary"].includes(step?.kind) || !step.callId || !window.TrellisSourceWitness(step) || hop?.kind !== "http" ||
       !Object.hasOwn(SEQUENCE_HOP_CONFIDENCE, hop.confidence) || typeof hop.participant !== "string" || !hop.participant ||
       typeof hop.method !== "string" || typeof hop.pathTemplate !== "string" || typeof hop.serverApp !== "string" || !hop.serverApp) return null;
   const participant = view?.participants?.find(item => item.id === hop.participant);
   return participant?.kind === "interfaceHandler" && participant.column?.id === `app:${hop.serverApp}` &&
-    typeof participant.declaration?.id === "string" && typeof participant.declaration.name === "string" && sourceWitness(participant.declaration) ? participant : null;
+    typeof participant.declaration?.id === "string" && typeof participant.declaration.name === "string" && window.TrellisSourceWitness(participant.declaration) ? participant : null;
 }
 // The words of a hop (#853): method, path template, confidence, and that it is not proof.
 function sequenceHopLabel(hop) {
@@ -76,7 +65,7 @@ function sequenceTarget(view, step) {
   const hop = sequenceHop(view, step);
   if (hop) return hop;
   const evidence = step?.callEvidence, pin = view?.revision;
-  if (!["call", "boundary"].includes(step?.kind) || !step.callId || !sourceWitness(step) ||
+  if (!["call", "boundary"].includes(step?.kind) || !step.callId || !window.TrellisSourceWitness(step) ||
       typeof pin?.indexGeneration !== "string" || !pin.indexGeneration || !Number.isSafeInteger(pin.indexRevision) ||
       evidence?.boundaryReason !== "none" || evidence.resolution !== "resolved" ||
       !(evidence.freshness === "fresh" && !evidence.projection ||
@@ -86,7 +75,7 @@ function sequenceTarget(view, step) {
       !["direct", "constructor"].includes(evidence.dispatch) || !evidence.provenanceId || typeof step.target !== "string") return null;
   const participant = view.participants?.find(item => item.id === step.target);
   const declaration = participant?.declaration;
-  return declaration?.id === step.target && sourceWitness(declaration) ? participant : null;
+  return declaration?.id === step.target && window.TrellisSourceWitness(declaration) ? participant : null;
 }
 function sequenceEvidenceLabel(step, view) {
   if (!["call", "boundary"].includes(step?.kind) || !step.callId) return "Measured source syntax";
@@ -147,8 +136,8 @@ function sequenceEarlyReturn(step) {
 function sequenceEntry(step) {
   const children = step?.children || [];
   return step?.kind === "group" && !step.alternate?.length && children.length &&
-    children.every(child => child.kind === "call" && !child.hidden && !child.children?.length && !child.alternate?.length && sourceWitness(child) && child.path === step.path) &&
-    sourceWitness(step) ? children[0] : null;
+    children.every(child => child.kind === "call" && !child.hidden && !child.children?.length && !child.alternate?.length && window.TrellisSourceWitness(child) && child.path === step.path) &&
+    window.TrellisSourceWitness(step) ? children[0] : null;
 }
 // Exact DTO prose is abbreviated for display only. These mappings never
 // equate guards, alter their source ranges, or change the control tree.

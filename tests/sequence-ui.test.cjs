@@ -3,6 +3,8 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const vm = require("node:vm");
+// web/sequence.js after the script it reads the source witness from, as index.html loads them.
+const sequenceSource = ["web/source-witness.js", "web/sequence.js"].map(file => fs.readFileSync(file, "utf8")).join("\n");
 class Element {
   constructor(tag) { this.tag = tag; this.children = []; this.attrs = {}; this.textContent = ""; this.listeners = {}; }
   setAttribute(key, value) { this.attrs[key] = value; }
@@ -13,7 +15,7 @@ class Element {
 // web/sequence.js with a document that only makes elements: the model and the two plain states.
 function sequenceModel() {
   const window = {};
-  vm.runInNewContext(fs.readFileSync("web/sequence.js", "utf8"), {window, document:{createElement:tag => new Element(tag)}});
+  vm.runInNewContext(sequenceSource, {window, document:{createElement:tag => new Element(tag)}});
   return window.TrellisSequence;
 }
 const range = {startLine:3, startColumn:2, endLine:7, endColumn:9};
@@ -76,7 +78,7 @@ test("compact labels shorten known parser prose and leave unknown text as measur
 function peleProjector() {
   const window = {};
   const context = vm.createContext({window, TextEncoder});
-  vm.runInContext(fs.readFileSync("web/sequence.js", "utf8"), context);
+  vm.runInContext(sequenceSource, context);
   vm.runInContext(fs.readFileSync("web/sequence-pele.js", "utf8"), context);
   return window.TrellisPeleSequence;
 }
@@ -158,7 +160,7 @@ test("negative control: original step identity check detects altered projector",
   const evaluate = text => {
     const window = {};
     const context = vm.createContext({window, TextEncoder});
-    vm.runInContext(fs.readFileSync("web/sequence.js", "utf8"), context);
+    vm.runInContext(sequenceSource, context);
     vm.runInContext(text, context);
     const row = window.TrellisPeleSequence.project(fixture).rows[0];
     assert.equal(row.id, row.step.id, "Pele map must retain original measured identity");
@@ -201,7 +203,7 @@ test("Pele rejects changed inline style and oversized SVG before DOMParser", asy
   let parses = 0;
   const sandbox = {window:{pele:{render:() => ({svg:frozen.replace("max-width:100%", "max-width:200%")})}},
     TextEncoder, DOMParser:class { parseFromString() { parses++; throw Error("should not parse"); } }};
-  vm.runInNewContext(fs.readFileSync("web/sequence.js", "utf8"), sandbox);
+  vm.runInNewContext(sequenceSource, sandbox);
   vm.runInNewContext(source, sandbox);
   const container = {replaceChildren() { throw Error("partial DOM installed"); }};
   const changed = await sandbox.window.TrellisPeleSequence.render(container, view);
@@ -233,11 +235,11 @@ test("real Chromium validates pinned SVG and source note identity under unchange
     page.on("pageerror", error => errors.push(error.message));
     await page.route("http://127.0.0.1:43987/**", route => {
       const path = new URL(route.request().url()).pathname;
-      const assets = {"/vendor/pele-1.10.0-trellis.2.js":"web/vendor/pele-1.10.0-trellis.2.js", "/sequence.js":"web/sequence.js", "/sequence-pele.js":"web/sequence-pele.js"};
+      const assets = {"/vendor/pele-1.10.0-trellis.2.js":"web/vendor/pele-1.10.0-trellis.2.js", "/source-witness.js":"web/source-witness.js", "/sequence.js":"web/sequence.js", "/sequence-pele.js":"web/sequence-pele.js"};
       if (assets[path]) return route.fulfill({status:200, contentType:"text/javascript; charset=utf-8", body:fs.readFileSync(assets[path])});
       if (path === "/test.css") return route.fulfill({status:200, contentType:"text/css", body:"#diagram { width:240px; height:110px; overflow:auto }"});
       return route.fulfill({status:200, contentType:"text/html; charset=utf-8", body:
-        `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'"><script src="/vendor/pele-1.10.0-trellis.2.js"></script><script src="/sequence.js"></script><script src="/sequence-pele.js"></script><link rel="stylesheet" href="/test.css"><div id="diagram"></div>`});
+        `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'"><script src="/vendor/pele-1.10.0-trellis.2.js"></script><script src="/source-witness.js"></script><script src="/sequence.js"></script><script src="/sequence-pele.js"></script><link rel="stylesheet" href="/test.css"><div id="diagram"></div>`});
     });
     await page.goto("http://127.0.0.1:43987/");
     await page.evaluate(() => document.addEventListener("securitypolicyviolation", event =>
@@ -559,7 +561,7 @@ test("calls-first keeps original ordered calls, conditional/unknown context and 
 });
 test("calls-first zero-call summary never claims that a method has no behavior", () => {
   const window = {};
-  vm.runInNewContext(fs.readFileSync("web/sequence.js","utf8"),{window});
+  vm.runInNewContext(sequenceSource,{window});
   const view = viewWith([{id:"write",kind:"effect",label:"write state",children:[],alternate:[]}]);
   assert.match(window.TrellisSequence.emptySummary(view),/No measured calls.*non-call behavior.*Show all steps/i);
   assert.equal(window.TrellisSequence.emptySummary(view,{showDetails:true}),"");
@@ -601,7 +603,7 @@ test("calls-first preserves extractor-labelled uncertainty outside boundaries on
 
 test("older-basis sequence evidence keeps historical identity and is not labelled fresh", () => {
   const window = {};
-  vm.runInNewContext(fs.readFileSync("web/sequence.js", "utf8"), {window});
+  vm.runInNewContext(sequenceSource, {window});
   const projection = {semanticStatus:"olderBasis", currentPin:{indexGeneration:"generation",indexRevision:2},
     semanticBasisPin:{indexGeneration:"generation",indexRevision:1},basisNativeRevisionId:"native-P"};
   const evidence = {projection, boundaryReason:"none",freshness:"possiblyStale",historicalFreshness:"fresh"};
@@ -617,7 +619,7 @@ test("older-basis sequence evidence keeps historical identity and is not labelle
 // steps never use that room, and omitted arrows are counted as interactions, not internal steps.
 test("Interactions cap arrows after filtering internal steps and count the omitted ones", () => {
   const window = {};
-  vm.runInNewContext(fs.readFileSync("web/sequence.js", "utf8"), {window});
+  vm.runInNewContext(sequenceSource, {window});
   const witness = {path:"a.rs", range:{startLine:1, endLine:1}};
   const seed = {id:"seed", name:"run", ...witness};
   const participants = [{id:"seed", label:"run", declaration:seed, column:{id:"A", label:"A"}},
@@ -669,7 +671,7 @@ test("#716: each Pele lane says whether it is a type, a module or a class, and w
 });
 test("#716: a lane name breaks after a separator or before a capital, never inside a word", () => {
   const window = {};
-  vm.runInNewContext(fs.readFileSync("web/sequence.js", "utf8"), {window, document:{}});
+  vm.runInNewContext(sequenceSource, {window, document:{}});
   const lines = name => Array.from(window.TrellisSequence.laneHeader(undefined, name));
   assert.deepEqual(lines("behavior_columns"), ["behavior_", "columns"]);
   assert.deepEqual(lines("graph_read::tests"), ["graph_", "read::", "tests"]);

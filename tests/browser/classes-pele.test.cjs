@@ -10,9 +10,9 @@ const {resolve, join} = require("node:path");
 const {chromium} = require("playwright");
 const ROOT = resolve(__dirname, "../..");
 const pin = readFileSync(join(ROOT, "web/index-pin.js"), "utf8");
-const files = {"/vendor/pele-1.10.0-trellis.2.js": "web/vendor/pele-1.10.0-trellis.2.js", "/classes.js": "web/classes.js", "/style.css": "web/style.css", "/classes.css": "web/classes.css"};
+const files = {"/vendor/pele-1.10.0-trellis.2.js": "web/vendor/pele-1.10.0-trellis.2.js", "/context-menu.js": "web/context-menu.js", "/classes.js": "web/classes.js", "/style.css": "web/style.css", "/classes.css": "web/classes.css"};
 const html = `<!doctype html><html><head><link rel="stylesheet" href="/style.css"><link rel="stylesheet" href="/classes.css">
-<script src="/index-pin.js" defer></script><script src="/vendor/pele-1.10.0-trellis.2.js" defer></script><script src="/classes.js" defer></script></head>
+<script src="/index-pin.js" defer></script><script src="/vendor/pele-1.10.0-trellis.2.js" defer></script><script src="/context-menu.js" defer></script><script src="/classes.js" defer></script></head>
 <body><section id="classes-panel"><p id="classes-state"></p><input id="classes-query"><button id="classes-search">Search</button><input id="classes-unmatched" type="checkbox">
 <div id="classes-results"></div><div id="classes-diagram"></div></section></body></html>`;
 const policy = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";

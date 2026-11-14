@@ -1174,19 +1174,8 @@ form("connect-form", async () => {
 });
 $("logout").addEventListener("click", () => disconnect());
 
-function sourceWitness(item) {
-  const r = item?.range;
-  return typeof item?.path === "string" && !!item.path.trim() && !!r &&
-    Number.isSafeInteger(r.startLine) && r.startLine > 0 &&
-    Number.isSafeInteger(r.endLine) && r.endLine >= r.startLine &&
-    (r.startColumn == null || (Number.isSafeInteger(r.startColumn) && r.startColumn > 0)) &&
-    (r.endColumn == null || (Number.isSafeInteger(r.endColumn) && r.endColumn > 0)) &&
-    (r.startLine !== r.endLine || r.startColumn == null || r.endColumn == null || r.endColumn >= r.startColumn) &&
-    (r.startByte == null || (Number.isSafeInteger(r.startByte) && r.startByte >= 0)) &&
-    (r.endByte == null || (Number.isSafeInteger(r.endByte) && r.endByte > (r.startByte ?? -1)));
-}
 async function showSource(item, revision) {
-  if (!sourceWitness(item)) throw new Error("Measured source path and range unavailable.");
+  if (!window.TrellisSourceWitness(item)) throw new Error("Measured source path and range unavailable.");
   return showCachedSource(item.path, item.range, revision);
 }
 let workspaceSource = null;
@@ -1377,7 +1366,7 @@ async function setSection(name, view = null) {
   for (const state of fileStates.values()) if (state.outlineLoading) {
     state.serial++; state.outlineLoading = false; state.outlineError = "Symbol read interrupted. Retry to read this indexed outline.";
   }
-  window.TrellisNavigation?.reset(); window.TrellisClasses?.closeContextMenu?.();
+  window.TrellisNavigation?.reset(); window.TrellisContextMenu?.closeContextMenu?.();
   window.TrellisShell?.setSection(name);
   if (name !== "files") {
     // A navigation names its target view: the last-used tab neither shows nor refreshes (#451).
@@ -3108,12 +3097,12 @@ async function openClasses(options = {}) {
   return window.TrellisClasses.open(options.seed ? {seed:options.seed} : options);
 }
 function attachClassMenu(node, options) {
-  if (!classLanguage(options.path) || !window.TrellisClasses?.showContextMenu) return;
+  if (!classLanguage(options.path) || !window.TrellisContextMenu?.showContextMenu) return;
   const current = browseGuard();
   const show = event => {
     if (!current() || !token || !status) return;
     event.preventDefault();
-    window.TrellisClasses.showContextMenu(event, [{
+    window.TrellisContextMenu.showContextMenu(event, [{
       label: options.seed ? "Show enclosing class diagram" : "Show class diagram",
       run: () => { if (current()) return perform(() => openClasses(options)); },
     }]);
@@ -3124,7 +3113,7 @@ function attachClassMenu(node, options) {
   });
 }
 function inspectSourceSymbol(symbol, revision) {
-  if (!sourceWitness(symbol) || !IndexPin.equal(revision, status?.revision)) throw new Error("Source inspection is stale. Refresh the indexed view.");
+  if (!window.TrellisSourceWitness(symbol) || !IndexPin.equal(revision, status?.revision)) throw new Error("Source inspection is stale. Refresh the indexed view.");
   const context = navigationContext(), serial = sourceSerial;
   const inspector = {symbol}; sourceInspector = inspector;
   const current = () => navigationCurrent(context) && sourceInspector === inspector && sourceSerial === serial;
@@ -3141,7 +3130,7 @@ window.TrellisNavigation?.init({
   selectMethod: (symbol, revision) => perform(() => navigateDiagram(symbol, revision)),
   inspectSymbol: (symbol, revision) => perform(() => inspectSourceSymbol(symbol, revision)),
   openSource: (symbol, revision) => perform(() => section === "files" ? openFilesLocation(symbol, revision) : showSource(symbol, revision)),
-  showMenu: (event, actions, options) => window.TrellisClasses?.showContextMenu(event, actions, options),
+  showMenu: (event, actions, options) => window.TrellisContextMenu?.showContextMenu(event, actions, options),
 });
 function initClassView() {
   window.TrellisClasses?.init({
