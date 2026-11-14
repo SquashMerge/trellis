@@ -227,7 +227,7 @@ impl McpSelectedLines {
         Self { bytes, checkpoints }
     }
 
-    fn range(&self, range: &crate::native_evidence::Range) -> Result<Option<McpLines>> {
+    fn range(&self, range: &crate::native_records::Range) -> Result<Option<McpLines>> {
         if !(range.start <= range.end && range.end <= self.bytes.len()) {
             return Err(SelectedIntegrity(
                 "store_unavailable: selected byte range outside source".into(),
@@ -263,7 +263,7 @@ impl McpSelectedLines {
 #[cfg(test)]
 fn mcp_lines_for_range(
     bytes: &[u8],
-    range: &crate::native_evidence::Range,
+    range: &crate::native_records::Range,
 ) -> Result<Option<McpLines>> {
     McpSelectedLines::new(bytes.to_vec()).range(range)
 }
@@ -366,7 +366,7 @@ impl EvidenceResponse {
 /// Full selected document-version identity for compact MCP document references.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct McpDocumentVersion {
-    pub document: crate::native_evidence::DocumentKey,
+    pub document: crate::native_records::DocumentKey,
     pub revision_id: String,
     pub content_hash: String,
     pub provenance_id: String,
@@ -391,7 +391,7 @@ struct McpCheckedSource {
 }
 
 impl McpCheckedSource {
-    fn item(&self, range: &crate::native_evidence::Range) -> Result<McpItemSource> {
+    fn item(&self, range: &crate::native_records::Range) -> Result<McpItemSource> {
         Ok(McpItemSource {
             document: self.document.clone(),
             lines: self.lines.range(range)?,
@@ -403,11 +403,11 @@ impl McpCheckedSource {
 impl EvidenceResponse {
     fn mcp_checked_source<'a>(
         &self,
-        cache: &'a mut BTreeMap<crate::native_evidence::DocumentKey, McpCheckedSource>,
+        cache: &'a mut BTreeMap<crate::native_records::DocumentKey, McpCheckedSource>,
         selected: &ReadRevision,
-        declaration: &crate::native_evidence::Declaration,
+        declaration: &crate::native_records::Declaration,
         hash: &str,
-        provenance: &crate::native_evidence::Provenance,
+        provenance: &crate::native_records::Provenance,
     ) -> Result<&'a McpCheckedSource> {
         if !cache.contains_key(&declaration.document) {
             let source = self.mcp_document_version(selected, declaration, hash, provenance)?;
@@ -432,9 +432,9 @@ impl EvidenceResponse {
     fn mcp_document_version(
         &self,
         selected: &ReadRevision,
-        declaration: &crate::native_evidence::Declaration,
+        declaration: &crate::native_records::Declaration,
         hash: &str,
-        provenance: &crate::native_evidence::Provenance,
+        provenance: &crate::native_records::Provenance,
     ) -> Result<McpCheckedSource> {
         #[cfg(test)]
         super::count_selected_read(|counts| counts.source_reads += 1);
@@ -521,16 +521,16 @@ pub struct McpFind {
     /// Per language (java, rust, python, javascript):
     /// [selected, complete, partial, failed, unselected].
     pub scope: [[u64; 5]; 5],
-    pub provenance: Vec<crate::native_evidence::Provenance>,
+    pub provenance: Vec<crate::native_records::Provenance>,
     pub has_more: bool,
     pub pin: IndexPin,
 }
 
 pub struct McpFindSymbol {
-    pub declaration: crate::native_evidence::Declaration,
+    pub declaration: crate::native_records::Declaration,
     pub content_hash: String,
     /// The native coverage tuple of the symbol's document.
-    pub coverage: crate::native_evidence::Coverage,
+    pub coverage: crate::native_records::Coverage,
 }
 
 impl EvidenceResponse {
@@ -660,7 +660,7 @@ impl EvidenceResponse {
     fn mcp_checked_lookup_key(
         &self,
         selected: &ReadRevision,
-        declaration: &crate::native_evidence::Declaration,
+        declaration: &crate::native_records::Declaration,
         source: &McpCheckedSource,
     ) -> Result<Option<String>> {
         let scope = v8_native_scope_for(&self.db, &declaration.document, selected)?
@@ -693,7 +693,7 @@ impl EvidenceResponse {
     /// (a partial Rust impl parse) is left out.
     pub fn mcp_stable_lookup_keys<'a>(
         &self,
-        declarations: impl IntoIterator<Item = &'a crate::native_evidence::Declaration>,
+        declarations: impl IntoIterator<Item = &'a crate::native_records::Declaration>,
         pin: IndexPin,
     ) -> Result<BTreeMap<String, String>> {
         let selected = self.selected(Some(pin))?;
@@ -752,7 +752,7 @@ pub struct McpFindSymbolWithLines {
 pub struct McpFindWithLines {
     pub symbols: Vec<McpFindSymbolWithLines>,
     pub scope: [[u64; 5]; 5],
-    pub provenance: Vec<crate::native_evidence::Provenance>,
+    pub provenance: Vec<crate::native_records::Provenance>,
     pub has_more: bool,
     pub pin: IndexPin,
 }
@@ -812,7 +812,7 @@ impl EvidenceResponse {
         selected: &ReadRevision,
         check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<McpFindScope> {
-        use crate::native_evidence::DocumentKey;
+        use crate::native_records::DocumentKey;
         // Include manifest rows without native declarations, including failed and unselected rows.
         let mut stmt = self.db.prepare(
             "SELECT s.id,m.language,m.path,m.coverage_selected,m.coverage_state,
@@ -877,7 +877,7 @@ impl EvidenceResponse {
     fn mcp_validated_coverage(
         &self,
         scope: &V8NativeScope,
-    ) -> Result<crate::native_evidence::Coverage> {
+    ) -> Result<crate::native_records::Coverage> {
         let key = &scope.key;
         let row = read_native_coverage_v8(&self.db, scope)?;
         if !(row.revision_id == scope.native_revision_id
@@ -933,16 +933,16 @@ impl EvidenceResponse {
         has_more: bool,
         check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<McpFind> {
-        use crate::native_evidence::Provenance;
+        use crate::native_records::Provenance;
         let scopes = &scope.scopes;
         let mut symbols = Vec::new();
         let mut provenance = Vec::new();
         let mut loaded: BTreeMap<
             String,
             (
-                BTreeMap<String, crate::native_evidence::Declaration>,
+                BTreeMap<String, crate::native_records::Declaration>,
                 String,
-                crate::native_evidence::Coverage,
+                crate::native_records::Coverage,
             ),
         > = BTreeMap::new();
         for (version, id) in hits {
@@ -1009,7 +1009,7 @@ impl EvidenceResponse {
         let selected = self.selected(Some(found.pin))?;
         // Hits from one document may be interleaved with others in rank order.
         // Visit them document by document so at most one raw BLOB is held (#165).
-        let mut by_document: BTreeMap<&crate::native_evidence::DocumentKey, Vec<usize>> =
+        let mut by_document: BTreeMap<&crate::native_records::DocumentKey, Vec<usize>> =
             BTreeMap::new();
         for (index, symbol) in found.symbols.iter().enumerate() {
             by_document
@@ -1076,10 +1076,10 @@ impl EvidenceResponse {
 
 /// One selected native declaration with its complete required evidence closure.
 pub struct McpDeclaration {
-    pub declaration: crate::native_evidence::Declaration,
+    pub declaration: crate::native_records::Declaration,
     pub content_hash: String,
-    pub coverage: Vec<crate::native_evidence::Coverage>,
-    pub provenance: Vec<crate::native_evidence::Provenance>,
+    pub coverage: Vec<crate::native_records::Coverage>,
+    pub provenance: Vec<crate::native_records::Provenance>,
     pub pin: IndexPin,
 }
 
@@ -1119,7 +1119,7 @@ impl EvidenceResponse {
         symbol_id: &str,
         selected: &ReadRevision,
     ) -> Result<Option<McpDeclaration>> {
-        use crate::native_evidence::Provenance;
+        use crate::native_records::Provenance;
         let Some(scope) = v8_owner_scope_for(&self.db, symbol_id, selected)? else {
             return Ok(None);
         };
@@ -1217,7 +1217,7 @@ impl EvidenceResponse {
 
 /// An outgoing call and its optional, independently verified lexical suggestions.
 pub struct McpOutgoingCall {
-    pub call: crate::native_evidence::Call,
+    pub call: crate::native_records::Call,
     pub content_hash: String,
     pub callee_text: Option<String>,
     pub callee_text_truncated: bool,
@@ -1230,9 +1230,9 @@ pub struct McpOutgoingCall {
 
 #[derive(Clone)]
 pub struct McpOutgoingCandidate {
-    pub declaration: crate::native_evidence::Declaration,
-    pub coverage: crate::native_evidence::Coverage,
-    pub provenance: crate::native_evidence::Provenance,
+    pub declaration: crate::native_records::Declaration,
+    pub coverage: crate::native_records::Coverage,
+    pub provenance: crate::native_records::Provenance,
 }
 
 pub struct McpOutgoing {
@@ -1258,7 +1258,7 @@ pub struct McpOutgoingWithLines {
 
 fn mcp_callee_text(
     source: &str,
-    range: Option<&crate::native_evidence::Range>,
+    range: Option<&crate::native_records::Range>,
 ) -> Result<(Option<String>, bool)> {
     let Some(range) = range else {
         return Ok((None, false));
@@ -1373,7 +1373,7 @@ impl EvidenceResponse {
         hint_now: &dyn Fn() -> std::time::Instant,
         required_deadline: std::time::Instant,
     ) -> Result<Option<(McpOutgoing, usize)>> {
-        use crate::native_evidence::{DocumentKey, Provenance};
+        use crate::native_records::{DocumentKey, Provenance};
         let selected = self.selected(None)?;
         ensure!(
             expected.is_none_or(|pin| pin == selected.pin),
@@ -1462,14 +1462,14 @@ impl EvidenceResponse {
         // connection or lock transition is needed for these candidate SELECTs.
         let _progress_guard =
             (!calls.is_empty()).then(|| install_optional_hint_progress(&self.db, &progress));
-        let owner_is_test = owner.declaration.role == crate::native_evidence::DeclarationRole::Test;
+        let owner_is_test = owner.declaration.role == crate::native_records::DeclarationRole::Test;
         // One admitted snapshot: verify and decode each selected version only once.
         // A failed optional verification is never cached as trusted evidence.
         let mut verified_versions = BTreeMap::<
             String,
             (
-                Vec<crate::native_evidence::Declaration>,
-                crate::native_evidence::Coverage,
+                Vec<crate::native_records::Declaration>,
+                crate::native_records::Coverage,
                 String,
             ),
         >::new();
@@ -1484,7 +1484,7 @@ impl EvidenceResponse {
                 item.omitted = None;
                 continue;
             }
-            let Some(lookup) = crate::native_evidence::verified_callee_lookup(
+            let Some(lookup) = crate::native_records::verified_callee_lookup(
                 &scope.key.language,
                 &item.call,
                 &source.text,
@@ -1565,7 +1565,7 @@ impl EvidenceResponse {
                         path: row.get(4)?,
                     };
                     let (start, end): (i64, i64) = (row.get(5)?, row.get(6)?);
-                    let role = crate::native_evidence::DeclarationRole::from_stored(
+                    let role = crate::native_records::DeclarationRole::from_stored(
                         &row.get::<_, String>(7)?,
                     )
                     .map_err(|error| SelectedIntegrity(error.to_string()))?;
@@ -1579,7 +1579,7 @@ impl EvidenceResponse {
                     }
                 };
                 // Test code is ineligible for non-test callers.
-                if !owner_is_test && role == crate::native_evidence::DeclarationRole::Test {
+                if !owner_is_test && role == crate::native_records::DeclarationRole::Test {
                     continue;
                 }
                 ranked.push((
@@ -1917,13 +1917,13 @@ impl EvidenceResponse {
 
 /// Required syntax-tier reverse hits and their selected document evidence.
 pub struct McpIncomingCallWithLines {
-    pub call: crate::native_evidence::Call,
-    pub caller: crate::native_evidence::Declaration,
+    pub call: crate::native_records::Call,
+    pub caller: crate::native_records::Declaration,
     pub content_hash: String,
     pub source: McpItemSource,
     pub callee_text: String,
-    pub coverage: crate::native_evidence::Coverage,
-    pub provenance: crate::native_evidence::Provenance,
+    pub coverage: crate::native_records::Coverage,
+    pub provenance: crate::native_records::Provenance,
 }
 
 pub struct McpIncomingWithLines {
@@ -1995,7 +1995,7 @@ impl EvidenceResponse {
         exclude: Option<Option<&str>>,
         check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<Option<McpIncomingWithLines>> {
-        use crate::native_evidence::{DeclarationRole, DocumentKey, Provenance};
+        use crate::native_records::{DeclarationRole, DocumentKey, Provenance};
         let selected = self.selected(None)?;
         ensure!(
             expected.is_none_or(|pin| pin == selected.pin),
@@ -2336,8 +2336,8 @@ fn mcp_hint_proximity(owner: &str, candidate: &str) -> u8 {
 }
 
 fn mcp_candidate_proof_matches(
-    declaration: &crate::native_evidence::Declaration,
-    provenance: &crate::native_evidence::Provenance,
+    declaration: &crate::native_records::Declaration,
+    provenance: &crate::native_records::Provenance,
 ) -> bool {
     declaration.document == provenance.document
         && declaration.revision_id == provenance.revision_id
@@ -2377,7 +2377,7 @@ mod outgoing_tests {
     use super::*;
     #[test]
     fn duplicate_verified_hint_dedupes_but_conflicting_record_fails() {
-        use crate::native_evidence::{Coverage, Declaration, DocumentKey, Provenance};
+        use crate::native_records::{Coverage, Declaration, DocumentKey, Provenance};
         use serde_json::json;
         let document = DocumentKey {
             source_set_id: "source-set:v1:test".into(),
@@ -2484,14 +2484,14 @@ mod outgoing_tests {
     #[test]
     fn unicode_callee_clips_on_utf8_scalar_boundary() {
         let text = format!("{}éz", "a".repeat(1023));
-        let range = crate::native_evidence::Range {
+        let range = crate::native_records::Range {
             start: 0,
             end: text.len(),
         };
         let (shown, clipped) = mcp_callee_text(&text, Some(&range)).unwrap();
         assert_eq!(shown.unwrap().len(), 1023);
         assert!(clipped);
-        let range = crate::native_evidence::Range {
+        let range = crate::native_records::Range {
             start: 1023,
             end: 1025,
         };
@@ -2503,7 +2503,7 @@ mod outgoing_tests {
         assert!(
             mcp_callee_text(
                 &text,
-                Some(&crate::native_evidence::Range {
+                Some(&crate::native_records::Range {
                     start: 1024,
                     end: 1025
                 })
@@ -2934,7 +2934,7 @@ mod enriched_read_tests {
 
     #[test]
     fn stored_roles_hide_inline_rust_test_helpers_from_production_calls() {
-        use crate::native_evidence::DeclarationRole;
+        use crate::native_records::DeclarationRole;
         let state = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         std::fs::write(workspace.path().join("lib.rs"),
@@ -3305,7 +3305,7 @@ mod enriched_read_tests {
 
     #[test]
     fn find_ranks_production_within_match_tiers_before_limit_and_lookahead() {
-        use crate::native_evidence::DeclarationRole::{Production, Test};
+        use crate::native_records::DeclarationRole::{Production, Test};
 
         let state = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
@@ -3618,7 +3618,7 @@ mod enriched_read_tests {
 #[cfg(test)]
 mod source_range_tests {
     use super::{McpLines, mcp_lf_range, mcp_lines_for_range};
-    use crate::native_evidence::Range;
+    use crate::native_records::Range;
 
     #[test]
     fn selected_item_lines_reciprocate_lf_source_reads() {
@@ -3788,9 +3788,9 @@ mod find_scope_tests {
         selected: &ReadRevision,
     ) -> (
         [[u64; 5]; 5],
-        BTreeMap<String, crate::native_evidence::Coverage>,
+        BTreeMap<String, crate::native_records::Coverage>,
     ) {
-        use crate::native_evidence::DocumentKey;
+        use crate::native_records::DocumentKey;
         let keys = read
             .db
             .prepare(

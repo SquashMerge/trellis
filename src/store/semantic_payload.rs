@@ -549,7 +549,7 @@ pub(in crate::store) fn cleanup_payload_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::native_evidence::{DocumentKey, Range};
+    use crate::native_records::{DocumentKey, Range};
 
     fn document(path: &str) -> DocumentKey {
         DocumentKey {

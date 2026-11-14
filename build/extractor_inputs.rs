@@ -9,6 +9,8 @@
 /// its explicit non-extraction allowlist.
 ///
 /// - `native_evidence`: tree-sitter measurement, witnesses, revision headers.
+/// - `native_records`: the native record types, the producer descriptor constants and the
+///   lookup-key normalization, moved out of `native_evidence`.
 /// - `native_ids`: canonical JSON, digests and ID minting.
 /// - `indexer*`: graph projection and per-language native kinds.
 /// - `classes`: class extraction and the class catalog.
@@ -31,6 +33,7 @@ pub const EXTRACTION_MODULES: &[&str] = &[
     "src/model.rs",
     "src/native_evidence.rs",
     "src/native_ids.rs",
+    "src/native_records.rs",
     "src/native_rust_macros.rs",
     "src/parallel.rs",
     "src/search_card.rs",

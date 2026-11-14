@@ -85,6 +85,11 @@ const NON_OUTPUT_ITEMS: &[(&str, &str)] = &[
         "native facts the join reads; native extraction has its own hash",
     ),
     (
+        "native_records",
+        "the native record types and constants moved out of `native_evidence`; native \
+         extraction has its own hash, which lists the file",
+    ),
+    (
         "capture",
         "the admitted inputs; source bytes enter facts only through content hashes",
     ),

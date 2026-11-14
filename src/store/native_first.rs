@@ -824,7 +824,7 @@ impl Store {
 /// A document S publishes at commit: settled and staged, or copied from its basis row.
 enum CommitDocument<'a> {
     Staged(&'a crate::semantic_evidence::SemanticPublication),
-    Copied(&'a crate::native_evidence::DocumentKey),
+    Copied(&'a crate::native_records::DocumentKey),
 }
 
 /// A bounded one-document overlay read. The tuple and every target retain P authority.
@@ -904,7 +904,7 @@ impl Store {
         &self,
         pin: IndexPin,
         producer: &str,
-        document: &crate::native_evidence::DocumentKey,
+        document: &crate::native_records::DocumentKey,
     ) -> Result<
         Option<(
             SemanticProjection,

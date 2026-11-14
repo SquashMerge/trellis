@@ -9,7 +9,7 @@ use crate::{
         DefaultProducers, DocumentFacts, GraphAnswer, GraphFacts, GraphIntegrity, GraphQuery,
         GraphRequest, GraphSnapshot, GraphSource, HistoryFacts, SemanticDocument, evaluate,
     },
-    native_evidence::DocumentKey,
+    native_records::DocumentKey,
     semantic_evidence as sem,
 };
 pub(super) use sequence_callbacks::syntax_callbacks;
@@ -35,7 +35,7 @@ struct SnapshotGraphSource<'a> {
     producer: Option<String>,
     snapshot: GraphSnapshot,
     scopes: BTreeMap<DocumentKey, V8NativeScope>,
-    declaration_roles: BTreeMap<(DocumentKey, String), crate::native_evidence::DeclarationRole>,
+    declaration_roles: BTreeMap<(DocumentKey, String), crate::native_records::DeclarationRole>,
     facts: GraphFacts,
     check: &'a mut dyn FnMut() -> Result<()>,
 }
@@ -83,7 +83,7 @@ impl SnapshotGraphSource<'_> {
             .into_iter()
             .map(|declaration| (declaration.syntax_id.clone(), declaration))
             .collect();
-        let mut calls: BTreeMap<String, Vec<crate::native_evidence::Call>> = BTreeMap::new();
+        let mut calls: BTreeMap<String, Vec<crate::native_records::Call>> = BTreeMap::new();
         for call in read_native_calls_v8(self.db, &scope, None)? {
             calls
                 .entry(call.owner_syntax_id.clone())
@@ -96,7 +96,7 @@ impl SnapshotGraphSource<'_> {
             params![scope.version_id, scope.key.source_set_id, scope.key.language, scope.key.path],
             |r| r.get(0),
         )?;
-        let native_provenance = native_to_semantic(&crate::native_evidence::Provenance {
+        let native_provenance = native_to_semantic(&crate::native_records::Provenance {
             id: scope.proof_id(),
             producer_id: scope.producer_id.clone(),
             document: scope.key.clone(),
@@ -255,7 +255,7 @@ impl GraphSource for SnapshotGraphSource<'_> {
         &mut self,
         key: &DocumentKey,
         syntax_id: &str,
-    ) -> Result<crate::native_evidence::DeclarationRole> {
+    ) -> Result<crate::native_records::DeclarationRole> {
         let cache_key = (key.clone(), syntax_id.to_string());
         if let Some(role) = self.declaration_roles.get(&cache_key) {
             return Ok(*role);
@@ -275,7 +275,7 @@ impl GraphSource for SnapshotGraphSource<'_> {
             .ok_or_else(|| {
                 SelectedIntegrity("store_unavailable: graph declaration role missing".into())
             })?;
-        let role = crate::native_evidence::DeclarationRole::from_stored(&stored)
+        let role = crate::native_records::DeclarationRole::from_stored(&stored)
             .map_err(|error| SelectedIntegrity(error.to_string()))?;
         self.declaration_roles.insert(cache_key, role);
         Ok(role)
@@ -321,7 +321,7 @@ impl GraphSource for SnapshotGraphSource<'_> {
         Ok(history)
     }
 
-    fn names_declaration(&mut self, call: &crate::native_evidence::Call) -> Result<bool> {
+    fn names_declaration(&mut self, call: &crate::native_records::Call) -> Result<bool> {
         if let Some(named) = self.facts.named_calls.get(&call.id) {
             return Ok(*named);
         }
@@ -425,7 +425,7 @@ pub(super) fn navigation_calls(
     selector: &crate::navigation::SourceSelector,
     reader: &mut crate::navigation::Reader<'_>,
 ) -> Result<()> {
-    use crate::native_evidence::{Call, Range};
+    use crate::native_records::{Call, Range};
     let Some(producer) = selector.semantic_producer_id.as_deref() else {
         return Ok(());
     };
@@ -855,7 +855,7 @@ pub(super) fn sequence_calls(
 /// is enough to enrich; the others then keep their own stale or missing boundaries.
 fn syntax_fallback(
     semantic: &SemanticDocument,
-    calls: &[crate::native_evidence::Call],
+    calls: &[crate::native_records::Call],
     path: &str,
     source: &mut dyn GraphSource,
 ) -> Result<Option<String>> {
@@ -1319,7 +1319,7 @@ impl Enrichment<'_, '_> {
         &mut self,
         target: Symbol,
         column: crate::behavior::SequenceColumn,
-        key: &crate::native_evidence::DocumentKey,
+        key: &crate::native_records::DocumentKey,
     ) -> Result<()> {
         let declaration = self
             .source
@@ -1577,7 +1577,7 @@ mod tests {
         };
         assert_eq!(
             source.declaration_role(&key, &id).unwrap(),
-            crate::native_evidence::DeclarationRole::Test
+            crate::native_records::DeclarationRole::Test
         );
         assert!(source.facts.documents.is_empty());
         source.declaration_roles.clear();

@@ -736,7 +736,7 @@ pub struct ViewCallBinding {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DurableAnchor {
     pub syntax_id: String,
-    pub document: crate::native_evidence::DocumentKey,
+    pub document: crate::native_records::DocumentKey,
     pub captured_revision_id: String,
     pub header_hash: String,
     pub sibling_group_hash: String,

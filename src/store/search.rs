@@ -95,7 +95,7 @@ impl Store {
 
 pub(super) fn write_cards(
     db: &Connection,
-    artifact: &crate::native_evidence::Artifact,
+    artifact: &crate::native_records::Artifact,
     storage_ids: &BTreeMap<String, (i64, i64, i64)>,
     reuse: &PreflightReuse,
     immutable: &mut ImmutableAppend,
@@ -125,7 +125,7 @@ pub(super) fn write_cards(
             .get(&captured.path)
             .context("native_evidence_required: search card document absent")?
             .0;
-        let card = crate::search_capture::render_card(declaration, captured);
+        let card = crate::search_card::render_card(declaration, captured);
         let terms = crate::search_lexical::card_terms(db, &card.text)?;
         immutable.insert(
             db,
@@ -252,7 +252,7 @@ fn search_candidate(row: &rusqlite::Row<'_>) -> Result<crate::search_rank::Searc
             syntax_id: stored_id_row(row, 1, false)?,
         },
         card_hash,
-        role: crate::native_evidence::DeclarationRole::from_stored(&row.get::<_, String>(3)?)
+        role: crate::native_records::DeclarationRole::from_stored(&row.get::<_, String>(3)?)
             .map_err(|error| SelectedIntegrity(error.to_string()))?,
     })
 }
@@ -263,7 +263,7 @@ fn search_candidate(row: &rusqlite::Row<'_>) -> Result<crate::search_rank::Searc
 fn search_exact_lookup_keys(query: &str) -> BTreeSet<String> {
     let mut keys = BTreeSet::from([query.to_owned()]);
     for language in ["rust", "python", "java", "javascript", "typescript"] {
-        if let Ok(key) = crate::native_evidence::lookup(language, query) {
+        if let Ok(key) = crate::native_records::lookup(language, query) {
             keys.insert(key);
         }
     }
@@ -689,9 +689,8 @@ impl EvidenceResponse {
                     syntax_id: stored_id_row(row, 1, false)?,
                 };
                 let stored_role: String = row.get(2)?;
-                let stored_role =
-                    crate::native_evidence::DeclarationRole::from_stored(&stored_role)
-                        .map_err(|error| SelectedIntegrity(error.to_string()))?;
+                let stored_role = crate::native_records::DeclarationRole::from_stored(&stored_role)
+                    .map_err(|error| SelectedIntegrity(error.to_string()))?;
                 policy.exact.insert(key, stored_role);
             }
             Ok(policy)
@@ -743,7 +742,7 @@ impl EvidenceResponse {
                     );
                 }
                 let stored_role: String = row.get(3)?;
-                let role = crate::native_evidence::DeclarationRole::from_stored(&stored_role)
+                let role = crate::native_records::DeclarationRole::from_stored(&stored_role)
                     .map_err(|error| SelectedIntegrity(error.to_string()))?;
                 let key = SearchCandidateKey {
                     version_id: row.get(0)?,
@@ -766,8 +765,8 @@ impl EvidenceResponse {
                     .contains_key(b)
                     .cmp(&policy.exact.contains_key(a))
                     .then_with(|| {
-                        (*a_role != crate::native_evidence::DeclarationRole::Production)
-                            .cmp(&(*b_role != crate::native_evidence::DeclarationRole::Production))
+                        (*a_role != crate::native_records::DeclarationRole::Production)
+                            .cmp(&(*b_role != crate::native_records::DeclarationRole::Production))
                     })
                     .then_with(|| a_score.is_none().cmp(&b_score.is_none()))
                     .then_with(|| match (a_score, b_score) {
