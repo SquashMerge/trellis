@@ -7,8 +7,8 @@
 use super::DaemonState;
 use crate::indexer::IndexOptions;
 use crate::store::topology::WriterSession;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub(super) const STARTUP_BACKOFF_FIRST: Duration = Duration::from_millis(250);
@@ -515,6 +515,59 @@ pub(super) struct WatchStatus {
     pub(super) capturing: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// The published "accepted FIFO work is pending" flag. It is written only under the watch
+/// status lock, which the quiet read holds across its read of this flag and of the status
+/// (#1082). The flag stays an atomic for its lock-free readers.
+#[derive(Default)]
+pub(super) struct FifoPublication {
+    pub(super) pending: AtomicBool,
+    /// Counts accepted-work publications. An observation of the queue is only as new as the
+    /// count it was made at.
+    accepted: AtomicU64,
+}
+
+impl FifoPublication {
+    /// A request was accepted, or may have been: publish pending.
+    pub(super) fn accept(&self, watch_status: &Mutex<Option<WatchStatus>>) {
+        let _published = watch_status.lock().unwrap();
+        self.accepted.fetch_add(1, Ordering::AcqRel);
+        self.pending.store(true, Ordering::Release);
+    }
+
+    /// The count to observe the queue at. Read it before the observation.
+    pub(super) fn observe(&self) -> u64 {
+        self.accepted.load(Ordering::Acquire)
+    }
+
+    /// Publish what an observation of the queue made at `observed` found, and return what
+    /// was published before. An empty queue is published only if nothing was accepted since:
+    /// otherwise the accepted request's own publication is newer and stands (`None`), and the
+    /// wake it sent has the worker observe again. `observed: None` is unconditional.
+    pub(super) fn publish(
+        &self,
+        watch_status: &Mutex<Option<WatchStatus>>,
+        observed: Option<u64>,
+        pending: bool,
+    ) -> Option<bool> {
+        let _published = watch_status.lock().unwrap();
+        if !pending
+            && observed.is_some_and(|observed| observed != self.accepted.load(Ordering::Acquire))
+        {
+            return None;
+        }
+        Some(self.pending.swap(pending, Ordering::AcqRel))
+    }
+}
+
+impl WatchStatus {
+    /// The watcher holds intent the worker has not acknowledged.
+    pub(super) fn pending(&self) -> bool {
+        self.other_intent
+            || self.capturing.load(Ordering::SeqCst)
+            || self.generation.load(Ordering::SeqCst) != self.acknowledged
+    }
+}
+
 /// A failed or panicked step is retried after this delay.
 const STEP_RETRY: Duration = Duration::from_millis(250);
 /// Retention runs at most this often while idle (a deferral shortens it).
@@ -580,7 +633,7 @@ impl DaemonState {
         }
         // An accepted head that made no progress (and set no deferral) is
         // retried rather than left until the next inventory.
-        if self.fifo_pending.load(Ordering::Acquire) {
+        if self.fifo.pending.load(Ordering::Acquire) {
             return Some(now + STEP_RETRY);
         }
         let watcher_due = match &*self.watcher_work.lock().unwrap() {
@@ -647,22 +700,27 @@ impl DaemonState {
     /// as pending). When it drains, wake the lifecycle: a declined release
     /// may now proceed.
     pub(super) fn publish_fifo_pending(&self) {
-        let pending = if matches!(
+        // Read before the queue: a request accepted after this is newer than what is seen.
+        let observed = self.fifo.observe();
+        let (pending, observed) = if matches!(
             *self.runtime.lock().unwrap(),
             RuntimeState::Closing | RuntimeState::Retired
         ) {
-            false
+            (false, None)
         } else {
             // A deletion can race the step. Never recreate the directory in
             // this publication probe, even when an admitted read delays close.
-            match self.close_if_index_missing() {
+            let pending = match self.close_if_index_missing() {
                 Ok(true) => !self.retired(),
                 Ok(false) => !matches!(self.store.earliest_unfinished_request(), Ok(None)),
                 Err(_) => true,
-            }
+            };
+            (pending, Some(observed))
         };
-        let was = self.fifo_pending.swap(pending, Ordering::AcqRel);
-        if was
+        #[cfg(test)]
+        self.test_fifo_between_observation_and_publication.run();
+        let was = self.fifo.publish(&self.watch_status, observed, pending);
+        if was == Some(true)
             && !pending
             && let Some(lifecycle) = self.lifecycle.get()
         {
@@ -709,7 +767,7 @@ impl DaemonState {
     ) -> anyhow::Result<crate::store::requests::Request> {
         let lease = self.admission_lease()?;
         let row = self.store.enqueue_request(options, expected)?;
-        self.fifo_pending.store(true, Ordering::Release);
+        self.fifo.accept(&self.watch_status);
         drop(lease);
         self.pending_requests.lock().unwrap().push(row.id.clone());
         *self.recovery_retry_after.lock().unwrap() = None;
@@ -726,7 +784,7 @@ impl DaemonState {
         let row = self
             .store
             .enqueue_semantic_import(std::path::Path::new(self.store.workspace_root()), options)?;
-        self.fifo_pending.store(true, Ordering::Release);
+        self.fifo.accept(&self.watch_status);
         drop(lease);
         self.pending_requests.lock().unwrap().push(row.id.clone());
         *self.recovery_retry_after.lock().unwrap() = None;
@@ -751,13 +809,13 @@ impl DaemonState {
             Err(error) => {
                 // An error after COMMIT may still have accepted the row, unwoken: the worker
                 // re-reads the queue and publishes whether FIFO work really remains (#629).
-                self.fifo_pending.store(true, Ordering::Release);
+                self.fifo.accept(&self.watch_status);
                 drop(lease);
                 self.inbox.wake();
                 return Err(error);
             }
         };
-        self.fifo_pending.store(true, Ordering::Release);
+        self.fifo.accept(&self.watch_status);
         drop(lease);
         self.pending_requests.lock().unwrap().push(row.id.clone());
         *self.recovery_retry_after.lock().unwrap() = None;
@@ -832,7 +890,7 @@ impl DaemonState {
             RuntimeState::Activating | RuntimeState::Reconciling { waiting: true, .. } => None,
         };
         if self.leases.load(Ordering::Acquire) != 0
-            || self.fifo_pending.load(Ordering::Acquire)
+            || self.fifo.pending.load(Ordering::Acquire)
             || !idle(RuntimePhase::of(&state))
         {
             return RetireOutcome::Declined;
@@ -890,7 +948,7 @@ impl DaemonState {
             if !matches!(*state, RuntimeState::RetireRequested { .. }) {
                 return Ok(());
             }
-            if self.fifo_pending.load(Ordering::Acquire) || !self.store.try_begin_closing() {
+            if self.fifo.pending.load(Ordering::Acquire) || !self.store.try_begin_closing() {
                 self.cancel_retirement(state);
                 return Ok(());
             }
@@ -1060,7 +1118,7 @@ impl DaemonState {
     }
 
     pub(crate) fn fifo_pending(&self) -> bool {
-        self.fifo_pending.load(Ordering::Acquire)
+        self.fifo.pending.load(Ordering::Acquire)
     }
 
     pub(crate) fn leases(&self) -> usize {
@@ -1441,6 +1499,119 @@ mod missing_index_tests {
         assert!(state.retired());
         assert!(!state.fifo_pending());
         assert!(!index_dir.exists());
+    }
+}
+
+#[cfg(test)]
+mod quiet_read_tests {
+    use crate::http::exceptional_recovery_tests::serving_queue_watch_fixture;
+    use crate::testing::HANG_BACKSTOP;
+    use std::sync::mpsc;
+
+    /// #1082: the quiet read is one decision from two publications, the FIFO flag and the
+    /// watch status. Here it has read "no FIFO work" while a watcher hint is pending. Before
+    /// it reads the watch status, a request is accepted and the hint is acknowledged. FIFO
+    /// work or watcher intent was pending at every instant, so the read must not answer quiet
+    /// from the old FIFO flag and the new watch status.
+    #[test]
+    fn the_quiet_read_never_pairs_an_old_fifo_flag_with_a_newer_watch_status() {
+        let (_tmp, store, state, options) = serving_queue_watch_fixture();
+        state.worker_step().unwrap();
+        assert!(state.ready_and_quiet(), "the fixture settles");
+        {
+            let guard = state.watcher_work.lock().unwrap();
+            let watcher = &guard.as_ref().unwrap().1;
+            watcher.submit_watch_event_for_tests(Ok(notify::Event::new(
+                notify::EventKind::Modify(notify::event::ModifyKind::Any),
+            )
+            .add_path(options.workspace_root.join("a.js"))));
+        }
+        assert!(state.checkout_watch_pending());
+        assert!(!state.fifo_pending());
+
+        // Taken before the read: the read holds the runtime state at its pause.
+        let owner = state.retained_serving_session().unwrap();
+        let (crossed, crossing) = mpsc::channel();
+        let (started, worker_thread) = mpsc::channel();
+        let (worker, reader) = (state.clone(), state.clone());
+        state.test_quiet_between_reads.set(move || {
+            // Publication is possible between the two reads only if the read does not hold
+            // the lock both are published under. If it is possible, it happens here.
+            let publishable = reader.watch_status.try_lock().is_ok();
+            let thread = std::thread::spawn(move || {
+                // An enqueue that holds its admission lease: the COMMIT and its wake.
+                store.enqueue_request(&options, None).unwrap();
+                // The worker acknowledges the hint and publishes the watch status.
+                let mut guard = worker.watcher_work.lock().unwrap();
+                let watcher = &mut guard.as_mut().unwrap().1;
+                watcher
+                    .reconcile_due(&store, &owner, &options, &worker.watcher_cancel, true)
+                    .unwrap();
+                worker.publish_watch_status(watcher, &options);
+                drop(guard);
+                let _ = crossed.send(());
+            });
+            if publishable {
+                crossing
+                    .recv_timeout(HANG_BACKSTOP)
+                    .expect("the enqueue and the acknowledgement never finished");
+            }
+            let _ = started.send(thread);
+        });
+        let quiet = state.ready_and_quiet();
+        worker_thread
+            .recv_timeout(HANG_BACKSTOP)
+            .expect("the read never reached the point between its two reads")
+            .join()
+            .unwrap();
+        assert!(state.fifo_pending(), "the accepted request is pending");
+        assert!(!state.checkout_watch_pending(), "the hint was acknowledged");
+        assert!(
+            !quiet,
+            "the read answered quiet from the FIFO flag before the enqueue and the watch \
+             status after the acknowledgement"
+        );
+        assert!(!state.ready_and_quiet());
+    }
+
+    /// #1082: the worker observes an empty queue and then publishes "no FIFO work". A request
+    /// accepted between the two has already published "FIFO work pending"; the older
+    /// observation must not clear it, or the quiet read answers quiet over accepted work.
+    #[test]
+    fn an_older_empty_queue_observation_does_not_clear_a_newer_accepted_request() {
+        let (_tmp, store, state, options) = serving_queue_watch_fixture();
+        state.worker_step().unwrap();
+        assert!(state.ready_and_quiet(), "the fixture settles");
+
+        let (accepted, acceptance) = mpsc::channel();
+        let enqueuer = state.clone();
+        state
+            .test_fifo_between_observation_and_publication
+            .set(move || {
+                // The worker has seen an empty queue. An enqueue takes its lease, commits,
+                // publishes and returns before the worker publishes what it saw.
+                let request =
+                    std::thread::spawn(move || enqueuer.enqueue_index(&options, None).unwrap())
+                        .join()
+                        .unwrap();
+                let _ = accepted.send(request.id);
+            });
+        state.publish_fifo_pending();
+        let id = acceptance
+            .recv_timeout(HANG_BACKSTOP)
+            .expect("the worker never published its queue observation");
+        assert_eq!(store.request_by_id(&id).unwrap().unwrap().state, "queued");
+        assert!(
+            state.fifo_pending(),
+            "the worker's older empty-queue observation cleared the accepted request's \
+             publication"
+        );
+        assert!(!state.ready_and_quiet());
+
+        // The enqueue woke the worker: its next step drains the request and publishes that.
+        state.worker_step().unwrap();
+        assert_eq!(store.request_by_id(&id).unwrap().unwrap().state, "done");
+        assert!(!state.fifo_pending());
     }
 }
 
