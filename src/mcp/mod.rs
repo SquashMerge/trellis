@@ -1782,169 +1782,269 @@ fn coordinate(
     daemon_handle: Option<tokio::runtime::Handle>,
     relayed: bool,
 ) -> std::io::Result<()> {
-    use std::collections::{HashMap, VecDeque};
-    use std::io::BufReader;
-    use std::time::Instant;
+    let mut connection =
+        Connection::open(workspace, input, output, registry, daemon_handle, relayed)?;
+    loop {
+        if connection.wait_idle() {
+            return Ok(());
+        }
+        let mut finished = connection.settle_completed()?;
+        connection.settle_checked(&mut finished)?;
+        connection.restart_due_checks();
+        let Some(deciding) = connection.fence_decisions(&finished) else {
+            return Ok(());
+        };
+        connection.send_finished(finished)?;
+        connection.expire()?;
+        connection.admit(deciding)?;
+    }
+}
+
+/// A finished call's decision awaiting its send: its token, its result, its send-time
+/// identity gate if it selected a checkout, and the show to record with a success.
+type Finished = (
+    u64,
+    serde_json::Value,
+    Option<SendGate>,
+    Option<show::Pending>,
+);
+
+/// One connection's coordinator state (Decision 0009 §7). `coordinate` runs its phases in
+/// order, once per turn: `wait_idle`, `settle_completed`, `settle_checked`,
+/// `restart_due_checks`, `fence_decisions`, `send_finished`, `expire`, `admit`.
+///
+/// The fields are declared in the order they are dropped when the connection ends: a
+/// dropped `InFlight` cancels its worker, and the dropped inbox ends the reader.
+struct Connection<W: std::io::Write> {
+    /// The final checks' results not yet taken in (#131).
+    checked: std::collections::VecDeque<(u64, CheckedResult)>,
+    /// Selected calls awaiting their final identity check (#131).
+    checks: std::collections::HashMap<u64, FinalCheck>,
+    /// Requests handled at the last fence and not yet decided.
+    arrivals: std::collections::VecDeque<impl_receive::Outcome>,
+    writer: W,
+    in_flight: std::collections::HashMap<u64, InFlight>,
+    /// Worker results not yet settled.
+    completed: std::collections::VecDeque<(u64, std::io::Result<CallOutcome>)>,
+    session: session::Session,
+    inbox: Inbox,
+    sender: std::sync::mpsc::Sender<Input>,
+    workspace: std::sync::Arc<OpenedWorkspace>,
     #[cfg(feature = "test-support")]
-    let _scope = crate::testing::enter_scope(Some(workspace.hooks.scope.clone()));
-    let workspace = std::sync::Arc::new(workspace);
-    let (sender, receiver) = std::sync::mpsc::channel::<Input>();
-    let reader_sender = sender.clone();
-    let window = std::sync::Arc::new(FrameWindow::default());
-    let reader_window = window.clone();
-    let reader_workspace = workspace.clone();
-    #[cfg(feature = "test-support")]
-    let frame_read = workspace.hooks.frame_read.clone();
-    let completed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let counter = completed.clone();
-    std::thread::Builder::new()
-        .name("mcp-stdin".into())
-        .spawn(move || {
-            let mut reader = BufReader::new(input);
-            loop {
-                let read = if relayed {
-                    wire::read_relayed_frame(&mut reader)
-                } else {
-                    wire::read_frame(&mut reader).map(|frame| (None, frame))
-                };
-                // Protocol acceptance: the deadline starts when the frame is
-                // complete, not when the coordinator reaches it.
-                let accepted = reader_workspace.clock_now();
-                // Counted when complete, before it is published: a decision
-                // that samples the count waits for every frame it covers.
-                let seq = counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
-                match read {
-                    Ok((_, wire::Frame::Eof)) => {
-                        reader_window.acquire();
-                        let _ =
-                            reader_sender.send(Input::Frame(wire::Frame::Eof, None, accepted, seq));
-                        break;
-                    }
-                    Ok((relay, frame)) => {
-                        #[cfg(feature = "test-support")]
-                        if let Some(hook) = &frame_read {
-                            hook();
+    _scope: crate::testing::ScopeGuard,
+    daemon_handle: Option<tokio::runtime::Handle>,
+    registry: Registry,
+}
+
+impl<W: std::io::Write> Connection<W> {
+    /// Starts the `mcp-stdin` reader thread and returns the connection, with nothing
+    /// received yet.
+    fn open(
+        workspace: OpenedWorkspace,
+        input: impl std::io::Read + Send + 'static,
+        output: W,
+        registry: Registry,
+        daemon_handle: Option<tokio::runtime::Handle>,
+        relayed: bool,
+    ) -> std::io::Result<Self> {
+        use std::collections::{HashMap, VecDeque};
+        use std::io::BufReader;
+        #[cfg(feature = "test-support")]
+        let _scope = crate::testing::enter_scope(Some(workspace.hooks.scope.clone()));
+        let workspace = std::sync::Arc::new(workspace);
+        let (sender, receiver) = std::sync::mpsc::channel::<Input>();
+        let reader_sender = sender.clone();
+        let window = std::sync::Arc::new(FrameWindow::default());
+        let reader_window = window.clone();
+        let reader_workspace = workspace.clone();
+        #[cfg(feature = "test-support")]
+        let frame_read = workspace.hooks.frame_read.clone();
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counter = completed.clone();
+        std::thread::Builder::new()
+            .name("mcp-stdin".into())
+            .spawn(move || {
+                let mut reader = BufReader::new(input);
+                loop {
+                    let read = if relayed {
+                        wire::read_relayed_frame(&mut reader)
+                    } else {
+                        wire::read_frame(&mut reader).map(|frame| (None, frame))
+                    };
+                    // Protocol acceptance: the deadline starts when the frame is
+                    // complete, not when the coordinator reaches it.
+                    let accepted = reader_workspace.clock_now();
+                    // Counted when complete, before it is published: a decision
+                    // that samples the count waits for every frame it covers.
+                    let seq = counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+                    match read {
+                        Ok((_, wire::Frame::Eof)) => {
+                            reader_window.acquire();
+                            let _ = reader_sender.send(Input::Frame(
+                                wire::Frame::Eof,
+                                None,
+                                accepted,
+                                seq,
+                            ));
+                            break;
                         }
-                        reader_window.acquire();
-                        if reader_sender
-                            .send(Input::Frame(frame, relay, accepted, seq))
-                            .is_err()
-                        {
+                        Ok((relay, frame)) => {
+                            #[cfg(feature = "test-support")]
+                            if let Some(hook) = &frame_read {
+                                hook();
+                            }
+                            reader_window.acquire();
+                            if reader_sender
+                                .send(Input::Frame(frame, relay, accepted, seq))
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            use std::io::Write;
+                            let _ = writeln!(
+                                std::io::stderr().lock(),
+                                "MCP stdin read failed: {error}"
+                            );
+                            reader_window.acquire();
+                            let _ = reader_sender.send(Input::Frame(
+                                wire::Frame::Eof,
+                                None,
+                                accepted,
+                                seq,
+                            ));
                             break;
                         }
                     }
-                    Err(error) => {
-                        use std::io::Write;
-                        let _ =
-                            writeln!(std::io::stderr().lock(), "MCP stdin read failed: {error}");
-                        reader_window.acquire();
-                        let _ =
-                            reader_sender.send(Input::Frame(wire::Frame::Eof, None, accepted, seq));
-                        break;
-                    }
                 }
-            }
-        })?;
-    let mut inbox = Inbox {
-        receiver,
-        window,
-        completed,
-        received: 0,
-        later: None,
-        ended: false,
-        #[cfg(feature = "test-support")]
-        waiting_hook: workspace.hooks.settle_waiting.clone(),
-    };
-    let mut session = session::Session::new();
-    let mut completed: VecDeque<(u64, std::io::Result<CallOutcome>)> = VecDeque::new();
-    let mut in_flight: HashMap<u64, InFlight> = HashMap::new();
-    let mut writer = output;
-    // One fence pass (Decision 0009 §7): handle every frame completed before
-    // now, in order. A cancel removes its ID's pending admission; a request
-    // joins `arrivals`, decided after a later fence; a worker result joins
-    // `completed`. Nothing is written here. Returns true at end of input.
-    let fence = |inbox: &mut Inbox,
-                 session: &mut session::Session,
-                 arrivals: &mut VecDeque<impl_receive::Outcome>,
-                 completed: &mut VecDeque<(u64, std::io::Result<CallOutcome>)>,
-                 checked: &mut VecDeque<(u64, CheckedResult)>|
-     -> bool {
-        let until = inbox.decision();
-        while let Some(input) = inbox.settled(until) {
+            })?;
+        let inbox = Inbox {
+            receiver,
+            window,
+            completed,
+            received: 0,
+            later: None,
+            ended: false,
+            #[cfg(feature = "test-support")]
+            waiting_hook: workspace.hooks.settle_waiting.clone(),
+        };
+        let session = session::Session::new();
+        let completed: VecDeque<(u64, std::io::Result<CallOutcome>)> = VecDeque::new();
+        let in_flight: HashMap<u64, InFlight> = HashMap::new();
+        let writer = output;
+        // Requests handled at the last fence and not yet decided.
+        let arrivals: VecDeque<impl_receive::Outcome> = VecDeque::new();
+        // Selected calls awaiting their final identity check, and the checks'
+        // results not yet taken in (#131).
+        let checks: HashMap<u64, FinalCheck> = HashMap::new();
+        let checked: VecDeque<(u64, CheckedResult)> = VecDeque::new();
+        Ok(Self {
+            checked,
+            checks,
+            arrivals,
+            writer,
+            in_flight,
+            completed,
+            session,
+            inbox,
+            sender,
+            workspace,
+            #[cfg(feature = "test-support")]
+            _scope,
+            daemon_handle,
+            registry,
+        })
+    }
+
+    /// One fence pass (Decision 0009 §7): handle every frame completed before
+    /// now, in order. A cancel removes its ID's pending admission; a request
+    /// joins `arrivals`, decided after a later fence; a worker result joins
+    /// `completed`. Nothing is written here. Returns true at end of input.
+    fn fence(&mut self) -> bool {
+        let until = self.inbox.decision();
+        while let Some(input) = self.inbox.settled(until) {
             match input {
                 Input::Frame(frame, relay, accepted, _) => {
-                    if receive(frame, relay, accepted, session, arrivals) {
+                    if receive(
+                        frame,
+                        relay,
+                        accepted,
+                        &mut self.session,
+                        &mut self.arrivals,
+                    ) {
                         return true;
                     }
                 }
-                Input::Done(token, outcome) => completed.push_back((token, outcome)),
-                Input::FinalChecked(token, result) => checked.push_back((token, result)),
+                Input::Done(token, outcome) => self.completed.push_back((token, outcome)),
+                Input::FinalChecked(token, result) => self.checked.push_back((token, result)),
             }
         }
-        if inbox.ended {
-            session.eof();
+        if self.inbox.ended {
+            self.session.eof();
             return true;
         }
         false
-    };
-    // A cancelled or ended call stops its worker cooperatively.
-    let cancel_dropped = |session: &session::Session, in_flight: &mut HashMap<u64, InFlight>| {
-        in_flight.retain(|token, call| {
-            let pending = session.pending(*token).is_some();
+    }
+
+    /// A cancelled or ended call stops its worker cooperatively.
+    fn cancel_dropped(&mut self) {
+        self.in_flight.retain(|token, call| {
+            let pending = self.session.pending(*token).is_some();
             if !pending {
                 call.cancel
                     .store(true, std::sync::atomic::Ordering::Release);
             }
             pending
         });
-    };
-    let deadline_answer = |call: &InFlight| {
-        let envelope = match &*call.resolved.lock().unwrap() {
-            Some((root, catching_up)) => tools::attributed_root(
-                tools::failure(&call.id, "deadline_exceeded"),
-                root,
-                *catching_up,
-            ),
-            None => tools::admission_failure(&call.id, "deadline_exceeded", &call.attempted),
-        };
-        tools::result(&call.name, envelope, call.modern)
-    };
-    // Requests handled at the last fence and not yet decided.
-    let mut arrivals: VecDeque<impl_receive::Outcome> = VecDeque::new();
-    // Selected calls awaiting their final identity check, and the checks'
-    // results not yet taken in (#131).
-    let mut checks: HashMap<u64, FinalCheck> = HashMap::new();
-    let mut checked: VecDeque<(u64, CheckedResult)> = VecDeque::new();
-    loop {
-        if arrivals.is_empty() && completed.is_empty() && checked.is_empty() {
-            let retry = checks
+    }
+
+    /// Phase A: with nothing to decide, wait for input, a call's deadline or a final
+    /// check's retry tick. True at end of input.
+    fn wait_idle(&mut self) -> bool {
+        if self.arrivals.is_empty() && self.completed.is_empty() && self.checked.is_empty() {
+            let retry = self
+                .checks
                 .values()
                 .filter(|check| !check.running)
                 .filter_map(|check| check.retry_at)
                 .min();
-            let next = in_flight
+            let next = self
+                .in_flight
                 .values()
-                .filter(|_| workspace.call_timer_enabled())
+                .filter(|_| self.workspace.call_timer_enabled())
                 .map(|call| call.deadline)
                 .chain(retry)
                 .min();
-            match inbox.wait(next) {
+            match self.inbox.wait(next) {
                 Some(Input::Frame(frame, relay, accepted, _)) => {
-                    if receive(frame, relay, accepted, &mut session, &mut arrivals) {
-                        cancel_dropped(&session, &mut in_flight);
-                        return Ok(());
+                    if receive(
+                        frame,
+                        relay,
+                        accepted,
+                        &mut self.session,
+                        &mut self.arrivals,
+                    ) {
+                        self.cancel_dropped();
+                        return true;
                     }
                 }
-                Some(Input::Done(token, outcome)) => completed.push_back((token, outcome)),
-                Some(Input::FinalChecked(token, result)) => checked.push_back((token, result)),
-                None if inbox.ended => {
-                    session.eof();
-                    cancel_dropped(&session, &mut in_flight);
-                    return Ok(());
+                Some(Input::Done(token, outcome)) => self.completed.push_back((token, outcome)),
+                Some(Input::FinalChecked(token, result)) => self.checked.push_back((token, result)),
+                None if self.inbox.ended => {
+                    self.session.eof();
+                    self.cancel_dropped();
+                    return true;
                 }
                 None => {}
             }
         }
+        false
+    }
+
+    /// Phase B: each finished call's blocking final step, before the fence.
+    fn settle_completed(&mut self) -> std::io::Result<Vec<Finished>> {
+        use std::time::Instant;
         // Blocking steps come before the fence: each finished call's final
         // root check, and the test pause points. Only a proven missing or
         // replaced root is `root_changed`.
@@ -1962,17 +2062,17 @@ fn coordinate(
         // it is started again after a tick, and the call is
         // `deadline_exceeded` once its deadline passes (#131).
         let mut finished = Vec::new();
-        while let Some((token, outcome)) = completed.pop_front() {
-            let Some(call) = in_flight.get(&token) else {
+        while let Some((token, outcome)) = self.completed.pop_front() {
+            let Some(call) = self.in_flight.get(&token) else {
                 // Already decided at its deadline, or cancelled.
                 continue;
             };
             let outcome = outcome?;
             let selected = match &outcome.finals {
-                Finals::Selected { witness, .. } if workspace.clock_now() < call.deadline => {
+                Finals::Selected { witness, .. } if self.workspace.clock_now() < call.deadline => {
                     Some((witness.clone(), "selected_final"))
                 }
-                Finals::Capacity { witness, .. } if workspace.clock_now() < call.deadline => {
+                Finals::Capacity { witness, .. } if self.workspace.clock_now() < call.deadline => {
                     Some((witness.clone(), "capacity_final"))
                 }
                 _ => None,
@@ -1981,12 +2081,12 @@ fn coordinate(
                 let running = start_final_check(
                     token,
                     &witness,
-                    workspace.helper_deadline(call.deadline),
+                    self.workspace.helper_deadline(call.deadline),
                     stage,
-                    &sender,
+                    &self.sender,
                 );
                 let retry_at = (!running).then(|| Instant::now() + FINAL_RECHECK_TICK);
-                checks.insert(
+                self.checks.insert(
                     token,
                     FinalCheck {
                         outcome,
@@ -1998,30 +2098,37 @@ fn coordinate(
             }
             let mut result = outcome.result;
             let mut show = outcome.show;
-            if workspace.clock_now() < call.deadline
+            if self.workspace.clock_now() < call.deadline
                 && let Finals::Launch { catching_up } = &outcome.finals
             {
                 phase_hook("launch_final")?;
-                if workspace.check().is_err() {
+                if self.workspace.check().is_err() {
                     show = None;
                     result = tools::resolved_root_changed(
                         &call.name,
                         &call.id,
-                        workspace.root(),
+                        self.workspace.root(),
                         *catching_up,
                         call.modern,
                     );
                 }
             }
             #[cfg(feature = "test-support")]
-            if let Some(hook) = &workspace.hooks.send_decision {
+            if let Some(hook) = &self.workspace.hooks.send_decision {
                 hook(&call.id);
             }
             finished.push((token, result, None, show));
         }
-        while let Some((token, result)) = checked.pop_front() {
+        Ok(finished)
+    }
+
+    /// Phase C: each final identity check's result.
+    fn settle_checked(&mut self, finished: &mut Vec<Finished>) -> std::io::Result<()> {
+        use std::time::Instant;
+        while let Some((token, result)) = self.checked.pop_front() {
             let result = result?;
-            let (Some(mut check), Some(call)) = (checks.remove(&token), in_flight.get(&token))
+            let (Some(mut check), Some(call)) =
+                (self.checks.remove(&token), self.in_flight.get(&token))
             else {
                 // Its call was decided, cancelled or expired meanwhile.
                 continue;
@@ -2045,10 +2152,10 @@ fn coordinate(
                     capacity: matches!(check.outcome.finals, Finals::Capacity { .. }),
                 }),
                 Err(SelectionError::Unavailable) => {
-                    if workspace.clock_now() < call.deadline {
+                    if self.workspace.clock_now() < call.deadline {
                         check.running = false;
                         check.retry_at = Some(Instant::now() + FINAL_RECHECK_TICK);
-                        checks.insert(token, check);
+                        self.checks.insert(token, check);
                     }
                     // Past its deadline, the expiry below answers it.
                     continue;
@@ -2066,18 +2173,25 @@ fn coordinate(
                 }
             };
             #[cfg(feature = "test-support")]
-            if let Some(hook) = &workspace.hooks.send_decision {
+            if let Some(hook) = &self.workspace.hooks.send_decision {
                 hook(&call.id);
             }
             finished.push((token, check.outcome.result, gate, check.outcome.show));
         }
+        Ok(())
+    }
+
+    /// Phase D: forget the checks of calls already decided or expired, and start again
+    /// each check that is due.
+    fn restart_due_checks(&mut self) {
+        use std::time::Instant;
         let now = Instant::now();
-        checks.retain(|token, _| {
-            in_flight
+        self.checks.retain(|token, _| {
+            self.in_flight
                 .get(token)
-                .is_some_and(|call| workspace.clock_now() < call.deadline)
+                .is_some_and(|call| self.workspace.clock_now() < call.deadline)
         });
-        for (token, check) in &mut checks {
+        for (token, check) in &mut self.checks {
             if check.running || check.retry_at.is_some_and(|at| now < at) {
                 continue;
             }
@@ -2086,13 +2200,24 @@ fn coordinate(
             else {
                 unreachable!("only selected calls have final checks")
             };
-            let deadline = workspace.helper_deadline(in_flight[token].deadline);
-            check.running = start_final_check(*token, witness, deadline, "final_recheck", &sender);
+            let deadline = self
+                .workspace
+                .helper_deadline(self.in_flight[token].deadline);
+            check.running =
+                start_final_check(*token, witness, deadline, "final_recheck", &self.sender);
             check.retry_at = (!check.running).then(|| now + FINAL_RECHECK_TICK);
         }
+    }
+
+    /// Phase E: the fence for this turn's decisions. Returns the requests to decide now,
+    /// or `None` at end of input.
+    fn fence_decisions(
+        &mut self,
+        finished: &[Finished],
+    ) -> Option<std::collections::VecDeque<impl_receive::Outcome>> {
         #[cfg(feature = "test-support")]
-        if let Some(hook) = &workspace.hooks.immediate_decision {
-            for arrival in &arrivals {
+        if let Some(hook) = &self.workspace.hooks.immediate_decision {
+            for arrival in &self.arrivals {
                 if let impl_receive::Outcome::Request(admission, _, _) = arrival
                     && matches!(admission.action, session::Action::Call { .. })
                 {
@@ -2102,28 +2227,28 @@ fn coordinate(
         }
         // The fence for every decision below. Requests it handles are decided
         // after the next one.
-        let deciding = std::mem::take(&mut arrivals);
-        if fence(
-            &mut inbox,
-            &mut session,
-            &mut arrivals,
-            &mut completed,
-            &mut checked,
-        ) {
-            for (token, _, _, _) in &finished {
-                if let Some(call) = in_flight.get(token) {
+        let deciding = std::mem::take(&mut self.arrivals);
+        if self.fence() {
+            for (token, _, _, _) in finished {
+                if let Some(call) = self.in_flight.get(token) {
                     call.cancel
                         .store(true, std::sync::atomic::Ordering::Release);
                 }
             }
-            cancel_dropped(&session, &mut in_flight);
-            return Ok(());
+            self.cancel_dropped();
+            return None;
         }
-        cancel_dropped(&session, &mut in_flight);
+        self.cancel_dropped();
         #[cfg(feature = "test-support")]
-        if let Some(hook) = &workspace.hooks.fence_handled {
-            hook(deciding.len() + arrivals.len());
+        if let Some(hook) = &self.workspace.hooks.fence_handled {
+            hook(deciding.len() + self.arrivals.len());
         }
+        Some(deciding)
+    }
+
+    /// Phase F: the send decision of each finished call.
+    fn send_finished(&mut self, finished: Vec<Finished>) -> std::io::Result<()> {
+        use std::time::Instant;
         // Each decision: cancelled (not pending) -> deadline -> outcome. A
         // selected call's identity is compared again here, at its send, with
         // filesystem calls only: its helper's success may be stale after
@@ -2132,13 +2257,13 @@ fn coordinate(
         // nothing (`Unavailable`) leaves the call pending: its final check
         // starts again after a tick, until its deadline.
         for (token, result, gate, show) in finished {
-            let Some(call) = in_flight.remove(&token) else {
+            let Some(call) = self.in_flight.remove(&token) else {
                 continue;
             };
             phase_hook("call_send")?;
             // The show recorded with this answer, only if the answer stays this success.
             let mut record = None;
-            let result = if workspace.clock_now() >= call.deadline {
+            let result = if self.workspace.clock_now() >= call.deadline {
                 deadline_answer(&call)
             } else if let Some(gate) = gate {
                 phase_hook("selected_call_send")?;
@@ -2160,7 +2285,7 @@ fn coordinate(
                                 catching_up,
                             }
                         };
-                        checks.insert(
+                        self.checks.insert(
                             token,
                             FinalCheck {
                                 outcome: CallOutcome {
@@ -2172,7 +2297,7 @@ fn coordinate(
                                 retry_at: Some(Instant::now() + FINAL_RECHECK_TICK),
                             },
                         );
-                        in_flight.insert(token, call);
+                        self.in_flight.insert(token, call);
                         continue;
                     }
                     Err(_) => tools::resolved_root_changed(
@@ -2190,68 +2315,84 @@ fn coordinate(
             // The final send decision: a pending call is committed now, so its show is
             // recorded with it; a cancelled call answers nothing and records nothing.
             let result = match record {
-                Some(pending) if session.pending(token).is_some() => {
+                Some(pending) if self.session.pending(token).is_some() => {
                     show::commit(pending, result, &call.name, call.modern)
                 }
                 _ => result,
             };
             let response = architecture::response(&call.id, result);
-            if let Some(value) = session
+            if let Some(value) = self
+                .session
                 .prepare(token, response)
-                .and_then(|prepared| session.commit(prepared))
+                .and_then(|prepared| self.session.commit(prepared))
             {
                 #[cfg(feature = "test-support")]
                 let value = {
                     let mut value = value;
-                    if let Some(hook) = &workspace.hooks.committed_response {
+                    if let Some(hook) = &self.workspace.hooks.committed_response {
                         hook(&call.id, &mut value);
                     }
                     value
                 };
-                send_call(&mut writer, &call, &value)?;
+                send_call(&mut self.writer, &call, &value)?;
             }
         }
-        let now = workspace.clock_now();
-        let mut expired: Vec<u64> = in_flight
+        Ok(())
+    }
+
+    /// Phase G: answer each call past its deadline, in token order.
+    fn expire(&mut self) -> std::io::Result<()> {
+        let now = self.workspace.clock_now();
+        let mut expired: Vec<u64> = self
+            .in_flight
             .iter()
             .filter(|(_, call)| call.deadline <= now)
             .map(|(token, _)| *token)
             .collect();
         expired.sort_unstable();
         for token in expired {
-            let call = in_flight.remove(&token).expect("expired call");
+            let call = self.in_flight.remove(&token).expect("expired call");
             call.cancel
                 .store(true, std::sync::atomic::Ordering::Release);
             let response = architecture::response(&call.id, deadline_answer(&call));
-            if let Some(value) = session
+            if let Some(value) = self
+                .session
                 .prepare(token, response)
-                .and_then(|prepared| session.commit(prepared))
+                .and_then(|prepared| self.session.commit(prepared))
             {
-                wire::write_relayed_response(&mut writer, call.relay, &value)?;
+                wire::write_relayed_response(&mut self.writer, call.relay, &value)?;
             }
         }
+        Ok(())
+    }
+
+    /// Phase H: decide each request handled at the previous fence.
+    fn admit(
+        &mut self,
+        deciding: std::collections::VecDeque<impl_receive::Outcome>,
+    ) -> std::io::Result<()> {
         let mut non_calls = 0;
         for arrival in deciding {
             let (admission, accepted, relay) = match arrival {
                 impl_receive::Outcome::Error(error, relay) => {
                     // Never admitted, so no cancel can name it.
-                    wire::write_relayed_response(&mut writer, relay, &error.response())?;
+                    wire::write_relayed_response(&mut self.writer, relay, &error.response())?;
                     continue;
                 }
                 impl_receive::Outcome::Request(admission, accepted, relay) => {
                     (admission, accepted, relay)
                 }
             };
-            if session.pending(admission.token).is_none() {
+            if self.session.pending(admission.token).is_none() {
                 // Cancelled at the fence.
                 continue;
             }
-            let modern = session.mode() == session::Mode::Modern;
-            let deadline = accepted + workspace.call_deadline;
+            let modern = self.session.mode() == session::Mode::Modern;
+            let deadline = accepted + self.workspace.call_deadline;
             let result = match &admission.action {
                 session::Action::Unknown => None,
                 session::Action::Call { name, arguments } => {
-                    let attempted = attempted_workspace(arguments.as_ref(), &workspace);
+                    let attempted = attempted_workspace(arguments.as_ref(), &self.workspace);
                     let refuse = |code: &str| {
                         Some(tools::result(
                             name,
@@ -2269,7 +2410,7 @@ fn coordinate(
                         failure["error"]["message"] = serde_json::json!(message);
                         Some(tools::result(name, failure, modern))
                     };
-                    if workspace.clock_now() >= deadline {
+                    if self.workspace.clock_now() >= deadline {
                         // The deadline overrides any outcome still unsent.
                         refuse("deadline_exceeded")
                     } else if name != architecture::PROMPT_NAME
@@ -2282,20 +2423,22 @@ fn coordinate(
                                 arguments.as_ref(),
                                 &admission.id,
                                 modern,
-                                &workspace,
+                                &self.workspace,
                             )
                             .response,
                         )
-                    } else if live_calls(&session, &in_flight) >= MAX_CONNECTION_CALLS {
+                    } else if live_calls(&self.session, &self.in_flight) >= MAX_CONNECTION_CALLS {
                         // The message names the per-connection limit (#528).
                         refuse("too_many_requests")
-                    } else if let Some(permit) = WorkerPermit::acquire(workspace.call_workers()) {
+                    } else if let Some(permit) =
+                        WorkerPermit::acquire(self.workspace.call_workers())
+                    {
                         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                         let resolved: Resolved = Default::default();
                         let context = CallContext {
-                            workspace: workspace.clone(),
-                            registry: registry.clone(),
-                            daemon_handle: daemon_handle.clone(),
+                            workspace: self.workspace.clone(),
+                            registry: self.registry.clone(),
+                            daemon_handle: self.daemon_handle.clone(),
                             id: admission.id.clone(),
                             modern,
                             name: name.clone(),
@@ -2304,14 +2447,14 @@ fn coordinate(
                             cancel: cancel.clone(),
                             resolved: resolved.clone(),
                         };
-                        let done = sender.clone();
+                        let done = self.sender.clone();
                         let token = admission.token;
                         #[cfg(feature = "test-support")]
-                        let worker_done = workspace.hooks.worker_done.clone();
+                        let worker_done = self.workspace.hooks.worker_done.clone();
                         let scope = crate::testing::inherit_scope();
                         // A read held out by a spilled publication answers typed
                         // `rebuild_in_progress` before the call's deadline (#905).
-                        let answer_by = workspace.helper_deadline(deadline);
+                        let answer_by = self.workspace.helper_deadline(deadline);
                         let answer_by = answer_by
                             .checked_sub(SPILL_ANSWER_TIME)
                             .unwrap_or(answer_by);
@@ -2333,7 +2476,7 @@ fn coordinate(
                                 });
                         match spawned {
                             Ok(_) => {
-                                in_flight.insert(
+                                self.in_flight.insert(
                                     token,
                                     InFlight {
                                         id: admission.id.clone(),
@@ -2366,18 +2509,21 @@ fn coordinate(
                         let response = serde_json::json!({"jsonrpc":"2.0","id":admission.id,
                             "error":{"code":-32000,"message":format!("Too many outstanding requests on this connection (limit {MAX_CONNECTION_REQUESTS})"),
                                 "data":{"code":"too_many_requests"}}});
-                        if let Some(value) = session
+                        if let Some(value) = self
+                            .session
                             .prepare(admission.token, response)
-                            .and_then(|prepared| session.commit(prepared))
+                            .and_then(|prepared| self.session.commit(prepared))
                         {
-                            wire::write_relayed_response(&mut writer, relay, &value)?;
+                            wire::write_relayed_response(&mut self.writer, relay, &value)?;
                         }
                         continue;
                     }
                     Some(match action {
-                        session::Action::Discover => catalog::discover(workspace.build_version()),
+                        session::Action::Discover => {
+                            catalog::discover(self.workspace.build_version())
+                        }
                         session::Action::Initialize => {
-                            catalog::initialize(workspace.build_version())
+                            catalog::initialize(self.workspace.build_version())
                         }
                         session::Action::PromptList => architecture::list(modern),
                         _ => catalog::list(modern),
@@ -2394,14 +2540,30 @@ fn coordinate(
             } else {
                 wire::RESPONSE_BYTES
             };
-            if let Some(value) = session
+            if let Some(value) = self
+                .session
                 .prepare(admission.token, response)
-                .and_then(|prepared| session.commit(prepared))
+                .and_then(|prepared| self.session.commit(prepared))
             {
-                wire::write_relayed_capped(&mut writer, relay, &value, cap)?;
+                wire::write_relayed_capped(&mut self.writer, relay, &value, cap)?;
             }
         }
+        Ok(())
     }
+}
+
+/// A call's `deadline_exceeded` answer, in the resolved shape once read admission sampled
+/// its root.
+fn deadline_answer(call: &InFlight) -> serde_json::Value {
+    let envelope = match &*call.resolved.lock().unwrap() {
+        Some((root, catching_up)) => tools::attributed_root(
+            tools::failure(&call.id, "deadline_exceeded"),
+            root,
+            *catching_up,
+        ),
+        None => tools::admission_failure(&call.id, "deadline_exceeded", &call.attempted),
+    };
+    tools::result(&call.name, envelope, call.modern)
 }
 
 /// Writes one call's committed response. A response over the cap answers that call
