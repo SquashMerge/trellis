@@ -1,5 +1,6 @@
 use super::selected_read_once_tests::published_store;
 use super::*;
+use crate::metrics_read::MetricsOptions;
 use crate::{index_coordinator::IndexJobCoordinator, indexer::IndexOptions};
 use std::{fs, sync::atomic::AtomicBool};
 

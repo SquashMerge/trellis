@@ -261,7 +261,7 @@ fn stage_targets(
     limits: &BatchLimits,
     count: &mut u64,
 ) -> Result<()> {
-    use crate::semantic_evidence::Target;
+    use crate::semantic_records::Target;
     let target = |target: &Target, count: &mut u64| -> Result<()> {
         if let Target::Internal {
             document,

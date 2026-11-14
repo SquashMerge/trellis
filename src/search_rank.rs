@@ -5,60 +5,14 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use anyhow::{Result, ensure};
 
 /// Owner-reviewed Decision 0018 constants; not runtime tuning parameters.
-pub const CANDIDATE_DEPTH: usize = 200;
+/// `CANDIDATE_DEPTH` is one of them and lives in `search_vocab.rs`.
 const RRF_K: f64 = 20.0;
 const LEXICAL_WEIGHT: f64 = 1.0;
 const VECTOR_WEIGHT: f64 = 4.0;
 use crate::search_embed::DIMENSIONS;
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct SearchCandidateKey {
-    pub version_id: i64,
-    pub syntax_id: String,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SearchRole {
-    #[default]
-    Any,
-    Production,
-    Test,
-}
-
-impl SearchRole {
-    pub fn accepts(self, role: crate::native_evidence::DeclarationRole) -> bool {
-        match self {
-            Self::Any => true,
-            Self::Production => role == crate::native_evidence::DeclarationRole::Production,
-            Self::Test => role == crate::native_evidence::DeclarationRole::Test,
-        }
-    }
-}
-
-/// Measured declaration metadata selected from the same admitted index head.
-#[derive(Clone, Debug, Default)]
-pub struct SearchPolicy {
-    pub exact: BTreeMap<SearchCandidateKey, crate::native_evidence::DeclarationRole>,
-    pub role: SearchRole,
-}
-
-impl SearchPolicy {
-    pub fn exact_priority(&self, key: &SearchCandidateKey) -> u8 {
-        match self.exact.get(key) {
-            Some(crate::native_evidence::DeclarationRole::Production) => 0,
-            Some(crate::native_evidence::DeclarationRole::Test) => 1,
-            None => 2,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SearchCandidate {
-    pub key: SearchCandidateKey,
-    pub card_hash: String,
-    pub role: crate::native_evidence::DeclarationRole,
-}
+pub use crate::search_vocab::{
+    CANDIDATE_DEPTH, SearchCandidate, SearchCandidateKey, SearchPolicy, SearchRole,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RankedHit {

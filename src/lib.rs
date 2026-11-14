@@ -1,5 +1,7 @@
 pub(crate) mod apps;
+mod architecture_core;
 pub mod architecture_details;
+mod architecture_read;
 pub mod auth;
 pub mod behavior;
 mod behavior_bindings;
@@ -11,6 +13,7 @@ mod behavior_python;
 mod behavior_rust;
 pub mod build_info;
 pub mod capture;
+pub mod capture_records;
 pub mod class_diagram;
 pub mod classes;
 pub mod daemon;
@@ -43,6 +46,7 @@ pub(crate) mod jsonc;
 mod language_set_tests;
 pub mod mcp;
 pub mod metrics;
+pub mod metrics_read;
 pub mod model;
 pub mod model_management;
 #[cfg(feature = "test-support")]
@@ -73,11 +77,13 @@ pub mod search_lexical;
 pub mod search_model;
 pub mod search_rank;
 pub mod search_vectors;
+pub mod search_vocab;
 pub mod semantic_batch;
 pub mod semantic_evidence;
 pub mod semantic_import;
 #[cfg(test)]
 mod semantic_join_inputs_tests;
+pub mod semantic_records;
 pub mod skipped_config;
 pub(crate) mod skipped_source;
 pub mod source_dir;

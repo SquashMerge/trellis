@@ -68,9 +68,9 @@ impl SemanticProjection {
     /// A projection cannot inherit an exact-native fresh grant from its basis.
     pub fn effective_freshness(
         &self,
-        historical: crate::semantic_evidence::Freshness,
-    ) -> crate::semantic_evidence::Freshness {
-        use crate::semantic_evidence::Freshness;
+        historical: crate::semantic_records::Freshness,
+    ) -> crate::semantic_records::Freshness {
+        use crate::semantic_records::Freshness;
         match historical {
             Freshness::Stale => Freshness::Stale,
             Freshness::Fresh | Freshness::PossiblyStale => Freshness::PossiblyStale,
@@ -592,7 +592,7 @@ mod projection_tests {
     use super::*;
     #[test]
     fn projection_never_inherits_freshness() {
-        use crate::semantic_evidence::Freshness;
+        use crate::semantic_records::Freshness;
         let generation = uuid::Uuid::new_v4();
         let projection = SemanticProjection {
             current_pin: IndexPin {
@@ -721,16 +721,16 @@ pub struct ViewCallBinding {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projection: Option<SemanticProjection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub historical_freshness: Option<crate::semantic_evidence::Freshness>,
+    pub historical_freshness: Option<crate::semantic_records::Freshness>,
     pub call_id: String,
     /// The call-graph engine's boundary reason: `none` when the graph traverses the call.
     pub boundary_reason: BoundaryReason,
     /// The declared internal target of a resolved binding, located exactly in this snapshot
     /// and not stale. With a `dispatch` boundary it is the declared, not a proven, callee.
     pub target_id: Option<String>,
-    pub freshness: crate::semantic_evidence::Freshness,
+    pub freshness: crate::semantic_records::Freshness,
     /// Resolution, declared target, ambiguous candidates and dispatch, as published.
-    pub binding: crate::semantic_evidence::CallBinding,
+    pub binding: crate::semantic_records::CallBinding,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
