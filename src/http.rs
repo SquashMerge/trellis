@@ -4720,9 +4720,7 @@ fn metrics_query(uri: &axum::http::Uri) -> Result<crate::store::MetricsOptions, 
         }
         options.metrics = names.split(',').map(str::to_owned).collect();
     }
-    options
-        .validate_transport(crate::store::MetricsSourceSetIds::Current)
-        .map_err(|_| invalid())?;
+    options.validate_transport().map_err(|_| invalid())?;
     Ok(options)
 }
 
