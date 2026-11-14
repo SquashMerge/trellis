@@ -231,7 +231,7 @@ export default class Trellis extends View {
         if (changed || (!this.view && !this.viewError && !this.loading)) this.loadArchitecture(cx);
         if (changed) this.reloadSequence(cx);
         this.observeShow(data?.viewRequest, cx);
-        // The status line's "Last re-index failed" note (web/app.js renderIndexStatus). Best effort:
+        // The status line's "Last re-index failed" note (web/app-checkout.js renderIndexStatus). Best effort:
         // a daemon or `trellis api` without the route leaves the note out.
         try { const job = await client.job(rootKey); if (live()) this.job = job && typeof job === "object" ? job : null; }
         catch { if (live()) this.job = null; }
@@ -788,7 +788,7 @@ export default class Trellis extends View {
   }
 
   // The web app's header: the Trellis by SquashMerge mark, the views, the followed checkout and
-  // its pin; then the status line (web/app.js renderIndexStatus): the index state, and a failed
+  // its pin; then the status line (web/app-checkout.js renderIndexStatus): the index state, and a failed
   // later re-index as a secondary note.
   header(t, cx) {
     const row = this.checkouts?.find((r) => r.rootKey === this.rootKey);

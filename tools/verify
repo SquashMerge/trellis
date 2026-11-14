@@ -221,6 +221,17 @@ checks() {
   node --test tests/factory-config.test.cjs
   node docs/semantic-evidence/check-policy.mjs --self-test
   node --check web/app.js
+  node --check web/app-state.js
+  node --check web/app-api.js
+  node --check web/app-agent.js
+  node --check web/app-navigation.js
+  node --check web/app-checkout.js
+  node --check web/app-source.js
+  node --check web/app-files.js
+  node --check web/app-tree.js
+  node --check web/app-sequence.js
+  node --check web/app-libraries.js
+  node --check web/app-views.js
   node --check web/index-pin.js
   node --check web/source-witness.js
   node --check web/context-menu.js

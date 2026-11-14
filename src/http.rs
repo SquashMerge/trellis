@@ -2316,6 +2316,33 @@ const WOFF2: &str = "font/woff2";
 pub const WEB_ASSETS: &[WebAsset] = &[
     web_asset("/", HTML, include_bytes!("../web/index.html")),
     web_asset("/app.js", JS, include_bytes!("../web/app.js")),
+    web_asset("/app-state.js", JS, include_bytes!("../web/app-state.js")),
+    web_asset("/app-api.js", JS, include_bytes!("../web/app-api.js")),
+    web_asset("/app-agent.js", JS, include_bytes!("../web/app-agent.js")),
+    web_asset(
+        "/app-navigation.js",
+        JS,
+        include_bytes!("../web/app-navigation.js"),
+    ),
+    web_asset(
+        "/app-checkout.js",
+        JS,
+        include_bytes!("../web/app-checkout.js"),
+    ),
+    web_asset("/app-source.js", JS, include_bytes!("../web/app-source.js")),
+    web_asset("/app-files.js", JS, include_bytes!("../web/app-files.js")),
+    web_asset("/app-tree.js", JS, include_bytes!("../web/app-tree.js")),
+    web_asset(
+        "/app-sequence.js",
+        JS,
+        include_bytes!("../web/app-sequence.js"),
+    ),
+    web_asset(
+        "/app-libraries.js",
+        JS,
+        include_bytes!("../web/app-libraries.js"),
+    ),
+    web_asset("/app-views.js", JS, include_bytes!("../web/app-views.js")),
     web_asset(
         "/viewer-metrics.js",
         JS,

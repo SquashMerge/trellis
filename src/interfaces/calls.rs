@@ -1881,12 +1881,12 @@ fn run(client: &Client) {
         let read = |path: &str| std::fs::read_to_string(dir.join(path)).unwrap();
         let (http, app, cli) = (
             read("src/http.rs"),
-            read("web/app.js"),
+            read("web/app-checkout.js"),
             read("tests/daemon/cli.rs"),
         );
         let found = run(&[
             ("src/http.rs", &http),
-            ("web/app.js", &app),
+            ("web/app-checkout.js", &app),
             ("tests/daemon/cli.rs", &cli),
         ]);
         let reached = |path: &str| {
