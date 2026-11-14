@@ -15,15 +15,23 @@ Only first-party references are counted. `rules check` gives every instance a
 with an `externalPackage` destination are left out of every figure, so a new
 `import json` in a tool changes nothing here.
 
-The run fails when deviating pairs, deviating references, unknown references or partial
-files rise above the record. Coverage is judged on unknown references (the references
-of the instances whose status is `unknown`), not on pair counts: a pair is one source
-file's aggregate, so splitting, merging or renaming a file moves pair counts without
-changing what is known. The pair totals are recorded as information and never fail.
+The run fails when deviating pairs, deviating references or partial files rise above
+the record. It also fails on lost coverage, as spec G1 words it: a lower deviation count
+(pairs or references below the record) together with more unknown references than
+recorded. Unknown references are the references of the instances whose status is
+`unknown`. When deviations are not lower, a rise in unknown references is only a notice:
+they are over a third of the population's references, so ordinary new code raises them.
+Pair totals are recorded as information and never fail: a pair is one source file's
+aggregate, so splitting, merging or renaming a file moves pair counts without changing
+what is known.
+
+`--update` refuses to lower the recorded deviations while unknown references are above
+the record, unless `--accept-unknown-rise` is given. It prints the unknown-reference
+change either way.
 
 Known gap: a bare JavaScript import the tool leaves unresolved (`destination` null, such
 as `node:crypto` or `esbuild`) is not classified `externalPackage`. It stays in the
-population as unknown references, so a new one can fail as lost coverage (see #1088).
+population as unknown references (see #1088).
 
 The measurement runs through a daemon of its own under a private HOME, on a fresh index
 of this checkout with fresh rust-analyzer and scip-typescript evidence; it never touches
@@ -65,12 +73,16 @@ DESCRIPTION = {
                   "unresolved destinations. Standard-library and external packages are "
                   "not counted. Known gap: a bare JavaScript import the tool leaves "
                   "unresolved (destination null, such as node:crypto or esbuild) is "
-                  "not an externalPackage, so it stays in the population and a new "
-                  "one can fail as lost coverage (see #1088).",
-    "rule": "A run fails when deviatingPairs, deviatingReferences, unknownReferences or "
-            "partialFiles is above this record. unknownReferences is the sum of "
-            "referenceCount over the population's instances with status unknown. "
-            "comparablePairs, conformingPairs and unknownPairs are information only: "
+                  "not an externalPackage, so it stays in the population as unknown "
+                  "references (see #1088).",
+    "rule": "A run fails when deviatingPairs, deviatingReferences or partialFiles is "
+            "above this record. It also fails as lost coverage when deviatingPairs or "
+            "deviatingReferences is below this record while unknownReferences is above "
+            "it; with deviations not lower, a rise in unknownReferences is a notice. "
+            "unknownReferences is the sum of referenceCount over the population's "
+            "instances with status unknown. An update does not lower the deviations "
+            "while unknownReferences is above the record unless --accept-unknown-rise "
+            "is given. comparablePairs, conformingPairs and unknownPairs are information only: "
             "a pair is one source file's aggregate, so a file split, merge, rename "
             "or deletion moves them without changing coverage.",
     "measurement": "`python3 tools/rules-ratchet.py --update`: a debug build of this "
@@ -78,6 +90,7 @@ DESCRIPTION = {
                    "rust-analyzer (trusted) and scip-typescript (restricted) imported.",
 }
 UPDATE = "python3 tools/rules-ratchet.py --update"
+ACCEPT = "--accept-unknown-rise"
 # Each `trellis status` waits a bounded time for the first index; this many calls is a
 # backstop against a hang, not a speed expectation.
 INDEX_ATTEMPTS = 20
@@ -175,39 +188,81 @@ def summarize(payload):
     }, len(instances) - len(first_party)
 
 
+DEVIATIONS = ("deviatingPairs", "deviatingReferences")
+
+
+def claims_on_less_evidence(record, measured):
+    """Spec G1's lost coverage: a lower deviation count with more unknown references.
+    The check reports observed references, not absence, so fewer deviations on less
+    evidence is not progress."""
+    return (any(measured[key] < record[key] for key in DEVIATIONS)
+            and measured["unknownReferences"] > record["unknownReferences"])
+
+
+def unknown_change(record, measured):
+    """One line saying how unknown references moved against the record."""
+    delta = measured["unknownReferences"] - record["unknownReferences"]
+    return (f"unknownReferences: recorded {record['unknownReferences']}, measured "
+            f"{measured['unknownReferences']} ({delta:+d})")
+
+
 def compare(record, measured):
     """Returns (verdict, lines); verdict is `fail`, `lower` or `equal`.
 
-    A rise in deviating pairs or references fails. So does worse coverage: more
-    unknown references or more partial files, because the check reports observed
-    references, not absence, so fewer deviations on less evidence is not progress.
-    Pair totals never fail: they move when a file is split, merged, renamed or deleted.
-    Anything else that differs is only a notice that the record can be updated.
+    A rise in deviating pairs, deviating references or partial files fails. So does a
+    lower deviation count with more unknown references. A rise in unknown references
+    with deviations not lower is a notice, as is any other difference. Pair totals
+    never fail: they move when a file is split, merged, renamed or deleted.
     """
     def change(key):
         return f"{key}: recorded {record[key]}, measured {measured[key]}"
 
-    rises = [change(key) for key in ("deviatingPairs", "deviatingReferences")
-             if measured[key] > record[key]]
-    lost = [change(key) for key in ("unknownReferences", "partialFiles")
-            if measured[key] > record[key]]
-    if rises or lost:
+    rises = [change(key) for key in DEVIATIONS if measured[key] > record[key]]
+    partial = measured["partialFiles"] > record["partialFiles"]
+    lost = claims_on_less_evidence(record, measured)
+    if rises or partial or lost:
         lines = []
         if rises:
             lines.append("rules ratchet FAILED: deviations rose")
             lines += [f"  {line}" for line in rises]
+        if partial:
+            lines.append("rules ratchet FAILED: more files are partial")
+            lines.append(f"  {change('partialFiles')}")
         if lost:
-            lines.append("rules ratchet FAILED: the comparison population lost coverage")
-            lines += [f"  {line}" for line in lost]
+            lines.append("rules ratchet FAILED: the comparison population lost coverage: "
+                         "fewer deviations on more unknown references")
+            lines += [f"  {change(key)}" for key in DEVIATIONS if measured[key] < record[key]]
+            lines.append(f"  {unknown_change(record, measured)}")
         lines.append("  Remove the added deviation or restore the coverage. A reviewed "
                      f"re-baseline or exception updates the record explicitly: {UPDATE}")
         return "fail", lines
     differs = [change(key) for key in KEYS if measured[key] != record[key]]
     if differs:
-        return "lower", (["rules ratchet NOTICE: the record can be updated"]
-                         + [f"  {line}" for line in differs]
-                         + [f"  Update it: {UPDATE}"])
+        lines = ["rules ratchet NOTICE: the record can be updated"]
+        lines += [f"  {line}" for line in differs]
+        if measured["unknownReferences"] > record["unknownReferences"]:
+            lines.append(f"  NOTICE: unknown references rose; {unknown_change(record, measured)}. "
+                         "Not a failure, because deviations are not lower.")
+        return "lower", lines + [f"  Update it: {UPDATE}"]
     return "equal", ["rules ratchet: " + ", ".join(f"{key} {measured[key]}" for key in KEYS)]
+
+
+def update_refusal(previous, measured, accept_unknown_rise):
+    """Returns (refused, lines) for rewriting the record `previous` with `measured`.
+
+    Lowering the recorded deviations while unknown references are above the record
+    would lock in an improvement claimed on less evidence, so it needs the flag."""
+    lines = [f"rules ratchet: {unknown_change(previous, measured)}"]
+    if not claims_on_less_evidence(previous, measured):
+        return False, lines
+    if accept_unknown_rise:
+        return False, lines + ["rules ratchet: lowering the recorded deviations on more "
+                               f"unknown references, as {ACCEPT} asks"]
+    return True, lines + [
+        "rules ratchet FAILED: the record was not rewritten: deviations are lower than "
+        "recorded while unknown references are higher",
+        *(f"  {key}: recorded {previous[key]}, measured {measured[key]}" for key in DEVIATIONS),
+        f"  If the rise in unknown references is reviewed and accepted: {UPDATE} {ACCEPT}"]
 
 
 def read_record(path):
@@ -387,6 +442,9 @@ def shut_down(trellis, daemon, home):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--update", action="store_true", help="rewrite the record")
+    parser.add_argument(ACCEPT, action="store_true",
+                        help="with --update: lower the recorded deviations although "
+                             "unknown references are above the record")
     parser.add_argument("--binary", type=Path, help="a built trellis; default: build one")
     parser.add_argument("--record", type=Path, default=RECORD)
     parser.add_argument("--save-payload", type=Path,
@@ -417,7 +475,14 @@ def main():
 
 
 def check(args, target_dir, home, owned):
-    record = None if args.update else read_record(args.record)
+    if args.update:
+        # A missing record, or one of another version, has nothing to compare with.
+        try:
+            record = read_record(args.record)
+        except (Failed, OSError, ValueError):
+            record = None
+    else:
+        record = read_record(args.record)
     binary = args.binary.resolve() if args.binary else build(target_dir)
     trellis = Trellis(binary, private_env(home))
     missing = missing_producers(trellis)
@@ -436,6 +501,13 @@ def check(args, target_dir, home, owned):
     print(f"rules ratchet: {external} pairs with a standard-library or external package "
           "destination are not counted")
     if args.update:
+        if record is None:
+            print("rules ratchet: no current record to compare the update with")
+        else:
+            refused, lines = update_refusal(record, measured, args.accept_unknown_rise)
+            print("\n".join(lines))
+            if refused:
+                return 1
         write_record(args.record, measured)
         print(f"rules ratchet: wrote {args.record}: "
               + ", ".join(f"{key} {measured[key]}" for key in KEYS))

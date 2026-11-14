@@ -68,18 +68,57 @@ class Ratchet(unittest.TestCase):
             self.assertIn("deviations rose", lines[0])
             self.assertIn(f"{key}: recorded {RECORD[key]}, measured {RECORD[key] + 1}", lines[1])
 
-    def test_fewer_deviations_on_lost_coverage_fail(self):
-        for key, value in (("unknownReferences", 51), ("partialFiles", 2)):
-            verdict, lines = self.verdict(deviatingPairs=2, deviatingReferences=5, **{key: value})
-            self.assertEqual(verdict, "fail", key)
-            self.assertIn("lost coverage", lines[0])
-            self.assertIn(f"{key}: recorded {RECORD[key]}, measured {value}", lines[1])
-
-    def test_a_rise_in_unknown_references_fails(self):
-        verdict, lines = self.verdict(unknownReferences=51)
+    def test_more_partial_files_fail(self):
+        verdict, lines = self.verdict(deviatingPairs=2, deviatingReferences=5, partialFiles=2)
         self.assertEqual(verdict, "fail")
-        self.assertEqual(lines[:2], ["rules ratchet FAILED: the comparison population lost coverage",
-                                     "  unknownReferences: recorded 50, measured 51"])
+        self.assertEqual(lines[:2], ["rules ratchet FAILED: more files are partial",
+                                     "  partialFiles: recorded 1, measured 2"])
+
+    def test_fewer_deviations_on_more_unknown_references_fail(self):
+        for lower in ({"deviatingPairs": 2}, {"deviatingReferences": 9},
+                      {"deviatingPairs": 2, "deviatingReferences": 5}):
+            verdict, lines = self.verdict(unknownReferences=51, **lower)
+            self.assertEqual(verdict, "fail", lower)
+            self.assertIn("lost coverage", lines[0])
+            self.assertIn("  unknownReferences: recorded 50, measured 51 (+1)", lines)
+
+    def test_equal_deviations_on_more_unknown_references_are_a_notice(self):
+        verdict, lines = self.verdict(unknownReferences=53)
+        self.assertEqual(verdict, "lower")
+        self.assertIn("NOTICE", lines[0])
+        self.assertTrue(any("unknown references rose" in line and "(+3)" in line
+                            and "Not a failure" in line for line in lines), lines)
+
+    def test_fewer_deviations_on_equal_or_fewer_unknown_references_are_a_notice(self):
+        for unknown in (50, 49):
+            verdict, lines = self.verdict(deviatingPairs=2, deviatingReferences=5,
+                                          unknownReferences=unknown)
+            self.assertEqual(verdict, "lower", unknown)
+            self.assertIn("the record can be updated", lines[0])
+            self.assertIn(RR.UPDATE, lines[-1])
+            self.assertFalse(any("rose" in line for line in lines))
+
+    def test_an_update_that_lowers_deviations_on_more_unknown_references_is_refused(self):
+        measured = {**RECORD, "deviatingPairs": 2, "unknownReferences": 51}
+        refused, lines = RR.update_refusal(RECORD, measured, False)
+        self.assertTrue(refused)
+        self.assertEqual(lines[0], "rules ratchet: unknownReferences: recorded 50, measured 51 (+1)")
+        self.assertIn("not rewritten", lines[1])
+        self.assertIn(f"{RR.UPDATE} --accept-unknown-rise", lines[-1])
+        accepted, lines = RR.update_refusal(RECORD, measured, True)
+        self.assertFalse(accepted)
+        self.assertIn("(+1)", lines[0])
+        self.assertIn("--accept-unknown-rise", lines[-1])
+
+    def test_other_updates_are_not_refused_and_print_the_unknown_change(self):
+        for changed, delta in (({"unknownReferences": 53}, "(+3)"),
+                               ({"deviatingPairs": 2, "unknownReferences": 48}, "(-2)"),
+                               ({"deviatingPairs": 4, "unknownReferences": 51}, "(+1)"),
+                               ({}, "(+0)")):
+            refused, lines = RR.update_refusal(RECORD, {**RECORD, **changed}, False)
+            self.assertFalse(refused, changed)
+            self.assertEqual(len(lines), 1)
+            self.assertIn(delta, lines[0])
 
     def test_pair_totals_never_fail(self):
         # Fewer comparable or conforming pairs (code deleted, files merged) and more
@@ -95,6 +134,7 @@ class Ratchet(unittest.TestCase):
                         {"unknownReferences": 40, "unknownPairs": 6}, {"partialFiles": 0},
                         {"deviatingPairs": 2, "deviatingReferences": 5, "conformingPairs": 31,
                          "comparablePairs": 41, "unknownReferences": 49}):
+            # (A rise in unknown references alone is the notice tested above.)
             verdict, lines = self.verdict(**changed)
             self.assertEqual(verdict, "lower", changed)
             self.assertIn("NOTICE", lines[0])
@@ -137,12 +177,20 @@ class Ratchet(unittest.TestCase):
         self.assertIn("deviatingPairs: recorded 1, measured 2", lines[1])
         self.assertIn("deviatingReferences: recorded 4, measured 5", lines[2])
 
-    def test_a_new_unresolved_first_party_reference_is_lost_coverage(self):
+    def test_a_new_unresolved_first_party_reference_is_a_notice(self):
         record, _ = RR.summarize(payload(*TREE))
         measured, _ = RR.summarize(payload(*TREE, row("unknown", 1, destination=None)))
         verdict, lines = RR.compare(record, measured)
+        self.assertEqual(verdict, "lower")
+        self.assertIn("  unknownReferences: recorded 2, measured 3", lines)
+
+    def test_a_deviation_that_becomes_unresolved_is_lost_coverage(self):
+        record, _ = RR.summarize(payload(*TREE))
+        measured, _ = RR.summarize(payload(row("unknown", 4, destination=None), *TREE[1:]))
+        verdict, lines = RR.compare(record, measured)
         self.assertEqual(verdict, "fail")
-        self.assertIn("unknownReferences: recorded 2, measured 3", lines[1])
+        self.assertIn("lost coverage", lines[0])
+        self.assertIn("  unknownReferences: recorded 2, measured 6 (+4)", lines)
 
     def test_a_file_split_that_adds_an_unknown_pair_passes(self):
         # One source's unresolved references become two sources' (#1087): one more
@@ -172,7 +220,7 @@ class Ratchet(unittest.TestCase):
             written = json.loads(path.read_text())
             self.assertEqual(list(written), ["schemaVersion", "population", "rule", "measurement", *RR.KEYS])
             self.assertIn("externalPackage", written["population"])
-            self.assertIn("unknownReferences", written["rule"])
+            self.assertIn("--accept-unknown-rise", written["rule"])
             # A record of an earlier version, with another population or rule, is refused.
             path.write_text(json.dumps({"schemaVersion": 2, **RECORD}))
             with self.assertRaisesRegex(RR.Failed, "--update"):
