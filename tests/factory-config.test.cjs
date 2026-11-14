@@ -319,6 +319,7 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
       checks: [
         ["python3", "tools/flaky-patterns-test.py"],
         ["python3", "tools/flaky-patterns.py"],
+        ["python3", "tools/rules-ratchet-test.py"],
         ["node", "--test", "tests/mcp-catalog-sdk.test.mjs", "tests/mcp-smoke.test.mjs"],
         ["python3", "tools/stage3-watcher-runner-test.py"],
         ["python3", "tools/verify-67-mixed-performance-test.py"],
@@ -337,6 +338,8 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
         ["node", "--import", "./herdr-mod/test/register.mjs", "--test", "herdr-mod/test/mod.test.mjs", "herdr-mod/test/view.test.mjs", "herdr-mod/test/parity.test.mjs", "herdr-mod/test/setup.test.mjs"],
         ["node", "--test", "tests/browse-ui.test.cjs", "tests/sequence-ui.test.cjs", "tests/token-ui.test.cjs", "tests/external-source-ui.test.cjs", "tests/dependency-ui.test.cjs", "tests/shell-ui.test.cjs", "tests/classes-ui.test.cjs", "tests/navigation-ui.test.cjs", "tests/metric-heat.test.cjs", "tests/viewer-metrics-ui.test.cjs", "tests/files-ui.test.cjs", "tests/architecture-ui.test.cjs", "tests/architecture-pele-ui.test.cjs", "tests/treemap-ui.test.cjs", "tests/treemap-pele.test.cjs", "tests/architecture-apps-ui.test.cjs", "tests/app-switcher-ui.test.cjs"],
       ],
+      // The rules-check ratchet (#1008) builds and measures inside its one command.
+      ratchet: [["python3", "tools/rules-ratchet.py"]],
     };
     function assertRan(commands, expected) {
       const key = (command) => JSON.stringify(command);
@@ -434,7 +437,7 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
     assert.equal(testsOnly.result.status, 0, testsOnly.output);
     // No browser suite, so no system package install.
     assertRan(testsOnly.commands, { setup: lanes.setup, tests: lanes.tests });
-    assert.doesNotMatch(testsOnly.output, /==> verify lane (rust|semantic|cohorts|checks)/);
+    assert.doesNotMatch(testsOnly.output, /==> verify lane (rust|semantic|cohorts|checks|ratchet)/);
     rmSync(log);
     const split = runVerify({}, undefined, ["--lane", "lint", "--lane=semantic", "--lane", "cohorts", "--lane", "checks"]);
     assert.equal(split.result.status, 0, split.output);

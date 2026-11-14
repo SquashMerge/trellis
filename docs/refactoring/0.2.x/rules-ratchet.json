@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "deviatingPairs": 90,
+  "deviatingReferences": 754,
+  "comparablePairs": 2271,
+  "conformingPairs": 1384,
+  "unknownPairs": 797,
+  "partialFiles": 0
+}
