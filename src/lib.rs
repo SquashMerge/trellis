@@ -29,6 +29,7 @@ pub(crate) mod evidence_limits;
 #[cfg(test)]
 mod extractor_inputs_tests;
 pub mod file_tree;
+mod files_read;
 pub mod files_view;
 pub mod git_status;
 pub mod graph_query;

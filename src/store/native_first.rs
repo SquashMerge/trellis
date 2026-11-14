@@ -392,73 +392,25 @@ pub(crate) fn endpoint_boundary(
 }
 
 impl Store {
-    /// Complete an offline fixture's exact target through the ordinary bounded owner units.
+    /// The storage half of `Store::complete_pending_semantic_for_tests` (the unit loop is in
+    /// `index_coordinator/semantic_fixture.rs`): `published` is the S commit of `target` over
+    /// `expected`, and no target is outstanding.
     #[cfg(feature = "test-support")]
-    #[doc(hidden)]
-    pub fn complete_pending_semantic_for_tests(
+    pub(crate) fn ensure_semantic_fixture_committed_for_tests(
         &self,
+        published: IndexPin,
         expected: IndexPin,
-        session: &Arc<topology::WriterSession>,
-        cancel: &CancelFlag,
-    ) -> Result<Option<IndexPin>> {
-        self.verify_writer_session(session)?;
-        ensure!(
-            self.index_baseline()? == expected,
-            "semantic fixture head changed"
-        );
-        let Some(target) = self.pending_semantic_target()? else {
-            return Ok(None);
-        };
-        ensure!(target.pin == expected, "semantic fixture target changed");
-        let mut continuation = None;
-        // A unit bound detects a broken fixture; only Published proves completion.
-        for _ in 0..10_000 {
-            ensure!(
-                self.pending_semantic_target()?.as_ref() == Some(&target),
-                "semantic fixture target superseded"
-            );
-            match crate::index_coordinator::cooperative_semantic_unit(
-                self,
-                session,
-                &mut continuation,
-                cancel,
-                || true,
-            )? {
-                SemanticUnitOutcome::Progress => {}
-                SemanticUnitOutcome::Published => {
-                    let published = self.index_baseline()?;
-                    ensure!(
-                        published.index_generation == expected.index_generation
-                            && published.index_revision == expected.index_revision + 1,
-                        "semantic fixture published a different paired pin"
-                    );
-                    self.with_evidence(|db| {
-                        let committed: bool = db.query_row(
-                            "SELECT EXISTS(SELECT 1 FROM semantic_catchup_commits k JOIN native_revisions s ON s.id=k.revision_id WHERE k.revision_id=?1 AND k.target_revision_id=?2 AND s.native_revision_id=?3)",
-                            params![semantic_pin_key(published), semantic_pin_key(expected), target.native_revision_id],
-                            |row| row.get(0),
-                        )?;
-                        ensure!(committed && pending_target(db)?.is_none(), "semantic fixture publication did not clear its exact target");
-                        Ok(())
-                    })?;
-                    return Ok(Some(published));
-                }
-                other => anyhow::bail!("semantic fixture did not progress: {other:?}"),
-            }
-        }
-        anyhow::bail!("semantic fixture exceeded its unit bound")
-    }
-
-    /// Offline fixtures that published native N with their own writer and dropped it: take
-    /// the writer again and drive any outstanding exact target at head to its S commit.
-    #[cfg(feature = "test-support")]
-    #[doc(hidden)]
-    pub fn catch_up_semantic_for_tests(&self, cancel: &CancelFlag) -> Result<IndexPin> {
-        let session = Arc::new(topology::WriterSession::writer(self.writer()?));
-        let head = self.index_baseline()?;
-        Ok(self
-            .complete_pending_semantic_for_tests(head, &session, cancel)?
-            .unwrap_or(head))
+        target: &PendingSemanticTarget,
+    ) -> Result<()> {
+        self.with_evidence(|db| {
+            let committed: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM semantic_catchup_commits k JOIN native_revisions s ON s.id=k.revision_id WHERE k.revision_id=?1 AND k.target_revision_id=?2 AND s.native_revision_id=?3)",
+                params![semantic_pin_key(published), semantic_pin_key(expected), target.native_revision_id],
+                |row| row.get(0),
+            )?;
+            ensure!(committed && pending_target(db)?.is_none(), "semantic fixture publication did not clear its exact target");
+            Ok(())
+        })
     }
 
     /// Whether the published head still has an outstanding semantic catch-up target.
