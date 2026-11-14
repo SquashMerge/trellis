@@ -1558,7 +1558,7 @@ mod tests {
             language: "rust".into(),
             path: "target.rs".into(),
         };
-        let selected = ReadRevision::new(
+        let selected = ReadRevision::for_tests(
             IndexPin {
                 index_generation: uuid::Uuid::nil(),
                 index_revision: 1,
@@ -1569,14 +1569,14 @@ mod tests {
             source_set_id: key.source_set_id.clone(),
             revision_id: "revision".into(),
         };
-        let scope = V8NativeScope {
-            revision_key: selected.key.clone(),
-            version_id: "version".into(),
-            vid: 2,
-            key: key.clone(),
-            native_revision_id: snapshot.revision_id.clone(),
-            producer_id: "native".into(),
-        };
+        let scope = V8NativeScope::for_tests(
+            selected.key.clone(),
+            "version".into(),
+            2,
+            key.clone(),
+            snapshot.revision_id.clone(),
+            "native".into(),
+        );
         let mut check = || Ok(());
         let mut source = SnapshotGraphSource {
             db: &db,
