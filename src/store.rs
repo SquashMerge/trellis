@@ -1432,12 +1432,17 @@ struct SelectedHeaders {
     producer_hash: OnceLock<String>,
 }
 impl ReadRevision {
-    pub(crate) fn new(pin: IndexPin, key: String) -> Self {
+    fn new(pin: IndexPin, key: String) -> Self {
         Self {
             pin,
             key,
             headers: Arc::default(),
         }
+    }
+    /// [`Self::new`] for the query-layer tests that read through a selected revision.
+    #[cfg(test)]
+    pub(crate) fn for_tests(pin: IndexPin, key: String) -> Self {
+        Self::new(pin, key)
     }
     /// `selected_producer_hash`, computed once for this selected revision.
     /// A failure is not memoized: it fails the read and is recomputed if retried.
@@ -9602,7 +9607,7 @@ fn validate_paired_rows(db: &Connection) -> Result<()> {
 
 #[derive(Clone)]
 pub(crate) struct V8NativeScope {
-    pub(crate) revision_key: String, // internal pin:v1 generation/revision key
+    revision_key: String, // internal pin:v1 generation/revision key
     pub(crate) version_id: String,
     pub(crate) vid: i64,
     pub(crate) key: crate::native_records::DocumentKey,
@@ -9610,6 +9615,25 @@ pub(crate) struct V8NativeScope {
     pub(crate) producer_id: String,
 }
 impl V8NativeScope {
+    /// A scope built field by field, for the query-layer tests that read through one.
+    #[cfg(test)]
+    pub(crate) fn for_tests(
+        revision_key: String,
+        version_id: String,
+        vid: i64,
+        key: crate::native_records::DocumentKey,
+        native_revision_id: String,
+        producer_id: String,
+    ) -> Self {
+        Self {
+            revision_key,
+            version_id,
+            vid,
+            key,
+            native_revision_id,
+            producer_id,
+        }
+    }
     pub(crate) fn proof_id(&self) -> String {
         format!(
             "native-proof:v1:{}",
