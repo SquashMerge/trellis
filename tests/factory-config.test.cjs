@@ -308,6 +308,7 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
         ["node", "--check", "web/context-menu.js"],
         ["node", "--check", "web/pele-svg.js"],
         ["node", "--check", "web/architecture-apps.js"],
+        ["node", "--check", "web/architecture-display.js"],
         ["node", "--check", "web/deviations-model.js"],
         ["node", "--check", "web/sequence-model.js"],
         ["node", "--import", "./herdr-mod/test/register.mjs", "--test", "herdr-mod/test/mod.test.mjs", "herdr-mod/test/view.test.mjs", "herdr-mod/test/parity.test.mjs", "herdr-mod/test/setup.test.mjs"],

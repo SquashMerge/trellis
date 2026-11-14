@@ -15,8 +15,8 @@ const WEB = {
   // the parameter shadows the real global, so the caller decides how text is measured.
   pele: { file: "vendor/pele-1.10.0-trellis.2.js", params: "globalThis", result: "pele" },
   "metric-heat": { file: "metric-heat.js", params: "window", result: "window.TrellisMetricHeat" },
-  // The pure parts it exports: the summary display (`createDisplay`) and the module helpers.
-  architecture: { file: "architecture.js", params: "window, document", result: "window.TrellisArchitecture" },
+  // The summary display (`createDisplay`) and the module helpers (pure).
+  "architecture-display": { file: "architecture-display.js", params: "window", result: "window.TrellisArchitectureDisplay" },
   // Apps, All apps layout, interface cards and inspector facts (pure).
   "architecture-apps": { file: "architecture-apps.js", params: "window", result: "window.TrellisArchitectureApps" },
   // The Deviations tree model (pure); its DOM view is not bundled.
