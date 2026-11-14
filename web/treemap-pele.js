@@ -2,17 +2,23 @@
 // Exact vendored Pele .2 owns layout. Indexed records own identity and evidence.
 (() => {
   const NS = "http://www.w3.org/2000/svg";
-  const THEME = "--_bg:var(--pele-bg,#fff);--_fg:var(--pele-fg,#1f1f1f);--_m:var(--pele-muted,#6e6e6e);--_l:var(--pele-line,#1f1f1f);--_s:var(--pele-surface,#f3f3f3);--_a:var(--pele-surface-alt,#e6e6e6);--_b:var(--pele-border,#8a8a8a);--_c:var(--pele-accent,#5b7bd5);color:var(--_fg)";
-  const FONT = ";--_fm:var(--pele-font-mono,monospace);font:14px sans-serif;letter-spacing:normal;word-spacing:normal;text-transform:none;direction:ltr;font-family:var(--pele-font,sans-serif)";
+  const {unsupported, bytes, rootStyle, asButton, textMeasurer} = window.TrellisPeleSvg;
+  // Pele writes the radius and heading-weight variables only for the treemaps that use them.
+  const THEMES = [rootStyle(14,{radius:false}), rootStyle(14), rootStyle(14,{heading:true})];
+  // The first style attribute must be one of those themes; a second one fails the inline-style check.
+  const theme = raw => { const found = raw.match(/ style="([^"]*)"/); return found && THEMES.includes(found[1]) ? found[0] : null; };
+  const ADMISSION = {kind:"treemap", theme, active:/<\/?(?:script|style|foreignObject|image|a)\b|<!/i,
+    tags:new Set(["svg","g","rect","text","title"]),
+    attrs:new Set(["xmlns","class","viewBox","width","height","fill","fill-opacity","role","aria-roledescription","stroke","font-size","data-id","x","y","rx","text-anchor","font-weight"]),
+    words:{large:"Treemap SVG too large", root:"Changed Pele Treemap root", theme:"Changed Pele Treemap theme", style:"Unexpected Treemap SVG markup", active:"Unexpected Treemap SVG markup",
+      invalid:"Invalid Treemap SVG", element:"Unexpected Treemap SVG element", attribute:"Unexpected Treemap SVG attribute"}};
   const colors = ["#343644","#FFC20A","#FFAA10","#FF7A00"];
   const classifications = {production:"#ABA5FF",mixed:"#FFAA10",test:"#85C7FF",none:"#343644"};
   const selections = new WeakMap();
   const MIN_WIDTH = 640, MIN_HEIGHT = 360;
   const identity = file => JSON.stringify([file.sourceSetId,file.language,file.path]);
   const directoryKey = directory => JSON.stringify([directory.sourceSetId,directory.path]);
-  const bytes = value => new TextEncoder().encode(value).length;
   const compare = (a,b) => a < b ? -1 : a > b ? 1 : 0;
-  function unsupported(message) { const error = new Error(message); error.code = "unsupported"; throw error; }
   function project(files, options = {}) {
     if (!Array.isArray(files)) unsupported("Invalid Treemap files");
     const nodes = new Map(), directories = new Map(), seen = new Set(), zeroArea = [];
@@ -102,22 +108,7 @@
     return {width,height:Math.min(4000,height)};
   }
   function validatedSvg(raw, projection) {
-    if (typeof raw !== "string" || bytes(raw) > 8*1024*1024) unsupported("Treemap SVG too large");
-    if (!raw.startsWith('<svg xmlns="http://www.w3.org/2000/svg" class="pele pele-treemap"')) unsupported("Changed Pele Treemap root");
-    const theme = raw.match(/ style="([^"]*)"/);
-    const style = THEME+";--_r:var(--pele-radius,4px)";
-    if (!theme || ![THEME+FONT,style+FONT,style+";--_hw:var(--pele-heading-weight,bold)"+FONT].includes(theme[1])) unsupported("Changed Pele Treemap theme");
-    const safe = raw.replace(theme[0],"").replaceAll(' style="rx:var(--_r)"',' rx="var(--_r)"');
-    if (/\sstyle\s*=|<\/?(?:script|style|foreignObject|image|a)\b|<!/i.test(safe)) unsupported("Unexpected Treemap SVG markup");
-    const root = new DOMParser().parseFromString(safe,"image/svg+xml").documentElement;
-    if (root.localName !== "svg" || root.namespaceURI !== NS || root.querySelector("parsererror")) unsupported("Invalid Treemap SVG");
-    const tags = new Set(["svg","g","rect","text","title"]);
-    const attrs = new Set(["xmlns","class","viewBox","width","height","fill","fill-opacity","role","aria-roledescription","stroke","font-size","data-id","x","y","rx","text-anchor","font-weight"]);
-    let count = 0;
-    for (const node of [root,...root.querySelectorAll("*")]) {
-      if (++count > 12000 || node.namespaceURI !== NS || !tags.has(node.localName)) unsupported("Unexpected Treemap SVG element");
-      for (const attr of node.attributes) if (!attrs.has(attr.name) || /url\s*\(|javascript:|<|>|[\u0000-\u001f]/i.test(attr.value)) unsupported("Unexpected Treemap SVG attribute");
-    }
+    const {root, count} = window.TrellisPeleSvg.admit(raw, ADMISSION);
     const outerWidth = projection.width+16, outerHeight = projection.height+16;
     if (root.getAttribute("class") !== "pele pele-treemap" || root.getAttribute("width") !== String(outerWidth) || root.getAttribute("height") !== String(outerHeight) || root.getAttribute("viewBox") !== `0 0 ${outerWidth} ${outerHeight}`) unsupported("Changed Treemap viewport");
     const controls = new Map();
@@ -169,8 +160,8 @@
     try {
       if (document.fonts?.ready) await document.fonts.ready;
       if (!current()) return {status:"stale"};
-      const ctx = document.createElement("canvas").getContext("2d");
-      if (!ctx) unsupported("Treemap text measurement unavailable");
+      const measure = textMeasurer();
+      if (!measure) unsupported("Treemap text measurement unavailable");
       const projection = project(files,options);
       if (typeof window.pele?.render !== "function") unsupported("Pele asset unavailable");
       const result = await window.pele.render(projection.source,{config:projection.config,fontSize:14,padding:8,responsive:false,links:false,images:false});
@@ -181,10 +172,10 @@
         const section = item.kind === "directory";
         if (label) {
           const size = Number(label.getAttribute("font-size") || (section ? 12 : 14));
-          ctx.font = `${section ? "bold " : ""}${size}px Inter, sans-serif`;
+          measure.font(`${section ? "bold " : ""}${size}px Inter, sans-serif`);
           const x = Number(label.getAttribute("x"));
           const width = section ? geometry.x+geometry.width-8-x : 2*Math.max(0,Math.min(x-geometry.x-4,geometry.x+geometry.width-4-x));
-          label.textContent = fit(item.label,Math.max(0,width),text => ctx.measureText(text).width);
+          label.textContent = fit(item.label,Math.max(0,width),measure);
           if (section) label.setAttribute("font-weight","bold");
           label.setAttribute("fill",section || item.band === 0 || item.band == null || item.band === "none" ? "#F7F7FB" : "#0B0C10");
         }
@@ -195,16 +186,13 @@
         if (section) { rect.setAttribute("fill-opacity","1"); rect.setAttribute("stroke","#777A8E"); }
         const testOnly = !section && (item.record.fileRole === "test" || (item.record.roleCounts?.production === 0 && item.record.roleCounts?.test > 0));
         if (testOnly) { rect.setAttribute("stroke-dasharray","4 3"); rect.setAttribute("stroke","#B8BAC8"); }
-        node.setAttribute("role","button"); node.setAttribute("tabindex","0"); node.setAttribute("aria-label",item.full);
-        node.setAttribute("aria-pressed",String(options.selectedKey === item.key));
-        node.setAttribute(section ? "data-trellis-directory-id" : "data-trellis-file-id",item.key);
-        const select = event => {
+        asButton(node,item.full,event => {
           event.stopPropagation(); if (!current()) return;
           for (const control of controls.values()) control.node.setAttribute("aria-pressed",String(control.node === node));
           (section ? options.onSelectDirectory : options.onSelectFile)?.(item.record);
-        };
-        node.addEventListener("click",select);
-        node.addEventListener("keydown",event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); select(event); } });
+        });
+        node.setAttribute("aria-pressed",String(options.selectedKey === item.key));
+        node.setAttribute(section ? "data-trellis-directory-id" : "data-trellis-file-id",item.key);
       }
       if (!current()) return {status:"stale"};
       container.replaceChildren(root);

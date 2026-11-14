@@ -507,6 +507,7 @@ async fn provisioned_page_serves_all_referenced_assets() {
         "index-pin.js",
         "source-witness.js",
         "context-menu.js",
+        "pele-svg.js",
         "sequence.js",
         "shell.js",
         "classes.js",
