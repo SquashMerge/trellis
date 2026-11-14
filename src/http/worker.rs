@@ -7,8 +7,8 @@
 use super::DaemonState;
 use crate::indexer::IndexOptions;
 use crate::store::topology::WriterSession;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub(super) const STARTUP_BACKOFF_FIRST: Duration = Duration::from_millis(250);
@@ -515,6 +515,18 @@ pub(super) struct WatchStatus {
     pub(super) capturing: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// Publish whether accepted FIFO work is pending, and return what was published before.
+/// Written under the watch status lock, which the quiet read holds across its read of this
+/// flag and of the status (#1082). The flag stays an atomic for its lock-free readers.
+pub(super) fn publish_fifo(
+    watch_status: &Mutex<Option<WatchStatus>>,
+    fifo_pending: &AtomicBool,
+    pending: bool,
+) -> bool {
+    let _published = watch_status.lock().unwrap();
+    fifo_pending.swap(pending, Ordering::AcqRel)
+}
+
 impl WatchStatus {
     /// The watcher holds intent the worker has not acknowledged.
     pub(super) fn pending(&self) -> bool {
@@ -670,7 +682,7 @@ impl DaemonState {
                 Err(_) => true,
             }
         };
-        let was = self.fifo_pending.swap(pending, Ordering::AcqRel);
+        let was = publish_fifo(&self.watch_status, &self.fifo_pending, pending);
         if was
             && !pending
             && let Some(lifecycle) = self.lifecycle.get()
@@ -718,7 +730,7 @@ impl DaemonState {
     ) -> anyhow::Result<crate::store::requests::Request> {
         let lease = self.admission_lease()?;
         let row = self.store.enqueue_request(options, expected)?;
-        self.fifo_pending.store(true, Ordering::Release);
+        publish_fifo(&self.watch_status, &self.fifo_pending, true);
         drop(lease);
         self.pending_requests.lock().unwrap().push(row.id.clone());
         *self.recovery_retry_after.lock().unwrap() = None;
@@ -735,7 +747,7 @@ impl DaemonState {
         let row = self
             .store
             .enqueue_semantic_import(std::path::Path::new(self.store.workspace_root()), options)?;
-        self.fifo_pending.store(true, Ordering::Release);
+        publish_fifo(&self.watch_status, &self.fifo_pending, true);
         drop(lease);
         self.pending_requests.lock().unwrap().push(row.id.clone());
         *self.recovery_retry_after.lock().unwrap() = None;
@@ -760,13 +772,13 @@ impl DaemonState {
             Err(error) => {
                 // An error after COMMIT may still have accepted the row, unwoken: the worker
                 // re-reads the queue and publishes whether FIFO work really remains (#629).
-                self.fifo_pending.store(true, Ordering::Release);
+                publish_fifo(&self.watch_status, &self.fifo_pending, true);
                 drop(lease);
                 self.inbox.wake();
                 return Err(error);
             }
         };
-        self.fifo_pending.store(true, Ordering::Release);
+        publish_fifo(&self.watch_status, &self.fifo_pending, true);
         drop(lease);
         self.pending_requests.lock().unwrap().push(row.id.clone());
         *self.recovery_retry_after.lock().unwrap() = None;

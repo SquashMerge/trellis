@@ -212,7 +212,10 @@ pub struct DaemonState {
     /// The last step made progress, so more work may be ready at once.
     step_progress: AtomicBool,
     /// Published watcher intent; readers never take the watcher's lock.
-    watch_status: Mutex<Option<worker::WatchStatus>>,
+    /// The watcher's published status. This lock is also the publication lock of
+    /// `fifo_pending`: both are written under it, so the quiet read sees one state (#1082).
+    /// A leaf lock: nothing else is taken while it is held.
+    watch_status: Arc<Mutex<Option<worker::WatchStatus>>>,
     /// Read and enqueue admission leases held against release.
     leases: Arc<std::sync::atomic::AtomicUsize>,
     /// Published by the worker after each step (and set by the enqueue gate):
@@ -427,11 +430,13 @@ pub fn new_with_config(
     let origins = hosts.iter().map(|h| format!("http://{h}")).collect();
     let inbox = Arc::new(worker::WorkerInbox::default());
     let fifo_pending = Arc::new(AtomicBool::new(false));
+    let watch_status = Arc::new(Mutex::new(None));
     let queue_waker: Arc<dyn Fn() + Send + Sync> = {
         let inbox = inbox.clone();
         let fifo_pending = fifo_pending.clone();
+        let watch_status = watch_status.clone();
         Arc::new(move || {
-            fifo_pending.store(true, Ordering::Release);
+            worker::publish_fifo(&watch_status, &fifo_pending, true);
             inbox.wake();
         })
     };
@@ -448,7 +453,7 @@ pub fn new_with_config(
         #[cfg(feature = "test-support")]
         worker_hold: std::sync::RwLock::new(()),
         step_progress: AtomicBool::new(false),
-        watch_status: Mutex::new(None),
+        watch_status,
         leases: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         fifo_pending,
         lifecycle: Arc::new(std::sync::OnceLock::new()),
@@ -763,22 +768,32 @@ impl DaemonState {
     /// unacknowledged intent. It is the admission condition of an automatic producer run
     /// (#1082).
     ///
-    /// Unlike a phase sample followed by [`Self::checkout_watch_pending`], this is one
-    /// coherent read. The runtime state is held while the status is read, and a session
-    /// change clears the status under that same lock, so a published status always belongs
-    /// to the session seen here. A runtime with no serving session, or a session whose
-    /// watcher has not published yet, has an inventory ahead of it and is never quiet.
+    /// One coherent read, unlike separate samples of the phase, the FIFO flag and
+    /// [`Self::checkout_watch_pending`]:
+    /// - The runtime state is held while the status is read, and a session change clears the
+    ///   status under that lock, so a published status belongs to the session seen here. A
+    ///   runtime with no serving session, or a session whose watcher has not published yet,
+    ///   has an inventory ahead of it and is never quiet.
+    /// - The FIFO flag and the watch status are both published under the watch status lock,
+    ///   which is held across both reads. A request accepted, or a hint acknowledged, while
+    ///   this read runs is published wholly before it or wholly after it, never between.
+    ///
+    /// The watcher's live ingress generation is not published under a lock: a hint accepted
+    /// after this read is a later event, which the worker publishes.
     ///
     /// Lock order: the runtime state, then the watch status, as `set_runtime_state` and
     /// `request_retire` take them. Never the reverse (#1078).
     pub(crate) fn ready_and_quiet(&self) -> bool {
         let state = self.runtime.lock().unwrap();
-        if !matches!(*state, RuntimeState::Ready(_)) || self.fifo_pending() {
+        if !matches!(*state, RuntimeState::Ready(_)) {
+            return false;
+        }
+        let status = self.watch_status.lock().unwrap();
+        if self.fifo_pending() {
             return false;
         }
         #[cfg(test)]
         self.test_quiet_between_reads.run();
-        let status = self.watch_status.lock().unwrap();
         status.as_ref().is_some_and(|status| !status.pending())
     }
 
