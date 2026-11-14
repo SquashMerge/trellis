@@ -13107,7 +13107,7 @@ impl Store {
         mut before_commit: impl FnMut(&Connection) -> Result<()>,
         commit_loss: Option<CommitLoss>,
     ) -> Result<IndexPin> {
-        use crate::{batch_descriptor::Descriptor, semantic_batch::limits};
+        use crate::batch_descriptor::Descriptor;
         leader.belongs_to(&self.identity)?;
         self.identity.verify()?;
         check_cancel(cancel)?;
@@ -13127,7 +13127,7 @@ impl Store {
         let conn = self.cache_write()?;
         let db: &Connection = &conn;
         #[allow(unused_mut)]
-        let mut cache_kib = i64::try_from(limits::BATCH_WRITER_CACHE_KIB)?;
+        let mut cache_kib = i64::try_from(crate::semantic_batch::limits::BATCH_WRITER_CACHE_KIB)?;
         // A tiny writer cache makes a small test batch spill like a large producer's (#905).
         #[cfg(feature = "test-support")]
         if let Some(kib) = std::env::var("TRELLIS_TEST_BATCH_WRITER_CACHE_KIB")
@@ -13143,7 +13143,7 @@ impl Store {
         storage_result(db.pragma_update(
             Some("stage"),
             "cache_size",
-            -i64::try_from(limits::STAGE_ATTACH_CACHE_KIB)?,
+            -i64::try_from(crate::semantic_batch::limits::STAGE_ATTACH_CACHE_KIB)?,
         ))?;
         let gate = || -> Result<()> {
             check_cancel(cancel)?;
