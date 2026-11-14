@@ -144,7 +144,8 @@ The optional paired pin is supplied as `indexGeneration` and `indexRevision`. Fi
 `sourceSetId,language,path`; directory selectors require `sourceSetId,path` (empty path means the
 source-set root); declaration selectors require `sourceSetId,path,sid` and no language. Source-set IDs
 accept the emitted canonical `source-set:v1:path-<64 lowercase hex>` and
-`source-set:v1:<lowercase hyphenated UUID>` forms. Never derive a source-set ID from the browser root key.
+`source-set:v1:<lowercase hyphenated UUID>` forms; `trellis metrics --source-set-id` and its daemon
+request accept the same two forms (#984). Never derive a source-set ID from the browser root key.
 
 The optional `topCognitive=1..10` query adds `payload.topCognitive`; absent means this field is omitted.
 It contains at most the requested count of callable rows from the selected scope, ordered by raw

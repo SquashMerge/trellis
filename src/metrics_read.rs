@@ -105,10 +105,11 @@ impl MetricsOptions {
         Ok(())
     }
 
-    /// `validate`, then the identifier forms a transport accepts. Every
-    /// transport (CLI, daemon request, browser API) validates through this.
+    /// `validate`, then the identifier forms every transport (CLI, daemon
+    /// request, browser API) accepts. A source-set ID is either form the
+    /// index publishes: `source-set:v1:path-<hash>` or `source-set:v1:<UUID>`.
     /// The message names the first failing rule, in a fixed order.
-    pub fn validate_transport(&self, source_set_ids: MetricsSourceSetIds) -> Result<()> {
+    pub fn validate_transport(&self) -> Result<()> {
         fn lower_hex(text: &str) -> bool {
             text.bytes()
                 .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
@@ -122,9 +123,7 @@ impl MetricsOptions {
                 if let Some(hash) = identity.strip_prefix("path-") {
                     return hash.len() == 64 && lower_hex(hash);
                 }
-                source_set_ids == MetricsSourceSetIds::Current
-                    && uuid::Uuid::parse_str(identity)
-                        .is_ok_and(|uuid| uuid.to_string() == identity)
+                uuid::Uuid::parse_str(identity).is_ok_and(|uuid| uuid.to_string() == identity)
             }),
             "source set ID"
         );
@@ -161,15 +160,6 @@ impl MetricsOptions {
     }
 }
 
-/// Which source-set ID forms a metrics transport accepts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MetricsSourceSetIds {
-    /// Every current form: path-derived and UUID. The browser API.
-    Current,
-    /// Only `source-set:v1:path-<hash>`. The CLI and its daemon request
-    /// reject UUID source-set IDs today (#984).
-    PathOnly,
-}
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MetricsFileRow {

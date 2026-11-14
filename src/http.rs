@@ -4722,9 +4722,7 @@ fn metrics_query(uri: &axum::http::Uri) -> Result<crate::metrics_read::MetricsOp
         }
         options.metrics = names.split(',').map(str::to_owned).collect();
     }
-    options
-        .validate_transport(crate::metrics_read::MetricsSourceSetIds::Current)
-        .map_err(|_| invalid())?;
+    options.validate_transport().map_err(|_| invalid())?;
     Ok(options)
 }
 
