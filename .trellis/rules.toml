@@ -59,6 +59,9 @@ paths = [
   # The class reads, moved up from storage (S7, #1052): the class page and class diagram read
   # bodies, their forwarding methods and the presentation helpers. SQL until S14, as above.
   "src/class_read.rs",
+  # The Files reads, moved up from storage (S16): the outline and syntax-match read bodies
+  # and their forwarding methods. SQL until S14, as above.
+  "src/files_read.rs",
 ]
 
 [layers.indexing]
