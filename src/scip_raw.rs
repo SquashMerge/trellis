@@ -1647,6 +1647,8 @@ impl<R: Read> ScipDecodeContinuation<R> {
         })
     }
 
+    /// One top-level unit a call. This is the frame of every unit: the end of the input, the
+    /// unit's header, its buffer and its wire walk, then the unit's step. `Ok(None)` is a yield.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn advance<'s>(
         &mut self,
@@ -1659,32 +1661,7 @@ impl<R: Read> ScipDecodeContinuation<R> {
     ) -> Result<Option<ArtifactSummary>, ScipCaptureError> {
         cancelled(cancel)?;
         if self.input.remaining == 0 {
-            if let Some(meta) = self.metadata.as_ref() {
-                unknown(&meta.special_fields)?;
-                if known(meta.version)? != artifact.protocol_version
-                    || known(meta.text_document_encoding)? != artifact.text_document_encoding
-                    || !meta.project_root.is_empty()
-                        && meta.project_root != artifact.project_root_uri
-                {
-                    return Err(invalid("metadata binding"));
-                }
-                if let Some(tool) = meta.tool_info.as_ref() {
-                    unknown(&tool.special_fields)?;
-                    if !tool.name.is_empty() && tool.name != artifact.producer_id
-                        || !tool.version.is_empty() && tool.version != artifact.producer_version
-                    {
-                        return Err(invalid("tool binding"));
-                    }
-                }
-            }
-            if self.documents != artifact.assigned_documents {
-                return Err(invalid("missing artifact document"));
-            }
-            return Ok(Some(ArtifactSummary {
-                documents: self.documents,
-                external_symbols: self.external_symbols,
-                relationships: self.relationships,
-            }));
+            return self.finish(artifact).map(Some);
         }
         let mut budget = WireBudget::new(limits);
         budget.fields = counters.wire_fields;
@@ -1739,205 +1716,289 @@ impl<R: Read> ScipDecodeContinuation<R> {
                 .get_or_insert_with(types::Metadata::new)
                 .merge_from_bytes(&unit.bytes)
                 .map_err(|_| invalid("protobuf parse"))?,
-            3 => {
-                let s = types::SymbolInformation::parse_from_bytes(&unit.bytes)
-                    .map_err(|_| invalid("protobuf parse"))?;
-                self.traversed += 1;
-                if self.traversed.is_multiple_of(1024) {
-                    cancelled(cancel)?;
-                }
-                let _ = symbol(
-                    &s,
-                    artifact.position_encoding,
-                    cancel,
-                    &mut self.traversed,
-                    false,
-                )?;
+            3 => self.step_external_symbol(artifact, &unit, cancel)?,
+            _ => self.step_document(
+                artifact, resolve, &mut unit, &budget, max_unit, limits, sink, cancel,
+            )?,
+        }
+        self.relationships = budget.relationships;
+        Ok(None)
+    }
+
+    /// The end of the input: the merged metadata and the document count, then the summary.
+    fn finish(
+        &self,
+        artifact: &AuthenticatedArtifact<'_>,
+    ) -> Result<ArtifactSummary, ScipCaptureError> {
+        if let Some(meta) = self.metadata.as_ref() {
+            unknown(&meta.special_fields)?;
+            if known(meta.version)? != artifact.protocol_version
+                || known(meta.text_document_encoding)? != artifact.text_document_encoding
+                || !meta.project_root.is_empty() && meta.project_root != artifact.project_root_uri
+            {
+                return Err(invalid("metadata binding"));
             }
-            _ => {
-                let wire_digest = sha(&unit.bytes);
-                let mut cap = if budget.document_cap_exceeded {
-                    Some(DocumentCap::Document)
-                } else if budget.document_occurrences > limits.document_occurrences {
-                    Some(DocumentCap::Occurrences)
-                } else {
-                    None
-                };
-                let (d, source) = if let Some(over) = cap {
-                    let (path, language) = document_identity(&unit.bytes)?;
-                    if !valid_path(&path) {
-                        return Err(invalid("unlisted document"));
-                    }
-                    let source = resolve(&path, &language)?;
-                    let text = if unread(&source) {
-                        None
-                    } else {
-                        Some(
-                            std::str::from_utf8(&source.bytes)
-                                .map_err(|_| invalid("non-UTF8 source"))?,
-                        )
-                    };
-                    cap = Some(cap_document(
-                        &mut unit.bytes,
-                        artifact,
-                        &source.language,
-                        &path,
-                        text,
-                        over,
-                        limits,
-                        &mut self.traversed,
-                        cancel,
-                    )?);
-                    let d = types::Document::parse_from_bytes(&unit.bytes)
-                        .map_err(|_| invalid("protobuf parse"))?;
-                    unknown(&d.special_fields)?;
-                    (d, source)
-                } else {
-                    let mut d = types::Document::parse_from_bytes(&unit.bytes)
-                        .map_err(|_| invalid("protobuf parse"))?;
-                    unknown(&d.special_fields)?;
-                    if !valid_path(&d.relative_path) {
-                        return Err(invalid("unlisted document"));
-                    }
-                    let source = resolve(&d.relative_path, &d.language)?;
-                    let problem = d.occurrences.iter().enumerate().find_map(|(ordinal, o)| {
-                        range_problem(o, &source.language, &d.relative_path)
-                            .map(|values| (ordinal, values))
-                    });
-                    if let Some((ordinal, values)) = problem {
-                        // Owner ruling 2026-11-03 (#652): the document keeps no claim; the rest
-                        // of the artifact imports.
-                        report_invalid_range(&source.language, &d.relative_path, ordinal, values);
-                        let text = if unread(&source) {
-                            None
-                        } else {
-                            Some(
-                                std::str::from_utf8(&source.bytes)
-                                    .map_err(|_| invalid("non-UTF8 source"))?,
-                            )
-                        };
-                        let path = d.relative_path.clone();
-                        cap = Some(cap_document(
-                            &mut unit.bytes,
-                            artifact,
-                            &source.language,
-                            &path,
-                            text,
-                            DocumentCap::InvalidRange,
-                            limits,
-                            &mut self.traversed,
-                            cancel,
-                        )?);
-                        d = types::Document::parse_from_bytes(&unit.bytes)
-                            .map_err(|_| invalid("protobuf parse"))?;
-                    }
-                    (d, source)
-                };
-                // An unread source (#576) is admitted with no claims: the producer read the real
-                // file, so its text and positions can't be bound to the stored placeholder, and
-                // nothing it said there can be anchored. Every source-independent check still runs.
-                let read = !unread(&source);
-                sink.begin_document(&UnitDocument {
-                    path: &d.relative_path,
-                    language: &source.language,
-                    wire_digest: &wire_digest,
-                    cap: cap.filter(|_| read),
-                })?;
-                if read && !d.text.is_empty() && d.text.as_bytes() != source.bytes.as_ref() {
-                    return Err(invalid("document source binding"));
-                }
-                let raw = known(d.position_encoding)?;
-                if !(0..=3).contains(&raw)
-                    || raw != 0 && raw != i32::from(artifact.position_encoding)
+            if let Some(tool) = meta.tool_info.as_ref() {
+                unknown(&tool.special_fields)?;
+                if !tool.name.is_empty() && tool.name != artifact.producer_id
+                    || !tool.version.is_empty() && tool.version != artifact.producer_version
                 {
-                    return Err(invalid("position encoding"));
+                    return Err(invalid("tool binding"));
                 }
-                let reserved = reserve_document(&d, max_unit, cancel)?;
-                unit.counters.unit_reservation_high_water_bytes = unit
-                    .counters
-                    .unit_reservation_high_water_bytes
-                    .max(reserved as u64);
-                let text = if read {
+            }
+        }
+        if self.documents != artifact.assigned_documents {
+            return Err(invalid("missing artifact document"));
+        }
+        Ok(ArtifactSummary {
+            documents: self.documents,
+            external_symbols: self.external_symbols,
+            relationships: self.relationships,
+        })
+    }
+
+    /// One external-symbol unit: parsed and validated; it emits nothing.
+    fn step_external_symbol(
+        &mut self,
+        artifact: &AuthenticatedArtifact<'_>,
+        unit: &UnitBuffer<'_>,
+        cancel: &CancelFlag,
+    ) -> Result<(), ScipCaptureError> {
+        let s = types::SymbolInformation::parse_from_bytes(&unit.bytes)
+            .map_err(|_| invalid("protobuf parse"))?;
+        self.traversed += 1;
+        if self.traversed.is_multiple_of(1024) {
+            cancelled(cancel)?;
+        }
+        let _ = symbol(
+            &s,
+            artifact.position_encoding,
+            cancel,
+            &mut self.traversed,
+            false,
+        )?;
+        Ok(())
+    }
+
+    /// One document unit: admitted, announced to the sink, bound to its source, then emitted.
+    #[allow(clippy::too_many_arguments)]
+    fn step_document<'s>(
+        &mut self,
+        artifact: &AuthenticatedArtifact<'_>,
+        resolve: &mut dyn FnMut(&str, &str) -> Result<DocumentSource<'s>, ScipCaptureError>,
+        unit: &mut UnitBuffer<'_>,
+        budget: &WireBudget<'_>,
+        max_unit: usize,
+        limits: &BatchLimits,
+        sink: &mut dyn ClaimSink,
+        cancel: &CancelFlag,
+    ) -> Result<(), ScipCaptureError> {
+        let wire_digest = sha(&unit.bytes);
+        let (d, source, cap) =
+            self.admit_document(artifact, resolve, unit, budget, limits, cancel)?;
+        // An unread source (#576) is admitted with no claims: the producer read the real
+        // file, so its text and positions can't be bound to the stored placeholder, and
+        // nothing it said there can be anchored. Every source-independent check still runs.
+        let read = !unread(&source);
+        sink.begin_document(&UnitDocument {
+            path: &d.relative_path,
+            language: &source.language,
+            wire_digest: &wire_digest,
+            cap: cap.filter(|_| read),
+        })?;
+        if read && !d.text.is_empty() && d.text.as_bytes() != source.bytes.as_ref() {
+            return Err(invalid("document source binding"));
+        }
+        let raw = known(d.position_encoding)?;
+        if !(0..=3).contains(&raw) || raw != 0 && raw != i32::from(artifact.position_encoding) {
+            return Err(invalid("position encoding"));
+        }
+        let reserved = reserve_document(&d, max_unit, cancel)?;
+        unit.counters.unit_reservation_high_water_bytes = unit
+            .counters
+            .unit_reservation_high_water_bytes
+            .max(reserved as u64);
+        let text = if read {
+            Some(std::str::from_utf8(&source.bytes).map_err(|_| invalid("non-UTF8 source"))?)
+        } else {
+            None
+        };
+        self.emit_occurrences(artifact, &d, &source, read, text, sink, cancel)?;
+        self.emit_symbols(artifact, &d, &source, read, sink, cancel)?;
+        sink.end_document()?;
+        self.documents += 1;
+        Ok(())
+    }
+
+    /// The document's cap, its parse and its source. A document over a cap, or with an invalid
+    /// range, is cut down in the unit's buffer and parsed again.
+    fn admit_document<'s>(
+        &mut self,
+        artifact: &AuthenticatedArtifact<'_>,
+        resolve: &mut dyn FnMut(&str, &str) -> Result<DocumentSource<'s>, ScipCaptureError>,
+        unit: &mut UnitBuffer<'_>,
+        budget: &WireBudget<'_>,
+        limits: &BatchLimits,
+        cancel: &CancelFlag,
+    ) -> Result<(types::Document, DocumentSource<'s>, Option<DocumentCap>), ScipCaptureError> {
+        let mut cap = if budget.document_cap_exceeded {
+            Some(DocumentCap::Document)
+        } else if budget.document_occurrences > limits.document_occurrences {
+            Some(DocumentCap::Occurrences)
+        } else {
+            None
+        };
+        let (d, source) = if let Some(over) = cap {
+            let (path, language) = document_identity(&unit.bytes)?;
+            if !valid_path(&path) {
+                return Err(invalid("unlisted document"));
+            }
+            let source = resolve(&path, &language)?;
+            let text = if unread(&source) {
+                None
+            } else {
+                Some(std::str::from_utf8(&source.bytes).map_err(|_| invalid("non-UTF8 source"))?)
+            };
+            cap = Some(cap_document(
+                &mut unit.bytes,
+                artifact,
+                &source.language,
+                &path,
+                text,
+                over,
+                limits,
+                &mut self.traversed,
+                cancel,
+            )?);
+            let d = types::Document::parse_from_bytes(&unit.bytes)
+                .map_err(|_| invalid("protobuf parse"))?;
+            unknown(&d.special_fields)?;
+            (d, source)
+        } else {
+            let mut d = types::Document::parse_from_bytes(&unit.bytes)
+                .map_err(|_| invalid("protobuf parse"))?;
+            unknown(&d.special_fields)?;
+            if !valid_path(&d.relative_path) {
+                return Err(invalid("unlisted document"));
+            }
+            let source = resolve(&d.relative_path, &d.language)?;
+            let problem = d.occurrences.iter().enumerate().find_map(|(ordinal, o)| {
+                range_problem(o, &source.language, &d.relative_path).map(|values| (ordinal, values))
+            });
+            if let Some((ordinal, values)) = problem {
+                // Owner ruling 2026-11-03 (#652): the document keeps no claim; the rest
+                // of the artifact imports.
+                report_invalid_range(&source.language, &d.relative_path, ordinal, values);
+                let text = if unread(&source) {
+                    None
+                } else {
                     Some(
                         std::str::from_utf8(&source.bytes)
                             .map_err(|_| invalid("non-UTF8 source"))?,
                     )
-                } else {
-                    None
                 };
-                let mut positions = Vec::with_capacity(d.occurrences.len() * 4);
-                let mut unresolved_markers = Vec::new();
-                for o in &d.occurrences {
-                    self.traversed += 1;
-                    if self.traversed.is_multiple_of(1024) {
-                        cancelled(cancel)?;
-                    }
-                    let first = positions.len();
-                    let raw = occurrence(o, &mut positions, false)?;
-                    if unresolved_module_marker(artifact, &source.language, &d.relative_path, o) {
-                        unresolved_markers.push((positions[first], positions[first + 1]));
-                    }
-                    if read {
-                        sink.claim(make_claim(
-                            artifact,
-                            &d,
-                            &source.language,
-                            "occurrence",
-                            raw,
-                        ))?;
-                    }
-                }
-                if let Some(text) = text {
-                    validate_positions(text, artifact.position_encoding, &mut positions, cancel)?;
-                    check_module_markers(
-                        text,
-                        artifact.position_encoding,
-                        &unresolved_markers,
-                        cancel,
-                    )?;
-                }
-                for s in &d.symbols {
-                    self.traversed += 1;
-                    if self.traversed.is_multiple_of(1024) {
-                        cancelled(cancel)?;
-                    }
-                    let (info, rels) = symbol(
-                        s,
-                        artifact.position_encoding,
-                        cancel,
-                        &mut self.traversed,
-                        true,
-                    )?;
-                    if !read {
-                        continue;
-                    }
-                    sink.claim(make_claim(
-                        artifact,
-                        &d,
-                        &source.language,
-                        "symbolInformation",
-                        info,
-                    ))?;
-                    for r in rels {
-                        self.traversed += 1;
-                        if self.traversed.is_multiple_of(1024) {
-                            cancelled(cancel)?;
-                        }
-                        sink.claim(make_claim(
-                            artifact,
-                            &d,
-                            &source.language,
-                            "relationship",
-                            r,
-                        ))?;
-                    }
-                }
-                sink.end_document()?;
-                self.documents += 1;
+                let path = d.relative_path.clone();
+                cap = Some(cap_document(
+                    &mut unit.bytes,
+                    artifact,
+                    &source.language,
+                    &path,
+                    text,
+                    DocumentCap::InvalidRange,
+                    limits,
+                    &mut self.traversed,
+                    cancel,
+                )?);
+                d = types::Document::parse_from_bytes(&unit.bytes)
+                    .map_err(|_| invalid("protobuf parse"))?;
+            }
+            (d, source)
+        };
+        Ok((d, source, cap))
+    }
+
+    /// The document's occurrences, claimed in order when its source was read, then their
+    /// positions checked against the source text.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_occurrences(
+        &mut self,
+        artifact: &AuthenticatedArtifact<'_>,
+        d: &types::Document,
+        source: &DocumentSource<'_>,
+        read: bool,
+        text: Option<&str>,
+        sink: &mut dyn ClaimSink,
+        cancel: &CancelFlag,
+    ) -> Result<(), ScipCaptureError> {
+        let mut positions = Vec::with_capacity(d.occurrences.len() * 4);
+        let mut unresolved_markers = Vec::new();
+        for o in &d.occurrences {
+            self.traversed += 1;
+            if self.traversed.is_multiple_of(1024) {
+                cancelled(cancel)?;
+            }
+            let first = positions.len();
+            let raw = occurrence(o, &mut positions, false)?;
+            if unresolved_module_marker(artifact, &source.language, &d.relative_path, o) {
+                unresolved_markers.push((positions[first], positions[first + 1]));
+            }
+            if read {
+                sink.claim(make_claim(artifact, d, &source.language, "occurrence", raw))?;
             }
         }
-        self.relationships = budget.relationships;
-        Ok(None)
+        if let Some(text) = text {
+            validate_positions(text, artifact.position_encoding, &mut positions, cancel)?;
+            check_module_markers(
+                text,
+                artifact.position_encoding,
+                &unresolved_markers,
+                cancel,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The document's symbols and their relationships, claimed in order when its source was read.
+    fn emit_symbols(
+        &mut self,
+        artifact: &AuthenticatedArtifact<'_>,
+        d: &types::Document,
+        source: &DocumentSource<'_>,
+        read: bool,
+        sink: &mut dyn ClaimSink,
+        cancel: &CancelFlag,
+    ) -> Result<(), ScipCaptureError> {
+        for s in &d.symbols {
+            self.traversed += 1;
+            if self.traversed.is_multiple_of(1024) {
+                cancelled(cancel)?;
+            }
+            let (info, rels) = symbol(
+                s,
+                artifact.position_encoding,
+                cancel,
+                &mut self.traversed,
+                true,
+            )?;
+            if !read {
+                continue;
+            }
+            sink.claim(make_claim(
+                artifact,
+                d,
+                &source.language,
+                "symbolInformation",
+                info,
+            ))?;
+            for r in rels {
+                self.traversed += 1;
+                if self.traversed.is_multiple_of(1024) {
+                    cancelled(cancel)?;
+                }
+                sink.claim(make_claim(artifact, d, &source.language, "relationship", r))?;
+            }
+        }
+        Ok(())
     }
 }
 
