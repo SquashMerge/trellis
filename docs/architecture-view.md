@@ -28,7 +28,8 @@ fixed path, line and column, without a partial diagram.
 Layer edges count reference **sites**, not module pairs or rule-check instances.
 Production references are solid. Test references are dashed and toggleable. Site
 roles ([rules](rules.md#production-and-test-evidence)) determine this split: `cfg(test)` is test, while `cfg(feature="test-support")`
-remains production under Decision 0011. The **Test-only edges** overlay does not change production reference totals,
+remains production under Decision 0011 unless the rules file names the feature in
+[`test_features`](rules.md#amendment-988-test-features). The **Test-only edges** overlay does not change production reference totals,
 policy or metric role selection. The separate **Include tests and fixtures in metrics** checkbox changes heat
 without changing which reference edges are shown.
 

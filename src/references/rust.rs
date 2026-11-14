@@ -1957,56 +1957,113 @@ pub(super) fn extract(
     Ok(result)
 }
 
-/// Whether the syntax at `start..end`, or anything enclosing it, carries an outer attribute
-/// that marks test code under Decision 0011 (#988). Attributes are a node's preceding
-/// siblings, or its leading children for a match arm, which owns its own.
-pub(super) fn under_test_attribute(
+/// What the attributes on and around one site say about it (#988).
+#[derive(Default)]
+pub(super) struct SiteMarks {
+    /// An outer attribute marks test code under Decision 0011.
+    pub(super) test: bool,
+    /// The features of the `cfg(feature = "..")` gates on the site, sorted and distinct.
+    pub(super) features: Vec<String>,
+}
+
+/// A Cargo feature name a rules file may name and a gate may carry.
+pub(crate) fn feature_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    name.len() <= 64
+        && chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+' | '.'))
+}
+
+/// The feature of a gate that is exactly `cfg(feature = "name")` or `cfg(any(test, feature =
+/// "name"))`, whitespace aside, as an outer or inner attribute. Any other condition names none.
+fn feature_gate(attribute: &str) -> Option<String> {
+    if !attribute.contains("feature") {
+        return None;
+    }
+    let compact: String = attribute.chars().filter(|c| !c.is_whitespace()).collect();
+    let condition = compact
+        .strip_prefix("#![cfg(")
+        .or_else(|| compact.strip_prefix("#[cfg("))?
+        .strip_suffix(")]")?;
+    let operand = match condition
+        .strip_prefix("any(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        Some(list) => list
+            .strip_prefix("test,")
+            .or_else(|| list.strip_suffix(",test"))?,
+        None => condition,
+    };
+    let name = operand.strip_prefix("feature=\"")?.strip_suffix('"')?;
+    feature_name(name).then(|| name.to_owned())
+}
+
+/// The marks of the syntax at `start..end` and of everything enclosing it. Outer attributes
+/// are a node's preceding siblings, or its leading children for a match arm, which owns its
+/// own; inner attributes lead the file, module body or block they apply to. A test marker is
+/// an outer attribute only: the producer already stores an inner one on its declaration.
+pub(super) fn site_marks(
     doc: &DocumentInput,
     tree: &Tree,
     start: usize,
     end: usize,
     work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
-) -> Result<bool> {
-    let marks = |node: Node<'_>| {
-        node.kind() == "attribute_item"
-            && crate::native_evidence::rust_test_attribute(node, &doc.file)
-    };
+) -> Result<SiteMarks> {
+    let outer = |node: Node<'_>| node.kind() == "attribute_item";
     let passes = |node: Node<'_>| {
         matches!(
             node.kind(),
-            "attribute_item" | "line_comment" | "block_comment"
+            "attribute_item" | "inner_attribute_item" | "line_comment" | "block_comment"
         )
     };
+    let mut features = BTreeSet::new();
     let mut current = tree.root_node().descendant_for_byte_range(start, end);
     while let Some(node) = current {
         owner_step(work, check)?;
         let mut previous = node.prev_named_sibling();
         while let Some(sibling) = previous {
             owner_step(work, check)?;
-            if marks(sibling) {
-                return Ok(true);
-            }
             if !passes(sibling) {
                 break;
             }
+            if outer(sibling) {
+                if crate::native_evidence::rust_test_attribute(sibling, &doc.file) {
+                    return Ok(SiteMarks {
+                        test: true,
+                        features: Vec::new(),
+                    });
+                }
+                features.extend(feature_gate(text(doc, sibling)));
+            }
             previous = sibling.prev_named_sibling();
         }
-        if node.kind() == "match_arm" {
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                owner_step(work, check)?;
-                if marks(child) {
-                    return Ok(true);
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            owner_step(work, check)?;
+            if !passes(child) {
+                break;
+            }
+            if child.kind() == "inner_attribute_item" {
+                features.extend(feature_gate(text(doc, child)));
+            } else if outer(child) && node.kind() == "match_arm" {
+                if crate::native_evidence::rust_test_attribute(child, &doc.file) {
+                    return Ok(SiteMarks {
+                        test: true,
+                        features: Vec::new(),
+                    });
                 }
-                if !passes(child) {
-                    break;
-                }
+                features.extend(feature_gate(text(doc, child)));
             }
         }
         current = node.parent();
     }
-    Ok(false)
+    Ok(SiteMarks {
+        test: false,
+        features: features.into_iter().collect(),
+    })
 }
 
 /// The path of module `name` in module directory `directory` (`""` is the checkout's).

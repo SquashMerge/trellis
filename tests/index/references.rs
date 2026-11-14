@@ -376,6 +376,139 @@ struct Fields {
     assert_eq!(unresolved[0]["site"]["role"], "test");
 }
 
+/// #988: a read that names test features reports the production sites under their gates as
+/// test. Without the name, and for any other gate, nothing changes.
+#[test]
+fn references_rust_named_test_feature_gates_are_test_at_read_time() {
+    let source = r#"
+mod store;
+mod gated;
+fn production() {
+    crate::store::plain();
+    #[cfg(feature = "test-support")]
+    crate::store::statement();
+    crate::store::plain();
+    match 1 { #[cfg( feature="test-support" )] 2 => crate::store::arm(), _ => {} }
+    #[cfg(any(test, feature = "test-support"))]
+    crate::store::any_test();
+    #[cfg(any(feature = "test-support", test))]
+    crate::store::any_test();
+    #[cfg(feature = "other")]
+    crate::store::other();
+    #[cfg(not(feature = "test-support"))]
+    crate::store::negated();
+    #[cfg(all(feature = "test-support", unix))]
+    crate::store::all();
+    #[cfg(any(feature = "test-support", unix))]
+    crate::store::any_other();
+}
+#[cfg(feature = "test-support")]
+fn seam() { crate::store::seam(); }
+mod inline {
+    #![cfg(feature = "test-support")]
+    fn f() { crate::store::inline(); }
+}
+"#;
+    let input = snapshot(&[
+        ("src/lib.rs", source),
+        (
+            "src/gated.rs",
+            "//! Fixtures.\n#![cfg(feature = \"test-support\")]\nfn f() { crate::store::file(); }",
+        ),
+        (
+            "src/store.rs",
+            "pub fn plain() {} pub fn statement() {} pub fn arm() {} pub fn any_test() {} \
+             pub fn other() {} pub fn negated() {} pub fn all() {} pub fn any_other() {} \
+             pub fn seam() {} pub fn inline() {} pub fn file() {}",
+        ),
+    ]);
+    let read = |features: &[&str]| {
+        let features: Vec<String> = features.iter().map(|f| (*f).to_owned()).collect();
+        references::project_where(&input, &[], None, None, &features, 20, &mut || Ok(()))
+            .unwrap()
+            .data
+    };
+    let spellings = |data: &Value, role: &str, source: &str| -> Vec<String> {
+        data[role]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|pair| pair["source"]["path"] == source)
+            .flat_map(|pair| pair["sites"].as_array().unwrap())
+            .map(|site| {
+                assert_eq!(
+                    site["role"],
+                    if role == "tests" {
+                        "test"
+                    } else {
+                        "production"
+                    }
+                );
+                site["spelling"]
+                    .as_str()
+                    .unwrap()
+                    .trim_start_matches("crate::store::")
+                    .to_owned()
+            })
+            .collect()
+    };
+
+    // No key: today's answer exactly, in the stored order.
+    let default = read(&[]);
+    assert_eq!(default, project(&input));
+    assert_eq!(default, read(&["unused"]));
+    assert!(default["tests"].as_array().unwrap().is_empty());
+    assert_eq!(
+        spellings(&default, "production", "src/lib.rs"),
+        [
+            "plain",
+            "statement",
+            "plain",
+            "arm",
+            "any_test",
+            "any_test",
+            "other",
+            "negated",
+            "all",
+            "any_other",
+            "seam",
+            "inline"
+        ]
+    );
+    let production = edge(&default, "production", "src/lib.rs", "src/store.rs");
+    assert_eq!(production["count"], 12);
+    assert_eq!(production["kindCounts"]["call"], 12);
+
+    let named = read(&["test-support"]);
+    assert_eq!(
+        spellings(&named, "production", "src/lib.rs"),
+        ["plain", "plain", "other", "negated", "all", "any_other"]
+    );
+    assert_eq!(
+        spellings(&named, "tests", "src/lib.rs"),
+        ["statement", "arm", "any_test", "any_test", "seam", "inline"]
+    );
+    assert_eq!(spellings(&named, "tests", "src/gated.rs"), ["file"]);
+    assert!(spellings(&named, "production", "src/gated.rs").is_empty());
+    let production = edge(&named, "production", "src/lib.rs", "src/store.rs");
+    let tests = edge(&named, "tests", "src/lib.rs", "src/store.rs");
+    assert_eq!(production["count"], 6);
+    assert_eq!(tests["count"], 6);
+    assert_eq!(tests["kindCounts"]["call"], 6);
+    // Only the roles move: the same sites are scanned and mapped.
+    assert_eq!(named["counts"], default["counts"]);
+    assert_eq!(named["modules"], default["modules"]);
+    // A second named feature marks its own gates too.
+    assert_eq!(
+        spellings(
+            &read(&["other", "test-support"]),
+            "production",
+            "src/lib.rs"
+        ),
+        ["plain", "plain", "negated", "all", "any_other"]
+    );
+}
+
 #[test]
 fn references_count_maximal_paths_and_use_stored_roles() {
     let input = snapshot(&[

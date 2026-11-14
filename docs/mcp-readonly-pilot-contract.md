@@ -1163,7 +1163,9 @@ sites, each marked `mapping:"semantic"` with its binding's provenance, and each 
 reports its `evidenceTier` and `semanticSites` (#523; see
 [rules](rules.md#semantic-bindings-523)).
 Decision 0011 roles separate production and tests: feature-only `test-support`
-remains production. A site's role is its enclosing declaration's stored role, or test
+remains production unless the rules file names the feature in
+[`test_features`](rules.md#amendment-988-test-features), which makes the reference sites
+under its gate test at read time. A site's role is its enclosing declaration's stored role, or test
 under a `cfg(test)` attribute on syntax that is no declaration
 ([rules](rules.md#production-and-test-evidence); #988, owner ruling 2026-11-14). Call/type constraints use only fresh selected bindings and stay
 unknown without them, never invented positive bindings. **Amendment (#936, owner
