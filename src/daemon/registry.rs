@@ -2563,7 +2563,11 @@ impl CheckoutRuntime {
     pub fn cli_symbols(&self, search: &str, limit: usize) -> anyhow::Result<serde_json::Value> {
         anyhow::ensure!((1..=150).contains(&limit), "limit must be 1..150");
         let (response, catching_up) = self.evidence_response()?;
-        let (revision, items) = response.symbols_at(search, limit)?;
+        // Corruption found by this read schedules the re-index, as on every other selected
+        // read (docs/local-topology.md, #261); the caller still gets the typed refusal (#903).
+        let (revision, items) = response
+            .symbols_at(search, limit)
+            .map_err(|error| response.report_index_failure(error))?;
         response.finish(())?;
         Ok(serde_json::json!({"catchingUp": catching_up,
             "data": {"revision": revision, "items": items}}))
@@ -2573,7 +2577,8 @@ impl CheckoutRuntime {
         query.validate()?;
         let (response, catching_up) = self.evidence_response()?;
         let view = response
-            .query_view(query)?
+            .query_view(query)
+            .map_err(|error| response.report_index_failure(error))?
             .ok_or_else(|| anyhow::anyhow!("seed not found in current index"))?;
         Ok(serde_json::json!({"catchingUp": catching_up,
             "data": response.finish(view)?}))
