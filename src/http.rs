@@ -2422,6 +2422,11 @@ pub const WEB_ASSETS: &[WebAsset] = &[
         include_bytes!("../web/context-menu.js"),
     ),
     web_asset("/pele-svg.js", JS, include_bytes!("../web/pele-svg.js")),
+    web_asset(
+        "/sequence-model.js",
+        JS,
+        include_bytes!("../web/sequence-model.js"),
+    ),
     web_asset("/sequence.js", JS, include_bytes!("../web/sequence.js")),
     web_asset(
         "/sequence-pele.js",

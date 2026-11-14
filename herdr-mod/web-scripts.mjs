@@ -26,8 +26,9 @@ const WEB = {
   "architecture-pele": { file: "architecture-pele.js", params: "window, document, DOMParser, TextEncoder", result: "window.TrellisArchitecturePele" },
   // The shared source-range check the two Sequence scripts read from `window`; load it first.
   "source-witness": { file: "source-witness.js", params: "window", result: "window.TrellisSourceWitness" },
-  // The language-neutral Sequence helpers (labels, lanes, display). It draws nothing itself (#1007).
-  sequence: { file: "sequence.js", params: "window, document", result: "window.TrellisSequence" },
+  // The language-neutral Sequence model (labels, lanes, display) and the per-container render owner
+  // the adapter takes (pure). The browser's empty and error states (sequence.js) are not bundled.
+  "sequence-model": { file: "sequence-model.js", params: "window", result: "window.TrellisSequence" },
   "sequence-pele": { file: "sequence-pele.js", params: "window, document, DOMParser, TextEncoder", result: "window.TrellisPeleSequence" },
 };
 

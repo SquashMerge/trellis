@@ -1,8 +1,8 @@
 // The Sequence diagram, drawn by the browser's own web/sequence-pele.js over the helpers in
-// web/sequence.js (labels, lanes, the Interactions display), both bundled unchanged, with the
+// web/sequence-model.js (labels, lanes, the Interactions display), both bundled unchanged, with the
 // shared headless Pele. Options are the browser's defaults: Interactions, details hidden.
 import makeSourceWitness from "trellis-web:source-witness";
-import makeSequence from "trellis-web:sequence";
+import makeSequence from "trellis-web:sequence-model";
 import makePeleSvg from "trellis-web:pele-svg";
 import makeSequencePele from "trellis-web:sequence-pele";
 import { DOMParser, TextEncoder, serialize } from "./dom.js";
@@ -11,7 +11,7 @@ import { FONT_FAMILY, document, measure, pele } from "./runtime.js";
 const env = { pele };
 // Both Sequence scripts read the shared source witness from their window.
 makeSourceWitness(env);
-export const helpers = makeSequence(env, document);
+export const helpers = makeSequence(env);
 // The adapter reads the shared Pele helpers from the same window.
 makePeleSvg(env, document, DOMParser, TextEncoder);
 const adapter = makeSequencePele(env, document, DOMParser, TextEncoder);

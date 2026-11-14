@@ -23,6 +23,7 @@ function harness(withApp = false) {
     fetch(path){requests.push(path);throw new Error("Unexpected request "+path);}});
   const run = code => vm.runInContext(code,context);
   run(fs.readFileSync("web/source-witness.js","utf8"));
+  run(fs.readFileSync("web/sequence-model.js","utf8"));
   run(fs.readFileSync("web/sequence.js","utf8"));
   run(fs.readFileSync("web/shell.js","utf8"));
   if(withApp){
