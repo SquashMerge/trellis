@@ -545,35 +545,82 @@ fn unchanged_serve_reuses_selected_versions_and_detects_selected_source_corrupti
     drop(db);
     drop(changed);
 
+    // The daemon outlives its serve clients, and its background owners read the selected
+    // documents too: the Architecture owner builds every new head. Corruption found by any
+    // selected read schedules a re-index (docs/local-topology.md, #261), so settle the
+    // checkout at its head first. The next read of the damaged source is then the `symbols`
+    // read below, not a background read whose re-index would answer it (#903).
+    let settle = || {
+        let mut settle = isolated_command(&home);
+        settle.env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"));
+        crate::child::settled(settle, &root, None)
+    };
+    let damaged = settle();
     let db = rusqlite::Connection::open(&dbpath).unwrap();
-    let selected_id = &next_ids.last().unwrap().1;
+    let (settled_rev, settled_ids) = pin_and_ids(&db);
+    assert_eq!(damaged["indexRevision"], settled_rev, "{damaged}");
+    let selected = settled_ids.last().unwrap();
+    assert_eq!(
+        (selected.0, selected.1),
+        (settled_rev, changed_ids.1),
+        "the settled head selects the published evidence"
+    );
+    let edited_bytes = fs::read(&file).unwrap();
     assert_eq!(
         db.execute(
             "UPDATE document_versions SET source_bytes=?1 WHERE vid=?2",
-            rusqlite::params![vec![b'x'; old_bytes.len()], selected_id]
+            rusqlite::params![vec![b'x'; edited_bytes.len()], selected.1]
         )
         .unwrap(),
         1
     );
     drop(db);
     let corrupt_log = temp.path().join("serve-corrupt.log");
+    // A repeated serve registration is inert: it starts no reconciliation and reads nothing.
     let rejected = serve(&root, &home, &corrupt_log);
-    // Attachment starts startup reconciliation; a selected read must still refuse the damaged head.
+    // The read hashes the selected source it would answer from: typed refusal, no data.
     let corrupt_selected = command(&root, &home, "symbols").output().unwrap();
+    let refusal = String::from_utf8_lossy(&corrupt_selected.stderr);
     assert!(
         !corrupt_selected.status.success(),
-        "corrupt selected corrupt was accepted"
+        "a read of the damaged selected source was answered: {}",
+        String::from_utf8_lossy(&corrupt_selected.stdout)
     );
     assert!(
         corrupt_selected.stdout.is_empty(),
-        "damaged selected corrupt escaped on stdout"
+        "damaged selected source escaped on stdout"
     );
+    assert!(
+        refusal.contains("incompatible_index: source hash mismatch"),
+        "untyped refusal: {refusal}"
+    );
+    // The refused read scheduled the re-index. Once it settles, the index is a new generation
+    // rebuilt from the working tree, and the same read is answered from it.
+    let repaired = settle();
+    assert_ne!(
+        repaired["indexGeneration"], damaged["indexGeneration"],
+        "the damaged generation was kept"
+    );
+    assert_eq!(repaired["indexRevision"], 1, "{repaired}");
+    let answered = command(&root, &home, "symbols").output().unwrap();
+    let answered = crate::child::cli_json(&answered, "symbols after the re-index");
+    assert_eq!(answered["data"]["revision"], repaired, "{answered}");
+    let names: Vec<&str> = answered["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["a.js", "sued"]);
     let db = rusqlite::Connection::open(&dbpath).unwrap();
-    assert_eq!(
-        pin_and_ids(&db),
-        (r3, next_ids.clone()),
-        "corrupt selected source was republished"
-    );
+    let stored: Vec<Vec<u8>> = db
+        .prepare("SELECT source_bytes FROM document_versions")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(stored, [edited_bytes], "the re-index kept damaged source");
     let headers: i64 = db
         .query_row("SELECT count(*) FROM native_revisions", [], |r| r.get(0))
         .unwrap();
@@ -584,8 +631,8 @@ fn unchanged_serve_reuses_selected_versions_and_detects_selected_source_corrupti
         .unwrap();
     assert_eq!(
         (headers, bindings),
-        (r3, r3),
-        "refused Serve installed partial metadata"
+        (1, 1),
+        "the re-index installed partial metadata"
     );
     drop(db);
     drop(rejected);

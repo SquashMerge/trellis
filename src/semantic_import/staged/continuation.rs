@@ -134,93 +134,40 @@ impl JoinContinuation {
             self.stage_base = stage_bytes(parts.conn)?;
         }
         let ctx = JoinCtx {
-            conn: parts.conn,
-            limits: self.limits.clone(),
-            budget: RefCell::new(budget.clone()),
-            live: LiveBudget::new(self.limits.unit_expansion_bytes),
-            counters: RefCell::new(BatchCounters::default()),
-            cache: RefCell::new(DocCache {
-                budget: self.limits.document_cache_bytes,
-                ..DocCache::default()
-            }),
             rows: Cell::new(self.rows),
             ledger: RefCell::new(std::mem::take(&mut self.ledger)),
-            passes: RefCell::new(Vec::new()),
-            stage_base: self.stage_base,
-            mutations: if shared {
-                DestinationMutations::default()
-            } else {
-                self.mutations
-            },
-            cancel: cancel.clone(),
-            unread: RefCell::default(),
-            proofs: RefCell::default(),
+            ..JoinCtx::new(
+                parts.conn,
+                &self.limits,
+                budget,
+                self.stage_base,
+                shared,
+                self.mutations,
+                cancel,
+            )
         };
         let producer = parts.producer.producer();
         let result = (|| {
             ctx.check_cancel()?;
             let captured_header = captured.header()?;
             let destination_header = destination_reader.header()?;
-            let descriptor = parts.descriptor;
-            let destination_rev = if shared { 0 } else { 1 };
-            let side = |reader, header, rev, side, filtered| StagedSide {
-                ctx: &ctx,
-                reader,
-                header,
-                rev,
-                side,
-                filtered,
-                document: None,
-                local_claims: None,
-                local_group: None,
-            };
-            let join = StagedJoin {
-                ctx: &ctx,
-                producer: &producer,
-                descriptor,
-                admitted_encoding: descriptor.producer.position_encoding,
-                captured: side(captured, &captured_header, 0, 0, false),
-                destination: side(
-                    destination_reader,
-                    &destination_header,
-                    destination_rev,
-                    1,
-                    false,
-                ),
-                filtered: side(
-                    destination_reader,
-                    &destination_header,
-                    destination_rev,
-                    1,
-                    true,
-                ),
-                destination_header: &destination_header,
-                reimport_context_matches: parts.reimport_destination
-                    == Some(destination_header.revision.id.as_str()),
-                validator: EmissionValidator::new(EmissionHeader {
-                    producer: &producer,
-                    captured_revision: captured_header.revision.clone(),
-                    destination_revision: destination_header.revision.clone(),
-                    source_set_languages: destination_header.source_set.languages.clone(),
-                    artifact_hashes: descriptor
-                        .artifacts
-                        .iter()
-                        .map(|a| a.sha256.clone())
-                        .collect(),
-                    source_manifest_hash: descriptor.source_manifest_hash.clone(),
-                }),
-                basis: StagedBasis {
-                    conn: ctx.conn,
-                    descriptor,
-                    producer: &producer,
-                    captured: &captured_header.revision,
+            let join = build_join(
+                &ctx,
+                &producer,
+                &parts,
+                JoinReaders {
+                    captured,
+                    captured_header: &captured_header,
+                    destination: destination_reader,
+                    destination_header: &destination_header,
                 },
-                emitted: Cell::new(self.emitted),
-                identical_joins: Cell::new(self.identical_joins),
-                identity_kind: descriptor.producer.identity_kind.as_str(),
-                descriptor_sha256: parts.descriptor_sha256,
-                witnessed: self.witnessed,
-            };
+                shared,
+                JoinResume {
+                    emitted: self.emitted,
+                    identical_joins: self.identical_joins,
+                    witnessed: self.witnessed,
+                },
+            );
             let result = in_transaction(ctx.conn, || self.unit(&join, shared));
             self.emitted = join.emitted.get();
             ctx.check_output()?;
@@ -260,430 +207,507 @@ impl JoinContinuation {
         ).optional()?)
     }
 
+    /// One bounded unit of the current phase. Each `step_*` function is one phase's unit: it
+    /// does the work of a single call and leaves the cursor where the next call resumes.
     fn unit(&mut self, join: &StagedJoin<'_>, shared: bool) -> Result<Option<JoinedBatch>> {
-        let conn = join.conn();
-        let captured_global =
-            || streaming::CompletedGlobal::new(join.ctx, 0, false, join.captured.source_set_id());
         match self.phase {
-            Phase::Start => {
-                // Invalidate any old seal before clearing its output, then delete bounded
-                // pages. The stage may still contain the original captured-witness join.
-                self.attempt = NEXT_ATTEMPT.fetch_add(1, Ordering::Relaxed) as i64;
-                conn.execute(
-                    "INSERT OR REPLACE INTO join_state VALUES(1,?1,?2,?3)",
-                    params![
-                        self.destination.index_generation.to_string(),
-                        self.destination.index_revision as i64,
-                        self.attempt
-                    ],
-                )?;
-                conn.execute_batch("CREATE TABLE IF NOT EXISTS continuation_symbol_keys(artifact INTEGER NOT NULL,key TEXT NOT NULL,symbol TEXT,scope TEXT NOT NULL,PRIMARY KEY(artifact,key));
-                    CREATE INDEX IF NOT EXISTS continuation_symbol_buckets ON continuation_symbol_keys(artifact,symbol,scope);
-                    CREATE TABLE IF NOT EXISTS continuation_closure_documents(language TEXT NOT NULL,path TEXT NOT NULL,PRIMARY KEY(language,path));")?;
-                self.transition(Phase::Reset);
-            }
-            Phase::Reset => {
-                let tables: Vec<&str> = JOIN_TABLES
-                    .iter()
-                    .copied()
-                    .chain(["continuation_symbol_keys", "continuation_closure_documents"])
-                    .collect();
-                if let Some(table) = tables.get(self.reset_table) {
-                    let key = match *table {
-                        "nat_declarations" => "rev,doc_ord,syntax_id,n",
-                        "g_definitions" => "side,symbol,local_doc,owner_doc,syntax_id",
-                        _ => "rowid",
-                    };
-                    let changed = conn.execute(&format!(
-                        "DELETE FROM {table} WHERE ({key}) IN (SELECT {key} FROM {table} LIMIT 128)"),[])?;
-                    if changed == 0 {
-                        self.reset_table += 1;
-                    }
-                } else {
-                    // Empty-table index creation does no whole-corpus work.
-                    for table in &OUTPUT_TABLES[1..] {
-                        conn.execute_batch(&format!(
-                            "CREATE INDEX IF NOT EXISTS continuation_{table}_doc ON {table}(doc)"
-                        ))?;
-                    }
-                    conn.execute_batch("CREATE INDEX IF NOT EXISTS continuation_coverage_key ON out_coverage(language,path)")?;
-                    self.transition(Phase::ClearDestinationInventory);
-                }
-            }
-            Phase::ClearDestinationInventory => {
-                let deleted = conn.execute(
-                    "DELETE FROM nat_docs WHERE rev=1 AND ord IN \
-                    (SELECT ord FROM nat_docs WHERE rev=1 ORDER BY ord LIMIT 128)",
-                    [],
-                )?;
-                if deleted == 0 {
-                    conn.execute("DELETE FROM nat_done WHERE rev=1", [])?;
-                    self.transition(Phase::Seed);
-                }
-            }
-            Phase::Seed => {
-                let page: Vec<i64> = conn
-                    .prepare_cached(
-                        "SELECT ord FROM nat_docs WHERE rev=0 AND ord>?1 ORDER BY ord LIMIT 128",
-                    )?
-                    .query_map([self.last], |row| row.get(0))?
-                    .collect::<rusqlite::Result<_>>()?;
-                join.ctx.reserve_rows(RETAINED_SEED, page.len() as u64)?;
-                if let Some(last) = page.last() {
-                    self.last = *last;
-                } else {
-                    self.transition(Phase::CapturedInventory);
-                }
-            }
+            Phase::Start => self.step_start(join)?,
+            Phase::Reset => self.step_reset(join)?,
+            Phase::ClearDestinationInventory => self.step_clear_destination_inventory(join)?,
+            Phase::Seed => self.step_seed(join)?,
             Phase::CapturedInventory | Phase::DestinationInventory => {
-                let rev = u8::from(self.phase == Phase::DestinationInventory);
-                let side = if rev == 0 {
-                    &join.captured
-                } else {
-                    &join.destination
-                };
-                if exists(conn, "SELECT 1 FROM nat_done WHERE rev=?1", &[&rev])? {
-                    self.transition(if shared || rev == 1 {
-                        if self.witnessed {
-                            Phase::WitnessTargets
-                        } else {
-                            Phase::CapturedDiscovery
-                        }
-                    } else {
-                        Phase::DestinationInventory
-                    });
-                    if shared {
-                        self.manifest = Some(SourceManifestHasher::new(side.source_set_id()));
-                    }
-                } else {
-                    let page = side.reader.canonical_inventory_page(
-                        &mut self.inventory_cursor,
-                        INVENTORY_PAGE_DOCUMENTS,
-                    )?;
-                    for document in &page {
-                        join.ctx.check_cancel()?;
-                        join.ctx.row("nat_docs")?;
-                        #[cfg(feature = "test-support")]
-                        if !self.witnessed && (rev == 1 || shared) {
-                            crate::semantic_import::note_destination_document();
-                        }
-                        self.last += 1;
-                        conn.prepare_cached("INSERT INTO nat_docs VALUES(?1,?2,?3,?4,?5,?6,NULL)")?
-                            .execute(params![
-                                rev,
-                                self.last,
-                                document.key.language,
-                                document.key.path,
-                                document.content_hash,
-                                document.byte_length as i64
-                            ])?;
-                    }
-                    if page.is_empty() {
-                        #[cfg(feature = "test-support")]
-                        if !self.witnessed && (rev == 1 || shared) {
-                            crate::semantic_import::note_destination_index_build();
-                        }
-                        conn.execute("INSERT INTO nat_done VALUES(?1)", [rev])?;
-                        self.transition(if shared || rev == 1 {
-                            if self.witnessed {
-                                Phase::WitnessTargets
-                            } else {
-                                Phase::CapturedDiscovery
-                            }
-                        } else {
-                            Phase::DestinationInventory
-                        });
-                        self.manifest =
-                            Some(SourceManifestHasher::new(join.destination.source_set_id()));
-                    }
-                }
+                self.step_inventory(join, shared)?
             }
             Phase::CapturedDiscovery | Phase::DestinationDiscovery => {
-                let captured = self.phase == Phase::CapturedDiscovery;
-                let side = if captured {
-                    &join.captured
-                } else {
-                    &join.filtered
-                };
-                if let Some((ord, document)) = self.document(join, side.rev)? {
-                    streaming::discover_document(
-                        side,
-                        join.admitted_encoding,
-                        if !captured {
-                            streaming::TargetStatus::OwnAndCaptured
-                        } else if shared {
-                            streaming::TargetStatus::Own
-                        } else {
-                            streaming::TargetStatus::None
-                        },
-                        &document,
-                    )?;
-                    self.last = ord;
-                } else if captured {
-                    self.identical_joins = shared;
-                    self.transition(Phase::ClaimInventory);
-                } else {
-                    self.transition(Phase::DestinationTargets);
-                }
+                self.step_discovery(join, shared)?
             }
-            Phase::ClaimInventory => {
-                let next: Option<(i64, String, String)> = conn
-                    .prepare_cached(
-                        "SELECT ord,language,path FROM sources WHERE ord>?1 ORDER BY ord LIMIT 1",
-                    )?
-                    .query_row([self.last], |row| {
-                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                    })
-                    .optional()?;
-                if let Some((ord, language, path)) = next {
-                    anyhow::ensure!(
-                        !exists(
-                            conn,
-                            "SELECT 1 FROM claims WHERE source_ord=?1 LIMIT 1",
-                            &[&ord]
-                        )? || exists(
-                            conn,
-                            "SELECT 1 FROM nat_docs WHERE rev=0 AND language=?1 AND path=?2",
-                            &[&language, &path]
-                        )?,
-                        "missing admitted claim document"
-                    );
-                    self.last = ord;
-                } else {
-                    self.transition(Phase::Eligibility);
-                }
-            }
-            Phase::Eligibility => {
-                if let Some((ord, document)) = self.document(join, 0)? {
-                    let (flags, joined) =
-                        join.eligibility_document(&document, &captured_global()?)?;
-                    if joined.is_some() && (!flags.eligible || flags.failed) {
-                        self.identical_joins = false;
-                    }
-                    self.last = ord;
-                } else {
-                    self.transition(if shared {
-                        Phase::Settlement
-                    } else {
-                        Phase::DestinationDiscovery
-                    });
-                }
-            }
-            Phase::DestinationTargets | Phase::CapturedTargets => {
-                let next: Option<(i64, String, String)> = conn
-                    .prepare_cached(
-                        "SELECT ord,language,path FROM sources WHERE ord>?1 ORDER BY ord LIMIT 1",
-                    )?
-                    .query_row([self.last], |row| {
-                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                    })
-                    .optional()?;
-                if let Some((ord, language, path)) = next {
-                    let document = native::DocumentKey {
-                        source_set_id: join.captured.source_set_id().to_owned(),
-                        language,
-                        path,
-                    };
-                    streaming::remaining_document_status(
-                        &join.captured,
-                        &join.destination,
-                        ord,
-                        &document,
-                        self.phase == Phase::CapturedTargets,
-                    )?;
-                    self.last = ord;
-                } else {
-                    self.transition(if self.phase == Phase::DestinationTargets {
-                        Phase::CapturedTargets
-                    } else {
-                        Phase::Settlement
-                    });
-                }
-            }
-            Phase::WitnessTargets => {
-                let mut statement = conn.prepare_cached(
-                    "SELECT rowid,rev,language,path,syntax_id,n,named,name_ok,method \
-                    FROM witness_target_status WHERE rowid>?1 ORDER BY rowid LIMIT 128",
-                )?;
-                let mut rows = statement.query([self.last])?;
-                let mut any = false;
-                while let Some(row) = rows.next()? {
-                    join.ctx.check_cancel()?;
-                    join.ctx.row("nat_declarations")?;
-                    let cursor: i64 = row.get(0)?;
-                    let bytes = [2usize, 3, 4].into_iter().try_fold(0u64, |total, column| {
-                        let bytes = row.get_ref(column)?.as_bytes()?.len() as u64;
-                        total.checked_add(bytes).ok_or_else(|| {
-                            anyhow::anyhow!(ScipCaptureError::LimitExceeded(
-                                "unit expansion".into()
-                            ))
-                        })
-                    })?;
-                    let _owned = join.ctx.live.reserve(bytes)?;
-                    conn.execute("INSERT INTO nat_declarations SELECT ?1,d.ord,?4,?5,?6,?7,?8 FROM nat_docs d \
-                        WHERE d.rev=?1 AND d.language=?2 AND d.path=?3",params![row.get::<_,u8>(1)?,row.get::<_,String>(2)?,
-                        row.get::<_,String>(3)?,row.get::<_,Vec<u8>>(4)?,row.get::<_,i64>(5)?,
-                        row.get::<_,bool>(6)?,row.get::<_,bool>(7)?,row.get::<_,bool>(8)?])?;
-                    self.last = cursor;
-                    any = true;
-                }
-                if !any {
-                    witness::check_complete(join)?;
-                    self.transition(Phase::Settlement);
-                }
-            }
-            Phase::Settlement => {
-                // The manifest is a separate bounded inventory pass. Never rescan the whole
-                // inventory for every settlement document.
-                if self.manifest_hash.is_empty() {
-                    let mut statement = conn.prepare_cached(
-                        "SELECT ord,language,path,content_hash FROM nat_docs WHERE rev=?1 AND ord>?2 ORDER BY ord LIMIT 128")?;
-                    let page = statement
-                        .query_map(params![join.destination.rev, self.last], |row| {
-                            Ok((
-                                row.get::<_, i64>(0)?,
-                                row.get::<_, String>(1)?,
-                                row.get::<_, String>(2)?,
-                                row.get::<_, String>(3)?,
-                            ))
-                        })?
-                        .collect::<rusqlite::Result<Vec<_>>>()?;
-                    let manifest = self.manifest.get_or_insert_with(|| {
-                        SourceManifestHasher::new(join.destination.source_set_id())
-                    });
-                    for (ord, language, path, hash) in &page {
-                        manifest.push(language, path, hash);
-                        self.last = *ord;
-                    }
-                    if page.is_empty() {
-                        self.manifest_hash =
-                            self.manifest.take().expect("manifest initialized").finish();
-                        self.last = -1;
-                    }
-                } else if let Some((ord, document)) = self.document(join, join.destination.rev)? {
-                    if self.witnessed && witness::copied(join, &document)? {
-                        self.last = ord;
-                        return Ok(None);
-                    }
-                    let captured = captured_global()?;
-                    let destination = if shared {
-                        captured.eligible_view()?
-                    } else {
-                        streaming::CompletedGlobal::new(
-                            join.ctx,
-                            1,
-                            false,
-                            join.destination.source_set_id(),
-                        )?
-                    };
-                    let (flags, excluded) = if self.witnessed {
-                        witness::document_flags(join, &document)?
-                    } else {
-                        join.document_flags(&document)?
-                    };
-                    let outcome = if flags.eligible && !flags.failed {
-                        join.settle_document(
-                            &document,
-                            &captured,
-                            &destination,
-                            &self.manifest_hash,
-                            None,
-                        )?
-                    } else {
-                        settle::DocumentOutcome::default()
-                    };
-                    join.document_coverage(
-                        &document,
-                        flags,
-                        excluded.as_deref(),
-                        &outcome,
-                        &mut self.tallies,
-                    )?;
-                    self.last = ord;
-                } else {
-                    #[cfg(feature = "test-support")]
-                    crate::semantic_batch::testing::run_before_closure_hook(conn);
-                    self.transition(Phase::Closure);
-                }
-            }
-            Phase::Closure => {
-                if let Some((ord, document)) = self.document(join, join.destination.rev)? {
-                    if !(self.witnessed && witness::copied(join, &document)?) {
-                        self.closure_document(join, &document)?;
-                    }
-                    self.last = ord;
-                } else {
-                    self.transition(Phase::OutputClosure);
-                }
-            }
-            Phase::OutputClosure => {
-                let next: Option<(i64,String,String)> = conn.prepare_cached("SELECT ord,language,path FROM out_coverage WHERE ord>?1 ORDER BY ord LIMIT 1")?.query_row(
-                    [self.last], |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
-                ).optional()?;
-                if let Some((ord, language, path)) = next {
-                    anyhow::ensure!(
-                        exists(
-                            conn,
-                            "SELECT 1 FROM continuation_closure_documents WHERE language=?1 AND path=?2",
-                            &[&language, &path]
-                        )?,
-                        "coverage on an unselected document"
-                    );
-                    anyhow::ensure!(
-                        !exists(
-                            conn,
-                            "SELECT 1 FROM out_coverage WHERE language=?1 AND path=?2 AND ord<>?3 LIMIT 1",
-                            &[&language, &path, &ord]
-                        )?,
-                        "duplicate coverage row"
-                    );
-                    self.last = ord;
-                } else {
-                    self.transition(Phase::OutputRows);
-                }
-            }
-            Phase::OutputRows => {
-                if let Some(table) = OUTPUT_TABLES.get(self.output_table) {
-                    let page = conn
-                        .prepare_cached(&format!(
-                            "SELECT ord,doc FROM {table} WHERE ord>?1 ORDER BY ord LIMIT 128"
-                        ))?
-                        .query_map([self.last], |row| {
-                            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-                        })?
-                        .collect::<rusqlite::Result<Vec<_>>>()?;
-                    for (ord, doc) in &page {
-                        join.ctx.check_cancel()?;
-                        anyhow::ensure!(
-                            exists(conn, "SELECT 1 FROM out_coverage WHERE ord=?1", &[doc])?,
-                            "semantic row without coverage"
-                        );
-                        self.last = *ord;
-                    }
-                    if page.is_empty() {
-                        self.output_table += 1;
-                        self.last = -1;
-                    }
-                } else {
-                    self.transition(Phase::Report);
-                }
-            }
-            Phase::Report => {
-                let report = join.report(std::mem::take(&mut self.tallies))?;
-                self.transition(Phase::Done);
-                return Ok(Some(JoinedBatch::seal(
-                    self.captured_pin.expect("captured identity initialized"),
-                    self.destination,
-                    join.destination_id().to_owned(),
-                    join.descriptor_sha256.to_owned(),
-                    self.attempt,
-                    report,
-                )));
-            }
+            Phase::ClaimInventory => self.step_claim_inventory(join)?,
+            Phase::Eligibility => self.step_eligibility(join, shared)?,
+            Phase::DestinationTargets | Phase::CapturedTargets => self.step_targets(join)?,
+            Phase::WitnessTargets => self.step_witness_targets(join)?,
+            // The manifest is a separate bounded inventory pass. Never rescan the whole
+            // inventory for every settlement document.
+            Phase::Settlement if self.manifest_hash.is_empty() => self.step_manifest(join)?,
+            Phase::Settlement => self.step_settlement(join, shared)?,
+            Phase::Closure => self.step_closure(join)?,
+            Phase::OutputClosure => self.step_output_closure(join)?,
+            Phase::OutputRows => self.step_output_rows(join)?,
+            Phase::Report => return self.step_report(join).map(Some),
             Phase::Done | Phase::Failed => anyhow::bail!("staged continuation is not active"),
         }
         Ok(None)
     }
+
+    /// The phase that follows one side's complete inventory.
+    fn after_inventory(&self, shared: bool, rev: u8) -> Phase {
+        if shared || rev == 1 {
+            if self.witnessed {
+                Phase::WitnessTargets
+            } else {
+                Phase::CapturedDiscovery
+            }
+        } else {
+            Phase::DestinationInventory
+        }
+    }
+
+    /// The admitted source after the cursor, in `sources` order.
+    fn next_source(&self, conn: &Connection) -> Result<Option<(i64, String, String)>> {
+        let next = conn
+            .prepare_cached(
+                "SELECT ord,language,path FROM sources WHERE ord>?1 ORDER BY ord LIMIT 1",
+            )?
+            .query_row([self.last], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .optional()?;
+        Ok(next)
+    }
+
+    fn step_start(&mut self, join: &StagedJoin<'_>) -> Result<()> {
+        let conn = join.conn();
+        // Invalidate any old seal before clearing its output, then delete bounded
+        // pages. The stage may still contain the original captured-witness join.
+        self.attempt = NEXT_ATTEMPT.fetch_add(1, Ordering::Relaxed) as i64;
+        conn.execute(
+            "INSERT OR REPLACE INTO join_state VALUES(1,?1,?2,?3)",
+            params![
+                self.destination.index_generation.to_string(),
+                self.destination.index_revision as i64,
+                self.attempt
+            ],
+        )?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS continuation_symbol_keys(artifact INTEGER NOT NULL,key TEXT NOT NULL,symbol TEXT,scope TEXT NOT NULL,PRIMARY KEY(artifact,key));
+                    CREATE INDEX IF NOT EXISTS continuation_symbol_buckets ON continuation_symbol_keys(artifact,symbol,scope);
+                    CREATE TABLE IF NOT EXISTS continuation_closure_documents(language TEXT NOT NULL,path TEXT NOT NULL,PRIMARY KEY(language,path));")?;
+        self.transition(Phase::Reset);
+        Ok(())
+    }
+
+    fn step_reset(&mut self, join: &StagedJoin<'_>) -> Result<()> {
+        let conn = join.conn();
+        let tables: Vec<&str> = JOIN_TABLES
+            .iter()
+            .copied()
+            .chain(["continuation_symbol_keys", "continuation_closure_documents"])
+            .collect();
+        if let Some(table) = tables.get(self.reset_table) {
+            let key = match *table {
+                "nat_declarations" => "rev,doc_ord,syntax_id,n",
+                "g_definitions" => "side,symbol,local_doc,owner_doc,syntax_id",
+                _ => "rowid",
+            };
+            let changed = conn.execute(
+                &format!(
+                    "DELETE FROM {table} WHERE ({key}) IN (SELECT {key} FROM {table} LIMIT 128)"
+                ),
+                [],
+            )?;
+            if changed == 0 {
+                self.reset_table += 1;
+            }
+        } else {
+            // Empty-table index creation does no whole-corpus work.
+            for table in &OUTPUT_TABLES[1..] {
+                conn.execute_batch(&format!(
+                    "CREATE INDEX IF NOT EXISTS continuation_{table}_doc ON {table}(doc)"
+                ))?;
+            }
+            conn.execute_batch("CREATE INDEX IF NOT EXISTS continuation_coverage_key ON out_coverage(language,path)")?;
+            self.transition(Phase::ClearDestinationInventory);
+        }
+        Ok(())
+    }
+
+    fn step_clear_destination_inventory(&mut self, join: &StagedJoin<'_>) -> Result<()> {
+        let conn = join.conn();
+        let deleted = conn.execute(
+            "DELETE FROM nat_docs WHERE rev=1 AND ord IN \
+            (SELECT ord FROM nat_docs WHERE rev=1 ORDER BY ord LIMIT 128)",
+            [],
+        )?;
+        if deleted == 0 {
+            conn.execute("DELETE FROM nat_done WHERE rev=1", [])?;
+            self.transition(Phase::Seed);
+        }
+        Ok(())
+    }
+
+    fn step_seed(&mut self, join: &StagedJoin<'_>) -> Result<()> {
+        let conn = join.conn();
+        let page: Vec<i64> = conn
+            .prepare_cached(
+                "SELECT ord FROM nat_docs WHERE rev=0 AND ord>?1 ORDER BY ord LIMIT 128",
+            )?
+            .query_map([self.last], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        join.ctx.reserve_rows(RETAINED_SEED, page.len() as u64)?;
+        if let Some(last) = page.last() {
+            self.last = *last;
+        } else {
+            self.transition(Phase::CapturedInventory);
+        }
+        Ok(())
+    }
+
+    fn step_inventory(&mut self, join: &StagedJoin<'_>, shared: bool) -> Result<()> {
+        let conn = join.conn();
+        let rev = u8::from(self.phase == Phase::DestinationInventory);
+        let side = if rev == 0 {
+            &join.captured
+        } else {
+            &join.destination
+        };
+        if exists(conn, "SELECT 1 FROM nat_done WHERE rev=?1", &[&rev])? {
+            self.transition(self.after_inventory(shared, rev));
+            if shared {
+                self.manifest = Some(SourceManifestHasher::new(side.source_set_id()));
+            }
+        } else {
+            let page = side
+                .reader
+                .canonical_inventory_page(&mut self.inventory_cursor, INVENTORY_PAGE_DOCUMENTS)?;
+            for document in &page {
+                join.ctx.check_cancel()?;
+                join.ctx.row("nat_docs")?;
+                #[cfg(feature = "test-support")]
+                if !self.witnessed && (rev == 1 || shared) {
+                    crate::semantic_import::note_destination_document();
+                }
+                self.last += 1;
+                conn.prepare_cached("INSERT INTO nat_docs VALUES(?1,?2,?3,?4,?5,?6,NULL)")?
+                    .execute(params![
+                        rev,
+                        self.last,
+                        document.key.language,
+                        document.key.path,
+                        document.content_hash,
+                        document.byte_length as i64
+                    ])?;
+            }
+            if page.is_empty() {
+                #[cfg(feature = "test-support")]
+                if !self.witnessed && (rev == 1 || shared) {
+                    crate::semantic_import::note_destination_index_build();
+                }
+                conn.execute("INSERT INTO nat_done VALUES(?1)", [rev])?;
+                self.transition(self.after_inventory(shared, rev));
+                self.manifest = Some(SourceManifestHasher::new(join.destination.source_set_id()));
+            }
+        }
+        Ok(())
+    }
+
+    fn step_discovery(&mut self, join: &StagedJoin<'_>, shared: bool) -> Result<()> {
+        let captured = self.phase == Phase::CapturedDiscovery;
+        let side = if captured {
+            &join.captured
+        } else {
+            &join.filtered
+        };
+        if let Some((ord, document)) = self.document(join, side.rev)? {
+            streaming::discover_document(
+                side,
+                join.admitted_encoding,
+                if !captured {
+                    streaming::TargetStatus::OwnAndCaptured
+                } else if shared {
+                    streaming::TargetStatus::Own
+                } else {
+                    streaming::TargetStatus::None
+                },
+                &document,
+            )?;
+            self.last = ord;
+        } else if captured {
+            self.identical_joins = shared;
+            self.transition(Phase::ClaimInventory);
+        } else {
+            self.transition(Phase::DestinationTargets);
+        }
+        Ok(())
+    }
+
+    fn step_claim_inventory(&mut self, join: &StagedJoin<'_>) -> Result<()> {
+        let conn = join.conn();
+        let next = self.next_source(conn)?;
+        if let Some((ord, language, path)) = next {
+            anyhow::ensure!(
+                !exists(
+                    conn,
+                    "SELECT 1 FROM claims WHERE source_ord=?1 LIMIT 1",
+                    &[&ord]
+                )? || exists(
+                    conn,
+                    "SELECT 1 FROM nat_docs WHERE rev=0 AND language=?1 AND path=?2",
+                    &[&language, &path]
+                )?,
+                "missing admitted claim document"
+            );
+            self.last = ord;
+        } else {
+            self.transition(Phase::Eligibility);
+        }
+        Ok(())
+    }
+
+    fn step_eligibility(&mut self, join: &StagedJoin<'_>, shared: bool) -> Result<()> {
+        if let Some((ord, document)) = self.document(join, 0)? {
+            let (flags, joined) = join.eligibility_document(&document, &captured_global(join)?)?;
+            if joined.is_some() && (!flags.eligible || flags.failed) {
+                self.identical_joins = false;
+            }
+            self.last = ord;
+        } else {
+            self.transition(if shared {
+                Phase::Settlement
+            } else {
+                Phase::DestinationDiscovery
+            });
+        }
+        Ok(())
+    }
+
+    fn step_targets(&mut self, join: &StagedJoin<'_>) -> Result<()> {
+        let conn = join.conn();
+        let next = self.next_source(conn)?;
+        if let Some((ord, language, path)) = next {
+            let document = native::DocumentKey {
+                source_set_id: join.captured.source_set_id().to_owned(),
+                language,
+                path,
+            };
+            streaming::remaining_document_status(
+                &join.captured,
+                &join.destination,
+                ord,
+                &document,
+                self.phase == Phase::CapturedTargets,
+            )?;
+            self.last = ord;
+        } else {
+            self.transition(if self.phase == Phase::DestinationTargets {
+                Phase::CapturedTargets
+            } else {
+                Phase::Settlement
+            });
+        }
+        Ok(())
+    }
+
+    fn step_witness_targets(&mut self, join: &StagedJoin<'_>) -> Result<()> {
+        let conn = join.conn();
+        let mut statement = conn.prepare_cached(
+            "SELECT rowid,rev,language,path,syntax_id,n,named,name_ok,method \
+            FROM witness_target_status WHERE rowid>?1 ORDER BY rowid LIMIT 128",
+        )?;
+        let mut rows = statement.query([self.last])?;
+        let mut any = false;
+        while let Some(row) = rows.next()? {
+            join.ctx.check_cancel()?;
+            join.ctx.row("nat_declarations")?;
+            let cursor: i64 = row.get(0)?;
+            let bytes = [2usize, 3, 4].into_iter().try_fold(0u64, |total, column| {
+                let bytes = row.get_ref(column)?.as_bytes()?.len() as u64;
+                total.checked_add(bytes).ok_or_else(|| {
+                    anyhow::anyhow!(ScipCaptureError::LimitExceeded("unit expansion".into()))
+                })
+            })?;
+            let _owned = join.ctx.live.reserve(bytes)?;
+            conn.execute(
+                "INSERT INTO nat_declarations SELECT ?1,d.ord,?4,?5,?6,?7,?8 FROM nat_docs d \
+                WHERE d.rev=?1 AND d.language=?2 AND d.path=?3",
+                params![
+                    row.get::<_, u8>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, bool>(6)?,
+                    row.get::<_, bool>(7)?,
+                    row.get::<_, bool>(8)?
+                ],
+            )?;
+            self.last = cursor;
+            any = true;
+        }
+        if !any {
+            witness::check_complete(join)?;
+            self.transition(Phase::Settlement);
+        }
+        Ok(())
+    }
+
+    /// The first units of settlement: the destination's source manifest hash, a page a call.
+    fn step_manifest(&mut self, join: &StagedJoin<'_>) -> Result<()> {
+        let conn = join.conn();
+        let mut statement = conn.prepare_cached(
+            "SELECT ord,language,path,content_hash FROM nat_docs WHERE rev=?1 AND ord>?2 ORDER BY ord LIMIT 128")?;
+        let page = statement
+            .query_map(params![join.destination.rev, self.last], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let manifest = self
+            .manifest
+            .get_or_insert_with(|| SourceManifestHasher::new(join.destination.source_set_id()));
+        for (ord, language, path, hash) in &page {
+            manifest.push(language, path, hash);
+            self.last = *ord;
+        }
+        if page.is_empty() {
+            self.manifest_hash = self.manifest.take().expect("manifest initialized").finish();
+            self.last = -1;
+        }
+        Ok(())
+    }
+
+    fn step_settlement(&mut self, join: &StagedJoin<'_>, shared: bool) -> Result<()> {
+        if let Some((ord, document)) = self.document(join, join.destination.rev)? {
+            if self.witnessed && witness::copied(join, &document)? {
+                self.last = ord;
+                return Ok(());
+            }
+            let captured = captured_global(join)?;
+            let destination = if shared {
+                captured.eligible_view()?
+            } else {
+                streaming::CompletedGlobal::new(
+                    join.ctx,
+                    1,
+                    false,
+                    join.destination.source_set_id(),
+                )?
+            };
+            let (flags, excluded) = if self.witnessed {
+                witness::document_flags(join, &document)?
+            } else {
+                join.document_flags(&document)?
+            };
+            let outcome = if flags.eligible && !flags.failed {
+                join.settle_document(
+                    &document,
+                    &captured,
+                    &destination,
+                    &self.manifest_hash,
+                    None,
+                )?
+            } else {
+                settle::DocumentOutcome::default()
+            };
+            join.document_coverage(
+                &document,
+                flags,
+                excluded.as_deref(),
+                &outcome,
+                &mut self.tallies,
+            )?;
+            self.last = ord;
+        } else {
+            #[cfg(feature = "test-support")]
+            crate::semantic_batch::testing::run_before_closure_hook(join.conn());
+            self.transition(Phase::Closure);
+        }
+        Ok(())
+    }
+
+    fn step_closure(&mut self, join: &StagedJoin<'_>) -> Result<()> {
+        if let Some((ord, document)) = self.document(join, join.destination.rev)? {
+            if !(self.witnessed && witness::copied(join, &document)?) {
+                self.closure_document(join, &document)?;
+            }
+            self.last = ord;
+        } else {
+            self.transition(Phase::OutputClosure);
+        }
+        Ok(())
+    }
+
+    fn step_output_closure(&mut self, join: &StagedJoin<'_>) -> Result<()> {
+        let conn = join.conn();
+        let next: Option<(i64, String, String)> = conn
+            .prepare_cached(
+                "SELECT ord,language,path FROM out_coverage WHERE ord>?1 ORDER BY ord LIMIT 1",
+            )?
+            .query_row([self.last], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .optional()?;
+        if let Some((ord, language, path)) = next {
+            anyhow::ensure!(
+                exists(
+                    conn,
+                    "SELECT 1 FROM continuation_closure_documents WHERE language=?1 AND path=?2",
+                    &[&language, &path]
+                )?,
+                "coverage on an unselected document"
+            );
+            anyhow::ensure!(
+                !exists(
+                    conn,
+                    "SELECT 1 FROM out_coverage WHERE language=?1 AND path=?2 AND ord<>?3 LIMIT 1",
+                    &[&language, &path, &ord]
+                )?,
+                "duplicate coverage row"
+            );
+            self.last = ord;
+        } else {
+            self.transition(Phase::OutputRows);
+        }
+        Ok(())
+    }
+
+    fn step_output_rows(&mut self, join: &StagedJoin<'_>) -> Result<()> {
+        let conn = join.conn();
+        if let Some(table) = OUTPUT_TABLES.get(self.output_table) {
+            let page = conn
+                .prepare_cached(&format!(
+                    "SELECT ord,doc FROM {table} WHERE ord>?1 ORDER BY ord LIMIT 128"
+                ))?
+                .query_map([self.last], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for (ord, doc) in &page {
+                join.ctx.check_cancel()?;
+                anyhow::ensure!(
+                    exists(conn, "SELECT 1 FROM out_coverage WHERE ord=?1", &[doc])?,
+                    "semantic row without coverage"
+                );
+                self.last = *ord;
+            }
+            if page.is_empty() {
+                self.output_table += 1;
+                self.last = -1;
+            }
+        } else {
+            self.transition(Phase::Report);
+        }
+        Ok(())
+    }
+
+    fn step_report(&mut self, join: &StagedJoin<'_>) -> Result<JoinedBatch> {
+        let report = join.report(std::mem::take(&mut self.tallies))?;
+        self.transition(Phase::Done);
+        Ok(JoinedBatch::seal(
+            self.captured_pin.expect("captured identity initialized"),
+            self.destination,
+            join.destination_id().to_owned(),
+            join.descriptor_sha256.to_owned(),
+            self.attempt,
+            report,
+        ))
+    }
+}
+
+/// The captured side's completed global rows, with a live reservation for their source set.
+fn captured_global<'a>(join: &StagedJoin<'a>) -> Result<streaming::CompletedGlobal<'a>> {
+    streaming::CompletedGlobal::new(join.ctx, 0, false, join.captured.source_set_id())
 }
 
 impl JoinContinuation {
