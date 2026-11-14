@@ -15,6 +15,7 @@ pub mod build_info;
 pub mod capture;
 pub mod capture_records;
 pub mod class_diagram;
+mod class_read;
 pub mod classes;
 pub mod daemon;
 pub mod dependencies;
