@@ -4061,3 +4061,149 @@ async fn settled_waits_for_the_architecture_build_owed_for_a_new_head() {
     assert_eq!(settled, head);
     assert_eq!(scheduler.architecture_builds_for_tests(), builds + 1);
 }
+
+/// A settled checkout whose selected document's stored source no longer matches its recorded
+/// hash: the same-length damage an external write leaves behind (#903). Returns the runtime,
+/// the head it was settled at and the index database.
+#[cfg(feature = "test-support")]
+async fn settled_checkout_for_source_damage(
+    base: &Path,
+    registry: &mut CheckoutRegistry,
+) -> (
+    std::sync::Arc<trellis::daemon::registry::CheckoutRuntime>,
+    trellis::model::IndexPin,
+    std::path::PathBuf,
+) {
+    let checkout = base.join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function seed() { return 42; }\n").unwrap();
+    let id = identity(&checkout);
+    registry.attach_launch(1, &id).unwrap();
+    let runtime = registry.activate(&id.root_key).unwrap();
+    let head = runtime
+        .settled_for_tests(None)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    (runtime, head, roots(base).index_db(&id))
+}
+
+/// Overwrites the selected document's stored source with same-length bytes, leaving its
+/// recorded hash and derived rows alone.
+#[cfg(feature = "test-support")]
+fn damage_selected_source(index_db: &Path) {
+    let db = rusqlite::Connection::open(index_db).unwrap();
+    assert_eq!(
+        db.execute(
+            "UPDATE document_versions SET source_bytes=zeroblob(length(source_bytes))
+             WHERE vid IN (SELECT m.vid FROM revision_documents m
+               JOIN native_revisions r ON r.id=m.revision_id
+               JOIN index_metadata i ON r.published_index_revision=i.index_revision)",
+            [],
+        )
+        .unwrap(),
+        1
+    );
+}
+
+/// What the index holds once the re-index has settled: a new generation at revision 1 whose
+/// only stored source is the working tree's, and a `symbols` read answered from it.
+#[cfg(feature = "test-support")]
+async fn assert_reindexed_from_the_working_tree(
+    runtime: &std::sync::Arc<trellis::daemon::registry::CheckoutRuntime>,
+    damaged: trellis::model::IndexPin,
+    index_db: &Path,
+) {
+    let repaired = runtime
+        .settled_for_tests(None)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_ne!(repaired.index_generation, damaged.index_generation);
+    assert_eq!(repaired.index_revision, 1);
+    let symbols = runtime.cli_symbols("", 50).unwrap();
+    assert_eq!(
+        symbols["data"]["revision"],
+        serde_json::to_value(repaired).unwrap()
+    );
+    let names: Vec<&str> = symbols["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["a.js", "seed"]);
+    let db = rusqlite::Connection::open(index_db).unwrap();
+    let stored: Vec<Vec<u8>> = db
+        .prepare("SELECT source_bytes FROM document_versions")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(stored, [b"function seed() { return 42; }\n".to_vec()]);
+}
+
+/// #903, the read first. With every background owner idle at the head, the CLI `symbols` read
+/// is the first to read the damaged source: it is refused typed, with no data, and it
+/// schedules the re-index (docs/local-topology.md: a source BLOB whose hash disagrees "is
+/// corruption and schedules a re-index"). The worker then rebuilds from the working tree.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_cli_read_of_a_damaged_selected_source_is_refused_and_schedules_the_reindex() {
+    let base = tempfile::tempdir().unwrap();
+    let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
+    let (runtime, damaged, index_db) =
+        settled_checkout_for_source_damage(base.path(), &mut registry).await;
+    damage_selected_source(&index_db);
+    let refused = runtime.cli_symbols("", 50).unwrap_err();
+    assert_eq!(
+        refused.to_string(),
+        "incompatible_index: source hash mismatch"
+    );
+    assert_reindexed_from_the_working_tree(&runtime, damaged, &index_db).await;
+}
+
+/// #903, the background owner first. The Architecture owner's turn is held before it admits
+/// its read, the source is damaged, and the turn is released: the owner's read finds the
+/// damage and schedules the re-index, with no client read involved. A CLI `symbols` read
+/// issued after that is answered from the rebuilt generation, never from the damaged bytes.
+/// This is the ordering in which the subprocess test's "must fail" read succeeded.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_background_read_of_a_damaged_selected_source_schedules_the_reindex_before_a_cli_read() {
+    use std::sync::{Mutex, mpsc};
+    let base = tempfile::tempdir().unwrap();
+    let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
+    let (runtime, damaged, index_db) =
+        settled_checkout_for_source_damage(base.path(), &mut registry).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let builds = scheduler.architecture_builds_for_tests();
+    let (reached_tx, reached) = mpsc::channel();
+    let (release, held) = mpsc::channel::<()>();
+    let held = Mutex::new(held);
+    scheduler.set_architecture_hook_for_tests(std::sync::Arc::new(move |point| {
+        if point == "architecture_step_started" {
+            let _ = reached_tx.send(());
+            // Returns at once after the release below drops the sender.
+            let _ = held
+                .lock()
+                .unwrap()
+                .recv_timeout(trellis::testing::HANG_BACKSTOP);
+        }
+    }));
+    // A rules file makes the owner build this same head again; its turn stops at the hold.
+    fs::create_dir(base.path().join("work/.trellis")).unwrap();
+    fs::write(
+        base.path().join("work/.trellis/rules.toml"),
+        "version=1\n[layers.app]\norder=1\npaths=['**/*.js']",
+    )
+    .unwrap();
+    scheduler.architecture_hint();
+    reached
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .expect("the owner's turn reached the hold");
+    damage_selected_source(&index_db);
+    drop(release);
+    assert_reindexed_from_the_working_tree(&runtime, damaged, &index_db).await;
+    // The owner read the damaged head once, then built the rebuilt one.
+    assert!(scheduler.architecture_builds_for_tests() > builds);
+}

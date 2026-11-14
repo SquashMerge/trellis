@@ -557,6 +557,8 @@ impl DaemonState {
 
     /// One owner turn: compare head and rules with what is published and build what differs.
     fn architecture_step(self: &Arc<Self>, owner: &ArchitectureOwner) {
+        // Before the turn admits its read: a test orders the owner's read against other work.
+        owner.hook("architecture_step_started");
         let Some(lease) = self.background_lease() else {
             return;
         };
