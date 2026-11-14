@@ -1,7 +1,7 @@
-//! Batch descriptor admission that needs indexing policy: the checked-in producer pin, the
-//! producer context profile, the generation-origin rule that applies it, and the path check
-//! against the batch directory. The grammar and the checks over bytes, limits and the
-//! captured revision are in `crate::batch_descriptor`, re-exported here.
+//! Batch descriptor admission that needs indexing policy: the producer context profile, the
+//! generation-origin rule that applies it, and the path check against the batch directory.
+//! The grammar, the producer pin check and the checks over bytes, limits and the captured
+//! revision are in `crate::batch_descriptor`, re-exported here.
 pub use crate::batch_descriptor::{
     ArtifactEntry, CoverageRow, Descriptor, DescriptorComponents, DescriptorMetadata,
     DescriptorProducer, DescriptorSourceSet, Disposition, ExclusionReason, FORMAT_VERSION,
@@ -10,7 +10,7 @@ pub use crate::batch_descriptor::{
     SourceRow, Totals, basis_artifact_ordinal, check_page_bytes, parse_page,
 };
 use crate::{
-    scip_admission::{PinnedProducer, admission, pinned_producer, validate_selected_role},
+    scip_admission::{admission, validate_selected_role},
     scip_raw::ScipCaptureError,
 };
 use std::path::Path;
@@ -18,11 +18,6 @@ use std::path::Path;
 type Result<T> = std::result::Result<T, ScipCaptureError>;
 
 impl Descriptor {
-    /// Check 2: the declared producer must equal the checked-in pin exactly.
-    pub fn check_producer(&self) -> Result<PinnedProducer> {
-        pinned_producer(&self.trust_origin, &self.profile_id, &self.producer)
-    }
-
     /// The admitted run's controlled context policy, or full captured context.
     /// Supplied batches, pickups and the synthetic stand-in cannot narrow input dependencies.
     pub fn context_profile(&self) -> Result<Option<crate::producer::profiles::Row>> {
