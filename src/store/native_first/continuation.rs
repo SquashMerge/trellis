@@ -2,9 +2,12 @@
 use super::*;
 use crate::semantic_batch::RetainedStageContinuation;
 use crate::semantic_batch::{
-    AdmittedBatch, LookupBudget, StageOwner, counters::BatchCounters, limits::BatchLimits,
+    StageOwner,
+    counters::{BatchCounters, LookupBudget},
+    limits::BatchLimits,
 };
 use crate::semantic_import::{DestinationMutations, JoinContinuation};
+use crate::store::batch_input::AdmittedBatch;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SemanticUnitOutcome {

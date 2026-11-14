@@ -21,6 +21,8 @@
 /// - `store/captured_witness`: the captured-version reads the witnessed settlement trusts.
 /// - `store/staging`: the stage database, its schema and its claim and witness writers, moved
 ///   out of `semantic_batch`.
+/// - `store/batch_input`: the admitted and joined batch types and the retained re-import
+///   destination check, moved out of `semantic_batch`.
 /// - `batch_descriptor`: the batch descriptor and page grammar and the source-manifest hash,
 ///   moved out of `semantic_batch`.
 /// - `producer_pin`: the checked-in producer pin and its registry, whose identity the stored
@@ -51,6 +53,7 @@ pub const JOIN_MODULES: &[&str] = &[
     "src/semantic_records.rs",
     "src/skipped_config.rs",
     "src/skipped_source.rs",
+    "src/store/batch_input.rs",
     "src/store/captured_witness.rs",
     "src/store/native_first.rs",
     "src/store/native_first/**",

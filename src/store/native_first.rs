@@ -44,8 +44,8 @@ pub(crate) struct PreparedSemantic {
 
 pub(crate) enum PreparedOutput {
     Joined {
-        admitted: Box<crate::semantic_batch::AdmittedBatch>,
-        joined: crate::semantic_batch::JoinedBatch,
+        admitted: Box<crate::store::batch_input::AdmittedBatch>,
+        joined: crate::store::batch_input::JoinedBatch,
     },
     Unavailable {
         diagnostic: String,

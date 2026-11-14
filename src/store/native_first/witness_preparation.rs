@@ -3,8 +3,10 @@ use super::witness::{self, OriginalRow, WitnessEligibility};
 use super::*;
 use crate::native_records::DocumentKey;
 use crate::semantic_batch::{
-    AdmittedBatch, LookupBudget, counters::BatchCounters, limits::BatchLimits,
+    counters::{BatchCounters, LookupBudget},
+    limits::BatchLimits,
 };
+use crate::store::batch_input::AdmittedBatch;
 use crate::store::staging::{Stage, WitnessFallback, WitnessStageWriter};
 use std::collections::VecDeque;
 

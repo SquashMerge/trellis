@@ -2,7 +2,7 @@
 #![cfg(feature = "test-support")]
 
 use super::*;
-use crate::{native_ids, semantic_batch::AdmittedBatch, semantic_records as sem};
+use crate::{native_ids, semantic_records as sem, store::batch_input::AdmittedBatch};
 
 pub(in crate::store) fn enabled(store: &Store) -> bool {
     store.semantic_test_hooks().full_oracle || TEST_REJOIN_ORACLE_MISMATCH.get()
