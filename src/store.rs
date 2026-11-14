@@ -6486,7 +6486,7 @@ fn read_semantic_call_facts(
 
 /// The pinned identity kind of a producer id; every producer outside the synthetic pin is an executable.
 fn producer_identity_kind(producer_id: &str) -> &'static str {
-    crate::scip_admission::pinned_producer_by_id(producer_id)
+    crate::producer_pin::pinned_producer_by_id(producer_id)
         .map_or(
             crate::batch_descriptor::IdentityKind::Executable,
             |pinned| pinned.identity_kind,
