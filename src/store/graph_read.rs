@@ -231,7 +231,7 @@ impl GraphSource for SnapshotGraphSource<'_> {
         projection: &crate::model::SemanticProjection,
         producer: &str,
         document: &DocumentKey,
-    ) -> Result<Option<crate::graph_query::BoundaryReason>> {
+    ) -> Result<Option<crate::model::BoundaryReason>> {
         let eligible = native_first::endpoint_boundary(
             self.db,
             self.selected.pin,
@@ -552,7 +552,7 @@ pub(super) fn navigation_calls(
         };
         let disposition = crate::graph_query::call_disposition(Some(&semantic), &call, &mut source)
             .map_err(engine_error)?;
-        if disposition.boundary_reason != crate::graph_query::BoundaryReason::None {
+        if disposition.boundary_reason != crate::model::BoundaryReason::None {
             continue;
         }
         let Some((id, target_key)) = disposition.exact_target else {
@@ -673,7 +673,7 @@ pub(super) fn sequence_calls(
                         step.call_evidence = Some(crate::behavior::CallEvidence {
                             projection: Some(projection.clone()),
                             historical_freshness: None,
-                            boundary_reason: crate::graph_query::BoundaryReason::pending(
+                            boundary_reason: crate::model::BoundaryReason::pending(
                                 projection.semantic_status,
                             ),
                             resolution: None,
@@ -1041,7 +1041,7 @@ fn hide_incidental(
     accessor: &mut dyn FnMut(&str, &DocumentKey) -> Result<bool>,
 ) -> Result<()> {
     use crate::behavior::IncidentalReason;
-    use crate::graph_query::{self as engine, BoundaryReason};
+    use crate::{graph_query as engine, model::BoundaryReason};
     let semantic = engine::semantic(Some(languages), document).map_err(engine_error)?;
     for at in 0..steps.len() {
         let step = &mut steps[at];
@@ -1172,9 +1172,9 @@ fn shown_within(
 /// source-hint lanes were full) is still a call here: those hint lanes are not drawn.
 fn is_incidental(
     step: &crate::behavior::SequenceStep,
-    reason: crate::graph_query::BoundaryReason,
+    reason: crate::model::BoundaryReason,
 ) -> bool {
-    reason == crate::graph_query::BoundaryReason::External
+    reason == crate::model::BoundaryReason::External
         && matches!(step.kind.as_str(), "call" | "boundary")
         && step.children.is_empty()
         && step.alternate.is_empty()
@@ -1196,7 +1196,10 @@ impl Enrichment<'_, '_> {
         owner: &str,
         depth: usize,
     ) -> Result<()> {
-        use crate::graph_query::{self as engine, BoundaryReason, GraphEdge, Visit};
+        use crate::{
+            graph_query::{self as engine, GraphEdge, Visit},
+            model::BoundaryReason,
+        };
         let semantic = engine::semantic(Some(self.languages), document).map_err(engine_error)?;
         for step in steps {
             self.source.check_work()?;

@@ -4,7 +4,7 @@ use super::witness::{self, CurrentDeclaration, SelectedVersion};
 use super::*;
 use crate::native_evidence::{DocumentKey, Range};
 use crate::scip_raw::ScipCaptureError;
-use crate::semantic_batch::{BatchLimits, staging::Stage};
+use crate::semantic_batch::{limits::BatchLimits, staging::Stage};
 
 #[derive(Default)]
 pub(crate) struct TargetIndexCursor {

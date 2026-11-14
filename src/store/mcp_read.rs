@@ -2516,7 +2516,7 @@ mod outgoing_tests {
 #[cfg(test)]
 mod enriched_read_tests {
     use super::*;
-    use crate::indexer::IndexOptions;
+    use crate::model::IndexOptions;
     use std::sync::{Arc, atomic::AtomicBool};
 
     #[test]
@@ -3687,7 +3687,7 @@ mod source_range_tests {
 #[cfg(all(test, feature = "test-support"))]
 mod find_scope_tests {
     use super::*;
-    use crate::indexer::IndexOptions;
+    use crate::model::IndexOptions;
     use std::sync::{Arc, atomic::AtomicBool};
 
     thread_local! {

@@ -274,6 +274,15 @@ pub struct CallSite {
     pub regions: Vec<String>,
     pub provenance: Provenance,
 }
+/// Reader order from the graph SQL queries: path, start byte, descending
+/// end byte, then ID. String comparison uses SQLite's BINARY byte order.
+pub(crate) fn compare_reader_calls(a: &CallSite, b: &CallSite) -> std::cmp::Ordering {
+    a.path
+        .cmp(&b.path)
+        .then_with(|| a.range.start_byte.cmp(&b.range.start_byte))
+        .then_with(|| b.range.end_byte.cmp(&a.range.end_byte))
+        .then_with(|| a.id.cmp(&b.id))
+}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ControlRegion {
@@ -715,7 +724,7 @@ pub struct ViewCallBinding {
     pub historical_freshness: Option<crate::semantic_evidence::Freshness>,
     pub call_id: String,
     /// The call-graph engine's boundary reason: `none` when the graph traverses the call.
-    pub boundary_reason: crate::graph_query::BoundaryReason,
+    pub boundary_reason: BoundaryReason,
     /// The declared internal target of a resolved binding, located exactly in this snapshot
     /// and not stale. With a `dispatch` boundary it is the declared, not a proven, callee.
     pub target_id: Option<String>,
@@ -819,6 +828,67 @@ impl AnchorResult {
             status: AnchorStatus::Orphaned,
             target_id: None,
             reason,
+        }
+    }
+}
+
+/// Why the call-graph engine stops at a call: `none` when the graph traverses it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BoundaryReason {
+    None,
+    External,
+    Unresolved,
+    Ambiguous,
+    Dispatch,
+    Stale,
+    NodeLimit,
+    MissingEvidence,
+    CatchingUp,
+    /// No retained raw input will catch the document up; its language needs re-import.
+    NeedsReimport,
+}
+
+impl BoundaryReason {
+    /// The boundary a pending (`catchingUp` or `needsReimport`) document imposes.
+    pub fn pending(status: SemanticStatus) -> Self {
+        if status == SemanticStatus::NeedsReimport {
+            Self::NeedsReimport
+        } else {
+            Self::CatchingUp
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct IndexOptions {
+    pub workspace_root: std::path::PathBuf,
+    pub max_file_bytes: u64,
+    /// The cap on one config input (#581). Always
+    /// [`crate::skipped_config::CONFIG_INPUT_MAX_BYTES`] outside tests, so it is neither a
+    /// flag nor a reconcile option; tests lower it to exercise the skip at normal size.
+    pub max_config_bytes: u64,
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ReconcileOptions {
+    pub version: u8,
+    pub max_file_bytes: u64,
+}
+impl From<&IndexOptions> for ReconcileOptions {
+    fn from(options: &IndexOptions) -> Self {
+        Self {
+            version: 2,
+            max_file_bytes: options.max_file_bytes.min(256 * 1024 * 1024),
+        }
+    }
+}
+impl IndexOptions {
+    pub fn new(workspace_root: std::path::PathBuf) -> Self {
+        Self {
+            workspace_root,
+            max_file_bytes: 2 * 1024 * 1024,
+            max_config_bytes: crate::skipped_config::CONFIG_INPUT_MAX_BYTES,
         }
     }
 }

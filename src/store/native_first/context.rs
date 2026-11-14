@@ -12,7 +12,7 @@ fn profile(
         return Ok(None);
     }
     selected_ensure!(
-        mode == "controlledProfile" && hash.is_some_and(crate::scip_admission::hexhash),
+        mode == "controlledProfile" && hash.is_some_and(crate::scip_vocab::hexhash),
         "incompatible_index: invalid semantic context scope"
     );
     let trust = match trust {

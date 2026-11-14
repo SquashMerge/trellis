@@ -73,7 +73,7 @@ pub struct PartialFile {
 pub(crate) fn module_only_reason(diagnostic: Option<&str>) -> Option<&'static str> {
     use crate::skipped_source::Skip;
     let diagnostic = diagnostic?;
-    if diagnostic == crate::evidence_budget::DIAGNOSTIC {
+    if diagnostic == crate::evidence_limits::DIAGNOSTIC {
         return Some("evidence_budget");
     }
     [Skip::Oversized, Skip::NotUtf8]

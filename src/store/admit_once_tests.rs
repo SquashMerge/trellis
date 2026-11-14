@@ -1,5 +1,5 @@
 use super::*;
-use crate::indexer::IndexOptions;
+use crate::model::IndexOptions;
 use std::sync::{Arc, atomic::AtomicBool};
 
 fn fixture() -> (tempfile::TempDir, tempfile::TempDir, Store, IndexPin) {

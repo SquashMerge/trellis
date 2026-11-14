@@ -12,6 +12,7 @@
 /// - `native_ids`: canonical JSON, digests and ID minting.
 /// - `indexer*`: graph projection and per-language native kinds.
 /// - `classes`: class extraction and the class catalog.
+/// - `evidence_budget`, `evidence_limits`: the per-document budgets and their charging.
 /// - `model` (addition): the graph `Symbol`/`CallSite`/`ControlRegion` types
 ///   whose serde shape is the stored graph payload and projection hash input.
 /// - `parallel` (addition): the ordered worker map whose ordering contract
@@ -24,6 +25,7 @@ pub const EXTRACTION_MODULES: &[&str] = &[
     "src/indexer_rust.rs",
     "src/indexer_ts.rs",
     "src/evidence_budget.rs",
+    "src/evidence_limits.rs",
     "src/model.rs",
     "src/native_evidence.rs",
     "src/native_ids.rs",
