@@ -884,14 +884,14 @@ impl DaemonState {
     }
     /// Lose the serving session as a failed completion does: its watcher and published
     /// watch status go with it, and the runtime returns to startup reconciliation.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-support"))]
     pub(crate) fn lose_serving_session_for_tests(&self) {
         self.replace_serving_session(None);
     }
 
     /// Run `hook` once on the worker, after a step's FIFO drain and before it installs or
     /// reconciles the serving session's watcher.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-support"))]
     pub(crate) fn set_after_startup_drain_hook_for_tests(
         &self,
         hook: impl FnOnce() + Send + 'static,
