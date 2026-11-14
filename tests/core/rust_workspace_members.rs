@@ -246,7 +246,7 @@ fn a_crate_private_item_of_another_member_stays_unknown() {
 }
 
 /// #828: inline `crate::`, `self::` and `super::` paths with no `use` item reach the module
-/// they name, through `pub(crate)` modules and items as in `src/store/architecture_core.rs`.
+/// they name, through `pub(crate)` modules and items as in `src/architecture_core.rs`.
 #[test]
 fn inline_qualified_paths_without_a_use_item_resolve() {
     let (_state, _root, store, pin) = indexed(

@@ -1,5 +1,5 @@
 use super::*;
-use crate::{native_records::DocumentKey, semantic_batch::descriptor::Descriptor};
+use crate::{batch_descriptor::Descriptor, native_records::DocumentKey};
 use serde_json::json;
 
 fn batch() -> SelectedRawBatch {

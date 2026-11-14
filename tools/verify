@@ -223,14 +223,29 @@ checks() {
   node --test tests/factory-config.test.cjs
   node docs/semantic-evidence/check-policy.mjs --self-test
   node --check web/app.js
+  node --check web/app-state.js
+  node --check web/app-api.js
+  node --check web/app-agent.js
+  node --check web/app-navigation.js
+  node --check web/app-status.js
+  node --check web/app-source.js
+  node --check web/app-files.js
+  node --check web/app-tree.js
+  node --check web/app-sequence.js
+  node --check web/app-libraries.js
+  node --check web/app-views.js
   node --check web/index-pin.js
   node --check web/source-witness.js
   node --check web/context-menu.js
   node --check web/pele-svg.js
   node --check web/architecture-apps.js
+  node --check web/architecture-display.js
+  node --check web/deviations-model.js
+  node --check web/sequence-model.js
+  node --check web/architecture-routing.js
   # The Herdr mod's logic over the browser's own Architecture adapter (#707); no install needed.
   node --import ./herdr-mod/test/register.mjs --test herdr-mod/test/mod.test.mjs herdr-mod/test/view.test.mjs herdr-mod/test/parity.test.mjs herdr-mod/test/setup.test.mjs
-  node --test tests/browse-ui.test.cjs tests/sequence-ui.test.cjs tests/token-ui.test.cjs tests/external-source-ui.test.cjs tests/dependency-ui.test.cjs tests/shell-ui.test.cjs tests/classes-ui.test.cjs tests/navigation-ui.test.cjs tests/metric-heat.test.cjs tests/viewer-metrics-ui.test.cjs tests/files-ui.test.cjs tests/architecture-ui.test.cjs tests/architecture-pele-ui.test.cjs tests/treemap-ui.test.cjs tests/treemap-pele.test.cjs tests/architecture-apps-ui.test.cjs tests/app-switcher-ui.test.cjs
+  node --test tests/browse-ui.test.cjs tests/sequence-ui.test.cjs tests/token-ui.test.cjs tests/external-source-ui.test.cjs tests/dependency-ui.test.cjs tests/shell-ui.test.cjs tests/classes-ui.test.cjs tests/navigation-ui.test.cjs tests/metric-heat.test.cjs tests/viewer-metrics-ui.test.cjs tests/files-ui.test.cjs tests/architecture-ui.test.cjs tests/architecture-pele-ui.test.cjs tests/treemap-ui.test.cjs tests/treemap-pele.test.cjs tests/architecture-apps-ui.test.cjs tests/app-switcher-ui.test.cjs tests/architecture-routing.test.cjs
 }
 # The rules-check ratchet (#1008): deviating pairs and references may only fall.
 # It measures through its own daemon under a private HOME, with both semantic

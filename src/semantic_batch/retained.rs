@@ -6,13 +6,15 @@ use super::{
     admit::{Passes, ReaderSource, StageOwner, check_cancel},
     descriptor::{Descriptor, RowOrder, SourceManifestHasher, SourceRow},
     limits::IO_BUFFER_BYTES,
-    staging::{Stage, artifact_file},
 };
 use crate::{
     model::CancelFlag,
     scip_admission::admission,
     scip_raw::{self, ScipCaptureError},
-    store::NativeReader,
+    store::{
+        NativeReader,
+        staging::{Stage, artifact_file},
+    },
 };
 use anyhow::{Result, ensure};
 pub(crate) use continuation::RetainedStageContinuation;

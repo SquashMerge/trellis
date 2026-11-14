@@ -1,67 +1,94 @@
 "use strict";
 const test = require("node:test"), assert = require("node:assert/strict"), fs = require("node:fs"), vm = require("node:vm");
-function setup() {
+// `dom` (the Herdr mod's DOM, herdr-mod/src/dom.js) is for the one test that admits a drawing.
+function setup(dom) {
   const window = {};
-  vm.runInNewContext(["web/pele-svg.js","web/architecture-pele.js"].map(file=>fs.readFileSync(file,"utf8")).join("\n"),{window,TextEncoder});
+  vm.runInNewContext(["web/metric-heat.js","web/architecture-apps.js","web/architecture-display.js","web/pele-svg.js","web/architecture-routing.js","web/architecture-pele.js"].map(file=>fs.readFileSync(file,"utf8")).join("\n"),
+    {window,TextEncoder,...(dom?{DOMParser:dom.DOMParser,document:dom.createDocument(text=>Array.from(text).length*7)}:{})});
   const vendor = vm.createContext({}); vm.runInContext(fs.readFileSync("web/vendor/pele-1.10.0-trellis.2.js","utf8"),vendor);
-  return {adapter:window.TrellisArchitecturePele,pele:vendor.pele};
+  return {adapter:window.TrellisArchitecturePele,pele:vendor.pele,window};
 }
 const {fixture} = require("./fixtures/pele-1.10.0-trellis.2/architecture-fixture.cjs");
-test("patched block projection maps forty exact native file identities, peers/shared and summary roles",()=>{
-  const {adapter,pele}=setup(), view=fixture(), p=adapter.project(view,{showTests:true});
+// The adapter's options as the product builds them: the real `createDisplay` (web/architecture-display.js),
+// its plan for the whole payload and `options(part, scale)`, as web/architecture.js `stack` and the Herdr
+// mod's `summarize` do. `open` names the open bands (every band unless given) and `unassigned` opens that row.
+function stack(window,view,{showTests=false,open=view.layers.map(layer=>layer.name),unassigned=false}={}) {
+  const shown={open:new Map(open.map(name=>[name,true])),drilled:new Set(),unassigned,hidden:false};
+  const shared=window.TrellisArchitectureDisplay.createDisplay({metric:()=>"cognitive",aggregate:()=>"max",role:()=>"production",relative:()=>false,
+    showTests:()=>showTests,view:()=>view,model:()=>view,shown:()=>shown,endMark:()=>null,scopeGroup:()=>null});
+  const plan=shared.plan(view,null);
+  return shared.options(plan.parts[0],plan.scale);
+}
+// The display draws a file chip only for a file with measured declarations, as the payload reports them.
+const measured=view=>{for(const module of view.modules)module.declarationCount=1;return view;};
+test("patched block projection maps forty exact native file identities, peers/shared and summary roles",async()=>{
+  const {adapter,pele,window}=setup(await import("../herdr-mod/src/dom.js")), view=measured(fixture()), p=adapter.project(view,stack(window,view,{showTests:true}));
   assert.equal([...p.nodes.values()].filter(n=>n.kind==="M").length,40);
   assert.equal(p.edges.size,5);
   assert.equal([...p.nodes.values()].find(n=>n.kind==="M").record,view.modules[0]);
   const raw=pele.render(p.source,{fontSize:14,padding:8,responsive:false,links:false,images:false}).svg;
   assert.match(raw,/class="pele pele-block"/);
   for(const [id,n] of p.nodes) assert.equal((raw.match(new RegExp(`data-id="${id}"`,"g"))||[]).length,1);
+  // Pele draws the boxes; the five arrows are the adapter's own, added when the drawing is admitted.
+  assert.equal((raw.match(/class="pele-edge"/g)||[]).length,0);
+  const {root}=adapter.validatedSvg(raw,p), tags=[...root.querySelectorAll(".pele-edge-label")];
   for(const e of p.edges.values()) {
-    for (const line of e.placeholder.split("<br/>")) assert.ok(raw.includes(line),`missing generated edge token ${e.id}`);
-    assert.match(raw,new RegExp(`data-id="[1-9][0-9]*-${e.from}-${e.to}"`));
+    const tag=tags.filter(node=>node.querySelector("text").textContent===e.placeholder);
+    assert.equal(tag.length,1,`missing generated edge token ${e.id}`);
+    assert.match(tag[0].getAttribute("data-id"),new RegExp(`^[1-9][0-9]*-${e.from}-${e.to}$`));
+    assert.equal(root.querySelectorAll(`.pele-edge[data-id="${tag[0].getAttribute("data-id")}"]`).length,1);
   }
-  assert.equal((raw.match(/class="pele-edge"/g)||[]).length,5);
+  assert.equal(root.querySelectorAll(".pele-edge").length,5);
 });
 test("repository strings never become Mermaid grammar and preserve original DTO identity",()=>{
-  const {adapter}=setup(), view=fixture(), hostile='x"]\nend\nclick x "javascript:alert(1)" <script>&';
+  const {adapter,window}=setup(), view=measured(fixture()), hostile='x"]\nend\nclick x "javascript:alert(1)" <script>&';
   view.layers[0].name=hostile; view.modules[0].layer=hostile; view.edges.forEach(e=>{ if(e.sourceLayer==="UI")e.sourceLayer=hostile; if(e.destinationLayer==="UI")e.destinationLayer=hostile; });
   view.modules.filter(m=>m.layer==="UI").forEach(m=>m.layer=hostile);
   view.modules[0].identity.path=hostile;
-  const p=adapter.project(view,{showTests:true});
+  const p=adapter.project(view,stack(window,view,{showTests:true}));
   assert.ok(!p.source.includes(hostile)); assert.ok(!p.source.includes("javascript:"));
   const module=[...p.nodes.values()].find(n=>n.record===view.modules[0]);
   assert.equal(module.record.identity.path,hostile); assert.ok(module.full.includes(hostile));
-  const duplicate=fixture(); duplicate.modules.push(duplicate.modules[0]); assert.throws(()=>adapter.project(duplicate),/duplicate Architecture module/);
+  const duplicate=measured(fixture()); duplicate.modules.push(duplicate.modules[0]); assert.throws(()=>adapter.project(duplicate,stack(window,duplicate)),/duplicate Architecture module/);
 });
 test("test toggle changes only rendered test edges and never production records, counts or modules",()=>{
-  const {adapter}=setup(), view=fixture(), before=JSON.stringify(view);
-  const hidden=adapter.project(view), shown=adapter.project(view,{showTests:true});
+  const {adapter,window}=setup(), view=measured(fixture()), before=JSON.stringify(view);
+  const hidden=adapter.project(view,stack(window,view)), shown=adapter.project(view,stack(window,view,{showTests:true}));
   assert.equal(hidden.edges.size,4);assert.equal(shown.edges.size,5);
   assert.deepEqual([...hidden.edges.values()].map(e=>e.record),view.edges.filter(e=>e.role==="production"));
   assert.equal(JSON.stringify(view),before);
   assert.equal([...hidden.nodes.values()].filter(n=>n.kind==="M").length,40);
 });
 test("empty authored layers and unassigned modules remain explicit without inventing membership",()=>{
-  const {adapter}=setup(), view=fixture();view.layers.push({name:"Empty",order:3,shared:false});view.modules[0].layer=null;
-  const p=adapter.project(view);
-  assert.ok([...p.nodes.values()].some(n=>n.full==="No indexed modules"));
-  assert.ok([...p.nodes.values()].some(n=>n.full==="Unassigned / unknown"));
-  assert.equal([...p.nodes.values()].find(n=>n.record===view.modules[0]).record.layer,null);
+  const {adapter,window}=setup(), view=measured(fixture());view.layers.push({name:"Empty",order:3,shared:false});view.modules[0].layer=null;
+  const p=adapter.project(view,stack(window,view,{unassigned:true})), nodes=[...p.nodes.values()];
+  // The words are the display's: an open band with no file says so, and the unassigned row counts its files.
+  const empty=nodes.find(n=>n.kind==="L"&&n.record.name==="Empty");
+  assert.ok(nodes.some(n=>n.full==="No files shown"&&n.host===empty.id));
+  const row=nodes.find(n=>n.kind==="U");
+  assert.equal(row.full,"Unassigned / unknown\n1 file · no layer");
+  const loose=nodes.find(n=>n.record===view.modules[0]);
+  assert.equal(loose.record.layer,null);assert.equal(loose.host,row.id);
 });
 test("all edge policy/exception buckets retain separate exact records without count matching",()=>{
-  const {adapter}=setup(), view=fixture(); const first=view.edges[0];
+  const {adapter,window}=setup(), view=measured(fixture()); const first=view.edges[0];
   view.edges.push({...first,status:"deviates",excepted:true,exceptionReason:"Reviewed boundary"});
-  const p=adapter.project(view,{showTests:true});
+  const p=adapter.project(view,stack(window,view,{showTests:true}));
   assert.equal(p.edges.size,6);assert.equal(new Set([...p.edges.values()].map(e=>e.expected)).size,6);
-  const duplicate=fixture();duplicate.edges.push({...duplicate.edges[0]});assert.throws(()=>adapter.project(duplicate),/duplicate Architecture edge/);
+  const duplicate=measured(fixture());duplicate.edges.push({...duplicate.edges[0]});assert.throws(()=>adapter.project(duplicate,stack(window,duplicate)),/duplicate Architecture edge/);
 });
 
 test("layer counters keep separate rows and reserve room beyond compact module chips",()=>{
-  const {adapter}=setup(),view=fixture();
-  const p=adapter.project(view,{layerLabel:layer=>`${layer.name}\nMax module cognitive (max)\n17\nProd refs down: 23456\nProd refs up: 78\nUp deviation: 78\nPeer/shared deviation: 900\nExcepted refs: 12`});
+  const {adapter,window}=setup(),view=measured(fixture());
+  // The display's own options, with a header of eight rows in place of its label.
+  const p=adapter.project(view,{...stack(window,view),layerLabel:layer=>`${layer.name}\nMax module cognitive (max)\n17\nProd refs down: 23456\nProd refs up: 78\nUp deviation: 78\nPeer/shared deviation: 900\nExcepted refs: 12`});
   const layer=[...p.nodes.values()].find(n=>n.kind==="L");
-  assert.equal(layer.display.length,8);assert.equal(layer.display[4],"Prod refs up: 78");
+  // The eight rows stay whole, above the band's own stat line.
+  assert.equal(layer.statLines.length,1);assert.equal(layer.display.length,8+layer.statLines.length);assert.equal(layer.display[4],"Prod refs up: 78");
   assert.equal(layer.display[6],"Peer/shared deviation: 900");
-  assert.ok(p.source.includes(']:4'));
+  // The header reserves its band's whole row of five chips, and the stack spans those five columns.
+  assert.equal(layer.lineWidth,5*(104+32)+4*12-32);
+  assert.ok(p.source.includes(`block:${p.layout.stack}["${p.nodes.get(p.layout.stack).placeholder}"]:5`));
 });
 module.exports={fixture};
 test("display projection: module chips, a folded band as a short composite, stats line and compact arrow counts",()=>{
@@ -166,13 +193,17 @@ test("#850: sharedSide left draws the shared boxes left of the stack, nearest fi
   for(const [way,glyph] of right.tags) assert.equal(glyph,way==="into shared"?"→":"←");
   for(const [way,glyph] of left.tags) assert.equal(glyph,way==="into shared"?"←":"→","a tag points the way its arrow runs");
 });
-test("#850: sharedSide is ignored without the summary display or without a shared layer",()=>{
-  const {adapter}=setup(), view=fixture();
-  assert.equal(adapter.project(view,{sharedSide:"left"}).source,adapter.project(view).source,"the full projection is unchanged");
+test("#850: sharedSide is ignored without a shared layer",()=>{
+  const {adapter}=setup();
   const ordered=fixture(); ordered.layers=ordered.layers.filter(l=>!l.shared); ordered.modules=ordered.modules.filter(m=>ordered.layers.some(l=>l.name===m.layer)||m.layer===null);
   ordered.edges=ordered.edges.filter(e=>ordered.layers.some(l=>l.name===e.sourceLayer)&&ordered.layers.some(l=>l.name===e.destinationLayer));
   const display={layers:new Set(ordered.layers.map(l=>l.name)),expanded:()=>false,edge:()=>true,unassigned:null,entries:()=>[]};
   const p=adapter.project(ordered,{display,sharedSide:"left",measureText:text=>Array.from(text).length*7});
   assert.equal(p.layout.sharedLeft,false);
   assert.equal(p.source,adapter.project(ordered,{display,measureText:text=>Array.from(text).length*7}).source);
+});
+test("#1066: a call without a display is refused",()=>{
+  const {adapter}=setup();
+  assert.throws(()=>adapter.project(fixture()),error=>error.message==="Architecture display unavailable"&&error.code==="unsupported");
+  assert.throws(()=>adapter.project(fixture(),{showTests:true,display:null}),/Architecture display unavailable/);
 });

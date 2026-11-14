@@ -967,10 +967,9 @@ impl StagedJoin<'_> {
             if outcome.omitted
                 && (!captured.fused_proofs.is_empty() || !captured.fused_calls.is_empty())
             {
-                return Err(crate::semantic_batch::staging::WitnessFallback(
-                    "fused_reference_target_lost",
-                )
-                .into());
+                return Err(
+                    crate::store::staging::WitnessFallback("fused_reference_target_lost").into(),
+                );
             }
             for raw in &captured.fused_proofs {
                 source(

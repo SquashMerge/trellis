@@ -15,19 +15,22 @@ const WEB = {
   // the parameter shadows the real global, so the caller decides how text is measured.
   pele: { file: "vendor/pele-1.10.0-trellis.2.js", params: "globalThis", result: "pele" },
   "metric-heat": { file: "metric-heat.js", params: "window", result: "window.TrellisMetricHeat" },
-  // The pure parts it exports: the summary display (`createDisplay`) and the module helpers.
-  architecture: { file: "architecture.js", params: "window, document", result: "window.TrellisArchitecture" },
+  // The summary display (`createDisplay`) and the module helpers (pure).
+  "architecture-display": { file: "architecture-display.js", params: "window", result: "window.TrellisArchitectureDisplay" },
   // Apps, All apps layout, interface cards and inspector facts (pure).
   "architecture-apps": { file: "architecture-apps.js", params: "window", result: "window.TrellisArchitectureApps" },
-  // Only the pure Deviations tree model is used; its DOM view is not.
-  "architecture-deviations": { file: "architecture-deviations.js", params: "window, document", result: "window.TrellisDeviations" },
+  // The Deviations tree model (pure); its DOM view is not bundled.
+  "deviations-model": { file: "deviations-model.js", params: "window", result: "window.TrellisDeviationsModel" },
   // What the Pele adapters share (SVG admission, button semantics, the text measurer); they read it from `window`, so load it first.
   "pele-svg": { file: "pele-svg.js", params: "window, document, DOMParser, TextEncoder", result: "window.TrellisPeleSvg" },
+  // The arrow routing arithmetic the Architecture adapter reads from `window` (pure); load it first.
+  "architecture-routing": { file: "architecture-routing.js", params: "window", result: "window.TrellisArchitectureRouting" },
   "architecture-pele": { file: "architecture-pele.js", params: "window, document, DOMParser, TextEncoder", result: "window.TrellisArchitecturePele" },
   // The shared source-range check the two Sequence scripts read from `window`; load it first.
   "source-witness": { file: "source-witness.js", params: "window", result: "window.TrellisSourceWitness" },
-  // The language-neutral Sequence helpers (labels, lanes, display). It draws nothing itself (#1007).
-  sequence: { file: "sequence.js", params: "window, document", result: "window.TrellisSequence" },
+  // The language-neutral Sequence model (labels, lanes, display) and the per-container render owner
+  // the adapter takes (pure). The browser's empty and error states (sequence.js) are not bundled.
+  "sequence-model": { file: "sequence-model.js", params: "window", result: "window.TrellisSequence" },
   "sequence-pele": { file: "sequence-pele.js", params: "window, document, DOMParser, TextEncoder", result: "window.TrellisPeleSequence" },
 };
 

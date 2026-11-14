@@ -1,9 +1,11 @@
 //! Bounded streamed semantic batch import: resource policy and the high-water counters that prove it.
-use crate::{model::IndexPin, scip_admission::PinnedProducer, scip_raw::ScipCaptureError};
+use crate::{
+    model::IndexPin, scip_admission::PinnedProducer, scip_raw::ScipCaptureError,
+    store::staging::Stage,
+};
 use anyhow::{Context, Result};
 use descriptor::Descriptor;
 use rusqlite::Connection;
-use staging::Stage;
 
 pub mod admit;
 pub mod counters;
@@ -11,7 +13,6 @@ pub mod descriptor;
 pub mod limits;
 pub mod origin;
 pub(crate) mod retained;
-pub mod staging;
 #[cfg(feature = "test-support")]
 pub mod testing;
 

@@ -1,6 +1,9 @@
 pub(crate) mod apps;
+mod architecture_core;
 pub mod architecture_details;
+mod architecture_read;
 pub mod auth;
+pub mod batch_descriptor;
 pub mod behavior;
 mod behavior_bindings;
 mod behavior_columns;
@@ -13,6 +16,7 @@ pub mod build_info;
 pub mod capture;
 pub mod capture_records;
 pub mod class_diagram;
+mod class_read;
 pub mod classes;
 pub mod daemon;
 pub mod dependencies;
@@ -28,6 +32,7 @@ pub mod file_tree;
 pub mod files_view;
 pub mod git_status;
 pub mod graph_query;
+mod graph_read;
 pub(crate) mod heap;
 pub mod http;
 pub mod index_coordinator;
@@ -44,6 +49,7 @@ pub(crate) mod jsonc;
 mod language_set_tests;
 pub mod mcp;
 pub mod metrics;
+pub mod metrics_read;
 pub mod model;
 pub mod model_management;
 #[cfg(feature = "test-support")]
@@ -55,6 +61,7 @@ mod native_rust_macros;
 #[cfg(test)]
 mod native_typescript_tests;
 pub mod navigation;
+mod navigation_read;
 mod parallel;
 pub mod process_info;
 pub mod producer;
@@ -81,6 +88,8 @@ pub mod semantic_import;
 #[cfg(test)]
 mod semantic_join_inputs_tests;
 pub mod semantic_records;
+mod sequence_hops;
+mod sequence_read;
 pub mod skipped_config;
 pub(crate) mod skipped_source;
 pub mod source_dir;
@@ -92,4 +101,5 @@ pub mod syntax_bounds;
 mod test_alloc;
 #[doc(hidden)]
 pub mod testing;
+mod view_read;
 pub mod watch;

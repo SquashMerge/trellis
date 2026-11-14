@@ -1876,19 +1876,39 @@ fn run(client: &Client) {
     }
 
     #[test]
-    fn trellis_own_client_reaches_the_dispatch_arm_and_its_test_only_route_is_excluded() {
+    fn trellis_own_client_reaches_the_status_handler_and_its_test_only_route_is_excluded() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let read = |path: &str| std::fs::read_to_string(dir.join(path)).unwrap();
-        let (http, app, cli) = (
-            read("src/http.rs"),
-            read("web/app.js"),
-            read("tests/daemon/cli.rs"),
+        // The browser client is app.js and the app-*.js scripts it was split into (#1069).
+        let app: Vec<(String, String)> = [
+            "state",
+            "api",
+            "agent",
+            "navigation",
+            "status",
+            "source",
+            "files",
+            "tree",
+            "sequence",
+            "libraries",
+            "views",
+        ]
+        .iter()
+        .map(|part| format!("web/app-{part}.js"))
+        .chain(["web/app.js".to_owned()])
+        .map(|path| {
+            let text = read(&path);
+            (path, text)
+        })
+        .collect();
+        let (http, cli) = (read("src/http.rs"), read("tests/daemon/cli.rs"));
+        let mut files = vec![("src/http.rs", http.as_str())];
+        files.extend(
+            app.iter()
+                .map(|(path, text)| (path.as_str(), text.as_str())),
         );
-        let found = run(&[
-            ("src/http.rs", &http),
-            ("web/app.js", &app),
-            ("tests/daemon/cli.rs", &cli),
-        ]);
+        files.push(("tests/daemon/cli.rs", &cli));
+        let found = run(&files);
         let reached = |path: &str| {
             let call = found
                 .calls
@@ -1900,9 +1920,15 @@ fn run(client: &Client) {
         };
         let (route, confidence) = reached("/api/status").expect("matched");
         assert_eq!(route.path_template, "/api/checkouts/{root_key}/status");
+        // The arm delegates to exactly one same-document function (#1046), so the handler
+        // is that declaration.
         assert_eq!(
             route.handler.kind,
-            crate::interfaces::HandlerKind::DispatchArm
+            crate::interfaces::HandlerKind::Declaration
+        );
+        assert_eq!(
+            route.handler.stable_lookup_key.as_deref(),
+            Some("src/http.rs::status_answer")
         );
         assert_eq!(confidence, Confidence::WrapperInferred);
         let (_, confidence) = reached("/api/checkouts").expect("matched");

@@ -2,8 +2,15 @@
 //!
 //! The pure engine in `graph_query` asks a [`SnapshotGraphSource`] for facts; every fact it
 //! reads is recorded so a byte-reduced answer can be re-evaluated without SQL (#40).
-use super::*;
 mod sequence_callbacks;
+use crate::model::*;
+use crate::store::{
+    EvidenceResponse, ReadRevision, SelectedDocument, SelectedIntegrity, Store, V8NativeScope,
+    id_codec, native_first, read_native_calls_v8, read_native_coverage_v8,
+    read_native_declarations_v8, read_semantic_history, read_semantic_tuple,
+    read_semantic_tuple_for_call, semantic_display, semantic_payload, semantic_pin_key,
+    v8_native_scope_for, v8_owner_scope_for,
+};
 use crate::{
     graph_query::{
         DefaultProducers, DocumentFacts, GraphAnswer, GraphFacts, GraphIntegrity, GraphQuery,
@@ -12,7 +19,13 @@ use crate::{
     native_records::DocumentKey,
     semantic_records as sem,
 };
+use anyhow::{Context, Result, ensure};
+use rusqlite::{Connection, OptionalExtension, params};
 pub(super) use sequence_callbacks::syntax_callbacks;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 /// Corruption found by the engine fails like any other selected-read corruption (#261).
 fn engine_error(error: anyhow::Error) -> anyhow::Error {
@@ -1545,7 +1558,7 @@ mod tests {
             language: "rust".into(),
             path: "target.rs".into(),
         };
-        let selected = ReadRevision::new(
+        let selected = ReadRevision::for_tests(
             IndexPin {
                 index_generation: uuid::Uuid::nil(),
                 index_revision: 1,
@@ -1556,14 +1569,14 @@ mod tests {
             source_set_id: key.source_set_id.clone(),
             revision_id: "revision".into(),
         };
-        let scope = V8NativeScope {
-            revision_key: selected.key.clone(),
-            version_id: "version".into(),
-            vid: 2,
-            key: key.clone(),
-            native_revision_id: snapshot.revision_id.clone(),
-            producer_id: "native".into(),
-        };
+        let scope = V8NativeScope::for_tests(
+            selected.key.clone(),
+            "version".into(),
+            2,
+            key.clone(),
+            snapshot.revision_id.clone(),
+            "native".into(),
+        );
         let mut check = || Ok(());
         let mut source = SnapshotGraphSource {
             db: &db,

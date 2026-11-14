@@ -44,6 +44,21 @@ paths = [
   "src/graph_query.rs", "src/rules/**", "src/rules_edit.rs", "src/behavior_columns.rs",
   "src/apps.rs", "src/apps/**", "src/interfaces.rs", "src/interfaces/**",
   "src/model_management.rs", "src/search_config.rs", "src/symbol_lookup.rs",
+  # The Architecture and metrics read service, moved up from storage (S5, #1045): the
+  # per-revision core, the Architecture operations and the metrics projection, with the tests
+  # that moved with them. Storage keeps the read they start from.
+  "src/architecture_core.rs", "src/architecture_read.rs", "src/architecture_read_apps_tests.rs",
+  "src/metrics_read.rs", "src/metrics_read_parallel_tests.rs",
+  # The Sequence, graph and navigation reads, moved up from storage (S6, #1048): the snapshot
+  # graph source and Sequence enrichment, the Sequence boundary hops, and the read bodies and
+  # forwarding methods of each view, with the tests that moved with them. They contain SQL
+  # until the read API is narrowed (S14).
+  "src/graph_read.rs", "src/graph_read/**", "src/sequence_hops.rs",
+  "src/sequence_hops_tests.rs", "src/sequence_callback_hops_tests.rs",
+  "src/navigation_read.rs", "src/sequence_read.rs", "src/view_read.rs",
+  # The class reads, moved up from storage (S7, #1052): the class page and class diagram read
+  # bodies, their forwarding methods and the presentation helpers. SQL until S14, as above.
+  "src/class_read.rs",
 ]
 
 [layers.indexing]
@@ -113,6 +128,12 @@ paths = [
   # source-extension input tables and the per-source read counters (S4b, #1003).
   # Admission, the walk and `Capture` stay in capture.rs.
   "src/capture_records.rs",
+  # The batch descriptor and page grammar: the serde types, the format version, the checks
+  # over bytes, limits and the captured revision, the row order and the source-manifest hash
+  # (S8, #1071). Producers write it, admission and storage read it. The checks that consult
+  # the producer registry, the producer profiles or the filesystem stay in
+  # semantic_batch/descriptor.rs.
+  "src/batch_descriptor.rs",
 ]
 
 # Coarse developer-tool boundary; does not infer internal tooling architecture.

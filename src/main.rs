@@ -480,14 +480,6 @@ fn cli_first_index_wait() -> Duration {
     CLI_FIRST_INDEX_WAIT
 }
 
-/// The read commands that activate their checkout and wait for its first head (#842).
-fn awaits_first_head(operation: &str) -> bool {
-    matches!(
-        operation,
-        "status" | "symbols" | "query" | "metrics" | "rules_check" | "references"
-    )
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     // Before any SQLite connection opens (#673).
@@ -1343,7 +1335,7 @@ fn query_cli_payload(args: &QueryArgs) -> Result<serde_json::Value> {
 }
 
 fn metrics_cli_payload(args: &MetricsArgs) -> Result<serde_json::Value> {
-    let mut options = trellis::store::MetricsOptions {
+    let mut options = trellis::metrics_read::MetricsOptions {
         scope: args.scope.clone(),
         source_set_id: args.source_set_id.clone(),
         language: args.language.clone(),
@@ -1394,7 +1386,7 @@ fn metrics_cli_payload(args: &MetricsArgs) -> Result<serde_json::Value> {
 
 /// The metrics option rules of the CLI and of the daemon request it sends:
 /// the shared transport rules, as `invalid_argument`.
-fn validate_cli_metrics_options(options: &trellis::store::MetricsOptions) -> Result<()> {
+fn validate_cli_metrics_options(options: &trellis::metrics_read::MetricsOptions) -> Result<()> {
     options
         .validate_transport()
         .map_err(|error| anyhow::anyhow!("invalid_argument: {error}"))
@@ -1402,7 +1394,7 @@ fn validate_cli_metrics_options(options: &trellis::store::MetricsOptions) -> Res
 
 /// The work budget of a metrics request, from its still unvalidated scope.
 fn metrics_work_budget(request: &protocol::Request) -> Duration {
-    trellis::store::MetricsOptions::work_budget(
+    trellis::metrics_read::MetricsOptions::work_budget(
         request.payload["args"]["scope"]
             .as_str()
             .unwrap_or_default(),
@@ -2335,6 +2327,388 @@ impl Drop for ServeRegistration {
     }
 }
 
+/// One daemon-socket operation: the request's operation string, parsed once.
+/// Everything the connection handler decides by operation is in the two
+/// tables below, [`Operation::requires_preface`] and [`Operation::route`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Operation {
+    DaemonStop,
+    Mcp,
+    Api,
+    GcReport,
+    Serve,
+    Status,
+    Symbols,
+    Query,
+    Index,
+    SemanticImport,
+    Metrics,
+    RulesCheck,
+    References,
+    ProducerPlan,
+    ProducerStatus,
+    ProducerPickup,
+    ProducerRun,
+    ProducerCancel,
+    SettledForTests,
+    /// Any other string. It is refused as `unknown daemon operation` only
+    /// after the request's workspace has been checked, like a known read.
+    Unknown,
+}
+
+/// Which handler answers an operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Route {
+    /// Hands the connection to the daemon's stop sequence, which answers it.
+    Stop,
+    /// Attaches an MCP session and serves it on this connection.
+    Mcp,
+    /// One allowlisted browser route, with no checkout attached.
+    Api,
+    /// The index garbage-collection report, with no checkout attached.
+    GcReport,
+    /// One request against the workspace it names.
+    Read(ReadKind, ReadPolicy),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadKind {
+    /// Registers a browser session and holds the connection open.
+    Serve,
+    /// Activates the checkout and runs one selected read or write.
+    Checkout,
+    /// Refused once the workspace has been checked.
+    Unknown,
+}
+
+/// The per-operation policy of a [`Route::Read`] request. `Serve` and
+/// `Unknown` end before `marker`, `awaits_first_head` and `replayable` are
+/// consulted, and before `read_scope` applies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReadPolicy {
+    /// One deadline for the whole CLI read (#142): activation contention, the
+    /// wait for startup reconciliation and every SQLite busy wait share it, so
+    /// they cannot stack. When it passes the read fails typed.
+    budget: ReadBudget,
+    /// Activation and the selected read run under that deadline as the
+    /// store's read deadline.
+    read_scope: bool,
+    marker: Marker,
+    /// The read commands that activate their checkout and wait for its first
+    /// head (#842). The read then starts a fresh budget.
+    awaits_first_head: bool,
+    /// A read-only call repeats on typed contention and on `index_not_ready`
+    /// until its deadline. An accepted write is never replayed.
+    replayable: bool,
+    reply: ReplyTransfer,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadBudget {
+    Fixed(Duration),
+    /// From the request's scope, so it stays code: `metrics_read_budget`.
+    MetricsWork,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Marker {
+    /// Publishes the workspace marker that activation needs. A status read
+    /// activates its checkout like every other read (#842).
+    Publish,
+    /// Observes an existing marker and creates none.
+    ExistingReadOnly,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplyTransfer {
+    /// Written whole, or in chunks when it exceeds one frame.
+    Chunked,
+    /// A success past the deadline becomes `deadline_exceeded`, a deadline
+    /// error more than 500 ms late is not sent, and the transfer has its own
+    /// window.
+    DeadlineBounded,
+}
+
+impl Operation {
+    fn parse(operation: &str) -> Self {
+        match operation {
+            "daemon_stop" => Self::DaemonStop,
+            "mcp" => Self::Mcp,
+            "api" => Self::Api,
+            "gc_report" => Self::GcReport,
+            "serve" => Self::Serve,
+            "status" => Self::Status,
+            "symbols" => Self::Symbols,
+            "query" => Self::Query,
+            "index" => Self::Index,
+            "semantic_import" => Self::SemanticImport,
+            "metrics" => Self::Metrics,
+            "rules_check" => Self::RulesCheck,
+            "references" => Self::References,
+            "producer_plan" => Self::ProducerPlan,
+            "producer_status" => Self::ProducerStatus,
+            "producer_pickup" => Self::ProducerPickup,
+            "producer_run" => Self::ProducerRun,
+            "producer_cancel" => Self::ProducerCancel,
+            "settled_for_tests" => Self::SettledForTests,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Whether the request must arrive behind the metrics admission preface.
+    /// Every other operation must arrive without it.
+    fn requires_preface(self) -> bool {
+        matches!(self, Self::Metrics)
+    }
+
+    fn route(self) -> Route {
+        use {Marker::*, ReadBudget::*, ReadKind::*, ReplyTransfer::*};
+        match self {
+            Self::DaemonStop => Route::Stop,
+            Self::Mcp => Route::Mcp,
+            Self::Api => Route::Api,
+            Self::GcReport => Route::GcReport,
+            Self::Serve => Route::Read(
+                Serve,
+                ReadPolicy {
+                    budget: Fixed(CLI_READ_WAIT),
+                    read_scope: false,
+                    marker: Publish,
+                    awaits_first_head: false,
+                    replayable: true,
+                    reply: Chunked,
+                },
+            ),
+            Self::Unknown => Route::Read(
+                Unknown,
+                ReadPolicy {
+                    budget: Fixed(CLI_READ_WAIT),
+                    read_scope: false,
+                    marker: Publish,
+                    awaits_first_head: false,
+                    replayable: true,
+                    reply: Chunked,
+                },
+            ),
+            Self::Status | Self::Symbols | Self::Query => Route::Read(
+                Checkout,
+                ReadPolicy {
+                    budget: Fixed(CLI_READ_WAIT),
+                    read_scope: true,
+                    marker: Publish,
+                    awaits_first_head: true,
+                    replayable: true,
+                    reply: Chunked,
+                },
+            ),
+            Self::Metrics => Route::Read(
+                Checkout,
+                ReadPolicy {
+                    budget: MetricsWork,
+                    read_scope: true,
+                    marker: Publish,
+                    awaits_first_head: true,
+                    replayable: true,
+                    reply: DeadlineBounded,
+                },
+            ),
+            // A rules check or references read can wait for the revision's
+            // architecture core (#556).
+            Self::RulesCheck | Self::References => Route::Read(
+                Checkout,
+                ReadPolicy {
+                    budget: Fixed(CLI_ARCHITECTURE_WAIT),
+                    read_scope: true,
+                    marker: Publish,
+                    awaits_first_head: true,
+                    replayable: true,
+                    reply: Chunked,
+                },
+            ),
+            Self::ProducerPlan | Self::ProducerStatus => Route::Read(
+                Checkout,
+                ReadPolicy {
+                    budget: Fixed(CLI_READ_WAIT),
+                    read_scope: true,
+                    marker: ExistingReadOnly,
+                    awaits_first_head: false,
+                    replayable: true,
+                    reply: Chunked,
+                },
+            ),
+            Self::Index
+            | Self::SemanticImport
+            | Self::ProducerPickup
+            | Self::ProducerRun
+            | Self::ProducerCancel => Route::Read(
+                Checkout,
+                ReadPolicy {
+                    budget: Fixed(CLI_READ_WAIT),
+                    read_scope: false,
+                    marker: Publish,
+                    awaits_first_head: false,
+                    replayable: false,
+                    reply: Chunked,
+                },
+            ),
+            // Only activation contention shares this; the wait has its own bound.
+            Self::SettledForTests => Route::Read(
+                Checkout,
+                ReadPolicy {
+                    budget: Fixed(trellis::testing::HANG_BACKSTOP),
+                    read_scope: false,
+                    marker: ExistingReadOnly,
+                    awaits_first_head: false,
+                    replayable: true,
+                    reply: Chunked,
+                },
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod operation_policy_tests {
+    use super::*;
+
+    const KNOWN: [&str; 19] = [
+        "daemon_stop",
+        "mcp",
+        "api",
+        "gc_report",
+        "serve",
+        "status",
+        "symbols",
+        "query",
+        "index",
+        "semantic_import",
+        "metrics",
+        "rules_check",
+        "references",
+        "producer_plan",
+        "producer_status",
+        "producer_pickup",
+        "producer_run",
+        "producer_cancel",
+        "settled_for_tests",
+    ];
+
+    /// The policy as the string comparisons spelled it before the table
+    /// (#1072), kept here as the independent statement of each rule.
+    fn expected_route(operation: &str) -> Route {
+        match operation {
+            "daemon_stop" => return Route::Stop,
+            "mcp" => return Route::Mcp,
+            "api" => return Route::Api,
+            "gc_report" => return Route::GcReport,
+            _ => {}
+        }
+        let kind = if operation == "serve" {
+            ReadKind::Serve
+        } else if matches!(
+            operation,
+            "status"
+                | "symbols"
+                | "query"
+                | "index"
+                | "semantic_import"
+                | "metrics"
+                | "rules_check"
+                | "references"
+                | "producer_plan"
+                | "producer_status"
+                | "producer_pickup"
+                | "producer_run"
+                | "producer_cancel"
+                | "settled_for_tests"
+        ) {
+            ReadKind::Checkout
+        } else {
+            ReadKind::Unknown
+        };
+        let budget = if operation == "metrics" {
+            ReadBudget::MetricsWork
+        } else if matches!(operation, "rules_check" | "references") {
+            ReadBudget::Fixed(Duration::from_secs(30))
+        } else if operation == "settled_for_tests" {
+            ReadBudget::Fixed(trellis::testing::HANG_BACKSTOP)
+        } else {
+            ReadBudget::Fixed(Duration::from_secs(5))
+        };
+        let read_scope = matches!(
+            operation,
+            "status"
+                | "symbols"
+                | "query"
+                | "metrics"
+                | "rules_check"
+                | "references"
+                | "producer_plan"
+                | "producer_status"
+        );
+        let marker = if matches!(
+            operation,
+            "producer_plan" | "producer_status" | "settled_for_tests"
+        ) {
+            Marker::ExistingReadOnly
+        } else {
+            Marker::Publish
+        };
+        let awaits_first_head = matches!(
+            operation,
+            "status" | "symbols" | "query" | "metrics" | "rules_check" | "references"
+        );
+        let replayable = !matches!(
+            operation,
+            "index" | "semantic_import" | "producer_pickup" | "producer_run" | "producer_cancel"
+        );
+        let reply = if operation == "metrics" {
+            ReplyTransfer::DeadlineBounded
+        } else {
+            ReplyTransfer::Chunked
+        };
+        Route::Read(
+            kind,
+            ReadPolicy {
+                budget,
+                read_scope,
+                marker,
+                awaits_first_head,
+                replayable,
+                reply,
+            },
+        )
+    }
+
+    #[test]
+    fn every_operation_has_the_policy_its_string_had() {
+        for operation in KNOWN
+            .into_iter()
+            .chain(["", "bogus", "Status", "status ", "metrics2"])
+        {
+            let parsed = Operation::parse(operation);
+            assert_eq!(parsed.route(), expected_route(operation), "{operation:?}");
+            assert_eq!(
+                parsed.requires_preface(),
+                operation == "metrics",
+                "{operation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_known_string_is_its_own_operation() {
+        let parsed: Vec<Operation> = KNOWN.into_iter().map(Operation::parse).collect();
+        for (index, operation) in parsed.iter().enumerate() {
+            assert_ne!(*operation, Operation::Unknown, "{}", KNOWN[index]);
+            assert!(!parsed[..index].contains(operation), "{}", KNOWN[index]);
+        }
+        for other in ["", "bogus", "Status", "status ", "metrics2"] {
+            assert_eq!(Operation::parse(other), Operation::Unknown, "{other:?}");
+        }
+    }
+}
+
 fn dispatch_connection(
     mut stream: std::os::unix::net::UnixStream,
     session: u64,
@@ -2349,6 +2723,50 @@ fn dispatch_connection(
         stop_sender,
     } = control;
     let runtime = tokio::runtime::Handle::current();
+    let (request, operation) = admit_request(&mut stream, &browser_shutdown, accepted_at)?;
+    match operation.route() {
+        Route::Stop => hand_off_stop(stream, session, &request, &stop_sender),
+        Route::Mcp => serve_mcp_connection(
+            stream,
+            session,
+            &request,
+            &registry,
+            &browser_shutdown,
+            &runtime,
+        ),
+        Route::Api => {
+            // `trellis api` (#817): one allowlisted browser route, answered by its own handler.
+            let result = cli_api_result(&request, &registry, &runtime);
+            write_daemon_reply(&mut stream, &result_reply(request.id, result))
+        }
+        Route::GcReport => {
+            let result = search.gc_report();
+            write_daemon_reply(&mut stream, &result_reply(request.id, result))
+        }
+        Route::Read(kind, policy) => read_connection(
+            stream,
+            &ReadCtx {
+                request: &request,
+                operation,
+                kind,
+                policy,
+                session,
+                registry: &registry,
+                browser: &browser,
+                browser_shutdown: &browser_shutdown,
+                runtime: &runtime,
+            },
+        ),
+    }
+}
+
+/// Phase A: reads the request, checks the metrics admission preface against
+/// its operation, and acknowledges an admitted metrics request.
+fn admit_request(
+    stream: &mut std::os::unix::net::UnixStream,
+    browser_shutdown: &tokio::sync::watch::Sender<bool>,
+    accepted_at: Instant,
+) -> Result<(protocol::Request, Operation)> {
     let ingress_deadline = accepted_at + Duration::from_secs(20);
     #[cfg(feature = "test-support")]
     let ingress_deadline = std::env::var("TRELLIS_TEST_METRICS_INGRESS_DEADLINE_MS")
@@ -2357,15 +2775,16 @@ fn dispatch_connection(
         .map(|milliseconds| accepted_at + Duration::from_millis(milliseconds))
         .unwrap_or(ingress_deadline);
     let (request, prefaced) = read_daemon_request(
-        &stream,
+        stream,
         browser_shutdown.subscribe(),
         ingress_deadline,
         #[cfg(test)]
         None,
     )?;
+    let operation = Operation::parse(&request.operation);
     if prefaced {
         ensure!(
-            request.operation == "metrics",
+            operation.requires_preface(),
             "invalid prefaced daemon operation"
         );
         #[cfg(feature = "test-support")]
@@ -2373,7 +2792,7 @@ fn dispatch_connection(
             std::thread::sleep(delay);
         }
         protocol::write_frame_until(
-            &mut stream,
+            stream,
             &protocol::Reply {
                 id: request.id,
                 payload: serde_json::json!({"admitted": true}),
@@ -2384,210 +2803,230 @@ fn dispatch_connection(
         metrics_test_phase(b"A");
     } else {
         ensure!(
-            request.operation != "metrics",
+            !operation.requires_preface(),
             "metrics admission preface required"
         );
     }
-    if request.operation == "daemon_stop" {
-        ensure!(
-            request.payload == serde_json::json!({}),
-            "invalid daemon stop request"
-        );
-        stop_sender
-            .send(DaemonStop {
-                session,
-                request: request.id,
-                stream,
-            })
-            .map_err(|_| anyhow::anyhow!("daemon_unavailable: daemon already stopping"))?;
-        return Ok(());
-    }
-    if request.operation == "mcp" {
-        let relayed = request
-            .payload
-            .get("relay")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        let result = (|| -> Result<mcp::OpenedWorkspace> {
-            protocol::check_mcp_identity(request.payload.get("mcpIdentity"))?;
-            let root: PathBuf = serde_json::from_value(
-                request
-                    .payload
-                    .get("workspace")
-                    .cloned()
-                    .context("missing workspace")?,
-            )?;
-            let identity = WorkspaceIdentity::discover_unattached(Some(&root), &root)?;
-            let device: u64 = serde_json::from_value(
-                request
-                    .payload
-                    .get("device")
-                    .cloned()
-                    .context("missing root device")?,
-            )?;
-            let inode: u64 = serde_json::from_value(
-                request
-                    .payload
-                    .get("inode")
-                    .cloned()
-                    .context("missing root inode")?,
-            )?;
-            ensure!(
-                (identity.device, identity.inode) == (device, inode),
-                "root_changed: launch checkout identity changed"
-            );
-            TopologyRoots::production()?.reject_root_overlap(&identity)?;
-            ensure!(identity.root.join(".git").exists(), "not a Git checkout");
-            let identity = identity.attach_marker()?;
-            let attachments: Vec<protocol::McpAttachment> = request
-                .payload
-                .get("attachments")
-                .cloned()
-                .map(serde_json::from_value)
-                .transpose()?
-                .unwrap_or_default();
-            let probe = runtime.block_on(async { registry.lock().await.selection_probe() });
-            let mut prepared = Vec::new();
-            for attachment in attachments {
-                // A failed old attachment cannot block the still-valid launch
-                // workspace or attach a new incarnation at its old path.
-                let restored = (|| -> Result<_> {
-                    let captured = WorkspaceIdentity::discover_unattached(
-                        Some(&attachment.root),
-                        &attachment.root,
-                    )
-                    .and_then(WorkspaceIdentity::attach_existing_marker_readonly)?;
-                    ensure!(attachment.matches(&captured), "selected identity changed");
-                    let selection = probe
-                        .prepare(&identity, &attachment.root)
-                        .map_err(|error| anyhow::anyhow!("{}", error.reason()))?;
-                    ensure!(
-                        attachment.matches(selection.identity()),
-                        "selected identity changed"
-                    );
-                    Ok(selection)
-                })();
-                if let Ok(selection) = restored {
-                    prepared.push(selection);
-                }
+    Ok((request, operation))
+}
+
+/// Phase B: hands the connection to the daemon's stop sequence.
+fn hand_off_stop(
+    stream: std::os::unix::net::UnixStream,
+    session: u64,
+    request: &protocol::Request,
+    stop_sender: &tokio::sync::mpsc::UnboundedSender<DaemonStop>,
+) -> Result<()> {
+    ensure!(
+        request.payload == serde_json::json!({}),
+        "invalid daemon stop request"
+    );
+    stop_sender
+        .send(DaemonStop {
+            session,
+            request: request.id,
+            stream,
+        })
+        .map_err(|_| anyhow::anyhow!("daemon_unavailable: daemon already stopping"))?;
+    Ok(())
+}
+
+/// Phase C: attaches an MCP session, answers, and serves it until it ends.
+fn serve_mcp_connection(
+    mut stream: std::os::unix::net::UnixStream,
+    session: u64,
+    request: &protocol::Request,
+    registry: &Arc<tokio::sync::Mutex<registry::CheckoutRegistry>>,
+    browser_shutdown: &tokio::sync::watch::Sender<bool>,
+    runtime: &tokio::runtime::Handle,
+) -> Result<()> {
+    let relayed = request
+        .payload
+        .get("relay")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let result = open_mcp_workspace(request, session, registry, runtime);
+    let reply = protocol::Reply {
+        id: request.id,
+        payload: match &result {
+            Ok(_) => {
+                serde_json::json!({"result": true, "mcpIdentity": protocol::mcp_identity()})
             }
-            runtime.block_on(async {
-                let mut registry = registry.lock().await;
-                registry
-                    .attach_launch(session, &identity)
-                    .map_err(|error| anyhow::anyhow!("{}", error.reason()))?;
-                for selection in prepared {
-                    // Capacity or an incarnation change can race preparation.
-                    // Restore the other selections and keep launch usable.
-                    let _ = registry.select_prepared(session, selection);
-                }
-                Ok::<_, anyhow::Error>(())
-            })?;
-            Ok(mcp::OpenedWorkspace::new(identity))
+            Err(error) => serde_json::json!({"error": format!("{error:#}")}),
+        },
+    };
+    let delivered = protocol::write_frame(&mut stream, &reply);
+    let served = match (result, delivered) {
+        // An idle MCP attachment has no read deadline. Its reader ends at
+        // end of input or on the published daemon shutdown (#741).
+        (Ok(workspace), Ok(())) => mcp::run_daemon_socket(
+            workspace,
+            stream,
+            relayed,
+            browser_shutdown.subscribe(),
+            registry.clone(),
+            session,
+            runtime.clone(),
+        )
+        .map_err(anyhow::Error::from),
+        (Err(error), _) => Err(error),
+        (_, Err(error)) => Err(error.into()),
+    };
+    runtime.block_on(async { registry.lock().await.disconnect(session) });
+    served
+}
+
+fn open_mcp_workspace(
+    request: &protocol::Request,
+    session: u64,
+    registry: &Arc<tokio::sync::Mutex<registry::CheckoutRegistry>>,
+    runtime: &tokio::runtime::Handle,
+) -> Result<mcp::OpenedWorkspace> {
+    protocol::check_mcp_identity(request.payload.get("mcpIdentity"))?;
+    let root: PathBuf = serde_json::from_value(
+        request
+            .payload
+            .get("workspace")
+            .cloned()
+            .context("missing workspace")?,
+    )?;
+    let identity = WorkspaceIdentity::discover_unattached(Some(&root), &root)?;
+    let device: u64 = serde_json::from_value(
+        request
+            .payload
+            .get("device")
+            .cloned()
+            .context("missing root device")?,
+    )?;
+    let inode: u64 = serde_json::from_value(
+        request
+            .payload
+            .get("inode")
+            .cloned()
+            .context("missing root inode")?,
+    )?;
+    ensure!(
+        (identity.device, identity.inode) == (device, inode),
+        "root_changed: launch checkout identity changed"
+    );
+    TopologyRoots::production()?.reject_root_overlap(&identity)?;
+    ensure!(identity.root.join(".git").exists(), "not a Git checkout");
+    let identity = identity.attach_marker()?;
+    let attachments: Vec<protocol::McpAttachment> = request
+        .payload
+        .get("attachments")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()?
+        .unwrap_or_default();
+    let probe = runtime.block_on(async { registry.lock().await.selection_probe() });
+    let mut prepared = Vec::new();
+    for attachment in attachments {
+        // A failed old attachment cannot block the still-valid launch
+        // workspace or attach a new incarnation at its old path.
+        let restored = (|| -> Result<_> {
+            let captured =
+                WorkspaceIdentity::discover_unattached(Some(&attachment.root), &attachment.root)
+                    .and_then(WorkspaceIdentity::attach_existing_marker_readonly)?;
+            ensure!(attachment.matches(&captured), "selected identity changed");
+            let selection = probe
+                .prepare(&identity, &attachment.root)
+                .map_err(|error| anyhow::anyhow!("{}", error.reason()))?;
+            ensure!(
+                attachment.matches(selection.identity()),
+                "selected identity changed"
+            );
+            Ok(selection)
         })();
-        let reply = protocol::Reply {
-            id: request.id,
-            payload: match &result {
-                Ok(_) => {
-                    serde_json::json!({"result": true, "mcpIdentity": protocol::mcp_identity()})
-                }
-                Err(error) => serde_json::json!({"error": format!("{error:#}")}),
-            },
-        };
-        let delivered = protocol::write_frame(&mut stream, &reply);
-        let served = match (result, delivered) {
-            // An idle MCP attachment has no read deadline. Its reader ends at
-            // end of input or on the published daemon shutdown (#741).
-            (Ok(workspace), Ok(())) => mcp::run_daemon_socket(
-                workspace,
-                stream,
-                relayed,
-                browser_shutdown.subscribe(),
-                registry.clone(),
-                session,
-                runtime.clone(),
-            )
-            .map_err(anyhow::Error::from),
-            (Err(error), _) => Err(error),
-            (_, Err(error)) => Err(error.into()),
-        };
-        runtime.block_on(async { registry.lock().await.disconnect(session) });
-        return served;
+        if let Ok(selection) = restored {
+            prepared.push(selection);
+        }
     }
-    if request.operation == "api" {
-        // `trellis api` (#817): one allowlisted browser route, answered by its own handler.
-        let result = (|| -> Result<serde_json::Value> {
-            let field = |name: &str| {
-                request
-                    .payload
-                    .get(name)
-                    .and_then(serde_json::Value::as_str)
-            };
-            let method = field("method").context("invalid_request: missing method")?;
-            let target = field("target").context("invalid_request: missing target")?;
-            let (status, body) = runtime.block_on(trellis::http::cli_api(
-                registry.clone(),
-                method,
-                target,
-                field("body"),
-            ))?;
-            Ok(serde_json::json!({"status": status, "body": body}))
-        })();
-        let reply = protocol::Reply {
-            id: request.id,
-            payload: match result {
-                Ok(value) => serde_json::json!({"result": value}),
-                Err(error) => serde_json::json!({"error": format!("{error:#}")}),
-            },
-        };
-        return write_daemon_reply(&mut stream, &reply);
+    runtime.block_on(async {
+        let mut registry = registry.lock().await;
+        registry
+            .attach_launch(session, &identity)
+            .map_err(|error| anyhow::anyhow!("{}", error.reason()))?;
+        for selection in prepared {
+            // Capacity or an incarnation change can race preparation.
+            // Restore the other selections and keep launch usable.
+            let _ = registry.select_prepared(session, selection);
+        }
+        Ok::<_, anyhow::Error>(())
+    })?;
+    Ok(mcp::OpenedWorkspace::new(identity))
+}
+
+/// Phase D: the `trellis api` request, answered by the browser route's handler.
+fn cli_api_result(
+    request: &protocol::Request,
+    registry: &Arc<tokio::sync::Mutex<registry::CheckoutRegistry>>,
+    runtime: &tokio::runtime::Handle,
+) -> Result<serde_json::Value> {
+    let field = |name: &str| {
+        request
+            .payload
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+    };
+    let method = field("method").context("invalid_request: missing method")?;
+    let target = field("target").context("invalid_request: missing target")?;
+    let (status, body) = runtime.block_on(trellis::http::cli_api(
+        registry.clone(),
+        method,
+        target,
+        field("body"),
+    ))?;
+    Ok(serde_json::json!({"status": status, "body": body}))
+}
+
+fn result_reply<T: Serialize>(id: u64, result: Result<T>) -> protocol::Reply {
+    protocol::Reply {
+        id,
+        payload: match result {
+            Ok(value) => serde_json::json!({"result": value}),
+            Err(error) => serde_json::json!({"error": format!("{error:#}")}),
+        },
     }
-    if request.operation == "gc_report" {
-        let result = search.gc_report();
-        let reply = protocol::Reply {
-            id: request.id,
-            payload: match result {
-                Ok(value) => serde_json::json!({"result": value}),
-                Err(error) => serde_json::json!({"error": format!("{error:#}")}),
-            },
-        };
-        return write_daemon_reply(&mut stream, &reply);
-    }
-    let serve = request.operation == "serve";
+}
+
+/// What the phases of a [`Route::Read`] request share.
+#[derive(Clone, Copy)]
+struct ReadCtx<'a> {
+    request: &'a protocol::Request,
+    operation: Operation,
+    kind: ReadKind,
+    policy: ReadPolicy,
+    session: u64,
+    registry: &'a Arc<tokio::sync::Mutex<registry::CheckoutRegistry>>,
+    browser: &'a Arc<tokio::sync::Mutex<daemon::BrowserProvisioner>>,
+    browser_shutdown: &'a tokio::sync::watch::Sender<bool>,
+    runtime: &'a tokio::runtime::Handle,
+}
+
+/// Phases F to H: budgets the request, runs it, detaches the session and
+/// replies. A registered serve then holds the connection.
+fn read_connection(mut stream: std::os::unix::net::UnixStream, ctx: &ReadCtx) -> Result<()> {
+    let ReadCtx {
+        request,
+        kind,
+        policy,
+        session,
+        registry,
+        browser_shutdown,
+        runtime,
+        ..
+    } = *ctx;
+    let serve = kind == ReadKind::Serve;
     let _serve_registration =
         serve.then(|| ServeRegistration::new(registry.clone(), runtime.clone(), session));
-    // One deadline for the whole CLI read (#142): activation contention, the
-    // wait for startup reconciliation and every SQLite busy wait share it, so
-    // they cannot stack. When it passes the read fails typed.
-    let metrics = request.operation == "metrics";
-    let metrics_work = metrics_work_budget(&request);
-    #[cfg(feature = "test-support")]
-    let metrics_work =
-        metrics_test_duration("TRELLIS_TEST_METRICS_WORK_DEADLINE_MS").unwrap_or(metrics_work);
-    #[cfg(feature = "test-support")]
-    let metrics_work = if matches!(
-        request.payload["args"]["scope"].as_str(),
-        Some("file" | "declaration")
-    ) {
-        metrics_test_duration_file("TRELLIS_TEST_METRICS_FILE_WORK_DEADLINE_MS_FILE")
-            .unwrap_or(metrics_work)
-    } else {
-        metrics_work
+    let read_budget = match policy.budget {
+        ReadBudget::MetricsWork => metrics_read_budget(request),
+        ReadBudget::Fixed(wait) => wait,
     };
-    let architecture = matches!(request.operation.as_str(), "rules_check" | "references");
-    let read_budget = if metrics {
-        metrics_work
-    } else if architecture {
-        CLI_ARCHITECTURE_WAIT
-    } else if request.operation == "settled_for_tests" {
-        // Only activation contention shares this; the wait has its own bound.
-        trellis::testing::HANG_BACKSTOP
-    } else {
-        CLI_READ_WAIT
-    };
-    // The read's deadline, as `run` finally set it: a wait for the first head
+    // The read's deadline, as `run_read` finally set it: a wait for the first head
     // (#842) starts a fresh read budget after it.
-    let answered_deadline = std::cell::Cell::new(Instant::now() + read_budget);
+    let mut answered_deadline = Instant::now() + read_budget;
     // Progress of that wait goes to the client as frames before its reply.
     let mut progress_stream = stream.try_clone().ok();
     let mut progress = |message: String| {
@@ -2601,492 +3040,585 @@ fn dispatch_connection(
             );
         }
     };
-    let read_scope = matches!(
-        request.operation.as_str(),
-        "status"
-            | "symbols"
-            | "query"
-            | "metrics"
-            | "rules_check"
-            | "references"
-            | "producer_plan"
-            | "producer_status"
-    );
-    let mut run = || -> Result<serde_json::Value> {
-        let request_deadline = answered_deadline.get();
-        let root: PathBuf = serde_json::from_value(
+    let result = run_read(ctx, read_budget, &mut answered_deadline, &mut progress);
+    let request_deadline = answered_deadline;
+    if !serve {
+        runtime.block_on(async { registry.lock().await.disconnect(session) });
+    }
+    let serve_registered = serve && result.is_ok();
+    reply_to_read(&mut stream, ctx, result, request_deadline)?;
+    if serve_registered {
+        // The scoped registration holds the daemon alive until this control
+        // connection closes or the daemon stops, signalled by
+        // the shutdown channel instead of a polled flag (#138 item 21).
+        wait_for_serve_disconnect(stream, browser_shutdown.subscribe(), runtime)?;
+    }
+    Ok(())
+}
+
+/// The work budget of a metrics read, from its request.
+fn metrics_read_budget(request: &protocol::Request) -> Duration {
+    let metrics_work = metrics_work_budget(request);
+    #[cfg(feature = "test-support")]
+    let metrics_work =
+        metrics_test_duration("TRELLIS_TEST_METRICS_WORK_DEADLINE_MS").unwrap_or(metrics_work);
+    #[cfg(feature = "test-support")]
+    let metrics_work = if matches!(
+        request.payload["args"]["scope"].as_str(),
+        Some("file" | "declaration")
+    ) {
+        metrics_test_duration_file("TRELLIS_TEST_METRICS_FILE_WORK_DEADLINE_MS_FILE")
+            .unwrap_or(metrics_work)
+    } else {
+        metrics_work
+    };
+    metrics_work
+}
+
+/// Phase G: checks the workspace, then registers a serve or runs the
+/// operation on its activated checkout.
+fn run_read(
+    ctx: &ReadCtx,
+    read_budget: Duration,
+    answered_deadline: &mut Instant,
+    progress: &mut dyn FnMut(String),
+) -> Result<serde_json::Value> {
+    let ReadCtx {
+        request,
+        operation,
+        kind,
+        policy,
+        ..
+    } = *ctx;
+    let request_deadline = *answered_deadline;
+    let root: PathBuf = serde_json::from_value(
+        request
+            .payload
+            .get("workspace")
+            .cloned()
+            .context("missing workspace")?,
+    )?;
+    let identity = WorkspaceIdentity::discover_unattached(Some(&root), &root)?;
+    TopologyRoots::production()?.reject_root_overlap(&identity)?;
+    if kind == ReadKind::Serve {
+        return register_serve(ctx, identity);
+    }
+    ensure!(kind == ReadKind::Checkout, "unknown daemon operation");
+    let metrics_options = if operation == Operation::Metrics {
+        Some(metrics_options_from_request(
             request
                 .payload
-                .get("workspace")
-                .cloned()
-                .context("missing workspace")?,
-        )?;
-        let identity = WorkspaceIdentity::discover_unattached(Some(&root), &root)?;
-        TopologyRoots::production()?.reject_root_overlap(&identity)?;
-        if serve {
-            let options = checked_serve_options(
-                request
-                    .payload
-                    .get("options")
-                    .cloned()
-                    .context("missing options")?,
-            )?;
-            let bind = serde_json::from_value(
-                request
-                    .payload
-                    .get("bind")
-                    .cloned()
-                    .context("missing bind")?,
-            )?;
-            let token_file: PathBuf = serde_json::from_value(
-                request
-                    .payload
-                    .get("tokenFile")
-                    .cloned()
-                    .context("missing token file")?,
-            )?;
-            let identity = identity.attach_marker()?;
-            let address = runtime.block_on(async {
-                let mut browser = browser.lock().await;
-                let first = browser.address().is_none();
-                let address = browser
-                    .register_serve(&registry, &identity, options, bind, &token_file)
-                    .await?;
-                if first {
-                    browser.start_owned(browser_shutdown.subscribe())?;
-                }
-                Ok::<_, anyhow::Error>(address)
-            })?;
-            return Ok(serde_json::json!(address.to_string()));
-        }
-        ensure!(
-            matches!(
-                request.operation.as_str(),
-                "status"
-                    | "symbols"
-                    | "query"
-                    | "index"
-                    | "semantic_import"
-                    | "metrics"
-                    | "rules_check"
-                    | "references"
-                    | "producer_plan"
-                    | "producer_status"
-                    | "producer_pickup"
-                    | "producer_run"
-                    | "producer_cancel"
-                    | "settled_for_tests"
-            ),
-            "unknown daemon operation"
-        );
-        let metrics_options = if metrics {
-            Some(metrics_options_from_request(
-                request
-                    .payload
-                    .get("args")
-                    .context("invalid_argument: missing args")?,
-            )?)
-        } else {
-            None
-        };
-        // A status read activates its checkout like every other read (#842), so
-        // it publishes the workspace marker that activation needs.
-        let identity = if matches!(
-            request.operation.as_str(),
-            "producer_plan" | "producer_status" | "settled_for_tests"
-        ) {
-            identity.attach_existing_marker_readonly()?
-        } else {
-            identity.attach_marker()?
-        };
-        // Virgin queue publication can contend with a short-lived index-use
-        // reader before any request ID has been accepted. Retry only that
-        // typed pre-acceptance admission; never replay an enqueue after COMMIT.
-        let activation_deadline = request_deadline;
-        let checkout = in_read_scope(read_scope, activation_deadline, || {
-            loop {
-                let activated = runtime.block_on(async {
-                    let mut checked = registry.lock().await;
-                    checked
-                        .attach_launch(session, &identity)
-                        .map_err(|e| anyhow::anyhow!("{}", e.reason()))?;
-                    checked.activate(&identity.root_key)
-                });
-                match activated {
-                    Ok(checkout) => break Ok(checkout),
-                    Err(error) if trellis::store::cli_read_retryable_contention(&error) => {
-                        if Instant::now() >= activation_deadline {
-                            break Err(trellis::store::cli_read_busy_expired());
-                        }
-                        std::thread::sleep(Duration::from_millis(20));
-                    }
-                    Err(error) => break Err(error),
-                }
-            }
-        })?;
-        // The activation above is the one MCP and serve use: it starts startup
-        // reconciliation, the first index and the watcher. A read with no head
-        // to answer from waits for that first head, then gets its own budget.
-        let request_deadline = if awaits_first_head(&request.operation)
-            && await_first_head(&checkout, CLI_READ_WAIT, &mut progress)?
-        {
+                .get("args")
+                .context("invalid_argument: missing args")?,
+        )?)
+    } else {
+        None
+    };
+    let identity = match policy.marker {
+        Marker::ExistingReadOnly => identity.attach_existing_marker_readonly()?,
+        Marker::Publish => identity.attach_marker()?,
+    };
+    // Virgin queue publication can contend with a short-lived index-use
+    // reader before any request ID has been accepted. Retry only that
+    // typed pre-acceptance admission; never replay an enqueue after COMMIT.
+    let activation_deadline = request_deadline;
+    let checkout = in_read_scope(policy.read_scope, activation_deadline, || {
+        activate_checkout(ctx, &identity, activation_deadline)
+    })?;
+    // The activation above is the one MCP and serve use: it starts startup
+    // reconciliation, the first index and the watcher. A read with no head
+    // to answer from waits for that first head, then gets its own budget.
+    let request_deadline =
+        if policy.awaits_first_head && await_first_head(&checkout, CLI_READ_WAIT, progress)? {
             Instant::now() + read_budget
         } else {
             request_deadline
         };
-        answered_deadline.set(request_deadline);
-        let args = request.payload.get("args").context("missing args")?;
-        let deadline = request_deadline;
-        let replayable_read = !matches!(
-            request.operation.as_str(),
-            "index" | "semantic_import" | "producer_pickup" | "producer_run" | "producer_cancel"
-        );
-        // Pauses a read-only request after activation, so a fixture can take
-        // index-use contention before the selected read (#687).
-        #[cfg(all(feature = "test-support", unix))]
-        let mut contention_fixture =
-            std::env::var_os("TRELLIS_TEST_CLI_READ_CONTENTION_SOCKET").filter(|_| replayable_read);
-        #[cfg(all(feature = "test-support", unix))]
-        if let Some(path) = &contention_fixture {
-            use std::io::{Read, Write};
-            let mut fixture = std::os::unix::net::UnixStream::connect(path)
-                .expect("connect CLI read contention fixture");
-            fixture
-                .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
-                .unwrap();
-            fixture
-                .write_all(b"R")
-                .expect("report CLI read before the selected read");
-            fixture
-                .read_exact(&mut [0])
-                .expect("release CLI read contention fixture");
-        }
-        in_read_scope(read_scope, request_deadline, || {
-            loop {
-                // Recorded before the read: a state change between the read and
-                // the wait below is never missed.
-                let state_version = checkout.state_version();
-                let selected = match request.operation.as_str() {
-                    "status" => checkout.cli_status(),
-                    #[cfg(feature = "test-support")]
-                    "settled_for_tests" => (|| {
-                        let at: Option<trellis::model::IndexPin> =
-                            serde_json::from_value(args["at"].clone())
-                                .context("invalid_argument: at is not a revision")?;
-                        let pin = checkout.await_settled_for_tests(at)?;
-                        Ok(serde_json::json!({ "revision": pin }))
-                    })(),
-                    "producer_plan" => checkout.cli_producer_plan(args),
-                    "producer_status" => checkout.cli_producer_status(args),
-                    "producer_pickup" => checkout.cli_producer_pickup(args),
-                    "producer_run" => checkout.cli_producer_run(args),
-                    "producer_cancel" => checkout.cli_producer_cancel(args),
-                    "symbols" => checkout.cli_symbols(
-                        args["search"].as_str().context("missing search")?,
-                        args["limit"].as_u64().context("missing limit")? as usize,
-                    ),
-                    "query" => checkout.cli_query(&ViewQuery {
-                        seed: args["seed"].as_str().context("missing seed")?.into(),
-                        depth: args["depth"].as_u64().context("missing depth")? as usize,
-                        max_nodes: args["maxNodes"].as_u64().context("missing maxNodes")? as usize,
-                        max_calls: args["maxCalls"].as_u64().context("missing maxCalls")? as usize,
-                        include_callbacks: args["includeCallbacks"]
-                            .as_bool()
-                            .context("missing includeCallbacks")?,
-                        exclude_paths: serde_json::from_value(args["excludePaths"].clone())?,
-                        semantic_producer_id: serde_json::from_value(
-                            args.get("semanticProducerId").cloned().unwrap_or_default(),
-                        )
-                        .context("invalid_argument: semanticProducerId must be a string")?,
-                    }),
-                    "rules_check" | "references" => (|| {
-                        let kind = if request.operation == "references" {
-                            "references"
-                        } else {
-                            "check"
-                        };
-                        let mut check = || {
-                            ensure!(Instant::now() < request_deadline, "deadline_exceeded");
-                            Ok(())
-                        };
-                        // The owner finishes the first read after a publication; leave time to
-                        // answer. The wait comes before read admission, and again if the head
-                        // moved meanwhile.
-                        let (response, catching_up, result) = loop {
-                            let wait = request_deadline
-                                .saturating_duration_since(Instant::now())
-                                .saturating_sub(Duration::from_secs(1));
-                            checkout.await_architecture_tool(kind, args, wait, &mut check);
-                            let (response, catching_up) = checkout.evidence_response()?;
-                            let result =
-                                checkout.architecture_tool(&response, kind, args, &mut check);
-                            let building = result.as_ref().err().is_some_and(|error| {
-                                error
-                                    .downcast_ref::<trellis::http::ArchitectureBuilding>()
-                                    .is_some()
-                            });
-                            if !building || wait.is_zero() {
-                                break (response, catching_up, result);
-                            }
-                            drop(response);
-                            std::thread::sleep(Duration::from_millis(1));
-                        };
-                        match result {
-                            Ok(payload) => {
-                                check()?;
-                                let value =
-                                    serde_json::json!({"catchingUp":catching_up,"payload":payload});
-                                ensure!(
-                                    serde_json::to_vec(&value)?.len() <= 64 * 1024 * 1024,
-                                    "response_too_large"
-                                );
-                                check()?;
-                                response.finish(value)
-                            }
-                            Err(error) => {
-                                if let Some(diagnostic) = trellis::rules::diagnostic(&error) {
-                                    response.finish(serde_json::json!({"catchingUp":catching_up,"error":diagnostic}))
-                                } else {
-                                    Err(error)
-                                }
-                            }
-                        }
-                    })(),
-                    "metrics" => {
-                        let options = metrics_options.as_ref().expect("metrics options validated");
-                        let mut before_work = || {
-                            #[cfg(feature = "test-support")]
-                            metrics_test_phase(b"W");
-                            #[cfg(feature = "test-support")]
-                            if let Ok(gate) = std::env::var("TRELLIS_TEST_METRICS_WORK_GATE") {
-                                use std::io::Write;
-                                let gate = PathBuf::from(gate);
-                                if let Ok(mut started) = std::fs::OpenOptions::new()
-                                    .create(true)
-                                    .append(true)
-                                    .open(gate.join("started"))
-                                {
-                                    let _ = started.write_all(b"x");
-                                }
-                                while !gate.join("release").exists()
-                                    && Instant::now() < request_deadline
-                                {
-                                    std::thread::sleep(Duration::from_millis(20));
-                                }
-                            }
-                            #[cfg(feature = "test-support")]
-                            if let Ok(delay) = std::env::var("TRELLIS_TEST_METRICS_WORK_DELAY_MS")
-                                && let Ok(milliseconds) = delay.parse::<u64>()
-                            {
-                                std::thread::sleep(Duration::from_millis(milliseconds).min(
-                                    request_deadline.saturating_duration_since(Instant::now())
-                                        + Duration::from_millis(100),
-                                ));
-                            }
-                        };
-                        #[cfg(feature = "test-support")]
-                        let mut delayed_parse = false;
-                        let mut on_progress = || {
-                            #[cfg(feature = "test-support")]
-                            if !delayed_parse
-                                && trellis::metrics::in_parser_progress_for_tests()
-                                && let Ok(delay) =
-                                    std::env::var("TRELLIS_TEST_METRICS_PARSE_DELAY_MS")
-                                && let Ok(milliseconds) = delay.parse::<u64>()
-                            {
-                                delayed_parse = true;
-                                if let Ok(path) =
-                                    std::env::var("TRELLIS_TEST_METRICS_PARSE_HIT_FILE")
-                                {
-                                    let _ = std::fs::write(path, b"parse");
-                                }
-                                std::thread::sleep(Duration::from_millis(milliseconds).min(
-                                    request_deadline.saturating_duration_since(Instant::now())
-                                        + Duration::from_millis(100),
-                                ));
-                            }
-                        };
-                        #[cfg(feature = "test-support")]
-                        let serialize_threshold =
-                            std::env::var("TRELLIS_TEST_METRICS_SERIALIZE_DELAY_AT_BYTES")
-                                .ok()
-                                .or_else(|| {
-                                    std::env::var(
-                                        "TRELLIS_TEST_METRICS_SERIALIZE_DELAY_AT_BYTES_FILE",
-                                    )
-                                    .ok()
-                                    .and_then(|path| std::fs::read_to_string(path).ok())
-                                })
-                                .and_then(|value| value.trim().parse::<usize>().ok());
-                        #[cfg(feature = "test-support")]
-                        let serialize_delay =
-                            std::env::var("TRELLIS_TEST_METRICS_SERIALIZE_DELAY_MS")
-                                .ok()
-                                .and_then(|value| value.parse::<u64>().ok());
-                        #[cfg(feature = "test-support")]
-                        let mut delayed_serialize = false;
-                        let mut on_write = |written: usize| {
-                            #[cfg(feature = "test-support")]
-                            if !delayed_serialize
-                                && serialize_threshold.is_some_and(|threshold| written >= threshold)
-                                && let Some(milliseconds) = serialize_delay
-                            {
-                                delayed_serialize = true;
-                                if let Ok(path) =
-                                    std::env::var("TRELLIS_TEST_METRICS_SERIALIZE_HIT_FILE")
-                                {
-                                    let _ = std::fs::write(path, b"serialize");
-                                }
-                                std::thread::sleep(Duration::from_millis(milliseconds).min(
-                                    request_deadline.saturating_duration_since(Instant::now())
-                                        + Duration::from_millis(100),
-                                ));
-                            }
-                            let _ = written;
-                        };
-                        #[cfg(feature = "test-support")]
-                        let limit = std::env::var("TRELLIS_TEST_METRICS_LIMIT_FILE")
-                            .ok()
-                            .and_then(|path| std::fs::read_to_string(path).ok())
-                            .and_then(|value| value.trim().parse::<usize>().ok())
-                            .unwrap_or(64 * 1024 * 1024)
-                            .min(64 * 1024 * 1024);
-                        #[cfg(not(feature = "test-support"))]
-                        let limit = 64 * 1024 * 1024;
-                        // Errors become `selected`, so typed contention reaches the
-                        // shared bounded retry below instead of returning (#687).
-                        (|| {
-                            let (body, _) = checkout.metrics_response(
-                                options,
-                                &mut || {
-                                    if Instant::now() >= request_deadline {
-                                        anyhow::bail!("deadline_exceeded");
-                                    }
-                                    Ok(())
-                                },
-                                registry::MetricsResponseHooks {
-                                    before_work: &mut before_work,
-                                    before_finish: &mut || {},
-                                    after_finish: &mut || {},
-                                    on_write: &mut on_write,
-                                    on_progress: &mut on_progress,
-                                },
-                                limit,
-                            )?;
-                            let value = serde_json::from_slice(&body)?;
-                            if Instant::now() >= request_deadline {
-                                anyhow::bail!("deadline_exceeded");
-                            }
-                            Ok(value)
-                        })()
-                    }
-                    "index" => {
-                        ensure!(
-                            args.as_object().is_some_and(|values| values
-                                .keys()
-                                .all(|key| matches!(key.as_str(), "workspace" | "maxFileBytes"))),
-                            "invalid_request: unknown index option"
-                        );
-                        let mut options = IndexOptions::new(identity.root.clone());
-                        if let Some(value) = args.get("maxFileBytes") {
-                            options.max_file_bytes =
-                                value.as_u64().context("invalid maxFileBytes")?;
-                        }
-                        ensure!(
-                            (1..=16_777_216).contains(&options.max_file_bytes),
-                            "max-file-bytes must be 1..16777216"
-                        );
-                        #[cfg(feature = "test-support")]
-                        if let Some(path) =
-                            std::env::var_os("TRELLIS_TEST_DAEMON_INDEX_CLAIM_SOCKET")
-                        {
-                            checkout.set_after_claim_hook_for_tests(move || {
-                                use std::io::{Read, Write};
-                                let mut hook = std::os::unix::net::UnixStream::connect(path)
-                                    .expect("connect accepted index fixture");
-                                hook.set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
-                                    .unwrap();
-                                hook.write_all(b"C").unwrap();
-                                hook.read_exact(&mut [0]).unwrap();
-                            });
-                        }
-                        checkout.cli_index(&options)
-                    }
-                    "semantic_import" => {
-                        let options: trellis::store::requests::SemanticImportOptions =
-                            serde_json::from_value(args.clone()).map_err(|_| {
-                                anyhow::anyhow!("invalid_request: semantic import options")
-                            })?;
-                        checkout.cli_semantic_import(&options)
-                    }
-                    _ => anyhow::bail!("unknown daemon operation"),
-                };
-                // A peer's exclusive index-use lock (a restarted daemon's startup
-                // probe or recovery stage, or another process) refuses the read
-                // with typed contention (#687). It publishes no in-process signal,
-                // so wait out this bounded external contention like activation
-                // above, then report typed expiry. Only read-only calls repeat.
-                if replayable_read
-                    && selected
-                        .as_ref()
-                        .err()
-                        .is_some_and(trellis::store::cli_read_retryable_contention)
-                {
-                    if Instant::now() >= deadline {
-                        break Err(trellis::store::cli_read_busy_expired());
-                    }
-                    #[cfg(all(feature = "test-support", unix))]
-                    if let Some(path) = contention_fixture.take() {
-                        use std::io::Write;
-                        let mut signal = std::os::unix::net::UnixStream::connect(path)
-                            .expect("connect CLI read contention fixture");
-                        signal
-                            .write_all(b"B")
-                            .expect("report CLI read contention wait");
-                    }
-                    std::thread::sleep(
-                        Duration::from_millis(20)
-                            .min(deadline.saturating_duration_since(Instant::now())),
-                    );
-                    continue;
-                }
-                // Mandatory startup reconciliation may be running when a CLI read first attaches.
-                // This only repeats read-only calls; index is never replayed.
-                if replayable_read
-                    && selected
-                        .as_ref()
-                        .err()
-                        .is_some_and(|error| error.to_string().starts_with("index_not_ready:"))
-                    && Instant::now() < deadline
-                {
-                    #[cfg(all(feature = "test-support", unix))]
-                    if let Ok(path) = std::env::var("TRELLIS_TEST_CLI_READ_WAIT_SOCKET") {
-                        use std::io::Write;
-                        let mut signal = std::os::unix::net::UnixStream::connect(path)
-                            .expect("connect CLI startup read fixture");
-                        signal
-                            .write_all(b"W")
-                            .expect("report CLI startup read wait");
-                    }
-                    // Wait for startup reconciliation to progress, not a poll (#138
-                    // item 16).
-                    checkout.wait_state_change(
-                        state_version,
-                        deadline.saturating_duration_since(Instant::now()),
-                    );
-                    continue;
-                }
-                break selected;
-            }
-        })
-    };
-    let result = run();
-    let request_deadline = answered_deadline.get();
-    if !serve {
-        runtime.block_on(async { registry.lock().await.disconnect(session) });
+    *answered_deadline = request_deadline;
+    let args = request.payload.get("args").context("missing args")?;
+    // Pauses a read-only request after activation, so a fixture can take
+    // index-use contention before the selected read (#687).
+    #[cfg(all(feature = "test-support", unix))]
+    let mut contention_fixture =
+        std::env::var_os("TRELLIS_TEST_CLI_READ_CONTENTION_SOCKET").filter(|_| policy.replayable);
+    #[cfg(all(feature = "test-support", unix))]
+    if let Some(path) = &contention_fixture {
+        use std::io::{Read, Write};
+        let mut fixture = std::os::unix::net::UnixStream::connect(path)
+            .expect("connect CLI read contention fixture");
+        fixture
+            .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+            .unwrap();
+        fixture
+            .write_all(b"R")
+            .expect("report CLI read before the selected read");
+        fixture
+            .read_exact(&mut [0])
+            .expect("release CLI read contention fixture");
     }
+    let read = SelectedRead {
+        ctx,
+        checkout: &checkout,
+        identity: &identity,
+        args,
+        metrics_options: metrics_options.as_ref(),
+        request_deadline,
+    };
+    in_read_scope(policy.read_scope, request_deadline, || {
+        read.with_retry(
+            #[cfg(all(feature = "test-support", unix))]
+            &mut contention_fixture,
+        )
+    })
+}
+
+fn register_serve(ctx: &ReadCtx, identity: WorkspaceIdentity) -> Result<serde_json::Value> {
+    let ReadCtx {
+        request,
+        registry,
+        browser,
+        browser_shutdown,
+        runtime,
+        ..
+    } = *ctx;
+    let options = checked_serve_options(
+        request
+            .payload
+            .get("options")
+            .cloned()
+            .context("missing options")?,
+    )?;
+    let bind = serde_json::from_value(
+        request
+            .payload
+            .get("bind")
+            .cloned()
+            .context("missing bind")?,
+    )?;
+    let token_file: PathBuf = serde_json::from_value(
+        request
+            .payload
+            .get("tokenFile")
+            .cloned()
+            .context("missing token file")?,
+    )?;
+    let identity = identity.attach_marker()?;
+    let address = runtime.block_on(async {
+        let mut browser = browser.lock().await;
+        let first = browser.address().is_none();
+        let address = browser
+            .register_serve(registry, &identity, options, bind, &token_file)
+            .await?;
+        if first {
+            browser.start_owned(browser_shutdown.subscribe())?;
+        }
+        Ok::<_, anyhow::Error>(address)
+    })?;
+    Ok(serde_json::json!(address.to_string()))
+}
+
+/// Attaches the session and activates its checkout, waiting out typed
+/// contention until `activation_deadline`.
+fn activate_checkout(
+    ctx: &ReadCtx,
+    identity: &WorkspaceIdentity,
+    activation_deadline: Instant,
+) -> Result<Arc<registry::CheckoutRuntime>> {
+    let ReadCtx {
+        session,
+        registry,
+        runtime,
+        ..
+    } = *ctx;
+    loop {
+        let activated = runtime.block_on(async {
+            let mut checked = registry.lock().await;
+            checked
+                .attach_launch(session, identity)
+                .map_err(|e| anyhow::anyhow!("{}", e.reason()))?;
+            checked.activate(&identity.root_key)
+        });
+        match activated {
+            Ok(checkout) => break Ok(checkout),
+            Err(error) if trellis::store::cli_read_retryable_contention(&error) => {
+                if Instant::now() >= activation_deadline {
+                    break Err(trellis::store::cli_read_busy_expired());
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => break Err(error),
+        }
+    }
+}
+
+/// One selected read or write on an activated checkout.
+struct SelectedRead<'a> {
+    ctx: &'a ReadCtx<'a>,
+    checkout: &'a registry::CheckoutRuntime,
+    identity: &'a WorkspaceIdentity,
+    args: &'a serde_json::Value,
+    metrics_options: Option<&'a trellis::metrics_read::MetricsOptions>,
+    request_deadline: Instant,
+}
+
+impl SelectedRead<'_> {
+    /// Runs the operation, repeating a replayable one while it meets typed
+    /// contention or `index_not_ready`, until the deadline.
+    fn with_retry(
+        &self,
+        #[cfg(all(feature = "test-support", unix))] contention_fixture: &mut Option<
+            std::ffi::OsString,
+        >,
+    ) -> Result<serde_json::Value> {
+        let checkout = self.checkout;
+        let deadline = self.request_deadline;
+        let replayable_read = self.ctx.policy.replayable;
+        loop {
+            // Recorded before the read: a state change between the read and
+            // the wait below is never missed.
+            let state_version = checkout.state_version();
+            let selected = self.once();
+            // A peer's exclusive index-use lock (a restarted daemon's startup
+            // probe or recovery stage, or another process) refuses the read
+            // with typed contention (#687). It publishes no in-process signal,
+            // so wait out this bounded external contention like activation
+            // above, then report typed expiry. Only read-only calls repeat.
+            if replayable_read
+                && selected
+                    .as_ref()
+                    .err()
+                    .is_some_and(trellis::store::cli_read_retryable_contention)
+            {
+                if Instant::now() >= deadline {
+                    break Err(trellis::store::cli_read_busy_expired());
+                }
+                #[cfg(all(feature = "test-support", unix))]
+                if let Some(path) = contention_fixture.take() {
+                    use std::io::Write;
+                    let mut signal = std::os::unix::net::UnixStream::connect(path)
+                        .expect("connect CLI read contention fixture");
+                    signal
+                        .write_all(b"B")
+                        .expect("report CLI read contention wait");
+                }
+                std::thread::sleep(
+                    Duration::from_millis(20)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+                continue;
+            }
+            // Mandatory startup reconciliation may be running when a CLI read first attaches.
+            // This only repeats read-only calls; index is never replayed.
+            if replayable_read
+                && selected
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| error.to_string().starts_with("index_not_ready:"))
+                && Instant::now() < deadline
+            {
+                #[cfg(all(feature = "test-support", unix))]
+                if let Ok(path) = std::env::var("TRELLIS_TEST_CLI_READ_WAIT_SOCKET") {
+                    use std::io::Write;
+                    let mut signal = std::os::unix::net::UnixStream::connect(path)
+                        .expect("connect CLI startup read fixture");
+                    signal
+                        .write_all(b"W")
+                        .expect("report CLI startup read wait");
+                }
+                // Wait for startup reconciliation to progress, not a poll (#138
+                // item 16).
+                checkout.wait_state_change(
+                    state_version,
+                    deadline.saturating_duration_since(Instant::now()),
+                );
+                continue;
+            }
+            break selected;
+        }
+    }
+
+    fn once(&self) -> Result<serde_json::Value> {
+        let Self {
+            ctx,
+            checkout,
+            identity,
+            args,
+            metrics_options,
+            request_deadline,
+        } = *self;
+        match ctx.operation {
+            Operation::Status => checkout.cli_status(),
+            #[cfg(feature = "test-support")]
+            Operation::SettledForTests => {
+                let at: Option<trellis::model::IndexPin> =
+                    serde_json::from_value(args["at"].clone())
+                        .context("invalid_argument: at is not a revision")?;
+                let pin = checkout.await_settled_for_tests(at)?;
+                Ok(serde_json::json!({ "revision": pin }))
+            }
+            Operation::ProducerPlan => checkout.cli_producer_plan(args),
+            Operation::ProducerStatus => checkout.cli_producer_status(args),
+            Operation::ProducerPickup => checkout.cli_producer_pickup(args),
+            Operation::ProducerRun => checkout.cli_producer_run(args),
+            Operation::ProducerCancel => checkout.cli_producer_cancel(args),
+            Operation::Symbols => checkout.cli_symbols(
+                args["search"].as_str().context("missing search")?,
+                args["limit"].as_u64().context("missing limit")? as usize,
+            ),
+            Operation::Query => checkout.cli_query(&ViewQuery {
+                seed: args["seed"].as_str().context("missing seed")?.into(),
+                depth: args["depth"].as_u64().context("missing depth")? as usize,
+                max_nodes: args["maxNodes"].as_u64().context("missing maxNodes")? as usize,
+                max_calls: args["maxCalls"].as_u64().context("missing maxCalls")? as usize,
+                include_callbacks: args["includeCallbacks"]
+                    .as_bool()
+                    .context("missing includeCallbacks")?,
+                exclude_paths: serde_json::from_value(args["excludePaths"].clone())?,
+                semantic_producer_id: serde_json::from_value(
+                    args.get("semanticProducerId").cloned().unwrap_or_default(),
+                )
+                .context("invalid_argument: semanticProducerId must be a string")?,
+            }),
+            Operation::RulesCheck => {
+                cli_architecture_read(checkout, "check", args, request_deadline)
+            }
+            Operation::References => {
+                cli_architecture_read(checkout, "references", args, request_deadline)
+            }
+            Operation::Metrics => {
+                let options = metrics_options.expect("metrics options validated");
+                cli_metrics_read(checkout, options, request_deadline)
+            }
+            Operation::Index => cli_index(checkout, identity, args),
+            Operation::SemanticImport => {
+                let options: trellis::store::requests::SemanticImportOptions =
+                    serde_json::from_value(args.clone())
+                        .map_err(|_| anyhow::anyhow!("invalid_request: semantic import options"))?;
+                checkout.cli_semantic_import(&options)
+            }
+            _ => anyhow::bail!("unknown daemon operation"),
+        }
+    }
+}
+
+fn cli_architecture_read(
+    checkout: &registry::CheckoutRuntime,
+    kind: &str,
+    args: &serde_json::Value,
+    request_deadline: Instant,
+) -> Result<serde_json::Value> {
+    let mut check = || {
+        ensure!(Instant::now() < request_deadline, "deadline_exceeded");
+        Ok(())
+    };
+    // The owner finishes the first read after a publication; leave time to
+    // answer. The wait comes before read admission, and again if the head
+    // moved meanwhile.
+    let (response, catching_up, result) = loop {
+        let wait = request_deadline
+            .saturating_duration_since(Instant::now())
+            .saturating_sub(Duration::from_secs(1));
+        checkout.await_architecture_tool(kind, args, wait, &mut check);
+        let (response, catching_up) = checkout.evidence_response()?;
+        let result = checkout.architecture_tool(&response, kind, args, &mut check);
+        let building = result.as_ref().err().is_some_and(|error| {
+            error
+                .downcast_ref::<trellis::http::ArchitectureBuilding>()
+                .is_some()
+        });
+        if !building || wait.is_zero() {
+            break (response, catching_up, result);
+        }
+        drop(response);
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    match result {
+        Ok(payload) => {
+            check()?;
+            let value = serde_json::json!({"catchingUp":catching_up,"payload":payload});
+            ensure!(
+                serde_json::to_vec(&value)?.len() <= 64 * 1024 * 1024,
+                "response_too_large"
+            );
+            check()?;
+            response.finish(value)
+        }
+        Err(error) => {
+            if let Some(diagnostic) = trellis::rules::diagnostic(&error) {
+                response.finish(serde_json::json!({"catchingUp":catching_up,"error":diagnostic}))
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+fn cli_metrics_read(
+    checkout: &registry::CheckoutRuntime,
+    options: &trellis::metrics_read::MetricsOptions,
+    request_deadline: Instant,
+) -> Result<serde_json::Value> {
+    let mut before_work = || {
+        #[cfg(feature = "test-support")]
+        metrics_test_phase(b"W");
+        #[cfg(feature = "test-support")]
+        if let Ok(gate) = std::env::var("TRELLIS_TEST_METRICS_WORK_GATE") {
+            use std::io::Write;
+            let gate = PathBuf::from(gate);
+            if let Ok(mut started) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(gate.join("started"))
+            {
+                let _ = started.write_all(b"x");
+            }
+            while !gate.join("release").exists() && Instant::now() < request_deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        #[cfg(feature = "test-support")]
+        if let Ok(delay) = std::env::var("TRELLIS_TEST_METRICS_WORK_DELAY_MS")
+            && let Ok(milliseconds) = delay.parse::<u64>()
+        {
+            std::thread::sleep(Duration::from_millis(milliseconds).min(
+                request_deadline.saturating_duration_since(Instant::now())
+                    + Duration::from_millis(100),
+            ));
+        }
+    };
     #[cfg(feature = "test-support")]
-    if metrics
+    let mut delayed_parse = false;
+    let mut on_progress = || {
+        #[cfg(feature = "test-support")]
+        if !delayed_parse
+            && trellis::metrics::in_parser_progress_for_tests()
+            && let Ok(delay) = std::env::var("TRELLIS_TEST_METRICS_PARSE_DELAY_MS")
+            && let Ok(milliseconds) = delay.parse::<u64>()
+        {
+            delayed_parse = true;
+            if let Ok(path) = std::env::var("TRELLIS_TEST_METRICS_PARSE_HIT_FILE") {
+                let _ = std::fs::write(path, b"parse");
+            }
+            std::thread::sleep(Duration::from_millis(milliseconds).min(
+                request_deadline.saturating_duration_since(Instant::now())
+                    + Duration::from_millis(100),
+            ));
+        }
+    };
+    #[cfg(feature = "test-support")]
+    let serialize_threshold = std::env::var("TRELLIS_TEST_METRICS_SERIALIZE_DELAY_AT_BYTES")
+        .ok()
+        .or_else(|| {
+            std::env::var("TRELLIS_TEST_METRICS_SERIALIZE_DELAY_AT_BYTES_FILE")
+                .ok()
+                .and_then(|path| std::fs::read_to_string(path).ok())
+        })
+        .and_then(|value| value.trim().parse::<usize>().ok());
+    #[cfg(feature = "test-support")]
+    let serialize_delay = std::env::var("TRELLIS_TEST_METRICS_SERIALIZE_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
+    #[cfg(feature = "test-support")]
+    let mut delayed_serialize = false;
+    let mut on_write = |written: usize| {
+        #[cfg(feature = "test-support")]
+        if !delayed_serialize
+            && serialize_threshold.is_some_and(|threshold| written >= threshold)
+            && let Some(milliseconds) = serialize_delay
+        {
+            delayed_serialize = true;
+            if let Ok(path) = std::env::var("TRELLIS_TEST_METRICS_SERIALIZE_HIT_FILE") {
+                let _ = std::fs::write(path, b"serialize");
+            }
+            std::thread::sleep(Duration::from_millis(milliseconds).min(
+                request_deadline.saturating_duration_since(Instant::now())
+                    + Duration::from_millis(100),
+            ));
+        }
+        let _ = written;
+    };
+    #[cfg(feature = "test-support")]
+    let limit = std::env::var("TRELLIS_TEST_METRICS_LIMIT_FILE")
+        .ok()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(64 * 1024 * 1024)
+        .min(64 * 1024 * 1024);
+    #[cfg(not(feature = "test-support"))]
+    let limit = 64 * 1024 * 1024;
+    // Errors become `selected`, so typed contention reaches the
+    // shared bounded retry below instead of returning (#687).
+    (|| {
+        let (body, _) = checkout.metrics_response(
+            options,
+            &mut || {
+                if Instant::now() >= request_deadline {
+                    anyhow::bail!("deadline_exceeded");
+                }
+                Ok(())
+            },
+            registry::MetricsResponseHooks {
+                before_work: &mut before_work,
+                before_finish: &mut || {},
+                after_finish: &mut || {},
+                on_write: &mut on_write,
+                on_progress: &mut on_progress,
+            },
+            limit,
+        )?;
+        let value = serde_json::from_slice(&body)?;
+        if Instant::now() >= request_deadline {
+            anyhow::bail!("deadline_exceeded");
+        }
+        Ok(value)
+    })()
+}
+
+fn cli_index(
+    checkout: &registry::CheckoutRuntime,
+    identity: &WorkspaceIdentity,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    ensure!(
+        args.as_object().is_some_and(|values| values
+            .keys()
+            .all(|key| matches!(key.as_str(), "workspace" | "maxFileBytes"))),
+        "invalid_request: unknown index option"
+    );
+    let mut options = IndexOptions::new(identity.root.clone());
+    if let Some(value) = args.get("maxFileBytes") {
+        options.max_file_bytes = value.as_u64().context("invalid maxFileBytes")?;
+    }
+    ensure!(
+        (1..=16_777_216).contains(&options.max_file_bytes),
+        "max-file-bytes must be 1..16777216"
+    );
+    #[cfg(feature = "test-support")]
+    if let Some(path) = std::env::var_os("TRELLIS_TEST_DAEMON_INDEX_CLAIM_SOCKET") {
+        checkout.set_after_claim_hook_for_tests(move || {
+            use std::io::{Read, Write};
+            let mut hook = std::os::unix::net::UnixStream::connect(path)
+                .expect("connect accepted index fixture");
+            hook.set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+                .unwrap();
+            hook.write_all(b"C").unwrap();
+            hook.read_exact(&mut [0]).unwrap();
+        });
+    }
+    checkout.cli_index(&options)
+}
+
+/// Phase H: answers the request.
+fn reply_to_read(
+    stream: &mut std::os::unix::net::UnixStream,
+    ctx: &ReadCtx,
+    result: Result<serde_json::Value>,
+    request_deadline: Instant,
+) -> Result<()> {
+    let request = ctx.request;
+    let bounded = ctx.policy.reply == ReplyTransfer::DeadlineBounded;
+    #[cfg(feature = "test-support")]
+    if bounded
         && result.as_ref().err().is_some_and(|error| {
             let message = error.to_string();
             message.contains("deadline_exceeded") || message.contains("cancelled")
@@ -3096,8 +3628,7 @@ fn dispatch_connection(
     {
         std::thread::sleep(delay);
     }
-    let serve_registered = serve && result.is_ok();
-    let expired_success = metrics && result.is_ok() && Instant::now() >= request_deadline;
+    let expired_success = bounded && result.is_ok() && Instant::now() >= request_deadline;
     let reply = protocol::Reply {
         id: request.id,
         payload: match result {
@@ -3106,7 +3637,7 @@ fn dispatch_connection(
             Err(error) => serde_json::json!({"error": format!("{error:#}")}),
         },
     };
-    if metrics {
+    if bounded {
         let transfer_window = Duration::from_secs(30);
         #[cfg(feature = "test-support")]
         let transfer_window =
@@ -3119,15 +3650,9 @@ fn dispatch_connection(
         {
             return Ok(());
         }
-        write_daemon_reply_until(&mut stream, &reply, transfer_deadline)?;
+        write_daemon_reply_until(stream, &reply, transfer_deadline)?;
     } else {
-        write_daemon_reply(&mut stream, &reply)?;
-    }
-    if serve_registered {
-        // The scoped registration holds the daemon alive until this control
-        // connection closes or the daemon stops, signalled by
-        // the shutdown channel instead of a polled flag (#138 item 21).
-        wait_for_serve_disconnect(stream, browser_shutdown.subscribe(), &runtime)?;
+        write_daemon_reply(stream, &reply)?;
     }
     Ok(())
 }
@@ -3373,7 +3898,7 @@ fn result_is_deadline(payload: &serde_json::Value) -> bool {
 
 fn metrics_options_from_request(
     args: &serde_json::Value,
-) -> Result<trellis::store::MetricsOptions> {
+) -> Result<trellis::metrics_read::MetricsOptions> {
     fn field<T: serde::de::DeserializeOwned>(args: &serde_json::Value, name: &str) -> Result<T> {
         serde_json::from_value(args[name].clone())
             .map_err(|error| anyhow::anyhow!("invalid_argument: {name}: {error}"))
@@ -3402,7 +3927,7 @@ fn metrics_options_from_request(
             .is_none_or(|value| value.as_array().is_some_and(|names| !names.is_empty())),
         "invalid_argument: empty metrics selection"
     );
-    let options = trellis::store::MetricsOptions {
+    let options = trellis::metrics_read::MetricsOptions {
         workbench: false,
         scope: args["scope"]
             .as_str()
