@@ -548,8 +548,8 @@ impl SemanticTestHooks {
 
 #[derive(Clone)]
 pub struct Store {
-    pub(crate) roots: topology::TopologyRoots,
-    pub(crate) identity: Arc<topology::WorkspaceIdentity>,
+    roots: topology::TopologyRoots,
+    identity: Arc<topology::WorkspaceIdentity>,
     publication_gate: Arc<PublicationGate>,
     maintenance_busy_attempts: Arc<AtomicU64>,
     #[cfg(feature = "test-support")]
@@ -12988,6 +12988,12 @@ impl Store {
 
     pub fn evidence_response(&self) -> Result<EvidenceResponse> {
         self.evidence_response_daemon_local()
+    }
+
+    /// Where this checkout's index database is, for tests that edit it directly.
+    #[cfg(test)]
+    pub(crate) fn index_db_path_for_tests(&self) -> std::path::PathBuf {
+        self.roots.index_db(&self.identity)
     }
 
     #[cfg(test)]

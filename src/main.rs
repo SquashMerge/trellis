@@ -1392,11 +1392,11 @@ fn metrics_cli_payload(args: &MetricsArgs) -> Result<serde_json::Value> {
     Ok(payload)
 }
 
-/// The metrics option rules of the CLI and of the daemon request it sends.
-/// Both accept only path-derived source-set IDs (#984).
+/// The metrics option rules of the CLI and of the daemon request it sends:
+/// the shared transport rules, as `invalid_argument`.
 fn validate_cli_metrics_options(options: &trellis::metrics_read::MetricsOptions) -> Result<()> {
     options
-        .validate_transport(trellis::metrics_read::MetricsSourceSetIds::PathOnly)
+        .validate_transport()
         .map_err(|error| anyhow::anyhow!("invalid_argument: {error}"))
 }
 
@@ -3566,33 +3566,35 @@ mod metrics_request_tests {
         );
     }
 
-    /// The shared identifier rules, with each transport's source-set forms
+    /// The shared identifier rules: both published source-set forms (#984)
     /// and the first failing rule's message.
     #[test]
-    fn identifier_rules_are_shared_and_keep_each_transports_source_set_forms() {
-        use trellis::metrics_read::MetricsSourceSetIds::{Current, PathOnly};
+    fn identifier_rules_are_shared_and_accept_both_source_set_forms() {
         let path_id = format!("source-set:v1:path-{}", "a".repeat(64));
         let uuid_id = "source-set:v1:6f1f0a52-0d0c-4d6e-9a43-0c1a3e3a8b11";
         let file = |id: &str| {
             json!({"scope": "file", "aggregate": "sum", "sourceSetId": id,
                    "path": "src/a.rs", "language": "rust"})
         };
-        let options = metrics_options_from_request(&file(&path_id)).unwrap();
-        assert!(options.validate_transport(Current).is_ok());
-        // The CLI and its daemon request accept only the path form (#984).
-        let mut uuid_options = options.clone();
-        uuid_options.source_set_id = Some(uuid_id.into());
-        assert!(uuid_options.validate_transport(Current).is_ok());
-        assert_eq!(
-            uuid_options
-                .validate_transport(PathOnly)
-                .unwrap_err()
-                .to_string(),
-            "source set ID"
-        );
+        for id in [path_id.as_str(), uuid_id] {
+            let options = metrics_options_from_request(&file(id)).unwrap();
+            assert_eq!(options.source_set_id.as_deref(), Some(id));
+        }
         let rejected =
             |args: serde_json::Value| metrics_options_from_request(&args).unwrap_err().to_string();
-        assert_eq!(rejected(file(uuid_id)), "invalid_argument: source set ID");
+        for invalid in [
+            "garbage",
+            "source-set:v2:6f1f0a52-0d0c-4d6e-9a43-0c1a3e3a8b11",
+            "source-set:v1:6F1F0A52-0D0C-4D6E-9A43-0C1A3E3A8B11",
+            "source-set:v1:6f1f0a520d0c4d6e9a430c1a3e3a8b11",
+            "source-set:v1:path-abc",
+        ] {
+            assert_eq!(
+                rejected(file(invalid)),
+                "invalid_argument: source set ID",
+                "{invalid}"
+            );
+        }
         let mut args = file(&path_id);
         args["path"] = json!("src/a:b.rs");
         assert_eq!(rejected(args.clone()), "invalid_argument: path");
