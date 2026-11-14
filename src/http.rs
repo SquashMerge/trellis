@@ -212,12 +212,15 @@ pub struct DaemonState {
     /// The last step made progress, so more work may be ready at once.
     step_progress: AtomicBool,
     /// Published watcher intent; readers never take the watcher's lock.
-    watch_status: Mutex<Option<worker::WatchStatus>>,
+    /// The watcher's published status. This lock is also the publication lock of
+    /// `fifo`: both are written under it, so the quiet read sees one state (#1082).
+    /// A leaf lock: nothing else is taken while it is held.
+    watch_status: Arc<Mutex<Option<worker::WatchStatus>>>,
     /// Read and enqueue admission leases held against release.
     leases: Arc<std::sync::atomic::AtomicUsize>,
     /// Published by the worker after each step (and set by the enqueue gate):
     /// accepted FIFO work keeps the runtime from retiring.
-    fifo_pending: Arc<AtomicBool>,
+    fifo: Arc<worker::FifoPublication>,
     /// The registry's lifecycle wake (Decision 0009 §5).
     lifecycle: Arc<std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>>,
     /// The runtime closed because its captured root was lost.
@@ -335,6 +338,14 @@ pub struct DaemonState {
     /// runtime state.
     #[cfg(test)]
     test_watch_pending_before_state: crate::store::TestOneShotHook,
+    /// Runs in the quiet read, between its read of the FIFO flag and its read of the watch
+    /// status.
+    #[cfg(test)]
+    test_quiet_between_reads: crate::store::TestOneShotHook,
+    /// Runs in the worker's FIFO publication, after it observed the queue and before it
+    /// publishes what it observed.
+    #[cfg(test)]
+    test_fifo_between_observation_and_publication: crate::store::TestOneShotHook,
 }
 impl Drop for DaemonState {
     /// A lossless shutdown: an idle worker waiting without a deadline exits.
@@ -422,12 +433,14 @@ pub fn new_with_config(
     #[cfg(feature = "test-support")]
     let origins = hosts.iter().map(|h| format!("http://{h}")).collect();
     let inbox = Arc::new(worker::WorkerInbox::default());
-    let fifo_pending = Arc::new(AtomicBool::new(false));
+    let fifo = Arc::new(worker::FifoPublication::default());
+    let watch_status = Arc::new(Mutex::new(None));
     let queue_waker: Arc<dyn Fn() + Send + Sync> = {
         let inbox = inbox.clone();
-        let fifo_pending = fifo_pending.clone();
+        let fifo = fifo.clone();
+        let watch_status = watch_status.clone();
         Arc::new(move || {
-            fifo_pending.store(true, Ordering::Release);
+            fifo.accept(&watch_status);
             inbox.wake();
         })
     };
@@ -444,9 +457,9 @@ pub fn new_with_config(
         #[cfg(feature = "test-support")]
         worker_hold: std::sync::RwLock::new(()),
         step_progress: AtomicBool::new(false),
-        watch_status: Mutex::new(None),
+        watch_status,
         leases: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        fifo_pending,
+        fifo,
         lifecycle: Arc::new(std::sync::OnceLock::new()),
         root_lost: AtomicBool::new(false),
         state_version: AtomicU64::new(0),
@@ -559,6 +572,10 @@ pub fn new_with_config(
         test_session_change_before_watch_status: crate::store::TestOneShotHook::default(),
         #[cfg(test)]
         test_watch_pending_before_state: crate::store::TestOneShotHook::default(),
+        #[cfg(test)]
+        test_quiet_between_reads: crate::store::TestOneShotHook::default(),
+        #[cfg(test)]
+        test_fifo_between_observation_and_publication: crate::store::TestOneShotHook::default(),
         jobs: Mutex::new(Jobs {
             current: None,
             jobs: BTreeMap::new(),
@@ -737,11 +754,12 @@ impl DaemonState {
         // The status lock is released before the runtime state is read. A session change
         // holds the state while it clears this status, so a reader that kept the status
         // while it waited for the state would deadlock with the worker (#1078).
-        let published = self.watch_status.lock().unwrap().as_ref().map(|status| {
-            status.other_intent
-                || status.capturing.load(Ordering::SeqCst)
-                || status.generation.load(Ordering::SeqCst) != status.acknowledged
-        });
+        let published = self
+            .watch_status
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(worker::WatchStatus::pending);
         if let Some(pending) = published {
             return pending;
         }
@@ -749,6 +767,40 @@ impl DaemonState {
         self.test_watch_pending_before_state.run();
         // A serving session's first watcher has not run its full inventory.
         self.runtime.lock().unwrap().session().is_some()
+    }
+
+    /// Whether the checkout is `Ready` with nothing pending: no accepted FIFO work, and a
+    /// watcher of the current serving session whose published status holds no
+    /// unacknowledged intent. It is the admission condition of an automatic producer run
+    /// (#1082).
+    ///
+    /// One coherent read, unlike separate samples of the phase, the FIFO flag and
+    /// [`Self::checkout_watch_pending`]:
+    /// - The runtime state is held while the status is read, and a session change clears the
+    ///   status under that lock, so a published status belongs to the session seen here. A
+    ///   runtime with no serving session, or a session whose watcher has not published yet,
+    ///   has an inventory ahead of it and is never quiet.
+    /// - The FIFO flag and the watch status are both published under the watch status lock,
+    ///   which is held across both reads. A request accepted, or a hint acknowledged, while
+    ///   this read runs is published wholly before it or wholly after it, never between.
+    ///
+    /// The watcher's live ingress generation is not published under a lock: a hint accepted
+    /// after this read is a later event, which the worker publishes.
+    ///
+    /// Lock order: the runtime state, then the watch status, as `set_runtime_state` and
+    /// `request_retire` take them. Never the reverse (#1078).
+    pub(crate) fn ready_and_quiet(&self) -> bool {
+        let state = self.runtime.lock().unwrap();
+        if !matches!(*state, RuntimeState::Ready(_)) {
+            return false;
+        }
+        let status = self.watch_status.lock().unwrap();
+        if self.fifo_pending() {
+            return false;
+        }
+        #[cfg(test)]
+        self.test_quiet_between_reads.run();
+        status.as_ref().is_some_and(|status| !status.pending())
     }
 
     /// A deterministic fixture can submit an accepted source hint through the
@@ -859,6 +911,23 @@ impl DaemonState {
     ) {
         self.replace_serving_session(Some(session));
     }
+    /// Lose the serving session as a failed completion does: its watcher and published
+    /// watch status go with it, and the runtime returns to startup reconciliation.
+    #[cfg(all(test, feature = "test-support"))]
+    pub(crate) fn lose_serving_session_for_tests(&self) {
+        self.replace_serving_session(None);
+    }
+
+    /// Run `hook` once on the worker, after a step's FIFO drain and before it installs or
+    /// reconciles the serving session's watcher.
+    #[cfg(all(test, feature = "test-support"))]
+    pub(crate) fn set_after_startup_drain_hook_for_tests(
+        &self,
+        hook: impl FnOnce() + Send + 'static,
+    ) {
+        self.test_queue_after_startup_drain.set(hook);
+    }
+
     /// Losing the serving session sends the runtime back to startup
     /// reconciliation (Decision 0009 §2); gaining one makes it Ready.
     fn replace_serving_session(&self, next: Option<Arc<crate::store::topology::WriterSession>>) {
@@ -928,7 +997,7 @@ impl DaemonState {
         if self.store.root_path_replaced().unwrap_or(true) || session.verify().is_err() {
             return Some("root_or_writer");
         }
-        if self.fifo_pending.load(Ordering::Acquire)
+        if self.fifo.pending.load(Ordering::Acquire)
             || !self.pending_requests.lock().unwrap().is_empty()
         {
             return Some("local_fifo");
