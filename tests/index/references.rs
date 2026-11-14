@@ -376,6 +376,94 @@ struct Fields {
     assert_eq!(unresolved[0]["site"]["role"], "test");
 }
 
+/// #988 review: every shape in which the pinned grammar attaches an attribute. In each row
+/// the reference to `T` is under `#[cfg(test)]` and the reference to `P` beside it is not.
+#[test]
+fn references_rust_cfg_test_reaches_every_attribute_shape() {
+    let shapes = [
+        (
+            "struct-expression field",
+            "fn f() -> S { S { #[cfg(test)] a: crate::store::T, b: crate::store::P } }",
+        ),
+        (
+            "tuple-struct field after a visibility",
+            "struct S(#[cfg(test)] pub crate::store::T, pub crate::store::P);",
+        ),
+        (
+            "tuple-struct field",
+            "struct S(#[cfg(test)] crate::store::T, crate::store::P);",
+        ),
+        (
+            "named field after a visibility",
+            "struct S { #[cfg(test)] pub a: crate::store::T, pub b: crate::store::P }",
+        ),
+        (
+            "enum variant",
+            "enum E { #[cfg(test)] A(crate::store::T), B(crate::store::P) }",
+        ),
+        (
+            "parameter",
+            "fn f(#[cfg(test)] a: crate::store::T, b: crate::store::P) {}",
+        ),
+        (
+            "generic parameter",
+            "fn f<#[cfg(test)] A: crate::store::T, B: crate::store::P>() {}",
+        ),
+        (
+            "argument",
+            "fn f() { g(#[cfg(test)] crate::store::T, crate::store::P); }",
+        ),
+        (
+            "array element",
+            "fn f() { let _ = [#[cfg(test)] crate::store::T, crate::store::P]; }",
+        ),
+        (
+            "tuple element",
+            "fn f() { let _ = (#[cfg(test)] crate::store::T, crate::store::P); }",
+        ),
+        (
+            "expression statement",
+            "fn f() { #[cfg(test)] crate::store::T; crate::store::P; }",
+        ),
+        (
+            "match arm",
+            "fn f() { match 1 { #[cfg(test)] 1 => crate::store::T, _ => crate::store::P } }",
+        ),
+        (
+            "inner attribute of a function body",
+            "fn f() { #![cfg(test)] crate::store::T; } fn g() { crate::store::P; }",
+        ),
+        (
+            "inner attribute of a block",
+            "fn f() { { #![cfg(test)] crate::store::T; } crate::store::P; }",
+        ),
+    ];
+    for (shape, source) in shapes {
+        let input = snapshot(&[
+            ("src/lib.rs", &format!("mod store;\n{source}\n")),
+            ("src/store.rs", "pub struct T; pub struct P;"),
+        ]);
+        let data = project(&input);
+        let spellings = |role: &str| -> Vec<&str> {
+            data[role]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|pair| pair["target"]["path"] == "src/store.rs")
+                .flat_map(|pair| pair["sites"].as_array().unwrap())
+                .filter(|site| site["relationKind"] != "import")
+                .map(|site| site["spelling"].as_str().unwrap())
+                .collect()
+        };
+        assert_eq!(spellings("tests"), ["crate::store::T"], "{shape}: {data}");
+        assert_eq!(
+            spellings("production"),
+            ["crate::store::P"],
+            "{shape}: {data}"
+        );
+    }
+}
+
 /// #988: a read that names test features reports the production sites under their gates as
 /// test. Without the name, and for any other gate, nothing changes.
 #[test]
@@ -507,6 +595,53 @@ mod inline {
         ),
         ["plain", "plain", "negated", "all", "any_other"]
     );
+}
+
+/// #988: a named feature's gate is read in the attribute shapes the `cfg(test)` walk reads.
+#[test]
+fn references_rust_named_test_feature_gates_reach_owned_and_field_attributes() {
+    for (shape, source) in [
+        (
+            "struct-expression field",
+            "fn f() -> S { S { #[cfg(feature = \"fx\")] a: crate::store::T, b: crate::store::P } }",
+        ),
+        (
+            "tuple-struct field after a visibility",
+            "struct S(#[cfg(feature = \"fx\")] pub crate::store::T, pub crate::store::P);",
+        ),
+        (
+            "inner attribute of a block",
+            "fn f() { { #![cfg(feature = \"fx\")] crate::store::T; } crate::store::P; }",
+        ),
+    ] {
+        let input = snapshot(&[
+            ("src/lib.rs", &format!("mod store;\n{source}\n")),
+            ("src/store.rs", "pub struct T; pub struct P;"),
+        ]);
+        let data =
+            references::project_where(&input, &[], None, None, &["fx".to_owned()], 20, &mut || {
+                Ok(())
+            })
+            .unwrap()
+            .data;
+        let spellings = |role: &str| -> Vec<&str> {
+            data[role]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|pair| pair["target"]["path"] == "src/store.rs")
+                .flat_map(|pair| pair["sites"].as_array().unwrap())
+                .filter(|site| site["relationKind"] != "import")
+                .map(|site| site["spelling"].as_str().unwrap())
+                .collect()
+        };
+        assert_eq!(spellings("tests"), ["crate::store::T"], "{shape}: {data}");
+        assert_eq!(
+            spellings("production"),
+            ["crate::store::P"],
+            "{shape}: {data}"
+        );
+    }
 }
 
 #[test]

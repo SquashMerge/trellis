@@ -1960,7 +1960,7 @@ pub(super) fn extract(
 /// What the attributes on and around one site say about it (#988).
 #[derive(Default)]
 pub(super) struct SiteMarks {
-    /// An outer attribute marks test code under Decision 0011.
+    /// An attribute marks test code under Decision 0011.
     pub(super) test: bool,
     /// The features of the `cfg(feature = "..")` gates on the site, sorted and distinct.
     pub(super) features: Vec<String>,
@@ -2000,10 +2000,16 @@ fn feature_gate(attribute: &str) -> Option<String> {
     feature_name(name).then(|| name.to_owned())
 }
 
-/// The marks of the syntax at `start..end` and of everything enclosing it. Outer attributes
-/// are a node's preceding siblings, or its leading children for a match arm, which owns its
-/// own; inner attributes lead the file, module body or block they apply to. A test marker is
-/// an outer attribute only: the producer already stores an inner one on its declaration.
+/// The marks of the syntax at `start..end` and of everything enclosing it: whether an
+/// attribute marks test code under Decision 0011, and otherwise the features that gate it
+/// (#988). The pinned grammar attaches an attribute in one of three shapes, and every
+/// enclosing node is checked for all of them:
+///
+/// - an outer attribute is a preceding sibling of what it applies to: an item or statement,
+///   a field, an enum variant, a parameter, a generic parameter, or an element of an argument
+///   list, array or tuple. A tuple-struct field's visibility lies between the two;
+/// - a match arm and a struct-expression field own their outer attributes as leading children;
+/// - an inner attribute leads the file, block or module body it applies to.
 pub(super) fn site_marks(
     doc: &DocumentInput,
     tree: &Tree,
@@ -2012,50 +2018,46 @@ pub(super) fn site_marks(
     work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<SiteMarks> {
-    let outer = |node: Node<'_>| node.kind() == "attribute_item";
-    let passes = |node: Node<'_>| {
-        matches!(
-            node.kind(),
-            "attribute_item" | "inner_attribute_item" | "line_comment" | "block_comment"
-        )
+    let marks = |node: Node<'_>| crate::native_evidence::rust_test_attribute(node, &doc.file);
+    let comment = |node: Node<'_>| matches!(node.kind(), "line_comment" | "block_comment");
+    let test = || {
+        Ok(SiteMarks {
+            test: true,
+            features: Vec::new(),
+        })
     };
     let mut features = BTreeSet::new();
     let mut current = tree.root_node().descendant_for_byte_range(start, end);
     while let Some(node) = current {
         owner_step(work, check)?;
-        let mut previous = node.prev_named_sibling();
+        // Any token but these, a separating comma included, ends the node's own attributes.
+        let mut previous = node.prev_sibling();
         while let Some(sibling) = previous {
             owner_step(work, check)?;
-            if !passes(sibling) {
-                break;
+            match sibling.kind() {
+                "attribute_item" if marks(sibling) => return test(),
+                "attribute_item" => features.extend(feature_gate(text(doc, sibling))),
+                "inner_attribute_item" | "visibility_modifier" => {}
+                _ if comment(sibling) => {}
+                _ => break,
             }
-            if outer(sibling) {
-                if crate::native_evidence::rust_test_attribute(sibling, &doc.file) {
-                    return Ok(SiteMarks {
-                        test: true,
-                        features: Vec::new(),
-                    });
-                }
-                features.extend(feature_gate(text(doc, sibling)));
-            }
-            previous = sibling.prev_named_sibling();
+            previous = sibling.prev_sibling();
         }
+        let owns = matches!(
+            node.kind(),
+            "match_arm" | "field_initializer" | "shorthand_field_initializer"
+        );
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
             owner_step(work, check)?;
-            if !passes(child) {
-                break;
-            }
-            if child.kind() == "inner_attribute_item" {
-                features.extend(feature_gate(text(doc, child)));
-            } else if outer(child) && node.kind() == "match_arm" {
-                if crate::native_evidence::rust_test_attribute(child, &doc.file) {
-                    return Ok(SiteMarks {
-                        test: true,
-                        features: Vec::new(),
-                    });
-                }
-                features.extend(feature_gate(text(doc, child)));
+            match child.kind() {
+                "inner_attribute_item" if marks(child) => return test(),
+                "attribute_item" if owns && marks(child) => return test(),
+                "inner_attribute_item" => features.extend(feature_gate(text(doc, child))),
+                "attribute_item" if owns => features.extend(feature_gate(text(doc, child))),
+                "attribute_item" => {}
+                _ if comment(child) => {}
+                _ => break,
             }
         }
         current = node.parent();
