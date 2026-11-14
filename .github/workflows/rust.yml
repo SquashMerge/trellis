@@ -80,6 +80,12 @@ jobs:
       - name: Mark the start of this job's builds
         if: runner.os == 'Linux'
         run: touch "$RUNNER_TEMP/build-start"
+      # nextest kills a hung test after five minutes and leaves no trace of where it was.
+      # This watcher runs beside the tests and writes one `sample` of every thread of a test
+      # that is nearly that old (#1078). It never signals a test, and macOS ships `sample`.
+      - name: Watch for hung tests
+        if: matrix.job == 'tests' && runner.os == 'macOS'
+        run: nohup ./tools/sample-hung-tests "$RUNNER_TEMP/hung-test-samples" > /dev/null 2>&1 &
       # verify provisions the browser packages and the pinned Chromium itself.
       # On Linux the browser job also checks Chromium's system libraries and
       # layout font in the background, and installs them with apt only if one is missing, since
@@ -88,6 +94,15 @@ jobs:
         env:
           PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/pw-browsers
           TRELLIS_BROWSER_SYSTEM_DEPS: ${{ runner.os == 'Linux' && '1' || '' }}
+      - name: Show hung-test samples
+        if: failure() && matrix.job == 'tests' && runner.os == 'macOS'
+        run: |
+          for command in "$RUNNER_TEMP"/hung-test-samples/*.cmd; do
+            [ -e "$command" ] || { echo "no test ran long enough to be sampled"; break; }
+            echo "::group::$(cat "$command")"
+            cat "${command%.cmd}.txt" || true
+            echo "::endgroup::"
+          done
       # Every ELF executable or shared object this job linked must name mold in
       # its .comment section (rust-lld would name LLD instead). Skipped when
       # mold could not be fetched and the job fell back to the system linker.
