@@ -4403,13 +4403,16 @@ fn status_head_response(digest: &Value, if_none_match: Option<&str>) -> Response
     response
 }
 
+/// What every provisioned core route family answers: the response and whether the
+/// checkout is still catching up.
+type CoreAnswer = Result<(Response, bool), ApiError>;
+
 async fn provisioned_core_answer(
     runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
     request: BrowserCoreRequest<'_>,
     hook: Option<SelectedResponseHook>,
     metrics: MetricsHttpControls,
-) -> Result<(Response, bool), ApiError> {
-    use axum::http::Method;
+) -> CoreAnswer {
     let BrowserCoreRequest {
         route,
         method,
@@ -4425,881 +4428,1057 @@ async fn provisioned_core_answer(
         BrowserCoreRoute::Metrics
         | BrowserCoreRoute::Architecture
         | BrowserCoreRoute::ArchitectureDetails => {
-            let architecture = matches!(route, BrowserCoreRoute::Architecture);
-            let details = if matches!(route, BrowserCoreRoute::ArchitectureDetails) {
-                Some(architecture_details_query(uri)?)
-            } else {
-                None
-            };
-            let detail_read = details.is_some();
-            let options = if detail_read {
-                // A detail page evaluates the whole revision, like the summary.
-                crate::metrics_read::MetricsOptions::default()
-            } else if architecture {
-                architecture_query(uri)?
-            } else {
-                metrics_query(uri)?
-            };
-            let runtime = runtime.clone();
-            // The guard belongs to this request future, not to the blocking worker.
-            struct CancelOnDrop(Arc<std::sync::atomic::AtomicBool>);
-            impl Drop for CancelOnDrop {
-                fn drop(&mut self) {
-                    self.0.store(true, std::sync::atomic::Ordering::Release);
-                }
-            }
-            let guard = CancelOnDrop(Arc::new(std::sync::atomic::AtomicBool::new(false)));
-            let cancellation = guard.0.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                let duration = if metrics.deadline_ms != 0 {
-                    Duration::from_millis(metrics.deadline_ms)
-                } else {
-                    crate::metrics_read::MetricsOptions::work_budget(&options.scope)
-                };
-                let deadline = metrics.now() + duration;
-                let work_hook = hook.clone();
-                let finish_hook = hook.clone();
-                let serialize_hook = hook.clone();
-                let after_finish_hook = hook.clone();
-                let check_hook = hook.clone();
-                let mut before_work = || {
-                    if let Some(hook) = &work_hook {
-                        hook("before_work");
-                    }
-                };
-                let mut before_finish = || {
-                    if let Some(hook) = &finish_hook {
-                        hook("before_read_finish");
-                    }
-                };
-                let mut after_finish = || {
-                    if let Some(hook) = &after_finish_hook {
-                        hook("after_read_finish");
-                    }
-                };
-                let mut on_progress = || {
-                    if let Some(hook) = &hook {
-                        #[cfg(feature = "test-support")]
-                        if crate::metrics::in_parser_progress_for_tests() {
-                            hook("metrics_parser_progress");
-                            return;
-                        }
-                        hook("metrics_read_progress");
-                    }
-                };
-                let mut on_write = |written: usize| {
-                    if let Some(hook) = &serialize_hook {
-                        hook(if written >= metrics.limit.saturating_sub(80) {
-                            "metrics_serialize_last"
-                        } else {
-                            "metrics_serialize"
-                        });
-                    }
-                };
-                let mut check = || {
-                    if cancellation.load(std::sync::atomic::Ordering::Acquire)
-                        || metrics
-                            .test_cancel
-                            .load(std::sync::atomic::Ordering::Relaxed)
-                    {
-                        if let Some(hook) = &check_hook {
-                            hook("metrics_cancelled");
-                        }
-                        anyhow::bail!("cancelled");
-                    }
-                    if metrics.now()
-                        + Duration::from_millis(
-                            metrics
-                                .clock_skew_ms
-                                .load(std::sync::atomic::Ordering::Relaxed),
-                        )
-                        >= deadline
-                    {
-                        anyhow::bail!("deadline_exceeded");
-                    }
-                    Ok(())
-                };
-                let hooks = crate::daemon::registry::MetricsResponseHooks {
-                    before_work: &mut before_work,
-                    before_finish: &mut before_finish,
-                    after_finish: &mut after_finish,
-                    on_write: &mut on_write,
-                    on_progress: &mut on_progress,
-                };
-                let result = if let Some(details) = &details {
-                    runtime.architecture_details_response(details, &mut check, hooks, metrics.limit)
-                } else if architecture {
-                    runtime.architecture_response(&options, &mut check, hooks, metrics.limit)
-                } else {
-                    runtime.metrics_response(&options, &mut check, hooks, metrics.limit)
-                };
-                if let Some(hook) = &hook {
-                    hook("metrics_worker_done");
-                }
-                result
-            })
-            .await
-            .map_err(|_| {
-                ApiError(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal_error",
-                    "Operation failed",
-                )
-            })?;
-            drop(guard);
-            let (body, catching_up) = match result {
-                Ok(answer) => answer,
-                Err(error) => {
-                    if let Some(diagnostic) = crate::rules::diagnostic(&error) {
-                        return Ok((
-                            (
-                                StatusCode::UNPROCESSABLE_ENTITY,
-                                Json(json!({"error": diagnostic})),
-                            )
-                                .into_response(),
-                            false,
-                        ));
-                    }
-                    if let Some(building) =
-                        error.downcast_ref::<architecture::ArchitectureBuilding>()
-                    {
-                        if detail_read {
-                            return Err(ApiError(
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                "architecture_building",
-                                "Architecture is being computed for this revision; retry shortly",
-                            ));
-                        }
-                        return Ok((
-                            (
-                                StatusCode::ACCEPTED,
-                                Json(json!({"payload": building.payload(), "catchingUp": false})),
-                            )
-                                .into_response(),
-                            false,
-                        ));
-                    }
-                    // Only detail reads add these typed refusals; other routes keep their mapping.
-                    for cause in error.chain().filter(|_| detail_read) {
-                        let text = cause.to_string();
-                        if text.starts_with("rules_conflict:") {
-                            return Err(ApiError(
-                                StatusCode::CONFLICT,
-                                "rules_conflict",
-                                "Rules changed on disk; reload the Architecture view",
-                            ));
-                        }
-                        if text.starts_with("invalid_request:") {
-                            return Err(invalid());
-                        }
-                        if text.starts_with("not_found: architecture edge") {
-                            return Err(ApiError(
-                                StatusCode::NOT_FOUND,
-                                "not_found",
-                                "No such Architecture edge at this pin and rules file",
-                            ));
-                        }
-                    }
-                    return Err(ApiError::from(error));
-                }
-            };
-            Ok((
-                (
-                    [(axum::http::header::CONTENT_TYPE, "application/json")],
-                    body,
-                )
-                    .into_response(),
-                catching_up,
-            ))
+            metrics_family_answer(runtime, route, uri, hook, metrics).await
         }
         BrowserCoreRoute::RulesInventory
         | BrowserCoreRoute::RulesPreview
         | BrowserCoreRoute::RulesApply => {
-            let apply = matches!(route, BrowserCoreRoute::RulesApply);
-            let inventory = matches!(route, BrowserCoreRoute::RulesInventory);
-            let pin = if inventory {
-                let options = architecture_query(uri)?;
-                if uri.query().is_some_and(|query| {
-                    query.split('&').any(|pair| {
-                        !matches!(
-                            pair.split_once('=').map(|(name, _)| name),
-                            Some("indexGeneration" | "indexRevision")
-                        )
-                    })
-                }) {
+            rules_answer(runtime, route, uri, body, hook, metrics).await
+        }
+        BrowserCoreRoute::RefreshDependencies => {
+            refresh_dependencies_answer(runtime, body, hook).await
+        }
+        BrowserCoreRoute::Dependencies => dependencies_answer(runtime, uri, hook).await,
+        BrowserCoreRoute::DependencySymbols => dependency_symbols_answer(runtime, uri, hook).await,
+        BrowserCoreRoute::DependencySource => dependency_source_answer(runtime, uri, hook).await,
+        BrowserCoreRoute::RustSources => rust_sources_answer(runtime, uri, hook).await,
+        BrowserCoreRoute::RustSourceTree => rust_source_tree_answer(runtime, uri, hook).await,
+        BrowserCoreRoute::RustSourceFile => rust_source_file_answer(runtime, uri, hook).await,
+        BrowserCoreRoute::Status | BrowserCoreRoute::StatusHead => {
+            status_answer(runtime, route, uri, if_none_match, hook).await
+        }
+        BrowserCoreRoute::Tree => tree_answer(runtime, uri, hook).await,
+        BrowserCoreRoute::Files => files_answer(runtime, uri, hook).await,
+        BrowserCoreRoute::FileSymbols => file_symbols_answer(runtime, uri, hook).await,
+        BrowserCoreRoute::SyntaxMatches => syntax_matches_answer(runtime, body, hook).await,
+        BrowserCoreRoute::Methods => methods_answer(runtime, uri, hook).await,
+        BrowserCoreRoute::Classes => classes_answer(runtime, uri, hook).await,
+        BrowserCoreRoute::Sequence => sequence_answer(runtime, body, hook).await,
+        BrowserCoreRoute::ClassDiagram => class_diagram_answer(runtime, body, hook).await,
+        BrowserCoreRoute::Navigation => navigation_answer(runtime, body, hook).await,
+        BrowserCoreRoute::Source => source_answer(runtime, uri).await,
+        BrowserCoreRoute::Index | BrowserCoreRoute::CurrentJob => {
+            index_answer(runtime, method, body).await
+        }
+        BrowserCoreRoute::Job => job_answer(runtime, method, suffix).await,
+    }
+}
+
+/// `metrics`, `architecture` and `architecture/details`: one bounded, cancellable worker.
+async fn metrics_family_answer(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    route: BrowserCoreRoute,
+    uri: &axum::http::Uri,
+    hook: Option<SelectedResponseHook>,
+    metrics: MetricsHttpControls,
+) -> CoreAnswer {
+    let architecture = matches!(route, BrowserCoreRoute::Architecture);
+    let details = if matches!(route, BrowserCoreRoute::ArchitectureDetails) {
+        Some(architecture_details_query(uri)?)
+    } else {
+        None
+    };
+    let detail_read = details.is_some();
+    let options = if detail_read {
+        // A detail page evaluates the whole revision, like the summary.
+        crate::metrics_read::MetricsOptions::default()
+    } else if architecture {
+        architecture_query(uri)?
+    } else {
+        metrics_query(uri)?
+    };
+    let runtime = runtime.clone();
+    // The guard belongs to this request future, not to the blocking worker.
+    struct CancelOnDrop(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let guard = CancelOnDrop(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    let cancellation = guard.0.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let duration = if metrics.deadline_ms != 0 {
+            Duration::from_millis(metrics.deadline_ms)
+        } else {
+            crate::metrics_read::MetricsOptions::work_budget(&options.scope)
+        };
+        let deadline = metrics.now() + duration;
+        let work_hook = hook.clone();
+        let finish_hook = hook.clone();
+        let serialize_hook = hook.clone();
+        let after_finish_hook = hook.clone();
+        let check_hook = hook.clone();
+        let mut before_work = || {
+            if let Some(hook) = &work_hook {
+                hook("before_work");
+            }
+        };
+        let mut before_finish = || {
+            if let Some(hook) = &finish_hook {
+                hook("before_read_finish");
+            }
+        };
+        let mut after_finish = || {
+            if let Some(hook) = &after_finish_hook {
+                hook("after_read_finish");
+            }
+        };
+        let mut on_progress = || {
+            if let Some(hook) = &hook {
+                #[cfg(feature = "test-support")]
+                if crate::metrics::in_parser_progress_for_tests() {
+                    hook("metrics_parser_progress");
+                    return;
+                }
+                hook("metrics_read_progress");
+            }
+        };
+        let mut on_write = |written: usize| {
+            if let Some(hook) = &serialize_hook {
+                hook(if written >= metrics.limit.saturating_sub(80) {
+                    "metrics_serialize_last"
+                } else {
+                    "metrics_serialize"
+                });
+            }
+        };
+        let mut check = || {
+            if cancellation.load(std::sync::atomic::Ordering::Acquire)
+                || metrics
+                    .test_cancel
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                if let Some(hook) = &check_hook {
+                    hook("metrics_cancelled");
+                }
+                anyhow::bail!("cancelled");
+            }
+            if metrics.now()
+                + Duration::from_millis(
+                    metrics
+                        .clock_skew_ms
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                )
+                >= deadline
+            {
+                anyhow::bail!("deadline_exceeded");
+            }
+            Ok(())
+        };
+        let hooks = crate::daemon::registry::MetricsResponseHooks {
+            before_work: &mut before_work,
+            before_finish: &mut before_finish,
+            after_finish: &mut after_finish,
+            on_write: &mut on_write,
+            on_progress: &mut on_progress,
+        };
+        let result = if let Some(details) = &details {
+            runtime.architecture_details_response(details, &mut check, hooks, metrics.limit)
+        } else if architecture {
+            runtime.architecture_response(&options, &mut check, hooks, metrics.limit)
+        } else {
+            runtime.metrics_response(&options, &mut check, hooks, metrics.limit)
+        };
+        if let Some(hook) = &hook {
+            hook("metrics_worker_done");
+        }
+        result
+    })
+    .await
+    .map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "Operation failed",
+        )
+    })?;
+    drop(guard);
+    let (body, catching_up) = match result {
+        Ok(answer) => answer,
+        Err(error) => {
+            if let Some(diagnostic) = crate::rules::diagnostic(&error) {
+                return Ok((
+                    (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        Json(json!({"error": diagnostic})),
+                    )
+                        .into_response(),
+                    false,
+                ));
+            }
+            if let Some(building) = error.downcast_ref::<architecture::ArchitectureBuilding>() {
+                if detail_read {
+                    return Err(ApiError(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "architecture_building",
+                        "Architecture is being computed for this revision; retry shortly",
+                    ));
+                }
+                return Ok((
+                    (
+                        StatusCode::ACCEPTED,
+                        Json(json!({"payload": building.payload(), "catchingUp": false})),
+                    )
+                        .into_response(),
+                    false,
+                ));
+            }
+            // Only detail reads add these typed refusals; other routes keep their mapping.
+            for cause in error.chain().filter(|_| detail_read) {
+                let text = cause.to_string();
+                if text.starts_with("rules_conflict:") {
+                    return Err(ApiError(
+                        StatusCode::CONFLICT,
+                        "rules_conflict",
+                        "Rules changed on disk; reload the Architecture view",
+                    ));
+                }
+                if text.starts_with("invalid_request:") {
                     return Err(invalid());
                 }
-                Some(options.pin.ok_or_else(invalid)?)
-            } else {
-                if uri.query().is_some() {
-                    return Err(invalid());
-                }
-                None
-            };
-            let request = if inventory {
-                None
-            } else {
-                let request: crate::rules_edit::Request =
-                    serde_json::from_slice(&body).map_err(|_| invalid())?;
-                request.validate(apply).map_err(|_| invalid())?;
-                Some(request)
-            };
-            struct CancelOnDrop(Arc<std::sync::atomic::AtomicBool>);
-            impl Drop for CancelOnDrop {
-                fn drop(&mut self) {
-                    self.0.store(true, std::sync::atomic::Ordering::Release);
+                if text.starts_with("not_found: architecture edge") {
+                    return Err(ApiError(
+                        StatusCode::NOT_FOUND,
+                        "not_found",
+                        "No such Architecture edge at this pin and rules file",
+                    ));
                 }
             }
-            let guard = CancelOnDrop(Arc::new(std::sync::atomic::AtomicBool::new(false)));
-            let cancellation = guard.0.clone();
-            let runtime = runtime.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                let duration = if metrics.deadline_ms != 0 {
-                    Duration::from_millis(metrics.deadline_ms)
-                } else {
-                    Duration::from_secs(300)
-                };
-                let deadline = metrics.now() + duration;
-                let mut check = || {
-                    anyhow::ensure!(
-                        !cancellation.load(std::sync::atomic::Ordering::Acquire)
-                            && !metrics
-                                .test_cancel
-                                .load(std::sync::atomic::Ordering::Relaxed),
-                        "cancelled"
-                    );
-                    anyhow::ensure!(
-                        metrics.now()
-                            + Duration::from_millis(
-                                metrics
-                                    .clock_skew_ms
-                                    .load(std::sync::atomic::Ordering::Relaxed)
-                            )
-                            < deadline,
-                        "deadline_exceeded"
-                    );
-                    Ok(())
-                };
-                let result = if let Some(request) = request {
-                    if let Some(hook) = &hook {
-                        hook("before_work");
-                    }
-                    runtime.rules_edit_response(
-                        &request,
-                        apply,
-                        &mut check,
-                        metrics.limit,
-                        &mut || {
-                            if let Some(hook) = &hook {
-                                hook("rules_before_rename");
-                            }
-                        },
+            return Err(ApiError::from(error));
+        }
+    };
+    Ok((
+        (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response(),
+        catching_up,
+    ))
+}
+
+/// `architecture/rules` (inventory), `architecture/rules/preview` and `architecture/rules/apply`.
+async fn rules_answer(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    route: BrowserCoreRoute,
+    uri: &axum::http::Uri,
+    body: Bytes,
+    hook: Option<SelectedResponseHook>,
+    metrics: MetricsHttpControls,
+) -> CoreAnswer {
+    let apply = matches!(route, BrowserCoreRoute::RulesApply);
+    let inventory = matches!(route, BrowserCoreRoute::RulesInventory);
+    let pin = if inventory {
+        let options = architecture_query(uri)?;
+        if uri.query().is_some_and(|query| {
+            query.split('&').any(|pair| {
+                !matches!(
+                    pair.split_once('=').map(|(name, _)| name),
+                    Some("indexGeneration" | "indexRevision")
+                )
+            })
+        }) {
+            return Err(invalid());
+        }
+        Some(options.pin.ok_or_else(invalid)?)
+    } else {
+        if uri.query().is_some() {
+            return Err(invalid());
+        }
+        None
+    };
+    let request = if inventory {
+        None
+    } else {
+        let request: crate::rules_edit::Request =
+            serde_json::from_slice(&body).map_err(|_| invalid())?;
+        request.validate(apply).map_err(|_| invalid())?;
+        Some(request)
+    };
+    struct CancelOnDrop(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let guard = CancelOnDrop(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    let cancellation = guard.0.clone();
+    let runtime = runtime.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let duration = if metrics.deadline_ms != 0 {
+            Duration::from_millis(metrics.deadline_ms)
+        } else {
+            Duration::from_secs(300)
+        };
+        let deadline = metrics.now() + duration;
+        let mut check = || {
+            anyhow::ensure!(
+                !cancellation.load(std::sync::atomic::Ordering::Acquire)
+                    && !metrics
+                        .test_cancel
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                "cancelled"
+            );
+            anyhow::ensure!(
+                metrics.now()
+                    + Duration::from_millis(
+                        metrics
+                            .clock_skew_ms
+                            .load(std::sync::atomic::Ordering::Relaxed)
                     )
-                } else {
-                    let (response, catching_up) = runtime.evidence_response()?;
-                    if let Some(hook) = &hook {
-                        hook("before_work");
-                    }
-                    check()?;
-                    let payload = match response.rules_edit_inventory(pin.expect("inventory pin")) {
-                        Ok(payload) => payload,
-                        Err(error) => {
-                            if let Some(diagnostic) = crate::rules::diagnostic(&error) {
-                                crate::metrics::serialize_checked(
-                                    &json!({"error":diagnostic}),
-                                    metrics.limit,
-                                    &mut check,
-                                )?;
-                            }
-                            check()?;
-                            response.finish(())?;
-                            return Err(error);
-                        }
-                    };
-                    let bytes = crate::metrics::serialize_checked(
-                        &json!({"payload":payload,"catchingUp":catching_up}),
-                        metrics.limit,
-                        &mut check,
-                    )?;
-                    if let Some(hook) = &hook {
-                        hook("before_read_finish");
+                    < deadline,
+                "deadline_exceeded"
+            );
+            Ok(())
+        };
+        let result = if let Some(request) = request {
+            if let Some(hook) = &hook {
+                hook("before_work");
+            }
+            runtime.rules_edit_response(&request, apply, &mut check, metrics.limit, &mut || {
+                if let Some(hook) = &hook {
+                    hook("rules_before_rename");
+                }
+            })
+        } else {
+            let (response, catching_up) = runtime.evidence_response()?;
+            if let Some(hook) = &hook {
+                hook("before_work");
+            }
+            check()?;
+            let payload = match response.rules_edit_inventory(pin.expect("inventory pin")) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    if let Some(diagnostic) = crate::rules::diagnostic(&error) {
+                        crate::metrics::serialize_checked(
+                            &json!({"error":diagnostic}),
+                            metrics.limit,
+                            &mut check,
+                        )?;
                     }
                     check()?;
                     response.finish(())?;
-                    Ok((bytes, catching_up, None))
-                };
-                if let Some(hook) = &hook {
-                    hook("metrics_worker_done");
+                    return Err(error);
                 }
-                result
-            })
-            .await
-            .map_err(|_| {
-                ApiError(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal_error",
-                    "Operation failed",
-                )
-            })?;
-            drop(guard);
-            match result {
-                Ok((bytes, catching_up, outcome)) => {
-                    let mut response =
-                        ([(header::CONTENT_TYPE, "application/json")], bytes).into_response();
-                    if let Some(outcome) = outcome {
-                        response.headers_mut().insert(
-                            "X-Trellis-Mutation-Outcome",
-                            outcome.parse().expect("static outcome"),
-                        );
-                    }
-                    Ok((response, catching_up))
-                }
-                Err(error) => {
-                    if let Some(diagnostic) = crate::rules::diagnostic(&error) {
-                        return Ok((
-                            (
-                                StatusCode::UNPROCESSABLE_ENTITY,
-                                Json(json!({"error":diagnostic})),
-                            )
-                                .into_response(),
-                            false,
-                        ));
-                    }
-                    for cause in error.chain() {
-                        let text = cause.to_string();
-                        if text.starts_with("invalid_request:") {
-                            let message = if text
-                                .contains("positively witnessed production layer deviation")
-                            {
-                                "Selected pair is not a witnessed production layer deviation"
-                            } else if text.contains("expanded rules exceed 2 MiB") {
-                                "Expanded rules exceed the 2 MiB rules-file limit"
-                            } else if text
-                                .contains("assignment requires an indexed unassigned file")
-                            {
-                                "Assignment requires an indexed unassigned file"
-                            } else {
-                                "Rules change is invalid; check the operation, selections and limits"
-                            };
-                            return Err(ApiError(
-                                StatusCode::BAD_REQUEST,
-                                "invalid_request",
-                                message,
-                            ));
-                        }
-                        if text.starts_with("rules_conflict:") {
-                            return Err(ApiError(
-                                StatusCode::CONFLICT,
-                                "rules_conflict",
-                                "Rules changed on disk; reload rules and preview again",
-                            ));
-                        }
-                    }
-                    Err(ApiError::from(error))
-                }
-            }
-        }
-        BrowserCoreRoute::RefreshDependencies => {
-            let request: Value = serde_json::from_slice(&body).map_err(|_| invalid())?;
-            if !request.as_object().is_some_and(|object| object.is_empty()) {
-                return Err(invalid());
-            }
-            let state = runtime.browser_scheduler()?;
-            // One configuration version for the whole request (Decision 0009 §6).
-            let config = state.config();
-            let (revision, catching_up) = selected_refresh_preflight(runtime, hook).await?;
-            if config.dependency_options.is_none() {
-                return Err(ApiError(
-                    StatusCode::CONFLICT,
-                    "dependencies_disabled",
-                    "Dependency catalog is disabled",
-                ));
-            }
-            if state.dependencies.lock().unwrap().stopped {
-                return Err(ApiError(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "shutting_down",
-                    "Daemon is shutting down",
-                ));
-            }
-            // Check once more immediately before scheduling work. Once scheduled,
-            // a later root or head change cannot undo the requested refresh.
-            selected_refresh_postflight(runtime, revision).await?;
-            runtime.require_mutation_ready()?;
-            // Scheduled only for the configuration version this request
-            // checked; a registration in between refuses it.
-            if !state.start_dependency_index_for(&config) {
-                return Err(ApiError(
-                    StatusCode::CONFLICT,
-                    "configuration_changed",
-                    "The checkout configuration changed; retry the refresh",
-                ));
-            }
-            let mut response = match selected_refresh_postflight(runtime, revision).await {
-                Ok(()) => (StatusCode::ACCEPTED, Json(json!({"state":"loading"}))).into_response(),
-                Err(error) => selected_mutation_error(error, "committed"),
             };
-            response
-                .headers_mut()
-                .insert("X-Trellis-Mutation-Outcome", "committed".parse().unwrap());
+            let bytes = crate::metrics::serialize_checked(
+                &json!({"payload":payload,"catchingUp":catching_up}),
+                metrics.limit,
+                &mut check,
+            )?;
+            if let Some(hook) = &hook {
+                hook("before_read_finish");
+            }
+            check()?;
+            response.finish(())?;
+            Ok((bytes, catching_up, None))
+        };
+        if let Some(hook) = &hook {
+            hook("metrics_worker_done");
+        }
+        result
+    })
+    .await
+    .map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "Operation failed",
+        )
+    })?;
+    drop(guard);
+    match result {
+        Ok((bytes, catching_up, outcome)) => {
+            let mut response =
+                ([(header::CONTENT_TYPE, "application/json")], bytes).into_response();
+            if let Some(outcome) = outcome {
+                response.headers_mut().insert(
+                    "X-Trellis-Mutation-Outcome",
+                    outcome.parse().expect("static outcome"),
+                );
+            }
             Ok((response, catching_up))
         }
-        BrowserCoreRoute::Dependencies => {
-            if uri.query().is_some() {
-                return Err(invalid());
-            }
-            let state = runtime.browser_scheduler()?;
-            let (payload, catching_up) = selected_catalog_read(runtime, hook, move |r| {
-                let revision = r.status().map_err(ApiError::from)?.revision;
-                let (index_state, catalog, mut warnings) = {
-                    let index = state.dependencies.lock().unwrap();
-                    (index.state, index.catalog.clone(), index.warnings.clone())
-                };
-                Ok(if let Some(catalog) = catalog {
-                    if catalog.workspace_revision == revision {
-                        json!({"state":index_state,"workspaceRevision":revision,
-                            "catalogId":catalog.id,"packages":catalog.packages,
-                            "symbolCount":catalog.symbols.len(),"warnings":catalog.warnings})
-                    } else {
-                        warnings.push("Workspace changed; refresh the dependency catalog".into());
-                        json!({"state":"failed","workspaceRevision":revision,
-                            "catalogId":null,"packages":[],"symbolCount":0,"warnings":warnings})
-                    }
-                } else {
-                    json!({"state":index_state,"workspaceRevision":revision,
-                        "catalogId":null,"packages":[],"symbolCount":0,"warnings":warnings})
-                })
-            })
-            .await?;
-            Ok((Json(payload).into_response(), catching_up))
-        }
-        BrowserCoreRoute::DependencySymbols => {
-            let Query(q) =
-                Query::<DependencySymbolsQuery>::try_from_uri(uri).map_err(|_| invalid())?;
-            if q.catalog_id.is_empty()
-                || q.catalog_id.len() > 8192
-                || q.q.len() > 8192
-                || q.package_id.as_ref().is_some_and(|id| id.len() > 8192)
-                || !(1..=200).contains(&q.limit)
-                || q.offset > 50_000
-            {
-                return Err(invalid());
-            }
-            let state = runtime.browser_scheduler()?;
-            let (payload, catching_up) = selected_catalog_read(runtime, hook, move |r| {
-                let revision = r.status().map_err(ApiError::from)?.revision;
-                let catalog = selected_catalog(&state, revision, &q.catalog_id)?;
-                if q.package_id.as_ref().is_some_and(|id| !catalog.packages.iter().any(|p| &p.id == id)) { return Err(missing()); }
-                let search = q.q.to_lowercase();
-                let mut matches = catalog.symbols.iter().filter(|symbol| {
-                    q.package_id.as_ref().is_none_or(|id| &symbol.package_id == id)
-                    && (search.is_empty() || symbol.qualified_name.to_lowercase().contains(&search)
-                        || symbol.name.to_lowercase().contains(&search))
-                }).skip(q.offset);
-                let items: Vec<_> = matches.by_ref().take(q.limit).collect();
-                let next_offset = matches.next().map(|_| q.offset + items.len());
-                let payload = json!({"catalogId":catalog.id,"workspaceRevision":catalog.workspace_revision,
-                    "items":items,"nextOffset":next_offset});
-                if !state.catalog_snapshot(revision).is_some_and(|current| Arc::ptr_eq(&current, &catalog)) { return Err(dependency_stale()); }
-                Ok(payload)
-            }).await?;
-            Ok((Json(payload).into_response(), catching_up))
-        }
-        BrowserCoreRoute::DependencySource => {
-            let Query(q) =
-                Query::<DependencySourceQuery>::try_from_uri(uri).map_err(|_| invalid())?;
-            if q.catalog_id.is_empty()
-                || q.catalog_id.len() > 8192
-                || q.source_ref.is_empty()
-                || q.source_ref.len() > 8192
-            {
-                return Err(invalid());
-            }
-            let state = runtime.browser_scheduler()?;
-            let (payload, catching_up) = selected_catalog_read(runtime, hook, move |r| {
-                let revision = r.status().map_err(ApiError::from)?.revision;
-                let catalog = selected_catalog(&state, revision, &q.catalog_id)?;
-                let source = catalog.sources.get(&q.source_ref).ok_or_else(missing)?;
-                let text = source.directory.read_file(&source.path).map_err(rust_source_error)?;
-                let hash = hex::encode(Sha256::digest(text.as_bytes()));
-                if hash != source.hash { return Err(dependency_stale()); }
-                let package = catalog.packages.iter().find(|p| p.id == source.package_id).ok_or_else(missing)?;
-                let definitions: Vec<_> = catalog.symbols.iter().filter(|symbol| symbol.source_ref == q.source_ref)
-                    .map(|symbol| json!({"id":symbol.id,"name":symbol.name,"kind":symbol.kind,
-                        "parent":symbol.parent,"path":symbol.path,"range":symbol.range})).collect();
-                let file = SourceFile { path: source.path.clone(), hash: hash.clone(), language: "rust".into(), text };
-                let payload = json!({"id":q.source_ref,"rootId":package.id,"rootLabel":package.name,
-                    "path":source.path,"hash":hash,"file":file,"definitions":definitions,
-                    "warnings":["Definitional candidates only; not confirmed callees. Separate from the workspace graph and source-sharing scope."]});
-                if !state.catalog_snapshot(revision).is_some_and(|current| Arc::ptr_eq(&current, &catalog)) { return Err(dependency_stale()); }
-                Ok(payload)
-            }).await?;
-            Ok((Json(payload).into_response(), catching_up))
-        }
-        BrowserCoreRoute::RustSources => {
-            if uri.query().is_some() {
-                return Err(invalid());
-            }
-            let state = runtime.browser_scheduler()?;
-            // One configuration version for the whole request (Decision 0009 §6).
-            let config = state.config();
-            let (payload, catching_up) = selected_catalog_read(runtime, hook, move |_| {
-                Ok(json!({"roots":config.rust_sources.iter().map(|r| json!({"id":r.label,"label":r.label,
-                    "path":r.directory.root.to_string_lossy()})).collect::<Vec<_>>() }))
-            }).await?;
-            Ok((Json(payload).into_response(), catching_up))
-        }
-        BrowserCoreRoute::RustSourceTree => {
-            let Query(q) = Query::<RustTreeQuery>::try_from_uri(uri).map_err(|_| invalid())?;
-            if !crate::file_tree::valid_path(&q.path)
-                || !(1..=200).contains(&q.limit)
-                || q.offset > crate::file_tree::SCAN_LIMIT
-            {
-                return Err(browse_invalid());
-            }
-            let state = runtime.browser_scheduler()?;
-            // One configuration version for the whole request (Decision 0009 §6).
-            let config = state.config();
-            let (page, catching_up) = selected_catalog_read(runtime, hook, move |r| {
-                let revision = r.status().map_err(ApiError::from)?.revision;
-                let root = config
-                    .rust_sources
-                    .iter()
-                    .find(|root| root.label == q.root)
-                    .ok_or_else(missing)?;
-                let (items, next_offset, truncated) = root
-                    .directory
-                    .list(&q.path, q.offset, q.limit)
-                    .map_err(rust_source_error)?;
-                Ok(crate::file_tree::Page {
-                    root: root.directory.root.to_string_lossy().into_owned(),
-                    indexed_workspace: String::new(),
-                    path: q.path,
-                    revision,
-                    items,
-                    next_offset,
-                    truncated,
-                })
-            })
-            .await?;
-            Ok((Json(page).into_response(), catching_up))
-        }
-        BrowserCoreRoute::RustSourceFile => {
-            let Query(q) = Query::<RustFileQuery>::try_from_uri(uri).map_err(|_| invalid())?;
-            if q.path.is_empty()
-                || !crate::file_tree::valid_path(&q.path)
-                || !q.path.ends_with(".rs")
-            {
-                return Err(browse_invalid());
-            }
-            let state = runtime.browser_scheduler()?;
-            // One configuration version for the whole request (Decision 0009 §6).
-            let config = state.config();
-            let (file, catching_up) = selected_catalog_read(runtime, hook, move |_| {
-                let root = config
-                    .rust_sources
-                    .iter()
-                    .find(|root| root.label == q.root)
-                    .ok_or_else(missing)?;
-                root.snapshot(&q.path).map_err(rust_source_error)
-            })
-            .await?;
-            Ok((Json(file).into_response(), catching_up))
-        }
-        BrowserCoreRoute::Status | BrowserCoreRoute::StatusHead => {
-            if uri.query().is_some() {
-                return Err(invalid());
-            }
-            let head = matches!(route, BrowserCoreRoute::StatusHead);
-            let search = runtime.search_availability();
-            // A status poll is an open viewer of this checkout (#818); its answer carries the
-            // latest agent view request, so a viewer follows it.
-            runtime.view_requests().note_viewer(Instant::now());
-            let view_request = runtime.view_requests().status_json();
-            let runtime = runtime.clone();
-            let (status, catching_up) = tokio::task::spawn_blocking(move || {
-                let (response, catching_up) = runtime.evidence_response()?;
-                #[cfg(feature = "test-support")]
-                let projected = crate::store::status_semantic_projections_on_thread_for_tests();
-                // #666: the head digest needs no per-language semantic projection.
-                let mut status = if head {
-                    response.status_head()?
-                } else {
-                    response.status()?
-                };
-                // Status semantic projections run by the browser's status reads
-                // themselves, counted on their own blocking thread: the dependency
-                // catalog build and other background readers never count (#700).
-                #[cfg(feature = "test-support")]
-                runtime.count_browser_status_projections(
-                    crate::store::status_semantic_projections_on_thread_for_tests() - projected,
-                );
-                let catching_up = catching_up || response.semantic_catching_up()?;
-                status.catching_up |= catching_up;
-                if let Some(hook) = hook {
-                    hook("before_read_finish");
-                }
-                Ok::<_, anyhow::Error>((response.finish(status)?, catching_up))
-            })
-            .await
-            .map_err(|_| {
-                ApiError(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal_error",
-                    "Operation failed",
-                )
-            })??;
-            // The head digest (#527) is the fixed-size part of the same status read that
-            // the browser polls; diagnostics and statistics stay on `status`.
-            let body = if head {
-                let digest = json!({
-                    "workspaceRoot": status.workspace_root,
-                    "revision": status.revision,
-                    "catchingUp": status.catching_up,
-                    "indexedAt": status.indexed_at,
-                    "viewRequest": view_request,
-                });
-                status_head_response(&digest, if_none_match)
-            } else {
-                let mut body = serde_json::to_value(status).map_err(|_| {
-                    ApiError(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "internal_error",
-                        "Operation failed",
+        Err(error) => {
+            if let Some(diagnostic) = crate::rules::diagnostic(&error) {
+                return Ok((
+                    (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        Json(json!({"error":diagnostic})),
                     )
-                })?;
-                body["searchIndex"] = serde_json::to_value(search).map_err(|_| {
-                    ApiError(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "internal_error",
-                        "Operation failed",
-                    )
-                })?;
-                body["viewRequest"] = view_request;
-                Json(body).into_response()
-            };
-            Ok((body, catching_up))
-        }
-        BrowserCoreRoute::Tree => {
-            let Query(q) = Query::<TreeQuery>::try_from_uri(uri).map_err(|_| browse_invalid())?;
-            if !crate::file_tree::valid_path(&q.path)
-                || !(1..=200).contains(&q.limit)
-                || q.offset > crate::file_tree::SCAN_LIMIT
-            {
-                return Err(browse_invalid());
+                        .into_response(),
+                    false,
+                ));
             }
-            let state = runtime.browser_scheduler()?;
-            // One configuration version for the whole request (Decision 0009 §6).
-            let config = state.config();
-            let (page, catching_up) = selected_evidence(runtime, hook, move |response| {
-                let (mut items, next_offset, truncated) = config
-                    .browser
-                    .list(&q.path, q.offset, q.limit)
-                    .map_err(BrowseDirectoryError)?;
-                let (revision, indexed_workspace) =
-                    response.tree_metadata(&config.browser.root, &mut items)?;
-                for item in items
-                    .iter_mut()
-                    .filter(|item| item.kind == "file" && item.indexed_path.is_none())
-                {
-                    let absolute = config.browser.root.join(&item.path);
-                    let reason = if !absolute.starts_with(&indexed_workspace) {
-                        "Outside indexed workspace"
-                    } else {
-                        match crate::capture::language_of_path(&absolute) {
-                            Some(_) => "Not indexed yet (may be excluded or size-limited)",
-                            None => "Unsupported source type",
-                        }
-                    };
-                    item.unindexed_reason = Some(reason.into());
+            for cause in error.chain() {
+                let text = cause.to_string();
+                if text.starts_with("invalid_request:") {
+                    let message =
+                        if text.contains("positively witnessed production layer deviation") {
+                            "Selected pair is not a witnessed production layer deviation"
+                        } else if text.contains("expanded rules exceed 2 MiB") {
+                            "Expanded rules exceed the 2 MiB rules-file limit"
+                        } else if text.contains("assignment requires an indexed unassigned file") {
+                            "Assignment requires an indexed unassigned file"
+                        } else {
+                            "Rules change is invalid; check the operation, selections and limits"
+                        };
+                    return Err(ApiError(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request",
+                        message,
+                    ));
                 }
-                Ok(crate::file_tree::Page {
-                    root: config.browser.root.to_string_lossy().into_owned(),
-                    indexed_workspace,
-                    path: q.path,
-                    revision,
-                    items,
-                    next_offset,
-                    truncated,
-                })
-            })
-            .await?;
-            Ok((Json(page).into_response(), catching_up))
-        }
-        BrowserCoreRoute::Files => {
-            let Query(q) = Query::<FilesQuery>::try_from_uri(uri).map_err(|_| browse_invalid())?;
-            q.validate()?;
-            let pin = q.pin.pin()?;
-            let (value, catching_up) =
-                selected_evidence(runtime, hook, move |r| match q.q.as_deref() {
-                    Some(filter) => r.files_matching_at(pin, filter, q.offset, q.limit),
-                    None => r.files_at(pin, q.offset, q.limit),
-                })
-                .await?;
-            Ok((Json(value).into_response(), catching_up))
-        }
-        BrowserCoreRoute::FileSymbols => {
-            let Query(q) = Query::<FileSymbolsQuery>::try_from_uri(uri).map_err(|_| invalid())?;
-            let pin = q.validate()?;
-            let (value, catching_up) = selected_evidence(runtime, hook, move |r| {
-                r.file_symbols_at(&q.path, pin, q.offset, q.limit)
-            })
-            .await?;
-            Ok((
-                Json(value.ok_or_else(missing)?).into_response(),
-                catching_up,
-            ))
-        }
-        BrowserCoreRoute::SyntaxMatches => {
-            let q: crate::files_view::SyntaxMatchesRequest =
-                serde_json::from_slice(&body).map_err(|_| invalid())?;
-            q.validate()?;
-            let (value, catching_up) =
-                selected_evidence(runtime, hook, move |r| r.syntax_matches_at(&q)).await?;
-            Ok((
-                Json(value.ok_or_else(missing)?).into_response(),
-                catching_up,
-            ))
-        }
-        BrowserCoreRoute::Methods => {
-            let Query(q) = Query::<SourceQuery>::try_from_uri(uri).map_err(|_| browse_invalid())?;
-            if q.path.is_empty()
-                || q.path.len() > 8192
-                || q.path.contains(['\0', '\\', ':'])
-                || q.path
-                    .split('/')
-                    .any(|p| p.is_empty() || p == "." || p == "..")
-            {
-                return Err(browse_invalid());
-            }
-            let pin = q.pin.pin()?;
-            let (value, catching_up) =
-                selected_evidence(runtime, hook, move |r| r.methods_at(&q.path, pin)).await?;
-            Ok((
-                Json(value.ok_or_else(missing)?).into_response(),
-                catching_up,
-            ))
-        }
-        BrowserCoreRoute::Classes => {
-            let Query(q) = Query::<ClassesQuery>::try_from_uri(uri).map_err(|_| invalid())?;
-            let pin = q.pin.pin()?;
-            let (value, catching_up) = selected_evidence(runtime, hook, move |r| {
-                r.classes_at(q.path.as_deref(), &q.q, pin, q.offset, q.limit)
-            })
-            .await?;
-            Ok((Json(value).into_response(), catching_up))
-        }
-        BrowserCoreRoute::Sequence => {
-            let q: SequenceRequest = serde_json::from_slice(&body).map_err(|_| browse_invalid())?;
-            if q.seed.is_empty() || q.seed.len() > 8192 || q.seed.contains('\0') {
-                return Err(browse_invalid());
-            }
-            let hops = runtime.clone();
-            let (value, catching_up) = selected_evidence(runtime, hook, move |r| {
-                let mut view = if q.interactions && !q.show_all {
-                    r.sequence_interactions_at(&q.seed, q.expected_revision)?
-                } else {
-                    r.sequence_at(&q.seed, q.expected_revision, q.show_all)?
-                };
-                // #853: client calls that cross to another app's handler.
-                // The Interactions candidates (#663) of an enriched view are not bound by shown
-                // steps; every other view keeps that bound when a hop reveals a call.
-                if let Some(view) = view.as_mut() {
-                    let candidates = q.interactions
-                        && !q.show_all
-                        && view.semantic.tier == crate::behavior::EvidenceTier::Semantic;
-                    hops.sequence_interfaces(r, view, !candidates)?;
+                if text.starts_with("rules_conflict:") {
+                    return Err(ApiError(
+                        StatusCode::CONFLICT,
+                        "rules_conflict",
+                        "Rules changed on disk; reload rules and preview again",
+                    ));
                 }
-                Ok(view)
-            })
-            .await?;
-            Ok((
-                Json(value.ok_or_else(missing)?).into_response(),
-                catching_up,
-            ))
-        }
-        BrowserCoreRoute::ClassDiagram => {
-            let q: crate::class_diagram::ClassDiagramRequest =
-                serde_json::from_slice(&body).map_err(|_| invalid())?;
-            q.validate()?;
-            let (value, catching_up) =
-                selected_evidence(runtime, hook, move |r| r.class_diagram_at(&q)).await?;
-            Ok((Json(value).into_response(), catching_up))
-        }
-        BrowserCoreRoute::Navigation => {
-            if body.len() > 32 * 1024 {
-                return Err(invalid());
             }
-            let q: crate::navigation::NavigationRequest =
-                serde_json::from_slice(&body).map_err(|_| invalid())?;
-            q.validate()?;
-            let (value, catching_up) =
-                selected_evidence(runtime, hook, move |r| r.navigation_at(&q)).await?;
-            Ok((Json(value).into_response(), catching_up))
-        }
-        BrowserCoreRoute::Source => {
-            let Query(q) = Query::<SourceQuery>::try_from_uri(uri).map_err(|_| invalid())?;
-            if q.path.is_empty()
-                || q.path.len() > 8192
-                || q.path.contains(['\0', '\\', ':'])
-                || q.path
-                    .split('/')
-                    .any(|part| part.is_empty() || part == "." || part == "..")
-            {
-                return Err(invalid());
-            }
-            let pin = q.pin.pin()?;
-            let runtime = runtime.clone();
-            let (file, catching_up) = tokio::task::spawn_blocking(move || {
-                let (response, catching_up) = runtime.evidence_response()?;
-                let catching_up = catching_up || response.semantic_catching_up()?;
-                let file = response.source_at(&q.path, pin)?;
-                Ok::<_, anyhow::Error>((response.finish(file)?, catching_up))
-            })
-            .await
-            .map_err(|_| {
-                ApiError(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal_error",
-                    "Operation failed",
-                )
-            })??;
-            let (revision, file) = file.ok_or_else(missing)?;
-            Ok((
-                Json(json!({"revision":revision,"file":file})).into_response(),
-                catching_up,
-            ))
-        }
-        BrowserCoreRoute::Index | BrowserCoreRoute::CurrentJob => {
-            let state = runtime.browser_scheduler()?;
-            let response = if method == Method::POST {
-                start_index(State(state), body).await?.into_response()
-            } else {
-                current_job(State(state)).await?.into_response()
-            };
-            Ok((response, runtime.catching_up()))
-        }
-        BrowserCoreRoute::Job => {
-            let state = runtime.browser_scheduler()?;
-            let tail = suffix.strip_prefix("jobs/").unwrap();
-            let response = if method == Method::GET && !tail.contains('/') {
-                job(State(state), Path(tail.to_owned()))
-                    .await?
-                    .into_response()
-            } else if method == Method::POST && tail.ends_with("/cancel") {
-                let id = tail.strip_suffix("/cancel").unwrap();
-                if id.contains('/') {
-                    return Err(missing());
-                }
-                cancel_job(State(state), Path(id.to_owned()))
-                    .await?
-                    .into_response()
-            } else {
-                return Err(missing());
-            };
-            Ok((response, runtime.catching_up()))
+            Err(ApiError::from(error))
         }
     }
+}
+
+/// `dependencies/refresh`. A strict sequence (Decision 0009 §6): it moves as one unit.
+async fn refresh_dependencies_answer(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    body: Bytes,
+    hook: Option<SelectedResponseHook>,
+) -> CoreAnswer {
+    let request: Value = serde_json::from_slice(&body).map_err(|_| invalid())?;
+    if !request.as_object().is_some_and(|object| object.is_empty()) {
+        return Err(invalid());
+    }
+    let state = runtime.browser_scheduler()?;
+    // One configuration version for the whole request (Decision 0009 §6).
+    let config = state.config();
+    let (revision, catching_up) = selected_refresh_preflight(runtime, hook).await?;
+    if config.dependency_options.is_none() {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "dependencies_disabled",
+            "Dependency catalog is disabled",
+        ));
+    }
+    if state.dependencies.lock().unwrap().stopped {
+        return Err(ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "shutting_down",
+            "Daemon is shutting down",
+        ));
+    }
+    // Check once more immediately before scheduling work. Once scheduled,
+    // a later root or head change cannot undo the requested refresh.
+    selected_refresh_postflight(runtime, revision).await?;
+    runtime.require_mutation_ready()?;
+    // Scheduled only for the configuration version this request
+    // checked; a registration in between refuses it.
+    if !state.start_dependency_index_for(&config) {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "configuration_changed",
+            "The checkout configuration changed; retry the refresh",
+        ));
+    }
+    let mut response = match selected_refresh_postflight(runtime, revision).await {
+        Ok(()) => (StatusCode::ACCEPTED, Json(json!({"state":"loading"}))).into_response(),
+        Err(error) => selected_mutation_error(error, "committed"),
+    };
+    response
+        .headers_mut()
+        .insert("X-Trellis-Mutation-Outcome", "committed".parse().unwrap());
+    Ok((response, catching_up))
+}
+
+/// `dependencies`: the dependency catalog summary.
+async fn dependencies_answer(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    uri: &axum::http::Uri,
+    hook: Option<SelectedResponseHook>,
+) -> CoreAnswer {
+    if uri.query().is_some() {
+        return Err(invalid());
+    }
+    let state = runtime.browser_scheduler()?;
+    let (payload, catching_up) = selected_catalog_read(runtime, hook, move |r| {
+        let revision = r.status().map_err(ApiError::from)?.revision;
+        let (index_state, catalog, mut warnings) = {
+            let index = state.dependencies.lock().unwrap();
+            (index.state, index.catalog.clone(), index.warnings.clone())
+        };
+        Ok(if let Some(catalog) = catalog {
+            if catalog.workspace_revision == revision {
+                json!({"state":index_state,"workspaceRevision":revision,
+                    "catalogId":catalog.id,"packages":catalog.packages,
+                    "symbolCount":catalog.symbols.len(),"warnings":catalog.warnings})
+            } else {
+                warnings.push("Workspace changed; refresh the dependency catalog".into());
+                json!({"state":"failed","workspaceRevision":revision,
+                    "catalogId":null,"packages":[],"symbolCount":0,"warnings":warnings})
+            }
+        } else {
+            json!({"state":index_state,"workspaceRevision":revision,
+                "catalogId":null,"packages":[],"symbolCount":0,"warnings":warnings})
+        })
+    })
+    .await?;
+    Ok((Json(payload).into_response(), catching_up))
+}
+
+/// `dependencies/symbols`.
+async fn dependency_symbols_answer(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    uri: &axum::http::Uri,
+    hook: Option<SelectedResponseHook>,
+) -> CoreAnswer {
+    let Query(q) = Query::<DependencySymbolsQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+    if q.catalog_id.is_empty()
+        || q.catalog_id.len() > 8192
+        || q.q.len() > 8192
+        || q.package_id.as_ref().is_some_and(|id| id.len() > 8192)
+        || !(1..=200).contains(&q.limit)
+        || q.offset > 50_000
+    {
+        return Err(invalid());
+    }
+    let state = runtime.browser_scheduler()?;
+    let (payload, catching_up) = selected_catalog_read(runtime, hook, move |r| {
+        let revision = r.status().map_err(ApiError::from)?.revision;
+        let catalog = selected_catalog(&state, revision, &q.catalog_id)?;
+        if q.package_id
+            .as_ref()
+            .is_some_and(|id| !catalog.packages.iter().any(|p| &p.id == id))
+        {
+            return Err(missing());
+        }
+        let search = q.q.to_lowercase();
+        let mut matches = catalog
+            .symbols
+            .iter()
+            .filter(|symbol| {
+                q.package_id
+                    .as_ref()
+                    .is_none_or(|id| &symbol.package_id == id)
+                    && (search.is_empty()
+                        || symbol.qualified_name.to_lowercase().contains(&search)
+                        || symbol.name.to_lowercase().contains(&search))
+            })
+            .skip(q.offset);
+        let items: Vec<_> = matches.by_ref().take(q.limit).collect();
+        let next_offset = matches.next().map(|_| q.offset + items.len());
+        let payload = json!({"catalogId":catalog.id,"workspaceRevision":catalog.workspace_revision,
+            "items":items,"nextOffset":next_offset});
+        if !state
+            .catalog_snapshot(revision)
+            .is_some_and(|current| Arc::ptr_eq(&current, &catalog))
+        {
+            return Err(dependency_stale());
+        }
+        Ok(payload)
+    })
+    .await?;
+    Ok((Json(payload).into_response(), catching_up))
+}
+
+/// `dependencies/source`.
+async fn dependency_source_answer(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    uri: &axum::http::Uri,
+    hook: Option<SelectedResponseHook>,
+) -> CoreAnswer {
+    let Query(q) = Query::<DependencySourceQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+    if q.catalog_id.is_empty()
+        || q.catalog_id.len() > 8192
+        || q.source_ref.is_empty()
+        || q.source_ref.len() > 8192
+    {
+        return Err(invalid());
+    }
+    let state = runtime.browser_scheduler()?;
+    let (payload, catching_up) = selected_catalog_read(runtime, hook, move |r| {
+        let revision = r.status().map_err(ApiError::from)?.revision;
+        let catalog = selected_catalog(&state, revision, &q.catalog_id)?;
+        let source = catalog.sources.get(&q.source_ref).ok_or_else(missing)?;
+        let text = source.directory.read_file(&source.path).map_err(rust_source_error)?;
+        let hash = hex::encode(Sha256::digest(text.as_bytes()));
+        if hash != source.hash { return Err(dependency_stale()); }
+        let package = catalog.packages.iter().find(|p| p.id == source.package_id).ok_or_else(missing)?;
+        let definitions: Vec<_> = catalog.symbols.iter().filter(|symbol| symbol.source_ref == q.source_ref)
+            .map(|symbol| json!({"id":symbol.id,"name":symbol.name,"kind":symbol.kind,
+                "parent":symbol.parent,"path":symbol.path,"range":symbol.range})).collect();
+        let file = SourceFile { path: source.path.clone(), hash: hash.clone(), language: "rust".into(), text };
+        let payload = json!({"id":q.source_ref,"rootId":package.id,"rootLabel":package.name,
+            "path":source.path,"hash":hash,"file":file,"definitions":definitions,
+            "warnings":["Definitional candidates only; not confirmed callees. Separate from the workspace graph and source-sharing scope."]});
+        if !state.catalog_snapshot(revision).is_some_and(|current| Arc::ptr_eq(&current, &catalog)) { return Err(dependency_stale()); }
+        Ok(payload)
+    }).await?;
+    Ok((Json(payload).into_response(), catching_up))
+}
+
+/// `rust-sources`: the configured Rust source roots.
+async fn rust_sources_answer(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    uri: &axum::http::Uri,
+    hook: Option<SelectedResponseHook>,
+) -> CoreAnswer {
+    if uri.query().is_some() {
+        return Err(invalid());
+    }
+    let state = runtime.browser_scheduler()?;
+    // One configuration version for the whole request (Decision 0009 §6).
+    let config = state.config();
+    let (payload, catching_up) = selected_catalog_read(runtime, hook, move |_| {
+        Ok(
+            json!({"roots":config.rust_sources.iter().map(|r| json!({"id":r.label,"label":r.label,
+            "path":r.directory.root.to_string_lossy()})).collect::<Vec<_>>() }),
+        )
+    })
+    .await?;
+    Ok((Json(payload).into_response(), catching_up))
+}
+
+/// `rust-sources/tree`.
+async fn rust_source_tree_answer(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    uri: &axum::http::Uri,
+    hook: Option<SelectedResponseHook>,
+) -> CoreAnswer {
+    let Query(q) = Query::<RustTreeQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+    if !crate::file_tree::valid_path(&q.path)
+        || !(1..=200).contains(&q.limit)
+        || q.offset > crate::file_tree::SCAN_LIMIT
+    {
+        return Err(browse_invalid());
+    }
+    let state = runtime.browser_scheduler()?;
+    // One configuration version for the whole request (Decision 0009 §6).
+    let config = state.config();
+    let (page, catching_up) = selected_catalog_read(runtime, hook, move |r| {
+        let revision = r.status().map_err(ApiError::from)?.revision;
+        let root = config
+            .rust_sources
+            .iter()
+            .find(|root| root.label == q.root)
+            .ok_or_else(missing)?;
+        let (items, next_offset, truncated) = root
+            .directory
+            .list(&q.path, q.offset, q.limit)
+            .map_err(rust_source_error)?;
+        Ok(crate::file_tree::Page {
+            root: root.directory.root.to_string_lossy().into_owned(),
+            indexed_workspace: String::new(),
+            path: q.path,
+            revision,
+            items,
+            next_offset,
+            truncated,
+        })
+    })
+    .await?;
+    Ok((Json(page).into_response(), catching_up))
+}
+
+/// `rust-sources/file`.
+async fn rust_source_file_answer(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    uri: &axum::http::Uri,
+    hook: Option<SelectedResponseHook>,
+) -> CoreAnswer {
+    let Query(q) = Query::<RustFileQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+    if q.path.is_empty() || !crate::file_tree::valid_path(&q.path) || !q.path.ends_with(".rs") {
+        return Err(browse_invalid());
+    }
+    let state = runtime.browser_scheduler()?;
+    // One configuration version for the whole request (Decision 0009 §6).
+    let config = state.config();
+    let (file, catching_up) = selected_catalog_read(runtime, hook, move |_| {
+        let root = config
+            .rust_sources
+            .iter()
+            .find(|root| root.label == q.root)
+            .ok_or_else(missing)?;
+        root.snapshot(&q.path).map_err(rust_source_error)
+    })
+    .await?;
+    Ok((Json(file).into_response(), catching_up))
+}
+
+/// `status` and `status/head`.
+async fn status_answer(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    route: BrowserCoreRoute,
+    uri: &axum::http::Uri,
+    if_none_match: Option<&str>,
+    hook: Option<SelectedResponseHook>,
+) -> CoreAnswer {
+    if uri.query().is_some() {
+        return Err(invalid());
+    }
+    let head = matches!(route, BrowserCoreRoute::StatusHead);
+    let search = runtime.search_availability();
+    // A status poll is an open viewer of this checkout (#818); its answer carries the
+    // latest agent view request, so a viewer follows it.
+    runtime.view_requests().note_viewer(Instant::now());
+    let view_request = runtime.view_requests().status_json();
+    let runtime = runtime.clone();
+    let (status, catching_up) = tokio::task::spawn_blocking(move || {
+        let (response, catching_up) = runtime.evidence_response()?;
+        #[cfg(feature = "test-support")]
+        let projected = crate::store::status_semantic_projections_on_thread_for_tests();
+        // #666: the head digest needs no per-language semantic projection.
+        let mut status = if head {
+            response.status_head()?
+        } else {
+            response.status()?
+        };
+        // Status semantic projections run by the browser's status reads
+        // themselves, counted on their own blocking thread: the dependency
+        // catalog build and other background readers never count (#700).
+        #[cfg(feature = "test-support")]
+        runtime.count_browser_status_projections(
+            crate::store::status_semantic_projections_on_thread_for_tests() - projected,
+        );
+        let catching_up = catching_up || response.semantic_catching_up()?;
+        status.catching_up |= catching_up;
+        if let Some(hook) = hook {
+            hook("before_read_finish");
+        }
+        Ok::<_, anyhow::Error>((response.finish(status)?, catching_up))
+    })
+    .await
+    .map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "Operation failed",
+        )
+    })??;
+    // The head digest (#527) is the fixed-size part of the same status read that
+    // the browser polls; diagnostics and statistics stay on `status`.
+    let body = if head {
+        let digest = json!({
+            "workspaceRoot": status.workspace_root,
+            "revision": status.revision,
+            "catchingUp": status.catching_up,
+            "indexedAt": status.indexed_at,
+            "viewRequest": view_request,
+        });
+        status_head_response(&digest, if_none_match)
+    } else {
+        let mut body = serde_json::to_value(status).map_err(|_| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "Operation failed",
+            )
+        })?;
+        body["searchIndex"] = serde_json::to_value(search).map_err(|_| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "Operation failed",
+            )
+        })?;
+        body["viewRequest"] = view_request;
+        Json(body).into_response()
+    };
+    Ok((body, catching_up))
+}
+
+/// `tree`: one page of the browsed directory.
+async fn tree_answer(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    uri: &axum::http::Uri,
+    hook: Option<SelectedResponseHook>,
+) -> CoreAnswer {
+    let Query(q) = Query::<TreeQuery>::try_from_uri(uri).map_err(|_| browse_invalid())?;
+    if !crate::file_tree::valid_path(&q.path)
+        || !(1..=200).contains(&q.limit)
+        || q.offset > crate::file_tree::SCAN_LIMIT
+    {
+        return Err(browse_invalid());
+    }
+    let state = runtime.browser_scheduler()?;
+    // One configuration version for the whole request (Decision 0009 §6).
+    let config = state.config();
+    let (page, catching_up) = selected_evidence(runtime, hook, move |response| {
+        let (mut items, next_offset, truncated) = config
+            .browser
+            .list(&q.path, q.offset, q.limit)
+            .map_err(BrowseDirectoryError)?;
+        let (revision, indexed_workspace) =
+            response.tree_metadata(&config.browser.root, &mut items)?;
+        for item in items
+            .iter_mut()
+            .filter(|item| item.kind == "file" && item.indexed_path.is_none())
+        {
+            let absolute = config.browser.root.join(&item.path);
+            let reason = if !absolute.starts_with(&indexed_workspace) {
+                "Outside indexed workspace"
+            } else {
+                match crate::capture::language_of_path(&absolute) {
+                    Some(_) => "Not indexed yet (may be excluded or size-limited)",
+                    None => "Unsupported source type",
+                }
+            };
+            item.unindexed_reason = Some(reason.into());
+        }
+        Ok(crate::file_tree::Page {
+            root: config.browser.root.to_string_lossy().into_owned(),
+            indexed_workspace,
+            path: q.path,
+            revision,
+            items,
+            next_offset,
+            truncated,
+        })
+    })
+    .await?;
+    Ok((Json(page).into_response(), catching_up))
+}
+
+/// `files`.
+async fn files_answer(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    uri: &axum::http::Uri,
+    hook: Option<SelectedResponseHook>,
+) -> CoreAnswer {
+    let Query(q) = Query::<FilesQuery>::try_from_uri(uri).map_err(|_| browse_invalid())?;
+    q.validate()?;
+    let pin = q.pin.pin()?;
+    let (value, catching_up) = selected_evidence(runtime, hook, move |r| match q.q.as_deref() {
+        Some(filter) => r.files_matching_at(pin, filter, q.offset, q.limit),
+        None => r.files_at(pin, q.offset, q.limit),
+    })
+    .await?;
+    Ok((Json(value).into_response(), catching_up))
+}
+
+/// `symbols`: one file's outline.
+async fn file_symbols_answer(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    uri: &axum::http::Uri,
+    hook: Option<SelectedResponseHook>,
+) -> CoreAnswer {
+    let Query(q) = Query::<FileSymbolsQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+    let pin = q.validate()?;
+    let (value, catching_up) = selected_evidence(runtime, hook, move |r| {
+        r.file_symbols_at(&q.path, pin, q.offset, q.limit)
+    })
+    .await?;
+    Ok((
+        Json(value.ok_or_else(missing)?).into_response(),
+        catching_up,
+    ))
+}
+
+/// `syntax-matches`.
+async fn syntax_matches_answer(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    body: Bytes,
+    hook: Option<SelectedResponseHook>,
+) -> CoreAnswer {
+    let q: crate::files_view::SyntaxMatchesRequest =
+        serde_json::from_slice(&body).map_err(|_| invalid())?;
+    q.validate()?;
+    let (value, catching_up) =
+        selected_evidence(runtime, hook, move |r| r.syntax_matches_at(&q)).await?;
+    Ok((
+        Json(value.ok_or_else(missing)?).into_response(),
+        catching_up,
+    ))
+}
+
+/// `methods`.
+async fn methods_answer(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    uri: &axum::http::Uri,
+    hook: Option<SelectedResponseHook>,
+) -> CoreAnswer {
+    let Query(q) = Query::<SourceQuery>::try_from_uri(uri).map_err(|_| browse_invalid())?;
+    if q.path.is_empty()
+        || q.path.len() > 8192
+        || q.path.contains(['\0', '\\', ':'])
+        || q.path
+            .split('/')
+            .any(|p| p.is_empty() || p == "." || p == "..")
+    {
+        return Err(browse_invalid());
+    }
+    let pin = q.pin.pin()?;
+    let (value, catching_up) =
+        selected_evidence(runtime, hook, move |r| r.methods_at(&q.path, pin)).await?;
+    Ok((
+        Json(value.ok_or_else(missing)?).into_response(),
+        catching_up,
+    ))
+}
+
+/// `classes`.
+async fn classes_answer(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    uri: &axum::http::Uri,
+    hook: Option<SelectedResponseHook>,
+) -> CoreAnswer {
+    let Query(q) = Query::<ClassesQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+    let pin = q.pin.pin()?;
+    let (value, catching_up) = selected_evidence(runtime, hook, move |r| {
+        r.classes_at(q.path.as_deref(), &q.q, pin, q.offset, q.limit)
+    })
+    .await?;
+    Ok((Json(value).into_response(), catching_up))
+}
+
+/// `sequence`.
+async fn sequence_answer(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    body: Bytes,
+    hook: Option<SelectedResponseHook>,
+) -> CoreAnswer {
+    let q: SequenceRequest = serde_json::from_slice(&body).map_err(|_| browse_invalid())?;
+    if q.seed.is_empty() || q.seed.len() > 8192 || q.seed.contains('\0') {
+        return Err(browse_invalid());
+    }
+    let hops = runtime.clone();
+    let (value, catching_up) = selected_evidence(runtime, hook, move |r| {
+        let mut view = if q.interactions && !q.show_all {
+            r.sequence_interactions_at(&q.seed, q.expected_revision)?
+        } else {
+            r.sequence_at(&q.seed, q.expected_revision, q.show_all)?
+        };
+        // #853: client calls that cross to another app's handler.
+        // The Interactions candidates (#663) of an enriched view are not bound by shown
+        // steps; every other view keeps that bound when a hop reveals a call.
+        if let Some(view) = view.as_mut() {
+            let candidates = q.interactions
+                && !q.show_all
+                && view.semantic.tier == crate::behavior::EvidenceTier::Semantic;
+            hops.sequence_interfaces(r, view, !candidates)?;
+        }
+        Ok(view)
+    })
+    .await?;
+    Ok((
+        Json(value.ok_or_else(missing)?).into_response(),
+        catching_up,
+    ))
+}
+
+/// `class-diagram`.
+async fn class_diagram_answer(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    body: Bytes,
+    hook: Option<SelectedResponseHook>,
+) -> CoreAnswer {
+    let q: crate::class_diagram::ClassDiagramRequest =
+        serde_json::from_slice(&body).map_err(|_| invalid())?;
+    q.validate()?;
+    let (value, catching_up) =
+        selected_evidence(runtime, hook, move |r| r.class_diagram_at(&q)).await?;
+    Ok((Json(value).into_response(), catching_up))
+}
+
+/// `navigation`.
+async fn navigation_answer(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    body: Bytes,
+    hook: Option<SelectedResponseHook>,
+) -> CoreAnswer {
+    if body.len() > 32 * 1024 {
+        return Err(invalid());
+    }
+    let q: crate::navigation::NavigationRequest =
+        serde_json::from_slice(&body).map_err(|_| invalid())?;
+    q.validate()?;
+    let (value, catching_up) =
+        selected_evidence(runtime, hook, move |r| r.navigation_at(&q)).await?;
+    Ok((Json(value).into_response(), catching_up))
+}
+
+/// `source`. It fires no selected-response hook of its own.
+async fn source_answer(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    uri: &axum::http::Uri,
+) -> CoreAnswer {
+    let Query(q) = Query::<SourceQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+    if q.path.is_empty()
+        || q.path.len() > 8192
+        || q.path.contains(['\0', '\\', ':'])
+        || q.path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(invalid());
+    }
+    let pin = q.pin.pin()?;
+    let runtime = runtime.clone();
+    let (file, catching_up) = tokio::task::spawn_blocking(move || {
+        let (response, catching_up) = runtime.evidence_response()?;
+        let catching_up = catching_up || response.semantic_catching_up()?;
+        let file = response.source_at(&q.path, pin)?;
+        Ok::<_, anyhow::Error>((response.finish(file)?, catching_up))
+    })
+    .await
+    .map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "Operation failed",
+        )
+    })??;
+    let (revision, file) = file.ok_or_else(missing)?;
+    Ok((
+        Json(json!({"revision":revision,"file":file})).into_response(),
+        catching_up,
+    ))
+}
+
+/// `index` (start) and `jobs/current`.
+async fn index_answer(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    method: &axum::http::Method,
+    body: Bytes,
+) -> CoreAnswer {
+    use axum::http::Method;
+    let state = runtime.browser_scheduler()?;
+    let response = if method == Method::POST {
+        start_index(State(state), body).await?.into_response()
+    } else {
+        current_job(State(state)).await?.into_response()
+    };
+    Ok((response, runtime.catching_up()))
+}
+
+/// `jobs/{id}` and `jobs/{id}/cancel`.
+async fn job_answer(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    method: &axum::http::Method,
+    suffix: &str,
+) -> CoreAnswer {
+    use axum::http::Method;
+    let state = runtime.browser_scheduler()?;
+    let tail = suffix.strip_prefix("jobs/").unwrap();
+    let response = if method == Method::GET && !tail.contains('/') {
+        job(State(state), Path(tail.to_owned()))
+            .await?
+            .into_response()
+    } else if method == Method::POST && tail.ends_with("/cancel") {
+        let id = tail.strip_suffix("/cancel").unwrap();
+        if id.contains('/') {
+            return Err(missing());
+        }
+        cancel_job(State(state), Path(id.to_owned()))
+            .await?
+            .into_response()
+    } else {
+        return Err(missing());
+    };
+    Ok((response, runtime.catching_up()))
 }
 
 #[cfg(test)]

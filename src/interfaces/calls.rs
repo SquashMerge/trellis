@@ -1876,7 +1876,7 @@ fn run(client: &Client) {
     }
 
     #[test]
-    fn trellis_own_client_reaches_the_dispatch_arm_and_its_test_only_route_is_excluded() {
+    fn trellis_own_client_reaches_the_status_handler_and_its_test_only_route_is_excluded() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let read = |path: &str| std::fs::read_to_string(dir.join(path)).unwrap();
         let (http, app, cli) = (
@@ -1900,9 +1900,15 @@ fn run(client: &Client) {
         };
         let (route, confidence) = reached("/api/status").expect("matched");
         assert_eq!(route.path_template, "/api/checkouts/{root_key}/status");
+        // The arm delegates to exactly one same-document function (#1046), so the handler
+        // is that declaration.
         assert_eq!(
             route.handler.kind,
-            crate::interfaces::HandlerKind::DispatchArm
+            crate::interfaces::HandlerKind::Declaration
+        );
+        assert_eq!(
+            route.handler.stable_lookup_key.as_deref(),
+            Some("src/http.rs::status_answer")
         );
         assert_eq!(confidence, Confidence::WrapperInferred);
         let (_, confidence) = reached("/api/checkouts").expect("matched");

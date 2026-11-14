@@ -509,7 +509,12 @@ fn trellis_real_router_and_client() {
     };
     let status = route("/api/checkouts/{root_key}/status");
     assert_eq!(status["method"], "GET");
-    assert_eq!(status["handler"]["kind"], "dispatchArm");
+    // The `Status` arm delegates to one same-document function (#1046).
+    assert_eq!(status["handler"]["kind"], "declaration");
+    assert_eq!(
+        status["handler"]["stableLookupKey"],
+        "src/http.rs::status_answer"
+    );
     assert_eq!(status["handler"]["variant"], "Status");
     assert_eq!(status["handler"]["path"], "src/http.rs");
     assert_eq!(status["handler"]["layer"], "entry");
