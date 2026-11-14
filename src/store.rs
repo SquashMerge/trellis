@@ -861,6 +861,15 @@ enum ActivationStage {
     AfterJournalBackupBeforeDirFsync,
     AfterRenameBeforeDirFsync,
 }
+/// The full capture and document spool that exceptional recreation publishes, measured by
+/// the indexing caller (`index_coordinator::recreate_capture`). Recreation calls it once, at
+/// its own point under the recovery lock: for an in-place rebuild after the use lock is
+/// downgraded to shared and the publication baseline is read, and for a replacement after the
+/// private stage exists while use is still exclusive.
+pub(crate) type RecreateCapture<'a> = dyn FnMut() -> Result<(
+        crate::capture::Capture,
+        crate::native_evidence::FullDocumentSpool,
+    )> + 'a;
 // Serde's compact JSON serializer writes exactly the bytes persisted by `json()`.
 // Count and abort while streaming; never build an over-limit encoded source.
 struct EncodedSourceBudget {
@@ -11289,19 +11298,25 @@ impl Store {
         Ok(())
     }
     /// Only an already-classified corrupt index under a fresh exclusive leader may enter.
+    /// `capture_and_spool` is the caller's full capture; see [`RecreateCapture`] for where it
+    /// runs.
     pub(crate) fn recreate_index_exclusive(
         &self,
         options: &crate::model::IndexOptions,
         leader: &mut topology::WriterGuard,
         cancel: &CancelFlag,
+        capture_and_spool: &mut RecreateCapture<'_>,
     ) -> Result<IndexPin> {
-        self.recreate_index_exclusive_with_hook(options, leader, cancel, |_| Ok(()))
+        self.recreate_index_exclusive_with_hook(options, leader, cancel, capture_and_spool, |_| {
+            Ok(())
+        })
     }
     fn recreate_index_exclusive_with_hook(
         &self,
         options: &crate::model::IndexOptions,
         leader: &mut topology::WriterGuard,
         cancel: &CancelFlag,
+        capture_and_spool: &mut RecreateCapture<'_>,
         mut at: impl FnMut(ActivationStage) -> Result<()>,
     ) -> Result<IndexPin> {
         ensure!(
@@ -11428,17 +11443,7 @@ impl Store {
                 .map_err(|_| anyhow::anyhow!("recovery_required: disposition changed under EX"))?;
             let _publication = self.enter_publication(cancel, Duration::from_millis(250))?;
             let expected = self.publication_index_baseline()?;
-            let capture = crate::capture::Capture::admit(options, cancel, &|_| {})?;
-            let spool = crate::native_evidence::spool_full_capture(
-                options,
-                &capture,
-                &self.identity.root,
-                self.root_id(),
-                cancel,
-                &|_| {},
-                |_, _| {},
-                &self.native_spool_dir()?,
-            )?;
+            let (capture, spool) = capture_and_spool()?;
             return self
                 .publish_validated_stream_recovery(&spool, &capture, leader, expected, cancel);
         } else {
@@ -11459,17 +11464,7 @@ impl Store {
             // Rebuild from the same bounded, sorted document spool as a normal
             // full publication. No facts or projections from the old index are
             // usable here; the private stage remains the sole SQL target.
-            let capture = crate::capture::Capture::admit(options, cancel, &|_| {})?;
-            let spool = crate::native_evidence::spool_full_capture(
-                options,
-                &capture,
-                &self.identity.root,
-                self.root_id(),
-                cancel,
-                &|_| {},
-                |_, _| {},
-                &self.native_spool_dir()?,
-            )?;
+            let (capture, spool) = capture_and_spool()?;
             let pin =
                 self.publish_validated_stream_to_stage(&spool, &capture, &stage, leader, cancel)?;
             ensure!(
@@ -12538,6 +12533,7 @@ impl Store {
         &self,
         options: &crate::model::IndexOptions,
         cancel: &CancelFlag,
+        capture_and_spool: &mut RecreateCapture<'_>,
     ) -> Result<(IndexPin, Arc<topology::WriterSession>)> {
         ensure!(
             self.is_recreate_pending(),
@@ -12553,7 +12549,7 @@ impl Store {
             .writer_under_exclusive(self.identity.clone(), exclusive)?;
         #[cfg(test)]
         self.test_exclusive_recovery_hook.run();
-        let pin = self.recreate_index_exclusive(options, &mut writer, cancel)?;
+        let pin = self.recreate_index_exclusive(options, &mut writer, cancel, capture_and_spool)?;
         let session = Arc::new(topology::WriterSession::writer(writer));
         self.verify_writer_session(&session)?;
         ensure!(
@@ -20055,6 +20051,8 @@ mod selected_manifest_query_plan_tests;
 
 #[cfg(test)]
 mod rebaseline_fault_tests;
+#[cfg(test)]
+mod recreate_capture_point_tests;
 #[cfg(test)]
 mod recreate_spool_tests;
 

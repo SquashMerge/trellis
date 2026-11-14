@@ -786,6 +786,13 @@ fn only_short_or_invalid_magic_headers_request_typed_recreation() {
                 &IndexOptions::new(work.path().to_owned()),
                 &mut leader,
                 &cancel,
+                &mut || {
+                    crate::index_coordinator::recreate_capture(
+                        &recovering,
+                        &IndexOptions::new(work.path().to_owned()),
+                        &cancel,
+                    )
+                },
             )
             .unwrap();
         assert_eq!(pin.index_revision, 1);
@@ -818,6 +825,13 @@ fn exceptional_corrupt_recreate_refuses_busy_use_without_unlinking_index() {
     let result = recovering.recreate_pending_writer_session(
         &IndexOptions::new(work.path().to_owned()),
         &Arc::new(AtomicBool::new(false)),
+        &mut || {
+            crate::index_coordinator::recreate_capture(
+                &recovering,
+                &IndexOptions::new(work.path().to_owned()),
+                &Arc::new(AtomicBool::new(false)),
+            )
+        },
     );
     assert!(
         result.is_err(),
@@ -1003,7 +1017,9 @@ fn assert_obsolete_index_recreates_and_preserves_requests(earlier_schema: bool) 
     );
     assert!(recovering.status().is_err());
     let (pin, session) = recovering
-        .recreate_pending_writer_session(&options, &cancel)
+        .recreate_pending_writer_session(&options, &cancel, &mut || {
+            crate::index_coordinator::recreate_capture(&recovering, &options, &cancel)
+        })
         .unwrap();
     assert_ne!(
         fs::metadata(&index).unwrap().ino(),
@@ -1061,15 +1077,21 @@ fn earlier_schema_changed_before_rename_refuses_replacement_and_preserves_reques
             .unwrap();
         let mut changed_live = None;
         let error = recovering
-            .recreate_index_exclusive_with_hook(&options, &mut leader, &cancel, |phase| {
-                if phase == ActivationStage::BeforeRename {
-                    let db = Connection::open(&index)?;
-                    db.pragma_update(None, "user_version", replacement_version)?;
-                    drop(db);
-                    changed_live = Some(fs::read(&index)?);
-                }
-                Ok(())
-            })
+            .recreate_index_exclusive_with_hook(
+                &options,
+                &mut leader,
+                &cancel,
+                &mut || crate::index_coordinator::recreate_capture(&recovering, &options, &cancel),
+                |phase| {
+                    if phase == ActivationStage::BeforeRename {
+                        let db = Connection::open(&index)?;
+                        db.pragma_update(None, "user_version", replacement_version)?;
+                        drop(db);
+                        changed_live = Some(fs::read(&index)?);
+                    }
+                    Ok(())
+                },
+            )
             .unwrap_err();
         assert!(error.to_string().contains("recovery_required"), "{error:#}");
         assert_eq!(fs::metadata(&index).unwrap().ino(), inode);
@@ -1142,6 +1164,13 @@ fn current_schema_obsolete_markers_still_refuse_root_spelling_mismatch() {
             .recreate_pending_writer_session(
                 &IndexOptions::new(work.path().to_owned()),
                 &Arc::new(AtomicBool::new(false)),
+                &mut || {
+                    crate::index_coordinator::recreate_capture(
+                        &recovering,
+                        &IndexOptions::new(work.path().to_owned()),
+                        &Arc::new(AtomicBool::new(false)),
+                    )
+                },
             )
             .expect_err("obsolete metadata does not authorize a different root spelling");
         assert!(
@@ -1324,6 +1353,13 @@ fn staged_hot_journal_after_validation_refuses_without_deleting_sidecar() {
             &IndexOptions::new(work.path().to_owned()),
             &mut leader,
             &cancel,
+            &mut || {
+                crate::index_coordinator::recreate_capture(
+                    &recovering,
+                    &IndexOptions::new(work.path().to_owned()),
+                    &cancel,
+                )
+            },
             |phase| {
                 if phase == ActivationStage::BeforeRename {
                     let stage = fs::read_dir(&dir)?
@@ -1443,6 +1479,7 @@ fn exceptional_activation_is_atomic_and_keeps_pending_on_ambiguous_failure() {
             &options,
             &mut leader,
             &cancel,
+            &mut || crate::index_coordinator::recreate_capture(&recovering, &options, &cancel),
             |phase| {
                 if Some(phase) == fault {
                     anyhow::bail!("injected activation boundary");
@@ -1471,7 +1508,13 @@ fn exceptional_activation_is_atomic_and_keeps_pending_on_ambiguous_failure() {
                 fs::write(&wal, b"unsafe sidecar").unwrap();
                 assert!(
                     recovering
-                        .recreate_index_exclusive(&options, &mut leader, &cancel)
+                        .recreate_index_exclusive(&options, &mut leader, &cancel, &mut || {
+                            crate::index_coordinator::recreate_capture(
+                                &recovering,
+                                &options,
+                                &cancel,
+                            )
+                        })
                         .is_err()
                 );
                 assert_eq!(fs::read(&wal).unwrap(), b"unsafe sidecar");
