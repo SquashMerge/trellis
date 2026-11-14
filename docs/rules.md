@@ -1127,7 +1127,11 @@ fallback. Projection is not persisted, writes no `index.db`, and changes neither
 native producer output nor Stage 3 extraction.
 
 The one current-file exception is root `.trellis/rules.toml`, read once per
-check/explain/prompt as bounded configuration. References alone do not read it.
+check/explain/prompt as bounded configuration. A references read takes one thing from
+it (#988): the `test_features` list, through the same bounded read, once per request. That
+read is lenient: a missing or invalid file names no test feature and the references read
+still answers, with no rules descriptor in its response. Check, explain and prompt still
+fail with a typed `invalid_rules` error on an invalid file.
 Its descriptor is `{path:".trellis/rules.toml",source:"checkout-config",contentHash}`.
 **The code pin does not identify these rules bytes.** Editing only rules can change
 the digest and outcome at an unchanged code pin. Code evidence never falls back
