@@ -4,7 +4,8 @@ Simplify verbose sequence labels and large class views with repeated paths and m
 Simplify defaults, not evidence. Frontend-only; DO NOT edit native extraction, API, cache/schema,
 providers or inspected repositories. Preserve snapshots/tokens/views/notes/budgets.
 
-Sequence display (#594): web/sequence.js shares the display projection with web/sequence-pele.js.
+Sequence display (#594): web/sequence-model.js holds the display projection; web/sequence.js and
+web/sequence-pele.js share it.
 - Calls-first is the default. Hide standalone writes, bindings, returns and deferred-definition
   leaves until Show all steps. Keep admitted measured calls/collapsed entry previews in order,
   enclosing branch/alternative/loop/try scope, concise unknown/protocol boundaries and early-exit

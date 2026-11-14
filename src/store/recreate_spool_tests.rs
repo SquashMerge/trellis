@@ -43,12 +43,18 @@ fn corrupt_recreate_stages_from_spool_without_losing_prior_head_on_failure() {
         observed.store(true, Ordering::Release);
     }));
     let error = recovering
-        .recreate_index_exclusive_with_hook(&options, &mut leader, &cancel, |stage| {
-            if stage == ActivationStage::BeforeRename {
-                anyhow::bail!("stop before replacement");
-            }
-            Ok(())
-        })
+        .recreate_index_exclusive_with_hook(
+            &options,
+            &mut leader,
+            &cancel,
+            &mut || crate::index_coordinator::recreate_capture(&recovering, &options, &cancel),
+            |stage| {
+                if stage == ActivationStage::BeforeRename {
+                    anyhow::bail!("stop before replacement");
+                }
+                Ok(())
+            },
+        )
         .unwrap_err();
     assert!(
         error.to_string().contains("stop before replacement"),
@@ -64,7 +70,9 @@ fn corrupt_recreate_stages_from_spool_without_losing_prior_head_on_failure() {
         RecoveryDisposition::RecreatePending
     );
     let pin = recovering
-        .recreate_index_exclusive(&options, &mut leader, &cancel)
+        .recreate_index_exclusive(&options, &mut leader, &cancel, &mut || {
+            crate::index_coordinator::recreate_capture(&recovering, &options, &cancel)
+        })
         .unwrap();
     assert_eq!(pin.index_revision, 1);
     assert_eq!(recovering.status().unwrap().revision, pin);
