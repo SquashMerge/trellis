@@ -342,6 +342,10 @@ pub struct DaemonState {
     /// status.
     #[cfg(test)]
     test_quiet_between_reads: crate::store::TestOneShotHook,
+    /// Runs in the worker's FIFO publication, after it observed the queue and before it
+    /// publishes what it observed.
+    #[cfg(test)]
+    test_fifo_between_observation_and_publication: crate::store::TestOneShotHook,
 }
 impl Drop for DaemonState {
     /// A lossless shutdown: an idle worker waiting without a deadline exits.
@@ -570,6 +574,8 @@ pub fn new_with_config(
         test_watch_pending_before_state: crate::store::TestOneShotHook::default(),
         #[cfg(test)]
         test_quiet_between_reads: crate::store::TestOneShotHook::default(),
+        #[cfg(test)]
+        test_fifo_between_observation_and_publication: crate::store::TestOneShotHook::default(),
         jobs: Mutex::new(Jobs {
             current: None,
             jobs: BTreeMap::new(),

@@ -682,6 +682,8 @@ impl DaemonState {
                 Err(_) => true,
             }
         };
+        #[cfg(test)]
+        self.test_fifo_between_observation_and_publication.run();
         let was = publish_fifo(&self.watch_status, &self.fifo_pending, pending);
         if was
             && !pending
@@ -1535,6 +1537,46 @@ mod quiet_read_tests {
              status after the acknowledgement"
         );
         assert!(!state.ready_and_quiet());
+    }
+
+    /// #1082: the worker observes an empty queue and then publishes "no FIFO work". A request
+    /// accepted between the two has already published "FIFO work pending"; the older
+    /// observation must not clear it, or the quiet read answers quiet over accepted work.
+    #[test]
+    fn an_older_empty_queue_observation_does_not_clear_a_newer_accepted_request() {
+        let (_tmp, store, state, options) = serving_queue_watch_fixture();
+        state.worker_step().unwrap();
+        assert!(state.ready_and_quiet(), "the fixture settles");
+
+        let (accepted, acceptance) = mpsc::channel();
+        let enqueuer = state.clone();
+        state
+            .test_fifo_between_observation_and_publication
+            .set(move || {
+                // The worker has seen an empty queue. An enqueue takes its lease, commits,
+                // publishes and returns before the worker publishes what it saw.
+                let request =
+                    std::thread::spawn(move || enqueuer.enqueue_index(&options, None).unwrap())
+                        .join()
+                        .unwrap();
+                let _ = accepted.send(request.id);
+            });
+        state.publish_fifo_pending();
+        let id = acceptance
+            .recv_timeout(HANG_BACKSTOP)
+            .expect("the worker never published its queue observation");
+        assert_eq!(store.request_by_id(&id).unwrap().unwrap().state, "queued");
+        assert!(
+            state.fifo_pending(),
+            "the worker's older empty-queue observation cleared the accepted request's \
+             publication"
+        );
+        assert!(!state.ready_and_quiet());
+
+        // The enqueue woke the worker: its next step drains the request and publishes that.
+        state.worker_step().unwrap();
+        assert_eq!(store.request_by_id(&id).unwrap().unwrap().state, "done");
+        assert!(!state.fifo_pending());
     }
 }
 
