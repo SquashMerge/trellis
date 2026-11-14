@@ -29,9 +29,9 @@ This cut is the shell plus two views, Architecture and Sequence. The daemon can 
 
 The mod now draws Architecture from the browser's own modules, so the two can't drift:
 
-- **Summary display.** `web/architecture.js` exports `createDisplay(state)`: the band labels and stat chips, the module chips and their budget, the per-app parts of All apps, the heat scale, the legend words and the review counts. The browser's `create()` and the mod both call it. The mod's earlier port of these functions is gone.
+- **Summary display.** `web/architecture-display.js` exports `createDisplay(state)`: the band labels and stat chips, the module chips and their budget, the per-app parts of All apps, the heat scale, the legend words and the review counts. The browser's `create()` and the mod both call it. The mod's earlier port of these functions is gone.
 - **Apps.** `web/architecture-apps.js` (pure) gives the switcher's choices, the source line, the All apps column layout, column headers, interface cards, cross-app lines and the inspector facts (`appFacts`, `interfaceFacts`, `footnote`, new and used by the browser too).
-- **Deviations.** The Deviations tree is `web/architecture-deviations.js`'s pure `model`, over pages of `architecture/details`, shown as native rows.
+- **Deviations.** The Deviations tree is `web/deviations-model.js`'s pure `model`, over pages of `architecture/details`, shown as native rows.
 - **Colours and controls.** `web-scripts.mjs` reads the `--sm-*` tokens from `web/style.css` and the Color by and Aggregation options (and their default) from `web/index.html` at build time. Heat fills, the error tone and ink on heat keep the web colours; surfaces, text and lines use the Herdr theme.
 - **Logo and status line.** The header shows `web/brand/trellis-mark-transparent-v1.png` (copied as `trellis-mark.png` by `build.mjs`) and "Trellis by SquashMerge". The status line adds the web app's "Last re-index failed · code: reason" from `jobs/current`.
 - **`trellis api`.** It now also serves `GET …/architecture/details` and `GET …/jobs/current`, so the remote transport has the same features.
@@ -46,7 +46,7 @@ Choices made here, for the owner to confirm:
 ## How the diagram is drawn
 
 1. `src/client.js` reads the token, then `/status` for the pin, then `/architecture?…` for the payload.
-2. `src/diagram.js` `summarize()` calls the browser's own `createDisplay` (`web/architecture.js`, #886) with the pane's choices: Color by and Aggregation, the app, open bands and directories. Production role, fixed bands and hidden tests are the browser's defaults.
+2. `src/diagram.js` `summarize()` calls the browser's own `createDisplay` (`web/architecture-display.js`, #886) with the pane's choices: Color by and Aggregation, the app, open bands and directories. Production role, fixed bands and hidden tests are the browser's defaults.
 3. `web/architecture-pele.js` `render()` runs unchanged. It projects to Mermaid block source, fits the width (up to 12 Pele layouts), validates Pele's SVG, rewrites labels, adds stat chips and routes the arrows. It runs over `src/dom.js`, a small SVG DOM with a strict XML parser and the compound selectors the adapter uses. Unsupported selectors throw rather than match wrongly.
 4. The vendored Pele (`web/vendor/pele-1.10.0-trellis.2.js`) runs with a shadowed `globalThis`, so it measures with its built-in Helvetica width table. The adapter measures with the same table, which the build extracts from the vendored file, so wrapping and fitting agree with Pele's layout.
 5. The tree is serialized with theme colours and written to `~/.config/herdr-app/mods/trellis/.render/architecture-<copy>-<hash>.svg`. The folder is hidden, so the write doesn't reload the mod. The pane shows the file with `image()` at 1:1, and deletes the previous file when a new one is shown, and its own file in `close()`.
@@ -118,18 +118,20 @@ Next steps, in increasing cost:
 
 ## Bundle size
 
-`main.js` is **910.6 KiB** with Sequence (it was 839.7 KiB with Architecture only). esbuild minifies whitespace and syntax, but keeps names for readable stack traces.
+`main.js` is **915.0 KiB** (#1050; it was 1008.6 KiB while the mod bundled the browser's whole Architecture controller, Deviations view and Sequence states for their pure parts). esbuild minifies whitespace and syntax, but keeps names for readable stack traces.
 
 | Part | Size |
 |---|---|
 | Vendored Pele (already minified) | 695.5 KiB |
-| `web/architecture.js` (only three helpers are used) | 61.2 KiB |
-| `web/architecture-pele.js` | 38.9 KiB |
-| `web/sequence.js` and `web/sequence-pele.js` | 55.3 KiB |
-| Mod code | 57.1 KiB |
-| `web/metric-heat.js` | 2.6 KiB |
+| Mod code | 86.6 KiB |
+| `web/architecture-pele.js` and `web/pele-svg.js` | 44.0 KiB |
+| `web/sequence-model.js`, `web/sequence-pele.js` and `web/source-witness.js` | 41.6 KiB |
+| `web/architecture-display.js` | 17.0 KiB |
+| `web/architecture-apps.js` | 16.4 KiB |
+| `web/deviations-model.js` | 10.4 KiB |
+| `web/metric-heat.js` | 2.5 KiB |
 
-`herdr-app check` loads and renders it in about 0.15 s. If size matters later, the easiest saving is to move `moduleKey`, `commonDirectory` and `groupModules` into their own browser script, which saves about 60 KiB.
+`herdr-app check` loads and renders it in about 0.15 s. The mod bundles only the browser's pure scripts and its Pele adapters (#1050): no browser controller or view.
 
 ## Transport
 
@@ -212,7 +214,7 @@ Checked on the mini (2026-11-08): reinstalling the mod reloaded the pane, and `"
 ## What each remaining view needs
 
 - **Classes.** It needs `GET classes` (the catalog), `POST class-diagram` and `web/classes.js`'s Pele adapter. That adapter also parses with `DOMParser` and uses compound and `:scope >` selectors, so it should run on `src/dom.js`. Its DOM-bound UI (members toggle, chooser) would be ported to native rows, as Architecture's options were. Clicks would use the same box hit-testing, on class and member nodes.
-- **Sequence: built** (`src/sequence.js`). `web/sequence-pele.js` runs unchanged, over the helpers in `web/sequence.js`, which is wrapped unchanged; it exports helpers and draws nothing itself (#1007). Its HTML expand/collapse buttons are `foreignObject`s, which an image can't draw, so they're left out of the SVG; the step rows expand and collapse groups instead. Pele's `var(--_x)` theme slots are filled from `theme()`, as the browser's stylesheet fills them, and the selected step is filled with `selected`. Not yet: the source dock (`GET source` into the shipped read-only `Editor`), Show all steps, the inspector, and the browser's fallback renderer when Pele refuses a view. That case is a typed `unsupported` error above the native step list, which still holds the whole answer.
+- **Sequence: built** (`src/sequence.js`). `web/sequence-pele.js` runs unchanged, over the helpers in `web/sequence-model.js`, which is wrapped unchanged; it exports helpers and draws nothing itself (#1007). Its HTML expand/collapse buttons are `foreignObject`s, which an image can't draw, so they're left out of the SVG; the step rows expand and collapse groups instead. Pele's `var(--_x)` theme slots are filled from `theme()`, as the browser's stylesheet fills them, and the selected step is filled with `selected`. Not yet: the source dock (`GET source` into the shipped read-only `Editor`), Show all steps, the inspector, and the browser's fallback renderer when Pele refuses a view. That case is a typed `unsupported` error above the native step list, which still holds the whole answer.
 - **Treemap and metrics.** It needs `GET metrics` and `web/treemap-pele.js`, which uses the same DOM pattern plus `<title>`, which `src/dom.js` handles. `web/viewer-metrics.js` holds the metric-panel logic. A followed file maps to its treemap box directly.
 - **Search.** The daemon has no browser search route today; search is MCP-only (`trellis_search_symbols` and `trellis_find_symbols`). This view needs either a new authenticated loopback route or `exec("trellis", …)` against the CLI. Results are native rows, and a click opens the file in `trellis-files` through shared state, the reverse of the current publish.
 - **Deviations and Apps: built** (#886; see [Parity](#parity-with-the-web-apps-architecture-view-886)).

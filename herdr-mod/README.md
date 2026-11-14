@@ -10,9 +10,9 @@ Both views follow the file selected in the `trellis-files` panel. The pane talks
 
 - `src/main.js` is the pane: the followed checkout with a pin, index status, typed error states, the diagram and the layer list.
 - `src/client.js` is the daemon client: routes, the two transports (`fetch` here, `trellis api` elsewhere) and typed errors.
-- `src/diagram.js` draws Architecture. It uses the browser's own `web/architecture-pele.js`, the `web/pele-svg.js` it reads, `web/metric-heat.js`, `web/architecture.js` (`createDisplay`), `web/architecture-apps.js`, `web/architecture-deviations.js` (its model) and the vendored Pele, bundled unchanged, and reads the colour tokens and the Color by choices from `web/style.css` and `web/index.html` at build time.
+- `src/diagram.js` draws Architecture. It uses the browser's own `web/architecture-pele.js`, the `web/pele-svg.js` it reads, `web/metric-heat.js`, `web/architecture-display.js` (`createDisplay`), `web/architecture-apps.js`, `web/deviations-model.js` and the vendored Pele, bundled unchanged, and reads the colour tokens and the Color by choices from `web/style.css` and `web/index.html` at build time.
 - `src/architecture-ui.js` lays out the Architecture tab's native parts: controls, switcher, column headers, interface cards, legend, inspector and Deviations tree.
-- `src/sequence.js` draws Sequence. It uses `web/sequence-pele.js` and the helpers in `web/sequence.js`, with the `web/source-witness.js` they both read and the `web/pele-svg.js` the adapter reads, bundled unchanged.
+- `src/sequence.js` draws Sequence. It uses `web/sequence-pele.js` and the helpers in `web/sequence-model.js`, with the `web/source-witness.js` they both read and the `web/pele-svg.js` the adapter reads, bundled unchanged.
 - `src/dom.js` is the small SVG DOM the adapter needs, because the mod runtime has none.
 - `trellis-files/publish-selection.patch` is the one change to a clone of Herdr's shipped Files mod.
 - `src/panels.js` turns on the tab bar's Files button in the `trellis` layout.

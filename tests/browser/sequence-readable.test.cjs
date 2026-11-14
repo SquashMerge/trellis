@@ -8,8 +8,8 @@ const {createServer} = require("node:http");
 const {resolve, join} = require("node:path");
 const {chromium} = require("playwright");
 const ROOT = resolve(__dirname, "../..");
-const files = {"/vendor/pele-1.10.0-trellis.2.js":"web/vendor/pele-1.10.0-trellis.2.js", "/sequence-pele.js":"web/sequence-pele.js", "/source-witness.js":"web/source-witness.js", "/sequence.js":"web/sequence.js", "/pele-svg.js":"web/pele-svg.js", "/style.css":"web/style.css"};
-const html = '<!doctype html><html><head><link rel="stylesheet" href="/style.css"><script src="/vendor/pele-1.10.0-trellis.2.js" defer></script><script src="/source-witness.js" defer></script><script src="/sequence.js" defer></script><script src="/pele-svg.js" defer></script><script src="/sequence-pele.js" defer></script></head><body><div id="sequence-diagram" class="sequence-scroll" style="flex:none;width:900px;height:500px"></div><div id="files-mini-sequence" class="sequence-scroll" style="flex:none;width:300px;height:200px"></div></body></html>';
+const files = {"/vendor/pele-1.10.0-trellis.2.js":"web/vendor/pele-1.10.0-trellis.2.js", "/sequence-pele.js":"web/sequence-pele.js", "/source-witness.js":"web/source-witness.js", "/sequence-model.js":"web/sequence-model.js", "/sequence.js":"web/sequence.js", "/pele-svg.js":"web/pele-svg.js", "/style.css":"web/style.css"};
+const html = '<!doctype html><html><head><link rel="stylesheet" href="/style.css"><script src="/vendor/pele-1.10.0-trellis.2.js" defer></script><script src="/source-witness.js" defer></script><script src="/sequence-model.js" defer></script><script src="/sequence.js" defer></script><script src="/pele-svg.js" defer></script><script src="/sequence-pele.js" defer></script></head><body><div id="sequence-diagram" class="sequence-scroll" style="flex:none;width:900px;height:500px"></div><div id="files-mini-sequence" class="sequence-scroll" style="flex:none;width:300px;height:200px"></div></body></html>';
 const baseView = () => JSON.parse(readFileSync(join(ROOT, "tests/fixtures/sequence-pele/rust.json")));
 let server, browser, page;
 

@@ -226,6 +226,9 @@ checks() {
   node --check web/context-menu.js
   node --check web/pele-svg.js
   node --check web/architecture-apps.js
+  node --check web/architecture-display.js
+  node --check web/deviations-model.js
+  node --check web/sequence-model.js
   node --check web/architecture-routing.js
   # The Herdr mod's logic over the browser's own Architecture adapter (#707); no install needed.
   node --import ./herdr-mod/test/register.mjs --test herdr-mod/test/mod.test.mjs herdr-mod/test/view.test.mjs herdr-mod/test/parity.test.mjs herdr-mod/test/setup.test.mjs

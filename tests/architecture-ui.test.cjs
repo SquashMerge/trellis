@@ -88,7 +88,7 @@ function harness(extra = {}) {
     clear:() => {get("architecture-inspector").hidden=true;get("architecture-inspector-content").replaceChildren();},
     show:() => {get("architecture-inspector").hidden=false;},
   };
-  vm.runInNewContext(pinSource + "\n" + fs.readFileSync(path.join(__dirname, "../web/metric-heat.js"), "utf8") + "\n" + fs.readFileSync(path.join(__dirname, "../web/architecture-apps.js"), "utf8") + "\n" + fs.readFileSync(path.join(__dirname, "../web/architecture-deviations.js"), "utf8") + "\n" + source, {window,document,URLSearchParams,console,setTimeout:(run,delay) => {timers.push({run,delay}); return timers.length;},clearTimeout:id => {if (id) timers[id-1].run = null;}});
+  vm.runInNewContext(pinSource + "\n" + fs.readFileSync(path.join(__dirname, "../web/metric-heat.js"), "utf8") + "\n" + fs.readFileSync(path.join(__dirname, "../web/architecture-apps.js"), "utf8") + "\n" + fs.readFileSync(path.join(__dirname, "../web/architecture-display.js"), "utf8") + "\n" + fs.readFileSync(path.join(__dirname, "../web/deviations-model.js"), "utf8") + "\n" + fs.readFileSync(path.join(__dirname, "../web/architecture-deviations.js"), "utf8") + "\n" + source, {window,document,URLSearchParams,console,setTimeout:(run,delay) => {timers.push({run,delay}); return timers.length;},clearTimeout:id => {if (id) timers[id-1].run = null;}});
   const controller = window.TrellisArchitecture.create({inspector, request:async (url,current,options) => {
     if (url.startsWith("/api/architecture/details?")) { detailCalls.push({url,current}); if (detailError) throw detailError; if (detailGate) await detailGate; return emulateDetails(full, url, edgePairs); }
     calls.push({url,current,options}); const data = await response(url,options);
@@ -882,7 +882,7 @@ test("#523: inspectors describe semantic evidence for mixed edges and bound rule
 });
 
 // Deviations tree (#786): the module loads into node:vm with a small DOM stub and stub deps.
-const deviationsSource = fs.readFileSync(path.join(__dirname, "../web/architecture-deviations.js"), "utf8");
+const deviationsSource = ["../web/deviations-model.js", "../web/architecture-deviations.js"].map(file => fs.readFileSync(path.join(__dirname, file), "utf8")).join("\n");
 const plain = value => JSON.parse(JSON.stringify(value));
 const deq = (actual, expected, message) => assert.deepEqual(plain(actual), plain(expected), message);
 const callId = letter => `occ:v2:${letter.repeat(32)}`;

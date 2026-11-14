@@ -2,17 +2,17 @@
 // Pele adapter: projection, validation, labels, routed arrows) and the vendored Pele run here
 // headless over src/dom.js. What the browser derives from a payload for its summary display
 // (band labels and stat chips, module chips and their budget, the per-app parts of All apps,
-// the heat scale) is web/architecture.js's own `createDisplay`, and the app switcher, column
+// the heat scale) is web/architecture-display.js's `createDisplay`, and the app switcher, column
 // headers, interface cards, cross-app lines and inspector facts are web/architecture-apps.js's.
 // All are bundled unchanged (#886), so the two views can't drift. The colour tokens and the
 // Color by and Aggregation choices are read from web/style.css and web/index.html at build time.
 import makeMetricHeat from "trellis-web:metric-heat";
 import makeApps from "trellis-web:architecture-apps";
-import makeArchitecture from "trellis-web:architecture";
+import makeArchitectureDisplay from "trellis-web:architecture-display";
 import makePeleSvg from "trellis-web:pele-svg";
 import makeArchitectureRouting from "trellis-web:architecture-routing";
 import makeArchitecturePele from "trellis-web:architecture-pele";
-import makeDeviations from "trellis-web:architecture-deviations";
+import makeDeviationsModel from "trellis-web:deviations-model";
 import TOKENS from "trellis-web:tokens";
 import CONTROLS from "trellis-web:controls";
 import { DOMParser, TextEncoder, serialize } from "./dom.js";
@@ -22,14 +22,14 @@ export { measure } from "./runtime.js";
 
 export const heat = makeMetricHeat({});
 export const apps = makeApps({});
-const helpers = makeArchitecture({ TrellisMetricHeat: heat, TrellisArchitectureApps: apps }, document);
+const helpers = makeArchitectureDisplay({ TrellisMetricHeat: heat, TrellisArchitectureApps: apps });
 // The adapter reads the shared Pele helpers and the arrow routing from its window.
 const env = { pele };
 makePeleSvg(env, document, DOMParser, TextEncoder);
 makeArchitectureRouting(env);
 const adapter = makeArchitecturePele(env, document, DOMParser, TextEncoder);
-/** The Deviations tree's pure model (web/architecture-deviations.js). */
-export const deviationModel = makeDeviations({}, document).model;
+/** The Deviations tree's pure model (web/deviations-model.js). */
+export const deviationModel = makeDeviationsModel({}).model;
 export { TOKENS, CONTROLS };
 
 // The browser's defaults are the selects' own: the `selected` option, else the first.

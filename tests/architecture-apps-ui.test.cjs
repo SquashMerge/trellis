@@ -43,7 +43,7 @@ function controller(payload, options = {}) {
     // `drawer`: the page is at the narrow-screen drawer width, the one width at which All apps stacks.
     matchMedia:query => ({matches:query === "(max-width: 900px)" && options.drawer === true})};
   get("architecture-diagram").clientWidth = options.width ?? 1500;
-  vm.runInNewContext([pinSource, read("web/metric-heat.js"), read("web/architecture-apps.js"), read("web/architecture-deviations.js"), read("web/architecture.js")].join("\n"),
+  vm.runInNewContext([pinSource, read("web/metric-heat.js"), read("web/architecture-apps.js"), read("web/architecture-display.js"), read("web/deviations-model.js"), read("web/architecture-deviations.js"), read("web/architecture.js")].join("\n"),
     {window, document, URLSearchParams, console, setTimeout, clearTimeout});
   const architecture = window.TrellisArchitecture.create({
     request:async url => { calls.push(url); return {payload}; }, onInspect:() => inspected.push(true),
@@ -360,7 +360,7 @@ test("T00 markup in app names and layers is text: no element is created from a c
   assert.equal(all.filter(item => item.tagName === "img").length, 0); assert.equal(h.window.__pwned, undefined);
   assert.ok(text(headers(h)[0]).includes(bad)); assert.ok(cardsOf(h)[0].attrs["aria-label"].includes(bad));
   assert.ok(all.some(item => item.textContent.includes(bad)));
-  const source = read("web/architecture-apps.js") + read("web/architecture.js");
+  const source = read("web/architecture-apps.js") + read("web/architecture-display.js") + read("web/architecture.js");
   assert.doesNotMatch(source, /innerHTML|outerHTML|insertAdjacentHTML/);
 });
 
