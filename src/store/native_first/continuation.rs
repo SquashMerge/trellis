@@ -469,19 +469,37 @@ impl Store {
                             request_id: &request,
                             incarnation: &incarnation,
                         };
+                        let rows = read.retained_batch();
                         current.admission = Some(if current.full {
-                            read.start_admission(false, &stage_parent, owner, &limits, cancel)?
-                                .authenticated()
+                            RetainedStageContinuation::new(
+                                &rows,
+                                &captured,
+                                &stage_parent,
+                                owner,
+                                &limits,
+                                cancel,
+                            )?
+                            .authenticated()
                         } else {
-                            read.start_admission(true, &stage_parent, owner, &limits, cancel)?
-                                .copying(read.copy_filter())
+                            RetainedStageContinuation::new_witnessed(
+                                &rows,
+                                &captured,
+                                &stage_parent,
+                                owner,
+                                &limits,
+                                cancel,
+                            )?
+                            .copying(read.copy_filter())
                         });
                         return Ok(None);
                     }
                     if let Some(admission) = current.admission.as_mut() {
-                        if let Some(admitted) =
-                            read.advance_admission(admission, &mut current.counters, cancel)?
-                        {
+                        if let Some(admitted) = admission.advance(
+                            &read.retained_batch(),
+                            &captured,
+                            &mut current.counters,
+                            cancel,
+                        )? {
                             Self::semantic_phase_diagnostic(
                                 "admitted",
                                 if current.full { "full" } else { "witnessed" },
