@@ -478,6 +478,14 @@ class NightlyClassifier(unittest.TestCase):
         self.assertIn("name each such pair", meaning)
         self.assertNotIn("deviations are below", meaning)
 
+    def test_the_issue_explains_a_new_pair_as_the_record_exceeded(self):
+        # A new deviating pair is `record-exceeded` even when no total rose.
+        log = self.compared(pairs={STORAGE: 0, ("src/web.rs", "src/storage.rs"): 1})
+        self.assertEqual(self.outcomes(log), {"record-exceeded"})
+        self.assertNotIn("deviatingPairs: recorded", log)
+        meaning = re.search(r"'record-exceeded': `([^`]+)`", self.WORKFLOW.read_text()).group(1)
+        self.assertIn("a deviating pair was measured that the record does not have", meaning)
+
 
 def done(code, stdout="", stderr=""):
     return subprocess.CompletedProcess([], code, stdout, stderr)
