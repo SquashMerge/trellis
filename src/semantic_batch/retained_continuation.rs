@@ -55,7 +55,7 @@ pub(crate) struct RetainedStageContinuation {
     /// The current artifact's checked proof documents (path to source ordinal).
     proof_documents: ProofDocuments,
     /// Witnessed S: the documents it copies, whose proof identities are not staged.
-    copy: Option<crate::store::native_first::copy::CopyFilter>,
+    copy: Option<crate::store::native_first::CopyFilter>,
 }
 
 /// Stage bytes charged per row a unit changes, beyond the payload it reports.
@@ -235,7 +235,7 @@ impl RetainedStageContinuation {
     }
 
     /// Witnessed S does not stage the proof identities of the documents it copies (#669 H1).
-    pub(crate) fn copying(mut self, filter: crate::store::native_first::copy::CopyFilter) -> Self {
+    pub(crate) fn copying(mut self, filter: crate::store::native_first::CopyFilter) -> Self {
         self.copy = Some(filter);
         self
     }
@@ -840,7 +840,7 @@ fn advance_witness_proof(
     key: &mut String,
     limits: &BatchLimits,
     assigned: &mut ProofDocuments,
-    copy: Option<(&crate::store::native_first::copy::CopyFilter, &str)>,
+    copy: Option<(&crate::store::native_first::CopyFilter, &str)>,
 ) -> Result<Option<WitnessProofPage>> {
     let mut page = WitnessProofPage {
         rows: 0,

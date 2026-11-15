@@ -2237,11 +2237,12 @@ pub fn cooperative_maintenance_unit(
 pub(crate) fn cooperative_semantic_unit(
     store: &Store,
     session: &Arc<WriterSession>,
-    continuation: &mut Option<crate::store::SemanticContinuation>,
+    continuation: &mut Option<crate::semantic_catchup::SemanticContinuation>,
     cancel: &CancelFlag,
     mut priority: impl FnMut() -> bool,
-) -> Result<crate::store::SemanticUnitOutcome> {
-    use crate::store::{MaintenanceQueueState, SemanticUnitOutcome};
+) -> Result<crate::semantic_catchup::SemanticUnitOutcome> {
+    use crate::semantic_catchup::SemanticUnitOutcome;
+    use crate::store::MaintenanceQueueState;
     if !priority() || cancel.load(Ordering::Acquire) {
         return Ok(SemanticUnitOutcome::Deferred);
     }
@@ -2268,7 +2269,7 @@ pub(crate) fn cooperative_semantic_unit(
     loop {
         let outcome = store.semantic_maintenance_unit(session, continuation, cancel)?;
         if outcome != SemanticUnitOutcome::Progress
-            || started.elapsed() >= crate::store::semantic_step_slice()
+            || started.elapsed() >= crate::semantic_catchup::step_slice()
             || !admitted()
         {
             return Ok(outcome);

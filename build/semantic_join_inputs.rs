@@ -10,6 +10,8 @@
 /// - `semantic_import*`: the join and its settlement, staged rows and provenance IDs.
 /// - `semantic_batch*`: document inventory, staging, retained inputs and the production
 ///   resource limits (`limits.rs`), whose caps shape published reasons.
+/// - `semantic_catchup`: the S scheduler, which chooses the witnessed or FULL route and
+///   what an unavailable producer publishes, moved out of `store/native_first`.
 /// - `semantic_evidence`: the evidence rows' canonical forms and validation.
 /// - `semantic_records`: the evidence rows' types, whose serde shape is the stored row and
 ///   payload encoding, moved out of `semantic_evidence`.
@@ -47,6 +49,7 @@ pub const JOIN_MODULES: &[&str] = &[
     "src/scip_vocab.rs",
     "src/semantic_batch.rs",
     "src/semantic_batch/**",
+    "src/semantic_catchup.rs",
     "src/semantic_evidence.rs",
     "src/semantic_import.rs",
     "src/semantic_import/**",

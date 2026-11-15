@@ -163,6 +163,34 @@ impl Store {
         })
     }
 
+    /// One snapshot on a held connection with the destination revision selected in it;
+    /// `Ok(None)` when the pending target is no longer `target`.
+    fn with_pending_semantic_inputs<T>(
+        &self,
+        target: &PendingSemanticTarget,
+        held: &HeldIndexRead,
+        read: impl FnOnce(&Connection, &ReadRevision) -> Result<T>,
+    ) -> Result<Option<T>> {
+        self.with_held_read(held, |db| {
+            let selected = self.read_revision_for(db, Some(target.pin), true)?;
+            // S binds new keys to the same cached statements row after row. Without the
+            // query planner stability guarantee SQLite re-prepares a statement whenever a
+            // value it planned around (a LIMIT, a small-integer comparison) is rebound.
+            storage_result(db.set_db_config(
+                rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_QPSG,
+                true,
+            ))?;
+            if pending_target(db)?.as_ref() != Some(target) {
+                return Ok(None);
+            }
+            selected_ensure!(
+                target.root_id == self.identity.root_key,
+                "incompatible_index: pending semantic root differs"
+            );
+            read(db, &selected).map(Some)
+        })
+    }
+
     /// The producer row recorded at the pending target, in its own snapshot.
     pub(crate) fn pending_producer_at(
         &self,
