@@ -114,23 +114,41 @@ impl Catalog {
             results: BTreeMap::new(),
             export_memo: std::cell::RefCell::new(BTreeMap::new()),
         };
+        result.index_documents(docs, trees, selected, work, check)?;
+        result.prove_membership(docs, work, check)?;
+        result.index_child_names(work, check)?;
+        // Catalog work happens before request-source filters. Each unit merges its stars once;
+        // resolving an observed site below is an indexed lookup, never a catalog scan.
+        result.check_followed_bodies(docs, trees, selected, work, check)?;
+        result.resolve_imports(selected, work, check)?;
+        Ok(result)
+    }
+
+    /// The first pass: each Python file's source set, file declaration, module paths and
+    /// scanned unit.
+    fn index_documents(
+        &mut self,
+        docs: &[&DocumentInput],
+        trees: &[Tree],
+        selected: &[usize],
+        work: &mut Work,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
         for (document, doc) in docs.iter().enumerate() {
             if doc.key.language != "python" {
                 continue;
             }
             charge(doc.key.path.len(), work, check)?;
-            result
-                .source_sets
+            self.source_sets
                 .insert(document, doc.key.source_set_id.clone());
             let mut native = BTreeMap::<_, Vec<&Declaration>>::new();
             for declaration in &doc.declarations {
                 owner_step(work, check)?;
                 if declaration.kind == "module" && declaration.ancestors.is_empty() {
-                    result
-                        .file_declarations
+                    self.file_declarations
                         .insert(document, declaration_id(document, declaration));
                     if declaration.role == DeclarationRole::Test {
-                        result.test_modules.insert(document);
+                        self.test_modules.insert(document);
                     }
                 } else {
                     native
@@ -141,19 +159,17 @@ impl Catalog {
             }
             for (path, package, root) in module_paths(
                 &doc.key.path,
-                result.source_roots.get(&doc.key.source_set_id),
+                self.source_roots.get(&doc.key.source_set_id),
                 work,
                 check,
             )? {
                 if let Some(first) = path.first() {
                     owner_step(work, check)?;
-                    result
-                        .roots
+                    self.roots
                         .insert((doc.key.source_set_id.clone(), first.clone()));
                 }
                 charge(path.len(), work, check)?;
-                result
-                    .modules
+                self.modules
                     .entry((doc.key.source_set_id.clone(), path))
                     .or_default()
                     .push((document, package, root));
@@ -173,9 +189,20 @@ impl Catalog {
                 work,
                 check,
             )?;
-            result.units.insert(document, unit);
+            self.units.insert(document, unit);
         }
-        for (&document, doc) in &result.file_declarations {
+        Ok(())
+    }
+
+    /// The package each file is proved a member of, when exactly one of its module paths
+    /// leads back to it.
+    fn prove_membership(
+        &mut self,
+        docs: &[&DocumentInput],
+        work: &mut Work,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        for (&document, doc) in &self.file_declarations {
             owner_step(work, check)?;
             let input = docs[doc.document];
             let source_set = &input.key.source_set_id;
@@ -183,11 +210,11 @@ impl Catalog {
             let mut proved = Vec::new();
             for (path, package, _) in module_paths(
                 &input.key.path,
-                result.source_roots.get(source_set),
+                self.source_roots.get(source_set),
                 work,
                 check,
             )? {
-                if let Ok(layout) = result.layout(source_set, &path, work, check)?
+                if let Ok(layout) = self.layout(source_set, &path, work, check)?
                     && layout.document == doc.document
                 {
                     proved.push((path, package, layout.proof));
@@ -195,56 +222,53 @@ impl Catalog {
             }
             if proved.len() == 1 {
                 let (mut path, package, proof) = proved.pop().expect("one proved module path");
-                result.module_proofs.insert(document, proof);
+                self.module_proofs.insert(document, proof);
                 if !package {
                     path.pop();
                 }
-                result.membership.insert(document, path);
+                self.membership.insert(document, path);
             }
         }
-        for (source_set, path) in result.modules.keys() {
+        Ok(())
+    }
+
+    /// The submodule names of each proved package.
+    fn index_child_names(
+        &mut self,
+        work: &mut Work,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        for (source_set, path) in self.modules.keys() {
             owner_step(work, check)?;
             if path.len() > 1
-                && let Ok(parent) =
-                    result.layout(source_set, &path[..path.len() - 1], work, check)?
+                && let Ok(parent) = self.layout(source_set, &path[..path.len() - 1], work, check)?
                 && parent.package
             {
                 owner_step(work, check)?;
-                result
-                    .child_names
+                self.child_names
                     .entry(parent.document)
                     .or_default()
                     .insert(path.last().expect("child module name").clone());
             }
         }
-        // Catalog work happens before request-source filters. Each unit merges its stars once;
-        // resolving an observed site below is an indexed lookup, never a catalog scan.
-        result.check_followed_bodies(docs, trees, selected, work, check)?;
-        for (&document, unit) in &result.units {
+        Ok(())
+    }
+
+    /// The last pass: the resolution of every import of each selected unit, its stars merged
+    /// once.
+    fn resolve_imports(
+        &mut self,
+        selected: &[usize],
+        work: &mut Work,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        for (&document, unit) in &self.units {
             if !selected.binary_search(&document).is_ok() {
                 continue;
             }
             owner_step(work, check)?;
             charge(unit.imports.len(), work, check)?;
-            let mut contributors = Vec::new();
-            for import in &unit.imports {
-                owner_step(work, check)?;
-                if import.star && import.module_scope && !import.uncertain {
-                    contributors.push(result.import_exports(
-                        document,
-                        import,
-                        1,
-                        &mut Route::new(),
-                        work,
-                        check,
-                    )?);
-                } else if import.star {
-                    contributors.push(std::sync::Arc::new(Names {
-                        unknown_set: true,
-                        ..Names::default()
-                    }));
-                }
-            }
+            let contributors = self.star_contributors(document, unit, work, check)?;
             let mut merged = Names::default();
             for (import, names) in unit.imports.iter().filter(|i| i.star).zip(&contributors) {
                 if import.module_scope {
@@ -257,52 +281,12 @@ impl Catalog {
                 let mut resolution = if import.star {
                     let own = &contributors[star_index];
                     star_index += 1;
-                    let mut resolution = SiteResolution::default();
-                    if own.unknown_set {
-                        resolution.residual = Some("python_export_name_set_unknown");
-                    }
-                    let mut shadowed = false;
-                    for name in own.names.keys() {
-                        owner_step(work, check)?;
-                        if unit.bindings.contains_key(name) {
-                            shadowed = true;
-                            let binding = result.binding(
-                                document,
-                                name,
-                                1,
-                                &mut Route::new(),
-                                work,
-                                check,
-                            )?;
-                            if binding.unknown || binding.candidates.len() != 1 {
-                                resolution.residual = Some("python_explicit_name_unproved");
-                            }
-                            continue;
-                        }
-                        let bucket = &merged.names[name];
-                        if unit.dynamic
-                            || merged.unknown_set
-                            || bucket.unknown
-                            || bucket.candidates.len() != 1
-                        {
-                            resolution.residual = Some("python_wildcard_name_ambiguous");
-                            continue;
-                        }
-                        add_bucket(&mut resolution, bucket, work, check)?;
-                    }
-                    if resolution.targets.is_empty() && resolution.residual.is_none() {
-                        resolution.residual = Some(if shadowed {
-                            "python_wildcard_fully_shadowed"
-                        } else {
-                            "python_wildcard_empty"
-                        });
-                    }
-                    resolution
+                    self.star_resolution(document, unit, own, &merged, work, check)?
                 } else {
-                    result.explicit(document, import, work, check)?
+                    self.explicit(document, import, work, check)?
                 };
                 if import.star
-                    && let Some(package) = result.external(document, import, work, check)?
+                    && let Some(package) = self.external(document, import, work, check)?
                 {
                     owner_step(work, check)?;
                     resolution
@@ -311,12 +295,86 @@ impl Catalog {
                     resolution.residual = Some("python_external_members_unknown");
                 }
                 owner_step(work, check)?;
-                result
-                    .results
+                self.results
                     .insert((document, import.start, import.end), resolution);
             }
         }
-        Ok(result)
+        Ok(())
+    }
+
+    /// What each star import of a unit contributes, in import order: its module's exports, or
+    /// an unknown set for a star that is nested or conditional.
+    fn star_contributors(
+        &self,
+        document: usize,
+        unit: &Unit,
+        work: &mut Work,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<Vec<std::sync::Arc<Names>>> {
+        let mut contributors = Vec::new();
+        for import in &unit.imports {
+            owner_step(work, check)?;
+            if import.star && import.module_scope && !import.uncertain {
+                contributors.push(self.import_exports(
+                    document,
+                    import,
+                    1,
+                    &mut Route::new(),
+                    work,
+                    check,
+                )?);
+            } else if import.star {
+                contributors.push(std::sync::Arc::new(Names {
+                    unknown_set: true,
+                    ..Names::default()
+                }));
+            }
+        }
+        Ok(contributors)
+    }
+
+    /// One star import's targets: each name it contributes that the unit does not bind itself
+    /// and that the merged stars prove to be one declaration.
+    fn star_resolution(
+        &self,
+        document: usize,
+        unit: &Unit,
+        own: &Names,
+        merged: &Names,
+        work: &mut Work,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<SiteResolution> {
+        let mut resolution = SiteResolution::default();
+        if own.unknown_set {
+            resolution.residual = Some("python_export_name_set_unknown");
+        }
+        let mut shadowed = false;
+        for name in own.names.keys() {
+            owner_step(work, check)?;
+            if unit.bindings.contains_key(name) {
+                shadowed = true;
+                let binding = self.binding(document, name, 1, &mut Route::new(), work, check)?;
+                if binding.unknown || binding.candidates.len() != 1 {
+                    resolution.residual = Some("python_explicit_name_unproved");
+                }
+                continue;
+            }
+            let bucket = &merged.names[name];
+            if unit.dynamic || merged.unknown_set || bucket.unknown || bucket.candidates.len() != 1
+            {
+                resolution.residual = Some("python_wildcard_name_ambiguous");
+                continue;
+            }
+            add_bucket(&mut resolution, bucket, work, check)?;
+        }
+        if resolution.targets.is_empty() && resolution.residual.is_none() {
+            resolution.residual = Some(if shadowed {
+                "python_wildcard_fully_shadowed"
+            } else {
+                "python_wildcard_empty"
+            });
+        }
+        Ok(resolution)
     }
 
     fn check_followed_bodies(
@@ -1476,36 +1534,17 @@ fn scan(
         if matches!(kind, "comment" | "string" | "concatenated_string") {
             continue;
         }
+        let visit = Visit {
+            doc,
+            document,
+            native,
+            node,
+            module_scope,
+            conditional,
+            decorated,
+        };
         if matches!(kind, "import_statement" | "import_from_statement") {
-            let imports = import_nodes(doc, node, module_scope, conditional, work, check)?;
-            for import in imports {
-                owner_step(work, check)?;
-                if module_scope && !import.star {
-                    let name = import.alias.clone().or_else(|| {
-                        if import.from {
-                            import.name.clone()
-                        } else {
-                            import.path.first().cloned()
-                        }
-                    });
-                    if let Some(name) = name {
-                        let index = unit.imports.len();
-                        record(
-                            unit,
-                            name,
-                            node.start_byte(),
-                            if conditional {
-                                BindingKind::Unknown
-                            } else {
-                                BindingKind::Imported(index)
-                            },
-                            work,
-                            check,
-                        )?;
-                    }
-                }
-                unit.imports.push(import);
-            }
+            scan_imports(visit, unit, work, check)?;
             continue;
         }
         if kind == "future_import_statement" {
@@ -1513,140 +1552,12 @@ fn scan(
         }
         if kind == "type_alias_statement"
             && module_scope
-            && let Some(mut left) = node.child_by_field_name("left")
-        {
-            while left.kind() != "identifier" && left.named_child_count() > 0 {
-                check()?;
-                left = left.named_child(0).expect("type alias name child");
-            }
-            if left.kind() == "identifier" {
-                record(
-                    unit,
-                    text(doc, left).to_owned(),
-                    node.start_byte(),
-                    BindingKind::Unknown,
-                    work,
-                    check,
-                )?;
-            }
-            continue;
-        }
-        if matches!(kind, "function_definition" | "class_definition")
-            && module_scope
-            && let Some(name) = node.child_by_field_name("name")
-        {
-            let name = text(doc, name).to_owned();
-            if name == "__getattr__" {
-                unit.dynamic = true;
-            }
-            record(
-                unit,
-                name,
-                node.start_byte(),
-                if conditional || decorated {
-                    BindingKind::Unknown
-                } else {
-                    native_binding(document, node, native)
-                },
-                work,
-                check,
-            )?;
-        }
-        if kind == "assignment"
-            && module_scope
             && let Some(left) = node.child_by_field_name("left")
         {
-            if left.kind() == "identifier" {
-                let name = text(doc, left).to_owned();
-                let right = node.child_by_field_name("right");
-                if name == "__all__" {
-                    let selected = if !conditional && matches!(unit.all, All::Absent) {
-                        if let Some(right) = right {
-                            literal_all(doc, right, work, check)?
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-                    unit.all = selected.map(All::Literal).unwrap_or(All::Unknown);
-                }
-                let binding = match right {
-                    Some(right) if !conditional && right.kind() == "identifier" => {
-                        crate::native_evidence::lookup("python", text(doc, right))
-                            .map_or(BindingKind::Unknown, BindingKind::Alias)
-                    }
-                    Some(right)
-                        if !conditional
-                            && !matches!(right.kind(), "assignment" | "augmented_assignment") =>
-                    {
-                        native_binding(document, node, native)
-                    }
-                    _ => BindingKind::Unknown,
-                };
-                record(unit, name, node.start_byte(), binding, work, check)?;
-                if right.is_some_and(|right| {
-                    right.kind() == "identifier" && text(doc, right) == "__all__"
-                }) {
-                    unit.all = All::Unknown;
-                }
-            } else {
-                block_pattern(doc, left, unit, node.start_byte(), work, check)?;
-            }
+            bind_type_alias(visit, left, unit, work, check)?;
+            continue;
         }
-        if module_scope
-            && matches!(kind, "augmented_assignment" | "named_expression")
-            && let Some(left) = node.child_by_field_name(if kind == "named_expression" {
-                "name"
-            } else {
-                "left"
-            })
-        {
-            block_pattern(doc, left, unit, node.start_byte(), work, check)?;
-        }
-        if module_scope
-            && matches!(
-                kind,
-                "for_statement"
-                    | "for_in_clause"
-                    | "with_item"
-                    | "except_clause"
-                    | "as_pattern"
-                    | "delete_statement"
-                    | "case_pattern"
-            )
-        {
-            if let Some(left) = node
-                .child_by_field_name("left")
-                .or_else(|| node.child_by_field_name("alias"))
-            {
-                block_pattern(doc, left, unit, node.start_byte(), work, check)?;
-            } else if matches!(kind, "delete_statement" | "as_pattern" | "case_pattern") {
-                block_pattern(doc, node, unit, node.start_byte(), work, check)?;
-            }
-        }
-        if module_scope
-            && kind == "call"
-            && let Some(function) = node.child_by_field_name("function")
-        {
-            if function.kind() == "identifier" && matches!(text(doc, function), "exec" | "eval") {
-                unit.dynamic = true;
-            }
-            if function.kind() == "attribute"
-                && let Some(object) = function.child_by_field_name("object")
-            {
-                if object.kind() == "identifier" && text(doc, object) == "__all__" {
-                    unit.all = All::Unknown;
-                }
-                if object.kind() == "call"
-                    && object
-                        .child_by_field_name("function")
-                        .is_some_and(|f| matches!(text(doc, f), "globals" | "locals"))
-                {
-                    unit.dynamic = true;
-                }
-            }
-        }
+        scan_bindings(visit, unit, work, check)?;
         let nested = matches!(kind, "function_definition" | "class_definition" | "lambda");
         let controlled = matches!(
             kind,
@@ -1678,6 +1589,269 @@ fn scan(
         }
     }
     Ok(())
+}
+/// What one visited node hands to the step that scans it: its file, and the flags its
+/// ancestors set.
+#[derive(Clone, Copy)]
+struct Visit<'a, 'tree> {
+    doc: &'a DocumentInput,
+    document: usize,
+    native: &'a BTreeMap<(usize, usize), Vec<&'a Declaration>>,
+    node: Node<'tree>,
+    module_scope: bool,
+    conditional: bool,
+    decorated: bool,
+}
+/// An `import` or `from` statement: every import is kept, and one at module scope binds its
+/// name.
+fn scan_imports(
+    visit: Visit<'_, '_>,
+    unit: &mut Unit,
+    work: &mut Work,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<()> {
+    let Visit {
+        doc,
+        node,
+        module_scope,
+        conditional,
+        ..
+    } = visit;
+    let imports = import_nodes(doc, node, module_scope, conditional, work, check)?;
+    for import in imports {
+        owner_step(work, check)?;
+        if module_scope && !import.star {
+            let name = import.alias.clone().or_else(|| {
+                if import.from {
+                    import.name.clone()
+                } else {
+                    import.path.first().cloned()
+                }
+            });
+            if let Some(name) = name {
+                let index = unit.imports.len();
+                record(
+                    unit,
+                    name,
+                    node.start_byte(),
+                    if conditional {
+                        BindingKind::Unknown
+                    } else {
+                        BindingKind::Imported(index)
+                    },
+                    work,
+                    check,
+                )?;
+            }
+        }
+        unit.imports.push(import);
+    }
+    Ok(())
+}
+/// A module-scope `type` statement binds its name, to nothing proved.
+fn bind_type_alias(
+    visit: Visit<'_, '_>,
+    mut left: Node<'_>,
+    unit: &mut Unit,
+    work: &mut Work,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<()> {
+    let Visit { doc, node, .. } = visit;
+    while left.kind() != "identifier" && left.named_child_count() > 0 {
+        check()?;
+        left = left.named_child(0).expect("type alias name child");
+    }
+    if left.kind() == "identifier" {
+        record(
+            unit,
+            text(doc, left).to_owned(),
+            node.start_byte(),
+            BindingKind::Unknown,
+            work,
+            check,
+        )?;
+    }
+    Ok(())
+}
+/// What a node that is neither an import nor a type alias binds at module scope, and the
+/// hazards a call raises there. The kinds are not exclusive: an `except` clause binds and
+/// also makes its children conditional, so every block is tried and the walk goes on to the
+/// children.
+fn scan_bindings(
+    visit: Visit<'_, '_>,
+    unit: &mut Unit,
+    work: &mut Work,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<()> {
+    let Visit {
+        doc,
+        node,
+        module_scope,
+        ..
+    } = visit;
+    let kind = node.kind();
+    if matches!(kind, "function_definition" | "class_definition")
+        && module_scope
+        && let Some(name) = node.child_by_field_name("name")
+    {
+        bind_definition(visit, name, unit, work, check)?;
+    }
+    if kind == "assignment"
+        && module_scope
+        && let Some(left) = node.child_by_field_name("left")
+    {
+        bind_assignment(visit, left, unit, work, check)?;
+    }
+    if module_scope
+        && matches!(kind, "augmented_assignment" | "named_expression")
+        && let Some(left) = node.child_by_field_name(if kind == "named_expression" {
+            "name"
+        } else {
+            "left"
+        })
+    {
+        block_pattern(doc, left, unit, node.start_byte(), work, check)?;
+    }
+    if module_scope
+        && matches!(
+            kind,
+            "for_statement"
+                | "for_in_clause"
+                | "with_item"
+                | "except_clause"
+                | "as_pattern"
+                | "delete_statement"
+                | "case_pattern"
+        )
+    {
+        if let Some(left) = node
+            .child_by_field_name("left")
+            .or_else(|| node.child_by_field_name("alias"))
+        {
+            block_pattern(doc, left, unit, node.start_byte(), work, check)?;
+        } else if matches!(kind, "delete_statement" | "as_pattern" | "case_pattern") {
+            block_pattern(doc, node, unit, node.start_byte(), work, check)?;
+        }
+    }
+    if module_scope
+        && kind == "call"
+        && let Some(function) = node.child_by_field_name("function")
+    {
+        call_hazards(doc, function, unit);
+    }
+    Ok(())
+}
+/// A module-scope `def` or `class` binds its name: to its declaration, unless it is
+/// conditional or decorated.
+fn bind_definition(
+    visit: Visit<'_, '_>,
+    name: Node<'_>,
+    unit: &mut Unit,
+    work: &mut Work,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<()> {
+    let Visit {
+        doc,
+        document,
+        native,
+        node,
+        conditional,
+        decorated,
+        ..
+    } = visit;
+    let name = text(doc, name).to_owned();
+    if name == "__getattr__" {
+        unit.dynamic = true;
+    }
+    record(
+        unit,
+        name,
+        node.start_byte(),
+        if conditional || decorated {
+            BindingKind::Unknown
+        } else {
+            native_binding(document, node, native)
+        },
+        work,
+        check,
+    )?;
+    Ok(())
+}
+/// A module-scope assignment binds its targets. A plain name binds to what the right side
+/// proves, and `__all__` is read as the export list once, when it is a literal.
+fn bind_assignment(
+    visit: Visit<'_, '_>,
+    left: Node<'_>,
+    unit: &mut Unit,
+    work: &mut Work,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<()> {
+    let Visit {
+        doc,
+        document,
+        native,
+        node,
+        conditional,
+        ..
+    } = visit;
+    if left.kind() == "identifier" {
+        let name = text(doc, left).to_owned();
+        let right = node.child_by_field_name("right");
+        if name == "__all__" {
+            let selected = if !conditional && matches!(unit.all, All::Absent) {
+                if let Some(right) = right {
+                    literal_all(doc, right, work, check)?
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            unit.all = selected.map(All::Literal).unwrap_or(All::Unknown);
+        }
+        let binding = match right {
+            Some(right) if !conditional && right.kind() == "identifier" => {
+                crate::native_evidence::lookup("python", text(doc, right))
+                    .map_or(BindingKind::Unknown, BindingKind::Alias)
+            }
+            Some(right)
+                if !conditional
+                    && !matches!(right.kind(), "assignment" | "augmented_assignment") =>
+            {
+                native_binding(document, node, native)
+            }
+            _ => BindingKind::Unknown,
+        };
+        record(unit, name, node.start_byte(), binding, work, check)?;
+        if right.is_some_and(|right| right.kind() == "identifier" && text(doc, right) == "__all__")
+        {
+            unit.all = All::Unknown;
+        }
+    } else {
+        block_pattern(doc, left, unit, node.start_byte(), work, check)?;
+    }
+    Ok(())
+}
+/// A call that can bind or export a name unseen: `exec`, `eval`, a method of `__all__`, or
+/// a method of `globals()` or `locals()`.
+fn call_hazards(doc: &DocumentInput, function: Node<'_>, unit: &mut Unit) {
+    if function.kind() == "identifier" && matches!(text(doc, function), "exec" | "eval") {
+        unit.dynamic = true;
+    }
+    if function.kind() == "attribute"
+        && let Some(object) = function.child_by_field_name("object")
+    {
+        if object.kind() == "identifier" && text(doc, object) == "__all__" {
+            unit.all = All::Unknown;
+        }
+        if object.kind() == "call"
+            && object
+                .child_by_field_name("function")
+                .is_some_and(|f| matches!(text(doc, f), "globals" | "locals"))
+        {
+            unit.dynamic = true;
+        }
+    }
 }
 fn block_pattern(
     doc: &DocumentInput,
