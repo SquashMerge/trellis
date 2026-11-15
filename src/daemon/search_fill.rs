@@ -783,6 +783,49 @@ impl Inbox {
             .and_then(|position| self.ready.remove(position))
             .or_else(|| self.ready.pop_front())
     }
+    /// Whether a non-startup slot is ready. Startup discovery waits for those.
+    fn normal_ready(&self) -> bool {
+        self.ready
+            .iter()
+            .any(|id| self.slots.get(id).is_some_and(|slot| !slot.startup))
+    }
+    /// Queues every slot whose fault retry is due.
+    fn promote_due(&mut self, now: Instant) {
+        let due = self
+            .slots
+            .iter()
+            .filter_map(|(id, slot)| slot.retry_at.filter(|at| *at <= now).map(|_| *id))
+            .collect::<Vec<_>>();
+        for id in due {
+            let slot = self.slots.get_mut(&id).unwrap();
+            slot.retry_at = None;
+            slot.queued = true;
+            self.ready.push_back(id);
+        }
+    }
+    /// Publishes the slot as running and copies out what its attempt needs.
+    fn claim(&mut self, id: u64) -> Option<Job> {
+        let slot = self.slots.get_mut(&id)?;
+        slot.queued = false;
+        slot.dirty = false;
+        slot.running = true;
+        slot.running_pin = None;
+        Some(Job {
+            id,
+            source: slot.source.clone(),
+            cancel: slot.cancel.clone(),
+            completed: slot.completed,
+            head: slot.head.clone(),
+        })
+    }
+    /// Time until the earliest scheduled fault retry.
+    fn next_retry(&self, now: Instant) -> Option<Duration> {
+        self.slots
+            .values()
+            .filter_map(|slot| slot.retry_at)
+            .min()
+            .map(|at| at.saturating_duration_since(now))
+    }
     fn has_pending_work(&self) -> bool {
         self.startup.is_some()
             || self.discovering
@@ -1232,236 +1275,272 @@ fn retryable_fault(error: &anyhow::Error) -> bool {
         )
 }
 
-fn drive(core: Arc<Core>, backend: Arc<dyn FillBackend>) {
-    loop {
-        let (id, source, cancel, completed, head) = {
-            let mut inbox = core.inbox.lock().unwrap();
-            loop {
-                drop(inbox);
-                let matrix_idle = core.expire_idle_matrices(backend.idle_now());
-                inbox = core.inbox.lock().unwrap();
-                if inbox.shutdown {
-                    return;
-                }
-                let normal_ready = inbox
-                    .ready
-                    .iter()
-                    .any(|id| inbox.slots.get(id).is_some_and(|slot| !slot.startup));
-                if !normal_ready && let Some(roots) = inbox.startup.take() {
-                    inbox.discovering = true;
-                    drop(inbox);
-                    #[cfg(test)]
-                    if let Some(hook) = core.before_startup_discovery.lock().unwrap().take() {
-                        hook();
-                    }
-                    #[cfg(test)]
-                    let override_sources = core.startup_discovery_sources.lock().unwrap().take();
-                    #[cfg(test)]
-                    let sources = override_sources
-                        .unwrap_or_else(|| super::search_startup::discover_sources(roots));
-                    #[cfg(not(test))]
-                    let sources = super::search_startup::discover_sources(roots);
-                    for source in sources {
-                        if core.inbox.lock().unwrap().shutdown {
-                            break;
-                        }
-                        let Some(registration) =
-                            core.register_source_mode(Arc::downgrade(&source), true)
-                        else {
-                            continue;
-                        };
-                        registration.notify();
-                        core.startup_sources
-                            .lock()
-                            .unwrap()
-                            .push((source, registration));
-                    }
-                    inbox = core.inbox.lock().unwrap();
-                    inbox.discovering = false;
-                    core.changed.notify_all();
-                    continue;
-                }
-                let now = Instant::now();
-                let due = inbox
-                    .slots
-                    .iter()
-                    .filter_map(|(id, slot)| slot.retry_at.filter(|at| *at <= now).map(|_| *id))
-                    .collect::<Vec<_>>();
-                for id in due {
-                    let slot = inbox.slots.get_mut(&id).unwrap();
-                    slot.retry_at = None;
-                    slot.queued = true;
-                    inbox.ready.push_back(id);
-                }
-                if let Some(id) = inbox.next_ready() {
-                    let Some(slot) = inbox.slots.get_mut(&id) else {
-                        continue;
-                    };
-                    slot.queued = false;
-                    slot.dirty = false;
-                    slot.running = true;
-                    slot.running_pin = None;
-                    break (
-                        id,
-                        slot.source.clone(),
-                        slot.cancel.clone(),
-                        slot.completed,
-                        slot.head.clone(),
-                    );
-                }
-                let pending_fill = inbox.has_pending_work();
-                // Inbox -> admission only claims the transition. Never wait for
-                // the model with this inbox held; notifications use this mutex.
-                if !pending_fill && backend.begin_idle_expiry() {
-                    drop(inbox);
-                    // Model lifetime is global. Each resident matrix has its
-                    // own timer and is not invalidated by model unloading.
-                    backend.finish_idle_expiry();
-                    inbox = core.inbox.lock().unwrap();
-                    continue;
-                }
-                let retry = inbox
-                    .slots
-                    .values()
-                    .filter_map(|slot| slot.retry_at)
-                    .min()
-                    .map(|at| at.saturating_duration_since(now));
-                // An expired idle cutoff must not spin while a future retry is
-                // pending. Pending fill work takes priority over idle eviction.
-                let idle = if pending_fill {
-                    None
-                } else {
-                    backend.idle_remaining()
-                };
-                let remaining = [retry, idle, matrix_idle].into_iter().flatten().min();
-                inbox = match remaining {
-                    Some(remaining) => core.changed.wait_timeout(inbox, remaining).unwrap().0,
-                    None => core.changed.wait(inbox).unwrap(),
-                };
-            }
+/// What the owner does next. `Core::next_step` decides it with the inbox held;
+/// `drive` performs it with the inbox released.
+enum Step {
+    Shutdown,
+    /// Startup discovery was claimed: `discovering` is already published.
+    Discover(crate::store::topology::TopologyRoots),
+    /// The slot was claimed: it is already published as running.
+    Run(Job),
+    /// Model idle expiry was claimed by `begin_idle_expiry`.
+    ExpireModel,
+    /// Nothing to perform: the owner waited for a change, or a ready id had
+    /// no slot. Decide again.
+    Recheck,
+}
+
+/// One claimed attempt, copied out of its slot so the attempt runs unlocked.
+struct Job {
+    id: u64,
+    source: Source,
+    cancel: Arc<AtomicBool>,
+    completed: Option<Completed>,
+    head: Arc<HeadSlot>,
+}
+
+/// How an attempt's result settles its slot.
+enum Verdict {
+    /// Memory declined, deferred or head changed: forget the completed pin.
+    /// Only a head change requeues by itself.
+    Reset { changed: bool },
+    /// A retryable fault with budget left: schedule the owner's retry.
+    RetryFault,
+    /// A retryable fault with the budget spent: cool down and settle the head.
+    FaultExhausted,
+    /// Success, or a failure that is not retried.
+    Done,
+}
+
+fn classify(result: &Result<()>, retries: usize) -> Verdict {
+    let Err(error) = result else {
+        return Verdict::Done;
+    };
+    let changed = error.is::<SearchHeadChanged>();
+    if error.is::<MemoryDeclined>() || error.is::<SearchDeferred>() || changed {
+        Verdict::Reset { changed }
+    } else if !retryable_fault(error) {
+        Verdict::Done
+    } else if retries < MAX_FAULT_RETRIES {
+        Verdict::RetryFault
+    } else {
+        Verdict::FaultExhausted
+    }
+}
+
+impl Core {
+    /// The owner's decision, made in one inbox critical section. Each claim
+    /// (startup discovery, a slot, model idle expiry) is recorded here, so
+    /// the step that follows needs no lock to know it is the only one. With
+    /// nothing to do it waits on the same guard, so a hint cannot fall
+    /// between the decision and the wait.
+    fn next_step(&self, backend: &dyn FillBackend, matrix_idle: Option<Duration>) -> Step {
+        let mut inbox = self.inbox.lock().unwrap();
+        if inbox.shutdown {
+            return Step::Shutdown;
+        }
+        if !inbox.normal_ready()
+            && let Some(roots) = inbox.startup.take()
+        {
+            inbox.discovering = true;
+            return Step::Discover(roots);
+        }
+        let now = Instant::now();
+        inbox.promote_due(now);
+        if let Some(id) = inbox.next_ready() {
+            return inbox.claim(id).map_or(Step::Recheck, Step::Run);
+        }
+        let pending_fill = inbox.has_pending_work();
+        // Inbox -> admission only claims the transition. Never wait for
+        // the model with this inbox held; notifications use this mutex.
+        if !pending_fill && backend.begin_idle_expiry() {
+            return Step::ExpireModel;
+        }
+        let retry = inbox.next_retry(now);
+        // An expired idle cutoff must not spin while a future retry is
+        // pending. Pending fill work takes priority over idle eviction.
+        let idle = if pending_fill {
+            None
+        } else {
+            backend.idle_remaining()
         };
-        head.begin();
-        let Some(source) = source.upgrade() else {
-            head.stop();
-            core.inbox.lock().unwrap().slots.remove(&id);
-            continue;
+        let remaining = [retry, idle, matrix_idle].into_iter().flatten().min();
+        let _inbox = match remaining {
+            Some(remaining) => self.changed.wait_timeout(inbox, remaining).unwrap().0,
+            None => self.changed.wait(inbox).unwrap(),
         };
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            if source.is_startup() && core.startup_at_cap() {
-                return Outcome {
-                    pin: None,
-                    cache_epoch: 0,
-                    result: Err(MemoryDeclined.into()),
-                };
+        Step::Recheck
+    }
+
+    /// Runs with the inbox released; `next_step` already published
+    /// `discovering`. Takes the inbox only to register each source and, at
+    /// the end, to publish that discovery finished.
+    fn discover_startup(self: &Arc<Self>, roots: crate::store::topology::TopologyRoots) {
+        #[cfg(test)]
+        if let Some(hook) = self.before_startup_discovery.lock().unwrap().take() {
+            hook();
+        }
+        #[cfg(test)]
+        let override_sources = self.startup_discovery_sources.lock().unwrap().take();
+        #[cfg(test)]
+        let sources =
+            override_sources.unwrap_or_else(|| super::search_startup::discover_sources(roots));
+        #[cfg(not(test))]
+        let sources = super::search_startup::discover_sources(roots);
+        for source in sources {
+            if self.inbox.lock().unwrap().shutdown {
+                break;
             }
-            if let Err(error) = backend.prepare(source.as_ref(), &cancel, &head) {
-                return Outcome {
-                    pin: None,
-                    cache_epoch: 0,
-                    result: Err(error),
-                };
-            }
-            // Cancellation/unregister can discard the resident head during
-            // inference. Keep its already-reserved staging charge until the
-            // running job physically drops every vector buffer.
-            let _scratch = head.fill_scratch();
-            if backend
-                .search()
-                .upgrade()
-                .is_some_and(|search| search.model_configured())
-                && _scratch.is_none()
-            {
-                return Outcome {
-                    pin: None,
-                    cache_epoch: 0,
-                    result: Err(MemoryDeclined.into()),
-                };
-            }
-            backend.run(source.as_ref(), &cancel, completed, &|pin| {
-                let mut inbox = core.inbox.lock().unwrap();
-                if let Some(slot) = inbox.slots.get_mut(&id) {
-                    slot.running_pin = Some(pin);
-                }
-                core.changed.notify_all();
-            })
-        }))
-        .unwrap_or_else(|_| Outcome {
-            pin: completed.map(|done| done.pin),
-            cache_epoch: completed.map_or(0, |done| done.cache_epoch),
-            result: Err(EmbedError::Runtime("fill job panicked".into()).into()),
-        });
-        // Release the source before publishing completion. It does not keep a
-        // retired checkout alive while this owner waits for its next hint.
-        drop(source);
-        head.finish(&outcome.result);
-        let mut inbox = core.inbox.lock().unwrap();
-        let Some(slot) = inbox.slots.get_mut(&id) else {
+            let Some(registration) = self.register_source_mode(Arc::downgrade(&source), true)
+            else {
+                continue;
+            };
+            registration.notify();
+            self.startup_sources
+                .lock()
+                .unwrap()
+                .push((source, registration));
+        }
+        let mut inbox = self.inbox.lock().unwrap();
+        inbox.discovering = false;
+        self.changed.notify_all();
+    }
+
+    /// The owner's settle transition: one inbox critical section, ordered
+    /// with `notify` and `request` (#777).
+    fn settle(&self, job: &Job, outcome: Outcome) {
+        let mut inbox = self.inbox.lock().unwrap();
+        let Some(slot) = inbox.slots.get_mut(&job.id) else {
             // A dropped registration can still have held staging until this
             // owner transition. Publish that its physical cleanup completed.
-            core.changed.notify_all();
-            continue;
+            self.changed.notify_all();
+            return;
         };
         slot.running = false;
         slot.running_pin = None;
-        let changed = outcome
-            .result
-            .as_ref()
-            .is_err_and(|error| error.is::<SearchHeadChanged>());
-        let retryable = outcome.result.as_ref().is_err_and(retryable_fault);
-        let deferred = outcome
-            .result
-            .as_ref()
-            .is_err_and(|error| error.is::<SearchDeferred>());
-        let memory_declined = outcome
-            .result
-            .as_ref()
-            .is_err_and(|error| error.is::<MemoryDeclined>());
-        if memory_declined {
-            slot.completed = None;
-            slot.retries = 0;
-            // An explicit successor hint can name a smaller/newer pin. It
-            // must survive this attempt's admission failure.
-        } else if deferred {
-            slot.completed = None;
-            slot.retries = 0;
-            // dirty records only an explicit hint received after this attempt
-            // started; that successor must survive transient deferral.
-        } else if changed {
-            slot.completed = None;
-            slot.retries = 0;
-        } else if retryable && slot.retries < MAX_FAULT_RETRIES {
-            slot.retries += 1;
-            slot.retry_at = Some(Instant::now() + FAULT_RETRY);
-            core.changed.notify_all();
-            continue;
-        } else if retryable {
-            // A later checkout signal can restart bounded fault recovery. Do
-            // not mark a failed head complete or turn accumulated hints into
-            // an unbounded self-retry loop.
-            slot.completed = None;
-            slot.retries = 0;
-            slot.dirty = false;
-            slot.fault_cooldown = Some(Instant::now() + FAULT_RETRY);
-            // The owner decided no retry remains: publish that the head is
-            // settled, or describe/status keep reading busy work as pending
-            // (#777). A later hint begins it again after its inbox update.
-            head.settle();
-        } else {
-            slot.completed = if outcome.result.is_ok() {
-                outcome.pin.map(|pin| Completed {
-                    pin,
-                    cache_epoch: outcome.cache_epoch,
-                })
-            } else {
-                None
-            };
-            slot.retries = 0;
-        }
-        if changed || slot.dirty {
+        let requeue = match classify(&outcome.result, slot.retries) {
+            Verdict::Reset { changed } => {
+                slot.completed = None;
+                slot.retries = 0;
+                // dirty records only an explicit hint received after this
+                // attempt started. It can name a smaller/newer pin, so it
+                // must survive this attempt's admission failure or deferral.
+                changed || slot.dirty
+            }
+            Verdict::RetryFault => {
+                slot.retries += 1;
+                slot.retry_at = Some(Instant::now() + FAULT_RETRY);
+                // The owner's own retry is scheduled; a hint stays dirty.
+                false
+            }
+            Verdict::FaultExhausted => {
+                // A later checkout signal can restart bounded fault recovery. Do
+                // not mark a failed head complete or turn accumulated hints into
+                // an unbounded self-retry loop.
+                slot.completed = None;
+                slot.retries = 0;
+                slot.dirty = false;
+                slot.fault_cooldown = Some(Instant::now() + FAULT_RETRY);
+                // The owner decided no retry remains: publish that the head is
+                // settled, or describe/status keep reading busy work as pending
+                // (#777). A later hint begins it again after its inbox update.
+                job.head.settle();
+                false
+            }
+            Verdict::Done => {
+                slot.completed = if outcome.result.is_ok() {
+                    outcome.pin.map(|pin| Completed {
+                        pin,
+                        cache_epoch: outcome.cache_epoch,
+                    })
+                } else {
+                    None
+                };
+                slot.retries = 0;
+                slot.dirty
+            }
+        };
+        if requeue {
             slot.queued = true;
-            inbox.ready.push_back(id);
+            inbox.ready.push_back(job.id);
         }
-        core.changed.notify_all();
+        self.changed.notify_all();
+    }
+}
+
+/// One attempt, with no lock held. A panic is a retryable runtime fault that
+/// keeps the previously completed pin.
+fn attempt(core: &Core, backend: &dyn FillBackend, job: &Job, source: &dyn FillSource) -> Outcome {
+    let declined = |error: anyhow::Error| Outcome {
+        pin: None,
+        cache_epoch: 0,
+        result: Err(error),
+    };
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if source.is_startup() && core.startup_at_cap() {
+            return declined(MemoryDeclined.into());
+        }
+        if let Err(error) = backend.prepare(source, &job.cancel, &job.head) {
+            return declined(error);
+        }
+        // Cancellation/unregister can discard the resident head during
+        // inference. Keep its already-reserved staging charge until the
+        // running job physically drops every vector buffer.
+        let _scratch = job.head.fill_scratch();
+        if backend
+            .search()
+            .upgrade()
+            .is_some_and(|search| search.model_configured())
+            && _scratch.is_none()
+        {
+            return declined(MemoryDeclined.into());
+        }
+        backend.run(source, &job.cancel, job.completed, &|pin| {
+            let mut inbox = core.inbox.lock().unwrap();
+            if let Some(slot) = inbox.slots.get_mut(&job.id) {
+                slot.running_pin = Some(pin);
+            }
+            core.changed.notify_all();
+        })
+    }))
+    .unwrap_or_else(|_| Outcome {
+        pin: job.completed.map(|done| done.pin),
+        cache_epoch: job.completed.map_or(0, |done| done.cache_epoch),
+        result: Err(EmbedError::Runtime("fill job panicked".into()).into()),
+    })
+}
+
+/// A claimed job from begin to settle. Only `settle` takes the inbox.
+fn run_job(core: &Core, backend: &dyn FillBackend, job: Job) {
+    job.head.begin();
+    let Some(source) = job.source.upgrade() else {
+        job.head.stop();
+        core.inbox.lock().unwrap().slots.remove(&job.id);
+        return;
+    };
+    let outcome = attempt(core, backend, &job, source.as_ref());
+    // Release the source before publishing completion. It does not keep a
+    // retired checkout alive while this owner waits for its next hint.
+    drop(source);
+    job.head.finish(&outcome.result);
+    core.settle(&job, outcome);
+}
+
+/// The owner loop: sweep idle matrices, decide under the inbox, act outside it.
+fn drive(core: Arc<Core>, backend: Arc<dyn FillBackend>) {
+    loop {
+        // Ranking and publication lock individual heads; the sweep takes the
+        // inbox itself, so it runs before the decision, never inside it.
+        let matrix_idle = core.expire_idle_matrices(backend.idle_now());
+        match core.next_step(backend.as_ref(), matrix_idle) {
+            Step::Shutdown => return,
+            Step::Discover(roots) => core.discover_startup(roots),
+            Step::Run(job) => run_job(&core, backend.as_ref(), job),
+            // Model lifetime is global. Each resident matrix has its
+            // own timer and is not invalidated by model unloading.
+            Step::ExpireModel => backend.finish_idle_expiry(),
+            Step::Recheck => {}
+        }
     }
 }
 
