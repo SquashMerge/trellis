@@ -4,10 +4,10 @@
   "rule": "A run fails when deviatingPairs, deviatingReferences or partialFiles is above this record. It also fails as lost coverage when deviatingPairs or deviatingReferences is below this record while unknownReferences is above it; with deviations not lower, a rise in unknownReferences is a notice. unknownReferences is the sum of referenceCount over the population's instances with status unknown. An update does not lower the deviations while unknownReferences is above the record unless --accept-unknown-rise is given. comparablePairs, conformingPairs and unknownPairs are information only: a pair is one source file's aggregate, so a file split, merge, rename or deletion moves them without changing coverage.",
   "measurement": "`python3 tools/rules-ratchet.py --update`: a debug build of this checkout, its own daemon under a private HOME, a fresh index, then rust-analyzer (trusted) and scip-typescript (restricted) imported.",
   "deviatingPairs": 31,
-  "deviatingReferences": 218,
-  "unknownReferences": 7043,
+  "deviatingReferences": 209,
+  "unknownReferences": 7115,
   "partialFiles": 0,
-  "comparablePairs": 1806,
-  "conformingPairs": 1524,
-  "unknownPairs": 251
+  "comparablePairs": 1814,
+  "conformingPairs": 1531,
+  "unknownPairs": 252
 }
