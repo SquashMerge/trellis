@@ -170,8 +170,8 @@ jobs:
             const meanings = {
               'not-run': 'Infrastructure failure, not a layering regression: the job failed before the ratchet ran (the build or a producer install failed). Nothing was compared with the record.',
               'not-measured': 'Infrastructure failure, not a layering regression: the ratchet could not measure (a producer was missing or failed, or the daemon or the index failed). Nothing was compared with the record.',
-              'record-exceeded': `The record is exceeded: deviating pairs, deviating references or partial files rose above ${record}.`,
-              'lost-coverage': `Lost coverage: deviations are below ${record} while unknown references are above it, which is not progress.`,
+              'record-exceeded': `The record is exceeded: deviating pairs, deviating references or partial files rose above ${record}, or a deviating pair was measured that the record does not have.`,
+              'lost-coverage': `Lost coverage: a deviating pair in ${record} has fewer deviating references than recorded, or is gone, while its source file has more unknown references than recorded for it, which is not progress. The lines below name each such pair.`,
               'record-exceeded, lost-coverage': `The record ${record} is exceeded and coverage was lost; the lines below give both.`,
             };
             const meaning = meanings[outcome] || meanings['not-measured'];
