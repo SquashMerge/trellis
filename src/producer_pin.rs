@@ -265,6 +265,36 @@ pub fn pinned_producer(
     profile_id: &str,
     declared: &DescriptorProducer,
 ) -> Result<PinnedProducer, ScipCaptureError> {
+    let pinned = pinned_identity(trust_origin, profile_id, declared)?;
+    if pinned.version != declared.version {
+        return Err(admission("producer profile pin"));
+    }
+    Ok(pinned)
+}
+
+/// The pin of a batch Trellis ran itself on an executable it verified by hash (#1126). Every
+/// field but the version must equal the pin, the executable hash being the host target's. The
+/// version is the one the descriptor records, which is what that binary reported: a binary
+/// pinned per target can report a text the reference host's does not.
+pub fn pinned_producer_reporting_version(
+    trust_origin: &str,
+    profile_id: &str,
+    declared: &DescriptorProducer,
+) -> Result<PinnedProducer, ScipCaptureError> {
+    let mut pinned = pinned_identity(trust_origin, profile_id, declared)?;
+    if pinned.identity_kind != IdentityKind::Executable || declared.version.is_empty() {
+        return Err(admission("producer profile pin"));
+    }
+    pinned.version.clone_from(&declared.version);
+    Ok(pinned)
+}
+
+/// The pin `declared` names, when every field but the version equals it.
+fn pinned_identity(
+    trust_origin: &str,
+    profile_id: &str,
+    declared: &DescriptorProducer,
+) -> Result<PinnedProducer, ScipCaptureError> {
     let profiles = profiles()?;
     let pinned = match trust_origin {
         REFERENCE_TRUST_ORIGIN => profiles
@@ -277,7 +307,6 @@ pub fn pinned_producer(
     };
     if pinned.profile_id != profile_id
         || pinned.name != declared.name
-        || pinned.version != declared.version
         || pinned.identity_kind != declared.identity_kind
         || pinned.executable_hash != declared.executable_hash
         || pinned.position_encoding != declared.position_encoding

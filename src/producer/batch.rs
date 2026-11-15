@@ -45,10 +45,16 @@ fn invalid(detail: &str) -> anyhow::Error {
     anyhow::anyhow!("{PRODUCER_OUTPUT_INVALID}: {detail}")
 }
 
-/// What the manifest needs from an artifact: its project root and the documents it names.
+/// Longest producer version text a batch records from an artifact.
+const MAX_TOOL_VERSION_BYTES: usize = 128;
+
+/// What the manifest needs from an artifact: its project root, the version its producer
+/// reports and the documents it names.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct ArtifactScan {
     pub project_root: String,
+    /// The bytes of `Metadata.tool_info.version`; empty when the artifact carries none.
+    pub tool_version: Vec<u8>,
     pub documents: BTreeSet<String>,
 }
 
@@ -112,9 +118,10 @@ fn utf8(bytes: &[u8]) -> Result<&str> {
     std::str::from_utf8(bytes).map_err(|_| invalid("artifact text"))
 }
 
-/// Reads `Metadata.project_root` (Index field 1, Metadata field 3) and every
-/// `Document.relative_path` (Index field 2, Document field 1). Bounded by the artifact size,
-/// 100,000 documents and 4096-byte paths; a malformed artifact is `producer_output_invalid`.
+/// Reads `Metadata.project_root` (Index field 1, Metadata field 3), `ToolInfo.version`
+/// (Metadata field 2, ToolInfo field 2) and every `Document.relative_path` (Index field 2,
+/// Document field 1). Bounded by the artifact size, 100,000 documents and 4096-byte paths; a
+/// malformed artifact is `producer_output_invalid`.
 pub fn scan_artifact(bytes: &[u8]) -> Result<ArtifactScan> {
     ensure!(
         bytes.len() as u64 <= BatchLimits::PRODUCTION.artifact_bytes,
@@ -124,8 +131,15 @@ pub fn scan_artifact(bytes: &[u8]) -> Result<ArtifactScan> {
     for_each_field(bytes, |number, field| {
         match (number, field) {
             (1, Field::Bytes(metadata)) => for_each_field(metadata, |number, field| {
-                if let (3, Field::Bytes(root)) = (number, field) {
-                    scan.project_root = utf8(root)?.to_owned();
+                match (number, field) {
+                    (2, Field::Bytes(tool)) => for_each_field(tool, |number, field| {
+                        if let (2, Field::Bytes(version)) = (number, field) {
+                            scan.tool_version = version.to_vec();
+                        }
+                        Ok(())
+                    })?,
+                    (3, Field::Bytes(root)) => scan.project_root = utf8(root)?.to_owned(),
+                    _ => {}
                 }
                 Ok(())
             })?,
@@ -362,6 +376,22 @@ pub fn write_batch(reader: &NativeReader<'_>, spec: &BatchSpec<'_>) -> Result<Wr
     artifact_languages.sort_by_key(|language| crate::scip_admission::order(language));
     artifact_languages.dedup();
 
+    // A run on a hash-verified executable records the version that executable reported, so
+    // the descriptor and the artifact agree by construction (#1126). The pin's text is the
+    // reference host's capture, and a binary pinned for another target can report a
+    // different one. Every other batch, and an artifact that reports none, records the pin's.
+    let producer_version = if generation.records_reported_version() && !scan.tool_version.is_empty()
+    {
+        let version = utf8(&scan.tool_version)?;
+        ensure!(
+            version.len() <= MAX_TOOL_VERSION_BYTES && !version.chars().any(char::is_control),
+            invalid("tool version")
+        );
+        version.to_owned()
+    } else {
+        spec.pin.version.clone()
+    };
+
     let header = reader.header()?;
     let batch_dir = spec.dir.join(BATCH_DIR);
     fs::DirBuilder::new()
@@ -428,7 +458,7 @@ pub fn write_batch(reader: &NativeReader<'_>, spec: &BatchSpec<'_>) -> Result<Wr
         decoder_version: DECODER_VERSION.to_owned(),
         producer: DescriptorProducer {
             name: spec.pin.name.clone(),
-            version: spec.pin.version.clone(),
+            version: producer_version,
             identity_kind: spec.pin.identity_kind,
             executable_hash: spec.pin.executable_hash.clone(),
             position_encoding: spec.pin.position_encoding,
