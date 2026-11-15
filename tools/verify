@@ -5,12 +5,14 @@
 # first failed lane's status.
 #
 # Usage: ./tools/verify [--lane NAME]...
-# With no --lane, every lane runs: rust tests semantic cohorts checks. CI runs
-# lanes as separate jobs by naming them. The rust lane is lint then browser;
+# With no --lane, the default lanes run: rust tests semantic cohorts checks. CI
+# runs lanes as separate jobs by naming them. The rust lane is lint then browser;
 # each half is also a lane of its own, so CI can run them on separate runners.
+# The ratchet lane runs only when it is named (owner ruling, #1008):
+#   ./tools/verify --lane ratchet
 set -eu
 
-all_lanes="rust tests semantic cohorts checks"
+default_lanes="rust tests semantic cohorts checks"
 lanes=""
 while [ "$#" -gt 0 ]; do
   case $1 in
@@ -24,12 +26,12 @@ while [ "$#" -gt 0 ]; do
       shift
       ;;
     *)
-      echo "verify: unknown argument: $1 (usage: ./tools/verify [--lane rust|lint|browser|tests|semantic|cohorts|checks]...)" >&2
+      echo "verify: unknown argument: $1 (usage: ./tools/verify [--lane rust|lint|browser|tests|semantic|cohorts|checks|ratchet]...)" >&2
       exit 2
       ;;
   esac
   case $lane in
-    rust | lint | browser | tests | semantic | cohorts | checks) ;;
+    rust | lint | browser | tests | semantic | cohorts | checks | ratchet) ;;
     *)
       echo "verify: unknown lane: $lane" >&2
       exit 2
@@ -51,7 +53,7 @@ case " $lanes " in
     esac
     ;;
 esac
-[ -n "$lanes" ] || lanes=$all_lanes
+[ -n "$lanes" ] || lanes=$default_lanes
 
 # User daemon settings must not make tests load local models or change diagnostics.
 # Tests that need these settings set them explicitly on their own child commands.
@@ -211,6 +213,7 @@ checks() {
   # Flaky-test patterns in test code, with the helper to use instead (#720).
   python3 tools/flaky-patterns-test.py
   python3 tools/flaky-patterns.py
+  python3 tools/rules-ratchet-test.py
   node --test tests/mcp-catalog-sdk.test.mjs tests/mcp-smoke.test.mjs
   python3 tools/stage3-watcher-runner-test.py
   python3 tools/verify-67-mixed-performance-test.py
@@ -244,6 +247,14 @@ checks() {
   # The Herdr mod's logic over the browser's own Architecture adapter (#707); no install needed.
   node --import ./herdr-mod/test/register.mjs --test herdr-mod/test/mod.test.mjs herdr-mod/test/view.test.mjs herdr-mod/test/parity.test.mjs herdr-mod/test/setup.test.mjs
   node --test tests/browse-ui.test.cjs tests/sequence-ui.test.cjs tests/token-ui.test.cjs tests/external-source-ui.test.cjs tests/dependency-ui.test.cjs tests/shell-ui.test.cjs tests/classes-ui.test.cjs tests/navigation-ui.test.cjs tests/metric-heat.test.cjs tests/viewer-metrics-ui.test.cjs tests/files-ui.test.cjs tests/architecture-ui.test.cjs tests/architecture-pele-ui.test.cjs tests/treemap-ui.test.cjs tests/treemap-pele.test.cjs tests/architecture-apps-ui.test.cjs tests/app-switcher-ui.test.cjs tests/architecture-routing.test.cjs
+}
+# The rules-check ratchet (#1008): deviating pairs and references may only fall.
+# On request only, never a default lane: the measurement takes minutes.
+# It measures through its own daemon under a private HOME, with both semantic
+# producers, and prints a notice instead when either is not installed. It owns
+# `target-ratchet`, so it neither waits on nor writes the rust lane's `target`.
+ratchet() {
+  python3 tools/rules-ratchet.py
 }
 
 started=$(date +%s)

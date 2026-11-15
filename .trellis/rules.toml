@@ -1,4 +1,7 @@
 version = 1
+# Reference sites under `cfg(feature = "test-support")` are test, not production
+# (docs/rules.md, Amendment #988; enabled by owner ruling, 2026-11-15).
+test_features = ["test-support"]
 
 # Source-reviewed #163 candidate. Add only positively witnessed exceptions.
 # Lower order is higher. Same-layer families do not require allowed peers.

@@ -55,7 +55,7 @@ pub(super) fn extract(
             true
         })?;
         let lines = LineIndex::new(&doc.input.file.text);
-        let callers = Callers::new(doc.input);
+        let callers = Callers::new(doc.input, check)?;
         let mut calls = Vec::new();
         for call in sites {
             check()?;

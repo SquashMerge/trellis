@@ -249,8 +249,10 @@ impl<'a> Document<'a> {
                 continue;
             }
             let handler = match self.function(handler) {
-                Some(function) => self.declaration_handler(function, None),
-                None => self.span_handler(HandlerKind::Closure, Self::range(handler), None),
+                Some(function) => self.declaration_handler(function, None, check)?,
+                None => {
+                    self.span_handler(HandlerKind::Closure, Self::range(handler), None, check)?
+                }
             };
             routes.push(Route {
                 method: method.into(),
@@ -326,42 +328,56 @@ impl<'a> Document<'a> {
         Some(node)
     }
 
-    fn keys(&self) -> &BTreeMap<String, String> {
-        self.keys.get_or_init(|| {
-            crate::symbol_lookup::keys_from_source(
-                &self.doc.key.path,
-                &self.doc.key.language,
-                self.source,
-                &self.doc.declarations,
-            )
-            .unwrap_or_default()
-        })
+    /// The document's stable lookup keys, derived once. A failed derivation is the caller's
+    /// error and is not kept (#1115): it was once kept as an empty map, which read as a
+    /// handler without a key.
+    fn keys(&self, check: &mut impl FnMut() -> Result<()>) -> Result<&BTreeMap<String, String>> {
+        if let Some(keys) = self.keys.get() {
+            return Ok(keys);
+        }
+        let keys = crate::references::callers::lookup_keys(self.doc, check)?;
+        Ok(self.keys.get_or_init(|| keys))
     }
 
-    fn declaration_handler(&self, function: &Declaration, variant: Option<&str>) -> Handler {
-        Handler {
+    fn declaration_handler(
+        &self,
+        function: &Declaration,
+        variant: Option<&str>,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<Handler> {
+        Ok(Handler {
             kind: HandlerKind::Declaration,
             syntax_id: Some(function.syntax_id.clone()),
-            stable_lookup_key: self.keys().get(&function.syntax_id).cloned(),
+            stable_lookup_key: self.keys(check)?.get(&function.syntax_id).cloned(),
             document: self.doc.key.clone(),
             lines: self.lines.lines(&function.range),
             range: function.range.clone(),
             variant: variant.map(str::to_owned),
-        }
+        })
     }
 
     /// A handler that is a span inside the innermost named callable around it.
-    fn span_handler(&self, kind: HandlerKind, range: Range, variant: Option<&str>) -> Handler {
+    fn span_handler(
+        &self,
+        kind: HandlerKind,
+        range: Range,
+        variant: Option<&str>,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<Handler> {
         let callable = named_callable(self.doc, &range);
-        Handler {
+        let stable_lookup_key = match callable {
+            Some(callable) => self.keys(check)?.get(&callable.syntax_id).cloned(),
+            None => None,
+        };
+        Ok(Handler {
             kind,
             syntax_id: callable.map(|d| d.syntax_id.clone()),
-            stable_lookup_key: callable.and_then(|d| self.keys().get(&d.syntax_id).cloned()),
+            stable_lookup_key,
             document: self.doc.key.clone(),
             lines: self.lines.lines(&range),
             range,
             variant: variant.map(str::to_owned),
-        }
+        })
     }
 
     /// Whether the node, or the function it names, embeds a static file.
@@ -689,7 +705,7 @@ impl<'a> Document<'a> {
             {
                 return Ok(None);
             }
-            return Ok(Some(self.declaration_handler(registered, variant)));
+            return Ok(Some(self.declaration_handler(registered, variant, check)?));
         };
         let value = arm.child_by_field_name("value");
         if let Some(value) = value
@@ -708,8 +724,10 @@ impl<'a> Document<'a> {
             return Ok(None);
         }
         Ok(Some(match delegate {
-            Some(function) => self.declaration_handler(function, variant),
-            None => self.span_handler(HandlerKind::DispatchArm, Self::range(arm), variant),
+            Some(function) => self.declaration_handler(function, variant, check)?,
+            None => {
+                self.span_handler(HandlerKind::DispatchArm, Self::range(arm), variant, check)?
+            }
         }))
     }
 }
@@ -1600,5 +1618,69 @@ fn app(prefix: &str) {
         assert_eq!(lines(0, 3), Lines { start: 1, end: 1 });
         assert_eq!(lines(3, 9), Lines { start: 2, end: 4 });
         assert_eq!(lines(6, 6), Lines { start: 3, end: 3 });
+    }
+
+    /// #1115: a stopped key derivation was once kept as an empty map, so a handler read as
+    /// one without a stable key, and kept reading so for the rest of the document.
+    #[test]
+    fn a_stopped_key_derivation_is_the_error_and_is_not_kept() {
+        let source = r#"
+struct State;
+impl State { fn ready(&self) {} }
+async fn health() { probe(); }
+fn probe() {}
+fn router() -> Router { Router::new().route("/healthz", get(health)) }
+"#;
+        let shot = snapshot(&[("src/http.rs", source)]);
+        let doc = &shot.documents[0];
+        let stopped = || anyhow::bail!("request_cancelled: test");
+        let tree = parse(doc, &tree_sitter_rust::LANGUAGE.into(), &mut || Ok(())).unwrap();
+        let document = Document::new(doc, tree.root_node());
+        let function = declaration(&shot, "health");
+        let error = document
+            .declaration_handler(function, None, &mut stopped.clone())
+            .unwrap_err();
+        assert_eq!(error.to_string(), "request_cancelled: test");
+        let error = document
+            .span_handler(
+                HandlerKind::Closure,
+                function.range.clone(),
+                None,
+                &mut stopped.clone(),
+            )
+            .unwrap_err();
+        assert_eq!(error.to_string(), "request_cancelled: test");
+        let handler = document
+            .declaration_handler(function, None, &mut || Ok(()))
+            .unwrap();
+        assert_eq!(
+            handler.stable_lookup_key.as_deref(),
+            Some("src/http.rs::health")
+        );
+
+        // The measured-call owners of the same document derive the same keys.
+        assert!(!doc.calls.is_empty());
+        let error = crate::references::callers::Callers::new(doc, &mut stopped.clone())
+            .err()
+            .unwrap();
+        assert_eq!(error.to_string(), "request_cancelled: test");
+        // Wherever the extraction is stopped, the reparse included, it fails: it never
+        // answers a route whose handler lost its key.
+        let mut polls = 0;
+        extract(&shot, &mut Work::new(usize::MAX), &mut || {
+            polls += 1;
+            Ok(())
+        })
+        .unwrap();
+        for stop in 1..=polls {
+            let mut poll = 0;
+            let error = extract(&shot, &mut Work::new(usize::MAX), &mut || {
+                poll += 1;
+                anyhow::ensure!(poll != stop, "request_cancelled: test");
+                Ok(())
+            })
+            .unwrap_err();
+            assert_eq!(error.to_string(), "request_cancelled: test", "poll {stop}");
+        }
     }
 }
