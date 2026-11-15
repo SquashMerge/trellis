@@ -908,11 +908,14 @@ mod tests {
     use std::sync::{Arc, atomic::AtomicBool};
 
     fn documents() -> Vec<DocumentInput> {
-        let root = tempfile::tempdir().unwrap();
-        for (path, text) in [
+        documents_with(&[
             ("Use.java", "package app; import pkg.*; class Use {}"),
             ("T.java", "package pkg; public class T {}"),
-        ] {
+        ])
+    }
+    fn documents_with(files: &[(&str, &str)]) -> Vec<DocumentInput> {
+        let root = tempfile::tempdir().unwrap();
+        for (path, text) in files {
             std::fs::write(root.path().join(path), text).unwrap();
         }
         let identity =
@@ -1023,5 +1026,122 @@ mod tests {
             );
             assert_eq!(checks, 3);
         });
+    }
+
+    /// Where a build stops on its budget is a stability rule: the same documents charge the
+    /// same steps, so the same budget stops them at the same step with the same error.
+    #[test]
+    fn catalog_build_and_site_resolution_charge_exact_steps() {
+        const BUILD: usize = 176;
+        let documents = documents_with(&[
+            (
+                "Use.java",
+                "package app;\n\
+                 import pkg.T;\n\
+                 import static pkg.T.make;\n\
+                 import pkg.*;\n\
+                 import pkg.*;\n\
+                 class Use<E> {\n\
+                 \x20   class Inner {}\n\
+                 \x20   pkg.T field;\n\
+                 \x20   java.util.List<E> list;\n\
+                 }\n",
+            ),
+            ("T.java", "package pkg; public class T {}"),
+        ]);
+        let docs: Vec<_> = documents.iter().collect();
+        let trees: Vec<_> = docs
+            .iter()
+            .map(|doc| parse(doc, &mut || Ok(())).unwrap())
+            .collect();
+        assert!(trees.iter().all(|tree| !tree.root_node().has_error()));
+        let selected: Vec<_> = (0..docs.len()).collect();
+        let build = |limit| {
+            let mut work = Work::new(limit);
+            let catalog = Catalog::new(&docs, &trees, &selected, &mut work, &mut || Ok(()));
+            (catalog, work)
+        };
+        let (catalog, mut work) = build(work::reference_limit(docs.len(), 0));
+        let catalog = catalog.unwrap();
+        assert_eq!(work.used, BUILD);
+
+        let source = docs
+            .iter()
+            .position(|doc| doc.key.path == "Use.java")
+            .unwrap();
+        let sites = extract(docs[source], &trees[source], &mut work, &mut || Ok(())).unwrap();
+        let extracted = work.used - BUILD;
+        let resolved: Vec<_> = sites
+            .iter()
+            .map(|site| {
+                let before = work.used;
+                catalog
+                    .resolve(
+                        source,
+                        site,
+                        &mut BTreeMap::new(),
+                        &mut work,
+                        &mut || Ok(()),
+                    )
+                    .unwrap();
+                (site.spelling.as_str(), work.used - before)
+            })
+            .collect();
+        assert_eq!(extracted, 76);
+        assert_eq!(
+            resolved,
+            [
+                ("import pkg.T;", 6),
+                ("import static pkg.T.make;", 1),
+                ("import pkg.*;", 3),
+                ("import pkg.*;", 3),
+                ("pkg.T", 6),
+                ("java.util.List", 14),
+            ]
+        );
+
+        // One step short of the build's charge fails typed, on the step that exceeds it.
+        let (stopped, work) = build(BUILD - 1);
+        assert_eq!(
+            stopped.err().expect("budget stop").to_string(),
+            "bounded_work: reference owner lookup"
+        );
+        assert_eq!(work.used, BUILD);
+        assert!(build(BUILD).0.is_ok());
+    }
+
+    /// A type name its package declares twice exports nothing proved, and a unit that imports
+    /// the package on demand must see that mark.
+    #[test]
+    fn on_demand_import_of_a_twice_declared_type_is_ambiguous() {
+        let documents = documents_with(&[
+            ("Use.java", "package app; import dup.*; class Use {}"),
+            ("D.java", "package dup; public class D {}"),
+            ("Other.java", "package dup; class D {}"),
+        ]);
+        let docs: Vec<_> = documents.iter().collect();
+        let trees: Vec<_> = docs
+            .iter()
+            .map(|doc| parse(doc, &mut || Ok(())).unwrap())
+            .collect();
+        assert!(trees.iter().all(|tree| !tree.root_node().has_error()));
+        let mut work = Work::new(work::reference_limit(docs.len(), 0));
+        let selected: Vec<_> = (0..docs.len()).collect();
+        let catalog = Catalog::new(&docs, &trees, &selected, &mut work, &mut || Ok(())).unwrap();
+        let source = docs
+            .iter()
+            .position(|doc| doc.key.path == "Use.java")
+            .unwrap();
+        let sites = extract(docs[source], &trees[source], &mut work, &mut || Ok(())).unwrap();
+        let [import] = sites.as_slice() else {
+            panic!("one import site");
+        };
+        let resolution = catalog
+            .resolve(source, import, &mut BTreeMap::new(), &mut work, &mut || {
+                Ok(())
+            })
+            .unwrap();
+        assert!(resolution.targets.is_empty());
+        assert_eq!(resolution.residual, Some("java_wildcard_name_ambiguous"));
     }
 }
