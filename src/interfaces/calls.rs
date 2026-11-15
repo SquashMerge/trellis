@@ -210,7 +210,7 @@ impl<'w> Document<'w, '_> {
 
     fn collect(&self, found: &mut Vec<ClientCall>, budget: &mut Budget<'_>) -> Result<()> {
         let lines = LineIndex::new(&self.doc.file.text);
-        let callers = Callers::new(self.doc);
+        let callers = Callers::new(self.doc, budget.check)?;
         let mut sites: Vec<(&Call, Node<'w>, Form)> = Vec::new();
         for call in &self.doc.calls {
             budget.step(1)?;

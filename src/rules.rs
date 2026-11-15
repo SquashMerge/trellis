@@ -2491,7 +2491,7 @@ fn evaluate_document(
     check: &mut (impl FnMut() -> Result<()> + Send),
 ) -> Result<DocumentRows> {
     let mut work = Work::new(limit);
-    let callers = crate::references::callers::Callers::new(doc);
+    let callers = crate::references::callers::Callers::new(doc, check)?;
     let mut instances = Vec::new();
     let mut test_only = Vec::new();
     let bases = if inheritance {

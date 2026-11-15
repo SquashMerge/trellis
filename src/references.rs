@@ -1348,7 +1348,7 @@ fn prepare_file(
     let keys = if raw.is_empty() && doc.semantic.anchors.is_empty() {
         BTreeMap::new()
     } else {
-        callers::lookup_keys(doc)
+        callers::lookup_keys(doc, check)?
     };
     let context = SiteContext {
         doc,
