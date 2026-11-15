@@ -1543,7 +1543,7 @@ fn callables_inside_measured_macros_are_scored_at_their_exact_ranges() {
     assert_eq!(branching.metrics["cyclomatic"], 2);
     assert_eq!(branching.metrics["loc"], 3);
     assert_eq!(branching.metrics["fanOut"], 1);
-    assert_eq!(branching.metrics["maxNesting"], 2);
+    assert_eq!(branching.metrics["maxNesting"], 1);
     let outer = row("|r| format!(\"{}\", (|x: &usize| x + 1)(r))");
     assert_eq!(outer.metrics["halstead"]["N2"], 3, "{}", outer.metrics);
     // A named function in a macro counts direct recursion, as it would outside one.

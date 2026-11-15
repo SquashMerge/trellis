@@ -11,7 +11,7 @@ pub use crate::semantic_batch::origin::GenerationOrigin;
 use crate::{
     native_ids::canonical_into,
     native_records as native,
-    producer_pin::{PinnedProducer, pinned_producer},
+    producer_pin::{PinnedProducer, pinned_producer, pinned_producer_reporting_version},
     scip_raw::{self, Completion, ScipCaptureError},
     scip_vocab::{admission, hexhash, order, path},
     semantic_batch::limits::BatchLimits,
@@ -225,6 +225,18 @@ pub struct Generation {
     pub asserted: Vec<GenerationComponent>,
 }
 
+impl Generation {
+    /// Whether the batch's producer version is the one its executable reported (#1126): a
+    /// Trellis run whose executable Trellis verified against the pinned hash before running
+    /// it. A pickup, an external batch and a run verified another way record the pin's text.
+    pub fn records_reported_version(&self) -> bool {
+        self.origin == GenerationOrigin::TrellisRun
+            && self
+                .observed
+                .contains(&GenerationComponent::ProducerExecutable)
+    }
+}
+
 impl Descriptor {
     /// Serde-only parse of the closed grammar. No admission rule is applied.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
@@ -253,9 +265,21 @@ impl Descriptor {
         Ok(descriptor)
     }
 
-    /// Check 2: the declared producer must equal the checked-in pin exactly.
+    /// Check 2: the declared producer must equal the checked-in pin exactly. The one field a
+    /// batch may record for itself is the version of a run on a hash-verified executable
+    /// (`Generation::records_reported_version`): the pin's hash for the host target is the
+    /// exact check there, and the returned producer carries the recorded version.
     pub fn check_producer(&self) -> Result<PinnedProducer> {
-        pinned_producer(&self.trust_origin, &self.profile_id, &self.producer)
+        let reported = self
+            .generation
+            .as_ref()
+            .is_some_and(Generation::records_reported_version);
+        let check = if reported {
+            pinned_producer_reporting_version
+        } else {
+            pinned_producer
+        };
+        check(&self.trust_origin, &self.profile_id, &self.producer)
     }
 
     /// The project-root spellings a stored batch may bind to on store reuse. Every spelling
