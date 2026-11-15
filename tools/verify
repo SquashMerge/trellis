@@ -214,6 +214,8 @@ checks() {
   python3 tools/flaky-patterns-test.py
   python3 tools/flaky-patterns.py
   python3 tools/rules-ratchet-test.py
+  # tools/test-selected's mapping and refusals, on a synthetic checkout (#1145).
+  python3 tools/test-selected-test.py
   node --test tests/mcp-catalog-sdk.test.mjs tests/mcp-smoke.test.mjs
   python3 tools/stage3-watcher-runner-test.py
   python3 tools/verify-67-mixed-performance-test.py

@@ -1,0 +1,382 @@
+#!/usr/bin/env python3
+"""Run the narrowest real test command for each selected file (#1145).
+
+Usage: tools/test-selected <selector>...
+
+A selector is a repo-relative path to an existing file, or `path::test_name`.
+Every argument is a selector: there are no options, so a caller can append
+selectors it did not write. All selectors are checked before anything runs.
+One that cannot be mapped is refused: the script names it, runs nothing and
+exits 2. It never falls back to running more than was selected.
+
+Set TRELLIS_TEST_SELECTED_PRINT=1 to print the mapped commands without running
+them. README.md ("Running selected tests") lists what maps and what is refused.
+
+Commands run from the repository root, which is found from this file's own
+path, with the pinned toolchain and `--locked`, the way ./tools/verify runs
+them. Identical commands run once. The exit status is the first failed
+command's; every command still runs.
+"""
+import os
+import re
+import shlex
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+PRINT_ENV = "TRELLIS_TEST_SELECTED_PRINT"
+# ./tools/verify unsets these: user daemon settings must not reach tests.
+UNSET = ("TRELLIS_SEARCH_MODEL", "TRELLIS_SEARCH_BACKEND", "TRELLIS_INDEX_DIAGNOSTICS")
+# The tests lane's flags; --no-tests=fail so a selector that selects nothing fails.
+NEXTEST = ["cargo", "nextest", "run", "--locked", "--features", "test-support", "--no-fail-fast", "--no-tests=fail"]
+# GHSA-vc25-qg58-w57c: the same floor ./tools/verify enforces.
+NEXTEST_FLOOR = (0, 9, 150)
+
+RUST_FILTER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(::[A-Za-z_][A-Za-z0-9_]*)*\Z")
+PYTHON_FILTER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?\Z")
+NODE_TEST = re.compile(r"[^/]+\.test\.[cm]js\Z")
+# Top-level Node tests that load packages from tests/mcp (./tools/verify installs them).
+NEEDS_MCP_PACKAGES = ("tests/mcp-catalog-sdk.test.mjs", "tests/mcp-smoke.test.mjs")
+
+
+class Refused(Exception):
+    """A selector this script will not run; the message says why."""
+
+
+class Command:
+    def __init__(self, argv, env=None):
+        self.argv = argv
+        self.env = env or {}
+
+    def key(self):
+        return (tuple(self.argv), tuple(sorted(self.env.items())))
+
+    def line(self):
+        return " ".join([f"{name}={shlex.quote(value)}" for name, value in sorted(self.env.items())] + [shlex.join(self.argv)])
+
+
+# --- Rust: which Cargo target reaches a file, and under which module path ---
+
+RUST_TOKEN = re.compile(
+    r"""//[^\n]*                          # line comment
+      | (?P<block>/\*)                    # block comment (nested; closed by hand)
+      | (?:br|cr|r)(?P<hashes>\#*)"       # raw string (closed by hand)
+      | (?P<string>[bc]?"(?:[^"\\]|\\.)*")
+      | b?'(?:\\.[^'\n]*|[^\\'\n])'       # char literal, so a quote in one opens no string
+      | (?P<ident>[A-Za-z_][A-Za-z0-9_]*)
+      | (?P<punct>[{};\#\[\]=])
+    """,
+    re.S | re.X,
+)
+BLOCK_EDGE = re.compile(r"/\*|\*/")
+
+
+def rust_tokens(text):
+    """The identifiers, string literals and `{ } ; # [ ] =` of Rust source, in order."""
+    tokens = []
+    position = 0
+    while True:
+        match = RUST_TOKEN.search(text, position)
+        if not match:
+            return tokens
+        position = match.end()
+        if match.group("block"):
+            depth = 1
+            while depth:
+                edge = BLOCK_EDGE.search(text, position)
+                if not edge:
+                    return tokens
+                depth += 1 if edge.group() == "/*" else -1
+                position = edge.end()
+        elif match.group("hashes") is not None:
+            end = text.find('"' + match.group("hashes"), position)
+            if end < 0:
+                return tokens
+            position = end + 1 + len(match.group("hashes"))
+        elif match.group("string"):
+            tokens.append(("string", match.group("string")))
+        elif match.group("ident"):
+            tokens.append(("ident", match.group("ident")))
+        elif match.group("punct"):
+            tokens.append(("punct", match.group("punct")))
+
+
+def module_declarations(text):
+    """Yield (inline module names, name, `#[path]` literal or None) for each `mod name;`.
+
+    Only declarations at module level count: one inside a function body, a
+    macro, or an inline module that itself carries `#[path]` is skipped.
+    """
+    tokens = rust_tokens(text)
+    scopes = []  # an inline module's name, or None for any other brace
+    path = None
+    index = 0
+    while index < len(tokens):
+        kind, value = tokens[index]
+        following = tokens[index + 1 : index + 6]
+        if (
+            (kind, value) == ("punct", "#")
+            and [token[1] for token in following[:3]] == ["[", "path", "="]
+            and len(following) == 5
+            and following[3][0] == "string"
+            and following[4] == ("punct", "]")
+        ):
+            path = following[3][1].strip('bc"')
+            index += 6
+            continue
+        if (kind, value) == ("ident", "mod") and len(following) >= 2 and following[0][0] == "ident":
+            name, after = following[0][1], following[1]
+            if after == ("punct", ";"):
+                if None not in scopes:
+                    yield list(scopes), name, path
+                path = None
+                index += 3
+                continue
+            if after == ("punct", "{"):
+                scopes.append(name if path is None else None)
+                path = None
+                index += 3
+                continue
+        if kind == "punct" and value in "{};":
+            path = None
+            if value == "{":
+                scopes.append(None)
+            elif value == "}" and scopes:
+                scopes.pop()
+        index += 1
+
+
+def reach(root, crate_root):
+    """Map each source file a crate root reaches (repo-relative) to its module paths."""
+    reached = {}
+    # (file, module path, whether child modules sit beside the file rather than under its stem)
+    pending = [(crate_root, (), True)]
+    while pending:
+        file, module, owns_directory = pending.pop()
+        if module in reached.setdefault(file, []):
+            continue
+        reached[file].append(module)
+        try:
+            with open(os.path.join(root, file), encoding="utf-8") as source:
+                text = source.read()
+        except (OSError, UnicodeDecodeError):
+            continue
+        directory = os.path.dirname(file)
+        children = directory if owns_directory else os.path.join(directory, os.path.basename(file)[: -len(".rs")])
+        for inline, name, path in module_declarations(text):
+            if path is not None:
+                base = os.path.join(children, *inline) if inline else directory
+                candidates = [(os.path.normpath(os.path.join(base, path)), True)]
+            else:
+                base = os.path.join(children, *inline)
+                candidates = [(os.path.join(base, name + ".rs"), False), (os.path.join(base, name, "mod.rs"), True)]
+            for candidate, owns in candidates:
+                if not candidate.startswith("..") and os.path.isfile(os.path.join(root, candidate)):
+                    pending.append((candidate, module + tuple(inline) + (name,), owns))
+                    break
+    return reached
+
+
+def cargo_targets(root):
+    """Cargo's auto-discovered targets: (nextest target flags, crate root, description)."""
+    targets = []
+    if os.path.isfile(os.path.join(root, "src/lib.rs")):
+        targets.append((["--lib"], "src/lib.rs", "the library"))
+    if os.path.isfile(os.path.join(root, "src/main.rs")):
+        with open(os.path.join(root, "Cargo.toml"), encoding="utf-8") as manifest:
+            package = re.search(r'^\[package\][^\[]*?^name\s*=\s*"([^"]+)"', manifest.read(), re.M | re.S)
+        if package:
+            targets.append((["--bin", package.group(1)], "src/main.rs", f"binary {package.group(1)}"))
+    for directory, flag, noun in (("src/bin", "--bin", "binary"), ("tests", "--test", "test binary")):
+        try:
+            names = sorted(os.listdir(os.path.join(root, directory)))
+        except OSError:
+            continue
+        for name in names:
+            if name.endswith(".rs") and os.path.isfile(os.path.join(root, directory, name)):
+                targets.append(([flag, name[: -len(".rs")]], f"{directory}/{name}", f"{noun} {name[: -len('.rs')]}"))
+            elif os.path.isfile(os.path.join(root, directory, name, "main.rs")):
+                targets.append(([flag, name], f"{directory}/{name}/main.rs", f"{noun} {name}"))
+    return targets
+
+
+def map_rust(root, path, test, environ, cache):
+    if test is not None and not RUST_FILTER.match(test):
+        raise Refused("a Rust test name is identifiers joined by `::`")
+    if "targets" not in cache:
+        cache["targets"] = [(flags, description, reach(root, crate_root)) for flags, crate_root, description in cargo_targets(root)]
+    owners = [(flags, description, reached[path]) for flags, description, reached in cache["targets"] if path in reached]
+    if not owners:
+        raise Refused("no Cargo library, binary or test target reaches this file through `mod` declarations")
+    if owners[0][0] != ["--lib"] and len(owners) > 1:
+        names = ", ".join(description for _, description, _ in owners)
+        raise Refused(f"{len(owners)} targets share this file ({names}); select a test file of the one you mean")
+    flags, description, modules = owners[0]
+    if len(modules) > 1:
+        raise Refused(f"{description} declares this file as more than one module")
+    prefix = "".join(part + "::" for part in modules[0])
+    argv = NEXTEST + flags
+    if test is not None:
+        argv += ["-E", f"test(/^{prefix}(.+::)?{test}$/)"]
+    elif prefix:
+        argv += ["-E", f"test(/^{prefix}/)"]
+    target = environ.get("CARGO_TARGET_DIR") or "target"
+    return Command(argv, {"CARGO_TARGET_DIR": os.path.join(root, target) + "-test-support"})
+
+
+# --- Node and Python ---
+
+
+def read(root, path):
+    with open(os.path.join(root, path), encoding="utf-8", errors="replace") as file:
+        return file.read()
+
+
+def map_node(root, path, test, imports=()):
+    argv = ["node"]
+    for module in imports:
+        argv += ["--import", module]
+    argv.append("--test")
+    if test is not None:
+        # node --test passes when the pattern matches nothing, so a misspelt name must not get that far.
+        if test not in read(root, path):
+            raise Refused("the file's text does not contain that test name")
+        # The whole name, literally: escape what a JavaScript regular expression reads.
+        argv.append("--test-name-pattern=^" + re.sub(r"([\\^$.*+?()\[\]{}|/])", r"\\\1", test) + "$")
+    return Command(argv + [path])
+
+
+def map_python(root, path, argv, test):
+    if test is not None:
+        if not PYTHON_FILTER.match(test):
+            raise Refused("a Python test name is `test_method` or `Class.test_method`")
+        # Before Python 3.12 unittest passes when nothing matches; refuse a name the file does not define.
+        text = read(root, path)
+        *owner, method = test.split(".")
+        if not re.search(rf"^\s*def {method}\(", text, re.M) or (owner and not re.search(rf"^class {owner[0]}\b", text, re.M)):
+            raise Refused("the file does not define that test")
+        # unittest matches the pattern against `module.Class.test_method`.
+        argv = argv + ["-k", "*." + test]
+    return Command(argv)
+
+
+def map_selector(root, selector, environ, cache):
+    """The command for one selector, or Refused."""
+    if selector.startswith("-"):
+        raise Refused("a selector must not start with `-`")
+    path, separator, test = selector.partition("::")
+    if separator and not test:
+        raise Refused("`::` must be followed by a test name")
+    if not separator:
+        test = None
+    if not path:
+        raise Refused("the path is empty")
+    if os.path.isabs(path):
+        raise Refused("the path must be relative to the repository root")
+    full = os.path.join(root, path)
+    if not os.path.exists(full):
+        raise Refused("the path does not exist" if not os.path.lexists(full) else "the path is a broken symbolic link")
+    # Symbolic links resolved: the file itself must be inside the checkout.
+    physical = os.path.realpath(full)
+    if os.path.commonpath([physical, root]) != root or physical == root:
+        raise Refused("the path is outside the checkout")
+    if not os.path.isfile(physical):
+        raise Refused("the path is not a file")
+    path = os.path.relpath(physical, root).replace(os.sep, "/")
+    directory, _, name = path.rpartition("/")
+
+    if path.startswith("tests/fixtures/") or path.startswith("tests/proptest-regressions/"):
+        raise Refused("test data has no single test; select the test file that reads it")
+    if path.startswith("tests/browser/"):
+        raise Refused(
+            "the browser suite needs the built binaries and the pinned Chromium; "
+            "the browser lane owns it (./tools/verify --lane browser)"
+        )
+    if directory in ("tools/selection", "tools/extraction"):
+        raise Refused(
+            f"{directory} is a standalone research harness with its own packages; "
+            f"no verify lane runs it (npm ci --prefix {directory}, then npm --prefix {directory} test)"
+        )
+    if NODE_TEST.match(name):
+        if directory == "tests":
+            if path in NEEDS_MCP_PACKAGES and not os.path.isdir(os.path.join(root, "tests/mcp/node_modules")):
+                raise Refused(
+                    "it needs the tests/mcp packages, which are not installed; ./tools/verify installs them "
+                    "(or: npm ci --prefix tests/mcp --ignore-scripts)"
+                )
+            return map_node(root, path, test)
+        if directory == "herdr-mod/test":
+            return map_node(root, path, test, imports=["./herdr-mod/test/register.mjs"])
+        if directory in ("tools/semantic-contract/test", "tools/synthetic-cohorts/test"):
+            return map_node(root, path, test)
+    if directory == "tools" and name.endswith("-test.py"):
+        return map_python(root, path, ["python3", path], test)
+    if path.startswith("tools/") and name.startswith("test_") and name.endswith(".py"):
+        return map_python(root, path, ["python3", "-m", "unittest", "discover", "-s", directory, "-p", name], test)
+    if name.endswith(".rs") and (path.startswith("src/") or path.startswith("tests/")):
+        return map_rust(root, path, test, environ, cache)
+    raise Refused("no test command is known for this layout")
+
+
+def nextest_problem(root, env):
+    """Why cargo-nextest cannot be used here, or None."""
+    try:
+        version = subprocess.run(
+            ["cargo", "nextest", "--version"], cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
+        )
+    except OSError:
+        return "cargo is not installed"
+    found = re.search(r"cargo-nextest (\d+)\.(\d+)\.(\d+)", version.stdout) if version.returncode == 0 else None
+    if not found:
+        return "cargo-nextest is required (cargo install cargo-nextest --locked)"
+    if tuple(int(part) for part in found.groups()) < NEXTEST_FLOOR:
+        return f"cargo-nextest {'.'.join(found.groups())} is affected by GHSA-vc25-qg58-w57c; upgrade to 0.9.150 or newer"
+    return None
+
+
+def main(selectors, environ):
+    if not selectors:
+        print("usage: tools/test-selected <path>[::test_name]...", file=sys.stderr)
+        return 2
+    commands = []
+    refused = False
+    cache = {}
+    for selector in selectors:
+        try:
+            command = map_selector(ROOT, selector, environ, cache)
+        except Refused as reason:
+            print(f"test-selected: refused {selector!r}: {reason}", file=sys.stderr)
+            refused = True
+            continue
+        if command.key() not in [known.key() for known in commands]:
+            commands.append(command)
+    if refused:
+        print("test-selected: nothing was run", file=sys.stderr)
+        return 2
+    if environ.get(PRINT_ENV, "") not in ("", "0"):
+        for command in commands:
+            print(command.line())
+        return 0
+    env = {name: value for name, value in environ.items() if name not in UNSET}
+    if any(command.argv[:2] == ["cargo", "nextest"] for command in commands):
+        problem = nextest_problem(ROOT, env)
+        if problem:
+            print(f"test-selected: {problem}; nothing was run", file=sys.stderr)
+            return 127
+    status = 0
+    for command in commands:
+        print(f"==> {command.line()}", flush=True)
+        try:
+            code = subprocess.run(command.argv, cwd=ROOT, env={**env, **command.env}).returncode
+        except OSError as error:
+            print(f"test-selected: cannot run {command.argv[0]}: {error}", file=sys.stderr)
+            code = 127
+        if code != 0:
+            print(f"test-selected: failed (exit {code}): {command.line()}", file=sys.stderr, flush=True)
+            # A signal's negative status is not an exit code.
+            status = status or (code if code > 0 else 1)
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:], os.environ))
