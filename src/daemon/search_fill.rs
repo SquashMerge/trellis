@@ -1511,7 +1511,7 @@ fn attempt(core: &Core, backend: &dyn FillBackend, job: &Job, source: &dyn FillS
 }
 
 /// A claimed job from begin to settle. Only `settle` takes the inbox.
-fn run(core: &Core, backend: &dyn FillBackend, job: Job) {
+fn run_job(core: &Core, backend: &dyn FillBackend, job: Job) {
     job.head.begin();
     let Some(source) = job.source.upgrade() else {
         job.head.stop();
@@ -1535,7 +1535,7 @@ fn drive(core: Arc<Core>, backend: Arc<dyn FillBackend>) {
         match core.next_step(backend.as_ref(), matrix_idle) {
             Step::Shutdown => return,
             Step::Discover(roots) => core.discover_startup(roots),
-            Step::Run(job) => run(&core, backend.as_ref(), job),
+            Step::Run(job) => run_job(&core, backend.as_ref(), job),
             // Model lifetime is global. Each resident matrix has its
             // own timer and is not invalidated by model unloading.
             Step::ExpireModel => backend.finish_idle_expiry(),
