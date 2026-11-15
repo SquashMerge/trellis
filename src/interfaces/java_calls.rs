@@ -78,7 +78,7 @@ pub(super) fn extract(
             view,
             receivers: HashMap::new(),
         };
-        let callers = Callers::new(view.doc);
+        let callers = Callers::new(view.doc, check)?;
         let mut calls = Vec::new();
         for node in sites {
             check()?;

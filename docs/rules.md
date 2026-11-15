@@ -1599,6 +1599,9 @@ per page and each check instance keeps one evidence entry. Under the
 [#769 amendment](mcp-readonly-pilot-contract.md#amendment-769-rules-tools-point-to-the-next-call),
 a check instance that omits evidence carries `nextCall`, the ready-made
 `trellis_rules_explain` arguments that show the rest. Under the
+[#985 amendment](mcp-readonly-pilot-contract.md#amendment-985-explains-limit-reaches-the-pairs-sites),
+`omittedEvidence` counts a pair's unshown sites from `referenceCount`, and explain's
+`limit` is also the sites the evaluation samples per pair. Under the
 [#714 amendment](mcp-readonly-pilot-contract.md#amendment-714-rules-check-pages-deviations-first),
 MCP check pages each instance array by status, deviations first, then unknowns, then
 conformances.
@@ -1646,7 +1649,9 @@ names the function that runs the import: a JavaScript or TypeScript `require(...
 `import(...)` whose site is its measured call.
 
 Limits: structural type paths stay `reference` without semantic evidence, and the browser, CLI
-and MCP rules samples are 5 sites per pair.
+and MCP check rules samples are 5 sites per pair. MCP explain samples up to its `limit`
+(1–50, default 5) sites per pair
+([#985](mcp-readonly-pilot-contract.md#amendment-985-explains-limit-reaches-the-pairs-sites)).
 
 ## Proposal workflow
 

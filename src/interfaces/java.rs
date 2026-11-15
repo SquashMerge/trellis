@@ -1232,13 +1232,11 @@ impl<'a> Document<'a> {
 
     fn keys(&self) -> &BTreeMap<String, String> {
         self.keys.get_or_init(|| {
-            crate::symbol_lookup::keys_from_source(
+            crate::symbol_lookup::keys_by_name(
                 &self.doc.key.path,
                 &self.doc.key.language,
-                self.source,
                 &self.doc.declarations,
             )
-            .unwrap_or_default()
         })
     }
 
