@@ -43,7 +43,8 @@ pub(super) fn architecture_read<'a>(
     let kind = architecture::operation(name);
     let arguments = architecture::store_arguments(name, &serde_json::Value::Object(args.clone()));
     // check/explain sample rule evidence per instance (#448). Explain's
-    // `limit` sets the sample; check's counts instances per page (#725).
+    // `limit` sets the sample, in the evaluation too (#985); check's counts
+    // instances per page (#725).
     let evidence_limit = match kind {
         "check" => Some(architecture::CHECK_EVIDENCE_SAMPLE),
         "explain" => Some(args.get("limit").map_or(5, |value| {

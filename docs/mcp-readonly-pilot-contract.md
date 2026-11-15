@@ -743,6 +743,16 @@ changes, only the order of rows within two arrays. This section wins over the #7
 - **The answer.** Explain's `unassigned` keeps only the catalog entries that are a returned instance's (in `instances` or `testOnly`) `target` or `destination`: for example the unassigned destination of a `layer_unassigned` instance. `externalPackages` closes over the returned instances and those entries only. `page.total` therefore counts the instance's own items.
 - **Unchanged.** `unassignedFileCount` stays the checkout-wide number of unassigned files, so the count is still there. `trellis_rules_check` lists the whole catalog (filtered by `paths` and `app`, as before). Evaluation, verdicts, counts, the field set and the schemas are unchanged.
 
+## Amendment (#985): explain's `limit` reaches the pair's sites
+
+**Status: proposed by the builder of [#985](https://github.com/SquashMerge/trellis/issues/985), for ratification.** It makes the server do what the #448 `limit` sentence, the #725 instance text and the #769 `nextCall` text already say. `toolVersion` is unchanged (30): no schema or catalog text changes, as for #908 and #912.
+
+- **The problem.** A `$layers` or `$external` instance is one (source, destination, role) pair, and its `evidence` is the pair's site sample from the references projection. Check and explain always evaluated with the default sample of 5 sites per pair, because the MCP `limit` never reached the evaluation. `omittedEvidence` was then counted from those at most 5 entries. With `limit:50`, a pair with 85 references answered 5 entries and `omittedEvidence:0`, and a check instance's `nextCall` never asked for more than 5.
+- **Explain.** Explain's `limit` (1–50, default 5) is also the number of sites the evaluation samples per pair, so an explained pair keeps up to `limit` evidence entries: all of them when `referenceCount` is `limit` or less. The sample order is unchanged (R5: `call` sites first), so a smaller limit's entries are a prefix of a larger one's.
+- **`omittedEvidence`.** For check and explain it is the instance's evidence count minus the entries shown, where the evidence count is `referenceCount` for a pair. An instance that already carried every entry (unresolved sites, a declaration instance's own evidence) is unchanged. A check instance of a pair with 85 references therefore answers `omittedEvidence:84`, and its `nextCall` `limit` is 50.
+- **More than 50.** A pair with more than 50 references shows 50 at most, with `omittedEvidence` the exact remainder. There is no evidence offset, and `trellis_references` has the same 50-site sample bound per edge ([rules.md](rules.md#work-bounds-and-located-failures)), so no call lists a pair's sites past the fiftieth; the count says how many there are.
+- **Unchanged:** evaluation, verdicts, counts, `referenceCount`, `kindCounts`, instance order, paging, every bound, the schemas and the catalog. The CLI and the browser's reads still evaluate with 5 sample sites per pair ([rules.md](rules.md#classified-reference-evidence-785), Limits); the sentence below that the CLI "keeps every evidence entry" means every entry of that evaluation.
+
 ## Tool catalog
 
 ### `trellis_workspace_describe` (W1)
