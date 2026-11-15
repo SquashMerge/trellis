@@ -1,6 +1,6 @@
 # Metrics v1
 
-`metricsVersion` is `metrics:v1`, independent of the native evidence version. Metrics are computed from selected pinned source and native facts, not persisted. A supplied pin is the complete `(indexGeneration,indexRevision)` pair; missing means the admitted current head. A stale, incomplete or wrong-generation pin never falls back to head. Invalid selected source/facts abort the whole result.
+`metricsVersion` is `metrics:v1`, independent of the native evidence version. It identifies the shape of the metrics record: a change to how a metric is computed that leaves the record's shape unchanged does not change it, and only a change to the record's fields does (owner ruling 2026-11-15, #987). Metrics are computed from selected pinned source and native facts, not persisted. A supplied pin is the complete `(indexGeneration,indexRevision)` pair; missing means the admitted current head. A stale, incomplete or wrong-generation pin never falls back to head. Invalid selected source/facts abort the whole result.
 
 ## Callable role selection
 
