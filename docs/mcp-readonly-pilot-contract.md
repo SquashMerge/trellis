@@ -1161,9 +1161,11 @@ syntax, not compiler resolution; `semanticComplete:false` is invariant. Where a
 language has a selected producer (#483), fresh call and type bindings also map
 sites, each marked `mapping:"semantic"` with its binding's provenance, and each edge
 reports its `evidenceTier` and `semanticSites` (#523; see
-[rules](rules.md#semantic-bindings-523)). Stored
+[rules](rules.md#semantic-bindings-523)).
 Decision 0011 roles separate production and tests: feature-only `test-support`
-remains production. Call/type constraints use only fresh selected bindings and stay
+remains production. A site's role is its enclosing declaration's stored role, or test
+under a `cfg(test)` attribute on syntax that is no declaration
+([rules](rules.md#production-and-test-evidence); #988, owner ruling 2026-11-14). Call/type constraints use only fresh selected bindings and stay
 unknown without them, never invented positive bindings. **Amendment (#936, owner
 ruling 2026-11-12):** "fresh" here also admits `possiblyStale` bindings, such as the
 evidence semantic catch-up carries forward after an edit, until a producer re-run

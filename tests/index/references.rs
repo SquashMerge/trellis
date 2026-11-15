@@ -289,6 +289,181 @@ fn references_rust_direct_wildcard_expands_public_declaration_owner() {
     assert!(data["unresolved"].as_array().unwrap().is_empty());
 }
 
+/// #988: a site under a `#[cfg(test)]` statement, block, match arm or `use` item is test even
+/// though no stored declaration covers it. Only the Decision 0011 markers count.
+#[test]
+fn references_rust_cfg_test_syntax_without_a_declaration_is_test() {
+    let source = r#"
+mod store;
+#[cfg(test)]
+use crate::store::imported;
+fn production() {
+    #[cfg(test)]
+    let _fault = crate::store::statement();
+    // A comment or another attribute between the marker and its item changes nothing.
+    #[cfg(all(test, unix))]
+    #[allow(unused)]
+    { crate::store::block(); }
+    match 1 { #[cfg(test)] 2 => crate::store::arm(), _ => crate::store::plain_arm() }
+    #[cfg(any(test, unix))]
+    crate::store::any_test();
+    #[cfg(not(test))]
+    crate::store::not_test();
+    #[cfg(feature = "test-support")]
+    crate::store::feature();
+    crate::store::after();
+}
+struct Fields {
+    #[cfg(test)]
+    hook: crate::store::Hook,
+    plain: crate::store::Plain,
+}
+"#;
+    let input = snapshot(&[
+        ("src/lib.rs", source),
+        (
+            "src/store.rs",
+            "pub fn imported() {} pub fn statement() {} pub fn block() {} pub fn arm() {} \
+             pub fn plain_arm() {} pub fn any_test() {} pub fn not_test() {} pub fn feature() {} \
+             pub fn after() {} pub struct Hook; pub struct Plain;",
+        ),
+    ]);
+    let data = project(&input);
+    let spellings = |role: &str| -> Vec<String> {
+        let mut found: Vec<_> = edge(&data, role, "src/lib.rs", "src/store.rs")["sites"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|site| {
+                assert_eq!(
+                    site["role"],
+                    if role == "tests" {
+                        "test"
+                    } else {
+                        "production"
+                    }
+                );
+                site["spelling"].as_str().unwrap().to_owned()
+            })
+            .collect();
+        found.sort();
+        found
+    };
+    assert_eq!(
+        spellings("tests"),
+        [
+            "crate::store::Hook",
+            "crate::store::arm",
+            "crate::store::block",
+            "crate::store::statement"
+        ]
+    );
+    assert_eq!(
+        spellings("production"),
+        [
+            "crate::store::Plain",
+            "crate::store::after",
+            "crate::store::any_test",
+            "crate::store::feature",
+            "crate::store::not_test",
+            "crate::store::plain_arm"
+        ]
+    );
+    // The conditional `use` stays unresolved, now as a test site.
+    let unresolved = data["unresolved"].as_array().unwrap();
+    assert_eq!(unresolved.len(), 1, "{data}");
+    assert_eq!(unresolved[0]["site"]["spelling"], "crate::store::imported");
+    assert_eq!(unresolved[0]["site"]["role"], "test");
+}
+
+/// #988 review: every shape in which the pinned grammar attaches an attribute. In each row
+/// the reference to `T` is under `#[cfg(test)]` and the reference to `P` beside it is not.
+#[test]
+fn references_rust_cfg_test_reaches_every_attribute_shape() {
+    let shapes = [
+        (
+            "struct-expression field",
+            "fn f() -> S { S { #[cfg(test)] a: crate::store::T, b: crate::store::P } }",
+        ),
+        (
+            "tuple-struct field after a visibility",
+            "struct S(#[cfg(test)] pub crate::store::T, pub crate::store::P);",
+        ),
+        (
+            "tuple-struct field",
+            "struct S(#[cfg(test)] crate::store::T, crate::store::P);",
+        ),
+        (
+            "named field after a visibility",
+            "struct S { #[cfg(test)] pub a: crate::store::T, pub b: crate::store::P }",
+        ),
+        (
+            "enum variant",
+            "enum E { #[cfg(test)] A(crate::store::T), B(crate::store::P) }",
+        ),
+        (
+            "parameter",
+            "fn f(#[cfg(test)] a: crate::store::T, b: crate::store::P) {}",
+        ),
+        (
+            "generic parameter",
+            "fn f<#[cfg(test)] A: crate::store::T, B: crate::store::P>() {}",
+        ),
+        (
+            "argument",
+            "fn f() { g(#[cfg(test)] crate::store::T, crate::store::P); }",
+        ),
+        (
+            "array element",
+            "fn f() { let _ = [#[cfg(test)] crate::store::T, crate::store::P]; }",
+        ),
+        (
+            "tuple element",
+            "fn f() { let _ = (#[cfg(test)] crate::store::T, crate::store::P); }",
+        ),
+        (
+            "expression statement",
+            "fn f() { #[cfg(test)] crate::store::T; crate::store::P; }",
+        ),
+        (
+            "match arm",
+            "fn f() { match 1 { #[cfg(test)] 1 => crate::store::T, _ => crate::store::P } }",
+        ),
+        (
+            "inner attribute of a function body",
+            "fn f() { #![cfg(test)] crate::store::T; } fn g() { crate::store::P; }",
+        ),
+        (
+            "inner attribute of a block",
+            "fn f() { { #![cfg(test)] crate::store::T; } crate::store::P; }",
+        ),
+    ];
+    for (shape, source) in shapes {
+        let input = snapshot(&[
+            ("src/lib.rs", &format!("mod store;\n{source}\n")),
+            ("src/store.rs", "pub struct T; pub struct P;"),
+        ]);
+        let data = project(&input);
+        let spellings = |role: &str| -> Vec<&str> {
+            data[role]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|pair| pair["target"]["path"] == "src/store.rs")
+                .flat_map(|pair| pair["sites"].as_array().unwrap())
+                .filter(|site| site["relationKind"] != "import")
+                .map(|site| site["spelling"].as_str().unwrap())
+                .collect()
+        };
+        assert_eq!(spellings("tests"), ["crate::store::T"], "{shape}: {data}");
+        assert_eq!(
+            spellings("production"),
+            ["crate::store::P"],
+            "{shape}: {data}"
+        );
+    }
+}
+
 /// #986: a private glob maps only the names its scope uses. A re-exporting glob still exposes
 /// every name.
 #[test]

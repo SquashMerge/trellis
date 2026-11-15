@@ -2028,6 +2028,60 @@ pub(super) fn extract(
     Ok(result)
 }
 
+/// Whether the syntax at `start..end`, or anything enclosing it, carries an attribute that
+/// marks test code under Decision 0011 (#988). The pinned grammar attaches an attribute in
+/// one of three shapes, and every enclosing node is checked for all of them:
+///
+/// - an outer attribute is a preceding sibling of what it applies to: an item or statement,
+///   a field, an enum variant, a parameter, a generic parameter, or an element of an argument
+///   list, array or tuple. A tuple-struct field's visibility lies between the two;
+/// - a match arm and a struct-expression field own their outer attributes as leading children;
+/// - an inner attribute leads the block or module body it applies to.
+pub(super) fn under_test_attribute(
+    doc: &DocumentInput,
+    tree: &Tree,
+    start: usize,
+    end: usize,
+    work: &mut Work,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<bool> {
+    let marks = |node: Node<'_>| crate::native_evidence::rust_test_attribute(node, &doc.file);
+    let comment = |node: Node<'_>| matches!(node.kind(), "line_comment" | "block_comment");
+    let mut current = tree.root_node().descendant_for_byte_range(start, end);
+    while let Some(node) = current {
+        owner_step(work, check)?;
+        // Any token but these, a separating comma included, ends the node's own attributes.
+        let mut previous = node.prev_sibling();
+        while let Some(sibling) = previous {
+            owner_step(work, check)?;
+            match sibling.kind() {
+                "attribute_item" if marks(sibling) => return Ok(true),
+                "attribute_item" | "inner_attribute_item" | "visibility_modifier" => {}
+                _ if comment(sibling) => {}
+                _ => break,
+            }
+            previous = sibling.prev_sibling();
+        }
+        let owns = matches!(
+            node.kind(),
+            "match_arm" | "field_initializer" | "shorthand_field_initializer"
+        );
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            owner_step(work, check)?;
+            match child.kind() {
+                "inner_attribute_item" if marks(child) => return Ok(true),
+                "attribute_item" if owns && marks(child) => return Ok(true),
+                "attribute_item" | "inner_attribute_item" => {}
+                _ if comment(child) => {}
+                _ => break,
+            }
+        }
+        current = node.parent();
+    }
+    Ok(false)
+}
+
 /// The path of module `name` in module directory `directory` (`""` is the checkout's).
 fn child_path(directory: &str, name: &str) -> String {
     if directory.is_empty() {

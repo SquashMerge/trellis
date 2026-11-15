@@ -1243,6 +1243,7 @@ struct SiteContext<'a> {
     newlines: Vec<usize>,
     callers: callers::Callers<'a>,
     keys: BTreeMap<String, String>,
+    tree: &'a Tree,
 }
 impl SiteContext<'_> {
     #[allow(clippy::too_many_arguments)]
@@ -1274,10 +1275,18 @@ impl SiteContext<'_> {
                 },
             }
         });
-        let role = owner.map(|d| match d.role {
+        let mut role = owner.map(|d| match d.role {
             DeclarationRole::Test => "test",
             DeclarationRole::Production => "production",
         });
+        // A `#[cfg(test)]` statement, block, arm or `use` item is no declaration, so no
+        // stored role covers it (#988).
+        if role == Some("production")
+            && doc.key.language == "rust"
+            && rust::under_test_attribute(doc, self.tree, start, end, work, check)?
+        {
+            role = Some("test");
+        }
         let range = crate::native_evidence::Range { start, end };
         let call_id = match call_id {
             Some(id) => Some(id),
@@ -1358,6 +1367,7 @@ fn prepare_file(
         declarations: RangeIndex::new(doc.declarations.iter().map(|d| &d.range), &mut work, check)?,
         calls: RangeIndex::new(doc.calls.iter().map(|c| &c.range), &mut work, check)?,
         newlines: newlines(&doc.file.text),
+        tree,
     };
     // Semantic anchors by start offset (#523). A structural site consumes every anchor
     // inside it, and a call joined on its whole invocation that starts with it; it is
