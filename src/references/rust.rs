@@ -79,6 +79,8 @@ impl ScopeIndex {
     }
 }
 type Name = (u8, String);
+/// The declarations of the Rust files, by document and range.
+type DeclarationsByRange<'a> = BTreeMap<(usize, usize, usize), Vec<&'a Declaration>>;
 const TYPE: u8 = 0;
 const VALUE: u8 = 1;
 
@@ -196,6 +198,21 @@ pub(super) struct Catalog {
     externs: BTreeMap<usize, BTreeMap<String, Option<usize>>>,
     pub(super) work: Work,
 }
+/// A crate root: a conventional root of the checkout's package, or a library or binary
+/// root of a proved Cargo workspace member (#772). Its modules live in its directory.
+fn crate_root(
+    workspace: &super::cargo_workspace::Workspace,
+    doc: &DocumentInput,
+) -> Option<String> {
+    let path = doc.key.path.as_str();
+    if matches!(path, "src/lib.rs" | "src/main.rs") {
+        return Some("src".to_owned());
+    }
+    workspace.crate_root(&doc.key.source_set_id, path)?;
+    // A root at the checkout's top level (`[lib] path = "lib.rs"`) has the checkout
+    // directory, `""`, as its module directory.
+    Some(path.rsplit_once('/').map_or("", |(dir, _)| dir).to_owned())
+}
 
 impl Catalog {
     pub(super) fn new(
@@ -218,67 +235,7 @@ impl Catalog {
             externs: BTreeMap::new(),
             work,
         };
-        // A crate root: a conventional root of the checkout's package, or a library or binary
-        // root of a proved Cargo workspace member (#772). Its modules live in its directory.
-        let crate_root = |doc: &DocumentInput| -> Option<String> {
-            let path = doc.key.path.as_str();
-            if matches!(path, "src/lib.rs" | "src/main.rs") {
-                return Some("src".to_owned());
-            }
-            workspace.crate_root(&doc.key.source_set_id, path)?;
-            // A root at the checkout's top level (`[lib] path = "lib.rs"`) has the checkout
-            // directory, `""`, as its module directory.
-            Some(path.rsplit_once('/').map_or("", |(dir, _)| dir).to_owned())
-        };
-        let mut declarations = BTreeMap::new();
-        for (document, doc) in docs.iter().enumerate() {
-            if doc.key.language != "rust" {
-                continue;
-            }
-            for declaration in &doc.declarations {
-                result.step(check)?;
-                // The file module can span exactly the same bytes as its sole item.
-                if declaration.kind == "module" && declaration.ancestors.is_empty() {
-                    continue;
-                }
-                declarations
-                    .entry((document, declaration.range.start, declaration.range.end))
-                    .or_insert_with(Vec::new)
-                    .push(declaration);
-            }
-            if let Some(declaration) = doc
-                .declarations
-                .iter()
-                .find(|d| d.kind == "module" && d.ancestors.is_empty())
-            {
-                result.file_declarations.insert(
-                    document,
-                    DeclarationId {
-                        document,
-                        start: declaration.range.start,
-                        end: declaration.range.end,
-                        sid: declaration.syntax_id.clone(),
-                    },
-                );
-            }
-            let path = &doc.key.path;
-            let directory = if let Some(directory) = crate_root(doc) {
-                directory
-            } else if let Some(prefix) = path.strip_suffix("/mod.rs") {
-                prefix.to_owned()
-            } else {
-                path.strip_suffix(".rs").unwrap_or(path).to_owned()
-            };
-            let scope = result.add_scope(
-                document,
-                trees[document].root_node(),
-                None,
-                directory,
-                true,
-                check,
-            )?;
-            result.files.insert(document, scope);
-        }
+        let declarations = result.index_files(docs, trees, workspace, check)?;
         let mut edges = Vec::new();
         for (&document, &scope) in &result.files.clone() {
             result.scan(
@@ -298,10 +255,84 @@ impl Catalog {
                 scope.cut = true;
             }
         }
-        for edge in &mut edges {
-            result.step(check)?;
+        result.link_module_edges(docs, documents, &mut edges, check)?;
+        result.assign_parents(&edges, check)?;
+        result.mark_roots(docs, documents, workspace, &edges, check)?;
+        result.keep_lost_owners_unknown(docs, trees, &edges, check)?;
+        result.build_scope_indexes(check)?;
+        Ok(result)
+    }
+    /// The declarations of every Rust file by range, and each file's module scope.
+    fn index_files<'a>(
+        &mut self,
+        docs: &[&'a DocumentInput],
+        trees: &[Tree],
+        workspace: &super::cargo_workspace::Workspace,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<DeclarationsByRange<'a>> {
+        let mut declarations = BTreeMap::new();
+        for (document, doc) in docs.iter().enumerate() {
+            if doc.key.language != "rust" {
+                continue;
+            }
+            for declaration in &doc.declarations {
+                self.step(check)?;
+                // The file module can span exactly the same bytes as its sole item.
+                if declaration.kind == "module" && declaration.ancestors.is_empty() {
+                    continue;
+                }
+                declarations
+                    .entry((document, declaration.range.start, declaration.range.end))
+                    .or_insert_with(Vec::new)
+                    .push(declaration);
+            }
+            if let Some(declaration) = doc
+                .declarations
+                .iter()
+                .find(|d| d.kind == "module" && d.ancestors.is_empty())
+            {
+                self.file_declarations.insert(
+                    document,
+                    DeclarationId {
+                        document,
+                        start: declaration.range.start,
+                        end: declaration.range.end,
+                        sid: declaration.syntax_id.clone(),
+                    },
+                );
+            }
+            let path = &doc.key.path;
+            let directory = if let Some(directory) = crate_root(workspace, doc) {
+                directory
+            } else if let Some(prefix) = path.strip_suffix("/mod.rs") {
+                prefix.to_owned()
+            } else {
+                path.strip_suffix(".rs").unwrap_or(path).to_owned()
+            };
+            let scope = self.add_scope(
+                document,
+                trees[document].root_node(),
+                None,
+                directory,
+                true,
+                check,
+            )?;
+            self.files.insert(document, scope);
+        }
+        Ok(declarations)
+    }
+    /// A `mod name;` finds its file, and the binding of every `mod` learns its module scope.
+    fn link_module_edges(
+        &mut self,
+        docs: &[&DocumentInput],
+        documents: &BTreeMap<DocumentKey, usize>,
+        edges: &mut [ModuleEdge],
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        for edge in edges {
+            self.step(check)?;
             if edge.child.is_none() {
-                let scope = &result.scopes[edge.scope];
+                let scope = &self.scopes[edge.scope];
                 let doc = docs[scope.document];
                 let prefix = child_path(&scope.directory, &edge.name);
                 let candidates = find(
@@ -310,12 +341,12 @@ impl Catalog {
                     documents,
                 );
                 if let [document] = candidates.as_slice() {
-                    edge.child = result.files.get(document).copied();
+                    edge.child = self.files.get(document).copied();
                 }
             }
             if let Some(child) = edge.child {
                 let key = (TYPE, edge.name.clone());
-                if let Some(bindings) = result.scopes[edge.scope].explicit.get_mut(&key) {
+                if let Some(bindings) = self.scopes[edge.scope].explicit.get_mut(&key) {
                     for binding in bindings {
                         if let Some(candidate) = &mut binding.candidate
                             && candidate.declaration.start == edge.start
@@ -327,71 +358,113 @@ impl Catalog {
                 }
             }
         }
+        Ok(())
+    }
+    /// A module with one declaring scope has it as its parent; with several it is ambiguous.
+    fn assign_parents(
+        &mut self,
+        edges: &[ModuleEdge],
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
         let mut parents: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
-        for edge in &edges {
-            result.step(check)?;
+        for edge in edges {
+            self.step(check)?;
             if let Some(child) = edge.child {
                 parents.entry(child).or_default().insert(edge.scope);
             }
         }
         for (child, parents) in parents {
             if parents.len() == 1 {
-                result.scopes[child].parent = parents.first().copied();
+                self.scopes[child].parent = parents.first().copied();
             } else {
-                result.ambiguous.insert(child);
+                self.ambiguous.insert(child);
             }
         }
-        // A file is owned only by a unique, witnessed chain from a conventional root.
-        for (&document, &scope) in &result.files.clone() {
-            if crate_root(docs[document]).is_none() {
+        Ok(())
+    }
+    /// A file is owned only by a unique, witnessed chain from a conventional root.
+    fn mark_roots(
+        &mut self,
+        docs: &[&DocumentInput],
+        documents: &BTreeMap<DocumentKey, usize>,
+        workspace: &super::cargo_workspace::Workspace,
+        edges: &[ModuleEdge],
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        for (&document, &scope) in &self.files.clone() {
+            if crate_root(workspace, docs[document]).is_none() {
                 continue;
             }
             let key = &docs[document].key;
-            if let Some(root) = workspace.crate_root(&key.source_set_id, &key.path) {
-                let mut externs = BTreeMap::new();
-                for (name, library) in workspace.externs(&key.source_set_id, root) {
-                    result.step(check)?;
-                    let library = library.and_then(|path| {
-                        let document = documents.get(&DocumentKey {
-                            source_set_id: key.source_set_id.clone(),
-                            language: "rust".into(),
-                            path: path.to_owned(),
-                        })?;
-                        result.files.get(document).copied()
-                    });
-                    externs.insert(name, library);
-                }
-                result.externs.insert(scope, externs);
+            self.bind_externs(documents, workspace, key, scope, check)?;
+            self.reach_from_root(scope, edges, check)?;
+        }
+        Ok(())
+    }
+    /// The extern crate names a workspace member's root binds (#772).
+    fn bind_externs(
+        &mut self,
+        documents: &BTreeMap<DocumentKey, usize>,
+        workspace: &super::cargo_workspace::Workspace,
+        key: &DocumentKey,
+        scope: usize,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        if let Some(root) = workspace.crate_root(&key.source_set_id, &key.path) {
+            let mut externs = BTreeMap::new();
+            for (name, library) in workspace.externs(&key.source_set_id, root) {
+                self.step(check)?;
+                let library = library.and_then(|path| {
+                    let document = documents.get(&DocumentKey {
+                        source_set_id: key.source_set_id.clone(),
+                        language: "rust".into(),
+                        path: path.to_owned(),
+                    })?;
+                    self.files.get(document).copied()
+                });
+                externs.insert(name, library);
             }
-            let mut pending = vec![(scope, BTreeSet::new())];
-            while let Some((current, mut route)) = pending.pop() {
-                result.step(check)?;
-                if !route.insert(current) {
+            self.externs.insert(scope, externs);
+        }
+        Ok(())
+    }
+    /// Every scope the root `scope` reaches through singly bound `mod` items has it as a root.
+    fn reach_from_root(
+        &mut self,
+        scope: usize,
+        edges: &[ModuleEdge],
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let mut pending = vec![(scope, BTreeSet::new())];
+        while let Some((current, mut route)) = pending.pop() {
+            self.step(check)?;
+            if !route.insert(current) {
+                continue;
+            }
+            self.roots.entry(current).or_default().insert(scope);
+            for edge in edges {
+                self.step(check)?;
+                if edge.scope != current {
                     continue;
                 }
-                result.roots.entry(current).or_default().insert(scope);
-                for edge in &edges {
-                    result.step(check)?;
-                    if edge.scope != current {
-                        continue;
-                    }
-                    let bindings = result.scopes[current]
-                        .explicit
-                        .get(&(TYPE, edge.name.clone()));
-                    if bindings.is_some_and(|b| b.len() == 1)
-                        && let Some(child) = edge.child
-                    {
-                        pending.push((child, route.clone()));
-                    }
+                let bindings = self.scopes[current]
+                    .explicit
+                    .get(&(TYPE, edge.name.clone()));
+                if bindings.is_some_and(|b| b.len() == 1)
+                    && let Some(child) = edge.child
+                {
+                    pending.push((child, route.clone()));
                 }
             }
         }
-        result.keep_lost_owners_unknown(docs, trees, &edges, check)?;
-        for id in 0..result.scopes.len() {
-            result.step(check)?;
-            let scope = &result.scopes[id];
-            result
-                .scope_indexes
+        Ok(())
+    }
+    /// One interval index per file over its scopes, for `scope_at`.
+    fn build_scope_indexes(&mut self, check: &mut impl FnMut() -> Result<()>) -> Result<()> {
+        for id in 0..self.scopes.len() {
+            self.step(check)?;
+            let scope = &self.scopes[id];
+            self.scope_indexes
                 .entry(scope.document)
                 .or_insert_with(|| ScopeIndex {
                     ranges: Vec::new(),
@@ -400,13 +473,13 @@ impl Catalog {
                 .ranges
                 .push((id, scope.start, scope.end));
         }
-        for index in result.scope_indexes.values_mut() {
+        for index in self.scope_indexes.values_mut() {
             index.ranges.sort_by_key(|&(id, start, _)| (start, id));
             check()?;
             index.max_ends.resize(index.ranges.len(), 0);
-            index.build(0, index.ranges.len(), &mut result.work, check)?;
+            index.build(0, index.ranges.len(), &mut self.work, check)?;
         }
-        Ok(result)
+        Ok(())
     }
     /// A parser error can hide a `mod` from its file, and a file with two owners has no proved
     /// crate. So a file a broken module could declare, because its text names it, has no root
@@ -549,89 +622,34 @@ impl Catalog {
                 continue;
             }
             if matches!(child.kind(), "attribute_item" | "inner_attribute_item") {
-                let attribute: String = text(doc, child)
-                    .chars()
-                    .filter(|c| !c.is_whitespace())
-                    .collect();
-                if attribute.starts_with("#![cfg(") || attribute.starts_with("#![cfg_attr(") {
-                    scope_uncertain = true;
-                } else if attribute.starts_with("#[cfg(")
-                    || attribute.starts_with("#[cfg_attr(")
-                    || attribute == "#[test]"
-                {
-                    uncertain = true;
-                } else if attribute.starts_with("#[path=") {
-                    custom_path = true;
-                } else if ![
-                    "#[derive(",
-                    "#[allow(",
-                    "#[warn(",
-                    "#[deny(",
-                    "#[forbid(",
-                    "#[doc",
-                    "#[test]",
-                    "#[inline",
-                    "#[repr(",
-                    "#[must_use",
-                    "#[cold]",
-                    "#[no_mangle]",
-                ]
-                .iter()
-                .any(|a| attribute.starts_with(a))
-                {
-                    self.scopes[scope].opaque = true;
-                    if child.kind() == "inner_attribute_item" {
-                        scope_uncertain = true;
-                    } else {
-                        uncertain = true;
-                    }
-                }
+                self.note_attribute(
+                    doc,
+                    child,
+                    scope,
+                    &mut uncertain,
+                    &mut scope_uncertain,
+                    &mut custom_path,
+                );
                 continue;
             }
             let item_uncertain = uncertain || scope_uncertain;
             uncertain = false;
             let item_custom = custom_path;
             custom_path = false;
+            let item = Item {
+                doc,
+                document,
+                scope,
+                child,
+                item_uncertain,
+                item_custom,
+            };
             if child.kind() == "extern_crate_declaration" {
-                if let Some(name) = child
-                    .child_by_field_name("alias")
-                    .or_else(|| child.child_by_field_name("name"))
-                {
-                    self.scopes[scope]
-                        .explicit
-                        .entry((TYPE, text(doc, name).to_owned()))
-                        .or_default()
-                        .push(Binding {
-                            candidate: None,
-                            public: visibility(doc, child).is_some(),
-                            crate_only: false,
-                            uncertain: true,
-                        });
-                }
+                self.bind_extern_crate(item);
                 continue;
             }
             if child.kind() == "use_declaration" {
-                let public = visibility(doc, child).is_some();
-                let crate_only = crate_visibility(doc, child);
-                let restricted = visibility(doc, child).is_some_and(|v| v != "pub") && !crate_only;
-                if let Some(argument) = child.child_by_field_name("argument") {
-                    let (imports, cut) = imports(
-                        doc,
-                        argument,
-                        (public, crate_only),
-                        item_uncertain || restricted,
-                        &mut self.work,
-                        check,
-                    )?;
-                    // Indexed once here; a name lookup then reads only its matches (#894).
-                    self.charge(imports.len(), check)?;
-                    for import in imports {
-                        self.scopes[scope].imports.push(import);
-                    }
-                    // A skipped import could bind any name, so nothing here is proved absent.
-                    self.scopes[scope].opaque |= cut;
-                    self.scopes[scope].cut |= cut;
-                }
+                self.bind_use(item, check)?;
                 continue;
             }
             if child.kind() == "macro_invocation"
@@ -643,110 +661,263 @@ impl Catalog {
             if opaque(child) {
                 continue;
             }
-            let namespaces: &[u8] = match child.kind() {
-                "mod_item" | "type_item" | "trait_item" | "union_item" | "enum_item" => &[TYPE],
-                "function_item" | "const_item" | "static_item" => &[VALUE],
-                "struct_item" => {
-                    if child
-                        .child_by_field_name("body")
-                        .is_some_and(|b| b.kind() == "field_declaration_list")
-                    {
-                        &[TYPE]
-                    } else {
-                        &[TYPE, VALUE]
-                    }
-                }
-                _ => &[],
-            };
+            let namespaces = item_namespaces(child);
             if !namespaces.is_empty()
                 && let Some(name) = child.child_by_field_name("name")
             {
-                let name = text(doc, name).to_owned();
-                let declaration = declarations
-                    .get(&(document, child.start_byte(), child.end_byte()))
-                    .and_then(|d| (d.len() == 1).then(|| d[0]));
-                let candidate = declaration.map(|d| Candidate {
-                    declaration: DeclarationId {
-                        document,
-                        start: d.range.start,
-                        end: d.range.end,
-                        sid: d.syntax_id.clone(),
-                    },
-                    module: None,
-                    follow: 0,
-                    proof: BTreeSet::from([document]),
-                });
-                let public = visibility(doc, child).is_some();
-                // `pub(crate)` is visible throughout its crate (#828); other restricted
-                // visibilities are not modeled.
-                let crate_only = crate_visibility(doc, child);
-                let restricted = visibility(doc, child).is_some_and(|v| v != "pub") && !crate_only;
-                for &namespace in namespaces {
-                    self.step(check)?;
-                    self.scopes[scope]
-                        .explicit
-                        .entry((namespace, name.clone()))
-                        .or_default()
-                        .push(Binding {
-                            candidate: candidate.clone(),
-                            public,
-                            crate_only,
-                            uncertain: item_uncertain
-                                || restricted
-                                || item_custom
-                                || declaration.is_some_and(|d| d.role == DeclarationRole::Test),
-                        });
-                }
+                let name = self.bind_item(item, name, namespaces, declarations, check)?;
                 if child.kind() == "mod_item" {
-                    let directory = child_path(&self.scopes[scope].directory, &name);
-                    let child_scope = if let Some(body) = child.child_by_field_name("body") {
-                        let child_scope =
-                            self.add_scope(document, body, Some(scope), directory, true, check)?;
-                        self.scan(
-                            docs,
-                            body,
-                            child_scope,
-                            declarations,
-                            edges,
-                            depth + 1,
-                            check,
-                        )?;
-                        Some(child_scope)
-                    } else {
-                        None
-                    };
-                    if !item_custom {
-                        edges.push(ModuleEdge {
-                            scope,
-                            name,
-                            start: child.start_byte(),
-                            end: child.end_byte(),
-                            child: child_scope,
-                        });
-                    }
+                    self.enter_module(docs, item, name, declarations, edges, depth, check)?;
                     continue;
                 }
             }
-            if matches!(
-                child.kind(),
-                "impl_item" | "trait_item" | "enum_item" | "struct_item" | "union_item"
-            ) {
-                // Members are not module exports; their nested bodies still have lexical scopes.
-                self.scan_bodies(docs, child, scope, declarations, edges, depth + 1, check)?;
-            } else if child.kind() == "block" {
-                let block = self.add_scope(
-                    document,
-                    child,
-                    Some(scope),
-                    self.scopes[scope].directory.clone(),
-                    false,
-                    check,
-                )?;
-                self.bind_parameters(docs, child, block, check)?;
-                self.scan(docs, child, block, declarations, edges, depth + 1, check)?;
+            self.descend(docs, item, declarations, edges, depth, check)?;
+        }
+        Ok(())
+    }
+    /// What an attribute says about the item after it, or with `#!` about the whole scope.
+    fn note_attribute(
+        &mut self,
+        doc: &DocumentInput,
+        child: Node<'_>,
+        scope: usize,
+        uncertain: &mut bool,
+        scope_uncertain: &mut bool,
+        custom_path: &mut bool,
+    ) {
+        let attribute: String = text(doc, child)
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        if attribute.starts_with("#![cfg(") || attribute.starts_with("#![cfg_attr(") {
+            *scope_uncertain = true;
+        } else if attribute.starts_with("#[cfg(")
+            || attribute.starts_with("#[cfg_attr(")
+            || attribute == "#[test]"
+        {
+            *uncertain = true;
+        } else if attribute.starts_with("#[path=") {
+            *custom_path = true;
+        } else if ![
+            "#[derive(",
+            "#[allow(",
+            "#[warn(",
+            "#[deny(",
+            "#[forbid(",
+            "#[doc",
+            "#[test]",
+            "#[inline",
+            "#[repr(",
+            "#[must_use",
+            "#[cold]",
+            "#[no_mangle]",
+        ]
+        .iter()
+        .any(|a| attribute.starts_with(a))
+        {
+            self.scopes[scope].opaque = true;
+            if child.kind() == "inner_attribute_item" {
+                *scope_uncertain = true;
             } else {
-                self.scan(docs, child, scope, declarations, edges, depth + 1, check)?;
+                *uncertain = true;
             }
+        }
+    }
+    /// `extern crate name;` binds a name this catalog does not follow.
+    fn bind_extern_crate(&mut self, item: Item<'_, '_>) {
+        let Item {
+            doc, scope, child, ..
+        } = item;
+        if let Some(name) = child
+            .child_by_field_name("alias")
+            .or_else(|| child.child_by_field_name("name"))
+        {
+            self.scopes[scope]
+                .explicit
+                .entry((TYPE, text(doc, name).to_owned()))
+                .or_default()
+                .push(Binding {
+                    candidate: None,
+                    public: visibility(doc, child).is_some(),
+                    crate_only: false,
+                    uncertain: true,
+                });
+        }
+    }
+    /// The imports of one `use` declaration, indexed in their scope.
+    fn bind_use(
+        &mut self,
+        item: Item<'_, '_>,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let Item {
+            doc,
+            scope,
+            child,
+            item_uncertain,
+            ..
+        } = item;
+        let public = visibility(doc, child).is_some();
+        let crate_only = crate_visibility(doc, child);
+        let restricted = visibility(doc, child).is_some_and(|v| v != "pub") && !crate_only;
+        if let Some(argument) = child.child_by_field_name("argument") {
+            let (imports, cut) = imports(
+                doc,
+                argument,
+                (public, crate_only),
+                item_uncertain || restricted,
+                &mut self.work,
+                check,
+            )?;
+            // Indexed once here; a name lookup then reads only its matches (#894).
+            self.charge(imports.len(), check)?;
+            for import in imports {
+                self.scopes[scope].imports.push(import);
+            }
+            // A skipped import could bind any name, so nothing here is proved absent.
+            self.scopes[scope].opaque |= cut;
+            self.scopes[scope].cut |= cut;
+        }
+        Ok(())
+    }
+    /// Binds a named item in each of its namespaces and returns its name.
+    fn bind_item(
+        &mut self,
+        item: Item<'_, '_>,
+        name: Node<'_>,
+        namespaces: &[u8],
+        declarations: &BTreeMap<(usize, usize, usize), Vec<&Declaration>>,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<String> {
+        let Item {
+            doc,
+            document,
+            scope,
+            child,
+            item_uncertain,
+            item_custom,
+        } = item;
+        let name = text(doc, name).to_owned();
+        let declaration = declarations
+            .get(&(document, child.start_byte(), child.end_byte()))
+            .and_then(|d| (d.len() == 1).then(|| d[0]));
+        let candidate = declaration.map(|d| Candidate {
+            declaration: DeclarationId {
+                document,
+                start: d.range.start,
+                end: d.range.end,
+                sid: d.syntax_id.clone(),
+            },
+            module: None,
+            follow: 0,
+            proof: BTreeSet::from([document]),
+        });
+        let public = visibility(doc, child).is_some();
+        // `pub(crate)` is visible throughout its crate (#828); other restricted
+        // visibilities are not modeled.
+        let crate_only = crate_visibility(doc, child);
+        let restricted = visibility(doc, child).is_some_and(|v| v != "pub") && !crate_only;
+        for &namespace in namespaces {
+            self.step(check)?;
+            self.scopes[scope]
+                .explicit
+                .entry((namespace, name.clone()))
+                .or_default()
+                .push(Binding {
+                    candidate: candidate.clone(),
+                    public,
+                    crate_only,
+                    uncertain: item_uncertain
+                        || restricted
+                        || item_custom
+                        || declaration.is_some_and(|d| d.role == DeclarationRole::Test),
+                });
+        }
+        Ok(name)
+    }
+    /// An inline `mod` gets its scope and is scanned; every `mod` without a custom path is an edge.
+    #[allow(clippy::too_many_arguments)] // Shares the same captured scan inputs and depth budget.
+    fn enter_module(
+        &mut self,
+        docs: &[&DocumentInput],
+        item: Item<'_, '_>,
+        name: String,
+        declarations: &BTreeMap<(usize, usize, usize), Vec<&Declaration>>,
+        edges: &mut Vec<ModuleEdge>,
+        depth: usize,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let Item {
+            document,
+            scope,
+            child,
+            item_custom,
+            ..
+        } = item;
+        let directory = child_path(&self.scopes[scope].directory, &name);
+        let child_scope = if let Some(body) = child.child_by_field_name("body") {
+            let child_scope =
+                self.add_scope(document, body, Some(scope), directory, true, check)?;
+            self.scan(
+                docs,
+                body,
+                child_scope,
+                declarations,
+                edges,
+                depth + 1,
+                check,
+            )?;
+            Some(child_scope)
+        } else {
+            None
+        };
+        if !item_custom {
+            edges.push(ModuleEdge {
+                scope,
+                name,
+                start: child.start_byte(),
+                end: child.end_byte(),
+                child: child_scope,
+            });
+        }
+        Ok(())
+    }
+    /// The scopes below an item that is not a module: the bodies of a type's members, a block,
+    /// or whatever the node holds.
+    fn descend(
+        &mut self,
+        docs: &[&DocumentInput],
+        item: Item<'_, '_>,
+        declarations: &BTreeMap<(usize, usize, usize), Vec<&Declaration>>,
+        edges: &mut Vec<ModuleEdge>,
+        depth: usize,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let Item {
+            document,
+            scope,
+            child,
+            ..
+        } = item;
+        if matches!(
+            child.kind(),
+            "impl_item" | "trait_item" | "enum_item" | "struct_item" | "union_item"
+        ) {
+            // Members are not module exports; their nested bodies still have lexical scopes.
+            self.scan_bodies(docs, child, scope, declarations, edges, depth + 1, check)?;
+        } else if child.kind() == "block" {
+            let block = self.add_scope(
+                document,
+                child,
+                Some(scope),
+                self.scopes[scope].directory.clone(),
+                false,
+                check,
+            )?;
+            self.bind_parameters(docs, child, block, check)?;
+            self.scan(docs, child, block, declarations, edges, depth + 1, check)?;
+        } else {
+            self.scan(docs, child, scope, declarations, edges, depth + 1, check)?;
         }
         Ok(())
     }
@@ -1846,6 +2017,35 @@ impl Catalog {
             });
         }
         Ok(result)
+    }
+}
+/// One child of a scanned node, with what the attributes before it said about it. Data only:
+/// each pass of `scan` destructures it into the names its statements use.
+#[derive(Clone, Copy)]
+struct Item<'a, 'tree> {
+    doc: &'a DocumentInput,
+    document: usize,
+    scope: usize,
+    child: Node<'tree>,
+    item_uncertain: bool,
+    item_custom: bool,
+}
+/// The namespaces an item's name is bound in; none for a node that binds no name.
+fn item_namespaces(child: Node<'_>) -> &'static [u8] {
+    match child.kind() {
+        "mod_item" | "type_item" | "trait_item" | "union_item" | "enum_item" => &[TYPE],
+        "function_item" | "const_item" | "static_item" => &[VALUE],
+        "struct_item" => {
+            if child
+                .child_by_field_name("body")
+                .is_some_and(|b| b.kind() == "field_declaration_list")
+            {
+                &[TYPE]
+            } else {
+                &[TYPE, VALUE]
+            }
+        }
+        _ => &[],
     }
 }
 fn visibility<'a>(doc: &'a DocumentInput, node: Node<'_>) -> Option<&'a str> {

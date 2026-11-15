@@ -36,7 +36,16 @@ population as unknown references (see #1088).
 The measurement runs through a daemon of its own under a private HOME, on a fresh index
 of this checkout with fresh rust-analyzer and scip-typescript evidence; it never touches
 the user's daemon or index. It runs only when `trellis producer doctor` reports both
-producers `ready`; otherwise it prints a notice and exits 0.
+producers `ready`; otherwise it prints a notice and exits 0. The nightly job passes
+`--require-producers`, which makes that a failure.
+
+Exit status: 0, the record holds (or the run was not made, without
+`--require-producers`); 1, the measurement is worse than the record: deviations rose,
+more files are partial, or coverage was lost (or `--update` refused to rewrite the
+record); 3, no comparison was made: a producer is missing or failed, the build, the
+daemon or the index failed, the record or the binary is missing or unreadable, the
+cleanup failed, or anything else went wrong. An exit of 3 says nothing about the
+layering. 2 is a usage error.
 
 The script starts that daemon itself, so it knows its PID, and on every exit it stops
 it, waits for the process to be gone and only then removes the HOME. A stop that fails
@@ -54,6 +63,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -102,6 +112,10 @@ ERROR_CODE = re.compile(r"^Error: ([a-z_]+)(?::|$)", re.MULTILINE)
 # Hang backstops for the cleanup: `daemon stop` and the daemon's exit after it, then
 # after SIGTERM, then after SIGKILL.
 STOP_SECS, TERM_SECS, KILL_SECS = 120, 15, 15
+# Exit statuses. WORSE: the measurement was made and is worse than the record.
+# NOT_MEASURED: no comparison was made, so nothing is known about the layering. 2 is
+# argparse's usage error.
+WORSE, NOT_MEASURED = 1, 3
 
 
 class Failed(Exception):
@@ -335,6 +349,19 @@ def missing_producers(trellis):
     return reasons
 
 
+def without_producers(missing, required):
+    """Returns (exit status, line) for a run that cannot be made because producers are
+    not ready. On request that is a notice; where they are required, as in the nightly
+    job, it is a failure to measure, never a worse measurement."""
+    reasons = "; ".join(missing)
+    if required:
+        return NOT_MEASURED, ("rules ratchet FAILED: not measured: it needs both semantic "
+                              f"producers, and {reasons}. Nothing was compared with the record.")
+    return 0, ("rules ratchet NOT RUN: it needs both semantic producers, and "
+               f"{reasons}. Run `trellis producer doctor` for the install "
+               "commands. Deviations added by this change are not checked.")
+
+
 def error_code(done):
     """The typed code of a failed CLI command that printed no reply, else None."""
     if done.returncode != 1 or done.stdout.strip():
@@ -445,6 +472,9 @@ def main():
     parser.add_argument(ACCEPT, action="store_true",
                         help="with --update: lower the recorded deviations although "
                              "unknown references are above the record")
+    parser.add_argument("--require-producers", action="store_true",
+                        help="fail (exit 3) when a producer is not ready, instead of "
+                             "printing a notice and exiting 0")
     parser.add_argument("--binary", type=Path, help="a built trellis; default: build one")
     parser.add_argument("--record", type=Path, default=RECORD)
     parser.add_argument("--save-payload", type=Path,
@@ -456,22 +486,29 @@ def main():
         signal.signal(signum, Signals.handle)
     home = Path(tempfile.mkdtemp(prefix="trellis-ratchet-"))
     owned = []  # [trellis, daemon] once this run has started its daemon
-    code = 1
+    code = NOT_MEASURED
     try:
         code = check(args, target_dir, home, owned)
     except Failed as error:
-        print(f"rules ratchet FAILED: {error}", file=sys.stderr)
-        code = 1
+        print(f"rules ratchet FAILED: not measured: {error}", file=sys.stderr)
+        code = NOT_MEASURED
     except Interrupted as error:
         print(f"rules ratchet interrupted by {error}", file=sys.stderr)
         code = 128 + Signals.received
+    except Exception as error:  # a missing record or binary, an I/O error, a defect here
+        # Only an explicit comparison may exit WORSE; Python's own exit for an uncaught
+        # exception is 1 too.
+        traceback.print_exc()
+        print(f"rules ratchet FAILED: not measured: {type(error).__name__}: {error}",
+              file=sys.stderr)
+        code = NOT_MEASURED
     finally:
         Signals.cleaning = True
         problems = shut_down(*(owned or (None, None)), home)
         for problem in problems:
             print(f"rules ratchet FAILED: cleanup: {problem}", file=sys.stderr)
         print(f"rules ratchet took {int(time.monotonic() - started)} s")
-    return code or (1 if problems else 0)
+    return code or (NOT_MEASURED if problems else 0)
 
 
 def check(args, target_dir, home, owned):
@@ -487,10 +524,9 @@ def check(args, target_dir, home, owned):
     trellis = Trellis(binary, private_env(home))
     missing = missing_producers(trellis)
     if missing:
-        print("rules ratchet NOT RUN: it needs both semantic producers, and "
-              + "; ".join(missing) + ". Run `trellis producer doctor` for the install "
-              "commands. Deviations added by this change are not checked.")
-        return 0
+        code, line = without_producers(missing, args.require_producers)
+        print(line)
+        return code
     Signals.check()
     daemon = trellis.start_daemon()
     owned += [trellis, daemon]
@@ -507,14 +543,14 @@ def check(args, target_dir, home, owned):
             refused, lines = update_refusal(record, measured, args.accept_unknown_rise)
             print("\n".join(lines))
             if refused:
-                return 1
+                return WORSE
         write_record(args.record, measured)
         print(f"rules ratchet: wrote {args.record}: "
               + ", ".join(f"{key} {measured[key]}" for key in KEYS))
         return 0
     verdict, lines = compare(record, measured)
     print("\n".join(lines))
-    return 1 if verdict == "fail" else 0
+    return WORSE if verdict == "fail" else 0
 
 
 if __name__ == "__main__":

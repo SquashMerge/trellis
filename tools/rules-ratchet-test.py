@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Offline checks of tools/rules-ratchet.py's comparison and record (#1008)."""
+import contextlib
 import importlib.util
+import re
+import io
 import json
+import signal
 import subprocess
 import sys
 import tempfile
@@ -229,6 +233,117 @@ class Ratchet(unittest.TestCase):
     def test_the_checked_in_record_is_well_formed(self):
         record = RR.read_record(RR.RECORD)
         self.assertEqual(RR.compare(record, record)[0], "equal")
+
+
+class Outcomes(unittest.TestCase):
+    """The exit status says whether a comparison was made (spec G1, nightly)."""
+    MISSING = ["scip-typescript is missing (no launcher on the declared PATH)"]
+
+    def test_missing_producers_are_a_notice_on_request(self):
+        code, line = RR.without_producers(self.MISSING, required=False)
+        self.assertEqual(code, 0)
+        self.assertTrue(line.startswith("rules ratchet NOT RUN: "), line)
+        self.assertIn(self.MISSING[0], line)
+
+    def test_required_producers_that_are_missing_fail_as_not_measured(self):
+        code, line = RR.without_producers(self.MISSING, required=True)
+        self.assertEqual(code, RR.NOT_MEASURED)
+        self.assertTrue(line.startswith("rules ratchet FAILED: not measured: "), line)
+        self.assertIn(self.MISSING[0], line)
+        self.assertIn("Nothing was compared", line)
+
+    def run_main(self, check=None, argv=()):
+        """main() with the measurement replaced by `check`, when one is given; returns
+        (status, stderr)."""
+        handlers = {signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)}
+        for name in ("check", "shut_down"):
+            self.addCleanup(setattr, RR, name, getattr(RR, name))
+        if check is not None:
+            RR.check = check
+        RR.shut_down = lambda trellis, daemon, home: RR.shutil.rmtree(home) or []
+        self.addCleanup(setattr, RR.Signals, "cleaning", False)
+        self.addCleanup(setattr, sys, "argv", sys.argv)
+        sys.argv = ["rules-ratchet.py", *argv]
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                return RR.main(), err.getvalue()
+        finally:
+            for signum, handler in handlers.items():
+                signal.signal(signum, handler)
+
+    def test_a_measurement_that_could_not_be_made_is_not_a_worse_one(self):
+        def fails(*_):
+            raise RR.Failed("producer run rust-analyzer: state failed, outcome None, producer_failed")
+        code, err = self.run_main(fails)
+        self.assertEqual(code, RR.NOT_MEASURED)
+        self.assertIn("rules ratchet FAILED: not measured: producer run rust-analyzer", err)
+        self.assertNotEqual(RR.NOT_MEASURED, RR.WORSE)
+
+    def test_a_worse_measurement_keeps_its_own_status(self):
+        self.assertEqual(self.run_main(lambda *_: RR.WORSE)[0], RR.WORSE)
+        self.assertEqual(self.run_main(lambda *_: 0)[0], 0)
+
+    def test_a_missing_record_is_not_measured(self):
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "no-record.json"
+            code, err = self.run_main(argv=["--record", str(missing), "--binary", "/bin/true"])
+        self.assertEqual(code, RR.NOT_MEASURED)
+        self.assertIn("rules ratchet FAILED: not measured: FileNotFoundError", err)
+        self.assertIn("no-record.json", err)
+        self.assertIn("Traceback", err)
+
+    def test_a_missing_binary_is_not_measured(self):
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "no-trellis"
+            code, err = self.run_main(argv=["--binary", str(missing)])
+        self.assertEqual(code, RR.NOT_MEASURED)
+        self.assertIn("rules ratchet FAILED: not measured: FileNotFoundError", err)
+        self.assertIn("no-trellis", err)
+
+    def test_an_unexpected_exception_is_not_measured(self):
+        def breaks(*_):
+            raise KeyError("payload")
+        code, err = self.run_main(breaks)
+        self.assertEqual(code, RR.NOT_MEASURED)
+        self.assertIn("rules ratchet FAILED: not measured: KeyError", err)
+
+
+class NightlyClassifier(unittest.TestCase):
+    """The nightly job names a layering outcome only from this script's own FAILED
+    lines; the patterns it greps for must be the lines `compare` prints."""
+    WORKFLOW = RR.ROOT / ".github/workflows/proptest-nightly.yml"
+
+    def patterns(self):
+        text = self.WORKFLOW.read_text()
+        found = re.findall(r"if grep -E?q '(\^rules ratchet FAILED: [^']+)' \"\$out/ratchet\.log\"; "
+                           r"then outcome=\"?(?:\$\{outcome:\+\$outcome, \})?([a-z-]+)", text)
+        return {outcome: re.compile(pattern, re.MULTILINE) for pattern, outcome in found}
+
+    def outcomes(self, log):
+        return {outcome for outcome, pattern in self.patterns().items() if pattern.search(log)}
+
+    def compared(self, **changed):
+        return "\n".join(RR.compare(RECORD, {**RECORD, **changed})[1])
+
+    def test_each_comparison_failure_is_named_from_its_own_line(self):
+        self.assertEqual(set(self.patterns()), {"record-exceeded", "lost-coverage"})
+        self.assertEqual(self.outcomes(self.compared(deviatingPairs=4)), {"record-exceeded"})
+        self.assertEqual(self.outcomes(self.compared(partialFiles=2)), {"record-exceeded"})
+        self.assertEqual(self.outcomes(self.compared(deviatingPairs=2, unknownReferences=51)),
+                         {"lost-coverage"})
+        self.assertEqual(self.outcomes(self.compared(deviatingPairs=2, deviatingReferences=11,
+                                                     unknownReferences=51)),
+                         {"record-exceeded", "lost-coverage"})
+
+    def test_an_exit_of_1_without_those_lines_is_not_a_layering_outcome(self):
+        for log in ("Traceback (most recent call last):\nFileNotFoundError: no record\n",
+                    "rules ratchet FAILED: not measured: producer run rust-analyzer\n",
+                    self.compared(), ""):
+            self.assertEqual(self.outcomes(log), set(), log)
+        text = self.WORKFLOW.read_text()
+        self.assertIn('[ -n "$outcome" ] || outcome=not-measured', text)
+        self.assertNotIn("worse-than-record", text)
 
 
 def done(code, stdout="", stderr=""):
