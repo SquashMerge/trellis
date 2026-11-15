@@ -77,7 +77,7 @@ paths = [
   "src/scip_admission.rs", "src/semantic_evidence.rs", "src/semantic_import.rs",
   "src/search_capture.rs",
   "src/native_rust_macros_tests.rs", "src/extractor_inputs_tests.rs", "src/indexer_projection_vectors_tests.rs",
-  "src/semantic_import_complexity_tests.rs", "src/native_rust_macros.rs", "src/producer/**", "src/evidence_budget.rs", "src/semantic_batch.rs", "src/semantic_batch/**",
+  "src/semantic_import_complexity_tests.rs", "src/native_rust_macros.rs", "src/producer/**", "src/evidence_budget.rs", "src/semantic_batch.rs", "src/semantic_batch/**", "src/semantic_catchup.rs",
   "src/semantic_import/**",
   "src/language_set_tests.rs", "src/native_typescript_tests.rs", "src/semantic_join_inputs_tests.rs",
   # In-file test modules moved out of src/native_evidence.rs (R1, #1004).

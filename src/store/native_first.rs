@@ -2,7 +2,7 @@
 use super::*;
 pub(super) mod context;
 mod continuation;
-pub(crate) mod copy;
+mod copy;
 mod local_targets;
 #[cfg(feature = "test-support")]
 pub(in crate::store) mod oracle;
@@ -11,16 +11,13 @@ pub(crate) mod retained_batch;
 mod retained_batch_tests;
 #[cfg(test)]
 mod tests;
-mod unit_read;
+pub(crate) mod unit_read;
 #[cfg(test)]
 mod unit_read_tests;
 pub(crate) mod witness;
 mod witness_preparation;
-#[cfg(any(test, feature = "test-support"))]
-pub use continuation::set_semantic_step_slice_for_tests;
-pub(crate) use continuation::{
-    HeldIndexRead, SemanticContinuation, SemanticUnitOutcome, step_slice,
-};
+pub(crate) use continuation::HeldIndexRead;
+pub(crate) use copy::CopyFilter;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PendingSemanticSelection {
@@ -445,32 +442,6 @@ impl Store {
     ) -> Result<Option<SemanticProjection>> {
         self.native_at(pin, |db, _| {
             semantic_projection_for(db, pin, producer, language, path)
-        })
-    }
-
-    fn with_pending_semantic_inputs<T>(
-        &self,
-        target: &PendingSemanticTarget,
-        held: &HeldIndexRead,
-        read: impl FnOnce(&Connection, &ReadRevision) -> Result<T>,
-    ) -> Result<Option<T>> {
-        self.with_held_read(held, |db| {
-            let selected = self.read_revision_for(db, Some(target.pin), true)?;
-            // S binds new keys to the same cached statements row after row. Without the
-            // query planner stability guarantee SQLite re-prepares a statement whenever a
-            // value it planned around (a LIMIT, a small-integer comparison) is rebound.
-            storage_result(db.set_db_config(
-                rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_QPSG,
-                true,
-            ))?;
-            if pending_target(db)?.as_ref() != Some(target) {
-                return Ok(None);
-            }
-            selected_ensure!(
-                target.root_id == self.identity.root_key,
-                "incompatible_index: pending semantic root differs"
-            );
-            read(db, &selected).map(Some)
         })
     }
 }
