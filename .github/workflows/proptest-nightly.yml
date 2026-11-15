@@ -51,3 +51,132 @@ jobs:
             } else {
               await github.rest.issues.create({owner, repo, title, body});
             }
+
+  # The rules-check ratchet (refactoring spec G1): the same measurement as
+  # `./tools/verify --lane ratchet`, by the script behind that lane, with both
+  # producers required. It reports through `ratchet-report`, never through the
+  # property tests' issue.
+  ratchet:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: 0
+    outputs:
+      outcome: ${{ steps.ratchet.outputs.outcome }}
+      summary: ${{ steps.ratchet.outputs.summary }}
+    steps:
+      - uses: actions/checkout@v7
+      # scip-typescript runs under node, and npm installs it.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+      - uses: ./.github/actions/setup-mold
+      - name: Build Trellis
+        run: cargo build --locked --bin trellis
+      # Trellis names each producer's pinned install command (the pins are in
+      # docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json) and runs it only
+      # on `producer install`. It never installs a prerequisite, so the Rust
+      # toolchain that rust-analyzer is a component of is installed here first,
+      # at the version that command names, with the standard library's source,
+      # which the reference host's toolchain also has.
+      - name: Install the pinned producers
+        shell: bash
+        run: |
+          trellis=target/debug/trellis
+          toolchain=$("$trellis" producer doctor --json | jq -er '.producers[] | select(.name == "rust-analyzer") | .installCommand | split(" ") | last')
+          rustup toolchain install "$toolchain" --profile minimal --component rust-src --no-self-update
+          "$trellis" producer install rust-analyzer --yes
+          "$trellis" producer install scip-typescript --yes
+          "$trellis" producer doctor
+      # Exit 0: the record holds. Exit 1: the measurement is worse than the
+      # record. Anything else: no comparison was made (a producer, the daemon or
+      # the index failed), which says nothing about the layering.
+      - name: Run the ratchet
+        id: ratchet
+        shell: bash
+        run: |
+          out="$RUNNER_TEMP/ratchet"
+          mkdir -p "$out"
+          code=0
+          python3 tools/rules-ratchet.py --binary target/debug/trellis --require-producers --save-payload "$out/rules-check.json" > "$out/ratchet.log" 2>&1 || code=$?
+          cat "$out/ratchet.log"
+          case $code in
+            0) outcome=passed ;;
+            1)
+              outcome=""
+              if grep -Eq '^rules ratchet FAILED: (deviations rose|more files are partial)' "$out/ratchet.log"; then outcome=record-exceeded; fi
+              if grep -q '^rules ratchet FAILED: the comparison population lost coverage' "$out/ratchet.log"; then outcome="${outcome:+$outcome, }lost-coverage"; fi
+              [ -n "$outcome" ] || outcome=worse-than-record
+              ;;
+            *) outcome=not-measured ;;
+          esac
+          {
+            echo "outcome=$outcome"
+            echo "summary<<RATCHET_SUMMARY_END"
+            tail -n 40 "$out/ratchet.log" | cut -c 1-600
+            echo "RATCHET_SUMMARY_END"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Rules ratchet: $outcome (exit $code)"
+            echo
+            tail -n 40 "$out/ratchet.log" | cut -c 1-600 | sed 's/^/    /'
+          } >> "$GITHUB_STEP_SUMMARY"
+          case $outcome in
+            passed) ;;
+            not-measured) echo "::error title=Rules ratchet not measured::No comparison with the record was made (exit $code). This is an infrastructure failure, not a layering regression." ;;
+            *) echo "::error title=Rules ratchet $outcome::The measurement is worse than docs/refactoring/0.2.x/rules-ratchet.json." ;;
+          esac
+          exit "$code"
+      # The ratchet's printed lines and the `rules check` payload it measured.
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() && steps.ratchet.outcome != 'skipped' }}
+        with:
+          name: rules-ratchet-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ratchet/
+          retention-days: 14
+          if-no-files-found: warn
+
+  # The ratchet's own issue, apart from the property tests' one. It says which
+  # outcome failed the job; a run that made no comparison is reported as an
+  # infrastructure failure, never as a layering regression.
+  ratchet-report:
+    if: ${{ always() && needs.ratchet.result == 'failure' }}
+    needs: ratchet
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the ratchet's failure issue
+        uses: actions/github-script@v9
+        env:
+          OUTCOME: ${{ needs.ratchet.outputs.outcome }}
+          SUMMARY: ${{ needs.ratchet.outputs.summary }}
+        with:
+          script: |
+            const title = 'Nightly rules ratchet failed';
+            const {owner, repo} = context.repo;
+            const url = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const outcome = process.env.OUTCOME || 'not-run';
+            const record = '`docs/refactoring/0.2.x/rules-ratchet.json`';
+            const meanings = {
+              'not-run': 'Infrastructure failure, not a layering regression: the job failed before the ratchet ran (the build or a producer install failed). Nothing was compared with the record.',
+              'not-measured': 'Infrastructure failure, not a layering regression: the ratchet could not measure (a producer was missing or failed, or the daemon or the index failed). Nothing was compared with the record.',
+              'record-exceeded': `The record is exceeded: deviating pairs, deviating references or partial files rose above ${record}.`,
+              'lost-coverage': `Lost coverage: deviations are below ${record} while unknown references are above it, which is not progress.`,
+              'record-exceeded, lost-coverage': `The record ${record} is exceeded and coverage was lost; the lines below give both.`,
+            };
+            const meaning = meanings[outcome] || `The measurement is worse than ${record}.`;
+            const fence = '`'.repeat(3);
+            const summary = (process.env.SUMMARY || '').trim().split(fence).join("'''");
+            const lines = summary ? `\n\n${fence}\n${summary}\n${fence}` : '';
+            const body = `The nightly rules ratchet failed at ${context.sha}: **${outcome}**.\n\n${meaning}${lines}\n\n[Run logs](${url}). The run's \`rules-ratchet\` artifact has the full output and the measured \`rules check\` payload.`;
+            const issues = await github.paginate(github.rest.issues.listForRepo, {owner, repo, state: 'open', per_page: 100});
+            const existing = issues.find(issue => !issue.pull_request && issue.title === title);
+            if (existing) {
+              await github.rest.issues.createComment({owner, repo, issue_number: existing.number, body});
+            } else {
+              await github.rest.issues.create({owner, repo, title, body});
+            }

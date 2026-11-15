@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Offline checks of tools/rules-ratchet.py's comparison and record (#1008)."""
+import contextlib
 import importlib.util
+import io
 import json
+import signal
 import subprocess
 import sys
 import tempfile
@@ -229,6 +232,54 @@ class Ratchet(unittest.TestCase):
     def test_the_checked_in_record_is_well_formed(self):
         record = RR.read_record(RR.RECORD)
         self.assertEqual(RR.compare(record, record)[0], "equal")
+
+
+class Outcomes(unittest.TestCase):
+    """The exit status says whether a comparison was made (spec G1, nightly)."""
+    MISSING = ["scip-typescript is missing (no launcher on the declared PATH)"]
+
+    def test_missing_producers_are_a_notice_on_request(self):
+        code, line = RR.without_producers(self.MISSING, required=False)
+        self.assertEqual(code, 0)
+        self.assertTrue(line.startswith("rules ratchet NOT RUN: "), line)
+        self.assertIn(self.MISSING[0], line)
+
+    def test_required_producers_that_are_missing_fail_as_not_measured(self):
+        code, line = RR.without_producers(self.MISSING, required=True)
+        self.assertEqual(code, RR.NOT_MEASURED)
+        self.assertTrue(line.startswith("rules ratchet FAILED: not measured: "), line)
+        self.assertIn(self.MISSING[0], line)
+        self.assertIn("Nothing was compared", line)
+
+    def run_main(self, check):
+        """main() with the measurement replaced by `check`; returns (status, stderr)."""
+        handlers = {signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)}
+        for name, value in (("check", check), ("shut_down", RR.shut_down)):
+            self.addCleanup(setattr, RR, name, getattr(RR, name))
+        RR.check = check
+        RR.shut_down = lambda trellis, daemon, home: RR.shutil.rmtree(home) or []
+        self.addCleanup(setattr, RR.Signals, "cleaning", False)
+        self.addCleanup(setattr, sys, "argv", sys.argv)
+        sys.argv = ["rules-ratchet.py"]
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                return RR.main(), err.getvalue()
+        finally:
+            for signum, handler in handlers.items():
+                signal.signal(signum, handler)
+
+    def test_a_measurement_that_could_not_be_made_is_not_a_worse_one(self):
+        def fails(*_):
+            raise RR.Failed("producer run rust-analyzer: state failed, outcome None, producer_failed")
+        code, err = self.run_main(fails)
+        self.assertEqual(code, RR.NOT_MEASURED)
+        self.assertIn("rules ratchet FAILED: not measured: producer run rust-analyzer", err)
+        self.assertNotEqual(RR.NOT_MEASURED, RR.WORSE)
+
+    def test_a_worse_measurement_keeps_its_own_status(self):
+        self.assertEqual(self.run_main(lambda *_: RR.WORSE)[0], RR.WORSE)
+        self.assertEqual(self.run_main(lambda *_: 0)[0], 0)
 
 
 def done(code, stdout="", stderr=""):
