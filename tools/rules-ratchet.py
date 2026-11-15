@@ -32,13 +32,6 @@ deviating pair whose source or destination file was renamed, split or merged is 
 the record does not have, so the run fails until the record is updated. The pair under
 the old path counts as fallen.
 
-The record is measured on macOS. The nightly job runs on Linux, which counts a few more
-unknown references on the same tree (13 more on main at 588f6343, not attributed by
-file), so there a source file can be above its recorded count with no change. That
-matters only while a recorded pair has fewer deviating references than the record: from
-a merge that lowers a pair until the record is next updated, the nightly job can report
-lost coverage for that pair where a macOS run prints a notice.
-
 Pair totals are recorded as information and never fail: an unknown pair is one source
 file's aggregate, so splitting, merging or renaming a file moves pair counts without
 changing what is known.
@@ -121,12 +114,7 @@ DESCRIPTION = {
             "and renames are not detected: a deviating pair whose source or "
             "destination file was renamed, split or merged is a pair this record does "
             "not have, so the run fails until the record is updated, and the pair "
-            "under the old path counts as fallen. This record is measured on macOS; "
-            "a Linux measurement of the same tree counts a few more unknown "
-            "references, so on Linux a source file can be above its recorded count "
-            "with no change, and a pair with fewer deviating references than recorded "
-            "can then fail as lost coverage there until this record is updated. An "
-            "update is refused when the "
+            "under the old path counts as fallen. An update is refused when the "
             "measurement is lost coverage by this rule, unless --accept-unknown-rise "
             "is given. comparablePairs, conformingPairs and unknownPairs are "
             "information only: an unknown pair is one source file's aggregate, so a "
