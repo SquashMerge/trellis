@@ -13901,34 +13901,6 @@ impl Store {
 
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
-    pub fn publish_stream_native_only_for_tests(
-        &self,
-        options: &crate::model::IndexOptions,
-        capture: &crate::capture::Capture,
-        leader: &topology::WriterGuard,
-        cancel: &CancelFlag,
-    ) -> Result<IndexPin> {
-        let spool = crate::native_evidence::spool_full_capture(
-            options,
-            capture,
-            Path::new(&self.workspace_root),
-            self.root_id(),
-            cancel,
-            &|_| {},
-            |_, _| {},
-            &self.native_spool_dir()?,
-        )?;
-        self.publish_validated_stream_recovery(
-            &spool,
-            capture,
-            leader,
-            self.publication_index_baseline()?,
-            cancel,
-        )
-    }
-
-    #[cfg(feature = "test-support")]
-    #[doc(hidden)]
     #[allow(clippy::too_many_arguments)]
     pub fn publish_stream_semantic_for_tests(
         &self,
@@ -14017,33 +13989,6 @@ impl Store {
             },
             Some((semantic, captured)),
         )
-    }
-
-    /// A document-local native publication, which rejoins selected batches through the
-    /// witness path where it applies.
-    #[cfg(feature = "test-support")]
-    #[doc(hidden)]
-    pub fn publish_local_for_tests(
-        &self,
-        options: &crate::model::IndexOptions,
-        capture: &crate::capture::Capture,
-        leader: &topology::WriterGuard,
-        cancel: &CancelFlag,
-    ) -> Result<IndexPin> {
-        let expected = self.publication_index_baseline()?;
-        let prepared = self
-            .prepare_local_revision(capture, &expected, cancel)?
-            .context("document-local publication unavailable")?;
-        let changed = crate::indexer::project_native_documents(
-            options,
-            capture,
-            &prepared.native,
-            &prepared.changed_paths,
-            cancel,
-            &|_| {},
-        )?;
-        let graph = self.compose_local_revision(capture, &prepared, changed, cancel)?;
-        self.publish_local_native_recovery(&graph, capture, prepared, leader, expected, cancel)
     }
 
     /// Keep the synchronous, same-thread oracle mismatch hook active across N and S.
