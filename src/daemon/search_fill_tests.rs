@@ -1571,3 +1571,36 @@ fn hint_during_the_final_busy_attempt_cannot_undo_its_settlement() {
     drop(registration);
     resume.send(()).unwrap();
 }
+
+#[test]
+fn hint_during_a_retried_attempt_waits_for_the_owner_retry() {
+    // No driver thread: this is the owner's settle transition alone.
+    let core = Arc::new(Core::default());
+    let source: Arc<dyn FillSource> = Arc::new(TestSource(pin(1)));
+    let registration = core.register_source(Arc::downgrade(&source));
+    registration.notify();
+    let job = {
+        let mut inbox = core.inbox.lock().unwrap();
+        let id = inbox.next_ready().unwrap();
+        inbox.claim(id).unwrap()
+    };
+    // The hint arrives while the attempt runs, and the attempt then faults.
+    registration.notify();
+    core.settle(
+        &job,
+        Outcome {
+            pin: Some(pin(1)),
+            cache_epoch: 0,
+            result: Err(StorageBusy.into()),
+        },
+    );
+    {
+        let inbox = core.inbox.lock().unwrap();
+        let slot = &inbox.slots[&registration.id];
+        // The hint is kept, but it does not run ahead of the fault backoff.
+        assert!(!slot.running && slot.dirty && !slot.queued);
+        assert!(inbox.ready.is_empty());
+        assert_eq!(slot.retries, 1);
+        assert!(slot.retry_at.is_some());
+    }
+}
