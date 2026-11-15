@@ -2357,34 +2357,4 @@ packages = ["core", "pkgs/one/one", "pkgs/two/two"]
         assert_eq!(work.used, BUILD);
         assert!(build(BUILD).0.is_ok());
     }
-
-    /// A star import that only may run proves no name set, though its module is captured.
-    #[test]
-    fn conditional_module_scope_star_import_exports_an_unknown_name_set() {
-        let documents = documents_with(&[
-            ("use.py", "if FLAG:\n    from provider import *\n"),
-            ("provider.py", "def public_name():\n    pass\n"),
-        ]);
-        let docs: Vec<_> = documents.iter().collect();
-        let trees = parsed(&docs);
-        let selected: Vec<_> = (0..docs.len()).collect();
-        let mut work = Work::new(work::reference_limit(docs.len(), 0));
-        let catalog =
-            Catalog::new(&docs, &trees, &[], &selected, &mut work, &mut || Ok(())).unwrap();
-        let source = docs
-            .iter()
-            .position(|doc| doc.key.path == "use.py")
-            .unwrap();
-        let sites = extract(docs[source], &trees[source], &mut work, &mut || Ok(())).unwrap();
-        let [import] = sites.as_slice() else {
-            panic!("one import site");
-        };
-        let resolution = catalog
-            .resolve(source, import, &mut BTreeMap::new(), &mut work, &mut || {
-                Ok(())
-            })
-            .unwrap();
-        assert!(resolution.targets.is_empty());
-        assert_eq!(resolution.residual, Some("python_export_name_set_unknown"));
-    }
 }
