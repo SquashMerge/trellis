@@ -1848,15 +1848,7 @@ impl Catalog {
         if self.root(scope).is_none() {
             return Ok(SiteResolution::unknown("rust_module_ownership_unproved"));
         }
-        let imports = self.scope_imports(scope, check)?;
-        let mut import = None;
-        for candidate in imports {
-            self.step(check)?;
-            if candidate.start == site.start && candidate.end == site.end {
-                import = Some(candidate);
-                break;
-            }
-        }
+        let import = self.find_import_at(scope, site, check)?;
         let path = import
             .as_ref()
             .map(|i| i.path.clone())
@@ -1872,19 +1864,7 @@ impl Catalog {
                 check,
             )?
         {
-            let identity = package.identity.clone();
-            self.charge(package.evidence.len(), check)?;
-            if let Some(existing) = external_packages.get_mut(&identity) {
-                existing.evidence.extend(package.evidence);
-                existing.evidence.sort();
-                existing.evidence.dedup();
-            } else {
-                external_packages.insert(identity.clone(), package);
-            }
-            return Ok(SiteResolution {
-                targets: BTreeSet::from([Target::External(identity)]),
-                ..SiteResolution::default()
-            });
+            return self.record_external(package, external_packages, check);
         }
         let context = ResolveContext {
             packages,
@@ -1895,85 +1875,22 @@ impl Catalog {
         let mut route = BTreeSet::new();
         let mut shadowed = false;
         let mut unused = false;
-        let mut names = if let Some(import) = &import {
+        let names = if let Some(import) = &import {
             if import.uncertain {
                 return Ok(SiteResolution::unknown("rust_conditional_export"));
             }
             if import.star {
-                let mut own = self.expand(scope, import, 1, &mut route, context, None, check)?;
-                // A re-exporting glob passes every name on; a private one references only
-                // the names its scope spells (#986).
-                if !import.public {
-                    unused =
-                        self.drop_unused(docs[document], tree, scope, import, &mut own, check)?;
-                }
-                let others = self.scope_imports(scope, check)?;
-                let mut competing = Names::default();
-                for other in others
-                    .iter()
-                    .filter(|i| i.star && (i.start != import.start || i.end != import.end))
-                {
-                    if self
-                        .external_target(
-                            scope,
-                            &other.path,
-                            packages,
-                            docs,
-                            Some((other.start, other.end)),
-                            check,
-                        )?
-                        .is_some()
-                    {
-                        continue;
-                    }
-                    let expanded =
-                        self.expand(scope, other, 1, &mut route, context, None, check)?;
-                    competing.unknown_set |= expanded.unknown_set;
-                    for (key, bucket) in expanded.names {
-                        self.merge_bucket(competing.names.entry(key).or_default(), bucket, check)?;
-                    }
-                }
-                self.charge(own.names.len(), check)?;
-                let keys: Vec<_> = own.names.keys().cloned().collect();
-                for key in keys {
-                    self.step(check)?;
-                    let direct = self.scopes[scope].explicit.contains_key(&key);
-                    let mut explicit_imports = Vec::new();
-                    for other in &others {
-                        self.step(check)?;
-                        if !other.star && other.binding_name() == Some(key.1.as_str()) {
-                            self.step(check)?;
-                            explicit_imports.push(other.clone());
-                        }
-                    }
-                    let mut explicit = direct;
-                    for named in explicit_imports {
-                        let resolved = if named.uncertain {
-                            Names {
-                                unknown_set: true,
-                                ..Names::default()
-                            }
-                        } else {
-                            self.path(scope, &named.path, 1, &mut route, context, check)?
-                        };
-                        explicit |= resolved.unknown_set
-                            || resolved
-                                .names
-                                .keys()
-                                .any(|(namespace, _)| *namespace == key.0);
-                    }
-                    if explicit {
-                        own.names.remove(&key);
-                        shadowed = true;
-                        continue;
-                    }
-                    let bucket = own.names.get_mut(&key).expect("existing name");
-                    bucket.unknown |= competing.unknown_set || self.scopes[scope].opaque;
-                    if let Some(other) = competing.names.get(&key) {
-                        self.merge_bucket(bucket, other.clone(), check)?;
-                    }
-                }
-                own
+                self.star_names(
+                    document,
+                    scope,
+                    import,
+                    tree,
+                    &mut route,
+                    context,
+                    &mut shadowed,
+                    &mut unused,
+                    check,
+                )?
             } else {
                 self.path(scope, &import.path, 1, &mut route, context, check)?
             }
@@ -1983,6 +1900,180 @@ impl Catalog {
                 None => return Ok(SiteResolution::unknown("rust_path_unsupported")),
             }
         };
+        self.publish_names(site, &import, names, shadowed, unused, check)
+    }
+    /// The import the site is, when its range is one of the scope's imports.
+    fn find_import_at(
+        &mut self,
+        scope: usize,
+        site: &RawSite,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<Option<Import>> {
+        let imports = self.scope_imports(scope, check)?;
+        let mut import = None;
+        for candidate in imports {
+            self.step(check)?;
+            if candidate.start == site.start && candidate.end == site.end {
+                import = Some(candidate);
+                break;
+            }
+        }
+        Ok(import)
+    }
+    /// A site that reaches an external package: the package joins the read's packages, or its
+    /// evidence joins the entry already there.
+    fn record_external(
+        &mut self,
+        package: external::ExternalPackage,
+        external_packages: &mut BTreeMap<external::ExternalIdentity, external::ExternalPackage>,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<SiteResolution> {
+        let identity = package.identity.clone();
+        self.charge(package.evidence.len(), check)?;
+        if let Some(existing) = external_packages.get_mut(&identity) {
+            existing.evidence.extend(package.evidence);
+            existing.evidence.sort();
+            existing.evidence.dedup();
+        } else {
+            external_packages.insert(identity.clone(), package);
+        }
+        Ok(SiteResolution {
+            targets: BTreeSet::from([Target::External(identity)]),
+            ..SiteResolution::default()
+        })
+    }
+    /// The names a glob import brings into its scope: what it expands to, less the names a
+    /// private glob's scope never spells and the names the scope binds explicitly, each
+    /// marked by what the scope's other globs also offer. `route` is the site's, shared
+    /// with every expansion and path walk; the two flags say why a name was dropped.
+    #[allow(clippy::too_many_arguments)] // The site's tree, route and flags stay the caller's.
+    fn star_names(
+        &mut self,
+        document: usize,
+        scope: usize,
+        import: &Import,
+        tree: &Tree,
+        route: &mut Route,
+        context: ResolveContext<'_, '_>,
+        shadowed: &mut bool,
+        unused: &mut bool,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<Names> {
+        let ResolveContext { docs, .. } = context;
+        let mut own = self.expand(scope, import, 1, route, context, None, check)?;
+        // A re-exporting glob passes every name on; a private one references only
+        // the names its scope spells (#986).
+        if !import.public {
+            *unused = self.drop_unused(docs[document], tree, scope, import, &mut own, check)?;
+        }
+        let others = self.scope_imports(scope, check)?;
+        let competing = self.competing_star_names(scope, import, &others, route, context, check)?;
+        self.charge(own.names.len(), check)?;
+        let keys: Vec<_> = own.names.keys().cloned().collect();
+        for key in keys {
+            self.step(check)?;
+            let explicit = self.name_is_explicit(scope, &key, &others, route, context, check)?;
+            if explicit {
+                own.names.remove(&key);
+                *shadowed = true;
+                continue;
+            }
+            let bucket = own.names.get_mut(&key).expect("existing name");
+            bucket.unknown |= competing.unknown_set || self.scopes[scope].opaque;
+            if let Some(other) = competing.names.get(&key) {
+                self.merge_bucket(bucket, other.clone(), check)?;
+            }
+        }
+        Ok(own)
+    }
+    /// What the scope's other globs offer, merged. A glob that reaches an external package
+    /// offers nothing here.
+    fn competing_star_names(
+        &mut self,
+        scope: usize,
+        import: &Import,
+        others: &[Import],
+        route: &mut Route,
+        context: ResolveContext<'_, '_>,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<Names> {
+        let ResolveContext { packages, docs, .. } = context;
+        let mut competing = Names::default();
+        for other in others
+            .iter()
+            .filter(|i| i.star && (i.start != import.start || i.end != import.end))
+        {
+            if self
+                .external_target(
+                    scope,
+                    &other.path,
+                    packages,
+                    docs,
+                    Some((other.start, other.end)),
+                    check,
+                )?
+                .is_some()
+            {
+                continue;
+            }
+            let expanded = self.expand(scope, other, 1, route, context, None, check)?;
+            competing.unknown_set |= expanded.unknown_set;
+            for (key, bucket) in expanded.names {
+                self.merge_bucket(competing.names.entry(key).or_default(), bucket, check)?;
+            }
+        }
+        Ok(competing)
+    }
+    /// Whether the scope binds `key` itself, by a declaration or by a named import that
+    /// resolves in the key's namespace or cannot be read.
+    fn name_is_explicit(
+        &mut self,
+        scope: usize,
+        key: &Name,
+        others: &[Import],
+        route: &mut Route,
+        context: ResolveContext<'_, '_>,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<bool> {
+        let direct = self.scopes[scope].explicit.contains_key(key);
+        let mut explicit_imports = Vec::new();
+        for other in others {
+            self.step(check)?;
+            if !other.star && other.binding_name() == Some(key.1.as_str()) {
+                self.step(check)?;
+                explicit_imports.push(other.clone());
+            }
+        }
+        let mut explicit = direct;
+        for named in explicit_imports {
+            let resolved = if named.uncertain {
+                Names {
+                    unknown_set: true,
+                    ..Names::default()
+                }
+            } else {
+                self.path(scope, &named.path, 1, route, context, check)?
+            };
+            explicit |= resolved.unknown_set
+                || resolved
+                    .names
+                    .keys()
+                    .any(|(namespace, _)| *namespace == key.0);
+        }
+        Ok(explicit)
+    }
+    /// The site's resolution from the names found: the targets and proof of each name in the
+    /// site's namespace, and the residual when the set is unknown, a name is ambiguous or
+    /// nothing is left.
+    fn publish_names(
+        &mut self,
+        site: &RawSite,
+        import: &Option<Import>,
+        mut names: Names,
+        shadowed: bool,
+        unused: bool,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<SiteResolution> {
         let mut result = SiteResolution::default();
         if names.unknown_set {
             result.residual = Some("rust_export_name_set_unknown");
