@@ -1599,6 +1599,67 @@ impl Catalog {
             packages.root_allowed(source_set, root_path),
         ))
     }
+    /// Removes from a private glob's `names` those its scope never spells, and says whether it
+    /// removed any (#986). A use is an identifier anywhere in the scope outside the glob,
+    /// macro arguments and nested items included, so a shadowed or unrelated identifier of the
+    /// same spelling still counts. Syntax the walk cannot read proves no name unused.
+    fn drop_unused(
+        &mut self,
+        doc: &DocumentInput,
+        tree: &Tree,
+        scope: usize,
+        import: &Import,
+        names: &mut Names,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<bool> {
+        self.step(check)?;
+        if names.names.is_empty() {
+            return Ok(false);
+        }
+        let (start, end) = (self.scopes[scope].start, self.scopes[scope].end);
+        let Some(root) = tree.root_node().descendant_for_byte_range(start, end) else {
+            return Ok(false);
+        };
+        if root.has_error() {
+            return Ok(false);
+        }
+        self.charge(names.names.len(), check)?;
+        // `r#name` and `name` are one identifier, whichever side spells the prefix.
+        let plain = |name: &str| name.strip_prefix("r#").unwrap_or(name).to_owned();
+        let mut unseen: BTreeSet<String> =
+            names.names.keys().map(|(_, name)| plain(name)).collect();
+        let mut stack = vec![(root, 0)];
+        let mut visits = 0;
+        while let Some((node, depth)) = stack.pop() {
+            if unseen.is_empty() {
+                return Ok(false);
+            }
+            check()?;
+            visits += 1;
+            if visits > VISITS || depth > DEPTH {
+                return Ok(false);
+            }
+            if node.start_byte() == import.start && node.end_byte() == import.end {
+                continue;
+            }
+            if matches!(
+                node.kind(),
+                "identifier" | "type_identifier" | "shorthand_field_identifier"
+            ) {
+                unseen.remove(&plain(text(doc, node)));
+                continue;
+            }
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                stack.push((child, depth + 1));
+            }
+        }
+        names
+            .names
+            .retain(|(_, name), _| !unseen.contains(&plain(name)));
+        Ok(!unseen.is_empty())
+    }
+    #[allow(clippy::too_many_arguments)] // Captured inputs and the site's own tree stay explicit.
     pub(super) fn resolve(
         &mut self,
         document: usize,
@@ -1606,6 +1667,7 @@ impl Catalog {
         packages: &external::RustPackages,
         external_packages: &mut BTreeMap<external::ExternalIdentity, external::ExternalPackage>,
         docs: &[&DocumentInput],
+        tree: &Tree,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<SiteResolution> {
         self.step(check)?;
@@ -1661,12 +1723,19 @@ impl Catalog {
         };
         let mut route = BTreeSet::new();
         let mut shadowed = false;
+        let mut unused = false;
         let mut names = if let Some(import) = &import {
             if import.uncertain {
                 return Ok(SiteResolution::unknown("rust_conditional_export"));
             }
             if import.star {
                 let mut own = self.expand(scope, import, 1, &mut route, context, None, check)?;
+                // A re-exporting glob passes every name on; a private one references only
+                // the names its scope spells (#986).
+                if !import.public {
+                    unused =
+                        self.drop_unused(docs[document], tree, scope, import, &mut own, check)?;
+                }
                 let others = self.scope_imports(scope, check)?;
                 let mut competing = Names::default();
                 for other in others
@@ -1767,6 +1836,8 @@ impl Catalog {
             result.residual = Some(if import.as_ref().is_some_and(|i| i.star) {
                 if shadowed {
                     "rust_wildcard_fully_shadowed"
+                } else if unused {
+                    "rust_wildcard_unused"
                 } else {
                     "rust_wildcard_empty"
                 }

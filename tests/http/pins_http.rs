@@ -442,16 +442,12 @@ async fn active_and_hot_journal_keep_pinned_http_safe() {
         code == 200 || ((code == 409 || code == 503) && body["error"]["code"] == "storage_busy"),
         "{code}: {body}"
     );
-    child.kill().unwrap();
-    child.wait().unwrap();
-    assert_eq!(
-        &std::fs::read(&journal).unwrap()[..8],
-        &[0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7],
-        "SQLite did not flush a genuine hot journal"
-    );
-    let hot_journal = std::fs::read(&journal).unwrap();
-    // Release the retained session and watcher synchronously; Weak::upgrade
-    // alone cannot prove that the last Arc's fields have finished dropping.
+    // Retire the fixture's runtime while the writer is still alive. Its worker
+    // may hold a writable connection opened before the journal existed; SQLite
+    // would roll a hot journal back on that connection's next read, so the
+    // journal must not become hot until no such connection is left. The
+    // release waits out a step in flight, and that step cannot recover the
+    // journal of a live writer.
     state.release_checkout_runtime_for_fixture();
     let retired = Arc::downgrade(&state);
     drop(leader);
@@ -467,9 +463,18 @@ async fn active_and_hot_journal_keep_pinned_http_safe() {
         );
         tokio::task::yield_now().await;
     }
-    assert_eq!(std::fs::read(&journal).unwrap(), hot_journal);
+    // Exclusive index use proves no connection of this process is open, and
+    // admits none until it is dropped: from here only the killed writer's
+    // journal can change, and nothing in this process can roll it back.
     let unrelated =
         trellis::store::topology::UseGuard::acquire_existing(&use_path, true, true).unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(
+        &std::fs::read(&journal).unwrap()[..8],
+        &[0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7],
+        "SQLite did not flush a genuine hot journal"
+    );
     let state = http::new(
         store.clone(),
         IndexOptions::new(temp.path().join("workspace")),

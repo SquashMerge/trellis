@@ -797,6 +797,7 @@ fn resolve(
                         &packages,
                         &mut found.packages,
                         &docs,
+                        &trees[source],
                         check,
                     )?),
                     Some(item) if doc.key.language == "java" => Some(java.resolve(

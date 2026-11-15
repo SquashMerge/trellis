@@ -883,6 +883,15 @@ Supported mapping is deliberately narrow:
   import/reexport edges. Native final-owner mapping and real intermediate-module
   proof stay distinct. A wildcard can provide positive native mappings while
   residual unknowns remain; no native or external member inventory is invented.
+  A private glob (`use super::*;`) maps only the exposed names its scope spells
+  (#986): an identifier anywhere in that module or block outside the glob itself,
+  macro arguments and nested items included. Comments and strings are not uses.
+  This is syntax, not binding: a shadowed or unrelated identifier of the same
+  spelling still counts, and a trait used only through its methods, or a name only
+  a macro expansion spells, does not. A glob none of whose names is spelled is
+  unknown with reason `rust_wildcard_unused`. A re-exporting glob (`pub use`,
+  with any visibility) still exposes every name. Syntax the walk cannot read
+  (a parser error, or past the syntax bounds) proves no name unused.
   Captured Cargo declarations and reviewed `std/core/alloc` roots prove package
   targets, never semantic calls. An inline `crate::`/`self::`/`super::` path with no
   `use` item resolves like an import of the same path, and a `pub(crate)` module or
