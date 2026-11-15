@@ -4243,8 +4243,13 @@ fn real_typescript_ambiguous_calls_read_as_one_edge_with_the_union() {
         let binding = edge.binding.as_ref().unwrap();
         let callee = &main[binding.join.anchor.range.start..binding.join.anchor.range.end];
         let rows = rows_of(callee);
-        let lowest = rows.iter().map(|b| &b.provenance_id).min().unwrap();
-        assert_eq!(&binding.provenance_id, lowest, "{callee}");
+        // The row of the lowest raw fact digest represents the call (#1102).
+        let digest = |id: &str| {
+            let proof = graph.provenance.iter().find(|p| p.id == id).unwrap();
+            proof.derived_from.as_ref().unwrap().fact_digest.clone()
+        };
+        let lowest = rows.iter().map(|b| digest(&b.provenance_id)).min().unwrap();
+        assert_eq!(digest(&binding.provenance_id), lowest, "{callee}");
         assert_eq!(binding.candidates, rows[0].candidates, "{callee}");
         for row in &rows {
             assert!(

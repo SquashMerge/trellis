@@ -760,21 +760,52 @@ fn select_binding<'a>(
         .filter(|b| b.join.anchor.document == call.document)
         .filter_map(|b| Some((b, semantic.provenance.get(&b.provenance_id)?)))
         .collect();
-    // Contradictory evidence at one call site is published as one ambiguous row per
-    // provenance, each carrying the full candidate union (contract-v1 "Duplicate
-    // contradictory exact bindings ... both provenances remain"). All rows here belong to
-    // one producer coverage tuple. The lowest provenance ID represents the call; evidence
-    // selection gathers the other ambiguous proofs. Any other multi-match is corrupt.
-    if matches.len() > 1
-        && !matches
+    // A call has one row per producer fact that joins it (contract-v1: "their separate
+    // provenance is preserved"). Publication admits two shapes. Rows that assert at most one
+    // distinct target between them agree: scip-typescript gives one occurrence per declaration
+    // of a merged library symbol, so `new Set()` is four unresolved rows (#1102). Rows that
+    // assert more are contradictory evidence, published as one ambiguous row per provenance,
+    // each with the full candidate union (#466). Anything else was never published.
+    if matches.len() > 1 {
+        let mut asserted = Vec::<&Target>::new();
+        for target in matches
             .iter()
-            .all(|(b, _)| b.resolution == Resolution::Ambiguous)
-    {
-        return Err(integrity("multiple call bindings match one call"));
+            .flat_map(|(b, _)| b.declared_target.iter().chain(&b.candidates))
+        {
+            if !asserted.contains(&target) {
+                asserted.push(target);
+            }
+        }
+        if asserted.len() > 1
+            && !matches
+                .iter()
+                .all(|(b, _)| b.resolution == Resolution::Ambiguous)
+        {
+            return Err(integrity("contradictory call bindings match one call"));
+        }
     }
     Ok(matches
         .into_iter()
-        .min_by(|(a, _), (b, _)| a.provenance_id.cmp(&b.provenance_id)))
+        .min_by_key(|(binding, proof)| representative_key(binding.resolution, proof)))
+}
+
+/// Orders the rows of one call; the least represents it. A row that asserts the call's target
+/// comes before an unresolved one, which asserts none and so contradicts nothing. Equal rows
+/// follow their raw producer fact's digest, which depends only on the imported evidence: a
+/// minted provenance ID also hashes the native revision, so it changes with the build. The ID
+/// only separates rows the digest cannot. `store::semantic_display` orders its rows the same way.
+fn representative_key(
+    resolution: Resolution,
+    proof: &sem::Provenance,
+) -> (bool, Option<&str>, &str) {
+    (
+        resolution == Resolution::Unresolved,
+        proof
+            .derived_from
+            .as_ref()
+            .map(|raw| raw.fact_digest.as_str()),
+        proof.id.as_str(),
+    )
 }
 
 fn boundary_reason(binding: &CallBinding, proof: &sem::Provenance) -> BoundaryReason {
