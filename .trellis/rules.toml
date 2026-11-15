@@ -62,6 +62,11 @@ paths = [
   # The Files reads, moved up from storage (S16): the outline and syntax-match read bodies
   # and their forwarding methods. SQL until S14, as above.
   "src/files_read.rs",
+  # The Files projection those reads use (E3): the outline and syntax-match shapes, their
+  # request validation and bounds, and the tree-sitter scan. Query code by content; its users
+  # are the query layer and the HTTP entry. It parses with the indexing layer's grammars and
+  # macro expansions, which is a downward read from here.
+  "src/files_view.rs",
 ]
 
 [layers.indexing]
@@ -103,7 +108,7 @@ paths = ["src/store.rs", "src/store/**", "src/search_vectors.rs", "src/sqlite_co
 apps = ["trellis"]
 shared = true
 paths = [
-  "src/model.rs", "src/testing.rs", "src/native_ids.rs", "src/scip_raw.rs", "src/files_view.rs", "src/parallel.rs", "src/build_info.rs", "src/search_lexical.rs",
+  "src/model.rs", "src/testing.rs", "src/native_ids.rs", "src/scip_raw.rs", "src/parallel.rs", "src/build_info.rs", "src/search_lexical.rs",
   "src/lib.rs", "src/scip_raw/**", "src/test_alloc.rs", "src/syntax_bounds.rs", "src/heap.rs",
   # Leaf constants, small types and pure helpers that storage and shared code use (S1, #999).
   # They reference no layer: the skipped-input placeholders, the batch resource policy with

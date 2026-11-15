@@ -96,6 +96,8 @@ struct Raw {
     /// HTTP interface settings (#855).
     #[serde(default)]
     interfaces: RawInterfaces,
+    /// Cargo features whose gates mark test code for reference sites (#988).
+    test_features: Option<Spanned<Vec<Spanned<String>>>>,
 }
 /// The `[interfaces]` table (#855). `wrappers` is its only key.
 #[derive(Deserialize, Default)]
@@ -299,6 +301,8 @@ pub struct Config {
     apps: Vec<AuthoredApp>,
     /// Authored `[[interfaces.wrappers]]` entries in written order (#855).
     wrappers: Vec<InterfaceWrapper>,
+    /// The authored `test_features`, sorted (#988).
+    test_features: Vec<String>,
 }
 
 /// Where a configured request wrapper reads its method (#855).
@@ -336,6 +340,11 @@ impl Config {
     /// The authored request wrappers, in written order (#855).
     pub(crate) fn interface_wrappers(&self) -> &[InterfaceWrapper] {
         &self.wrappers
+    }
+
+    /// The Cargo features whose `cfg` gates mark a Rust reference site as test (#988).
+    pub(crate) fn test_features(&self) -> &[String] {
+        &self.test_features
     }
 
     /// How many `[apps.<name>]` tables the file authors (#794).
@@ -539,6 +548,7 @@ pub fn parse(text: &str) -> Result<Config> {
     let layers = parse_layers(text, raw.layers, &mut patterns)?;
     let apps = authored_apps(text, raw.apps)?;
     let wrappers = interface_wrappers(text, raw.interfaces)?;
+    let test_features = test_features(text, raw.test_features)?;
     let roles = parse_roles(text, raw.roles, &mut patterns)?;
     let (rules, ids) = parse_rules(text, raw.rules, &roles)?;
     let exceptions = parse_exceptions(text, raw.exceptions, &ids)?;
@@ -554,6 +564,7 @@ pub fn parse(text: &str) -> Result<Config> {
         external_deny,
         apps,
         wrappers,
+        test_features,
     })
 }
 /// The size bound, the TOML and schema decode, the version and the named collection bounds.
@@ -1023,6 +1034,60 @@ fn parse_exception(
         kind,
         reason: e.reason.get_ref().clone(),
     })
+}
+
+/// The most features `test_features` may name.
+const TEST_FEATURE_LIMIT: usize = 64;
+
+/// The authored `test_features` (#988): distinct Cargo feature names, each at most 64 bytes of
+/// ASCII letters, digits, `_`, `-`, `+` and `.`, starting with a letter, digit or `_`.
+fn test_features(text: &str, raw: Option<Spanned<Vec<Spanned<String>>>>) -> Result<Vec<String>> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let raw = raw.into_inner();
+    if raw.len() > TEST_FEATURE_LIMIT {
+        return Err(error(
+            text,
+            raw[TEST_FEATURE_LIMIT].span(),
+            "too_large",
+            "token",
+            "test_features exceeds 64 entries",
+        ));
+    }
+    let mut features = BTreeSet::new();
+    for feature in raw {
+        let span = feature.span();
+        let feature = feature.into_inner();
+        if !crate::references::feature_name(&feature) {
+            return Err(error(
+                text,
+                span,
+                "schema",
+                "token",
+                format!("test feature {feature:?} is not a Cargo feature name"),
+            ));
+        }
+        if !features.insert(feature.clone()) {
+            return Err(error(
+                text,
+                span,
+                "schema",
+                "token",
+                format!("test feature {feature:?} is repeated"),
+            ));
+        }
+    }
+    Ok(features.into_iter().collect())
+}
+
+/// The test features of the checkout's rules file for a read that does not otherwise load it
+/// (#988). A missing or invalid file names none, so such a read still answers.
+pub(crate) fn load_test_features(root: &Path) -> Vec<String> {
+    match load(root) {
+        Ok(Some(config)) => config.test_features,
+        _ => Vec::new(),
+    }
 }
 
 /// The most wrappers `[interfaces]` may author.

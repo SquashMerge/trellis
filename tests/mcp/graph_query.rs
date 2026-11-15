@@ -1823,33 +1823,30 @@ fn binding_with_anchor_hash_unlike_provenance_hash_is_still_classified_by_freshn
     }
 }
 
+/// #1102: several producer facts at one call site that agree on its target are published as
+/// one row per provenance. They are one resolved call, not corruption.
 #[test]
-fn two_bindings_for_one_call_are_typed_integrity_corruption() {
+fn agreeing_bindings_for_one_call_are_one_resolved_edge() {
     let mut w = world(true);
     w.decl(A, "src/lib.rs");
     w.decl(B, "src/lib.rs");
     w.call(A, 10, 10);
-    w.bind(
-        10,
-        Bind {
-            prov: Some("p1".into()),
-            ..direct(B)
-        },
-    );
-    w.bind(
-        10,
-        Bind {
-            prov: Some("p2".into()),
-            ..direct(B)
-        },
-    );
+    for prov in ["p2", "p1"] {
+        w.bind(
+            10,
+            Bind {
+                prov: Some(prov.into()),
+                ..direct(B)
+            },
+        );
+    }
     let mut facts = w.build();
-    let error =
-        evaluate(&request(A, true), &mut facts).expect_err("no answer for ambiguous binding rows");
-    assert!(
-        error.downcast_ref::<GraphIntegrity>().is_some(),
-        "{error:#}"
-    );
+    let req = request(A, true);
+    let r = run(&mut facts, &req);
+    assert_eq!(edges(&r), vec![(10, A, Some(B), Visit::New, NONE)]);
+    assert_eq!(r.edges[0].binding.as_ref().unwrap().provenance_id, "p1");
+    assert!(!r.partial);
+    assert_keys(&req, &r, &[]);
 }
 
 #[test]
@@ -2331,8 +2328,10 @@ fn ambiguous_rows_sharing_a_call_are_one_edge_with_the_full_union() {
     assert_keys(&req, &r, &[(WarningCode::BindingAmbiguous, Some("pA"))]);
 }
 
+/// What publication rejects stays corruption on read: rows of one call that assert more than one
+/// target must all be ambiguous.
 #[test]
-fn non_ambiguous_multi_match_for_one_call_stays_integrity() {
+fn contradictory_rows_for_one_call_stay_integrity() {
     let external = Bind {
         target: Tgt::External,
         resolution: Resolution::External,
@@ -2341,8 +2340,12 @@ fn non_ambiguous_multi_match_for_one_call_stays_integrity() {
     };
     for (case, rows) in [
         (
-            "duplicate resolved",
-            vec![("pA", direct(B)), ("pB", direct(B))],
+            "resolved to two targets",
+            vec![("pA", direct(B)), ("pB", direct(90))],
+        ),
+        (
+            "resolved+external",
+            vec![("pA", direct(B)), ("pB", external.clone())],
         ),
         (
             "ambiguous+resolved",
@@ -2361,9 +2364,62 @@ fn non_ambiguous_multi_match_for_one_call_stays_integrity() {
         assert!(
             integrity
                 .0
-                .contains("multiple call bindings match one call"),
+                .contains("contradictory call bindings match one call"),
             "{case}"
         );
+    }
+}
+
+/// #1102: a fact that names no target does not contradict one that does. The call takes the
+/// single asserted target, whichever row has the lower provenance ID.
+#[test]
+fn an_unresolved_row_yields_to_the_single_asserted_target() {
+    let unresolved = Bind {
+        target: Tgt::Nothing,
+        resolution: Resolution::Unresolved,
+        dispatch: Dispatch::Unknown,
+        stale_target: None,
+        ..direct(0)
+    };
+    for rows in [
+        vec![("pA", unresolved.clone()), ("pB", direct(B))],
+        vec![("pB", direct(B)), ("pA", unresolved.clone())],
+        vec![("pA", direct(B)), ("pB", unresolved.clone())],
+    ] {
+        let mut facts = contradictory_call(&rows).build();
+        let r = run(&mut facts, &request(A, true));
+        assert_eq!(edges(&r), vec![(10, A, Some(B), Visit::New, NONE)]);
+        let binding = r.edges[0].binding.as_ref().unwrap();
+        assert_eq!(binding.resolution, Resolution::Resolved);
+    }
+}
+
+/// #1102: minted provenance IDs change with the build, so they must not pick the row. The raw
+/// fact's digest does, for an ambiguous call and for agreeing rows alike.
+#[test]
+fn the_representative_follows_the_raw_fact_not_the_provenance_id() {
+    for bind in [ambiguous(), direct(B)] {
+        let mut chosen = Vec::new();
+        // Two builds of the same evidence: the same raw facts under swapped provenance IDs.
+        for ids in [["p1", "p2", "p3"], ["p3", "p1", "p2"]] {
+            let rows: Vec<_> = ids.iter().map(|id| (*id, bind.clone())).collect();
+            let mut w = contradictory_call(&rows);
+            let semantic = w.doc("src/lib.rs").semantic.as_mut().unwrap();
+            for (id, digest) in ids.iter().zip(["cc", "aa", "bb"]) {
+                semantic.provenance.get_mut(*id).unwrap().derived_from = Some(sem::DerivedFrom {
+                    provenance_id: format!("raw-{digest}"),
+                    record_kind: sem::RecordKind::Occurrence,
+                    fact_digest: digest.repeat(32),
+                });
+            }
+            let mut facts = w.build();
+            let r = run(&mut facts, &request(A, true));
+            assert_eq!(r.edges.len(), 1);
+            let id = &r.edges[0].binding.as_ref().unwrap().provenance_id;
+            let proof = r.provenance.iter().find(|p| &p.id == id).unwrap();
+            chosen.push(proof.derived_from.as_ref().unwrap().fact_digest.clone());
+        }
+        assert_eq!(chosen, ["aa".repeat(32), "aa".repeat(32)]);
     }
 }
 

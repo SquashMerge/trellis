@@ -1723,7 +1723,9 @@ fn attribute_tokens(text: &str) -> Vec<&str> {
     }
     tokens
 }
-fn rust_test_attribute(n: Node<'_>, file: &SourceFile) -> bool {
+/// Whether an attribute marks test code under Decision 0011: `cfg(test)`, a direct `test`
+/// operand of `cfg(all(..))`, or a final-path `test` attribute.
+pub(crate) fn rust_test_attribute(n: Node<'_>, file: &SourceFile) -> bool {
     let Some(text) = file.text.get(n.start_byte()..n.end_byte()) else {
         return false;
     };
