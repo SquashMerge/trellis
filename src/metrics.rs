@@ -274,25 +274,7 @@ fn bind(
         let owned_regions = regions_by_owner
             .get(d.syntax_id.as_str())
             .map_or(&[][..], Vec::as_slice);
-        metrics.max_nesting = owned_regions
-            .iter()
-            .map(|r| {
-                let mut depth = 1;
-                let mut parent = r.parent_id.as_deref();
-                while let Some(id) = parent {
-                    depth += 1;
-                    parent = owned_regions
-                        .iter()
-                        .find(|other| other.id == id)
-                        .and_then(|other| other.parent_id.as_deref());
-                    if depth > regions.len() {
-                        break;
-                    }
-                }
-                depth
-            })
-            .max()
-            .unwrap_or(0);
+        metrics.max_nesting = max_nesting(source, &d.document.language, owned_regions);
         metrics.parameters = d.header.parameters.len();
         rows.push(DeclarationMetrics {
             role: d.role,
@@ -307,6 +289,53 @@ fn bind(
         });
     }
     Ok(rows)
+}
+/// The deepest of one callable's stored control regions, counting the levels on each
+/// region's parent chain (#987). An arm is as deep as its statement and an `else if` as deep
+/// as the first `if` of its chain, so neither is a level.
+fn max_nesting(source: &str, language: &str, owned: &[&ControlRegion]) -> usize {
+    let by_id: HashMap<&str, &ControlRegion> = owned.iter().map(|r| (r.id.as_str(), *r)).collect();
+    let parent_of =
+        |r: &ControlRegion| r.parent_id.as_deref().and_then(|id| by_id.get(id).copied());
+    let level = |r: &ControlRegion| {
+        if matches!(
+            r.kind.as_str(),
+            "else_clause"
+                | "elif_clause"
+                | "switch_case"
+                | "switch_default"
+                | "catch_clause"
+                | "finally_clause"
+        ) {
+            return false;
+        }
+        // The `if` of an `else if` ends where its parent does and follows the `else`: under
+        // an `else_clause`, or directly under the first `if` in Java, which stores no clause.
+        // An `if` in an `else` block ends before the block does, and an unbraced `if (a) if (b)`
+        // follows a `)`. Python spells the continuation `elif`, and its `else:` block has no
+        // closing token, so an `if` ending it would look like one.
+        let continuation = language != "python"
+            && matches!(r.kind.as_str(), "if_statement" | "if_expression")
+            && parent_of(r).is_some_and(|parent| {
+                matches!(parent.kind.as_str(), "else_clause" | "if_statement")
+                    && parent.range.end == r.range.end
+            })
+            && source
+                .get(..r.range.start)
+                .is_some_and(|before| before.trim_end().ends_with("else"));
+        !continuation
+    };
+    owned
+        .iter()
+        .map(|r| {
+            // Stored parents form a chain; the bound only stops a corrupt cycle.
+            std::iter::successors(Some(*r), |r| parent_of(r))
+                .take(owned.len())
+                .filter(|r| level(r))
+                .count()
+        })
+        .max()
+        .unwrap_or(0)
 }
 /// The tree holding a declaration: the plain tree, unless it sits in a measured Rust macro,
 /// whose token tree has no syntax of its own (#551).
