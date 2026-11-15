@@ -85,6 +85,7 @@ pub mod search_rank;
 pub mod search_vectors;
 pub mod search_vocab;
 pub mod semantic_batch;
+pub(crate) mod semantic_catchup;
 pub mod semantic_evidence;
 pub mod semantic_import;
 #[cfg(test)]

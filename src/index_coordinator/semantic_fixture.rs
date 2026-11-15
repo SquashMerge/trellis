@@ -4,7 +4,8 @@
 use super::cooperative_semantic_unit;
 use crate::{
     model::{CancelFlag, IndexPin},
-    store::{SemanticUnitOutcome, Store, topology::WriterSession},
+    semantic_catchup::SemanticUnitOutcome,
+    store::{Store, topology::WriterSession},
 };
 use anyhow::{Result, ensure};
 use std::sync::Arc;

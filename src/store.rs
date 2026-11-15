@@ -5,11 +5,6 @@ pub(crate) mod captured_witness;
 pub(crate) mod id_codec;
 pub(crate) mod mcp_read;
 mod native_join_budget;
-#[cfg(any(test, feature = "test-support"))]
-pub use native_first::set_semantic_step_slice_for_tests;
-pub(crate) use native_first::{
-    SemanticContinuation, SemanticUnitOutcome, step_slice as semantic_step_slice,
-};
 mod published_admission;
 #[cfg(feature = "test-support")]
 pub(crate) mod read_counters;

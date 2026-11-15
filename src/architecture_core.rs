@@ -159,10 +159,12 @@ impl ArchitectureCore {
     pub(crate) fn references(
         &self,
         paths: &[String],
+        test_features: &[String],
         sample_limit: usize,
         check: &mut (impl FnMut() -> Result<()> + Send),
     ) -> Result<Projection> {
-        self.references.select(paths, sample_limit, check)
+        self.references
+            .select_where(paths, None, None, test_features, sample_limit, check)
     }
     /// The references of one read's sources: its `paths` under its `prefix` (#837), and in
     /// `files` when given (#851).
@@ -170,12 +172,14 @@ impl ArchitectureCore {
         &self,
         parsed: &ArchitectureArguments,
         files: Option<&std::collections::BTreeSet<String>>,
+        test_features: &[String],
         check: &mut (impl FnMut() -> Result<()> + Send),
     ) -> Result<Projection> {
         self.references.select_where(
             &parsed.paths,
             parsed.prefix.as_deref(),
             files,
+            test_features,
             parsed.sample_limit,
             check,
         )

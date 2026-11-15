@@ -135,18 +135,18 @@ pub(crate) fn copy_source(
 /// same question.
 #[derive(Clone)]
 pub(crate) struct CopyFilter {
-    pub(crate) target: PendingSemanticTarget,
-    pub(crate) captured_pin: IndexPin,
-    pub(crate) producer: String,
-    pub(crate) batch_id: i64,
-    pub(crate) join_inputs: String,
+    pub(in crate::store) target: PendingSemanticTarget,
+    pub(in crate::store) captured_pin: IndexPin,
+    pub(in crate::store) producer: String,
+    pub(in crate::store) batch_id: i64,
+    pub(in crate::store) join_inputs: String,
 }
 
 impl CopyFilter {
     /// Whether S copies `document`: [`copy_source`] names its basis tuple, and its captured
     /// and current versions are the same (the witness's reuse condition), so the copied rows
     /// are exactly what re-settling it would emit.
-    pub(crate) fn copies(&self, db: &Connection, document: &DocumentKey) -> Result<bool> {
+    pub(in crate::store) fn copies(&self, db: &Connection, document: &DocumentKey) -> Result<bool> {
         if copy_source(
             db,
             &self.target,
