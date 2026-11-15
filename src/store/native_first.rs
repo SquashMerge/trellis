@@ -8,6 +8,9 @@ mod local_targets;
 pub(in crate::store) mod oracle;
 #[cfg(test)]
 mod tests;
+mod unit_read;
+#[cfg(test)]
+mod unit_read_tests;
 pub(crate) mod witness;
 mod witness_preparation;
 #[cfg(any(test, feature = "test-support"))]
