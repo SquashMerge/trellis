@@ -17,9 +17,36 @@ SPEC = importlib.util.spec_from_file_location(
 RR = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(RR)
 
+# A record of three deviating pairs from two source files. Its unknown references are
+# 20 from src/store.rs, 5 from src/http.rs and 25 from files with no deviating pair.
 RECORD = {"deviatingPairs": 3, "deviatingReferences": 10, "unknownReferences": 50,
-          "partialFiles": 1, "comparablePairs": 40, "conformingPairs": 30, "unknownPairs": 7}
+          "partialFiles": 1, "comparablePairs": 40, "conformingPairs": 30, "unknownPairs": 7,
+          "deviatingReferencesByPair": {"src/http.rs": {"src/storage.rs": 1},
+                                        "src/store.rs": {"src/capture.rs": 6, "src/indexer.rs": 3}},
+          "unknownReferencesBySource": {"src/http.rs": 5, "src/store.rs": 20}}
+UNRELATED = {"src/cli.rs": 15, "src/daemon.rs": 10}
 
+
+def figures(pairs=None, unknown=None, **totals):
+    """A measurement of RECORD's tree after changes: `pairs` gives (source, destination)
+    pairs new reference counts, 0 for a pair that is gone, and `unknown` gives source
+    files new unknown-reference counts. The deviation and unknown totals follow."""
+    flat = {**RR.pairs(RECORD), **(pairs or {})}
+    by_pair = {}
+    for (source, destination), references in flat.items():
+        if references:
+            by_pair.setdefault(source, {})[destination] = references
+    by_source = {**RECORD["unknownReferencesBySource"], **UNRELATED, **(unknown or {})}
+    return {**RECORD, "deviatingPairs": sum(map(len, by_pair.values())),
+            "deviatingReferences": sum(sum(each.values()) for each in by_pair.values()),
+            "unknownReferences": sum(by_source.values()),
+            "deviatingReferencesByPair": by_pair, "unknownReferencesBySource": by_source,
+            **totals}
+
+
+CAPTURE = ("src/store.rs", "src/capture.rs")
+INDEXER = ("src/store.rs", "src/indexer.rs")
+STORAGE = ("src/http.rs", "src/storage.rs")
 
 NATIVE = {"sourceSetId": "source-set:v1:0", "language": "rust", "path": "src/storage.rs",
           "sid": "sid:v1:0"}
@@ -57,76 +84,133 @@ TREE = (row("deviates", 4), row("conforms", 9), row("conforms", 1),
 
 
 class Ratchet(unittest.TestCase):
-    def verdict(self, **changed):
-        return RR.compare(RECORD, {**RECORD, **changed})
+    def verdict(self, pairs=None, unknown=None, **totals):
+        return RR.compare(RECORD, figures(pairs, unknown, **totals))
 
     def test_the_same_figures_pass(self):
         verdict, lines = self.verdict()
         self.assertEqual(verdict, "equal")
         self.assertIn("deviatingPairs 3", lines[0])
 
-    def test_an_added_pair_or_reference_fails(self):
+    def test_a_total_above_the_record_fails(self):
+        # The totals alone decide this, whatever the pairs say.
         for key in ("deviatingPairs", "deviatingReferences"):
             verdict, lines = self.verdict(**{key: RECORD[key] + 1})
             self.assertEqual(verdict, "fail", key)
             self.assertIn("deviations rose", lines[0])
             self.assertIn(f"{key}: recorded {RECORD[key]}, measured {RECORD[key] + 1}", lines[1])
+        verdict, lines = self.verdict(pairs={CAPTURE: 8})
+        self.assertEqual(verdict, "fail")
+        self.assertEqual(lines[:2], ["rules ratchet FAILED: deviations rose",
+                                     "  deviatingReferences: recorded 10, measured 12"])
+
+    def test_a_new_deviating_pair_fails_though_the_totals_do_not_rise(self):
+        # One pair gone, another new: the same totals. A renamed source file looks the
+        # same, and fails the same way until the record is updated.
+        verdict, lines = self.verdict(pairs={STORAGE: 0, ("src/web.rs", "src/storage.rs"): 1})
+        self.assertEqual(verdict, "fail")
+        self.assertEqual(lines[:2], [
+            "rules ratchet FAILED: deviations rose",
+            "  new deviating pair: src/web.rs -> src/storage.rs (1 references)"])
+        self.assertFalse(any("lost coverage" in line for line in lines))
 
     def test_more_partial_files_fail(self):
-        verdict, lines = self.verdict(deviatingPairs=2, deviatingReferences=5, partialFiles=2)
+        verdict, lines = self.verdict(pairs={CAPTURE: 1}, partialFiles=2)
         self.assertEqual(verdict, "fail")
         self.assertEqual(lines[:2], ["rules ratchet FAILED: more files are partial",
                                      "  partialFiles: recorded 1, measured 2"])
 
-    def test_fewer_deviations_on_more_unknown_references_fail(self):
-        for lower in ({"deviatingPairs": 2}, {"deviatingReferences": 9},
-                      {"deviatingPairs": 2, "deviatingReferences": 5}):
-            verdict, lines = self.verdict(unknownReferences=51, **lower)
-            self.assertEqual(verdict, "fail", lower)
+    def test_a_fall_in_a_pair_with_a_rise_only_in_unrelated_files_is_a_notice(self):
+        # #1140: the fall and the rise are not related. src/http.rs has a deviating pair
+        # too, but not the one that fell.
+        for unknown in ({"src/cli.rs": 18}, {"src/http.rs": 8}, {"src/new.rs": 3}):
+            verdict, lines = self.verdict(pairs={CAPTURE: 4}, unknown=unknown)
+            self.assertEqual(verdict, "lower", unknown)
+            self.assertIn("NOTICE", lines[0])
+            self.assertIn("  src/store.rs -> src/capture.rs: deviating references recorded 6, "
+                          "measured 4", lines)
+            self.assertTrue(any("unknown references rose" in line and "(+3)" in line
+                                and "Not a failure" in line for line in lines), lines)
+            self.assertFalse(any("FAILED" in line for line in lines))
+
+    def test_a_fall_in_a_pair_with_a_rise_from_its_source_file_is_lost_coverage(self):
+        verdict, lines = self.verdict(pairs={CAPTURE: 4}, unknown={"src/store.rs": 22})
+        self.assertEqual(verdict, "fail")
+        self.assertIn("lost coverage", lines[0])
+        self.assertEqual(lines[1], "  src/store.rs -> src/capture.rs: deviating references "
+                         "recorded 6, measured 4; unknown references from src/store.rs: "
+                         "recorded 20, measured 22 (+2)")
+        # Only the pair that fell is named, not the source file's other pair.
+        self.assertFalse(any("src/indexer.rs" in line for line in lines))
+
+    def test_a_removed_pair_with_a_rise_from_its_source_file_is_lost_coverage(self):
+        # The pair is gone; the source file still has, or no longer has, other pairs.
+        for gone, source in ((CAPTURE, "src/store.rs"), (STORAGE, "src/http.rs")):
+            before = RECORD["unknownReferencesBySource"][source]
+            verdict, lines = self.verdict(pairs={gone: 0}, unknown={source: before + 1})
+            self.assertEqual(verdict, "fail", gone)
             self.assertIn("lost coverage", lines[0])
-            self.assertIn("  unknownReferences: recorded 50, measured 51 (+1)", lines)
+            self.assertIn(f"  {gone[0]} -> {gone[1]}: deviating references recorded "
+                          f"{RECORD['deviatingReferencesByPair'][gone[0]][gone[1]]}, measured 0; "
+                          f"unknown references from {source}: recorded {before}, "
+                          f"measured {before + 1} (+1)", lines)
 
-    def test_equal_deviations_on_more_unknown_references_are_a_notice(self):
-        verdict, lines = self.verdict(unknownReferences=53)
-        self.assertEqual(verdict, "lower")
-        self.assertIn("NOTICE", lines[0])
-        self.assertTrue(any("unknown references rose" in line and "(+3)" in line
-                            and "Not a failure" in line for line in lines), lines)
+    def test_lost_coverage_does_not_need_the_unknown_total_to_rise(self):
+        # The source file's rise is hidden in the total by a fall elsewhere.
+        verdict, lines = self.verdict(pairs={INDEXER: 2},
+                                      unknown={"src/store.rs": 21, "src/cli.rs": 10})
+        self.assertEqual(verdict, "fail")
+        self.assertIn("lost coverage", lines[0])
 
-    def test_fewer_deviations_on_equal_or_fewer_unknown_references_are_a_notice(self):
-        for unknown in (50, 49):
-            verdict, lines = self.verdict(deviatingPairs=2, deviatingReferences=5,
-                                          unknownReferences=unknown)
+    def test_a_rise_in_unknown_references_without_a_fall_is_a_notice(self):
+        for unknown in ({"src/cli.rs": 18}, {"src/store.rs": 23}):
+            verdict, lines = self.verdict(unknown=unknown)
+            self.assertEqual(verdict, "lower", unknown)
+            self.assertIn("NOTICE", lines[0])
+            self.assertTrue(any("unknown references rose" in line and "(+3)" in line
+                                and "Not a failure" in line for line in lines), lines)
+        self.assertIn("  unknown references from src/store.rs: recorded 20, measured 23", lines)
+
+    def test_a_fall_on_equal_or_fewer_unknown_references_from_its_source_is_a_notice(self):
+        for unknown in (20, 19):
+            verdict, lines = self.verdict(pairs={CAPTURE: 1, INDEXER: 0},
+                                          unknown={"src/store.rs": unknown})
             self.assertEqual(verdict, "lower", unknown)
             self.assertIn("the record can be updated", lines[0])
             self.assertIn(RR.UPDATE, lines[-1])
             self.assertFalse(any("rose" in line for line in lines))
 
-    def test_an_update_that_lowers_deviations_on_more_unknown_references_is_refused(self):
-        measured = {**RECORD, "deviatingPairs": 2, "unknownReferences": 51}
+    def test_an_update_that_is_lost_coverage_is_refused_without_the_flag(self):
+        measured = figures(pairs={CAPTURE: 4}, unknown={"src/store.rs": 21})
         refused, lines = RR.update_refusal(RECORD, measured, False)
         self.assertTrue(refused)
         self.assertEqual(lines[0], "rules ratchet: unknownReferences: recorded 50, measured 51 (+1)")
         self.assertIn("not rewritten", lines[1])
+        self.assertIn("src/store.rs -> src/capture.rs", lines[2])
         self.assertIn(f"{RR.UPDATE} --accept-unknown-rise", lines[-1])
         accepted, lines = RR.update_refusal(RECORD, measured, True)
         self.assertFalse(accepted)
         self.assertIn("(+1)", lines[0])
-        self.assertIn("--accept-unknown-rise", lines[-1])
+        self.assertIn("--accept-unknown-rise", lines[1])
+        self.assertIn("src/store.rs -> src/capture.rs", lines[2])
 
     def test_other_updates_are_not_refused_and_print_the_unknown_change(self):
-        for changed, delta in (({"unknownReferences": 53}, "(+3)"),
-                               ({"deviatingPairs": 2, "unknownReferences": 48}, "(-2)"),
-                               ({"deviatingPairs": 4, "unknownReferences": 51}, "(+1)"),
-                               ({}, "(+0)")):
-            refused, lines = RR.update_refusal(RECORD, {**RECORD, **changed}, False)
+        for changed, delta in (
+                ({"unknown": {"src/cli.rs": 18}}, "(+3)"),
+                # A fall with a rise in unrelated files only.
+                ({"pairs": {CAPTURE: 4}, "unknown": {"src/cli.rs": 18}}, "(+3)"),
+                ({"pairs": {CAPTURE: 4}, "unknown": {"src/store.rs": 18}}, "(-2)"),
+                ({"pairs": {CAPTURE: 7}, "unknown": {"src/store.rs": 21}}, "(+1)"),
+                ({"pairs": {("src/web.rs", "src/storage.rs"): 1}}, "(+0)"),
+                ({}, "(+0)")):
+            refused, lines = RR.update_refusal(RECORD, figures(**changed), False)
             self.assertFalse(refused, changed)
             self.assertEqual(len(lines), 1)
             self.assertIn(delta, lines[0])
 
     def test_pair_totals_never_fail(self):
         # Fewer comparable or conforming pairs (code deleted, files merged) and more
-        # unknown pairs (a file split) are notices while unknown references do not rise.
+        # unknown pairs (a file split) are notices.
         for changed in ({"comparablePairs": 39}, {"conformingPairs": 29}, {"unknownPairs": 8},
                         {"comparablePairs": 35, "conformingPairs": 26, "unknownPairs": 9}):
             verdict, lines = self.verdict(**changed)
@@ -134,11 +218,10 @@ class Ratchet(unittest.TestCase):
             self.assertIn("NOTICE", lines[0])
 
     def test_improvements_are_only_a_notice(self):
-        for changed in ({"deviatingPairs": 2, "deviatingReferences": 5},
-                        {"unknownReferences": 40, "unknownPairs": 6}, {"partialFiles": 0},
-                        {"deviatingPairs": 2, "deviatingReferences": 5, "conformingPairs": 31,
-                         "comparablePairs": 41, "unknownReferences": 49}):
-            # (A rise in unknown references alone is the notice tested above.)
+        for changed in ({"pairs": {STORAGE: 0, CAPTURE: 2}},
+                        {"unknown": {"src/cli.rs": 5}, "unknownPairs": 6}, {"partialFiles": 0},
+                        {"pairs": {STORAGE: 0}, "unknown": {"src/http.rs": 4},
+                         "conformingPairs": 31, "comparablePairs": 41}):
             verdict, lines = self.verdict(**changed)
             self.assertEqual(verdict, "lower", changed)
             self.assertIn("NOTICE", lines[0])
@@ -154,7 +237,23 @@ class Ratchet(unittest.TestCase):
         self.assertEqual(RR.summarize(measured), ({
             "deviatingPairs": 2, "deviatingReferences": 10, "unknownReferences": 2,
             "partialFiles": 1, "comparablePairs": 6, "conformingPairs": 2,
-            "unknownPairs": 1}, 2))
+            "unknownPairs": 1,
+            "deviatingReferencesByPair": {"src/http.rs": {"src/storage.rs": 10}},
+            "unknownReferencesBySource": {"src/http.rs": 2}}, 2))
+
+    def test_a_payload_is_summarized_by_pair_and_by_source_file(self):
+        # A pair is the instance's `target` path and its destination's path; an unknown
+        # instance's references belong to its `target` path.
+        measured, _ = RR.summarize(payload(
+            row("deviates", 4), row("deviates", 6, destination={**NATIVE, "path": "src/capture.rs"}),
+            row("deviates", 3, source="src/store.rs"),
+            row("deviates", 5, source="src/cli.rs", excepted=True),
+            row("unknown", 2, destination=None), row("unknown", 7, destination=None, source="src/cli.rs"),
+            row("unknown", 1, destination=stdlib("os"), source="src/store.rs")))
+        self.assertEqual(measured["deviatingReferencesByPair"], {
+            "src/http.rs": {"src/storage.rs": 4, "src/capture.rs": 6},
+            "src/store.rs": {"src/storage.rs": 3}})
+        self.assertEqual(measured["unknownReferencesBySource"], {"src/http.rs": 2, "src/cli.rs": 7})
 
     def test_counts_that_disagree_with_the_instances_are_refused(self):
         measured = payload(*TREE)
@@ -194,7 +293,9 @@ class Ratchet(unittest.TestCase):
         verdict, lines = RR.compare(record, measured)
         self.assertEqual(verdict, "fail")
         self.assertIn("lost coverage", lines[0])
-        self.assertIn("  unknownReferences: recorded 2, measured 6 (+4)", lines)
+        self.assertEqual(lines[1], "  src/http.rs -> src/storage.rs: deviating references "
+                         "recorded 4, measured 0; unknown references from src/http.rs: "
+                         "recorded 2, measured 6 (+4)")
 
     def test_a_file_split_that_adds_an_unknown_pair_passes(self):
         # One source's unresolved references become two sources' (#1087): one more
@@ -211,9 +312,16 @@ class Ratchet(unittest.TestCase):
     def test_the_record_round_trips_byte_for_byte(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "record.json"
-            RR.write_record(path, RECORD)
+            # A measurement: pairs in no order, and every file's unknown references.
+            measured = figures()
+            measured["deviatingReferencesByPair"] = dict(reversed(
+                measured["deviatingReferencesByPair"].items()))
+            RR.write_record(path, measured)
             first = path.read_bytes()
-            self.assertEqual({key: RR.read_record(path)[key] for key in RR.KEYS}, RECORD)
+            written = RR.read_record(path)
+            self.assertEqual({key: written[key] for key in RECORD}, RECORD)
+            self.assertEqual(list(written["deviatingReferencesByPair"]), ["src/http.rs", "src/store.rs"])
+            self.assertEqual(RR.compare(written, measured)[0], "equal")
             RR.write_record(path, RR.read_record(path))
             self.assertEqual(path.read_bytes(), first)
 
@@ -222,17 +330,28 @@ class Ratchet(unittest.TestCase):
             path = Path(directory) / "record.json"
             RR.write_record(path, RECORD)
             written = json.loads(path.read_text())
-            self.assertEqual(list(written), ["schemaVersion", "population", "rule", "measurement", *RR.KEYS])
+            self.assertEqual(list(written), ["schemaVersion", "population", "rule", "measurement", *RR.KEYS,
+                                             "deviatingReferencesByPair", "unknownReferencesBySource"])
             self.assertIn("externalPackage", written["population"])
             self.assertIn("--accept-unknown-rise", written["rule"])
-            # A record of an earlier version, with another population or rule, is refused.
-            path.write_text(json.dumps({"schemaVersion": 2, **RECORD}))
-            with self.assertRaisesRegex(RR.Failed, "--update"):
-                RR.read_record(path)
+            self.assertIn("renames are not detected", written["rule"])
+            # A record of an earlier version or shape is refused: version 3 had the
+            # totals only (#1140).
+            totals = {key: RECORD[key] for key in RR.KEYS}
+            for old in ({**written, "schemaVersion": 3}, {"schemaVersion": 3, **totals},
+                        {key: value for key, value in written.items()
+                         if key != "unknownReferencesBySource"},
+                        {**written, "unknownReferencesBySource": {"src/store.rs": 20}}):
+                path.write_text(json.dumps(old))
+                with self.assertRaisesRegex(RR.Failed, "--update"):
+                    RR.read_record(path)
 
     def test_the_checked_in_record_is_well_formed(self):
         record = RR.read_record(RR.RECORD)
         self.assertEqual(RR.compare(record, record)[0], "equal")
+        flat = RR.pairs(record)
+        self.assertEqual((len(flat), sum(flat.values())),
+                         (record["deviatingPairs"], record["deviatingReferences"]))
 
 
 class Outcomes(unittest.TestCase):
@@ -323,18 +442,24 @@ class NightlyClassifier(unittest.TestCase):
     def outcomes(self, log):
         return {outcome for outcome, pattern in self.patterns().items() if pattern.search(log)}
 
-    def compared(self, **changed):
-        return "\n".join(RR.compare(RECORD, {**RECORD, **changed})[1])
+    def compared(self, pairs=None, unknown=None, **totals):
+        return "\n".join(RR.compare(RECORD, figures(pairs, unknown, **totals))[1])
 
     def test_each_comparison_failure_is_named_from_its_own_line(self):
         self.assertEqual(set(self.patterns()), {"record-exceeded", "lost-coverage"})
         self.assertEqual(self.outcomes(self.compared(deviatingPairs=4)), {"record-exceeded"})
         self.assertEqual(self.outcomes(self.compared(partialFiles=2)), {"record-exceeded"})
-        self.assertEqual(self.outcomes(self.compared(deviatingPairs=2, unknownReferences=51)),
-                         {"lost-coverage"})
-        self.assertEqual(self.outcomes(self.compared(deviatingPairs=2, deviatingReferences=11,
-                                                     unknownReferences=51)),
+        self.assertEqual(self.outcomes(self.compared(pairs={("src/web.rs", "src/storage.rs"): 1})),
+                         {"record-exceeded"})
+        lost = {"pairs": {STORAGE: 0}, "unknown": {"src/http.rs": 6}}
+        self.assertEqual(self.outcomes(self.compared(**lost)), {"lost-coverage"})
+        self.assertEqual(self.outcomes(self.compared(**lost, partialFiles=2)),
                          {"record-exceeded", "lost-coverage"})
+        # The nightly summary is the log's last 40 lines, cut at 600 characters: the
+        # line that names the pair is whole in it.
+        named = [line for line in self.compared(**lost).splitlines() if "src/http.rs -> " in line]
+        self.assertEqual(len(named), 1)
+        self.assertLess(len(named[0]), 600)
 
     def test_an_exit_of_1_without_those_lines_is_not_a_layering_outcome(self):
         for log in ("Traceback (most recent call last):\nFileNotFoundError: no record\n",

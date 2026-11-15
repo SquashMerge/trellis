@@ -16,18 +16,29 @@ with an `externalPackage` destination are left out of every figure, so a new
 `import json` in a tool changes nothing here.
 
 The run fails when deviating pairs, deviating references or partial files rise above
-the record. It also fails on lost coverage, as spec G1 words it: a lower deviation count
-(pairs or references below the record) together with more unknown references than
-recorded. Unknown references are the references of the instances whose status is
-`unknown`. When deviations are not lower, a rise in unknown references is only a notice:
-they are over a third of the population's references, so ordinary new code raises them.
-Pair totals are recorded as information and never fail: a pair is one source file's
-aggregate, so splitting, merging or renaming a file moves pair counts without changing
-what is known.
+the record, and when a deviating pair is measured that the record does not have. It also
+fails on lost coverage, as spec G1 words it, decided per pair (#1140): a recorded pair
+has fewer deviating references than recorded, or is gone, and its source file has more
+unknown references than recorded for that file. That is a deviating reference that
+became unresolvable instead of being fixed. Unknown references are the references of the
+instances whose status is `unknown`; each has a source file, the instance's `target`.
+Any other rise in unknown references is only a notice: they are over a third of the
+population's references, so ordinary new code raises them. The record keeps the
+deviating references of each pair and the unknown references of each of those pairs'
+source files for this comparison.
 
-`--update` refuses to lower the recorded deviations while unknown references are above
-the record, unless `--accept-unknown-rise` is given. It prints the unknown-reference
-change either way.
+A pair is its source path and its destination path; renames are not detected. A
+deviating pair whose source or destination file was renamed, split or merged is a pair
+the record does not have, so the run fails until the record is updated. The pair under
+the old path counts as fallen.
+
+Pair totals are recorded as information and never fail: an unknown pair is one source
+file's aggregate, so splitting, merging or renaming a file moves pair counts without
+changing what is known.
+
+`--update` refuses to rewrite the record from a measurement that is lost coverage by
+that per-pair rule, unless `--accept-unknown-rise` is given. It prints the
+unknown-reference change either way.
 
 Known gap: a bare JavaScript import the tool leaves unresolved (`destination` null, such
 as `node:crypto` or `esbuild`) is not classified `externalPackage`. It stays in the
@@ -74,7 +85,12 @@ PRODUCERS = (("rust-analyzer", "trusted"), ("scip-typescript", "restricted"))
 # them describe the population and are information only.
 RATCHETED = ("deviatingPairs", "deviatingReferences", "unknownReferences", "partialFiles")
 KEYS = (*RATCHETED, "comparablePairs", "conformingPairs", "unknownPairs")
-SCHEMA_VERSION = 3
+# What the per-pair comparison needs (#1140): the deviating references of each pair, as
+# {source path: {destination path: references}}, and the unknown references from each
+# source file, as {source path: references}. The record keeps the second only for the
+# sources of its deviating pairs.
+BY_PAIR, BY_SOURCE = "deviatingReferencesByPair", "unknownReferencesBySource"
+SCHEMA_VERSION = 4
 # What the record's figures count and how they were measured, written into the record
 # so it can be read without this script.
 DESCRIPTION = {
@@ -86,15 +102,24 @@ DESCRIPTION = {
                   "not an externalPackage, so it stays in the population as unknown "
                   "references (see #1088).",
     "rule": "A run fails when deviatingPairs, deviatingReferences or partialFiles is "
-            "above this record. It also fails as lost coverage when deviatingPairs or "
-            "deviatingReferences is below this record while unknownReferences is above "
-            "it; with deviations not lower, a rise in unknownReferences is a notice. "
+            "above this record, or when it measures a deviating pair that is not in "
+            "deviatingReferencesByPair. It also fails as lost coverage, decided per "
+            "pair: a pair in deviatingReferencesByPair (source path, then destination "
+            "path) has fewer deviating references than recorded, or is gone, while its "
+            "source file has more unknown references than unknownReferencesBySource "
+            "records for it. Any other rise in unknown references is a notice. "
             "unknownReferences is the sum of referenceCount over the population's "
-            "instances with status unknown. An update does not lower the deviations "
-            "while unknownReferences is above the record unless --accept-unknown-rise "
-            "is given. comparablePairs, conformingPairs and unknownPairs are information only: "
-            "a pair is one source file's aggregate, so a file split, merge, rename "
-            "or deletion moves them without changing coverage.",
+            "instances with status unknown; unknownReferencesBySource is that sum for "
+            "each source file of a recorded deviating pair. Pairs are compared by path "
+            "and renames are not detected: a deviating pair whose source or "
+            "destination file was renamed, split or merged is a pair this record does "
+            "not have, so the run fails until the record is updated, and the pair "
+            "under the old path counts as fallen. An update is refused when the "
+            "measurement is lost coverage by this rule, unless --accept-unknown-rise "
+            "is given. comparablePairs, conformingPairs and unknownPairs are "
+            "information only: an unknown pair is one source file's aggregate, so a "
+            "file split, merge, rename or deletion moves them without changing "
+            "coverage.",
     "measurement": "`python3 tools/rules-ratchet.py --update`: a debug build of this "
                    "checkout, its own daemon under a private HOME, a fresh index, then "
                    "rust-analyzer (trusted) and scip-typescript (restricted) imported.",
@@ -191,6 +216,14 @@ def summarize(payload):
         raise Failed("rules check counts disagree with its instances")
     first_party = [row for row in instances if not is_external(row)]
     deviating, unknown = having(first_party, "deviates"), having(first_party, "unknown")
+    by_pair, by_source = {}, {}
+    for row in deviating:
+        destinations = by_pair.setdefault(row["target"]["path"], {})
+        destination = row["destination"]["path"]
+        destinations[destination] = destinations.get(destination, 0) + row["referenceCount"]
+    for row in unknown:
+        source = row["target"]["path"]
+        by_source[source] = by_source.get(source, 0) + row["referenceCount"]
     return {
         "deviatingPairs": len(deviating),
         "deviatingReferences": sum(row["referenceCount"] for row in deviating),
@@ -199,18 +232,44 @@ def summarize(payload):
         "comparablePairs": len(first_party),
         "conformingPairs": len(having(first_party, "conforms")),
         "unknownPairs": len(unknown),
+        BY_PAIR: by_pair,
+        BY_SOURCE: by_source,
     }, len(instances) - len(first_party)
 
 
 DEVIATIONS = ("deviatingPairs", "deviatingReferences")
 
 
-def claims_on_less_evidence(record, measured):
-    """Spec G1's lost coverage: a lower deviation count with more unknown references.
-    The check reports observed references, not absence, so fewer deviations on less
-    evidence is not progress."""
-    return (any(measured[key] < record[key] for key in DEVIATIONS)
-            and measured["unknownReferences"] > record["unknownReferences"])
+def pairs(figures):
+    """The deviating pairs as {(source, destination): references}."""
+    return {(source, destination): references
+            for source, destinations in figures[BY_PAIR].items()
+            for destination, references in destinations.items()}
+
+
+def recorded(figures):
+    """The part of a measurement the record keeps, in the record's order: the totals,
+    every deviating pair, and the unknown references of those pairs' source files."""
+    by_pair = {source: dict(sorted(destinations.items()))
+               for source, destinations in sorted(figures[BY_PAIR].items())}
+    return {**{key: figures[key] for key in KEYS}, BY_PAIR: by_pair,
+            BY_SOURCE: {source: figures[BY_SOURCE].get(source, 0) for source in by_pair}}
+
+
+def lost_coverage(record, measured):
+    """Spec G1's lost coverage, one line per pair: a recorded pair with fewer deviating
+    references, or gone, whose source file has more unknown references than recorded.
+    The check reports observed references, not absence, so a deviating reference that
+    became unresolvable is not progress."""
+    now, lines = pairs(measured), []
+    for (source, destination), references in pairs(record).items():
+        before, after = record[BY_SOURCE][source], measured[BY_SOURCE].get(source, 0)
+        if now.get((source, destination), 0) < references and after > before:
+            lines.append(f"{source} -> {destination}: deviating references recorded "
+                         f"{references}, measured {now.get((source, destination), 0)}; "
+                         f"unknown references from {source}: recorded {before}, "
+                         f"measured {after} ({after - before:+d})")
+    return lines
 
 
 def unknown_change(record, measured):
@@ -223,17 +282,22 @@ def unknown_change(record, measured):
 def compare(record, measured):
     """Returns (verdict, lines); verdict is `fail`, `lower` or `equal`.
 
-    A rise in deviating pairs, deviating references or partial files fails. So does a
-    lower deviation count with more unknown references. A rise in unknown references
-    with deviations not lower is a notice, as is any other difference. Pair totals
-    never fail: they move when a file is split, merged, renamed or deleted.
+    A rise in deviating pairs, deviating references or partial files fails, and so does
+    a deviating pair the record does not have. So does lost coverage: a recorded pair
+    with fewer deviating references and more unknown references from its source file.
+    Any other rise in unknown references is a notice, as is any other difference. Pair
+    totals never fail: they move when a file is split, merged, renamed or deleted.
     """
     def change(key):
         return f"{key}: recorded {record[key]}, measured {measured[key]}"
 
+    before, now = pairs(record), pairs(measured)
     rises = [change(key) for key in DEVIATIONS if measured[key] > record[key]]
+    rises += [f"new deviating pair: {source} -> {destination} ({references} references)"
+              for (source, destination), references in sorted(now.items())
+              if (source, destination) not in before]
     partial = measured["partialFiles"] > record["partialFiles"]
-    lost = claims_on_less_evidence(record, measured)
+    lost = lost_coverage(record, measured)
     if rises or partial or lost:
         lines = []
         if rises:
@@ -244,19 +308,27 @@ def compare(record, measured):
             lines.append(f"  {change('partialFiles')}")
         if lost:
             lines.append("rules ratchet FAILED: the comparison population lost coverage: "
-                         "fewer deviations on more unknown references")
-            lines += [f"  {change(key)}" for key in DEVIATIONS if measured[key] < record[key]]
-            lines.append(f"  {unknown_change(record, measured)}")
+                         "fewer deviating references in a pair on more unknown "
+                         "references from its source file")
+            lines += [f"  {line}" for line in lost]
         lines.append("  Remove the added deviation or restore the coverage. A reviewed "
                      f"re-baseline or exception updates the record explicitly: {UPDATE}")
         return "fail", lines
-    differs = [change(key) for key in KEYS if measured[key] != record[key]]
-    if differs:
+    if recorded(measured) != recorded(record):
         lines = ["rules ratchet NOTICE: the record can be updated"]
-        lines += [f"  {line}" for line in differs]
+        lines += [f"  {change(key)}" for key in KEYS if measured[key] != record[key]]
+        lines += [f"  {source} -> {destination}: deviating references recorded {references}, "
+                  f"measured {now.get((source, destination), 0)}"
+                  for (source, destination), references in before.items()
+                  if now.get((source, destination), 0) != references]
+        lines += [f"  unknown references from {source}: recorded {references}, measured "
+                  f"{measured[BY_SOURCE].get(source, 0)}"
+                  for source, references in record[BY_SOURCE].items()
+                  if measured[BY_SOURCE].get(source, 0) != references]
         if measured["unknownReferences"] > record["unknownReferences"]:
             lines.append(f"  NOTICE: unknown references rose; {unknown_change(record, measured)}. "
-                         "Not a failure, because deviations are not lower.")
+                         "Not a failure: no pair with fewer deviating references has more "
+                         "unknown references from its source file.")
         return "lower", lines + [f"  Update it: {UPDATE}"]
     return "equal", ["rules ratchet: " + ", ".join(f"{key} {measured[key]}" for key in KEYS)]
 
@@ -264,26 +336,38 @@ def compare(record, measured):
 def update_refusal(previous, measured, accept_unknown_rise):
     """Returns (refused, lines) for rewriting the record `previous` with `measured`.
 
-    Lowering the recorded deviations while unknown references are above the record
-    would lock in an improvement claimed on less evidence, so it needs the flag."""
+    A measurement that is lost coverage against the record would lock in an improvement
+    claimed on less evidence, so writing it needs the flag."""
     lines = [f"rules ratchet: {unknown_change(previous, measured)}"]
-    if not claims_on_less_evidence(previous, measured):
+    lost = lost_coverage(previous, measured)
+    if not lost:
         return False, lines
     if accept_unknown_rise:
-        return False, lines + ["rules ratchet: lowering the recorded deviations on more "
-                               f"unknown references, as {ACCEPT} asks"]
+        return False, lines + ["rules ratchet: recording fewer deviating references on more "
+                               f"unknown references from the same source file, as {ACCEPT} asks",
+                               *(f"  {line}" for line in lost)]
     return True, lines + [
-        "rules ratchet FAILED: the record was not rewritten: deviations are lower than "
-        "recorded while unknown references are higher",
-        *(f"  {key}: recorded {previous[key]}, measured {measured[key]}" for key in DEVIATIONS),
+        "rules ratchet FAILED: the record was not rewritten: a pair has fewer deviating "
+        "references than recorded while its source file has more unknown references",
+        *(f"  {line}" for line in lost),
         f"  If the rise in unknown references is reviewed and accepted: {UPDATE} {ACCEPT}"]
+
+
+def counts(value):
+    """Whether `value` is a {path: non-negative integer} object."""
+    return isinstance(value, dict) and all(
+        isinstance(count, int) and count >= 0 for count in value.values())
 
 
 def read_record(path):
     record = json.loads(path.read_text())
     if (record.get("schemaVersion") != SCHEMA_VERSION
             or any(record.get(key) != text for key, text in DESCRIPTION.items())
-            or any(not isinstance(record.get(key), int) for key in KEYS)):
+            or any(not isinstance(record.get(key), int) for key in KEYS)
+            or not isinstance(record.get(BY_PAIR), dict)
+            or not all(counts(destinations) for destinations in record[BY_PAIR].values())
+            or not counts(record.get(BY_SOURCE))
+            or set(record[BY_SOURCE]) != set(record[BY_PAIR])):
         raise Failed(f"{path}: not a version {SCHEMA_VERSION} rules-ratchet record; "
                      f"rewrite it with {UPDATE}")
     return record
@@ -291,7 +375,7 @@ def read_record(path):
 
 def write_record(path, measured):
     path.write_text(json.dumps({"schemaVersion": SCHEMA_VERSION, **DESCRIPTION,
-                                **{key: measured[key] for key in KEYS}}, indent=2) + "\n")
+                                **recorded(measured)}, indent=2) + "\n")
 
 
 def private_env(home):
@@ -470,8 +554,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--update", action="store_true", help="rewrite the record")
     parser.add_argument(ACCEPT, action="store_true",
-                        help="with --update: lower the recorded deviations although "
-                             "unknown references are above the record")
+                        help="with --update: rewrite the record although a pair has fewer "
+                             "deviating references on more unknown references from its "
+                             "source file")
     parser.add_argument("--require-producers", action="store_true",
                         help="fail (exit 3) when a producer is not ready, instead of "
                              "printing a notice and exiting 0")
@@ -513,7 +598,7 @@ def main():
 
 def check(args, target_dir, home, owned):
     if args.update:
-        # A missing record, or one of another version, has nothing to compare with.
+        # A missing record, or one of another version or shape, has nothing to compare with.
         try:
             record = read_record(args.record)
         except (Failed, OSError, ValueError):
