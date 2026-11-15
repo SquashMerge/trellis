@@ -6,6 +6,11 @@ use super::{
         ArtifactEntry, Descriptor, PageEntry, SourceManifestHasher, basis_artifact_ordinal,
     },
 };
+pub(crate) use crate::store::read_counters::reset_whole_snapshot_reads;
+pub use crate::store::read_counters::{
+    native_document_loads, note_whole_snapshot_read, reset_native_document_loads,
+    whole_snapshot_reads,
+};
 use crate::{
     capture::Capture,
     index_coordinator::CopiedInput,
@@ -27,22 +32,6 @@ use std::{
     path::Path,
     sync::atomic::{AtomicU64, Ordering},
 };
-
-thread_local! {
-    static NATIVE_DOCUMENT_LOADS: Cell<u64> = const { Cell::new(0) };
-}
-
-pub fn reset_native_document_loads() {
-    NATIVE_DOCUMENT_LOADS.with(|loads| loads.set(0));
-}
-
-pub fn native_document_loads() -> u64 {
-    NATIVE_DOCUMENT_LOADS.with(Cell::get)
-}
-
-pub(crate) fn note_native_document_load() {
-    NATIVE_DOCUMENT_LOADS.with(|loads| loads.set(loads.get() + 1));
-}
 
 type DocumentCommonHook =
     Box<dyn FnMut(u8, &native::DocumentKey, &crate::semantic_import::JoinedFacts, &Connection)>;
@@ -107,7 +96,6 @@ type RowHook = Box<dyn FnMut(&str, &mut serde_json::Value)>;
 
 thread_local! {
     static BEFORE_ROW: std::cell::RefCell<Option<RowHook>> = const { std::cell::RefCell::new(None) };
-    static WHOLE_SNAPSHOT_READS: Cell<u64> = const { Cell::new(0) };
     static BEFORE_CLOSURE: std::cell::RefCell<Option<ClosureHook>> = const { std::cell::RefCell::new(None) };
     static BEFORE_COVERAGE: std::cell::RefCell<Option<ClosureHook>> = const { std::cell::RefCell::new(None) };
 }
@@ -155,20 +143,6 @@ pub(crate) fn run_before_closure_hook(conn: &Connection) {
     if let Some(hook) = BEFORE_CLOSURE.with(|slot| slot.borrow_mut().take()) {
         hook(conn);
     }
-}
-
-/// Called by `retained_native_snapshot_from_db`: a whole-revision read happened.
-pub fn note_whole_snapshot_read() {
-    WHOLE_SNAPSHOT_READS.with(|reads| reads.set(reads.get() + 1));
-}
-
-/// Whole-revision snapshot reads on this thread since `stage_batch` last started.
-pub fn whole_snapshot_reads() -> u64 {
-    WHOLE_SNAPSHOT_READS.with(Cell::get)
-}
-
-pub(crate) fn reset_whole_snapshot_reads() {
-    WHOLE_SNAPSHOT_READS.with(|reads| reads.set(0));
 }
 
 struct MemoryInputs<'a> {
