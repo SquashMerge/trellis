@@ -470,6 +470,14 @@ class NightlyClassifier(unittest.TestCase):
         self.assertIn('[ -n "$outcome" ] || outcome=not-measured', text)
         self.assertNotIn("worse-than-record", text)
 
+    def test_the_issue_explains_lost_coverage_by_the_per_pair_rule(self):
+        # #1140: lost coverage can fail while the repo-wide unknown total falls, so the
+        # issue's explanation must not speak of the totals.
+        meaning = re.search(r"'lost-coverage': `([^`]+)`", self.WORKFLOW.read_text()).group(1)
+        self.assertIn("its source file has more unknown references than recorded for it", meaning)
+        self.assertIn("name each such pair", meaning)
+        self.assertNotIn("deviations are below", meaning)
+
 
 def done(code, stdout="", stderr=""):
     return subprocess.CompletedProcess([], code, stdout, stderr)
