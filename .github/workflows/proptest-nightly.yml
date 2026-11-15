@@ -95,9 +95,11 @@ jobs:
           # binds the artifact's tool version to the pinned one.
           rustup run "$toolchain" rust-analyzer --version
           scip-typescript --version
-      # Exit 0: the record holds. Exit 1: the measurement is worse than the
-      # record. Anything else: no comparison was made (a producer, the daemon or
-      # the index failed), which says nothing about the layering.
+      # Exit 0: the record holds. Exit 1 with the script's own FAILED line for a
+      # comparison: the measurement is worse than the record. Anything else,
+      # an exit of 1 without such a line included: no comparison was made (a
+      # producer, the daemon or the index failed), which says nothing about the
+      # layering.
       - name: Run the ratchet
         id: ratchet
         shell: bash
@@ -113,7 +115,7 @@ jobs:
               outcome=""
               if grep -Eq '^rules ratchet FAILED: (deviations rose|more files are partial)' "$out/ratchet.log"; then outcome=record-exceeded; fi
               if grep -q '^rules ratchet FAILED: the comparison population lost coverage' "$out/ratchet.log"; then outcome="${outcome:+$outcome, }lost-coverage"; fi
-              [ -n "$outcome" ] || outcome=worse-than-record
+              [ -n "$outcome" ] || outcome=not-measured
               ;;
             *) outcome=not-measured ;;
           esac
@@ -172,7 +174,7 @@ jobs:
               'lost-coverage': `Lost coverage: deviations are below ${record} while unknown references are above it, which is not progress.`,
               'record-exceeded, lost-coverage': `The record ${record} is exceeded and coverage was lost; the lines below give both.`,
             };
-            const meaning = meanings[outcome] || `The measurement is worse than ${record}.`;
+            const meaning = meanings[outcome] || meanings['not-measured'];
             const fence = '`'.repeat(3);
             const summary = (process.env.SUMMARY || '').trim().split(fence).join("'''");
             const lines = summary ? `\n\n${fence}\n${summary}\n${fence}` : '';

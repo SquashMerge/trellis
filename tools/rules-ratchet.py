@@ -41,9 +41,11 @@ producers `ready`; otherwise it prints a notice and exits 0. The nightly job pas
 
 Exit status: 0, the record holds (or the run was not made, without
 `--require-producers`); 1, the measurement is worse than the record: deviations rose,
-more files are partial, or coverage was lost; 3, no comparison was made: a producer is
-missing or failed, the build, the daemon or the index failed, or the cleanup did. An
-exit of 3 says nothing about the layering.
+more files are partial, or coverage was lost (or `--update` refused to rewrite the
+record); 3, no comparison was made: a producer is missing or failed, the build, the
+daemon or the index failed, the record or the binary is missing or unreadable, the
+cleanup failed, or anything else went wrong. An exit of 3 says nothing about the
+layering. 2 is a usage error.
 
 The script starts that daemon itself, so it knows its PID, and on every exit it stops
 it, waits for the process to be gone and only then removes the HOME. A stop that fails
@@ -61,6 +63,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -492,6 +495,13 @@ def main():
     except Interrupted as error:
         print(f"rules ratchet interrupted by {error}", file=sys.stderr)
         code = 128 + Signals.received
+    except Exception as error:  # a missing record or binary, an I/O error, a defect here
+        # Only an explicit comparison may exit WORSE; Python's own exit for an uncaught
+        # exception is 1 too.
+        traceback.print_exc()
+        print(f"rules ratchet FAILED: not measured: {type(error).__name__}: {error}",
+              file=sys.stderr)
+        code = NOT_MEASURED
     finally:
         Signals.cleaning = True
         problems = shut_down(*(owned or (None, None)), home)
