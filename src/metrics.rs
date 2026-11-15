@@ -293,20 +293,63 @@ fn bind(
 /// The deepest of one callable's stored control regions, counting the levels on each
 /// region's parent chain (#987). An arm is as deep as its statement and an `else if` as deep
 /// as the first `if` of its chain, so neither is a level.
+///
+/// An arm is level with its statement only when that statement is the stored region above
+/// it, which then supplies the level. Java's `try (resource)` is not stored, so its `catch`
+/// and `finally` keep theirs. It is the only statement of the five grammars that owns a
+/// stored arm kind without being stored itself.
 fn max_nesting(source: &str, language: &str, owned: &[&ControlRegion]) -> usize {
     let by_id: HashMap<&str, &ControlRegion> = owned.iter().map(|r| (r.id.as_str(), *r)).collect();
     let parent_of =
         |r: &ControlRegion| r.parent_id.as_deref().and_then(|id| by_id.get(id).copied());
+    // The `catch` and `finally` of a stored `try` run to its end, one after the other. Those
+    // of a `try (resource)` directly in its body end before the `}` that closes that body.
+    let closes = |arm: &ControlRegion, statement: &ControlRegion| {
+        let mut end = arm.range.end;
+        for _ in 0..owned.len() {
+            if end == statement.range.end {
+                return true;
+            }
+            let next = owned
+                .iter()
+                .filter(|r| {
+                    matches!(r.kind.as_str(), "catch_clause" | "finally_clause")
+                        && r.parent_id.as_deref() == Some(statement.id.as_str())
+                        && r.range.start >= end
+                })
+                .min_by_key(|r| r.range.start);
+            match next {
+                Some(next)
+                    if source
+                        .get(end..next.range.start)
+                        .is_some_and(|gap| !gap.contains('}')) =>
+                {
+                    end = next.range.end;
+                }
+                _ => return false,
+            }
+        }
+        false
+    };
     let level = |r: &ControlRegion| {
-        if matches!(
-            r.kind.as_str(),
-            "else_clause"
-                | "elif_clause"
-                | "switch_case"
-                | "switch_default"
-                | "catch_clause"
-                | "finally_clause"
-        ) {
+        let parent = parent_of(r);
+        let parent_kind = parent.map_or("", |parent| parent.kind.as_str());
+        let arm = match r.kind.as_str() {
+            "else_clause" | "elif_clause" => matches!(
+                parent_kind,
+                "if_statement"
+                    | "if_expression"
+                    | "for_statement"
+                    | "while_statement"
+                    | "try_statement"
+            ),
+            "switch_case" | "switch_default" => parent_kind == "switch_statement",
+            "catch_clause" | "finally_clause" => {
+                parent_kind == "try_statement" && parent.is_some_and(|parent| closes(r, parent))
+            }
+            _ => false,
+        };
+        if arm {
             return false;
         }
         // The `if` of an `else if` ends where its parent does and follows the `else`: under
@@ -316,10 +359,8 @@ fn max_nesting(source: &str, language: &str, owned: &[&ControlRegion]) -> usize 
         // closing token, so an `if` ending it would look like one.
         let continuation = language != "python"
             && matches!(r.kind.as_str(), "if_statement" | "if_expression")
-            && parent_of(r).is_some_and(|parent| {
-                matches!(parent.kind.as_str(), "else_clause" | "if_statement")
-                    && parent.range.end == r.range.end
-            })
+            && matches!(parent_kind, "else_clause" | "if_statement")
+            && parent.is_some_and(|parent| parent.range.end == r.range.end)
             && source
                 .get(..r.range.start)
                 .is_some_and(|before| before.trim_end().ends_with("else"));

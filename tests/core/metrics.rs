@@ -1755,3 +1755,64 @@ fn switch_and_try_arms_are_as_deep_as_their_statement() {
         );
     }
 }
+
+/// #987 review: an arm is level with its statement only when that statement is itself a
+/// stored region. Java's `try (resource)` is not stored, so its arms carry the level.
+#[test]
+fn arms_of_a_statement_that_is_not_stored_keep_their_level() {
+    for (source, expected) in [
+        (
+            "class Case { int calc(java.io.Reader in) { try (java.io.Reader r = in) { return r.read(); } catch (java.io.IOException e) { return -1; } } }",
+            1,
+        ),
+        (
+            "class Case { int calc(java.io.Reader in, int x) { try (java.io.Reader r = in) { return r.read(); } catch (java.io.IOException e) { if (x > 0) { return x; } return -1; } } }",
+            2,
+        ),
+        (
+            "class Case { int calc(java.io.Reader in) { try (java.io.Reader r = in) { return r.read(); } catch (java.io.IOException e) { return -1; } catch (RuntimeException e) { return -2; } finally { in = null; } } }",
+            1,
+        ),
+        // Inside a stored `try`, the resource statement's own `catch` is one level deeper,
+        // and the outer `catch` is still level with the outer `try`.
+        (
+            "class Case { int calc(java.io.Reader in) { try { try (java.io.Reader r = in) { return r.read(); } catch (java.io.IOException e) { return -1; } } catch (RuntimeException e) { return -2; } } }",
+            2,
+        ),
+    ] {
+        assert_eq!(
+            native_max_nesting("java", "Case.java", source),
+            expected,
+            "{source}"
+        );
+    }
+}
+
+/// #987 review: every arm of a stored statement is level with it, whatever sits between two
+/// arms, and so are Python's `else` and `finally` after a loop or a `try`.
+#[test]
+fn every_arm_of_a_stored_statement_is_level_with_it() {
+    for (language, filename, source) in [
+        (
+            "java",
+            "Case.java",
+            "class Case { int calc(int x) { try { return x; } catch (IllegalStateException e) { return 1; } // next\n catch (RuntimeException e) { return 2; } finally { x = 0; } } }",
+        ),
+        (
+            "python",
+            "case.py",
+            "def calc(x):\n    try:\n        return x()\n    except ValueError:\n        return 1\n    else:\n        return 2\n    finally:\n        x = None\n",
+        ),
+        (
+            "python",
+            "case.py",
+            "def calc(xs):\n    for x in xs:\n        return x\n    else:\n        return 0\n",
+        ),
+    ] {
+        assert_eq!(
+            native_max_nesting(language, filename, source),
+            1,
+            "{language}: {source}"
+        );
+    }
+}
