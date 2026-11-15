@@ -121,7 +121,7 @@ def module_declarations(text):
             and following[3][0] == "string"
             and following[4] == ("punct", "]")
         ):
-            path = following[3][1].strip('bc"')
+            path = following[3][1].partition('"')[2][:-1]
             index += 6
             continue
         if (kind, value) == ("ident", "mod") and len(following) >= 2 and following[0][0] == "ident":
@@ -278,7 +278,7 @@ def map_selector(root, selector, environ, cache):
         raise Refused("the path does not exist" if not os.path.lexists(full) else "the path is a broken symbolic link")
     # Symbolic links resolved: the file itself must be inside the checkout.
     physical = os.path.realpath(full)
-    if os.path.commonpath([physical, root]) != root or physical == root:
+    if os.path.commonpath([physical, root]) != root:
         raise Refused("the path is outside the checkout")
     if not os.path.isfile(physical):
         raise Refused("the path is not a file")

@@ -136,8 +136,9 @@ FILES = {
             panic!("selected");
         }
     """,
-    "tests/suite/outer.rs": '#[path = "moved.rs"]\nmod inner;\n',
-    "tests/suite/moved.rs": "#[test]\nfn passes() {}\n",
+    # A literal that starts with a string prefix letter is still read whole.
+    "tests/suite/outer.rs": '#[path = "borrowed.rs"]\nmod inner;\n',
+    "tests/suite/borrowed.rs": "#[test]\nfn passes() {}\n",
     "tests/other/main.rs": '#[path = "../support/helper.rs"]\nmod helper;\n',
     "tests/support/helper.rs": "",
     "tests/unit.test.cjs": NODE_TEST,
@@ -218,7 +219,7 @@ class Mapping(Checkout):
                          [self.cargo("--test suite -E 'test(/^cases::/)'")])
 
     def test_a_path_attribute_decides_the_module(self):
-        self.assertEqual(self.mapped("tests/suite/moved.rs"),
+        self.assertEqual(self.mapped("tests/suite/borrowed.rs"),
                          [self.cargo("--test suite -E 'test(/^outer::inner::/)'")])
         self.assertEqual(self.mapped("src/alpha_tests.rs"),
                          [self.cargo("--lib -E 'test(/^alpha::tests::/)'")])
@@ -330,7 +331,6 @@ class Refusals(Checkout):
         (self.outside / "outside.test.cjs").write_text("")
         self.assert_refused("../outside.test.cjs", "outside the checkout")
         self.assert_refused("tests/../../outside.test.cjs", "outside the checkout")
-        self.assert_refused(".", "outside the checkout")
 
     def test_a_link_that_leaves_the_checkout(self):
         (self.outside / "outside.test.cjs").write_text("")
@@ -341,6 +341,7 @@ class Refusals(Checkout):
 
     def test_a_directory(self):
         self.assert_refused("tests/suite", "not a file")
+        self.assert_refused(".", "not a file")
 
     def test_an_unknown_layout(self):
         for selector in ("tests/notes.md", "tools/sample.py", "web/app.js", "Cargo.toml",
@@ -489,7 +490,7 @@ class CargoRuns(Checkout):
     def test_selectors_run_their_own_tests_only(self):
         # The library and the suite binary each hold a failing test beside the selected ones.
         passing = ("src/alpha.rs", "src/gamma/mod.rs::passes", "tests/suite/cases.rs::passes",
-                   "tests/suite/moved.rs", "tests/single.rs")
+                   "tests/suite/borrowed.rs", "tests/single.rs")
         result = self.run_selected(*passing)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stdout.count("==> CARGO_TARGET_DIR="), len(passing))
