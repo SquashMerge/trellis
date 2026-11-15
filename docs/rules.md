@@ -692,6 +692,47 @@ entries. An `app` that names no app, or a name that several apps share, is a loc
 never change a rule verdict, a count or an app. The reading rules are in
 [architecture-view.md](architecture-view.md#apps-and-http-interfaces-data-and-extraction-784-788).
 
+### Amendment (#988): test features
+
+**Status: owner ruling 2026-11-14 ([#988](https://github.com/SquashMerge/trellis/issues/988)),
+recorded in [Decision 0011](semantic-evidence/decisions/0011-test-production-declaration-role.md).**
+
+`test_features` is an optional top-level key, the tenth: a list of Cargo feature names that
+gate test support in this checkout.
+
+```toml
+test_features = ["test-support"]
+```
+
+A Rust reference site whose role is production is reported as test when one of these holds
+for the site or for syntax enclosing it:
+
+- it carries the outer attribute `#[cfg(feature = "<name>")]`;
+- it carries the outer attribute `#[cfg(any(test, feature = "<name>"))]`, with the two
+  operands in either order;
+- its file, inline module or block starts with the inner attribute
+  `#![cfg(feature = "<name>")]` or `#![cfg(any(test, feature = "<name>"))]`.
+
+The gate's whole condition must be one of those two forms. Whitespace between tokens is
+ignored, and the name is the string literal's exact value, so `feature = "test support"` or
+`" test-support"` does not match `test-support`. A literal with an escape, a raw literal and
+an attribute with a comment inside are not interpreted. These do not match: `not(...)`;
+`all(...)`, although such code also needs the feature; an `any` with any other or further
+operand, because that code is also built without the feature; and `cfg_attr`. A `mod` item's
+own gate does not reach a file it declares.
+
+Each name is 1 to 64 bytes of ASCII letters, digits, `_`, `-`, `+` and `.`, and starts with
+a letter, a digit or `_`. A value that is not a list of such names, a
+repeated name and more than 64 names are each a located `invalid_rules` error.
+
+The key applies to the whole checkout, not to one app: a file's app is itself computed from
+the references the key shapes. It changes reference-site roles at read time only, for
+`trellis_references` and for the rules check, explain, view and details that read them. A
+references read uses the key from the checkout's current rules file; a missing or invalid
+file names no feature for it. Declaration roles, `callerRole`, find, search, metrics and the
+treemap do not change, and nothing is re-indexed when the key changes. A rules file without the key behaves exactly
+as before.
+
 ## External package policy
 
 A layer needs a nonempty `paths` or `external` collection; either selects that
@@ -759,7 +800,8 @@ The closed top-level keys are `version`, `layer_policy`, `external_policy`, `lay
 start empty. (#783: an ordered layer gains `app` and a shared layer gains `apps`; see
 [Amendment (#783)](#amendment-783-apps-and-per-app-layers). #794: `apps` is an eighth
 top-level key, a map of authored `[apps.<name>]` tables; see
-[Amendment (#794)](#amendment-794-authored-apps).) A selector has at least one of `paths`, `name`, `language`, `extends`
+[Amendment (#794)](#amendment-794-authored-apps). #855: `interfaces` is a ninth. #988:
+`test_features` is a tenth; see [Amendment (#988)](#amendment-988-test-features).) A selector has at least one of `paths`, `name`, `language`, `extends`
 and `implements`. Keys combine with AND; entries within `paths` or `language`
 combine with OR. Languages are `java`, `rust`, `python`, `javascript`, `typescript`. Name patterns
 match the measured nullable name; null never receives an invented name.
@@ -1011,7 +1053,9 @@ roles stay stored, and the call tools' `callerRole` is the caller declaration's
 stored role as before.
 [Decision 0011](semantic-evidence/decisions/0011-test-production-declaration-role.md)
 governs the role: Rust `cfg(test)` and inherited positive test markers are test;
-`cfg(feature = "test-support")` is **production**, not a third role. A filename
+`cfg(feature = "test-support")` is **production**, not a third role, unless the rules file
+names the feature in [`test_features`](#amendment-988-test-features); then the reference
+sites under its gate are test at read time. A filename
 such as `src/testing.rs` alone does not override the stored role.
 
 Test references/instances are reported separately and never count as violations. Test-only policy comparisons retain their underlying
@@ -1098,7 +1142,11 @@ fallback. Projection is not persisted, writes no `index.db`, and changes neither
 native producer output nor Stage 3 extraction.
 
 The one current-file exception is root `.trellis/rules.toml`, read once per
-check/explain/prompt as bounded configuration. References alone do not read it.
+check/explain/prompt as bounded configuration. A references read takes one thing from
+it (#988): the `test_features` list, through the same bounded read, once per request. That
+read is lenient: a missing or invalid file names no test feature and the references read
+still answers, with no rules descriptor in its response. Check, explain and prompt still
+fail with a typed `invalid_rules` error on an invalid file.
 Its descriptor is `{path:".trellis/rules.toml",source:"checkout-config",contentHash}`.
 **The code pin does not identify these rules bytes.** Editing only rules can change
 the digest and outcome at an unchanged code pin. Code evidence never falls back

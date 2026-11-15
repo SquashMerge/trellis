@@ -344,6 +344,48 @@ fn interface_wrapper_errors_are_located() {
     assert_eq!(located(&format!("version=1\n{many}"))["kind"], "too_large");
 }
 
+/// #988: `test_features` parses to sorted distinct Cargo feature names; absent or empty names
+/// none.
+#[test]
+fn test_features_parse_sorted() {
+    let config = parse("version=1\ntest_features=['test-support', 'fixtures_2']\n").unwrap();
+    assert_eq!(config.test_features(), ["fixtures_2", "test-support"]);
+    assert!(parse("version=1\n").unwrap().test_features().is_empty());
+    assert!(
+        parse("version=1\ntest_features=[]\n")
+            .unwrap()
+            .test_features()
+            .is_empty()
+    );
+}
+
+/// #988: an invalid `test_features` is a located rules error.
+#[test]
+fn test_feature_errors_are_located() {
+    let long = format!("test_features=['{}']\n", "a".repeat(65));
+    for (body, kind, needle) in [
+        ("test_features=['']\n", "schema", "Cargo feature name"),
+        ("test_features=['-a']\n", "schema", "Cargo feature name"),
+        ("test_features=['a b']\n", "schema", "Cargo feature name"),
+        ("test_features=['a\"']\n", "schema", "Cargo feature name"),
+        (long.as_str(), "schema", "Cargo feature name"),
+        ("test_features=['a', 'a']\n", "schema", "repeated"),
+        ("test_features='a'\n", "schema", ""),
+        ("test_features=[1]\n", "schema", ""),
+    ] {
+        let d = located(&format!("version=1\n{body}"));
+        assert_eq!(d["kind"], kind, "{body}: {d}");
+        assert_eq!(d["line"], 2, "{body}: {d}");
+        assert!(
+            d["message"].as_str().unwrap().contains(needle),
+            "{body}: {d}"
+        );
+    }
+    let many: Vec<String> = (0..65).map(|at| format!("'f{at}'")).collect();
+    let d = located(&format!("version=1\ntest_features=[{}]\n", many.join(",")));
+    assert_eq!(d["kind"], "too_large");
+}
+
 /// #794: `[apps.<name>]` tables parse in name order, each with its roots.
 #[test]
 fn authored_apps_parse_in_name_order() {

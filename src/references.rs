@@ -18,6 +18,7 @@ mod js_workspace;
 pub(crate) mod parallel_check;
 mod python;
 mod rust;
+pub(crate) use rust::feature_name;
 pub mod tsconfig;
 pub(crate) mod work;
 
@@ -152,13 +153,14 @@ pub struct ReferenceBase {
 /// One source document's resolved sites.
 struct SourceReferences {
     projection: Option<crate::model::SemanticProjection>,
-    edges: BTreeMap<(Target, bool), EdgeSites>,
+    /// By target, stored role (test = true) and the sites' feature gates.
+    edges: BTreeMap<(Target, bool, Vec<String>), EdgeSites>,
     unresolved: Vec<(Site, &'static str)>,
     /// Modules that prove this source's mapped sites.
     proof: BTreeSet<usize>,
     packages: BTreeMap<external::ExternalIdentity, external::ExternalPackage>,
-    /// Coverage per role (test = true).
-    coverage: BTreeMap<bool, SiteCoverage>,
+    /// Coverage per stored role (test = true) and feature gates.
+    coverage: BTreeMap<(bool, Vec<String>), SiteCoverage>,
     mapped: usize,
     semantic: usize,
 }
@@ -199,6 +201,12 @@ struct KindCounts {
     reference: usize,
 }
 impl KindCounts {
+    fn merge(&mut self, other: &Self) {
+        self.call += other.call;
+        self.r#type += other.r#type;
+        self.import += other.import;
+        self.reference += other.reference;
+    }
     fn add(&mut self, kind: RelationKind) {
         match kind {
             RelationKind::Call => self.call += 1,
@@ -257,6 +265,13 @@ struct Site {
     provenance_id: Option<String>,
     #[serde(flatten)]
     semantic_metadata: BTreeMap<String, Value>,
+    /// The features of the `cfg(feature = "..")` gates on a production Rust site, sorted and
+    /// distinct (#988). A read that names one as a test feature reports the site as test.
+    #[serde(skip)]
+    gates: Vec<String>,
+    /// The site's position among its source's sites: the order of merged samples.
+    #[serde(skip)]
+    ordinal: usize,
 }
 #[derive(Clone, Copy, Serialize)]
 struct Lines {
@@ -339,16 +354,18 @@ pub fn project_under(
     sample_limit: usize,
     check: &mut (impl FnMut() -> Result<()> + Send),
 ) -> Result<Projection> {
-    project_where(snapshot, paths, prefix, None, sample_limit, check)
+    project_where(snapshot, paths, prefix, None, &[], sample_limit, check)
 }
 
 /// [`project_under`] of only the sources whose path is in `files`, when it is given: the
-/// files of the apps an `app` argument names (#851).
+/// files of the apps an `app` argument names (#851). A production site under a `cfg` gate of
+/// one of `test_features` is reported as test (#988).
 pub fn project_where(
     snapshot: &Snapshot,
     paths: &[String],
     prefix: Option<&str>,
     files: Option<&BTreeSet<String>>,
+    test_features: &[String],
     sample_limit: usize,
     check: &mut (impl FnMut() -> Result<()> + Send),
 ) -> Result<Projection> {
@@ -358,6 +375,7 @@ pub fn project_where(
             paths,
             prefix,
             files,
+            test_features,
         },
         sample_limit,
         crate::parallel::default_workers(),
@@ -374,6 +392,9 @@ struct Sources<'a> {
     paths: &'a [String],
     prefix: Option<&'a str>,
     files: Option<&'a BTreeSet<String>>,
+    /// The Cargo features whose gates mark test code for this read (#988). Selection only:
+    /// resolution records every gate.
+    test_features: &'a [String],
 }
 
 impl Sources<'_> {
@@ -382,6 +403,7 @@ impl Sources<'_> {
             paths: &[],
             prefix: None,
             files: None,
+            test_features: &[],
         }
     }
 
@@ -412,6 +434,7 @@ pub fn project_with_workers(
             paths,
             prefix: None,
             files: None,
+            test_features: &[],
         },
         sample_limit,
         workers,
@@ -747,13 +770,17 @@ fn resolve(
                 mapped: 0,
                 semantic: 0,
             };
-            for PreparedSite {
-                raw,
-                mut site,
-                anchor,
-            } in sites
+            for (
+                ordinal,
+                PreparedSite {
+                    raw,
+                    mut site,
+                    anchor,
+                },
+            ) in sites.into_iter().enumerate()
             {
                 check()?;
+                site.ordinal = ordinal;
                 let anchor = anchor.map(|index| &doc.semantic.anchors[index]);
                 let historical = doc.semantic.projection.is_some();
                 let structural = match &raw {
@@ -859,7 +886,10 @@ fn resolve(
                 let bound = site.mapping == "semantic";
                 let semantic = bound && resolution.residual.is_none();
                 let mapped = !resolution.targets.is_empty();
-                let covered = found.coverage.entry(test).or_default();
+                let covered = found
+                    .coverage
+                    .entry((test, site.gates.clone()))
+                    .or_default();
                 covered.sites += 1;
                 covered.semantic += usize::from(semantic);
                 covered.mapped += usize::from(mapped);
@@ -869,7 +899,10 @@ fn resolve(
                 found.proof.extend(resolution.proof);
                 for target in resolution.targets {
                     owner_step(&mut rust.work, check)?;
-                    let edge = found.edges.entry((target, test)).or_default();
+                    let edge = found
+                        .edges
+                        .entry((target, test, site.gates.clone()))
+                        .or_default();
                     edge.count += 1;
                     edge.semantic += usize::from(bound);
                     edge.kinds.add(site.relation_kind);
@@ -945,7 +978,7 @@ impl ReferenceBase {
         sample_limit: usize,
         check: &mut (impl FnMut() -> Result<()> + Send),
     ) -> Result<Projection> {
-        self.select_where(paths, prefix, None, sample_limit, check)
+        self.select_where(paths, prefix, None, &[], sample_limit, check)
     }
 
     /// [`Self::select_under`] of only the sources whose path is in `files`, when it is given:
@@ -955,6 +988,7 @@ impl ReferenceBase {
         paths: &[String],
         prefix: Option<&str>,
         files: Option<&BTreeSet<String>>,
+        test_features: &[String],
         sample_limit: usize,
         check: &mut (impl FnMut() -> Result<()> + Send),
     ) -> Result<Projection> {
@@ -963,6 +997,7 @@ impl ReferenceBase {
                 paths,
                 prefix,
                 files,
+                test_features,
             },
             sample_limit,
             check,
@@ -980,6 +1015,19 @@ impl ReferenceBase {
             "invalid_request: reference sample limit"
         );
         let globs = path_globs(sources.paths, check)?;
+        // #988: a gate of a named test feature makes its production sites test for this read.
+        let gated = |gates: &[String]| {
+            gates
+                .iter()
+                .any(|gate| sources.test_features.contains(gate))
+        };
+        let site_json = |site: &Site| {
+            let mut value = json!(site);
+            if gated(&site.gates) {
+                value["role"] = json!("test");
+            }
+            value
+        };
         let identities = &self.identities;
         let mut emitted_modules = BTreeSet::new();
         let mut external_packages: BTreeMap<_, external::ExternalPackage> = BTreeMap::new();
@@ -1000,8 +1048,10 @@ impl ReferenceBase {
             semantic_sites += found.semantic;
             emitted_modules.insert(source);
             emitted_modules.extend(found.proof.iter().copied());
-            for (test, row) in &found.coverage {
-                let total = coverage.entry((path.clone(), *test)).or_default();
+            for ((test, gates), row) in &found.coverage {
+                let total = coverage
+                    .entry((path.clone(), *test || gated(gates)))
+                    .or_default();
                 total.sites += row.sites;
                 total.mapped += row.mapped;
                 total.unresolved += row.unresolved;
@@ -1020,8 +1070,29 @@ impl ReferenceBase {
                     }
                 }
             }
-            for ((target, test), edge) in &found.edges {
-                let (count, semantic) = (&edge.count, &edge.semantic);
+            // Edges that differ only in gates are one edge of the role this read gives them.
+            let mut merged: BTreeMap<(&Target, bool), Vec<&EdgeSites>> = BTreeMap::new();
+            for ((target, test, gates), edge) in &found.edges {
+                check()?;
+                merged
+                    .entry((target, *test || gated(gates)))
+                    .or_default()
+                    .push(edge);
+            }
+            for ((target, test), parts) in &merged {
+                let mut kinds = KindCounts::default();
+                let (mut count, mut semantic) = (0usize, 0usize);
+                for part in parts {
+                    count += part.count;
+                    semantic += part.semantic;
+                    kinds.merge(&part.kinds);
+                }
+                let (count, semantic) = (&count, &semantic);
+                let in_order = |pick: fn(&EdgeSites) -> &Vec<Site>| {
+                    let mut sites: Vec<&Site> = parts.iter().flat_map(|part| pick(part)).collect();
+                    sites.sort_by_key(|site| site.ordinal);
+                    sites
+                };
                 check()?;
                 let target = match target {
                     Target::Native(target) => {
@@ -1030,11 +1101,11 @@ impl ReferenceBase {
                     }
                     Target::External(identity) => json!(identity),
                 };
-                let sampled: Vec<_> = edge
-                    .calls
-                    .iter()
-                    .chain(&edge.others)
+                let sampled: Vec<_> = in_order(|part| &part.calls)
+                    .into_iter()
+                    .chain(in_order(|part| &part.others))
                     .take(sample_limit)
+                    .map(site_json)
                     .collect();
                 let omitted = count - sampled.len();
                 let tier = match semantic {
@@ -1043,7 +1114,7 @@ impl ReferenceBase {
                     _ => "mixed",
                 };
                 let mut edge = json!({"source":identities[source],"target":target,"count":count,
-                    "kindCounts":edge.kinds,"sites":sampled,"omittedSites":omitted,"evidenceTier":tier,"semanticSites":semantic});
+                    "kindCounts":kinds,"sites":sampled,"omittedSites":omitted,"evidenceTier":tier,"semanticSites":semantic});
                 // The edge itself is detachable even when sampling omits other sites.
                 if *semantic > 0
                     && let Some(projection) = &found.projection
@@ -1058,7 +1129,9 @@ impl ReferenceBase {
             }
             for (site, reason) in &found.unresolved {
                 check()?;
-                unresolved.push(json!({"source":identities[source],"site":site,"reason":reason}));
+                unresolved.push(
+                    json!({"source":identities[source],"site":site_json(site),"reason":reason}),
+                );
             }
         }
         let emitted_modules: Vec<_> = emitted_modules
@@ -1280,12 +1353,15 @@ impl SiteContext<'_> {
             DeclarationRole::Production => "production",
         });
         // A `#[cfg(test)]` statement, block, arm or `use` item is no declaration, so no
-        // stored role covers it (#988).
-        if role == Some("production")
-            && doc.key.language == "rust"
-            && rust::under_test_attribute(doc, self.tree, start, end, work, check)?
-        {
-            role = Some("test");
+        // stored role covers it (#988). A feature gate is kept for the read to judge.
+        let mut gates = Vec::new();
+        if role == Some("production") && doc.key.language == "rust" {
+            let marks = rust::site_marks(doc, self.tree, start, end, work, check)?;
+            if marks.test {
+                role = Some("test");
+            } else {
+                gates = marks.features;
+            }
         }
         let range = crate::native_evidence::Range { start, end };
         let call_id = match call_id {
@@ -1335,6 +1411,8 @@ impl SiteContext<'_> {
             mapping: "structural",
             provenance_id: None,
             semantic_metadata: BTreeMap::new(),
+            gates,
+            ordinal: 0,
         })
     }
 }
