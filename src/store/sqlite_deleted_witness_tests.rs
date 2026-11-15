@@ -256,6 +256,13 @@ fn aborted_stage_retries_and_successful_recreations_do_not_accumulate_witnesses(
             .recreate_pending_writer_session(
                 &crate::model::IndexOptions::new(workspace.path().to_owned()),
                 &Arc::new(AtomicBool::new(false)),
+                &mut || {
+                    crate::index_coordinator::recreate_capture(
+                        &recovering,
+                        &crate::model::IndexOptions::new(workspace.path().to_owned()),
+                        &Arc::new(AtomicBool::new(false)),
+                    )
+                },
             )
             .unwrap();
         drop(leader);
