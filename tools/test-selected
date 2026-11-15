@@ -5,9 +5,14 @@ Usage: tools/test-selected <selector>...
 
 A selector is a repo-relative path to an existing file, or `path::test_name`.
 Every argument is a selector: there are no options, so a caller can append
-selectors it did not write. All selectors are checked before anything runs.
-One that cannot be mapped is refused: the script names it, runs nothing and
-exits 2. It never falls back to running more than was selected.
+selectors it did not write. It never falls back to running more than was
+selected. There are two ways a selector fails:
+
+- Refused, before any command runs: every selector is mapped first, and one
+  that cannot be mapped is named, nothing runs, and the exit status is 2.
+- Mapped, but its command runs no selected test: that command fails and so
+  does the run (non-zero exit). Mapping does not prove a test exists, so this
+  is found only by running, possibly after earlier selectors' commands ran.
 
 Set TRELLIS_TEST_SELECTED_PRINT=1 to print the mapped commands without running
 them. README.md ("Running selected tests") lists what maps and what is refused.
@@ -425,10 +430,9 @@ def map_selector(root, selector, environ, cache):
     if directory == "tools" and name.endswith("-test.py"):
         return map_python(root, path, ["python3", path], test)
     if path.startswith("tools/") and name.startswith("test_") and name.endswith(".py"):
-        # discover reads -p as a glob; a literal name must not select other files.
-        if any(character in name for character in "*?["):
-            raise Refused("unittest discovery would read `*`, `?` or `[` in the file name as a pattern")
-        return map_python(root, path, ["python3", "-m", "unittest", "discover", "-s", directory, "-p", name], test)
+        # The file itself, not `unittest discover -p <name>`: discovery reads the name as a
+        # pattern and also runs a file of that name in any package below the directory.
+        return map_python(root, path, ["python3", path], test)
     if name.endswith(".rs") and (path.startswith("src/") or path.startswith("tests/")):
         return map_rust(root, path, test, environ, cache)
     raise Refused("no test command is known for this layout")
@@ -452,7 +456,12 @@ def nextest_problem(root, env):
 
 def main(selectors, environ):
     if not selectors:
-        print("usage: tools/test-selected <path>[::test_name]...", file=sys.stderr)
+        print(
+            "usage: tools/test-selected <path>[::test_name]...\n"
+            "A selector that cannot be mapped is refused before any command runs (exit 2).\n"
+            "A mapped selector whose command runs no selected test fails the run when it is reached.",
+            file=sys.stderr,
+        )
         return 2
     commands = []
     refused = False

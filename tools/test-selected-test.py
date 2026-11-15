@@ -330,11 +330,11 @@ class Mapping(Checkout):
         self.assertEqual(self.mapped("tools/sample-test.py::Sample.test_passes"),
                          ["python3 tools/sample-test.py -k '*.Sample.test_passes'"])
 
-    def test_python_unittest_files_run_under_discover(self):
-        discover = "python3 -m unittest discover -s tools/semantic-contract/test -p test_batch.py"
-        self.assertEqual(self.mapped("tools/semantic-contract/test/test_batch.py"), [discover])
+    def test_python_unittest_files_run_as_the_file_itself(self):
+        direct = "python3 tools/semantic-contract/test/test_batch.py"
+        self.assertEqual(self.mapped("tools/semantic-contract/test/test_batch.py"), [direct])
         self.assertEqual(self.mapped("tools/semantic-contract/test/test_batch.py::test_passes"),
-                         [discover + " -k '*.test_passes'"])
+                         [direct + " -k '*.test_passes'"])
 
     def test_a_node_test_that_needs_installed_packages_maps_once_they_are_there(self):
         self.assert_refused("tests/mcp-smoke.test.mjs", "tests/mcp packages, which are not installed")
@@ -440,17 +440,6 @@ class Refusals(Checkout):
         self.write("tools/broken-test.py", "def (:\n")
         self.assert_refused("tools/broken-test.py::test_passes", "cannot be parsed for its tests")
 
-    def test_a_python_file_name_discovery_would_read_as_a_pattern(self):
-        # `-p test_[ab].py` matches test_a.py, not the selected file.
-        self.write("tools/release/test_[ab].py", PYTHON_TEST)
-        self.write("tools/release/test_a.py", PYTHON_TEST)
-        for name in ("test_[ab].py", "test_[ab].py::test_passes"):
-            self.assert_refused(f"tools/release/{name}", "as a pattern")
-        self.write("tools/release/test_*.py", PYTHON_TEST)
-        self.assert_refused("tools/release/test_*.py", "as a pattern")
-        self.write("tools/release/test_?.py", PYTHON_TEST)
-        self.assert_refused("tools/release/test_?.py", "as a pattern")
-
     def test_a_module_cycle_is_refused_not_followed(self):
         self.write("src/lib.rs", '#[path = "lib.rs"]\nmod again;\nmod alpha;\n')
         self.assert_refused("src/lib.rs", "the library cannot be read to its end")
@@ -517,7 +506,72 @@ class Runs(Checkout):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(sorted(os.listdir(self.ran)), ["python-passes"])
 
-    def test_a_python_unittest_file_runs_under_discover(self):
+    def marker_test(self, marker):
+        return f"""\
+            import os
+            import unittest
+            from pathlib import Path
+
+            class Only(unittest.TestCase):
+                def test_runs(self):
+                    Path(os.environ["RAN"], "{marker}").touch()
+
+            if __name__ == "__main__":
+                unittest.main()
+        """
+
+    def test_a_python_file_of_the_same_name_in_a_package_below_does_not_run(self):
+        # `unittest discover -s tools/some -p test_x.py` runs both files.
+        self.write("tools/some/test_x.py", self.marker_test("selected"))
+        self.write("tools/some/pkg/__init__.py", "")
+        self.write("tools/some/pkg/test_x.py", self.marker_test("below"))
+        result = self.run_selected("tools/some/test_x.py")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Ran 1 test in", result.stderr)
+        self.assertEqual(sorted(os.listdir(self.ran)), ["selected"])
+        result = self.run_selected("tools/some/pkg/test_x.py::Only.test_runs")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(sorted(os.listdir(self.ran)), ["below", "selected"])
+
+    def test_a_python_file_name_with_pattern_characters_runs_only_that_file(self):
+        # `-p 'test_[ab].py'` would run test_a.py and not the selected file.
+        self.write("tools/some/test_[ab].py", self.marker_test("selected"))
+        self.write("tools/some/test_a.py", self.marker_test("matched"))
+        self.write("tools/some/test_*.py", self.marker_test("star"))
+        result = self.run_selected("tools/some/test_[ab].py", "tools/some/test_*.py")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(sorted(os.listdir(self.ran)), ["selected", "star"])
+
+    def test_a_python_file_that_does_not_run_its_tests_fails(self):
+        self.write("tools/some/test_inert.py", """\
+            import unittest
+
+            class Only(unittest.TestCase):
+                def test_runs(self):
+                    pass
+        """)
+        self.assert_ran_nothing("tools/some/test_inert.py", "it ran no test")
+
+    def test_an_empty_selection_after_a_valid_one_fails_the_run(self):
+        # Mapping cannot tell that the second selector's name is no test; its run does.
+        result = self.run_selected("tools/sample-test.py::test_passes", "tests/unit.test.cjs::not a test")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("test-selected: failed (it ran no test named 'not a test'): ", result.stderr)
+        self.assertEqual(sorted(os.listdir(self.ran)), ["python-passes"])
+        shutil.rmtree(self.ran)
+        self.ran.mkdir()
+        result = self.run_selected("tests/unit.test.cjs::passes (a.b)", "tools/sample-test.py::Sample.test_skipped",
+                                   "tools/sample-test.py::test_passes_too")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("test-selected: failed (it ran no test): python3 tools/sample-test.py -k", result.stderr)
+        self.assertEqual(sorted(os.listdir(self.ran)), ["node-passes", "python-passes-too"])
+
+    def test_the_usage_states_when_each_failure_happens(self):
+        result = self.run_selected()
+        self.assertIn("refused before any command runs (exit 2)", result.stderr)
+        self.assertIn("runs no selected test fails the run when it is reached", result.stderr)
+
+    def test_a_python_unittest_file_runs_by_name(self):
         result = self.run_selected("tools/semantic-contract/test/test_batch.py::Sample.test_passes_too")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(sorted(os.listdir(self.ran)), ["python-passes-too"])
