@@ -104,19 +104,7 @@ impl Catalog {
         workers: usize,
     ) -> Result<Self> {
         let check = &mut request.worker();
-        let tsconfig = match root_tsconfig {
-            Some(input) => {
-                ensure!(
-                    work.charge(input.bytes.len()),
-                    "bounded_work: reference tsconfig parsing"
-                );
-                check()?;
-                let parsed = tsconfig::parse(&input.bytes);
-                check()?;
-                Some((input.source_set_id.clone(), parsed))
-            }
-            None => None,
-        };
+        let tsconfig = root_config(root_tsconfig, work, check)?;
         let mut resolver = Resolver {
             docs,
             trees,
@@ -128,136 +116,38 @@ impl Catalog {
             workspaces,
             tsconfig,
         };
-        for (document, doc) in docs.iter().enumerate() {
-            if !script_family(&doc.key.language) {
-                continue;
-            }
-            let mut native = BTreeMap::<_, Vec<&Declaration>>::new();
-            let mut test_only = false;
-            for row in &doc.declarations {
-                owner_step(work, check)?;
-                if row.kind == "module"
-                    && row.ancestors.is_empty()
-                    && row.role == DeclarationRole::Test
-                {
-                    test_only = true;
-                }
-                native
-                    .entry((row.range.start, row.range.end, row.kind.as_str()))
-                    .or_default()
-                    .push(row);
-            }
-            let mut unit = inventory(
-                doc,
-                trees[document].root_node(),
-                document,
-                &native,
-                work,
-                check,
-            )?;
-            unit.test_only = test_only;
-            owner_step(work, check)?;
-            resolver.units.insert(document, Arc::new(unit));
-        }
-        // Selected hazards are independent per document: compute them in batches
-        // of `workers`, each against the allowance remaining before its batch, and
-        // admit their counts in document order.
-        let pending: Vec<usize> = selected
-            .iter()
-            .copied()
-            .filter(|document| resolver.units.contains_key(document))
-            .collect();
-        for batch in pending.chunks(workers.max(1)) {
-            let remaining = work.remaining();
-            let computed = map_all(batch, workers, request, |&document| {
-                let mut local = Work::new(remaining);
-                let hazards = body_hazards(
-                    docs[document],
-                    trees[document].root_node(),
-                    &mut local,
-                    &mut request.worker(),
-                )?;
-                Ok((hazards, local.used))
-            })?;
-            for (&document, (hazards, used)) in batch.iter().zip(computed) {
-                merge_work(work, used, check)?;
-                owner_step(work, check)?;
-                resolver.hazards.insert(document, hazards);
-            }
-        }
+        resolver.inventory_units(docs, trees, work, check)?;
+        resolver.selected_hazards(docs, trees, selected, work, request, workers, check)?;
         let mut catalog = Self {
             results: BTreeMap::new(),
             packages: BTreeMap::new(),
         };
+        catalog.resolve_selected_sources(&mut resolver, docs, selected, packages, work, check)?;
+        Ok(catalog)
+    }
+
+    /// The last pass: what each import and re-export source of a selected file resolves to.
+    fn resolve_selected_sources(
+        &mut self,
+        resolver: &mut Resolver<'_>,
+        docs: &[&DocumentInput],
+        selected: &[usize],
+        packages: &external::JavascriptPackages,
+        work: &mut Work,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
         for &document in selected {
             let Some(unit) = resolver.units.get(&document).cloned() else {
                 continue;
             };
             resolver.hazards(document, work, check)?;
-            let mut contributors = Vec::new();
-            for source in unit.sources.iter().filter(|s| s.star) {
-                let names =
-                    resolver.source_exports(document, source, 1, &Route::new(), work, check)?;
-                owner_step(work, check)?;
-                contributors.push(names);
-            }
-            let merged = if let [only] = contributors.as_slice() {
-                Arc::clone(only)
-            } else {
-                let mut merged = Names::default();
-                for names in &contributors {
-                    merge_names(&mut merged, names, work, check)?;
-                }
-                Arc::new(merged)
-            };
+            let (contributors, merged) = star_contributors(resolver, document, &unit, work, check)?;
             let mut stars = contributors.into_iter();
             for source in &unit.sources {
                 owner_step(work, check)?;
-                let mut resolution = SiteResolution::default();
-                if source.star {
-                    let own = stars.next().expect("star contribution");
-                    if own.unknown_set || unit.unknown_set || resolver.hazards[&document].dynamic {
-                        resolution.residual = Some("javascript_export_name_set_unknown");
-                    }
-                    let mut shadowed = false;
-                    for name in own.names.keys() {
-                        owner_step(work, check)?;
-                        if unit.explicit.contains_key(name) {
-                            shadowed = true;
-                            let bucket =
-                                resolver.named(document, name, 0, &Route::new(), work, check)?;
-                            if bucket.unknown || bucket.candidates.len() != 1 {
-                                resolution.residual = Some("javascript_explicit_name_unproved");
-                            }
-                            continue;
-                        }
-                        let bucket = &merged.names[name];
-                        if unit.unknown_set
-                            || resolver.hazards[&document].dynamic
-                            || bucket.unknown
-                            || bucket.candidates.len() != 1
-                        {
-                            resolution.residual = Some("javascript_wildcard_name_ambiguous");
-                        } else {
-                            add_bucket(&mut resolution, bucket, work, check)?;
-                        }
-                    }
-                    if resolution.targets.is_empty() && resolution.residual.is_none() {
-                        resolution.residual = Some(if shadowed {
-                            "javascript_wildcard_fully_shadowed"
-                        } else {
-                            "javascript_wildcard_empty"
-                        });
-                    }
-                } else {
-                    match resolver.target(document, source.specifier.as_deref(), work, check)? {
-                        Ok(target) => {
-                            owner_step(work, check)?;
-                            resolution.targets.insert(Target::Native(target));
-                        }
-                        Err(reason) => resolution.residual = Some(reason),
-                    }
-                }
+                let mut resolution = local_resolution(
+                    resolver, document, &unit, source, &mut stars, &merged, work, check,
+                )?;
                 // A package is the fallback only when no local module matched. An
                 // ambiguous local mapping stays ambiguous.
                 if source.supported
@@ -285,8 +175,7 @@ impl Catalog {
                         resolution
                             .targets
                             .insert(Target::External(package.identity.clone()));
-                        catalog
-                            .packages
+                        self.packages
                             .entry(package.identity.clone())
                             .or_insert(package);
                         resolution.residual =
@@ -294,12 +183,11 @@ impl Catalog {
                     }
                 }
                 owner_step(work, check)?;
-                catalog
-                    .results
+                self.results
                     .insert((document, source.start, source.end), resolution);
             }
         }
-        Ok(catalog)
+        Ok(())
     }
     pub(super) fn resolve(
         &self,
@@ -333,7 +221,203 @@ impl Catalog {
         Ok(resolution)
     }
 }
+
+/// The root config of the request, parsed once, with the source set it belongs to.
+fn root_config(
+    root_tsconfig: Option<&tsconfig::RootTsconfigInput>,
+    work: &mut Work,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<
+    Option<(
+        String,
+        std::result::Result<tsconfig::RootTsconfig, &'static str>,
+    )>,
+> {
+    let tsconfig = match root_tsconfig {
+        Some(input) => {
+            ensure!(
+                work.charge(input.bytes.len()),
+                "bounded_work: reference tsconfig parsing"
+            );
+            check()?;
+            let parsed = tsconfig::parse(&input.bytes);
+            check()?;
+            Some((input.source_set_id.clone(), parsed))
+        }
+        None => None,
+    };
+    Ok(tsconfig)
+}
+
+/// The export names each star source of a unit contributes, in source order, and their merge.
+fn star_contributors(
+    resolver: &mut Resolver<'_>,
+    document: usize,
+    unit: &Unit,
+    work: &mut Work,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<(Vec<Arc<Names>>, Arc<Names>)> {
+    let mut contributors = Vec::new();
+    for source in unit.sources.iter().filter(|s| s.star) {
+        let names = resolver.source_exports(document, source, 1, &Route::new(), work, check)?;
+        owner_step(work, check)?;
+        contributors.push(names);
+    }
+    let merged = if let [only] = contributors.as_slice() {
+        Arc::clone(only)
+    } else {
+        let mut merged = Names::default();
+        for names in &contributors {
+            merge_names(&mut merged, names, work, check)?;
+        }
+        Arc::new(merged)
+    };
+    Ok((contributors, merged))
+}
+
+/// What one source resolves to among the captured files: the names a star forwards, or the
+/// module a named source reaches. `stars` yields the contribution of each star in turn.
+#[allow(clippy::too_many_arguments)] // One source keeps its unit, star sets and shared budget explicit.
+fn local_resolution(
+    resolver: &mut Resolver<'_>,
+    document: usize,
+    unit: &Unit,
+    source: &Source,
+    stars: &mut impl Iterator<Item = Arc<Names>>,
+    merged: &Names,
+    work: &mut Work,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<SiteResolution> {
+    let mut resolution = SiteResolution::default();
+    if source.star {
+        let own = stars.next().expect("star contribution");
+        if own.unknown_set || unit.unknown_set || resolver.hazards[&document].dynamic {
+            resolution.residual = Some("javascript_export_name_set_unknown");
+        }
+        let mut shadowed = false;
+        for name in own.names.keys() {
+            owner_step(work, check)?;
+            if unit.explicit.contains_key(name) {
+                shadowed = true;
+                let bucket = resolver.named(document, name, 0, &Route::new(), work, check)?;
+                if bucket.unknown || bucket.candidates.len() != 1 {
+                    resolution.residual = Some("javascript_explicit_name_unproved");
+                }
+                continue;
+            }
+            let bucket = &merged.names[name];
+            if unit.unknown_set
+                || resolver.hazards[&document].dynamic
+                || bucket.unknown
+                || bucket.candidates.len() != 1
+            {
+                resolution.residual = Some("javascript_wildcard_name_ambiguous");
+            } else {
+                add_bucket(&mut resolution, bucket, work, check)?;
+            }
+        }
+        if resolution.targets.is_empty() && resolution.residual.is_none() {
+            resolution.residual = Some(if shadowed {
+                "javascript_wildcard_fully_shadowed"
+            } else {
+                "javascript_wildcard_empty"
+            });
+        }
+    } else {
+        match resolver.target(document, source.specifier.as_deref(), work, check)? {
+            Ok(target) => {
+                owner_step(work, check)?;
+                resolution.targets.insert(Target::Native(target));
+            }
+            Err(reason) => resolution.residual = Some(reason),
+        }
+    }
+    Ok(resolution)
+}
 impl Resolver<'_> {
+    /// The first pass: the unit of every JavaScript and TypeScript file.
+    fn inventory_units(
+        &mut self,
+        docs: &[&DocumentInput],
+        trees: &[Tree],
+        work: &mut Work,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        for (document, doc) in docs.iter().enumerate() {
+            if !script_family(&doc.key.language) {
+                continue;
+            }
+            let mut native = BTreeMap::<_, Vec<&Declaration>>::new();
+            let mut test_only = false;
+            for row in &doc.declarations {
+                owner_step(work, check)?;
+                if row.kind == "module"
+                    && row.ancestors.is_empty()
+                    && row.role == DeclarationRole::Test
+                {
+                    test_only = true;
+                }
+                native
+                    .entry((row.range.start, row.range.end, row.kind.as_str()))
+                    .or_default()
+                    .push(row);
+            }
+            let mut unit = inventory(
+                doc,
+                trees[document].root_node(),
+                document,
+                &native,
+                work,
+                check,
+            )?;
+            unit.test_only = test_only;
+            owner_step(work, check)?;
+            self.units.insert(document, Arc::new(unit));
+        }
+        Ok(())
+    }
+
+    /// The second pass: the body hazards of each selected unit.
+    #[allow(clippy::too_many_arguments)] // The batches share the request, its workers and one budget.
+    fn selected_hazards(
+        &mut self,
+        docs: &[&DocumentInput],
+        trees: &[Tree],
+        selected: &[usize],
+        work: &mut Work,
+        request: &parallel_check::RequestCheck<'_>,
+        workers: usize,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        // Selected hazards are independent per document: compute them in batches
+        // of `workers`, each against the allowance remaining before its batch, and
+        // admit their counts in document order.
+        let pending: Vec<usize> = selected
+            .iter()
+            .copied()
+            .filter(|document| self.units.contains_key(document))
+            .collect();
+        for batch in pending.chunks(workers.max(1)) {
+            let remaining = work.remaining();
+            let computed = map_all(batch, workers, request, |&document| {
+                let mut local = Work::new(remaining);
+                let hazards = body_hazards(
+                    docs[document],
+                    trees[document].root_node(),
+                    &mut local,
+                    &mut request.worker(),
+                )?;
+                Ok((hazards, local.used))
+            })?;
+            for (&document, (hazards, used)) in batch.iter().zip(computed) {
+                merge_work(work, used, check)?;
+                owner_step(work, check)?;
+                self.hazards.insert(document, hazards);
+            }
+        }
+        Ok(())
+    }
+
     fn config(
         &self,
         document: usize,
