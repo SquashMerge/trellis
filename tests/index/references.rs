@@ -277,7 +277,7 @@ fn references_java_direct_package_wildcard_expands_public_type_owner() {
 #[test]
 fn references_rust_direct_wildcard_expands_public_declaration_owner() {
     let input = snapshot(&[
-        ("src/lib.rs", "mod m; use crate::m::*;"),
+        ("src/lib.rs", "mod m; use crate::m::*; fn user() { a(); }"),
         ("src/m.rs", "pub fn a() {}"),
     ]);
     let data = project(&input);
@@ -462,6 +462,128 @@ fn references_rust_cfg_test_reaches_every_attribute_shape() {
             "{shape}: {data}"
         );
     }
+}
+
+/// #986: a private glob maps only the names its scope uses. A re-exporting glob still exposes
+/// every name.
+#[test]
+fn references_rust_private_glob_maps_only_the_names_its_scope_uses() {
+    let input = snapshot(&[
+        ("src/lib.rs", "mod parent; mod upper;"),
+        (
+            "src/parent.rs",
+            "mod direct; mod in_macro; mod local_only; mod unused; mod facade; \
+             pub use crate::upper::{NOTE, helper}; pub fn local() {}",
+        ),
+        (
+            "src/parent/direct.rs",
+            "use super::*; fn f() -> &'static str { NOTE }",
+        ),
+        (
+            "src/parent/in_macro.rs",
+            "use super::*; fn f() { let _ = format!(\"{}\", helper()); }",
+        ),
+        (
+            "src/parent/local_only.rs",
+            "use super::*; fn f() { local(); }",
+        ),
+        // A name in a comment or a string is not a use: NOTE "helper"
+        (
+            "src/parent/unused.rs",
+            "use super::*; // NOTE\nfn f() -> &'static str { \"helper local\" }",
+        ),
+        ("src/parent/facade.rs", "pub use super::*;"),
+        (
+            "src/upper.rs",
+            "pub const NOTE: &str = \"\"; pub fn helper() {}",
+        ),
+    ]);
+    let data = project(&input);
+    for (source, upper, parent) in [
+        ("src/parent/direct.rs", true, false),
+        ("src/parent/in_macro.rs", true, false),
+        ("src/parent/local_only.rs", false, true),
+        ("src/parent/unused.rs", false, false),
+        ("src/parent/facade.rs", true, true),
+    ] {
+        assert_eq!(has_edge(&data, source, "src/upper.rs"), upper, "{source}");
+        assert_eq!(has_edge(&data, source, "src/parent.rs"), parent, "{source}");
+    }
+    let site = &edge(&data, "production", "src/parent/direct.rs", "src/upper.rs")["sites"][0];
+    assert_eq!(site["relationKind"], "import");
+    assert_eq!(site["spelling"], "super::*");
+    let unresolved: Vec<_> = data["unresolved"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|unknown| {
+            (
+                unknown["source"]["path"].as_str().unwrap(),
+                unknown["reason"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        unresolved,
+        [("src/parent/unused.rs", "rust_wildcard_unused")],
+        "{data}"
+    );
+}
+
+/// #986 review: `r#name` and `name` are one identifier on both sides of the comparison, so a
+/// raw-identifier export reached through a private glob is used however its use spells it,
+/// in a macro's arguments too. A path keyword is never a use of a name.
+#[test]
+fn references_rust_private_glob_matches_raw_identifiers_either_way() {
+    let input = snapshot(&[
+        (
+            "src/lib.rs",
+            "mod upper; mod raw; mod raw_macro; mod raw_use; mod plain_use; mod keywords;",
+        ),
+        ("src/raw.rs", "use crate::upper::*; fn f() { r#type(); }"),
+        (
+            "src/raw_macro.rs",
+            "use crate::upper::*; fn f() { let _ = format!(\"{:?}\", r#type()); }",
+        ),
+        (
+            "src/raw_use.rs",
+            "use crate::upper::*; fn f() { r#tight(); }",
+        ),
+        (
+            "src/plain_use.rs",
+            "use crate::upper::*; fn f() { loose(); }",
+        ),
+        (
+            "src/keywords.rs",
+            "use crate::upper::*; struct S; impl S { fn f(&self) -> Self { let _ = self; crate::m!(self, Self, crate, super) } }",
+        ),
+        (
+            "src/upper.rs",
+            "pub fn r#type() {} pub fn r#loose() {} pub fn tight() {}",
+        ),
+    ]);
+    let data = project(&input);
+    for (source, upper) in [
+        ("src/raw.rs", true),
+        ("src/raw_macro.rs", true),
+        ("src/raw_use.rs", true),
+        ("src/plain_use.rs", true),
+        ("src/keywords.rs", false),
+    ] {
+        assert_eq!(
+            has_edge(&data, source, "src/upper.rs"),
+            upper,
+            "{source}: {data}"
+        );
+    }
+    let unused: Vec<_> = data["unresolved"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|unknown| unknown["reason"] == "rust_wildcard_unused")
+        .map(|unknown| unknown["source"]["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(unused, ["src/keywords.rs"], "{data}");
 }
 
 #[test]
@@ -998,10 +1120,13 @@ fn references_indexed_owners_preserve_linear_selection_and_prefer_exact_calls() 
 fn references_rust_conventional_directory_and_inline_wildcards_expand() {
     for files in [
         vec![
-            ("src/lib.rs", "mod m; use crate::m::*;"),
+            ("src/lib.rs", "mod m; use crate::m::*; fn user() { a(); }"),
             ("src/m/mod.rs", "pub fn a() {} pub fn b() {}"),
         ],
-        vec![("src/lib.rs", "mod m { pub fn a() {} } use crate::m::*;")],
+        vec![(
+            "src/lib.rs",
+            "mod m { pub fn a() {} } use crate::m::*; fn user() { a(); }",
+        )],
     ] {
         let input = snapshot(&files);
         let data = project_rust_source(&input, 20);
@@ -1022,7 +1147,7 @@ fn references_rust_nested_self_super_and_inline_file_ancestry_are_proved() {
         ("src/lib.rs", "mod outer;"),
         (
             "src/outer.rs",
-            "pub fn a() {} mod inner { mod leaf; use self::leaf::*; use super::a; }",
+            "pub fn a() {} mod inner { mod leaf; use self::leaf::*; use super::a; fn user() { b(); } }",
         ),
         ("src/outer/inner/leaf.rs", "pub fn b() {}"),
         ("src/inner/leaf.rs", "pub fn decoy() {}"),
@@ -1157,7 +1282,7 @@ fn references_rust_shadowing_obeys_lexical_scope_and_constructor_namespace() {
     let input = snapshot(&[
         (
             "src/lib.rs",
-            "mod m; fn f() { use crate::m::*; fn a() {} } fn g() { use crate::m::*; }",
+            "mod m; fn f() { use crate::m::*; fn a() {} } fn g() { use crate::m::*; a(); }",
         ),
         ("src/m.rs", "pub fn a() {}"),
     ]);
@@ -1172,7 +1297,10 @@ fn references_rust_shadowing_obeys_lexical_scope_and_constructor_namespace() {
 #[test]
 fn references_rust_named_module_export_uses_declaration_owner_not_members() {
     let input = snapshot(&[
-        ("src/lib.rs", "mod m; use crate::m::*;"),
+        (
+            "src/lib.rs",
+            "mod m; use crate::m::*; fn user() { let _ = child; }",
+        ),
         ("src/m.rs", "pub mod child;"),
         ("src/m/child.rs", "pub fn a() {}"),
     ]);
@@ -1193,7 +1321,7 @@ fn references_rust_named_and_renamed_public_forwarding_keep_final_owner() {
         let input = snapshot(&[
             (
                 "src/lib.rs",
-                "mod origin; mod facade; use crate::facade::*;",
+                "mod origin; mod facade; use crate::facade::*; fn user() { a(); renamed(); }",
             ),
             ("src/facade.rs", forwarding),
             ("src/origin.rs", "pub fn a() {}"),
@@ -1249,7 +1377,10 @@ fn references_rust_forwarding_depth_four_resolves_but_fifth_edge_is_unknown() {
 #[test]
 fn references_rust_cycle_keeps_independent_direct_export_and_residual_unknown() {
     let input = snapshot(&[
-        ("src/lib.rs", "mod a; mod b; use crate::a::*;"),
+        (
+            "src/lib.rs",
+            "mod a; mod b; use crate::a::*; fn user() { good(); }",
+        ),
         ("src/a.rs", "pub fn good() {} pub use crate::b::*;"),
         ("src/b.rs", "pub use crate::a::*;"),
     ]);
@@ -1268,7 +1399,7 @@ fn references_rust_diamond_deduplicates_original_identity_not_spelling() {
     let input = snapshot(&[
         (
             "src/lib.rs",
-            "mod facade; mod left; mod right; mod origin; use crate::facade::*;",
+            "mod facade; mod left; mod right; mod origin; use crate::facade::*; fn user() { a(); }",
         ),
         (
             "src/facade.rs",
@@ -1324,7 +1455,8 @@ fn references_rust_conditional_known_name_keeps_other_positive_and_stored_role()
     let input = snapshot(&[
         (
             "src/lib.rs",
-            "mod m; use crate::m::*; #[cfg(test)] mod tests { use crate::m::*; }",
+            "mod m; use crate::m::*; fn user() { good(); bad(); } \
+             #[cfg(test)] mod tests { use crate::m::*; fn user() { good(); bad(); } }",
         ),
         (
             "src/m.rs",
@@ -1353,7 +1485,7 @@ fn references_rust_opaque_exports_block_wildcard_uniqueness_not_explicit_names()
     let input = snapshot(&[
         (
             "src/lib.rs",
-            "mod m; mod opaque; mod facade; use crate::facade::*;",
+            "mod m; mod opaque; mod facade; use crate::facade::*; fn user() { good(); }",
         ),
         ("src/m.rs", "pub fn good() {}"),
         ("src/opaque.rs", "make_items!();"),
@@ -1374,7 +1506,7 @@ fn references_rust_opaque_exports_block_wildcard_uniqueness_not_explicit_names()
     let blocked = snapshot(&[
         (
             "src/lib.rs",
-            "mod m; mod opaque; use crate::m::*; use crate::opaque::*;",
+            "mod m; mod opaque; use crate::m::*; use crate::opaque::*; fn user() { good(); }",
         ),
         ("src/m.rs", "pub fn good() {}"),
         ("src/opaque.rs", "make_items!();"),
@@ -1389,7 +1521,7 @@ fn references_rust_fanout_counts_once_per_site_and_once_per_final_owner() {
     let input = snapshot(&[
         (
             "src/lib.rs",
-            "mod facade; mod left; mod right; use crate::facade::*;",
+            "mod facade; mod left; mod right; use crate::facade::*; fn user() { a(); b(); c(); conditional(); }",
         ),
         (
             "src/facade.rs",
@@ -1440,7 +1572,7 @@ fn references_rust_empty_and_fully_shadowed_expansions_have_distinct_coverage() 
 
 #[test]
 fn references_rust_clipped_samples_keep_proof_closure_ranges_and_exact_counts() {
-    let source = "mod first; mod second; mod origin; fn f() { use crate::first::*; } fn g() { use crate::second::*; }";
+    let source = "mod first; mod second; mod origin; fn f() { use crate::first::*; a(); } fn g() { use crate::second::*; a(); }";
     let input = snapshot(&[
         ("src/lib.rs", source),
         ("src/first.rs", "pub use crate::origin::a;"),
@@ -1544,7 +1676,10 @@ fn references_rust_competing_consumer_wildcards_do_not_select_by_source_order() 
 #[test]
 fn references_rust_restricted_visibility_is_not_promoted_outside_its_scope() {
     let input = snapshot(&[
-        ("src/lib.rs", "mod m; use crate::m::inner::*;"),
+        (
+            "src/lib.rs",
+            "mod m; use crate::m::inner::*; fn user() { good(); restricted(); private(); }",
+        ),
         ("src/m.rs", "pub mod inner;"),
         (
             "src/m/inner.rs",
@@ -1676,7 +1811,7 @@ fn references_rust_forwarded_module_alias_keeps_final_owner_and_intermediate_pro
     let input = snapshot(&[
         (
             "src/lib.rs",
-            "mod alias; mod bridge; use crate::alias::renamed::*;",
+            "mod alias; mod bridge; use crate::alias::renamed::*; fn user() { a(); }",
         ),
         ("src/alias.rs", "pub use crate::bridge::m as renamed;"),
         ("src/bridge.rs", "pub mod m;"),
@@ -1706,7 +1841,7 @@ fn references_rust_forwarded_module_alias_keeps_final_owner_and_intermediate_pro
 fn references_rust_file_module_super_uses_lexical_parent_not_file_itself() {
     let input = snapshot(&[
         ("src/lib.rs", "mod m; mod n;"),
-        ("src/m.rs", "use super::n::*;"),
+        ("src/m.rs", "use super::n::*; fn user() { a(); }"),
         ("src/n.rs", "pub fn a() {}"),
         ("src/m/n.rs", "pub fn decoy() {}"),
     ]);
@@ -1897,7 +2032,7 @@ fn references_rust_follow_depth_is_consumed_across_multiple_module_alias_segment
         ("crate::A::B::C::*", "pub fn good() {}", true),
         ("crate::A::B::C::D::*", "pub use crate::d as D;", false),
     ] {
-        let consumer = format!("use {path};");
+        let consumer = format!("use {path}; fn user() {{ good(); }}");
         let input = snapshot(&[
             (
                 "src/lib.rs",
@@ -2142,7 +2277,7 @@ fn references_rust_public_local_star_forwarding_survives_dependency_star() {
     let mut input = snapshot(&[
         (
             "src/lib.rs",
-            "mod origin; mod facade; use crate::facade::*;",
+            "mod origin; mod facade; use crate::facade::*; fn user() { a(); }",
         ),
         ("src/facade.rs", "pub use crate::origin::*; pub use dep::*;"),
         ("src/origin.rs", "pub fn a() {}"),
