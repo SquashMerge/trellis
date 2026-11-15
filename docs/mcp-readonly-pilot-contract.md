@@ -745,7 +745,7 @@ changes, only the order of rows within two arrays. This section wins over the #7
 
 ## Amendment (#985): explain's `limit` reaches the pair's sites
 
-**Status: proposed by the builder of [#985](https://github.com/SquashMerge/trellis/issues/985), for ratification.** It makes the server do what the #448 `limit` sentence, the #725 instance text and the #769 `nextCall` text already say. `toolVersion` is unchanged (30): no schema or catalog text changes, as for #908 and #912.
+**Status: proposed by the builder of [#985](https://github.com/SquashMerge/trellis/issues/985), for ratification.** It makes the server do what the #448 `limit` sentence, the #725 instance text and the #769 `nextCall` text already say. `toolVersion` is unchanged (31, #988): no schema, catalog or prompt text changes, as for #908 and #912.
 
 - **The problem.** A `$layers` or `$external` instance is one (source, destination, role) pair, and its `evidence` is the pair's site sample from the references projection. Check and explain always evaluated with the default sample of 5 sites per pair, because the MCP `limit` never reached the evaluation. `omittedEvidence` was then counted from those at most 5 entries. With `limit:50`, a pair with 85 references answered 5 entries and `omittedEvidence:0`, and a check instance's `nextCall` never asked for more than 5.
 - **Explain.** Explain's `limit` (1–50, default 5) is also the number of sites the evaluation samples per pair, so an explained pair keeps up to `limit` evidence entries: all of them when `referenceCount` is `limit` or less. The sample order is unchanged (R5: `call` sites first), so a smaller limit's entries are a prefix of a larger one's.
