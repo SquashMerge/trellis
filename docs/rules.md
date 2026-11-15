@@ -1291,10 +1291,11 @@ read as well, so after an edit the evidence that semantic catch-up carries forwa
 keeps serving Architecture until a producer re-run imports `fresh` evidence that
 replaces it. Each site and rule evidence row such a binding supports carries
 `freshness:"possiblyStale"`, and the language's semantic tier keeps reporting its
-worst freshness and counts. A call is represented by its lowest-provenance binding, as in the call
-graph; when that one is unusable the call has no binding. Any internal target must
-be a declaration of this snapshot (semantic references carry no separate
-current-target flag); its module is the declaration's file.
+worst freshness and counts. A call with several binding rows is represented by the row the call
+graph selects (#1102): a row that names a target before an unresolved one, then the lowest raw
+fact digest, then the lowest provenance ID; when that one is unusable the call has no
+binding. Any internal target must be a declaration of this snapshot (semantic references
+carry no separate current-target flag); its module is the declaration's file.
 
 - A structural site takes in every binding inside its range, and a call joined on a
   whole invocation that starts with it. It is bound by the binding that ends where
