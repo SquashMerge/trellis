@@ -91,6 +91,10 @@ jobs:
           "$trellis" producer install rust-analyzer --yes
           "$trellis" producer install scip-typescript --yes
           "$trellis" producer doctor
+          # The version each producer reports on this host, for the log: an import
+          # binds the artifact's tool version to the pinned one.
+          rustup run "$toolchain" rust-analyzer --version
+          scip-typescript --version
       # Exit 0: the record holds. Exit 1: the measurement is worse than the
       # record. Anything else: no comparison was made (a producer, the daemon or
       # the index failed), which says nothing about the layering.
