@@ -1599,6 +1599,67 @@ impl Catalog {
             packages.root_allowed(source_set, root_path),
         ))
     }
+    /// Removes from a private glob's `names` those its scope never spells, and says whether it
+    /// removed any (#986). A use is an identifier anywhere in the scope outside the glob,
+    /// macro arguments and nested items included, so a shadowed or unrelated identifier of the
+    /// same spelling still counts. Syntax the walk cannot read proves no name unused.
+    fn drop_unused(
+        &mut self,
+        doc: &DocumentInput,
+        tree: &Tree,
+        scope: usize,
+        import: &Import,
+        names: &mut Names,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<bool> {
+        self.step(check)?;
+        if names.names.is_empty() {
+            return Ok(false);
+        }
+        let (start, end) = (self.scopes[scope].start, self.scopes[scope].end);
+        let Some(root) = tree.root_node().descendant_for_byte_range(start, end) else {
+            return Ok(false);
+        };
+        if root.has_error() {
+            return Ok(false);
+        }
+        self.charge(names.names.len(), check)?;
+        // `r#name` and `name` are one identifier, whichever side spells the prefix.
+        let plain = |name: &str| name.strip_prefix("r#").unwrap_or(name).to_owned();
+        let mut unseen: BTreeSet<String> =
+            names.names.keys().map(|(_, name)| plain(name)).collect();
+        let mut stack = vec![(root, 0)];
+        let mut visits = 0;
+        while let Some((node, depth)) = stack.pop() {
+            if unseen.is_empty() {
+                return Ok(false);
+            }
+            check()?;
+            visits += 1;
+            if visits > VISITS || depth > DEPTH {
+                return Ok(false);
+            }
+            if node.start_byte() == import.start && node.end_byte() == import.end {
+                continue;
+            }
+            if matches!(
+                node.kind(),
+                "identifier" | "type_identifier" | "shorthand_field_identifier"
+            ) {
+                unseen.remove(&plain(text(doc, node)));
+                continue;
+            }
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                stack.push((child, depth + 1));
+            }
+        }
+        names
+            .names
+            .retain(|(_, name), _| !unseen.contains(&plain(name)));
+        Ok(!unseen.is_empty())
+    }
+    #[allow(clippy::too_many_arguments)] // Captured inputs and the site's own tree stay explicit.
     pub(super) fn resolve(
         &mut self,
         document: usize,
@@ -1606,6 +1667,7 @@ impl Catalog {
         packages: &external::RustPackages,
         external_packages: &mut BTreeMap<external::ExternalIdentity, external::ExternalPackage>,
         docs: &[&DocumentInput],
+        tree: &Tree,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<SiteResolution> {
         self.step(check)?;
@@ -1661,12 +1723,19 @@ impl Catalog {
         };
         let mut route = BTreeSet::new();
         let mut shadowed = false;
+        let mut unused = false;
         let mut names = if let Some(import) = &import {
             if import.uncertain {
                 return Ok(SiteResolution::unknown("rust_conditional_export"));
             }
             if import.star {
                 let mut own = self.expand(scope, import, 1, &mut route, context, None, check)?;
+                // A re-exporting glob passes every name on; a private one references only
+                // the names its scope spells (#986).
+                if !import.public {
+                    unused =
+                        self.drop_unused(docs[document], tree, scope, import, &mut own, check)?;
+                }
                 let others = self.scope_imports(scope, check)?;
                 let mut competing = Names::default();
                 for other in others
@@ -1767,6 +1836,8 @@ impl Catalog {
             result.residual = Some(if import.as_ref().is_some_and(|i| i.star) {
                 if shadowed {
                     "rust_wildcard_fully_shadowed"
+                } else if unused {
+                    "rust_wildcard_unused"
                 } else {
                     "rust_wildcard_empty"
                 }
@@ -1955,6 +2026,186 @@ pub(super) fn extract(
         (a.start, a.end, a.kind, &a.spelling).cmp(&(b.start, b.end, b.kind, &b.spelling))
     });
     Ok(result)
+}
+
+/// What the attributes on and around one site say about it (#988).
+#[derive(Default)]
+pub(super) struct SiteMarks {
+    /// An attribute marks test code under Decision 0011.
+    pub(super) test: bool,
+    /// The features of the `cfg(feature = "..")` gates on the site, sorted and distinct.
+    pub(super) features: Vec<String>,
+}
+
+/// A Cargo feature name a rules file may name and a gate may carry.
+pub(crate) fn feature_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    name.len() <= 64
+        && chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+' | '.'))
+}
+
+/// One token of a `cfg` attribute: a word, a plain string literal's exact value, or a
+/// punctuation character.
+#[derive(Clone, Copy, PartialEq)]
+enum GateToken<'a> {
+    Word(&'a str),
+    Text(&'a str),
+    Mark(char),
+}
+
+/// The tokens of an attribute, with whitespace between tokens dropped and a string literal's
+/// value kept exactly. `None` for what this reader does not interpret: a comment, an escape,
+/// an unterminated or raw literal, or more tokens than any gate it accepts has.
+fn gate_tokens(attribute: &str) -> Option<Vec<GateToken<'_>>> {
+    const MOST: usize = 20;
+    let mut tokens = Vec::new();
+    let mut rest = attribute;
+    while let Some(first) = rest.chars().next() {
+        if tokens.len() == MOST {
+            return None;
+        }
+        if first.is_whitespace() {
+            rest = &rest[first.len_utf8()..];
+        } else if first == '"' {
+            let end = rest[1..].find('"')?;
+            let value = &rest[1..1 + end];
+            if value.contains('\\') {
+                return None;
+            }
+            tokens.push(GateToken::Text(value));
+            rest = &rest[end + 2..];
+        } else if first.is_ascii_alphabetic() || first == '_' {
+            let end = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            // `r"…"`, `r#"…"#`, `b"…"` and `c"…"` are literals this reader does not interpret.
+            if rest[end..].starts_with(['"', '#']) {
+                return None;
+            }
+            tokens.push(GateToken::Word(&rest[..end]));
+            rest = &rest[end..];
+        } else if first == '/' {
+            return None;
+        } else {
+            tokens.push(GateToken::Mark(first));
+            rest = &rest[first.len_utf8()..];
+        }
+    }
+    Some(tokens)
+}
+
+/// The feature of a gate whose whole condition is `feature = "name"` or `any(test, feature =
+/// "name")`, the two operands in either order, as an outer or inner `cfg` attribute. The
+/// name is the literal's exact value; only whitespace between tokens is ignored. Any other
+/// condition names none: `not(..)`, `all(..)`, an `any` with other or more operands, and
+/// `cfg_attr`.
+fn feature_gate(attribute: &str) -> Option<String> {
+    use GateToken::{Mark, Text, Word};
+    if !attribute.contains("feature") {
+        return None;
+    }
+    let tokens = gate_tokens(attribute)?;
+    let tokens = tokens.strip_prefix(&[Mark('#')])?;
+    let tokens = tokens.strip_prefix(&[Mark('!')]).unwrap_or(tokens);
+    let condition = tokens
+        .strip_prefix(&[Mark('['), Word("cfg"), Mark('(')])?
+        .strip_suffix(&[Mark(')'), Mark(']')])?;
+    let name = match condition {
+        [Word("feature"), Mark('='), Text(name)]
+        | [
+            Word("any"),
+            Mark('('),
+            Word("test"),
+            Mark(','),
+            Word("feature"),
+            Mark('='),
+            Text(name),
+            Mark(')'),
+        ]
+        | [
+            Word("any"),
+            Mark('('),
+            Word("feature"),
+            Mark('='),
+            Text(name),
+            Mark(','),
+            Word("test"),
+            Mark(')'),
+        ] => *name,
+        _ => return None,
+    };
+    feature_name(name).then(|| name.to_owned())
+}
+
+/// The marks of the syntax at `start..end` and of everything enclosing it: whether an
+/// attribute marks test code under Decision 0011, and otherwise the features that gate it
+/// (#988). The pinned grammar attaches an attribute in one of three shapes, and every
+/// enclosing node is checked for all of them:
+///
+/// - an outer attribute is a preceding sibling of what it applies to: an item or statement,
+///   a field, an enum variant, a parameter, a generic parameter, or an element of an argument
+///   list, array or tuple. A tuple-struct field's visibility lies between the two;
+/// - a match arm and a struct-expression field own their outer attributes as leading children;
+/// - an inner attribute leads the file, block or module body it applies to.
+pub(super) fn site_marks(
+    doc: &DocumentInput,
+    tree: &Tree,
+    start: usize,
+    end: usize,
+    work: &mut Work,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<SiteMarks> {
+    let marks = |node: Node<'_>| crate::native_evidence::rust_test_attribute(node, &doc.file);
+    let comment = |node: Node<'_>| matches!(node.kind(), "line_comment" | "block_comment");
+    let test = || {
+        Ok(SiteMarks {
+            test: true,
+            features: Vec::new(),
+        })
+    };
+    let mut features = BTreeSet::new();
+    let mut current = tree.root_node().descendant_for_byte_range(start, end);
+    while let Some(node) = current {
+        owner_step(work, check)?;
+        // Any token but these, a separating comma included, ends the node's own attributes.
+        let mut previous = node.prev_sibling();
+        while let Some(sibling) = previous {
+            owner_step(work, check)?;
+            match sibling.kind() {
+                "attribute_item" if marks(sibling) => return test(),
+                "attribute_item" => features.extend(feature_gate(text(doc, sibling))),
+                "inner_attribute_item" | "visibility_modifier" => {}
+                _ if comment(sibling) => {}
+                _ => break,
+            }
+            previous = sibling.prev_sibling();
+        }
+        let owns = matches!(
+            node.kind(),
+            "match_arm" | "field_initializer" | "shorthand_field_initializer"
+        );
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            owner_step(work, check)?;
+            match child.kind() {
+                "inner_attribute_item" if marks(child) => return test(),
+                "attribute_item" if owns && marks(child) => return test(),
+                "inner_attribute_item" => features.extend(feature_gate(text(doc, child))),
+                "attribute_item" if owns => features.extend(feature_gate(text(doc, child))),
+                "attribute_item" => {}
+                _ if comment(child) => {}
+                _ => break,
+            }
+        }
+        current = node.parent();
+    }
+    Ok(SiteMarks {
+        test: false,
+        features: features.into_iter().collect(),
+    })
 }
 
 /// The path of module `name` in module directory `directory` (`""` is the checkout's).
@@ -2298,5 +2549,50 @@ mod cache_tests {
             index.enclosing(101, 102, &mut work, &mut check).unwrap(),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod feature_gate_tests {
+    use super::feature_gate;
+
+    #[test]
+    fn a_gate_names_its_feature_by_the_literals_exact_value() {
+        for (attribute, feature) in [
+            ("#[cfg(feature=\"x\")]", Some("x")),
+            ("#[cfg(feature = \"x\")]", Some("x")),
+            ("#[ cfg ( feature\n=\t\"x\" ) ]", Some("x")),
+            ("#![cfg(feature = \"test-support\")]", Some("test-support")),
+            ("#[cfg(any(test, feature = \"x\"))]", Some("x")),
+            ("#[cfg(any(feature = \"x\", test))]", Some("x")),
+            // The value is compared as written: whitespace inside the quotes is part of it.
+            ("#[cfg(feature = \"x y\")]", None),
+            ("#[cfg(feature = \" x\")]", None),
+            ("#[cfg(feature = \"x \")]", None),
+            ("#[cfg(feature = \"test -support\")]", None),
+            ("#[cfg(feature = \"\")]", None),
+            // An escape, a raw literal and a comment are not interpreted.
+            ("#[cfg(feature = \"\\u{78}\")]", None),
+            ("#[cfg(feature = r\"x\")]", None),
+            ("#[cfg(feature = r#\"x\"#)]", None),
+            ("#[cfg(/* test */ feature = \"x\")]", None),
+            // Only the two whole-condition forms count.
+            ("#[cfg(not(feature = \"x\"))]", None),
+            ("#[cfg(all(feature = \"x\"))]", None),
+            ("#[cfg(all(test, feature = \"x\"))]", None),
+            ("#[cfg(all(feature = \"x\", unix))]", None),
+            ("#[cfg(any(feature = \"x\"))]", None),
+            ("#[cfg(any(feature = \"x\", unix))]", None),
+            ("#[cfg(any(test, feature = \"x\", unix))]", None),
+            ("#[cfg(any(test, not(feature = \"x\")))]", None),
+            ("#[cfg(any(feature = \"x\", feature = \"y\"))]", None),
+            ("#[cfg(feature = \"x\", unix)]", None),
+            ("#[cfg_attr(feature = \"x\", inline)]", None),
+            ("#[cfg(target_feature = \"x\")]", None),
+            ("#[cfg(feature = \"x\"", None),
+            ("#[doc = \"feature = x\"]", None),
+        ] {
+            assert_eq!(feature_gate(attribute).as_deref(), feature, "{attribute}");
+        }
     }
 }

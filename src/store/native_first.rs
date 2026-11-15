@@ -2,19 +2,22 @@
 use super::*;
 pub(super) mod context;
 mod continuation;
-pub(crate) mod copy;
+mod copy;
 mod local_targets;
 #[cfg(feature = "test-support")]
 pub(in crate::store) mod oracle;
+pub(crate) mod retained_batch;
+#[cfg(test)]
+mod retained_batch_tests;
 #[cfg(test)]
 mod tests;
+pub(crate) mod unit_read;
+#[cfg(test)]
+mod unit_read_tests;
 pub(crate) mod witness;
 mod witness_preparation;
-#[cfg(any(test, feature = "test-support"))]
-pub use continuation::set_semantic_step_slice_for_tests;
-pub(crate) use continuation::{
-    HeldIndexRead, SemanticContinuation, SemanticUnitOutcome, step_slice,
-};
+pub(crate) use continuation::HeldIndexRead;
+pub(crate) use copy::CopyFilter;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PendingSemanticSelection {
@@ -44,8 +47,8 @@ pub(crate) struct PreparedSemantic {
 
 pub(crate) enum PreparedOutput {
     Joined {
-        admitted: Box<crate::semantic_batch::AdmittedBatch>,
-        joined: crate::semantic_batch::JoinedBatch,
+        admitted: Box<crate::store::batch_input::AdmittedBatch>,
+        joined: crate::store::batch_input::JoinedBatch,
     },
     Unavailable {
         diagnostic: String,
@@ -389,73 +392,25 @@ pub(crate) fn endpoint_boundary(
 }
 
 impl Store {
-    /// Complete an offline fixture's exact target through the ordinary bounded owner units.
+    /// The storage half of `Store::complete_pending_semantic_for_tests` (the unit loop is in
+    /// `index_coordinator/semantic_fixture.rs`): `published` is the S commit of `target` over
+    /// `expected`, and no target is outstanding.
     #[cfg(feature = "test-support")]
-    #[doc(hidden)]
-    pub fn complete_pending_semantic_for_tests(
+    pub(crate) fn ensure_semantic_fixture_committed_for_tests(
         &self,
+        published: IndexPin,
         expected: IndexPin,
-        session: &Arc<topology::WriterSession>,
-        cancel: &CancelFlag,
-    ) -> Result<Option<IndexPin>> {
-        self.verify_writer_session(session)?;
-        ensure!(
-            self.index_baseline()? == expected,
-            "semantic fixture head changed"
-        );
-        let Some(target) = self.pending_semantic_target()? else {
-            return Ok(None);
-        };
-        ensure!(target.pin == expected, "semantic fixture target changed");
-        let mut continuation = None;
-        // A unit bound detects a broken fixture; only Published proves completion.
-        for _ in 0..10_000 {
-            ensure!(
-                self.pending_semantic_target()?.as_ref() == Some(&target),
-                "semantic fixture target superseded"
-            );
-            match crate::index_coordinator::cooperative_semantic_unit(
-                self,
-                session,
-                &mut continuation,
-                cancel,
-                || true,
-            )? {
-                SemanticUnitOutcome::Progress => {}
-                SemanticUnitOutcome::Published => {
-                    let published = self.index_baseline()?;
-                    ensure!(
-                        published.index_generation == expected.index_generation
-                            && published.index_revision == expected.index_revision + 1,
-                        "semantic fixture published a different paired pin"
-                    );
-                    self.with_evidence(|db| {
-                        let committed: bool = db.query_row(
-                            "SELECT EXISTS(SELECT 1 FROM semantic_catchup_commits k JOIN native_revisions s ON s.id=k.revision_id WHERE k.revision_id=?1 AND k.target_revision_id=?2 AND s.native_revision_id=?3)",
-                            params![semantic_pin_key(published), semantic_pin_key(expected), target.native_revision_id],
-                            |row| row.get(0),
-                        )?;
-                        ensure!(committed && pending_target(db)?.is_none(), "semantic fixture publication did not clear its exact target");
-                        Ok(())
-                    })?;
-                    return Ok(Some(published));
-                }
-                other => anyhow::bail!("semantic fixture did not progress: {other:?}"),
-            }
-        }
-        anyhow::bail!("semantic fixture exceeded its unit bound")
-    }
-
-    /// Offline fixtures that published native N with their own writer and dropped it: take
-    /// the writer again and drive any outstanding exact target at head to its S commit.
-    #[cfg(feature = "test-support")]
-    #[doc(hidden)]
-    pub fn catch_up_semantic_for_tests(&self, cancel: &CancelFlag) -> Result<IndexPin> {
-        let session = Arc::new(topology::WriterSession::writer(self.writer()?));
-        let head = self.index_baseline()?;
-        Ok(self
-            .complete_pending_semantic_for_tests(head, &session, cancel)?
-            .unwrap_or(head))
+        target: &PendingSemanticTarget,
+    ) -> Result<()> {
+        self.with_evidence(|db| {
+            let committed: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM semantic_catchup_commits k JOIN native_revisions s ON s.id=k.revision_id WHERE k.revision_id=?1 AND k.target_revision_id=?2 AND s.native_revision_id=?3)",
+                params![semantic_pin_key(published), semantic_pin_key(expected), target.native_revision_id],
+                |row| row.get(0),
+            )?;
+            ensure!(committed && pending_target(db)?.is_none(), "semantic fixture publication did not clear its exact target");
+            Ok(())
+        })
     }
 
     /// Whether the published head still has an outstanding semantic catch-up target.
@@ -487,32 +442,6 @@ impl Store {
     ) -> Result<Option<SemanticProjection>> {
         self.native_at(pin, |db, _| {
             semantic_projection_for(db, pin, producer, language, path)
-        })
-    }
-
-    fn with_pending_semantic_inputs<T>(
-        &self,
-        target: &PendingSemanticTarget,
-        held: &HeldIndexRead,
-        read: impl FnOnce(&Connection, &ReadRevision) -> Result<T>,
-    ) -> Result<Option<T>> {
-        self.with_held_read(held, |db| {
-            let selected = self.read_revision_for(db, Some(target.pin), true)?;
-            // S binds new keys to the same cached statements row after row. Without the
-            // query planner stability guarantee SQLite re-prepares a statement whenever a
-            // value it planned around (a LIMIT, a small-integer comparison) is rebound.
-            storage_result(db.set_db_config(
-                rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_QPSG,
-                true,
-            ))?;
-            if pending_target(db)?.as_ref() != Some(target) {
-                return Ok(None);
-            }
-            selected_ensure!(
-                target.root_id == self.identity.root_key,
-                "incompatible_index: pending semantic root differs"
-            );
-            read(db, &selected).map(Some)
         })
     }
 }

@@ -1,4 +1,7 @@
-//! The high-water counters that prove the batch resource policy in `limits`.
+//! The high-water counters that prove the batch resource policy in `limits`, and the lookup
+//! budget of the staged join.
+use super::limits::BatchLimits;
+use crate::scip_raw::ScipCaptureError;
 
 /// Counters threaded through batch staging and decoding. The `*_high_water*` fields are the
 /// AC5 test seam; `wire_fields` and `candidates` are the batch-shared decoder walk budget.
@@ -59,5 +62,54 @@ impl BatchCounters {
             .candidate_group_high_water
             .max(join.candidate_group_high_water);
         self.staged_row_attempts = join.staged_row_attempts.clone();
+    }
+}
+
+/// Lookup work charged by the staged join. One budget serves every attempt of a request, so a
+/// revision-conflict retry cannot spend the limit twice over.
+#[derive(Debug, Clone)]
+pub struct LookupBudget {
+    limit: u64,
+    used: u64,
+}
+
+impl LookupBudget {
+    pub fn new(limits: &BatchLimits) -> Self {
+        Self {
+            limit: limits.lookup_steps,
+            used: 0,
+        }
+    }
+
+    /// Accounts `units` of work before it is done.
+    pub fn charge(&mut self, units: u64) -> std::result::Result<(), ScipCaptureError> {
+        self.used = self.used.saturating_add(units);
+        if self.used > self.limit {
+            return Err(ScipCaptureError::LimitExceeded("lookup steps".into()));
+        }
+        Ok(())
+    }
+
+    pub fn used(&self) -> u64 {
+        self.used
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lookup_budget_fails_typed_once_the_limit_is_passed() {
+        let mut limits = BatchLimits::PRODUCTION;
+        limits.lookup_steps = 3;
+        let mut budget = LookupBudget::new(&limits);
+        budget.charge(2).unwrap();
+        budget.charge(1).unwrap();
+        assert!(matches!(
+            budget.charge(1),
+            Err(ScipCaptureError::LimitExceeded(name)) if name == "lookup steps"
+        ));
+        assert_eq!(budget.used(), 4);
     }
 }

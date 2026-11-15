@@ -96,6 +96,8 @@ struct Raw {
     /// HTTP interface settings (#855).
     #[serde(default)]
     interfaces: RawInterfaces,
+    /// Cargo features whose gates mark test code for reference sites (#988).
+    test_features: Option<Spanned<Vec<Spanned<String>>>>,
 }
 /// The `[interfaces]` table (#855). `wrappers` is its only key.
 #[derive(Deserialize, Default)]
@@ -299,6 +301,8 @@ pub struct Config {
     apps: Vec<AuthoredApp>,
     /// Authored `[[interfaces.wrappers]]` entries in written order (#855).
     wrappers: Vec<InterfaceWrapper>,
+    /// The authored `test_features`, sorted (#988).
+    test_features: Vec<String>,
 }
 
 /// Where a configured request wrapper reads its method (#855).
@@ -336,6 +340,11 @@ impl Config {
     /// The authored request wrappers, in written order (#855).
     pub(crate) fn interface_wrappers(&self) -> &[InterfaceWrapper] {
         &self.wrappers
+    }
+
+    /// The Cargo features whose `cfg` gates mark a Rust reference site as test (#988).
+    pub(crate) fn test_features(&self) -> &[String] {
+        &self.test_features
     }
 
     /// How many `[apps.<name>]` tables the file authors (#794).
@@ -539,6 +548,7 @@ pub fn parse(text: &str) -> Result<Config> {
     let layers = parse_layers(text, raw.layers, &mut patterns)?;
     let apps = authored_apps(text, raw.apps)?;
     let wrappers = interface_wrappers(text, raw.interfaces)?;
+    let test_features = test_features(text, raw.test_features)?;
     let roles = parse_roles(text, raw.roles, &mut patterns)?;
     let (rules, ids) = parse_rules(text, raw.rules, &roles)?;
     let exceptions = parse_exceptions(text, raw.exceptions, &ids)?;
@@ -554,6 +564,7 @@ pub fn parse(text: &str) -> Result<Config> {
         external_deny,
         apps,
         wrappers,
+        test_features,
     })
 }
 /// The size bound, the TOML and schema decode, the version and the named collection bounds.
@@ -1023,6 +1034,60 @@ fn parse_exception(
         kind,
         reason: e.reason.get_ref().clone(),
     })
+}
+
+/// The most features `test_features` may name.
+const TEST_FEATURE_LIMIT: usize = 64;
+
+/// The authored `test_features` (#988): distinct Cargo feature names, each at most 64 bytes of
+/// ASCII letters, digits, `_`, `-`, `+` and `.`, starting with a letter, digit or `_`.
+fn test_features(text: &str, raw: Option<Spanned<Vec<Spanned<String>>>>) -> Result<Vec<String>> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let raw = raw.into_inner();
+    if raw.len() > TEST_FEATURE_LIMIT {
+        return Err(error(
+            text,
+            raw[TEST_FEATURE_LIMIT].span(),
+            "too_large",
+            "token",
+            "test_features exceeds 64 entries",
+        ));
+    }
+    let mut features = BTreeSet::new();
+    for feature in raw {
+        let span = feature.span();
+        let feature = feature.into_inner();
+        if !crate::references::feature_name(&feature) {
+            return Err(error(
+                text,
+                span,
+                "schema",
+                "token",
+                format!("test feature {feature:?} is not a Cargo feature name"),
+            ));
+        }
+        if !features.insert(feature.clone()) {
+            return Err(error(
+                text,
+                span,
+                "schema",
+                "token",
+                format!("test feature {feature:?} is repeated"),
+            ));
+        }
+    }
+    Ok(features.into_iter().collect())
+}
+
+/// The test features of the checkout's rules file for a read that does not otherwise load it
+/// (#988). A missing or invalid file names none, so such a read still answers.
+pub(crate) fn load_test_features(root: &Path) -> Vec<String> {
+    match load(root) {
+        Ok(Some(config)) => config.test_features,
+        _ => Vec::new(),
+    }
 }
 
 /// The most wrappers `[interfaces]` may author.
@@ -2932,52 +2997,26 @@ pub(crate) fn evaluate_prepared<'a>(
         "bounded_work: layer assignment pattern budget"
     );
     let scope = AppScope::new(config, base.apps());
-    let mut matcher = LayerMatcher::new(config);
     let mut unassigned = Vec::new();
-    let mut unassigned_files = 0usize;
-    let mut assignments = BTreeMap::new();
-    let mut module_by_id = BTreeMap::new();
-    for module in modules {
-        check()?;
-        let path = module["identity"]["path"]
-            .as_str()
-            .context("store_unavailable: module path absent")?;
-        let layer = matcher.select(path, &mut work, check)?;
-        assignments.insert(path, layer);
-        module_by_id.insert(module["identity"].to_string(), module);
-        // Owner ruling 2026-10-31 (#559): the list follows the source filter; the total does not.
-        // Destinations still resolve across the snapshot.
-        if layer.is_none() {
-            unassigned_files += 1;
-            if glob_matches(&filter, path) {
-                unassigned.push(module["identity"].clone());
-            }
-        }
-    }
-    let mut external_assignments = BTreeMap::new();
+    let ModuleAssignments {
+        assignments,
+        module_by_id,
+        unassigned_files,
+    } = assign_modules(config, modules, &filter, &mut unassigned, &mut work, check)?;
     let external_packages = refs.data["externalPackages"]
         .as_array()
         .context("store_unavailable: external package descriptors absent")?;
-    for package in external_packages {
-        check()?;
-        let identity = &package["identity"];
-        let selector = ExternalSelector::from_identity(identity)
-            .context("store_unavailable: external package identity absent")?;
-        ensure!(
-            work.charge(config.layers.len()),
-            "bounded_work: external layer assignment budget"
-        );
-        let layer = config
-            .layers
-            .iter()
-            .find(|(_, layer)| layer.external.contains(&selector))
-            .map(|(name, _)| name.as_str());
-        external_assignments.insert(identity.to_string(), layer);
-        if layer.is_none() {
-            unassigned.push(identity.clone());
-        }
-    }
-    let mut unresolved_positions = BTreeMap::new();
+    let external_assignments =
+        assign_external(config, external_packages, &mut unassigned, &mut work, check)?;
+    let join = PolicyJoin {
+        config,
+        filter: &filter,
+        scope: &scope,
+        source_set,
+        assignments: &assignments,
+        external_assignments: &external_assignments,
+        module_by_id: &module_by_id,
+    };
     let mut instances = Vec::new();
     let mut test_only = Vec::new();
     for (field, test) in [("production", false), ("tests", true)] {
@@ -2986,147 +3025,14 @@ pub(crate) fn evaluate_prepared<'a>(
             .context("store_unavailable: references edges absent")?
         {
             check()?;
-            let source = &edge["source"];
-            let target = &edge["target"];
-            let path = source["path"]
-                .as_str()
-                .context("store_unavailable: edge source path absent")?;
-            if !glob_matches(&filter, path) {
-                continue;
-            }
-            let source_layer = assignments.get(path).copied().flatten();
-            let external = ExternalSelector::from_identity(target);
-            let target_layer = if external.is_some() {
-                *external_assignments
-                    .get(&target.to_string())
-                    .context("store_unavailable: edge external package descriptor absent")?
-            } else {
-                assignments
-                    .get(
-                        target["path"]
-                            .as_str()
-                            .context("store_unavailable: edge target path absent")?,
-                    )
-                    .copied()
-                    .flatten()
-            };
-            let denied = external
-                .as_ref()
-                .is_some_and(|s| config.external_deny.contains(s));
-            if config.layers.is_empty() && !denied {
-                continue;
-            }
-            let module = module_by_id
-                .get(&source.to_string())
-                .context("store_unavailable: edge source module absent")?;
-            let sites = edge["sites"]
-                .as_array()
-                .context("store_unavailable: edge sites absent")?;
-            ensure!(
-                work.charge(1 + sites.len()),
-                "bounded_work: rules reference evidence budget"
-            );
-            let mut evidence = Vec::new();
-            for site in sites {
-                check()?;
-                evidence.push(reference_evidence(module, site));
-            }
             let rows = if test { &mut test_only } else { &mut instances };
-            if !config.layers.is_empty() {
-                let (status, mut unresolved) =
-                    layer_status(config, &scope, source_layer, target_layer);
-                if test {
-                    unresolved.push("test_only".into());
-                }
-                let mut row = json!({"rule":"$layers","target":source,"destination":target,"sourceLayer":source_layer,"destinationLayer":target_layer,"status":status,
-                    "excepted":false,"exceptionReason":null,"constraints":[],"evidence":evidence,"unresolved":unresolved,"referenceCount":edge["count"],"kindCounts":edge["kindCounts"],"projection":edge["projection"]});
-                ensure!(
-                    work.charge(config.exceptions.len()),
-                    "bounded_work: exception match budget"
-                );
-                decorate(config, source_set, &mut row);
-                rows.push(row);
-            }
-            if denied {
-                let unresolved = if test { vec!["test_only"] } else { vec![] };
-                rows.push(json!({"rule":"$external","target":source,"destination":target,"sourceLayer":source_layer,"destinationLayer":target_layer,"status":"deviates",
-                    "excepted":false,"exceptionReason":null,"constraints":[],"evidence":evidence,"unresolved":unresolved,"referenceCount":edge["count"],"kindCounts":edge["kindCounts"],"projection":edge["projection"]}));
-            }
+            join.edge_rows(edge, test, rows, &mut work, check)?;
         }
     }
     if !config.layers.is_empty() {
-        for unresolved in refs.data["unresolved"]
-            .as_array()
-            .context("store_unavailable: unresolved references absent")?
-        {
-            check()?;
-            let source = &unresolved["source"];
-            let site = &unresolved["site"];
-            let path = source["path"]
-                .as_str()
-                .context("store_unavailable: unresolved source path absent")?;
-            if !glob_matches(&filter, path) {
-                continue;
-            }
-            let module = module_by_id
-                .get(&source.to_string())
-                .context("store_unavailable: unresolved source module absent")?;
-            let test = site["role"] == "test";
-            let mut reasons = vec![
-                unresolved["reason"]
-                    .as_str()
-                    .unwrap_or("reference_unresolved")
-                    .to_owned(),
-            ];
-            if test {
-                reasons.push("test_only".into());
-            }
-            let row = json!({"rule":"$layers","target":source,"destination":null,"sourceLayer":assignments.get(path).copied().flatten(),"destinationLayer":null,"status":"unknown",
-            "excepted":false,"exceptionReason":null,"constraints":[],"evidence":[reference_evidence(module,site)],"unresolved":reasons,"referenceCount":1,"kindCounts":unknown_kind_counts(site)});
-            // One unresolved source instance keeps every unresolved observed site.
-            let rows = if test { &mut test_only } else { &mut instances };
-            let key = (test, source.to_string());
-            if let Some(index) = unresolved_positions.get(&key).copied() {
-                let existing: &mut Value = &mut rows[index];
-                existing["referenceCount"] =
-                    json!(existing["referenceCount"].as_u64().unwrap_or(0) + 1);
-                if let Some(kind) = site["relationKind"].as_str() {
-                    existing["kindCounts"][kind] =
-                        json!(existing["kindCounts"][kind].as_u64().unwrap_or(0) + 1);
-                }
-                existing["evidence"]
-                    .as_array_mut()
-                    .expect("constructed evidence array")
-                    .push(reference_evidence(module, site));
-                let reasons = existing["unresolved"]
-                    .as_array_mut()
-                    .expect("constructed reason array");
-                for reason in row["unresolved"].as_array().expect("constructed reasons") {
-                    if !reasons.contains(reason) {
-                        reasons.push(reason.clone());
-                    }
-                }
-            } else {
-                unresolved_positions.insert(key, rows.len());
-                rows.push(row);
-            }
-        }
+        join.unresolved_rows(refs, &mut instances, &mut test_only, check)?;
     }
-    // Prepared rows carry their document in `target`.
-    for (prepared, rows) in [
-        (&base.declarations, &mut instances),
-        (&base.test_declarations, &mut test_only),
-    ] {
-        for row in prepared {
-            check()?;
-            let path = row["target"]["path"]
-                .as_str()
-                .context("store_unavailable: rule target path absent")?;
-            if glob_matches(&filter, path) {
-                rows.push(row.clone());
-            }
-        }
-    }
+    select_prepared(base, &filter, &mut instances, &mut test_only, check)?;
     let sort_rows = |rows: &mut Vec<Value>| {
         rows.sort_by_cached_key(|row| {
             (
@@ -3183,6 +3089,291 @@ pub(crate) fn evaluate_prepared<'a>(
         "partialFiles":partial_files,"limitations":limitations,"semanticDocumentStatus":refs.data["semanticDocumentStatus"],"partial":refs.data["partial"]}),
         layers: assignments,
     })
+}
+
+/// The layer of every module by path, every module by identity, and the count of modules with
+/// no layer.
+struct ModuleAssignments<'a> {
+    assignments: BTreeMap<&'a str, Option<&'a str>>,
+    module_by_id: BTreeMap<String, &'a Value>,
+    unassigned_files: usize,
+}
+
+/// Assigns every module its layer. Modules with no layer that the filter selects are added to
+/// `unassigned`.
+fn assign_modules<'a>(
+    config: &'a Config,
+    modules: &'a [Value],
+    filter: &[GlobSet],
+    unassigned: &mut Vec<Value>,
+    work: &mut Work,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<ModuleAssignments<'a>> {
+    let mut matcher = LayerMatcher::new(config);
+    let mut unassigned_files = 0usize;
+    let mut assignments = BTreeMap::new();
+    let mut module_by_id = BTreeMap::new();
+    for module in modules {
+        check()?;
+        let path = module["identity"]["path"]
+            .as_str()
+            .context("store_unavailable: module path absent")?;
+        let layer = matcher.select(path, work, check)?;
+        assignments.insert(path, layer);
+        module_by_id.insert(module["identity"].to_string(), module);
+        // Owner ruling 2026-10-31 (#559): the list follows the source filter; the total does not.
+        // Destinations still resolve across the snapshot.
+        if layer.is_none() {
+            unassigned_files += 1;
+            if glob_matches(filter, path) {
+                unassigned.push(module["identity"].clone());
+            }
+        }
+    }
+    Ok(ModuleAssignments {
+        assignments,
+        module_by_id,
+        unassigned_files,
+    })
+}
+
+/// The layer of every external package by identity. Packages with no layer are added to
+/// `unassigned`.
+fn assign_external<'a>(
+    config: &'a Config,
+    external_packages: &[Value],
+    unassigned: &mut Vec<Value>,
+    work: &mut Work,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<BTreeMap<String, Option<&'a str>>> {
+    let mut external_assignments = BTreeMap::new();
+    for package in external_packages {
+        check()?;
+        let identity = &package["identity"];
+        let selector = ExternalSelector::from_identity(identity)
+            .context("store_unavailable: external package identity absent")?;
+        ensure!(
+            work.charge(config.layers.len()),
+            "bounded_work: external layer assignment budget"
+        );
+        let layer = config
+            .layers
+            .iter()
+            .find(|(_, layer)| layer.external.contains(&selector))
+            .map(|(name, _)| name.as_str());
+        external_assignments.insert(identity.to_string(), layer);
+        if layer.is_none() {
+            unassigned.push(identity.clone());
+        }
+    }
+    Ok(external_assignments)
+}
+
+/// What the reference passes of `evaluate_prepared` read: the source filter and the layer of
+/// every module and external package.
+struct PolicyJoin<'a, 'e> {
+    config: &'a Config,
+    filter: &'e [GlobSet],
+    scope: &'e AppScope<'e>,
+    source_set: Option<&'e str>,
+    assignments: &'e BTreeMap<&'a str, Option<&'a str>>,
+    external_assignments: &'e BTreeMap<String, Option<&'a str>>,
+    module_by_id: &'e BTreeMap<String, &'a Value>,
+}
+
+impl PolicyJoin<'_, '_> {
+    /// The `$layers` and `$external` rows of one reference edge, pushed to `rows`.
+    fn edge_rows(
+        &self,
+        edge: &Value,
+        test: bool,
+        rows: &mut Vec<Value>,
+        work: &mut Work,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let Self {
+            config,
+            filter,
+            scope,
+            source_set,
+            assignments,
+            external_assignments,
+            module_by_id,
+        } = *self;
+        let source = &edge["source"];
+        let target = &edge["target"];
+        let path = source["path"]
+            .as_str()
+            .context("store_unavailable: edge source path absent")?;
+        if !glob_matches(filter, path) {
+            return Ok(());
+        }
+        let source_layer = assignments.get(path).copied().flatten();
+        let external = ExternalSelector::from_identity(target);
+        let target_layer = if external.is_some() {
+            *external_assignments
+                .get(&target.to_string())
+                .context("store_unavailable: edge external package descriptor absent")?
+        } else {
+            assignments
+                .get(
+                    target["path"]
+                        .as_str()
+                        .context("store_unavailable: edge target path absent")?,
+                )
+                .copied()
+                .flatten()
+        };
+        let denied = external
+            .as_ref()
+            .is_some_and(|s| config.external_deny.contains(s));
+        if config.layers.is_empty() && !denied {
+            return Ok(());
+        }
+        let module = module_by_id
+            .get(&source.to_string())
+            .context("store_unavailable: edge source module absent")?;
+        let sites = edge["sites"]
+            .as_array()
+            .context("store_unavailable: edge sites absent")?;
+        ensure!(
+            work.charge(1 + sites.len()),
+            "bounded_work: rules reference evidence budget"
+        );
+        let mut evidence = Vec::new();
+        for site in sites {
+            check()?;
+            evidence.push(reference_evidence(module, site));
+        }
+        if !config.layers.is_empty() {
+            let (status, mut unresolved) = layer_status(config, scope, source_layer, target_layer);
+            if test {
+                unresolved.push("test_only".into());
+            }
+            let mut row = json!({"rule":"$layers","target":source,"destination":target,"sourceLayer":source_layer,"destinationLayer":target_layer,"status":status,
+                "excepted":false,"exceptionReason":null,"constraints":[],"evidence":evidence,"unresolved":unresolved,"referenceCount":edge["count"],"kindCounts":edge["kindCounts"],"projection":edge["projection"]});
+            ensure!(
+                work.charge(config.exceptions.len()),
+                "bounded_work: exception match budget"
+            );
+            decorate(config, source_set, &mut row);
+            rows.push(row);
+        }
+        if denied {
+            let unresolved = if test { vec!["test_only"] } else { vec![] };
+            rows.push(json!({"rule":"$external","target":source,"destination":target,"sourceLayer":source_layer,"destinationLayer":target_layer,"status":"deviates",
+                "excepted":false,"exceptionReason":null,"constraints":[],"evidence":evidence,"unresolved":unresolved,"referenceCount":edge["count"],"kindCounts":edge["kindCounts"],"projection":edge["projection"]}));
+        }
+        Ok(())
+    }
+
+    /// The `$layers` rows of the unresolved references: one row a source and role, which keeps
+    /// every unresolved site of that source.
+    fn unresolved_rows(
+        &self,
+        refs: &Projection,
+        instances: &mut Vec<Value>,
+        test_only: &mut Vec<Value>,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let Self {
+            filter,
+            assignments,
+            module_by_id,
+            ..
+        } = *self;
+        let mut unresolved_positions = BTreeMap::new();
+        for unresolved in refs.data["unresolved"]
+            .as_array()
+            .context("store_unavailable: unresolved references absent")?
+        {
+            check()?;
+            let source = &unresolved["source"];
+            let site = &unresolved["site"];
+            let path = source["path"]
+                .as_str()
+                .context("store_unavailable: unresolved source path absent")?;
+            if !glob_matches(filter, path) {
+                continue;
+            }
+            let module = module_by_id
+                .get(&source.to_string())
+                .context("store_unavailable: unresolved source module absent")?;
+            let test = site["role"] == "test";
+            let mut reasons = vec![
+                unresolved["reason"]
+                    .as_str()
+                    .unwrap_or("reference_unresolved")
+                    .to_owned(),
+            ];
+            if test {
+                reasons.push("test_only".into());
+            }
+            let row = json!({"rule":"$layers","target":source,"destination":null,"sourceLayer":assignments.get(path).copied().flatten(),"destinationLayer":null,"status":"unknown",
+            "excepted":false,"exceptionReason":null,"constraints":[],"evidence":[reference_evidence(module,site)],"unresolved":reasons,"referenceCount":1,"kindCounts":unknown_kind_counts(site)});
+            // One unresolved source instance keeps every unresolved observed site.
+            let rows = if test {
+                &mut *test_only
+            } else {
+                &mut *instances
+            };
+            let key = (test, source.to_string());
+            if let Some(index) = unresolved_positions.get(&key).copied() {
+                merge_unresolved(&mut rows[index], &row, module, site);
+            } else {
+                unresolved_positions.insert(key, rows.len());
+                rows.push(row);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One more unresolved site of a source that already has its row.
+fn merge_unresolved(existing: &mut Value, row: &Value, module: &Value, site: &Value) {
+    existing["referenceCount"] = json!(existing["referenceCount"].as_u64().unwrap_or(0) + 1);
+    if let Some(kind) = site["relationKind"].as_str() {
+        existing["kindCounts"][kind] =
+            json!(existing["kindCounts"][kind].as_u64().unwrap_or(0) + 1);
+    }
+    existing["evidence"]
+        .as_array_mut()
+        .expect("constructed evidence array")
+        .push(reference_evidence(module, site));
+    let reasons = existing["unresolved"]
+        .as_array_mut()
+        .expect("constructed reason array");
+    for reason in row["unresolved"].as_array().expect("constructed reasons") {
+        if !reasons.contains(reason) {
+            reasons.push(reason.clone());
+        }
+    }
+}
+
+/// The prepared declaration rows of the documents the filter selects.
+fn select_prepared(
+    base: &RulesBase,
+    filter: &[GlobSet],
+    instances: &mut Vec<Value>,
+    test_only: &mut Vec<Value>,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<()> {
+    // Prepared rows carry their document in `target`.
+    for (prepared, rows) in [
+        (&base.declarations, instances),
+        (&base.test_declarations, test_only),
+    ] {
+        for row in prepared {
+            check()?;
+            let path = row["target"]["path"]
+                .as_str()
+                .context("store_unavailable: rule target path absent")?;
+            if glob_matches(filter, path) {
+                rows.push(row.clone());
+            }
+        }
+    }
+    Ok(())
 }
 /// The evaluation's limitations: the bindings note says whether any were admitted (#523).
 fn limitations(semantic: bool) -> Vec<String> {

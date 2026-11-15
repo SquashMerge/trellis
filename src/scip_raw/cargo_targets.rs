@@ -586,197 +586,226 @@ impl CargoTargetsContinuation {
         }
     }
 
+    /// One unit a call: the step of the current phase. `None` is a yield; `Some` is the result.
     pub(crate) fn advance(&mut self) -> Option<CargoTargets> {
         match self.phase {
-            CargoPhase::Discover => {
-                if self.package >= self.manifests.len() {
-                    self.phase = CargoPhase::Start;
-                    return None;
-                }
-                let manifest = &self.manifests[self.package];
-                if manifest.unread {
-                    self.phase = CargoPhase::Done;
-                    return Some(CargoTargets::default());
-                }
-                if self.discovery.is_none() {
-                    if manifest
-                        .table
-                        .as_ref()
-                        .is_some_and(|table| !table.contains_key("package"))
-                    {
-                        self.package += 1;
-                        return None;
-                    }
-                    self.discovery = TargetDiscovery::new(manifest, &self.files);
-                    if self.discovery.is_none() {
-                        self.poisoned.insert(self.package);
-                        self.package += 1;
-                    }
-                    return None;
-                }
-                let discovery = self.discovery.as_mut().expect("discovery");
-                match discovery.advance(manifest, &self.files) {
-                    Some(false) => {}
-                    Some(true) => {
-                        self.phase = CargoPhase::Start;
-                        // Drain one target per subsequent unit, before the next manifest.
-                    }
-                    None => {
-                        self.poisoned.insert(self.package);
-                        self.discovery = None;
-                        self.package += 1;
-                    }
-                }
+            CargoPhase::Discover => self.step_discover(),
+            CargoPhase::Start => self.step_start(),
+            CargoPhase::Vertex if self.edge.is_some() => self.step_edge(),
+            CargoPhase::Vertex => self.step_vertex(),
+            CargoPhase::Associate => self.step_associate(),
+            CargoPhase::ClearSeen => self.step_clear_seen(),
+            CargoPhase::Output => self.step_output(),
+            CargoPhase::Done => Some(CargoTargets::default()),
+        }
+    }
+
+    /// One manifest header, or one unit of its target discovery.
+    fn step_discover(&mut self) -> Option<CargoTargets> {
+        if self.package >= self.manifests.len() {
+            self.phase = CargoPhase::Start;
+            return None;
+        }
+        let manifest = &self.manifests[self.package];
+        if manifest.unread {
+            self.phase = CargoPhase::Done;
+            return Some(CargoTargets::default());
+        }
+        if self.discovery.is_none() {
+            if manifest
+                .table
+                .as_ref()
+                .is_some_and(|table| !table.contains_key("package"))
+            {
+                self.package += 1;
+                return None;
             }
-            CargoPhase::Start => {
-                if let Some(discovery) = self.discovery.as_mut() {
-                    if let Some(target) = discovery.found.pop() {
-                        *self.roots.entry(target.root.clone()).or_default() += 1;
-                        self.targets.push((self.package, target));
-                    } else {
-                        self.discovery = None;
-                        self.package += 1;
-                        self.phase = CargoPhase::Discover;
-                    }
-                    return None;
-                }
-                if self.target >= self.targets.len() {
-                    self.phase = CargoPhase::Output;
-                    return None;
-                }
-                let root = &self.targets[self.target].1.root;
-                if self.files.contains_key(root) {
-                    self.pending.push((root.clone(), true, false));
-                }
-                self.phase = CargoPhase::Vertex;
+            self.discovery = TargetDiscovery::new(manifest, &self.files);
+            if self.discovery.is_none() {
+                self.poisoned.insert(self.package);
+                self.package += 1;
             }
-            CargoPhase::Vertex => {
-                if let Some((file, mod_rs, included, index, preflight)) = self.edge.take() {
-                    let modules = self.files.get(&file).expect("captured module");
-                    let Some(module) = modules.refs.get(index) else {
-                        if preflight {
-                            self.edge = Some((file, mod_rs, included, 0, false));
-                        }
-                        return None;
-                    };
-                    if preflight {
-                        if !matches!(module, ModRef::Include(_)) {
-                            self.poisoned.insert(self.targets[self.target].0);
-                        } else {
-                            self.edge = Some((file, mod_rs, included, index + 1, true));
-                        }
-                        return None;
-                    }
-                    self.edge = Some((file.clone(), mod_rs, included, index + 1, false));
-                    let owned = if mod_rs {
-                        parent(&file).to_owned()
-                    } else {
-                        file.strip_suffix(".rs").unwrap_or(&file).to_owned()
-                    };
-                    let (candidates, child_mod_rs, child_included) = match module {
-                        ModRef::Conventional { inline, name } => {
-                            let base = join(&owned, &inline.join("/")).unwrap_or_default();
-                            let prefix = if base.is_empty() {
-                                name.clone()
-                            } else {
-                                format!("{base}/{name}")
-                            };
-                            (
-                                vec![format!("{prefix}.rs"), format!("{prefix}/mod.rs")],
-                                None,
-                                false,
-                            )
-                        }
-                        ModRef::Path { inline, path } => {
-                            let base = if inline.is_empty() {
-                                parent(&file).to_owned()
-                            } else {
-                                join(&owned, &inline.join("/")).unwrap_or_default()
-                            };
-                            (join(&base, path).into_iter().collect(), Some(true), false)
-                        }
-                        ModRef::Include(path) => (
-                            join(parent(&file), path).into_iter().collect::<Vec<_>>(),
-                            Some(mod_rs),
-                            true,
-                        ),
-                    };
-                    let found: Vec<_> = candidates
-                        .into_iter()
-                        .filter(|path| self.files.contains_key(path))
-                        .collect();
-                    match found.as_slice() {
-                        [] if child_included => {}
-                        [child] => self.pending.push((
-                            child.clone(),
-                            child_mod_rs.unwrap_or_else(|| child.ends_with("/mod.rs")),
-                            child_included,
-                        )),
-                        _ => {
-                            self.poisoned.insert(self.targets[self.target].0);
-                        }
-                    }
-                    return None;
-                }
-                if let Some((file, mod_rs, included)) = self.pending.pop() {
-                    self.reached.insert(file.clone());
-                    if !self.seen.insert((file.clone(), mod_rs)) {
-                        return None;
-                    }
-                    let modules = self.files.get(&file).expect("captured module");
-                    if modules.unread {
-                        self.phase = CargoPhase::Done;
-                        return Some(CargoTargets::default());
-                    }
-                    if modules.uncertain {
-                        self.poisoned.insert(self.targets[self.target].0);
-                    } else {
-                        self.edge = Some((file, mod_rs, included, 0, included));
-                    }
+            return None;
+        }
+        let discovery = self.discovery.as_mut().expect("discovery");
+        match discovery.advance(manifest, &self.files) {
+            Some(false) => {}
+            Some(true) => {
+                self.phase = CargoPhase::Start;
+                // Drain one target per subsequent unit, before the next manifest.
+            }
+            None => {
+                self.poisoned.insert(self.package);
+                self.discovery = None;
+                self.package += 1;
+            }
+        }
+        None
+    }
+
+    /// Drains one discovered target of the current manifest, or starts the next target's graph.
+    fn step_start(&mut self) -> Option<CargoTargets> {
+        if let Some(discovery) = self.discovery.as_mut() {
+            if let Some(target) = discovery.found.pop() {
+                *self.roots.entry(target.root.clone()).or_default() += 1;
+                self.targets.push((self.package, target));
+            } else {
+                self.discovery = None;
+                self.package += 1;
+                self.phase = CargoPhase::Discover;
+            }
+            return None;
+        }
+        if self.target >= self.targets.len() {
+            self.phase = CargoPhase::Output;
+            return None;
+        }
+        let root = &self.targets[self.target].1.root;
+        if self.files.contains_key(root) {
+            self.pending.push((root.clone(), true, false));
+        }
+        self.phase = CargoPhase::Vertex;
+        None
+    }
+
+    /// One module edge of the vertex in hand: an include preflight, or the reference resolved.
+    /// The edge is taken, and put back advanced unless the vertex is finished.
+    fn step_edge(&mut self) -> Option<CargoTargets> {
+        let (file, mod_rs, included, index, preflight) = self.edge.take()?;
+        let modules = self.files.get(&file).expect("captured module");
+        let Some(module) = modules.refs.get(index) else {
+            if preflight {
+                self.edge = Some((file, mod_rs, included, 0, false));
+            }
+            return None;
+        };
+        if preflight {
+            if !matches!(module, ModRef::Include(_)) {
+                self.poisoned.insert(self.targets[self.target].0);
+            } else {
+                self.edge = Some((file, mod_rs, included, index + 1, true));
+            }
+            return None;
+        }
+        self.edge = Some((file.clone(), mod_rs, included, index + 1, false));
+        let owned = if mod_rs {
+            parent(&file).to_owned()
+        } else {
+            file.strip_suffix(".rs").unwrap_or(&file).to_owned()
+        };
+        let (candidates, child_mod_rs, child_included) = match module {
+            ModRef::Conventional { inline, name } => {
+                let base = join(&owned, &inline.join("/")).unwrap_or_default();
+                let prefix = if base.is_empty() {
+                    name.clone()
                 } else {
-                    self.phase = CargoPhase::Associate;
-                }
+                    format!("{base}/{name}")
+                };
+                (
+                    vec![format!("{prefix}.rs"), format!("{prefix}/mod.rs")],
+                    None,
+                    false,
+                )
             }
-            CargoPhase::Associate => {
-                if let Some(path) = self.reached.pop_first() {
-                    self.owners.entry(path).or_default().insert(self.target);
+            ModRef::Path { inline, path } => {
+                let base = if inline.is_empty() {
+                    parent(&file).to_owned()
                 } else {
-                    self.phase = CargoPhase::ClearSeen;
+                    join(&owned, &inline.join("/")).unwrap_or_default()
+                };
+                (join(&base, path).into_iter().collect(), Some(true), false)
+            }
+            ModRef::Include(path) => (
+                join(parent(&file), path).into_iter().collect::<Vec<_>>(),
+                Some(mod_rs),
+                true,
+            ),
+        };
+        let found: Vec<_> = candidates
+            .into_iter()
+            .filter(|path| self.files.contains_key(path))
+            .collect();
+        match found.as_slice() {
+            [] if child_included => {}
+            [child] => self.pending.push((
+                child.clone(),
+                child_mod_rs.unwrap_or_else(|| child.ends_with("/mod.rs")),
+                child_included,
+            )),
+            _ => {
+                self.poisoned.insert(self.targets[self.target].0);
+            }
+        }
+        None
+    }
+
+    /// One module vertex: the next pending file of the current target.
+    fn step_vertex(&mut self) -> Option<CargoTargets> {
+        if let Some((file, mod_rs, included)) = self.pending.pop() {
+            self.reached.insert(file.clone());
+            if !self.seen.insert((file.clone(), mod_rs)) {
+                return None;
+            }
+            let modules = self.files.get(&file).expect("captured module");
+            if modules.unread {
+                self.phase = CargoPhase::Done;
+                return Some(CargoTargets::default());
+            }
+            if modules.uncertain {
+                self.poisoned.insert(self.targets[self.target].0);
+            } else {
+                self.edge = Some((file, mod_rs, included, 0, included));
+            }
+        } else {
+            self.phase = CargoPhase::Associate;
+        }
+        None
+    }
+
+    /// One reached file gets the current target as an owner.
+    fn step_associate(&mut self) -> Option<CargoTargets> {
+        if let Some(path) = self.reached.pop_first() {
+            self.owners.entry(path).or_default().insert(self.target);
+        } else {
+            self.phase = CargoPhase::ClearSeen;
+        }
+        None
+    }
+
+    /// Forgets one seen vertex; when none is left, moves to the next target.
+    fn step_clear_seen(&mut self) -> Option<CargoTargets> {
+        if self.seen.pop_first().is_none() {
+            self.target += 1;
+            self.phase = CargoPhase::Start;
+        }
+        None
+    }
+
+    /// One poisoned-package probe of a candidate, or the next single-owner file.
+    fn step_output(&mut self) -> Option<CargoTargets> {
+        if let Some((path, index, package)) = self.check.take() {
+            if package < self.manifests.len() {
+                let dir = &self.manifests[package].dir;
+                let poisoned = self.poisoned.contains(&package)
+                    && (dir.is_empty() || path.starts_with(&format!("{dir}/")));
+                if !poisoned {
+                    self.check = Some((path, index, package + 1));
+                }
+            } else {
+                self.output.insert(path, self.targets[index].1.clone());
+            }
+        } else if let Some((path, owning)) = self.owners.pop_first() {
+            if owning.len() == 1 {
+                let index = *owning.first().expect("one owner");
+                if self.roots.get(&self.targets[index].1.root) == Some(&1) {
+                    self.check = Some((path, index, 0));
                 }
             }
-            CargoPhase::ClearSeen => {
-                if self.seen.pop_first().is_none() {
-                    self.target += 1;
-                    self.phase = CargoPhase::Start;
-                }
-            }
-            CargoPhase::Output => {
-                if let Some((path, index, package)) = self.check.take() {
-                    if package < self.manifests.len() {
-                        let dir = &self.manifests[package].dir;
-                        let poisoned = self.poisoned.contains(&package)
-                            && (dir.is_empty() || path.starts_with(&format!("{dir}/")));
-                        if !poisoned {
-                            self.check = Some((path, index, package + 1));
-                        }
-                    } else {
-                        self.output.insert(path, self.targets[index].1.clone());
-                    }
-                } else if let Some((path, owning)) = self.owners.pop_first() {
-                    if owning.len() == 1 {
-                        let index = *owning.first().expect("one owner");
-                        if self.roots.get(&self.targets[index].1.root) == Some(&1) {
-                            self.check = Some((path, index, 0));
-                        }
-                    }
-                } else {
-                    self.phase = CargoPhase::Done;
-                    return Some(CargoTargets {
-                        owners: std::mem::take(&mut self.output),
-                    });
-                }
-            }
-            CargoPhase::Done => return Some(CargoTargets::default()),
+        } else {
+            self.phase = CargoPhase::Done;
+            return Some(CargoTargets {
+                owners: std::mem::take(&mut self.output),
+            });
         }
         None
     }

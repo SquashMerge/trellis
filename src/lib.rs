@@ -29,6 +29,7 @@ pub(crate) mod evidence_limits;
 #[cfg(test)]
 mod extractor_inputs_tests;
 pub mod file_tree;
+mod files_read;
 pub mod files_view;
 pub mod git_status;
 pub mod graph_query;
@@ -84,6 +85,7 @@ pub mod search_rank;
 pub mod search_vectors;
 pub mod search_vocab;
 pub mod semantic_batch;
+pub(crate) mod semantic_catchup;
 pub mod semantic_evidence;
 pub mod semantic_import;
 #[cfg(test)]

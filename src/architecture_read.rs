@@ -153,6 +153,15 @@ impl EvidenceResponse {
         Ok(config)
     }
 
+    /// The test features a read's reference sites follow (#988): those of the rules file the
+    /// read loaded, else of the checkout's file, which a plain references read does not load.
+    fn test_features(&self, config: Option<&crate::rules::Config>) -> Vec<String> {
+        match config {
+            Some(config) => config.test_features().to_vec(),
+            None => crate::rules::load_test_features(Path::new(self.store.workspace_root())),
+        }
+    }
+
     /// One architecture operation over a computed core.
     pub(crate) fn architecture_response_at(
         &self,
@@ -181,7 +190,8 @@ impl EvidenceResponse {
             }
             _ => None,
         };
-        let references = core.references_in(parsed, app_files.as_ref(), check)?;
+        let test_features = self.test_features(config);
+        let references = core.references_in(parsed, app_files.as_ref(), &test_features, check)?;
         let apps = if kind == "prompt" {
             Some(crate::rules::prompt_apps(
                 config,
@@ -197,7 +207,7 @@ impl EvidenceResponse {
             (false, _) => None,
             (true, Some(config)) => {
                 let base = core.rules(config)?;
-                let whole = core.references(&[], 5, check)?;
+                let whole = core.references(&[], config.test_features(), 5, check)?;
                 let evaluated = crate::rules::evaluate_prepared(config, base, &whole, &[], check)?;
                 Some(crate::rules::path_apps(
                     Some(config),
@@ -263,7 +273,8 @@ impl EvidenceResponse {
         crate::rules::AppAssignment<'c>,
         crate::references::Projection,
     )> {
-        let whole = core.references(&[], 5, check)?;
+        let test_features = config.map_or(&[][..], crate::rules::Config::test_features);
+        let whole = core.references(&[], test_features, 5, check)?;
         let assignment = match config {
             Some(config) => {
                 let base = core.rules(config)?;
@@ -493,6 +504,7 @@ impl EvidenceResponse {
                 .as_ref()
                 .filter(|_| kind == "references")
                 .map(|(_, _, files)| files),
+            &self.test_features(config),
             parsed.sample_limit,
             check,
         )?;
@@ -684,7 +696,7 @@ impl EvidenceResponse {
         let ArchitectureView::Ready { mut payload, .. } = view else {
             anyhow::bail!("store_unavailable: architecture summary state");
         };
-        let references = core.references(&[], 5, check)?;
+        let references = core.references(&[], config.test_features(), 5, check)?;
         let evaluated =
             crate::rules::evaluate_prepared(config, core.rules(config)?, &references, &[], check)?;
         payload["evidenceTier"] = references.data["evidenceTier"].clone();
@@ -957,7 +969,7 @@ impl EvidenceResponse {
         core: &ArchitectureCore,
         check: &mut (impl FnMut() -> Result<()> + Send),
     ) -> Result<serde_json::Value> {
-        let references = core.references(&[], 5, check)?;
+        let references = core.references(&[], config.test_features(), 5, check)?;
         let evaluated =
             crate::rules::evaluate_prepared(config, core.rules(config)?, &references, &[], check)?;
         let layers =
@@ -999,7 +1011,15 @@ impl EvidenceResponse {
         let snapshot = self
             .architecture_snapshot(Some(pin), check)
             .map_err(|error| self.store.report_index_failure(error))?;
-        let references = crate::references::project(&snapshot, &[], 5, check)?;
+        let references = crate::references::project_where(
+            &snapshot,
+            &[],
+            None,
+            None,
+            base.test_features(),
+            5,
+            check,
+        )?;
         let evaluated =
             crate::rules::evaluate_with_layers(base, &snapshot, &references, &[], check)?;
         crate::rules_edit::validate_selection(request, &evaluated.data, &evaluated.layers, check)?;

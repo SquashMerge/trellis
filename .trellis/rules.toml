@@ -59,6 +59,14 @@ paths = [
   # The class reads, moved up from storage (S7, #1052): the class page and class diagram read
   # bodies, their forwarding methods and the presentation helpers. SQL until S14, as above.
   "src/class_read.rs",
+  # The Files reads, moved up from storage (S16): the outline and syntax-match read bodies
+  # and their forwarding methods. SQL until S14, as above.
+  "src/files_read.rs",
+  # The Files projection those reads use (E3): the outline and syntax-match shapes, their
+  # request validation and bounds, and the tree-sitter scan. Query code by content; its users
+  # are the query layer and the HTTP entry. It parses with the indexing layer's grammars and
+  # macro expansions, which is a downward read from here.
+  "src/files_view.rs",
 ]
 
 [layers.indexing]
@@ -74,7 +82,7 @@ paths = [
   "src/scip_admission.rs", "src/semantic_evidence.rs", "src/semantic_import.rs",
   "src/search_capture.rs",
   "src/native_rust_macros_tests.rs", "src/extractor_inputs_tests.rs", "src/indexer_projection_vectors_tests.rs",
-  "src/semantic_import_complexity_tests.rs", "src/native_rust_macros.rs", "src/producer/**", "src/evidence_budget.rs", "src/semantic_batch.rs", "src/semantic_batch/**",
+  "src/semantic_import_complexity_tests.rs", "src/native_rust_macros.rs", "src/producer/**", "src/evidence_budget.rs", "src/semantic_batch.rs", "src/semantic_batch/**", "src/semantic_catchup.rs",
   "src/semantic_import/**",
   "src/language_set_tests.rs", "src/native_typescript_tests.rs", "src/semantic_join_inputs_tests.rs",
   # In-file test modules moved out of src/native_evidence.rs (R1, #1004).
@@ -100,7 +108,7 @@ paths = ["src/store.rs", "src/store/**", "src/search_vectors.rs", "src/sqlite_co
 apps = ["trellis"]
 shared = true
 paths = [
-  "src/model.rs", "src/testing.rs", "src/native_ids.rs", "src/scip_raw.rs", "src/files_view.rs", "src/parallel.rs", "src/build_info.rs", "src/search_lexical.rs",
+  "src/model.rs", "src/testing.rs", "src/native_ids.rs", "src/scip_raw.rs", "src/parallel.rs", "src/build_info.rs", "src/search_lexical.rs",
   "src/lib.rs", "src/scip_raw/**", "src/test_alloc.rs", "src/syntax_bounds.rs", "src/heap.rs",
   # Leaf constants, small types and pure helpers that storage and shared code use (S1, #999).
   # They reference no layer: the skipped-input placeholders, the batch resource policy with
@@ -141,6 +149,11 @@ paths = [
   # configuration read. Storage checks the pin at publish time through
   # `Descriptor::check_producer`, which is in the grammar file above.
   "src/producer_pin.rs",
+  # The proof that batch admission ran (S8, #1071): one zero-sized type with no dependency.
+  # Admission creates it and the storage-owned `AdmittedBatch` (store/batch_input.rs) is
+  # built from it. It is a module of `semantic_batch` because Rust privacy is by module
+  # tree: that is what restricts its constructor to admission.
+  "src/semantic_batch/admission_proof.rs",
 ]
 
 # Coarse developer-tool boundary; does not infer internal tooling architecture.

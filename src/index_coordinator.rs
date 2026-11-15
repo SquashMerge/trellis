@@ -1225,6 +1225,28 @@ impl WatcherWork {
     }
 }
 
+/// The full capture and document spool an exceptional recreation publishes. Storage calls it
+/// at its own point under the recovery lock (`Store::recreate_index_exclusive`); no facts or
+/// projections from the old index are used.
+pub(crate) fn recreate_capture(
+    store: &Store,
+    options: &IndexOptions,
+    cancel: &CancelFlag,
+) -> Result<(Capture, crate::native_evidence::FullDocumentSpool)> {
+    let capture = Capture::admit(options, cancel, &|_| {})?;
+    let spool = crate::native_evidence::spool_full_capture(
+        options,
+        &capture,
+        &store.state_topology().1.root,
+        store.root_id(),
+        cancel,
+        &|_| {},
+        |_, _| {},
+        &store.native_spool_dir()?,
+    )?;
+    Ok((capture, spool))
+}
+
 /// One explicit index command returns the owner that published its one full capture.
 /// Exceptional recovery cannot take the live-baseline path or upgrade shared use.
 pub fn reconcile_workspace(
@@ -1237,7 +1259,9 @@ pub fn reconcile_workspace(
     // activation: confirm old-root terminal rows before ANY startup reconciliation publication.
     store.settle_foreign_root_requests()?;
     if store.is_recreate_pending() {
-        return store.recreate_pending_writer_session(options, cancel);
+        return store.recreate_pending_writer_session(options, cancel, &mut || {
+            recreate_capture(store, options, cancel)
+        });
     }
     let coordinator = IndexJobCoordinator::prepare(store, None)?;
     let session = coordinator.session();
@@ -2213,11 +2237,12 @@ pub fn cooperative_maintenance_unit(
 pub(crate) fn cooperative_semantic_unit(
     store: &Store,
     session: &Arc<WriterSession>,
-    continuation: &mut Option<crate::store::SemanticContinuation>,
+    continuation: &mut Option<crate::semantic_catchup::SemanticContinuation>,
     cancel: &CancelFlag,
     mut priority: impl FnMut() -> bool,
-) -> Result<crate::store::SemanticUnitOutcome> {
-    use crate::store::{MaintenanceQueueState, SemanticUnitOutcome};
+) -> Result<crate::semantic_catchup::SemanticUnitOutcome> {
+    use crate::semantic_catchup::SemanticUnitOutcome;
+    use crate::store::MaintenanceQueueState;
     if !priority() || cancel.load(Ordering::Acquire) {
         return Ok(SemanticUnitOutcome::Deferred);
     }
@@ -2244,7 +2269,7 @@ pub(crate) fn cooperative_semantic_unit(
     loop {
         let outcome = store.semantic_maintenance_unit(session, continuation, cancel)?;
         if outcome != SemanticUnitOutcome::Progress
-            || started.elapsed() >= crate::store::semantic_step_slice()
+            || started.elapsed() >= crate::semantic_catchup::step_slice()
             || !admitted()
         {
             return Ok(outcome);
@@ -2266,7 +2291,9 @@ pub fn establish_serving_session(
                 "recovery_required: index options unavailable; run explicit trellis index"
             )
         })?;
-        let (_, session) = store.recreate_pending_writer_session(options, cancel)?;
+        let (_, session) = store.recreate_pending_writer_session(options, cancel, &mut || {
+            recreate_capture(store, options, cancel)
+        })?;
         session.verify()?;
         sweep_abandoned_semantic_stages(store);
         return Ok(session);
@@ -2315,6 +2342,9 @@ fn sweep_abandoned_semantic_stages(store: &Store) {
     // running generated import still names (D2). Nothing is importing yet at this point.
     crate::producer::run::sweep_state(store, false);
 }
+
+#[cfg(feature = "test-support")]
+mod semantic_fixture;
 
 #[cfg(test)]
 mod tests;

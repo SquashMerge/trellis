@@ -2,17 +2,15 @@ use super::*;
 use anyhow::Context;
 use std::process::Command;
 
+/// A checkout runtime over a standalone scheduler in `tmp`, with its workspace root. Such a
+/// scheduler has no background worker: the test drives every worker step itself.
 #[cfg(feature = "test-support")]
-#[test]
-fn cli_status_names_a_blocked_reconciliation_and_clears_after_recovery() {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().join("workspace");
+fn standalone_runtime(tmp: &Path) -> (std::path::PathBuf, Arc<ActiveResources>, CheckoutRuntime) {
+    let root = tmp.join("workspace");
     fs::create_dir(&root).unwrap();
     fs::write(root.join("a.js"), "function a() {}\n").unwrap();
-    // A standalone scheduler has no background worker; each fault and
-    // recovery transition below is driven explicitly by this test.
     let store =
-        crate::testing::retry_admission(|| Store::open_for_tests(&tmp.path().join("state"), &root));
+        crate::testing::retry_admission(|| Store::open_for_tests(&tmp.join("state"), &root));
     let scheduler = http::new(
         store.clone(),
         IndexOptions::new(root.clone()),
@@ -43,6 +41,16 @@ fn cli_status_names_a_blocked_reconciliation_and_clears_after_recovery() {
         mcp_admitted_gate: std::sync::Mutex::new(None),
         evidence_sampled_hook: std::sync::Mutex::new(None),
     };
+    (root, resources, runtime)
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn cli_status_names_a_blocked_reconciliation_and_clears_after_recovery() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A standalone scheduler has no background worker; each fault and
+    // recovery transition below is driven explicitly by this test.
+    let (root, resources, runtime) = standalone_runtime(tmp.path());
     let queued = resources
         .store
         .enqueue_request(&IndexOptions::new(root.clone()), None)
@@ -519,4 +527,279 @@ fn capacity_failure_retains_verified_root_without_reserving_a_slot() {
     assert!(registry.entries.values().all(
         |entry| entry.sessions.contains(&17) == (entry.identity.root_key == identity.root_key)
     ));
+}
+
+/// #1082: an automatic producer run is admitted by the runtime that owns the phase and the
+/// watcher, not by the decider's earlier sample of them.
+#[cfg(feature = "test-support")]
+mod auto_run_admission {
+    use super::*;
+    use crate::producer::approval::{Approval, ApprovalRead, ApprovalRequest};
+    use crate::producer::auto::{self, AutoRunRuntime, AutoRunSources, LaunchRequest};
+    use crate::producer::auto_config::{AutoConfig, ConfigState};
+    use crate::producer::run::{AutoCancel, SupersedeToken};
+    use crate::testing::HANG_BACKSTOP;
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, atomic::AtomicBool, atomic::Ordering, mpsc};
+
+    const PRODUCER: &str = "alpha";
+    const HEAD: &str = "h1";
+
+    fn approval() -> Approval {
+        Approval {
+            producer: PRODUCER.to_owned(),
+            trust_profile: crate::producer::TrustProfile::Trusted,
+            request: ApprovalRequest {
+                limits: crate::producer::plan::LimitsRequest {
+                    timeout_secs: 1800,
+                    memory_mib: 8192,
+                },
+                executable: None,
+                environment: Default::default(),
+            },
+            template_sha256: "a".repeat(64),
+            root_record_id: "record".into(),
+            root_inode: 1,
+            approved_at: 7,
+        }
+    }
+
+    fn request() -> LaunchRequest {
+        LaunchRequest {
+            approval: approval(),
+            expected_revision: HEAD.to_owned(),
+            token: SupersedeToken::default(),
+        }
+    }
+
+    /// One enabled, approved producer that is due at the head, with no gate.
+    struct Due;
+
+    impl AutoRunSources for Due {
+        fn pin(&self) -> anyhow::Result<IndexPin> {
+            Ok(IndexPin {
+                index_generation: uuid::Uuid::from_u128(1),
+                index_revision: 1,
+            })
+        }
+
+        fn head(&self, producers: &[&str]) -> anyhow::Result<crate::store::AutoRunHead> {
+            Ok(crate::store::AutoRunHead {
+                pin: self.pin()?,
+                native_revision_id: HEAD.to_owned(),
+                due: producers
+                    .iter()
+                    .map(|name| ((*name).to_owned(), true))
+                    .collect(),
+            })
+        }
+
+        fn config(&self) -> ConfigState {
+            ConfigState::Valid(BTreeMap::from([(
+                PRODUCER.to_owned(),
+                AutoConfig {
+                    enabled: true,
+                    quiet: Duration::ZERO,
+                    min_interval: Duration::ZERO,
+                    battery_gate: false,
+                    load_gate: false,
+                },
+            )]))
+        }
+
+        fn approval(&self, _producer: &str) -> ApprovalRead {
+            ApprovalRead::Valid(Box::new(approval()))
+        }
+
+        fn seed(&self) -> BTreeMap<String, auto::Seed> {
+            BTreeMap::new()
+        }
+    }
+
+    struct NoProbes;
+
+    impl crate::producer::auto_gate::Probes for NoProbes {
+        fn on_battery(&self) -> Option<bool> {
+            None
+        }
+
+        fn load_saturated(&self) -> Option<bool> {
+            None
+        }
+    }
+
+    /// One-shot: tells the test the run thread reached `launch`, then waits to be released.
+    type Hold = (mpsc::Sender<()>, mpsc::Receiver<()>);
+
+    /// The checkout's real host. Its first launch is held before the runtime is asked to admit
+    /// it, and every launch's outcome is reported.
+    struct HeldLaunch {
+        host: AutoHost,
+        hold: Mutex<Option<Hold>>,
+        outcomes: Mutex<mpsc::Sender<LaunchOutcome>>,
+    }
+
+    impl AutoRunRuntime for HeldLaunch {
+        fn alive(&self) -> bool {
+            self.host.alive()
+        }
+
+        fn phase_ready(&self) -> bool {
+            self.host.phase_ready()
+        }
+
+        fn intent_pending(&self) -> bool {
+            self.host.intent_pending()
+        }
+
+        fn active_origin(&self) -> Option<crate::producer::state::RunOrigin> {
+            self.host.active_origin()
+        }
+
+        fn supersede(&self, token: &SupersedeToken) -> AutoCancel {
+            self.host.supersede(token)
+        }
+
+        fn state_version(&self) -> u64 {
+            self.host.state_version()
+        }
+
+        fn wait_state_change(&self, seen: u64, timeout: Duration) {
+            self.host.wait_state_change(seen, timeout);
+        }
+
+        fn wake(&self) {
+            self.host.wake();
+        }
+
+        fn launch(&self, request: LaunchRequest) -> LaunchOutcome {
+            let hold = self.hold.lock().unwrap().take();
+            if let Some((reached, release)) = hold {
+                let _ = reached.send(());
+                release
+                    .recv_timeout(HANG_BACKSTOP)
+                    .expect("the held launch was never released");
+            }
+            let outcome = self.host.launch(request);
+            let _ = self.outcomes.lock().unwrap().send(outcome.clone());
+            outcome
+        }
+    }
+
+    /// A `Ready` checkout whose watcher has acknowledged its first inventory.
+    fn settled_checkout(tmp: &Path) -> (Arc<ActiveResources>, Arc<CheckoutRuntime>) {
+        let (root, resources, runtime) = standalone_runtime(tmp);
+        resources
+            .scheduler
+            .enqueue_index(&IndexOptions::new(root), None)
+            .unwrap();
+        resources
+            .scheduler
+            .force_root_transition_tick_for_tests()
+            .unwrap();
+        let runtime = Arc::new(runtime);
+        let host = AutoHost {
+            runtime: Arc::downgrade(&runtime),
+        };
+        assert!(host.phase_ready());
+        assert!(!host.intent_pending(), "the fixture has nothing pending");
+        (resources, runtime)
+    }
+
+    /// The decider samples a settled `Ready` checkout and decides to start. Before its run
+    /// thread reaches the runtime, the serving session is lost and startup reconciliation
+    /// makes the checkout `Ready` again on a new session, whose watcher has not run its
+    /// first inventory. The decider's sample said nothing was pending; the runtime must not
+    /// admit the run on it.
+    #[test]
+    fn a_run_decided_before_a_session_replacement_is_not_admitted_before_its_first_inventory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (resources, runtime) = settled_checkout(tmp.path());
+        let scheduler = resources.scheduler.clone();
+
+        let (reached, launch_reached) = mpsc::channel();
+        let (release_launch, release) = mpsc::channel();
+        let (outcomes, launch_outcome) = mpsc::channel();
+        let held = Arc::new(HeldLaunch {
+            host: AutoHost {
+                runtime: Arc::downgrade(&runtime),
+            },
+            hold: Mutex::new(Some((reached, release))),
+            outcomes: Mutex::new(outcomes),
+        });
+        let closed = Arc::new(AtomicBool::new(false));
+        let deps = auto::Deps {
+            runtime: held.clone(),
+            sources: Arc::new(Due),
+            clock: Arc::new(auto::SystemClock),
+            probes: Arc::new(NoProbes),
+            intervals: auto::Intervals {
+                quiet: Some(Duration::ZERO),
+                min_interval: Some(Duration::ZERO),
+                ..Default::default()
+            },
+            spawn: auto::thread_spawner(),
+            closed: closed.clone(),
+            published: Default::default(),
+        };
+        let decider = std::thread::spawn(move || auto::run_loop(deps));
+        launch_reached
+            .recv_timeout(HANG_BACKSTOP)
+            .expect("the decider never started a run on the settled checkout");
+
+        // The worker, on this thread: the session is lost, and the next step reconciles to a
+        // new one. It stops between making the checkout `Ready` and its watcher's inventory.
+        scheduler.lose_serving_session_for_tests();
+        let (admitted, admission) = mpsc::channel();
+        let paused = scheduler.clone();
+        scheduler.set_after_startup_drain_hook_for_tests(move || {
+            assert_eq!(paused.runtime_phase(), RuntimePhase::Ready);
+            assert!(
+                paused.checkout_watch_pending(),
+                "the replacement watcher's first inventory is pending"
+            );
+            let _ = release_launch.send(());
+            let outcome = launch_outcome
+                .recv_timeout(HANG_BACKSTOP)
+                .expect("the held launch never returned");
+            let _ = admitted.send(outcome);
+        });
+        scheduler.force_root_transition_tick_for_tests().unwrap();
+        let outcome = admission
+            .recv_timeout(HANG_BACKSTOP)
+            .expect("the worker never reached the replacement watcher");
+        assert_eq!(
+            outcome,
+            LaunchOutcome::NotReady,
+            "an automatic run was admitted while the replacement watcher's first inventory \
+             was pending"
+        );
+
+        closed.store(true, Ordering::Release);
+        held.wake();
+        decider.join().unwrap();
+
+        // Once that inventory is acknowledged the same request passes admission: it is
+        // refused later, by the plan, for its unknown producer.
+        assert!(!scheduler.checkout_watch_pending());
+        assert_ne!(held.host.launch(request()), LaunchOutcome::NotReady);
+    }
+
+    /// With no serving session the checkout has its reconciliation and the next watcher's
+    /// first inventory ahead of it. That is pending intent, not a quiet checkout.
+    #[test]
+    fn a_checkout_that_lost_its_serving_session_reports_pending_intent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (resources, runtime) = settled_checkout(tmp.path());
+        let host = AutoHost {
+            runtime: Arc::downgrade(&runtime),
+        };
+        // The decider's phase sample, then the loss, then its intent sample.
+        assert!(host.phase_ready());
+        resources.scheduler.lose_serving_session_for_tests();
+        assert!(
+            host.intent_pending(),
+            "a checkout with no serving session read as having nothing pending"
+        );
+    }
 }
