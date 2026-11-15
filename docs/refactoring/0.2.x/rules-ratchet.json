@@ -1,13 +1,81 @@
 {
-  "schemaVersion": 3,
+  "schemaVersion": 4,
   "population": "Production instances of `trellis rules check` whose destination is not an externalPackage: first-party sources to first-party or unresolved destinations. Standard-library and external packages are not counted. Known gap: a bare JavaScript import the tool leaves unresolved (destination null, such as node:crypto or esbuild) is not an externalPackage, so it stays in the population as unknown references (see #1088).",
-  "rule": "A run fails when deviatingPairs, deviatingReferences or partialFiles is above this record. It also fails as lost coverage when deviatingPairs or deviatingReferences is below this record while unknownReferences is above it; with deviations not lower, a rise in unknownReferences is a notice. unknownReferences is the sum of referenceCount over the population's instances with status unknown. An update does not lower the deviations while unknownReferences is above the record unless --accept-unknown-rise is given. comparablePairs, conformingPairs and unknownPairs are information only: a pair is one source file's aggregate, so a file split, merge, rename or deletion moves them without changing coverage.",
+  "rule": "A run fails when deviatingPairs, deviatingReferences or partialFiles is above this record, or when it measures a deviating pair that is not in deviatingReferencesByPair. It also fails as lost coverage, decided per pair: a pair in deviatingReferencesByPair (source path, then destination path) has fewer deviating references than recorded, or is gone, while its source file has more unknown references than unknownReferencesBySource records for it. Any other rise in unknown references is a notice. unknownReferences is the sum of referenceCount over the population's instances with status unknown; unknownReferencesBySource is that sum for each source file of a recorded deviating pair. Pairs are compared by path and renames are not detected: a deviating pair whose source or destination file was renamed, split or merged is a pair this record does not have, so the run fails until the record is updated, and the pair under the old path counts as fallen. An update is refused when the measurement is lost coverage by this rule, unless --accept-unknown-rise is given. comparablePairs, conformingPairs and unknownPairs are information only: an unknown pair is one source file's aggregate, so a file split, merge, rename or deletion moves them without changing coverage.",
   "measurement": "`python3 tools/rules-ratchet.py --update`: a debug build of this checkout, its own daemon under a private HOME, a fresh index, then rust-analyzer (trusted) and scip-typescript (restricted) imported.",
   "deviatingPairs": 31,
   "deviatingReferences": 209,
-  "unknownReferences": 7115,
+  "unknownReferences": 7134,
   "partialFiles": 0,
   "comparablePairs": 1814,
   "conformingPairs": 1531,
-  "unknownPairs": 252
+  "unknownPairs": 252,
+  "deviatingReferencesByPair": {
+    "src/native_navigation_fixture.rs": {
+      "tests/common/graph_fixtures.rs": 17
+    },
+    "src/store.rs": {
+      "src/capture.rs": 53,
+      "src/classes.rs": 20,
+      "src/evidence_budget.rs": 1,
+      "src/indexer.rs": 5,
+      "src/metrics.rs": 2,
+      "src/native_evidence.rs": 40,
+      "src/producer/retention.rs": 3,
+      "src/references.rs": 4,
+      "src/references/external.rs": 1,
+      "src/references/tsconfig.rs": 2,
+      "src/scip_admission.rs": 1,
+      "src/semantic_batch.rs": 1,
+      "src/semantic_evidence.rs": 1,
+      "src/semantic_import.rs": 1,
+      "src/semantic_import/staged/publication.rs": 1
+    },
+    "src/store/captured_witness.rs": {
+      "src/semantic_import/staged/publication.rs": 1
+    },
+    "src/store/mcp_read.rs": {
+      "src/symbol_lookup.rs": 1
+    },
+    "src/store/native_first.rs": {
+      "src/semantic_import/staged/publication.rs": 1
+    },
+    "src/store/native_first/context.rs": {
+      "src/producer/mod.rs": 3,
+      "src/producer/profiles.rs": 5,
+      "src/producer/worktree.rs": 1,
+      "src/semantic_batch/descriptor.rs": 1
+    },
+    "src/store/requests.rs": {
+      "src/scip_admission.rs": 2
+    },
+    "src/store/semantic_display.rs": {
+      "src/graph_query.rs": 22,
+      "src/references.rs": 4
+    },
+    "src/store/semantic_payload.rs": {
+      "src/semantic_import.rs": 1
+    },
+    "src/store/semantic_retention.rs": {
+      "src/producer/mod.rs": 1,
+      "src/producer/retention.rs": 10,
+      "src/producer/state.rs": 2
+    },
+    "src/testing.rs": {
+      "src/store.rs": 1
+    }
+  },
+  "unknownReferencesBySource": {
+    "src/native_navigation_fixture.rs": 14,
+    "src/store.rs": 521,
+    "src/store/captured_witness.rs": 6,
+    "src/store/mcp_read.rs": 50,
+    "src/store/native_first.rs": 21,
+    "src/store/native_first/context.rs": 14,
+    "src/store/requests.rs": 50,
+    "src/store/semantic_display.rs": 110,
+    "src/store/semantic_payload.rs": 33,
+    "src/store/semantic_retention.rs": 8,
+    "src/testing.rs": 0
+  }
 }
