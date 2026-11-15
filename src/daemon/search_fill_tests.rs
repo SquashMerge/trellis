@@ -1604,3 +1604,68 @@ fn hint_during_a_retried_attempt_waits_for_the_owner_retry() {
         assert!(slot.retry_at.is_some());
     }
 }
+
+#[test]
+fn head_change_requeues_the_slot_without_a_hint() {
+    let core = Arc::new(Core::default());
+    let source: Arc<dyn FillSource> = Arc::new(TestSource(pin(1)));
+    let registration = core.register_source(Arc::downgrade(&source));
+    registration.notify();
+    let job = {
+        let mut inbox = core.inbox.lock().unwrap();
+        inbox.slots.get_mut(&registration.id).unwrap().completed = Some(Completed {
+            pin: pin(1),
+            cache_epoch: 0,
+        });
+        let id = inbox.next_ready().unwrap();
+        inbox.claim(id).unwrap()
+    };
+    core.settle(
+        &job,
+        Outcome {
+            pin: Some(pin(1)),
+            cache_epoch: 0,
+            result: Err(SearchHeadChanged.into()),
+        },
+    );
+    {
+        let inbox = core.inbox.lock().unwrap();
+        let slot = &inbox.slots[&registration.id];
+        assert!(!slot.running && !slot.dirty && slot.queued);
+        assert!(slot.completed.is_none() && slot.retry_at.is_none());
+        assert_eq!(inbox.ready, [registration.id]);
+    }
+}
+
+#[test]
+fn startup_discovery_is_claimed_only_when_no_checkout_is_ready() {
+    let core = Arc::new(Core::default());
+    let backend = DeferredMatrixBackend {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let roots = crate::store::topology::TopologyRoots::isolated_for_tests(
+        directory.path().join("cache"),
+        directory.path().join("data"),
+    );
+    let source: Arc<dyn FillSource> = Arc::new(TestSource(pin(1)));
+    let registration = core.register_source(Arc::downgrade(&source));
+    registration.notify();
+    core.inbox.lock().unwrap().startup = Some(roots);
+    // The ready checkout is claimed first and discovery stays queued.
+    assert!(matches!(
+        core.next_step(&backend, None),
+        Step::Run(job) if job.id == registration.id
+    ));
+    {
+        let inbox = core.inbox.lock().unwrap();
+        assert!(inbox.startup.is_some() && !inbox.discovering);
+        assert!(inbox.slots[&registration.id].running);
+    }
+    // With nothing ready, the next decision claims discovery and publishes it.
+    assert!(matches!(core.next_step(&backend, None), Step::Discover(_)));
+    {
+        let inbox = core.inbox.lock().unwrap();
+        assert!(inbox.startup.is_none() && inbox.discovering);
+    }
+}
