@@ -79,6 +79,8 @@ impl ScopeIndex {
     }
 }
 type Name = (u8, String);
+/// The declarations of the Rust files, by document and range.
+type DeclarationsByRange<'a> = BTreeMap<(usize, usize, usize), Vec<&'a Declaration>>;
 const TYPE: u8 = 0;
 const VALUE: u8 = 1;
 
@@ -267,7 +269,7 @@ impl Catalog {
         trees: &[Tree],
         workspace: &super::cargo_workspace::Workspace,
         check: &mut impl FnMut() -> Result<()>,
-    ) -> Result<BTreeMap<(usize, usize, usize), Vec<&'a Declaration>>> {
+    ) -> Result<DeclarationsByRange<'a>> {
         let mut declarations = BTreeMap::new();
         for (document, doc) in docs.iter().enumerate() {
             if doc.key.language != "rust" {
