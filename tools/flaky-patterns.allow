@@ -157,7 +157,7 @@ store-open tests/mcp/graph_query_store.rs sequence_corrupt_binding_fails_without
 store-open tests/mcp/graph_query_store.rs published_freshness_is_trusted_not_recomputed -- in-process Publisher fixture; no Trellis child, daemon or scheduler
 store-open tests/mcp/graph_query_store.rs corrupt_stored_row_is_typed_without_partial_result -- in-process Publisher fixture; no Trellis child, daemon or scheduler
 store-open tests/mcp/graph_query_store.rs in_scope_missing_coverage_row_is_typed_corruption -- in-process Publisher fixture; no Trellis child, daemon or scheduler
-store-open tests/mcp/graph_query_store.rs non_ambiguous_multi_match_for_one_call_stays_typed_corruption -- in-process Publisher fixture; no Trellis child, daemon or scheduler
+store-open tests/mcp/graph_query_store.rs contradictory_rows_for_one_call_stay_typed_corruption -- in-process Publisher fixture; no Trellis child, daemon or scheduler
 store-open tests/mcp/graph_query_store.rs corrupt_stored_coverage_reason_count_schedules_a_rebuild -- in-process Publisher fixture; no Trellis child, daemon or scheduler
 store-open tests/retained_semantic_reimport.rs ordinary_retained_edit -- opens only after stop_daemon waits for the daemon to exit and release its election lock
 store-open tests/semantic/proptest_witness_rejoin.rs world -- in-process fixture on a fresh state dir, inside the re-executed child
