@@ -2344,6 +2344,9 @@ fn sweep_abandoned_semantic_stages(store: &Store) {
 }
 
 #[cfg(feature = "test-support")]
+mod publication_fixture;
+
+#[cfg(feature = "test-support")]
 mod semantic_fixture;
 
 #[cfg(test)]
