@@ -1572,42 +1572,34 @@ fn hint_during_the_final_busy_attempt_cannot_undo_its_settlement() {
     resume.send(()).unwrap();
 }
 
-#[test]
-fn hint_during_a_retried_attempt_waits_for_the_owner_retry() {
-    // No driver thread: this is the owner's settle transition alone.
-    let core = Arc::new(Core::default());
-    let source: Arc<dyn FillSource> = Arc::new(TestSource(pin(1)));
-    let registration = core.register_source(Arc::downgrade(&source));
-    registration.notify();
-    let job = {
-        let mut inbox = core.inbox.lock().unwrap();
-        let id = inbox.next_ready().unwrap();
-        inbox.claim(id).unwrap()
-    };
-    // The hint arrives while the attempt runs, and the attempt then faults.
-    registration.notify();
-    core.settle(
-        &job,
-        Outcome {
-            pin: Some(pin(1)),
-            cache_epoch: 0,
-            result: Err(StorageBusy.into()),
-        },
-    );
-    {
-        let inbox = core.inbox.lock().unwrap();
-        let slot = &inbox.slots[&registration.id];
-        // The hint is kept, but it does not run ahead of the fault backoff.
-        assert!(!slot.running && slot.dirty && !slot.queued);
-        assert!(inbox.ready.is_empty());
-        assert_eq!(slot.retries, 1);
-        assert!(slot.retry_at.is_some());
+/// One slot's settle state, copied out so an assertion never fails with the
+/// inbox held.
+#[derive(Debug, PartialEq)]
+struct Settled {
+    running: bool,
+    dirty: bool,
+    queued: bool,
+    retries: usize,
+    retry_scheduled: bool,
+    completed: bool,
+    ready: Vec<u64>,
+}
+fn settled(core: &Core, id: u64) -> Settled {
+    let inbox = core.inbox.lock().unwrap();
+    let slot = &inbox.slots[&id];
+    Settled {
+        running: slot.running,
+        dirty: slot.dirty,
+        queued: slot.queued,
+        retries: slot.retries,
+        retry_scheduled: slot.retry_at.is_some(),
+        completed: slot.completed.is_some(),
+        ready: inbox.ready.iter().copied().collect(),
     }
 }
-
-#[test]
-fn head_change_requeues_the_slot_without_a_hint() {
-    let core = Arc::new(Core::default());
+/// Registers one checkout on a core with no driver thread, hints it and
+/// claims it the way the owner does.
+fn claimed(core: &Arc<Core>) -> (Arc<dyn FillSource>, FillRegistration, Job) {
     let source: Arc<dyn FillSource> = Arc::new(TestSource(pin(1)));
     let registration = core.register_source(Arc::downgrade(&source));
     registration.notify();
@@ -1618,23 +1610,57 @@ fn head_change_requeues_the_slot_without_a_hint() {
             cache_epoch: 0,
         });
         let id = inbox.next_ready().unwrap();
-        inbox.claim(id).unwrap()
+        inbox.claim(id)
     };
-    core.settle(
-        &job,
-        Outcome {
-            pin: Some(pin(1)),
-            cache_epoch: 0,
-            result: Err(SearchHeadChanged.into()),
-        },
-    );
-    {
-        let inbox = core.inbox.lock().unwrap();
-        let slot = &inbox.slots[&registration.id];
-        assert!(!slot.running && !slot.dirty && slot.queued);
-        assert!(slot.completed.is_none() && slot.retry_at.is_none());
-        assert_eq!(inbox.ready, [registration.id]);
+    (source, registration, job.unwrap())
+}
+fn failed(error: anyhow::Error) -> Outcome {
+    Outcome {
+        pin: Some(pin(1)),
+        cache_epoch: 0,
+        result: Err(error),
     }
+}
+
+#[test]
+fn hint_during_a_retried_attempt_waits_for_the_owner_retry() {
+    let core = Arc::new(Core::default());
+    let (_source, registration, job) = claimed(&core);
+    // The hint arrives while the attempt runs, and the attempt then faults.
+    registration.notify();
+    core.settle(&job, failed(StorageBusy.into()));
+    // The hint is kept, but it does not run ahead of the fault backoff.
+    assert_eq!(
+        settled(&core, registration.id),
+        Settled {
+            running: false,
+            dirty: true,
+            queued: false,
+            retries: 1,
+            retry_scheduled: true,
+            completed: true,
+            ready: vec![],
+        }
+    );
+}
+
+#[test]
+fn head_change_requeues_the_slot_without_a_hint() {
+    let core = Arc::new(Core::default());
+    let (_source, registration, job) = claimed(&core);
+    core.settle(&job, failed(SearchHeadChanged.into()));
+    assert_eq!(
+        settled(&core, registration.id),
+        Settled {
+            running: false,
+            dirty: false,
+            queued: true,
+            retries: 0,
+            retry_scheduled: false,
+            completed: false,
+            ready: vec![registration.id],
+        }
+    );
 }
 
 #[test]
@@ -1652,20 +1678,20 @@ fn startup_discovery_is_claimed_only_when_no_checkout_is_ready() {
     let registration = core.register_source(Arc::downgrade(&source));
     registration.notify();
     core.inbox.lock().unwrap().startup = Some(roots);
+    let published = || {
+        let inbox = core.inbox.lock().unwrap();
+        (
+            inbox.startup.is_some(),
+            inbox.discovering,
+            inbox.slots[&registration.id].running,
+        )
+    };
     // The ready checkout is claimed first and discovery stays queued.
-    assert!(matches!(
-        core.next_step(&backend, None),
-        Step::Run(job) if job.id == registration.id
-    ));
-    {
-        let inbox = core.inbox.lock().unwrap();
-        assert!(inbox.startup.is_some() && !inbox.discovering);
-        assert!(inbox.slots[&registration.id].running);
-    }
+    let first = core.next_step(&backend, None);
+    assert!(matches!(first, Step::Run(job) if job.id == registration.id));
+    assert_eq!(published(), (true, false, true));
     // With nothing ready, the next decision claims discovery and publishes it.
-    assert!(matches!(core.next_step(&backend, None), Step::Discover(_)));
-    {
-        let inbox = core.inbox.lock().unwrap();
-        assert!(inbox.startup.is_none() && inbox.discovering);
-    }
+    let second = core.next_step(&backend, None);
+    assert!(matches!(second, Step::Discover(_)));
+    assert_eq!(published(), (false, true, true));
 }
