@@ -534,3 +534,65 @@ fn review_removed_rules_must_not_reuse_old_interface_extraction() {
         ),
     }
 }
+
+/// #988: the rules file's `test_features` reaches the check and the references read, which
+/// loads no rules file of its own.
+#[test]
+fn test_features_move_gated_references_out_of_the_production_check() {
+    const RULES: &str = "version = 1\n[layers.low]\norder = 2\npaths = [\"src/low.rs\"]\n\
+                         [layers.high]\norder = 1\npaths = [\"src/high.rs\"]\n";
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path();
+    write(dir, "Cargo.toml", "[package]\nname = \"one\"\n");
+    write(dir, "src/lib.rs", "mod high;\nmod low;\n");
+    write(dir, "src/high.rs", "pub fn hook() {}\n");
+    write(
+        dir,
+        "src/low.rs",
+        "fn f() {\n    #[cfg(feature = \"test-support\")]\n    crate::high::hook();\n}\n",
+    );
+    let store = publish(&state, dir);
+    let response = store.evidence_response().unwrap();
+    let pin = response.selected_pin(None).unwrap();
+    let answer = |kind: &str, rules: &str, loaded: bool| {
+        write(dir, ".trellis/rules.toml", rules);
+        let config = crate::rules::parse(rules).unwrap();
+        let core = response
+            .architecture_core_at(pin, Some(&config), false, &mut || Ok(()), &|_| {})
+            .unwrap();
+        let arguments = serde_json::json!({});
+        let parsed = EvidenceResponse::architecture_arguments(kind, &arguments).unwrap();
+        response
+            .architecture_response_at(
+                kind,
+                &arguments,
+                &parsed,
+                loaded.then_some(&config),
+                &core,
+                &mut || Ok(()),
+            )
+            .unwrap()
+    };
+    let named = format!("test_features = [\"test-support\"]\n{RULES}");
+
+    let plain = answer("check", RULES, true);
+    assert_eq!(plain["counts"]["deviates"], 1, "{plain}");
+    assert_eq!(plain["testCounts"]["deviates"], 0, "{plain}");
+    let check = answer("check", &named, true);
+    assert_eq!(check["counts"]["deviates"], 0, "{check}");
+    assert_eq!(check["testCounts"]["deviates"], 1, "{check}");
+
+    let plain = answer("references", RULES, false);
+    assert_eq!(plain["production"].as_array().unwrap().len(), 1, "{plain}");
+    assert!(plain["tests"].as_array().unwrap().is_empty(), "{plain}");
+    let references = answer("references", &named, false);
+    assert!(
+        references["production"].as_array().unwrap().is_empty(),
+        "{references}"
+    );
+    assert_eq!(
+        references["tests"][0]["sites"][0]["role"], "test",
+        "{references}"
+    );
+}

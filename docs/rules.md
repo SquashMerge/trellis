@@ -692,6 +692,47 @@ entries. An `app` that names no app, or a name that several apps share, is a loc
 never change a rule verdict, a count or an app. The reading rules are in
 [architecture-view.md](architecture-view.md#apps-and-http-interfaces-data-and-extraction-784-788).
 
+### Amendment (#988): test features
+
+**Status: owner ruling 2026-11-14 ([#988](https://github.com/SquashMerge/trellis/issues/988)),
+recorded in [Decision 0011](semantic-evidence/decisions/0011-test-production-declaration-role.md).**
+
+`test_features` is an optional top-level key, the tenth: a list of Cargo feature names that
+gate test support in this checkout.
+
+```toml
+test_features = ["test-support"]
+```
+
+A Rust reference site whose role is production is reported as test when one of these holds
+for the site or for syntax enclosing it:
+
+- it carries the outer attribute `#[cfg(feature = "<name>")]`;
+- it carries the outer attribute `#[cfg(any(test, feature = "<name>"))]`, with the two
+  operands in either order;
+- its file, inline module or block starts with the inner attribute
+  `#![cfg(feature = "<name>")]` or `#![cfg(any(test, feature = "<name>"))]`.
+
+The gate's whole condition must be one of those two forms. Whitespace between tokens is
+ignored, and the name is the string literal's exact value, so `feature = "test support"` or
+`" test-support"` does not match `test-support`. A literal with an escape, a raw literal and
+an attribute with a comment inside are not interpreted. These do not match: `not(...)`;
+`all(...)`, although such code also needs the feature; an `any` with any other or further
+operand, because that code is also built without the feature; and `cfg_attr`. A `mod` item's
+own gate does not reach a file it declares.
+
+Each name is 1 to 64 bytes of ASCII letters, digits, `_`, `-`, `+` and `.`, and starts with
+a letter, a digit or `_`. A value that is not a list of such names, a
+repeated name and more than 64 names are each a located `invalid_rules` error.
+
+The key applies to the whole checkout, not to one app: a file's app is itself computed from
+the references the key shapes. It changes reference-site roles at read time only, for
+`trellis_references` and for the rules check, explain, view and details that read them. A
+references read uses the key from the checkout's current rules file; a missing or invalid
+file names no feature for it. Declaration roles, `callerRole`, find, search, metrics and the
+treemap do not change, and nothing is re-indexed when the key changes. A rules file without the key behaves exactly
+as before.
+
 ## External package policy
 
 A layer needs a nonempty `paths` or `external` collection; either selects that
@@ -725,7 +766,7 @@ These arrays share existing configuration collection/work bounds.
 external bans. Every positively observed matching external edge emits a reserved
 `$external` instance with `status:"deviates"`, even if its source has no layer.
 Nonmatches emit no `$external` row; absent edges do not prove absence. Aggregate
-by source module, external identity and stored production/test role with the
+by source module, external identity and production/test site role with the
 existing exact counts and bounded samples. Test-only instances never fail the
 production CLI check. Unproved roots stay unknown, never guessed to match a ban.
 
@@ -759,7 +800,8 @@ The closed top-level keys are `version`, `layer_policy`, `external_policy`, `lay
 start empty. (#783: an ordered layer gains `app` and a shared layer gains `apps`; see
 [Amendment (#783)](#amendment-783-apps-and-per-app-layers). #794: `apps` is an eighth
 top-level key, a map of authored `[apps.<name>]` tables; see
-[Amendment (#794)](#amendment-794-authored-apps).) A selector has at least one of `paths`, `name`, `language`, `extends`
+[Amendment (#794)](#amendment-794-authored-apps). #855: `interfaces` is a ninth. #988:
+`test_features` is a tenth; see [Amendment (#988)](#amendment-988-test-features).) A selector has at least one of `paths`, `name`, `language`, `extends`
 and `implements`. Keys combine with AND; entries within `paths` or `language`
 combine with OR. Languages are `java`, `rust`, `python`, `javascript`, `typescript`. Name patterns
 match the measured nullable name; null never receives an invented name.
@@ -841,6 +883,15 @@ Supported mapping is deliberately narrow:
   import/reexport edges. Native final-owner mapping and real intermediate-module
   proof stay distinct. A wildcard can provide positive native mappings while
   residual unknowns remain; no native or external member inventory is invented.
+  A private glob (`use super::*;`) maps only the exposed names its scope spells
+  (#986): an identifier anywhere in that module or block outside the glob itself,
+  macro arguments and nested items included. Comments and strings are not uses.
+  This is syntax, not binding: a shadowed or unrelated identifier of the same
+  spelling still counts, and a trait used only through its methods, or a name only
+  a macro expansion spells, does not. A glob none of whose names is spelled is
+  unknown with reason `rust_wildcard_unused`. A re-exporting glob (`pub use`,
+  with any visibility) still exposes every name. Syntax the walk cannot read
+  (a parser error, or past the syntax bounds) proves no name unused.
   Captured Cargo declarations and reviewed `std/core/alloc` roots prove package
   targets, never semantic calls. An inline `crate::`/`self::`/`super::` path with no
   `use` item resolves like an import of the same path, and a `pub(crate)` module or
@@ -988,10 +1039,23 @@ unknown under the ratified literal-list-only rule.
 
 A site's role comes from its innermost enclosing **stored** native declaration,
 falling back to the stored file-module owner. Ambiguous ownership is unknown.
-There is no read-time path or cfg classifier.
+There is no read-time path classifier. One read-time cfg rule applies (#988, owner
+ruling 2026-11-14, recorded in Decision 0011): a Rust site whose stored role is
+production is test when it, or syntax enclosing it, carries an attribute that
+marks test code under Decision 0011 point 3. This covers what is no declaration and
+so has no stored role of its own, under `#[cfg(test)]` or `#[cfg(all(test, …))]`: a
+statement, a block, a match arm, a `use` item, a field of a struct, tuple struct or
+struct expression, an enum variant, a parameter, a generic parameter, and an element
+of an argument list, array or tuple. A block or function body that starts with
+`#![cfg(test)]` is covered too. `cfg(any(test, …))` and
+`cfg(not(test))` do not mark. The rule changes reference-site roles only; declaration
+roles stay stored, and the call tools' `callerRole` is the caller declaration's
+stored role as before.
 [Decision 0011](semantic-evidence/decisions/0011-test-production-declaration-role.md)
 governs the role: Rust `cfg(test)` and inherited positive test markers are test;
-`cfg(feature = "test-support")` is **production**, not a third role. A filename
+`cfg(feature = "test-support")` is **production**, not a third role, unless the rules file
+names the feature in [`test_features`](#amendment-988-test-features); then the reference
+sites under its gate are test at read time. A filename
 such as `src/testing.rs` alone does not override the stored role.
 
 Test references/instances are reported separately and never count as violations. Test-only policy comparisons retain their underlying
@@ -1078,7 +1142,11 @@ fallback. Projection is not persisted, writes no `index.db`, and changes neither
 native producer output nor Stage 3 extraction.
 
 The one current-file exception is root `.trellis/rules.toml`, read once per
-check/explain/prompt as bounded configuration. References alone do not read it.
+check/explain/prompt as bounded configuration. A references read takes one thing from
+it (#988): the `test_features` list, through the same bounded read, once per request. That
+read is lenient: a missing or invalid file names no test feature and the references read
+still answers, with no rules descriptor in its response. Check, explain and prompt still
+fail with a typed `invalid_rules` error on an invalid file.
 Its descriptor is `{path:".trellis/rules.toml",source:"checkout-config",contentHash}`.
 **The code pin does not identify these rules bytes.** Editing only rules can change
 the digest and outcome at an unchanged code pin. Code evidence never falls back
@@ -1291,10 +1359,11 @@ read as well, so after an edit the evidence that semantic catch-up carries forwa
 keeps serving Architecture until a producer re-run imports `fresh` evidence that
 replaces it. Each site and rule evidence row such a binding supports carries
 `freshness:"possiblyStale"`, and the language's semantic tier keeps reporting its
-worst freshness and counts. A call is represented by its lowest-provenance binding, as in the call
-graph; when that one is unusable the call has no binding. Any internal target must
-be a declaration of this snapshot (semantic references carry no separate
-current-target flag); its module is the declaration's file.
+worst freshness and counts. A call with several binding rows is represented by the row the call
+graph selects (#1102): a row that names a target before an unresolved one, then the lowest raw
+fact digest, then the lowest provenance ID; when that one is unusable the call has no
+binding. Any internal target must be a declaration of this snapshot (semantic references
+carry no separate current-target flag); its module is the declaration's file.
 
 - A structural site takes in every binding inside its range, and a call joined on a
   whole invocation that starts with it. It is bound by the binding that ends where
@@ -1369,7 +1438,7 @@ Workspace member crates themselves resolve as in-repo modules (#772, see above).
 bindings distinguish upstream package names from Cargo keys/renames (including
 hyphen normalization). Conflicting normalized bindings and local path dependencies
 are not guessed external packages. Sections, optional and target qualifiers do
-not prove installation/activation or change stored site roles. In particular,
+not prove installation/activation or change site roles. In particular,
 `build-dependencies` and `dev-dependencies` are retained declaration evidence,
 not a claim that Cargo exposes them to a production lib/bin target. Conflicting
 identities across sections stay unknown; target-applicable Cargo bindings would

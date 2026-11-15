@@ -277,7 +277,7 @@ fn references_java_direct_package_wildcard_expands_public_type_owner() {
 #[test]
 fn references_rust_direct_wildcard_expands_public_declaration_owner() {
     let input = snapshot(&[
-        ("src/lib.rs", "mod m; use crate::m::*;"),
+        ("src/lib.rs", "mod m; use crate::m::*; fn user() { a(); }"),
         ("src/m.rs", "pub fn a() {}"),
     ]);
     let data = project(&input);
@@ -287,6 +287,559 @@ fn references_rust_direct_wildcard_expands_public_declaration_owner() {
     );
     assert_eq!(data["counts"]["mappedSites"], 1);
     assert!(data["unresolved"].as_array().unwrap().is_empty());
+}
+
+/// #988: a site under a `#[cfg(test)]` statement, block, match arm or `use` item is test even
+/// though no stored declaration covers it. Only the Decision 0011 markers count.
+#[test]
+fn references_rust_cfg_test_syntax_without_a_declaration_is_test() {
+    let source = r#"
+mod store;
+#[cfg(test)]
+use crate::store::imported;
+fn production() {
+    #[cfg(test)]
+    let _fault = crate::store::statement();
+    // A comment or another attribute between the marker and its item changes nothing.
+    #[cfg(all(test, unix))]
+    #[allow(unused)]
+    { crate::store::block(); }
+    match 1 { #[cfg(test)] 2 => crate::store::arm(), _ => crate::store::plain_arm() }
+    #[cfg(any(test, unix))]
+    crate::store::any_test();
+    #[cfg(not(test))]
+    crate::store::not_test();
+    #[cfg(feature = "test-support")]
+    crate::store::feature();
+    crate::store::after();
+}
+struct Fields {
+    #[cfg(test)]
+    hook: crate::store::Hook,
+    plain: crate::store::Plain,
+}
+"#;
+    let input = snapshot(&[
+        ("src/lib.rs", source),
+        (
+            "src/store.rs",
+            "pub fn imported() {} pub fn statement() {} pub fn block() {} pub fn arm() {} \
+             pub fn plain_arm() {} pub fn any_test() {} pub fn not_test() {} pub fn feature() {} \
+             pub fn after() {} pub struct Hook; pub struct Plain;",
+        ),
+    ]);
+    let data = project(&input);
+    let spellings = |role: &str| -> Vec<String> {
+        let mut found: Vec<_> = edge(&data, role, "src/lib.rs", "src/store.rs")["sites"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|site| {
+                assert_eq!(
+                    site["role"],
+                    if role == "tests" {
+                        "test"
+                    } else {
+                        "production"
+                    }
+                );
+                site["spelling"].as_str().unwrap().to_owned()
+            })
+            .collect();
+        found.sort();
+        found
+    };
+    assert_eq!(
+        spellings("tests"),
+        [
+            "crate::store::Hook",
+            "crate::store::arm",
+            "crate::store::block",
+            "crate::store::statement"
+        ]
+    );
+    assert_eq!(
+        spellings("production"),
+        [
+            "crate::store::Plain",
+            "crate::store::after",
+            "crate::store::any_test",
+            "crate::store::feature",
+            "crate::store::not_test",
+            "crate::store::plain_arm"
+        ]
+    );
+    // The conditional `use` stays unresolved, now as a test site.
+    let unresolved = data["unresolved"].as_array().unwrap();
+    assert_eq!(unresolved.len(), 1, "{data}");
+    assert_eq!(unresolved[0]["site"]["spelling"], "crate::store::imported");
+    assert_eq!(unresolved[0]["site"]["role"], "test");
+}
+
+/// #988 review: every shape in which the pinned grammar attaches an attribute. In each row
+/// the reference to `T` is under `#[cfg(test)]` and the reference to `P` beside it is not.
+#[test]
+fn references_rust_cfg_test_reaches_every_attribute_shape() {
+    let shapes = [
+        (
+            "struct-expression field",
+            "fn f() -> S { S { #[cfg(test)] a: crate::store::T, b: crate::store::P } }",
+        ),
+        (
+            "tuple-struct field after a visibility",
+            "struct S(#[cfg(test)] pub crate::store::T, pub crate::store::P);",
+        ),
+        (
+            "tuple-struct field",
+            "struct S(#[cfg(test)] crate::store::T, crate::store::P);",
+        ),
+        (
+            "named field after a visibility",
+            "struct S { #[cfg(test)] pub a: crate::store::T, pub b: crate::store::P }",
+        ),
+        (
+            "enum variant",
+            "enum E { #[cfg(test)] A(crate::store::T), B(crate::store::P) }",
+        ),
+        (
+            "parameter",
+            "fn f(#[cfg(test)] a: crate::store::T, b: crate::store::P) {}",
+        ),
+        (
+            "generic parameter",
+            "fn f<#[cfg(test)] A: crate::store::T, B: crate::store::P>() {}",
+        ),
+        (
+            "argument",
+            "fn f() { g(#[cfg(test)] crate::store::T, crate::store::P); }",
+        ),
+        (
+            "array element",
+            "fn f() { let _ = [#[cfg(test)] crate::store::T, crate::store::P]; }",
+        ),
+        (
+            "tuple element",
+            "fn f() { let _ = (#[cfg(test)] crate::store::T, crate::store::P); }",
+        ),
+        (
+            "expression statement",
+            "fn f() { #[cfg(test)] crate::store::T; crate::store::P; }",
+        ),
+        (
+            "match arm",
+            "fn f() { match 1 { #[cfg(test)] 1 => crate::store::T, _ => crate::store::P } }",
+        ),
+        (
+            "inner attribute of a function body",
+            "fn f() { #![cfg(test)] crate::store::T; } fn g() { crate::store::P; }",
+        ),
+        (
+            "inner attribute of a block",
+            "fn f() { { #![cfg(test)] crate::store::T; } crate::store::P; }",
+        ),
+    ];
+    for (shape, source) in shapes {
+        let input = snapshot(&[
+            ("src/lib.rs", &format!("mod store;\n{source}\n")),
+            ("src/store.rs", "pub struct T; pub struct P;"),
+        ]);
+        let data = project(&input);
+        let spellings = |role: &str| -> Vec<&str> {
+            data[role]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|pair| pair["target"]["path"] == "src/store.rs")
+                .flat_map(|pair| pair["sites"].as_array().unwrap())
+                .filter(|site| site["relationKind"] != "import")
+                .map(|site| site["spelling"].as_str().unwrap())
+                .collect()
+        };
+        assert_eq!(spellings("tests"), ["crate::store::T"], "{shape}: {data}");
+        assert_eq!(
+            spellings("production"),
+            ["crate::store::P"],
+            "{shape}: {data}"
+        );
+    }
+}
+
+/// #988: a read that names test features reports the production sites under their gates as
+/// test. Without the name, and for any other gate, nothing changes.
+#[test]
+fn references_rust_named_test_feature_gates_are_test_at_read_time() {
+    let source = r#"
+mod store;
+mod gated;
+fn production() {
+    crate::store::plain();
+    #[cfg(feature = "test-support")]
+    crate::store::statement();
+    crate::store::plain();
+    match 1 { #[cfg( feature="test-support" )] 2 => crate::store::arm(), _ => {} }
+    #[cfg(any(test, feature = "test-support"))]
+    crate::store::any_test();
+    #[cfg(any(feature = "test-support", test))]
+    crate::store::any_test();
+    #[cfg(feature = "other")]
+    crate::store::other();
+    #[cfg(not(feature = "test-support"))]
+    crate::store::negated();
+    #[cfg(all(feature = "test-support", unix))]
+    crate::store::all();
+    #[cfg(any(feature = "test-support", unix))]
+    crate::store::any_other();
+}
+#[cfg(feature = "test-support")]
+fn seam() { crate::store::seam(); }
+mod inline {
+    #![cfg(feature = "test-support")]
+    fn f() { crate::store::inline(); }
+}
+"#;
+    let input = snapshot(&[
+        ("src/lib.rs", source),
+        (
+            "src/gated.rs",
+            "//! Fixtures.\n#![cfg(feature = \"test-support\")]\nfn f() { crate::store::file(); }",
+        ),
+        (
+            "src/store.rs",
+            "pub fn plain() {} pub fn statement() {} pub fn arm() {} pub fn any_test() {} \
+             pub fn other() {} pub fn negated() {} pub fn all() {} pub fn any_other() {} \
+             pub fn seam() {} pub fn inline() {} pub fn file() {}",
+        ),
+    ]);
+    let read = |features: &[&str]| {
+        let features: Vec<String> = features.iter().map(|f| (*f).to_owned()).collect();
+        references::project_where(&input, &[], None, None, &features, 20, &mut || Ok(()))
+            .unwrap()
+            .data
+    };
+    let spellings = |data: &Value, role: &str, source: &str| -> Vec<String> {
+        data[role]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|pair| pair["source"]["path"] == source)
+            .flat_map(|pair| pair["sites"].as_array().unwrap())
+            .map(|site| {
+                assert_eq!(
+                    site["role"],
+                    if role == "tests" {
+                        "test"
+                    } else {
+                        "production"
+                    }
+                );
+                site["spelling"]
+                    .as_str()
+                    .unwrap()
+                    .trim_start_matches("crate::store::")
+                    .to_owned()
+            })
+            .collect()
+    };
+
+    // No key: today's answer exactly, in the stored order.
+    let default = read(&[]);
+    assert_eq!(default, project(&input));
+    assert_eq!(default, read(&["unused"]));
+    assert!(default["tests"].as_array().unwrap().is_empty());
+    assert_eq!(
+        spellings(&default, "production", "src/lib.rs"),
+        [
+            "plain",
+            "statement",
+            "plain",
+            "arm",
+            "any_test",
+            "any_test",
+            "other",
+            "negated",
+            "all",
+            "any_other",
+            "seam",
+            "inline"
+        ]
+    );
+    let production = edge(&default, "production", "src/lib.rs", "src/store.rs");
+    assert_eq!(production["count"], 12);
+    assert_eq!(production["kindCounts"]["call"], 12);
+
+    let named = read(&["test-support"]);
+    assert_eq!(
+        spellings(&named, "production", "src/lib.rs"),
+        ["plain", "plain", "other", "negated", "all", "any_other"]
+    );
+    assert_eq!(
+        spellings(&named, "tests", "src/lib.rs"),
+        ["statement", "arm", "any_test", "any_test", "seam", "inline"]
+    );
+    assert_eq!(spellings(&named, "tests", "src/gated.rs"), ["file"]);
+    assert!(spellings(&named, "production", "src/gated.rs").is_empty());
+    let production = edge(&named, "production", "src/lib.rs", "src/store.rs");
+    let tests = edge(&named, "tests", "src/lib.rs", "src/store.rs");
+    assert_eq!(production["count"], 6);
+    assert_eq!(tests["count"], 6);
+    assert_eq!(tests["kindCounts"]["call"], 6);
+    // Only the roles move: the same sites are scanned and mapped.
+    assert_eq!(named["counts"], default["counts"]);
+    assert_eq!(named["modules"], default["modules"]);
+    // A second named feature marks its own gates too.
+    assert_eq!(
+        spellings(
+            &read(&["other", "test-support"]),
+            "production",
+            "src/lib.rs"
+        ),
+        ["plain", "plain", "negated", "all", "any_other"]
+    );
+}
+
+/// #988: a named feature's gate is read in the attribute shapes the `cfg(test)` walk reads.
+#[test]
+fn references_rust_named_test_feature_gates_reach_owned_and_field_attributes() {
+    for (shape, source) in [
+        (
+            "struct-expression field",
+            "fn f() -> S { S { #[cfg(feature = \"fx\")] a: crate::store::T, b: crate::store::P } }",
+        ),
+        (
+            "tuple-struct field after a visibility",
+            "struct S(#[cfg(feature = \"fx\")] pub crate::store::T, pub crate::store::P);",
+        ),
+        (
+            "inner attribute of a block",
+            "fn f() { { #![cfg(feature = \"fx\")] crate::store::T; } crate::store::P; }",
+        ),
+    ] {
+        let input = snapshot(&[
+            ("src/lib.rs", &format!("mod store;\n{source}\n")),
+            ("src/store.rs", "pub struct T; pub struct P;"),
+        ]);
+        let data =
+            references::project_where(&input, &[], None, None, &["fx".to_owned()], 20, &mut || {
+                Ok(())
+            })
+            .unwrap()
+            .data;
+        let spellings = |role: &str| -> Vec<&str> {
+            data[role]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|pair| pair["target"]["path"] == "src/store.rs")
+                .flat_map(|pair| pair["sites"].as_array().unwrap())
+                .filter(|site| site["relationKind"] != "import")
+                .map(|site| site["spelling"].as_str().unwrap())
+                .collect()
+        };
+        assert_eq!(spellings("tests"), ["crate::store::T"], "{shape}: {data}");
+        assert_eq!(
+            spellings("production"),
+            ["crate::store::P"],
+            "{shape}: {data}"
+        );
+    }
+}
+
+/// #988 review: a gate names its feature by the literal's exact value. Whitespace inside the
+/// quotes is part of the value, so such a gate stays production beside the valid one.
+#[test]
+fn references_rust_test_feature_literal_is_matched_exactly() {
+    let source = r#"
+mod store;
+fn f() {
+    #[cfg(feature = "test-support")]
+    crate::store::direct();
+    #[cfg( any( test , feature="test-support" ) )]
+    crate::store::any_form();
+    #[cfg(feature = "test -support")]
+    crate::store::inner_space();
+    #[cfg(feature = " test-support")]
+    crate::store::leading_space();
+    #[cfg(feature = "test-support ")]
+    crate::store::trailing_space();
+    #[cfg(any(test, feature = "test -support"))]
+    crate::store::any_inner_space();
+    #[cfg(any(feature = " test-support", test))]
+    crate::store::any_leading_space();
+    #[cfg(any(test, feature = "test-support "))]
+    crate::store::any_trailing_space();
+    #[cfg(not(feature = "test-support"))]
+    crate::store::negated();
+}
+"#;
+    let input = snapshot(&[
+        ("src/lib.rs", source),
+        (
+            "src/store.rs",
+            "pub fn direct() {} pub fn any_form() {} pub fn inner_space() {} \
+             pub fn leading_space() {} pub fn trailing_space() {} pub fn any_inner_space() {} \
+             pub fn any_leading_space() {} pub fn any_trailing_space() {} pub fn negated() {}",
+        ),
+    ]);
+    let data = references::project_where(
+        &input,
+        &[],
+        None,
+        None,
+        &["test-support".to_owned()],
+        20,
+        &mut || Ok(()),
+    )
+    .unwrap()
+    .data;
+    let spellings = |role: &str| -> Vec<&str> {
+        edge(&data, role, "src/lib.rs", "src/store.rs")["sites"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|site| {
+                site["spelling"]
+                    .as_str()
+                    .unwrap()
+                    .trim_start_matches("crate::store::")
+            })
+            .collect()
+    };
+    assert_eq!(spellings("tests"), ["direct", "any_form"], "{data}");
+    assert_eq!(
+        spellings("production"),
+        [
+            "inner_space",
+            "leading_space",
+            "trailing_space",
+            "any_inner_space",
+            "any_leading_space",
+            "any_trailing_space",
+            "negated"
+        ],
+        "{data}"
+    );
+}
+
+/// #986: a private glob maps only the names its scope uses. A re-exporting glob still exposes
+/// every name.
+#[test]
+fn references_rust_private_glob_maps_only_the_names_its_scope_uses() {
+    let input = snapshot(&[
+        ("src/lib.rs", "mod parent; mod upper;"),
+        (
+            "src/parent.rs",
+            "mod direct; mod in_macro; mod local_only; mod unused; mod facade; \
+             pub use crate::upper::{NOTE, helper}; pub fn local() {}",
+        ),
+        (
+            "src/parent/direct.rs",
+            "use super::*; fn f() -> &'static str { NOTE }",
+        ),
+        (
+            "src/parent/in_macro.rs",
+            "use super::*; fn f() { let _ = format!(\"{}\", helper()); }",
+        ),
+        (
+            "src/parent/local_only.rs",
+            "use super::*; fn f() { local(); }",
+        ),
+        // A name in a comment or a string is not a use: NOTE "helper"
+        (
+            "src/parent/unused.rs",
+            "use super::*; // NOTE\nfn f() -> &'static str { \"helper local\" }",
+        ),
+        ("src/parent/facade.rs", "pub use super::*;"),
+        (
+            "src/upper.rs",
+            "pub const NOTE: &str = \"\"; pub fn helper() {}",
+        ),
+    ]);
+    let data = project(&input);
+    for (source, upper, parent) in [
+        ("src/parent/direct.rs", true, false),
+        ("src/parent/in_macro.rs", true, false),
+        ("src/parent/local_only.rs", false, true),
+        ("src/parent/unused.rs", false, false),
+        ("src/parent/facade.rs", true, true),
+    ] {
+        assert_eq!(has_edge(&data, source, "src/upper.rs"), upper, "{source}");
+        assert_eq!(has_edge(&data, source, "src/parent.rs"), parent, "{source}");
+    }
+    let site = &edge(&data, "production", "src/parent/direct.rs", "src/upper.rs")["sites"][0];
+    assert_eq!(site["relationKind"], "import");
+    assert_eq!(site["spelling"], "super::*");
+    let unresolved: Vec<_> = data["unresolved"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|unknown| {
+            (
+                unknown["source"]["path"].as_str().unwrap(),
+                unknown["reason"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        unresolved,
+        [("src/parent/unused.rs", "rust_wildcard_unused")],
+        "{data}"
+    );
+}
+
+/// #986 review: `r#name` and `name` are one identifier on both sides of the comparison, so a
+/// raw-identifier export reached through a private glob is used however its use spells it,
+/// in a macro's arguments too. A path keyword is never a use of a name.
+#[test]
+fn references_rust_private_glob_matches_raw_identifiers_either_way() {
+    let input = snapshot(&[
+        (
+            "src/lib.rs",
+            "mod upper; mod raw; mod raw_macro; mod raw_use; mod plain_use; mod keywords;",
+        ),
+        ("src/raw.rs", "use crate::upper::*; fn f() { r#type(); }"),
+        (
+            "src/raw_macro.rs",
+            "use crate::upper::*; fn f() { let _ = format!(\"{:?}\", r#type()); }",
+        ),
+        (
+            "src/raw_use.rs",
+            "use crate::upper::*; fn f() { r#tight(); }",
+        ),
+        (
+            "src/plain_use.rs",
+            "use crate::upper::*; fn f() { loose(); }",
+        ),
+        (
+            "src/keywords.rs",
+            "use crate::upper::*; struct S; impl S { fn f(&self) -> Self { let _ = self; crate::m!(self, Self, crate, super) } }",
+        ),
+        (
+            "src/upper.rs",
+            "pub fn r#type() {} pub fn r#loose() {} pub fn tight() {}",
+        ),
+    ]);
+    let data = project(&input);
+    for (source, upper) in [
+        ("src/raw.rs", true),
+        ("src/raw_macro.rs", true),
+        ("src/raw_use.rs", true),
+        ("src/plain_use.rs", true),
+        ("src/keywords.rs", false),
+    ] {
+        assert_eq!(
+            has_edge(&data, source, "src/upper.rs"),
+            upper,
+            "{source}: {data}"
+        );
+    }
+    let unused: Vec<_> = data["unresolved"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|unknown| unknown["reason"] == "rust_wildcard_unused")
+        .map(|unknown| unknown["source"]["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(unused, ["src/keywords.rs"], "{data}");
 }
 
 #[test]
@@ -823,10 +1376,13 @@ fn references_indexed_owners_preserve_linear_selection_and_prefer_exact_calls() 
 fn references_rust_conventional_directory_and_inline_wildcards_expand() {
     for files in [
         vec![
-            ("src/lib.rs", "mod m; use crate::m::*;"),
+            ("src/lib.rs", "mod m; use crate::m::*; fn user() { a(); }"),
             ("src/m/mod.rs", "pub fn a() {} pub fn b() {}"),
         ],
-        vec![("src/lib.rs", "mod m { pub fn a() {} } use crate::m::*;")],
+        vec![(
+            "src/lib.rs",
+            "mod m { pub fn a() {} } use crate::m::*; fn user() { a(); }",
+        )],
     ] {
         let input = snapshot(&files);
         let data = project_rust_source(&input, 20);
@@ -847,7 +1403,7 @@ fn references_rust_nested_self_super_and_inline_file_ancestry_are_proved() {
         ("src/lib.rs", "mod outer;"),
         (
             "src/outer.rs",
-            "pub fn a() {} mod inner { mod leaf; use self::leaf::*; use super::a; }",
+            "pub fn a() {} mod inner { mod leaf; use self::leaf::*; use super::a; fn user() { b(); } }",
         ),
         ("src/outer/inner/leaf.rs", "pub fn b() {}"),
         ("src/inner/leaf.rs", "pub fn decoy() {}"),
@@ -982,7 +1538,7 @@ fn references_rust_shadowing_obeys_lexical_scope_and_constructor_namespace() {
     let input = snapshot(&[
         (
             "src/lib.rs",
-            "mod m; fn f() { use crate::m::*; fn a() {} } fn g() { use crate::m::*; }",
+            "mod m; fn f() { use crate::m::*; fn a() {} } fn g() { use crate::m::*; a(); }",
         ),
         ("src/m.rs", "pub fn a() {}"),
     ]);
@@ -997,7 +1553,10 @@ fn references_rust_shadowing_obeys_lexical_scope_and_constructor_namespace() {
 #[test]
 fn references_rust_named_module_export_uses_declaration_owner_not_members() {
     let input = snapshot(&[
-        ("src/lib.rs", "mod m; use crate::m::*;"),
+        (
+            "src/lib.rs",
+            "mod m; use crate::m::*; fn user() { let _ = child; }",
+        ),
         ("src/m.rs", "pub mod child;"),
         ("src/m/child.rs", "pub fn a() {}"),
     ]);
@@ -1018,7 +1577,7 @@ fn references_rust_named_and_renamed_public_forwarding_keep_final_owner() {
         let input = snapshot(&[
             (
                 "src/lib.rs",
-                "mod origin; mod facade; use crate::facade::*;",
+                "mod origin; mod facade; use crate::facade::*; fn user() { a(); renamed(); }",
             ),
             ("src/facade.rs", forwarding),
             ("src/origin.rs", "pub fn a() {}"),
@@ -1074,7 +1633,10 @@ fn references_rust_forwarding_depth_four_resolves_but_fifth_edge_is_unknown() {
 #[test]
 fn references_rust_cycle_keeps_independent_direct_export_and_residual_unknown() {
     let input = snapshot(&[
-        ("src/lib.rs", "mod a; mod b; use crate::a::*;"),
+        (
+            "src/lib.rs",
+            "mod a; mod b; use crate::a::*; fn user() { good(); }",
+        ),
         ("src/a.rs", "pub fn good() {} pub use crate::b::*;"),
         ("src/b.rs", "pub use crate::a::*;"),
     ]);
@@ -1093,7 +1655,7 @@ fn references_rust_diamond_deduplicates_original_identity_not_spelling() {
     let input = snapshot(&[
         (
             "src/lib.rs",
-            "mod facade; mod left; mod right; mod origin; use crate::facade::*;",
+            "mod facade; mod left; mod right; mod origin; use crate::facade::*; fn user() { a(); }",
         ),
         (
             "src/facade.rs",
@@ -1149,7 +1711,8 @@ fn references_rust_conditional_known_name_keeps_other_positive_and_stored_role()
     let input = snapshot(&[
         (
             "src/lib.rs",
-            "mod m; use crate::m::*; #[cfg(test)] mod tests { use crate::m::*; }",
+            "mod m; use crate::m::*; fn user() { good(); bad(); } \
+             #[cfg(test)] mod tests { use crate::m::*; fn user() { good(); bad(); } }",
         ),
         (
             "src/m.rs",
@@ -1178,7 +1741,7 @@ fn references_rust_opaque_exports_block_wildcard_uniqueness_not_explicit_names()
     let input = snapshot(&[
         (
             "src/lib.rs",
-            "mod m; mod opaque; mod facade; use crate::facade::*;",
+            "mod m; mod opaque; mod facade; use crate::facade::*; fn user() { good(); }",
         ),
         ("src/m.rs", "pub fn good() {}"),
         ("src/opaque.rs", "make_items!();"),
@@ -1199,7 +1762,7 @@ fn references_rust_opaque_exports_block_wildcard_uniqueness_not_explicit_names()
     let blocked = snapshot(&[
         (
             "src/lib.rs",
-            "mod m; mod opaque; use crate::m::*; use crate::opaque::*;",
+            "mod m; mod opaque; use crate::m::*; use crate::opaque::*; fn user() { good(); }",
         ),
         ("src/m.rs", "pub fn good() {}"),
         ("src/opaque.rs", "make_items!();"),
@@ -1214,7 +1777,7 @@ fn references_rust_fanout_counts_once_per_site_and_once_per_final_owner() {
     let input = snapshot(&[
         (
             "src/lib.rs",
-            "mod facade; mod left; mod right; use crate::facade::*;",
+            "mod facade; mod left; mod right; use crate::facade::*; fn user() { a(); b(); c(); conditional(); }",
         ),
         (
             "src/facade.rs",
@@ -1265,7 +1828,7 @@ fn references_rust_empty_and_fully_shadowed_expansions_have_distinct_coverage() 
 
 #[test]
 fn references_rust_clipped_samples_keep_proof_closure_ranges_and_exact_counts() {
-    let source = "mod first; mod second; mod origin; fn f() { use crate::first::*; } fn g() { use crate::second::*; }";
+    let source = "mod first; mod second; mod origin; fn f() { use crate::first::*; a(); } fn g() { use crate::second::*; a(); }";
     let input = snapshot(&[
         ("src/lib.rs", source),
         ("src/first.rs", "pub use crate::origin::a;"),
@@ -1369,7 +1932,10 @@ fn references_rust_competing_consumer_wildcards_do_not_select_by_source_order() 
 #[test]
 fn references_rust_restricted_visibility_is_not_promoted_outside_its_scope() {
     let input = snapshot(&[
-        ("src/lib.rs", "mod m; use crate::m::inner::*;"),
+        (
+            "src/lib.rs",
+            "mod m; use crate::m::inner::*; fn user() { good(); restricted(); private(); }",
+        ),
         ("src/m.rs", "pub mod inner;"),
         (
             "src/m/inner.rs",
@@ -1501,7 +2067,7 @@ fn references_rust_forwarded_module_alias_keeps_final_owner_and_intermediate_pro
     let input = snapshot(&[
         (
             "src/lib.rs",
-            "mod alias; mod bridge; use crate::alias::renamed::*;",
+            "mod alias; mod bridge; use crate::alias::renamed::*; fn user() { a(); }",
         ),
         ("src/alias.rs", "pub use crate::bridge::m as renamed;"),
         ("src/bridge.rs", "pub mod m;"),
@@ -1531,7 +2097,7 @@ fn references_rust_forwarded_module_alias_keeps_final_owner_and_intermediate_pro
 fn references_rust_file_module_super_uses_lexical_parent_not_file_itself() {
     let input = snapshot(&[
         ("src/lib.rs", "mod m; mod n;"),
-        ("src/m.rs", "use super::n::*;"),
+        ("src/m.rs", "use super::n::*; fn user() { a(); }"),
         ("src/n.rs", "pub fn a() {}"),
         ("src/m/n.rs", "pub fn decoy() {}"),
     ]);
@@ -1722,7 +2288,7 @@ fn references_rust_follow_depth_is_consumed_across_multiple_module_alias_segment
         ("crate::A::B::C::*", "pub fn good() {}", true),
         ("crate::A::B::C::D::*", "pub use crate::d as D;", false),
     ] {
-        let consumer = format!("use {path};");
+        let consumer = format!("use {path}; fn user() {{ good(); }}");
         let input = snapshot(&[
             (
                 "src/lib.rs",
@@ -1967,7 +2533,7 @@ fn references_rust_public_local_star_forwarding_survives_dependency_star() {
     let mut input = snapshot(&[
         (
             "src/lib.rs",
-            "mod origin; mod facade; use crate::facade::*;",
+            "mod origin; mod facade; use crate::facade::*; fn user() { a(); }",
         ),
         ("src/facade.rs", "pub use crate::origin::*; pub use dep::*;"),
         ("src/origin.rs", "pub fn a() {}"),

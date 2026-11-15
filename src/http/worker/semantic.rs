@@ -4,7 +4,7 @@
 //! A yield releases the index snapshot and returns to FIFO/watcher selection.
 use super::{DaemonState, RuntimeState, STEP_RETRY};
 use crate::model::CancelFlag;
-use crate::store::{SemanticContinuation, SemanticUnitOutcome};
+use crate::semantic_catchup::{SemanticContinuation, SemanticUnitOutcome};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -359,7 +359,7 @@ mod tests {
         state.inbox.wait(Some(Instant::now())); // consume the accepted enqueue wake
         assert_eq!(state.maintenance_priority_reason(&session, &options), None);
         // Observe single bounded steps, not a whole time slice.
-        crate::store::set_semantic_step_slice_for_tests(Duration::ZERO);
+        crate::semantic_catchup::set_semantic_step_slice_for_tests(Duration::ZERO);
         let mut semantic = SemanticMaintenance::default();
         assert!(semantic.run_unit(&state, &cancel).is_some());
         assert!(semantic.continuation.is_some());
@@ -991,7 +991,7 @@ mod tests {
         state.inbox.wait(Some(Instant::now()));
         assert_eq!(state.maintenance_priority_reason(&session, &options), None);
         // Observe single bounded steps, not a whole time slice.
-        crate::store::set_semantic_step_slice_for_tests(Duration::ZERO);
+        crate::semantic_catchup::set_semantic_step_slice_for_tests(Duration::ZERO);
         let mut semantic = SemanticMaintenance::default();
         assert!(semantic.run_unit(&state, &cancel).is_some());
         assert!(semantic.continuation.is_some());
@@ -1105,7 +1105,7 @@ mod tests {
         state.inbox.wait(Some(Instant::now()));
         assert_eq!(state.maintenance_priority_reason(&session, &options), None);
         drop(session);
-        crate::store::set_semantic_step_slice_for_tests(Duration::ZERO);
+        crate::semantic_catchup::set_semantic_step_slice_for_tests(Duration::ZERO);
         let mut semantic = SemanticMaintenance::default();
         // The first unit only creates the continuation; the second opens its connection.
         assert!(semantic.run_unit(&state, &cancel).is_some());
