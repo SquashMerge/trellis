@@ -19,9 +19,10 @@ The run fails when deviating pairs, deviating references or partial files rise a
 the record, and when a deviating pair is measured that the record does not have. It also
 fails on lost coverage, as spec G1 words it, decided per pair (#1140): a recorded pair
 has fewer deviating references than recorded, or is gone, and its source file has more
-unknown references than recorded for that file. That is a deviating reference that
-became unresolvable instead of being fixed. Unknown references are the references of the
-instances whose status is `unknown`; each has a source file, the instance's `target`.
+unknown references than recorded for that file. That is what a deviating reference
+that became unresolvable instead of being fixed looks like; the check compares counts
+and does not prove it is the same reference. Unknown references are the references of
+the instances whose status is `unknown`; each has a source file, the instance's `target`.
 Any other rise in unknown references is only a notice: they are over a third of the
 population's references, so ordinary new code raises them. The record keeps the
 deviating references of each pair and the unknown references of each of those pairs'
@@ -259,8 +260,9 @@ def recorded(figures):
 def lost_coverage(record, measured):
     """Spec G1's lost coverage, one line per pair: a recorded pair with fewer deviating
     references, or gone, whose source file has more unknown references than recorded.
-    The check reports observed references, not absence, so a deviating reference that
-    became unresolvable is not progress."""
+    The check reports observed references, not absence, and these counts are what a
+    deviating reference that became unresolvable looks like; they do not prove it is
+    the same reference."""
     now, lines = pairs(measured), []
     for (source, destination), references in pairs(record).items():
         before, after = record[BY_SOURCE][source], measured[BY_SOURCE].get(source, 0)
