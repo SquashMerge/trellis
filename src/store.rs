@@ -14573,6 +14573,8 @@ impl Store {
     /// Read a prior immutable native version without running the native parser.
     /// Its source bytes must be exactly the newly admitted immutable source. The
     /// normalized rows are checked against the witness written at full admission.
+    /// Only the test seam `prepare_local_native` calls it.
+    #[cfg(test)]
     fn selected_reusable_native(
         &self,
         db: &Connection,
@@ -15327,7 +15329,7 @@ impl Store {
 
     /// Produce a selectively assembled native revision only for a proved local edit
     /// (or unchanged captured sources). Other changes use the full native path.
-    #[allow(dead_code)] // Test seam; the production fast path admits changed-only facts.
+    #[cfg(test)] // Test seam; the production fast path admits changed-only facts.
     pub(crate) fn prepare_local_native(
         &self,
         capture: &crate::capture::Capture,
