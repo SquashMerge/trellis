@@ -6,8 +6,11 @@ temporary tree and runs it there, argv-style and from another directory. The
 mapping tests read the printed commands; the end-to-end tests run real Node,
 Python and (where cargo-nextest is installed) Cargo tests of that tree.
 """
+import importlib.machinery
+import importlib.util
 import json
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -18,6 +21,10 @@ import unittest
 from pathlib import Path
 
 SCRIPT = Path(__file__).with_name("test-selected")
+sys.dont_write_bytecode = True
+LOADER = importlib.machinery.SourceFileLoader("test_selected", str(SCRIPT))
+SELECTED = importlib.util.module_from_spec(importlib.util.spec_from_loader("test_selected", LOADER))
+LOADER.exec_module(SELECTED)
 REPOSITORY = SCRIPT.parent.parent
 NEXTEST = "cargo nextest run --locked --features test-support --no-fail-fast --no-tests=fail"
 
@@ -41,6 +48,18 @@ PYTHON_TEST = """\
             ran("python-fails")
             self.fail("selected")
 
+        @unittest.skip("never runs")
+        def test_skipped(self):
+            ran("python-skipped")
+
+    class Other(unittest.TestCase):
+        def test_elsewhere(self):
+            ran("python-elsewhere")
+
+    class Helper:
+        def test_unreachable(self):
+            ran("python-unreachable")
+
     if __name__ == "__main__":
         unittest.main()
 """
@@ -52,6 +71,8 @@ NODE_TEST = """\
     test("passes (a.b)", () => ran("node-passes"));
     test("passes (a.b) again", () => ran("node-passes-again"));
     test("fails", () => { ran("node-fails"); throw new Error("selected"); });
+    test("skipped", { skip: true }, () => ran("node-skipped"));
+    const label = "not a test";
 """
 FILES = {
     "Cargo.toml": """\
@@ -160,6 +181,9 @@ FILES = {
 
 
 class Checkout(unittest.TestCase):
+    # A hang backstop, not a speed limit: mapping must end, whatever the checkout holds.
+    TIMEOUT = 120
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -183,13 +207,27 @@ class Checkout(unittest.TestCase):
             environ["TRELLIS_TEST_SELECTED_PRINT"] = "1"
         return subprocess.run(
             [str(self.root / "tools/test-selected"), *selectors],
-            cwd=self.outside, env=environ, capture_output=True, text=True)
+            cwd=self.outside, env=environ, capture_output=True, text=True, timeout=self.TIMEOUT)
 
     def mapped(self, *selectors):
         result = self.run_selected(*selectors, print_only=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(sorted(os.listdir(self.ran)), [], "print mode ran a test")
         return result.stdout.splitlines()
+
+    def write(self, name, text):
+        path = self.root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(textwrap.dedent(text))
+
+    def node(self, path, *options, imports=()):
+        """The printed command for a Node test: node --test with the event reporter."""
+        argv = ["node"]
+        for module in imports:
+            argv += ["--import", module]
+        argv += ["--test", *options, "--test-reporter=spec", "--test-reporter-destination=stdout",
+                 "--test-reporter=" + SELECTED.NODE_REPORTER, "--test-reporter-destination=<events file>", path]
+        return shlex.join(argv)
 
     def cargo(self, arguments):
         return f"CARGO_TARGET_DIR={self.root}/target-test-support {NEXTEST} {arguments}"
@@ -224,6 +262,27 @@ class Mapping(Checkout):
         self.assertEqual(self.mapped("src/alpha_tests.rs"),
                          [self.cargo("--lib -E 'test(/^alpha::tests::/)'")])
 
+    def test_a_raw_or_escaped_path_literal_names_the_file_rust_compiles(self):
+        # src/slot.rs and src/other.rs exist too, but the attributes redirect both modules away from them.
+        self.write("src/lib.rs", """\
+            #[path = r"actual.rs"]
+            mod slot;
+            #[path = r#"quoted.rs"#]
+            mod other;
+            #[path = "back\\\\slash.rs"]
+            mod escaped;
+            #[allow(dead_code)]
+            mod plain;
+        """)
+        for name in ("actual.rs", "slot.rs", "quoted.rs", "other.rs", "back\\slash.rs", "plain.rs"):
+            self.write(f"src/{name}", "")
+        self.assertEqual(self.mapped("src/actual.rs"), [self.cargo("--lib -E 'test(/^slot::/)'")])
+        self.assertEqual(self.mapped("src/quoted.rs"), [self.cargo("--lib -E 'test(/^other::/)'")])
+        self.assertEqual(self.mapped("src/back\\slash.rs"), [self.cargo("--lib -E 'test(/^escaped::/)'")])
+        self.assertEqual(self.mapped("src/plain.rs"), [self.cargo("--lib -E 'test(/^plain::/)'")])
+        for shadow in ("src/slot.rs", "src/other.rs"):
+            self.assert_refused(shadow, "no Cargo library, binary or test target reaches this file")
+
     def test_a_library_file_runs_its_module(self):
         self.assertEqual(self.mapped("src/alpha.rs"), [self.cargo("--lib -E 'test(/^alpha::/)'")])
         self.assertEqual(self.mapped("src/alpha/beta.rs"), [self.cargo("--lib -E 'test(/^alpha::beta::/)'")])
@@ -253,20 +312,18 @@ class Mapping(Checkout):
         self.assertIn("CARGO_TARGET_DIR=/elsewhere/cache-test-support ", result.stdout)
 
     def test_node_tests_run_under_node_test(self):
-        self.assertEqual(self.mapped("tests/unit.test.cjs"), ["node --test tests/unit.test.cjs"])
-        self.assertEqual(self.mapped("tests/esm.test.mjs"), ["node --test tests/esm.test.mjs"])
-        self.assertEqual(self.mapped("tools/semantic-contract/test/load.test.mjs"),
-                         ["node --test tools/semantic-contract/test/load.test.mjs"])
-        self.assertEqual(self.mapped("tools/synthetic-cohorts/test/cohorts.test.mjs"),
-                         ["node --test tools/synthetic-cohorts/test/cohorts.test.mjs"])
+        for path in ("tests/unit.test.cjs", "tests/esm.test.mjs", "tools/semantic-contract/test/load.test.mjs",
+                     "tools/synthetic-cohorts/test/cohorts.test.mjs"):
+            self.assertEqual(self.mapped(path), [self.node(path)])
+        self.assertTrue(self.node("tests/unit.test.cjs").startswith("node --test --test-reporter=spec "))
 
     def test_the_herdr_mod_tests_load_their_hooks(self):
         self.assertEqual(self.mapped("herdr-mod/test/mod.test.mjs"),
-                         ["node --import ./herdr-mod/test/register.mjs --test herdr-mod/test/mod.test.mjs"])
+                         [self.node("herdr-mod/test/mod.test.mjs", imports=["./herdr-mod/test/register.mjs"])])
 
     def test_a_node_test_name_is_an_escaped_whole_name_pattern(self):
         self.assertEqual(self.mapped("tests/unit.test.cjs::passes (a.b)"),
-                         [r"node --test '--test-name-pattern=^passes \(a\.b\)$' tests/unit.test.cjs"])
+                         [self.node("tests/unit.test.cjs", r"--test-name-pattern=^passes \(a\.b\)$")])
 
     def test_python_script_tests_run_themselves(self):
         self.assertEqual(self.mapped("tools/sample-test.py"), ["python3 tools/sample-test.py"])
@@ -282,17 +339,17 @@ class Mapping(Checkout):
     def test_a_node_test_that_needs_installed_packages_maps_once_they_are_there(self):
         self.assert_refused("tests/mcp-smoke.test.mjs", "tests/mcp packages, which are not installed")
         (self.root / "tests/mcp/node_modules").mkdir(parents=True)
-        self.assertEqual(self.mapped("tests/mcp-smoke.test.mjs"), ["node --test tests/mcp-smoke.test.mjs"])
+        self.assertEqual(self.mapped("tests/mcp-smoke.test.mjs"), [self.node("tests/mcp-smoke.test.mjs")])
 
     def test_the_same_command_is_listed_once_and_order_is_kept(self):
         self.assertEqual(
             self.mapped("tools/sample-test.py", "tests/unit.test.cjs", "tools/sample-test.py",
                         "tools/../tools/sample-test.py"),
-            ["python3 tools/sample-test.py", "node --test tests/unit.test.cjs"])
+            ["python3 tools/sample-test.py", self.node("tests/unit.test.cjs")])
 
     def test_a_link_inside_the_checkout_maps_as_its_target(self):
         (self.root / "tests/link.test.cjs").symlink_to("unit.test.cjs")
-        self.assertEqual(self.mapped("tests/link.test.cjs"), ["node --test tests/unit.test.cjs"])
+        self.assertEqual(self.mapped("tests/link.test.cjs"), [self.node("tests/unit.test.cjs")])
 
     def test_this_repository_test_binaries_map_file_by_file(self):
         """The real sources parse: every file of a directory test binary maps to that binary."""
@@ -304,7 +361,9 @@ class Mapping(Checkout):
         result = subprocess.run([str(SCRIPT), *files], capture_output=True, text=True,
                                 env={**os.environ, "TRELLIS_TEST_SELECTED_PRINT": "1"})
         self.assertEqual(result.returncode, 0, result.stderr)
-        for file, line in zip(files, result.stdout.splitlines(), strict=True):
+        lines = result.stdout.splitlines()
+        self.assertEqual(len(lines), len(files))
+        for file, line in zip(files, lines):
             self.assertIn(f" --test {file.split('/')[1]}", line + " ")
 
 
@@ -367,11 +426,75 @@ class Refusals(Checkout):
         self.assert_refused("tests/single.rs::/)|test(/", "identifiers joined by `::`")
         self.assert_refused("tools/sample-test.py::*", "`test_method` or `Class.test_method`")
 
-    def test_a_test_name_the_file_does_not_hold(self):
-        # node --test, and unittest before Python 3.12, pass when a name matches nothing.
-        self.assert_refused("tests/unit.test.cjs::passes (a.c)", "does not contain that test name")
-        self.assert_refused("tools/sample-test.py::test_missing", "does not define that test")
-        self.assert_refused("tools/sample-test.py::Other.test_passes", "does not define that test")
+    def test_a_node_name_that_is_not_a_whole_string_of_the_file(self):
+        # `require` is code, `passes` only part of a test's name, and `passes (a.c)` absent.
+        for name in ("require", "passes", "passes (a.c)"):
+            self.assert_refused(f"tests/unit.test.cjs::{name}", "does not hold that test name as one whole string literal")
+
+    def test_a_python_name_its_class_does_not_define(self):
+        self.assert_refused("tools/sample-test.py::test_missing", "no class of the file defines that test")
+        self.assert_refused("tools/sample-test.py::Missing.test_passes", "class Missing of the file does not define that test")
+        # Both names exist, but the method belongs to another class.
+        self.assert_refused("tools/sample-test.py::Sample.test_elsewhere", "class Sample of the file does not define that test")
+        self.assert_refused("tools/sample-test.py::Other.test_passes", "class Other of the file does not define that test")
+        self.write("tools/broken-test.py", "def (:\n")
+        self.assert_refused("tools/broken-test.py::test_passes", "cannot be parsed for its tests")
+
+    def test_a_python_file_name_discovery_would_read_as_a_pattern(self):
+        # `-p test_[ab].py` matches test_a.py, not the selected file.
+        self.write("tools/release/test_[ab].py", PYTHON_TEST)
+        self.write("tools/release/test_a.py", PYTHON_TEST)
+        for name in ("test_[ab].py", "test_[ab].py::test_passes"):
+            self.assert_refused(f"tools/release/{name}", "as a pattern")
+        self.write("tools/release/test_*.py", PYTHON_TEST)
+        self.assert_refused("tools/release/test_*.py", "as a pattern")
+        self.write("tools/release/test_?.py", PYTHON_TEST)
+        self.assert_refused("tools/release/test_?.py", "as a pattern")
+
+    def test_a_module_cycle_is_refused_not_followed(self):
+        self.write("src/lib.rs", '#[path = "lib.rs"]\nmod again;\nmod alpha;\n')
+        self.assert_refused("src/lib.rs", "the library cannot be read to its end")
+        self.assert_refused("src/alpha.rs", "its modules form a cycle through src/lib.rs")
+        # The library's cycle leaves no file with a known single owner.
+        self.assert_refused("tests/single.rs", "its modules form a cycle through src/lib.rs")
+
+    def test_a_longer_cycle_and_a_linked_spelling_are_cycles_too(self):
+        self.write("tests/suite/main.rs", "mod cases;\n")
+        self.write("tests/suite/cases.rs", '#[path = "main.rs"]\nmod back;\n')
+        self.assert_refused("tests/suite/cases.rs", "its modules form a cycle through tests/suite/main.rs")
+        self.write("tests/suite/cases.rs", "mod alias;\n")
+        (self.root / "tests/suite/cases").mkdir()
+        (self.root / "tests/suite/cases/alias.rs").symlink_to("../main.rs")
+        self.assert_refused("tests/suite/cases.rs", "its modules form a cycle through tests/suite/main.rs")
+
+    def test_a_cycle_in_another_target_does_not_stop_a_library_file(self):
+        self.write("tests/loop/main.rs", '#[path = "main.rs"]\nmod again;\n')
+        self.assertEqual(self.mapped("src/alpha.rs"), [self.cargo("--lib -E 'test(/^alpha::/)'")])
+        # A test file's single owner cannot be told while one test binary is unread.
+        self.assert_refused("tests/single.rs", "test binary loop cannot be read to its end")
+
+    def test_many_modules_are_bounded(self):
+        # Two declarations of each next file: 2^20 module paths without a bound.
+        for level in range(20):
+            self.write(f"tests/wide/m{level}.rs",
+                       f'#[path = "m{level + 1}.rs"]\nmod a;\n#[path = "m{level + 1}.rs"]\nmod b;\n')
+        self.write("tests/wide/m20.rs", "")
+        self.write("tests/wide/main.rs", "mod m0;\n")
+        self.assert_refused("tests/wide/m20.rs", "declares more than 20000 modules")
+
+    def test_a_file_declared_twice_has_no_single_module(self):
+        self.write("tests/suite/main.rs", 'mod cases;\n#[path = "cases.rs"]\nmod again;\n')
+        self.assert_refused("tests/suite/cases.rs", "declares this file as more than one module")
+
+    def test_a_path_attribute_that_cannot_be_read_exactly_maps_nothing(self):
+        for attribute in ('#[path = "\\u{61}ctual.rs"]', '#[path = b"actual.rs"]', '#[path = concat!("actual", ".rs")]',
+                          '#[cfg_attr(unix, path = "actual.rs")]', '#[cfg_attr(unix, allow(dead_code), path = "actual.rs")]'):
+            with self.subTest(attribute):
+                self.write("src/lib.rs", f"{attribute}\nmod slot;\n")
+                self.write("src/actual.rs", "")
+                self.write("src/slot.rs", "")
+                for selector in ("src/slot.rs", "src/actual.rs"):
+                    self.assert_refused(selector, "src/lib.rs: it ")
 
     def test_every_refusal_is_reported(self):
         result = self.run_selected("-x", "tests/unit.test.cjs", "tests/missing.rs")
@@ -386,7 +509,8 @@ class Runs(Checkout):
         result = self.run_selected("tools/sample-test.py")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("==> python3 tools/sample-test.py\n", result.stdout)
-        self.assertEqual(sorted(os.listdir(self.ran)), ["python-fails", "python-passes", "python-passes-too"])
+        self.assertEqual(sorted(os.listdir(self.ran)),
+                         ["python-elsewhere", "python-fails", "python-passes", "python-passes-too"])
 
     def test_a_python_test_name_runs_only_that_test(self):
         result = self.run_selected("tools/sample-test.py::test_passes")
@@ -401,13 +525,77 @@ class Runs(Checkout):
     def test_a_node_test_file_runs_whole_and_fails_with_its_failure(self):
         result = self.run_selected("tests/unit.test.cjs")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("==> node --test tests/unit.test.cjs\n", result.stdout)
+        self.assertIn("==> node --test --test-reporter=spec ", result.stdout)
         self.assertEqual(sorted(os.listdir(self.ran)), ["node-fails", "node-passes", "node-passes-again"])
 
     def test_a_node_test_name_runs_only_that_test(self):
         result = self.run_selected("tests/unit.test.cjs::passes (a.b)")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(sorted(os.listdir(self.ran)), ["node-passes"])
+
+    def assert_ran_nothing(self, selector, reason):
+        """The command ran and exited 0, yet no selected test ran: that is a failure."""
+        result = self.run_selected(selector)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(f"test-selected: failed ({reason}): ", result.stderr)
+        self.assertEqual(sorted(os.listdir(self.ran)), [])
+
+    def test_a_node_run_that_runs_no_selected_test_fails(self):
+        # Each name is a whole string of the file, so only the run can tell.
+        self.assert_ran_nothing("tests/unit.test.cjs::not a test", "it ran no test named 'not a test'")
+        self.assert_ran_nothing("tests/unit.test.cjs::skipped", "it ran no test named 'skipped'")
+        self.assert_ran_nothing("tests/esm.test.mjs", "it ran no test")
+        self.write("tests/suites.test.cjs", """\
+            const { describe, it } = require("node:test");
+            describe("group", () => { it("inner", { skip: true }, () => {}); });
+        """)
+        self.assert_ran_nothing("tests/suites.test.cjs::group", "it ran no test named 'group'")
+        self.assert_ran_nothing("tests/suites.test.cjs", "it ran no test")
+
+    def test_a_node_test_inside_a_suite_runs_by_name(self):
+        self.write("tests/suites.test.cjs", """\
+            const { describe, it } = require("node:test");
+            const { writeFileSync } = require("node:fs");
+            const { join } = require("node:path");
+            describe("group", () => {
+              it("inner", () => writeFileSync(join(process.env.RAN, "node-inner"), ""));
+              it("other", () => writeFileSync(join(process.env.RAN, "node-other"), ""));
+            });
+        """)
+        result = self.run_selected("tests/suites.test.cjs::inner")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(sorted(os.listdir(self.ran)), ["node-inner"])
+
+    def test_a_python_run_that_runs_no_selected_test_fails(self):
+        # Defined in a class, so the early check passes; unittest before 3.12 would exit 0.
+        # (Python 3.12 and newer exit 5 themselves; older ones need the count.)
+        result = self.run_selected("tools/sample-test.py::test_unreachable")
+        self.assertIn(result.returncode, (1, 5), result.stdout + result.stderr)
+        self.assertIn("test-selected: failed (", result.stderr)
+        self.assertEqual(sorted(os.listdir(self.ran)), [])
+        self.assert_ran_nothing("tools/sample-test.py::Sample.test_skipped", "it ran no test")
+        self.write("tools/empty-test.py", "import unittest\nunittest.main()\n")
+        result = self.run_selected("tools/empty-test.py")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("test-selected: failed (", result.stderr)
+
+    def test_the_python_proof_does_not_depend_on_unittest_exit_status(self):
+        # What unittest before Python 3.12 does: report no tests and exit 0.
+        self.write("tools/old-test.py", """\
+            import sys
+            sys.stderr.write("\\n" + "-" * 70 + "\\nRan 0 tests in 0.000s\\n\\nOK\\n")
+        """)
+        self.assert_ran_nothing("tools/old-test.py", "it ran no test")
+        self.write("tools/old-test.py", """\
+            import sys
+            sys.stderr.write("Ran 2 tests in 0.000s\\n\\nOK (skipped=2)\\n")
+        """)
+        self.assert_ran_nothing("tools/old-test.py", "it ran no test")
+        self.write("tools/old-test.py", """\
+            import sys
+            sys.stderr.write("Ran 2 tests in 0.000s\\n\\nOK (skipped=1)\\n")
+        """)
+        self.assertEqual(self.run_selected("tools/old-test.py").returncode, 0)
 
     def test_a_failure_does_not_stop_the_commands_after_it(self):
         result = self.run_selected("tests/unit.test.cjs::fails", "tools/sample-test.py::test_passes")
@@ -482,6 +670,8 @@ def nextest_installed():
 @unittest.skipUnless(nextest_installed(), "cargo-nextest is not installed")
 class CargoRuns(Checkout):
     """The synthetic crate under the real pinned toolchain and nextest; it has no dependencies."""
+
+    TIMEOUT = 1800
 
     def setUp(self):
         super().setUp()

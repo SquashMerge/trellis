@@ -217,8 +217,8 @@ mapped, the script names it, runs nothing and exits 2. It never runs more than w
 | `tests/<name>.rs`, `tests/<name>/main.rs` | `cargo nextest run … --test <name>` |
 | another file of `tests/<name>/` | `cargo nextest run … --test <name> -E 'test(/^<module>::/)'` |
 | any of the Rust rows with `::test_name` | the same target with `-E 'test(/^<module>::(.+::)?<test_name>$/)'` |
-| `tests/*.test.cjs`, `tests/*.test.mjs`, `tools/semantic-contract/test/*.test.mjs`, `tools/synthetic-cohorts/test/*.test.mjs` | `node --test <file>` |
-| `herdr-mod/test/*.test.mjs` | `node --import ./herdr-mod/test/register.mjs --test <file>` |
+| `tests/*.test.cjs`, `tests/*.test.mjs`, `tools/semantic-contract/test/*.test.mjs`, `tools/synthetic-cohorts/test/*.test.mjs` | `node --test <reporters> <file>` |
+| `herdr-mod/test/*.test.mjs` | `node --import ./herdr-mod/test/register.mjs --test <reporters> <file>` |
 | a Node row with `::test name` | adds `--test-name-pattern=^<test name, escaped>$` |
 | `tools/*-test.py` | `python3 <file>` |
 | `tools/**/test_*.py` | `python3 -m unittest discover -s <directory> -p <file name>` |
@@ -234,10 +234,16 @@ For Rust, `<module>` is the path by which the target's `mod` declarations reach 
 `foo::tests::`. A file's selector runs the tests of its module and of the modules below it;
 a crate root (`src/lib.rs`, `tests/<name>/main.rs`) runs its whole target. A test name is
 matched whole, anywhere in the file's module. Tests that live elsewhere are not run: for
-`src/foo.rs` tested from `tests/core/foo.rs`, select the test file. A selector that selects
-no test fails (nextest exits 4) instead of passing. Node, and unittest before Python 3.12,
-pass when a name matches nothing, so a Node name that does not occur in the file's text and
-a Python name the file does not define are refused.
+`src/foo.rs` tested from `tests/core/foo.rs`, select the test file.
+
+A command that runs no selected test fails, whatever its own exit status. nextest exits 4.
+`node --test` exits 0 when a name matches nothing, so each Node command also gets a second
+reporter that records the tests that finished; the script fails the command unless a test
+that was not skipped ran (the named one, when a name is given; a suite's name is not a
+test's). unittest before Python 3.12 exits 0 after running nothing, so the script reads its
+`Ran N tests` report and fails the command when every test was skipped or none ran. A
+`tools/*-test.py` script must therefore report the way `unittest.main()` does. The script
+itself runs on Python 3.9 and newer.
 
 Each selector is one command; identical commands run once. Each command is printed before
 it runs, a failure does not stop the later ones, and the exit status is the first failure's.
@@ -256,8 +262,17 @@ Refused:
 - `tests/fixtures/**` and `tests/proptest-regressions/**`: test data, with no single test;
 - a Rust file that no library, binary or test target reaches, and a helper that several
   test binaries share (`tests/support/*.rs`, `tests/common/*.rs`);
+- Rust files of a target whose modules cannot be read to their end: a module cycle, more
+  than 20000 modules, a source file over 16 MiB or not UTF-8, or a `path` attribute other
+  than `#[path = "…"]` with a plain or raw string (one under `cfg_attr`, a byte string, an
+  escape other than `\\`, `\"` and `\'`). A file the library reaches still maps when
+  the unread target is another one;
+- a `tools/**/test_*.py` whose name holds `*`, `?` or `[`, which unittest discovery would
+  read as a pattern;
 - a test name that is not an identifier path (Rust) or `test_method` / `Class.test_method`
-  (Python), or that the Node or Python file does not contain;
+  (Python); a Node name that is not one whole string literal of the file; a Python method
+  that no class of the file, or not the named class, defines. Names built at run time and
+  inherited test methods are refused by this;
 - every other layout, such as `web/*.js`, `examples/`, `build/` and documents.
 
 ## Feature Factory

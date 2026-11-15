@@ -17,11 +17,14 @@ path, with the pinned toolchain and `--locked`, the way ./tools/verify runs
 them. Identical commands run once. The exit status is the first failed
 command's; every command still runs.
 """
+import ast
+import json
 import os
 import re
 import shlex
 import subprocess
 import sys
+import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 PRINT_ENV = "TRELLIS_TEST_SELECTED_PRINT"
@@ -31,6 +34,18 @@ UNSET = ("TRELLIS_SEARCH_MODEL", "TRELLIS_SEARCH_BACKEND", "TRELLIS_INDEX_DIAGNO
 NEXTEST = ["cargo", "nextest", "run", "--locked", "--features", "test-support", "--no-fail-fast", "--no-tests=fail"]
 # GHSA-vc25-qg58-w57c: the same floor ./tools/verify enforces.
 NEXTEST_FLOOR = (0, 9, 150)
+
+# Repository content is untrusted: bound what is read and how far a module walk goes.
+MAX_SOURCE_BYTES = 16 * 1024 * 1024
+MAX_MODULES = 20000
+# A second reporter beside the readable one: one JSON line per finished test, to a file.
+# (No `#` or `?`: this is a data: URL.)
+NODE_REPORTER = (
+    'data:text/javascript,export default async function*(s){for await(const e of s)'
+    'if(e.type==="test:pass"||e.type==="test:fail")yield JSON.stringify({name:e.data.name,'
+    'kind:(e.data.details||{}).type,skip:e.data.skip!==undefined||e.data.todo!==undefined})+"\\n"}'
+)
+EVENTS = "<events file>"
 
 RUST_FILTER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(::[A-Za-z_][A-Za-z0-9_]*)*\Z")
 PYTHON_FILTER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?\Z")
@@ -44,35 +59,56 @@ class Refused(Exception):
 
 
 class Command:
-    def __init__(self, argv, env=None):
+    """One mapped command. `proof` says how its run shows that a selected test ran."""
+
+    def __init__(self, argv, env=None, proof=None):
         self.argv = argv
         self.env = env or {}
+        self.proof = proof
 
     def key(self):
         return (tuple(self.argv), tuple(sorted(self.env.items())))
 
-    def line(self):
-        return " ".join([f"{name}={shlex.quote(value)}" for name, value in sorted(self.env.items())] + [shlex.join(self.argv)])
+    def line(self, argv=None):
+        return " ".join([f"{name}={shlex.quote(value)}" for name, value in sorted(self.env.items())] + [shlex.join(argv or self.argv)])
+
+
+def read(root, path):
+    """A selected or reached source file's text, bounded; Refused if it cannot be read as text."""
+    full = os.path.join(root, path)
+    try:
+        if os.path.getsize(full) > MAX_SOURCE_BYTES:
+            raise Refused(f"{path} is larger than {MAX_SOURCE_BYTES} bytes")
+        with open(full, encoding="utf-8") as file:
+            return file.read()
+    except (OSError, UnicodeDecodeError) as error:
+        raise Refused(f"{path} cannot be read as UTF-8 text ({type(error).__name__})")
 
 
 # --- Rust: which Cargo target reaches a file, and under which module path ---
 
 RUST_TOKEN = re.compile(
-    r"""//[^\n]*                          # line comment
-      | (?P<block>/\*)                    # block comment (nested; closed by hand)
-      | (?:br|cr|r)(?P<hashes>\#*)"       # raw string (closed by hand)
-      | (?P<string>[bc]?"(?:[^"\\]|\\.)*")
-      | b?'(?:\\.[^'\n]*|[^\\'\n])'       # char literal, so a quote in one opens no string
+    r"""//[^\n]*                                # line comment
+      | (?P<block>/\*)                          # block comment (nested; closed by hand)
+      | (?P<raw>br|cr|r)(?P<hashes>\#*)"        # raw string (closed by hand)
+      | (?P<prefix>[bc]?)"(?P<string>(?:[^"\\]|\\.)*)"
+      | b?'(?:\\.[^'\n]*|[^\\'\n])'             # char literal, so a quote in one opens no string
       | (?P<ident>[A-Za-z_][A-Za-z0-9_]*)
-      | (?P<punct>[{};\#\[\]=])
+      | (?P<punct>[{};\#!\[\]=])
     """,
     re.S | re.X,
 )
 BLOCK_EDGE = re.compile(r"/\*|\*/")
+PLAIN_ESCAPE = re.compile(r"\\(.)", re.S)
 
 
 def rust_tokens(text):
-    """The identifiers, string literals and `{ } ; # [ ] =` of Rust source, in order."""
+    """The identifiers, string literals and `{ } ; # ! [ ] =` of Rust source, in order.
+
+    A string token's value is the text it denotes, or None for a literal this
+    script does not decode (a byte or C string, or an escape other than `\\\\`,
+    `\\"` and `\\'`).
+    """
     tokens = []
     position = 0
     while True:
@@ -88,13 +124,16 @@ def rust_tokens(text):
                     return tokens
                 depth += 1 if edge.group() == "/*" else -1
                 position = edge.end()
-        elif match.group("hashes") is not None:
+        elif match.group("raw"):
             end = text.find('"' + match.group("hashes"), position)
             if end < 0:
                 return tokens
+            tokens.append(("string", text[position:end] if match.group("raw") == "r" else None))
             position = end + 1 + len(match.group("hashes"))
-        elif match.group("string"):
-            tokens.append(("string", match.group("string")))
+        elif match.group("string") is not None:
+            body = match.group("string")
+            plain = not match.group("prefix") and all(escaped in "\\\"'" for escaped in PLAIN_ESCAPE.findall(body))
+            tokens.append(("string", PLAIN_ESCAPE.sub(r"\1", body) if plain else None))
         elif match.group("ident"):
             tokens.append(("ident", match.group("ident")))
         elif match.group("punct"):
@@ -102,10 +141,12 @@ def rust_tokens(text):
 
 
 def module_declarations(text):
-    """Yield (inline module names, name, `#[path]` literal or None) for each `mod name;`.
+    """Yield (inline module names, name, `#[path]` text or None) for each `mod name;`.
 
     Only declarations at module level count: one inside a function body, a
     macro, or an inline module that itself carries `#[path]` is skipped.
+    Refused for a `path` attribute this script cannot read exactly: guessing
+    would map a file to a module that Rust compiles from another file.
     """
     tokens = rust_tokens(text)
     scopes = []  # an inline module's name, or None for any other brace
@@ -113,18 +154,29 @@ def module_declarations(text):
     index = 0
     while index < len(tokens):
         kind, value = tokens[index]
-        following = tokens[index + 1 : index + 6]
-        if (
-            (kind, value) == ("punct", "#")
-            and [token[1] for token in following[:3]] == ["[", "path", "="]
-            and len(following) == 5
-            and following[3][0] == "string"
-            and following[4] == ("punct", "]")
-        ):
-            path = following[3][1].partition('"')[2][:-1]
-            index += 6
-            continue
-        if (kind, value) == ("ident", "mod") and len(following) >= 2 and following[0][0] == "ident":
+        if (kind, value) == ("punct", "#"):
+            start = index + 1
+            inner = tokens[start : start + 1] == [("punct", "!")]
+            start += inner
+            if tokens[start : start + 1] == [("punct", "[")]:
+                depth, end = 1, start + 1
+                while end < len(tokens) and depth:
+                    depth += {"[": 1, "]": -1}.get(tokens[end][1], 0) if tokens[end][0] == "punct" else 0
+                    end += 1
+                inside = tokens[start + 1 : end - 1]
+                names = [token for token in inside if token[0] != "punct" or token[1] == "="]
+                if names[:2] == [("ident", "path"), ("punct", "=")]:
+                    if inner or len(inside) != 3 or inside[2][0] != "string" or inside[2][1] is None:
+                        raise Refused("it has a `path` attribute that is not `#[path = \"…\"]` with a plain or raw string")
+                    path = inside[2][1]
+                elif names[:1] == [("ident", "cfg_attr")] and any(
+                    names[at : at + 2] == [("ident", "path"), ("punct", "=")] for at in range(len(names))
+                ):
+                    raise Refused("it sets a module `path` under `cfg_attr`")
+                index = end
+                continue
+        following = tokens[index + 1 : index + 3]
+        if (kind, value) == ("ident", "mod") and len(following) == 2 and following[0][0] == "ident":
             name, after = following[0][1], following[1]
             if after == ("punct", ";"):
                 if None not in scopes:
@@ -147,23 +199,37 @@ def module_declarations(text):
 
 
 def reach(root, crate_root):
-    """Map each source file a crate root reaches (repo-relative) to its module paths."""
+    """Map each source file a crate root reaches to its module paths, or Refused.
+
+    Files are keyed by their physical repo-relative path. Rust resolves a child
+    module from the path as written, so that is what the walk follows; a file
+    that is its own ancestor (by any spelling) is a cycle, and the walk stops.
+    """
     reached = {}
-    # (file, module path, whether child modules sit beside the file rather than under its stem)
-    pending = [(crate_root, (), True)]
+    visits = 0
+    # (file as written, module path, whether child modules sit beside the file
+    # rather than under its stem, the physical files above it)
+    pending = [(crate_root, (), True, ())]
     while pending:
-        file, module, owns_directory = pending.pop()
-        if module in reached.setdefault(file, []):
+        file, module, owns_directory, above = pending.pop()
+        physical = os.path.realpath(os.path.join(root, file))
+        if os.path.commonpath([physical, root]) != root:
             continue
-        reached[file].append(module)
+        key = os.path.relpath(physical, root).replace(os.sep, "/")
+        if key in above:
+            raise Refused(f"its modules form a cycle through {key}")
+        visits += 1
+        if visits > MAX_MODULES:
+            raise Refused(f"it declares more than {MAX_MODULES} modules")
+        if module not in reached.setdefault(key, []):
+            reached[key].append(module)
         try:
-            with open(os.path.join(root, file), encoding="utf-8") as source:
-                text = source.read()
-        except (OSError, UnicodeDecodeError):
-            continue
+            declarations = list(module_declarations(read(root, file)))
+        except Refused as reason:
+            raise Refused(f"{key}: {reason}")
         directory = os.path.dirname(file)
         children = directory if owns_directory else os.path.join(directory, os.path.basename(file)[: -len(".rs")])
-        for inline, name, path in module_declarations(text):
+        for inline, name, path in declarations:
             if path is not None:
                 base = os.path.join(children, *inline) if inline else directory
                 candidates = [(os.path.normpath(os.path.join(base, path)), True)]
@@ -171,8 +237,8 @@ def reach(root, crate_root):
                 base = os.path.join(children, *inline)
                 candidates = [(os.path.join(base, name + ".rs"), False), (os.path.join(base, name, "mod.rs"), True)]
             for candidate, owns in candidates:
-                if not candidate.startswith("..") and os.path.isfile(os.path.join(root, candidate)):
-                    pending.append((candidate, module + tuple(inline) + (name,), owns))
+                if os.path.isfile(os.path.join(root, candidate)):
+                    pending.append((candidate, module + tuple(inline) + (name,), owns, above + (key,)))
                     break
     return reached
 
@@ -204,8 +270,19 @@ def map_rust(root, path, test, environ, cache):
     if test is not None and not RUST_FILTER.match(test):
         raise Refused("a Rust test name is identifiers joined by `::`")
     if "targets" not in cache:
-        cache["targets"] = [(flags, description, reach(root, crate_root)) for flags, crate_root, description in cargo_targets(root)]
-    owners = [(flags, description, reached[path]) for flags, description, reached in cache["targets"] if path in reached]
+        cache["targets"] = []
+        for flags, crate_root, description in cargo_targets(root):
+            try:
+                cache["targets"].append((flags, description, reach(root, crate_root), None))
+            except Refused as problem:
+                cache["targets"].append((flags, description, {}, problem))
+    owners = [(flags, description, reached[path]) for flags, description, reached, _ in cache["targets"] if path in reached]
+    # The library wins when it reaches the file. Otherwise the file must have
+    # exactly one owner, which no unread target can be ruled out of.
+    if not (owners and owners[0][0] == ["--lib"]):
+        for _, description, _, problem in cache["targets"]:
+            if problem:
+                raise Refused(f"{description} cannot be read to its end, so no Rust file of it can be mapped: {problem}")
     if not owners:
         raise Refused("no Cargo library, binary or test target reaches this file through `mod` declarations")
     if owners[0][0] != ["--lib"] and len(owners) > 1:
@@ -227,37 +304,73 @@ def map_rust(root, path, test, environ, cache):
 # --- Node and Python ---
 
 
-def read(root, path):
-    with open(os.path.join(root, path), encoding="utf-8", errors="replace") as file:
-        return file.read()
-
-
 def map_node(root, path, test, imports=()):
     argv = ["node"]
     for module in imports:
         argv += ["--import", module]
     argv.append("--test")
     if test is not None:
-        # node --test passes when the pattern matches nothing, so a misspelt name must not get that far.
-        if test not in read(root, path):
-            raise Refused("the file's text does not contain that test name")
+        # An early refusal only; the run's own events decide (see node_proof).
+        text = read(root, path)
+        if not any(quote + test + quote in text for quote in "\"'`"):
+            raise Refused("the file does not hold that test name as one whole string literal")
         # The whole name, literally: escape what a JavaScript regular expression reads.
         argv.append("--test-name-pattern=^" + re.sub(r"([\\^$.*+?()\[\]{}|/])", r"\\\1", test) + "$")
-    return Command(argv + [path])
+    argv += ["--test-reporter=spec", "--test-reporter-destination=stdout",
+             "--test-reporter=" + NODE_REPORTER, "--test-reporter-destination=" + EVENTS]
+    return Command(argv + [path], proof=("node", path, test))
+
+
+def node_proof(events, path, test):
+    """Why the recorded test events do not show a selected test ran, or None.
+
+    `node --test` exits 0 when a name pattern matches nothing: it then reports
+    the file itself as one passing test. Only a test (not a suite, not skipped)
+    with the selected name, or any such test for a whole file, counts.
+    """
+    names = []
+    for line in events.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if event.get("kind") == "test" and not event.get("skip") and not os.path.isabs(str(event.get("name"))) and event.get("name") != path:
+            names.append(event.get("name"))
+    if test is None:
+        return None if names else "it ran no test"
+    return None if test in names else f"it ran no test named {test!r}"
 
 
 def map_python(root, path, argv, test):
     if test is not None:
         if not PYTHON_FILTER.match(test):
             raise Refused("a Python test name is `test_method` or `Class.test_method`")
-        # Before Python 3.12 unittest passes when nothing matches; refuse a name the file does not define.
-        text = read(root, path)
+        # An early refusal only; the run's own count decides (see unittest_proof).
+        try:
+            tree = ast.parse(read(root, path))
+        except (SyntaxError, ValueError, RecursionError, MemoryError) as error:
+            raise Refused(f"the file cannot be parsed for its tests ({type(error).__name__})")
         *owner, method = test.split(".")
-        if not re.search(rf"^\s*def {method}\(", text, re.M) or (owner and not re.search(rf"^class {owner[0]}\b", text, re.M)):
-            raise Refused("the file does not define that test")
+        if not any(
+            isinstance(node, ast.ClassDef)
+            and (not owner or node.name == owner[0])
+            and any(isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == method for item in node.body)
+            for node in tree.body
+        ):
+            raise Refused("no class of the file defines that test" if not owner else f"class {owner[0]} of the file does not define that test")
         # unittest matches the pattern against `module.Class.test_method`.
         argv = argv + ["-k", "*." + test]
-    return Command(argv)
+    return Command(argv, proof=("unittest",))
+
+
+def unittest_proof(output):
+    """Why unittest's report does not show a test ran, or None.
+
+    Before Python 3.12 unittest exits 0 when it ran nothing; a skipped test did not run.
+    """
+    ran = sum(int(count) for count in re.findall(r"^Ran (\d+) tests? in ", output, re.M))
+    skipped = sum(int(count) for count in re.findall(r"^OK \(.*?skipped=(\d+)", output, re.M))
+    return None if ran - skipped > 0 else "it ran no test"
 
 
 def map_selector(root, selector, environ, cache):
@@ -312,6 +425,9 @@ def map_selector(root, selector, environ, cache):
     if directory == "tools" and name.endswith("-test.py"):
         return map_python(root, path, ["python3", path], test)
     if path.startswith("tools/") and name.startswith("test_") and name.endswith(".py"):
+        # discover reads -p as a glob; a literal name must not select other files.
+        if any(character in name for character in "*?["):
+            raise Refused("unittest discovery would read `*`, `?` or `[` in the file name as a pattern")
         return map_python(root, path, ["python3", "-m", "unittest", "discover", "-s", directory, "-p", name], test)
     if name.endswith(".rs") and (path.startswith("src/") or path.startswith("tests/")):
         return map_rust(root, path, test, environ, cache)
@@ -365,17 +481,52 @@ def main(selectors, environ):
             return 127
     status = 0
     for command in commands:
-        print(f"==> {command.line()}", flush=True)
-        try:
-            code = subprocess.run(command.argv, cwd=ROOT, env={**env, **command.env}).returncode
-        except OSError as error:
-            print(f"test-selected: cannot run {command.argv[0]}: {error}", file=sys.stderr)
-            code = 127
-        if code != 0:
+        code, problem = run(command, env)
+        if code == 0 and problem:
+            print(f"test-selected: failed ({problem}): {command.line()}", file=sys.stderr, flush=True)
+            status = status or 1
+        elif code != 0:
             print(f"test-selected: failed (exit {code}): {command.line()}", file=sys.stderr, flush=True)
             # A signal's negative status is not an exit code.
             status = status or (code if code > 0 else 1)
     return status
+
+
+def run(command, env):
+    """Run one command; return its exit status and why it proved no selected test ran, if so."""
+    env = {**env, **command.env}
+    kind = command.proof[0] if command.proof else None
+    events = None
+    argv = command.argv
+    try:
+        if kind == "node":
+            handle, events = tempfile.mkstemp(prefix="test-selected-", suffix=".jsonl")
+            os.close(handle)
+            argv = [argument.replace(EVENTS, events) for argument in argv]
+        print(f"==> {command.line(argv)}", flush=True)
+        if kind == "unittest":
+            # unittest reports on stderr: pass it through and keep it for the count.
+            process = subprocess.Popen(argv, cwd=ROOT, env=env, stderr=subprocess.PIPE, text=True, errors="replace")
+            output = []
+            for line in process.stderr:
+                sys.stderr.write(line)
+                sys.stderr.flush()
+                output.append(line)
+            return process.wait(), unittest_proof("".join(output))
+        code = subprocess.run(argv, cwd=ROOT, env=env).returncode
+        if kind == "node":
+            with open(events, encoding="utf-8", errors="replace") as recorded:
+                return code, node_proof(recorded.read(), *command.proof[1:])
+        return code, None
+    except OSError as error:
+        print(f"test-selected: cannot run {argv[0]}: {error}", file=sys.stderr)
+        return 127, None
+    finally:
+        if events:
+            try:
+                os.unlink(events)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":
