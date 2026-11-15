@@ -133,7 +133,7 @@ A rust-analyzer re-pin now records every target. `scip-java`'s launcher hash sta
 
 ## Amendment 8 (2026-11-15): a run records the version its verified binary reports
 
-- **Status:** owner-approved approach 2026-11-15 ([#1126](https://github.com/SquashMerge/trellis/issues/1126)); text for ratification.
+- **Status:** ratified by the owner, 2026-11-15 ([#1126](https://github.com/SquashMerge/trellis/issues/1126)).
 - **Amends:** Amendment 6, item 2.
 
 Amendment 6 pinned one rust-analyzer hash for each target but kept one version text, the one the `aarch64-apple-darwin` binary reports. A binary pinned for another target can report a different text for the same release, and the artifact it writes carries that text in `ToolInfo.version`. Its hash verified, and its batch was then refused as `invalid_artifact: tool binding`.
