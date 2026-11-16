@@ -2269,4 +2269,92 @@ packages = ["core", "pkgs/one/one", "pkgs/two/two"]
         let many: Vec<_> = (0..2000).map(|i| format!("plugins/p{i}")).collect();
         assert_eq!(used(Some(&many)) - base, lookups);
     }
+
+    fn parsed(docs: &[&DocumentInput]) -> Vec<Tree> {
+        let trees: Vec<_> = docs
+            .iter()
+            .map(|doc| parse(doc, &mut || Ok(())).unwrap())
+            .collect();
+        assert!(trees.iter().all(|tree| !tree.root_node().has_error()));
+        trees
+    }
+
+    /// Where a build stops on its budget is a stability rule: the same documents charge the
+    /// same steps, so the same budget stops them at the same step with the same error.
+    #[test]
+    fn catalog_build_and_site_resolution_charge_exact_steps() {
+        const BUILD: usize = 344;
+        let documents = documents_with(&[
+            (
+                "use.py",
+                "import helper\n\
+                 from provider import public_name as renamed\n\
+                 from provider import *\n\
+                 try:\n\
+                 \x20   from fallback import *\n\
+                 except ImportError:\n\
+                 \x20   pass\n\
+                 type Alias = (hidden := int)\n",
+            ),
+            (
+                "provider.py",
+                "__all__ = ['public_name']\ndef public_name():\n    pass\n",
+            ),
+            ("fallback.py", "def fallback_name():\n    pass\n"),
+            ("helper.py", "VALUE = 1\n"),
+        ]);
+        let docs: Vec<_> = documents.iter().collect();
+        let trees = parsed(&docs);
+        let selected: Vec<_> = (0..docs.len()).collect();
+        let build = |limit| {
+            let mut work = Work::new(limit);
+            let catalog = Catalog::new(&docs, &trees, &[], &selected, &mut work, &mut || Ok(()));
+            (catalog, work)
+        };
+        let (catalog, mut work) = build(work::reference_limit(docs.len(), 0));
+        let catalog = catalog.unwrap();
+        assert_eq!(work.used, BUILD);
+
+        let source = docs
+            .iter()
+            .position(|doc| doc.key.path == "use.py")
+            .unwrap();
+        let sites = extract(docs[source], &trees[source], &mut work, &mut || Ok(())).unwrap();
+        let extracted = work.used - BUILD;
+        let resolved: Vec<_> = sites
+            .iter()
+            .map(|site| {
+                let before = work.used;
+                catalog
+                    .resolve(
+                        source,
+                        site,
+                        &mut BTreeMap::new(),
+                        &mut work,
+                        &mut || Ok(()),
+                    )
+                    .unwrap();
+                (site.spelling.as_str(), work.used - before)
+            })
+            .collect();
+        assert_eq!(extracted, 57);
+        assert_eq!(
+            resolved,
+            [
+                ("helper", 3),
+                ("provider", 3),
+                ("provider", 1),
+                ("fallback", 1),
+            ]
+        );
+
+        // One step short of the build's charge fails typed, on the step that exceeds it.
+        let (stopped, work) = build(BUILD - 1);
+        assert_eq!(
+            stopped.err().expect("budget stop").to_string(),
+            "bounded_work: reference owner lookup"
+        );
+        assert_eq!(work.used, BUILD);
+        assert!(build(BUILD).0.is_ok());
+    }
 }
