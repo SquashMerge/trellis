@@ -645,6 +645,7 @@ pub const WEB_ASSETS: &[WebAsset] = &[
         include_bytes!("../web/navigation.css"),
     ),
     web_asset("/index-pin.js", JS, include_bytes!("../web/index-pin.js")),
+    web_asset("/dto-core.js", JS, include_bytes!("../web/dto-core.js")),
     web_asset(
         "/source-witness.js",
         JS,

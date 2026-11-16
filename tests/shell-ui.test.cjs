@@ -31,7 +31,7 @@ function harness(withApp = false) {
     // No DOM parser here: the adapter double keeps the real Pele projection and installs one
     // selectable node per projected row.
     run(fs.readFileSync("web/pele-svg.js","utf8"));run(fs.readFileSync("web/sequence-pele.js","utf8"));run(fs.readFileSync("tests/support/sequence-adapter-double.js","utf8"));
-    run(fs.readFileSync("web/files.js","utf8"));run(fs.readFileSync("web/index-pin.js","utf8"));for(const file of APP_SCRIPTS)run(fs.readFileSync("web/"+file,"utf8"));run(`token="synthetic";selectedRootKey="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";checkouts=[{rootKey:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",workspaceRoot:"/repo",state:"available"}];status={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},workspaceRoot:"/repo"};`);}
+    run(fs.readFileSync("web/files.js","utf8"));run(fs.readFileSync("web/index-pin.js","utf8"));run(fs.readFileSync("web/dto-core.js","utf8"));for(const file of APP_SCRIPTS)run(fs.readFileSync("web/"+file,"utf8"));run(`token="synthetic";selectedRootKey="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";checkouts=[{rootKey:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",workspaceRoot:"/repo",state:"available"}];status={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},workspaceRoot:"/repo"};`);}
   if (withApp) {
     let handler = context.fetch;
     Object.defineProperty(context,"fetch",{configurable:true,get:()=>request,set(fn){handler=fn;}});
@@ -573,6 +573,25 @@ test("noncallable resolved target reads exact declaration source instead of requ
   assert.equal(requests.filter(path=>path === "/api/sequence").length,1);
   assert.ok(requests.some(path=>path.startsWith("/api/source?") && path.includes("path=target.rs")));
   assert.equal(h.get("workspace-source-panel").hidden,false);
+});
+
+test("W11 a checkout row's index label keeps the browser's own words over the core it shares with the Herdr mod", () => {
+  const h = harness(true);
+  const label = row => JSON.parse(h.run(`JSON.stringify(checkoutIndexLabel(${JSON.stringify(row)}))`));
+  const pin = {indexGeneration:"12345678-1234-4123-8123-123456789abc", indexRevision:1};
+  // The mod says "Unavailable · <indexError>" here; the browser says "Failed".
+  assert.deepEqual(label({state:"unavailable", indexError:"root_changed"}), {text:"Failed", state:"failed", shape:"□"});
+  assert.deepEqual(label(null), {text:"Failed", state:"failed", shape:"□"});
+  assert.deepEqual(label({state:"storage_busy"}), {text:"Busy", state:"failed", shape:"□"});
+  assert.deepEqual(label({state:"available", revision:pin, catchingUp:false}), {text:"Fresh · rev 12345678:1", state:"fresh", shape:"○"});
+  assert.deepEqual(label({state:"available", revision:pin, catchingUp:true}), {text:"Catching up · rev 12345678:1", state:"catching-up", shape:"◐"});
+  assert.deepEqual(label({state:"available", revision:pin}), {text:"Indexed · idle · rev 12345678:1", state:"unknown", shape:"◇"});
+  assert.deepEqual(label({state:"available"}), {text:"Not indexed", state:"unknown", shape:"◇"});
+  assert.deepEqual(label({state:"available", indexError:"corrupt", revision:pin}), {text:"Index unavailable · corrupt", state:"failed", shape:"□"});
+  // The browser's pin label validates, so a malformed pair is no revision label.
+  assert.deepEqual(label({state:"available", revision:{...pin, indexRevision:-1}, catchingUp:false}), {text:"Index status unavailable", state:"unknown", shape:"◇"});
+  assert.equal(h.run(`jobCause({error:{code:"invalid_artifact",reason:"empty range",message:"generic"}})`), "invalid_artifact: empty range");
+  assert.equal(h.run(`jobCause({state:"failed"})`), "cause not recorded");
 });
 
 test("one index status reconciles jobs, freshness, stale evidence and unavailable status", () => {

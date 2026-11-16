@@ -102,17 +102,9 @@ function uniqueSelectableRoot(key) {
   const matches = checkouts.filter(row => row.rootKey === key);
   return matches.length === 1 && selectable(matches[0]);
 }
+// The row's index state in the words the mod shares (dto-core.js); "Failed" is the browser's own.
 function checkoutIndexLabel(row) {
-  if (!row || row.state !== "available") return {text: row?.state === "storage_busy" ? "Busy" : "Failed", state:"failed", shape:"□"};
-  const pin = row.revision, catchingUp = row.catchingUp;
-  if (row.indexError && row.indexError !== "index_not_ready") return {text:`Index unavailable · ${row.indexError}`, state:"failed", shape:"□"};
-  if (!pin) return catchingUp === true ? {text:"Catching up", state:"catching-up", shape:"◐"}
-    : {text:"Not indexed", state:"unknown", shape:"◇"};
-  let label;
-  try { label = IndexPin.label(pin); } catch (_) { return {text:"Index status unavailable", state:"unknown", shape:"◇"}; }
-  return catchingUp === true ? {text:`Catching up · rev ${label}`, state:"catching-up", shape:"◐"}
-    : catchingUp === false ? {text:`Fresh · rev ${label}`, state:"fresh", shape:"○"}
-    : {text:`Indexed · idle · rev ${label}`, state:"unknown", shape:"◇"};
+  return window.TrellisDtoCore.checkoutIndexLabel(row, () => "Failed", pin => IndexPin.label(pin));
 }
 function selectedIndexStatus() {
   const row = checkouts.find(row => row.rootKey === selectedRootKey);
@@ -146,12 +138,8 @@ function selectedIndexStatus() {
 }
 // The visible label follows every poll; the live region speaks only when the leading state words change.
 function stateWord(text) { return String(text).split(" · ")[0]; }
-// The recorded failure code and reason, never the generic job message.
-function jobCause(value) {
-  const code = typeof value?.error?.code === "string" && value.error.code ? value.error.code : "cause not recorded";
-  const reason = typeof value?.error?.reason === "string" && value.error.reason ? `: ${value.error.reason}` : "";
-  return `${code}${reason}`;
-}
+// The recorded failure code and reason, never the generic job message (shared with the mod: dto-core.js).
+function jobCause(value) { return window.TrellisDtoCore.jobCause(value); }
 function renderIndexStatus() {
   const state = selectedIndexStatus();
   $("workspace-index-state")?.setAttribute("data-state", state.state);
