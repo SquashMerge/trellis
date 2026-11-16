@@ -1,6 +1,6 @@
 //! Pending eligibility belongs to a validated destination producer row, not raw capture C.
 use super::*;
-use crate::producer::{TrustProfile, profiles, worktree};
+use crate::producer_profiles::{self as profiles, self as worktree, TrustProfile};
 
 fn profile(
     producer: &str,
