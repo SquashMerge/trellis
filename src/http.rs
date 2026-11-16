@@ -559,6 +559,21 @@ pub const WEB_ASSETS: &[WebAsset] = &[
         include_bytes!("../web/architecture-deviations.js"),
     ),
     web_asset(
+        "/architecture-drawing.js",
+        JS,
+        include_bytes!("../web/architecture-drawing.js"),
+    ),
+    web_asset(
+        "/architecture-app-columns.js",
+        JS,
+        include_bytes!("../web/architecture-app-columns.js"),
+    ),
+    web_asset(
+        "/architecture-inspector.js",
+        JS,
+        include_bytes!("../web/architecture-inspector.js"),
+    ),
+    web_asset(
         "/architecture.js",
         JS,
         include_bytes!("../web/architecture.js"),
