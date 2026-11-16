@@ -1304,12 +1304,15 @@ impl Catalog {
             proof.insert(self.scopes[current].document);
             let exported = current == self.scopes[current].module
                 && !self.private_access(scope, current, check)?;
-            let declared =
-                if index + 1 < path.len() && route.contains(&(current, path[index].clone())) {
-                    self.declared_module(current, &path[index], exported, depth, context, check)?
-                } else {
-                    None
-                };
+            let declared = self.declared_module(
+                current,
+                &path[index..],
+                exported,
+                depth,
+                route,
+                context,
+                check,
+            )?;
             let mut found = match declared {
                 Some(found) => found,
                 None => self.binding(
@@ -1423,17 +1426,26 @@ impl Catalog {
     /// single unconditional `mod`, in a scope read whole, of a crate whose manifest proves
     /// edition 2018 or later qualifies; for anything else `binding` answers the re-entry
     /// with unknown.
+    #[allow(clippy::too_many_arguments)] // The lookup's captured context and route, as `binding`.
     fn declared_module(
         &mut self,
         scope: usize,
-        name: &str,
+        rest: &[String],
         exported: bool,
         depth: usize,
+        route: &Route,
         context: ResolveContext<'_, '_>,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Option<Names>> {
+        // A prefix has a segment after it; the last segment is always `binding`'s.
+        let [name, _, ..] = rest else {
+            return Ok(None);
+        };
+        if !route.contains(&(scope, name.clone())) {
+            return Ok(None);
+        }
         self.step(check)?;
-        let key = (TYPE, name.to_owned());
+        let key = (TYPE, name.clone());
         let declaring = &self.scopes[scope];
         let Some([binding]) = declaring.explicit.get(&key).map(Vec::as_slice) else {
             return Ok(None);
@@ -1456,7 +1468,7 @@ impl Catalog {
         // computed around it is cached.
         self.charge(self.export_traces.len(), check)?;
         for trace in &mut self.export_traces {
-            trace.consulted.insert((scope, name.to_owned()));
+            trace.consulted.insert((scope, name.clone()));
             trace.cycle = true;
         }
         let mut names = Names::default();
