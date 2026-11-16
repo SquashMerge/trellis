@@ -14,7 +14,7 @@ metal = ["candle-core/metal", "candle-nn/metal"]
 [dependencies]
 anyhow = "1"
 axum = "0.8"
-base64 = "0.22"
+base64 = "0.23"
 candle-core = "=0.11.1"
 candle-nn = "=0.11.1"
 clap = { version = "4", features = ["derive"] }
@@ -30,7 +30,7 @@ notify = "8"
 protobuf = "3"
 rand = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-rusqlite = { version = "0.41", features = ["bundled", "blob"] }
+rusqlite = { version = "0.42", features = ["bundled", "blob"] }
 scip = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision", "raw_value"] }
