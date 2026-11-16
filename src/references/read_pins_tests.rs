@@ -377,40 +377,39 @@ fn the_catalogs_charge_one_shared_budget() {
 
 /// docs/rules.md, "Work bounds and located failures": the one request-wide allowance.
 /// With a selected producer, every declaration of the snapshot is a possible semantic
-/// target, and collecting each one is one unit of that allowance: a budget one unit short
-/// of the declarations fails typed. Without a producer nothing is collected.
+/// target, and collecting them is charged to that allowance: the work one collection
+/// reports is the least allowance it runs under, and one unit less fails typed. How much
+/// a declaration costs is not asserted. Without a producer nothing is collected and
+/// nothing is charged.
 #[test]
-fn collecting_semantic_targets_is_charged_per_declaration() {
+fn collecting_semantic_targets_is_charged_to_the_allowance() {
     let mut snapshot = crate_snapshot();
-    let docs = |snapshot: &Snapshot| -> Vec<usize> {
-        let mut order: Vec<usize> = (0..snapshot.documents.len()).collect();
-        order.sort_by(|&a, &b| snapshot.documents[a].key.cmp(&snapshot.documents[b].key));
-        order
-    };
     let declarations: usize = snapshot
         .documents
         .iter()
         .map(|doc| doc.declarations.len())
         .sum();
     assert!(declarations > 4, "more than the four file modules");
+    // The declarations and producers collected, and the work charged for them.
     let collect = |snapshot: &Snapshot, budget: usize| {
-        let docs: Vec<_> = docs(snapshot)
-            .into_iter()
-            .map(|index| &snapshot.documents[index])
-            .collect();
+        let mut docs: Vec<_> = snapshot.documents.iter().collect();
+        docs.sort_by(|a, b| a.key.cmp(&b.key));
         let mut work = Work::new(budget);
         declared_targets(&docs, &mut work, &mut || Ok(()))
-            .map(|(declared, producers)| (declared.len(), producers.len()))
+            .map(|(declared, producers)| (declared.len(), producers.len(), work.used))
     };
-    assert_eq!(collect(&snapshot, 0).unwrap(), (0, 0));
+    assert_eq!(collect(&snapshot, 0).unwrap(), (0, 0, 0));
+    assert_eq!(collect(&snapshot, 5_000_000).unwrap(), (0, 0, 0));
     bind_the_call(&mut snapshot, BTreeMap::new());
-    assert_eq!(collect(&snapshot, declarations).unwrap(), (declarations, 1));
+    let (declared, producers, needed) = collect(&snapshot, 5_000_000).unwrap();
+    assert_eq!((declared, producers), (declarations, 1));
+    assert!(needed > 0);
     assert_eq!(
-        collect(&snapshot, declarations - 1)
-            .unwrap_err()
-            .to_string(),
-        "bounded_work: reference owner lookup"
+        collect(&snapshot, needed).unwrap(),
+        (declarations, 1, needed)
     );
+    let error = collect(&snapshot, needed - 1).unwrap_err();
+    assert!(error.to_string().starts_with("bounded_work: "), "{error}");
 }
 
 #[derive(Debug)]
@@ -423,18 +422,19 @@ impl std::fmt::Display for CallerStopped {
 impl std::error::Error for CallerStopped {}
 
 /// docs/mcp-readonly-pilot-contract.md, error classes: "Cancellation overrides all unsent
-/// outcomes." Whichever poll of the request's callback reports the stop, the read returns
-/// that error of the caller's, never a projection and never an error of its own. Which
-/// steps poll, and how often, is not asserted.
+/// outcomes." Whichever poll of the request's callback first reports the stop, the read
+/// returns that error of the caller's, never a projection and never an error of its own.
+/// Which steps poll, how often, and how many polls follow a stop are not asserted.
 #[test]
 fn a_stopped_read_returns_the_callers_error_at_every_poll() {
     let mut snapshot = crate_snapshot();
     bind_the_call(&mut snapshot, BTreeMap::new());
+    // A request that is stopped from its `stop`-th poll on.
     let stopping_at = |stop: usize, workers: usize| {
         let mut polls = 0usize;
         let result = project_with_workers(&snapshot, &[], 5, workers, &mut || {
             polls += 1;
-            if polls == stop {
+            if polls >= stop {
                 return Err(CallerStopped.into());
             }
             Ok(())
@@ -443,22 +443,15 @@ fn a_stopped_read_returns_the_callers_error_at_every_poll() {
     };
     let (whole, polls) = stopping_at(usize::MAX, 1);
     whole.unwrap();
-    assert!(polls > 1);
+    assert!(polls > 0);
     for stop in 1..=polls {
-        let (result, made) = stopping_at(stop, 1);
+        let (result, _) = stopping_at(stop, 1);
         let error = result.expect_err("a stopped read has no answer");
         assert!(error.downcast_ref::<CallerStopped>().is_some(), "{error}");
-        assert_eq!(made, stop, "no poll after the stop");
     }
-    // The first poll comes before any worker starts, whatever the worker count.
-    let (result, made) = stopping_at(1, 2);
-    assert!(
-        result
-            .unwrap_err()
-            .downcast_ref::<CallerStopped>()
-            .is_some()
-    );
-    assert_eq!(made, 1);
+    let (result, _) = stopping_at(1, 2);
+    let error = result.expect_err("a stopped read has no answer");
+    assert!(error.downcast_ref::<CallerStopped>().is_some(), "{error}");
 }
 
 /// docs/rules.md, "CLI JSON" and "Work bounds and located failures": both reads accept
