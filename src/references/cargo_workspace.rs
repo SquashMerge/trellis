@@ -41,6 +41,8 @@ struct Member {
     crate_name: String,
     library: Option<String>,
     binary: Option<String>,
+    /// Every crate root of the package is proved to be of edition 2018 or later.
+    uniform_paths: bool,
     /// Dependency bindings: extern crate name to the member it names, or `None` when the
     /// name is bound to more than one crate or to an unproved one.
     bindings: BTreeMap<String, Option<usize>>,
@@ -50,6 +52,16 @@ struct Member {
 struct SourceSet {
     members: Vec<Member>,
     roots: BTreeMap<String, CrateRoot>,
+    /// The files more than one retained package manifest, member or not, names as a target
+    /// root: each of those packages can compile the file under its own edition.
+    shared: BTreeSet<String>,
+    /// Each retained package manifest's directory with a directory Cargo discovers targets
+    /// in (`src/bin/`, `examples/`, `tests/`, `benches/`): a file under one can be a target
+    /// of that package without being named.
+    discovered: Vec<(String, String)>,
+    /// A retained package manifest names a target root by an absolute path. Nothing relates
+    /// that path to a file of the checkout, so no crate root of the checkout is proved.
+    absolute: bool,
 }
 
 /// The proved Cargo workspace members of each source set.
@@ -190,8 +202,135 @@ fn member(dir: &str, table: &toml::Table) -> Option<Member> {
         crate_name,
         library,
         binary,
+        uniform_paths: false,
         bindings: BTreeMap::new(),
     })
+}
+
+/// Whether every target of the package `table` is proved to be of edition 2018 or later,
+/// where a `use` path starts in its own module and not at the crate root. Only a literal
+/// `[package] edition`, or one inherited from the `[workspace.package]` of the checkout's
+/// root manifest, proves it. A missing key is edition 2015, and an edition that is not a
+/// string or that this list does not name proves nothing. A target can set an edition of
+/// its own and compile any file under it (`[[example]] edition = "2015"` with
+/// `path = "src/lib.rs"`), so an `edition` key in any other top-level table, or in any entry
+/// of a top-level array, proves nothing for the whole package, whatever its value, and so
+/// does a top-level array with an entry that is not a table (a `cargo-features` list that
+/// is not empty). A package that names
+/// another workspace root proves nothing either.
+fn uniform_paths(table: &toml::Table, root: &toml::Table) -> bool {
+    const UNIFORM: [&str; 3] = ["2018", "2021", "2024"];
+    let known = |edition: Option<&toml::Value>| {
+        edition
+            .and_then(toml::Value::as_str)
+            .is_some_and(|edition| UNIFORM.contains(&edition))
+    };
+    let own_edition = |section: &toml::Value| match section {
+        toml::Value::Table(section) => section.contains_key("edition"),
+        toml::Value::Array(entries) => entries.iter().any(|entry| {
+            entry
+                .as_table()
+                .is_none_or(|entry| entry.contains_key("edition"))
+        }),
+        _ => false,
+    };
+    let Some(package) = table.get("package").and_then(toml::Value::as_table) else {
+        return false;
+    };
+    if package.contains_key("workspace")
+        || table.iter().any(|(key, section)| {
+            !matches!(key.as_str(), "package" | "workspace") && own_edition(section)
+        })
+    {
+        return false;
+    }
+    match package.get("edition") {
+        Some(toml::Value::Table(inherit)) => {
+            inherit.len() == 1
+                && inherit.get("workspace").and_then(toml::Value::as_bool) == Some(true)
+                && known(
+                    root.get("workspace")
+                        .and_then(toml::Value::as_table)
+                        .and_then(|workspace| workspace.get("package"))
+                        .and_then(toml::Value::as_table)
+                        .and_then(|package| package.get("edition")),
+                )
+        }
+        edition => known(edition),
+    }
+}
+
+/// Whether the package manifest `table` names a target root, a target `path` or a string
+/// `package.build`, by an absolute path: a leading `/`, a drive letter or a backslash.
+fn absolute_target(table: &toml::Table) -> bool {
+    let absolute = |path: Option<&toml::Value>| {
+        path.and_then(toml::Value::as_str).is_some_and(|path| {
+            path.starts_with('/') || path.contains('\\') || path.chars().nth(1) == Some(':')
+        })
+    };
+    let named = |section: &toml::Value| absolute(section.as_table().and_then(|s| s.get("path")));
+    let Some(package) = table.get("package").and_then(toml::Value::as_table) else {
+        return false;
+    };
+    absolute(package.get("build"))
+        || table.values().any(|section| match section {
+            toml::Value::Table(_) => named(section),
+            toml::Value::Array(entries) => entries.iter().any(named),
+            _ => false,
+        })
+}
+
+/// The directories the package manifest `table` in `dir` discovers targets in, each with
+/// `dir` and a trailing `/`.
+fn target_dirs(dir: &str, table: &toml::Table) -> Vec<(String, String)> {
+    if !table.contains_key("package") {
+        return Vec::new();
+    }
+    ["src/bin", "examples", "tests", "benches"]
+        .into_iter()
+        .filter_map(|targets| Some((dir.to_owned(), format!("{}/", join(dir, targets)?))))
+        .collect()
+}
+
+/// The files the package manifest `table` in `dir` names as a target root: the conventional
+/// library, binary and build script roots, a string `package.build`, and the `path` of
+/// every top-level table and of every entry of
+/// a top-level array (`[lib]`, `[[bin]]`, `[[example]]`, `[[test]]`, `[[bench]]`). A path
+/// that leaves the checkout names no file of it. Nothing says whether Cargo would build the
+/// target; a file is only ever proved less by being named.
+fn target_roots(dir: &str, table: &toml::Table) -> BTreeSet<String> {
+    let mut roots = BTreeSet::new();
+    if !table.contains_key("package") {
+        return roots;
+    }
+    // A string `package.build` is the custom-build target's root, whatever file it names;
+    // `build = true`, `false` or no key claim nothing beyond the conventional `build.rs`.
+    let build = table
+        .get("package")
+        .and_then(toml::Value::as_table)
+        .and_then(|package| package.get("build"))
+        .and_then(toml::Value::as_str);
+    roots.extend(
+        ["src/lib.rs", "src/main.rs", "build.rs"]
+            .into_iter()
+            .chain(build)
+            .filter_map(|path| join(dir, path)),
+    );
+    let named = |section: &toml::Value| {
+        section
+            .as_table()
+            .and_then(|section| section.get("path"))
+            .and_then(toml::Value::as_str)
+            .and_then(|path| join(dir, path))
+    };
+    for section in table.values() {
+        match section {
+            toml::Value::Table(_) => roots.extend(named(section)),
+            toml::Value::Array(entries) => roots.extend(entries.iter().filter_map(named)),
+            _ => {}
+        }
+    }
+    roots
 }
 
 /// Each dependency table of a manifest that crate sources can name: `[dependencies]` and
@@ -253,15 +392,34 @@ impl Workspace {
             let Some(dirs) = member_dirs(&root, &nested) else {
                 continue;
             };
+            // Every retained package manifest, member or not, names target roots: a file two
+            // of them name can be compiled under two editions.
+            let mut claims: BTreeMap<String, usize> = BTreeMap::new();
+            for path in target_roots("", &root) {
+                *claims.entry(path).or_default() += 1;
+            }
+            let mut discovered = target_dirs("", &root);
+            let mut absolute = absolute_target(&root);
             let mut tables = Vec::new();
-            if let Some(member) = member("", &root) {
+            if let Some(mut member) = member("", &root) {
+                member.uniform_paths = uniform_paths(&root, &root);
                 tables.push((member, root.clone()));
             }
-            for dir in dirs {
+            for &dir in &nested {
                 super::owner_step(work, check)?;
-                if let Some(table) = parse(manifests[dir], work)?
-                    && let Some(member) = member(dir, &table)
+                let Some(table) = parse(manifests[dir], work)? else {
+                    continue;
+                };
+                for path in target_roots(dir, &table) {
+                    super::owner_step(work, check)?;
+                    *claims.entry(path).or_default() += 1;
+                }
+                discovered.extend(target_dirs(dir, &table));
+                absolute |= absolute_target(&table);
+                if dirs.contains(&dir)
+                    && let Some(mut member) = member(dir, &table)
                 {
+                    member.uniform_paths = uniform_paths(&table, &root);
                     tables.push((member, table));
                 }
             }
@@ -347,7 +505,15 @@ impl Workspace {
                         .collect::<BTreeMap<_, _>>(),
                 );
             }
-            let mut set = SourceSet::default();
+            let mut set = SourceSet {
+                shared: claims
+                    .into_iter()
+                    .filter_map(|(path, packages)| (packages > 1).then_some(path))
+                    .collect(),
+                discovered,
+                absolute,
+                ..SourceSet::default()
+            };
             let mut claimed: BTreeMap<String, Vec<CrateRoot>> = BTreeMap::new();
             for (index, ((mut member, _), bindings)) in tables.into_iter().zip(bindings).enumerate()
             {
@@ -379,6 +545,25 @@ impl Workspace {
     /// The crate root at `path`, when a proved member owns it alone.
     pub(super) fn crate_root(&self, source_set: &str, path: &str) -> Option<&CrateRoot> {
         self.sets.get(source_set)?.roots.get(path)
+    }
+
+    /// Whether the crate rooted at `path` is proved to be of edition 2018 or later: its
+    /// package proves it, no other retained package manifest names the file as a target
+    /// root, the file is in no directory another one discovers targets in, and no retained
+    /// package manifest names a target root by an absolute path.
+    pub(super) fn uniform_paths(&self, source_set: &str, path: &str) -> bool {
+        self.sets.get(source_set).is_some_and(|set| {
+            !set.absolute
+                && !set.shared.contains(path)
+                && set.roots.get(path).is_some_and(|root| {
+                    let member = &set.members[root.member];
+                    member.uniform_paths
+                        && !set
+                            .discovered
+                            .iter()
+                            .any(|(dir, targets)| *dir != member.dir && path.starts_with(targets))
+                })
+        })
     }
 
     /// The extern crate names the crate `from` binds to member libraries: each dependency on
@@ -435,6 +620,152 @@ mod tests {
     }
 
     const ROOT_TOML: &str = "[workspace]\nmembers = ['crates/*']\nexclude = ['crates/skip']\n[workspace.dependencies]\nshared = { path = 'crates/shared' }\n";
+
+    /// Edition 2018 or later is proved only by a literal or root-inherited `edition`.
+    #[test]
+    fn uniform_paths_need_a_proved_edition() {
+        let ws = workspace(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = ['*', 'host/*/*', 'implicit/sharer']\n[workspace.package]\nedition = '2021'\n",
+            ),
+            (
+                "inherits/Cargo.toml",
+                "[package]\nname = 'inherits'\nedition.workspace = true\n",
+            ),
+            (
+                "literal/Cargo.toml",
+                "[package]\nname = 'literal'\nedition = '2018'\n",
+            ),
+            ("absent/Cargo.toml", "[package]\nname = 'absent'\n"),
+            (
+                "old/Cargo.toml",
+                "[package]\nname = 'old'\nedition = '2015'\n",
+            ),
+            (
+                "target/Cargo.toml",
+                "[package]\nname = 'target'\nedition = '2021'\n[[bin]]\nname = 'target'\nedition = '2015'\n",
+            ),
+            (
+                "elsewhere/Cargo.toml",
+                "[package]\nname = 'elsewhere'\nedition.workspace = true\nworkspace = '../other'\n",
+            ),
+            // Any target can set an edition of its own and compile any file under it.
+            (
+                "example/Cargo.toml",
+                "[package]\nname = 'example'\nedition = '2021'\n[[example]]\nname = 'old'\nedition = '2015'\npath = 'src/lib.rs'\ncrate-type = ['lib']\n",
+            ),
+            (
+                "test/Cargo.toml",
+                "[package]\nname = 'test'\nedition = '2021'\n[[test]]\nname = 't'\nedition = '2021'\n",
+            ),
+            (
+                "bench/Cargo.toml",
+                "[package]\nname = 'bench'\nedition = '2021'\n[[bench]]\nname = 'b'\nedition = '2018'\n",
+            ),
+            (
+                "lib/Cargo.toml",
+                "[package]\nname = 'lib'\nedition = '2021'\n[lib]\nedition = '2021'\n",
+            ),
+            (
+                "shape/Cargo.toml",
+                "bin = ['not a table']\n[package]\nname = 'shape'\nedition = '2021'\n",
+            ),
+            (
+                "unstable/Cargo.toml",
+                "cargo-features = ['edition2027']\n[package]\nname = 'unstable'\nedition = '2024'\n",
+            ),
+            (
+                "number/Cargo.toml",
+                "[package]\nname = 'number'\nedition = 2021\n",
+            ),
+            // `plain` proves its own roots, but `borrower` names one of them as a target.
+            (
+                "plain/Cargo.toml",
+                "[package]\nname = 'plain'\nedition = '2021'\n[[example]]\nname = 'e'\n",
+            ),
+            // `discovered` is a member, and its library root is also an example of `host`.
+            (
+                "host/Cargo.toml",
+                "[package]\nname = 'host'\nedition = '2015'\n",
+            ),
+            (
+                "host/examples/discovered/Cargo.toml",
+                "[package]\nname = 'discovered'\nedition = '2021'\n[lib]\npath = 'main.rs'\n",
+            ),
+            (
+                "host/crates/control/Cargo.toml",
+                "[package]\nname = 'control'\nedition = '2021'\n",
+            ),
+            // A custom-build target is one more target: `builder` compiles `built`'s root.
+            (
+                "built/Cargo.toml",
+                "[package]\nname = 'built'\nedition = '2021'\nbuild = false\n",
+            ),
+            (
+                "builder/Cargo.toml",
+                "[package]\nname = 'builder'\nedition = '2015'\nbuild = '../built/src/lib.rs'\n",
+            ),
+            // The conventional `build.rs` of `implicit` is `sharer`'s library root.
+            (
+                "implicit/Cargo.toml",
+                "[package]\nname = 'implicit'\nedition = '2015'\n",
+            ),
+            (
+                "implicit/sharer/Cargo.toml",
+                "[package]\nname = 'sharer'\nedition = '2021'\n[lib]\npath = '../build.rs'\n",
+            ),
+            (
+                "borrower/Cargo.toml",
+                "[package]\nname = 'borrower'\n[[test]]\nname = 't'\npath = '../plain/src/lib.rs'\n",
+            ),
+        ]);
+        let uniform = |member: &str| ws.uniform_paths("s", &format!("{member}/src/lib.rs"));
+        assert!(uniform("inherits"));
+        assert!(uniform("literal"));
+        for member in [
+            "absent",
+            "old",
+            "target",
+            "elsewhere",
+            "unknown",
+            "example",
+            "test",
+            "bench",
+            "lib",
+            "shape",
+            "unstable",
+            "number",
+            "plain",
+            "borrower",
+            "built",
+            "builder",
+        ] {
+            assert!(!uniform(member), "{member}");
+        }
+        assert!(ws.uniform_paths("s", "plain/src/main.rs"));
+        assert!(ws.uniform_paths("s", "built/src/main.rs"));
+        assert!(!ws.uniform_paths("s", "implicit/build.rs"));
+        assert!(!ws.uniform_paths("s", "host/examples/discovered/main.rs"));
+        assert!(ws.uniform_paths("s", "host/crates/control/src/lib.rs"));
+        assert!(ws.uniform_paths("s", "literal/src/main.rs"));
+        assert!(!ws.uniform_paths("other", "literal/src/lib.rs"));
+        // An absolute target or build path anywhere relates to no file, so nothing is proved.
+        let package = "[package]\nname = 'modern'\nedition = '2021'\n";
+        for other in [
+            "[package]\nname = 'old'\n[lib]\npath = '/checkout/src/lib.rs'\n",
+            "[package]\nname = 'old'\nbuild = '/checkout/src/lib.rs'\n",
+            "[package]\nname = 'old'\n[[test]]\nname = 't'\npath = 'C:\\\\checkout\\\\src\\\\lib.rs'\n",
+        ] {
+            let ws = workspace(&[("Cargo.toml", package), ("old/Cargo.toml", other)]);
+            assert!(!ws.uniform_paths("s", "src/lib.rs"), "{other}");
+        }
+        let ws = workspace(&[
+            ("Cargo.toml", package),
+            ("old/Cargo.toml", "[package]\nname = 'old'\nbuild = false\n"),
+        ]);
+        assert!(ws.uniform_paths("s", "src/lib.rs"));
+    }
 
     #[test]
     fn members_bind_path_renamed_and_inherited_dependencies() {
