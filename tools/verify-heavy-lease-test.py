@@ -36,6 +36,23 @@ case "$name $*" in
     exit "${HEAVY_TEST_EXIT:-0}" ;;
 esac
 """
+# Runs the unmodified lease script with one observation added: when its atomic
+# mkdir of the lease finds another holder, it leaves a marker. That is the signal
+# that a run has reached the lease and been turned away.
+LEASE_OBSERVER = r"""import os, runpy, sys
+lease = os.environ["MIMIR_HEAVY_LOCK_FILE"] + ".lease"
+mkdir = os.mkdir
+def observed(path, *args, **kwargs):
+    try:
+        return mkdir(path, *args, **kwargs)
+    except FileExistsError:
+        if os.fspath(path) == lease:
+            open(os.path.join(os.environ["HEAVY_TEST_DIR"], "contended"), "a").close()
+        raise
+os.mkdir = observed
+sys.argv = sys.argv[1:]
+runpy.run_path(sys.argv[0], run_name="__main__")
+"""
 # Used only where the machine has neither gtimeout nor timeout.
 TIMEOUT_STUB = '#!/bin/sh\nshift 3\nexec "$@"\n'
 
@@ -161,14 +178,19 @@ class VerifyHeavyLease(unittest.TestCase):
             self.addCleanup(process.kill)
             return process
 
+        observer = self.dir / "lease-observer.py"
+        observer.write_text(LEASE_OBSERVER)
+        observing = self.stub(
+            "observing-python", f'#!/bin/sh\nexec "{sys.executable}" "{observer}" "$@"\n')
+
         first = start("first", HEAVY_TEST_HOLD="1")
         self.wait_for(lambda: self.events() == ["start first"], first)
-        second = start("second")
-        # The first run is paused inside its lane. Give the second a moment in which
-        # it could wrongly start; a slow machine can only make this check pass.
-        time.sleep(1)
+        # The first run is now paused inside its lane, holding the lease. Wait for
+        # the second to try the lease and find it taken. No sleep: without the
+        # lease the second never signals, runs to its end, and wait_for fails.
+        second = start("second", MIMIR_HEAVY_PYTHON=str(observing))
+        self.wait_for((self.dir / "contended").exists, second)
         self.assertEqual(self.events(), ["start first"])
-        self.assertIsNone(second.poll())
         (self.dir / "release").touch()
         for process in (first, second):
             output, _ = process.communicate(timeout=BACKSTOP)
@@ -180,7 +202,7 @@ class VerifyHeavyLease(unittest.TestCase):
     def wait_for(self, reached, process):
         deadline = time.monotonic() + BACKSTOP
         while not reached():
-            self.assertIsNone(process.poll(), "the run ended before reaching its lane")
+            self.assertIsNone(process.poll(), "the run ended before the awaited signal")
             self.assertLess(time.monotonic(), deadline, "hang backstop")
             time.sleep(0.05)
 
