@@ -36,22 +36,26 @@ case "$name $*" in
     exit "${HEAVY_TEST_EXIT:-0}" ;;
 esac
 """
-# Runs the unmodified lease script with one observation added: when its atomic
-# mkdir of the lease finds another holder, it leaves a marker. That is the signal
-# that a run has reached the lease and been turned away.
-LEASE_OBSERVER = r"""import os, runpy, sys
+# Stands in for the interpreter (MIMIR_HEAVY_PYTHON) of one run. It loads the
+# unmodified lease script and wraps its _publish_generation, the atomic mkdir of
+# the lease: when that finds the lease already held, it leaves a marker and
+# re-raises. Everything else is the real code. The marker is the signal that a
+# run has reached the lease and been turned away.
+LEASE_OBSERVER = r"""import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("heavy_run", sys.argv[1])
+heavy_run = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(heavy_run)
 lease = os.environ["MIMIR_HEAVY_LOCK_FILE"] + ".lease"
-mkdir = os.mkdir
-def observed(path, *args, **kwargs):
+publish = heavy_run._publish_generation
+def observed(path):
     try:
-        return mkdir(path, *args, **kwargs)
+        publish(path)
     except FileExistsError:
-        if os.fspath(path) == lease:
+        if str(path) == lease:
             open(os.path.join(os.environ["HEAVY_TEST_DIR"], "contended"), "a").close()
         raise
-os.mkdir = observed
-sys.argv = sys.argv[1:]
-runpy.run_path(sys.argv[0], run_name="__main__")
+heavy_run._publish_generation = observed
+sys.exit(heavy_run.run(sys.argv[2:]))
 """
 # Used only where the machine has neither gtimeout nor timeout.
 TIMEOUT_STUB = '#!/bin/sh\nshift 3\nexec "$@"\n'
@@ -92,9 +96,39 @@ class VerifyHeavyLease(unittest.TestCase):
                            "MIMIR_HEAVY_PYTHON": sys.executable,
                            "MIMIR_HEAVY_TIMEOUT_TOOL": tool, **extra})
 
+    def start(self, env, *args, command=("./tools/verify",)):
+        """Start a run with its output in files, and make sure it is gone before
+        the temporary directory is (cleanups run last-registered first, and the
+        directory's was registered in setUp)."""
+        self.runs = getattr(self, "runs", 0) + 1
+        out, err = self.dir / f"run-{self.runs}.out", self.dir / f"run-{self.runs}.err"
+        with open(out, "w") as stdout, open(err, "w") as stderr:
+            process = subprocess.Popen([*command, *args], cwd=ROOT, env=env,
+                                       stdout=stdout, stderr=stderr)
+        process.out, process.err = out, err
+        self.addCleanup(self.stop, process)
+        return process
+
+    def stop(self, process):
+        """Reap a run on every exit path, including a failed assertion while a lane
+        is held. Release the hold first so the run can end by itself: killing only
+        the process we started would leave a held lane waiting for a release file
+        in a directory that is about to be removed."""
+        (self.dir / "release").touch()
+        try:
+            process.wait(timeout=BACKSTOP)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+    def finish(self, process):
+        """Wait for a run and return it with its output read."""
+        process.wait(timeout=BACKSTOP)
+        process.stdout, process.stderr = process.out.read_text(), process.err.read_text()
+        return process
+
     def verify(self, env, *args, command=("./tools/verify",)):
-        return subprocess.run([*command, *args], cwd=ROOT, env=env, text=True,
-                              capture_output=True, timeout=BACKSTOP)
+        return self.finish(self.start(env, *args, command=command))
 
     def calls(self):
         path = self.dir / "calls"
@@ -171,12 +205,7 @@ class VerifyHeavyLease(unittest.TestCase):
 
     def test_two_runs_on_one_lock_do_not_overlap(self):
         def start(run, **extra):
-            process = subprocess.Popen(
-                ["./tools/verify", "--lane", "semantic"], cwd=ROOT, text=True,
-                env=self.leased(HEAVY_TEST_ID=run, **extra),
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-            self.addCleanup(process.kill)
-            return process
+            return self.start(self.leased(HEAVY_TEST_ID=run, **extra), "--lane", "semantic")
 
         observer = self.dir / "lease-observer.py"
         observer.write_text(LEASE_OBSERVER)
@@ -193,8 +222,8 @@ class VerifyHeavyLease(unittest.TestCase):
         self.assertEqual(self.events(), ["start first"])
         (self.dir / "release").touch()
         for process in (first, second):
-            output, _ = process.communicate(timeout=BACKSTOP)
-            self.assertEqual(process.returncode, 0, output)
+            done = self.finish(process)
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertEqual(self.events(),
                          ["start first", "end first", "start second", "end second"])
         self.assertFalse(self.lease.exists())

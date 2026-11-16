@@ -16,8 +16,11 @@ through a shared lease.
   `MIMIR_HEAVY_LOCK_HELD`), verify runs directly, so nothing waits on itself.
 
 The variable names a path in a directory that every participant can write. The
-lease needs Python 3 and `timeout` (`gtimeout` on macOS). If the variable is set
-but the lease can't be used, verify fails instead of running without it.
+lease needs Python 3.10 or later and `timeout` (`gtimeout` on macOS). On an older
+Python the lease script runs the command and then fails while releasing, which
+leaves the lease in place until it goes stale. `MIMIR_HEAVY_PYTHON` names the
+interpreter when `python3` is too old. If the variable is set but the lease
+can't be used, verify fails instead of running without it.
 
 `MIMIR_HEAVY_LOCK_TIMEOUT` (seconds, default 7200) covers the time spent waiting
 plus the run itself. Raise it when the queue may be long. The other settings are
