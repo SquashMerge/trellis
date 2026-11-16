@@ -57,6 +57,17 @@
       "runtime": "trellis.native.syntax@native-v10 test-support capture build; nativeExtractor hash includes capture adapter and test-support feature flag; tree-sitter 0.27.1; UTF-8; source-only extractionInputs []."
     },
     {
+      "name": "trellis-native-v18-javascript-test-support",
+      "status": "recorded",
+      "version": "native-v18",
+      "installedAtCapture": true,
+      "capturedOn": "2026-11-16",
+      "installMethod": "cargo build --locked --features test-support --bin trellis; deliberate tree-sitter runtime upgrade 0.27.1 -> 0.27.2 (supersedes Dependabot #970; no extractor source change) on main bd599b7a; JavaScript draft corpus captured twice byte-identical; descriptor and both captures reproducible from the README commands",
+      "artifactDigest": "sha256:14371616492bf34152be6e4350e6853645482937999fb04430245f232439b663",
+      "executableHash": "14371616492bf34152be6e4350e6853645482937999fb04430245f232439b663",
+      "runtime": "trellis.native.syntax@native-v18 test-support capture build; nativeExtractor hash includes capture adapter and test-support feature flag; tree-sitter 0.27.2; tree-sitter-typescript 0.23.2; UTF-8; source-only extractionInputs []."
+    },
+    {
       "name": "trellis-native-v17-javascript-test-support",
       "status": "recorded",
       "version": "native-v17",
@@ -77,6 +88,17 @@
       "artifactDigest": "sha256:52146f9e02702038ec4ebf7a5958da378ea9b718e2f270e618ed5bfebe89e78c",
       "executableHash": "52146f9e02702038ec4ebf7a5958da378ea9b718e2f270e618ed5bfebe89e78c",
       "runtime": "trellis.native.syntax@native-v16 test-support capture build; nativeExtractor hash includes capture adapter and test-support feature flag; tree-sitter 0.27.1; tree-sitter-typescript 0.23.2; UTF-8; source-only extractionInputs []."
+    },
+    {
+      "name": "trellis-native-v18-typescript-test-support",
+      "status": "recorded",
+      "version": "native-v18",
+      "installedAtCapture": true,
+      "capturedOn": "2026-11-16",
+      "installMethod": "cargo build --locked --features test-support --bin trellis; deliberate tree-sitter runtime upgrade 0.27.1 -> 0.27.2 (supersedes Dependabot #970; no extractor source change) on main bd599b7a; TypeScript draft corpus captured twice byte-identical; descriptor and both captures reproducible from the README commands",
+      "artifactDigest": "sha256:14371616492bf34152be6e4350e6853645482937999fb04430245f232439b663",
+      "executableHash": "14371616492bf34152be6e4350e6853645482937999fb04430245f232439b663",
+      "runtime": "trellis.native.syntax@native-v18 test-support capture build; nativeExtractor hash includes capture adapter and test-support feature flag; tree-sitter 0.27.2; tree-sitter-typescript 0.23.2; UTF-8; source-only extractionInputs []."
     },
     {
       "name": "trellis-native-v17-typescript-test-support",
