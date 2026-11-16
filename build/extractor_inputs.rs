@@ -9,6 +9,8 @@
 /// its explicit non-extraction allowlist.
 ///
 /// - `native_evidence`: tree-sitter measurement, witnesses, revision headers.
+/// - `native_evidence/extract`, `native_evidence/validate`: the per-document walk and the
+///   structural checks, moved out of `native_evidence`.
 /// - `native_records`: the native record types, the producer descriptor constants and the
 ///   lookup-key normalization, moved out of `native_evidence`.
 /// - `native_ids`: canonical JSON, digests and ID minting.
@@ -32,6 +34,8 @@ pub const EXTRACTION_MODULES: &[&str] = &[
     "src/evidence_limits.rs",
     "src/model.rs",
     "src/native_evidence.rs",
+    "src/native_evidence/extract.rs",
+    "src/native_evidence/validate.rs",
     "src/native_ids.rs",
     "src/native_records.rs",
     "src/native_rust_macros.rs",
