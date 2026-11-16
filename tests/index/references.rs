@@ -8148,13 +8148,16 @@ fn unresolved_spellings(data: &Value) -> Vec<&str> {
 }
 
 /// `input` with a captured root `Cargo.toml` of these bytes.
-fn with_cargo_manifest(mut input: Snapshot, manifest: &str) -> Snapshot {
+fn with_cargo_manifest(input: Snapshot, manifest: &str) -> Snapshot {
+    with_cargo_manifest_at(input, "Cargo.toml", manifest)
+}
+fn with_cargo_manifest_at(mut input: Snapshot, path: &str, manifest: &str) -> Snapshot {
     let source_set_id = input.documents[0].key.source_set_id.clone();
     input.manifests.push(references::external::ManifestInput {
         source_set_id,
         native_revision_id: "selected-native-revision".into(),
         dependency_hash: "captured-dependencies".into(),
-        path: "Cargo.toml".into(),
+        path: path.into(),
         content_hash: Some(hex::encode(Sha256::digest(manifest.as_bytes()))),
         bytes: Some(manifest.as_bytes().to_vec()),
     });
@@ -8381,20 +8384,109 @@ fn references_rust_reexport_sharing_a_name_stays_unknown_without_a_proved_editio
     );
     // Another package of the checkout, member or not, that names the root file as one of
     // its targets compiles it under its own edition.
-    let mut input = with_cargo_manifest(snapshot(&files), EDITION_2021);
-    let mut nested = input.manifests[0].clone();
-    nested.path = "old/Cargo.toml".into();
-    let bytes = b"[package]\nname = 'old'\nversion = '0.1.0'\n[lib]\npath = '../src/lib.rs'\n";
-    nested.content_hash = Some(hex::encode(Sha256::digest(bytes)));
-    nested.bytes = Some(bytes.to_vec());
-    input.manifests.push(nested);
-    let data = project(&input);
-    assert!(
-        unresolved_spellings(&data).contains(&"crate::parent::same"),
+    // That holds for a library path and for a custom-build path (`build = "../src/lib.rs"`
+    // in a 2015 package, which Cargo accepts).
+    for (case, nested_manifest) in [
+        (
+            "library path",
+            "[package]\nname = 'old'\nversion = '0.1.0'\n[lib]\npath = '../src/lib.rs'\n",
+        ),
+        (
+            "custom-build path",
+            "[package]\nname = 'old'\nversion = '0.1.0'\nedition = '2015'\n\
+             build = '../src/lib.rs'\n",
+        ),
+        // An absolute path cannot be related to a file of the checkout, so it may be this one.
+        (
+            "absolute library path",
+            "[package]\nname = 'old'\nversion = '0.1.0'\nedition = '2015'\n\
+             [lib]\npath = '/checkout/src/lib.rs'\n",
+        ),
+        (
+            "absolute custom-build path",
+            "[package]\nname = 'old'\nversion = '0.1.0'\nedition = '2015'\n\
+             build = '/checkout/src/lib.rs'\n",
+        ),
+    ] {
+        let input = with_cargo_manifest_at(
+            with_cargo_manifest(snapshot(&files), EDITION_2021),
+            "old/Cargo.toml",
+            nested_manifest,
+        );
+        let data = project(&input);
+        assert!(
+            unresolved_spellings(&data).contains(&"crate::parent::same"),
+            "{case}: {data}"
+        );
+        assert!(
+            !has_edge(&data, "src/caller.rs", "src/parent/same.rs"),
+            "{case}"
+        );
+        assert!(!has_edge(&data, "src/caller.rs", "src/same.rs"), "{case}");
+    }
+    // A nested package that claims other files leaves the root proved.
+    let data = project(&with_cargo_manifest_at(
+        with_cargo_manifest(snapshot(&files), EDITION_2021),
+        "old/Cargo.toml",
+        "[package]\nname = 'old'\nversion = '0.1.0'\nedition = '2015'\nbuild = 'make.rs'\n",
+    ));
+    assert_eq!(
+        mapped_spellings(&data, "src/caller.rs", "src/parent/same.rs"),
+        ["crate::parent::same"]
+    );
+}
+
+/// A package compiles the `build.rs` beside its manifest as a build script under its own
+/// edition, with no key that says so. Here that file is also the library root of a 2021
+/// workspace member, so the 2015 root package and the member compile the same crate root
+/// and mean different functions. In a virtual workspace only the member compiles it.
+#[test]
+fn references_rust_reexport_sharing_a_name_stays_unknown_over_a_conventional_build_script() {
+    let files = [
+        ("build.rs", "mod same; mod parent; mod caller; fn main() {}"),
+        ("same.rs", "pub fn same() -> u8 { 1 }"),
+        ("parent.rs", "mod same;\npub use same::same;"),
+        ("parent/same.rs", "pub fn same() -> bool { false }"),
+        (
+            "caller.rs",
+            "pub fn selected() { let _ = crate::parent::same(); }",
+        ),
+    ];
+    let member = "[package]\nname = 'member'\nversion = '0.1.0'\nedition = '2021'\n\
+                  [lib]\npath = '../build.rs'\n";
+    let workspace = "[workspace]\nmembers = ['member']\n";
+    let project_with = |root: &str| {
+        project(&with_cargo_manifest_at(
+            with_cargo_manifest(snapshot(&files), root),
+            "member/Cargo.toml",
+            member,
+        ))
+    };
+    for (case, package) in [
+        ("edition 2015", "edition = '2015'\n"),
+        ("no edition key", ""),
+        (
+            "build script switched off",
+            "edition = '2015'\nbuild = false\n",
+        ),
+    ] {
+        let data = project_with(&format!(
+            "[package]\nname = 'root'\nversion = '0.1.0'\n{package}{workspace}"
+        ));
+        assert!(
+            unresolved_spellings(&data).contains(&"crate::parent::same"),
+            "{case}: {data}"
+        );
+        for target in ["parent/same.rs", "same.rs"] {
+            assert!(!has_edge(&data, "caller.rs", target), "{case}: {target}");
+        }
+    }
+    let data = project_with(workspace);
+    assert_eq!(
+        mapped_spellings(&data, "caller.rs", "parent/same.rs"),
+        ["crate::parent::same"],
         "{data}"
     );
-    assert!(!has_edge(&data, "src/caller.rs", "src/parent/same.rs"));
-    assert!(!has_edge(&data, "src/caller.rs", "src/same.rs"));
 }
 
 /// In a crate of a proved edition, only the scope's own single, unconditional `mod` proves

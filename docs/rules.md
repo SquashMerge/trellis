@@ -905,15 +905,22 @@ Supported mapping is deliberately narrow:
   `[workspace.package]`; no target table of the package, `[lib]`, `[[bin]]`,
   `[[example]]`, `[[test]]`, `[[bench]]` or any other, has an `edition` key of any
   value, since a target can compile any file under its own edition; the manifest has
-  no `cargo-features` list and no `package.workspace`; and no other retained package
-  manifest names the crate's root file as one of its target roots or has it under a
-  directory Cargo discovers targets in), the
+  no top-level array with an entry that is not a table (so no `cargo-features` list
+  that is not empty) and no `package.workspace`; and no other retained package
+  manifest names the crate's root file as one of its target roots, a target `path`,
+  a string `package.build` or a conventional root (`src/lib.rs`, `src/main.rs`,
+  `build.rs`), or has it under a directory Cargo discovers targets in; and no
+  retained package manifest of the checkout names a target or build path that is
+  absolute, which relates to no checkout file and so leaves no crate of the checkout
+  proved), the
   scope has exactly one `mod` item of that name, the item is unconditional, and its
   file was read whole. Otherwise the repeated lookup stays unknown, as it was: a
   crate with no captured manifest, no `edition` key or edition 2015 (where a `use`
   path starts at the crate root and can name another module), and a prefix that the
-  scope binds only through an import, a glob or a macro. The four-edge limit is
-  unchanged.
+  scope binds only through an import, a glob or a macro. The edition proof covers
+  what manifests claim; a file that another crate pulls in from source
+  (`#[path = ...] mod`, `include!`) is not detected, which is a stated limit. The
+  four-edge limit is unchanged.
   Cargo workspace member crates (#772,
   owner-ratified 2026-11-10) are also proved roots: the members are the retained
   nested `Cargo.toml` directories that the captured root `[workspace] members`
