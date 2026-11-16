@@ -9,17 +9,12 @@
     return node;
   };
   // The pure display and helpers (architecture-display.js, loaded first).
-  const {createDisplay, moduleKey, commonDirectory, groupModules, display, external, plural, BOX_CAP} = window.TrellisArchitectureDisplay;
+  const {createDisplay, moduleKey, commonDirectory, groupModules, external, plural, BOX_CAP} = window.TrellisArchitectureDisplay;
   const targetLabel = identity => external(identity)
     ? `${identity.package} (${identity.language}${identity.standardLibrary ? " stdlib" : " package"})` : identity.path;
   const {metricValue, quartiles, relativeBand:band, exclusions} = window.TrellisMetricHeat;
-  const labels = {loc:"LOC (callable ranges)", sloc:"SLOC (callable ranges)", commentLines:"Comment lines (callable ranges)",
-    cognitive:"Cognitive", cyclomatic:"Cyclomatic", maxNesting:"Max nesting", maintainabilityIndex:"Maintainability (higher is better)",
-    fanOut:"Fan-out (call sites)", fanIn:"Fan-in", halstead:"Halstead", parameters:"Parameters", exits:"Exits"};
   // Resize re-layout: the quiet period, and the width change that is worth a new drawing.
   const RESIZE_DEBOUNCE_MS = 150, RESIZE_SLACK = 8;
-  // The narrow-screen drawer width (web/shell.js): the only width at which All apps columns stack (#949/#950).
-  const DRAWER_WIDTH = "(max-width: 900px)";
   const BUILD_PHASES = {reading:"reading indexed files", resolving:"resolving references", evaluating:"evaluating rules", measuring:"measuring code"};
   // The app choice when the page shares none: memory only, per checkout.
   function ownScope(context) {
@@ -244,60 +239,15 @@
       toggle.setAttribute("aria-expanded", String(shown.hidden));
       hiddenNames.textContent = layout.hidden.map(layer => layout.tests.has(layer.name) ? `${layer.name} (tests/fixtures; include them to show)` : layer.name).join(", ");
     }
-    // A drawn node's stable identity (its data attribute), so a new drawing can find it again.
-    const NODE_KEYS = ["data-trellis-module-id", "data-trellis-edge-id", "data-trellis-layer-id", "data-trellis-directory-id", "data-trellis-unassigned", "data-trellis-note-id", "data-trellis-action-id"];
-    function nodeKey(node) {
-      if (!node) return null;
-      if (node === hiddenToggle) return ["id", hiddenToggle.id];
-      const name = NODE_KEYS.find(key => node.hasAttribute?.(key));
-      return name ? [name, node.getAttribute(name)] : null;
-    }
-    function findNode(key) {
-      if (!key) return null;
-      if (key[0] === "id") return hiddenToggle;
-      const find = (name, value) => [...(get("architecture-diagram").querySelectorAll?.(`[${name}]`) || [])].find(node => node.getAttribute(name) === value) || null;
-      const found = find(key[0], key[1]);
-      if (found || key[0] !== "data-trellis-note-id") return found;
-      // A note the new drawing no longer has falls back to its owning band (or the unassigned row).
-      let layer = null;
-      try { [layer] = JSON.parse(key[1]); } catch { return null; }
-      return typeof layer === "string" ? find("data-trellis-layer-id", layer) : find("data-trellis-unassigned", "true");
-    }
-    const pressedNode = () => [...(get("architecture-diagram").querySelectorAll?.('[aria-pressed="true"]') || [])][0] || null;
-    function refocus(target) {
-      if (target.hidden) { hiddenToggle.focus?.(); return; }
-      for (const node of get("architecture-diagram").querySelectorAll?.("[role=button]") || []) {
-        if ((target.layer !== undefined && node.getAttribute("data-trellis-layer-id") === target.layer) ||
-            (target.directory !== undefined && node.getAttribute("data-trellis-directory-id") === target.directory) ||
-            (target.unassigned && node.hasAttribute("data-trellis-unassigned"))) { node.focus(); return; }
-      }
-    }
+    // Built from what they read: the drawn nodes' identities (architecture-drawing.js), the app switcher and the
+    // All apps columns (architecture-app-columns.js), and the inspector kinds (architecture-inspector.js).
+    const {nodeKey, findNode, pressedNode, refocus} = window.TrellisArchitectureDrawing.create({get, hiddenToggle});
     async function rerender(target, after) {
       const c = basis;
       if (!await render() || !usable() || !current(c)) return;
       after?.(); refocus(target);
     }
-    // The switcher and source line (#789): shown only with two or more detected apps. Choosing a
-    // button re-draws the held snapshot and never reads.
-    function switcher(payload) {
-      const target = get("architecture-apps"), line = get("architecture-source-line"), groups = apps.groups(payload);
-      const show = payload.state === "ready" && payload.apps.length >= 2 && groups.length > 0;
-      const refocus = show && !target.hidden && !!target.contains?.(document.activeElement);
-      target.hidden = line.hidden = !show; target.replaceChildren(); line.replaceChildren();
-      const footnote = get("architecture-footnote"); footnote.hidden = !show;
-      if (show) footnote.textContent = apps.footnote(window.TrellisIndexPin.label(payload));
-      if (!show) return;
-      const choose = (name, text) => {
-        const button = make("button", text); button.type = "button"; button.setAttribute("aria-pressed", String(scopeName(payload) === name));
-        button.addEventListener("click", () => { void setScope(name); }); target.append(button);
-        if (refocus && scopeName(payload) === name) button.focus?.();
-      };
-      choose(null, "All apps");
-      for (const item of groups) choose(item.name, apps.label(item));
-      const group = scopeGroup(payload);
-      line.append(make("span", apps.sourceLine(group, payload.apps.length)));
-      if (group?.duplicate) line.append(make("span", apps.duplicateNotice(group), "architecture-app-notice"));
-    }
+    const {switcher, syncCards, drawApps} = window.TrellisArchitectureAppColumns.create({get, make, apps, shared, scopeName, scopeGroup, setScope, openTab, inspect, pressOnly, openReview, asideBoxes});
     // A `↑` badge or a deviating arrow opens the Deviations tab on its edge, unselected and with
     // Calls only off (AC10, #845, #965).
     function openDeviations(action) {
@@ -516,135 +466,10 @@
         return false;
       }
     }
-    // ---- All apps (#790). Every string below that comes from the repository reaches the page through
-    // textContent (make) or setAttribute; the overlay is built with createElementNS. ----
-    const SVG_NS = "http://www.w3.org/2000/svg";
-    const cardEntries = new WeakMap();
-    const css = (node, props) => { if (node.style) Object.assign(node.style, props); };
-    // A card or header says Selected, in words and in its name, exactly while it is pressed; its overlay lines follow.
-    function syncCards() {
-      const root = get("architecture-diagram"), on = new Set();
-      for (const card of root.querySelectorAll?.("[data-trellis-card]") || []) {
-        const entry = cardEntries.get(card), pressedNow = card.getAttribute("aria-pressed") === "true";
-        if (!entry) continue;
-        card.setAttribute("aria-label", apps.cardName(entry, pressedNow));
-        if (pressedNow) on.add(apps.key(entry));
-      }
-      for (const line of root.querySelectorAll?.("[data-interface]") || []) line.setAttribute("data-selected", String(on.has(line.getAttribute("data-interface"))));
-    }
     // Presses one drawn control and no other; the selection survives a re-layout through its action id.
     function pressOnly(node) {
       for (const other of get("architecture-diagram").querySelectorAll?.("[aria-pressed]") || []) other.setAttribute("aria-pressed", String(other === node));
       pressed = nodeKey(node); syncCards();
-    }
-    async function drawApps({full, parts, canvas, width, stack, active, layout}) {
-      // Each gutter is as wide as the lines it carries (#949), so the lanes are counted before any column is drawn.
-      // Columns stack only at the narrow-screen drawer width (#949/#950, owner ruling 2026-11-12); else the canvas scrolls.
-      const laneCounts = shared.lanes(full, parts), drawer = !!window.matchMedia?.(DRAWER_WIDTH)?.matches;
-      let plan = apps.layout({width, count:parts.length, lanes:laneCounts, drawer});
-      const pele = window.TrellisArchitecturePele, grid = make("div", undefined, "architecture-apps-grid"), columns = [], boxes = [], bandsOf = new Map();
-      // Side by side, the grid's tracks alternate column and gutter, and column i takes track 2i + 1.
-      const place = () => {
-        grid.dataset.layout = plan.sideBySide ? "columns" : "stacked";
-        css(grid, {width:`${plan.width}px`, gridTemplateColumns:plan.sideBySide ? plan.widths.flatMap((each, index) => index ? [`${plan.gutters[index - 1]}px`, `${each}px`] : [`${each}px`]).join(" ") : `${plan.width}px`});
-      };
-      place();
-      // Each column's Shared bands sit on the side away from its interface partners (#850).
-      const sides = shared.sides(full, parts, plan.sideBySide);
-      for (const part of parts) {
-        const group = part.group, layered = part.slice.layers.some(layer => !layer.shared);
-        const column = make("div", undefined, "architecture-app-column"), box = make("div", undefined, "architecture-app-stack");
-        column.setAttribute("role", "group"); column.setAttribute("aria-label", group.name);
-        const info = shared.columnHeader(part);
-        const head = make("button", undefined, "architecture-app-header"); head.type = "button"; head.setAttribute("aria-pressed", "false");
-        head.setAttribute("data-trellis-action-id", JSON.stringify(["app", group.name]));
-        const line = make("span", info.deviations ? `${info.detail} · ` : info.detail, "architecture-app-line");
-        // The count opens the Deviations tab on this app (#965); the rest of the header inspects the app.
-        if (info.deviations) {
-          const tone = make("span", info.deviations, "architecture-app-deviations"); tone.dataset.tone = "error";
-          tone.setAttribute("title", `Open ${info.deviations} in Deviations`);
-          tone.addEventListener("click", event => { event?.stopPropagation?.(); if (active()) openTab({app:group.name, edge:null}); });
-          line.append(tone);
-        }
-        head.append(make("span", info.name, "architecture-app-name"), line);
-        if (info.manifests) head.append(make("span", `Detected from ${info.manifests}`, "architecture-app-line"));
-        head.append(make("span", "Selected", "architecture-selected-tag"));
-        head.addEventListener("click", () => { if (!active()) return; inspect("app", group); pressOnly(head); });
-        column.append(head, box); grid.append(column); columns.push(column); boxes.push(box);
-        // The re-layout below only widens columns, so side by side stays decided and the track is this one.
-        if (plan.sideBySide) css(column, {gridColumn:String(2 * columns.length - 1)});
-        if (!layered) {
-          const files = group.unassignedFileCount, button = make("button", `◇ ${files} unassigned · listed, never dropped`, "architecture-aside-box");
-          button.type = "button"; button.dataset.tone = "warning"; button.addEventListener("click", () => { if (active()) openReview("unassigned"); });
-          box.append(button); continue;
-        }
-        const outcome = await window.TrellisArchitecturePele.render(box, part.slice, stack(part, {width:plan.widths[columns.length - 1], title:`${group.name} · ordered layers`, sharedSide:sides.get(group.name)}));
-        if (!active()) return false;
-        if (outcome?.status !== "ready") throw new Error(outcome?.reason || outcome?.error?.message || "Architecture mapping failed. Nothing displayed.");
-        bandsOf.set(group.name, outcome.bands);
-      }
-      canvas.replaceChildren(grid);
-      // A drawing wider than its column (an unbreakable name) widens the column; the diagram scrolls.
-      plan = apps.layout({width, count:parts.length, lanes:laneCounts, drawer, natural:boxes.map(box => Math.ceil(box.scrollWidth || 0))}); place();
-      // Frames are in each drawing's own coordinates; the overlay and the cards live in the grid's.
-      const rect = node => node.getBoundingClientRect?.() || null, origin = rect(grid), places = new Map();
-      parts.forEach((part, index) => {
-        const at = origin && rect(boxes[index]), dx = at ? at.left - origin.left : plan.columns[index].x, dy = at ? at.top - origin.top : 0;
-        const bands = new Map([...(bandsOf.get(part.group.name) || [])].filter(([, frame]) => frame).map(([name, frame]) => [name, {x:frame.x + dx, y:frame.y + dy, w:frame.w, h:frame.h}]));
-        places.set(part.group.name, {index, bands, top:dy});
-      });
-      const entriesOf = full.interfaces.filter(entry => entry && places.has(entry.client) && places.has(entry.server) && entry.client !== entry.server);
-      const routed = apps.routes({interfaces:entriesOf}, plan, places, pele.edgeWidth), floor = new Map(), rest = make("div", undefined, "architecture-apps-cards");
-      let bottom = 0;
-      for (const entry of entriesOf) {
-        const words = apps.endsText(entry, routed.undrawn.get(entry) || []), button = make("button", undefined, "architecture-interface-card");
-        button.type = "button"; button.setAttribute("aria-pressed", "false"); button.setAttribute("data-trellis-action-id", apps.key(entry)); button.setAttribute("data-trellis-card", "interface");
-        const client = places.get(entry.client), server = places.get(entry.server), gutter = Math.min(client.index, server.index);
-        // A gutter narrower than a card (#949) lists the card under the grid, as for columns that are not adjacent;
-        // away from its gutter a card names its interface, as the Herdr pane's cards do.
-        const floats = plan.sideBySide && Math.abs(client.index - server.index) === 1 && apps.cardFits(plan.gutters[gutter]);
-        if (plan.sideBySide && !floats) button.append(make("span", `${entry.client} → ${entry.server}`, "architecture-card-line"));
-        for (const row of apps.cardText(entry)) {
-          const item = make("span", row.text, "architecture-card-line");
-          if (row.strong) item.dataset.strong = "true";
-          if (row.tone) item.dataset.tone = row.tone;
-          button.append(item);
-        }
-        for (const text of words) button.append(make("span", text, "architecture-card-ends"));
-        button.append(make("span", "Selected", "architecture-selected-tag"));
-        button.setAttribute("aria-label", apps.cardName(entry)); cardEntries.set(button, entry);
-        button.addEventListener("click", () => { if (!active()) return; inspect("interface", entry); pressOnly(button); });
-        if (!plan.sideBySide) columns[client.index].after(button);
-        else if (floats) {
-          // Below its own lines, so the card never covers a run; later cards in the gutter stack under it.
-          const ys = routed.lines.filter(item => item.entry === entry).map(item => item.y), start = ys.length ? Math.max(...ys) + 14 : Math.min(client.top, server.top);
-          const top = Math.max(start, floor.get(gutter) || 0);
-          button.dataset.gutter = "true"; css(button, {left:`${plan.columns[gutter].x + plan.columns[gutter].width}px`, top:`${top}px`, width:`${plan.gutters[gutter]}px`});
-          columns[client.index].after(button);
-          const height = button.offsetHeight || 96;
-          floor.set(gutter, top + height + 8); bottom = Math.max(bottom, top + height);
-        } else rest.append(button);
-      }
-      if (plan.sideBySide && bottom) css(grid, {minHeight:`${bottom + 8}px`});
-      if (routed.lines.length) {
-        const overlay = document.createElementNS(SVG_NS, "svg");
-        overlay.setAttribute("class", "architecture-apps-overlay"); overlay.setAttribute("aria-hidden", "true"); overlay.setAttribute("focusable", "false");
-        overlay.setAttribute("width", String(plan.width)); overlay.setAttribute("height", String(Math.max(grid.scrollHeight || 0, bottom + 8)));
-        for (const item of routed.lines) {
-          const path = document.createElementNS(SVG_NS, "path"), arrow = document.createElementNS(SVG_NS, "polygon");
-          path.setAttribute("class", "architecture-apps-line"); path.setAttribute("d", item.path); path.setAttribute("stroke-width", String(item.width));
-          arrow.setAttribute("class", "architecture-apps-arrow"); arrow.setAttribute("points", item.arrow);
-          for (const node of [path, arrow]) { node.setAttribute("data-interface", apps.key(item.entry)); node.setAttribute("data-selected", "false"); overlay.append(node); }
-        }
-        grid.append(overlay);
-      }
-      if (rest.children.length) canvas.append(rest);
-      if (!entriesOf.length) {
-        const names = parts.map(part => part.group.name), last = names.pop();
-        canvas.append(make("p", `No HTTP interface measured between ${names.length ? `${names.join(", ")} and ` : ""}${last}. This does not prove absence.`, "detail"));
-      }
-      canvas.append(asideBoxes(full, parts, layout, active));
-      return true;
     }
     // Below the columns: a dashed box for each hidden layer, which is the toggle's face while the layers are hidden,
     // and the unassigned files per app plus those outside every app. Counts are the DTO's.
@@ -803,25 +628,7 @@
         target.append(details);
       }
     }
-    // An edge's pairs and sampled sites are read on demand from the details route's `edge`
-    // kind (#917). Boundary callers group every pair loaded so far, above the pair list.
-    function edgePairs(target, record, active) {
-      const callers = make("div"), loaded = []; target.append(callers);
-      // The edge's bounded `key` names it; its reason text never travels in the request.
-      detailList(target, {kind:"edge", key:record.key, limit:"500"}, active, (list, items) => {
-        loaded.push(...items); callers.replaceChildren(); boundaryCallers(callers, loaded, active); pairDetails(list, items, active);
-      }, NO_PAIRS);
-    }
-    function values(target, metrics) {
-      const list = make("dl", undefined, "metric-inspector-values");
-      function visit(value, path) {
-        if (value && typeof value === "object") {
-          if (Object.hasOwn(value, "unavailable")) { list.append(make("dt", path), make("dd", `${display(value.value)} · ${value.unavailable}`)); }
-          else for (const [key, child] of Object.entries(value)) visit(child, path ? `${path} · ${labels[key] || key}` : labels[key] || key);
-        } else list.append(make("dt", path), make("dd", display(value)));
-      }
-      visit(metrics, ""); target.append(list);
-    }
+    const {values, evidenceSummary, ruleEvidence, inspectEdge, inspectLayer, inspectFound, inspectUnresolved, inspectExternal, inspectUnlayered, renderInstances} = window.TrellisArchitectureInspector.create({make, paragraph, disclosure, targetLabel, apps, layerLabel, appFilter, detailList, pairItems, instanceItems, boundaryCallers, pairDetails, inspectorSource, NO_PAIRS, inspect, overview, action, inspectRule, eligible});
     function openReview(mode) {
       if (!usable()) return;
       reviewMode = mode; get("architecture-review-panel").hidden = false; renderReview();
@@ -854,82 +661,6 @@
       reviewChips(target);
       paragraph(target, view.state === "ready" ? "Select a band, module chip or arrow to inspect its evidence." : "Authored exceptions stay editable without layers.", "detail");
     }
-    // Evidence wording follows what the selection rests on (#523); never semantically complete.
-    function evidenceSummary(payload) {
-      return payload.evidenceTier === "mixed"
-        ? "Syntax evidence and fresh semantic bindings · not semantically complete"
-        : "Syntax evidence · not compiler-resolved calls";
-    }
-    function edgeSites(edge) {
-      if (edge.evidenceTier === "semantic") return "reference sites, all bound by semantic evidence";
-      if (edge.evidenceTier === "mixed") return `reference sites, ${edge.semanticSites} bound by semantic evidence`;
-      return "structural reference sites";
-    }
-    function ruleEvidence(row) {
-      const semantic = (row.evidence || []).concat(...(row.constraints || []).map(c => c.evidence || []))
-        .some(item => item.kind === "semanticBinding" || item.kind === "typeRelationship");
-      return semantic
-        ? "Semantic evidence names a fresh producer binding and its proof; structural spelling and source-owner identities remain syntax evidence."
-        : "Captured spelling and source-owner identities are syntax evidence, not destination symbol bindings.";
-    }
-    const str = value => typeof value === "string" ? value : "";
-    // One interface row of a detail list: the route, its confidence, and a source read for the handler and each call site.
-    const endpointRows = active => (list, items) => {
-      for (const item of items) {
-        const entry = item?.entry, row = make("div", undefined, "architecture-rule-row");
-        if (!entry || typeof entry !== "object") continue;
-        const handler = entry.handler, sites = item.list === "clientOnly" ? [entry.callSite] : Array.isArray(entry.callSites) ? entry.callSites : [];
-        const route = `${str(entry.method) || "unresolved method"} ${str(entry.pathTemplate) || "(unresolved path)"}`;
-        row.dataset.list = str(item.list);
-        const tail = item.list === "matched" ? ` · ${str(entry.confidence)} · ${plural(sites.length, "call site")}` : "";
-        paragraph(row, `${route}${tail}`);
-        if (handler?.path && handler.lines) {
-          paragraph(row, `Handler ${handler.path}:${handler.lines.start}`, "detail");
-          inspectorSource(row, {path:handler.path}, {lines:handler.lines}, active, "Read handler source");
-        }
-        for (const site of sites) if (site?.document?.path) {
-          paragraph(row, `Call site ${site.document.path}:${site.lines?.start}`, "detail");
-          inspectorSource(row, {path:site.document.path}, site, active, "Read call-site source");
-        }
-        list.append(row);
-      }
-    };
-    // The interface inspector (AC15): its ends, counts and wrappers, then the matched routes and the one-sided routes and calls.
-    function inspectInterface(target, title, entry, active) {
-      const facts = apps.interfaceFacts(entry);
-      title.textContent = facts.title;
-      paragraph(target, facts.basis, "detail");
-      for (const line of facts.ends) paragraph(target, line);
-      const grid = make("dl", undefined, "metric-inspector-values");
-      for (const [name, value, tone] of facts.rows) { const item = make("dd", value); if (tone) item.dataset.tone = tone; grid.append(make("dt", name), item); }
-      target.append(grid);
-      if (facts.wrappers) paragraph(target, facts.wrappers, "detail architecture-mono");
-      const params = list => ({kind:"interfaces", client:entry.client, server:entry.server, list});
-      // The matched routes load up front, under their heading, before the one-sided lists (#950; owner ruling 2026-11-12).
-      paragraph(target, facts.matchedHeading, "detail");
-      const matched = make("div", undefined, "architecture-endpoints"); target.append(matched);
-      detailList(matched, params("matched"), active, endpointRows(active), "No matched routes at this pin.");
-      paragraph(target, "◆ Server-only routes: no call matched them", "detail");
-      detailList(target, params("serverOnly"), active, endpointRows(active), "No server-only routes.");
-      paragraph(target, "◆ Client-only calls: no route matched them. This does not prove absence.", "detail");
-      detailList(target, params("clientOnly"), active, endpointRows(active), "No client-only calls.");
-    }
-    // The app inspector: what was detected, how much of it has layers, and the interfaces it takes part in.
-    function inspectApp(target, title, group, payload, active) {
-      const facts = apps.appFacts(group, payload);
-      title.textContent = facts.title;
-      paragraph(target, facts.detail, "detail");
-      const grid = make("dl", undefined, "metric-inspector-values");
-      for (const [name, value, tone] of facts.rows) { const item = make("dd", value); if (tone) item.dataset.tone = tone; grid.append(make("dt", name), item); }
-      target.append(grid);
-      if (facts.origin) paragraph(target, facts.origin, "detail");
-      if (facts.duplicate) paragraph(target, facts.duplicate, "architecture-app-notice");
-      if (!facts.layered) paragraph(target, `${group.name} has no layers yet. The trellis_propose_rules MCP prompt can propose layers per app; this browser does not call it. Review .trellis/rules.toml to add layers with app = "${group.name}".`);
-      for (const entry of facts.interfaces) {
-        const button = make("button", `HTTP: ${entry.client} → ${entry.server}`); button.type = "button";
-        button.addEventListener("click", () => { if (active()) inspect("interface", entry); }); target.append(button);
-      }
-    }
     // One inspector per kind (`inspectors` below). Each fills the cleared inspector for its record.
     function inspectModule({target, title, record, c, active}) {
       title.textContent = record.identity.path;
@@ -951,49 +682,6 @@
       detailList(target, {kind:"pairs", path:record.identity.path}, active, pairItems(active), NO_PAIRS);
       paragraph(target, "Rule evaluation for this file (including exceptions and test-only outcomes)", "detail");
       detailList(target, {kind:"instances", path:record.identity.path}, active, instanceItems(active), "No rule instances name this file.");
-    }
-    function inspectEdge({target, title, record, active}) {
-      title.textContent = `${record.sourceLayer} → ${record.destinationLayer}`;
-      paragraph(target, `${record.count} exact ${record.role} ${edgeSites(record)} · ${record.status}${record.excepted ? ` · excepted: ${record.exceptionReason}` : " · not excepted"}${record.role === "test" ? " · hypothetical policy only; never a production violation" : ""}.`);
-      edgePairs(target, record, active);
-    }
-    function inspectLayer({target, title, record, payload, references, active}) {
-      title.textContent = record.name; paragraph(target, layerLabel(record));
-      for (const module of payload.modules.filter(item => item.layer === record.name)) {
-        const button = make("button", module.identity.path); button.type = "button"; button.addEventListener("click", () => { if (active()) inspect("module", module); }); target.append(button);
-      }
-      const packages = (references.externalPackages || []).filter(item => item.layer === record.name);
-      if (packages.length) disclosure(target, "External packages (no native source or metrics)", packages);
-      paragraph(target, "Reference pairs from or to this layer", "detail");
-      detailList(target, {kind:"pairs", layer:record.name}, active, pairItems(active), NO_PAIRS);
-      paragraph(target, "Layer policy and exceptions", "detail");
-      detailList(target, appFilter({kind:"instances", layer:record.name}), active, instanceItems(active), "No rule instances name this layer.");
-    }
-    // An interface or an app that the payload no longer has returns to the overview; `false` tells `inspect` to stop there.
-    function inspectFound({kind, target, title, record, payload, active}) {
-      const found = kind === "interface" ? apps.link(payload, record?.client, record?.server) : apps.group(payload, record?.name);
-      if (!found) { overview(); return false; }
-      if (kind === "interface") inspectInterface(target, title, found, active); else inspectApp(target, title, found, payload, active);
-    }
-    function inspectUnresolved({target, title, references, active}) {
-      title.textContent = "Unresolved structural references";
-      paragraph(target, `${references.counts?.unresolvedSites ?? 0} unresolved sites.`);
-      detailList(target, {kind:"unresolved"}, active, (list, items) => {
-        for (const item of items) {
-          const entry = make("details"); entry.append(make("summary", `${item.source.path} · ${item.reason}`), make("pre", JSON.stringify(item, null, 2)));
-          inspectorSource(entry, item.source, item.site, active); list.append(entry);
-        }
-      }, "No unresolved sites.");
-    }
-    function inspectExternal({target, title, active}) {
-      title.textContent = "External policy results";
-      paragraph(target, "Production and test-only $external results.", "detail");
-      detailList(target, {kind:"instances", rule:"$external"}, active, instanceItems(active), "No external policy results.");
-    }
-    function inspectUnlayered({target, title, payload, active}) {
-      title.textContent = "Same-layer and unassigned references";
-      detailList(target, {kind:"pairs", unlayered:"true"}, active, pairItems(active), NO_PAIRS);
-      disclosure(target, "Unassigned native file modules", payload.modules.filter(module => module.layer === null));
     }
     // Any other kind (the callers pass "unknown") is the same-layer and unassigned inspector.
     const inspectors = {module:inspectModule, edge:inspectEdge, layer:inspectLayer, interface:inspectFound, app:inspectFound, unresolved:inspectUnresolved, external:inspectExternal};
@@ -1018,19 +706,6 @@
     function action(target, label, fn, active = () => usable()) {
       const button = make("button", label); button.type = "button";
       button.addEventListener("click", () => { if (active() && !editBusy) return fn(); }); target.append(button); return button;
-    }
-    function renderInstances(target, rows, active, emptyNote = true) {
-      for (const row of rows) {
-        const r = row.instance, entry = make("div", undefined, "architecture-rule-row");
-        entry.dataset.rule = r.rule; entry.dataset.source = r.target?.path || ""; entry.dataset.destination = r.destination?.path || "";
-        const label = `${targetLabel(r.target)} → ${r.destination ? targetLabel(r.destination) : "Unknown destination"}`;
-        action(entry, `${r.rule} · ${label}`, () => inspectRule(row), active);
-        paragraph(entry, `${row.role} · ${r.sourceLayer ?? "Unassigned"} → ${r.destinationLayer ?? "Unknown"} · ${r.status} · ${r.excepted ? `excepted: ${r.exceptionReason}` : "not excepted"} · ${r.referenceCount ?? 0} exact reference sites`);
-        if (!eligible(row)) paragraph(entry, r.excepted ? "Already excepted. Edit or remove the authored entry." :
-          "New exceptions require a positively witnessed production $layers deviation between native files; unknown, external and test-only rows cannot be waived.", "detail");
-        target.append(entry);
-      }
-      if (!rows.length && emptyNote) paragraph(target, "No rule instances match this review scope.");
     }
     // One selected Deviations line: the module renders the panel body into the shared inspector.
     function inspectLine(record, render) {

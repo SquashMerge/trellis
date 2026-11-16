@@ -1,4 +1,4 @@
-# TypeScript conformance corpus — native-v17 DRAFT
+# TypeScript conformance corpus — native-v18 DRAFT
 
 Seven TypeScript sources for #683 cover interfaces, type aliases, enums, generics,
 abstract classes, parameter properties, decorators, overloads, namespaces and
@@ -28,7 +28,7 @@ used to meet a floor.
   candidates and no calls or controls, and its coverage intent requests only
   `definition`, like the call-free JavaScript `public.js` barrel.
 
-The raw capture comes from Trellis's `trellis.native.syntax@native-v17` extractor
+The raw capture comes from Trellis's `trellis.native.syntax@native-v18` extractor
 through the #95 `native-capture` command, with UTF-8 byte coordinates. Native
 identifier-site candidates carry no inferred semantic role or target. `.tsx`
 uses the tree-sitter-typescript `tsx` grammar; other paths use `typescript`.
@@ -36,15 +36,21 @@ Native measurement does no type checking, so `tsconfig.json` (`allowJs:false`,
 `include` of `src/**/*.ts` and `src/**/*.tsx`) and the dependency-free
 `package.json` describe the future semantic project, not native inputs.
 `captures/native.json` has SHA-256
-`3ef07c12b0fb72b65e4f543ea80f840c39c2f838ecb55c699c50776e844a2534`. The compiled
+`586cff6ae2f7d3418041307d27042246cacc89cf6415c0a34acaf1c38a662694`. The compiled
 native extractor hash is
-`0881e7bbc1ff94d807f12c9962cfc1ec1fa0a63448e6aeb8fde5373d94b42967`, pinned as
-`trellis-native-v17-typescript-test-support` in
-`docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json`. #958 moved the extractor to
-native-v17: the TypeScript `await f<T>(x)` misparse (a call of `await f`) is measured as the
-awaited call `f<T>(x)` with callee `f`. This corpus has no such call; two recaptures are
-byte-identical and differ from the native-v16 capture only in occurrence IDs, which
-include the producer version. The native anchors below are the native-v17 IDs.
+`14371616492bf34152be6e4350e6853645482937999fb04430245f232439b663`, pinned as
+`trellis-native-v18-typescript-test-support` in
+`docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json`. native-v18 is the deliberate
+tree-sitter runtime upgrade from 0.27.1 to 0.27.2 (Decision 0003: the runtime's `has_error`,
+byte child lookup and reverse cursor fixes can reach native measurement); the extractor source
+did not change. Two recaptures are byte-identical and differ from the native-v17 capture only in
+occurrence IDs, which include the producer version. The native anchors below are the native-v18
+IDs.
+
+#958 moved the extractor to native-v17, pinned as `trellis-native-v17-typescript-test-support`:
+the TypeScript `await f<T>(x)` misparse (a call of `await f`) is measured as the awaited call
+`f<T>(x)` with callee `f`. This corpus has no such call, so that recapture also changed only
+occurrence IDs.
 
 Before #958 the capture was the final native-v16 extractor of #683, pinned as
 `trellis-native-v16-typescript-test-support`. The #800 review re-pinned it after the extractor
@@ -88,11 +94,11 @@ C22 to C26 are covered by `src/native_typescript_tests.rs`, not by this corpus.
 |---|---|---|---|---|
 | C3 | abstract class | `src/geometry.ts:23` | `2:r1:sid:v1:2269896ca380b25af31e4033a1a79716` | `type` named `Shape`, `Header.modifiers` contains `abstract` |
 | C3/C11 | abstract method | `src/geometry.ts:24` | `2:r1:sid:v1:41af0be0ab8632e26fd249868b5f7f3f` | `method` `area` with `abstract` modifier |
-| C12 | decorator before `export` (call) | `src/geometry.ts:76` | `2:r1:occ:v2:7efe9af78d9905467ba6354910d8449f` | `@sealed()` written before `export` is a child of `export_statement`, so its call is owned by the file module |
-| C12 | decorator before `export` (reference) | `src/geometry.ts:32` | `2:r1:occ:v2:515e4e84ccca8cb124d3abc17faa7620` | bare `@sealed` is a reference candidate, no call |
-| C12 | member decorator (call) | `src/geometry.ts:50` | `2:r1:occ:v2:f6fc87be1945ca94d7ac47bbf0b9dd22` | `@logged("scale")` is a call owned by the class `Rectangle` |
-| #801 | static field initializer (call) | `src/geometry.ts:57` | `2:r1:occ:v2:254ff887da9ff1a44656b6153018eb26` | `new Square(1)` is a call owned by the class `Square`, not the field `unit` |
-| C12 | parameter decorator (reference) | `src/geometry.ts:51` | `2:r1:occ:v2:53c7d1fc71f0be4bc1fc11708a6314fa` | bare `@tagged` is a reference candidate, no call |
+| C12 | decorator before `export` (call) | `src/geometry.ts:76` | `2:r1:occ:v2:5f8b0c09a48613eaba3612320df0df5a` | `@sealed()` written before `export` is a child of `export_statement`, so its call is owned by the file module |
+| C12 | decorator before `export` (reference) | `src/geometry.ts:32` | `2:r1:occ:v2:a29e7bb2018d88d08b6d0801b91f8108` | bare `@sealed` is a reference candidate, no call |
+| C12 | member decorator (call) | `src/geometry.ts:50` | `2:r1:occ:v2:bd0206b28d4627d9c4c20ca18795801c` | `@logged("scale")` is a call owned by the class `Rectangle` |
+| #801 | static field initializer (call) | `src/geometry.ts:57` | `2:r1:occ:v2:e8c172dc725808e945c6dd58237e4941` | `new Square(1)` is a call owned by the class `Square`, not the field `unit` |
+| C12 | parameter decorator (reference) | `src/geometry.ts:51` | `2:r1:occ:v2:ec20b7f459cb0de921f594e4ef5b05dd` | bare `@tagged` is a reference candidate, no call |
 | C13 | parameter property | `src/geometry.ts:35` | `2:r1:sid:v1:5840aeb8c8bb52e7a5d015bea5fc9407` | `field` `width`, parent the constructor, modifiers `public`, `readonly` |
 | C13 | parameter property (private optional) | `src/geometry.ts:37` | `2:r1:sid:v1:793470ca398b9f80fb048d9bad59e317` | `field` `label`, modifier `private` |
 | C14 | override and accessors | `src/geometry.ts:63` | `2:r1:sid:v1:4a84e0f6e56c232002106f902bf12e6c` | `method` `area` with `override` modifier |
@@ -102,7 +108,7 @@ C22 to C26 are covered by `src/native_typescript_tests.rs`, not by this corpus.
 | C5 | enum | `src/shapes.ts:17` | `2:r1:sid:v1:c0e09faf25691bdeead2151f289b42f0` | `type` named `Direction`; members are not declarations |
 | C5 | const enum | `src/shapes.ts:24` | `2:r1:sid:v1:0c33acaa0e1d0b4a53022e0552f906b3` | `type` named `Flag`, modifier `const` |
 | C6 | type alias | `src/shapes.ts:13` | `2:r1:sid:v1:17bbc52183f99f1e448cb17a041e7ff9` | `alias` named `Pair`, `Header.typeParameters` `A`, `B = A` |
-| C9 | generic call | `src/shapes.ts:30` | `2:r1:occ:v2:964fd35812e287c780c3e7006369b7ac` | `boxOf<T>(…)` is a call with callee `boxOf` |
+| C9 | generic call | `src/shapes.ts:30` | `2:r1:occ:v2:1f985b14bc87e3afd0d69cf8a79ff6fa` | `boxOf<T>(…)` is a call with callee `boxOf` |
 | C9 | generic function | `src/shapes.ts:29` | `2:r1:sid:v1:851503928ed62cd3cdbdb87815ac9f8d` | `function` `boxOf`, `Header.typeParameters` `T` |
 | C7 | `namespace A.B.C` | `src/space.ts:1` | `2:r1:sid:v1:4fab45489e3bebb004600944213ce456` | `namespace` named `Metric` (rightmost identifier; no `Geo` or `Planar`) |
 | C7 | `namespace N` | `src/space.ts:17` | `2:r1:sid:v1:5efc0da060c2c783396bec51de699b7f` | `namespace` named `Tools` |
@@ -120,12 +126,12 @@ C22 to C26 are covered by `src/native_typescript_tests.rs`, not by this corpus.
 | C19 | declaration-only document | `src/ambient.d.ts:29` | `2:r1:sid:v1:55b2767b6211def0a5cdc505c7383830` | declarations and references only; no calls or control regions |
 | C15 | `import type {a as b}` | `src/imports.ts:1` | `2:r1:sid:v1:414bc678d64187edf39e18f892ced96e` | `alias` named `ShapeBox` |
 | C15 | `import {type a as b}` neighbour | `src/imports.ts:2` | `2:r1:sid:v1:7e90ded9cfdc50ac14f8e0bff8dc4657` | `alias` named `Heading`; `type Pair` declares nothing |
-| C16 | type-only export | `src/imports.ts:7` | `2:r1:occ:v2:03d9693fa94e4ed93f62e2b7d2e6b815` | no declaration; the specifier is a reference candidate |
-| C16 | type-only local export | `src/imports.ts:8` | `2:r1:occ:v2:d50a71a56c96be7e219d6c231dfa4704` | no declaration or alias; the specifier is a reference candidate |
-| C17 | `import x = require()` | `src/imports.ts:3` | `2:r1:occ:v2:fd97f360674485f4b41b2bde6d110f86` | no declaration (documented limit); `fs` is a reference candidate |
-| C17 | `import A = N.B` | `src/imports.ts:4` | `2:r1:occ:v2:4b34c6f3217e8650a232633fac710d47` | no declaration (documented limit); `Planar` is a reference candidate |
-| C21 | JSX attribute call | `src/view.tsx:12` | `2:r1:occ:v2:ce073188e60882c84d7980b2a27bdd36` | call inside a JSX expression is measured under `Label` |
-| C21/C9 | JSX generic call | `src/view.tsx:22` | `2:r1:occ:v2:df8ebb2387e0ff55a025e88f02752919` | generic call inside a JSX child, owned by `Panel` |
+| C16 | type-only export | `src/imports.ts:7` | `2:r1:occ:v2:3cb4a7027b90385b463e71ddde34be96` | no declaration; the specifier is a reference candidate |
+| C16 | type-only local export | `src/imports.ts:8` | `2:r1:occ:v2:cede6163051aec635d682bb27150b236` | no declaration or alias; the specifier is a reference candidate |
+| C17 | `import x = require()` | `src/imports.ts:3` | `2:r1:occ:v2:3a05af39e39d94878f8a51569d99051e` | no declaration (documented limit); `fs` is a reference candidate |
+| C17 | `import A = N.B` | `src/imports.ts:4` | `2:r1:occ:v2:41ea18e3542fd4d186ede585434260e2` | no declaration (documented limit); `Planar` is a reference candidate |
+| C21 | JSX attribute call | `src/view.tsx:12` | `2:r1:occ:v2:714b5c380eb2a03b4ca305580c6352ff` | call inside a JSX expression is measured under `Label` |
+| C21/C9 | JSX generic call | `src/view.tsx:22` | `2:r1:occ:v2:51a2eacb249ec8fa1e92ac49e7f37095` | generic call inside a JSX child, owned by `Panel` |
 | C9 | `<T,>` generic arrow | `src/view.tsx:8` | `2:r1:sid:v1:ecd3ed48e4c3ac903afd8fa50731e181` | `variable` `identity` holding the arrow; the arrow is an `anonymousFunction` |
 
 ## Amendment-table notes (TypeScript grammar limits)
