@@ -1,14 +1,8 @@
 //! Captured Java package/type proofs, not compiler or member bindings.
+use super::shared::{DeclarationId, charge};
 use super::*;
 
 type PackageKey = (String, Vec<String>);
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct DeclarationId {
-    document: usize,
-    start: usize,
-    end: usize,
-    sid: String,
-}
 #[derive(Default)]
 struct Bucket {
     declarations: BTreeSet<DeclarationId>,
@@ -634,12 +628,6 @@ fn standard_library(
         targets: BTreeSet::from([Target::External(identity)]),
         ..SiteResolution::default()
     }))
-}
-fn charge(count: usize, work: &mut Work, check: &mut impl FnMut() -> Result<()>) -> Result<()> {
-    for _ in 0..count {
-        owner_step(work, check)?;
-    }
-    Ok(())
 }
 fn type_declaration(node: Node<'_>) -> bool {
     matches!(
