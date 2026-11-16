@@ -2080,3 +2080,6 @@ mod parallel_tests;
 
 #[cfg(test)]
 mod classification_tests;
+
+#[cfg(test)]
+mod read_pins_tests;
