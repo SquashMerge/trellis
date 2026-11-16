@@ -12,6 +12,15 @@
 #   ./tools/verify --lane ratchet
 set -eu
 
+# When MIMIR_HEAVY_LOCK_FILE is set, the whole run (any lanes) takes the shared
+# heavy-run lease, so heavy runs on one machine go one at a time; see
+# tools/README.md. tools/heavy_run.py sets MIMIR_HEAVY_LOCK_HELD for the command
+# it runs, so a verify that is already inside a lease runs directly: no nesting,
+# no deadlock. With the variable unset this does nothing.
+if [ -n "${MIMIR_HEAVY_LOCK_FILE:-}" ] && [ -z "${MIMIR_HEAVY_LOCK_HELD:-}" ]; then
+  exec sh "$(dirname "$0")/heavy_run.sh" sh "$0" "$@"
+fi
+
 default_lanes="rust tests semantic cohorts checks"
 lanes=""
 while [ "$#" -gt 0 ]; do
@@ -216,6 +225,7 @@ checks() {
   python3 tools/rules-ratchet-test.py
   # tools/test-selected's mapping and refusals, on a synthetic checkout (#1145).
   python3 tools/test-selected-test.py
+  python3 tools/verify-heavy-lease-test.py
   node --test tests/mcp-catalog-sdk.test.mjs tests/mcp-smoke.test.mjs
   python3 tools/stage3-watcher-runner-test.py
   python3 tools/verify-67-mixed-performance-test.py

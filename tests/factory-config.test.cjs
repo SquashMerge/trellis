@@ -399,6 +399,8 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
           FAKE_BROWSER_ROOT: join(fakeDir, "browser-cache"),
           // Linux CI sets this for the real verify; the fake runs opt in per case.
           TRELLIS_BROWSER_SYSTEM_DEPS: "",
+          // The shared heavy-run lease needs the real python3; these runs build nothing.
+          MIMIR_HEAVY_LOCK_FILE: "",
           ...extraEnv,
         },
       });
@@ -430,6 +432,7 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
         ["python3", "tools/flaky-patterns.py"],
         ["python3", "tools/rules-ratchet-test.py"],
         ["python3", "tools/test-selected-test.py"],
+        ["python3", "tools/verify-heavy-lease-test.py"],
         ["node", "--test", "tests/mcp-catalog-sdk.test.mjs", "tests/mcp-smoke.test.mjs"],
         ["python3", "tools/stage3-watcher-runner-test.py"],
         ["python3", "tools/verify-67-mixed-performance-test.py"],
