@@ -165,7 +165,7 @@ app = "trellis"
 display = "hidden"
 order = 1
 paths = [
-  "tools/*.py", "tools/*.mjs", "src/bin/**", "src/native_navigation_fixture.rs", "tools/release/**",
+  "tools/*.py", "tools/*.mjs", "src/bin/**", "tools/release/**",
   "tools/semantic-contract/**", "tools/extraction/**", "tools/selection/**",
   "tools/metrics-oracle/**", "tools/metrics-bench/**", "tools/semantic-search/**",
   "tools/synthetic-cohorts/generate.mjs", "tools/synthetic-cohorts/test/**",
@@ -231,4 +231,11 @@ paths = ["tests/**"]
 app = "trellis"
 display = "hidden"
 order = 1
-paths = ["tests/common/**", "tests/support/**"]
+paths = [
+  "tests/common/**", "tests/support/**",
+  # The publisher behind the hidden `navigation-fixture` command, which seeds the browser
+  # acceptance suite: test support by content (owner ruling, 2026-11-16). `main.rs` declares
+  # and calls it only under `cfg(feature = "test-support")`, so no default build compiles
+  # it, and it includes tests/common/graph_fixtures.rs by `#[path]`.
+  "src/native_navigation_fixture.rs",
+]
