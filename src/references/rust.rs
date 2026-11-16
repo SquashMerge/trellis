@@ -1,5 +1,6 @@
 //! Bounded, captured-syntax Rust name and module proofs, not compiler bindings.
 //! Foreign-block items and derive-generated sibling names are not modeled.
+use super::shared::DeclarationId;
 use super::*;
 
 type RouteKey = (usize, String);
@@ -84,13 +85,6 @@ type DeclarationsByRange<'a> = BTreeMap<(usize, usize, usize), Vec<&'a Declarati
 const TYPE: u8 = 0;
 const VALUE: u8 = 1;
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct DeclarationId {
-    document: usize,
-    start: usize,
-    end: usize,
-    sid: String,
-}
 #[derive(Clone)]
 struct Candidate {
     declaration: DeclarationId,

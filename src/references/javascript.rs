@@ -1,25 +1,9 @@
 //! Captured ESM export names. No runtime, package member or call binding.
+use super::shared::{Bucket, Candidate, DeclarationId, add_bucket, charge, unknown_bucket};
 use super::*;
 use std::sync::Arc;
 
 type Route = BTreeSet<(usize, String)>;
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct DeclarationId {
-    document: usize,
-    start: usize,
-    end: usize,
-    sid: String,
-}
-#[derive(Clone)]
-struct Candidate {
-    id: DeclarationId,
-    proof: BTreeSet<usize>,
-}
-#[derive(Clone, Default)]
-struct Bucket {
-    candidates: BTreeMap<DeclarationId, Candidate>,
-    unknown: bool,
-}
 #[derive(Default)]
 struct Names {
     names: BTreeMap<String, Bucket>,
@@ -859,7 +843,7 @@ impl Resolver<'_> {
                     candidates: BTreeMap::from([(
                         id.clone(),
                         Candidate {
-                            id: id.clone(),
+                            declaration: id.clone(),
                             proof: BTreeSet::from([document]),
                         },
                     )]),
@@ -878,7 +862,7 @@ impl Resolver<'_> {
                         candidates: BTreeMap::from([(
                             id.clone(),
                             Candidate {
-                                id: id.clone(),
+                                declaration: id.clone(),
                                 proof: BTreeSet::from([document]),
                             },
                         )]),
@@ -937,12 +921,6 @@ impl Resolver<'_> {
     }
 }
 
-fn charge(count: usize, work: &mut Work, check: &mut impl FnMut() -> Result<()>) -> Result<()> {
-    for _ in 0..count {
-        owner_step(work, check)?;
-    }
-    Ok(())
-}
 fn charge_package(
     package: &external::ExternalPackage,
     work: &mut Work,
@@ -1001,17 +979,11 @@ fn local_alias(
     charge(id.sid.len() + 2, work, check)?;
     let mut candidate = bucket.candidates.pop_first().expect("unique alias RHS").1;
     candidate.proof.insert(id.document);
-    candidate.id = id.clone();
+    candidate.declaration = id.clone();
     Ok(Bucket {
         candidates: BTreeMap::from([(id, candidate)]),
         unknown: false,
     })
-}
-fn unknown_bucket() -> Bucket {
-    Bucket {
-        unknown: true,
-        ..Bucket::default()
-    }
 }
 fn unknown_names() -> Names {
     Names {
@@ -1027,7 +999,7 @@ fn charge_bucket(
     owner_step(work, check)?;
     for candidate in bucket.candidates.values() {
         charge(
-            candidate.id.sid.len() + candidate.proof.len() + 1,
+            candidate.declaration.sid.len() + candidate.proof.len() + 1,
             work,
             check,
         )?;
@@ -1086,19 +1058,6 @@ fn extend_proof(
     for candidate in bucket.candidates.values_mut() {
         owner_step(work, check)?;
         candidate.proof.insert(document);
-    }
-    Ok(())
-}
-fn add_bucket(
-    result: &mut SiteResolution,
-    bucket: &Bucket,
-    work: &mut Work,
-    check: &mut impl FnMut() -> Result<()>,
-) -> Result<()> {
-    for candidate in bucket.candidates.values() {
-        charge(candidate.proof.len() + 1, work, check)?;
-        result.targets.insert(Target::Native(candidate.id.document));
-        result.proof.extend(candidate.proof.iter().copied());
     }
     Ok(())
 }
