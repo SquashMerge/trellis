@@ -1,25 +1,9 @@
 //! Bounded captured Python module/name proofs, not interpreter or call bindings.
+use super::shared::{Bucket, Candidate, DeclarationId, add_bucket, charge, unknown_bucket};
 use super::*;
 
 type ModuleKey = (String, Vec<String>);
 type Route = BTreeSet<(usize, String)>;
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct DeclarationId {
-    document: usize,
-    start: usize,
-    end: usize,
-    sid: String,
-}
-#[derive(Clone)]
-struct Candidate {
-    declaration: DeclarationId,
-    proof: BTreeSet<usize>,
-}
-#[derive(Clone, Default)]
-struct Bucket {
-    candidates: BTreeMap<DeclarationId, Candidate>,
-    unknown: bool,
-}
 #[derive(Clone, Default)]
 struct Names {
     names: BTreeMap<String, Bucket>,
@@ -1150,18 +1134,6 @@ fn declaration_id(document: usize, row: &Declaration) -> DeclarationId {
         sid: row.syntax_id.clone(),
     }
 }
-fn unknown_bucket() -> Bucket {
-    Bucket {
-        unknown: true,
-        ..Bucket::default()
-    }
-}
-fn charge(count: usize, work: &mut Work, check: &mut impl FnMut() -> Result<()>) -> Result<()> {
-    for _ in 0..count {
-        owner_step(work, check)?;
-    }
-    Ok(())
-}
 fn charge_names(
     names: &Names,
     work: &mut Work,
@@ -1223,21 +1195,6 @@ fn extend_proof(
     for candidate in bucket.candidates.values_mut() {
         charge(proof.len(), work, check)?;
         candidate.proof.extend(proof.iter().copied());
-    }
-    Ok(())
-}
-fn add_bucket(
-    result: &mut SiteResolution,
-    bucket: &Bucket,
-    work: &mut Work,
-    check: &mut impl FnMut() -> Result<()>,
-) -> Result<()> {
-    for candidate in bucket.candidates.values() {
-        charge(candidate.proof.len() + 1, work, check)?;
-        result
-            .targets
-            .insert(Target::Native(candidate.declaration.document));
-        result.proof.extend(candidate.proof.iter().copied());
     }
     Ok(())
 }
