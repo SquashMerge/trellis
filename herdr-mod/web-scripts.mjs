@@ -14,6 +14,10 @@ const WEB = {
   // Pele reads only `globalThis.OffscreenCanvas`, `globalThis.document` and `globalThis.fonts`;
   // the parameter shadows the real global, so the caller decides how text is measured.
   pele: { file: "vendor/pele-1.10.0-trellis.2.js", params: "globalThis", result: "pele" },
+  // The index snapshot pair's shared form (pure); the daemon client wraps it with the mod's typed errors.
+  "index-pin": { file: "index-pin.js", params: "window", result: "window.TrellisIndexPinCore" },
+  // The shared checks and words for a daemon answer (pure); the daemon client wraps them too.
+  "dto-core": { file: "dto-core.js", params: "window", result: "window.TrellisDtoCore" },
   "metric-heat": { file: "metric-heat.js", params: "window", result: "window.TrellisMetricHeat" },
   // The summary display (`createDisplay`) and the module helpers (pure).
   "architecture-display": { file: "architecture-display.js", params: "window", result: "window.TrellisArchitectureDisplay" },
