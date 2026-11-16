@@ -81,7 +81,7 @@ paths = [
   # A tree-sitter extractor run at capture time, plus the persisted Catalog record (#998).
   "src/classes.rs", "src/classes/**",
   "src/index_coordinator.rs", "src/index_coordinator/**", "src/capture.rs", "src/watch.rs",
-  "src/native_evidence.rs", "src/native_capture.rs",
+  "src/native_evidence.rs", "src/native_evidence/**", "src/native_capture.rs",
   "src/scip_admission.rs", "src/semantic_evidence.rs", "src/semantic_import.rs",
   "src/search_capture.rs",
   "src/native_rust_macros_tests.rs", "src/extractor_inputs_tests.rs", "src/indexer_projection_vectors_tests.rs",

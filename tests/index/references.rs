@@ -8122,3 +8122,431 @@ fn a_rust_import_past_the_bound_leaves_an_explicit_duplicate_unknown() {
     assert_eq!(run(2), (false, true));
     assert_eq!(run(130), (false, true));
 }
+
+/// The sites of `source` that reached `target`, by spelling.
+fn mapped_spellings<'a>(data: &'a Value, source: &str, target: &str) -> Vec<&'a str> {
+    let mut spellings: Vec<_> = data["production"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|pair| pair["source"]["path"] == source && pair["target"]["path"] == target)
+        .flat_map(|pair| pair["sites"].as_array().unwrap())
+        .map(|site| site["spelling"].as_str().unwrap())
+        .collect();
+    spellings.sort_unstable();
+    spellings
+}
+fn unresolved_spellings(data: &Value) -> Vec<&str> {
+    let mut spellings: Vec<_> = data["unresolved"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["site"]["spelling"].as_str().unwrap())
+        .collect();
+    spellings.sort_unstable();
+    spellings
+}
+
+/// `input` with a captured root `Cargo.toml` of these bytes.
+fn with_cargo_manifest(input: Snapshot, manifest: &str) -> Snapshot {
+    with_cargo_manifest_at(input, "Cargo.toml", manifest)
+}
+fn with_cargo_manifest_at(mut input: Snapshot, path: &str, manifest: &str) -> Snapshot {
+    let source_set_id = input.documents[0].key.source_set_id.clone();
+    input.manifests.push(references::external::ManifestInput {
+        source_set_id,
+        native_revision_id: "selected-native-revision".into(),
+        dependency_hash: "captured-dependencies".into(),
+        path: path.into(),
+        content_hash: Some(hex::encode(Sha256::digest(manifest.as_bytes()))),
+        bytes: Some(manifest.as_bytes().to_vec()),
+    });
+    input
+}
+const EDITION_2021: &str = "[package]\nname = 'fixture'\nversion = '0.1.0'\nedition = '2021'\n";
+
+/// A module re-exporting an item that shares its child module's name (`mod parse; pub use
+/// parse::parse;`) asks for the prefix `parse` while binding `parse`. That used to leave the
+/// child module's name unknown, and with it every item re-exported from that child. In a
+/// crate of edition 2018 or later, literal or inherited, the prefix is the child module,
+/// also when the crate root has a module and a function of that name.
+#[test]
+fn references_rust_reexport_sharing_its_modules_name_keeps_the_final_owner() {
+    for manifest in [
+        EDITION_2021,
+        "[package]\nname = 'fixture'\nversion = '0.1.0'\nedition = '2018'\n",
+        "[package]\nname = 'fixture'\nversion = '0.1.0'\nedition.workspace = true\n\
+         [workspace.package]\nedition = '2024'\n",
+    ] {
+        let input = with_cargo_manifest(
+            snapshot(&[
+                (
+                    "src/lib.rs",
+                    "mod parent; mod caller; mod globber; fn same() {} \
+                     mod same { pub fn same() {} }",
+                ),
+                (
+                    "src/parent.rs",
+                    "mod same; mod other; mod listed; mod selfish;\n\
+                     pub use same::same;\n\
+                     pub use other::differs;\n\
+                     pub(crate) use listed::{listed, second, Third};\n\
+                     pub use self::selfish::selfish;\n",
+                ),
+                ("src/parent/same.rs", "pub fn same() {}"),
+                // A decoy of the same name in a sibling module; the crate root has two more.
+                (
+                    "src/parent/other.rs",
+                    "pub fn differs() {} pub fn same() {}",
+                ),
+                (
+                    "src/parent/listed.rs",
+                    "pub fn listed() {} pub fn second() {} pub struct Third;",
+                ),
+                ("src/parent/selfish.rs", "pub fn selfish() {}"),
+                (
+                    "src/caller.rs",
+                    "pub fn user() {\n\
+                     crate::parent::same();\n\
+                     crate::parent::differs();\n\
+                     crate::parent::listed();\n\
+                     crate::parent::second();\n\
+                     let _ = crate::parent::Third;\n\
+                     crate::parent::selfish();\n\
+                     }",
+                ),
+                (
+                    "src/globber.rs",
+                    "use crate::parent::*; pub fn user() { same(); second(); }",
+                ),
+            ]),
+            manifest,
+        );
+        let data = project(&input);
+        assert_eq!(unresolved_spellings(&data), Vec::<&str>::new(), "{data}");
+        for (target, spellings) in [
+            ("src/parent/same.rs", vec!["crate::parent::same"]),
+            ("src/parent/other.rs", vec!["crate::parent::differs"]),
+            (
+                "src/parent/listed.rs",
+                vec![
+                    "crate::parent::Third",
+                    "crate::parent::listed",
+                    "crate::parent::second",
+                ],
+            ),
+            ("src/parent/selfish.rs", vec!["crate::parent::selfish"]),
+        ] {
+            assert_eq!(
+                mapped_spellings(&data, "src/caller.rs", target),
+                spellings,
+                "{target}"
+            );
+        }
+        assert!(!has_edge(&data, "src/caller.rs", "src/lib.rs"));
+        assert!(!has_edge(&data, "src/caller.rs", "src/parent.rs"));
+        // The re-exporting imports themselves, and a glob over the re-exporting module.
+        assert_eq!(
+            mapped_spellings(&data, "src/parent.rs", "src/parent/same.rs"),
+            ["same::same"]
+        );
+        assert_eq!(
+            mapped_spellings(&data, "src/parent.rs", "src/parent/listed.rs"),
+            ["Third", "listed", "second"]
+        );
+        assert!(has_edge(&data, "src/globber.rs", "src/parent/same.rs"));
+        assert!(has_edge(&data, "src/globber.rs", "src/parent/listed.rs"));
+        assert!(!has_edge(&data, "src/globber.rs", "src/parent/other.rs"));
+    }
+}
+
+/// In edition 2015 a `use` path starts at the crate root, so `pub use same::same;` inside
+/// `parent` names the root's `same::same`, not the child's. This crate compiles under both
+/// editions and means a different function in each. The child is chosen only when the
+/// manifest proves edition 2018 or later; every other crate keeps the unknown answer, and
+/// neither function is chosen for it.
+#[test]
+fn references_rust_reexport_sharing_a_name_stays_unknown_without_a_proved_edition() {
+    let files = [
+        ("src/lib.rs", "mod same; mod parent; mod caller;"),
+        ("src/same.rs", "pub fn same() -> u8 { 1 }"),
+        ("src/parent.rs", "mod same;\npub use same::same;"),
+        ("src/parent/same.rs", "pub fn same() -> bool { false }"),
+        (
+            "src/caller.rs",
+            "pub fn selected() { let _ = crate::parent::same(); }",
+        ),
+    ];
+    let package = "[package]\nname = 'fixture'\nversion = '0.1.0'\n";
+    for (case, manifest) in [
+        ("no manifest", None),
+        ("no edition key, so 2015", Some(package.to_owned())),
+        ("edition 2015", Some(format!("{package}edition = '2015'\n"))),
+        (
+            "an edition this catalog does not know",
+            Some(format!("{package}edition = '2099'\n")),
+        ),
+        (
+            "inherited, with nothing to inherit",
+            Some(format!("{package}edition.workspace = true\n")),
+        ),
+        (
+            "inherited 2015",
+            Some(format!(
+                "{package}edition.workspace = true\n[workspace.package]\nedition = '2015'\n"
+            )),
+        ),
+        (
+            "a library target with its own edition",
+            Some(format!(
+                "{package}edition = '2021'\n[lib]\nedition = '2015'\n"
+            )),
+        ),
+        ("a manifest that is not TOML", Some("[package".to_owned())),
+        // Valid for Cargo: the example compiles the library's root file as edition 2015.
+        (
+            "an example target with its own edition over the library root",
+            Some(format!(
+                "{package}edition = '2021'\n[[example]]\nname = 'old'\nedition = '2015'\n\
+                 path = 'src/lib.rs'\ncrate-type = ['lib']\n"
+            )),
+        ),
+        (
+            "an example target with its own edition and no path",
+            Some(format!(
+                "{package}edition = '2021'\n[[example]]\nname = 'old'\nedition = '2021'\n"
+            )),
+        ),
+        (
+            "a binary target with its own edition",
+            Some(format!(
+                "{package}edition = '2021'\n[[bin]]\nname = 'old'\nedition = '2015'\n\
+                 path = 'src/lib.rs'\n"
+            )),
+        ),
+        (
+            "a test target with its own edition",
+            Some(format!(
+                "{package}edition = '2021'\n[[test]]\nname = 'old'\nedition = '2015'\n\
+                 path = 'src/lib.rs'\n"
+            )),
+        ),
+        (
+            "a bench target with its own edition",
+            Some(format!(
+                "{package}edition = '2021'\n[[bench]]\nname = 'old'\nedition = '2015'\n\
+                 path = 'src/lib.rs'\n"
+            )),
+        ),
+        (
+            "an unstable Cargo feature list",
+            Some(format!(
+                "cargo-features = ['edition2027']\n{package}edition = '2024'\n"
+            )),
+        ),
+        (
+            "an edition that is not a string",
+            Some(format!("{package}edition = 2021\n")),
+        ),
+    ] {
+        let mut input = snapshot(&files);
+        if let Some(manifest) = &manifest {
+            input = with_cargo_manifest(input, manifest);
+        }
+        let data = project(&input);
+        assert!(
+            unresolved_spellings(&data).contains(&"crate::parent::same"),
+            "{case}: {data}"
+        );
+        for target in ["src/parent/same.rs", "src/same.rs"] {
+            assert!(
+                !has_edge(&data, "src/caller.rs", target),
+                "{case}: {target}"
+            );
+        }
+    }
+    let data = project(&with_cargo_manifest(snapshot(&files), EDITION_2021));
+    assert_eq!(
+        mapped_spellings(&data, "src/caller.rs", "src/parent/same.rs"),
+        ["crate::parent::same"]
+    );
+    assert!(!has_edge(&data, "src/caller.rs", "src/same.rs"));
+    // A target without an edition of its own takes the package's, also over the same file.
+    let data = project(&with_cargo_manifest(
+        snapshot(&files),
+        &format!(
+            "{EDITION_2021}[[example]]\nname = 'same'\npath = 'src/lib.rs'\ncrate-type = ['lib']\n"
+        ),
+    ));
+    assert_eq!(
+        mapped_spellings(&data, "src/caller.rs", "src/parent/same.rs"),
+        ["crate::parent::same"]
+    );
+    // Another package of the checkout, member or not, that names the root file as one of
+    // its targets compiles it under its own edition.
+    // That holds for a library path and for a custom-build path (`build = "../src/lib.rs"`
+    // in a 2015 package, which Cargo accepts).
+    for (case, nested_manifest) in [
+        (
+            "library path",
+            "[package]\nname = 'old'\nversion = '0.1.0'\n[lib]\npath = '../src/lib.rs'\n",
+        ),
+        (
+            "custom-build path",
+            "[package]\nname = 'old'\nversion = '0.1.0'\nedition = '2015'\n\
+             build = '../src/lib.rs'\n",
+        ),
+        // An absolute path cannot be related to a file of the checkout, so it may be this one.
+        (
+            "absolute library path",
+            "[package]\nname = 'old'\nversion = '0.1.0'\nedition = '2015'\n\
+             [lib]\npath = '/checkout/src/lib.rs'\n",
+        ),
+        (
+            "absolute custom-build path",
+            "[package]\nname = 'old'\nversion = '0.1.0'\nedition = '2015'\n\
+             build = '/checkout/src/lib.rs'\n",
+        ),
+    ] {
+        let input = with_cargo_manifest_at(
+            with_cargo_manifest(snapshot(&files), EDITION_2021),
+            "old/Cargo.toml",
+            nested_manifest,
+        );
+        let data = project(&input);
+        assert!(
+            unresolved_spellings(&data).contains(&"crate::parent::same"),
+            "{case}: {data}"
+        );
+        assert!(
+            !has_edge(&data, "src/caller.rs", "src/parent/same.rs"),
+            "{case}"
+        );
+        assert!(!has_edge(&data, "src/caller.rs", "src/same.rs"), "{case}");
+    }
+    // A nested package that claims other files leaves the root proved.
+    let data = project(&with_cargo_manifest_at(
+        with_cargo_manifest(snapshot(&files), EDITION_2021),
+        "old/Cargo.toml",
+        "[package]\nname = 'old'\nversion = '0.1.0'\nedition = '2015'\nbuild = 'make.rs'\n",
+    ));
+    assert_eq!(
+        mapped_spellings(&data, "src/caller.rs", "src/parent/same.rs"),
+        ["crate::parent::same"]
+    );
+}
+
+/// A package compiles the `build.rs` beside its manifest as a build script under its own
+/// edition, with no key that says so. Here that file is also the library root of a 2021
+/// workspace member, so the 2015 root package and the member compile the same crate root
+/// and mean different functions. In a virtual workspace only the member compiles it.
+#[test]
+fn references_rust_reexport_sharing_a_name_stays_unknown_over_a_conventional_build_script() {
+    let files = [
+        ("build.rs", "mod same; mod parent; mod caller; fn main() {}"),
+        ("same.rs", "pub fn same() -> u8 { 1 }"),
+        ("parent.rs", "mod same;\npub use same::same;"),
+        ("parent/same.rs", "pub fn same() -> bool { false }"),
+        (
+            "caller.rs",
+            "pub fn selected() { let _ = crate::parent::same(); }",
+        ),
+    ];
+    let member = "[package]\nname = 'member'\nversion = '0.1.0'\nedition = '2021'\n\
+                  [lib]\npath = '../build.rs'\n";
+    let workspace = "[workspace]\nmembers = ['member']\n";
+    let project_with = |root: &str| {
+        project(&with_cargo_manifest_at(
+            with_cargo_manifest(snapshot(&files), root),
+            "member/Cargo.toml",
+            member,
+        ))
+    };
+    for (case, package) in [
+        ("edition 2015", "edition = '2015'\n"),
+        ("no edition key", ""),
+        (
+            "build script switched off",
+            "edition = '2015'\nbuild = false\n",
+        ),
+    ] {
+        let data = project_with(&format!(
+            "[package]\nname = 'root'\nversion = '0.1.0'\n{package}{workspace}"
+        ));
+        assert!(
+            unresolved_spellings(&data).contains(&"crate::parent::same"),
+            "{case}: {data}"
+        );
+        for target in ["parent/same.rs", "same.rs"] {
+            assert!(!has_edge(&data, "caller.rs", target), "{case}: {target}");
+        }
+    }
+    let data = project_with(workspace);
+    assert_eq!(
+        mapped_spellings(&data, "caller.rs", "parent/same.rs"),
+        ["crate::parent::same"],
+        "{data}"
+    );
+}
+
+/// In a crate of a proved edition, only the scope's own single, unconditional `mod` proves
+/// the prefix on such a re-entry. A prefix bound any other way keeps the unknown answer,
+/// and no decoy is chosen.
+#[test]
+fn references_rust_reexport_sharing_a_name_stays_unknown_without_a_proved_module() {
+    let call = "pub fn user() { crate::parent::same(); }";
+    for (case, parent, extra) in [
+        (
+            "conditional module",
+            "#[cfg(feature = \"x\")] mod same; pub use same::same;",
+            None,
+        ),
+        (
+            "prefix bound by a named import",
+            "use crate::elsewhere::same; pub use same::same;",
+            Some(("src/elsewhere.rs", "pub mod same { pub fn same() {} }")),
+        ),
+        (
+            "prefix bound by a glob import",
+            "use crate::elsewhere::*; pub use same::same;",
+            Some(("src/elsewhere.rs", "pub mod same { pub fn same() {} }")),
+        ),
+        (
+            "glob re-export of the same-named item",
+            "mod same; pub use same::*;",
+            None,
+        ),
+        (
+            "module only a macro could declare",
+            "declare_module!(same); pub use same::same;",
+            None,
+        ),
+        (
+            "parser error in the re-exporting file",
+            "mod same; pub use same::same; fn broken( {",
+            None,
+        ),
+    ] {
+        let mut files = vec![
+            (
+                "src/lib.rs",
+                "mod parent; mod caller; mod elsewhere; fn same() {}",
+            ),
+            ("src/parent.rs", parent),
+            ("src/parent/same.rs", "pub fn same() {}"),
+            ("src/caller.rs", call),
+        ];
+        files.push(extra.unwrap_or(("src/elsewhere.rs", "pub fn same() {}")));
+        let data = project(&with_cargo_manifest(snapshot(&files), EDITION_2021));
+        assert!(
+            unresolved_spellings(&data).contains(&"crate::parent::same"),
+            "{case}: {data}"
+        );
+        for target in ["src/parent/same.rs", "src/elsewhere.rs", "src/lib.rs"] {
+            assert!(
+                !has_edge(&data, "src/caller.rs", target),
+                "{case}: {target}"
+            );
+        }
+    }
+}
