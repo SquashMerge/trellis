@@ -64,7 +64,7 @@ jobs:
           echo "COMPOSITION_TARGET=$target" >> "$GITHUB_ENV"
           echo "TRELLIS_COMPOSITION_TARGET=$target" >> "$GITHUB_ENV"
       # verify runs the Rust tests with nextest (one process per test).
-      - if: matrix.job == 'tests'
+      - if: matrix.job == 'tests' || matrix.job == 'checks'
         uses: ./.github/actions/install-nextest
       # Each job caches only the target directory its lanes build, under its
       # own key, so the jobs never evict each other's caches.

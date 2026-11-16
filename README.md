@@ -202,6 +202,83 @@ The browser client is embedded in the executable. Rebuild after editing `web/`.
 Tests are offline and use temporary workspaces; no provider credentials or inference is used.
 The existing selection-experiment budget is closed and is not changed by this implementation.
 
+### Running selected tests
+
+`./tools/verify` is the full gate. `tools/test-selected <selector>...` runs only the tests of
+the files you name. A selector is a repo-relative path to an existing file, or
+`path::test_name`. Every argument is a selector (there are no options), so a tool can append
+selectors it did not write. All selectors are mapped before anything runs; if one cannot be
+mapped, the script names it, runs nothing and exits 2. It never runs more than was selected.
+
+| Selector | Command (run from the repository root) |
+| --- | --- |
+| `src/**.rs` in the library | `cargo nextest run … --lib -E 'test(/^<module>::/)'` |
+| `src/**.rs` only in a binary (`src/main.rs`, `src/bin/<name>.rs` and their modules) | `cargo nextest run … --bin <name>`, with the same module filter |
+| `tests/<name>.rs`, `tests/<name>/main.rs` | `cargo nextest run … --test <name>` |
+| another file of `tests/<name>/` | `cargo nextest run … --test <name> -E 'test(/^<module>::/)'` |
+| any of the Rust rows with `::test_name` | the same target with `-E 'test(/^<module>::(.+::)?<test_name>$/)'` |
+| `tests/*.test.cjs`, `tests/*.test.mjs`, `tools/semantic-contract/test/*.test.mjs`, `tools/synthetic-cohorts/test/*.test.mjs` | `node --test <reporters> <file>` |
+| `herdr-mod/test/*.test.mjs` | `node --import ./herdr-mod/test/register.mjs --test <reporters> <file>` |
+| a Node row with `::test name` | adds `--test-name-pattern=^<test name, escaped>$` |
+| `tools/*-test.py`, `tools/**/test_*.py` | `python3 <file>` |
+| a Python row with `::test_method` or `::Class.test_method` | adds `-k '*.<name>'` |
+
+`…` is `--locked --features test-support --no-fail-fast --no-tests=fail`, with
+`CARGO_TARGET_DIR` set to the tests lane's directory (`target-test-support`, or
+`$CARGO_TARGET_DIR-test-support`), so a selected run reuses that lane's build. Cargo runs
+under the toolchain pinned in `rust-toolchain.toml`.
+
+For Rust, `<module>` is the path by which the target's `mod` declarations reach the file,
+`#[path]` included, so `src/foo_tests.rs` declared as `mod tests` in `src/foo.rs` runs
+`foo::tests::`. A file's selector runs the tests of its module and of the modules below it;
+a crate root (`src/lib.rs`, `tests/<name>/main.rs`) runs its whole target. A test name is
+matched whole, anywhere in the file's module. Tests that live elsewhere are not run: for
+`src/foo.rs` tested from `tests/core/foo.rs`, select the test file.
+
+A command that runs no selected test fails, whatever its own exit status. nextest exits 4.
+`node --test` exits 0 when a name matches nothing, so each Node command also gets a second
+reporter that records the tests that finished; the script fails the command unless a test
+that was not skipped ran (the named one, when a name is given; a suite's name is not a
+test's). unittest before Python 3.12 exits 0 after running nothing, so the script reads its
+`Ran N tests` report and fails the command when every test was skipped or none ran. A
+Python test file is run as the file itself, so it must end in `unittest.main()` under
+`if __name__ == "__main__":`, as all of them do. (`unittest discover -p <name>` is not
+used for one file: it reads the name as a pattern and also runs a file of that name in a
+package below.) The script itself runs on Python 3.9 and newer.
+
+So a selector fails in one of two ways. A selector that cannot be mapped is refused
+before any command runs (exit 2). A selector that maps but whose command runs no selected
+test fails the run when that command is reached, which may be after earlier selectors'
+commands ran: mapping does not prove that a test exists.
+
+Each selector is one command; identical commands run once. Each command is printed before
+it runs, a failure does not stop the later ones, and the exit status is the first failure's.
+`TRELLIS_TEST_SELECTED_PRINT=1` prints the commands without running them.
+
+Refused:
+
+- a selector that starts with `-`, an absolute path, a path that does not exist, a
+  directory, and a path that resolves outside the checkout, symbolic links included;
+- `tests/browser/**`: the suite needs the built binaries and the pinned Chromium, so the
+  browser lane owns it (`./tools/verify --lane browser`);
+- `tests/mcp-catalog-sdk.test.mjs` and `tests/mcp-smoke.test.mjs` while the `tests/mcp`
+  packages are not installed (`./tools/verify` installs them);
+- `tools/selection/**` and `tools/extraction/**`: standalone research harnesses with their
+  own packages, which no verify lane runs;
+- `tests/fixtures/**` and `tests/proptest-regressions/**`: test data, with no single test;
+- a Rust file that no library, binary or test target reaches, and a helper that several
+  test binaries share (`tests/support/*.rs`, `tests/common/*.rs`);
+- Rust files of a target whose modules cannot be read to their end: a module cycle, more
+  than 20000 modules, a source file over 16 MiB or not UTF-8, or a `path` attribute other
+  than `#[path = "…"]` with a plain or raw string (one under `cfg_attr`, a byte string, an
+  escape other than `\\`, `\"` and `\'`). A file the library reaches still maps when
+  the unread target is another one;
+- a test name that is not an identifier path (Rust) or `test_method` / `Class.test_method`
+  (Python); a Node name that is not one whole string literal of the file; a Python method
+  that no class of the file, or not the named class, defines. Names built at run time and
+  inherited test methods are refused by this;
+- every other layout, such as `web/*.js`, `examples/`, `build/` and documents.
+
 ## Feature Factory
 
 Repository features can be driven from GitHub Issues through Feature Factory. The tracked configuration
