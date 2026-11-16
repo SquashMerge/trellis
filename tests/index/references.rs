@@ -8122,3 +8122,161 @@ fn a_rust_import_past_the_bound_leaves_an_explicit_duplicate_unknown() {
     assert_eq!(run(2), (false, true));
     assert_eq!(run(130), (false, true));
 }
+
+/// The sites of `source` that reached `target`, by spelling.
+fn mapped_spellings<'a>(data: &'a Value, source: &str, target: &str) -> Vec<&'a str> {
+    let mut spellings: Vec<_> = data["production"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|pair| pair["source"]["path"] == source && pair["target"]["path"] == target)
+        .flat_map(|pair| pair["sites"].as_array().unwrap())
+        .map(|site| site["spelling"].as_str().unwrap())
+        .collect();
+    spellings.sort_unstable();
+    spellings
+}
+fn unresolved_spellings(data: &Value) -> Vec<&str> {
+    let mut spellings: Vec<_> = data["unresolved"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["site"]["spelling"].as_str().unwrap())
+        .collect();
+    spellings.sort_unstable();
+    spellings
+}
+
+/// A module re-exporting an item that shares its child module's name (`mod parse; pub use
+/// parse::parse;`) asks for the prefix `parse` while binding `parse`. That used to leave the
+/// child module's name unknown, and with it every item re-exported from that child.
+#[test]
+fn references_rust_reexport_sharing_its_modules_name_keeps_the_final_owner() {
+    let input = snapshot(&[
+        (
+            "src/lib.rs",
+            "mod parent; mod caller; mod globber; fn same() {}",
+        ),
+        (
+            "src/parent.rs",
+            "mod same; mod other; mod listed; mod selfish;\n\
+             pub use same::same;\n\
+             pub use other::differs;\n\
+             pub(crate) use listed::{listed, second, Third};\n\
+             pub use self::selfish::selfish;\n",
+        ),
+        ("src/parent/same.rs", "pub fn same() {}"),
+        // A decoy of the same name in a sibling module, and one in the crate root.
+        (
+            "src/parent/other.rs",
+            "pub fn differs() {} pub fn same() {}",
+        ),
+        (
+            "src/parent/listed.rs",
+            "pub fn listed() {} pub fn second() {} pub struct Third;",
+        ),
+        ("src/parent/selfish.rs", "pub fn selfish() {}"),
+        (
+            "src/caller.rs",
+            "pub fn user() {\n\
+             crate::parent::same();\n\
+             crate::parent::differs();\n\
+             crate::parent::listed();\n\
+             crate::parent::second();\n\
+             let _ = crate::parent::Third;\n\
+             crate::parent::selfish();\n\
+             }",
+        ),
+        (
+            "src/globber.rs",
+            "use crate::parent::*; pub fn user() { same(); second(); }",
+        ),
+    ]);
+    let data = project(&input);
+    assert_eq!(unresolved_spellings(&data), Vec::<&str>::new(), "{data}");
+    for (target, spellings) in [
+        ("src/parent/same.rs", vec!["crate::parent::same"]),
+        ("src/parent/other.rs", vec!["crate::parent::differs"]),
+        (
+            "src/parent/listed.rs",
+            vec![
+                "crate::parent::Third",
+                "crate::parent::listed",
+                "crate::parent::second",
+            ],
+        ),
+        ("src/parent/selfish.rs", vec!["crate::parent::selfish"]),
+    ] {
+        assert_eq!(
+            mapped_spellings(&data, "src/caller.rs", target),
+            spellings,
+            "{target}"
+        );
+    }
+    assert!(!has_edge(&data, "src/caller.rs", "src/lib.rs"));
+    assert!(!has_edge(&data, "src/caller.rs", "src/parent.rs"));
+    // The re-exporting imports themselves, and a glob over the re-exporting module.
+    assert_eq!(
+        mapped_spellings(&data, "src/parent.rs", "src/parent/same.rs"),
+        ["same::same"]
+    );
+    assert_eq!(
+        mapped_spellings(&data, "src/parent.rs", "src/parent/listed.rs"),
+        ["Third", "listed", "second"]
+    );
+    assert!(has_edge(&data, "src/globber.rs", "src/parent/same.rs"));
+    assert!(has_edge(&data, "src/globber.rs", "src/parent/listed.rs"));
+    assert!(!has_edge(&data, "src/globber.rs", "src/parent/other.rs"));
+}
+
+/// Only the scope's own single, unconditional `mod` proves the prefix. Every other way the
+/// prefix could be bound stays unknown, and no decoy is chosen.
+#[test]
+fn references_rust_reexport_sharing_a_name_stays_unknown_without_a_proved_module() {
+    let call = "pub fn user() { crate::parent::same(); }";
+    for (case, parent, extra) in [
+        (
+            "conditional module",
+            "#[cfg(feature = \"x\")] mod same; pub use same::same;",
+            None,
+        ),
+        (
+            "module bound by an import",
+            "use crate::elsewhere::same; pub use same::same;",
+            Some(("src/elsewhere.rs", "pub mod same { pub fn same() {} }")),
+        ),
+        ("glob re-export", "mod same; pub use same::*;", None),
+        (
+            "module only a macro could declare",
+            "declare_module!(same); pub use same::same;",
+            None,
+        ),
+        (
+            "parser error in the re-exporting file",
+            "mod same; pub use same::same; fn broken( {",
+            None,
+        ),
+    ] {
+        let mut files = vec![
+            (
+                "src/lib.rs",
+                "mod parent; mod caller; mod elsewhere; fn same() {}",
+            ),
+            ("src/parent.rs", parent),
+            ("src/parent/same.rs", "pub fn same() {}"),
+            ("src/caller.rs", call),
+        ];
+        files.push(extra.unwrap_or(("src/elsewhere.rs", "pub fn same() {}")));
+        let data = project(&snapshot(&files));
+        assert!(
+            unresolved_spellings(&data).contains(&"crate::parent::same"),
+            "{case}: {data}"
+        );
+        for target in ["src/parent/same.rs", "src/elsewhere.rs", "src/lib.rs"] {
+            assert!(
+                !has_edge(&data, "src/caller.rs", target),
+                "{case}: {target}"
+            );
+        }
+    }
+}

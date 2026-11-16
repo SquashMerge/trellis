@@ -896,7 +896,11 @@ Supported mapping is deliberately narrow:
   targets, never semantic calls. An inline `crate::`/`self::`/`super::` path with no
   `use` item resolves like an import of the same path, and a `pub(crate)` module or
   item is visible throughout its own crate (#828); other restricted visibilities
-  (`pub(super)`, `pub(in ...)`) remain unknown. Cargo workspace member crates (#772,
+  (`pub(super)`, `pub(in ...)`) remain unknown. A re-export can share its module's
+  name (`mod parse; pub use parse::parse;`, #1162): the scope's own single,
+  unconditional `mod` item proves the path prefix, and any other binding of that
+  prefix (a conditional module, another import, a glob, a macro) stays unknown.
+  Cargo workspace member crates (#772,
   owner-ratified 2026-11-10) are also proved roots: the members are the retained
   nested `Cargo.toml` directories that the captured root `[workspace] members`
   literal paths and simple globs match and `exclude` does not, plus the root package.

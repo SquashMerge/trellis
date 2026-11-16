@@ -1297,15 +1297,24 @@ impl Catalog {
             proof.insert(self.scopes[current].document);
             let exported = current == self.scopes[current].module
                 && !self.private_access(scope, current, check)?;
-            let mut found = self.binding(
-                current,
-                &path[index],
-                exported,
-                depth,
-                route,
-                context,
-                check,
-            )?;
+            let declared =
+                if index + 1 < path.len() && route.contains(&(current, path[index].clone())) {
+                    self.declared_module(current, &path[index], exported, depth, context, check)?
+                } else {
+                    None
+                };
+            let mut found = match declared {
+                Some(found) => found,
+                None => self.binding(
+                    current,
+                    &path[index],
+                    exported,
+                    depth,
+                    route,
+                    context,
+                    check,
+                )?,
+            };
             if lexical
                 && current != self.scopes[current].module
                 && found
@@ -1397,6 +1406,51 @@ impl Catalog {
                 }
             }
         }
+    }
+    /// The module a path prefix names when the lookup of that same name in that same scope is
+    /// already under way: `mod parse; pub use parse::parse;` asks for the prefix `parse`
+    /// while binding `parse`. Only a module continues a path, and the scope's own `mod`
+    /// item is that module whatever the import under way binds, so the prefix is proved
+    /// without the import. Only a single unconditional `mod` in a scope read whole
+    /// qualifies; for anything else `binding` answers the re-entry with unknown.
+    fn declared_module(
+        &mut self,
+        scope: usize,
+        name: &str,
+        exported: bool,
+        depth: usize,
+        context: ResolveContext<'_, '_>,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<Option<Names>> {
+        self.step(check)?;
+        let key = (TYPE, name.to_owned());
+        let declaring = &self.scopes[scope];
+        let Some([binding]) = declaring.explicit.get(&key).map(Vec::as_slice) else {
+            return Ok(None);
+        };
+        if declaring.cut || binding.uncertain || (exported && !binding.visible(context)) {
+            return Ok(None);
+        }
+        let Some(mut candidate) = binding.candidate.clone().filter(|c| c.module.is_some()) else {
+            return Ok(None);
+        };
+        candidate.follow = candidate.follow.max(depth);
+        candidate.proof.insert(declaring.document);
+        // The answer depends on the route, as a refused re-entry does: no export set
+        // computed around it is cached.
+        self.charge(self.export_traces.len(), check)?;
+        for trace in &mut self.export_traces {
+            trace.consulted.insert((scope, name.to_owned()));
+            trace.cycle = true;
+        }
+        let mut names = Names::default();
+        names
+            .names
+            .entry(key)
+            .or_default()
+            .candidates
+            .insert(candidate.declaration.clone(), candidate);
+        Ok(Some(names))
     }
     /// A module prefix alone, useful as an expansion target, not a synthetic declaration.
     fn module_name(&self, module: usize, name: &str, depth: usize) -> Names {
