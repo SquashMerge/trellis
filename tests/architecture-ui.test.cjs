@@ -5,7 +5,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const source = fs.readFileSync(path.join(__dirname, "../web/architecture.js"), "utf8");
-const pinSource = fs.readFileSync(path.join(__dirname, "../web/index-pin.js"), "utf8");
+// With the checks the controller shares with the Herdr mod (dto-core.js), which it reads when an answer arrives.
+const pinSource = ["../web/index-pin.js", "../web/dto-core.js"].map(file => fs.readFileSync(path.join(__dirname, file), "utf8")).join("\n");
 const pin = {indexGeneration:"12345678-1234-4123-8123-123456789abc",indexRevision:1};
 const descendants = node => [node, ...node.children.flatMap(descendants)];
 const text = node => descendants(node).map(item => item.textContent).join(" ");
@@ -260,6 +261,13 @@ test("same-pin role changes fence both late request outcomes and async Pele comp
   renderer.resolve({status:"error", reason:"late production render"}); await oldRender;
   assert.equal(h.get("architecture-summary").textContent, state);
   assert.match(state, /all indexed callables/);
+});
+
+test("W11 an Architecture answer for another revision is the browser's own conflict: its words, and a refresh", async () => {
+  const h = harness(); h.setResponse(async () => ({payload:{...fixture(), indexRevision:fixture().indexRevision + 1}}));
+  await h.controller.refresh(); assert.equal(h.renders.length, 0);
+  assert.equal(h.get("architecture-state").textContent, "Architecture snapshot changed. Refresh status.");
+  assert.equal(h.conflicts.length, 1, "a plain Error that carries status 409 and revision_conflict reaches onConflict");
 });
 
 test("Architecture rejects wrong role echo and labels unavailable production populations", async () => {

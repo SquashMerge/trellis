@@ -455,6 +455,7 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
         ["node", "--check", "web/app-libraries.js"],
         ["node", "--check", "web/app-views.js"],
         ["node", "--check", "web/index-pin.js"],
+        ["node", "--check", "web/dto-core.js"],
         ["node", "--check", "web/source-witness.js"],
         ["node", "--check", "web/context-menu.js"],
         ["node", "--check", "web/pele-svg.js"],
