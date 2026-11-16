@@ -17,6 +17,12 @@
 import { exec, home, readTextFile } from "herdr";
 import { Buffer } from "buffer";
 import { gunzipSync } from "zlib";
+import makeIndexPin from "trellis-web:index-pin";
+import makeDtoCore from "trellis-web:dto-core";
+
+// The checks and words the browser shares (web/index-pin.js, web/dto-core.js). The wrappers below
+// keep what is this pane's own: its typed errors, its mutable pins and its words.
+const pins = makeIndexPin({}), dto = makeDtoCore({});
 
 const LOOPBACK = /^http:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):([0-9]{1,5})$/;
 const TOKEN = /^[A-Za-z0-9_-]{1,512}$/;
@@ -128,7 +134,7 @@ export function createClient({ url = DEFAULT_URL, tokenFile, machine = null, tra
     if (!validRootKey(rootKey)) throw new TrellisError("invalid_checkout", "Choose an available checkout.");
     return request(`/api/checkouts/${rootKey}/${suffix}`, body);
   };
-  const pinQuery = (pin) => `indexGeneration=${encodeURIComponent(pin.indexGeneration)}&indexRevision=${pin.indexRevision}`;
+  const pinQuery = pins.query;
   return {
     base, machine, transport: viaExec ? "exec" : "fetch",
     checkouts: () => request("/api/checkouts"),
@@ -146,15 +152,14 @@ export function createClient({ url = DEFAULT_URL, tokenFile, machine = null, tra
   };
 }
 
-/** web/index-pin.js IndexPin.copy: a validated index snapshot pair, or a typed error. */
+/** A validated index snapshot pair (web/index-pin.js's shared form, as a new mutable object), or a typed error. */
 export function pinOf(value) {
-  if (!value || typeof value !== "object" ||
-      !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value.indexGeneration) ||
-      !Number.isSafeInteger(value.indexRevision) || value.indexRevision < 0) throw new TrellisError("invalid_revision", "Invalid index snapshot pair.");
-  return { indexGeneration: value.indexGeneration, indexRevision: value.indexRevision };
+  const pin = pins.read(value);
+  if (!pin) throw new TrellisError("invalid_revision", "Invalid index snapshot pair.");
+  return pin;
 }
-export const samePin = (a, b) => (!a && !b) || (!!a && !!b && a.indexGeneration === b.indexGeneration && a.indexRevision === b.indexRevision);
-export const pinLabel = (pin) => `${pin.indexGeneration.slice(0, 8)}:${pin.indexRevision}`;
+export const samePin = (a, b) => (!a && !b) || (!!a && !!b && pins.same(a, b));
+export const pinLabel = (pin) => pins.label(pin);
 
 /** web/architecture.js payloadOf: the Architecture states the browser accepts, or a typed error. */
 export function architecturePayload(data, pin, aggregate = "max") {
@@ -163,44 +168,23 @@ export function architecturePayload(data, pin, aggregate = "max") {
     throw new TrellisError("revision_conflict", "Architecture snapshot changed. Refreshing.");
   }
   if (payload.state === "building") return payload;
-  if (!["ready", "missing_rules", "no_layers"].includes(payload.state) || !Array.isArray(payload.apps) || !Array.isArray(payload.interfaces) ||
-      payload.aggregate !== aggregate || payload.role !== "production" ||
-      payload.workbench !== true || payload.metricsVersion !== "metrics:v1" ||
-      !["syntax", "mixed"].includes(payload.evidenceTier) || payload.semanticComplete !== false ||
-      !Array.isArray(payload.layers) || !Array.isArray(payload.modules) || !Array.isArray(payload.edges) ||
-      (["ready", "no_layers"].includes(payload.state) && (typeof payload.rulesFile?.contentHash !== "string" || !payload.rulesFile.contentHash))) {
-    throw new TrellisError("invalid_response", "Invalid Architecture response. Nothing displayed.");
-  }
+  if (!dto.architecturePayload(payload, aggregate, "production")) throw new TrellisError("invalid_response", "Invalid Architecture response. Nothing displayed.");
   return payload;
 }
 
-/** web/app.js checkoutIndexLabel: a checkout's index state as words and a shape. */
+/** web/app.js checkoutIndexLabel: a checkout's index state as words and a shape; "Unavailable" with the row's error is this pane's own. */
 export function indexLabel(row) {
-  if (!row || row.state !== "available") return { text: row?.state === "storage_busy" ? "Busy" : `Unavailable${row?.indexError ? ` · ${row.indexError}` : ""}`, state: "failed", shape: "□" };
-  if (row.indexError && row.indexError !== "index_not_ready") return { text: `Index unavailable · ${row.indexError}`, state: "failed", shape: "□" };
-  const pin = row.revision;
-  if (!pin) return row.catchingUp === true ? { text: "Catching up", state: "catching-up", shape: "◐" } : { text: "Not indexed", state: "unknown", shape: "◇" };
-  let label;
-  try { label = pinLabel(pinOf(pin)); } catch { return { text: "Index status unavailable", state: "unknown", shape: "◇" }; }
-  return row.catchingUp === true ? { text: `Catching up · rev ${label}`, state: "catching-up", shape: "◐" }
-    : row.catchingUp === false ? { text: `Fresh · rev ${label}`, state: "fresh", shape: "○" }
-    : { text: `Indexed · idle · rev ${label}`, state: "unknown", shape: "◇" };
+  return dto.checkoutIndexLabel(row, (row) => `Unavailable${row?.indexError ? ` · ${row.indexError}` : ""}`, (pin) => pinLabel(pinOf(pin)));
 }
 
 /** web/architecture.js details: one validated page of Architecture detail, or a typed error. */
 export function detailPage(data, pin, rulesHash, kind, offset) {
   const page = data?.payload;
-  if (!page || !samePin({ indexGeneration: page.indexGeneration, indexRevision: page.indexRevision }, pin) || page.rulesFile?.contentHash !== rulesHash ||
-      page.kind !== kind || page.offset !== offset || !Array.isArray(page.items) || !Number.isSafeInteger(page.total) ||
-      !(page.nextOffset === null || (Number.isSafeInteger(page.nextOffset) && page.nextOffset > offset))) {
+  if (!page || !samePin({ indexGeneration: page.indexGeneration, indexRevision: page.indexRevision }, pin) || !dto.detailPage(page, rulesHash, kind, offset)) {
     throw new TrellisError("invalid_response", "Invalid Architecture detail response. Nothing displayed.");
   }
   return page;
 }
 
-/** web/app.js jobCause: the recorded failure code and reason, never the generic job message. */
-export function jobCause(job) {
-  const code = typeof job?.error?.code === "string" && job.error.code ? job.error.code : "cause not recorded";
-  const reason = typeof job?.error?.reason === "string" && job.error.reason ? `: ${job.error.reason}` : "";
-  return `${code}${reason}`;
-}
+/** The recorded failure code and reason, never the generic job message: the browser's own (web/dto-core.js). */
+export const jobCause = dto.jobCause;

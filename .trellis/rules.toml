@@ -191,7 +191,11 @@ paths = ["herdr-mod/build.mjs", "herdr-mod/web-plugin.mjs", "herdr-mod/web-scrip
 [layers.herdr-ui]
 app = "trellis-herdr-mod"
 order = 2
-paths = ["herdr-mod/src/main.js", "herdr-mod/src/architecture-ui.js", "herdr-mod/src/panels.js"]
+paths = [
+  "herdr-mod/src/main.js", "herdr-mod/src/checkout.js", "herdr-mod/src/agent-show.js",
+  "herdr-mod/src/architecture-view.js", "herdr-mod/src/deviations.js", "herdr-mod/src/sequence-view.js",
+  "herdr-mod/src/common.js", "herdr-mod/src/architecture-ui.js", "herdr-mod/src/panels.js",
+]
 
 [layers.herdr-adapters]
 app = "trellis-herdr-mod"

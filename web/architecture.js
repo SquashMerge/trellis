@@ -133,13 +133,7 @@
         const error = new Error("Architecture snapshot changed. Refresh status."); error.code = "revision_conflict"; error.status = 409; throw error;
       }
       if (payload.state === "building") return payload;
-      if (!["ready", "missing_rules", "no_layers"].includes(payload.state) || !Array.isArray(payload.apps) || !Array.isArray(payload.interfaces) || payload.aggregate !== c.aggregate || payload.role !== c.role ||
-          payload.workbench !== true || payload.metricsVersion !== "metrics:v1" ||
-          !["syntax", "mixed"].includes(payload.evidenceTier) || payload.semanticComplete !== false ||
-          !Array.isArray(payload.layers) || !Array.isArray(payload.modules) || !Array.isArray(payload.edges) ||
-          (["ready", "no_layers"].includes(payload.state) && (typeof payload.rulesFile?.contentHash !== "string" || !payload.rulesFile.contentHash))) {
-        throw new Error("Invalid Architecture response. Nothing displayed.");
-      }
+      if (!window.TrellisDtoCore.architecturePayload(payload, c.aggregate, c.role)) throw new Error("Invalid Architecture response. Nothing displayed.");
       return payload;
     }
     function paragraph(target, text, cls) { target.append(make("p", text, cls)); }
@@ -174,9 +168,7 @@
         rulesHash:c.rulesHash, offset:String(offset)});
       const data = await request(`/api/architecture/details?${query}`, active);
       const page = data?.payload;
-      if (!page || !window.TrellisIndexPin.equal(page, c.pin) || page.rulesFile?.contentHash !== c.rulesHash || page.kind !== params.kind ||
-          page.offset !== offset || !Array.isArray(page.items) || !Number.isSafeInteger(page.total) ||
-          !(page.nextOffset === null || (Number.isSafeInteger(page.nextOffset) && page.nextOffset > offset))) {
+      if (!page || !window.TrellisIndexPin.equal(page, c.pin) || !window.TrellisDtoCore.detailPage(page, c.rulesHash, params.kind, offset)) {
         throw new Error("Invalid Architecture detail response. Nothing displayed.");
       }
       return page;
