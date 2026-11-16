@@ -3,13 +3,18 @@
 //! The index writer attaches this database to its rollback-journal transaction. A slot
 //! is therefore publication truth, including a crash before the request's terminal ACK.
 use super::producer_state::StateDir;
+use super::{Store, nonterminal_storage_busy, semantic_pin_key, typed_storage_full};
 use crate::{
     producer_records::PRODUCER_STATE_CORRUPT, semantic_batch::origin::GenerationOrigin,
     store::requests::GeneratedImportOptions,
 };
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, params};
-use std::{collections::BTreeSet, path::PathBuf, time::Duration};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 pub(crate) fn unavailable_catalog(error: &anyhow::Error) -> bool {
     error.to_string().starts_with(PRODUCER_STATE_CORRUPT)
@@ -311,6 +316,79 @@ pub(crate) fn recovery_reason(
     } else {
         "retained semantic input needs re-import; normal validation is required".into()
     })
+}
+
+impl Store {
+    /// Called by the single checkout worker after native reconciliation, before the FIFO.
+    /// This is admission into the existing queue, not a second retry owner. `admissible` is
+    /// the retained descriptor's check 1, which the caller supplies; it runs only for a
+    /// present input.
+    pub(crate) fn enqueue_retained_runs(
+        &self,
+        admissible: impl Fn(
+            &GeneratedImportOptions,
+            &crate::semantic_batch::limits::BatchLimits,
+        ) -> Result<bool>,
+    ) -> Result<()> {
+        let db = self.cache_write()?;
+        match self.attach_retention(&db) {
+            Ok(_) => {}
+            Err(error) if nonterminal_storage_busy(&error) => return Err(error),
+            Err(error) if unavailable_catalog(&error) => return Ok(()),
+            Err(error) => return Err(typed_storage_full(error)),
+        }
+        let pin = self.index_baseline()?;
+        let key = semantic_pin_key(pin);
+        let generation = pin.index_generation.to_string();
+        let pending = self.pending_generation_ids()?;
+        for RetainedRun {
+            producer,
+            options,
+            attempted_generation,
+            ..
+        } in slots(&db)?
+        {
+            let needed: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM semantic_reimport WHERE revision_id=?1 AND producer=?2)",params![key,producer], |row| row.get(0))?;
+            if !needed || attempted_generation.as_deref() == Some(&generation) {
+                continue;
+            }
+            let present = inputs_present(&options)?;
+            if present && !admissible(&options, &self.batch_publication_limits())? {
+                // An inadmissible retained descriptor is a missing input: its needs-reimport
+                // row stays published, and the slot goes so it is never queued again (#811).
+                // Releasing the hold lets cleanup strip the run's inputs.
+                db.execute(
+                    "DELETE FROM retained.retained_runs WHERE producer=?1",
+                    [&producer],
+                )?;
+                continue;
+            }
+            if present
+                && !pending
+                    .iter()
+                    .any(|(origin, id)| *origin == options.origin && *id == options.generation_id)
+            {
+                match self
+                    .enqueue_generated_semantic_import(Path::new(self.workspace_root()), &options)
+                {
+                    Ok(_) => {}
+                    Err(error) if nonterminal_storage_busy(&error) => return Err(error),
+                    // Missing input is already published as needs-reimport. Do not retry it
+                    // forever, and never rewrite the original captured identity.
+                    Err(error)
+                        if error
+                            .to_string()
+                            .starts_with("invalid_request: generation directory") => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            db.execute(
+                "UPDATE retained.retained_runs SET attempted_generation=?1 WHERE producer=?2",
+                params![generation, producer],
+            )?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
