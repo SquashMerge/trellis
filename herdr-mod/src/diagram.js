@@ -139,7 +139,7 @@ export async function draw(view, { width, theme, highlight, pause, choice }) {
     return { summary, images: [{ ...image, parts: [0] }], cards: [], sideBySide: false };
   }
 
-  // All apps (#790): web/architecture.js drawApps, with the grid composed into one SVG.
+  // All apps (#790): web/architecture-app-columns.js drawApps, with the grid composed into one SVG.
   // Each gutter is as wide as the lines it carries (#949), counted before any column is drawn.
   const lanes = summary.lanes(view, plan.parts);
   let layout = apps.layout({ width, count: plan.parts.length, lanes });

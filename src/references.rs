@@ -531,6 +531,134 @@ fn resolve(
         "invalid_request: reference sample limit"
     );
     let globs = path_globs(sources.paths, check)?;
+    let Admitted {
+        docs,
+        sorted,
+        identities,
+        modules,
+        document_map,
+        total_bytes,
+    } = admit_snapshot(snapshot, check)?;
+    // Parsing is unbudgeted, so one pass over every document keeps all workers busy.
+    let (trees, gaps): (Vec<_>, Vec<_>) = map_all(&docs, workers, request, |doc| {
+        let check = &mut request.worker();
+        let tree = parse(doc, check)?;
+        let gap = syntax_bounds::scan(tree.root_node(), check)?;
+        Ok((tree, gap))
+    })?
+    .into_iter()
+    .unzip();
+    // Every snapshot document feeds resolution, so path filters do not narrow this list.
+    let partial_files: Vec<_> = docs
+        .iter()
+        .zip(&gaps)
+        .filter_map(|(doc, gap)| {
+            snapshot
+                .evidence_gaps
+                .get(&doc.key)
+                .map(|&reason| syntax_bounds::SyntaxGap::module_only(reason, doc.file.text.len()))
+                .as_ref()
+                .or(gap.as_ref())
+                .map(|gap| gap.file(&doc.key))
+        })
+        .collect();
+    let selected: Vec<_> = docs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, doc)| {
+            // A document with no evidence has no sites either: only `partialFiles` names it.
+            (sources.selects(&globs, &doc.key.path)
+                && !snapshot.evidence_gaps.contains_key(&doc.key))
+            .then_some(i)
+        })
+        .collect();
+    let limit = work::reference_limit(docs.len(), total_bytes);
+    let read = ReadContext {
+        snapshot,
+        docs: &docs,
+        trees: &trees,
+        document_map: &document_map,
+        selected: &selected,
+        sample_limit,
+        workers,
+        request,
+    };
+    let mut catalogs = build_catalogs(read, limit, check)?;
+    let (declared, producers) = declared_targets(&docs, &mut catalogs.rust.work, check)?;
+    let locate = |document: usize, sid: &str| {
+        sorted
+            .get(document)
+            .copied()
+            .filter(|&index| declared.contains(&(index, sid)))
+    };
+    let sources = selected_references(read, &mut catalogs, &locate, check)?;
+    drop_trees(trees, workers);
+    Ok(ReferenceBase {
+        pin: snapshot.pin,
+        partial_files,
+        identities,
+        modules,
+        sources,
+        producers,
+        document_status: docs
+            .iter()
+            .filter_map(|doc| doc.semantic.projection.as_ref())
+            .fold([0; 3], |mut counts, projection| {
+                use crate::model::SemanticStatus;
+                counts[match projection.semantic_status {
+                    SemanticStatus::OlderBasis => 0,
+                    SemanticStatus::CatchingUp => 1,
+                    SemanticStatus::NeedsReimport => 2,
+                }] += 1;
+                counts
+            }),
+        sample_limit,
+        work_used: catalogs.rust.work.used,
+    })
+}
+
+/// What `admit_snapshot` hands the rest of a read.
+struct Admitted<'a> {
+    /// The snapshot's documents in key order: every later index is a position here.
+    docs: Vec<&'a DocumentInput>,
+    /// The sorted position of each snapshot document.
+    sorted: Vec<usize>,
+    identities: Vec<Identity>,
+    modules: Vec<Value>,
+    document_map: BTreeMap<DocumentKey, usize>,
+    /// The bytes of every manifest, the root tsconfig and every document.
+    total_bytes: usize,
+}
+
+/// What the stages of one read share: the snapshot, its admitted documents with their trees,
+/// the selected sources and the request.
+#[derive(Clone, Copy)]
+struct ReadContext<'a, 'r> {
+    snapshot: &'a Snapshot,
+    docs: &'a [&'a DocumentInput],
+    trees: &'a [Tree],
+    document_map: &'a BTreeMap<DocumentKey, usize>,
+    selected: &'a [usize],
+    sample_limit: usize,
+    workers: usize,
+    request: &'a parallel_check::RequestCheck<'r>,
+}
+
+/// The language catalogs of one read. `rust.work` is the budget every later stage charges.
+struct Catalogs {
+    rust: rust::Catalog,
+    packages: external::RustPackages,
+    java: Box<java::Catalog>,
+    python: Box<python::Catalog>,
+    javascript: Option<javascript::Catalog>,
+}
+
+/// Admission: the documents in key order, each with one file module and within the byte
+/// budgets, after the manifests and the root tsconfig.
+fn admit_snapshot<'a>(
+    snapshot: &'a Snapshot,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<Admitted<'a>> {
     let mut order: Vec<usize> = (0..snapshot.documents.len()).collect();
     order.sort_by(|&a, &b| snapshot.documents[a].key.cmp(&snapshot.documents[b].key));
     let docs: Vec<_> = order.iter().map(|&i| &snapshot.documents[i]).collect();
@@ -600,40 +728,33 @@ fn resolve(
             "bounded_work: reference source bytes"
         );
     }
-    // Parsing is unbudgeted, so one pass over every document keeps all workers busy.
-    let (trees, gaps): (Vec<_>, Vec<_>) = map_all(&docs, workers, request, |doc| {
-        let check = &mut request.worker();
-        let tree = parse(doc, check)?;
-        let gap = syntax_bounds::scan(tree.root_node(), check)?;
-        Ok((tree, gap))
-    })?
-    .into_iter()
-    .unzip();
-    // Every snapshot document feeds resolution, so path filters do not narrow this list.
-    let partial_files: Vec<_> = docs
-        .iter()
-        .zip(&gaps)
-        .filter_map(|(doc, gap)| {
-            snapshot
-                .evidence_gaps
-                .get(&doc.key)
-                .map(|&reason| syntax_bounds::SyntaxGap::module_only(reason, doc.file.text.len()))
-                .as_ref()
-                .or(gap.as_ref())
-                .map(|gap| gap.file(&doc.key))
-        })
-        .collect();
-    let selected: Vec<_> = docs
-        .iter()
-        .enumerate()
-        .filter_map(|(i, doc)| {
-            // A document with no evidence has no sites either: only `partialFiles` names it.
-            (sources.selects(&globs, &doc.key.path)
-                && !snapshot.evidence_gaps.contains_key(&doc.key))
-            .then_some(i)
-        })
-        .collect();
-    let limit = work::reference_limit(docs.len(), total_bytes);
+    Ok(Admitted {
+        docs,
+        sorted,
+        identities,
+        modules,
+        document_map,
+        total_bytes,
+    })
+}
+
+/// The four catalogs, each built under its own count of the limit; the counts are then
+/// admitted in catalog order into the one budget the Rust catalog keeps.
+fn build_catalogs(
+    read: ReadContext<'_, '_>,
+    limit: usize,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<Catalogs> {
+    let ReadContext {
+        snapshot,
+        docs,
+        trees,
+        document_map,
+        selected,
+        workers,
+        request,
+        ..
+    } = read;
     let catalogs = map_batch(&[0u8, 1, 2, 3], workers, request, |language| {
         let mut check = request.worker();
         let mut work = Work::new(limit);
@@ -644,18 +765,18 @@ fn resolve(
                 let workspace =
                     cargo_workspace::Workspace::new(&snapshot.manifests, &mut work, &mut check)?;
                 let catalog =
-                    rust::Catalog::new(&docs, &trees, &document_map, &workspace, work, &mut check)?;
+                    rust::Catalog::new(docs, trees, document_map, &workspace, work, &mut check)?;
                 let used = catalog.work.used;
                 return Ok((CatalogJob::Rust(Box::new((catalog, packages))), used));
             }
             1 => CatalogJob::Java(Box::new(java::Catalog::new(
-                &docs, &trees, &selected, &mut work, &mut check,
+                docs, trees, selected, &mut work, &mut check,
             )?)),
             2 => CatalogJob::Python(Box::new(python::Catalog::new(
-                &docs,
-                &trees,
+                docs,
+                trees,
                 &snapshot.manifests,
-                &selected,
+                selected,
                 &mut work,
                 &mut check,
             )?)),
@@ -672,10 +793,10 @@ fn resolve(
                     let workspaces =
                         js_workspace::Workspaces::new(&snapshot.manifests, &mut work, &mut check)?;
                     Some(javascript::Catalog::new(
-                        &docs,
-                        &trees,
-                        &document_map,
-                        &selected,
+                        docs,
+                        trees,
+                        document_map,
+                        selected,
                         &packages,
                         &workspaces,
                         snapshot.root_tsconfig.as_ref(),
@@ -714,11 +835,30 @@ fn resolve(
     };
     let javascript = *javascript;
     rust.work = work;
+    Ok(Catalogs {
+        rust,
+        packages,
+        java,
+        python,
+        javascript,
+    })
+}
+
+/// Every declaration of the snapshot, by sorted document and syntax ID.
+type Declared<'a> = BTreeSet<(usize, &'a str)>;
+
+/// The declarations a semantic binding may target, and the selected producer of each
+/// language. Without a producer nothing is declared and nothing is charged.
+fn declared_targets<'a>(
+    docs: &[&'a DocumentInput],
+    work: &mut Work,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<(Declared<'a>, BTreeMap<String, String>)> {
     // Exact internal targets of semantic bindings: every declaration of the snapshot by
     // document, so a binding whose target is not in this snapshot is not used (#523).
     let mut declared: BTreeSet<(usize, &str)> = BTreeSet::new();
     let mut producers: BTreeMap<String, String> = BTreeMap::new();
-    for doc in &docs {
+    for doc in docs {
         if let Some(producer) = &doc.semantic.producer_id {
             producers.insert(doc.key.language.clone(), producer.clone());
         }
@@ -726,23 +866,36 @@ fn resolve(
     if !producers.is_empty() {
         for (index, doc) in docs.iter().enumerate() {
             for declaration in &doc.declarations {
-                owner_step(&mut rust.work, check)?;
+                owner_step(work, check)?;
                 declared.insert((index, declaration.syntax_id.as_str()));
             }
         }
     }
-    let locate = |document: usize, sid: &str| {
-        sorted
-            .get(document)
-            .copied()
-            .filter(|&index| declared.contains(&(index, sid)))
-    };
+    Ok((declared, producers))
+}
+
+/// The references of every selected source, in batches of one prepared file per worker,
+/// each admitted in source order.
+fn selected_references(
+    read: ReadContext<'_, '_>,
+    catalogs: &mut Catalogs,
+    locate: &impl Fn(usize, &str) -> Option<usize>,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<Vec<Option<SourceReferences>>> {
+    let ReadContext {
+        docs,
+        trees,
+        selected,
+        workers,
+        request,
+        ..
+    } = read;
     let mut sources: Vec<Option<SourceReferences>> = Vec::new();
     sources.resize_with(docs.len(), || None);
     let mut site_count = 0usize;
     let mut target_documents: BTreeMap<usize, TargetDocument<'_>> = BTreeMap::new();
     for batch in selected.chunks(workers) {
-        let remaining = rust.work.remaining();
+        let remaining = catalogs.rust.work.remaining();
         let prepared = map_batch(batch, workers, request, |&source| {
             prepare_file(
                 source,
@@ -753,176 +906,237 @@ fn resolve(
             )
         })?;
         for prepared in prepared {
-            let PreparedFile {
-                source,
-                work,
-                sites,
-            } = prepared;
-            let doc = docs[source];
-            request.check()?;
-            merge_work(&mut rust.work, work.used, check)?;
-            let mut found = SourceReferences {
-                projection: doc.semantic.projection.clone(),
-                edges: BTreeMap::new(),
-                unresolved: Vec::new(),
-                proof: BTreeSet::new(),
-                packages: BTreeMap::new(),
-                coverage: BTreeMap::new(),
-                mapped: 0,
-                semantic: 0,
-            };
-            for (
-                ordinal,
-                PreparedSite {
-                    raw,
-                    mut site,
-                    anchor,
-                },
-            ) in sites.into_iter().enumerate()
-            {
-                check()?;
-                site.ordinal = ordinal;
-                let anchor = anchor.map(|index| &doc.semantic.anchors[index]);
-                let historical = doc.semantic.projection.is_some();
-                let structural = match &raw {
-                    // Historical claims cannot be resolved against N by spelling. Any
-                    // independent structural fallback must remain explicitly native-N.
-                    Some(_) if historical && anchor.is_some() => None,
-                    None => None,
-                    Some(_) if site.owner_syntax_id.is_none() => {
-                        Some(SiteResolution::unknown("reference_owner_ambiguous"))
-                    }
-                    Some(item) if doc.key.language == "rust" => Some(rust.resolve(
-                        source,
-                        item,
-                        &packages,
-                        &mut found.packages,
-                        &docs,
-                        &trees[source],
-                        check,
-                    )?),
-                    Some(item) if doc.key.language == "java" => Some(java.resolve(
-                        source,
-                        item,
-                        &mut found.packages,
-                        &mut rust.work,
-                        check,
-                    )?),
-                    Some(item) if doc.key.language == "python" => Some(python.resolve(
-                        source,
-                        item,
-                        &mut found.packages,
-                        &mut rust.work,
-                        check,
-                    )?),
-                    Some(item) if script_family(&doc.key.language) => Some(
-                        javascript
-                            .as_ref()
-                            .expect("selected JavaScript catalog")
-                            .resolve(source, item, &mut found.packages, &mut rust.work, check)?,
-                    ),
-                    Some(_) => Some(SiteResolution::unknown("module_mapping_unavailable")),
-                };
-                let semantic = anchor
-                    .and_then(|anchor| semantic_resolution(anchor, structural.as_ref(), &locate));
-                let resolution = match (semantic, structural) {
-                    // A semantic-only site inside its own module adds no module edge.
-                    (Some(resolution), None)
-                        if resolution.targets.contains(&Target::Native(source)) =>
-                    {
-                        continue;
-                    }
-                    (Some(resolution), _) => {
-                        let anchor = anchor.expect("semantic resolution has an anchor");
-                        site.mapping = "semantic";
-                        site.provenance_id = Some(anchor.provenance_id.clone());
-                        site.semantic_metadata = anchor.metadata.clone();
-                        if anchor.metadata.get("semanticBoundary") == Some(&json!(true)) {
-                            site.caller = None;
-                            site.caller_reason = Some("semantic_boundary");
-                        }
-                        if site.relation_kind == RelationKind::Reference {
-                            if anchor.call_id.is_some() {
-                                site.relation_kind = RelationKind::Call;
-                            } else if anchor.type_role {
-                                site.relation_kind = RelationKind::Type;
-                            }
-                        }
-                        resolution
-                    }
-                    (None, Some(resolution)) => resolution,
-                    // A semantic-only site whose binding is not usable here is not a site.
-                    (None, None) => continue,
-                };
-                site_count += 1;
-                ensure!(
-                    site_count <= site_limit(),
-                    "bounded_work: reference site count"
-                );
-                if let (true, Some(SemanticOutcome::Internal(document, sid))) =
-                    (site.mapping == "semantic", anchor.map(|a| &a.outcome))
-                    && let Some(target) = locate(*document, sid)
-                    && resolution.targets.contains(&Target::Native(target))
-                {
-                    owner_step(&mut rust.work, check)?;
-                    let entry = target_documents
-                        .entry(target)
-                        .or_insert_with(|| TargetDocument::new(docs[target]));
-                    site.target = entry.by_sid.get(sid.as_str()).map(|d| ReferenceTarget {
-                        syntax_id: sid.clone(),
-                        display_key: display_key(d),
-                        document: d.document.clone(),
-                        lines: lines_of(&entry.newlines, d.range.start, d.range.end),
-                    });
-                }
-                if site.target.is_none() {
-                    site.target_reason = Some(target_reason(
-                        site.mapping == "structural",
-                        doc.semantic.producer_id.is_some(),
-                        anchor.map(|a| &a.outcome),
-                    ));
-                }
-                let role = site.role;
-                let test = role == Some("test");
-                let bound = site.mapping == "semantic";
-                let semantic = bound && resolution.residual.is_none();
-                let mapped = !resolution.targets.is_empty();
-                let covered = found
-                    .coverage
-                    .entry((test, site.gates.clone()))
-                    .or_default();
-                covered.sites += 1;
-                covered.semantic += usize::from(semantic);
-                covered.mapped += usize::from(mapped);
-                covered.unresolved += usize::from(resolution.residual.is_some());
-                found.semantic += usize::from(semantic);
-                found.mapped += usize::from(mapped);
-                found.proof.extend(resolution.proof);
-                for target in resolution.targets {
-                    owner_step(&mut rust.work, check)?;
-                    let edge = found
-                        .edges
-                        .entry((target, test, site.gates.clone()))
-                        .or_default();
-                    edge.count += 1;
-                    edge.semantic += usize::from(bound);
-                    edge.kinds.add(site.relation_kind);
-                    let sample = if site.relation_kind == RelationKind::Call {
-                        &mut edge.calls
-                    } else {
-                        &mut edge.others
-                    };
-                    if sample.len() < sample_limit {
-                        sample.push(site.clone());
-                    }
-                }
-                if let Some(reason) = resolution.residual {
-                    found.unresolved.push((site, reason));
-                }
-            }
+            let (source, found) = file_references(
+                read,
+                catalogs,
+                prepared,
+                locate,
+                &mut site_count,
+                &mut target_documents,
+                check,
+            )?;
             sources[source] = Some(found);
         }
     }
+    Ok(sources)
+}
+
+/// One prepared file's sites, in site order: each resolved structurally by its language's
+/// catalog, then by its semantic binding, counted against the site limit and recorded.
+fn file_references<'a>(
+    read: ReadContext<'a, '_>,
+    catalogs: &mut Catalogs,
+    prepared: PreparedFile,
+    locate: &impl Fn(usize, &str) -> Option<usize>,
+    site_count: &mut usize,
+    target_documents: &mut BTreeMap<usize, TargetDocument<'a>>,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<(usize, SourceReferences)> {
+    let ReadContext {
+        docs,
+        trees,
+        sample_limit,
+        request,
+        ..
+    } = read;
+    let Catalogs {
+        rust,
+        packages,
+        java,
+        python,
+        javascript,
+    } = catalogs;
+    let PreparedFile {
+        source,
+        work,
+        sites,
+    } = prepared;
+    let doc = docs[source];
+    request.check()?;
+    merge_work(&mut rust.work, work.used, check)?;
+    let mut found = SourceReferences {
+        projection: doc.semantic.projection.clone(),
+        edges: BTreeMap::new(),
+        unresolved: Vec::new(),
+        proof: BTreeSet::new(),
+        packages: BTreeMap::new(),
+        coverage: BTreeMap::new(),
+        mapped: 0,
+        semantic: 0,
+    };
+    for (
+        ordinal,
+        PreparedSite {
+            raw,
+            mut site,
+            anchor,
+        },
+    ) in sites.into_iter().enumerate()
+    {
+        check()?;
+        site.ordinal = ordinal;
+        let anchor = anchor.map(|index| &doc.semantic.anchors[index]);
+        let historical = doc.semantic.projection.is_some();
+        let structural = match &raw {
+            // Historical claims cannot be resolved against N by spelling. Any
+            // independent structural fallback must remain explicitly native-N.
+            Some(_) if historical && anchor.is_some() => None,
+            None => None,
+            Some(_) if site.owner_syntax_id.is_none() => {
+                Some(SiteResolution::unknown("reference_owner_ambiguous"))
+            }
+            Some(item) if doc.key.language == "rust" => Some(rust.resolve(
+                source,
+                item,
+                packages,
+                &mut found.packages,
+                docs,
+                &trees[source],
+                check,
+            )?),
+            Some(item) if doc.key.language == "java" => {
+                Some(java.resolve(source, item, &mut found.packages, &mut rust.work, check)?)
+            }
+            Some(item) if doc.key.language == "python" => {
+                Some(python.resolve(source, item, &mut found.packages, &mut rust.work, check)?)
+            }
+            Some(item) if script_family(&doc.key.language) => Some(
+                javascript
+                    .as_ref()
+                    .expect("selected JavaScript catalog")
+                    .resolve(source, item, &mut found.packages, &mut rust.work, check)?,
+            ),
+            Some(_) => Some(SiteResolution::unknown("module_mapping_unavailable")),
+        };
+        let semantic =
+            anchor.and_then(|anchor| semantic_resolution(anchor, structural.as_ref(), locate));
+        let resolution = match (semantic, structural) {
+            // A semantic-only site inside its own module adds no module edge.
+            (Some(resolution), None) if resolution.targets.contains(&Target::Native(source)) => {
+                continue;
+            }
+            (Some(resolution), _) => {
+                let anchor = anchor.expect("semantic resolution has an anchor");
+                apply_semantic(&mut site, anchor);
+                resolution
+            }
+            (None, Some(resolution)) => resolution,
+            // A semantic-only site whose binding is not usable here is not a site.
+            (None, None) => continue,
+        };
+        *site_count += 1;
+        ensure!(
+            *site_count <= site_limit(),
+            "bounded_work: reference site count"
+        );
+        if let (true, Some(SemanticOutcome::Internal(document, sid))) =
+            (site.mapping == "semantic", anchor.map(|a| &a.outcome))
+            && let Some(target) = locate(*document, sid)
+            && resolution.targets.contains(&Target::Native(target))
+        {
+            owner_step(&mut rust.work, check)?;
+            let entry = target_documents
+                .entry(target)
+                .or_insert_with(|| TargetDocument::new(docs[target]));
+            site.target = entry.by_sid.get(sid.as_str()).map(|d| ReferenceTarget {
+                syntax_id: sid.clone(),
+                display_key: display_key(d),
+                document: d.document.clone(),
+                lines: lines_of(&entry.newlines, d.range.start, d.range.end),
+            });
+        }
+        if site.target.is_none() {
+            site.target_reason = Some(target_reason(
+                site.mapping == "structural",
+                doc.semantic.producer_id.is_some(),
+                anchor.map(|a| &a.outcome),
+            ));
+        }
+        record_site(
+            &mut found,
+            site,
+            resolution,
+            sample_limit,
+            &mut rust.work,
+            check,
+        )?;
+    }
+    Ok((source, found))
+}
+
+/// What a semantic binding makes of the site it resolves: the mapping, the provenance and
+/// metadata of its anchor, no caller across a semantic boundary, and a call or type kind
+/// for a plain reference.
+fn apply_semantic(site: &mut Site, anchor: &SemanticAnchor) {
+    site.mapping = "semantic";
+    site.provenance_id = Some(anchor.provenance_id.clone());
+    site.semantic_metadata = anchor.metadata.clone();
+    if anchor.metadata.get("semanticBoundary") == Some(&json!(true)) {
+        site.caller = None;
+        site.caller_reason = Some("semantic_boundary");
+    }
+    if site.relation_kind == RelationKind::Reference {
+        if anchor.call_id.is_some() {
+            site.relation_kind = RelationKind::Call;
+        } else if anchor.type_role {
+            site.relation_kind = RelationKind::Type;
+        }
+    }
+}
+
+/// One resolved site into its source's tallies: coverage by role and gates, the proof, and
+/// per target the edge counts and a sample while the edge has room; an unresolved site is
+/// kept with its reason.
+fn record_site(
+    found: &mut SourceReferences,
+    site: Site,
+    resolution: SiteResolution,
+    sample_limit: usize,
+    work: &mut Work,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<()> {
+    let role = site.role;
+    let test = role == Some("test");
+    let bound = site.mapping == "semantic";
+    let semantic = bound && resolution.residual.is_none();
+    let mapped = !resolution.targets.is_empty();
+    let covered = found
+        .coverage
+        .entry((test, site.gates.clone()))
+        .or_default();
+    covered.sites += 1;
+    covered.semantic += usize::from(semantic);
+    covered.mapped += usize::from(mapped);
+    covered.unresolved += usize::from(resolution.residual.is_some());
+    found.semantic += usize::from(semantic);
+    found.mapped += usize::from(mapped);
+    found.proof.extend(resolution.proof);
+    for target in resolution.targets {
+        owner_step(work, check)?;
+        let edge = found
+            .edges
+            .entry((target, test, site.gates.clone()))
+            .or_default();
+        edge.count += 1;
+        edge.semantic += usize::from(bound);
+        edge.kinds.add(site.relation_kind);
+        let sample = if site.relation_kind == RelationKind::Call {
+            &mut edge.calls
+        } else {
+            &mut edge.others
+        };
+        if sample.len() < sample_limit {
+            sample.push(site.clone());
+        }
+    }
+    if let Some(reason) = resolution.residual {
+        found.unresolved.push((site, reason));
+    }
+    Ok(())
+}
+
+/// Frees the syntax trees of a read.
+fn drop_trees(trees: Vec<Tree>, workers: usize) {
     // Freeing every syntax tree is serial native work; spread it across workers.
     let trees: Vec<_> = trees
         .into_iter()
@@ -934,28 +1148,6 @@ fn resolve(
         &std::sync::atomic::AtomicBool::new(false),
         |_, tree| drop(tree.lock().unwrap_or_else(|e| e.into_inner()).take()),
     );
-    Ok(ReferenceBase {
-        pin: snapshot.pin,
-        partial_files,
-        identities,
-        modules,
-        sources,
-        producers,
-        document_status: docs
-            .iter()
-            .filter_map(|doc| doc.semantic.projection.as_ref())
-            .fold([0; 3], |mut counts, projection| {
-                use crate::model::SemanticStatus;
-                counts[match projection.semantic_status {
-                    SemanticStatus::OlderBasis => 0,
-                    SemanticStatus::CatchingUp => 1,
-                    SemanticStatus::NeedsReimport => 2,
-                }] += 1;
-                counts
-            }),
-        sample_limit,
-        work_used: rust.work.used,
-    })
 }
 
 impl ReferenceBase {
