@@ -1,0 +1,40 @@
+#!/bin/sh
+# Sample the threads of a test that is about to be killed for hanging (#1078).
+#
+# nextest runs each test as its own process (`<target>/debug/deps/<binary> --exact <test>`)
+# and kills one after five minutes, which leaves no trace of where it was. This watcher runs
+# beside the tests: once such a process is older than AGE seconds it writes one `sample` of
+# all its threads to OUT/<pid>.txt and the command line to OUT/<pid>.cmd. It samples each
+# process once, never signals it and never fails the job. macOS only: `sample` ships with it.
+#
+# Usage: tools/sample-hung-tests OUT [AGE] [INTERVAL]
+#   AGE defaults to 240 (nextest's kill is at 300) and INTERVAL to 15, both in seconds.
+set -u
+
+out=${1:?usage: tools/sample-hung-tests OUT [AGE] [INTERVAL]}
+age=${2:-240}
+interval=${3:-15}
+mkdir -p "$out" || exit 0
+
+while :; do
+  # etime is [[dd-]hh:]mm:ss.
+  ps -axo pid=,etime=,command= | awk -v age="$age" '
+    index($3, "/debug/deps/") && index($0, " --exact ") {
+      pid = $1
+      days = 0
+      clock = $2
+      if (split(clock, parts, "-") == 2) { days = parts[1]; clock = parts[2] }
+      fields = split(clock, t, ":")
+      seconds = t[fields] + 60 * t[fields - 1] + (fields == 3 ? 3600 * t[1] : 0) + 86400 * days
+      if (seconds >= age) {
+        $1 = ""; $2 = ""
+        sub(/^ +/, "")
+        print pid "\t" $0
+      }
+    }' | while IFS='	' read -r pid command; do
+    [ -e "$out/$pid.cmd" ] && continue
+    printf '%s\n' "$command" > "$out/$pid.cmd"
+    sample "$pid" 5 -file "$out/$pid.txt" > /dev/null 2>&1 || true
+  done
+  sleep "$interval"
+done

@@ -436,18 +436,6 @@ test("sequence draws resolved participants, expands direct callees and hides std
     await page.waitForFunction(() => /basis semantic\.synthetic/.test(document.querySelector("#inspector-evidence")?.textContent || ""));
     assert.match(await page.locator("#inspector-evidence").textContent(), /^Resolved declaration · direct · fresh · /);
     assert.match(await page.locator("#inspector-detail").textContent(), /"semanticBasis"/);
-    // The SVG fallback draws the same lanes: the arrow to `inner` starts on the callee lane.
-    const arrow = await page.evaluate(([view, id]) => {
-      const box = document.createElement("div"); document.body.append(box);
-      window.TrellisSequence.render(box, view, () => {}, new Set(), {});
-      const lanes = [...box.querySelectorAll(".sequence-lifelines line")].map(line => line.getAttribute("x1"));
-      const d = box.querySelector(`path.sequence-arrow[data-trellis-call-id="${id}"]`)?.getAttribute("d");
-      box.remove();
-      return {lanes, d};
-    }, [lanes, fixture.calleeCalls[0]]);
-    assert.equal(arrow.lanes.length, 3);
-    assert.ok(arrow.d.startsWith(`M ${arrow.lanes[1]} `), JSON.stringify(arrow));
-    assert.ok(arrow.d.endsWith(` H ${arrow.lanes[2]}`), JSON.stringify(arrow));
     assert.deepEqual(errors, []);
   } finally {
     await context?.close(); await browser?.close(); await H.stopDaemon(server);

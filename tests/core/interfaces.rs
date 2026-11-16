@@ -10,8 +10,9 @@ use std::{
 use trellis::{
     architecture_details::Query,
     indexer::{IndexOptions, index_workspace_bundle},
+    metrics_read::MetricsOptions,
     model::CancelFlag,
-    store::{MetricsOptions, Store},
+    store::Store,
 };
 
 struct Published {
@@ -477,6 +478,17 @@ fn trellis_real_router_and_client() {
         "web/package.json",
         "src/http.rs",
         "web/app.js",
+        "web/app-state.js",
+        "web/app-api.js",
+        "web/app-agent.js",
+        "web/app-navigation.js",
+        "web/app-status.js",
+        "web/app-source.js",
+        "web/app-files.js",
+        "web/app-tree.js",
+        "web/app-sequence.js",
+        "web/app-libraries.js",
+        "web/app-views.js",
         "web/architecture.js",
         "web/classes.js",
         "web/navigation.js",
@@ -508,7 +520,12 @@ fn trellis_real_router_and_client() {
     };
     let status = route("/api/checkouts/{root_key}/status");
     assert_eq!(status["method"], "GET");
-    assert_eq!(status["handler"]["kind"], "dispatchArm");
+    // The `Status` arm delegates to one same-document function (#1046).
+    assert_eq!(status["handler"]["kind"], "declaration");
+    assert_eq!(
+        status["handler"]["stableLookupKey"],
+        "src/http.rs::status_answer"
+    );
     assert_eq!(status["handler"]["variant"], "Status");
     assert_eq!(status["handler"]["path"], "src/http.rs");
     assert_eq!(status["handler"]["layer"], "entry");
@@ -516,7 +533,7 @@ fn trellis_real_router_and_client() {
         .as_array()
         .unwrap()
         .iter()
-        .filter(|site| site["document"]["path"] == "web/app.js")
+        .filter(|site| site["document"]["path"] == "web/app-status.js")
         .collect();
     assert!(!through_prefix.is_empty());
     assert!(through_prefix.iter().all(|site| site["layer"] == "web"));

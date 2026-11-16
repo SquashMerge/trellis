@@ -3,7 +3,7 @@ const test = require("node:test"), assert = require("node:assert/strict"), fs = 
 const asset = "web/vendor/pele-1.10.0-trellis.2.js";
 function setup(extra = {}) {
   const window = {}, context = {window,TextEncoder,...extra};
-  vm.runInNewContext(fs.readFileSync("web/treemap-pele.js","utf8"),context);
+  vm.runInNewContext(["web/pele-svg.js","web/treemap-pele.js"].map(file=>fs.readFileSync(file,"utf8")).join("\n"),context);
   const vendor = vm.createContext({}); vm.runInContext(fs.readFileSync(asset,"utf8"),vendor);
   return {adapter:window.TrellisTreemapPele,pele:vendor.pele};
 }
@@ -69,9 +69,9 @@ test("real pinned SVG map rejects mutations before controls; label fitting respe
     const page=await browser.newPage(), errors=[]; page.on("pageerror",error=>errors.push(error.message));
     await page.route("http://127.0.0.1:43989/**",route=>{
       const path=new URL(route.request().url()).pathname;
-      const assets={"/pele.js":asset,"/treemap-pele.js":"web/treemap-pele.js"};
+      const assets={"/pele.js":asset,"/pele-svg.js":"web/pele-svg.js","/treemap-pele.js":"web/treemap-pele.js"};
       if(assets[path]) return route.fulfill({contentType:"text/javascript; charset=utf-8",body:fs.readFileSync(assets[path])});
-      return route.fulfill({contentType:"text/html; charset=utf-8",body:`<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'"><script src="/pele.js"></script><script src="/treemap-pele.js"></script><div id="diagram"></div>`});
+      return route.fulfill({contentType:"text/html; charset=utf-8",body:`<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'"><script src="/pele.js"></script><script src="/pele-svg.js"></script><script src="/treemap-pele.js"></script><div id="diagram"></div>`});
     });
     await page.goto("http://127.0.0.1:43989/");
     assert.deepEqual(errors,[],"fixture asset parse errors");

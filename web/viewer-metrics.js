@@ -22,7 +22,7 @@
     "halstead.volume":"Halstead volume", fanOut:"Fan-out"};
   // Sequence starts from these highest-cognitive callables (#450); the API allows 1..10.
   const START_CALLABLES = 8;
-  function create({request, context, onConflict = () => {}, onChange = () => {}, onOpenCallable = null}) {
+  function create({request, context, onConflict = () => {}, onChange = () => {}, onOpenCallable = null, inspector = {}}) {
     let metric = "cognitive", aggregate = "max", role = "production", relative = false, epoch = 0, refreshSerial = 0, inspectionSerial = 0;
     let projection = null, projectionGuard = null, selected = null, loading = false, application = null;
     let decorations = [];
@@ -47,7 +47,7 @@
     function clearInspection() {
       inspectionSerial++;
       selected = null;
-      window.TrellisShell?.clearMetricInspector();
+      inspector.clear?.();
     }
     function reset() {
       epoch++; refreshSerial++; inspectionSerial++;
@@ -128,7 +128,7 @@
       }
     }
     function inspectionState(selection, message) {
-      window.TrellisShell?.showMetricInspector();
+      inspector.show?.();
       text("metric-inspector-title", selection.path || "Indexed workspace");
       text("metric-inspector-scope", `${selection.scope} · ${aggregate} · indexed snapshot · ${population()}`);
       text("metric-inspector-state", message);

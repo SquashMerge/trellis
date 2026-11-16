@@ -352,7 +352,7 @@ mod tests {
     }
 
     /// The browser says what a column is from its ID (#716): `module:` is a module, `type:` a
-    /// Rust type and any other ID a class (`sequenceColumnKind` in web/sequence.js).
+    /// Rust type and any other ID a class (`sequenceColumnKind` in web/sequence-model.js).
     #[test]
     fn a_column_id_says_whether_it_is_a_module_or_a_rust_type() {
         let columns = DocumentColumns {

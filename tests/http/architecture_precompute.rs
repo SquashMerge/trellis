@@ -12,7 +12,7 @@ use std::time::Duration;
 use trellis::daemon::registry::MetricsResponseHooks;
 use trellis::http::DaemonState;
 use trellis::indexer::IndexOptions;
-use trellis::store::MetricsOptions;
+use trellis::metrics_read::MetricsOptions;
 
 const OTHER_RULES: &str = "version=1\n[layers.other]\norder=1\npaths=['**/*.js']";
 

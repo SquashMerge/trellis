@@ -3,7 +3,6 @@
 
 use super::batch::WrittenBatch;
 use crate::{
-    http::{DaemonState, RuntimePhase},
     model::IndexPin,
     semantic_batch::descriptor::GenerationOrigin,
     store::{
@@ -13,6 +12,35 @@ use crate::{
 };
 use anyhow::{Result, ensure};
 use std::time::{Duration, Instant};
+
+/// How far the checkout runtime that schedules imports has come.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SchedulerPhase {
+    /// Startup reconciliation has not finished.
+    Starting,
+    Ready,
+    /// Still serving, with a retirement pending.
+    RetireRequested,
+    /// The runtime is closing or gone.
+    Stopped,
+}
+
+/// What producer code asks of the checkout runtime that owns the request queue: its phase,
+/// a wait for the next phase change, and the enqueue of a generated import. The daemon
+/// implements it; this layer only names it.
+pub trait ImportScheduler: Send + Sync {
+    fn phase(&self) -> SchedulerPhase;
+    /// A counter that changes whenever the runtime state does; pass it to `wait_state_change`.
+    fn state_version(&self) -> u64;
+    /// Wait until the runtime state changes after `seen`, or `timeout` passes.
+    fn wait_state_change(&self, seen: u64, timeout: Duration);
+    /// Enqueue `options` as request `id`. Only `submit` calls this.
+    fn enqueue_generated_semantic_import(
+        &self,
+        options: &GeneratedImportOptions,
+        id: uuid::Uuid,
+    ) -> Result<Request>;
+}
 
 /// How long a transiently busy queue read is retried before it is reported.
 const BUSY_WAIT: Duration = Duration::from_secs(30);
@@ -142,7 +170,7 @@ pub fn new_request_id() -> uuid::Uuid {
 /// request, no row is a rejection, and an unreadable queue leaves acceptance unknown.
 pub fn submit(
     store: &Store,
-    scheduler: &DaemonState,
+    scheduler: &dyn ImportScheduler,
     options: &GeneratedImportOptions,
     id: uuid::Uuid,
 ) -> std::result::Result<String, SubmitError> {
@@ -169,7 +197,7 @@ const POLL: Duration = Duration::from_millis(100);
 /// ends the wait as `root_changed`, because only a replacement runtime would settle it.
 pub fn wait(
     store: &Store,
-    scheduler: &DaemonState,
+    scheduler: &dyn ImportScheduler,
     options: &GeneratedImportOptions,
     id: String,
 ) -> Result<ImportOutcome> {
@@ -209,11 +237,7 @@ pub fn wait(
                 // A running request is the closing worker's to finish; a queued one is
                 // never started by a closing runtime.
                 ensure!(
-                    row.state == "running"
-                        || !matches!(
-                            scheduler.runtime_phase(),
-                            RuntimePhase::Closing | RuntimePhase::Retired
-                        ),
+                    row.state == "running" || scheduler.phase() != SchedulerPhase::Stopped,
                     "{}: captured root lost",
                     super::ROOT_CHANGED
                 );

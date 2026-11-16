@@ -18,13 +18,16 @@ pub(crate) struct Callers<'a> {
     owners: BTreeMap<&'a str, Caller>,
 }
 impl<'a> Callers<'a> {
-    pub(crate) fn new(doc: &'a DocumentInput) -> Self {
+    pub(crate) fn new(
+        doc: &'a DocumentInput,
+        check: &mut dyn FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<Self> {
         let keys = if doc.calls.is_empty() {
             BTreeMap::new()
         } else {
-            lookup_keys(doc)
+            lookup_keys(doc, check)?
         };
-        Self::with_keys(doc, &keys)
+        Ok(Self::with_keys(doc, &keys))
     }
     pub(crate) fn with_keys(doc: &'a DocumentInput, keys: &BTreeMap<String, String>) -> Self {
         let owners = doc
@@ -95,16 +98,21 @@ impl<'a> Callers<'a> {
     }
 }
 
-/// Stable lookup keys of the document's declarations by syntax ID.
-pub(crate) fn lookup_keys(doc: &DocumentInput) -> BTreeMap<String, String> {
-    // A partial Rust impl parse cannot supply a stable written key.
-    crate::symbol_lookup::keys_from_source(
+/// Stable lookup keys of the document's declarations by syntax ID. A Rust document beyond
+/// the syntax bounds has none, on every run: a partial impl parse cannot supply a stable
+/// written key. `check` stopping the derivation is the caller's error, never an empty map.
+pub(crate) fn lookup_keys(
+    doc: &DocumentInput,
+    check: &mut dyn FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    Ok(crate::symbol_lookup::keys_checked(
         &doc.key.path,
         &doc.key.language,
         &doc.file.text,
         &doc.declarations,
-    )
-    .unwrap_or_default()
+        check,
+    )?
+    .unwrap_or_default())
 }
 
 pub(super) fn matches_site(

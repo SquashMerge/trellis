@@ -19,12 +19,12 @@ fn semantic_fact_children_reuse_statement_without_reprepare_per_symbol() {
             params![id, format!("target-{id}")],
         ).unwrap();
     }
-    let document = crate::native_evidence::DocumentKey {
+    let document = crate::native_records::DocumentKey {
         source_set_id: "source-set".into(),
         language: "rust".into(),
         path: "main.rs".into(),
     };
-    let mut result = crate::semantic_evidence::SemanticSnapshot {
+    let mut result = crate::semantic_records::SemanticSnapshot {
         producers: vec![],
         coverage: vec![],
         provenance: vec![],
@@ -42,7 +42,7 @@ fn semantic_fact_children_reuse_statement_without_reprepare_per_symbol() {
     assert_eq!(result.symbols.len(), 4);
     for (offset, symbol) in result.symbols.iter().enumerate() {
         let expected = format!("target-{}", offset + 10);
-        let [crate::semantic_evidence::Target::External { symbol: target }] =
+        let [crate::semantic_records::Target::External { symbol: target }] =
             symbol.declarations.as_slice()
         else {
             panic!("expected one external target: {:?}", symbol.declarations);

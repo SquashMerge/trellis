@@ -513,6 +513,7 @@ mod omitted_python_context {
             &prepared.pin,
             &prepared.rules,
             run_path,
+            prepared.limits.memory_mib,
         );
         worktree::write_bin_links(&dir, &command.bin_links).unwrap();
         let outcome = exec::spawn_producer(
@@ -871,6 +872,7 @@ mod python_project_settings {
             &prepared.pin,
             &prepared.rules,
             run_path,
+            prepared.limits.memory_mib,
         );
         worktree::write_bin_links(&dir, &command.bin_links).unwrap();
         let outcome = exec::spawn_producer(

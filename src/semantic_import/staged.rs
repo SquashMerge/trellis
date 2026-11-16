@@ -29,10 +29,13 @@ use crate::{
     semantic_batch::{
         AdmittedBatch, BatchCounters, BatchLimits, JoinedBatch, LookupBudget,
         descriptor::{Descriptor, SourceManifestHasher, basis_artifact_ordinal},
-        staging::{JOIN_TABLES, claim_from_stage},
     },
     semantic_evidence::{self as semantic, EmissionHeader, EmissionValidator, RawClaimDocument},
-    store::{NativeHeader, NativeReader, Store},
+    store::{
+        NativeHeader, NativeReader, Store,
+        batch_input::JoinParts,
+        staging::{JOIN_TABLES, claim_from_stage},
+    },
 };
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -172,6 +175,43 @@ pub(super) struct ProofRow {
 
 /// Proof identities one unit keeps in [`JoinCtx::proofs`]; a fuller memo is cleared.
 const PROOF_MEMO_ENTRIES: usize = 16_384;
+
+impl<'a> JoinCtx<'a> {
+    /// A join's context with empty meters. A shared pin has no destination edits to apply.
+    fn new(
+        conn: &'a Connection,
+        limits: &BatchLimits,
+        budget: &LookupBudget,
+        stage_base: u64,
+        shared: bool,
+        mutations: DestinationMutations,
+        cancel: &CancelFlag,
+    ) -> Self {
+        Self {
+            conn,
+            limits: limits.clone(),
+            budget: RefCell::new(budget.clone()),
+            live: LiveBudget::new(limits.unit_expansion_bytes),
+            counters: RefCell::new(BatchCounters::default()),
+            cache: RefCell::new(DocCache {
+                budget: limits.document_cache_bytes,
+                ..DocCache::default()
+            }),
+            rows: Cell::new(0),
+            ledger: RefCell::new(BTreeMap::new()),
+            passes: RefCell::new(Vec::new()),
+            stage_base,
+            mutations: if shared {
+                DestinationMutations::default()
+            } else {
+                mutations
+            },
+            cancel: cancel.clone(),
+            unread: RefCell::default(),
+            proofs: RefCell::default(),
+        }
+    }
+}
 
 impl JoinCtx<'_> {
     /// The staged proof identity with `proof_id`, if any. Settling one document looks up each
@@ -1517,7 +1557,7 @@ fn native_pass(ctx: &JoinCtx<'_>, reader: &NativeReader<'_>, rev: u8) -> Result<
     for table in ["nat_docs", "nat_done"] {
         conn.execute(&format!("DELETE FROM {table} WHERE rev=?1"), [rev])?;
     }
-    conn.execute_batch(crate::semantic_batch::staging::UNIT_BEGIN)?;
+    conn.execute_batch(crate::store::staging::UNIT_BEGIN)?;
     let outcome = (|| -> Result<()> {
         let mut stream = reader.inventory()?;
         let mut ord = 0i64;
@@ -1540,11 +1580,11 @@ fn native_pass(ctx: &JoinCtx<'_>, reader: &NativeReader<'_>, rev: u8) -> Result<
     })();
     match outcome {
         Ok(()) => {
-            conn.execute_batch(crate::semantic_batch::staging::UNIT_COMMIT)?;
+            conn.execute_batch(crate::store::staging::UNIT_COMMIT)?;
             Ok(())
         }
         Err(error) => {
-            let _ = conn.execute_batch(crate::semantic_batch::staging::UNIT_ROLLBACK);
+            let _ = conn.execute_batch(crate::store::staging::UNIT_ROLLBACK);
             for table in ["nat_docs", "nat_done"] {
                 let _ = conn.execute(&format!("DELETE FROM {table} WHERE rev=?1"), [rev]);
             }
@@ -1556,11 +1596,11 @@ fn native_pass(ctx: &JoinCtx<'_>, reader: &NativeReader<'_>, rev: u8) -> Result<
 /// Runs one pass in a single stage transaction. The stage has no journal, so a failed pass
 /// commits what it wrote rather than rolling back; the next attempt clears every join table.
 fn in_transaction<T>(conn: &Connection, pass: impl FnOnce() -> Result<T>) -> Result<T> {
-    conn.execute_batch(crate::semantic_batch::staging::UNIT_BEGIN)?;
+    conn.execute_batch(crate::store::staging::UNIT_BEGIN)?;
     let result = pass();
-    let committed = conn.execute_batch(crate::semantic_batch::staging::UNIT_COMMIT);
+    let committed = conn.execute_batch(crate::store::staging::UNIT_COMMIT);
     if committed.is_err() {
-        let _ = conn.execute_batch(crate::semantic_batch::staging::UNIT_ROLLBACK);
+        let _ = conn.execute_batch(crate::store::staging::UNIT_ROLLBACK);
     }
     let value = result?;
     committed?;
@@ -2722,6 +2762,94 @@ pub fn join_staged(
     )
 }
 
+/// The two retained revisions a join reads, each with its header.
+struct JoinReaders<'a> {
+    captured: &'a NativeReader<'a>,
+    captured_header: &'a NativeHeader,
+    destination: &'a NativeReader<'a>,
+    destination_header: &'a NativeHeader,
+}
+
+/// What a join starts from: nothing for a one-shot join, the cursor's values for one unit of
+/// a continuation.
+struct JoinResume {
+    emitted: [i64; 7],
+    identical_joins: bool,
+    witnessed: bool,
+}
+
+/// Assembles the join over an open context and the two revisions. It reads nothing and
+/// charges nothing.
+fn build_join<'a>(
+    ctx: &'a JoinCtx<'a>,
+    producer: &'a semantic::Producer,
+    parts: &JoinParts<'a>,
+    readers: JoinReaders<'a>,
+    shared: bool,
+    resume: JoinResume,
+) -> StagedJoin<'a> {
+    let descriptor = parts.descriptor;
+    let destination_rev = if shared { 0 } else { 1 };
+    let side = |reader, header, rev, side, filtered| StagedSide {
+        ctx,
+        reader,
+        header,
+        rev,
+        side,
+        filtered,
+        document: None,
+        local_claims: None,
+        local_group: None,
+    };
+    StagedJoin {
+        ctx,
+        producer,
+        descriptor,
+        admitted_encoding: descriptor.producer.position_encoding,
+        captured: side(readers.captured, readers.captured_header, 0, 0, false),
+        destination: side(
+            readers.destination,
+            readers.destination_header,
+            destination_rev,
+            1,
+            false,
+        ),
+        filtered: side(
+            readers.destination,
+            readers.destination_header,
+            destination_rev,
+            1,
+            true,
+        ),
+        destination_header: readers.destination_header,
+        reimport_context_matches: parts.reimport_destination
+            == Some(readers.destination_header.revision.id.as_str()),
+        validator: EmissionValidator::new(EmissionHeader {
+            producer,
+            captured_revision: readers.captured_header.revision.clone(),
+            destination_revision: readers.destination_header.revision.clone(),
+            source_set_languages: readers.destination_header.source_set.languages.clone(),
+            artifact_hashes: descriptor
+                .artifacts
+                .iter()
+                .map(|artifact| artifact.sha256.clone())
+                .collect(),
+            source_manifest_hash: descriptor.source_manifest_hash.clone(),
+        }),
+        basis: StagedBasis {
+            conn: ctx.conn,
+            descriptor,
+            producer,
+            captured: &readers.captured_header.revision,
+        },
+        emitted: Cell::new(resume.emitted),
+        identical_joins: Cell::new(resume.identical_joins),
+        identity_kind: descriptor.producer.identity_kind.as_str(),
+        descriptor_sha256: parts.descriptor_sha256,
+        witnessed: resume.witnessed,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn join_staged_using(
     admitted: &mut AdmittedBatch,
@@ -2738,98 +2866,41 @@ fn join_staged_using(
     let captured_pin = admitted.captured_pin();
     let shared = captured_pin == destination;
     let parts = admitted.join_parts()?;
-    let ctx = JoinCtx {
-        conn: parts.conn,
-        limits: limits.clone(),
-        budget: RefCell::new(budget.clone()),
-        live: LiveBudget::new(limits.unit_expansion_bytes),
-        counters: RefCell::new(BatchCounters::default()),
-        cache: RefCell::new(DocCache {
-            budget: limits.document_cache_bytes,
-            ..DocCache::default()
-        }),
-        rows: Cell::new(0),
-        ledger: RefCell::new(BTreeMap::new()),
-        passes: RefCell::new(Vec::new()),
-        stage_base: stage_bytes(parts.conn)?,
-        mutations: if shared {
-            DestinationMutations::default()
-        } else {
-            mutations
-        },
-        cancel: cancel.clone(),
-        unread: RefCell::default(),
-        proofs: RefCell::default(),
-    };
+    let ctx = JoinCtx::new(
+        parts.conn,
+        limits,
+        budget,
+        stage_bytes(parts.conn)?,
+        shared,
+        mutations,
+        cancel,
+    );
     let producer = parts.producer.producer();
     let body =
         |attempt: i64, captured: &NativeReader<'_>, destination_reader: &NativeReader<'_>| {
             let captured_header = captured.header()?;
             let destination_header = destination_reader.header()?;
-            let descriptor = parts.descriptor;
             native_pass(&ctx, captured, 0)?;
             if !shared {
                 native_pass(&ctx, destination_reader, 1)?;
             }
-            let destination_rev = if shared { 0 } else { 1 };
-            let side = |reader, header, rev, side, filtered| StagedSide {
-                ctx: &ctx,
-                reader,
-                header,
-                rev,
-                side,
-                filtered,
-                document: None,
-                local_claims: None,
-                local_group: None,
-            };
-            let join = StagedJoin {
-                ctx: &ctx,
-                producer: &producer,
-                descriptor,
-                admitted_encoding: descriptor.producer.position_encoding,
-                captured: side(captured, &captured_header, 0, 0, false),
-                destination: side(
-                    destination_reader,
-                    &destination_header,
-                    destination_rev,
-                    1,
-                    false,
-                ),
-                filtered: side(
-                    destination_reader,
-                    &destination_header,
-                    destination_rev,
-                    1,
-                    true,
-                ),
-                destination_header: &destination_header,
-                reimport_context_matches: parts.reimport_destination
-                    == Some(destination_header.revision.id.as_str()),
-                validator: EmissionValidator::new(EmissionHeader {
-                    producer: &producer,
-                    captured_revision: captured_header.revision.clone(),
-                    destination_revision: destination_header.revision.clone(),
-                    source_set_languages: destination_header.source_set.languages.clone(),
-                    artifact_hashes: descriptor
-                        .artifacts
-                        .iter()
-                        .map(|artifact| artifact.sha256.clone())
-                        .collect(),
-                    source_manifest_hash: descriptor.source_manifest_hash.clone(),
-                }),
-                basis: StagedBasis {
-                    conn: ctx.conn,
-                    descriptor,
-                    producer: &producer,
-                    captured: &captured_header.revision,
+            let join = build_join(
+                &ctx,
+                &producer,
+                &parts,
+                JoinReaders {
+                    captured,
+                    captured_header: &captured_header,
+                    destination: destination_reader,
+                    destination_header: &destination_header,
                 },
-                emitted: Cell::new([0; 7]),
-                identical_joins: Cell::new(false),
-                identity_kind: descriptor.producer.identity_kind.as_str(),
-                descriptor_sha256: parts.descriptor_sha256,
-                witnessed: false,
-            };
+                shared,
+                JoinResume {
+                    emitted: [0; 7],
+                    identical_joins: false,
+                    witnessed: false,
+                },
+            );
             let report = join.run()?;
             emit_ledger_diagnostic(&ctx, ctx.budget.borrow().used());
             Ok(JoinedBatch::seal(

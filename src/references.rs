@@ -18,6 +18,7 @@ mod js_workspace;
 pub(crate) mod parallel_check;
 mod python;
 mod rust;
+pub(crate) use rust::feature_name;
 pub mod tsconfig;
 pub(crate) mod work;
 
@@ -152,13 +153,14 @@ pub struct ReferenceBase {
 /// One source document's resolved sites.
 struct SourceReferences {
     projection: Option<crate::model::SemanticProjection>,
-    edges: BTreeMap<(Target, bool), EdgeSites>,
+    /// By target, stored role (test = true) and the sites' feature gates.
+    edges: BTreeMap<(Target, bool, Vec<String>), EdgeSites>,
     unresolved: Vec<(Site, &'static str)>,
     /// Modules that prove this source's mapped sites.
     proof: BTreeSet<usize>,
     packages: BTreeMap<external::ExternalIdentity, external::ExternalPackage>,
-    /// Coverage per role (test = true).
-    coverage: BTreeMap<bool, SiteCoverage>,
+    /// Coverage per stored role (test = true) and feature gates.
+    coverage: BTreeMap<(bool, Vec<String>), SiteCoverage>,
     mapped: usize,
     semantic: usize,
 }
@@ -199,6 +201,12 @@ struct KindCounts {
     reference: usize,
 }
 impl KindCounts {
+    fn merge(&mut self, other: &Self) {
+        self.call += other.call;
+        self.r#type += other.r#type;
+        self.import += other.import;
+        self.reference += other.reference;
+    }
     fn add(&mut self, kind: RelationKind) {
         match kind {
             RelationKind::Call => self.call += 1,
@@ -257,6 +265,13 @@ struct Site {
     provenance_id: Option<String>,
     #[serde(flatten)]
     semantic_metadata: BTreeMap<String, Value>,
+    /// The features of the `cfg(feature = "..")` gates on a production Rust site, sorted and
+    /// distinct (#988). A read that names one as a test feature reports the site as test.
+    #[serde(skip)]
+    gates: Vec<String>,
+    /// The site's position among its source's sites: the order of merged samples.
+    #[serde(skip)]
+    ordinal: usize,
 }
 #[derive(Clone, Copy, Serialize)]
 struct Lines {
@@ -339,16 +354,18 @@ pub fn project_under(
     sample_limit: usize,
     check: &mut (impl FnMut() -> Result<()> + Send),
 ) -> Result<Projection> {
-    project_where(snapshot, paths, prefix, None, sample_limit, check)
+    project_where(snapshot, paths, prefix, None, &[], sample_limit, check)
 }
 
 /// [`project_under`] of only the sources whose path is in `files`, when it is given: the
-/// files of the apps an `app` argument names (#851).
+/// files of the apps an `app` argument names (#851). A production site under a `cfg` gate of
+/// one of `test_features` is reported as test (#988).
 pub fn project_where(
     snapshot: &Snapshot,
     paths: &[String],
     prefix: Option<&str>,
     files: Option<&BTreeSet<String>>,
+    test_features: &[String],
     sample_limit: usize,
     check: &mut (impl FnMut() -> Result<()> + Send),
 ) -> Result<Projection> {
@@ -358,6 +375,7 @@ pub fn project_where(
             paths,
             prefix,
             files,
+            test_features,
         },
         sample_limit,
         crate::parallel::default_workers(),
@@ -374,6 +392,9 @@ struct Sources<'a> {
     paths: &'a [String],
     prefix: Option<&'a str>,
     files: Option<&'a BTreeSet<String>>,
+    /// The Cargo features whose gates mark test code for this read (#988). Selection only:
+    /// resolution records every gate.
+    test_features: &'a [String],
 }
 
 impl Sources<'_> {
@@ -382,6 +403,7 @@ impl Sources<'_> {
             paths: &[],
             prefix: None,
             files: None,
+            test_features: &[],
         }
     }
 
@@ -412,6 +434,7 @@ pub fn project_with_workers(
             paths,
             prefix: None,
             files: None,
+            test_features: &[],
         },
         sample_limit,
         workers,
@@ -747,13 +770,17 @@ fn resolve(
                 mapped: 0,
                 semantic: 0,
             };
-            for PreparedSite {
-                raw,
-                mut site,
-                anchor,
-            } in sites
+            for (
+                ordinal,
+                PreparedSite {
+                    raw,
+                    mut site,
+                    anchor,
+                },
+            ) in sites.into_iter().enumerate()
             {
                 check()?;
+                site.ordinal = ordinal;
                 let anchor = anchor.map(|index| &doc.semantic.anchors[index]);
                 let historical = doc.semantic.projection.is_some();
                 let structural = match &raw {
@@ -770,6 +797,7 @@ fn resolve(
                         &packages,
                         &mut found.packages,
                         &docs,
+                        &trees[source],
                         check,
                     )?),
                     Some(item) if doc.key.language == "java" => Some(java.resolve(
@@ -858,7 +886,10 @@ fn resolve(
                 let bound = site.mapping == "semantic";
                 let semantic = bound && resolution.residual.is_none();
                 let mapped = !resolution.targets.is_empty();
-                let covered = found.coverage.entry(test).or_default();
+                let covered = found
+                    .coverage
+                    .entry((test, site.gates.clone()))
+                    .or_default();
                 covered.sites += 1;
                 covered.semantic += usize::from(semantic);
                 covered.mapped += usize::from(mapped);
@@ -868,7 +899,10 @@ fn resolve(
                 found.proof.extend(resolution.proof);
                 for target in resolution.targets {
                     owner_step(&mut rust.work, check)?;
-                    let edge = found.edges.entry((target, test)).or_default();
+                    let edge = found
+                        .edges
+                        .entry((target, test, site.gates.clone()))
+                        .or_default();
                     edge.count += 1;
                     edge.semantic += usize::from(bound);
                     edge.kinds.add(site.relation_kind);
@@ -944,7 +978,7 @@ impl ReferenceBase {
         sample_limit: usize,
         check: &mut (impl FnMut() -> Result<()> + Send),
     ) -> Result<Projection> {
-        self.select_where(paths, prefix, None, sample_limit, check)
+        self.select_where(paths, prefix, None, &[], sample_limit, check)
     }
 
     /// [`Self::select_under`] of only the sources whose path is in `files`, when it is given:
@@ -954,6 +988,7 @@ impl ReferenceBase {
         paths: &[String],
         prefix: Option<&str>,
         files: Option<&BTreeSet<String>>,
+        test_features: &[String],
         sample_limit: usize,
         check: &mut (impl FnMut() -> Result<()> + Send),
     ) -> Result<Projection> {
@@ -962,6 +997,7 @@ impl ReferenceBase {
                 paths,
                 prefix,
                 files,
+                test_features,
             },
             sample_limit,
             check,
@@ -979,6 +1015,19 @@ impl ReferenceBase {
             "invalid_request: reference sample limit"
         );
         let globs = path_globs(sources.paths, check)?;
+        // #988: a gate of a named test feature makes its production sites test for this read.
+        let gated = |gates: &[String]| {
+            gates
+                .iter()
+                .any(|gate| sources.test_features.contains(gate))
+        };
+        let site_json = |site: &Site| {
+            let mut value = json!(site);
+            if gated(&site.gates) {
+                value["role"] = json!("test");
+            }
+            value
+        };
         let identities = &self.identities;
         let mut emitted_modules = BTreeSet::new();
         let mut external_packages: BTreeMap<_, external::ExternalPackage> = BTreeMap::new();
@@ -999,8 +1048,10 @@ impl ReferenceBase {
             semantic_sites += found.semantic;
             emitted_modules.insert(source);
             emitted_modules.extend(found.proof.iter().copied());
-            for (test, row) in &found.coverage {
-                let total = coverage.entry((path.clone(), *test)).or_default();
+            for ((test, gates), row) in &found.coverage {
+                let total = coverage
+                    .entry((path.clone(), *test || gated(gates)))
+                    .or_default();
                 total.sites += row.sites;
                 total.mapped += row.mapped;
                 total.unresolved += row.unresolved;
@@ -1019,8 +1070,29 @@ impl ReferenceBase {
                     }
                 }
             }
-            for ((target, test), edge) in &found.edges {
-                let (count, semantic) = (&edge.count, &edge.semantic);
+            // Edges that differ only in gates are one edge of the role this read gives them.
+            let mut merged: BTreeMap<(&Target, bool), Vec<&EdgeSites>> = BTreeMap::new();
+            for ((target, test, gates), edge) in &found.edges {
+                check()?;
+                merged
+                    .entry((target, *test || gated(gates)))
+                    .or_default()
+                    .push(edge);
+            }
+            for ((target, test), parts) in &merged {
+                let mut kinds = KindCounts::default();
+                let (mut count, mut semantic) = (0usize, 0usize);
+                for part in parts {
+                    count += part.count;
+                    semantic += part.semantic;
+                    kinds.merge(&part.kinds);
+                }
+                let (count, semantic) = (&count, &semantic);
+                let in_order = |pick: fn(&EdgeSites) -> &Vec<Site>| {
+                    let mut sites: Vec<&Site> = parts.iter().flat_map(|part| pick(part)).collect();
+                    sites.sort_by_key(|site| site.ordinal);
+                    sites
+                };
                 check()?;
                 let target = match target {
                     Target::Native(target) => {
@@ -1029,11 +1101,11 @@ impl ReferenceBase {
                     }
                     Target::External(identity) => json!(identity),
                 };
-                let sampled: Vec<_> = edge
-                    .calls
-                    .iter()
-                    .chain(&edge.others)
+                let sampled: Vec<_> = in_order(|part| &part.calls)
+                    .into_iter()
+                    .chain(in_order(|part| &part.others))
                     .take(sample_limit)
+                    .map(site_json)
                     .collect();
                 let omitted = count - sampled.len();
                 let tier = match semantic {
@@ -1042,7 +1114,7 @@ impl ReferenceBase {
                     _ => "mixed",
                 };
                 let mut edge = json!({"source":identities[source],"target":target,"count":count,
-                    "kindCounts":edge.kinds,"sites":sampled,"omittedSites":omitted,"evidenceTier":tier,"semanticSites":semantic});
+                    "kindCounts":kinds,"sites":sampled,"omittedSites":omitted,"evidenceTier":tier,"semanticSites":semantic});
                 // The edge itself is detachable even when sampling omits other sites.
                 if *semantic > 0
                     && let Some(projection) = &found.projection
@@ -1057,7 +1129,9 @@ impl ReferenceBase {
             }
             for (site, reason) in &found.unresolved {
                 check()?;
-                unresolved.push(json!({"source":identities[source],"site":site,"reason":reason}));
+                unresolved.push(
+                    json!({"source":identities[source],"site":site_json(site),"reason":reason}),
+                );
             }
         }
         let emitted_modules: Vec<_> = emitted_modules
@@ -1242,6 +1316,7 @@ struct SiteContext<'a> {
     newlines: Vec<usize>,
     callers: callers::Callers<'a>,
     keys: BTreeMap<String, String>,
+    tree: &'a Tree,
 }
 impl SiteContext<'_> {
     #[allow(clippy::too_many_arguments)]
@@ -1273,10 +1348,21 @@ impl SiteContext<'_> {
                 },
             }
         });
-        let role = owner.map(|d| match d.role {
+        let mut role = owner.map(|d| match d.role {
             DeclarationRole::Test => "test",
             DeclarationRole::Production => "production",
         });
+        // A `#[cfg(test)]` statement, block, arm or `use` item is no declaration, so no
+        // stored role covers it (#988). A feature gate is kept for the read to judge.
+        let mut gates = Vec::new();
+        if role == Some("production") && doc.key.language == "rust" {
+            let marks = rust::site_marks(doc, self.tree, start, end, work, check)?;
+            if marks.test {
+                role = Some("test");
+            } else {
+                gates = marks.features;
+            }
+        }
         let range = crate::native_evidence::Range { start, end };
         let call_id = match call_id {
             Some(id) => Some(id),
@@ -1325,6 +1411,8 @@ impl SiteContext<'_> {
             mapping: "structural",
             provenance_id: None,
             semantic_metadata: BTreeMap::new(),
+            gates,
+            ordinal: 0,
         })
     }
 }
@@ -1348,7 +1436,7 @@ fn prepare_file(
     let keys = if raw.is_empty() && doc.semantic.anchors.is_empty() {
         BTreeMap::new()
     } else {
-        callers::lookup_keys(doc)
+        callers::lookup_keys(doc, check)?
     };
     let context = SiteContext {
         doc,
@@ -1357,6 +1445,7 @@ fn prepare_file(
         declarations: RangeIndex::new(doc.declarations.iter().map(|d| &d.range), &mut work, check)?,
         calls: RangeIndex::new(doc.calls.iter().map(|c| &c.range), &mut work, check)?,
         newlines: newlines(&doc.file.text),
+        tree,
     };
     // Semantic anchors by start offset (#523). A structural site consumes every anchor
     // inside it, and a call joined on its whole invocation that starts with it; it is
@@ -1789,612 +1878,13 @@ fn relative_path(source: &str, relative: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-mod historical_projection_tests {
-    use super::*;
-
-    fn anchor(outcome: SemanticOutcome) -> SemanticAnchor {
-        SemanticAnchor {
-            range: crate::native_evidence::Range { start: 0, end: 1 },
-            call_id: None,
-            type_role: true,
-            direct: false,
-            outcome,
-            basis_site: false,
-            provenance_id: "proof".into(),
-            metadata: BTreeMap::from([(
-                "projection".into(),
-                json!({"semanticStatus":"olderBasis"}),
-            )]),
-        }
-    }
-
-    #[test]
-    fn historical_unknown_and_external_claims_never_use_current_structural_targets() {
-        let structural = SiteResolution {
-            targets: BTreeSet::from([Target::Native(4)]),
-            ..SiteResolution::default()
-        };
-        for outcome in [
-            SemanticOutcome::Unresolved,
-            SemanticOutcome::Ambiguous,
-            SemanticOutcome::External,
-            SemanticOutcome::Boundary,
-        ] {
-            let result =
-                semantic_resolution(&anchor(outcome), Some(&structural), &|_, _| Some(4)).unwrap();
-            assert!(result.targets.is_empty());
-            assert!(result.residual.is_some());
-        }
-    }
-
-    #[test]
-    fn historical_internal_target_missing_from_native_is_a_boundary() {
-        let result = semantic_resolution(
-            &anchor(SemanticOutcome::Internal(1, "target".into())),
-            None,
-            &|_, _| None,
-        )
-        .unwrap();
-        assert!(result.targets.is_empty());
-        assert_eq!(result.residual, Some("semantic_endpoint_catching_up"));
-    }
-}
+mod historical_projection_tests;
 
 #[cfg(test)]
-mod range_index_tests {
-    use super::*;
-    use crate::native_evidence::Range;
-
-    #[test]
-    fn indexed_enclosure_matches_linear_ranges_and_stored_order() {
-        let ranges = [
-            Range { start: 0, end: 100 },
-            Range { start: 20, end: 40 },
-            Range { start: 5, end: 30 },
-            Range { start: 20, end: 40 },
-            Range { start: 40, end: 40 },
-            Range { start: 60, end: 80 },
-        ];
-        let mut work = Work::new(5_000_000);
-        let index = RangeIndex::new(ranges.iter(), &mut work, &mut || Ok(())).unwrap();
-        for start in 0..=101 {
-            for end in start..=101 {
-                let expected: Vec<_> = ranges
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, r)| r.start <= start && r.end >= end)
-                    .map(|(i, _)| i)
-                    .collect();
-                let mut found = index
-                    .enclosing(start, end, &mut work, &mut || Ok(()))
-                    .unwrap();
-                // Call enclosure chooses the first stored call, not the narrowest.
-                assert_eq!(found.iter().min(), expected.first());
-                found.sort_unstable();
-                assert_eq!(found, expected, "{start}..{end}");
-            }
-        }
-    }
-
-    #[test]
-    fn range_index_work_is_bounded_and_cancellable() {
-        let ranges = [Range { start: 0, end: 100 }];
-        let mut work = Work::new(5_000_000);
-        let index = RangeIndex::new(ranges.iter(), &mut work, &mut || Ok(())).unwrap();
-        work.used = work.limit;
-        let error = index
-            .enclosing(5, 10, &mut work, &mut || Ok(()))
-            .unwrap_err();
-        assert_eq!(error.to_string(), "bounded_work: reference owner lookup");
-        let mut checks = 0;
-        let error = RangeIndex::new(ranges.iter(), &mut Work::new(5_000_000), &mut || {
-            checks += 1;
-            ensure!(checks < 3, "cancelled");
-            Ok(())
-        })
-        .err()
-        .unwrap();
-        assert_eq!(error.to_string(), "cancelled");
-        let error = index
-            .enclosing(5, 10, &mut Work::new(5_000_000), &mut || {
-                anyhow::bail!("cancelled")
-            })
-            .unwrap_err();
-        assert_eq!(error.to_string(), "cancelled");
-    }
-}
+mod range_index_tests;
 
 #[cfg(test)]
-mod parallel_tests {
-    use super::*;
-    use std::sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    };
-
-    fn snapshot() -> Snapshot {
-        snapshot_of(&[
-            (
-                "src/lib.rs",
-                "mod provider; pub use provider::value; pub fn run() { value(); }",
-            ),
-            ("src/provider.rs", "pub fn value() {}"),
-            (
-                "Use.java",
-                "package app; import app.Provider; public class Use { Provider value; }",
-            ),
-            ("Provider.java", "package app; public class Provider {}"),
-            ("use.py", "from provider import value\nvalue()\n"),
-            ("provider.py", "def value():\n    return 1\n"),
-            ("use.js", "import { value } from './provider.js'; value();"),
-            ("provider.js", "export function value() {}"),
-        ])
-    }
-
-    pub(super) fn snapshot_of(files: &[(&str, &str)]) -> Snapshot {
-        let root = tempfile::tempdir().unwrap();
-        for (path, text) in files.iter().copied() {
-            let file = root.path().join(path);
-            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-            std::fs::write(file, text).unwrap();
-        }
-        let identity =
-            crate::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
-                .unwrap();
-        let (graph, native) = crate::indexer::index_workspace_with_native(
-            &crate::indexer::IndexOptions::new(root.path().to_owned()),
-            &identity.record_id,
-            &Arc::new(AtomicBool::new(false)),
-            |_| {},
-        )
-        .unwrap();
-        let documents = graph
-            .files
-            .into_iter()
-            .map(|file| {
-                let key = native
-                    .revision
-                    .documents
-                    .iter()
-                    .find(|doc| doc.key.path == file.path)
-                    .unwrap()
-                    .key
-                    .clone();
-                let declarations = native
-                    .declarations
-                    .iter()
-                    .filter(|declaration| declaration.document == key)
-                    .cloned()
-                    .collect();
-                let calls = native
-                    .calls
-                    .iter()
-                    .filter(|call| call.document == key)
-                    .cloned()
-                    .collect();
-                DocumentInput {
-                    semantic: Default::default(),
-                    key,
-                    file,
-                    declarations,
-                    calls,
-                }
-            })
-            .collect();
-        Snapshot {
-            pin: IndexPin {
-                index_generation: uuid::Uuid::new_v4(),
-                index_revision: 1,
-            },
-            documents,
-            manifests: Vec::new(),
-            root_tsconfig: None,
-            evidence_gaps: Default::default(),
-        }
-    }
-
-    /// #556: a read selects from one whole-revision base instead of resolving its own paths.
-    #[test]
-    fn a_resolved_base_selects_what_a_scoped_projection_returns() {
-        let snapshot = snapshot();
-        let base = resolve_all(&snapshot, &mut || Ok(())).unwrap();
-        for paths in [
-            vec![],
-            vec!["src/**".to_owned()],
-            vec!["use.js".to_owned()],
-            vec!["*.py".to_owned(), "Use.java".to_owned()],
-            vec!["missing/**".to_owned()],
-        ] {
-            for limit in [1, 5, MAX_SAMPLE_LIMIT] {
-                let scoped = project(&snapshot, &paths, limit, &mut || Ok(())).unwrap();
-                let selected = base.select(&paths, limit, &mut || Ok(())).unwrap();
-                assert_eq!(scoped.data, selected.data, "{paths:?} {limit}");
-                assert_eq!(
-                    format!("{:?}", scoped.coverage),
-                    format!("{:?}", selected.coverage),
-                    "{paths:?} {limit}"
-                );
-            }
-        }
-    }
-
-    /// #837: a `prefix` selects the sources under a directory, with or without `paths`, and
-    /// the scoped projection and the base's selection agree.
-    #[test]
-    fn a_prefix_selects_sources_under_a_directory() {
-        let snapshot = snapshot();
-        let base = resolve_all(&snapshot, &mut || Ok(())).unwrap();
-        let sources = |data: &Value| -> BTreeSet<String> {
-            ["production", "tests", "unresolved"]
-                .iter()
-                .flat_map(|field| data[*field].as_array().unwrap().clone())
-                .map(|row| row["source"]["path"].as_str().unwrap().to_owned())
-                .collect()
-        };
-        for (paths, prefix, scanned) in [
-            (vec![], "src", 2),
-            (vec!["**/lib.rs".to_owned()], "src", 1),
-            (vec!["use.js".to_owned()], "src", 0),
-            (vec![], "sr", 0),
-            (vec![], "src/lib.rs", 0),
-        ] {
-            let scoped = project_under(&snapshot, &paths, Some(prefix), 5, &mut || Ok(())).unwrap();
-            let selected = base
-                .select_under(&paths, Some(prefix), 5, &mut || Ok(()))
-                .unwrap();
-            assert_eq!(scoped.data, selected.data, "{paths:?} {prefix}");
-            assert_eq!(
-                scoped.data["counts"]["scannedDocuments"], scanned,
-                "{paths:?} {prefix}"
-            );
-            assert!(
-                sources(&scoped.data)
-                    .iter()
-                    .all(|path| path.starts_with("src/")),
-                "{paths:?} {prefix}"
-            );
-        }
-        assert!(
-            !sources(
-                &project_under(&snapshot, &[], Some("src"), 5, &mut || Ok(()))
-                    .unwrap()
-                    .data
-            )
-            .is_empty()
-        );
-        for (prefix, normalized) in [
-            ("src", Some("src")),
-            ("src/", Some("src")),
-            ("a/b c/", Some("a/b c")),
-            ("src//", None),
-            ("/", None),
-            ("", None),
-            ("..", None),
-            ("a/./b", None),
-            ("a\\b", None),
-            ("a:b", None),
-            ("a\0", None),
-        ] {
-            assert_eq!(directory_prefix(prefix), normalized, "{prefix:?}");
-        }
-    }
-
-    #[test]
-    fn serial_and_parallel_keep_payload_and_exact_work_counts() {
-        let snapshot = snapshot();
-        for paths in [vec![], vec!["src/lib.rs".into(), "use.*".into()]] {
-            let (serial, used) = project_configured(
-                &snapshot,
-                Sources {
-                    paths: &paths,
-                    prefix: None,
-                    files: None,
-                },
-                1,
-                1,
-                &mut || Ok(()),
-            )
-            .unwrap();
-            assert!(used > 0);
-            for workers in [2, 8] {
-                let (parallel, parallel_used) = project_configured(
-                    &snapshot,
-                    Sources {
-                        paths: &paths,
-                        prefix: None,
-                        files: None,
-                    },
-                    1,
-                    workers,
-                    &mut || Ok(()),
-                )
-                .unwrap();
-                assert_eq!(parallel_used, used);
-                assert_eq!(
-                    serde_json::to_vec(&parallel.data).unwrap(),
-                    serde_json::to_vec(&serial.data).unwrap()
-                );
-                assert_eq!(parallel.modules, serial.modules);
-            }
-        }
-    }
-
-    #[test]
-    fn parallel_parse_and_preparation_overlap_and_return_in_source_order() {
-        let snapshot = snapshot();
-        let docs = &snapshot.documents[..2];
-        let (tx, rx) = std::sync::mpsc::channel();
-        let rx = Mutex::new(rx);
-        let mut check = || Ok(());
-        let request = parallel_check::RequestCheck::new(&mut check);
-        let trees = map_batch(&[0usize, 1], 2, &request, |&index| {
-            if index == 0 {
-                rx.lock().unwrap().recv().unwrap();
-            }
-            let tree = parse(&docs[index], &mut request.worker())?;
-            if index == 1 {
-                tx.send(()).unwrap();
-            }
-            Ok(tree)
-        })
-        .unwrap();
-        assert_eq!(trees[0].root_node().end_byte(), docs[0].file.text.len());
-        assert_eq!(trees[1].root_node().end_byte(), docs[1].file.text.len());
-        let prepared = map_batch(&[0usize, 1], 2, &request, |&index| {
-            if index == 0 {
-                rx.lock().unwrap().recv().unwrap();
-            }
-            let prepared = prepare_file(
-                index,
-                &docs[index],
-                &trees[index],
-                5_000_000,
-                &mut request.worker(),
-            )?;
-            if index == 1 {
-                tx.send(()).unwrap();
-            }
-            Ok(prepared)
-        })
-        .unwrap();
-        assert_eq!(prepared[0].source, 0);
-        assert_eq!(prepared[1].source, 1);
-        assert!(prepared.iter().all(|file| file.work.used > 0));
-    }
-
-    #[test]
-    fn independent_catalog_jobs_overlap() {
-        let snapshot = snapshot();
-        let mut docs: Vec<_> = snapshot.documents.iter().collect();
-        docs.sort_by(|a, b| a.key.cmp(&b.key));
-        let trees: Vec<_> = docs
-            .iter()
-            .map(|doc| parse(doc, &mut || Ok(())).unwrap())
-            .collect();
-        let documents = docs
-            .iter()
-            .enumerate()
-            .map(|(i, doc)| (doc.key.clone(), i))
-            .collect();
-        let selected: Vec<_> = (0..docs.len()).collect();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let rx = Mutex::new(rx);
-        let mut check = || Ok(());
-        let request = parallel_check::RequestCheck::new(&mut check);
-        let catalogs = map_batch(&[0usize, 1], 2, &request, |&language| {
-            let mut check = request.worker();
-            let mut work = Work::new(5_000_000);
-            if language == 0 {
-                rx.lock().unwrap().recv().unwrap();
-                let packages = external::RustPackages::new(&[], &mut work, &mut check)?;
-                let catalog = rust::Catalog::new(
-                    &docs,
-                    &trees,
-                    &documents,
-                    &cargo_workspace::Workspace::default(),
-                    work,
-                    &mut check,
-                )?;
-                Ok(CatalogJob::Rust(Box::new((catalog, packages))))
-            } else {
-                let catalog = java::Catalog::new(&docs, &trees, &selected, &mut work, &mut check)?;
-                tx.send(()).unwrap();
-                Ok(CatalogJob::Java(Box::new(catalog)))
-            }
-        })
-        .unwrap();
-        assert!(matches!(&catalogs[0], CatalogJob::Rust(_)));
-        assert!(matches!(&catalogs[1], CatalogJob::Java(_)));
-    }
-
-    /// One pass over every item: after a failure no later item starts, and the
-    /// reported error is the first in input order, not the first in time.
-    #[test]
-    fn single_pass_reports_first_failure_in_input_order_and_starts_nothing_later() {
-        let mut check = || Ok(());
-        let request = parallel_check::RequestCheck::new(&mut check);
-        let (failed_tx, failed_rx) = std::sync::mpsc::channel();
-        let failed_rx = Mutex::new(failed_rx);
-        let started = Mutex::new(Vec::new());
-        let result = map_all(&[0usize, 1, 2, 3], 2, &request, |&index| -> Result<usize> {
-            started.lock().unwrap().push(index);
-            match index {
-                // Fails only after item 1 has failed, and after every later item
-                // had the chance to start on the other worker.
-                0 => {
-                    failed_rx.lock().unwrap().recv().unwrap();
-                    anyhow::bail!("first source failure")
-                }
-                1 => {
-                    failed_tx.send(()).unwrap();
-                    anyhow::bail!("later source failure")
-                }
-                _ => Ok(index),
-            }
-        });
-        assert_eq!(result.unwrap_err().to_string(), "first source failure");
-        let mut started = started.into_inner().unwrap();
-        started.sort();
-        assert_eq!(started, vec![0, 1]);
-        let all = map_all(&[0usize, 1, 2, 3], 2, &request, |&index| Ok(index * 10));
-        assert_eq!(all.unwrap(), vec![0, 10, 20, 30]);
-    }
-
-    /// An earlier index claimed before a later failure, but not yet past the
-    /// skip check, still runs: the later typed failure is never masked.
-    #[test]
-    fn a_claimed_earlier_item_runs_after_a_later_typed_failure() {
-        for message in [
-            "bounded_work: reference site count",
-            "bounded_work: reference owner lookup",
-        ] {
-            let mut check = || Ok(());
-            let request = parallel_check::RequestCheck::new(&mut check);
-            let (failed_tx, failed_rx) = std::sync::mpsc::channel();
-            let failed_rx = Mutex::new(failed_rx);
-            let entered = |index: usize| {
-                if index == 0 {
-                    failed_rx.lock().unwrap().recv().unwrap();
-                }
-            };
-            let failed = |index: usize| {
-                if index == 1 {
-                    failed_tx.send(()).unwrap();
-                }
-            };
-            let ran = Mutex::new(Vec::new());
-            let result = map_all_hooked(
-                &[0usize, 1, 2],
-                2,
-                &request,
-                &entered,
-                &failed,
-                |&index| -> Result<usize> {
-                    ran.lock().unwrap().push(index);
-                    anyhow::ensure!(index != 1, "{message}");
-                    Ok(index)
-                },
-            );
-            assert_eq!(result.unwrap_err().to_string(), message);
-            let mut ran = ran.into_inner().unwrap();
-            ran.sort();
-            assert_eq!(ran, vec![0, 1]);
-            assert!(request.result(Ok(())).is_ok());
-        }
-    }
-
-    #[test]
-    fn ordered_failure_stops_before_next_batch_and_work_is_bounded() {
-        let visited = AtomicUsize::new(0);
-        let mut check = || Ok(());
-        let request = parallel_check::RequestCheck::new(&mut check);
-        let result: Result<()> = (|| {
-            for batch in [0usize, 1, 2].chunks(2) {
-                map_batch(batch, 2, &request, |&index| -> Result<()> {
-                    visited.fetch_add(1, Ordering::Relaxed);
-                    if index == 0 {
-                        anyhow::bail!("first source failure")
-                    }
-                    anyhow::bail!("later source failure")
-                })?;
-            }
-            Ok(())
-        })();
-        assert_eq!(result.unwrap_err().to_string(), "first source failure");
-        assert_eq!(visited.load(Ordering::Relaxed), 2);
-        let snapshot = snapshot();
-        let doc = &snapshot.documents[0];
-        let tree = parse(doc, &mut || Ok(())).unwrap();
-        let error = prepare_file(0, doc, &tree, 0, &mut || Ok(()))
-            .err()
-            .unwrap();
-        assert!(error.to_string().starts_with("bounded_work:"));
-        let mut total = Work::new(3);
-        merge_work(&mut total, 2, &mut || Ok(())).unwrap();
-        let error = merge_work(&mut total, 2, &mut || Ok(())).unwrap_err();
-        assert_eq!(error.to_string(), "bounded_work: reference work total");
-        assert_eq!(total.used, 4);
-    }
-}
+mod parallel_tests;
 
 #[cfg(test)]
-mod classification_tests {
-    use super::parallel_tests::snapshot_of;
-    use super::*;
-
-    fn edge<'a>(data: &'a Value, source: &str, target: &str) -> &'a Value {
-        data["production"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|e| e["source"]["path"] == source && e["target"]["path"] == target)
-            .unwrap()
-    }
-
-    /// R1 and R2: a structural callee path is a call, and a site names its owner.
-    #[test]
-    fn structural_callee_paths_are_calls() {
-        let snapshot = snapshot_of(&[
-            (
-                "src/lib.rs",
-                "mod high;\nuse crate::high::T;\nfn run(_: crate::high::T) { crate::high::f(); }\n",
-            ),
-            ("src/high.rs", "pub struct T;\npub fn f() -> u8 { 0 }\n"),
-        ]);
-        let data = project(&snapshot, &[], 20, &mut || Ok(())).unwrap().data;
-        let pair = edge(&data, "src/lib.rs", "src/high.rs");
-        let sites = pair["sites"].as_array().unwrap();
-        let kind = |spelling: &str, line: u64| {
-            sites
-                .iter()
-                .find(|s| s["spelling"] == spelling && s["lines"]["start"] == line)
-                .unwrap_or_else(|| panic!("{spelling} on line {line}"))
-        };
-        assert_eq!(kind("crate::high::T", 2)["relationKind"], "import");
-        assert_eq!(kind("crate::high::T", 3)["relationKind"], "reference");
-        let call = kind("crate::high::f", 3);
-        assert_eq!(call["relationKind"], "call");
-        assert_eq!(call["caller"]["name"], "run");
-        assert_eq!(call["owner"]["name"], "run");
-        assert_eq!(call["owner"]["syntaxId"], call["ownerSyntaxId"]);
-        assert_eq!(call["owner"]["stableLookupKey"], "src/lib.rs::run");
-        assert_eq!(call["target"], Value::Null);
-        assert_eq!(call["targetReason"], "structural_only");
-        // Calls come first, and the counts add up to the edge.
-        assert_eq!(sites[0]["relationKind"], "call");
-        let counts = &pair["kindCounts"];
-        assert_eq!(counts["call"], 1);
-        assert_eq!(counts["import"], 1);
-        assert_eq!(counts["reference"], 1);
-        assert_eq!(counts["type"], 0);
-        // A site outside any declaration is owned by the file module.
-        let module = pair["source"]["sid"].clone();
-        let import = kind("crate::high::T", 2);
-        assert_eq!(import["owner"]["name"], Value::Null);
-        assert_eq!(import["owner"]["stableLookupKey"], Value::Null);
-        assert_eq!(import["owner"]["syntaxId"], module);
-    }
-
-    /// R3: the four reasons, and the order in which they apply.
-    #[test]
-    fn target_reason_vocabulary() {
-        use SemanticOutcome::*;
-        assert_eq!(target_reason(true, false, None), "structural_only");
-        // No producer wins over any outcome.
-        assert_eq!(
-            target_reason(true, false, Some(&External)),
-            "structural_only"
-        );
-        assert_eq!(target_reason(true, true, Some(&External)), "external");
-        assert_eq!(target_reason(false, true, Some(&External)), "external");
-        assert_eq!(target_reason(true, true, Some(&Ambiguous)), "ambiguous");
-        assert_eq!(target_reason(true, true, None), "unresolved");
-        assert_eq!(target_reason(true, true, Some(&Unresolved)), "unresolved");
-        assert_eq!(target_reason(false, true, Some(&Boundary)), "unresolved");
-        assert_eq!(
-            target_reason(false, true, Some(&Internal(0, "sid".into()))),
-            "unresolved"
-        );
-        assert_eq!(target_reason(false, true, None), "unresolved");
-    }
-}
+mod classification_tests;

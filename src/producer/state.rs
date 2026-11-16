@@ -104,6 +104,9 @@ pub struct RunRecord {
     /// What was established about the producer's process group once Trellis stopped owning
     /// it; `None` while the producer runs or when none was started.
     pub group_status: Option<GroupStatus>,
+    /// Why the run failed, for a failed or cancelled run with diagnostics (#967).
+    #[serde(default)]
+    pub failure: Option<super::failure::Failure>,
     #[serde(default)]
     pub origin: RunOrigin,
 }

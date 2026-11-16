@@ -93,11 +93,15 @@ admitted source and diagram data; browser history stores no source bytes, token 
 the section, selected Files symbol/basis, source range and active line, focus and scroll using the
 normal renderer. Already admitted declaration metadata is retained with the entry, including explicit
 continuation pages, so restore needs no new metadata request and never waits on one for position.
-Pending metadata remains independent of focus/scroll restoration. Entries are invalidated by session, checkout or full-pin changes. Missing state is a
-visible refusal. No new source read or source-text persistence is needed for a retained entry.
+Pending metadata remains independent of focus/scroll restoration. Entries are invalidated by session, checkout or full-pin changes. A stale
+entry (invalidated, or its in-memory state gone) clears the URL and history state with
+`history.replaceState`, adding no entry, and opens the root view (Architecture) with no error
+(#951, owner ruling 2026-11-12). No new source read or source-text persistence is needed for a retained entry.
 
 `#sequence?sid=…` waits for authentication and explicit checkout selection. Generated links add
-`rootKey`, `indexGeneration` and `indexRevision`; mismatches are refused. The sequence endpoint's
+`rootKey`, `indexGeneration` and `indexRevision`. Malformed links and a `rootKey` for another
+checkout are refused; a well-formed link whose pin is not the selected snapshot is stale and opens
+the root view as above, with no error (#951, owner ruling 2026-11-12). The sequence endpoint's
 returned seed must match the requested ID and full pin; no workspace scan or lexical lookup resolves
 a URL. Back, new routes, checkout/session changes and pin adoption fence all pending route results.
 

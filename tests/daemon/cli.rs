@@ -545,35 +545,82 @@ fn unchanged_serve_reuses_selected_versions_and_detects_selected_source_corrupti
     drop(db);
     drop(changed);
 
+    // The daemon outlives its serve clients, and its background owners read the selected
+    // documents too: the Architecture owner builds every new head. Corruption found by any
+    // selected read schedules a re-index (docs/local-topology.md, #261), so settle the
+    // checkout at its head first. The next read of the damaged source is then the `symbols`
+    // read below, not a background read whose re-index would answer it (#903).
+    let settle = || {
+        let mut settle = isolated_command(&home);
+        settle.env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"));
+        crate::child::settled(settle, &root, None)
+    };
+    let damaged = settle();
     let db = rusqlite::Connection::open(&dbpath).unwrap();
-    let selected_id = &next_ids.last().unwrap().1;
+    let (settled_rev, settled_ids) = pin_and_ids(&db);
+    assert_eq!(damaged["indexRevision"], settled_rev, "{damaged}");
+    let selected = settled_ids.last().unwrap();
+    assert_eq!(
+        (selected.0, selected.1),
+        (settled_rev, changed_ids.1),
+        "the settled head selects the published evidence"
+    );
+    let edited_bytes = fs::read(&file).unwrap();
     assert_eq!(
         db.execute(
             "UPDATE document_versions SET source_bytes=?1 WHERE vid=?2",
-            rusqlite::params![vec![b'x'; old_bytes.len()], selected_id]
+            rusqlite::params![vec![b'x'; edited_bytes.len()], selected.1]
         )
         .unwrap(),
         1
     );
     drop(db);
     let corrupt_log = temp.path().join("serve-corrupt.log");
+    // A repeated serve registration is inert: it starts no reconciliation and reads nothing.
     let rejected = serve(&root, &home, &corrupt_log);
-    // Attachment starts startup reconciliation; a selected read must still refuse the damaged head.
+    // The read hashes the selected source it would answer from: typed refusal, no data.
     let corrupt_selected = command(&root, &home, "symbols").output().unwrap();
+    let refusal = String::from_utf8_lossy(&corrupt_selected.stderr);
     assert!(
         !corrupt_selected.status.success(),
-        "corrupt selected corrupt was accepted"
+        "a read of the damaged selected source was answered: {}",
+        String::from_utf8_lossy(&corrupt_selected.stdout)
     );
     assert!(
         corrupt_selected.stdout.is_empty(),
-        "damaged selected corrupt escaped on stdout"
+        "damaged selected source escaped on stdout"
     );
+    assert!(
+        refusal.contains("incompatible_index: source hash mismatch"),
+        "untyped refusal: {refusal}"
+    );
+    // The refused read scheduled the re-index. Once it settles, the index is a new generation
+    // rebuilt from the working tree, and the same read is answered from it.
+    let repaired = settle();
+    assert_ne!(
+        repaired["indexGeneration"], damaged["indexGeneration"],
+        "the damaged generation was kept"
+    );
+    assert_eq!(repaired["indexRevision"], 1, "{repaired}");
+    let answered = command(&root, &home, "symbols").output().unwrap();
+    let answered = crate::child::cli_json(&answered, "symbols after the re-index");
+    assert_eq!(answered["data"]["revision"], repaired, "{answered}");
+    let names: Vec<&str> = answered["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["a.js", "sued"]);
     let db = rusqlite::Connection::open(&dbpath).unwrap();
-    assert_eq!(
-        pin_and_ids(&db),
-        (r3, next_ids.clone()),
-        "corrupt selected source was republished"
-    );
+    let stored: Vec<Vec<u8>> = db
+        .prepare("SELECT source_bytes FROM document_versions")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(stored, [edited_bytes], "the re-index kept damaged source");
     let headers: i64 = db
         .query_row("SELECT count(*) FROM native_revisions", [], |r| r.get(0))
         .unwrap();
@@ -584,8 +631,8 @@ fn unchanged_serve_reuses_selected_versions_and_detects_selected_source_corrupti
         .unwrap();
     assert_eq!(
         (headers, bindings),
-        (r3, r3),
-        "refused Serve installed partial metadata"
+        (1, 1),
+        "the re-index installed partial metadata"
     );
     drop(db);
     drop(rejected);
@@ -4298,6 +4345,111 @@ async fn read_under_index_use_contention(
     let output: Value = serde_json::from_slice(&fs::read(&stdout_path).unwrap()).unwrap();
     drop(replacement);
     Some((indexed, output))
+}
+
+/// #984: a Git checkout's source-set ID is `source-set:v1:<UUID>`. The CLI
+/// takes the ID the revision read reports for every located scope.
+#[test]
+fn metrics_located_scopes_accept_the_source_set_id_a_git_checkout_reports() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("source");
+    let home = temp.path().join("home");
+    let _daemon = FixtureDaemon::new(&home);
+    fs::create_dir_all(root.join("src")).unwrap();
+    let init = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "git init failed");
+    fs::write(
+        root.join("src/flow.js"),
+        "function start(x) { if (x) { return 1; } return 2; }\n",
+    )
+    .unwrap();
+    let indexed = command(&root, &home, "index").output().unwrap();
+    crate::child::assert_cli_success(&indexed, "indexed");
+    let metrics = |phase: &str, args: &[&str]| -> Value {
+        let output = command(&root, &home, "metrics")
+            .arg("--json")
+            .args(args)
+            .output()
+            .unwrap();
+        crate::child::assert_cli_success(&output, phase);
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    let revision = metrics("revision", &[]);
+    let file_row = &revision["payload"]["files"][0];
+    let source_set = file_row["sourceSetId"].as_str().unwrap();
+    let identity = source_set.strip_prefix("source-set:v1:").unwrap();
+    assert_eq!(
+        uuid::Uuid::parse_str(identity).unwrap().to_string(),
+        identity,
+        "{revision}"
+    );
+    let located = ["--source-set-id", source_set];
+
+    let file = metrics(
+        "file",
+        &[
+            &["--scope", "file", "--language", "javascript"][..],
+            &["--path", "src/flow.js"],
+            &located,
+        ]
+        .concat(),
+    );
+    assert_eq!(file["payload"]["files"][0], *file_row, "{file}");
+    assert_eq!(file["payload"]["files"][0]["metrics"]["cyclomatic"], 2);
+    let declaration_row = &file["payload"]["declarations"][0];
+    let sid = declaration_row["sid"].as_str().unwrap();
+
+    let directory = metrics(
+        "directory",
+        &[&["--scope", "directory", "--path", "src"][..], &located].concat(),
+    );
+    let subtree = directory["payload"]["directories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["path"] == "src")
+        .unwrap_or_else(|| panic!("no src directory: {directory}"));
+    assert_eq!(subtree["sourceSetId"], source_set);
+    assert_eq!(subtree["declarationCount"], 1);
+    assert_eq!(subtree["metrics"]["cyclomatic"], 2);
+
+    let declaration = metrics(
+        "declaration",
+        &[
+            &["--scope", "declaration", "--path", "src/flow.js"][..],
+            &["--sid", sid],
+            &located,
+        ]
+        .concat(),
+    );
+    assert_eq!(
+        declaration["payload"]["declarations"],
+        serde_json::json!([declaration_row]),
+        "{declaration}"
+    );
+
+    // A malformed ID is still refused before any read.
+    for invalid in [
+        "garbage",
+        "source-set:v2:6f1f0a52-0d0c-4d6e-9a43-0c1a3e3a8b11",
+        &source_set.to_uppercase(),
+    ] {
+        let mut rejected = command(&root, &home, "metrics");
+        rejected
+            .args(["--json", "--scope", "directory", "--path", "src"])
+            .args(["--source-set-id", invalid]);
+        let rejected = bounded_invalid_cli(temp.path(), "source-set", &mut rejected);
+        assert!(!rejected.status.success(), "{invalid}");
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr).contains("invalid_argument: source set ID"),
+            "{invalid}: {}",
+            String::from_utf8_lossy(&rejected.stderr)
+        );
+    }
 }
 
 #[test]

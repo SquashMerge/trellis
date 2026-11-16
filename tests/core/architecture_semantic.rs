@@ -7,9 +7,10 @@ use crate::graph_fixtures::{
 use serde_json::{Value, json};
 use std::fs;
 use trellis::{
+    metrics_read::MetricsOptions,
     model::IndexPin,
     semantic_evidence::{self as s, CoverageState, Dispatch, Resolution},
-    store::{MetricsOptions, Store},
+    store::Store,
 };
 
 // `orphan.rs` is not declared by `lib.rs`, so its structural sites are unresolved; `t.go()`
@@ -194,6 +195,32 @@ fn assert_syntax_only(store: &Store, pin: IndexPin) {
             .unwrap()
             .contains(&json!(NO_BINDINGS))
     );
+}
+
+/// #1102: a call with several binding rows is read as the call graph reads it. A row that names
+/// the target represents the call ahead of an unresolved row with a lower provenance ID.
+#[test]
+fn a_call_with_several_rows_is_bound_by_the_row_that_names_its_target() {
+    let mut spec = Spec::new(FILES);
+    spec.bindings = vec![
+        Bind {
+            resolution: Resolution::Unresolved,
+            target: None,
+            dispatch: Dispatch::Unknown,
+            provenance: "call-orphan-a".into(),
+            ..bind("orphan", 0, "upper")
+        },
+        Bind {
+            provenance: "call-orphan-b".into(),
+            ..bind("orphan", 0, "upper")
+        },
+    ];
+    let (_state, _root, store, pin) = publish(&spec);
+    let references = read(&store, "references", json!({"expectedBasis":pin}));
+    let orphan = edge(&references, "src/orphan.rs", "src/high.rs").unwrap();
+    assert_eq!(orphan["semanticSites"], 1);
+    assert_eq!(orphan["sites"][0]["mapping"], "semantic");
+    assert_eq!(orphan["sites"][0]["provenanceId"], "call-orphan-b");
 }
 
 #[test]

@@ -1,7 +1,7 @@
 //! Production matrix reads: exact membership changes, admitted pins and typed failures.
 use super::*;
 use crate::indexer::{IndexOptions, index_workspace_bundle};
-use crate::search_rank::SearchCandidate;
+use crate::search_vocab::SearchCandidate;
 use std::fs;
 
 struct Fixture {
@@ -112,7 +112,7 @@ fn two_document_edits_and_deletion_patch_exactly_without_retained_candidates() {
         .mcp_search_policy(
             "orchard",
             second,
-            crate::search_rank::SearchRole::Any,
+            crate::search_vocab::SearchRole::Any,
             &mut || Ok(()),
         )
         .unwrap();
@@ -221,7 +221,7 @@ fn split_reads_reject_wrong_head_and_invalid_previous_pins() {
                 "orchard",
                 wrong,
                 2,
-                &crate::search_rank::SearchPolicy::default(),
+                &crate::search_vocab::SearchPolicy::default(),
                 &mut || Ok(()),
             )
             .unwrap_err(),
@@ -332,7 +332,7 @@ fn cancellation_preserves_original_type_and_discards_work_in_every_read() {
                 "orchard",
                 second,
                 3,
-                &crate::search_rank::SearchPolicy::default(),
+                &crate::search_vocab::SearchPolicy::default(),
                 &mut stop_after(2),
             )
             .unwrap_err(),
@@ -483,7 +483,7 @@ fn canonical_head_count_matches_eligible_cards_not_all_native_declarations() {
                 .mcp_search_policy(
                     "orchard",
                     pin,
-                    crate::search_rank::SearchRole::Any,
+                    crate::search_vocab::SearchRole::Any,
                     &mut || Ok(()),
                 )
                 .unwrap(),
@@ -497,7 +497,7 @@ fn canonical_head_count_matches_eligible_cards_not_all_native_declarations() {
                 "a",
                 pin,
                 count,
-                &crate::search_rank::SearchPolicy::default(),
+                &crate::search_vocab::SearchPolicy::default(),
                 &mut || Ok(())
             )
             .unwrap()
@@ -537,7 +537,7 @@ fn cold_count_detects_missing_and_extra_fts_rows_even_without_query_terms() {
                     query,
                     pin,
                     count,
-                    &crate::search_rank::SearchPolicy::default(),
+                    &crate::search_vocab::SearchPolicy::default(),
                     &mut || Ok(()),
                 )
                 .unwrap_err();
@@ -577,7 +577,7 @@ fn lexical_required_corpus_faults_fail_even_without_query_terms() {
                 "a",
                 pin,
                 2,
-                &crate::search_rank::SearchPolicy::default(),
+                &crate::search_vocab::SearchPolicy::default(),
                 &mut || Ok(()),
             )
             .unwrap_err();
@@ -632,9 +632,12 @@ fn exact_policy_and_lexical_plans_use_indexed_candidate_joins() {
 
     for (query, expected_count) in [("unique_needle", 1), ("orchard", 3)] {
         let policy = response
-            .mcp_search_policy(query, pin, crate::search_rank::SearchRole::Any, &mut || {
-                Ok(())
-            })
+            .mcp_search_policy(
+                query,
+                pin,
+                crate::search_vocab::SearchRole::Any,
+                &mut || Ok(()),
+            )
             .unwrap();
         let expression = crate::search_lexical::query_expression(&response.db, query).unwrap();
         let sql = search_lexical_sql(expression.is_some());
@@ -648,7 +651,7 @@ fn exact_policy_and_lexical_plans_use_indexed_candidate_joins() {
                     query,
                     Option::<&str>::None,
                     expression,
-                    crate::search_rank::CANDIDATE_DEPTH as i64
+                    crate::search_vocab::CANDIDATE_DEPTH as i64
                 ],
                 |row| row.get(3),
             )
@@ -697,7 +700,7 @@ fn exact_policy_and_lexical_plans_use_indexed_candidate_joins() {
 
 #[test]
 fn candidate_roles_follow_selected_declarations_in_head_and_delta() {
-    use crate::native_evidence::DeclarationRole;
+    use crate::native_records::DeclarationRole;
     let fixture = Fixture::new();
     let first = fixture.publish();
     let original = fixture.head(first);
@@ -772,7 +775,7 @@ fn invalid_selected_role_fails_whole_head_and_delta() {
 #[test]
 fn exact_lookup_prefilter_includes_raw_javascript_fallback() {
     let query = r"invalid\uQQQQ";
-    assert!(crate::native_evidence::lookup("javascript", query).is_err());
+    assert!(crate::native_records::lookup("javascript", query).is_err());
     assert!(search_exact_lookup_keys(query).contains(query));
     assert!(search_exact_lookup_keys("r#type").contains("type"));
     assert!(search_exact_lookup_keys("Kelvin").contains("Kelvin"));
@@ -783,8 +786,8 @@ fn exact_lookup_prefilter_includes_raw_javascript_fallback() {
 fn exact_lookup_prefilter_derives_every_native_language_key() {
     for query in ["Kelvin", "r#type", r"café", r"abc", "caf\u{e9}"] {
         let keys = search_exact_lookup_keys(query);
-        for language in crate::native_evidence::LANGUAGES {
-            if let Ok(key) = crate::native_evidence::lookup(language, query) {
+        for language in crate::native_records::LANGUAGES {
+            if let Ok(key) = crate::native_records::lookup(language, query) {
                 assert!(keys.contains(&key), "{language} key of {query:?}");
             }
         }

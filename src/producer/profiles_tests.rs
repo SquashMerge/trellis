@@ -57,6 +57,7 @@ fn spec(row: &Row) -> profiles::CommandSpec {
         &pin,
         &profiles::rules(row),
         RUN,
+        8192,
     )
 }
 
@@ -72,6 +73,7 @@ fn profile_commands_are_closed_table() {
         ts.argv,
         [
             "/nodes/real/node",
+            "--max-old-space-size=6553",
             "/opt/launcher",
             "index",
             "--output",

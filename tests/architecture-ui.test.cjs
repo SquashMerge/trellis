@@ -5,7 +5,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const source = fs.readFileSync(path.join(__dirname, "../web/architecture.js"), "utf8");
-const pinSource = fs.readFileSync(path.join(__dirname, "../web/app.js"), "utf8").match(/const IndexPin = Object.freeze\(\{[\s\S]*?\n\}\);\nwindow.TrellisIndexPin = IndexPin;/)[0];
+const pinSource = fs.readFileSync(path.join(__dirname, "../web/index-pin.js"), "utf8");
 const pin = {indexGeneration:"12345678-1234-4123-8123-123456789abc",indexRevision:1};
 const descendants = node => [node, ...node.children.flatMap(descendants)];
 const text = node => descendants(node).map(item => item.textContent).join(" ");
@@ -63,7 +63,7 @@ function emulateDetails(full, url, edgePairs) {
     rulesFile:{contentHash:query.get("rulesHash")}, kind, offset, total:items.length,
     nextOffset:offset + limit < items.length ? offset + limit : null, items:items.slice(offset, offset + limit)}};
 }
-function harness() {
+function harness(extra = {}) {
   const elements = new Map(), calls = [], detailCalls = [], renders = [], reads = [], conflicts = [], timers = [], edgePairs = new Map(), sequences = [];
   let context = {rootKey:"checkout-one",session:1,pin}, response = async () => ({payload:fixture(),catchingUp:false}), full = null, detailError = null, detailGate = null;
   // Created nodes with an id (the inspector's review chips, #449) resolve by that id; the newest wins.
@@ -83,12 +83,13 @@ function harness() {
   }
   const get = document.getElementById;
   let renderer = async (_container, view, options) => {renders.push({view,options}); return {status:"ready"};};
-  const window = {TrellisArchitecturePele:{render:(...args) => renderer(...args)},TrellisShell:{
-    clearArchitectureInspector:() => {get("architecture-inspector").hidden=true;get("architecture-inspector-content").replaceChildren();},
-    showArchitectureInspector:() => {get("architecture-inspector").hidden=false;},
-  }};
-  vm.runInNewContext(pinSource + "\n" + fs.readFileSync(path.join(__dirname, "../web/metric-heat.js"), "utf8") + "\n" + fs.readFileSync(path.join(__dirname, "../web/architecture-apps.js"), "utf8") + "\n" + fs.readFileSync(path.join(__dirname, "../web/architecture-deviations.js"), "utf8") + "\n" + source, {window,document,URLSearchParams,console,setTimeout:(run,delay) => {timers.push({run,delay}); return timers.length;},clearTimeout:id => {if (id) timers[id-1].run = null;}});
-  const controller = window.TrellisArchitecture.create({request:async (url,current,options) => {
+  const window = {TrellisArchitecturePele:{render:(...args) => renderer(...args)}};
+  const inspector = {
+    clear:() => {get("architecture-inspector").hidden=true;get("architecture-inspector-content").replaceChildren();},
+    show:() => {get("architecture-inspector").hidden=false;},
+  };
+  vm.runInNewContext(pinSource + "\n" + fs.readFileSync(path.join(__dirname, "../web/metric-heat.js"), "utf8") + "\n" + fs.readFileSync(path.join(__dirname, "../web/architecture-apps.js"), "utf8") + "\n" + fs.readFileSync(path.join(__dirname, "../web/architecture-display.js"), "utf8") + "\n" + fs.readFileSync(path.join(__dirname, "../web/deviations-model.js"), "utf8") + "\n" + fs.readFileSync(path.join(__dirname, "../web/architecture-deviations.js"), "utf8") + "\n" + source, {window,document,URLSearchParams,console,setTimeout:(run,delay) => {timers.push({run,delay}); return timers.length;},clearTimeout:id => {if (id) timers[id-1].run = null;}});
+  const controller = window.TrellisArchitecture.create({inspector, request:async (url,current,options) => {
     if (url.startsWith("/api/architecture/details?")) { detailCalls.push({url,current}); if (detailError) throw detailError; if (detailGate) await detailGate; return emulateDetails(full, url, edgePairs); }
     calls.push({url,current,options}); const data = await response(url,options);
     if (!url.startsWith("/api/architecture?") || !data?.payload?.references) return data;
@@ -104,7 +105,7 @@ function harness() {
     }
     return {...data, payload:{...full, references, rules}};
   },context:() => context,
-    readSource:(site,revision,current) => reads.push({site,revision,current}),openSequence:(...args) => sequences.push(args),onConflict:() => conflicts.push(true)});
+    readSource:(site,revision,current) => reads.push({site,revision,current}),openSequence:(...args) => sequences.push(args),onConflict:() => conflicts.push(true), ...extra});
   const button = label => {const found = descendants(get("architecture-inspector-content")).find(item => item.tagName === "button" && item.textContent === label);assert.ok(found, `Missing ${label}`);return found;};
   return {timers,window,controller,calls,detailCalls,renders,sequences,reads,conflicts,get,button,setContext:value => {context=value;},setResponse:fn => {response=fn;},setRenderer:fn => {renderer=fn;},setDetailError:error => {detailError=error;},setDetailGate:gate => {detailGate=gate;}};
 }
@@ -408,7 +409,7 @@ test("a line's file-pair exception goes through one preview and applies the exac
   assert.equal(JSON.stringify(writes[1].options.body),JSON.stringify({...sent.options.body,proposedHash:"rules-proposed"}));assert.match(h.get("architecture-state").textContent,/Rules committed.*same code/);
 });
 
-test("a refresh that fails after an apply drops the reopen request, so a later refresh keeps the tree closed", async () => {
+test("a refresh that fails after an apply drops the reopen request; a later refresh opens the tab's tree on every edge (#965)", async () => {
   const h=harness();let hash="rules-one",failRead=false;
   h.setResponse(async url => {
     if(url.endsWith("/preview")) return editorResponse();
@@ -417,12 +418,15 @@ test("a refresh that fails after an apply drops the reopen request, so a later r
     return {payload:authoringFixture(hash)};
   });
   await h.controller.refresh();await draftLineException(h);
+  const chip = key => descendants(h.get("architecture-deviations-edges")).find(item => item.dataset.key === key);
+  await descendants(h.get("architecture-deviations-edges")).find(item => item.dataset.key).fire("click");
   h.get("architecture-reason").value="Reviewed";await h.get("architecture-reason").fire("input");await h.get("architecture-preview").fire("click");
   assert.equal(h.get("architecture-deviations").hidden,false,"the tree is open when the rules are applied");
   await h.get("architecture-confirm").fire("click");await flush();
   assert.equal(h.get("architecture-deviations").hidden,true);
-  failRead=false;await h.controller.refresh();await flush();
-  assert.equal(h.get("architecture-deviations").hidden,true,"a later successful refresh does not reopen the tree");
+  failRead=false;await h.controller.refresh();await flush();await flush();
+  assert.equal(h.get("architecture-deviations").hidden,false,"the Deviations tab's tree opens again");
+  assert.equal(chip("").attrs["aria-pressed"],"true","on every edge: the failed refresh dropped the request for its chip");
 });
 
 test("conflict preserves draft and reload requires a new preview on the new rules base", async () => {
@@ -878,7 +882,7 @@ test("#523: inspectors describe semantic evidence for mixed edges and bound rule
 });
 
 // Deviations tree (#786): the module loads into node:vm with a small DOM stub and stub deps.
-const deviationsSource = fs.readFileSync(path.join(__dirname, "../web/architecture-deviations.js"), "utf8");
+const deviationsSource = ["../web/deviations-model.js", "../web/architecture-deviations.js"].map(file => fs.readFileSync(path.join(__dirname, file), "utf8")).join("\n");
 const plain = value => JSON.parse(JSON.stringify(value));
 const deq = (actual, expected, message) => assert.deepEqual(plain(actual), plain(expected), message);
 const callId = letter => `occ:v2:${letter.repeat(32)}`;
@@ -942,7 +946,7 @@ function deviationsHarness(options = {}) {
     querySelector:selector => statics.has(selector) ? statics.get(selector) : statics.set(selector, track(dnode("static"))).get(selector)};
   const rows = options.rows || deviationRows(), state = {stale:false,usable:true,pages:options.pages || [[0, 2], [2, 3]],failAt:options.failAt ?? null,error:options.error ?? null,
     readError:null,eligible:true,view:options.view || deviationView()};
-  const sandbox = {document,console,navigator:{clipboard:{writeText:async value => {sandbox.copied = value;}}},window:{TrellisClasses:{showContextMenu(event, actions, opts) {
+  const sandbox = {document,console,navigator:{clipboard:{writeText:async value => {sandbox.copied = value;}}},window:{TrellisContextMenu:{showContextMenu(event, actions, opts) {
     menus.push({target:event.currentTarget,actions,options:opts});event.stopPropagation();}}}};
   vm.createContext(sandbox);
   vm.runInContext(pinSource, sandbox);
@@ -1114,7 +1118,7 @@ test("deviations read sends the five filters and pages until nextOffset is null"
   deq(h.calls.details[0].params, {kind:"instances",rule:"$layers",status:"deviates",role:"production",excepted:"false",limit:"500"});
   assert.equal(h.dev.isOpen(), true);
   assert.equal(h.get("architecture-deviations").hidden, false);
-  assert.equal(h.statics.get("#architecture-diagram").hidden, true);
+  assert.equal(h.statics.has("#architecture-diagram"), false, "the tree is its own tab: it hides nothing of Architecture (#965)");
   assert.equal(h.get("architecture-deviations-summary").textContent, "2 files · 13 deviating references · 4 calls");
   assert.equal(h.get("architecture-deviations-tree").attrs["aria-busy"], "false");
   assert.equal(h.get("architecture-deviations-notices").attrs.role, "status");
@@ -1122,10 +1126,7 @@ test("deviations read sends the five filters and pages until nextOffset is null"
   assert.equal(h.get("architecture-deviations-inspect").textContent, "Inspect same-layer and unassigned references");
   await h.get("architecture-deviations-inspect").dispatch("click");
   deq(h.calls.opened, ["unknown"], "the unknown count links to the existing same-layer and unassigned view");
-  assert.equal(h.dev.isOpen(), false, "which closes the tree");
-  assert.equal(h.statics.get("#architecture-diagram").hidden, false);
-  assert.equal(h.calls.overview, 1);
-  assert.equal(h.focus.active, h.trigger, "Back returns focus to the control that opened the tree");
+  assert.equal(h.dev.isOpen(), true, "in Architecture (#965); the tab's tree stays read for its return");
 });
 
 test("deviation rows: names, badges, kind tags, tabindex and unlisted footer", async () => {
@@ -1209,7 +1210,6 @@ test("deviations reload reopens with the same filters and no selection", async (
   assert.equal(h.calls.refreshes, 1);
   h.dev.reset(true);
   assert.equal(h.dev.isOpen(), false);
-  assert.equal(h.statics.get("#architecture-diagram").hidden, false);
   h.state.error = null;
   await h.dev.afterRefresh();
   assert.equal(h.dev.isOpen(), true);
@@ -1234,10 +1234,16 @@ test("deviations reload reopens with the same filters and no selection", async (
 test("a reset that is not a refresh drops the pending reopen request", async () => {
   const h = deviationsHarness();
   await h.dev.open(h.trigger);
+  const chip = name => descendants(h.get("architecture-deviations-edges")).find(item => item.dataset.key === name);
+  await chip("Storage→UI").dispatch("click");
   h.dev.reopenAfterRefresh();
   h.dev.reset();
+  await h.dev.show("Storage→Peer");
+  h.dev.reset(true);
   await h.dev.afterRefresh();
-  assert.equal(h.dev.isOpen(), false, "a later successful refresh does not reopen the tree");
+  assert.equal(h.dev.isOpen(), true, "the Deviations tab's tree opens after a refresh (#965)");
+  assert.equal(chip("Storage→Peer").attrs["aria-pressed"], "true", "on its own state, not the dropped request's chip");
+  h.dev.reset();
   await h.dev.open(h.trigger);
   h.dev.reopenAfterRefresh();
   h.dev.reset(true);
@@ -1742,16 +1748,19 @@ test("AC15 selecting a stub opens the interface inspector from the ends and the 
   assert.deepEqual(grid.children.map(item => item.textContent), ["Matched routes", "4", "Client call sites", "6", "◆ Server-only routes", "2", "◆ Client-only calls", "1",
     "exact", "4", "template", "1", "wrapper-inferred", "1", "unresolved", "0"]);
   assert.equal(grid.children[5].dataset.tone, "warning");
+  // #950 (owner ruling 2026-11-12): the matched routes load up front, with no button, under their heading and first.
   const lists = h.detailCalls.map(call => Object.fromEntries(new URL(call.url, "http://local").searchParams)).filter(query => query.kind === "interfaces");
-  assert.deepEqual(lists.map(query => [query.client, query.server, query.list]), [["web", "daemon", "serverOnly"], ["web", "daemon", "clientOnly"]], "matched waits for Open endpoints");
+  assert.deepEqual(lists.map(query => [query.client, query.server, query.list]), [["web", "daemon", "matched"], ["web", "daemon", "serverOnly"], ["web", "daemon", "clientOnly"]],
+    "one matched request, without a click, then the one-sided lists");
+  assert.equal(descendants(h.get("architecture-inspector-content")).some(item => item.tagName === "button" && item.textContent === "Open endpoints"), false, "no Open endpoints button");
   assert.ok(paragraphs.includes("POST /api/only")); assert.ok(paragraphs.includes("Handler src/http.rs:10"));
   assert.ok(paragraphs.includes("unresolved method (unresolved path)"));
-  await h.button("Open endpoints").fire("click"); await flush();
-  const matched = h.detailCalls.map(call => Object.fromEntries(new URL(call.url, "http://local").searchParams)).filter(query => query.list === "matched");
-  assert.equal(matched.length, 1); assert.equal(matched[0].client, "web");
-  const after = inspectorParagraphs(h);
-  assert.ok(after.includes("GET /api/<b>x</b> · template · 1 call site"), "route text is literal, never markup");
-  assert.equal(h.button("Open endpoints").disabled, true);
+  assert.ok(paragraphs.includes("GET /api/<b>x</b> · template · 1 call site"), "route text is literal, never markup");
+  const heading = paragraphs.indexOf("Matched routes (4)"), row = paragraphs.indexOf("GET /api/<b>x</b> · template · 1 call site");
+  assert.ok(heading >= 0, "the heading counts the interface's matched routes");
+  assert.equal(descendants(h.get("architecture-inspector-content")).find(item => item.tagName === "p" && item.textContent === "Matched routes (4)").className, "detail", "styled as the ◆ headings");
+  assert.ok(heading < row && row < paragraphs.indexOf("◆ Server-only routes: no call matched them") && paragraphs.indexOf("◆ Server-only routes: no call matched them") < paragraphs.indexOf("POST /api/only")
+    && paragraphs.indexOf("POST /api/only") < paragraphs.indexOf("◆ Client-only calls: no route matched them. This does not prove absence."), "matched, then server-only, then client-only");
   await h.button("Read call-site source").fire("click");
   assert.deepEqual(plainStats(h.reads.at(-1).site), {path:"web/app.js", range:{startLine:3, endLine:3, startByte:5, endByte:9}});
   const sources = descendants(h.get("architecture-inspector-content")).filter(item => item.tagName === "button" && item.textContent === "Read handler source");
@@ -1764,7 +1773,6 @@ test("an interface with no matched routes says so, and a missing interface falls
   const h = harness(); h.setResponse(async () => ({payload:dto})); await h.controller.refresh();
   await chooseApp(h, "web · javascript");
   h.renders.at(-1).options.onSelectInterface(statsOf(h, "UI")[0].action); await flush();
-  await h.button("Open endpoints").fire("click"); await flush();
   const text = inspectorParagraphs(h);
   assert.ok(text.includes("No matched routes at this pin.")); assert.ok(text.includes("No server-only routes.")); assert.ok(text.includes("No client-only calls."));
   const saved = {inspection:{kind:"interface", record:{client:"web", server:"nobody"}}, pressed:null, rulesHash:"rules-one", aggregate:"max", role:"production", scope:"web", reviewMode:"rules", reviewScope:null,
@@ -1870,9 +1878,11 @@ test("a late Deviations read for a badge never paints after the scope changed", 
   const gate = deferred(); h.setDetailGate(gate.promise);
   h.renders.at(-1).options.onOpenDeviation({sourceLayer:"Storage", destinationLayer:"Common"}); await flush();
   await chooseApp(h, "web · javascript");
-  gate.resolve(); h.setDetailGate(null); await flush(); await flush();
-  assert.equal(h.get("architecture-deviations").hidden, true, "the scope change closed the tree and the late pages found nobody");
-  assert.equal(h.get("architecture-deviations").children.length, 0);
+  gate.resolve(); h.setDetailGate(null); await flush(); await flush(); await flush();
+  // In the Deviations tab (#965) the scope change reads the new app's tree, on every edge; the old read paints nothing.
+  const reads = h.detailCalls.map(call => new URL(call.url, "http://local").searchParams).filter(query => query.get("kind") === "instances");
+  assert.deepEqual(reads.map(query => query.get("app")), [null, "web"], "the old read, then the new app's");
+  assert.deepEqual(treeChips(h).filter(chip => chip.attrs["aria-pressed"] === "true").map(chip => chip.dataset.key), [""], "every edge of the new app");
 });
 
 test("a scope needs a ready snapshot: apps sent with no_layers never keep a scope alive", async () => {
@@ -1906,7 +1916,7 @@ test("AC25 a selected stub marks its end band with a word, and leaving the selec
   assert.equal(nodes[0].attrs["aria-pressed"], "true"); assert.equal(h.renders.length, drawn + 1, "the drawing is swapped in place");
   assert.match(label(), /^1 · UI · 1 file · max 3 · client end$/);
   h.get("architecture-review").fire("click"); await flush();
-  await h.get("architecture-deviations-back").fire("click"); await flush();
+  await h.get("architecture-deviations-diagram").fire("click"); await flush();
   assert.equal(h.get("architecture-inspector-title").textContent, "Architecture review");
   assert.equal(nodes[0].attrs["aria-pressed"], "false", "returning from the tree leaves no stub marked Selected");
   assert.doesNotMatch(label(), /end/);
@@ -2009,13 +2019,13 @@ test("#845 selecting a deviating arrow opens the tree on its edge; other arrows 
     assert.equal(h.get("architecture-review-panel").hidden, true, "no review list opens");
     assert.equal(h.detailCalls.some(call => new URL(call.url, "http://local").searchParams.has("sourceLayer") && new URL(call.url, "http://local").searchParams.get("kind") !== "edge"), false, "no per-edge instance list is read");
   }
-  await h.get("architecture-deviations-back").fire("click");
-  assert.equal(h.get("architecture-deviations").hidden, true, "Back closes the tree");
+  const drawn = h.renders.length;
+  await h.get("architecture-deviations-diagram").fire("click"); await flush();
+  assert.equal(h.renders.length, drawn + 1, "Show on diagram draws Architecture again (#965)");
   assert.equal(h.get("architecture-inspector-title").textContent, "Architecture review", "and returns to the drawing's resting inspector");
   for (const index of [2, 3, 4]) {
     const reads = h.detailCalls.filter(call => new URL(call.url, "http://local").searchParams.get("kind") === "instances").length;
-    options.onSelectEdge(dto.edges[index]); await flush();
-    assert.equal(h.get("architecture-deviations").hidden, true, "an excepted, test-only or allowed arrow does not open the tree");
+    h.renders.at(-1).options.onSelectEdge(dto.edges[index]); await flush();
     assert.equal(h.get("architecture-inspector-title").textContent, `${dto.edges[index].sourceLayer} → ${dto.edges[index].destinationLayer}`, "the edge inspector shows the arrow");
     assert.equal(h.get("architecture-review-panel").hidden, true);
     assert.equal(h.detailCalls.filter(call => new URL(call.url, "http://local").searchParams.get("kind") === "instances").length, reads, "the edge inspector lists no rule instances");
@@ -2056,23 +2066,25 @@ test("#845 an arrow's tree read that lands after a revision change never paints"
   const next = {...pin, indexRevision:2};
   h.setContext({...saved, pin:next}); h.setResponse(async () => ({payload:{...edgeRoutingFixture(), indexRevision:2}}));
   await h.controller.refresh();
-  gate.resolve(); h.setDetailGate(null); await flush(); await flush();
-  assert.equal(h.get("architecture-deviations").hidden, true, "the new revision closed the tree");
-  assert.equal(h.get("architecture-deviations").children.length, 0, "and the late pages found nobody");
-  h.renders.at(-1).options.onSelectEdge(h.renders.at(-1).view.edges[0]); await flush(); await flush();
-  assert.deepEqual(pressedChips(h), ["Storage→UI"], "the new drawing's arrow opens a fresh tree");
+  gate.resolve(); h.setDetailGate(null); await flush(); await flush(); await flush();
+  // The Deviations tab reads its tree again at the new revision, on the same chip (#965); the late pages paint nothing.
+  const reads = h.detailCalls.map(call => new URL(call.url, "http://local").searchParams).filter(query => query.get("kind") === "instances");
+  assert.deepEqual(reads.map(query => query.get("indexRevision")), ["1", "2"]);
+  assert.deepEqual(pressedChips(h), ["Storage→UI"], "the new revision's tree keeps the chip");
+  assert.equal(h.renders.length, 1, "the tab draws no diagram");
 });
 
-test("#845 the tree hides the Architecture toolbar and leads back with the app or Architecture", async () => {
-  const h = deviationsHarness();
-  h.deps.backLabel = () => "← daemon";
+test("#965 the tree's Show on diagram asks for Architecture with the tree's edge", async () => {
+  const h = deviationsHarness(), asked = [];
+  h.deps.showDiagram = chip => asked.push(chip);
   const fresh = h.sandbox.window.TrellisDeviations.create(h.deps);
-  await fresh.open(h.trigger);
-  assert.equal(h.statics.get("#architecture-panel .architecture-toolbar").hidden, true, "no app switcher or metric toolbar above the tree");
-  assert.equal(h.get("architecture-deviations-back").textContent, "← daemon");
-  assert.equal(descendants(h.get("architecture-deviations")).some(item => /Review all rule instances/.test(item.textContent)), false);
-  fresh.close();
-  assert.equal(h.statics.get("#architecture-panel .architecture-toolbar").hidden, false, "Back restores it");
+  await fresh.show("Storage→UI");
+  const button = h.get("architecture-deviations-diagram");
+  assert.equal(button.textContent, "Show on diagram");
+  assert.equal(descendants(h.get("architecture-deviations")).some(item => /Review all rule instances|←/.test(item.textContent)), false);
+  await button.dispatch("click");
+  await fresh.show(null); await button.dispatch("click");
+  deq(asked, ["Storage→UI", null]);
 });
 
 test("#845 function rows drop the file prefix and are exact unless a sampled pair feeds them", () => {
@@ -2278,4 +2290,45 @@ test("#860 a module-level closure joins its file's module row: one (module level
   const [row] = modules;
   deq(row.lines.map(line => [line.evidence.lines.start, line.closure]), [[10, false], [30, true]], "both lines, the closure still marked");
   deq([row.calls, row.references], [1, 2], "counts are combined");
+});
+
+
+test("review965 an app-and-edge route keeps the edge in navigation when it changes the shared app", async () => {
+  let choice, h;
+  const wanted = {app:"web", edge:"UI→Common"};
+  let route = {...wanted};
+  h = harness({
+    appScope: {get:() => choice.get("checkout-one"), set:next => choice.set("checkout-one", next)},
+    navigate: {filter:filter => { route = {...filter}; }},
+  });
+  choice = h.window.TrellisArchitectureApps.selection();
+  choice.subscribe(() => { void h.controller.scopeChanged(); });
+  const dto = appsFixture();
+  dto.edges.push({sourceLayer:"UI", destinationLayer:"Common", role:"production", count:1, status:"deviates", excepted:false, exceptionReason:null, pairs:[]});
+  h.setResponse(async () => ({payload:dto}));
+  await h.controller.refresh();
+  assert.equal(choice.get("checkout-one"), null);
+  await h.controller.showDeviations(wanted);
+  await flush(); await flush();
+  assert.equal(h.controller.deviationsFilter().edge, wanted.edge, "the displayed tree keeps the requested edge");
+  assert.deepEqual(route, wanted, "the shared-app change must not rewrite the route to every edge");
+});
+
+
+test("review965 an interrupted history restore cannot suppress a newer Deviations tree", async () => {
+  const h = harness(), late = deferred();
+  let owned = true;
+  h.setResponse(() => late.promise);
+  const saved = {aggregate:"max", role:"production", scope:null, rulesHash:"rules-one", inspection:{kind:"deviation", record:{}}, deviations:{chip:null, callsOnly:false, expanded:[], selected:null}};
+  const returning = h.controller.restore(saved, () => owned);
+  await flush();
+  owned = false;
+  h.controller.suspend();
+  h.setResponse(async () => ({payload:edgeRoutingFixture()}));
+  await h.controller.showDeviations({app:null, edge:null});
+  await flush();
+  late.resolve({payload:edgeRoutingFixture()});
+  await returning; await flush();
+  const treeReads = h.detailCalls.filter(call => new URL(call.url, "http://local").searchParams.get("kind") === "instances");
+  assert.equal(treeReads.length, 1, "the newer visit must read its tree after the ready summary");
 });

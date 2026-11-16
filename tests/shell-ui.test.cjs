@@ -5,6 +5,7 @@ const SCOPED = `/api/checkouts/${ROOT}`;
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
+const {APP_SCRIPTS, LOAD_TIME_NEEDS} = require("./support/app-scripts.js");
 const vm = require("node:vm");
 function harness(withApp = false) {
   const elements = new Map(), requests = [], timers = new Map(); let timer = 0;
@@ -22,9 +23,15 @@ function harness(withApp = false) {
     setTimeout(fn){timers.set(++timer,fn);return timer;},clearTimeout(id){timers.delete(id);},
     fetch(path){requests.push(path);throw new Error("Unexpected request "+path);}});
   const run = code => vm.runInContext(code,context);
+  run(fs.readFileSync("web/source-witness.js","utf8"));
+  run(fs.readFileSync("web/sequence-model.js","utf8"));
   run(fs.readFileSync("web/sequence.js","utf8"));
   run(fs.readFileSync("web/shell.js","utf8"));
-  if(withApp){run(fs.readFileSync("web/files.js","utf8"));run(fs.readFileSync("web/app.js","utf8"));run(`token="synthetic";selectedRootKey="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";checkouts=[{rootKey:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",workspaceRoot:"/repo",state:"available"}];status={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},workspaceRoot:"/repo"};`);}
+  if(withApp){
+    // No DOM parser here: the adapter double keeps the real Pele projection and installs one
+    // selectable node per projected row.
+    run(fs.readFileSync("web/pele-svg.js","utf8"));run(fs.readFileSync("web/sequence-pele.js","utf8"));run(fs.readFileSync("tests/support/sequence-adapter-double.js","utf8"));
+    run(fs.readFileSync("web/files.js","utf8"));run(fs.readFileSync("web/index-pin.js","utf8"));for(const file of APP_SCRIPTS)run(fs.readFileSync("web/"+file,"utf8"));run(`token="synthetic";selectedRootKey="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";checkouts=[{rootKey:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",workspaceRoot:"/repo",state:"available"}];status={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},workspaceRoot:"/repo"};`);}
   if (withApp) {
     let handler = context.fetch;
     Object.defineProperty(context,"fetch",{configurable:true,get:()=>request,set(fn){handler=fn;}});
@@ -40,6 +47,8 @@ const text = node => all(node).map(n=>n.textContent).join(" ");
 const range={startLine:3,startColumn:2,endLine:9,endColumn:7};
 const call=(id="entry",target="candidate")=>({id,callId:id,kind:"call",label:`Call full::${id} <script>`,path:"main.rs",range,target,resolution:"unresolved",children:[],alternate:[]});
 const view=(steps=[])=>({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},seed:{id:"root",name:"root",path:"main.rs",range},participants:[{id:"root",kind:"method",label:"root"},{id:"candidate",kind:"externalCandidate",label:"Builder",identification:"Lexical type candidate, not resolved dispatch"},{id:"other",kind:"unresolvedReceiver",label:"Chain result"}],steps,warnings:[],hiddenSteps:0});
+// A step as the server sends it to the diagram: no target without resolved evidence, and an explicit `hidden`.
+const drawn=step=>({...step,target:null,hidden:false});
 const response=data=>({ok:true,status:200,json:async()=>data});
 const key=(element,value)=>{let prevented=false;element.listeners.keydown({key:value,preventDefault(){prevented=true;}});return prevented;};
 
@@ -61,7 +70,7 @@ test("without a usable index the view tabs and Files are greyed out and inert", 
   const h = harness();
   h.shell.setConnected(true);
   h.shell.setIndexAvailable(false);
-  for (const view of ["architecture", "treemap", "sequence", "classes"]) assert.equal(h.get(`view-${view}`).disabled, true, view);
+  for (const view of ["architecture", "treemap", "sequence", "classes", "deviations"]) assert.equal(h.get(`view-${view}`).disabled, true, view);
   assert.equal(h.get("section-files").disabled, true);
   h.get("view-sequence").listeners.click();
   assert.equal(h.get("sequence-panel").hidden, true, "a greyed tab cannot be clicked through");
@@ -72,30 +81,34 @@ test("without a usable index the view tabs and Files are greyed out and inert", 
   assert.equal(h.get("sequence-panel").hidden, false);
 });
 
-test("four workspace tabs have roving keyboard focus, skip a hidden Classes tab and never request source",()=>{
+test("five workspace tabs have roving keyboard focus, skip a hidden Classes tab and never request source",()=>{
   const h=harness();
   assert.equal(h.get("architecture-panel").hidden,false);assert.equal(h.get("sequence-panel").hidden,true);
   assert.equal(h.get("view-classes").hidden,true,"Classes starts hidden until the checkout is shown to have class-catalog code");
   h.shell.showView("sequence");
   assert.equal(key(h.get("view-sequence"),"ArrowRight"),true);
-  assert.equal(h.get("architecture-panel").hidden,false,"a hidden Classes tab is skipped");assert.ok(h.get("view-architecture").focused);
-  key(h.get("view-architecture"),"ArrowLeft");assert.equal(h.get("sequence-panel").hidden,false);
-  key(h.get("view-sequence"),"End");assert.equal(h.get("sequence-panel").hidden,false,"End is the last shown tab");
+  assert.equal(h.get("deviations-panel").hidden,false,"a hidden Classes tab is skipped");assert.ok(h.get("view-deviations").focused);
+  key(h.get("view-deviations"),"ArrowRight");assert.equal(h.get("architecture-panel").hidden,false,"the last tab wraps to the first");
+  key(h.get("view-architecture"),"ArrowLeft");assert.equal(h.get("deviations-panel").hidden,false);
+  key(h.get("view-deviations"),"ArrowLeft");assert.equal(h.get("sequence-panel").hidden,false);
+  key(h.get("view-sequence"),"End");assert.equal(h.get("deviations-panel").hidden,false,"End is the last shown tab, Deviations (#965)");
+  key(h.get("view-deviations"),"ArrowLeft");assert.equal(h.get("sequence-panel").hidden,false);
   h.shell.setViewAvailable("classes",true);assert.equal(h.get("view-classes").hidden,false);
   assert.equal(key(h.get("view-sequence"),"ArrowRight"),true);
   assert.equal(h.get("view-classes").attrs["aria-selected"],"true");
   assert.equal(h.get("classes-panel").hidden,false);
   assert.ok(h.get("view-classes").focused);
   assert.equal(h.get("view-classes").tabIndex,0);assert.equal(h.get("view-sequence").tabIndex,-1);
-  key(h.get("view-classes"),"ArrowRight");assert.equal(h.get("architecture-panel").hidden,false);assert.ok(h.get("view-architecture").focused);
+  key(h.get("view-classes"),"ArrowRight");assert.equal(h.get("deviations-panel").hidden,false);assert.ok(h.get("view-deviations").focused);
+  key(h.get("view-deviations"),"ArrowRight");assert.equal(h.get("architecture-panel").hidden,false);assert.ok(h.get("view-architecture").focused);
   key(h.get("view-architecture"),"ArrowRight");assert.equal(h.get("treemap-panel").hidden,false);
   key(h.get("view-treemap"),"ArrowRight");assert.equal(h.get("sequence-panel").hidden,false);
   key(h.get("view-sequence"),"ArrowLeft");assert.equal(h.get("treemap-panel").hidden,false);
-  key(h.get("view-treemap"),"End");assert.equal(h.get("classes-panel").hidden,false);
-  key(h.get("view-classes"),"Home");assert.equal(h.get("architecture-panel").hidden,false);
+  key(h.get("view-treemap"),"End");assert.equal(h.get("deviations-panel").hidden,false);
+  key(h.get("view-deviations"),"Home");assert.equal(h.get("architecture-panel").hidden,false);
   for (const name of ["tools", "terminal", "libraries"]) h.shell.showView(name);
   assert.equal(h.get("architecture-panel").hidden,false,"retired views are not routes");
-  for (const name of ["architecture", "treemap", "sequence", "classes"]) {
+  for (const name of ["architecture", "treemap", "sequence", "classes", "deviations"]) {
     assert.equal(h.get(`view-${name}`).attrs["aria-selected"],String(name === "architecture"));
     assert.equal(h.get(`view-${name}`).tabIndex,name === "architecture" ? 0 : -1);
   }
@@ -112,10 +125,10 @@ test("an explicitly opened unavailable view keeps its tab only while active",()=
   h.shell.setViewAvailable("classes",false);assert.equal(h.get("view-classes").hidden,true);
   h.shell.setViewAvailable("libraries",true);assert.equal(h.get("view-libraries").hidden,false,"unknown names are ignored");
 });
-test("workspace tabs have exactly four valid ARIA panel relationships",()=>{
+test("workspace tabs have exactly five valid ARIA panel relationships",()=>{
   const html=fs.readFileSync(path.join(__dirname,"../web/index.html"),"utf8");
   const tabs=[...html.matchAll(/<button id="view-([^"]+)" role="tab"[^>]*aria-controls="([^"]+)"/g)];
-  assert.deepEqual(tabs.map(match=>match[1]),["architecture","treemap","sequence","classes"]);
+  assert.deepEqual(tabs.map(match=>match[1]),["architecture","treemap","sequence","classes","deviations"],"Deviations is the last tab (#965)");
   assert.match(html,/<button id="view-classes"[^>]*\bhidden/);
   for(const [,name,panel] of tabs) {
     assert.match(html,new RegExp(`<section id="${panel}"[^>]*role="tabpanel"[^>]*aria-labelledby="view-${name}"`));
@@ -257,10 +270,10 @@ test("Architecture's resting overview shows the inspector without opening the na
   assert.equal(h.document.body.classList.contains("inspector-open"),true,"a selection still opens the drawer");
 });
 async function selectedHarness() {
-  const h=harness(true),step=call(),data=view([step]);
+  const h=harness(true),step=drawn(call()),data=view([step]);
   h.context.fetch=async path=>{h.requests.push(path);if(path==="/api/sequence")return response(data);if(path==="/api/status/head")return response({revision:data.revision,workspaceRoot:"/repo"});if(path.startsWith("/api/source?"))return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},file:{path:"main.rs",text:"line1\nline2\nline3"}});throw new Error("Unexpected "+path);};
   await h.run(`selectMethod(${JSON.stringify(data.seed)})`);
-  const pick=all(h.get("sequence-diagram")).find(n=>n.attrs.class?.split(" ").includes("sequence-source"));assert.ok(pick);
+  const pick=all(h.get("sequence-diagram")).find(n=>n.attrs["data-trellis-step-id"]);assert.ok(pick);
   pick.listeners.click();
   return h;
 }
@@ -282,8 +295,8 @@ for(const change of ["method","revision","disconnect","index"] ) test(`app inval
 test("captured app source callback rejects revision/session changes even without a shell reset",async()=>{
   const h=harness(true);let callback;
   h.context.window.TrellisShell.selectStep=(_,__,source)=>{callback=source;};
-  h.context.fetch=async path=>{if(path==="/api/status/head")return response({revision:view().revision,workspaceRoot:"/repo"});assert.equal(path,"/api/sequence");return response(view([call()]));};await h.run(`selectMethod(${JSON.stringify(view().seed)})`);
-  all(h.get("sequence-diagram")).find(n=>n.attrs.class?.split(" ").includes("sequence-source")).listeners.click();
+  h.context.fetch=async path=>{if(path==="/api/status/head")return response({revision:view().revision,workspaceRoot:"/repo"});assert.equal(path,"/api/sequence");return response(view([drawn(call())]));};await h.run(`selectMethod(${JSON.stringify(view().seed)})`);
+  all(h.get("sequence-diagram")).find(n=>n.attrs["data-trellis-step-id"]).listeners.click();
   h.context.fetch=()=>{throw new Error("Stale source fetch");};h.run("status.revision=2;epoch++;");
   await callback();assert.equal(h.get("source-dock").hidden,true);
 });
@@ -411,6 +424,16 @@ test("Git header uses measured counts independently of branch, upstream and inde
   assert.deepEqual(h.requests,[]);
 });
 
+test("a section change runs the registered reset before the shell changes anything, and the app registers Navigation's", () => {
+  const h = harness(); let seen = [];
+  h.shell.setSectionResetCallback(() => seen.push(h.document.body.classList.contains("files-section")));
+  h.shell.setSection("files"); h.get("section-diagrams").listeners.click();
+  assert.deepEqual(seen, [false, true]);
+  const app = harness(true); let resets = 0;
+  app.context.window.TrellisNavigation = {reset() { resets++; }};
+  app.shell.setSection("files");
+  assert.equal(resets, 1);
+});
 test("Files is a primary source section without automatic reads or drawers and preserves the diagram view", () => {
   const h = harness();
   h.context.window.matchMedia = () => ({matches:true});
@@ -486,7 +509,7 @@ test("Treemap owns its controls and inspector across view and Files transitions"
 });
 
 function resolvedView() {
-  const step = call("bound", "actual"), data = view([step]);
+  const step = {...call("bound", "actual"), hidden:false}, data = view([step]);
   const declaration = {id:"actual",name:"actual_target",kind:"function",path:"target.rs",range};
   data.participants.push({id:declaration.id,label:declaration.name,kind:"internal",declaration});
   step.callEvidence = {boundaryReason:"none",resolution:"resolved",dispatch:"direct",freshness:"fresh",provenanceId:"proof"};
@@ -521,7 +544,7 @@ test("app target callback binds original call object and declaration; same-pin s
     h.context.window.TrellisShell.selectStep = (_,__,___,target)=>{targetAction=target;};
     h.context.fetch = async path => response(path === "/api/status/head" ? {revision:data.revision,workspaceRoot:"/repo"} : data);
     await h.run(`selectMethod(${JSON.stringify(data.seed)})`);
-    all(h.get("sequence-diagram")).find(n=>n.attrs["data-source-step-id"]===step.id).listeners.click();
+    all(h.get("sequence-diagram")).find(n=>n.attrs["data-trellis-step-id"]===step.id).listeners.click();
     assert.equal(typeof targetAction,"function");
     h.run(change);
     h.context.fetch = ()=>assert.fail("obsolete target fetched");
@@ -542,7 +565,7 @@ test("noncallable resolved target reads exact declaration source instead of requ
     return response({revision:data.revision,file:{path:"target.rs",text:"class actual_target {}"}});
   };
   await h.run(`selectMethod(${JSON.stringify(data.seed)})`);
-  all(h.get("sequence-diagram")).find(n=>n.attrs["data-source-step-id"]===step.id).listeners.click();
+  all(h.get("sequence-diagram")).find(n=>n.attrs["data-trellis-step-id"]===step.id).listeners.click();
   const action = all(h.get("inspector-detail")).find(n=>n.attrs["data-trellis-target-id"]===declaration.id);
   assert.equal(action.textContent,"Read declaration source");
   await action.listeners.click();
@@ -705,4 +728,27 @@ test("semantic document projections prevent a fresh index badge", () => {
   assert.match(h.get("workspace-index-label").textContent, /^Older semantic basis · native rev /);
   h.run(`status.semanticLanguages[0].documents[0].projection.semanticStatus="catchingUp";renderIndexStatus();`);
   assert.match(h.get("workspace-index-label").textContent, /^Semantic catching up · native rev /);
+});
+
+// The app is split into classic scripts that share the page's global scope (#1069). Top-level
+// let and const are in a dead zone until their script has run, and a function declared by a
+// later script does not exist yet, so load order is part of the contract.
+test("index.html loads the app scripts in dependency order, and only app.js runs code at load", () => {
+  const web = path.join(__dirname, "../web");
+  const html = fs.readFileSync(path.join(web, "index.html"), "utf8");
+  const loaded = [...html.matchAll(/<script src="\/([^"]+)" defer><\/script>/g)].map(match => match[1]);
+  assert.equal([...html.matchAll(/<script\b/g)].length, loaded.length, "every script is a deferred classic script, so they run in document order");
+  assert.deepEqual(fs.readdirSync(web).filter(file => /^app(-[a-z]+)?\.js$/.test(file)).sort(), [...APP_SCRIPTS].sort(), "every app script is in the harness list");
+  assert.deepEqual(loaded.slice(-APP_SCRIPTS.length), APP_SCRIPTS, "the app scripts load last, in this order, app.js at the end");
+  for (const [file, needs] of Object.entries(LOAD_TIME_NEEDS)) for (const need of needs) {
+    assert.ok(loaded.includes(need) && loaded.indexOf(need) < loaded.indexOf(file), `${need} loads before ${file}`);
+  }
+  // Every script but app.js only declares: its top level is functions, let, const and comments.
+  // So no listener, observer or view exists until app.js runs, after every name is defined.
+  for (const file of APP_SCRIPTS.slice(0, -1)) {
+    const top = fs.readFileSync(path.join(web, file), "utf8").split("\n").filter(line => /^[^\s}]/.test(line));
+    assert.equal(top[0], '"use strict";', file);
+    assert.deepEqual(top.filter(line => !/^(?:"use strict";$|\/\/|(?:async )?function [A-Za-z]|(?:let|const) )/.test(line)), [], `${file} runs a statement at load`);
+  }
+  assert.equal(fs.readFileSync(path.join(web, "app.js"), "utf8").split("\n")[0], '"use strict";');
 });

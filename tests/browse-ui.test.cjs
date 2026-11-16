@@ -4,8 +4,11 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
+const {APP_SCRIPTS} = require("./support/app-scripts.js");
 const vm = require("node:vm");
-const source = ["sequence.js", "shell.js", "files.js", "app.js"].map(file => fs.readFileSync(path.join(__dirname, "../web", file), "utf8")).join("\n");
+// No DOM parser here: the adapter double keeps the real Pele projection and installs one
+// selectable node per projected row (tests/support/sequence-adapter-double.js).
+const source = ["../web/index-pin.js", "../web/source-witness.js", "../web/sequence-model.js", "../web/sequence.js", "../web/pele-svg.js", "../web/sequence-pele.js", "support/sequence-adapter-double.js", "../web/shell.js", "../web/files.js", ...APP_SCRIPTS.map(file => "../web/" + file)].map(file => fs.readFileSync(path.join(__dirname, file), "utf8")).join("\n");
 
 function deferred() {
   let resolve, reject;
@@ -174,26 +177,73 @@ test("sequence selection sends no query or provider calls; Show all steps is exp
   assert.deepEqual(requests[0][1].expectedRevision,JSON.parse(JSON.stringify(h.run("status.revision"))));
 });
 
-test("native SVG preserves nested branch loop try, safe labels, unknown lifelines and keyboard source",()=>{
-  const h=harness(), dto=view("<img src=x onerror=boom>"), selected=[];
-  const step=(id,kind,children=[],alternate=[])=>({id,kind,label:id,path:"src/a.js",range:{startLine:2,endLine:2},target:"unknown",children,alternate});
-  dto.steps=[step("condition","branch",[step("repeat","loop",[step("<script>bad</script>","call")])],[step("attempt","try",[step("write","effect")],[step("finally","boundary",[step("cleanup","call")])])])];
-  dto.steps.push({...step("hidden-log", "call"), hidden:true});
-  h.context.dto=dto; h.context.readSource=s=>selected.push(s);
-  h.run("renderSequence($('sequence-diagram'), dto, readSource)");
-  const all=descendants(h.get("sequence-diagram")), branch=all.find(n=>n.attrs?.["data-kind"]==="branch");
-  assert.ok(descendants(branch).some(n=>n.attrs?.["data-kind"]==="loop"));
-  const attempt=all.find(n=>n.attrs?.["data-kind"]==="try");
-  assert.ok(descendants(attempt).some(n=>n.attrs?.["data-step-id"]==="cleanup"));
-  assert.ok(all.some(n=>n.tagName==="svg")); assert.equal(all.filter(n=>n.attrs?.class==="sequence-arrow").length,0);
-  assert.ok(!all.some(n=>n.attrs?.["data-step-id"]==="write"), "standalone writes wait for Show all");
-  assert.ok(all.every(n=>!["script","img"].includes(n.tagName)));
-  assert.doesNotMatch(text(h.get("sequence-diagram")), /hidden-log/);
-  assert.doesNotMatch(text(h.get("sequence-diagram")), /Unknown target/);
-  assert.match(text(h.get("sequence-diagram")), /<script>bad<\/script>/);
-  const control=all.find(n=>n.attrs?.role==="button"); let prevented=false;
-  control.listeners.keydown({key:"Enter",preventDefault(){prevented=true;}});
-  assert.ok(prevented); assert.equal(selected[0].id,"condition");
+// #1007: no second renderer. When Pele cannot draw, the diagram area says so and why.
+const SEQUENCE_ERROR = "This Sequence could not be drawn: ";
+const drawnCall = id => ({id,callId:id,kind:"call",label:id,path:"src/a.js",range:{startLine:2,endLine:2},children:[],alternate:[],hidden:false});
+const sequenceError = container => container.children.filter(n => n.className === "sequence-empty").map(n => n.textContent);
+test("a Sequence the renderer cannot draw shows its reason in the diagram area and the status line", async () => {
+  const deep = levels => { let step = drawnCall(`level-${levels - 1}`); for (let n = levels - 2; n >= 0; n--) step = {...drawnCall(`level-${n}`), kind:"note", children:[step]}; return step; };
+  for (const [name, reason, setup, steps] of [
+    ["the renderer is unavailable", "Pele asset unavailable", "delete window.TrellisPeleSequence", [drawnCall("call")]],
+    ["a presentation limit is passed", "Unsupported sequence depth", "", [deep(25)]],
+    ["the view fails validation", "Duplicate sequence identity", "", [drawnCall("same"), drawnCall("same")]],
+  ]) {
+    const h = harness(), dto = {...view("root"), steps};
+    h.context.fetch = async () => response(dto);
+    if (setup) h.run(setup);
+    await h.run(`selectMethod(${JSON.stringify(symbol("root"))})`);
+    const diagram = h.get("sequence-diagram");
+    assert.deepEqual(sequenceError(diagram), [SEQUENCE_ERROR + reason], name);
+    assert.equal(diagram.children.length, 1, `${name}: nothing else is drawn`);
+    assert.equal(descendants(diagram).some(n => n.tagName === "svg" || n.attrs?.role === "button"), false, `${name}: no diagram, no controls`);
+    assert.ok(h.get("sequence-state").textContent.endsWith(` · ${SEQUENCE_ERROR}${reason}`), `${name}: ${h.get("sequence-state").textContent}`);
+    assert.doesNotMatch(h.get("sequence-state").textContent, /Pele rendered|fell back/);
+  }
+});
+test("a group redraw the renderer cannot draw replaces the diagram with its reason, only while current", async () => {
+  for (const current of [true, false]) {
+    const h = harness(), dto = {...view("root"), steps:[drawnCall("call")]};
+    h.context.fetch = async () => response(dto);
+    h.run("{ const adapter = window.TrellisPeleSequence; window.TrellisPeleSequence = {...adapter, render:(...args) => { window.drawnWith = args[4]; return adapter.render(...args); }}; }");
+    await h.run(`selectMethod(${JSON.stringify(symbol("root"))})`);
+    const diagram = h.get("sequence-diagram"), drawn = diagram.children[0], state = h.get("sequence-state");
+    assert.equal(drawn.tagName, "svg"); assert.match(state.textContent, / · Pele rendered$/);
+    if (!current) h.run("status.revision = {...status.revision, indexRevision:2}");
+    h.run("window.drawnWith.onUnsupported('Unsupported sequence step')");
+    if (current) {
+      assert.deepEqual(sequenceError(diagram), [SEQUENCE_ERROR + "Unsupported sequence step"]);
+      assert.equal(diagram.children.length, 1);
+      assert.ok(state.textContent.endsWith(` · ${SEQUENCE_ERROR}Unsupported sequence step`), state.textContent);
+      // The replaced diagram's rows are inert: the error state owns the container.
+      h.context.window.TrellisShell.selectStep = () => assert.fail("a replaced row selected");
+      drawn.children[0].listeners.click();
+    } else {
+      assert.equal(diagram.children[0], drawn, "an obsolete redraw changes nothing");
+      assert.match(state.textContent, / · Pele rendered$/);
+    }
+  }
+});
+test("the Files preview shows the same reason in place of a Sequence it cannot draw", async () => {
+  const h = harness();
+  h.context.dto = {...view("root"), steps:[drawnCall("same"), drawnCall("same")]};
+  h.run("filesMini=dto; filesSymbol=dto.seed; fitFilesMini=()=>{}");
+  await h.run("renderFilesMini(()=>true)");
+  const mini = h.get("files-mini-sequence");
+  assert.deepEqual(sequenceError(mini), [SEQUENCE_ERROR + "Duplicate sequence identity"]);
+  assert.equal(mini.children.length, 1);
+  assert.match(text(h.get("files-mini-notes")), /This Sequence could not be drawn: Duplicate sequence identity/);
+  assert.match(h.get("files-mini-state").textContent, /1 note in ⓘ/);
+  // A later group redraw that fails says so too, and only for the preview still shown.
+  h.context.dto = {...view("root"), steps:[drawnCall("call")]};
+  h.run("{ const adapter = window.TrellisPeleSequence; window.TrellisPeleSequence = {...adapter, render:(...args) => { window.drawnWith = args[4]; return adapter.render(...args); }}; }");
+  h.run("filesMini=dto; filesSymbol=dto.seed; window.miniCurrent=true");
+  await h.run("renderFilesMini(()=>window.miniCurrent)");
+  const drawn = mini.children[0]; assert.equal(drawn.tagName, "svg");
+  h.run("window.miniCurrent=false; window.drawnWith.onUnsupported('Unsupported sequence step')");
+  assert.equal(mini.children[0], drawn, "an obsolete redraw changes nothing");
+  h.run("window.miniCurrent=true; window.drawnWith.onUnsupported('Unsupported sequence step')");
+  assert.deepEqual(sequenceError(mini), [SEQUENCE_ERROR + "Unsupported sequence step"]);
+  assert.ok(h.get("files-mini-state").textContent.endsWith(` · ${SEQUENCE_ERROR}Unsupported sequence step`));
 });
 
 test("current sequence errors replace loading state and mismatch never paints",async()=>{
@@ -705,7 +755,7 @@ test("workspace change invalidates selections and source even when revision stay
 
 test("class context actions use cached file/method identity and never fetch source automatically", async () => {
   const h = harness(), opened = [], menus = [];
-  h.context.window.TrellisClasses = {showContextMenu: (event, actions) => menus.push(actions), open: opts => opened.push(opts)};
+  h.context.window.TrellisContextMenu = {showContextMenu: (event, actions) => menus.push(actions)}; h.context.window.TrellisClasses = {open: opts => opened.push(opts)};
   h.run(`attachClassMenu($('class-file'), {path:'src/Thing.java'}); attachClassMenu($('class-method'), {path:'src/Thing.java',seed:'method'});`);
   let prevented = false;
   h.get("class-file").listeners.contextmenu({preventDefault(){prevented=true;}});
@@ -717,7 +767,7 @@ test("class context actions use cached file/method identity and never fetch sour
 
 test("obsolete class context actions cannot cross revision or session changes", async () => {
   const h = harness(), menus = [], opened = [];
-  h.context.window.TrellisClasses = {showContextMenu: (e,a)=>menus.push(a),open:opts=>opened.push(opts)};
+  h.context.window.TrellisContextMenu = {showContextMenu: (e,a)=>menus.push(a)}; h.context.window.TrellisClasses = {open:opts=>opened.push(opts)};
   h.run(`attachClassMenu($('class-file'), {path:'Thing.py'});`);
   h.get("class-file").listeners.contextmenu({preventDefault(){}});
   h.run("status={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:2}}"); await menus[0][0].run();
@@ -741,7 +791,7 @@ test("class controller uses authenticated API and clears pending source on navig
 });
 
 test("unsupported class languages keep their ordinary file and method interactions", () => {
-  const h=harness();h.context.window.TrellisClasses={showContextMenu(){throw new Error('unexpected menu');}};
+  const h=harness();h.context.window.TrellisContextMenu={showContextMenu(){throw new Error('unexpected menu');}};
   h.run(`attachClassMenu($('go-file'),{path:'src/main.go'}); attachClassMenu($('rust-file'),{path:'src/main.rs'}); attachClassMenu($('js-file'),{path:'app.js'}); attachClassMenu($('mjs-file'),{path:'web/a.mjs'}); attachClassMenu($('ts-file'),{path:'src/a.ts'}); attachClassMenu($('tsx-file'),{path:'ui/a.tsx'}); attachClassMenu($('mts-file'),{path:'src/a.mts'}); attachClassMenu($('cts-file'),{path:'src/a.cts'});`);
   assert.equal(h.get('go-file').listeners.contextmenu,undefined);
   // JavaScript and Rust declarations are catalogued (#452): their files offer the class menu.
@@ -1053,7 +1103,7 @@ const metricsResponse = (scope, {files = [metricFile], directories = [], pin = m
 
 test("selecting a sequence step fences an already pending file metrics inspection", async () => {
   const h = harness({}, true), pending = deferred();
-  const step = {id:"selected-call",kind:"call",label:"Selected call",path:"src/a.js",range:{startLine:2,endLine:2},target:"unknown",children:[],alternate:[]};
+  const step = {id:"selected-call",kind:"call",label:"Selected call",path:"src/a.js",range:{startLine:2,endLine:2},children:[],alternate:[],hidden:false};
   const data = {...view("root"),steps:[step]};
   h.context.fetch = async request => {
     if (request === "/api/sequence") return response(data);
@@ -1067,7 +1117,7 @@ test("selecting a sequence step fences an already pending file metrics inspectio
   const file = descendants(h.get("file-tree")).find(node => node.tagName === "button" && node.title === "src/a.js");
   await file.listeners.click();
   assert.equal(h.get("metric-inspector").hidden, false);
-  const pick = descendants(h.get("sequence-diagram")).find(node => node.attrs?.class?.split(" ").includes("sequence-source"));
+  const pick = descendants(h.get("sequence-diagram")).find(node => node.attrs?.["data-trellis-step-id"]);
   pick.listeners.click();
   assert.equal(h.get("inspector-title").textContent, "Selected call");
   assert.equal(h.get("metric-inspector").hidden, true);
@@ -1467,7 +1517,7 @@ test("sid routes wait for an admitted checkout, resolve only the requested seed,
 });
 
 for (const hash of ["#sequence", "#sequence?sid=", "#sequence?sid=a&sid=b", `#sequence?sid=a&rootKey=${"b".repeat(64)}`,
-  "#sequence?sid=a&indexGeneration=87654321-1234-4123-8123-123456789abc&indexRevision=1"]) {
+  "#sequence?sid=a&indexGeneration=87654321-1234-4123-8123-123456789abc&indexRevision=x"]) {
   test(`invalid or mismatched route refuses requests: ${hash}`, async () => {
     const h = harness(historyWindow(hash));
     await h.run("readNavigationLocation()");
@@ -1509,10 +1559,48 @@ for (const [name, query] of [
   });
 }
 
-test("the stale-pin check comes before the call-ID check", async () => {
+test("a malformed call-ID link keeps its error even when its pin is stale (#951)", async () => {
   const h = harness(historyWindow(`#sequence?sid=a&rootKey=${ROOT}&indexGeneration=12345678-1234-4123-8123-123456789abc&indexRevision=2&callId=bad`));
   await h.run("readNavigationLocation()");
-  assert.match(h.get("error").textContent, /stale for the selected index snapshot/);
+  assert.equal(h.get("error").textContent, "Cannot open sequence: Sequence link has invalid call IDs.");
+});
+
+// #951 (owner ruling 2026-11-12): a stale entry or link strips the URL, adds no history entry and
+// opens the root view with no error.
+async function assertRoot(h, browser, entries) {
+  assert.equal(h.networkUrls.length, 0);
+  assert.equal(browser.location.hash, "");
+  assert.equal(browser.history.state, null);
+  assert.equal(browser.history.length, entries, "no new history entry");
+  assert.equal(h.get("error").hidden, true);
+  assert.doesNotMatch(h.get("sequence-state").textContent, /Cannot open sequence/);
+  assert.equal(h.run("selectedMethod"), null);
+}
+for (const [name, hash] of [
+  ["a sequence link for an older snapshot", `#sequence?sid=a&rootKey=${ROOT}&indexGeneration=12345678-1234-4123-8123-123456789abc&indexRevision=2`],
+  ["a sequence link for another generation", "#sequence?sid=a&indexGeneration=87654321-1234-4123-8123-123456789abc&indexRevision=1"],
+  ["a #source entry from another page load", "#source"],
+  ["a #classes entry from another page load", "#classes"]]) {
+  test(`${name} opens the root view with no error (#951)`, async () => {
+    const browser = historyWindow(hash), h = harness(browser);
+    await h.run("readNavigationLocation()");
+    await assertRoot(h, browser, 1);
+  });
+}
+
+test("a history key from this page whose entry is gone opens the root view with no error (#951)", async () => {
+  const browser = historyWindow(), h = harness(browser);
+  browser.history.pushState({trellisNavigation:`${h.run("navigationScope")}:99`}, "", "#sequence?sid=a");
+  await h.run("readNavigationLocation()");
+  await assertRoot(h, browser, 2);
+});
+
+test("a held entry for an older snapshot opens the root view with no error (#951)", async () => {
+  const browser = historyWindow(), h = harness(browser);
+  h.run(`rememberNavigation({kind:"view", view:"treemap"}, false, "#view")`);
+  h.run("status = {revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:2}}");
+  await h.run("readNavigationLocation(true)");
+  await assertRoot(h, browser, 2);
 });
 
 test("a valid call-ID link passes its boundary to selectMethod", async () => {
@@ -1684,7 +1772,7 @@ test("selected Git starts while index status is still pending", async () => {
 // #450: in-context library entry from a sequence step, Sequence starting points and
 // the Classes tab gate.
 const libraryCatalog = {state:"ready",catalogId:"catalog-1",workspaceRevision:metricPin,packages:[{id:"cargo:thing@1",ecosystem:"cargo",name:"thing",version:"1.0.0",source:"registry",aliases:["thing"],sourceState:"present",indexState:"complete",warnings:[]}],symbolCount:1,warnings:[]};
-const externalStep = (id, evidence) => ({id,callId:id,kind:"call",label:`${id}()`,path:"src/a.js",range:{startLine:2,endLine:2},children:[],alternate:[],callEvidence:evidence});
+const externalStep = (id, evidence) => ({id,callId:id,kind:"call",label:`${id}()`,path:"src/a.js",range:{startLine:2,endLine:2},children:[],alternate:[],hidden:false,callEvidence:evidence});
 async function selectStepWith(evidence) {
   const h = harness({}, true);
   const data = {...view("root"),steps:[externalStep("call", evidence)]};
@@ -1696,7 +1784,7 @@ async function selectStepWith(evidence) {
   };
   await h.run("refreshDependencies()");
   await h.run(`selectMethod(${JSON.stringify(symbol("root"))})`);
-  const pick = descendants(h.get("sequence-diagram")).find(node => node.attrs?.class?.split(" ").includes("sequence-source"));
+  const pick = descendants(h.get("sequence-diagram")).find(node => node.attrs?.["data-trellis-step-id"]);
   pick.listeners.click();
   return h;
 }
@@ -1897,7 +1985,7 @@ test("calls-first detail shortcut restores non-call rows and shares Options stat
   const dto={...view("root"),steps:[write,unknown]};
   h.context.fetch=async(path,options)=>{requests.push(JSON.parse(options.body));return response(dto);};
   await h.run(`selectMethod(${JSON.stringify(symbol("root"))})`);
-  const rows=()=>descendants(h.get("sequence-diagram")).filter(n=>n.attrs?.["data-source-step-id"]).map(n=>n.attrs["data-source-step-id"]);
+  const rows=()=>descendants(h.get("sequence-diagram")).filter(n=>n.attrs?.["data-trellis-step-id"]).map(n=>n.attrs["data-trellis-step-id"]);
   assert.deepEqual(rows(),["unknown"]);
   assert.match(text(h.get("sequence-diagram")),/No measured calls.*non-call behavior/i);
   assert.equal(h.get("sequence-incidental").hidden,false);
@@ -2430,4 +2518,59 @@ test("a user navigation during a Classes show's read wins, even when an unrelate
   assert.equal(opens.length, 1, "no second class read");
   assert.equal(h.run("selectedMethod.id"), "user");
   assert.equal(h.get("agent-shown").hidden, true);
+});
+
+// #940 review: Retry owns the view as the original open does.
+test("Open in Sequence Retry does not replace a view chosen while its sequence read is pending (#940)", async () => {
+  const {h} = await showHarness();
+  h.get("sequence-open").dataset = {};
+  h.context.fetch = async () => ({ok:false,status:503,json:async()=>({error:{code:"storage_busy",message:"The index is busy."}})});
+  await h.run("openArchitectureSequence({syntaxId:'caller',name:'caller'}, [{callId:'call-1'}], status.revision, {}, () => true)");
+  assert.match(h.get("sequence-open-label").textContent, /Open in Sequence failed: The index is busy/);
+  const read = deferred();
+  h.context.fetch = () => read.promise;
+  const retry = h.run("sequenceOpen.retry()");
+  assert.match(h.get("sequence-open-label").textContent, /Opening sequence for caller/);
+  h.run("window.TrellisShell.showView('classes')");
+  assert.equal(h.get("classes-panel").hidden, false, "the user's newly chosen view is shown");
+  read.resolve(response(view("caller")));
+  await retry;
+  assert.equal(h.run("selectedMethod.id"), "old", "the retry must not navigate after the user chose another view");
+  assert.equal(h.get("classes-panel").hidden, false);
+  assert.match(h.get("sequence-open-label").textContent, /The view changed; Open in Sequence was cancelled/);
+  assert.equal(h.get("sequence-open").hidden, false);
+});
+
+
+test("review951 a stale link clears an already selected method and source action at root", async () => {
+  const {h, browser} = await showHarness();
+  assert.equal(h.run("selectedMethod.id"), "old");
+  assert.equal(h.get("method-source").disabled, false);
+  browser.history.pushState(null, "", `#sequence?sid=stale&rootKey=${ROOT}&indexGeneration=12345678-1234-4123-8123-123456789abc&indexRevision=2`);
+  const entries = browser.history.length;
+  await h.run("readNavigationLocation()");
+  assert.equal(browser.location.hash, "");
+  assert.equal(browser.history.state, null);
+  assert.equal(browser.history.length, entries);
+  assert.equal(h.get("error").hidden, true);
+  assert.equal(h.get("architecture-panel").hidden, false);
+  h.run("window.TrellisShell.showView('sequence')");
+  assert.equal(h.get("sequence-panel").hidden, false);
+  assert.equal(h.get("method-source").disabled, true, "root must not leave a source action for the previous selection enabled");
+  assert.equal(h.run("selectedMethod"), null, "the root view must clear the earlier method selection");
+});
+
+
+test("review951 a stale link clears an earlier malformed-link error when returning to root", async () => {
+  const browser = historyWindow("#sequence?sid="), h = harness(browser);
+  await h.run("readNavigationLocation()");
+  assert.match(h.get("sequence-state").textContent, /Cannot open sequence/);
+  browser.history.replaceState(null, "", `#sequence?sid=a&rootKey=${ROOT}&indexGeneration=12345678-1234-4123-8123-123456789abc&indexRevision=2`);
+  await h.run("readNavigationLocation()");
+  assert.equal(browser.location.hash, "");
+  assert.equal(h.get("error").hidden, true);
+  assert.equal(h.get("architecture-panel").hidden, false);
+  h.run("window.TrellisShell.showView('sequence')");
+  assert.equal(h.get("sequence-panel").hidden, false);
+  assert.doesNotMatch(h.get("sequence-state").textContent, /Cannot open sequence/, "the root fallback must not retain the previous link error in Sequence");
 });

@@ -10,6 +10,9 @@ class El {
   on_size_change(fn) { this.props.size = fn; return this; }
   on_mouse_down(button, fn) { this.props[`press-${button}`] = fn; return this; }
   hover(fn) { return this; }
+  // Recorded so a test can tell a region that scrolls sideways.
+  overflow_x_scrollbar() { this.props.scrollX = true; return this; }
+  w(value) { this.props.w = value; return this; }
   text() { return [this.kind === "image" ? `[image ${this.arg}]` : "", ...this.kids.map((k) => (k instanceof El ? k.text() : String(k)))].filter(Boolean).join(" "); }
   find(id) { if (this.props.id === id) return this; for (const k of this.kids) if (k instanceof El) { const f = k.find(id); if (f) return f; } return null; }
   all(pred, out = []) { if (pred(this)) out.push(this); for (const k of this.kids) if (k instanceof El) k.all(pred, out); return out; }

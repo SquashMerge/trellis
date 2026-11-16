@@ -582,7 +582,7 @@ fn sequence_zero_and_multiple_producers_are_syntax_only() {
         assert_eq!(
             view.warnings
                 .iter()
-                .any(|warning| *warning == trellis::store::multiple_producers_note("rust")),
+                .any(|warning| *warning == trellis::graph_query::multiple_producers_note("rust")),
             multiple
         );
     }
@@ -1584,57 +1584,127 @@ fn ambiguous_call_rows_answer_graph_sequence_and_navigation_without_recovery() {
     assert!(!publisher.store.recovery_pending_for_tests());
 }
 
+/// #1102: producer facts at one call site that assert at most one target between them are
+/// published as one row per provenance, and read as one call. scip-typescript gives one
+/// occurrence per declaration of a merged library symbol, so real imports hold thousands.
 #[test]
-fn non_ambiguous_multi_match_for_one_call_stays_typed_corruption() {
-    for case in ["ambiguous+unresolved", "duplicate resolved"] {
+fn agreeing_call_rows_answer_graph_and_sequence_without_recovery() {
+    let unresolved = |provenance: &str| Bind {
+        resolution: s::Resolution::Unresolved,
+        target: None,
+        dispatch: s::Dispatch::Unknown,
+        provenance: provenance.into(),
+        ..bind("a", 0, "b")
+    };
+    let resolved = |provenance: &str| Bind {
+        provenance: provenance.into(),
+        ..bind("a", 0, "b")
+    };
+    for (case, bindings, expected) in [
+        (
+            "unresolved rows",
+            vec![
+                unresolved("row-2"),
+                unresolved("row-1"),
+                unresolved("row-3"),
+            ],
+            ("row-1", BoundaryReason::Unresolved),
+        ),
+        (
+            "resolved rows",
+            vec![resolved("row-2"), resolved("row-1")],
+            ("row-1", BoundaryReason::None),
+        ),
+        (
+            "an unresolved row beside the target",
+            vec![unresolved("row-1"), resolved("row-2")],
+            ("row-2", BoundaryReason::None),
+        ),
+    ] {
         let (state, root) = workspace();
-        let (pin, seed) = {
-            let mut publisher = Publisher::open(state.path(), root.path());
-            let pin = if case == "duplicate resolved" {
-                let mut spec = Spec::new(&[("a.rs", CONTRADICTED)]);
-                spec.bindings = vec![bind("a", 0, "b")];
-                publisher.publish(&spec)
-            } else {
-                publish_contradicted(&mut publisher)
-            };
-            (pin, syntax_id(publisher.native(), "a"))
-        };
-        sql(
-            state.path(),
-            if case == "duplicate resolved" {
-                "CREATE TEMP TABLE copy AS SELECT * FROM semantic_call_bindings; \
-                 UPDATE copy SET binding_id=binding_id+1000, ordinal=ordinal+1; \
-                 INSERT INTO semantic_call_bindings SELECT * FROM copy;"
-            } else {
-                "PRAGMA foreign_keys=OFF; \
-                 DELETE FROM semantic_call_candidates WHERE binding_id IN \
-                   (SELECT binding_id FROM semantic_call_bindings WHERE (payload_id,provenance_ordinal) IN \
-                     (SELECT payload_id,ordinal FROM semantic_provenance WHERE provenance_id='amb-2')); \
-                 UPDATE semantic_call_bindings SET resolution='unresolved' \
-                   WHERE (payload_id,provenance_ordinal) IN \
-                     (SELECT payload_id,ordinal FROM semantic_provenance WHERE provenance_id='amb-2');"
-            },
+        let mut publisher = Publisher::open(state.path(), root.path());
+        let mut spec = Spec::new(&[("a.rs", CONTRADICTED)]);
+        spec.bindings = bindings;
+        // Publication validates these rows: they are legitimate stored data.
+        let pin = publisher.publish(&spec);
+        let seed = syntax_id(publisher.native(), "a");
+        let target = syntax_id(publisher.native(), "b");
+        let (provenance, reason) = expected;
+        let bound = reason == BoundaryReason::None;
+
+        let graph = result(run(&publisher.store, &query(&seed, true)).unwrap());
+        assert_eq!(graph.edges.len(), 1, "{case}");
+        let edge = &graph.edges[0];
+        assert_eq!(edge.boundary_reason, reason, "{case}");
+        assert_eq!(
+            edge.to.as_deref(),
+            bound.then_some(target.as_str()),
+            "{case}"
         );
-        for path in ["graph", "sequence"] {
-            let store = Store::open_for_tests(state.path(), root.path()).unwrap();
-            let error = if path == "sequence" {
-                store.sequence_at(&seed, pin, false).unwrap_err()
-            } else {
-                run(&store, &query(&seed, true)).err().unwrap()
-            };
-            assert!(
-                error
-                    .to_string()
-                    .contains("multiple call bindings match one call"),
-                "{case} {path}: {error:#}"
-            );
-            // The MCP and HTTP boundaries report a graph read failure; sequence reports itself.
-            assert_eq!(
-                store.recovery_pending_for_tests(),
-                path == "sequence",
-                "{case} {path}"
-            );
-        }
+        let binding = edge.binding.as_ref().expect("selected binding");
+        assert_eq!(binding.provenance_id, provenance, "{case}");
+        assert!(warning_keys(&graph).is_empty(), "{case}");
+
+        let view = publisher
+            .store
+            .sequence_at(&seed, pin, false)
+            .unwrap()
+            .unwrap();
+        let steps = sequence_steps(&view.steps);
+        assert_eq!(steps.len(), 1, "{case}");
+        let evidence = steps[0].call_evidence.as_ref().unwrap();
+        assert_eq!(evidence.boundary_reason, reason, "{case}");
+        assert_eq!(
+            evidence.provenance_id.as_deref(),
+            Some(provenance),
+            "{case}"
+        );
+        assert_eq!(steps[0].target.is_some(), bound, "{case}");
+
+        // Neither read reports the index as damaged, so no re-index is scheduled.
+        assert!(!publisher.store.recovery_pending_for_tests(), "{case}");
+    }
+}
+
+/// Rows of one call that assert more than one target without all being ambiguous cannot be
+/// published, so on read they are still corruption.
+#[test]
+fn contradictory_rows_for_one_call_stay_typed_corruption() {
+    let (state, root) = workspace();
+    let (pin, seed) = {
+        let mut publisher = Publisher::open(state.path(), root.path());
+        let pin = publish_contradicted(&mut publisher);
+        (pin, syntax_id(publisher.native(), "a"))
+    };
+    sql(
+        state.path(),
+        "PRAGMA foreign_keys=OFF; \
+         DELETE FROM semantic_call_candidates WHERE binding_id IN \
+           (SELECT binding_id FROM semantic_call_bindings WHERE (payload_id,provenance_ordinal) IN \
+             (SELECT payload_id,ordinal FROM semantic_provenance WHERE provenance_id='amb-2')); \
+         UPDATE semantic_call_bindings SET resolution='unresolved' \
+           WHERE (payload_id,provenance_ordinal) IN \
+             (SELECT payload_id,ordinal FROM semantic_provenance WHERE provenance_id='amb-2');",
+    );
+    for path in ["graph", "sequence"] {
+        let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+        let error = if path == "sequence" {
+            store.sequence_at(&seed, pin, false).unwrap_err()
+        } else {
+            run(&store, &query(&seed, true)).err().unwrap()
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("contradictory call bindings match one call"),
+            "{path}: {error:#}"
+        );
+        // The MCP and HTTP boundaries report a graph read failure; sequence reports itself.
+        assert_eq!(
+            store.recovery_pending_for_tests(),
+            path == "sequence",
+            "{path}"
+        );
     }
 }
 

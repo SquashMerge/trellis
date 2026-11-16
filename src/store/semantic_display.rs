@@ -10,16 +10,14 @@
 use super::*;
 use crate::{
     graph_query::{
-        self as engine, BoundaryReason, DefaultProducers, DocumentFacts, GraphIntegrity,
-        GraphSnapshot, GraphSource, HistoryFacts, SemanticDocument,
+        self as engine, DefaultProducers, DocumentFacts, GraphIntegrity, GraphSnapshot,
+        GraphSource, HistoryFacts, SemanticDocument,
     },
-    model::SemanticState,
-    native_evidence::DocumentKey,
-    semantic_evidence as sem,
+    model::{BoundaryReason, SemanticState},
+    native_records::DocumentKey,
+    semantic_records as sem,
 };
 use serde_json::json;
-
-pub use crate::graph_query::{LANGUAGE_NOTE, NO_PRODUCER_NOTE, multiple_producers_note};
 
 /// An explicitly requested producer that the selected revision does not publish.
 #[derive(Debug)]
@@ -65,7 +63,7 @@ impl ProducerSelection {
     pub fn note(&self, language: &str) -> Option<String> {
         match &self.explicit {
             Some((_, languages)) => {
-                (!languages.contains(language)).then(|| LANGUAGE_NOTE.to_string())
+                (!languages.contains(language)).then(|| engine::LANGUAGE_NOTE.to_string())
             }
             None => self.defaults.note(language),
         }
@@ -81,7 +79,7 @@ impl ProducerSelection {
 }
 
 /// Every published producer of the revision with the languages its profile declares.
-pub(super) fn default_producers(db: &Connection, revision_key: &str) -> Result<DefaultProducers> {
+pub(crate) fn default_producers(db: &Connection, revision_key: &str) -> Result<DefaultProducers> {
     let rows = db
         .prepare_cached(
             "SELECT p.id,l.language FROM semantic_revision_producers p
@@ -101,7 +99,7 @@ pub(super) fn default_producers(db: &Connection, revision_key: &str) -> Result<D
 /// The one producer selection every read surface uses (#483). An explicit producer must
 /// be published at this revision and applies to the languages it covers; another language
 /// shows syntax only. Without one, each language uses its sole covering producer.
-pub(super) fn select_producers(
+pub(crate) fn select_producers(
     db: &Connection,
     revision_key: &str,
     explicit: Option<&str>,
@@ -189,7 +187,7 @@ impl GraphSource for Locate<'_> {
         projection: &crate::model::SemanticProjection,
         producer: &str,
         document: &DocumentKey,
-    ) -> Result<Option<crate::graph_query::BoundaryReason>> {
+    ) -> Result<Option<crate::model::BoundaryReason>> {
         native_first::endpoint_boundary(
             self.db,
             self.selected.pin,
@@ -283,7 +281,7 @@ impl<'a> SemanticCalls<'a> {
     /// The selected binding of one measured call, or `None` for syntax-only evidence.
     pub(super) fn call(
         &mut self,
-        call: &crate::native_evidence::Call,
+        call: &crate::native_records::Call,
     ) -> Result<Option<CallSemantic>> {
         let Some(tuple) = self.tuple(&call.document.language, &call.document.path)? else {
             return Ok(None);
@@ -457,7 +455,7 @@ pub(super) fn status_semantics(
     status.semantic_languages.clear();
     if !defaults.published && reimports.is_empty() {
         status.semantic_producer_id = None;
-        status.semantic_note = Some(NO_PRODUCER_NOTE.into());
+        status.semantic_note = Some(engine::NO_PRODUCER_NOTE.into());
         status.stats.semantic_state = SemanticState::Unavailable;
         return Ok(());
     }
@@ -551,7 +549,7 @@ pub(super) fn status_semantics(
     if selected.is_empty() {
         status.semantic_producer_id = None;
         status.semantic_note = Some(if notes.is_empty() {
-            LANGUAGE_NOTE.into()
+            engine::LANGUAGE_NOTE.into()
         } else {
             notes.join("; ")
         });
@@ -559,7 +557,7 @@ pub(super) fn status_semantics(
         return Ok(());
     }
     // A language no published producer covers is ordinary; only conflicts are noted.
-    notes.retain(|note| note != LANGUAGE_NOTE);
+    notes.retain(|note| note != engine::LANGUAGE_NOTE);
     status.semantic_note = (!notes.is_empty()).then(|| notes.join("; "));
     status.semantic_producer_id = (selected.len() == 1)
         .then(|| selected.pop_first())
@@ -705,7 +703,7 @@ pub(super) fn coverage_summary(
 }
 
 /// A CLI query's traversal: its nodes, calls, regions and selected bindings.
-pub(super) struct ViewWalk {
+pub(crate) struct ViewWalk {
     pub nodes: Vec<crate::model::Symbol>,
     pub calls: Vec<crate::model::CallSite>,
     pub regions: Vec<crate::model::ControlRegion>,
@@ -718,7 +716,7 @@ pub(super) struct ViewWalk {
 /// returned. Below the query depth, a call whose selected binding the call graph would
 /// traverse (`boundaryReason: none`) adds its exact target as a node, whose own calls are
 /// inspected while the depth allows. Each document uses its language's selected producer.
-pub(super) fn view_walk(
+pub(crate) fn view_walk(
     store: &Store,
     db: &Connection,
     selected: &ReadRevision,
@@ -760,8 +758,8 @@ pub(super) fn view_walk(
                 .filter(|call| call.caller == node.id)
                 .cloned()
                 .collect();
-            ordered.sort_by(crate::indexer::compare_reader_calls);
-            let native: BTreeMap<String, crate::native_evidence::Call> = if bound {
+            ordered.sort_by(crate::model::compare_reader_calls);
+            let native: BTreeMap<String, crate::native_records::Call> = if bound {
                 let scope = v8_owner_scope_for(db, &node.id, selected)?.ok_or_else(|| {
                     SelectedIntegrity("incompatible_index: selected view node missing".into())
                 })?;
@@ -1133,7 +1131,7 @@ pub(crate) fn partial_reasons(reasons: [Option<bool>; 4]) -> Vec<&'static str> {
 }
 
 /// The five MCP languages in #22 order.
-pub const MCP_LANGUAGES: [&str; 5] = crate::semantic_evidence::LANGUAGE_ORDER;
+pub const MCP_LANGUAGES: [&str; 5] = crate::semantic_records::LANGUAGE_ORDER;
 
 impl EvidenceResponse {
     /// Advisory work status from the admitted pin, not a publication eligibility proof.
@@ -1263,7 +1261,7 @@ impl EvidenceResponse {
         }
         let selection = select_producers(&self.db, &selected.key, None)?;
         for document in document_projections(&self.db, selected.pin, &selection)? {
-            if let Some(at) = crate::semantic_evidence::language_order(&document.language) {
+            if let Some(at) = crate::semantic_records::language_order(&document.language) {
                 if document.projection.semantic_status == crate::model::SemanticStatus::OlderBasis {
                     let basis = semantic_pin_key(document.projection.semantic_basis_pin);
                     let tuple: Option<(bool,String)> = self.db.query_row(
@@ -1370,12 +1368,12 @@ impl EvidenceResponse {
         }
         documents.sort_by(|a, b| {
             (
-                crate::semantic_evidence::language_order(a.language),
+                crate::semantic_records::language_order(a.language),
                 !a.failed,
                 &a.path,
             )
                 .cmp(&(
-                    crate::semantic_evidence::language_order(b.language),
+                    crate::semantic_records::language_order(b.language),
                     !b.failed,
                     &b.path,
                 ))
@@ -1389,8 +1387,8 @@ impl EvidenceResponse {
     pub(crate) fn mcp_call_semantics<'c>(
         &self,
         explicit: Option<&str>,
-        owner_document: &crate::native_evidence::DocumentKey,
-        calls: impl IntoIterator<Item = &'c crate::native_evidence::Call>,
+        owner_document: &crate::native_records::DocumentKey,
+        calls: impl IntoIterator<Item = &'c crate::native_records::Call>,
     ) -> Result<McpSemantic> {
         let selected = self.selected(None)?;
         let mut reader = SemanticCalls::new(&self.db, &selected, explicit)?;
@@ -1558,11 +1556,9 @@ pub(super) fn architecture_semantic(
             .transpose()
     };
     // Stored offsets are nonnegative and ordered; anything else is a corrupt row.
-    let range = |start: i64, end: i64| -> Result<crate::native_evidence::Range> {
+    let range = |start: i64, end: i64| -> Result<crate::native_records::Range> {
         match (usize::try_from(start), usize::try_from(end)) {
-            (Ok(start), Ok(end)) if start <= end => {
-                Ok(crate::native_evidence::Range { start, end })
-            }
+            (Ok(start), Ok(end)) if start <= end => Ok(crate::native_records::Range { start, end }),
             _ => Err(SelectedIntegrity("corrupt semantic offset".into()).into()),
         }
     };
@@ -1717,7 +1713,7 @@ pub(super) fn architecture_semantic(
     let mut calls = db.prepare_cached(
         "SELECT b.call_id,b.join_start,b.join_end,b.resolution,b.declared_kind,
                 b.declared_internal_syntax_id,b.declared_internal_language,b.declared_internal_path,
-                b.dispatch,b.stale_target,b.provenance_ordinal,b.binding_id,b.join_status,b.join_kind,b.join_document_language,b.join_document_path,COALESCE(b.join_native_revision_id,?6),p.basis_id
+                b.dispatch,b.stale_target,b.provenance_ordinal,b.binding_id,b.join_status,b.join_kind,b.join_document_language,b.join_document_path,COALESCE(b.join_native_revision_id,?6),p.basis_id,p.derived_from_fact_digest
          FROM semantic_call_bindings b
          JOIN semantic_provenance p ON p.payload_id=b.payload_id AND p.ordinal=b.provenance_ordinal
          LEFT JOIN semantic_coverage_freshness f ON f.revision_id=?5 AND f.tuple_id=?7 AND f.basis_id=p.basis_id
@@ -1817,10 +1813,11 @@ pub(super) fn architecture_semantic(
             documents[i].key.language.clone(),
             documents[i].key.path.clone(),
         );
-        // One binding per measured call: the lowest provenance, as the call graph selects.
-        // The lowest provenance represents a call, as in the call graph; an unusable one
-        // (stale, or outside this snapshot) leaves the call without a binding.
-        let mut by_call: BTreeMap<String, (String, Option<SemanticAnchor>)> = BTreeMap::new();
+        // One binding per measured call: the row the call graph selects, in the order of its
+        // `representative_key`. An unusable one (stale, or outside this snapshot)
+        // leaves the call without a binding.
+        type RowKey = (bool, Option<String>, String);
+        let mut by_call: BTreeMap<String, (RowKey, Option<SemanticAnchor>)> = BTreeMap::new();
         let mut cursor = calls.query(params![
             payload, language, path, historical, key, native, tuple
         ])?;
@@ -1835,9 +1832,14 @@ pub(super) fn architecture_semantic(
             // Every row's offsets and dispatch decode strictly, used or not.
             let anchor_range = range(row.get(1)?, row.get(2)?)?;
             let is_direct = direct(row.get_ref(8)?.as_str()?)?;
+            let row_key: RowKey = (
+                row.get_ref(3)?.as_str()? == "unresolved",
+                row.get(18)?,
+                provenance_id.clone(),
+            );
             if by_call
                 .get(&call_id)
-                .is_some_and(|(kept, _)| *kept <= provenance_id)
+                .is_some_and(|(kept, _)| *kept <= row_key)
             {
                 continue;
             }
@@ -1907,7 +1909,7 @@ pub(super) fn architecture_semantic(
                         }
                         _ if historical => SemanticOutcome::Boundary,
                         _ => {
-                            by_call.insert(call_id, (provenance_id, None));
+                            by_call.insert(call_id, (row_key, None));
                             continue;
                         }
                     }
@@ -1933,7 +1935,7 @@ pub(super) fn architecture_semantic(
                 provenance_id: provenance_id.clone(),
                 metadata: binding_metadata,
             };
-            by_call.insert(call_id, (provenance_id, Some(anchor)));
+            by_call.insert(call_id, (row_key, Some(anchor)));
         }
         drop(cursor);
         let mut anchors: Vec<SemanticAnchor> = by_call
@@ -2142,7 +2144,10 @@ mod reimport_tests {
         let status = response.status().unwrap();
         assert!(status.semantic_languages.is_empty());
         assert_eq!(status.semantic_producer_id, None);
-        assert_eq!(status.semantic_note.as_deref(), Some(NO_PRODUCER_NOTE));
+        assert_eq!(
+            status.semantic_note.as_deref(),
+            Some(engine::NO_PRODUCER_NOTE)
+        );
         assert_eq!(status.stats.semantic_state, SemanticState::Unavailable);
         for tier in response.mcp_language_tiers().unwrap() {
             assert!(tier.reimport.is_none());
@@ -2347,7 +2352,7 @@ mod mcp_languages_tests {
         );
         assert_eq!(
             super::MCP_LANGUAGES,
-            crate::semantic_evidence::LANGUAGE_ORDER
+            crate::semantic_records::LANGUAGE_ORDER
         );
     }
 

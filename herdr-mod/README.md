@@ -1,17 +1,18 @@
 # Trellis for Herdr
 
-A [Herdr app](https://herdr.dev) mod that shows Trellis in a pane beside the coding agents (#707). It has two views, drawn the same way the web app draws them:
+A [Herdr app](https://herdr.dev) mod that shows Trellis in a pane beside the coding agents (#707). It has three tabs, drawn the same way the web app draws them:
 
-- **Architecture:** the web app's Architecture view (#886): Color by and Aggregation, the app switcher with one column per app, HTTP interface cards and cross-app lines, the deviation counts and the Deviations tree, the heat legend and the inspector, with the layers and their counts as native rows.
+- **Architecture:** the web app's Architecture view (#886): Color by and Aggregation, the app switcher with one column per app, HTTP interface cards and cross-app lines, the deviation counts, the heat legend and the inspector, with the layers and their counts as native rows.
 - **Sequence:** a method's static call sequence, with its steps as native rows. Clicking a proven call re-centers on that method.
+- **Deviations:** the Deviations tree (#939) with its edge chips. The review chip, an app's deviation count and a deviating arrow (its label, line or head) open it with their filter. A line opens its caller in Sequence, or shows its location when it has none (this pane has no source view).
 
 Both views follow the file selected in the `trellis-files` panel. The pane talks to the Trellis daemon on the machine the shown space lives on.
 
 - `src/main.js` is the pane: the followed checkout with a pin, index status, typed error states, the diagram and the layer list.
 - `src/client.js` is the daemon client: routes, the two transports (`fetch` here, `trellis api` elsewhere) and typed errors.
-- `src/diagram.js` draws Architecture. It uses the browser's own `web/architecture-pele.js`, `web/metric-heat.js`, `web/architecture.js` (`createDisplay`), `web/architecture-apps.js`, `web/architecture-deviations.js` (its model) and the vendored Pele, bundled unchanged, and reads the colour tokens and the Color by choices from `web/style.css` and `web/index.html` at build time.
+- `src/diagram.js` draws Architecture. It uses the browser's own `web/architecture-pele.js`, the `web/pele-svg.js` it reads, `web/metric-heat.js`, `web/architecture-display.js` (`createDisplay`), `web/architecture-apps.js`, `web/deviations-model.js` and the vendored Pele, bundled unchanged, and reads the colour tokens and the Color by choices from `web/style.css` and `web/index.html` at build time.
 - `src/architecture-ui.js` lays out the Architecture tab's native parts: controls, switcher, column headers, interface cards, legend, inspector and Deviations tree.
-- `src/sequence.js` draws Sequence. It uses `web/sequence-pele.js` and the helpers in `web/sequence.js`, bundled unchanged.
+- `src/sequence.js` draws Sequence. It uses `web/sequence-pele.js` and the helpers in `web/sequence-model.js`, with the `web/source-witness.js` they both read and the `web/pele-svg.js` the adapter reads, bundled unchanged.
 - `src/dom.js` is the small SVG DOM the adapter needs, because the mod runtime has none.
 - `trellis-files/publish-selection.patch` is the one change to a clone of Herdr's shipped Files mod.
 - `src/panels.js` turns on the tab bar's Files button in the `trellis` layout.

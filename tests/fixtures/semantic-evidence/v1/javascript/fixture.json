@@ -14,7 +14,7 @@
   ],
   "producers": [
     {
-      "executableHash": "52146f9e02702038ec4ebf7a5958da378ea9b718e2f270e618ed5bfebe89e78c",
+      "executableHash": "0881e7bbc1ff94d807f12c9962cfc1ec1fa0a63448e6aeb8fde5373d94b42967",
       "id": "trellis.native.syntax",
       "kind": "native",
       "languages": [
@@ -25,7 +25,7 @@
         "typescript"
       ],
       "positionEncoding": "utf8",
-      "version": "native-v16"
+      "version": "native-v17"
     }
   ],
   "revisions": [
@@ -134,7 +134,7 @@
     "revisionId": "r1",
     "producers": [
       {
-        "executableHash": "52146f9e02702038ec4ebf7a5958da378ea9b718e2f270e618ed5bfebe89e78c",
+        "executableHash": "0881e7bbc1ff94d807f12c9962cfc1ec1fa0a63448e6aeb8fde5373d94b42967",
         "id": "trellis.native.syntax",
         "kind": "native",
         "languages": [
@@ -145,7 +145,7 @@
           "typescript"
         ],
         "positionEncoding": "utf8",
-        "version": "native-v16"
+        "version": "native-v17"
       }
     ]
   },
@@ -561,8 +561,8 @@
     {
       "ref": "native-executable",
       "kind": "executable",
-      "pinned": "docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json#trellis-native-v16-javascript-test-support",
-      "hash": "52146f9e02702038ec4ebf7a5958da378ea9b718e2f270e618ed5bfebe89e78c"
+      "pinned": "docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json#trellis-native-v17-javascript-test-support",
+      "hash": "0881e7bbc1ff94d807f12c9962cfc1ec1fa0a63448e6aeb8fde5373d94b42967"
     },
     {
       "ref": "rust-toolchain",

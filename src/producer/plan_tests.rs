@@ -29,7 +29,16 @@ fn basis(revision: &str) -> Basis {
 }
 
 fn build(revision: &str, trust: TrustProfile) -> Value {
-    let row = profiles::row(Target::Real(ProducerName::ScipPython), trust).unwrap();
+    build_for(ProducerName::ScipPython, revision, trust, 8192)
+}
+
+fn build_for(
+    producer: ProducerName,
+    revision: &str,
+    trust: TrustProfile,
+    memory_mib: u64,
+) -> Value {
+    let row = profiles::row(Target::Real(producer), trust).unwrap();
     let pin = row.target.pin().unwrap();
     let node = Exe {
         path: PathBuf::from("/n/node"),
@@ -70,7 +79,7 @@ fn build(revision: &str, trust: TrustProfile) -> Value {
         settings: &[],
         limits: LimitsRequest {
             timeout_secs: 1800,
-            memory_mib: 8192,
+            memory_mib,
         },
         run_dir: "/state/runs/{runId}",
     })
@@ -128,6 +137,29 @@ fn plan_hash_is_canonical_and_stable() {
         hash,
         plan::plan_sha256(&build("revision:v2:a", TrustProfile::Trusted))
     );
+}
+
+/// Node-launched producers get a V8 old-space limit of 80% of the memory bound, floored at
+/// Node's 4096 MiB default, as node's first argument; it is in the plan and its hash (#957).
+#[test]
+fn node_producers_size_the_v8_heap_from_the_memory_bound() {
+    for producer in [ProducerName::ScipPython, ProducerName::ScipTypescript] {
+        for (memory_mib, heap) in [(8192, 6553), (16384, 13107), (1024, 4096), (64, 4096)] {
+            let plan = build_for(producer, "revision:v2:a", TrustProfile::Trusted, memory_mib);
+            let argv = plan["command"]["argv"].as_array().unwrap();
+            assert_eq!(argv[0], "/n/node");
+            assert_eq!(
+                argv[1],
+                format!("--max-old-space-size={heap}"),
+                "{producer:?}"
+            );
+            assert_eq!(argv[2], "/n/main.js");
+            assert!(plan["command"]["env"].get("NODE_OPTIONS").is_none());
+            let mut without = plan.clone();
+            without["command"]["argv"].as_array_mut().unwrap().remove(1);
+            assert_ne!(plan::plan_sha256(&plan), plan::plan_sha256(&without));
+        }
+    }
 }
 
 #[test]

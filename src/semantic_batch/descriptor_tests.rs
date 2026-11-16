@@ -9,7 +9,7 @@ use super::{
 use crate::{
     native_evidence as native,
     native_ids::{canonical, digest},
-    scip_admission::pinned_producer_by_id,
+    scip_admission::{PinnedProducer, pinned_producer_by_id},
     scip_raw::{self, Completion, ScipCaptureError},
 };
 use serde_json::{Value, json};
@@ -764,4 +764,85 @@ fn reuse_refuses_run_roots_outside_the_run_directory() {
             "{forbidden} was accepted for reuse"
         );
     }
+}
+
+/// #1126: only a Trellis run on a hash-verified executable may record a version that is not
+/// the pin's text, and its executable hash is still checked exactly.
+#[test]
+fn only_a_hash_verified_run_records_the_version_its_executable_reported() {
+    const REPORTED: &str = "1.98.1 (48a229c 2026-09-01)";
+    let declare = |name: &str, generation: Value, version: &str| {
+        let pin = pinned_producer_by_id(name).unwrap();
+        let mut value = with_generation(generation);
+        value["trustOrigin"] = json!(pin.trust_origin);
+        value["profileId"] = json!(pin.profile_id);
+        value["producer"] = json!({
+            "name":pin.name,"version":version,"identityKind":pin.identity_kind.as_str(),
+            "executableHash":pin.executable_hash,"positionEncoding":pin.position_encoding,"languages":pin.languages,
+        });
+        Descriptor::parse(&descriptor_bytes(&value)).unwrap()
+    };
+    let verified_run = || {
+        let mut generation = generation_json("trellisRun");
+        generation["trustProfile"] = json!("trusted");
+        generation["observed"] = json!([
+            "source",
+            "config",
+            "dependencyManifests",
+            "producerVersion",
+            "producerExecutable"
+        ]);
+        generation["asserted"] = json!(["runtime", "externalInputs"]);
+        generation
+    };
+    let pin = pinned_producer_by_id("rust-analyzer").unwrap();
+    assert_ne!(pin.version, REPORTED);
+
+    let run = declare("rust-analyzer", verified_run(), REPORTED);
+    let checked = run.check_producer().unwrap();
+    assert_eq!(checked.version, REPORTED);
+    assert_eq!(
+        PinnedProducer {
+            version: pin.version.clone(),
+            ..checked
+        },
+        pin,
+        "every other field is the pin's"
+    );
+    // The pin's own text is what the reference host's binary reports.
+    assert_eq!(
+        declare("rust-analyzer", verified_run(), &pin.version)
+            .check_producer()
+            .unwrap(),
+        pin
+    );
+
+    let refused = |descriptor: Descriptor| {
+        assert_eq!(
+            admission_detail(descriptor.check_producer().unwrap_err()),
+            "producer profile pin"
+        );
+    };
+    // The hash is the gate: a run that names other bytes is refused whatever it reports.
+    let mut other_bytes = run.clone();
+    other_bytes.producer.executable_hash = hex('0');
+    refused(other_bytes);
+    refused(declare("rust-analyzer", verified_run(), ""));
+    // A batch Trellis did not run, and a run verified another way, record the pin's text.
+    refused(declare("rust-analyzer", Value::Null, REPORTED));
+    refused(declare(
+        "rust-analyzer",
+        generation_json("ownerPickup"),
+        REPORTED,
+    ));
+    refused(declare(
+        "rust-analyzer",
+        generation_json("trellisRun"),
+        REPORTED,
+    ));
+    let mut pickup_claiming_a_hash = verified_run();
+    pickup_claiming_a_hash["origin"] = json!("ownerPickup");
+    refused(declare("rust-analyzer", pickup_claiming_a_hash, REPORTED));
+    // The synthetic stand-in has no executable to verify.
+    refused(declare("trellis-synthetic-scip", verified_run(), "2"));
 }

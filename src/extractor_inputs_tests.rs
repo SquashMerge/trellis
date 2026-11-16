@@ -11,15 +11,11 @@ use std::{collections::BTreeSet, path::Path};
 /// stored fact for an unchanged capture.
 const NON_EXTRACTION_ITEMS: &[(&str, &str)] = &[
     (
-        "graph_query::BoundaryReason",
+        "semantic_records::CallBinding",
         "a field of the read-only query view's semantic bindings (#467), never extracted",
     ),
     (
-        "semantic_evidence::CallBinding",
-        "a field of the read-only query view's semantic bindings (#467), never extracted",
-    ),
-    (
-        "semantic_evidence::Freshness",
+        "semantic_records::Freshness",
         "a field of the read-only query view's semantic bindings (#467), never extracted",
     ),
     (

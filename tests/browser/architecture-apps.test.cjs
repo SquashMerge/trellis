@@ -41,10 +41,9 @@ async function published(files, rules, callback) {
     const indexed = await H.run(H.binary, ["index", "--workspace", paths.workspace], {env:paths.env, timeout:120000});
     server = await H.startDaemon(paths, indexed.json().status.revision.indexRevision);
     browser = await chromium.launch();
-    // Two columns need a canvas of 2·352 + 176 = 880px plus its 24px padding. At 1440 the canvas
-    // was 912px with overlay scrollbars but 897px where Chromium draws a classic 15px scrollbar in
-    // the stable gutter (Linux, and CI Macs without a trackpad), which stacks the columns. 1600
-    // leaves a margin no scrollbar or font takes away; the stacked layout is asserted at 760.
+    // Two to four columns sit side by side at any desktop width, and the canvas scrolls when they are wider
+    // (#949/#950, owner ruling 2026-11-12); 1600 fits two without a scroll. The stacked layout is asserted at the
+    // drawer width, 760.
     context = await browser.newContext({viewport:{width:1600, height:1000}});
     const page = await context.newPage(), errors = [];
     page.on("pageerror", error => errors.push(error.message));
@@ -84,10 +83,10 @@ const columnsDrawn = async page => {
 };
 const drawn = async page => {
   await page.locator("#architecture-state[data-state=ready]").waitFor({state:"attached"});
-  await page.locator(".architecture-apps-grid .architecture-interface-card").waitFor({state:"attached"});
+  await page.locator("#architecture-diagram .architecture-interface-card").first().waitFor({state:"attached"});
 };
 
-test("all_apps_layout: columns side by side with a gutter card and a hidden overlay line, stacked when narrow", {timeout:240000}, async () => published(httpFiles, httpRules, async ({page}) => {
+test("all_apps_layout: columns side by side with a lane-sized gutter, the card under the grid and a hidden overlay line, stacked when narrow", {timeout:240000}, async () => published(httpFiles, httpRules, async ({page}) => {
   await drawn(page);
   const grid = page.locator("#architecture-diagram .architecture-apps-grid");
   await columnsDrawn(page);
@@ -98,15 +97,18 @@ test("all_apps_layout: columns side by side with a gutter card and a hidden over
   const card = page.locator(".architecture-interface-card");
   assert.equal(await card.count(), 1);
   const lines = await card.locator(".architecture-card-line").allTextContents();
-  assert.equal(lines[0], "HTTP · 1 route"); assert.match(lines[1], /^\d+ call sites?$/);
+  // Listed under the grid (#949), the card first names its interface.
+  assert.equal(lines[0], `${longName} → srv`); assert.equal(lines[1], "HTTP · 1 route"); assert.match(lines[2], /^\d+ call sites?$/);
   assert.ok(lines.includes("◆ 1 server-only")); assert.ok(lines.includes("◆ 1 client-only"));
   const boxes = await page.evaluate(() => {
-    const rect = node => { const r = node.getBoundingClientRect(); return {left:r.left, right:r.right}; };
+    const rect = node => { const r = node.getBoundingClientRect(); return {left:r.left, right:r.right, top:r.top, bottom:r.bottom}; };
     const [first, second] = [...document.querySelectorAll(".architecture-app-column")].map(rect);
-    return {first, second, card:rect(document.querySelector(".architecture-interface-card"))};
+    return {first, second, grid:rect(document.querySelector(".architecture-apps-grid")), card:rect(document.querySelector(".architecture-interface-card")),
+      under:!!document.querySelector(".architecture-apps-cards .architecture-interface-card")};
   });
-  assert.ok(boxes.card.left >= boxes.first.right - 1 && boxes.card.right <= boxes.second.left + 1, "the card sits in the gutter between the columns");
-  assert.ok(Math.round(boxes.second.left - boxes.first.right) === 176, "176px gutter");
+  // #949: one line, so the gutter is the least 48px, narrower than a card, which is listed under the grid.
+  assert.equal(Math.round(boxes.second.left - boxes.first.right), 48, `48px gutter: ${JSON.stringify(boxes)}`);
+  assert.ok(boxes.under && boxes.card.top >= boxes.grid.bottom - 1, `the card sits under the grid: ${JSON.stringify(boxes)}`);
   const overlay = page.locator(".architecture-apps-overlay");
   assert.equal(await overlay.getAttribute("aria-hidden"), "true");
   assert.ok(await overlay.locator(".architecture-apps-line").count() >= 1, "the matched ends run as lines");
@@ -117,6 +119,39 @@ test("all_apps_layout: columns side by side with a gutter card and a hidden over
   await page.locator(".architecture-interface-card .architecture-card-ends").first().waitFor({state:"attached"});
   assert.equal(await page.locator(".architecture-apps-line").count(), 0, "no line is drawn when the columns stack");
   assert.match(await page.locator(".architecture-interface-card").textContent(), /→/, "the card names both ends in words");
+}));
+
+// #949: a Rust server with two JavaScript clients, `one` calling one route and `two` three. The server comes
+// first in manifest order, so only interface order puts it between its clients.
+const serverFirstFiles = new Map([
+  ["Cargo.toml", '[package]\nname = "srv"\n'],
+  ["src/main.rs", 'async fn a() {}\nasync fn b() {}\nasync fn c() {}\nfn router() -> Router {\n    Router::new().route("/a", get(a)).route("/b", get(b)).route("/c", get(c))\n}\nfn main() {}\n'],
+  ["one/package.json", '{"name":"one"}\n'], ["one/app.js", 'async function load(api) {\n  await api("/a");\n}\n'],
+  ["two/package.json", '{"name":"two"}\n'], ["two/app.js", 'async function load(api) {\n  await api("/a");\n  await api("/b");\n  await api("/c");\n}\n'],
+]);
+const serverFirstRules = "version=1\n[layers.server]\napp='srv'\norder=1\npaths=['src/**']\n[layers.first]\napp='one'\norder=1\npaths=['one/**']\n[layers.second]\napp='two'\norder=1\npaths=['two/**']\n";
+
+test("#949 three apps at a realistic width: the server between its two clients, side by side with both lines and a sideways scroll, the inspector open; stacked only at drawer width", {timeout:240000}, async () => published(serverFirstFiles, serverFirstRules, async ({page}) => {
+  // A canvas of about 1100px beside the open inspector. Three 352px columns and two 48px gutters take 1152px,
+  // so the columns stay side by side and the canvas scrolls (never stack; owner ruling 2026-11-12).
+  await page.setViewportSize({width:1700, height:1000});
+  await page.locator("#architecture-state[data-state=ready]").waitFor({state:"attached"});
+  await page.waitForFunction(() => document.querySelectorAll(".architecture-app-column").length === 3 && document.querySelector(".architecture-apps-grid")?.dataset.layout === "columns"
+    && !document.getElementById("architecture-diagram").dataset.layout).catch(() => {});
+  const inputs = await layoutInputs(page);
+  assert.ok(inputs.inspector > 0, `the inspector is open: ${JSON.stringify(inputs)}`);
+  assert.ok(inputs.canvasClientWidth >= 1050 && inputs.canvasClientWidth <= 1150, `a canvas of about 1100px: ${JSON.stringify(inputs)}`);
+  assert.equal(inputs.layout, "columns", `the three columns sit side by side: ${JSON.stringify(inputs)}`);
+  assert.deepEqual(await page.locator(".architecture-app-column").evaluateAll(nodes => nodes.map(node => node.getAttribute("aria-label"))), ["two", "srv", "one"],
+    "the client with more matched routes on the server's left, the other on its right");
+  assert.equal(await page.locator(".architecture-apps-overlay .architecture-apps-line").count(), 2, "both interfaces run as lines");
+  assert.equal(await page.locator(".architecture-interface-card .architecture-card-ends").count(), 0, "no end is left to words");
+  const scroll = await page.evaluate(() => { const canvas = document.getElementById("architecture-diagram"); return {scrollWidth:canvas.scrollWidth, clientWidth:canvas.clientWidth}; });
+  assert.ok(scroll.scrollWidth > scroll.clientWidth, `the canvas scrolls sideways instead of stacking: ${JSON.stringify(scroll)}`);
+  // At the narrow-screen drawer width (900px and under), and only there, the columns stack.
+  await page.setViewportSize({width:860, height:1000});
+  await page.waitForFunction(() => document.querySelector(".architecture-apps-grid")?.dataset.layout === "stacked");
+  assert.equal(await page.locator(".architecture-apps-line").count(), 0, "a stacked layout draws no line");
 }));
 
 test("all_apps_selected_word: a selected header or card says Selected, and is pressed", {timeout:240000}, async () => published(httpFiles, httpRules, async ({page}) => {
@@ -192,23 +227,24 @@ test("app_switcher_narrow: at 760px every app button of a 120-character name sta
   }
 }));
 
-// #850: a Rust server `srv` (manifest first, so the left column) with a Shared layer `common`, and a
-// JavaScript client `web`. The Shared layer's call back into `server` is a deviation, so its header has a chip. The interface runs between the ordered layers, so srv's Shared band goes
-// on its left and no line crosses it. The control adds a second route whose handler is in the Shared
-// layer, registered there: one end on each side is a tie, so the band keeps the right and the ordered end's line crosses it.
+// #850: a Rust server `srv` and a JavaScript client `web` with a Shared layer `common`. Interface order (#949)
+// puts the client web in the left column. The Shared layer's call back into `client` is a deviation, so its
+// header has a chip. The interface runs between the ordered layers, so web's Shared band goes on its left and
+// no line crosses it. The control adds a second call, made from the Shared layer: one end on each side is a
+// tie, so the band keeps the right and the ordered end's line crosses it.
 const sharedFiles = control => new Map([
   ["Cargo.toml", '[package]\nname = "srv"\n'],
-  ["src/main.rs", `mod util;\nasync fn health() {}\nfn router() -> Router {\n    Router::new().route("/health", get(health))\n}\npub fn version() -> u32 { 2 }\nfn main() { util::helper(); }\n`],
-  ["src/util.rs", `pub fn helper() -> u32 { crate::version() }\n${control ? 'pub async fn ping() {}\nfn routes() -> Router {\n    Router::new().route("/ping", get(ping))\n}\n' : ""}`],
+  ["src/main.rs", 'async fn health() {}\nasync fn ping() {}\nfn router() -> Router {\n    Router::new().route("/health", get(health)).route("/ping", get(ping))\n}\nfn main() {}\n'],
   ["web/package.json", '{"name":"web"}\n'],
-  ["web/app.js", 'async function load(api) {\n  await api("/health");\n  await api("/ping");\n}\n'],
+  ["web/app.js", 'import {helper} from "./util.js";\nexport function version() { return 2; }\nexport async function load(api) {\n  await api("/health");\n  return helper();\n}\n'],
+  ["web/util.js", `import {version} from "./app.js";\nexport function helper() { return version(); }\n${control ? 'export async function ping(api) {\n  await api("/ping");\n}\n' : ""}`],
 ]);
-const sharedRules = "version=1\n[layers.server]\napp='srv'\norder=1\npaths=['src/main.rs']\n[layers.common]\napps=['srv']\nshared=true\npaths=['src/util.rs']\n" +
-  "[layers.client]\napp='web'\norder=1\npaths=['web/**']\n";
+const sharedRules = "version=1\n[layers.server]\napp='srv'\norder=1\npaths=['src/**']\n[layers.common]\napps=['web']\nshared=true\npaths=['web/util.js']\n" +
+  "[layers.client]\napp='web'\norder=1\npaths=['web/app.js']\n";
 // In page pixels: the Shared band, the overlay segments that enter it, its header text lines and chips, and their overlaps.
 const sharedGeometry = page => page.evaluate(() => {
   const band = document.querySelector('.pele-cluster[data-trellis-layer-id="common"]'), frame = band.querySelector(":scope > rect").getBoundingClientRect();
-  const stacks = [...document.querySelectorAll(".architecture-app-column")].find(column => column.getAttribute("aria-label") === "srv").querySelectorAll(".pele-cluster");
+  const stacks = [...document.querySelectorAll(".architecture-app-column")].find(column => column.getAttribute("aria-label") === "web").querySelectorAll(".pele-cluster");
   const stack = [...stacks].find(cluster => cluster.querySelector(":scope > text")?.textContent.replace(/\s+/g, " ").includes("ordered")).querySelector(":scope > rect");
   const box = r => ({x:r.left, y:r.top, w:r.width, h:r.height});
   // A segment enters a box when it passes through the box shrunk by one pixel (Liang-Barsky).
@@ -247,10 +283,10 @@ async function sharedDrawn(page) {
   return sharedGeometry(page);
 }
 
-test("#850 shared_band_away_from_partner: srv's Shared band sits left of its stack, no interface line enters it, and its header text never overlaps", {timeout:240000}, async () => published(sharedFiles(false), sharedRules, async ({page}) => {
+test("#850 shared_band_away_from_partner: web's Shared band sits left of its stack, no interface line enters it, and its header text never overlaps", {timeout:240000}, async () => published(sharedFiles(false), sharedRules, async ({page}) => {
   const at = await sharedDrawn(page);
   const detail = JSON.stringify({...at, inputs:await layoutInputs(page)});
-  assert.ok(at.band.x + at.band.w <= at.stack.x + 0.5, `the Shared band is left of srv's ordered stack: ${detail}`);
+  assert.ok(at.band.x + at.band.w <= at.stack.x + 0.5, `the Shared band is left of web's ordered stack, away from srv on its right: ${detail}`);
   assert.ok(at.lineCount >= 1, `the interface draws its line: ${detail}`);
   assert.deepEqual(at.crossings, [], `no interface line enters the Shared band: ${detail}`);
   assert.equal(at.lines[0].startsWith("Shared"), true, detail); assert.ok(at.lines.some(line => /^1 file/.test(line)), `the file count is drawn whole: ${detail}`);
@@ -258,9 +294,9 @@ test("#850 shared_band_away_from_partner: srv's Shared band sits left of its sta
   assert.deepEqual(at.overlaps, [], `the Shared header's lines and chips do not overlap: ${detail}`);
   assert.deepEqual(at.outside, [], `the Shared header stays inside its band: ${detail}`);
   // The column's own arrows route around the moved band: the shared outbound arrow leaves the band's right side.
-  const arrows = await page.evaluate(arrowGeometry, '.architecture-app-column[aria-label="srv"] svg.trellis-architecture-svg');
-  assert.ok(arrows.arrows >= 1, `srv draws its shared arrow: ${JSON.stringify(arrows)}`);
-  assert.deepEqual([arrows.crossings, arrows.tagHits, arrows.detached], [[], [], []], `srv's arrows cross no band, chip or tag: ${JSON.stringify(arrows)}`);
+  const arrows = await page.evaluate(arrowGeometry, '.architecture-app-column[aria-label="web"] svg.trellis-architecture-svg');
+  assert.ok(arrows.arrows >= 1, `web draws its shared arrow: ${JSON.stringify(arrows)}`);
+  assert.deepEqual([arrows.crossings, arrows.tagHits, arrows.detached], [[], [], []], `web's arrows cross no band, chip or tag: ${JSON.stringify(arrows)}`);
 }));
 
 test("#850 negative control: a Shared end and an ordered end toward the partner tie, the band keeps the right and the check sees the crossing", {timeout:240000}, async () => published(sharedFiles(true), sharedRules, async ({page}) => {

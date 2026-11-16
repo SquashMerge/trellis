@@ -1,15 +1,19 @@
 //! Exact, search-only form-c card preparation and serialization.
 //!
 //! Inputs are measured during the existing native parse. This module neither reads
-//! source files nor parses source, and has no dependency on display keys.
+//! source files nor parses source, and has no dependency on display keys. It uses only
+//! shared records and `native_ids`, so storage can render a stored card with it.
 
 use std::collections::BTreeSet;
 
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::native_evidence::Header;
 use crate::native_ids::{canonical, digest};
+use crate::native_records::{Declaration, Header};
+use crate::search_card_records::CapturedCard;
+pub use crate::search_card_records::{
+    Ancestor, PreparedFacts, SearchCard, is_container, is_eligible,
+};
 
 pub const DOC_BYTES: usize = 600;
 pub const LITERAL_BYTES: usize = 100;
@@ -32,14 +36,6 @@ impl CardFormat {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
-pub struct Ancestor {
-    pub kind: String,
-    pub name: Option<String>,
-    pub self_type: Option<String>,
-    pub trait_name: Option<String>,
-}
-
 /// Payloads are already syntactically selected and attached to this declaration.
 /// Lists arrive in (startByte, endByte, nativeOrdinal) order; head is the captured
 /// declaration range, not a first-line fallback or a nested-body-filtered view.
@@ -53,16 +49,16 @@ pub struct MeasuredFacts<'a> {
     pub head: &'a str,
 }
 
-/// Prepared once for storage and card production, without rereading source.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
-pub struct PreparedFacts {
-    pub doc: String,
-    pub calls: Vec<String>,
-    pub types: Vec<String>,
-    pub strings: Vec<String>,
-    pub error_codes: Vec<String>,
-    pub members: Vec<String>,
-    pub head: String,
+/// Re-render owned captured facts against the declaration's current measured header.
+pub fn render_card(declaration: &Declaration, captured: &CapturedCard) -> SearchCard {
+    serialize(&CardInput {
+        kind: &declaration.kind,
+        name: declaration.name.as_deref().unwrap_or(""),
+        ancestors: &captured.ancestors,
+        path: &captured.path,
+        header: &declaration.header,
+        facts: &captured.facts,
+    })
 }
 
 pub struct CardInput<'a> {
@@ -72,21 +68,6 @@ pub struct CardInput<'a> {
     pub path: &'a str,
     pub header: &'a Header,
     pub facts: &'a PreparedFacts,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
-pub struct SearchCard {
-    pub text: String,
-    pub hash: String,
-}
-
-pub fn is_container(kind: &str) -> bool {
-    matches!(kind, "type" | "implementation" | "namespace" | "module")
-}
-
-pub fn is_eligible(kind: &str, name: Option<&str>) -> bool {
-    (is_container(kind) || matches!(kind, "function" | "method"))
-        && name.is_some_and(|name| !name.is_empty())
 }
 
 /// Longest scalar-safe UTF-8 prefix, with no marker or replacement character.

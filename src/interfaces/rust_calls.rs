@@ -209,7 +209,7 @@ fn collect(
         ..document
     };
     let lines = LineIndex::new(document.source);
-    let callers = Callers::new(doc);
+    let callers = Callers::new(doc, check)?;
     let mut calls = Vec::new();
     for node in sites {
         check()?;

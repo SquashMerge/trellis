@@ -3,9 +3,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
-import { DOMParser, serialize } from "../src/dom.js";
+import { DOMParser, TextEncoder, serialize } from "../src/dom.js";
+import { document as hostDocument, pele } from "../src/runtime.js";
+import makePeleSvg from "trellis-web:pele-svg";
+import makeArchitectureRouting from "trellis-web:architecture-routing";
+import makeArchitecturePele from "trellis-web:architecture-pele";
 import { readFileSync } from "node:fs";
-import { draw, hit, measure, summarize } from "../src/diagram.js";
+import { draw, hit, measure, segments, summarize } from "../src/diagram.js";
 import { drawSequence } from "../src/sequence.js";
 import { TrellisError, architecturePayload, createClient, indexLabel, pinOf } from "../src/client.js";
 import { state } from "./stubs/herdr.js";
@@ -51,10 +55,40 @@ test("the diagram is the browser adapter's drawing, themed, with a box per contr
   const colours = new Set([...out.svg.matchAll(/(?:fill|stroke)="([^"]+)"/g)].map((m) => m[1]));
   for (const colour of colours) assert.ok(colour === "none" || Object.values(theme).includes(colour) || web.includes(colour.toUpperCase()), `unthemed colour ${colour}`);
   assert.equal(out.boxes.filter((b) => b.kind === "L").length, 5);
-  assert.equal(out.boxes.filter((b) => b.kind === "E").length, 4, "test edges stay hidden, as in the browser");
+  assert.equal(new Set(out.boxes.filter((b) => b.kind === "E").map((b) => b.id)).size, 4, "test edges stay hidden, as in the browser");
   const arrow = out.boxes.find((b) => b.kind === "E");
   assert.equal(hit(out.boxes, arrow.x + 1, arrow.y + 1).id, arrow.id, "the smallest box under the pointer wins");
   assert.equal(hit(out.boxes, -5, -5), null);
+});
+
+// #939: the owner couldn't click the deviation arrows. Only an arrow's count label had a box,
+// so a press on its line or arrowhead fell through to the layer band under it.
+test("#939 an arrow is pressable along its line and arrowhead, not only on its count label", async () => {
+  const [out] = (await draw(view(), { width: 900, theme, highlight: null })).images;
+  for (const edge of out.boxes.filter((b) => b.kind === "E" && b.record.status === "deviates")) {
+    const dataId = new RegExp(`<g class="pele-edge-label" data-id="([^"]+)"[^>]*data-trellis-architecture-id="${edge.id}"`).exec(out.svg)[1];
+    const group = new RegExp(`<g class="pele-edge" data-id="${dataId}"[^>]*>(.*?)</g>`).exec(out.svg)[1];
+    const [line, head] = [...group.matchAll(/<path[^>]* d="([^"]+)"/g)].map((m) => m[1]);
+    const [[x0, y0], [x1, y1]] = [...line.matchAll(/(-?[\d.]+),(-?[\d.]+)/g)].slice(0, 2).map((m) => [Number(m[1]), Number(m[2])]);
+    const label = out.boxes.find((b) => b.id === edge.id);
+    // A point on the line away from the label, and the arrowhead's tip.
+    const along = [0.1, 0.9].map((f) => [x0 + (x1 - x0) * f, y0 + (y1 - y0) * f])
+      .find(([x, y]) => !(x >= label.x && x <= label.x + label.w && y >= label.y && y <= label.y + label.h));
+    assert.ok(along, "the line runs beyond its label");
+    assert.equal(hit(out.boxes, along[0], along[1])?.id, edge.id, "the line is the arrow");
+    const tip = /M(-?[\d.]+),(-?[\d.]+)/.exec(head).slice(1).map(Number);
+    assert.equal(hit(out.boxes, tip[0], tip[1])?.id, edge.id, "the arrowhead is the arrow");
+    assert.equal(hit(out.boxes, along[0] + 30, along[1])?.id === edge.id, false, "beside the line is not the arrow");
+  }
+});
+
+test("#939 path segments: absolute, relative, H, V, curves and close each give a bounding box", () => {
+  assert.deepEqual(segments("M1,2L1,10"), [{ x0: 1, y0: 2, x1: 1, y1: 10 }]);
+  assert.deepEqual(segments("M0 0 h5 v5 Z"), [{ x0: 0, y0: 0, x1: 5, y1: 0 }, { x0: 5, y0: 0, x1: 5, y1: 5 }, { x0: 0, y0: 0, x1: 5, y1: 5 }]);
+  assert.deepEqual(segments("M0,0Q10,-4 20,0"), [{ x0: 0, y0: -4, x1: 20, y1: 0 }]);
+  assert.deepEqual(segments("M0,0 3,4"), [{ x0: 0, y0: 0, x1: 3, y1: 4 }], "extra pairs after M are lines");
+  assert.deepEqual(segments(""), []);
+  assert.deepEqual(segments("M0,0Lx"), [], "a malformed path gives no boxes, never a throw");
 });
 
 test("opening a band and highlighting a module chip change only the drawing", async () => {
@@ -118,6 +152,44 @@ test("yielding between drawing phases changes nothing in either drawing", async 
   assert.ok(flat.svg && stepped.svg === flat.svg);
   assert.deepEqual(stepped.boxes, flat.boxes);
   assert.ok(pauses - before >= 4, `Sequence yields between phases (${pauses - before})`);
+});
+
+// #1060: where a render asks "am I still current?" (c) and where it yields to the host (p), for
+// one fixture drawing at one width. The trail was recorded from the render before it was split
+// into phases; a stop point that moves, appears or vanishes changes it.
+const CHECKPOINTS = "ccpcpcpcpcpcpcpcpccpcpcc";
+test("#1060 a superseded Architecture render stops at the same checkpoints and leaves the page as it was", async () => {
+  const env = { pele };
+  makePeleSvg(env, hostDocument, DOMParser, TextEncoder);
+  makeArchitectureRouting(env);
+  const adapter = makeArchitecturePele(env, hostDocument, DOMParser, TextEncoder);
+  // One render of the fixture; it is current until its `staleAt`-th question.
+  const render = (staleAt, yielding) => {
+    const summary = summarize(view()), container = hostDocument.createElement("div"), before = hostDocument.createElement("p");
+    container.append(before);
+    let trail = "", asked = 0;
+    const options = { ...summary.options(summary.plan.parts[0], summary.plan.scale, { width: 900 }), onToggleLayer() {},
+      isCurrent: () => { trail += "c"; return ++asked < staleAt; }, ...(yielding ? { pause: async () => { trail += "p"; } } : {}) };
+    const outcome = adapter.render(container, summary.plan.payload, options);
+    return { outcome, container, before, trail: () => trail };
+  };
+  const whole = render(Infinity, true);
+  assert.equal((await whole.outcome).status, "ready");
+  assert.equal(whole.trail(), CHECKPOINTS);
+  assert.equal(whole.container.children[0].localName, "svg");
+  const questions = [...CHECKPOINTS].flatMap((mark, at) => (mark === "c" ? [at] : []));
+  for (const [index, at] of questions.entries()) {
+    const stale = render(index + 1, true);
+    assert.deepEqual(await stale.outcome, { status: "stale" });
+    assert.equal(stale.trail(), CHECKPOINTS.slice(0, at + 1), `stops at question ${index + 1}`);
+    assert.deepEqual(stale.container.children, [stale.before], "a superseded render leaves the page as it was");
+  }
+  // Without a pause (and with no fonts to wait for, as here) the render is one synchronous run:
+  // the drawing is installed before `render` returns, so nothing can come between its phases.
+  const plain = render(Infinity, false);
+  assert.equal(plain.container.children[0].localName, "svg");
+  assert.equal(plain.trail(), "cccc");
+  assert.equal((await plain.outcome).status, "ready");
 });
 
 test("the trellis layout's Files button is enabled when the welcome left only Changes, and nothing else changes", async () => {

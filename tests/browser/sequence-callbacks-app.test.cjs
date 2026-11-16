@@ -73,7 +73,7 @@ test("a hop inside a callback is shown under the call it is passed to; a callbac
     page.on("pageerror", error => errors.push(error.message));
     await H.connect(page, server, paths.token);
     await page.evaluate(id => { location.hash = `#sequence?sid=${encodeURIComponent(id)}`; }, load.seed);
-    await page.waitForFunction(() => /Pele rendered|fell back/.test(document.querySelector("#sequence-state")?.textContent || ""));
+    await page.waitForFunction(() => /Pele rendered|could not be drawn/.test(document.querySelector("#sequence-state")?.textContent || ""));
     const state = await page.locator("#sequence-state").innerText();
     assert.match(state, /Pele rendered/);
     assert.match(state, /1 HTTP interface hop \(structural matches, not proof\)/);
@@ -88,7 +88,7 @@ test("a hop inside a callback is shown under the call it is passed to; a callbac
     assert.match(await page.locator("#call-inspector").innerText(), /HTTP interface hop · POST \/api\/sequence · exact · web-app → alpha/);
     // The negative control in the web shell: no callback frame, no hop.
     await page.evaluate(id => { location.hash = `#sequence?sid=${encodeURIComponent(id)}`; }, quiet.seed);
-    await page.waitForFunction(() => /^quiet/.test(document.querySelector("#sequence-state")?.textContent || "") && /Pele rendered|fell back/.test(document.querySelector("#sequence-state")?.textContent || ""));
+    await page.waitForFunction(() => /^quiet/.test(document.querySelector("#sequence-state")?.textContent || "") && /Pele rendered|could not be drawn/.test(document.querySelector("#sequence-state")?.textContent || ""));
     assert.equal(await page.locator("#sequence-diagram .pele-edge-label").filter({hasText:"structural match"}).count(), 0);
     assert.equal(await page.locator("#sequence-diagram .pele-note").filter({hasText:"callback passed to"}).count(), 0);
     assert.deepEqual(errors, []);

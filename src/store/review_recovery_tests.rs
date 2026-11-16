@@ -1,6 +1,6 @@
 use super::*;
 use crate::index_coordinator::{IndexJobCoordinator, reconcile_workspace};
-use crate::indexer::IndexOptions;
+use crate::model::IndexOptions;
 use std::{
     fs::OpenOptions,
     io::{Seek, SeekFrom, Write},

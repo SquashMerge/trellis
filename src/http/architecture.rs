@@ -10,8 +10,8 @@
 //! A read waits on the owner's signal, and its wait is bounded by what the caller can afford.
 //! When that runs out it gets a typed [`ArchitectureBuilding`] with the progress so far.
 use super::DaemonState;
+use crate::architecture_core::{ArchitectureCore, ArchitectureProgress, CoreFailure};
 use crate::model::IndexPin;
-use crate::store::{ArchitectureCore, ArchitectureProgress, CoreFailure};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -557,6 +557,8 @@ impl DaemonState {
 
     /// One owner turn: compare head and rules with what is published and build what differs.
     fn architecture_step(self: &Arc<Self>, owner: &ArchitectureOwner) {
+        // Before the turn admits its read: a test orders the owner's read against other work.
+        owner.hook("architecture_step_started");
         let Some(lease) = self.background_lease() else {
             return;
         };

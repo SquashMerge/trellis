@@ -2,47 +2,16 @@
 //! Syntax never supplies a target, candidate edge, dispatch resolution or callback traversal.
 use crate::{capture::Capture, model::*, native_evidence};
 use anyhow::{Context, Result, ensure};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::{Path, PathBuf},
+    path::Path,
     sync::atomic::Ordering,
 };
 use tree_sitter::Node;
 
-#[derive(Clone, Debug)]
-pub struct IndexOptions {
-    pub workspace_root: PathBuf,
-    pub max_file_bytes: u64,
-    /// The cap on one config input (#581). Always
-    /// [`crate::skipped_config::CONFIG_INPUT_MAX_BYTES`] outside tests, so it is neither a
-    /// flag nor a reconcile option; tests lower it to exercise the skip at normal size.
-    pub max_config_bytes: u64,
-}
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct ReconcileOptions {
-    pub version: u8,
-    pub max_file_bytes: u64,
-}
-impl From<&IndexOptions> for ReconcileOptions {
-    fn from(options: &IndexOptions) -> Self {
-        Self {
-            version: 2,
-            max_file_bytes: options.max_file_bytes.min(256 * 1024 * 1024),
-        }
-    }
-}
-impl IndexOptions {
-    pub fn new(workspace_root: PathBuf) -> Self {
-        Self {
-            workspace_root,
-            max_file_bytes: 2 * 1024 * 1024,
-            max_config_bytes: crate::skipped_config::CONFIG_INPUT_MAX_BYTES,
-        }
-    }
-}
+pub use crate::model::{IndexOptions, ReconcileOptions};
 
 fn root_id(root: &std::path::Path) -> Result<String> {
     Ok(crate::store::topology::WorkspaceIdentity::discover(Some(root), root)?.record_id)
@@ -801,16 +770,6 @@ pub(crate) fn compare_writer_calls(a: &CallSite, b: &CallSite) -> std::cmp::Orde
         b.range.end_byte,
         &b.id,
     ))
-}
-
-/// Reader order from the graph SQL queries: path, start byte, descending
-/// end byte, then ID. String comparison uses SQLite's BINARY byte order.
-pub(crate) fn compare_reader_calls(a: &CallSite, b: &CallSite) -> std::cmp::Ordering {
-    a.path
-        .cmp(&b.path)
-        .then_with(|| a.range.start_byte.cmp(&b.range.start_byte))
-        .then_with(|| b.range.end_byte.cmp(&a.range.end_byte))
-        .then_with(|| a.id.cmp(&b.id))
 }
 
 /// The sole graph-row derivation for both publication and selected reads.

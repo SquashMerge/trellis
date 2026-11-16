@@ -175,13 +175,11 @@ impl<'t> Reading<'_, 't> {
             let input = self.py.docs[doc].input;
             Handlers {
                 lines: LineIndex::new(&input.file.text),
-                keys: crate::symbol_lookup::keys_from_source(
+                keys: crate::symbol_lookup::keys_by_name(
                     &input.key.path,
                     &input.key.language,
-                    &input.file.text,
                     &input.declarations,
-                )
-                .unwrap_or_default(),
+                ),
             }
         })
     }
