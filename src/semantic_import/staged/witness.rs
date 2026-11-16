@@ -1,7 +1,7 @@
 //! Bounded original-source reconstruction for the common settlement.
 use super::*;
-use crate::semantic_batch::staging::WitnessFallback;
 use crate::store::native_first::witness::{CoverageInput, OriginalRow, OriginalSourceWitness};
+use crate::store::staging::WitnessFallback;
 
 pub(super) struct Prepared {
     pub facts: super::super::JoinedFacts,
@@ -40,7 +40,7 @@ pub(super) fn check_complete(join: &StagedJoin<'_>) -> Result<()> {
     )? {
         return fallback("current document lacks original source decision");
     }
-    crate::semantic_batch::staging::check_proof_identity_closure(join.conn())?;
+    crate::store::staging::check_proof_identity_closure(join.conn())?;
     Ok(())
 }
 

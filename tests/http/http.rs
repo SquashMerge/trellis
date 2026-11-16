@@ -66,6 +66,42 @@ async fn call(app: &Router, method: &str, path: &str, body: Value) -> (StatusCod
     let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     (code, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
 }
+// The checkout router serves every row of the one asset table (#1023): the
+// row's content type and bytes, under the guard's response headers.
+#[tokio::test]
+async fn checkout_router_serves_every_web_asset() {
+    let (_d, _store, _state, app) = setup_without_tick();
+    let get = |path: &'static str| {
+        let req = Request::builder()
+            .uri(path)
+            .header("host", "127.0.0.1:7331")
+            .body(Body::empty())
+            .unwrap();
+        app.clone().oneshot(req)
+    };
+    for asset in http::WEB_ASSETS {
+        let reply = get(asset.path).await.unwrap();
+        assert_eq!(reply.status(), StatusCode::OK, "{}", asset.path);
+        let headers = reply.headers();
+        assert_eq!(
+            headers["content-type"], asset.content_type,
+            "{}",
+            asset.path
+        );
+        assert_eq!(headers["cache-control"], "no-store");
+        assert_eq!(headers["x-content-type-options"], "nosniff");
+        assert!(headers.contains_key("content-security-policy"));
+        let body = to_bytes(reply.into_body(), 64 * 1024 * 1024).await.unwrap();
+        assert_eq!(body, asset.body, "{}", asset.path);
+    }
+    for unknown in ["/not-an-asset.js", "/vendor/not-an-asset.js"] {
+        let reply = get(unknown).await.unwrap();
+        assert_eq!(reply.status(), StatusCode::NOT_FOUND, "{unknown}");
+        let body = to_bytes(reply.into_body(), 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], "not_found", "{unknown}");
+    }
+}
 #[tokio::test]
 async fn guards_public_and_private() {
     // No startup reconciliation: /api/status has no head and answers 503.

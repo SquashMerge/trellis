@@ -181,7 +181,7 @@ fn native_v9_rows_survive_both_full_routes_and_local_reuse() {
             .unwrap()
             .run(&options, &cancel, |_| {})
             .unwrap();
-        let key = crate::native_evidence::DocumentKey {
+        let key = crate::native_records::DocumentKey {
             source_set_id: format!("source-set:v1:{}", store.root_id()),
             language: "rust".into(),
             path: "flow.rs".into(),

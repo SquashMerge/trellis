@@ -2207,7 +2207,7 @@ mod gc_final_witness_tests {
             if !old_schema {
                 candidate
                     .enqueue_request(
-                        &crate::indexer::IndexOptions::new(candidate_root.path().to_owned()),
+                        &crate::model::IndexOptions::new(candidate_root.path().to_owned()),
                         None,
                     )
                     .unwrap();
@@ -2312,7 +2312,7 @@ mod gc_final_witness_tests {
             crate::store::Store::open_for_tests(state.path(), candidate_root.path()).unwrap();
         candidate
             .enqueue_request(
-                &crate::indexer::IndexOptions::new(candidate_root.path().to_owned()),
+                &crate::model::IndexOptions::new(candidate_root.path().to_owned()),
                 None,
             )
             .unwrap();
@@ -2476,7 +2476,7 @@ mod gc_final_witness_tests {
             crate::store::Store::open_for_tests(state.path(), candidate_root.path()).unwrap();
         candidate
             .enqueue_request(
-                &crate::indexer::IndexOptions::new(candidate_root.path().to_owned()),
+                &crate::model::IndexOptions::new(candidate_root.path().to_owned()),
                 None,
             )
             .unwrap();

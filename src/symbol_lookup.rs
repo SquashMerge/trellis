@@ -4,7 +4,7 @@ use crate::{
     native_evidence::{Declaration, Key},
     syntax_bounds::{DEPTH, VISITS},
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::Result;
 use std::{collections::BTreeMap, time::Instant};
 use tree_sitter::Node;
 
@@ -12,6 +12,9 @@ use tree_sitter::Node;
 /// be unique: overloads, repeated declarations and separate impls intentionally collide.
 /// Anonymous containers other than Rust impls have no stable written name, so their contents
 /// have no lookup key. An incomplete Rust parse refuses the document, never a partial map.
+///
+/// This is the MCP read's derivation: the Rust impl reparse keeps the contracted Files
+/// budget, wall clock included, and every refusal is `deadline_exceeded`.
 pub(crate) fn keys_from_source(
     path: &str,
     language: &str,
@@ -23,24 +26,124 @@ pub(crate) fn keys_from_source(
         language,
         text,
     };
+    let limit = Limit::Deadline(Instant::now() + FILE_TIME_LIMIT);
+    derive(file, declarations, limit).map_err(|refused| match refused {
+        Refused::Bound(bound) => anyhow::anyhow!(bound),
+        Refused::Stopped(error) => error,
+    })
+}
+
+/// The same keys for a view-time build (references, rules, interfaces), which must give the
+/// same answer for the same input however busy the machine is (#1115). No wall clock decides
+/// it: the Rust impl reparse is bounded by the source size and the syntax bounds alone, and
+/// `check` is the build's own abort and hang backstop.
+///
+/// `Ok(None)` is a document beyond those bounds. It has no stable keys on any run, so a
+/// caller may keep that. An `Err` is `check`'s own error, and never an answer to keep.
+pub(crate) fn keys_checked(
+    path: &str,
+    language: &str,
+    text: &str,
+    declarations: &[Declaration],
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<Option<BTreeMap<String, String>>> {
+    let file = &Source {
+        path,
+        language,
+        text,
+    };
+    match derive(file, declarations, Limit::Check { check, polls: 0 }) {
+        Ok(keys) => Ok(Some(keys)),
+        Err(Refused::Bound(_)) => Ok(None),
+        Err(Refused::Stopped(error)) => Err(error),
+    }
+}
+
+/// The keys of a document in a language without Rust impls: every container is named or
+/// keyless, so there is nothing to reparse and nothing that can fail.
+pub(crate) fn keys_by_name(
+    path: &str,
+    language: &str,
+    declarations: &[Declaration],
+) -> BTreeMap<String, String> {
+    debug_assert_ne!(language, "rust", "Rust impl containers need their source");
+    let file = &Source {
+        path,
+        language,
+        text: "",
+    };
+    assemble(file, declarations, &BTreeMap::new())
+}
+
+const EXHAUSTED: &str = "deadline_exceeded: stable lookup Rust syntax budget exhausted";
+const MISSING_IMPL: &str = "deadline_exceeded: stable lookup missing Rust impl declaration";
+
+/// What bounds one Rust impl reparse besides the source size and the syntax bounds.
+enum Limit<'a> {
+    Deadline(Instant),
+    /// Polled once in [`POLL`] steps, the first step included.
+    Check {
+        check: &'a mut dyn FnMut() -> Result<()>,
+        polls: usize,
+    },
+}
+const POLL: usize = 256;
+impl Limit<'_> {
+    fn step(&mut self) -> Result<(), Refused> {
+        match self {
+            Self::Deadline(deadline) if Instant::now() >= *deadline => {
+                Err(Refused::Bound(EXHAUSTED))
+            }
+            Self::Deadline(_) => Ok(()),
+            Self::Check { check, polls } => {
+                let due = *polls == 0;
+                *polls = (*polls + 1) % POLL;
+                if due {
+                    check().map_err(Refused::Stopped)?;
+                }
+                Ok(())
+            }
+        }
+    }
+    fn deadline(&self) -> Option<Instant> {
+        match self {
+            Self::Deadline(deadline) => Some(*deadline),
+            Self::Check { .. } => None,
+        }
+    }
+}
+
+/// Why a document has no key map.
+enum Refused {
+    /// A bound was reached. Under [`Limit::Check`] every bound is a property of the input.
+    Bound(&'static str),
+    /// The caller's check stopped the reparse, or the parser could not start.
+    Stopped(anyhow::Error),
+}
+
+fn derive(
+    file: &Source<'_>,
+    declarations: &[Declaration],
+    limit: Limit<'_>,
+) -> Result<BTreeMap<String, String>, Refused> {
     let implementations: BTreeMap<_, _> = declarations
         .iter()
         .filter(|d| d.kind == "implementation" && d.name.is_none())
         .map(|d| {
             let mut path = d.ancestors.clone();
             path.push(d.key.clone());
-            Ok((serde_json::to_vec(&path)?, d))
+            (path_key(&path), d)
         })
-        .collect::<Result<_>>()?;
+        .collect();
     let mut required = BTreeMap::new();
     if file.language == "rust" {
         for d in declarations.iter().filter(|d| recoverable(file, d)) {
             for (i, ancestor) in d.ancestors.iter().enumerate() {
                 if ancestor.kind == "implementation" && ancestor.name.is_none() {
-                    let path = serde_json::to_vec(&d.ancestors[..=i])?;
-                    let block = implementations.get(&path).context(
-                        "deadline_exceeded: stable lookup missing Rust impl declaration",
-                    )?;
+                    let path = path_key(&d.ancestors[..=i]);
+                    let block = implementations
+                        .get(&path)
+                        .ok_or(Refused::Bound(MISSING_IMPL))?;
                     required.insert(path, *block);
                 }
             }
@@ -49,8 +152,21 @@ pub(crate) fn keys_from_source(
     let targets = if required.is_empty() {
         BTreeMap::new()
     } else {
-        impl_targets(file, &required)?
+        impl_targets(file, &required, limit)?
     };
+    Ok(assemble(file, declarations, &targets))
+}
+
+/// The map key of a declaration path. These records are plain strings and numbers.
+fn path_key(path: &[Key]) -> Vec<u8> {
+    serde_json::to_vec(path).expect("native key serialization")
+}
+
+fn assemble(
+    file: &Source<'_>,
+    declarations: &[Declaration],
+    targets: &BTreeMap<Vec<u8>, Option<String>>,
+) -> BTreeMap<String, String> {
     let mut result = BTreeMap::new();
     for d in declarations.iter().filter(|d| recoverable(file, d)) {
         let mut parts = vec![file.path.to_owned()];
@@ -61,7 +177,7 @@ pub(crate) fn keys_from_source(
             }
             if let Some(name) = &ancestor.name {
                 parts.push(name.clone());
-            } else if let Some(Some(name)) = targets.get(&serde_json::to_vec(&d.ancestors[..=i])?) {
+            } else if let Some(Some(name)) = targets.get(&path_key(&d.ancestors[..=i])) {
                 parts.push(name.clone());
             } else {
                 complete = false;
@@ -73,21 +189,13 @@ pub(crate) fn keys_from_source(
             result.insert(d.syntax_id.clone(), parts.join("::"));
         }
     }
-    Ok(result)
+    result
 }
 
 struct Source<'a> {
     path: &'a str,
     language: &'a str,
     text: &'a str,
-}
-
-#[cfg(test)]
-fn keys(
-    file: &crate::model::SourceFile,
-    declarations: &[Declaration],
-) -> Result<BTreeMap<String, String>> {
-    keys_from_source(&file.path, &file.language, &file.text, declarations)
 }
 
 fn file_module(file: &Source<'_>, index: usize, key: &Key) -> bool {
@@ -103,45 +211,53 @@ fn recoverable(file: &Source<'_>, d: &Declaration) -> bool {
         })
 }
 
-fn exhausted() -> anyhow::Error {
-    anyhow::anyhow!("deadline_exceeded: stable lookup Rust syntax budget exhausted")
-}
-
 fn impl_targets(
     file: &Source<'_>,
     required: &BTreeMap<Vec<u8>, &Declaration>,
-) -> Result<BTreeMap<Vec<u8>, Option<String>>> {
-    ensure!(file.text.len() <= FILE_INPUT_LIMIT, exhausted());
-    let deadline = Instant::now() + FILE_TIME_LIMIT;
+    mut limit: Limit<'_>,
+) -> Result<BTreeMap<Vec<u8>, Option<String>>, Refused> {
+    let exhausted = || Refused::Bound(EXHAUSTED);
+    if file.text.len() > FILE_INPUT_LIMIT {
+        return Err(exhausted());
+    }
     let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&tree_sitter_rust::LANGUAGE.into())?;
-    let mut progress = |_: &tree_sitter::ParseState| {
-        if Instant::now() >= deadline {
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .map_err(|error| Refused::Stopped(error.into()))?;
+    // The parser reports only that it stopped, so the reason waits here.
+    let mut stopped = None;
+    let mut progress = |_: &tree_sitter::ParseState| match limit.step() {
+        Ok(()) => std::ops::ControlFlow::Continue(()),
+        Err(refused) => {
+            stopped = Some(refused);
             std::ops::ControlFlow::Break(())
-        } else {
-            std::ops::ControlFlow::Continue(())
         }
     };
-    let tree = parser
-        .parse_with_options(
-            &mut |offset, _| &file.text.as_bytes()[offset..],
-            None,
-            Some(tree_sitter::ParseOptions::new().progress_callback(&mut progress)),
-        )
-        .ok_or_else(exhausted)?;
+    let tree = parser.parse_with_options(
+        &mut |offset, _| &file.text.as_bytes()[offset..],
+        None,
+        Some(tree_sitter::ParseOptions::new().progress_callback(&mut progress)),
+    );
+    let tree = match (tree, stopped) {
+        (Some(tree), None) => tree,
+        (_, Some(refused)) => return Err(refused),
+        (None, None) => return Err(exhausted()),
+    };
     let mut visits = 0;
-    bounded_tree(tree.root_node(), deadline, &mut visits)?;
-    let mut expansions =
-        crate::native_rust_macros::Expansions::new(file.text).with_deadline(deadline);
+    bounded_tree(tree.root_node(), &mut limit, &mut visits)?;
+    let mut expansions = crate::native_rust_macros::Expansions::new(file.text);
+    if let Some(deadline) = limit.deadline() {
+        expansions = expansions.with_deadline(deadline);
+    }
     let mut checked = std::collections::BTreeSet::new();
     checked.insert(tree.root_node().id());
     let mut targets = BTreeMap::new();
     for (path, declaration) in required {
-        ensure!(Instant::now() < deadline, exhausted());
+        limit.step()?;
         let range = &declaration.range;
         let root = expansions.root_for(tree.root_node(), range.start, range.end);
         if checked.insert(root.id()) {
-            bounded_tree(root, deadline, &mut visits)?;
+            bounded_tree(root, &mut limit, &mut visits)?;
         }
         // Expansion's absence can mean its byte budget ran out. Never treat that as proof
         // that another impl is the only match. All requested native impls need exact syntax.
@@ -156,7 +272,7 @@ fn impl_targets(
         let target = node
             .child_by_field_name("type")
             .and_then(|node| written_type(node, file.text.as_bytes()));
-        ensure!(Instant::now() < deadline, exhausted());
+        limit.step()?;
         targets.insert(path.clone(), target);
     }
     Ok(targets)
@@ -164,15 +280,15 @@ fn impl_targets(
 
 /// A bounded iterative walk also bounds the later tree-sitter range/path lookups. Expansion
 /// trees share the document's visit budget rather than getting one budget per declaration.
-fn bounded_tree(root: Node<'_>, deadline: Instant, visits: &mut usize) -> Result<()> {
+fn bounded_tree(root: Node<'_>, limit: &mut Limit<'_>, visits: &mut usize) -> Result<(), Refused> {
     let mut cursor = root.walk();
     let mut depth = 0;
     loop {
         *visits += 1;
-        ensure!(
-            *visits <= VISITS && depth < DEPTH && Instant::now() < deadline,
-            exhausted()
-        );
+        if *visits > VISITS || depth >= DEPTH {
+            return Err(Refused::Bound(EXHAUSTED));
+        }
+        limit.step()?;
         if cursor.goto_first_child() {
             depth += 1;
             continue;
@@ -237,6 +353,18 @@ mod tests {
         fs,
         sync::{Arc, atomic::AtomicBool},
     };
+
+    fn keys(file: &SourceFile, declarations: &[Declaration]) -> Result<BTreeMap<String, String>> {
+        keys_from_source(&file.path, &file.language, &file.text, declarations)
+    }
+
+    fn checked(
+        file: &SourceFile,
+        declarations: &[Declaration],
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<BTreeMap<String, String>>> {
+        keys_checked(&file.path, &file.language, &file.text, declarations, check)
+    }
 
     struct Fixture {
         _state: tempfile::TempDir,
@@ -426,5 +554,73 @@ mod tests {
                 .to_string()
                 .starts_with("deadline_exceeded: stable lookup")
         );
+    }
+
+    const IMPL: &str = "struct Store; impl Store { fn save() {} }";
+
+    #[test]
+    fn an_expired_deadline_is_a_typed_refusal_of_the_mcp_derivation() {
+        let fixture = Fixture::new();
+        let (file, native) = fixture.measure("store.rs", IMPL);
+        let source = Source {
+            path: &file.path,
+            language: &file.language,
+            text: &file.text,
+        };
+        let refused = derive(
+            &source,
+            &native.declarations,
+            Limit::Deadline(Instant::now()),
+        );
+        assert!(matches!(refused, Err(Refused::Bound(EXHAUSTED))));
+    }
+
+    /// #1115: a view-time derivation never reads the clock, so its answer cannot depend on
+    /// how long the reparse took.
+    #[test]
+    fn a_checked_derivation_is_bounded_by_its_check_alone() {
+        let fixture = Fixture::new();
+        let (file, native) = fixture.measure("store.rs", IMPL);
+        let mut polls = 0;
+        let found = checked(&file, &native.declarations, &mut || {
+            polls += 1;
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+        assert!(polls > 0);
+        assert_eq!(found, keys(&file, &native.declarations).unwrap());
+    }
+
+    #[test]
+    fn a_failing_check_is_the_error_of_a_checked_derivation_never_an_empty_map() {
+        let fixture = Fixture::new();
+        let (file, native) = fixture.measure("store.rs", IMPL);
+        let error = checked(&file, &native.declarations, &mut || {
+            anyhow::bail!("request_cancelled: test")
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "request_cancelled: test");
+    }
+
+    #[test]
+    fn a_document_beyond_the_syntax_bounds_has_no_checked_keys_on_any_run() {
+        let fixture = Fixture::new();
+        let (mut file, native) = fixture.measure("store.rs", IMPL);
+        file.text.push_str(&" ".repeat(FILE_INPUT_LIMIT));
+        for _ in 0..2 {
+            let found = checked(&file, &native.declarations, &mut || Ok(())).unwrap();
+            assert_eq!(found, None);
+        }
+    }
+
+    #[test]
+    fn a_language_without_impls_needs_no_source_for_its_keys() {
+        let fixture = Fixture::new();
+        let (file, native) =
+            fixture.measure("store.py", "class Store:\n    def save(self): pass\n");
+        let by_name = keys_by_name(&file.path, &file.language, &native.declarations);
+        assert_eq!(by_name, keys(&file, &native.declarations).unwrap());
+        assert!(by_name.values().any(|key| key == "store.py::Store::save"));
     }
 }

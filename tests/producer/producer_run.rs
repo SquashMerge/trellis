@@ -338,6 +338,11 @@ fn explicit_run_imports_stub_artifact() {
     assert_eq!(record["requestId"], reply["import"]["requestId"]);
     assert_eq!(record["origin"], "manual");
     assert_eq!(world.stub_entry()["lastRun"]["origin"], "manual");
+    // A run that imported has a null failure summary everywhere (#967).
+    let last = world.stub_entry()["lastRun"].clone();
+    for (place, value) in [("reply", &reply), ("record", &record), ("lastRun", &last)] {
+        assert_eq!(value.get("failure"), Some(&Value::Null), "{place}: {value}");
+    }
 }
 
 #[test]
@@ -504,6 +509,106 @@ fn crash_diagnostics_in_run_record() {
     world.mode(json!({}));
     let reply = reply_of(&world.run(&[]));
     assert_eq!(reply["outcome"], "producer_output_missing");
+}
+
+/// V8's fatal heap-limit abort, as scip-python printed it (#957).
+const V8_OOM: &str = "\n<--- Last few GCs --->\n\n[4242:0x7f8]   143012 ms: Mark-Compact 4055.8 (4130.1) -> 4046.6 (4131.6) MB, 1520.3 / 0.0 ms  (average mu = 0.112) allocation failure; scavenge might not succeed\n\n<--- JS stacktrace --->\n\nFATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory\n 1: 0x1001 node::Abort() [node]\n";
+
+/// A producer that aborts with V8's heap-limit stderr is `node_heap_exhausted`, and the reply,
+/// the record, `lastRun` and the CLI's stderr say why (#967, owner ruling 2026-11-12).
+#[test]
+fn v8_heap_abort_is_reported_as_node_heap_exhausted() {
+    let world = World::new();
+    world.mode(json!({"stderrText": V8_OOM, "abort": true}));
+    let output = world.run(&[]);
+    assert!(!output.status.success());
+    let reply = reply(&output);
+    assert_eq!(reply["outcome"], "producer_failed");
+    assert_eq!(reply["errorCode"], "producer_failed: node_heap_exhausted");
+    let run_id = reply["runId"].as_str().unwrap();
+    let record = world.record(run_id);
+    assert_eq!(record["errorCode"], "producer_failed: node_heap_exhausted");
+    let last = world.stub_entry()["lastRun"].clone();
+    for failure in [&reply["failure"], &record["failure"], &last["failure"]] {
+        assert_eq!(failure["reason"], "node_heap_exhausted", "{failure}");
+        assert_eq!(failure["exit"], "signal SIGABRT");
+        assert_eq!(
+            failure["peakRssBytes"],
+            reply["diagnostics"]["peakRssBytes"]
+        );
+        let lines = failure["stderrLines"].as_array().unwrap();
+        assert!(lines.len() <= 10, "{lines:?}");
+        assert_eq!(
+            lines.last().unwrap(),
+            " 1: 0x1001 node::Abort() [node]",
+            "{lines:?}"
+        );
+        assert!(lines.iter().all(|line| !line.as_str().unwrap().is_empty()));
+        assert!(lines.contains(&json!(
+            "FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory"
+        )));
+    }
+    let status = world.producer("status", &["--run", run_id]);
+    let status = crate::child::cli_json_with(&status, "producer status --run", None);
+    assert_eq!(status["run"]["failure"], reply["failure"]);
+    let text = stderr(&output);
+    let summary: Vec<&str> = text
+        .lines()
+        .filter(|line| line.starts_with("producer run failed:"))
+        .collect();
+    assert_eq!(summary.len(), 1, "{text}");
+    assert!(
+        summary[0].starts_with(
+            "producer run failed: producer_failed: node_heap_exhausted (signal SIGABRT, peak RSS "
+        ),
+        "{}",
+        summary[0]
+    );
+    assert!(summary[0].ends_with("raise --memory-mib"), "{}", summary[0]);
+}
+
+/// Any other failure has a summary with a null reason: the last ten non-empty stderr lines,
+/// each at most 512 bytes (#967).
+#[test]
+fn other_failures_have_a_summary_without_a_reason() {
+    let world = World::new();
+    let long = "é".repeat(400);
+    let mut text = String::from("JavaScript heap out of memory\n");
+    for line in 0..11 {
+        text.push_str(&format!("plain line {line}\n\n"));
+    }
+    text.push_str(&long);
+    text.push('\n');
+    world.mode(json!({"stderrText": text, "exit": 3}));
+    let output = world.run(&[]);
+    let reply = reply(&output);
+    // The V8 text without an abort is not a heap exhaustion.
+    assert_eq!(reply["errorCode"], "producer_failed");
+    let failure = &reply["failure"];
+    assert_eq!(failure["reason"], Value::Null);
+    assert_eq!(failure["exit"], "code 3");
+    let lines: Vec<&str> = failure["stderrLines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|line| line.as_str().unwrap())
+        .collect();
+    assert_eq!(lines.len(), 10);
+    assert_eq!(lines[0], "plain line 2");
+    assert_eq!(lines[8], "plain line 10");
+    assert_eq!(lines[9], "é".repeat(256));
+    assert_eq!(
+        world.record(reply["runId"].as_str().unwrap())["failure"],
+        *failure
+    );
+    let text = stderr(&output);
+    let summary: Vec<&str> = text
+        .lines()
+        .filter(|line| line.starts_with("producer run failed:"))
+        .collect();
+    assert_eq!(summary.len(), 1, "{text}");
+    assert!(summary[0].starts_with("producer run failed: producer_failed (code 3, peak RSS "));
+    assert!(!summary[0].contains("--memory-mib"));
 }
 
 fn reply_of(output: &Output) -> Value {

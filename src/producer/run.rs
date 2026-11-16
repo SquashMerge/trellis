@@ -6,7 +6,8 @@
 use super::approval;
 use super::batch::{self, ARTIFACT_PATH, BatchSpec};
 use super::exec::{self, Ending, Hooks, ProducerSpec};
-use super::import::{self, ImportOutcome};
+use super::failure;
+use super::import::{self, ImportOutcome, ImportScheduler};
 use super::plan::{self, PlanRequest, Prepared};
 use super::profiles::{self, Stub};
 use super::state::{
@@ -18,7 +19,6 @@ use super::{
     ProcessIdentity, ROOT_CHANGED,
 };
 use crate::{
-    http::DaemonState,
     semantic_batch::{
         BatchCounters, StageInput, StageOwner, descriptor::GenerationOrigin, stage_batch,
     },
@@ -136,7 +136,7 @@ impl CancelRequest {
 /// What a run needs from its checkout.
 pub struct RunContext<'a> {
     pub store: &'a Store,
-    pub scheduler: &'a DaemonState,
+    pub scheduler: &'a dyn ImportScheduler,
     pub stub: Option<&'a Stub>,
 }
 
@@ -580,6 +580,7 @@ impl Run<'_> {
             &prepared.pin,
             &prepared.rules,
             &dir_text,
+            prepared.limits.memory_mib,
         );
         let rules = &prepared.rules;
 
@@ -675,7 +676,12 @@ impl Run<'_> {
             Ending::Exited => {}
         }
         if diagnostics.exit.code != Some(0) {
-            return Ok(Finish::failed("producer_failed", "producer_failed").with(&diagnostics));
+            let code = if failure::node_heap_exhausted(&self.active.producer, &diagnostics) {
+                format!("producer_failed: {}", failure::NODE_HEAP_EXHAUSTED)
+            } else {
+                "producer_failed".to_owned()
+            };
+            return Ok(Finish::failed("producer_failed", code).with(&diagnostics));
         }
         let artifact_present =
             fs::symlink_metadata(self.dir.join(ARTIFACT_PATH)).is_ok_and(|meta| meta.is_file());
@@ -1003,6 +1009,7 @@ impl ProducerOwner {
             finished_at: None,
             diagnostics: None,
             group_status: None,
+            failure: None,
             origin: active.origin,
         };
         state.write_run_record(&record)?;
@@ -1029,6 +1036,11 @@ impl ProducerOwner {
             Err(error) => run.finish_from_error(&error, None),
         };
         active.control().finished = true;
+        let failure = failure::summarize(
+            &active.producer,
+            finish.state != RunState::Done,
+            finish.diagnostics.as_ref(),
+        );
         let written = run.recorder.update(|record| {
             record.state = finish.state;
             record.outcome = Some(finish.outcome.to_owned());
@@ -1036,6 +1048,7 @@ impl ProducerOwner {
             record.finished_at = Some(now_millis());
             record.process = None;
             record.diagnostics = finish.diagnostics.clone();
+            record.failure = failure.clone();
             if let Some(imported) = &finish.import {
                 record.request_id = Some(imported.request_id.clone());
             }
@@ -1073,6 +1086,7 @@ impl ProducerOwner {
                 "report": imported.report,
             })),
             "diagnostics": finish.diagnostics,
+            "failure": failure,
         }))
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "trellis"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 description = "Local diagram-first code index and daemon"
 license = "BUSL-1.1"

@@ -10,8 +10,8 @@ pub(crate) const SEARCH_CARD_BATCH_SIZE: usize = 16;
 
 #[derive(serde::Deserialize, Serialize)]
 struct StoredFacts {
-    facts: crate::search_card::PreparedFacts,
-    ancestors: Vec<crate::search_card::Ancestor>,
+    facts: crate::search_card_records::PreparedFacts,
+    ancestors: Vec<crate::search_card_records::Ancestor>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -95,7 +95,7 @@ impl Store {
 
 pub(super) fn write_cards(
     db: &Connection,
-    artifact: &crate::native_evidence::Artifact,
+    artifact: &crate::native_records::Artifact,
     storage_ids: &BTreeMap<String, (i64, i64, i64)>,
     reuse: &PreflightReuse,
     immutable: &mut ImmutableAppend,
@@ -104,7 +104,7 @@ pub(super) fn write_cards(
     let declarations: BTreeMap<_, _> = artifact
         .declarations
         .iter()
-        .filter(|d| crate::search_card::is_eligible(&d.kind, d.name.as_deref()))
+        .filter(|d| crate::search_card_records::is_eligible(&d.kind, d.name.as_deref()))
         .map(|d| ((d.document.path.as_str(), d.syntax_id.as_str()), d))
         .collect();
     let mut seen = BTreeSet::new();
@@ -125,7 +125,7 @@ pub(super) fn write_cards(
             .get(&captured.path)
             .context("native_evidence_required: search card document absent")?
             .0;
-        let card = crate::search_capture::render_card(declaration, captured);
+        let card = crate::search_card::render_card(declaration, captured);
         let terms = crate::search_lexical::card_terms(db, &card.text)?;
         immutable.insert(
             db,
@@ -154,7 +154,7 @@ pub(super) fn read_cards(
     db: &Connection,
     vid: i64,
     path: &str,
-) -> Result<Vec<crate::search_capture::CapturedCard>> {
+) -> Result<Vec<crate::search_card_records::CapturedCard>> {
     let mut statement = db.prepare(
         "SELECT syntax_id,card_text,card_hash,facts_json FROM native_version_search_cards WHERE vid=?1 ORDER BY syntax_id",
     )?;
@@ -172,10 +172,10 @@ pub(super) fn read_cards(
             let facts: StoredFacts = serde_json::from_str(&facts).context(SelectedIntegrity(
                 "incompatible_index: corrupt captured search facts".into(),
             ))?;
-            Ok(crate::search_capture::CapturedCard {
+            Ok(crate::search_card_records::CapturedCard {
                 path: path.to_owned(),
                 syntax_id: id_codec::decode_sid(&id)?,
-                card: crate::search_card::SearchCard { text, hash },
+                card: crate::search_card_records::SearchCard { text, hash },
                 facts: facts.facts,
                 ancestors: facts.ancestors,
             })
@@ -211,7 +211,7 @@ pub(super) fn publish_head(db: &Connection, revision: &str) -> Result<()> {
 pub struct SearchHeadDelta {
     pub pin: IndexPin,
     pub removed_version_ids: Vec<i64>,
-    pub added: std::sync::Arc<[crate::search_rank::SearchCandidate]>,
+    pub added: std::sync::Arc<[crate::search_vocab::SearchCandidate]>,
     /// Required head corpus count; callers validate their patched membership
     /// against it before publishing a new in-memory matrix.
     pub head_card_count: usize,
@@ -232,12 +232,12 @@ impl std::error::Error for SearchDeltaColdRebuild {}
 #[derive(Debug)]
 pub struct McpSearchCandidates {
     pub pin: IndexPin,
-    pub cards: Vec<crate::search_rank::SearchCandidate>,
-    pub lexical: Vec<crate::search_rank::SearchCandidateKey>,
+    pub cards: Vec<crate::search_vocab::SearchCandidate>,
+    pub lexical: Vec<crate::search_vocab::SearchCandidateKey>,
 }
 
-fn search_candidate(row: &rusqlite::Row<'_>) -> Result<crate::search_rank::SearchCandidate> {
-    use crate::search_rank::{SearchCandidate, SearchCandidateKey};
+fn search_candidate(row: &rusqlite::Row<'_>) -> Result<crate::search_vocab::SearchCandidate> {
+    use crate::search_vocab::{SearchCandidate, SearchCandidateKey};
     let card_hash: String = row.get(2)?;
     ensure!(
         card_hash.len() == 64
@@ -252,7 +252,7 @@ fn search_candidate(row: &rusqlite::Row<'_>) -> Result<crate::search_rank::Searc
             syntax_id: stored_id_row(row, 1, false)?,
         },
         card_hash,
-        role: crate::native_evidence::DeclarationRole::from_stored(&row.get::<_, String>(3)?)
+        role: crate::native_records::DeclarationRole::from_stored(&row.get::<_, String>(3)?)
             .map_err(|error| SelectedIntegrity(error.to_string()))?,
     })
 }
@@ -263,7 +263,7 @@ fn search_candidate(row: &rusqlite::Row<'_>) -> Result<crate::search_rank::Searc
 fn search_exact_lookup_keys(query: &str) -> BTreeSet<String> {
     let mut keys = BTreeSet::from([query.to_owned()]);
     for language in ["rust", "python", "java", "javascript", "typescript"] {
-        if let Ok(key) = crate::native_evidence::lookup(language, query) {
+        if let Ok(key) = crate::native_records::lookup(language, query) {
             keys.insert(key);
         }
     }
@@ -302,8 +302,8 @@ fn search_lexical_sql(has_expression: bool) -> String {
     )
 }
 
-fn search_role_filter(role: crate::search_rank::SearchRole) -> Option<&'static str> {
-    use crate::search_rank::SearchRole;
+fn search_role_filter(role: crate::search_vocab::SearchRole) -> Option<&'static str> {
+    use crate::search_vocab::SearchRole;
     match role {
         SearchRole::Any => None,
         SearchRole::Production => Some("production"),
@@ -399,7 +399,7 @@ impl EvidenceResponse {
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<(
         IndexPin,
-        std::sync::Arc<[crate::search_rank::SearchCandidate]>,
+        std::sync::Arc<[crate::search_vocab::SearchCandidate]>,
     )> {
         self.mcp_search_head_admitted(expected, check, &mut |_| Ok(()))
     }
@@ -411,7 +411,7 @@ impl EvidenceResponse {
         admit: &mut dyn FnMut(usize) -> Result<()>,
     ) -> Result<(
         IndexPin,
-        std::sync::Arc<[crate::search_rank::SearchCandidate]>,
+        std::sync::Arc<[crate::search_vocab::SearchCandidate]>,
     )> {
         self.search_read(check, |check| {
             let selected = self.store.read_revision_for(&self.db, None, true)?;
@@ -431,7 +431,7 @@ impl EvidenceResponse {
                 "store_unavailable: invalid head search count".into(),
             ))?;
             admit(count)?;
-            let _phase = crate::search_model::SearchPhaseTimer::start("head_candidates");
+            let _phase = crate::search_vocab::SearchPhaseTimer::start("head_candidates");
             let mut statement = self.db.prepare(
                 "SELECT c.vid,c.syntax_id,c.card_hash,d.role
                  FROM native_version_search_cards c
@@ -524,7 +524,7 @@ impl EvidenceResponse {
             // still an integrity failure, never permission for a cold fallback.
             self.store
                 .read_revision_for(&self.db, Some(previous), true)?;
-            let _phase = crate::search_model::SearchPhaseTimer::start("head_delta");
+            let _phase = crate::search_vocab::SearchPhaseTimer::start("head_delta");
             let added_count: i64 = self.db.query_row(
                 "WITH added(vid) AS (SELECT vid FROM revision_documents WHERE revision_id=?1
                  EXCEPT SELECT vid FROM revision_documents WHERE revision_id=?2)
@@ -661,16 +661,16 @@ impl EvidenceResponse {
         &self,
         query: &str,
         expected: IndexPin,
-        role: crate::search_rank::SearchRole,
+        role: crate::search_vocab::SearchRole,
         check: &mut impl FnMut() -> Result<()>,
-    ) -> Result<crate::search_rank::SearchPolicy> {
+    ) -> Result<crate::search_vocab::SearchPolicy> {
         self.search_read(check, |check| {
             let selected = self.store.read_revision_for(&self.db, None, true)?;
             ensure!(
                 selected.pin == expected,
                 "revision conflict: expected basis differs from admitted head"
             );
-            let mut policy = crate::search_rank::SearchPolicy {
+            let mut policy = crate::search_vocab::SearchPolicy {
                 exact: BTreeMap::new(),
                 role,
             };
@@ -684,14 +684,13 @@ impl EvidenceResponse {
             ])?;
             while let Some(row) = rows.next()? {
                 check()?;
-                let key = crate::search_rank::SearchCandidateKey {
+                let key = crate::search_vocab::SearchCandidateKey {
                     version_id: row.get(0)?,
                     syntax_id: stored_id_row(row, 1, false)?,
                 };
                 let stored_role: String = row.get(2)?;
-                let stored_role =
-                    crate::native_evidence::DeclarationRole::from_stored(&stored_role)
-                        .map_err(|error| SelectedIntegrity(error.to_string()))?;
+                let stored_role = crate::native_records::DeclarationRole::from_stored(&stored_role)
+                    .map_err(|error| SelectedIntegrity(error.to_string()))?;
                 policy.exact.insert(key, stored_role);
             }
             Ok(policy)
@@ -706,10 +705,10 @@ impl EvidenceResponse {
         query: &str,
         expected: IndexPin,
         expected_cards: usize,
-        policy: &crate::search_rank::SearchPolicy,
+        policy: &crate::search_vocab::SearchPolicy,
         check: &mut impl FnMut() -> Result<()>,
-    ) -> Result<Vec<crate::search_rank::SearchCandidateKey>> {
-        use crate::search_rank::{CANDIDATE_DEPTH, SearchCandidateKey};
+    ) -> Result<Vec<crate::search_vocab::SearchCandidateKey>> {
+        use crate::search_vocab::{CANDIDATE_DEPTH, SearchCandidateKey};
         self.search_read(check, |check| {
             let selected = self.store.read_revision_for(&self.db, None, true)?;
             ensure!(
@@ -720,7 +719,7 @@ impl EvidenceResponse {
                 search_head_count(&self.db)? == expected_cards,
                 SelectedIntegrity("store_unavailable: head search corpus mismatch".into())
             );
-            let _phase = crate::search_model::SearchPhaseTimer::start("lexical_search");
+            let _phase = crate::search_vocab::SearchPhaseTimer::start("lexical_search");
             let expression = crate::search_lexical::query_expression(&self.db, query)?;
             let sql = search_lexical_sql(expression.is_some());
             let mut statement = self.db.prepare(&sql)?;
@@ -743,7 +742,7 @@ impl EvidenceResponse {
                     );
                 }
                 let stored_role: String = row.get(3)?;
-                let role = crate::native_evidence::DeclarationRole::from_stored(&stored_role)
+                let role = crate::native_records::DeclarationRole::from_stored(&stored_role)
                     .map_err(|error| SelectedIntegrity(error.to_string()))?;
                 let key = SearchCandidateKey {
                     version_id: row.get(0)?,
@@ -766,8 +765,8 @@ impl EvidenceResponse {
                     .contains_key(b)
                     .cmp(&policy.exact.contains_key(a))
                     .then_with(|| {
-                        (*a_role != crate::native_evidence::DeclarationRole::Production)
-                            .cmp(&(*b_role != crate::native_evidence::DeclarationRole::Production))
+                        (*a_role != crate::native_records::DeclarationRole::Production)
+                            .cmp(&(*b_role != crate::native_records::DeclarationRole::Production))
                     })
                     .then_with(|| a_score.is_none().cmp(&b_score.is_none()))
                     .then_with(|| match (a_score, b_score) {
@@ -786,7 +785,7 @@ impl EvidenceResponse {
         &self,
         query: &str,
         expected: Option<IndexPin>,
-        policy: &crate::search_rank::SearchPolicy,
+        policy: &crate::search_vocab::SearchPolicy,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<McpSearchCandidates> {
         let (pin, cards) = self.mcp_search_head(expected, check)?;
@@ -802,11 +801,11 @@ impl EvidenceResponse {
     /// The caller sets has_more from the complete fused arm union before clipping.
     pub fn mcp_search_hydrate(
         &self,
-        keys: &[crate::search_rank::SearchCandidateKey],
+        keys: &[crate::search_vocab::SearchCandidateKey],
         expected: IndexPin,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<super::mcp_read::McpFindWithLines> {
-        let _phase = crate::search_model::SearchPhaseTimer::start("search_hydration");
+        let _phase = crate::search_vocab::SearchPhaseTimer::start("search_hydration");
         ensure!(keys.len() <= 50, "invalid_request: search hydration limit");
         self.search_read(check, |check| {
             let selected = self.store.read_revision_for(&self.db, None, true)?;

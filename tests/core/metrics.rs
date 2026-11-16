@@ -667,13 +667,8 @@ fn production_native_declarations_have_precise_ranges_and_parameters() {
         assert_eq!(row.metrics.exits.returns, exits, "{language}");
         assert_eq!(
             row.metrics.max_nesting,
-            if language == "rust" {
-                1
-            } else if language == "javascript" {
-                3
-            } else {
-                2
-            },
+            // `try` and what it holds; the `case` and `catch` arms add no level (#987).
+            if language == "rust" { 1 } else { 2 },
             "{language}"
         );
     }
@@ -1622,4 +1617,202 @@ fn a_typescript_new_self_call_is_syntactic_recursion() {
         recursive[0].metrics.cognitive,
         other[0].metrics.cognitive + 1
     );
+}
+
+fn native_max_nesting(language: &str, filename: &str, source: &str) -> usize {
+    let rows = native_rows(language, filename, source);
+    assert_eq!(rows.len(), 1, "{language}: {source}");
+    rows[0].metrics.max_nesting
+}
+
+/// #987: a flat `else if` / `elif` chain is one level however long it is.
+#[test]
+fn a_flat_else_if_chain_is_one_nesting_level() {
+    for (language, filename, source) in [
+        (
+            "javascript",
+            "case.js",
+            "function calc(x) { if (x === 1) { return 1; } else if (x === 2) { return 2; } else if (x === 3) { return 3; } else if (x === 4) { return 4; } else { return 0; } }",
+        ),
+        (
+            "typescript",
+            "case.ts",
+            "function calc(x: number): number { if (x === 1) { return 1; } else if (x === 2) { return 2; } else if (x === 3) { return 3; } else { return 0; } }",
+        ),
+        (
+            "rust",
+            "case.rs",
+            "fn calc(x: i32) -> i32 { if x == 1 { 1 } else if x == 2 { 2 } else if x == 3 { 3 } else if x == 4 { 4 } else { 0 } }",
+        ),
+        (
+            "java",
+            "Case.java",
+            "class Case { int calc(int x) { if (x == 1) { return 1; } else if (x == 2) { return 2; } else if (x == 3) { return 3; } else if (x == 4) { return 4; } else { return 0; } } }",
+        ),
+        (
+            "python",
+            "case.py",
+            "def calc(x):\n    if x == 1:\n        return 1\n    elif x == 2:\n        return 2\n    elif x == 3:\n        return 3\n    else:\n        return 0\n",
+        ),
+    ] {
+        assert_eq!(
+            native_max_nesting(language, filename, source),
+            1,
+            "{language}"
+        );
+    }
+}
+
+/// #987: a branch of a chain is as deep as the chain, so what it holds is one level deeper,
+/// and an `if` inside an `else` block is not a continuation of the chain.
+#[test]
+fn blocks_inside_a_chain_or_an_else_block_still_nest() {
+    for (language, filename, source, expected) in [
+        (
+            "javascript",
+            "case.js",
+            "function calc(x, y) { if (x) { return 1; } else if (y) { for (const v of y) { if (v) { return v; } } } return 0; }",
+            3,
+        ),
+        (
+            "javascript",
+            "case.js",
+            "function calc(x, y) { if (x) { return 1; } else { if (y) { return 2; } } return 0; }",
+            2,
+        ),
+        (
+            "javascript",
+            "case.js",
+            "function calc(x, y) { if (x) if (y) return 2; return 0; }",
+            2,
+        ),
+        (
+            "rust",
+            "case.rs",
+            "fn calc(x: i32, y: i32) -> i32 { if x > 0 { 1 } else { if y > 0 { 2 } else { 0 } } }",
+            2,
+        ),
+        (
+            "java",
+            "Case.java",
+            "class Case { int calc(int x, int y) { if (x > 0) if (y > 0) return 2; return 0; } }",
+            2,
+        ),
+        (
+            "java",
+            "Case.java",
+            "class Case { int calc(int x, int y) { if (x > 0) { return 1; } else { if (y > 0) { return 2; } } return 0; } }",
+            2,
+        ),
+        (
+            "python",
+            "case.py",
+            "def calc(x, y):\n    if x:\n        return 1\n    else:\n        if y:\n            return 2\n    return 0\n",
+            2,
+        ),
+    ] {
+        assert_eq!(
+            native_max_nesting(language, filename, source),
+            expected,
+            "{language}: {source}"
+        );
+    }
+}
+
+/// #987: a `case`, `catch` or `finally` is an arm of its statement, not a level inside it.
+#[test]
+fn switch_and_try_arms_are_as_deep_as_their_statement() {
+    for (language, filename, source, expected) in [
+        (
+            "javascript",
+            "case.js",
+            "function calc(x) { switch (x) { case 1: return 1; default: return 0; } }",
+            1,
+        ),
+        (
+            "javascript",
+            "case.js",
+            "function calc(x, y) { switch (x) { case 1: if (y) { return 1; } break; default: return 0; } return 2; }",
+            2,
+        ),
+        (
+            "javascript",
+            "case.js",
+            "function calc(x) { try { return x(); } catch (e) { return 1; } finally { x = null; } }",
+            1,
+        ),
+        (
+            "java",
+            "Case.java",
+            "class Case { int calc(int x) { try { return x; } catch (RuntimeException e) { if (x > 0) { return 1; } return 0; } } }",
+            2,
+        ),
+    ] {
+        assert_eq!(
+            native_max_nesting(language, filename, source),
+            expected,
+            "{language}: {source}"
+        );
+    }
+}
+
+/// #987 review: an arm is level with its statement only when that statement is itself a
+/// stored region. Java's `try (resource)` is not stored, so its arms carry the level.
+#[test]
+fn arms_of_a_statement_that_is_not_stored_keep_their_level() {
+    for (source, expected) in [
+        (
+            "class Case { int calc(java.io.Reader in) { try (java.io.Reader r = in) { return r.read(); } catch (java.io.IOException e) { return -1; } } }",
+            1,
+        ),
+        (
+            "class Case { int calc(java.io.Reader in, int x) { try (java.io.Reader r = in) { return r.read(); } catch (java.io.IOException e) { if (x > 0) { return x; } return -1; } } }",
+            2,
+        ),
+        (
+            "class Case { int calc(java.io.Reader in) { try (java.io.Reader r = in) { return r.read(); } catch (java.io.IOException e) { return -1; } catch (RuntimeException e) { return -2; } finally { in = null; } } }",
+            1,
+        ),
+        // Inside a stored `try`, the resource statement's own `catch` is one level deeper,
+        // and the outer `catch` is still level with the outer `try`.
+        (
+            "class Case { int calc(java.io.Reader in) { try { try (java.io.Reader r = in) { return r.read(); } catch (java.io.IOException e) { return -1; } } catch (RuntimeException e) { return -2; } } }",
+            2,
+        ),
+    ] {
+        assert_eq!(
+            native_max_nesting("java", "Case.java", source),
+            expected,
+            "{source}"
+        );
+    }
+}
+
+/// #987 review: every arm of a stored statement is level with it, whatever sits between two
+/// arms, and so are Python's `else` and `finally` after a loop or a `try`.
+#[test]
+fn every_arm_of_a_stored_statement_is_level_with_it() {
+    for (language, filename, source) in [
+        (
+            "java",
+            "Case.java",
+            "class Case { int calc(int x) { try { return x; } catch (IllegalStateException e) { return 1; } // next\n catch (RuntimeException e) { return 2; } finally { x = 0; } } }",
+        ),
+        (
+            "python",
+            "case.py",
+            "def calc(x):\n    try:\n        return x()\n    except ValueError:\n        return 1\n    else:\n        return 2\n    finally:\n        x = None\n",
+        ),
+        (
+            "python",
+            "case.py",
+            "def calc(xs):\n    for x in xs:\n        return x\n    else:\n        return 0\n",
+        ),
+    ] {
+        assert_eq!(
+            native_max_nesting(language, filename, source),
+            1,
+            "{language}: {source}"
+        );
+    }
 }

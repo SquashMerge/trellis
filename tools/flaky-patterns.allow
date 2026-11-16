@@ -14,7 +14,9 @@ store-open src/http/worker/semantic.rs * -- no daemon, registry or Trellis child
 store-open src/index_coordinator/queue_completion_retry_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
 store-open src/index_coordinator/tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
 store-open src/mcp/find_trigram_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
-store-open src/native_evidence.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/native_evidence_cached_executable_digest_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/native_evidence_full_document_spool_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/native_evidence_parallel_extraction_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
 store-open src/producer/batch_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
 store-open src/producer/plan_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
 store-open src/producer/retention.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
@@ -155,7 +157,7 @@ store-open tests/mcp/graph_query_store.rs sequence_corrupt_binding_fails_without
 store-open tests/mcp/graph_query_store.rs published_freshness_is_trusted_not_recomputed -- in-process Publisher fixture; no Trellis child, daemon or scheduler
 store-open tests/mcp/graph_query_store.rs corrupt_stored_row_is_typed_without_partial_result -- in-process Publisher fixture; no Trellis child, daemon or scheduler
 store-open tests/mcp/graph_query_store.rs in_scope_missing_coverage_row_is_typed_corruption -- in-process Publisher fixture; no Trellis child, daemon or scheduler
-store-open tests/mcp/graph_query_store.rs non_ambiguous_multi_match_for_one_call_stays_typed_corruption -- in-process Publisher fixture; no Trellis child, daemon or scheduler
+store-open tests/mcp/graph_query_store.rs contradictory_rows_for_one_call_stay_typed_corruption -- in-process Publisher fixture; no Trellis child, daemon or scheduler
 store-open tests/mcp/graph_query_store.rs corrupt_stored_coverage_reason_count_schedules_a_rebuild -- in-process Publisher fixture; no Trellis child, daemon or scheduler
 store-open tests/retained_semantic_reimport.rs ordinary_retained_edit -- opens only after stop_daemon waits for the daemon to exit and release its election lock
 store-open tests/semantic/proptest_witness_rejoin.rs world -- in-process fixture on a fresh state dir, inside the re-executed child

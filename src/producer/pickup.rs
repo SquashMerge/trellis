@@ -3,14 +3,11 @@
 //! start a producer.
 
 use super::batch::{self, BatchSpec};
+use super::import::{ImportScheduler, SchedulerPhase};
 use super::pickup_watch::{Host, HostPhase, Intervals, PickupWatch};
 use super::state::{LastImported, PickupConfig, PickupEntry, StateDir, now_millis};
 use super::{INDEX_NOT_READY, INVALID_REQUEST, import};
-use crate::{
-    http::{DaemonState, RuntimePhase},
-    semantic_batch::descriptor::GenerationOrigin,
-    store::Store,
-};
+use crate::{semantic_batch::descriptor::GenerationOrigin, store::Store};
 use anyhow::{Result, ensure};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -275,7 +272,7 @@ impl PickupOwner {
 
     /// Arm the configured watches and start the trigger thread. It imports only once startup
     /// reconciliation has finished, and ends when the runtime closes.
-    pub fn start_watch(&self, store: &Store, scheduler: &Arc<DaemonState>) {
+    pub fn start_watch(&self, store: &Store, scheduler: Arc<dyn ImportScheduler>) {
         let (roots, identity) = store.state_topology();
         if let Ok(Some(state)) = StateDir::existing(roots, identity) {
             self.watch
@@ -284,7 +281,7 @@ impl PickupOwner {
         self.watch.spawn(Arc::new(WatchHost {
             owner: self.clone(),
             store: store.clone(),
-            scheduler: scheduler.clone(),
+            scheduler,
         }));
     }
 
@@ -320,16 +317,16 @@ impl PickupOwner {
 
     /// Block until startup reconciliation has finished, so its sweep cannot remove the pickup
     /// directory this import is about to create.
-    fn wait_ready(scheduler: &DaemonState) -> Result<()> {
+    fn wait_ready(scheduler: &dyn ImportScheduler) -> Result<()> {
         let deadline = Instant::now() + READY_WAIT;
         loop {
             let seen = scheduler.state_version();
-            match scheduler.runtime_phase() {
-                RuntimePhase::Closing | RuntimePhase::Retired => {
+            match scheduler.phase() {
+                SchedulerPhase::Stopped => {
                     anyhow::bail!("{INDEX_NOT_READY}: checkout is closing")
                 }
-                RuntimePhase::Ready | RuntimePhase::RetireRequested => return Ok(()),
-                RuntimePhase::Activating | RuntimePhase::Reconciling { .. } => {}
+                SchedulerPhase::Ready | SchedulerPhase::RetireRequested => return Ok(()),
+                SchedulerPhase::Starting => {}
             }
             let now = Instant::now();
             ensure!(
@@ -433,7 +430,7 @@ impl PickupOwner {
     pub fn set(
         &self,
         store: &Store,
-        scheduler: &DaemonState,
+        scheduler: &dyn ImportScheduler,
         producer: &str,
         artifact: &str,
     ) -> Result<Value> {
@@ -499,7 +496,7 @@ impl PickupOwner {
     pub fn import(
         &self,
         store: &Store,
-        scheduler: &DaemonState,
+        scheduler: &dyn ImportScheduler,
         producer: &str,
         force: bool,
     ) -> Result<Value> {
@@ -512,7 +509,7 @@ impl PickupOwner {
     fn import_locked(
         &self,
         store: &Store,
-        scheduler: &DaemonState,
+        scheduler: &dyn ImportScheduler,
         state: &StateDir,
         producer: &str,
         force: bool,
@@ -815,15 +812,15 @@ fn head_revision(store: &Store) -> Result<String> {
 struct WatchHost {
     owner: PickupOwner,
     store: Store,
-    scheduler: Arc<DaemonState>,
+    scheduler: Arc<dyn ImportScheduler>,
 }
 
 impl Host for WatchHost {
     fn phase(&self) -> HostPhase {
-        match self.scheduler.runtime_phase() {
-            RuntimePhase::Ready => HostPhase::Ready,
-            RuntimePhase::Closing | RuntimePhase::Retired => HostPhase::Stopped,
-            _ => HostPhase::Starting,
+        match self.scheduler.phase() {
+            SchedulerPhase::Ready => HostPhase::Ready,
+            SchedulerPhase::Stopped => HostPhase::Stopped,
+            SchedulerPhase::Starting | SchedulerPhase::RetireRequested => HostPhase::Starting,
         }
     }
 
@@ -831,7 +828,7 @@ impl Host for WatchHost {
         // A failed import is already recorded in `lastImported`; only an error before a
         // verdict makes the trigger look again.
         self.owner
-            .import(&self.store, &self.scheduler, producer, false)
+            .import(&self.store, &*self.scheduler, producer, false)
             .map(drop)
     }
 

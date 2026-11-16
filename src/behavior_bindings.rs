@@ -86,198 +86,212 @@ impl Bindings {
                 out.unsafe_globals = true;
                 continue;
             }
-            // Escaped identifiers need ECMAScript name decoding. Until supported,
-            // suppress proof rather than miss an escaped shadow/write target.
-            if matches!(
-                n.kind(),
-                "identifier" | "shorthand_property_identifier_pattern"
-            ) && text(source, n).contains('\\')
-            {
-                out.unsafe_globals = true;
-            }
-            // Any syntactic eval reference may escape or be parenthesized/aliased.
-            // Fail closed rather than attempt to prove whether eval stays direct.
-            if matches!(n.kind(), "identifier" | "property_identifier") && text(source, n) == "eval"
-            {
-                out.unsafe_globals = true;
-            }
-            if n.kind() == "subscript_expression"
-                && n.child_by_field_name("index")
-                    .is_some_and(|index| matches!(text(source, index), "\"eval\"" | "'eval'"))
-            {
-                out.unsafe_globals = true;
-            }
-            match n.kind() {
-                "import_statement" => {
-                    if let Some(module) = n.child_by_field_name("source") {
-                        let raw = text(source, module);
-                        // Escape decoding is deliberately unsupported; do not invent a module name.
-                        if raw.contains('\\') {
-                            // Still record shadowing even when module spelling is unsupported.
-                            for clause in children(n)
-                                .into_iter()
-                                .filter(|x| x.kind() == "import_clause")
-                            {
-                                out.pattern(clause, tree, source);
-                            }
-                        }
-                        if raw.len() >= 2 && !raw.contains('\\') {
-                            let module = &raw[1..raw.len() - 1];
-                            for clause in children(n)
-                                .into_iter()
-                                .filter(|x| x.kind() == "import_clause")
-                            {
-                                for item in children(clause) {
-                                    match item.kind() {
-                                        "identifier" => out.add(
-                                            item,
-                                            tree,
-                                            Some((module.into(), "default".into())),
-                                            source,
-                                        ),
-                                        "namespace_import" => {
-                                            if let Some(id) = children(item)
-                                                .into_iter()
-                                                .find(|x| x.kind() == "identifier")
-                                            {
-                                                out.add(
-                                                    id,
-                                                    tree,
-                                                    Some((module.into(), "*".into())),
-                                                    source,
-                                                );
-                                            }
-                                        }
-                                        "named_imports" => {
-                                            for spec in children(item) {
-                                                if let Some(name) = spec.child_by_field_name("name")
-                                                {
-                                                    let local = spec
-                                                        .child_by_field_name("alias")
-                                                        .unwrap_or(name);
-                                                    out.add(
-                                                        local,
-                                                        tree,
-                                                        Some((
-                                                            module.into(),
-                                                            text(source, name).into(),
-                                                        )),
-                                                        source,
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                "variable_declarator" => {
-                    if let Some(name) = n.child_by_field_name("name") {
-                        let var = n
-                            .parent()
-                            .is_some_and(|p| p.kind() == "variable_declaration");
-                        out.pattern(name, scope(n, var), source);
-                    }
-                }
-                "catch_clause" => {
-                    if let Some(p) = n.child_by_field_name("parameter") {
-                        out.pattern(p, n, source);
-                    }
-                }
-                // TypeScript classes, enums and namespaces also bind values. Interfaces
-                // and type aliases do not. Any namespace counts, instantiated or not:
-                // a spare shadow only withholds a standard-global label.
-                "class_declaration"
-                | "class"
-                | "abstract_class_declaration"
-                | "enum_declaration"
-                | "internal_module"
-                | "module" => {
-                    let mut name = n.child_by_field_name("name");
-                    // `namespace A.B.C` binds `A`.
-                    while let Some(nested) = name.filter(|x| x.kind() == "nested_identifier") {
-                        name = nested.named_child(0);
-                    }
-                    if let Some(name) = name.filter(|x| x.kind() != "string") {
-                        out.add(name, scope(n.parent().unwrap_or(tree), false), None, source);
-                    }
-                }
-                // `declare function f(): T;` and overload signatures bind `f` like a
-                // function declaration in its lexical scope.
-                "function_signature" => {
-                    if let Some(name) = n.child_by_field_name("name") {
-                        out.add(name, scope(n.parent().unwrap_or(tree), false), None, source);
-                    }
-                }
-                // `import x = require("m")` and `import x = N.B`.
-                "import_require_clause" | "import_alias" => {
-                    if let Some(name) = n.named_child(0).filter(|x| x.kind() == "identifier") {
-                        out.add(name, scope(n, false), None, source);
-                    }
-                }
-                "for_in_statement" => {
-                    // Grammar places `let x` directly in the loop rather than a declarator.
-                    if n.child_by_field_name("kind").is_some() {
-                        if let Some(left) = n.child_by_field_name("left") {
-                            let var = n
-                                .child_by_field_name("kind")
-                                .is_some_and(|k| text(source, k) == "var");
-                            out.pattern(left, scope(n, var), source);
-                        }
-                    } else if let Some(left) = n.child_by_field_name("left") {
-                        out.write(left, source);
-                    }
-                }
-                "assignment_expression" | "augmented_assignment_expression" => {
-                    if let Some(left) = n.child_by_field_name("left") {
-                        out.write(left, source);
-                    }
-                }
-                "update_expression" => {
-                    if let Some(arg) = n.child_by_field_name("argument") {
-                        out.write(arg, source);
-                    }
-                }
-                "unary_expression" if text(source, n).trim_start().starts_with("delete ") => {
-                    if let Some(arg) = n.child_by_field_name("argument") {
-                        out.write(arg, source);
-                    }
-                }
-                "with_statement" => out.unsafe_globals = true,
-                "call_expression"
-                    if n.child_by_field_name("function")
-                        .is_some_and(|f| text(source, f) == "eval") =>
-                {
-                    out.unsafe_globals = true;
-                }
-                _ => {}
-            }
+            out.hazard(n, source);
+            out.bind(n, tree, source);
             if function(n) {
-                if let Some(p) = n
-                    .child_by_field_name("parameters")
-                    .or_else(|| n.child_by_field_name("parameter"))
-                {
-                    out.pattern(p, n, source);
-                }
-                if let Some(name) = n.child_by_field_name("name") {
-                    if matches!(
-                        n.kind(),
-                        "function_declaration" | "generator_function_declaration"
-                    ) {
-                        out.add(name, scope(n.parent().unwrap_or(tree), false), None, source);
-                        // Sloppy-script Annex B may also expose block functions in
-                        // the enclosing function. Conservatively allow that shadow.
-                        out.add(name, scope(n.parent().unwrap_or(tree), true), None, source);
-                    }
-                    out.add(name, n, None, source);
-                }
+                out.bind_function(n, tree, source);
             }
             todo.extend(children(n).into_iter().map(|child| (child, depth + 1)));
         }
         out
+    }
+
+    /// The fail-closed checks of one node: an escaped identifier, or any spelling of `eval`.
+    fn hazard(&mut self, n: Node<'_>, source: &str) {
+        // Escaped identifiers need ECMAScript name decoding. Until supported,
+        // suppress proof rather than miss an escaped shadow/write target.
+        if matches!(
+            n.kind(),
+            "identifier" | "shorthand_property_identifier_pattern"
+        ) && text(source, n).contains('\\')
+        {
+            self.unsafe_globals = true;
+        }
+        // Any syntactic eval reference may escape or be parenthesized/aliased.
+        // Fail closed rather than attempt to prove whether eval stays direct.
+        if matches!(n.kind(), "identifier" | "property_identifier") && text(source, n) == "eval" {
+            self.unsafe_globals = true;
+        }
+        if n.kind() == "subscript_expression"
+            && n.child_by_field_name("index")
+                .is_some_and(|index| matches!(text(source, index), "\"eval\"" | "'eval'"))
+        {
+            self.unsafe_globals = true;
+        }
+    }
+
+    /// What one node binds or writes, by its kind.
+    fn bind(&mut self, n: Node<'_>, tree: Node<'_>, source: &str) {
+        match n.kind() {
+            "import_statement" => self.bind_import(n, tree, source),
+            "variable_declarator" => {
+                if let Some(name) = n.child_by_field_name("name") {
+                    let var = n
+                        .parent()
+                        .is_some_and(|p| p.kind() == "variable_declaration");
+                    self.pattern(name, scope(n, var), source);
+                }
+            }
+            "catch_clause" => {
+                if let Some(p) = n.child_by_field_name("parameter") {
+                    self.pattern(p, n, source);
+                }
+            }
+            // TypeScript classes, enums and namespaces also bind values. Interfaces
+            // and type aliases do not. Any namespace counts, instantiated or not:
+            // a spare shadow only withholds a standard-global label.
+            "class_declaration"
+            | "class"
+            | "abstract_class_declaration"
+            | "enum_declaration"
+            | "internal_module"
+            | "module" => self.bind_named_declaration(n, tree, source),
+            // `declare function f(): T;` and overload signatures bind `f` like a
+            // function declaration in its lexical scope.
+            "function_signature" => {
+                if let Some(name) = n.child_by_field_name("name") {
+                    self.add(name, scope(n.parent().unwrap_or(tree), false), None, source);
+                }
+            }
+            // `import x = require("m")` and `import x = N.B`.
+            "import_require_clause" | "import_alias" => {
+                if let Some(name) = n.named_child(0).filter(|x| x.kind() == "identifier") {
+                    self.add(name, scope(n, false), None, source);
+                }
+            }
+            "for_in_statement" => self.bind_for_in(n, source),
+            "assignment_expression" | "augmented_assignment_expression" => {
+                if let Some(left) = n.child_by_field_name("left") {
+                    self.write(left, source);
+                }
+            }
+            "update_expression" => {
+                if let Some(arg) = n.child_by_field_name("argument") {
+                    self.write(arg, source);
+                }
+            }
+            "unary_expression" if text(source, n).trim_start().starts_with("delete ") => {
+                if let Some(arg) = n.child_by_field_name("argument") {
+                    self.write(arg, source);
+                }
+            }
+            "with_statement" => self.unsafe_globals = true,
+            "call_expression"
+                if n.child_by_field_name("function")
+                    .is_some_and(|f| text(source, f) == "eval") =>
+            {
+                self.unsafe_globals = true;
+            }
+            _ => {}
+        }
+    }
+
+    /// The bindings of one `import` statement. A module spelled with an escape still shadows.
+    fn bind_import(&mut self, n: Node<'_>, tree: Node<'_>, source: &str) {
+        if let Some(module) = n.child_by_field_name("source") {
+            let raw = text(source, module);
+            // Escape decoding is deliberately unsupported; do not invent a module name.
+            if raw.contains('\\') {
+                // Still record shadowing even when module spelling is unsupported.
+                for clause in children(n)
+                    .into_iter()
+                    .filter(|x| x.kind() == "import_clause")
+                {
+                    self.pattern(clause, tree, source);
+                }
+            }
+            if raw.len() >= 2 && !raw.contains('\\') {
+                let module = &raw[1..raw.len() - 1];
+                for clause in children(n)
+                    .into_iter()
+                    .filter(|x| x.kind() == "import_clause")
+                {
+                    self.bind_import_clause(clause, module, tree, source);
+                }
+            }
+        }
+    }
+
+    /// The default, namespace and named bindings of one import clause of `module`.
+    fn bind_import_clause(&mut self, clause: Node<'_>, module: &str, tree: Node<'_>, source: &str) {
+        for item in children(clause) {
+            match item.kind() {
+                "identifier" => {
+                    self.add(item, tree, Some((module.into(), "default".into())), source)
+                }
+                "namespace_import" => {
+                    if let Some(id) = children(item)
+                        .into_iter()
+                        .find(|x| x.kind() == "identifier")
+                    {
+                        self.add(id, tree, Some((module.into(), "*".into())), source);
+                    }
+                }
+                "named_imports" => {
+                    for spec in children(item) {
+                        if let Some(name) = spec.child_by_field_name("name") {
+                            let local = spec.child_by_field_name("alias").unwrap_or(name);
+                            self.add(
+                                local,
+                                tree,
+                                Some((module.into(), text(source, name).into())),
+                                source,
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The name a class, enum or namespace binds in its enclosing scope.
+    fn bind_named_declaration(&mut self, n: Node<'_>, tree: Node<'_>, source: &str) {
+        let mut name = n.child_by_field_name("name");
+        // `namespace A.B.C` binds `A`.
+        while let Some(nested) = name.filter(|x| x.kind() == "nested_identifier") {
+            name = nested.named_child(0);
+        }
+        if let Some(name) = name.filter(|x| x.kind() != "string") {
+            self.add(name, scope(n.parent().unwrap_or(tree), false), None, source);
+        }
+    }
+
+    /// `for (let x in y)` binds `x`; `for (x in y)` writes it.
+    fn bind_for_in(&mut self, n: Node<'_>, source: &str) {
+        // Grammar places `let x` directly in the loop rather than a declarator.
+        if n.child_by_field_name("kind").is_some() {
+            if let Some(left) = n.child_by_field_name("left") {
+                let var = n
+                    .child_by_field_name("kind")
+                    .is_some_and(|k| text(source, k) == "var");
+                self.pattern(left, scope(n, var), source);
+            }
+        } else if let Some(left) = n.child_by_field_name("left") {
+            self.write(left, source);
+        }
+    }
+
+    /// A function's parameters and its own name.
+    fn bind_function(&mut self, n: Node<'_>, tree: Node<'_>, source: &str) {
+        if let Some(p) = n
+            .child_by_field_name("parameters")
+            .or_else(|| n.child_by_field_name("parameter"))
+        {
+            self.pattern(p, n, source);
+        }
+        if let Some(name) = n.child_by_field_name("name") {
+            if matches!(
+                n.kind(),
+                "function_declaration" | "generator_function_declaration"
+            ) {
+                self.add(name, scope(n.parent().unwrap_or(tree), false), None, source);
+                // Sloppy-script Annex B may also expose block functions in
+                // the enclosing function. Conservatively allow that shadow.
+                self.add(name, scope(n.parent().unwrap_or(tree), true), None, source);
+            }
+            self.add(name, n, None, source);
+        }
     }
     fn add(&mut self, n: Node<'_>, s: Node<'_>, import: Option<(String, String)>, source: &str) {
         self.bindings.push(Binding {

@@ -65,7 +65,7 @@ fn index_fixture() -> (
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
     let (pin, owner) = crate::index_coordinator::reconcile_workspace(
         &store,
-        &crate::indexer::IndexOptions::new(workspace.path().to_owned()),
+        &crate::model::IndexOptions::new(workspace.path().to_owned()),
         &Arc::new(AtomicBool::new(false)),
         |_| {},
     )
@@ -78,7 +78,7 @@ fn request_read_does_not_close_another_live_sqlite_writers_locks() {
     let (_state, workspace, store, _, _owner) = index_fixture();
     let ack = store
         .enqueue_request(
-            &crate::indexer::IndexOptions::new(workspace.path().to_owned()),
+            &crate::model::IndexOptions::new(workspace.path().to_owned()),
             None,
         )
         .unwrap();

@@ -6,15 +6,15 @@
   const hide = (id, value) => { if (get(id)) get(id).hidden = value; };
   const make = (tag, value) => { const node = document.createElement(tag); if (value !== undefined) node.textContent = value; return node; };
   const describe = value => typeof value === "string" ? value : JSON.stringify(value, null, 2);
-  const views = {architecture:"architecture-panel", treemap:"treemap-panel", sequence:"sequence-panel", classes:"classes-panel"};
+  const views = {architecture:"architecture-panel", treemap:"treemap-panel", sequence:"sequence-panel", classes:"classes-panel", deviations:"deviations-panel"};
   // Views whose tab is hidden because the checkout has nothing for them (#450). An
   // explicitly opened view keeps its tab while it is active. Classes stays hidden until
   // the app shows the checkout has code the class catalog supports.
   const unavailableViews = new Set(["classes"]);
-  let openSource = null, targetSelection = null, sourceReturnFocus = null, activeView = "architecture", inspectorClearCallback = null, sectionCallback = null, viewCallback = null;
+  let openSource = null, targetSelection = null, sourceReturnFocus = null, activeView = "architecture", inspectorClearCallback = null, sectionCallback = null, sectionResetCallback = null, viewCallback = null;
   function setSection(name) {
     const files = name === "files";
-    window.TrellisNavigation?.reset(); window.TrellisClasses?.closeContextMenu?.();
+    sectionResetCallback?.(); window.TrellisContextMenu?.closeContextMenu?.();
     document.body.classList.toggle("files-section", files);
     document.body.classList.toggle("classes-view", !files && activeView === "classes");
     drawer("explorer", false); drawer("inspector", false);
@@ -39,6 +39,8 @@
     syncInspector();
   }
   function setSectionCallback(callback) { sectionCallback = callback; }
+  // Runs first in every section change, so the app can drop what belongs to the section being left.
+  function setSectionResetCallback(callback) { sectionResetCallback = callback; }
   function showFiles() {
     if (get("workspace")?.hidden) return;
     if (sectionCallback) return sectionCallback("files");
@@ -133,13 +135,14 @@
     if (name === "inspector" && open) inspectorCollapsed = false;
     syncInspector();
   }
-  function showView(name) {
+  // `how.user` marks a choice of tab by the viewer (a click or arrow key), as against a navigation (#965).
+  function showView(name, how = {}) {
     if (!Object.hasOwn(views, name)) return;
     if (document.body.classList.contains("files-section")) showDiagrams();
     activeView = name;
     document.body.classList.toggle("classes-view", name === "classes");
-    window.TrellisClasses?.closeContextMenu?.();
-    if (name === "sequence" || name === "classes" || ["architecture", "treemap"].includes(name)) drawer("explorer", false);
+    window.TrellisContextMenu?.closeContextMenu?.();
+    if (name === "sequence" || name === "classes" || ["architecture", "treemap", "deviations"].includes(name)) drawer("explorer", false);
     for (const [key, panel] of Object.entries(views)) {
       hide(panel, key !== name);
       const tab = get(`view-${key}`);
@@ -150,7 +153,7 @@
     // Focus on another tab moves to the shown one, so no tab but the selected one looks current (#913).
     const focused = document.activeElement;
     if (focused?.closest?.("#diagram-tabs") && focused !== get(`view-${name}`)) get(`view-${name}`)?.focus();
-    viewCallback?.(name);
+    viewCallback?.(name, how);
   }
   function syncViewTabs() {
     for (const key of Object.keys(views)) hide(`view-${key}`, unavailableViews.has(key) && key !== activeView);
@@ -230,17 +233,7 @@
     if (declared) return `${step.callEvidence.dispatch} dispatch · declaration ${declared.name || declared.kind} · ${declared.path}`;
     return step?.callEvidence ? window.TrellisSequence.evidenceLabel(step, view) : "Terminal syntax only · no verified target";
   }
-  function sourceWitness(item) {
-    const r = item?.range;
-    return typeof item?.path === "string" && !!item.path.trim() && !!r &&
-      Number.isSafeInteger(r.startLine) && r.startLine > 0 &&
-      Number.isSafeInteger(r.endLine) && r.endLine >= r.startLine &&
-      (r.startColumn == null || (Number.isSafeInteger(r.startColumn) && r.startColumn > 0)) &&
-      (r.endColumn == null || (Number.isSafeInteger(r.endColumn) && r.endColumn > 0)) &&
-      (r.startLine !== r.endLine || r.startColumn == null || r.endColumn == null || r.endColumn >= r.startColumn) &&
-      (r.startByte == null || (Number.isSafeInteger(r.startByte) && r.startByte >= 0)) &&
-      (r.endByte == null || (Number.isSafeInteger(r.endByte) && r.endByte > (r.startByte ?? -1)));
-  }
+  const sourceWitness = window.TrellisSourceWitness;
   function location(step) {
     if (!sourceWitness(step)) return "Source range unavailable";
     const r = step.range;
@@ -428,7 +421,7 @@
   document.addEventListener("scroll", event => {
     for (const node of placed()) if (event.target?.contains?.(node)) placePopover(node);
   }, true);
-  wireTabs(Object.keys(views), "view-", showView);
+  wireTabs(Object.keys(views), "view-", name => showView(name, {user:true}));
   wireTabs(["workspace", "library"], "dock-", showSource);
   get("inspector-open-source")?.addEventListener("click", () => { if (openSource) return openSource(); });
   get("inspector-clear")?.addEventListener("click", () => { resetInspector(); inspectorClearCallback?.(); });
@@ -455,6 +448,6 @@
     else if (mobile && document.body.classList.contains("explorer-open")) { drawer("explorer", false); get("explorer-toggle")?.focus(); }
     else if (get("source-dock") && !get("source-dock").hidden) closeSource();
   });
-  window.TrellisShell = {setIndexAvailable, setViewAvailable, closePopovers, showTreemapInspector, clearTreemapInspector,showArchitectureInspector, clearArchitectureInspector, setViewCallback, setSection, setSectionCallback, setConnected, updateCheckout, formatGit, checkoutLabel, rootName, updateWorkspace, showView, showSource, closeSource, showFiles, showDiagrams, showMetricInspector, clearMetricInspector, setInspectorClearCallback, inspectSymbol, selectStep, resetInspector, reset};
+  window.TrellisShell = {setIndexAvailable, setViewAvailable, closePopovers, showTreemapInspector, clearTreemapInspector,showArchitectureInspector, clearArchitectureInspector, setViewCallback, setSection, setSectionCallback, setSectionResetCallback, setConnected, updateCheckout, formatGit, checkoutLabel, rootName, updateWorkspace, showView, showSource, closeSource, showFiles, showDiagrams, showMetricInspector, clearMetricInspector, setInspectorClearCallback, inspectSymbol, selectStep, resetInspector, reset};
   reset();
 })();

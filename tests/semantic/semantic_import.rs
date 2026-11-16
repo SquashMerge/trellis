@@ -1083,6 +1083,98 @@ fn real_scip_typescript_calls_bind_at_exact_measured_callee_spans() {
     }
 }
 
+/// Real `@sourcegraph/scip-typescript@0.4.0 index --infer-tsconfig` output for TypeScript
+/// calls under `await` (issue #958), with the producer's metadata dropped and every document
+/// kept byte for byte.
+const ISSUE958_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/semantic-import/issue958-typescript-await"
+);
+
+/// #958: `await f()`, `await f<T>()`, `return await f()` and `await c.m()` measure the inner
+/// callee token, so the real scip-typescript occurrence there binds exactly as a plain call
+/// does, with the same dispatch.
+#[test]
+fn real_scip_typescript_awaited_calls_bind_like_plain_calls() {
+    let read = |path: &str| fs::read_to_string(format!("{ISSUE958_FIXTURE}/{path}")).unwrap();
+    let (lib, main) = (read("src/lib.ts"), read("src/main.ts"));
+    let bytes = fs::read(format!("{ISSUE958_FIXTURE}/index.scip")).unwrap();
+    let (_root, native, sources, inventory) = admitted_files_case(
+        "typescript",
+        "scip-typescript",
+        &[
+            ("src/lib.ts", &lib),
+            ("src/main.ts", &main),
+            (
+                "package.json",
+                r#"{"name":"issue958-fixture","version":"1.0.0"}"#,
+            ),
+        ],
+        &bytes,
+    );
+    let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+    // The callee token of the `nth` occurrence of `needle` in `src/main.ts`.
+    let span = |needle: &str, nth: usize| {
+        let (start, _) = main.match_indices(needle).nth(nth).unwrap();
+        let name = needle
+            .trim_start_matches("await ")
+            .split(['<', '('])
+            .next()
+            .unwrap();
+        let start = start + needle.find(name).unwrap();
+        native::Range {
+            start,
+            end: start + name.len(),
+        }
+    };
+    let declaration = |name: &str| {
+        native
+            .declarations
+            .iter()
+            .find(|d| d.document.path == "src/lib.ts" && d.name.as_deref() == Some(name))
+            .unwrap()
+            .syntax_id
+            .clone()
+    };
+    let (api_fetch, get) = (declaration("apiFetch"), declaration("get"));
+    use semantic::Dispatch::{Direct, Dynamic};
+    let expected = [
+        (span("apiFetch<string>(path)", 0), &api_fetch, Direct),
+        (span("apiFetch<string>(path)", 1), &api_fetch, Direct),
+        (span("await apiFetch(path)", 0), &api_fetch, Direct),
+        (span("await apiFetch(path)", 1), &api_fetch, Direct),
+        (span("get(\"x\")", 0), &get, Dynamic),
+    ];
+    for (callee, target, dispatch) in &expected {
+        let calls: Vec<_> = native
+            .calls
+            .iter()
+            .filter(|c| c.document.path == "src/main.ts" && c.callee_range.as_ref() == Some(callee))
+            .collect();
+        assert_eq!(calls.len(), 1, "one measured call at {callee:?}");
+        let binding = output
+            .call_bindings
+            .iter()
+            .find(|b| b.call_id.as_ref() == Some(&calls[0].id))
+            .unwrap_or_else(|| panic!("binding for the call at {callee:?}"));
+        assert_eq!(binding.join.status, semantic::JoinStatus::Exact);
+        assert_eq!(&binding.join.anchor.range, callee);
+        assert_eq!(
+            (binding.resolution, binding.dispatch),
+            (semantic::Resolution::Resolved, *dispatch),
+            "{callee:?}"
+        );
+        assert!(
+            matches!(
+                &binding.declared_target,
+                Some(semantic::Target::Internal { syntax_id, .. }) if syntax_id == *target
+            ),
+            "{callee:?}: {:?}",
+            binding.declared_target
+        );
+    }
+}
+
 /// #473: an unspecified SCIP kind (`0`) defers to the measured native declaration kind, but an
 /// explicit producer kind is still checked against it. On the real #444 bytes, stating SCIP
 /// `Method` (26) for the constructor and `run` agrees with their native `method` declarations.
@@ -2106,6 +2198,216 @@ fn admitted_java_direct_interface_enum_record_and_transitive_negative() {
             .filter(|(kind, _)| *kind == semantic::RelationshipKind::Extends)
             .count(),
         4
+    );
+    // The enum's implicit base is the one external target, claimed by its `Enum#`
+    // relationship: its `implements I` claim is an Implements row to the declared `I`, never
+    // an Extends row of the enum pass.
+    let enum_base = "scip-java java/lang/Enum#";
+    let enum_claim = relationship_proof(&inventory, "scip-java pkg E#", enum_base);
+    let externals: Vec<_> = output
+        .type_relationships
+        .iter()
+        .filter_map(|r| match &r.target {
+            semantic::Target::External { symbol } => {
+                Some((r.kind, symbol.symbol.as_str(), r.provenance_id.as_str()))
+            }
+            semantic::Target::Internal { .. } => None,
+        })
+        .collect();
+    assert_eq!(
+        externals,
+        [(semantic::RelationshipKind::Extends, enum_base, enum_claim)]
+    );
+    let declared = |name: &str| {
+        let start = source.find(&format!("{name} ")).unwrap();
+        native
+            .declarations
+            .iter()
+            .find(|d| d.name_range.as_ref().is_some_and(|r| r.start == start))
+            .unwrap()
+            .syntax_id
+            .as_str()
+    };
+    let enum_rows: Vec<_> = output
+        .type_relationships
+        .iter()
+        .filter(|r| {
+            matches!(&r.source, semantic::Target::Internal { syntax_id, .. }
+                if syntax_id == declared("E"))
+        })
+        .map(|r| (r.kind, &r.target, r.provenance_id.as_str()))
+        .collect();
+    let interface = semantic::Target::Internal {
+        syntax_id: declared("I").to_owned(),
+        document: native.revision.documents[0].key.clone(),
+        revision_id: native.revision.id.clone(),
+    };
+    let external = semantic::Target::External {
+        symbol: semantic::SymbolKey {
+            scheme: semantic::SymbolScheme::Scip,
+            symbol: enum_base.into(),
+            scope: semantic::SymbolScope::Global,
+            document: None,
+        },
+    };
+    assert_eq!(
+        enum_rows,
+        [
+            (
+                semantic::RelationshipKind::Implements,
+                &interface,
+                relationship_proof(&inventory, "scip-java pkg E#", "scip-java pkg I#")
+            ),
+            (semantic::RelationshipKind::Extends, &external, enum_claim),
+        ]
+    );
+}
+
+/// The proof of the relationship claim from `source` to `target`.
+fn relationship_proof<'a>(
+    inventory: &'a CapturedScipInventory,
+    source: &str,
+    target: &str,
+) -> &'a str {
+    inventory
+        .claims
+        .iter()
+        .find(|claim| {
+            claim.envelope.record_kind == "relationship"
+                && claim.envelope.raw["sourceSymbol"].as_str() == Some(source)
+                && claim.envelope.raw["targetSymbol"].as_str() == Some(target)
+        })
+        .unwrap()
+        .captured_proof_id
+        .as_str()
+}
+
+/// One document's relationship rows come out pass by pass: direct bases, then overrides,
+/// then the enum's implicit base.
+#[test]
+fn admitted_java_relationships_are_emitted_bases_then_overrides_then_enum_bases() {
+    let source = "class Base { void f() {} } class Child extends Base { void f() {} } enum E { A }";
+    let at = |needle: &str| source.find(needle).unwrap();
+    let (base, child, e) = (at("Base"), at("Child"), at("E {"));
+    let base_use = source.rfind("Base").unwrap();
+    let (f1, f2) = (at("f()"), source.rfind("f()").unwrap());
+    let b = "scip-java pkg Base#";
+    let c = "scip-java pkg Child#";
+    let en = "scip-java pkg E#";
+    let enum_base = "scip-java java/lang/Enum#";
+    let first = "scip-java pkg Base#f().";
+    let derived = "scip-java pkg Child#f().";
+    let (_root, native, sources, inventory) = admitted_case(
+        "java",
+        source,
+        vec![
+            (base, base + 4, b, 1),
+            (child, child + 5, c, 1),
+            (base_use, base_use + 4, b, 8),
+            (f1, f1 + 1, first, 1),
+            (f2, f2 + 1, derived, 1),
+            (e, e + 1, en, 1),
+        ],
+        vec![
+            (b, 7, vec![]),
+            (c, 7, vec![(b, true, false)]),
+            (first, 26, vec![]),
+            (derived, 26, vec![(first, true, true)]),
+            (en, 11, vec![(enum_base, true, false)]),
+        ],
+    );
+    let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+    let internal = |start: usize| semantic::Target::Internal {
+        syntax_id: native
+            .declarations
+            .iter()
+            .find(|d| d.name_range.as_ref().is_some_and(|r| r.start == start))
+            .unwrap()
+            .syntax_id
+            .clone(),
+        document: native.revision.documents[0].key.clone(),
+        revision_id: native.revision.id.clone(),
+    };
+    let row = |kind, source, target, from: &str, to: &str| semantic::TypeRelationship {
+        kind,
+        source,
+        target,
+        provenance_id: relationship_proof(&inventory, from, to).to_owned(),
+    };
+    assert_eq!(
+        output.type_relationships,
+        [
+            row(
+                semantic::RelationshipKind::Extends,
+                internal(child),
+                internal(base),
+                c,
+                b
+            ),
+            row(
+                semantic::RelationshipKind::Overrides,
+                internal(f2),
+                internal(f1),
+                derived,
+                first
+            ),
+            row(
+                semantic::RelationshipKind::Extends,
+                internal(e),
+                semantic::Target::External {
+                    symbol: semantic::SymbolKey {
+                        scheme: semantic::SymbolScheme::Scip,
+                        symbol: enum_base.into(),
+                        scope: semantic::SymbolScope::Global,
+                        document: None,
+                    },
+                },
+                en,
+                enum_base
+            ),
+        ]
+    );
+    assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+}
+
+/// A definition occurrence's joins are recorded in the order it makes them: its declaration
+/// name, then its reference.
+#[test]
+fn a_definition_occurrence_records_its_binding_join_before_its_reference_join() {
+    let symbol = "scip-typescript npm pkg 1.0.0 `A.js`/f().";
+    let (_root, native, sources, inventory) = admitted_case(
+        "javascript",
+        "function f(){}\n",
+        vec![(9, 10, symbol, 1)],
+        vec![(symbol, 17, vec![])],
+    );
+    let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+    let proof = inventory
+        .claims
+        .iter()
+        .find(|claim| claim.envelope.record_kind == "occurrence")
+        .unwrap()
+        .captured_proof_id
+        .as_str();
+    let joins: Vec<_> = output
+        .joins
+        .iter()
+        .map(|(proof, join)| (proof.as_str(), join.anchor.kind, join.status))
+        .collect();
+    assert_eq!(
+        joins,
+        [
+            (
+                proof,
+                semantic::JoinKind::DeclarationName,
+                semantic::JoinStatus::Exact
+            ),
+            (
+                proof,
+                semantic::JoinKind::Reference,
+                semantic::JoinStatus::Exact
+            ),
+        ]
     );
 }
 

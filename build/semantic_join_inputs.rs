@@ -10,12 +10,25 @@
 /// - `semantic_import*`: the join and its settlement, staged rows and provenance IDs.
 /// - `semantic_batch*`: document inventory, staging, retained inputs and the production
 ///   resource limits (`limits.rs`), whose caps shape published reasons.
-/// - `semantic_evidence`: the evidence rows' types, canonical forms and validation.
+/// - `semantic_catchup`: the S scheduler, which chooses the witnessed or FULL route and
+///   what an unavailable producer publishes, moved out of `store/native_first`.
+/// - `semantic_evidence`: the evidence rows' canonical forms and validation.
+/// - `semantic_records`: the evidence rows' types, whose serde shape is the stored row and
+///   payload encoding, moved out of `semantic_evidence`.
 /// - `scip_raw*`: the decoded claims, document caps and module roots the join reads.
-/// - `scip_admission`: the trust origins and hash helpers the stored basis records.
+/// - `scip_admission`, `scip_vocab`: the trust origins and hash helpers the stored basis
+///   records.
 /// - `store/native_first*`: staged commit, copies, witnessed settlement and context.
 /// - `store/semantic_payload`: the key, dependency set and projection.
 /// - `store/captured_witness`: the captured-version reads the witnessed settlement trusts.
+/// - `store/staging`: the stage database, its schema and its claim and witness writers, moved
+///   out of `semantic_batch`.
+/// - `store/batch_input`: the admitted and joined batch types and the retained re-import
+///   destination check, moved out of `semantic_batch`.
+/// - `batch_descriptor`: the batch descriptor and page grammar and the source-manifest hash,
+///   moved out of `semantic_batch`.
+/// - `producer_pin`: the checked-in producer pin and its registry, whose identity the stored
+///   basis records, moved out of `scip_admission`.
 /// - `native_ids`: canonical JSON, digests and the rejoined ID derivation.
 /// - `skipped_source`, `skipped_config`: placeholder hashes that enter the settled basis.
 /// - `indexer_ts`, `native_rust_macros`: the parsers the join uses on source it binds.
@@ -25,23 +38,30 @@
 /// modules, and `Cargo.lock` (a decoder change is `DECODER_VERSION`, which blocks batch
 /// selection).
 pub const JOIN_MODULES: &[&str] = &[
+    "src/batch_descriptor.rs",
     "src/indexer_ts.rs",
     "src/native_ids.rs",
     "src/native_rust_macros.rs",
+    "src/producer_pin.rs",
     "src/scip_admission.rs",
     "src/scip_raw.rs",
     "src/scip_raw/**",
+    "src/scip_vocab.rs",
     "src/semantic_batch.rs",
     "src/semantic_batch/**",
+    "src/semantic_catchup.rs",
     "src/semantic_evidence.rs",
     "src/semantic_import.rs",
     "src/semantic_import/**",
+    "src/semantic_records.rs",
     "src/skipped_config.rs",
     "src/skipped_source.rs",
+    "src/store/batch_input.rs",
     "src/store/captured_witness.rs",
     "src/store/native_first.rs",
     "src/store/native_first/**",
     "src/store/semantic_payload.rs",
+    "src/store/staging.rs",
 ];
 
 /// Test scaffolding is compiled only for tests and never writes a stored payload.

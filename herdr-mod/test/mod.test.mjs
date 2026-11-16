@@ -3,7 +3,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
-import { DOMParser, serialize } from "../src/dom.js";
+import { DOMParser, TextEncoder, serialize } from "../src/dom.js";
+import { document as hostDocument, pele } from "../src/runtime.js";
+import makePeleSvg from "trellis-web:pele-svg";
+import makeArchitectureRouting from "trellis-web:architecture-routing";
+import makeArchitecturePele from "trellis-web:architecture-pele";
 import { readFileSync } from "node:fs";
 import { draw, hit, measure, segments, summarize } from "../src/diagram.js";
 import { drawSequence } from "../src/sequence.js";
@@ -148,6 +152,44 @@ test("yielding between drawing phases changes nothing in either drawing", async 
   assert.ok(flat.svg && stepped.svg === flat.svg);
   assert.deepEqual(stepped.boxes, flat.boxes);
   assert.ok(pauses - before >= 4, `Sequence yields between phases (${pauses - before})`);
+});
+
+// #1060: where a render asks "am I still current?" (c) and where it yields to the host (p), for
+// one fixture drawing at one width. The trail was recorded from the render before it was split
+// into phases; a stop point that moves, appears or vanishes changes it.
+const CHECKPOINTS = "ccpcpcpcpcpcpcpcpccpcpcc";
+test("#1060 a superseded Architecture render stops at the same checkpoints and leaves the page as it was", async () => {
+  const env = { pele };
+  makePeleSvg(env, hostDocument, DOMParser, TextEncoder);
+  makeArchitectureRouting(env);
+  const adapter = makeArchitecturePele(env, hostDocument, DOMParser, TextEncoder);
+  // One render of the fixture; it is current until its `staleAt`-th question.
+  const render = (staleAt, yielding) => {
+    const summary = summarize(view()), container = hostDocument.createElement("div"), before = hostDocument.createElement("p");
+    container.append(before);
+    let trail = "", asked = 0;
+    const options = { ...summary.options(summary.plan.parts[0], summary.plan.scale, { width: 900 }), onToggleLayer() {},
+      isCurrent: () => { trail += "c"; return ++asked < staleAt; }, ...(yielding ? { pause: async () => { trail += "p"; } } : {}) };
+    const outcome = adapter.render(container, summary.plan.payload, options);
+    return { outcome, container, before, trail: () => trail };
+  };
+  const whole = render(Infinity, true);
+  assert.equal((await whole.outcome).status, "ready");
+  assert.equal(whole.trail(), CHECKPOINTS);
+  assert.equal(whole.container.children[0].localName, "svg");
+  const questions = [...CHECKPOINTS].flatMap((mark, at) => (mark === "c" ? [at] : []));
+  for (const [index, at] of questions.entries()) {
+    const stale = render(index + 1, true);
+    assert.deepEqual(await stale.outcome, { status: "stale" });
+    assert.equal(stale.trail(), CHECKPOINTS.slice(0, at + 1), `stops at question ${index + 1}`);
+    assert.deepEqual(stale.container.children, [stale.before], "a superseded render leaves the page as it was");
+  }
+  // Without a pause (and with no fonts to wait for, as here) the render is one synchronous run:
+  // the drawing is installed before `render` returns, so nothing can come between its phases.
+  const plain = render(Infinity, false);
+  assert.equal(plain.container.children[0].localName, "svg");
+  assert.equal(plain.trail(), "cccc");
+  assert.equal((await plain.outcome).status, "ready");
 });
 
 test("the trellis layout's Files button is enabled when the welcome left only Changes, and nothing else changes", async () => {

@@ -146,7 +146,7 @@ export function createClient({ url = DEFAULT_URL, tokenFile, machine = null, tra
   };
 }
 
-/** web/app.js IndexPin.copy: a validated index snapshot pair, or a typed error. */
+/** web/index-pin.js IndexPin.copy: a validated index snapshot pair, or a typed error. */
 export function pinOf(value) {
   if (!value || typeof value !== "object" ||
       !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value.indexGeneration) ||

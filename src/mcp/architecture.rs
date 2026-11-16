@@ -225,7 +225,7 @@ WORKFLOW
 4. Pull exact file-level edges from trellis_references only when writing baseline exceptions.
 
 CLOSED TOML GRAMMAR
-Only top-level keys version,layer_policy,external_policy,layers,roles,rules,exceptions,apps,interfaces are accepted. Optional [[interfaces.wrappers]] entries {callee,method,at,prefix,root|app} name JavaScript/TypeScript request wrappers for HTTP interface evidence only; they never change verdicts. version=1 is required; other collections may be empty/absent. A layer has nonempty paths or external selectors (or both), and exactly one integer order or shared=true. Each external selector is exactly {language,package,stdlib}, all required, matching a literal canonical package identity, not an alias, version or glob. Languages are rust,java,python,javascript,typescript. Same-layer repeated selectors deduplicate; different layers selecting the same external identity are an ambiguity. Lower order is higher; equal orders are peers; file order has no meaning. Assign each file to at most one layer. Paths are anchored checkout-relative case-sensitive globs: * and ? do not cross slash; ** crosses directories; no absolute paths, backslash, dot-parent, braces, brackets or negation. src/store/** does not include src/store.rs. Incoming shared edges and same-layer edges are allowed. Upward edges deviate. Downward edges are allowed. Cross-peer and shared-to-ordered edges deviate by default: an absent policy key means forbid. An explicit peers="allow" or shared_outbound="allow" overrides that default for the respective direction; an exact reviewed exception can approve an individual deviation.
+Only top-level keys version,layer_policy,external_policy,layers,roles,rules,exceptions,apps,interfaces,test_features are accepted. Optional test_features=["name",..] lists Cargo features that gate test support: Rust reference sites under #[cfg(feature="name")] or #[cfg(any(test, feature="name"))] count as test, not production. Optional [[interfaces.wrappers]] entries {callee,method,at,prefix,root|app} name JavaScript/TypeScript request wrappers for HTTP interface evidence only; they never change verdicts. version=1 is required; other collections may be empty/absent. A layer has nonempty paths or external selectors (or both), and exactly one integer order or shared=true. Each external selector is exactly {language,package,stdlib}, all required, matching a literal canonical package identity, not an alias, version or glob. Languages are rust,java,python,javascript,typescript. Same-layer repeated selectors deduplicate; different layers selecting the same external identity are an ambiguity. Lower order is higher; equal orders are peers; file order has no meaning. Assign each file to at most one layer. Paths are anchored checkout-relative case-sensitive globs: * and ? do not cross slash; ** crosses directories; no absolute paths, backslash, dot-parent, braces, brackets or negation. src/store/** does not include src/store.rs. Incoming shared edges and same-layer edges are allowed. Upward edges deviate. Downward edges are allowed. Cross-peer and shared-to-ordered edges deviate by default: an absent policy key means forbid. An explicit peers="allow" or shared_outbound="allow" overrides that default for the respective direction; an exact reviewed exception can approve an individual deviation.
 
 Minimal valid skeleton (replace example paths/layer names with actual evidence; absent policy keys default to forbid):
 version = 1
@@ -285,17 +285,19 @@ pub fn response(id: &Value, mut result: Value) -> Value {
     }
 }
 
-/// Arguments the store reads. MCP-only paging, filtering and evidence sampling never
-/// reach evaluation, so check/explain evaluate exactly what `trellis rules check` does.
-/// References keep `prefix`, which selects sources, and `groupBy`, whose `package` mode
-/// needs each file's app (#837).
+/// Arguments the store reads. MCP-only paging and filtering never reach evaluation, so
+/// check/explain reach the verdicts and counts `trellis rules check` does. References
+/// keep `prefix`, which selects sources, and `groupBy`, whose `package` mode needs each
+/// file's app (#837). `limit` reaches the store where it is a site sample: for
+/// references, and for explain (#985), whose evidence is the sites the evaluation
+/// sampled per pair. Check's `limit` counts instances per page and stays here.
 pub fn store_arguments(name: &str, arguments: &Value) -> Value {
     let mut arguments = arguments.clone();
     if let Some(object) = arguments.as_object_mut() {
         object.remove("offset");
         object.remove("status");
         object.remove("depth");
-        if name != "trellis_references" {
+        if !matches!(name, "trellis_references" | "trellis_rules_explain") {
             object.remove("limit");
         }
     }
@@ -312,13 +314,19 @@ pub const CHECK_DEFAULT_INSTANCES: usize = 20;
 
 /// Rule instances keep at most `limit` evidence entries each; `omittedEvidence`
 /// is the exact remainder. Verdicts, counts and `referenceCount` are unchanged.
+///
+/// #985: the evaluation itself holds only a sample of a pair's sites, so the remainder
+/// is counted from `referenceCount`, the pair's exact site count. An instance that
+/// carries every entry (unresolved sites, a declaration's own evidence) has at least
+/// `referenceCount` of them, and its own length counts.
 pub fn sample_evidence(payload: &mut Value, limit: usize) {
     for field in ["instances", "testOnly"] {
         for instance in payload[field].as_array_mut().into_iter().flatten() {
+            let references = instance["referenceCount"].as_u64().unwrap_or(0) as usize;
             let evidence = instance["evidence"]
                 .as_array_mut()
                 .expect("evaluated rule evidence");
-            let omitted = evidence.len().saturating_sub(limit);
+            let omitted = evidence.len().max(references).saturating_sub(limit);
             evidence.truncate(limit);
             instance["omittedEvidence"] = json!(omitted);
         }
@@ -1269,7 +1277,7 @@ mod tests {
             );
             assert!(text.contains("exactly one key, roots"));
             assert!(text.contains("to rename a detected app, author the new name at its root"));
-            assert!(text.contains("rules,exceptions,apps,interfaces are accepted"));
+            assert!(text.contains("rules,exceptions,apps,interfaces,test_features are accepted"));
         }
     }
 
@@ -1655,6 +1663,13 @@ mod tests {
         assert_eq!(rules["instances"][0]["evidence"], json!([1, 2, 3, 4, 5]));
         assert_eq!(rules["instances"][0]["omittedEvidence"], 2);
         assert_eq!(rules["instances"][1]["omittedEvidence"], 0);
+        // #985: a pair's evidence is a sample of its sites; the rest are still counted.
+        let mut pair = json!({"instances":[{"evidence":[1,2,3,4,5],"referenceCount":8},
+            {"evidence":[1],"referenceCount":0}],"testOnly":[]});
+        sample_evidence(&mut pair, 1);
+        assert_eq!(pair["instances"][0]["evidence"], json!([1]));
+        assert_eq!(pair["instances"][0]["omittedEvidence"], 7);
+        assert_eq!(pair["instances"][1]["omittedEvidence"], 0);
     }
 
     /// Every page of a grouped references answer, concatenated (#775).

@@ -164,10 +164,23 @@ impl Inproc {
         })
     }
 
-    /// Writes a run directory holding `artifact` and the batch written for it. Returns the
-    /// canonical run directory, the descriptor and its digest.
+    /// Writes a run directory holding `artifact` and the stub's batch written for it. Returns
+    /// the canonical run directory, the descriptor and its digest.
     fn write_run(
         &self,
+        id: &str,
+        artifact: impl FnOnce(&str) -> Vec<u8>,
+    ) -> anyhow::Result<(PathBuf, PathBuf, String)> {
+        let row = profiles::row(Target::Stub, TrustProfile::Restricted)?;
+        self.write_run_of(row, &["javascript"], id, artifact)
+    }
+
+    /// `write_run` for the producer and trust profile of `row`, as a run that resolved and
+    /// verified it writes its batch.
+    fn write_run_of(
+        &self,
+        row: profiles::Row,
+        languages: &[&str],
         id: &str,
         artifact: impl FnOnce(&str) -> Vec<u8>,
     ) -> anyhow::Result<(PathBuf, PathBuf, String)> {
@@ -178,7 +191,7 @@ impl Inproc {
             .clone();
         fs::create_dir(dir.join("out")).unwrap();
         fs::write(dir.join(batch::ARTIFACT_PATH), artifact(&worktree)).unwrap();
-        let pin = Target::Stub.pin().unwrap();
+        let pin = row.target.pin().unwrap();
         let resolution = Resolution {
             launcher: "/stub".into(),
             verification: Verification {
@@ -191,17 +204,14 @@ impl Inproc {
             rustup: None,
             python3: None,
         };
-        let table = profiles::run_generation(
-            &profiles::row(Target::Stub, TrustProfile::Restricted)?,
-            &resolution,
-        );
+        let table = profiles::run_generation(&row, &resolution);
         let head = self.store.index_baseline()?;
         let written = self.store.with_native_reader(head, |reader| {
             batch::write_batch(
                 reader,
                 &BatchSpec {
                     pin: &pin,
-                    languages: &["javascript"],
+                    languages,
                     workspace: &self.root,
                     dir: &dir,
                     generation: batch::run_generation(&table, GenerationOrigin::TrellisRun, id),
@@ -210,6 +220,36 @@ impl Inproc {
             )
         })?;
         Ok((dir, written.descriptor, written.descriptor_sha256))
+    }
+
+    /// rust-analyzer's artifact over the rust documents, bound to `project_root` and
+    /// reporting `version`.
+    fn rust_artifact(&self, project_root: &str, version: &str) -> Vec<u8> {
+        let fixture =
+            BatchFixture::from_published(&self.index_db(), &self.root).reference("rust-analyzer");
+        let bytes = fixture.scip_bytes("rust", &fixture.paths("rust"));
+        edit_scip(&bytes, |index| {
+            let metadata = index.metadata.as_mut().unwrap();
+            metadata.project_root = project_root.into();
+            metadata.tool_info.as_mut().unwrap().version = version.into();
+        })
+    }
+
+    /// A rust-analyzer run's batch for an artifact reporting `version`.
+    fn write_rust_run(&self, id: &str, version: &str) -> (PathBuf, PathBuf, String) {
+        let row = profiles::row(
+            Target::Real(trellis::producer::ProducerName::RustAnalyzer),
+            TrustProfile::Trusted,
+        )
+        .unwrap();
+        self.write_run_of(row, &["rust"], id, |worktree| {
+            self.rust_artifact(worktree, version)
+        })
+        .unwrap()
+    }
+
+    fn descriptor(path: &Path) -> Descriptor {
+        Descriptor::parse(&fs::read(path).unwrap()).unwrap()
     }
 
     fn stage(
@@ -435,6 +475,237 @@ fn generated_run_batch_reuse_rebinds_with_retained_project_root() {
         );
         assert!(complete_documents(&world.store, head, "trellis-synthetic-scip") > 0);
     }
+}
+
+/// What the `x86_64-unknown-linux-gnu` rust-analyzer 1.98.1 prints for its version (#1126); the
+/// pin's text is the `aarch64-apple-darwin` binary's, with an eight-character commit hash.
+const LINUX_RUST_ANALYZER: &str = "1.98.1 (48a229c 2026-09-01)";
+
+fn rust_analyzer_pin() -> trellis::scip_admission::PinnedProducer {
+    trellis::scip_admission::pinned_producer_by_id("rust-analyzer").unwrap()
+}
+
+/// #1126: a run's executable is verified against the hash pinned for its target, and the batch
+/// records the version that executable reported. One that reports a text other than the pin's
+/// imports, publishes under the reported version and is re-authenticated on reuse.
+#[test]
+fn run_batch_records_the_version_its_hash_verified_binary_reports() {
+    let world = inproc();
+    let pin = rust_analyzer_pin();
+    assert_ne!(pin.version, LINUX_RUST_ANALYZER);
+    let (dir, descriptor, sha) = world.write_rust_run(RUN_ID, LINUX_RUST_ANALYZER);
+    // On main this admission is the refusal of #1126: `invalid_artifact: tool binding`.
+    let published = world.publish_run(RUN_ID, &dir, &descriptor, &sha);
+    let written = Inproc::descriptor(&descriptor);
+    assert_eq!(written.producer.version, LINUX_RUST_ANALYZER);
+    assert_eq!(
+        written.producer.executable_hash, pin.executable_hash,
+        "the hash pinned for the host target is unchanged"
+    );
+    let documents = complete_documents(&world.store, published, "rust-analyzer");
+    assert!(documents > 0);
+    let versions = |at: IndexPin| -> Vec<String> {
+        let semantic = world.store.semantic_at(at).unwrap();
+        semantic
+            .provenance
+            .iter()
+            .filter(|proof| proof.producer_id == "rust-analyzer")
+            .filter_map(|proof| Some(proof.basis.as_ref()?.producer_version.clone()))
+            .chain(
+                semantic
+                    .producers
+                    .iter()
+                    .filter(|producer| producer.id == "rust-analyzer")
+                    .map(|producer| producer.version.clone()),
+            )
+            .collect()
+    };
+    assert!(!versions(published).is_empty());
+    assert!(
+        versions(published)
+            .iter()
+            .all(|version| version == LINUX_RUST_ANALYZER),
+        "{:?}",
+        versions(published)
+    );
+
+    // An unrelated native publication reuses the stored batch, which is checked against the
+    // pin again.
+    fs::write(
+        world.root.join("java/u00000.java"),
+        "class u00000 { void unrelated() {} }\n",
+    )
+    .unwrap();
+    world.republish_with_rejoin();
+    let head = world.store.index_baseline().unwrap();
+    assert!(head.index_revision > published.index_revision);
+    assert_eq!(
+        world.selected(head).len(),
+        1,
+        "the batch was dropped on reuse"
+    );
+    assert_eq!(
+        complete_documents(&world.store, head, "rust-analyzer"),
+        documents,
+        "reuse failed to re-authenticate the batch"
+    );
+    assert!(
+        versions(head)
+            .iter()
+            .all(|version| version == LINUX_RUST_ANALYZER)
+    );
+}
+
+/// On the reference host the binary reports the pin's own text, so the descriptor a run writes
+/// is the one it wrote before #1126; an artifact that reports no version records the pin's too.
+#[test]
+fn run_batch_of_a_binary_reporting_the_pin_text_records_the_pin_text() {
+    let world = inproc();
+    let pin = rust_analyzer_pin();
+    let (dir, descriptor, sha) = world.write_rust_run(RUN_ID, &pin.version);
+    assert_eq!(
+        Inproc::descriptor(&descriptor).check_producer().unwrap(),
+        pin
+    );
+    let published = world.publish_run(RUN_ID, &dir, &descriptor, &sha);
+    assert!(complete_documents(&world.store, published, "rust-analyzer") > 0);
+
+    let (_, descriptor, _) = world.write_rust_run(OTHER_ID, "");
+    assert_eq!(
+        Inproc::descriptor(&descriptor).producer.version,
+        pin.version
+    );
+}
+
+/// The reported version is the producer's output: one a descriptor cannot record is refused
+/// before any batch is written.
+#[test]
+fn run_batch_refuses_a_reported_version_it_cannot_record() {
+    let world = inproc();
+    let row = profiles::row(
+        Target::Real(trellis::producer::ProducerName::RustAnalyzer),
+        TrustProfile::Trusted,
+    )
+    .unwrap();
+    for (n, version) in ["1".repeat(129), "1.98.1\n(48a229c)".to_owned()]
+        .iter()
+        .enumerate()
+    {
+        let refused = world
+            .write_run_of(row, &["rust"], &format!("{:032x}", n + 1), |worktree| {
+                world.rust_artifact(worktree, version)
+            })
+            .unwrap_err();
+        assert_eq!(refused.to_string(), "producer_output_invalid: tool version");
+    }
+}
+
+/// A batch Trellis did not run keeps the tool binding: its descriptor must carry the pin's
+/// text, and an artifact reporting another version is refused.
+#[test]
+fn batch_trellis_did_not_run_still_binds_the_tool_version_to_the_pin() {
+    let world = inproc();
+    let tool_binding = |error: anyhow::Error| {
+        assert!(
+            matches!(
+                error.downcast_ref::<trellis::scip_admission::ScipCaptureError>(),
+                Some(trellis::scip_admission::ScipCaptureError::InvalidArtifact(reason))
+                    if reason == "tool binding"
+            ),
+            "{error:#}"
+        );
+    };
+
+    // External: the submitter's descriptor and artifact, under the workspace.
+    let mut fixture =
+        BatchFixture::from_published(&world.index_db(), &world.root).reference("rust-analyzer");
+    let docs = fixture.paths("rust");
+    let ordinal = fixture.artifact("rust", docs.clone());
+    let bytes = edit_scip(&fixture.scip_bytes("rust", &docs), |index| {
+        let metadata = index.metadata.as_mut().unwrap();
+        metadata.tool_info.as_mut().unwrap().version = LINUX_RUST_ANALYZER.into();
+    });
+    fixture.override_artifact_raw(ordinal, bytes);
+    let batch_dir = world.root.join(".trellis-semantic-batch");
+    let (descriptor, sha) = fixture.write(&batch_dir);
+    let external = StageInput::external(&world.root).unwrap();
+    tool_binding(world.stage(&external, &descriptor, &sha).err().unwrap());
+    // Declaring the reported text itself is not the pin.
+    let (descriptor, sha) = edit_descriptor(&descriptor, |value| {
+        value["producer"]["version"] = json!(LINUX_RUST_ANALYZER);
+    });
+    let refused = world.stage(&external, &descriptor, &sha).err().unwrap();
+    assert!(
+        format!("{refused:#}").contains("producer profile pin"),
+        "{refused:#}"
+    );
+
+    // An owner pickup: Trellis writes the descriptor, but ran and verified nothing.
+    let state = world.state();
+    let dir = fs::canonicalize(state.create_run_dir(RUN_ID).unwrap()).unwrap();
+    fs::create_dir(dir.join("out")).unwrap();
+    let workspace_uri = file_uri(&world.root);
+    fs::write(
+        dir.join(batch::ARTIFACT_PATH),
+        world.rust_artifact(&workspace_uri, LINUX_RUST_ANALYZER),
+    )
+    .unwrap();
+    let pin = rust_analyzer_pin();
+    let head = world.store.index_baseline().unwrap();
+    let written = world
+        .store
+        .with_native_reader(head, |reader| {
+            batch::write_batch(
+                reader,
+                &BatchSpec {
+                    pin: &pin,
+                    languages: &["rust"],
+                    workspace: &world.root,
+                    dir: &dir,
+                    generation: batch::pickup_generation(RUN_ID),
+                    snapshot: false,
+                },
+            )
+        })
+        .unwrap();
+    assert_eq!(
+        Inproc::descriptor(&written.descriptor).producer.version,
+        pin.version
+    );
+    let pickup =
+        StageInput::generated(&world.root, GenerationOrigin::OwnerPickup, RUN_ID, &dir).unwrap();
+    tool_binding(
+        world
+            .stage(&pickup, &written.descriptor, &written.descriptor_sha256)
+            .err()
+            .unwrap(),
+    );
+}
+
+/// The test stub is not verified by hash, so its run still records the pin's version and an
+/// artifact reporting another is refused.
+#[test]
+fn run_batch_of_an_unverified_executable_still_binds_the_tool_version_to_the_pin() {
+    let world = inproc();
+    let (dir, descriptor, sha) = world
+        .write_run(RUN_ID, |worktree| {
+            edit_scip(&world.artifact(worktree), |index| {
+                let metadata = index.metadata.as_mut().unwrap();
+                metadata.tool_info.as_mut().unwrap().version = "0.0.0-not-the-pin".into();
+            })
+        })
+        .unwrap();
+    assert_eq!(
+        Inproc::descriptor(&descriptor).producer.version,
+        Target::Stub.pin().unwrap().version
+    );
+    let input =
+        StageInput::generated(&world.root, GenerationOrigin::TrellisRun, RUN_ID, &dir).unwrap();
+    let refused = world.stage(&input, &descriptor, &sha).err().unwrap();
+    assert!(
+        format!("{refused:#}").contains("tool binding"),
+        "{refused:#}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------

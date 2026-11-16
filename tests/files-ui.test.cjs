@@ -4,9 +4,12 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const vm = require("node:vm");
 const path = require("node:path");
+const {APP_SCRIPTS} = require("./support/app-scripts.js");
 const ROOT = "a".repeat(64);
 const pin = {indexGeneration:"12345678-1234-4123-8123-123456789abc", indexRevision:1};
-const source = ["sequence.js", "shell.js", "files.js", "app.js"].map(file => fs.readFileSync(path.join(__dirname, "../web", file), "utf8")).join("\n");
+// No DOM parser here: the adapter double keeps the real Pele projection and installs one
+// selectable node per projected row (tests/support/sequence-adapter-double.js).
+const source = ["../web/index-pin.js", "../web/source-witness.js", "../web/sequence-model.js", "../web/sequence.js", "../web/pele-svg.js", "../web/sequence-pele.js", "support/sequence-adapter-double.js", "../web/shell.js", "../web/files.js", ...APP_SCRIPTS.map(file => "../web/" + file)].map(file => fs.readFileSync(path.join(__dirname, file), "utf8")).join("\n");
 const response = data => ({ok:true,status:200,json:async () => data});
 function deferred() { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return {promise, resolve, reject}; }
 const all = node => [node, ...(node.children || []).flatMap(all)];
@@ -402,14 +405,15 @@ test("mini Full without visible indexed source marks blank Back history and Forw
   assert.equal(h.requests.length,reads); assert.equal(browser.history.length,2);
 });
 
-test("source history from a previous pin is rejected without rereading source or adopting the successor", async () => {
+test("source history from a previous pin opens the root view without rereading source (#951)", async () => {
   const browser=historyBrowser(), h=harness(browser), item=outline("measured"); indexedNetwork(h,item);
   await h.run('setSection("files")'); await h.run('selectFilesFile(files[0])'); h.context.item=item;
   await h.run('selectFilesSymbol(item)'); await h.run('openFilesFull()');
   h.run('clearNavigationHistory(); status.revision={...status.revision,indexRevision:2}');
   const reads=h.requests.length;
   browser.history.go(-1); await h.run('readNavigationLocation()');
-  assert.equal(h.requests.length,reads); assert.match(h.get("error").textContent,/stale/);
+  assert.equal(h.requests.length,reads); assert.equal(h.get("error").hidden,true);
+  assert.equal(browser.location.hash,""); assert.equal(browser.history.state,null); assert.equal(h.run('section'),"diagrams");
   assert.equal(h.run('status.revision.indexRevision'),2);
 });
 

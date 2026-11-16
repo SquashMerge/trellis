@@ -37,8 +37,10 @@ path or name does not change that boundary. Working-tree-only text likewise has 
 
 Sequence URLs use `#sequence?sid=…`. A bare syntax ID resolves only after authentication and explicit
 checkout selection, against that checkout's admitted snapshot. Generated links also carry the
-checkout key and full index pin. A mismatched checkout or pin is a visible refusal, not an automatic
-switch to another snapshot. Source return state is local to the current browser session; it is not
+checkout key and full index pin. A malformed link or one for another checkout is a visible refusal,
+not an automatic switch to another snapshot. A link whose pin is no longer the selected snapshot, or a
+stale Back or Forward entry, clears the URL without adding a history entry and opens the root view
+(Architecture) with no error (#951, owner ruling 2026-11-12). Source return state is local to the current browser session; it is not
 saved source text and cannot survive logout or a reload.
 
 ## Class members

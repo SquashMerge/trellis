@@ -10,13 +10,21 @@ and repairs the pinned Playwright Chromium bundles. Setup completes before the p
 lanes start. The package lock pins `playwright` to exactly `1.64.1`; setup never uses `npx`,
 a system browser, or `--with-deps`. A first run needs npm registry and browser-download access.
 
-By default, setup uses an owner-private, stable **per-checkout** cache under the OS temp
-directory, outside the repository. Set `TRELLIS_RUN_CACHE` to an absolute, user-owned,
+By default, setup uses one owner-private cache **shared by every checkout**,
+`trellis-verify/` under the OS temp directory, outside the repository. It holds
+`playwright-browsers/` and `npm-cache/`, so the pinned Chromium is downloaded once, not once
+per clone. Verifies in different checkouts may provision at the same time: Playwright's
+installer holds a lock in the browser directory and marks a build complete only after
+extracting it, keeps builds for different pins side by side, and removes a build once no
+installed checkout refers to it. Set `TRELLIS_RUN_CACHE` to an absolute, user-owned,
 non-group-writable external directory to keep the npm and browser cache at a known location.
 An existing absolute external `PLAYWRIGHT_BROWSERS_PATH` (including CI's) is honored when
 it has the same safe ownership and permissions. Invalid, symlinked, or in-checkout cache
 paths fail verification; neither missing packages nor a missing browser are skipped.
 Run only one verifier per checkout at a time because `npm ci` replaces ignored dependencies.
+
+Earlier versions kept a full browser copy per checkout in `trellis-verify/<24 hex>/`.
+Setup removes this checkout's old directory, and any other that has not changed for a day.
 
 Linux still needs Chromium's host libraries. CI sets `TRELLIS_BROWSER_SYSTEM_DEPS=1`
 so `./tools/verify` runs `install-deps chromium` alongside the build and waits for it

@@ -882,3 +882,6 @@ fn reserved_canonical_key_matches_existing_encoding() {
         }
     }
 }
+
+#[path = "semantic_import_reservation_tests.rs"]
+mod reservation_tests;

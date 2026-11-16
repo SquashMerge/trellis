@@ -20,11 +20,11 @@ function harness(options = {}) {
   }
   const get = id => { if (!elements.has(id)) elements.set(id, node("div")); return elements.get(id); };
   const document = {getElementById:get, createElement:node};
-  const window = {TrellisShell:{showMetricInspector() { shown++; }, clearMetricInspector() { cleared++; }}};
+  const window = {};
   const context = vm.createContext({window, document, URLSearchParams});
   vm.runInContext(fs.readFileSync(path.join(__dirname, "../web/metric-heat.js"), "utf8"), context);
   vm.runInContext(fs.readFileSync(path.join(__dirname, "../web/viewer-metrics.js"), "utf8"), context);
-  const controller = window.TrellisMetrics.create({context:() => state, request(url) {
+  const controller = window.TrellisMetrics.create({inspector:{show() { shown++; }, clear() { cleared++; }}, context:() => state, request(url) {
     return new Promise((resolve, reject) => requests.push({url, resolve, reject}));
   }, onChange() { changes++; }, onConflict(error) { conflicts.push(error); }, onOpenCallable:options.onOpenCallable});
   const change = (id, value) => {

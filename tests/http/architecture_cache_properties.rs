@@ -8,8 +8,8 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use trellis::daemon::registry::{CheckoutRuntime, MetricsResponseHooks};
 use trellis::indexer::IndexOptions;
+use trellis::metrics_read::MetricsOptions;
 use trellis::model::IndexPin;
-use trellis::store::MetricsOptions;
 
 const A: &str = "version=1\n[layers.app]\norder=2\npaths=['src/roles.rs']\n[layers.target]\norder=1\npaths=['src/target.rs']";
 const B: &str = "version=1\n[layers.quiet]\norder=1\npaths=['src/roles.rs']\ndisplay='hidden'\n[layers.target]\norder=2\npaths=['src/target.rs']";

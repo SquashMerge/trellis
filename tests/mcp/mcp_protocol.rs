@@ -6261,7 +6261,7 @@ async fn an_oversized_answer_is_typed_and_keeps_the_connection() {
     }] {
         assert_eq!(reply["result"]["isError"], false, "{reply}");
         assert_eq!(
-            reply["result"]["structuredContent"]["data"]["toolVersion"], 30,
+            reply["result"]["structuredContent"]["data"]["toolVersion"], 31,
             "{reply}"
         );
     }
@@ -13042,6 +13042,103 @@ async fn rules_check_next_call_explains_an_instance_with_its_omitted_evidence() 
     // The unknown app_main.js instance (three unresolved imports) and the lib_000.js
     // deviation (two imports of app_main.js) omit evidence; lib_001.js does not.
     assert_eq!(hinted, 2, "{data}");
+    validate_structured_content(&structured);
+    drop(ask);
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+/// #985: a pair with more references than the default sample of 5. Check counts every
+/// entry it does not show, its `nextCall` asks for all of them, and explain keeps up to
+/// its `limit`, with `omittedEvidence` the exact remainder at every limit.
+#[tokio::test(flavor = "current_thread")]
+async fn rules_explain_limit_keeps_more_than_the_default_sample() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, topology) = published_inactive_checkout(
+        temp.path(),
+        &[
+            ("app_main.js", "export const y = 1;\n"),
+            ("lib_000.js", &"import './app_main.js';\n".repeat(8)),
+        ],
+    );
+    fs::create_dir(identity.root.join(".trellis")).unwrap();
+    fs::write(
+        identity.root.join(".trellis/rules.toml"),
+        "version = 1\n[layers.app]\norder = 1\npaths = [\"app_main.js\"]\n[layers.lib]\norder = 2\npaths = [\"lib_*.js\"]\n",
+    )
+    .unwrap();
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(985, &identity).unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    architecture_built(&registry, &identity).await;
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 985, None);
+    let mut ask = |id: i64, name: &str, arguments: Value| {
+        let frame = modern(
+            json!(id),
+            "tools/call",
+            json!({"name":name,"arguments":arguments}),
+        );
+        writeln!(client, "{frame}").unwrap();
+        let reply = next_reply(&mut reader);
+        tool(&reply, None, true);
+        reply["result"]["structuredContent"].clone()
+    };
+    let pair = |content: &Value| {
+        content["data"]["instances"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["rule"] == "$layers" && row["destination"]["path"] == "app_main.js")
+            .unwrap_or_else(|| panic!("the lib_000.js -> app_main.js instance: {content}"))
+            .clone()
+    };
+    let check = ask(1, "trellis_rules_check", json!({"schemaVersion":1}));
+    let row = pair(&check);
+    assert_eq!(row["referenceCount"], 8, "{row}");
+    assert_eq!(row["evidence"].as_array().unwrap().len(), 1, "{row}");
+    assert_eq!(row["omittedEvidence"], 7, "{row}");
+    let next = row["nextCall"]["arguments"].clone();
+    assert_eq!(next["limit"], 8, "{row}");
+    let mut structured = vec![json!({"name":"trellis_rules_check","structuredContent":check})];
+    let explain = |limit: Option<u64>| {
+        let mut arguments = next.clone();
+        match limit {
+            Some(limit) => arguments["limit"] = json!(limit),
+            None => {
+                arguments.as_object_mut().unwrap().remove("limit");
+            }
+        }
+        arguments
+    };
+    // (arguments, entries kept, entries omitted): the hint as given, explain's most, a
+    // limit below the count, and the default of 5.
+    for (id, (arguments, kept, omitted)) in [
+        (next.clone(), 8, 0),
+        (explain(Some(50)), 8, 0),
+        (explain(Some(6)), 6, 2),
+        (explain(None), 5, 3),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let explained = ask(10 + id as i64, "trellis_rules_explain", arguments.clone());
+        let same = pair(&explained);
+        assert_eq!(same["referenceCount"], 8, "{arguments}: {same}");
+        let evidence = same["evidence"].as_array().unwrap();
+        assert_eq!(evidence.len(), kept, "{arguments}: {same}");
+        assert_eq!(same["omittedEvidence"], omitted, "{arguments}: {same}");
+        // Each entry is a different site, and the first is check's witness.
+        let lines: std::collections::BTreeSet<u64> = evidence
+            .iter()
+            .map(|item| item["lines"]["start"].as_u64().unwrap())
+            .collect();
+        assert_eq!(lines.len(), kept, "{arguments}: {same}");
+        assert_eq!(evidence[0], row["evidence"][0]);
+        assert!(explained["data"]["page"]["nextOffset"].is_null());
+        structured.push(json!({"name":"trellis_rules_explain","structuredContent":explained}));
+    }
     validate_structured_content(&structured);
     drop(ask);
     drop(reader);

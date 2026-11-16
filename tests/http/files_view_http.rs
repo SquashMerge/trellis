@@ -274,75 +274,185 @@ async fn production_selected_routes_admit_evidence_and_refuse_unselected_direct_
     }
 }
 
-#[tokio::test]
-async fn production_new_evidence_routes_keep_before_finish_and_final_selected_root_fences() {
-    for (stage, suffix) in [
+/// The last stage a watched test body entered, and when (#1078).
+#[derive(Clone)]
+struct Stage(Arc<std::sync::Mutex<(String, std::time::Instant)>>);
+impl Stage {
+    fn enter(&self, what: String) {
+        *self.0.lock().unwrap() = (what, std::time::Instant::now());
+    }
+    fn last(&self) -> (String, std::time::Instant) {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+/// Run `body` as `#[tokio::test]` does, on a current-thread runtime, but on its own thread
+/// while this one watches it. A call that blocks the runtime's thread also stops every Tokio
+/// timer on it, so no timeout inside `body` can report it: the watchdog does, and names the
+/// stage `body` last entered. Each stage has the hang backstop, which is never a speed limit.
+fn run_watched<F>(body: impl FnOnce(Stage) -> F + Send + 'static)
+where
+    F: std::future::Future<Output = ()>,
+{
+    let stage = Stage(Arc::new(std::sync::Mutex::new((
+        "starting".into(),
+        std::time::Instant::now(),
+    ))));
+    let entered = stage.clone();
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    let test = std::thread::Builder::new()
+        .name("watched-test-body".into())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(body(entered.clone()));
+            // Dropping the runtime waits for its blocking tasks, with no bound.
+            entered.enter("dropping the Tokio runtime".into());
+            drop(runtime);
+            drop(done);
+        })
+        .unwrap();
+    loop {
+        let (what, since) = stage.last();
+        let left = (since + trellis::testing::HANG_BACKSTOP)
+            .saturating_duration_since(std::time::Instant::now());
+        match finished.recv_timeout(left) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => assert!(
+                stage.last().1 != since,
+                "the test body did not get past this stage: {what} (hang)"
+            ),
+            // Finished or panicked: the join below reports which.
+            _ => break,
+        }
+    }
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// One authenticated call under the hang backstop. `what` names it if it never answers.
+async fn call_named(
+    app: &Router,
+    method: &str,
+    path: &str,
+    body: Value,
+    what: &str,
+) -> (StatusCode, axum::http::HeaderMap, Value) {
+    tokio::time::timeout(
+        trellis::testing::HANG_BACKSTOP,
+        call(app, method, path, body, true),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("{what} did not answer (hang)"))
+}
+
+#[test]
+fn production_new_evidence_routes_keep_before_finish_and_final_selected_root_fences() {
+    run_watched(root_fence_iterations);
+}
+
+/// Each iteration builds its own runtime and loses its root mid-read. The stage names say
+/// which iteration and which call a hang was in (#1078).
+async fn root_fence_iterations(progress: Stage) {
+    let cases = [
         ("before_read_finish", "symbols"),
         ("after_handler", "symbols"),
         ("before_read_finish", "syntax-matches"),
         ("after_handler", "syntax-matches"),
-    ] {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("checkout");
-        std::fs::create_dir(&root).unwrap();
-        std::fs::write(root.join("a.js"), "function chosen() {}\nchosen();\n").unwrap();
-        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
-        let roots =
-            TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
-        let mut registry = CheckoutRegistry::with_roots(roots);
-        registry
-            .register(&identity, CheckoutOptions(json!({})))
-            .unwrap();
-        let registry = Arc::new(tokio::sync::Mutex::new(registry));
-        let browser =
-            ProvisionedBrowser::new(registry, TOKEN.into(), "127.0.0.1:7331".parse().unwrap())
-                .unwrap();
-        let app = browser.clone().router();
-        let prefix = format!("/api/checkouts/{}", identity.root_key);
-        let status = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
-            loop {
-                let (status, _, body) =
-                    call(&app, "GET", &format!("{prefix}/status"), Value::Null, true).await;
-                if status == StatusCode::OK {
-                    break body;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap();
-        let pin: IndexPin = serde_json::from_value(status["revision"].clone()).unwrap();
-        let (_, _, outline) =
-            call(&app, "GET", &outline_path(&prefix, pin), Value::Null, true).await;
-        let id = outline["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|i| i["symbol"]["name"] == "chosen")
-            .unwrap()["symbol"]["id"]
-            .clone();
-        let changed = Arc::new(AtomicBool::new(false));
-        let changed_hook = changed.clone();
-        let source = root.clone();
-        let moved = temp.path().join("moved");
-        browser.set_selected_response_hook_for_tests(Arc::new(move |at| {
-            if at == stage && !changed_hook.swap(true, Ordering::AcqRel) {
-                std::fs::rename(&source, &moved).unwrap();
-            }
-        }));
-        let (method, path, body) = if suffix == "symbols" {
-            ("GET", outline_path(&prefix, pin), Value::Null)
-        } else {
-            (
-                "POST",
-                format!("{prefix}/syntax-matches"),
-                json!({"expectedRevision":pin,"symbolId":id}),
-            )
-        };
-        let (status, _, error) = call(&app, method, &path, body, true).await;
-        assert!(changed.load(Ordering::Acquire), "{stage}/{suffix}");
-        assert_eq!(status, 409, "{stage}/{suffix}: {error}");
-        assert_eq!(error["error"]["code"], "root_changed");
-        assert!(error.get("items").is_none());
+    ];
+    for (index, (stage, suffix)) in cases.into_iter().enumerate() {
+        let at = format!(
+            "iteration {} of {} ({stage}/{suffix})",
+            index + 1,
+            cases.len()
+        );
+        root_fence_iteration(&progress, &at, stage, suffix).await;
     }
+}
+
+async fn root_fence_iteration(progress: &Stage, at: &str, stage: &'static str, suffix: &str) {
+    progress.enter(format!("{at}: building the checkout and its registry"));
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("checkout");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("a.js"), "function chosen() {}\nchosen();\n").unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+    let roots =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let mut registry = CheckoutRegistry::with_roots(roots);
+    registry
+        .register(&identity, CheckoutOptions(json!({})))
+        .unwrap();
+    let registry = Arc::new(tokio::sync::Mutex::new(registry));
+    let browser =
+        ProvisionedBrowser::new(registry, TOKEN.into(), "127.0.0.1:7331".parse().unwrap()).unwrap();
+    let app = browser.clone().router();
+    let prefix = format!("/api/checkouts/{}", identity.root_key);
+    progress.enter(format!("{at}: status poll (activation and first head)"));
+    let status = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            let (status, _, body) =
+                call(&app, "GET", &format!("{prefix}/status"), Value::Null, true).await;
+            if status == StatusCode::OK {
+                break body;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{at}: status never answered 200 (hang)"));
+    let pin: IndexPin = serde_json::from_value(status["revision"].clone()).unwrap();
+    progress.enter(format!("{at}: outline read before the root moves"));
+    let (_, _, outline) = call_named(
+        &app,
+        "GET",
+        &outline_path(&prefix, pin),
+        Value::Null,
+        &format!("{at}: the outline read before the root moves"),
+    )
+    .await;
+    let id = outline["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["symbol"]["name"] == "chosen")
+        .unwrap()["symbol"]["id"]
+        .clone();
+    let changed = Arc::new(AtomicBool::new(false));
+    let changed_hook = changed.clone();
+    let source = root.clone();
+    let moved = temp.path().join("moved");
+    browser.set_selected_response_hook_for_tests(Arc::new(move |at| {
+        if at == stage && !changed_hook.swap(true, Ordering::AcqRel) {
+            std::fs::rename(&source, &moved).unwrap();
+        }
+    }));
+    let (method, path, body) = if suffix == "symbols" {
+        ("GET", outline_path(&prefix, pin), Value::Null)
+    } else {
+        (
+            "POST",
+            format!("{prefix}/syntax-matches"),
+            json!({"expectedRevision":pin,"symbolId":id}),
+        )
+    };
+    progress.enter(format!("{at}: fenced {method} {suffix} whose root moves"));
+    let (status, _, error) = call_named(
+        &app,
+        method,
+        &path,
+        body,
+        &format!("{at}: the fenced {method} {suffix} whose root moves"),
+    )
+    .await;
+    assert!(changed.load(Ordering::Acquire), "{stage}/{suffix}");
+    assert_eq!(status, 409, "{stage}/{suffix}: {error}");
+    assert_eq!(error["error"]["code"], "root_changed");
+    assert!(error.get("items").is_none());
+    // The iteration's values drop here, in reverse order of declaration.
+    progress.enter(format!(
+        "{at}: dropping the browser, registry and temporary directories"
+    ));
 }
