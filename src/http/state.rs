@@ -1328,7 +1328,7 @@ impl DaemonState {
                     let (_stream, _) = listener.accept()?;
                 }
             }
-            self.store.enqueue_retained_runs()?;
+            crate::index_coordinator::enqueue_retained_runs(&self.store)?;
             #[cfg(test)]
             self.test_queue_current_phase.store(2, Ordering::Release);
             let gate_deferred = std::cell::Cell::new(false);
