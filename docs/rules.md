@@ -902,7 +902,12 @@ Supported mapping is deliberately narrow:
   answered from the scope's own `mod parse` item only when all of this holds: the
   crate's manifest proves edition 2018 or later (a literal `[package] edition` of
   `2018`, `2021` or `2024`, or one inherited from the root manifest's
-  `[workspace.package]`, with no edition of its own on `[lib]` or a `[[bin]]`), the
+  `[workspace.package]`; no target table of the package, `[lib]`, `[[bin]]`,
+  `[[example]]`, `[[test]]`, `[[bench]]` or any other, has an `edition` key of any
+  value, since a target can compile any file under its own edition; the manifest has
+  no `cargo-features` list and no `package.workspace`; and no other retained package
+  manifest names the crate's root file as one of its target roots or has it under a
+  directory Cargo discovers targets in), the
   scope has exactly one `mod` item of that name, the item is unconditional, and its
   file was read whole. Otherwise the repeated lookup stays unknown, as it was: a
   crate with no captured manifest, no `edition` key or edition 2015 (where a `use`

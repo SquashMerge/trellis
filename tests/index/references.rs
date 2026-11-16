@@ -8300,6 +8300,51 @@ fn references_rust_reexport_sharing_a_name_stays_unknown_without_a_proved_editio
             )),
         ),
         ("a manifest that is not TOML", Some("[package".to_owned())),
+        // Valid for Cargo: the example compiles the library's root file as edition 2015.
+        (
+            "an example target with its own edition over the library root",
+            Some(format!(
+                "{package}edition = '2021'\n[[example]]\nname = 'old'\nedition = '2015'\n\
+                 path = 'src/lib.rs'\ncrate-type = ['lib']\n"
+            )),
+        ),
+        (
+            "an example target with its own edition and no path",
+            Some(format!(
+                "{package}edition = '2021'\n[[example]]\nname = 'old'\nedition = '2021'\n"
+            )),
+        ),
+        (
+            "a binary target with its own edition",
+            Some(format!(
+                "{package}edition = '2021'\n[[bin]]\nname = 'old'\nedition = '2015'\n\
+                 path = 'src/lib.rs'\n"
+            )),
+        ),
+        (
+            "a test target with its own edition",
+            Some(format!(
+                "{package}edition = '2021'\n[[test]]\nname = 'old'\nedition = '2015'\n\
+                 path = 'src/lib.rs'\n"
+            )),
+        ),
+        (
+            "a bench target with its own edition",
+            Some(format!(
+                "{package}edition = '2021'\n[[bench]]\nname = 'old'\nedition = '2015'\n\
+                 path = 'src/lib.rs'\n"
+            )),
+        ),
+        (
+            "an unstable Cargo feature list",
+            Some(format!(
+                "cargo-features = ['edition2027']\n{package}edition = '2024'\n"
+            )),
+        ),
+        (
+            "an edition that is not a string",
+            Some(format!("{package}edition = 2021\n")),
+        ),
     ] {
         let mut input = snapshot(&files);
         if let Some(manifest) = &manifest {
@@ -8322,6 +8367,33 @@ fn references_rust_reexport_sharing_a_name_stays_unknown_without_a_proved_editio
         mapped_spellings(&data, "src/caller.rs", "src/parent/same.rs"),
         ["crate::parent::same"]
     );
+    assert!(!has_edge(&data, "src/caller.rs", "src/same.rs"));
+    // A target without an edition of its own takes the package's, also over the same file.
+    let data = project(&with_cargo_manifest(
+        snapshot(&files),
+        &format!(
+            "{EDITION_2021}[[example]]\nname = 'same'\npath = 'src/lib.rs'\ncrate-type = ['lib']\n"
+        ),
+    ));
+    assert_eq!(
+        mapped_spellings(&data, "src/caller.rs", "src/parent/same.rs"),
+        ["crate::parent::same"]
+    );
+    // Another package of the checkout, member or not, that names the root file as one of
+    // its targets compiles it under its own edition.
+    let mut input = with_cargo_manifest(snapshot(&files), EDITION_2021);
+    let mut nested = input.manifests[0].clone();
+    nested.path = "old/Cargo.toml".into();
+    let bytes = b"[package]\nname = 'old'\nversion = '0.1.0'\n[lib]\npath = '../src/lib.rs'\n";
+    nested.content_hash = Some(hex::encode(Sha256::digest(bytes)));
+    nested.bytes = Some(bytes.to_vec());
+    input.manifests.push(nested);
+    let data = project(&input);
+    assert!(
+        unresolved_spellings(&data).contains(&"crate::parent::same"),
+        "{data}"
+    );
+    assert!(!has_edge(&data, "src/caller.rs", "src/parent/same.rs"));
     assert!(!has_edge(&data, "src/caller.rs", "src/same.rs"));
 }
 
