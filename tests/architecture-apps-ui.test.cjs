@@ -5,7 +5,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const read = file => fs.readFileSync(path.join(__dirname, "..", file), "utf8");
-const pinSource = read("web/app.js").match(/const IndexPin = Object.freeze\(\{[\s\S]*?\n\}\);\nwindow.TrellisIndexPin = IndexPin;/)[0];
+const pinSource = read("web/index-pin.js");
 const pin = {indexGeneration:"12345678-1234-4123-8123-123456789abc",indexRevision:1};
 const descendants = node => [node, ...node.children.flatMap(descendants)];
 const text = node => descendants(node).map(item => item.textContent).join(" ");
@@ -40,11 +40,10 @@ function controller(payload, options = {}) {
   const bands = view => new Map(view.layers.filter(layer => !layer.shared).map((layer, index) => [layer.name, {x:10, y:40 + index * 80, w:options.bandWidth ?? 300, h:60}]));
   let renderer = async (container, view, renderOptions) => { renders.push({view, options:renderOptions}); container.replaceChildren(node("svg")); return {status:"ready", bands:bands(view)}; };
   const window = {TrellisArchitecturePele:{render:(...args) => renderer(...args), edgeWidth:count => 1 + count},
-    TrellisShell:{clearArchitectureInspector() {}, showArchitectureInspector() {}},
     // `drawer`: the page is at the narrow-screen drawer width, the one width at which All apps stacks.
     matchMedia:query => ({matches:query === "(max-width: 900px)" && options.drawer === true})};
   get("architecture-diagram").clientWidth = options.width ?? 1500;
-  vm.runInNewContext([pinSource, read("web/metric-heat.js"), read("web/architecture-apps.js"), read("web/architecture-deviations.js"), read("web/architecture.js")].join("\n"),
+  vm.runInNewContext([pinSource, read("web/metric-heat.js"), read("web/architecture-apps.js"), read("web/architecture-display.js"), read("web/deviations-model.js"), read("web/architecture-deviations.js"), read("web/architecture.js")].join("\n"),
     {window, document, URLSearchParams, console, setTimeout, clearTimeout});
   const architecture = window.TrellisArchitecture.create({
     request:async url => { calls.push(url); return {payload}; }, onInspect:() => inspected.push(true),
@@ -361,7 +360,7 @@ test("T00 markup in app names and layers is text: no element is created from a c
   assert.equal(all.filter(item => item.tagName === "img").length, 0); assert.equal(h.window.__pwned, undefined);
   assert.ok(text(headers(h)[0]).includes(bad)); assert.ok(cardsOf(h)[0].attrs["aria-label"].includes(bad));
   assert.ok(all.some(item => item.textContent.includes(bad)));
-  const source = read("web/architecture-apps.js") + read("web/architecture.js");
+  const source = read("web/architecture-apps.js") + read("web/architecture-display.js") + read("web/architecture.js");
   assert.doesNotMatch(source, /innerHTML|outerHTML|insertAdjacentHTML/);
 });
 

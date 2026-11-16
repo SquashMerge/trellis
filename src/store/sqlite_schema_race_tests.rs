@@ -8,7 +8,7 @@ fn ready() -> (
     Store,
     Graph,
     crate::capture::Capture,
-    crate::native_evidence::Artifact,
+    crate::native_records::Artifact,
     IndexPin,
     CancelFlag,
     Arc<topology::WriterSession>,
@@ -308,7 +308,7 @@ fn response_fences_root_and_error_results_before_release() {
 #[test]
 fn tree_metadata_applies_no_overlay_before_post_fence() {
     let (_state, work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
-    let mut entries = vec![crate::file_tree::Entry {
+    let mut entries = vec![crate::source_dir::Entry {
         name: "flow.js".into(),
         path: "flow.js".into(),
         kind: "file",
@@ -473,7 +473,7 @@ fn persisted_scan_classifies_same_size_preserved_mtime_edit_by_ctime() {
     let (_state, work, store, _graph, _capture, _native, _pin, cancel, _session) = ready();
     let path = work.path().join("flow.js");
     let before_meta = fs::metadata(&path).unwrap();
-    let before_stat: crate::capture::CaptureStat = {
+    let before_stat: crate::capture_records::CaptureStat = {
         let db = store.cache().unwrap();
         let payload: String = db
             .query_row(
@@ -521,7 +521,7 @@ fn persisted_scan_classifies_same_size_preserved_mtime_edit_by_ctime() {
     assert_eq!(capture.files[0].text, "function go() { observed(); }\n");
     assert_eq!(
         capture.source_operations["flow.js"],
-        crate::capture::SourceOperations {
+        crate::capture_records::SourceOperations {
             opens: 1,
             complete_reads: 1,
             hashes: 1,

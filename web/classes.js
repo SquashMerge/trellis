@@ -3,17 +3,16 @@
 // node and member line to the original DTO object; no relation is ever drawn.
 (() => {
   "use strict";
-  const SVG_NS = "http://www.w3.org/2000/svg";
-  const ROOT_STYLE = "--_bg:var(--pele-bg,#fff);--_fg:var(--pele-fg,#1f1f1f);--_m:var(--pele-muted,#6e6e6e);--_l:var(--pele-line,#1f1f1f);--_s:var(--pele-surface,#f3f3f3);--_a:var(--pele-surface-alt,#e6e6e6);--_b:var(--pele-border,#8a8a8a);--_c:var(--pele-accent,#5b7bd5);color:var(--_fg);--_r:var(--pele-radius,4px);--_hw:var(--pele-heading-weight,bold);--_fm:var(--pele-font-mono,monospace);font:14px sans-serif;letter-spacing:normal;word-spacing:normal;text-transform:none;direction:ltr;font-family:var(--pele-font,sans-serif)";
+  const {unsupported, encode, themeOnce} = window.TrellisPeleSvg;
+  const ROOT_STYLE = window.TrellisPeleSvg.rootStyle(14, {heading:true});
   const tags = new Set(["svg", "g", "path", "rect", "text", "tspan"]);
   const attrs = new Set(["xmlns", "class", "viewBox", "width", "height", "fill", "role", "aria-roledescription", "transform", "stroke", "font-size", "data-id", "d", "x", "y", "rx", "text-anchor", "font-weight", "xml:space"]);
   // Bounds match the card view: 24 classes and 200 members per compartment.
   // Pele itself rejects sources over 50,000 characters.
   const MAX_CLASSES = 24, MAX_MEMBERS = 200, MAX_SOURCE = 50000, LABEL = 60, MEMBER = 96;
-  function unsupported(reason) { const error = new Error(reason); error.code = "unsupported"; throw error; }
-  // Pele decodes numeric entities into SVG text. Escape everything outside a
-  // small literal alphabet so repository text cannot become Mermaid grammar.
-  const encode = value => Array.from(String(value)).map(c => /[A-Za-z0-9 ._-]/.test(c) ? c : `#${c.codePointAt(0)};`).join("");
+  const ADMISSION = {kind:"class", mark:true, theme:raw => themeOnce(raw, ROOT_STYLE), active:/<\/?(?:script|foreignObject|image|a)\b/i, tags, attrs, words:{
+    large:"Class SVG output too large", root:"Changed Pele class root/theme", theme:"Changed Pele class root/theme", style:"Unexpected inline class style",
+    active:"Unexpected class SVG element", invalid:"Invalid class SVG", element:"Unexpected class SVG element", attribute:"Unexpected class SVG attribute"}};
   // Display text only: control characters and whitespace runs become one space.
   const tidy = value => String(value).replace(/[\u0000-\u001f\u007f\s]+/g, " ").trim();
   const clip = (value, max) => { const chars = Array.from(value); return chars.length > max ? chars.slice(0, max - 1).join("") + "…" : value; };
@@ -72,22 +71,7 @@
     return new Set(open);
   }
   function validatedSvg(raw, projection) {
-    if (typeof raw !== "string" || new TextEncoder().encode(raw).length > 8 * 1024 * 1024) unsupported("Class SVG output too large");
-    const start = /^<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg" class="pele pele-class"/;
-    const signature = ` style="${ROOT_STYLE}"`;
-    if (!start.test(raw) || raw.split(signature).length !== 2) unsupported("Changed Pele class root/theme");
-    const safe = raw.replace(signature, "").replace(start, '<svg xmlns="http://www.w3.org/2000/svg" class="pele pele-class trellis-pele"')
-      .replaceAll(' style="rx:var(--_r)"', ' rx="var(--_r)"');
-    if (/\sstyle\s*=|<style\b/i.test(safe)) unsupported("Unexpected inline class style");
-    // Reject active/resource markup before DOM parsing.
-    if (/<\/?(?:script|foreignObject|image|a)\b/i.test(safe)) unsupported("Unexpected class SVG element");
-    const root = new DOMParser().parseFromString(safe, "image/svg+xml").documentElement;
-    if (root.localName !== "svg" || root.namespaceURI !== SVG_NS || root.querySelector("parsererror")) unsupported("Invalid class SVG");
-    let count = 0;
-    for (const node of [root, ...root.querySelectorAll("*")]) {
-      if (++count > 12000 || node.namespaceURI !== SVG_NS || !tags.has(node.localName)) unsupported("Unexpected class SVG element");
-      for (const a of node.attributes) if (!attrs.has(a.name) || /url\s*\(|javascript:|<|>|[\u0000-\u001f]/i.test(a.value)) unsupported("Unexpected class SVG attribute");
-    }
+    const {root} = window.TrellisPeleSvg.admit(raw, ADMISSION);
     const groups = [...root.querySelectorAll(".pele-node")];
     if (groups.length !== projection.classes.length || root.querySelectorAll("[data-id]").length !== projection.classes.length ||
         root.querySelectorAll(".pele-edge, .pele-edge-label, .pele-cluster, .pele-note, .pele-note-edge").length) unsupported("Missing, extra or related Pele class node");
@@ -147,8 +131,9 @@
   const APP_PAGES = 10;
   const WIDTH = 300, HEIGHT = 116, OPEN_HEIGHT = 390, STEP_X = 520;
   let api, ui, serial = 0, searchSerial = 0, seed = null, expanded = [], diagram = null;
-  let positions = new Map(), cards = new Map(), stage = null, menu = null, menuAnchor = null, warningBox = null;
-  let menuContext = null, menuExpanded = null, menuOnClose = null, menuScroll = new Map();
+  let positions = new Map(), cards = new Map(), stage = null, warningBox = null;
+  // The shared context menu (context-menu.js). This controller is its host: see init.
+  const {showContextMenu, closeContextMenu} = window.TrellisContextMenu;
   let bound = false, snapshot = null, diagramGeneration = 0, displayTicket = 0;
   // membersOpen is what the current render shows; memberChoices holds the reader's toggles.
   let controls, changeButton, allButton, chooser = null, showAll = false, membersOpen = new Set(), memberChoices = new Map();
@@ -207,76 +192,10 @@
     if (warnings.length > 50) list.append(el("li", `${warnings.length - 50} more notices omitted from this summary.`));
     warningBox.append(list);
   }
-  function closeContextMenu(restore = true, reason = "dismiss") {
-    const closing = menu, anchor = menuAnchor, expanded = menuExpanded, onClose = menuOnClose;
-    // Clear ownership before DOM, callbacks or focus can re-enter dismissal.
-    menu = menuAnchor = menuContext = menuOnClose = null; menuExpanded = null; menuScroll.clear();
-    if (closing) closing.remove();
-    if (anchor) { if (expanded === null) anchor.removeAttribute("aria-expanded"); else anchor.setAttribute("aria-expanded", expanded); }
-    if (onClose) onClose(reason);
-    if (restore && !menu && anchor && anchor.isConnected) anchor.focus({preventScroll: true});
-  }
   async function invoke(run, c) {
     if (!valid(c)) { closeContextMenu(false); return; }
     try { await run(); }
     catch (error) { if (valid(c) && error.name !== "AbortError") state(error.message || "Action unavailable.", "error"); }
-  }
-  // Public menu actions: [{label: string, run: () => void|Promise, disabled?: boolean}].
-  // The event's currentTarget is the focus-return anchor. Root must reset on session/revision changes.
-  // Optional onClose(reason): "dismiss", "replace" or "action"; called once.
-  // The returned handle can dismiss only the menu created by this call.
-  function showContextMenu(event, actions, options = {}) {
-    event.preventDefault(); event.stopPropagation();
-    closeContextMenu(false, "replace");
-    menuAnchor = event.currentTarget || event.target || document.activeElement;
-    menuExpanded = menuAnchor.getAttribute("aria-expanded");
-    // A queued scroll event from bringing the trigger into view must not close
-    // the newly opened menu. Actual subsequent scrolling still dismisses it.
-    for (let ancestor = menuAnchor, depth = 0; ancestor && depth < 64; ancestor = ancestor.parentNode, depth++) {
-      if (typeof ancestor.scrollTop === "number" && typeof ancestor.scrollLeft === "number") {
-        menuScroll.set(ancestor, [ancestor.scrollTop, ancestor.scrollLeft]);
-      }
-    }
-    menuContext = context();
-    const c = menuContext;
-    menu = el("div", undefined, "classes-context-menu");
-    const createdMenu = menu;
-    menuOnClose = typeof options.onClose === "function" ? options.onClose : null;
-    menu.setAttribute("role", "menu"); menu.setAttribute("aria-label", options.label || "Class actions");
-    menuAnchor.setAttribute("aria-expanded", "true");
-    const buttons = [];
-    for (const action of actions) {
-      const item = el("button", action.label);
-      item.type = "button"; item.setAttribute("role", "menuitem"); item.tabIndex = -1;
-      item.disabled = !!action.disabled;
-      item.addEventListener("click", () => {
-        if (menu !== createdMenu) return;
-        closeContextMenu(true, "action"); return invoke(action.run, c);
-      });
-      menu.append(item); if (!item.disabled) buttons.push(item);
-    }
-    menu.addEventListener("keydown", event => {
-      if (menu !== createdMenu) return;
-      if (!valid(c)) { closeContextMenu(false); return; }
-      if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); closeContextMenu(); return; }
-      if (event.key === "Tab") { closeContextMenu(); return; }
-      const index = buttons.indexOf(document.activeElement);
-      let next;
-      if (event.key === "ArrowDown") next = (index + 1) % buttons.length;
-      if (event.key === "ArrowUp") next = (index - 1 + buttons.length) % buttons.length;
-      if (event.key === "Home") next = 0;
-      if (event.key === "End") next = buttons.length - 1;
-      if (next !== undefined && buttons[next]) { event.preventDefault(); event.stopPropagation(); buttons[next].focus(); }
-    });
-    document.body.append(menu);
-    const rect = menuAnchor.getBoundingClientRect();
-    const keyboard = event.type === "keydown" || (!event.clientX && !event.clientY);
-    const x = keyboard ? rect.left : event.clientX, y = keyboard ? rect.bottom : event.clientY;
-    const bounds = menu.getBoundingClientRect();
-    menu.style.left = `${Math.max(8, Math.min(x, window.innerWidth - bounds.width - 8))}px`;
-    menu.style.top = `${Math.max(8, Math.min(y, window.innerHeight - bounds.height - 8))}px`;
-    if (buttons[0]) buttons[0].focus({preventScroll: true});
-    return {close: () => { if (menu === createdMenu) closeContextMenu(); }};
   }
   function listenMenu(node, actions) {
     node.setAttribute("aria-haspopup", "menu");
@@ -324,15 +243,7 @@
         if (event.key === "Enter") { event.preventDefault(); lookup({q: ui.query.value.trim()}); }
       });
       ui.unmatched?.addEventListener("change", () => { if (seed) return loadDiagram(seed, expanded); });
-      document.addEventListener("pointerdown", event => { if (menu && !menu.contains(event.target)) closeContextMenu(false); }, true);
-      document.addEventListener("focusin", event => { if (menu && (!valid(menuContext) || !menu.contains(event.target))) closeContextMenu(false); });
-      document.addEventListener("scroll", event => {
-        if (!menu || menu.contains(event.target)) return;
-        const previous = menuScroll.get(event.target);
-        if (!previous || (previous[0] === event.target.scrollTop && previous[1] === event.target.scrollLeft)) return;
-        closeContextMenu();
-      }, true);
-      window.addEventListener("resize", () => closeContextMenu());
+      window.TrellisContextMenu.bind({context, valid, invoke});
     }
     reset();
   }
@@ -706,5 +617,5 @@
   }
   // Reads the shown search or diagram again, as its own action would (stall recovery, #906).
   function retry() { return lastRead?.(); }
-  window.TrellisClasses = Object.freeze({init, open, reset, retry, showContextMenu, closeContextMenu, scopeChanged});
+  window.TrellisClasses = Object.freeze({init, open, reset, retry, scopeChanged});
 })();

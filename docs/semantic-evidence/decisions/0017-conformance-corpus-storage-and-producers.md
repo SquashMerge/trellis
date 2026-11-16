@@ -130,3 +130,15 @@ A rust-analyzer re-pin now records every target. `scip-java`'s launcher hash sta
 
 1. A TypeScript corpus may start as `profile:"draft"` with source, production native captures and annotations, as decision 3 allows for JavaScript. Semantic captures and outcome answers wait for corpus certification.
 2. TypeScript floors equal JavaScript's: ambiguous 20, unresolved 20, type relationships 20, unsupported documents 0, alias role required.
+
+## Amendment 8 (2026-11-15): a run records the version its verified binary reports
+
+- **Status:** ratified by the owner, 2026-11-15 ([#1126](https://github.com/SquashMerge/trellis/issues/1126)).
+- **Amends:** Amendment 6, item 2.
+
+Amendment 6 pinned one rust-analyzer hash for each target but kept one version text, the one the `aarch64-apple-darwin` binary reports. A binary pinned for another target can report a different text for the same release, and the artifact it writes carries that text in `ToolInfo.version`. Its hash verified, and its batch was then refused as `invalid_artifact: tool binding`.
+
+1. **Recorded version.** When Trellis runs a producer whose executable it verified against the pinned hash (`producerExecutable` is observed: rust-analyzer and scip-java), the descriptor's `producer.version` is the `ToolInfo.version` of the artifact that executable wrote, or the pin's `version` when the artifact carries none. The descriptor and the artifact agree by construction.
+2. **The pin is unchanged.** The executable hash stays the qualification gate, and the profile's shape and values do not change. The entry's `version` stays the reference host's capture: it names the toolchain to run, and it is the version of every batch item 1 does not cover.
+3. **Admission.** For a descriptor of item 1, every `producer` field except `version` must equal the pin exactly, the hash being the host target's; `version` must be non-empty. Every other descriptor (an external batch, an owner pickup, a run verified another way) must still equal the pin in every field. The artifact check of tool name and version against the descriptor is unchanged for every batch.
+4. **Reference host.** On `aarch64-apple-darwin` the binary reports the pin's text, so a run writes the same descriptor as before.

@@ -3,7 +3,7 @@
 //! Counts requested Rust storage, not allocator/RSS or tree-sitter C memory. The model sums
 //! fetch, decoder scratch and returned owners conservatively, even when phases do not overlap.
 use super::{ReadRevision, SelectedIntegrity, V8NativeScope, v8_native_scope_for};
-use crate::{native_evidence as n, scip_raw::ScipCaptureError};
+use crate::{native_records as n, scip_raw::ScipCaptureError};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::mem::size_of;

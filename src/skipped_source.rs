@@ -89,8 +89,8 @@ mod tests {
             "rust" => vec![tree_sitter_rust::LANGUAGE.into()],
             "python" => vec![tree_sitter_python::LANGUAGE.into()],
             "typescript" => vec![
-                crate::indexer_ts::grammar("a.ts"),
-                crate::indexer_ts::grammar("a.tsx"),
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+                tree_sitter_typescript::LANGUAGE_TSX.into(),
             ],
             _ => vec![tree_sitter_javascript::LANGUAGE.into()],
         }

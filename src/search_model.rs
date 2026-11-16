@@ -14,41 +14,7 @@ use crate::search_embed::{
     SearchEmbedderFactory, backend_available, model_id_for_card_format, supported_model_name,
 };
 
-/// Opt-in diagnostics for a quiet search query; never reads the clock when disabled.
-pub(crate) fn profiling_enabled() -> bool {
-    tracing::enabled!(target: "trellis::search_profile", tracing::Level::DEBUG)
-}
-
-pub(crate) struct SearchPhaseTimer {
-    phase: &'static str,
-    started: Option<std::time::Instant>,
-}
-
-impl SearchPhaseTimer {
-    pub(crate) fn start(phase: &'static str) -> Self {
-        Self {
-            phase,
-            started: profiling_enabled().then(std::time::Instant::now),
-        }
-    }
-
-    pub(crate) fn record(phase: &'static str, elapsed: std::time::Duration) {
-        tracing::debug!(
-            target: "trellis::search_profile",
-            phase,
-            elapsed_us = elapsed.as_micros(),
-            "search phase"
-        );
-    }
-}
-
-impl Drop for SearchPhaseTimer {
-    fn drop(&mut self) {
-        if let Some(started) = self.started {
-            Self::record(self.phase, started.elapsed());
-        }
-    }
-}
+pub(crate) use crate::search_vocab::{SearchPhaseTimer, profiling_enabled};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum BackendPreference {

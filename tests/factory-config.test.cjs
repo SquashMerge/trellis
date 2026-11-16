@@ -1,5 +1,5 @@
 const assert = require("node:assert/strict");
-const { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } = require("node:fs");
+const { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } = require("node:fs");
 const { tmpdir } = require("node:os");
 const { delimiter, dirname, join, resolve: resolvePath } = require("node:path");
 const { spawnSync } = require("node:child_process");
@@ -107,6 +107,115 @@ test("verify setup rejects symlinked and writable external caches", () => {
   }
 });
 
+// #1014: one browser download per checkout filled the disk; checkouts share one cache.
+const verifyEnv = () => import(require("node:url").pathToFileURL(join(ROOT, "tools/verify-env.mjs")).href);
+
+test("verify setup gives every checkout the same browser and npm cache", async () => {
+  const { cacheLayout } = await verifyEnv();
+  const one = cacheLayout("/work/trellis-1", {}, "/tmp/t", 501);
+  const two = cacheLayout("/work/trellis-2", {}, "/tmp/t", 501);
+  assert.equal(one.browsers, "/tmp/t/trellis-verify/playwright-browsers");
+  assert.equal(two.browsers, one.browsers);
+  assert.equal(two.npmCache, one.npmCache);
+  assert.equal(one.npmCache, "/tmp/t/trellis-verify/npm-cache");
+  assert.notEqual(two.legacyEntry, one.legacyEntry);
+});
+
+test("verify setup keeps an explicit browser path and run cache", async () => {
+  const { cacheLayout } = await verifyEnv();
+  const ci = cacheLayout("/work/trellis", { PLAYWRIGHT_BROWSERS_PATH: "/runner/pw-browsers" }, "/tmp/t", 501);
+  assert.equal(ci.browsers, "/runner/pw-browsers");
+  assert.equal(ci.npmCache, "/tmp/t/trellis-verify/npm-cache");
+  const pinned = cacheLayout("/work/trellis", { TRELLIS_RUN_CACHE: "/caches/run" }, "/tmp/t", 501);
+  assert.equal(pinned.browsers, "/caches/run/playwright-browsers");
+  assert.equal(pinned.npmCache, "/caches/run/npm-cache");
+  const both = cacheLayout("/work/trellis", { TRELLIS_RUN_CACHE: "/caches/run", PLAYWRIGHT_BROWSERS_PATH: "/runner/pw-browsers" }, "/tmp/t", 501);
+  assert.equal(both.browsers, "/runner/pw-browsers");
+});
+
+test("verify setup removes old per-checkout caches that are its own or idle, and nothing else", async () => {
+  const { LEGACY_IDLE_MS, cacheLayout, pruneLegacyEntries } = await verifyEnv();
+  const temp = mkdtempSync(join(tmpdir(), "trellis-verify-layout-"));
+  try {
+    const layout = cacheLayout("/work/trellis-1", {}, temp, 501);
+    const now = Date.now();
+    const old = new Date(now - LEGACY_IDLE_MS - 60_000);
+    const entry = (name, { idle, browserIdle = idle }) => {
+      const browsers = join(layout.parent, name, "playwright-browsers");
+      mkdirSync(join(browsers, "chromium-1"), { recursive: true });
+      writeFileSync(join(browsers, "chromium-1", "chrome"), "");
+      if (browserIdle) utimesSync(browsers, old, old);
+      if (idle) utimesSync(join(layout.parent, name), old, old);
+    };
+    entry(layout.legacyEntry, { idle: false });
+    entry("a".repeat(24), { idle: true });
+    entry("b".repeat(24), { idle: false });
+    // A running old-layout verify touches only its browser directory.
+    entry("c".repeat(24), { idle: true, browserIdle: false });
+    // Not old-layout names: the shared caches and anything else are left alone.
+    entry("d".repeat(23), { idle: true });
+    entry("playwright-browsers", { idle: true });
+    writeFileSync(join(layout.parent, "e".repeat(24)), "");
+    utimesSync(join(layout.parent, "e".repeat(24)), old, old);
+
+    assert.deepEqual(pruneLegacyEntries(layout.parent, layout.legacyEntry, [], now).sort(), [layout.legacyEntry, "a".repeat(24)].sort());
+    assert.deepEqual(readdirSync(layout.parent).sort(), ["b".repeat(24), "c".repeat(24), "d".repeat(23), "e".repeat(24), "playwright-browsers"].sort());
+    assert.deepEqual(pruneLegacyEntries(join(temp, "missing"), layout.legacyEntry, [], now), []);
+
+    // An installer's lock in the browser directory keeps an otherwise idle entry,
+    // and this checkout's own; a lock left by a crash long ago does not.
+    const locked = (name, lockIdle) => {
+      entry(name, { idle: true });
+      const browsers = join(layout.parent, name, "playwright-browsers");
+      mkdirSync(join(browsers, "__dirlock"));
+      if (lockIdle) utimesSync(join(browsers, "__dirlock"), old, old);
+      utimesSync(browsers, old, old);
+    };
+    locked(layout.legacyEntry, false);
+    locked("f".repeat(24), false);
+    locked("0".repeat(24), true);
+    assert.deepEqual(pruneLegacyEntries(layout.parent, layout.legacyEntry, [], now), ["0".repeat(24)]);
+    assert.equal(existsSync(join(layout.parent, layout.legacyEntry)), true);
+    assert.equal(existsSync(join(layout.parent, "f".repeat(24))), true);
+  } finally {
+    rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test("verify setup never removes an old per-checkout cache that holds a directory this run selected", async () => {
+  const { LEGACY_IDLE_MS, cacheLayout, pruneLegacyEntries } = await verifyEnv();
+  const temp = mkdtempSync(join(tmpdir(), "trellis-verify-selected-"));
+  try {
+    const layout = cacheLayout("/work/trellis-1", {}, temp, 501);
+    const now = Date.now();
+    const old = new Date(now - LEGACY_IDLE_MS - 60_000);
+    const other = "a".repeat(24);
+    const idle = "b".repeat(24);
+    for (const name of [layout.legacyEntry, other, idle]) {
+      const browsers = join(layout.parent, name, "playwright-browsers");
+      mkdirSync(join(browsers, "chromium-1"), { recursive: true });
+      utimesSync(browsers, old, old);
+      utimesSync(join(layout.parent, name), old, old);
+    }
+    // The explicit paths are spelled through a symlink to the parent; they are still the same directories.
+    const alias = join(temp, "alias");
+    symlinkSync(layout.parent, alias, "dir");
+    const explicit = (name) => cacheLayout("/work/trellis-1", { PLAYWRIGHT_BROWSERS_PATH: join(alias, name, "playwright-browsers") }, temp, 501).browsers;
+
+    // Inside this checkout's own old entry: kept, while the unrelated idle entries go.
+    assert.deepEqual(pruneLegacyEntries(layout.parent, layout.legacyEntry, [explicit(layout.legacyEntry)], now).sort(), [other, idle].sort());
+    assert.equal(existsSync(join(layout.parent, layout.legacyEntry, "playwright-browsers", "chromium-1")), true);
+
+    // Inside another checkout's idle entry, or the entry itself: kept.
+    for (const name of [other, idle]) mkdirSync(join(layout.parent, name, "playwright-browsers"), { recursive: true });
+    for (const name of [other, idle]) for (const path of [join(layout.parent, name, "playwright-browsers"), join(layout.parent, name)]) utimesSync(path, old, old);
+    assert.deepEqual(pruneLegacyEntries(layout.parent, layout.legacyEntry, [explicit(other), join(alias, idle)], now), [layout.legacyEntry]);
+    assert.deepEqual(readdirSync(layout.parent).sort(), [other, idle].sort());
+  } finally {
+    rmSync(temp, { recursive: true, force: true });
+  }
+});
+
 test("resolver accepts only canonical Trellis issue references", () => {
   const config = loadConfig();
   const fakeDir = makeFakeGh();
@@ -158,10 +267,11 @@ test("recognized issue lookup failures remain failures", () => {
   }
 });
 
-// verify skips apt only when this helper proves Chromium's libraries resolve;
-// any library ldd cannot inspect must send verify back to apt.
+// verify skips apt only when this helper proves Chromium's libraries resolve
+// and the font the layout tests measure in is installed; any library ldd
+// cannot inspect, or a missing or uncheckable font, must send verify back to apt.
 const BROWSER_PACKAGES = join(ROOT, "tests/browser/node_modules/playwright-core");
-test("browser library check fails when ldd cannot inspect a bundled library", { skip: !existsSync(BROWSER_PACKAGES) && "tests/browser packages are not installed" }, () => {
+test("browser library check fails when ldd cannot inspect a bundled library or the layout font is absent", { skip: !existsSync(BROWSER_PACKAGES) && "tests/browser packages are not installed" }, () => {
   const fakeDir = mkdtempSync(join(tmpdir(), "trellis-browser-libs-"));
   try {
     const browsers = join(fakeDir, "browsers");
@@ -188,15 +298,40 @@ if [ "$FAKE_LDD" = spawn ]; then /bin/rm -f "$0"; fi
 `);
       chmodSync(ldd, 0o755);
     };
-    const check = (mode) => {
+    // The fake fontconfig lists one family per line, as `fc-list : family` does.
+    const fcList = join(fakeDir, "bin", "fc-list");
+    const installFonts = () => {
+      writeFileSync(fcList, `#!/bin/sh
+if [ "$FAKE_FONTS" = fail ]; then exit 1; fi
+echo "DejaVu Sans Mono"
+if [ "$FAKE_FONTS" != missing ]; then echo "Liberation Sans Narrow"; echo "Liberation Sans,Liberation Sans Regular"; fi
+`);
+      chmodSync(fcList, 0o755);
+      writeFileSync(join(fakeDir, "bin", "fc-match"), "#!/bin/sh\necho 'DejaVu Sans Mono'\n");
+      chmodSync(join(fakeDir, "bin", "fc-match"), 0o755);
+    };
+    const check = (mode, fonts = "ok") => {
       install();
+      if (fonts === "absent") rmSync(fcList, { force: true });
+      else installFonts();
       return spawnSync(process.execPath, ["tools/verify-browser-libs.mjs"], {
-        cwd: ROOT, encoding: "utf8", env: { ...env, PATH: dirname(ldd), FAKE_LDD: mode },
+        cwd: ROOT, encoding: "utf8", env: { ...env, PATH: dirname(ldd), FAKE_LDD: mode, FAKE_FONTS: fonts },
       });
     };
     const resolved = check("ok");
     assert.equal(resolved.status, 0, resolved.stdout + resolved.stderr);
     assert.match(resolved.stdout, /every shared library resolves/);
+    assert.match(resolved.stdout, /^verify browser libraries: font Liberation Sans is installed$/m);
+    // Libraries present but the font is not (#1010): verify must take the apt route.
+    const noFont = check("ok", "missing");
+    assert.equal(noFont.status, 1, noFont.stdout + noFont.stderr);
+    assert.match(noFont.stdout, /every shared library resolves/);
+    assert.match(noFont.stdout, /^verify browser libraries: missing font Liberation Sans \(sans-serif resolves to DejaVu Sans Mono\)$/m);
+    for (const fonts of ["fail", "absent"]) {
+      const unchecked = check("ok", fonts);
+      assert.equal(unchecked.status, 1, `${fonts}: ${unchecked.stdout}${unchecked.stderr}`);
+      assert.match(unchecked.stdout, /cannot check \(fc-list could not list the installed fonts\)/, fonts);
+    }
     for (const mode of ["nonzero", "spawn"]) {
       const failed = check(mode);
       assert.equal(failed.status, 1, `${mode}: ${failed.stdout}${failed.stderr}`);
@@ -293,6 +428,7 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
       checks: [
         ["python3", "tools/flaky-patterns-test.py"],
         ["python3", "tools/flaky-patterns.py"],
+        ["python3", "tools/rules-ratchet-test.py"],
         ["node", "--test", "tests/mcp-catalog-sdk.test.mjs", "tests/mcp-smoke.test.mjs"],
         ["python3", "tools/stage3-watcher-runner-test.py"],
         ["python3", "tools/verify-67-mixed-performance-test.py"],
@@ -303,11 +439,33 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
         ["node", "--test", "tests/factory-config.test.cjs"],
         ["node", "docs/semantic-evidence/check-policy.mjs", "--self-test"],
         ["node", "--check", "web/app.js"],
+        ["node", "--check", "web/app-state.js"],
+        ["node", "--check", "web/app-api.js"],
+        ["node", "--check", "web/app-agent.js"],
+        ["node", "--check", "web/app-navigation.js"],
+        ["node", "--check", "web/app-status.js"],
+        ["node", "--check", "web/app-source.js"],
+        ["node", "--check", "web/app-files.js"],
+        ["node", "--check", "web/app-tree.js"],
+        ["node", "--check", "web/app-sequence.js"],
+        ["node", "--check", "web/app-libraries.js"],
+        ["node", "--check", "web/app-views.js"],
+        ["node", "--check", "web/index-pin.js"],
+        ["node", "--check", "web/source-witness.js"],
+        ["node", "--check", "web/context-menu.js"],
+        ["node", "--check", "web/pele-svg.js"],
         ["node", "--check", "web/architecture-apps.js"],
+        ["node", "--check", "web/architecture-display.js"],
+        ["node", "--check", "web/deviations-model.js"],
+        ["node", "--check", "web/sequence-model.js"],
+        ["node", "--check", "web/architecture-routing.js"],
         ["node", "--import", "./herdr-mod/test/register.mjs", "--test", "herdr-mod/test/mod.test.mjs", "herdr-mod/test/view.test.mjs", "herdr-mod/test/parity.test.mjs", "herdr-mod/test/setup.test.mjs"],
-        ["node", "--test", "tests/browse-ui.test.cjs", "tests/sequence-ui.test.cjs", "tests/token-ui.test.cjs", "tests/external-source-ui.test.cjs", "tests/dependency-ui.test.cjs", "tests/shell-ui.test.cjs", "tests/classes-ui.test.cjs", "tests/navigation-ui.test.cjs", "tests/metric-heat.test.cjs", "tests/viewer-metrics-ui.test.cjs", "tests/files-ui.test.cjs", "tests/architecture-ui.test.cjs", "tests/architecture-pele-ui.test.cjs", "tests/treemap-ui.test.cjs", "tests/treemap-pele.test.cjs", "tests/architecture-apps-ui.test.cjs", "tests/app-switcher-ui.test.cjs"],
+        ["node", "--test", "tests/browse-ui.test.cjs", "tests/sequence-ui.test.cjs", "tests/token-ui.test.cjs", "tests/external-source-ui.test.cjs", "tests/dependency-ui.test.cjs", "tests/shell-ui.test.cjs", "tests/classes-ui.test.cjs", "tests/navigation-ui.test.cjs", "tests/metric-heat.test.cjs", "tests/viewer-metrics-ui.test.cjs", "tests/files-ui.test.cjs", "tests/architecture-ui.test.cjs", "tests/architecture-pele-ui.test.cjs", "tests/treemap-ui.test.cjs", "tests/treemap-pele.test.cjs", "tests/architecture-apps-ui.test.cjs", "tests/app-switcher-ui.test.cjs", "tests/architecture-routing.test.cjs"],
       ],
     };
+    // The rules-check ratchet (#1008) builds and measures inside its one command.
+    // It is not a default lane: it runs only when named.
+    const ratchet = [["python3", "tools/rules-ratchet.py"]];
     function assertRan(commands, expected) {
       const key = (command) => JSON.stringify(command);
       assert.deepEqual(commands.map(key).sort(), Object.values(expected).flat().map(key).sort());
@@ -324,16 +482,26 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
     const success = runVerify();
     assert.equal(success.result.status, 0, success.output);
     assertRan(success.commands, lanes);
+    assert.doesNotMatch(success.output, /verify lane ratchet/);
+    rmSync(log);
+    const ratchetOnly = runVerify({}, undefined, ["--lane", "ratchet"]);
+    assert.equal(ratchetOnly.result.status, 0, ratchetOnly.output);
+    assertRan(ratchetOnly.commands, { setup: lanes.setup, ratchet });
+    assert.match(ratchetOnly.output, /==> verify lane ratchet \(exit 0\)/);
+    rmSync(log);
+    const withRatchet = runVerify({}, undefined, ["--lane", "checks", "--lane", "ratchet"]);
+    assert.equal(withRatchet.result.status, 0, withRatchet.output);
+    assertRan(withRatchet.commands, { setup: lanes.setup, checks: lanes.checks, ratchet });
     rmSync(log);
     // With TRELLIS_BROWSER_SYSTEM_DEPS set, the system packages are checked
-    // and, only if a library is missing, installed in the background; the
+    // and, only if a library or the layout font is missing, installed in the background; the
     // browser suite runs only after that succeeds (#244).
     const libs = ["node", "tools/verify-browser-libs.mjs"];
     const deps = ["node", "tests/browser/node_modules/playwright/cli.js", "install-deps", "chromium"];
     const present = runVerify({ TRELLIS_BROWSER_SYSTEM_DEPS: "1" });
     assert.equal(present.result.status, 0, present.output);
     assertRan(present.commands, { ...lanes, deps: [libs] });
-    assert.match(present.result.stdout, /^verify: Chromium's shared libraries all resolve; skipped the system package install \(no apt\)/m);
+    assert.match(present.result.stdout, /^verify: Chromium's shared libraries all resolve and its layout font is installed; skipped the system package install \(no apt\)/m);
     rmSync(log);
     const withDeps = runVerify({ TRELLIS_BROWSER_SYSTEM_DEPS: "1", FAKE_VERIFY_MISSING_LIBS: "1" });
     assert.equal(withDeps.result.status, 0, withDeps.output);
@@ -404,7 +572,7 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
     assert.equal(testsOnly.result.status, 0, testsOnly.output);
     // No browser suite, so no system package install.
     assertRan(testsOnly.commands, { setup: lanes.setup, tests: lanes.tests });
-    assert.doesNotMatch(testsOnly.output, /==> verify lane (rust|semantic|cohorts|checks)/);
+    assert.doesNotMatch(testsOnly.output, /==> verify lane (rust|semantic|cohorts|checks|ratchet)/);
     rmSync(log);
     const split = runVerify({}, undefined, ["--lane", "lint", "--lane=semantic", "--lane", "cohorts", "--lane", "checks"]);
     assert.equal(split.result.status, 0, split.output);
@@ -428,6 +596,20 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
   } finally {
     rmSync(fakeDir, { recursive: true, force: true });
   }
+});
+
+// Owner ruling 8 on #1008: the rules-check ratchet is not in PR CI. It is not a
+// default verify lane, so a pull-request workflow runs it only by naming it.
+test("no pull-request workflow runs the ratchet lane", () => {
+  const directory = join(ROOT, ".github/workflows");
+  const triggered = [];
+  for (const name of readdirSync(directory).filter((file) => /\.ya?ml$/.test(file))) {
+    const lines = readFileSync(join(directory, name), "utf8").split("\n").filter((line) => !/^\s*#/.test(line));
+    if (!lines.some((line) => /^\s*pull_request(_target)?:/.test(line))) continue;
+    triggered.push(name);
+    assert.ok(!lines.some((line) => /\bratchet\b/.test(line)), `${name} names the ratchet lane`);
+  }
+  assert.deepEqual(triggered, ["release-candidates.yml", "rust.yml"]);
 });
 
 test("verify cancellation rechecks recorded identities after descending, without PID fallback", () => {

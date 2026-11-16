@@ -17,7 +17,7 @@
 //!
 //! `--sleep-forever` is the descendant mode used by `tree`.
 
-#[path = "../producer/process_info.rs"]
+#[path = "../process_info.rs"]
 #[allow(dead_code)]
 mod process_info;
 

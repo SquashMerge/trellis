@@ -274,25 +274,7 @@ fn bind(
         let owned_regions = regions_by_owner
             .get(d.syntax_id.as_str())
             .map_or(&[][..], Vec::as_slice);
-        metrics.max_nesting = owned_regions
-            .iter()
-            .map(|r| {
-                let mut depth = 1;
-                let mut parent = r.parent_id.as_deref();
-                while let Some(id) = parent {
-                    depth += 1;
-                    parent = owned_regions
-                        .iter()
-                        .find(|other| other.id == id)
-                        .and_then(|other| other.parent_id.as_deref());
-                    if depth > regions.len() {
-                        break;
-                    }
-                }
-                depth
-            })
-            .max()
-            .unwrap_or(0);
+        metrics.max_nesting = max_nesting(source, &d.document.language, owned_regions);
         metrics.parameters = d.header.parameters.len();
         rows.push(DeclarationMetrics {
             role: d.role,
@@ -307,6 +289,94 @@ fn bind(
         });
     }
     Ok(rows)
+}
+/// The deepest of one callable's stored control regions, counting the levels on each
+/// region's parent chain (#987). An arm is as deep as its statement and an `else if` as deep
+/// as the first `if` of its chain, so neither is a level.
+///
+/// An arm is level with its statement only when that statement is the stored region above
+/// it, which then supplies the level. Java's `try (resource)` is not stored, so its `catch`
+/// and `finally` keep theirs. It is the only statement of the five grammars that owns a
+/// stored arm kind without being stored itself.
+fn max_nesting(source: &str, language: &str, owned: &[&ControlRegion]) -> usize {
+    let by_id: HashMap<&str, &ControlRegion> = owned.iter().map(|r| (r.id.as_str(), *r)).collect();
+    let parent_of =
+        |r: &ControlRegion| r.parent_id.as_deref().and_then(|id| by_id.get(id).copied());
+    // The `catch` and `finally` of a stored `try` run to its end, one after the other. Those
+    // of a `try (resource)` directly in its body end before the `}` that closes that body.
+    let closes = |arm: &ControlRegion, statement: &ControlRegion| {
+        let mut end = arm.range.end;
+        for _ in 0..owned.len() {
+            if end == statement.range.end {
+                return true;
+            }
+            let next = owned
+                .iter()
+                .filter(|r| {
+                    matches!(r.kind.as_str(), "catch_clause" | "finally_clause")
+                        && r.parent_id.as_deref() == Some(statement.id.as_str())
+                        && r.range.start >= end
+                })
+                .min_by_key(|r| r.range.start);
+            match next {
+                Some(next)
+                    if source
+                        .get(end..next.range.start)
+                        .is_some_and(|gap| !gap.contains('}')) =>
+                {
+                    end = next.range.end;
+                }
+                _ => return false,
+            }
+        }
+        false
+    };
+    let level = |r: &ControlRegion| {
+        let parent = parent_of(r);
+        let parent_kind = parent.map_or("", |parent| parent.kind.as_str());
+        let arm = match r.kind.as_str() {
+            "else_clause" | "elif_clause" => matches!(
+                parent_kind,
+                "if_statement"
+                    | "if_expression"
+                    | "for_statement"
+                    | "while_statement"
+                    | "try_statement"
+            ),
+            "switch_case" | "switch_default" => parent_kind == "switch_statement",
+            "catch_clause" | "finally_clause" => {
+                parent_kind == "try_statement" && parent.is_some_and(|parent| closes(r, parent))
+            }
+            _ => false,
+        };
+        if arm {
+            return false;
+        }
+        // The `if` of an `else if` ends where its parent does and follows the `else`: under
+        // an `else_clause`, or directly under the first `if` in Java, which stores no clause.
+        // An `if` in an `else` block ends before the block does, and an unbraced `if (a) if (b)`
+        // follows a `)`. Python spells the continuation `elif`, and its `else:` block has no
+        // closing token, so an `if` ending it would look like one.
+        let continuation = language != "python"
+            && matches!(r.kind.as_str(), "if_statement" | "if_expression")
+            && matches!(parent_kind, "else_clause" | "if_statement")
+            && parent.is_some_and(|parent| parent.range.end == r.range.end)
+            && source
+                .get(..r.range.start)
+                .is_some_and(|before| before.trim_end().ends_with("else"));
+        !continuation
+    };
+    owned
+        .iter()
+        .map(|r| {
+            // Stored parents form a chain; the bound only stops a corrupt cycle.
+            std::iter::successors(Some(*r), |r| parent_of(r))
+                .take(owned.len())
+                .filter(|r| level(r))
+                .count()
+        })
+        .max()
+        .unwrap_or(0)
 }
 /// The tree holding a declaration: the plain tree, unless it sits in a measured Rust macro,
 /// whose token tree has no syntax of its own (#551).
@@ -641,11 +711,19 @@ fn score(
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Score> {
     let body = callable_body(root, source, d, partial, check)?;
-    let mut s = empty();
-    let mut code_lines = std::collections::BTreeSet::new();
-    let mut comments = std::collections::BTreeSet::new();
-    let mut operators = BTreeMap::<String, usize>::new();
-    let mut operands = BTreeMap::<String, usize>::new();
+    let mut scorer = Scorer {
+        language,
+        source,
+        d,
+        body,
+        nested,
+        newline_offsets,
+        s: empty(),
+        code_lines: std::collections::BTreeSet::new(),
+        comments: std::collections::BTreeSet::new(),
+        operators: BTreeMap::new(),
+        operands: BTreeMap::new(),
+    };
     let mut stack = vec![(root, 0usize)];
     let mut visits = 0usize;
     while let Some((node, depth)) = stack.pop() {
@@ -657,13 +735,55 @@ fn score(
         if depth > MAX_DEPTH {
             continue;
         }
+        if scorer.pruned(node) {
+            continue;
+        }
+        if scorer.string_literal(node) {
+            continue;
+        }
+        if node.is_named() {
+            if scorer.named(node, depth, &mut stack) {
+                continue;
+            }
+        } else if node.child_count() > 0 {
+            let mut cursor = node.walk();
+            let children: Vec<_> = node.children(&mut cursor).collect();
+            stack.extend(children.into_iter().rev().map(|child| (child, depth)));
+            continue;
+        }
+        scorer.leaf(node);
+    }
+    scorer.finish()
+}
+
+/// One callable's measurement: its context, and what the walk of `score` has counted so far.
+struct Scorer<'a> {
+    language: &'a str,
+    source: &'a str,
+    d: &'a Declaration,
+    /// The executable body: Halstead leaves are counted inside it only.
+    body: Range,
+    nested: &'a [&'a Range],
+    newline_offsets: &'a [usize],
+    s: Score,
+    code_lines: std::collections::BTreeSet<usize>,
+    comments: std::collections::BTreeSet<usize>,
+    operators: BTreeMap<String, usize>,
+    operands: BTreeMap<String, usize>,
+}
+
+impl Scorer<'_> {
+    /// A node outside the declaration, inside a nested callable, or an annotation: neither it
+    /// nor anything under it is measured.
+    fn pruned(&self, node: Node<'_>) -> bool {
+        let (d, nested) = (self.d, self.nested);
         if node.end_byte() <= d.range.start
             || node.start_byte() >= d.range.end
             || nested
                 .iter()
                 .any(|r| node.start_byte() >= r.start && node.end_byte() <= r.end)
         {
-            continue;
+            return true;
         }
         let kind = node.kind();
         if matches!(
@@ -675,8 +795,16 @@ fn score(
                 | "outer_attribute_item"
                 | "inner_attribute_item"
         ) {
-            continue;
+            return true;
         }
+        false
+    }
+
+    /// A string literal without interpolation is one operand and its lines are code; its
+    /// children are not walked. Returns whether `node` was one.
+    fn string_literal(&mut self, node: Node<'_>) -> bool {
+        let (source, d, newline_offsets) = (self.source, self.d, self.newline_offsets);
+        let kind = node.kind();
         if matches!(
             kind,
             "string" | "string_literal" | "character_literal" | "raw_string_literal"
@@ -687,8 +815,8 @@ fn score(
             )
         }) {
             let token = &source[node.byte_range()];
-            if node.start_byte() >= body.start && node.end_byte() <= body.end {
-                *operands.entry(token.to_owned()).or_default() += 1;
+            if node.start_byte() >= self.body.start && node.end_byte() <= self.body.end {
+                *self.operands.entry(token.to_owned()).or_default() += 1;
             }
             let lo = node.start_byte().max(d.range.start);
             let hi = node.end_byte().min(d.range.end);
@@ -696,144 +824,170 @@ fn score(
                 let first = newline_offsets.partition_point(|&offset| offset < lo);
                 let last = newline_offsets.partition_point(|&offset| offset < hi)
                     - usize::from(source.as_bytes()[hi - 1] == b'\n');
-                code_lines.extend(first..=last);
+                self.code_lines.extend(first..=last);
             }
-            continue;
+            return true;
         }
-        if node.is_named() {
-            let structural = matches!(
-                kind,
-                "if_statement"
-                    | "for_statement"
-                    | "enhanced_for_statement"
-                    | "while_statement"
-                    | "do_statement"
-                    | "switch_expression"
-                    | "switch_statement"
-                    | "catch_clause"
-                    | "except_clause"
-                    | "for_in_statement"
-                    | "if_expression"
-                    | "for_expression"
-                    | "while_expression"
-                    | "loop_expression"
-                    | "match_expression"
-                    | "match_statement"
-                    | "ternary_expression"
-                    | "conditional_expression"
-            );
-            if structural {
-                if !matches!(
-                    kind,
-                    "match_statement"
-                        | "match_expression"
-                        | "switch_expression"
-                        | "switch_statement"
-                ) {
-                    s.cyclomatic += 1;
-                }
-                s.cognitive += 1 + depth;
+        false
+    }
+
+    /// Scores a named node and pushes its children, last first, so that they are visited in
+    /// source order. Returns whether it had children; a named node without any is a leaf.
+    fn named<'t>(
+        &mut self,
+        node: Node<'t>,
+        depth: usize,
+        stack: &mut Vec<(Node<'t>, usize)>,
+    ) -> bool {
+        let kind = node.kind();
+        let structural = matches!(
+            kind,
+            "if_statement"
+                | "for_statement"
+                | "enhanced_for_statement"
+                | "while_statement"
+                | "do_statement"
+                | "switch_expression"
+                | "switch_statement"
+                | "catch_clause"
+                | "except_clause"
+                | "for_in_statement"
+                | "if_expression"
+                | "for_expression"
+                | "while_expression"
+                | "loop_expression"
+                | "match_expression"
+                | "match_statement"
+                | "ternary_expression"
+                | "conditional_expression"
+        );
+        self.branch(node, kind, depth, structural);
+        self.match_arm(node, kind);
+        self.exit(node, kind);
+        let lambda = matches!(
+            kind,
+            "lambda_expression"
+                | "lambda"
+                | "arrow_function"
+                | "function_expression"
+                | "closure_expression"
+        );
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.children(&mut cursor).collect();
+        if !children.is_empty() {
+            for child in children.into_iter().rev() {
+                let continuation = matches!(kind, "if_statement" | "if_expression")
+                    && matches!(
+                        child.kind(),
+                        "if_statement" | "if_expression" | "else_clause"
+                    );
+                let else_continuation = kind == "else_clause"
+                    && matches!(child.kind(), "if_statement" | "if_expression");
+                stack.push((
+                    child,
+                    depth
+                        + usize::from(
+                            (structural && !continuation)
+                                || lambda
+                                || (kind == "else_clause" && !else_continuation),
+                        ),
+                ));
             }
-            if kind == "elif_clause" {
-                s.cognitive += 1;
-                s.cyclomatic += 1;
-            } else if kind == "else_clause"
-                && !node
-                    .named_children(&mut node.walk())
-                    .any(|child| matches!(child.kind(), "if_statement" | "if_expression"))
-            {
-                s.cognitive += 1;
-            }
-            if matches!(
-                kind,
-                "case_clause"
-                    | "switch_case"
-                    | "switch_rule"
-                    | "switch_block_statement_group"
-                    | "match_arm"
-            ) {
-                let arm = source[node.byte_range()].trim_start();
-                let wildcard = (kind == "case_clause" && arm.starts_with("case _"))
-                    || (kind == "match_arm" && arm.starts_with('_'));
-                let guarded = wildcard
-                    && (node.child_by_field_name("guard").is_some()
-                        || if kind == "case_clause" {
-                            arm.split_once(':')
-                                .is_some_and(|(head, _)| head.contains(" if "))
-                        } else {
-                            arm.split_once("=>")
-                                .is_some_and(|(head, _)| head.contains(" if "))
-                        });
-                if !arm.starts_with("default") && (!wildcard || guarded) {
-                    s.cyclomatic += 1;
-                }
-            }
-            if matches!(kind, "return_statement" | "return_expression") {
-                s.exits.returns += 1;
-            }
-            if matches!(kind, "throw_statement" | "raise_statement") {
-                s.exits.throws += 1;
-            }
-            if matches!(
-                kind,
-                "break_expression"
-                    | "continue_expression"
-                    | "break_statement"
-                    | "continue_statement"
-            ) {
-                let labeled = if language == "rust" {
-                    source[node.byte_range()]
-                        .trim_start_matches(|c: char| c.is_alphabetic() || c.is_whitespace())
-                        .starts_with('\'')
-                } else {
-                    matches!(language, "java" | "javascript" | "typescript")
-                        && node.named_child_count() > 0
-                };
-                if labeled {
-                    s.cognitive += 1;
-                }
-            }
-            let lambda = matches!(
-                kind,
-                "lambda_expression"
-                    | "lambda"
-                    | "arrow_function"
-                    | "function_expression"
-                    | "closure_expression"
-            );
-            let mut cursor = node.walk();
-            let children: Vec<_> = node.children(&mut cursor).collect();
-            if !children.is_empty() {
-                for child in children.into_iter().rev() {
-                    let continuation = matches!(kind, "if_statement" | "if_expression")
-                        && matches!(
-                            child.kind(),
-                            "if_statement" | "if_expression" | "else_clause"
-                        );
-                    let else_continuation = kind == "else_clause"
-                        && matches!(child.kind(), "if_statement" | "if_expression");
-                    stack.push((
-                        child,
-                        depth
-                            + usize::from(
-                                (structural && !continuation)
-                                    || lambda
-                                    || (kind == "else_clause" && !else_continuation),
-                            ),
-                    ));
-                }
-                continue;
-            }
-        } else if node.child_count() > 0 {
-            let mut cursor = node.walk();
-            let children: Vec<_> = node.children(&mut cursor).collect();
-            stack.extend(children.into_iter().rev().map(|child| (child, depth)));
-            continue;
+            return true;
         }
+        false
+    }
+
+    /// Branching structures, and the `elif` and `else` clauses.
+    fn branch(&mut self, node: Node<'_>, kind: &str, depth: usize, structural: bool) {
+        if structural {
+            if !matches!(
+                kind,
+                "match_statement" | "match_expression" | "switch_expression" | "switch_statement"
+            ) {
+                self.s.cyclomatic += 1;
+            }
+            self.s.cognitive += 1 + depth;
+        }
+        if kind == "elif_clause" {
+            self.s.cognitive += 1;
+            self.s.cyclomatic += 1;
+        } else if kind == "else_clause"
+            && !node
+                .named_children(&mut node.walk())
+                .any(|child| matches!(child.kind(), "if_statement" | "if_expression"))
+        {
+            self.s.cognitive += 1;
+        }
+    }
+
+    /// An arm of a `match` or a `switch` is one path, unless it is the default or an unguarded
+    /// wildcard.
+    fn match_arm(&mut self, node: Node<'_>, kind: &str) {
+        let source = self.source;
+        if matches!(
+            kind,
+            "case_clause"
+                | "switch_case"
+                | "switch_rule"
+                | "switch_block_statement_group"
+                | "match_arm"
+        ) {
+            let arm = source[node.byte_range()].trim_start();
+            let wildcard = (kind == "case_clause" && arm.starts_with("case _"))
+                || (kind == "match_arm" && arm.starts_with('_'));
+            let guarded = wildcard
+                && (node.child_by_field_name("guard").is_some()
+                    || if kind == "case_clause" {
+                        arm.split_once(':')
+                            .is_some_and(|(head, _)| head.contains(" if "))
+                    } else {
+                        arm.split_once("=>")
+                            .is_some_and(|(head, _)| head.contains(" if "))
+                    });
+            if !arm.starts_with("default") && (!wildcard || guarded) {
+                self.s.cyclomatic += 1;
+            }
+        }
+    }
+
+    /// Returns, throws, and labeled jumps.
+    fn exit(&mut self, node: Node<'_>, kind: &str) {
+        let (language, source) = (self.language, self.source);
+        if matches!(kind, "return_statement" | "return_expression") {
+            self.s.exits.returns += 1;
+        }
+        if matches!(kind, "throw_statement" | "raise_statement") {
+            self.s.exits.throws += 1;
+        }
+        if matches!(
+            kind,
+            "break_expression" | "continue_expression" | "break_statement" | "continue_statement"
+        ) {
+            let labeled = if language == "rust" {
+                source[node.byte_range()]
+                    .trim_start_matches(|c: char| c.is_alphabetic() || c.is_whitespace())
+                    .starts_with('\'')
+            } else {
+                matches!(language, "java" | "javascript" | "typescript")
+                    && node.named_child_count() > 0
+            };
+            if labeled {
+                self.s.cognitive += 1;
+            }
+        }
+    }
+
+    /// A leaf: a comment, or a token that is a line of code and, inside the body, a Halstead
+    /// operator or operand.
+    fn leaf(&mut self, node: Node<'_>) {
+        let (language, source, d, newline_offsets) =
+            (self.language, self.source, self.d, self.newline_offsets);
+        let kind = node.kind();
         let lo = node.start_byte().max(d.range.start);
         let hi = node.end_byte().min(d.range.end);
         if lo >= hi {
-            continue;
+            return;
         }
         let token = &source[lo..hi];
         let first_line = newline_offsets.partition_point(|&offset| offset < lo);
@@ -841,12 +995,12 @@ fn score(
             - usize::from(source.as_bytes()[hi - 1] == b'\n');
         if kind == "comment" || kind.contains("comment") {
             for line in first_line..=last_line {
-                comments.insert(line);
+                self.comments.insert(line);
             }
-            continue;
+            return;
         }
         if token.trim().is_empty() {
-            continue;
+            return;
         }
         if matches!(kind, "string_start" | "string_end")
             || (matches!(token, "`" | "${")
@@ -854,11 +1008,11 @@ fn score(
                     matches!(parent.kind(), "template_string" | "template_substitution")
                 }))
         {
-            code_lines.extend(first_line..=last_line);
-            continue;
+            self.code_lines.extend(first_line..=last_line);
+            return;
         }
         for line in first_line..=last_line {
-            code_lines.insert(line);
+            self.code_lines.insert(line);
         }
         if token == "else"
             && language != "python"
@@ -869,10 +1023,10 @@ fn score(
                         .any(|child| matches!(child.kind(), "if_statement" | "if_expression"))
             })
         {
-            s.cognitive += 1;
+            self.s.cognitive += 1;
         }
         if matches!(token, "(" | ")" | "[" | "]" | "{" | "}" | "," | ";" | ":") {
-            continue;
+            return;
         }
         let operand = matches!(
             kind,
@@ -885,75 +1039,87 @@ fn score(
             || kind.contains("float")
             || kind.contains("character")
             || matches!(kind, "true" | "false" | "null" | "True" | "False" | "None");
-        if lo >= body.start && hi <= body.end {
+        if lo >= self.body.start && hi <= self.body.end {
             if operand {
-                *operands.entry(token.to_owned()).or_default() += 1;
+                *self.operands.entry(token.to_owned()).or_default() += 1;
             } else {
-                *operators.entry(token.to_owned()).or_default() += 1;
+                *self.operators.entry(token.to_owned()).or_default() += 1;
             }
         }
         if matches!(token, "&&" | "||") || (language == "python" && matches!(token, "and" | "or")) {
-            s.cyclomatic += 1;
-            let parent = node.parent();
-            let same_run = parent.is_some_and(|parent| {
-                let text = &source[parent.byte_range()];
-                let op = token;
-                (parent.kind() == "binary_expression" || parent.kind() == "boolean_operator")
-                    && parent.parent().is_some_and(|ancestor| {
-                        (ancestor.kind() == "binary_expression"
-                            || ancestor.kind() == "boolean_operator")
-                            && ancestor
-                                .child_by_field_name("operator")
-                                .is_some_and(|operator| &source[operator.byte_range()] == op)
-                            && text.contains(op)
-                    })
-            });
-            if !same_run {
-                s.cognitive += 1;
+            self.boolean_operator(node, token);
+        }
+    }
+
+    /// `&&`, `||`, `and`, `or`: each is one path; a run of the same operator is one increment
+    /// of cognitive complexity.
+    fn boolean_operator(&mut self, node: Node<'_>, token: &str) {
+        let source = self.source;
+        self.s.cyclomatic += 1;
+        let parent = node.parent();
+        let same_run = parent.is_some_and(|parent| {
+            let text = &source[parent.byte_range()];
+            let op = token;
+            (parent.kind() == "binary_expression" || parent.kind() == "boolean_operator")
+                && parent.parent().is_some_and(|ancestor| {
+                    (ancestor.kind() == "binary_expression"
+                        || ancestor.kind() == "boolean_operator")
+                        && ancestor
+                            .child_by_field_name("operator")
+                            .is_some_and(|operator| &source[operator.byte_range()] == op)
+                        && text.contains(op)
+                })
+        });
+        if !same_run {
+            self.s.cognitive += 1;
+        }
+    }
+
+    /// Lines, Halstead figures and the maintainability index, from what was counted.
+    fn finish(mut self) -> Result<Score> {
+        let (source, d, newline_offsets) = (self.source, self.d, self.newline_offsets);
+        if d.range.start < d.range.end {
+            let lo = newline_offsets.partition_point(|&offset| offset < d.range.start);
+            let mut hi = newline_offsets.partition_point(|&offset| offset < d.range.end);
+            if source.as_bytes()[d.range.end - 1] == b'\n' {
+                hi -= 1;
             }
+            self.s.loc = hi - lo + 1;
         }
+        self.s.sloc = self.code_lines.len();
+        self.s.comment_lines = self.comments.len();
+        let h = &mut self.s.halstead;
+        h.n1 = self.operators.len();
+        h.n2 = self.operands.len();
+        h.total_operators = self.operators.values().sum();
+        h.total_operands = self.operands.values().sum();
+        h.vocabulary = h.n1 + h.n2;
+        h.length = h.total_operators + h.total_operands;
+        let volume = if h.length == 0 {
+            0.0
+        } else {
+            h.length as f64 * (h.vocabulary.max(1) as f64).log2()
+        };
+        let difficulty = if h.n2 == 0 {
+            0.0
+        } else {
+            (h.n1 as f64 / 2.0) * (h.total_operands as f64 / h.n2 as f64)
+        };
+        h.volume = round(volume)?;
+        h.difficulty = round(difficulty)?;
+        h.effort = round(difficulty * volume)?;
+        h.estimated_bugs = round(volume / 3000.0)?;
+        self.s.maintainability_index = round(
+            ((171.0
+                - 5.2 * volume.max(1.0).ln()
+                - 0.23 * self.s.cyclomatic as f64
+                - 16.2 * (self.s.loc.max(1) as f64).ln())
+                * 100.0
+                / 171.0)
+                .clamp(0.0, 100.0),
+        )?;
+        Ok(self.s)
     }
-    if d.range.start < d.range.end {
-        let lo = newline_offsets.partition_point(|&offset| offset < d.range.start);
-        let mut hi = newline_offsets.partition_point(|&offset| offset < d.range.end);
-        if source.as_bytes()[d.range.end - 1] == b'\n' {
-            hi -= 1;
-        }
-        s.loc = hi - lo + 1;
-    }
-    s.sloc = code_lines.len();
-    s.comment_lines = comments.len();
-    let h = &mut s.halstead;
-    h.n1 = operators.len();
-    h.n2 = operands.len();
-    h.total_operators = operators.values().sum();
-    h.total_operands = operands.values().sum();
-    h.vocabulary = h.n1 + h.n2;
-    h.length = h.total_operators + h.total_operands;
-    let volume = if h.length == 0 {
-        0.0
-    } else {
-        h.length as f64 * (h.vocabulary.max(1) as f64).log2()
-    };
-    let difficulty = if h.n2 == 0 {
-        0.0
-    } else {
-        (h.n1 as f64 / 2.0) * (h.total_operands as f64 / h.n2 as f64)
-    };
-    h.volume = round(volume)?;
-    h.difficulty = round(difficulty)?;
-    h.effort = round(difficulty * volume)?;
-    h.estimated_bugs = round(volume / 3000.0)?;
-    s.maintainability_index = round(
-        ((171.0
-            - 5.2 * volume.max(1.0).ln()
-            - 0.23 * s.cyclomatic as f64
-            - 16.2 * (s.loc.max(1) as f64).ln())
-            * 100.0
-            / 171.0)
-            .clamp(0.0, 100.0),
-    )?;
-    Ok(s)
 }
 
 /// FIFO memo contains only source-derived scores and gaps, never native identity or calls.

@@ -12,7 +12,7 @@ fn profile(
         return Ok(None);
     }
     selected_ensure!(
-        mode == "controlledProfile" && hash.is_some_and(crate::scip_admission::hexhash),
+        mode == "controlledProfile" && hash.is_some_and(crate::scip_vocab::hexhash),
         "incompatible_index: invalid semantic context scope"
     );
     let trust = match trust {
@@ -166,7 +166,7 @@ pub(in crate::store) fn publish(
     db: &Connection,
     key: &str,
     producer: &str,
-    descriptor: &crate::semantic_batch::descriptor::Descriptor,
+    descriptor: &crate::batch_descriptor::Descriptor,
     cancel: &CancelFlag,
 ) -> Result<()> {
     let Some(row) = descriptor.context_profile()? else {

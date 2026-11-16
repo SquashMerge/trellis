@@ -1,6 +1,6 @@
 //! Observational startup discovery and head reads; never activate a checkout.
 use super::*;
-use crate::search_rank::SearchCandidate;
+use crate::search_vocab::SearchCandidate;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecentSearchCheckout {

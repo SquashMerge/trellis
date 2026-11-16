@@ -366,11 +366,13 @@ impl<'a> Walker<'_, 'a> {
             return Ok(());
         }
         let handler = match self.document.function(handler) {
-            Some(function) => self.document.declaration_handler(function, None),
-            None => {
-                self.document
-                    .span_handler(HandlerKind::Closure, Document::range(handler), None)
-            }
+            Some(function) => self.document.declaration_handler(function, None, check)?,
+            None => self.document.span_handler(
+                HandlerKind::Closure,
+                Document::range(handler),
+                None,
+                check,
+            )?,
         };
         found.push(Found {
             path: self.document.doc.key.path.clone(),
@@ -426,8 +428,10 @@ impl<'a> Walker<'_, 'a> {
                 && d.range.end <= span.end
         });
         let handler = match declaration {
-            Some(function) => self.document.declaration_handler(function, None),
-            None => self.document.span_handler(HandlerKind::Closure, span, None),
+            Some(function) => self.document.declaration_handler(function, None, check)?,
+            None => self
+                .document
+                .span_handler(HandlerKind::Closure, span, None, check)?,
         };
         routes.reverse();
         for (start, (methods, path)) in routes {

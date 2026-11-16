@@ -9,6 +9,8 @@ use crate::{
 use anyhow::{Result, ensure};
 use std::sync::{Arc, atomic::Ordering};
 
+pub(crate) use crate::diagnostic_markers::{diagnostic_marker, diagnostics_enabled};
+
 #[cfg(test)]
 thread_local! {
     static FULL_STREAM_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -16,68 +18,6 @@ thread_local! {
 #[cfg(test)]
 fn full_stream_runs_for_tests() -> usize {
     FULL_STREAM_RUNS.with(std::cell::Cell::get)
-}
-
-// Optional diagnostics never write on the publication or maintenance thread.
-// A full bounded channel increments a loss counter rather than blocking work.
-struct DiagnosticMarkers {
-    sender: std::sync::mpsc::SyncSender<String>,
-    lost: std::sync::atomic::AtomicU64,
-    origin: std::time::Instant,
-}
-impl DiagnosticMarkers {
-    fn emit(&self, incarnation: &str, event: &str, detail: &str) {
-        let wall = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |time| time.as_millis());
-        let elapsed = self.origin.elapsed().as_micros();
-        let lost = self.lost.swap(0, Ordering::AcqRel);
-        let message = format!(
-            "maintenance wall_ms={wall} monotonic_us={elapsed} incarnation={incarnation} event={event} detail={detail} marker_lost={lost}\n"
-        );
-        if self.sender.try_send(message).is_err() {
-            self.lost.fetch_add(lost + 1, Ordering::AcqRel);
-        }
-    }
-}
-
-fn diagnostics() -> Option<&'static DiagnosticMarkers> {
-    static MARKERS: std::sync::OnceLock<Option<DiagnosticMarkers>> = std::sync::OnceLock::new();
-    MARKERS
-        .get_or_init(|| {
-            if std::env::var("TRELLIS_INDEX_DIAGNOSTICS").as_deref() != Ok("1") {
-                return None;
-            }
-            let (sender, receiver) = std::sync::mpsc::sync_channel::<String>(256);
-            std::thread::Builder::new()
-                .name("trellis-diagnostic-writer".into())
-                .spawn(move || {
-                    use std::io::Write;
-                    while let Ok(line) = receiver.recv() {
-                        // Never hold stderr's global lock while waiting for
-                        // the next marker: CLI publication diagnostics and
-                        // fixture barriers use stderr on other threads.
-                        let mut out = std::io::stderr().lock();
-                        let _ = out.write_all(line.as_bytes());
-                        let _ = out.flush();
-                    }
-                })
-                .ok()?;
-            Some(DiagnosticMarkers {
-                sender,
-                lost: std::sync::atomic::AtomicU64::new(0),
-                origin: std::time::Instant::now(),
-            })
-        })
-        .as_ref()
-}
-pub(crate) fn diagnostics_enabled() -> bool {
-    diagnostics().is_some()
-}
-pub(crate) fn diagnostic_marker(incarnation: &str, event: &str, detail: &str) {
-    if let Some(markers) = diagnostics() {
-        markers.emit(incarnation, event, detail);
-    }
 }
 
 struct PublicationAdmission<C> {
@@ -256,7 +196,8 @@ impl IndexJobCoordinator {
         capture: Capture,
         cutoff: impl FnMut() -> Result<()>,
     ) -> Result<(IndexPin, PublishPermit)> {
-        let diagnostic_incarnation = diagnostics().map(|_| self.session.incarnation().to_string());
+        let diagnostic_incarnation =
+            diagnostics_enabled().then(|| self.session.incarnation().to_string());
         let diagnostic_mode = std::sync::Mutex::new("unknown");
         let pin = self.run_with_capture(
             options,
@@ -1284,6 +1225,28 @@ impl WatcherWork {
     }
 }
 
+/// The full capture and document spool an exceptional recreation publishes. Storage calls it
+/// at its own point under the recovery lock (`Store::recreate_index_exclusive`); no facts or
+/// projections from the old index are used.
+pub(crate) fn recreate_capture(
+    store: &Store,
+    options: &IndexOptions,
+    cancel: &CancelFlag,
+) -> Result<(Capture, crate::native_evidence::FullDocumentSpool)> {
+    let capture = Capture::admit(options, cancel, &|_| {})?;
+    let spool = crate::native_evidence::spool_full_capture(
+        options,
+        &capture,
+        &store.state_topology().1.root,
+        store.root_id(),
+        cancel,
+        &|_| {},
+        |_, _| {},
+        &store.native_spool_dir()?,
+    )?;
+    Ok((capture, spool))
+}
+
 /// One explicit index command returns the owner that published its one full capture.
 /// Exceptional recovery cannot take the live-baseline path or upgrade shared use.
 pub fn reconcile_workspace(
@@ -1296,7 +1259,9 @@ pub fn reconcile_workspace(
     // activation: confirm old-root terminal rows before ANY startup reconciliation publication.
     store.settle_foreign_root_requests()?;
     if store.is_recreate_pending() {
-        return store.recreate_pending_writer_session(options, cancel);
+        return store.recreate_pending_writer_session(options, cancel, &mut || {
+            recreate_capture(store, options, cancel)
+        });
     }
     let coordinator = IndexJobCoordinator::prepare(store, None)?;
     let session = coordinator.session();
@@ -1483,7 +1448,8 @@ fn drain_requests_observed_with_cancel(
         // queue reread and current control pin still match this baseline.
         let mut before_publish = None;
         let mut publication = None;
-        let diagnostic_incarnation = diagnostics().map(|_| session.incarnation().to_string());
+        let diagnostic_incarnation =
+            diagnostics_enabled().then(|| session.incarnation().to_string());
         let diagnostic_mode = std::sync::Mutex::new("unknown");
         let mut completion_diagnostic = None;
         let outcome = (|| {
@@ -2271,11 +2237,12 @@ pub fn cooperative_maintenance_unit(
 pub(crate) fn cooperative_semantic_unit(
     store: &Store,
     session: &Arc<WriterSession>,
-    continuation: &mut Option<crate::store::SemanticContinuation>,
+    continuation: &mut Option<crate::semantic_catchup::SemanticContinuation>,
     cancel: &CancelFlag,
     mut priority: impl FnMut() -> bool,
-) -> Result<crate::store::SemanticUnitOutcome> {
-    use crate::store::{MaintenanceQueueState, SemanticUnitOutcome};
+) -> Result<crate::semantic_catchup::SemanticUnitOutcome> {
+    use crate::semantic_catchup::SemanticUnitOutcome;
+    use crate::store::MaintenanceQueueState;
     if !priority() || cancel.load(Ordering::Acquire) {
         return Ok(SemanticUnitOutcome::Deferred);
     }
@@ -2302,7 +2269,7 @@ pub(crate) fn cooperative_semantic_unit(
     loop {
         let outcome = store.semantic_maintenance_unit(session, continuation, cancel)?;
         if outcome != SemanticUnitOutcome::Progress
-            || started.elapsed() >= crate::store::semantic_step_slice()
+            || started.elapsed() >= crate::semantic_catchup::step_slice()
             || !admitted()
         {
             return Ok(outcome);
@@ -2324,7 +2291,9 @@ pub fn establish_serving_session(
                 "recovery_required: index options unavailable; run explicit trellis index"
             )
         })?;
-        let (_, session) = store.recreate_pending_writer_session(options, cancel)?;
+        let (_, session) = store.recreate_pending_writer_session(options, cancel, &mut || {
+            recreate_capture(store, options, cancel)
+        })?;
         session.verify()?;
         sweep_abandoned_semantic_stages(store);
         return Ok(session);
@@ -2367,18 +2336,21 @@ pub fn establish_serving_session(
 /// left in the index directory belongs to a crashed attempt.
 fn sweep_abandoned_semantic_stages(store: &Store) {
     if let Ok(index_dir) = store.semantic_stage_parent() {
-        crate::semantic_batch::staging::remove_abandoned_semantic_stages(&index_dir);
+        crate::store::staging::remove_abandoned_semantic_stages(&index_dir);
     }
     // Producer runs and pickup directories a crashed daemon left, except those a queued or
     // running generated import still names (D2). Nothing is importing yet at this point.
     crate::producer::run::sweep_state(store, false);
 }
 
+#[cfg(feature = "test-support")]
+mod publication_fixture;
+
+#[cfg(feature = "test-support")]
+mod semantic_fixture;
+
 #[cfg(test)]
 mod tests;
 
 #[cfg(test)]
 mod queue_completion_retry_tests;
-
-#[cfg(test)]
-mod marker_tests;

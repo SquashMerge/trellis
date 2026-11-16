@@ -12,8 +12,8 @@
 //! that re-keying, so S neither reads nor writes the payload's rows; corruption in them is found
 //! by the read path as a typed integrity failure that schedules a re-index.
 use super::*;
-use crate::native_evidence::DocumentKey;
-use crate::semantic_evidence as sem;
+use crate::native_records::DocumentKey;
+use crate::semantic_records as sem;
 
 /// What a copied row takes from the destination native revision.
 pub(crate) struct CopyDestination {
@@ -56,8 +56,7 @@ impl CopyDestination {
             db,
             selected: &read,
         };
-        let mut manifest =
-            crate::semantic_batch::descriptor::SourceManifestHasher::new(&source_set_id);
+        let mut manifest = crate::batch_descriptor::SourceManifestHasher::new(&source_set_id);
         let mut cursor = CanonicalInventoryCursor::default();
         loop {
             let page = reader.canonical_inventory_page(&mut cursor, 256)?;
@@ -136,18 +135,18 @@ pub(crate) fn copy_source(
 /// same question.
 #[derive(Clone)]
 pub(crate) struct CopyFilter {
-    pub(crate) target: PendingSemanticTarget,
-    pub(crate) captured_pin: IndexPin,
-    pub(crate) producer: String,
-    pub(crate) batch_id: i64,
-    pub(crate) join_inputs: String,
+    pub(in crate::store) target: PendingSemanticTarget,
+    pub(in crate::store) captured_pin: IndexPin,
+    pub(in crate::store) producer: String,
+    pub(in crate::store) batch_id: i64,
+    pub(in crate::store) join_inputs: String,
 }
 
 impl CopyFilter {
     /// Whether S copies `document`: [`copy_source`] names its basis tuple, and its captured
     /// and current versions are the same (the witness's reuse condition), so the copied rows
     /// are exactly what re-settling it would emit.
-    pub(crate) fn copies(&self, db: &Connection, document: &DocumentKey) -> Result<bool> {
+    pub(in crate::store) fn copies(&self, db: &Connection, document: &DocumentKey) -> Result<bool> {
         if copy_source(
             db,
             &self.target,

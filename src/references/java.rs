@@ -122,6 +122,20 @@ impl Catalog {
             source_sets: BTreeMap::new(),
             unplaced: BTreeSet::new(),
         };
+        result.index_package_exports(docs, trees, work, check)?;
+        result.mark_duplicate_types(work, check)?;
+        result.build_units(docs, trees, selected, work, check)?;
+        Ok(result)
+    }
+
+    /// The first pass: the types each package declares, file by file, and those it exports.
+    fn index_package_exports(
+        &mut self,
+        docs: &[&DocumentInput],
+        trees: &[Tree],
+        work: &mut Work,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
         for (document, doc) in docs.iter().enumerate() {
             if doc.key.language != "java" {
                 continue;
@@ -139,64 +153,47 @@ impl Catalog {
             }
             let root = trees[document].root_node();
             if package_unknown(doc, root, work, check)? {
-                result.unplaced.insert(doc.key.source_set_id.clone());
+                self.unplaced.insert(doc.key.source_set_id.clone());
             }
             let package_path = package_path(doc, root, work, check)?;
             owner_step(work, check)?;
-            let package = result
+            let package = self
                 .packages
                 .entry((doc.key.source_set_id.clone(), package_path))
                 .or_default();
             // A parser error can hide any top-level type of its file.
             package.partial |= root.has_error();
-            let mut cursor = root.walk();
-            for child in root.named_children(&mut cursor) {
-                owner_step(work, check)?;
-                if !type_declaration(child) {
-                    continue;
-                }
-                let Some(name) = child.child_by_field_name("name") else {
-                    continue;
-                };
-                owner_step(work, check)?;
-                let name = text(doc, name).to_owned();
-                owner_step(work, check)?;
-                package.declared.insert(name.clone());
-                owner_step(work, check)?;
-                *package.declarations.entry(name.clone()).or_default() += 1;
-                if !public(child, work, check)? {
-                    continue;
-                }
-                owner_step(work, check)?;
-                let bucket = package.exports.entry(name).or_default();
-                let rows = native.get(&(child.start_byte(), child.end_byte()));
-                if child.kind() == "annotation_type_declaration" {
-                    bucket.unknown = true;
-                } else if let Some(rows) = rows.filter(|rows| rows.len() == 1) {
-                    let row = rows[0];
-                    if row.role == DeclarationRole::Test {
-                        bucket.unknown = true;
-                    } else {
-                        owner_step(work, check)?;
-                        bucket.declarations.insert(DeclarationId {
-                            document,
-                            start: row.range.start,
-                            end: row.range.end,
-                            sid: row.syntax_id.clone(),
-                        });
-                    }
-                } else {
-                    bucket.unknown = true;
-                }
-            }
+            export_types(doc, root, document, &native, package, work, check)?;
         }
-        for package in result.packages.values_mut() {
+        Ok(())
+    }
+
+    /// A type name a package declares twice exports nothing proved.
+    fn mark_duplicate_types(
+        &mut self,
+        work: &mut Work,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        for package in self.packages.values_mut() {
             owner_step(work, check)?;
             for (name, bucket) in &mut package.exports {
                 owner_step(work, check)?;
                 bucket.unknown |= package.declarations[name] > 1;
             }
         }
+        Ok(())
+    }
+
+    /// The last pass: the unit of each selected file, with its imports, its blockers and the
+    /// packages it imports on demand merged.
+    fn build_units(
+        &mut self,
+        docs: &[&DocumentInput],
+        trees: &[Tree],
+        selected: &[usize],
+        work: &mut Work,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
         for &document in selected {
             let doc = docs[document];
             if doc.key.language != "java" {
@@ -208,50 +205,15 @@ impl Catalog {
                 package: package_path(doc, root, work, check)?,
                 ..Unit::default()
             };
-            let mut cursor = root.walk();
-            for child in root.named_children(&mut cursor) {
-                owner_step(work, check)?;
-                if child.kind() == "import_declaration" {
-                    if let Some(import) = import(doc, child, work, check)? {
-                        if !import.star {
-                            if let Some(name) = import.path.last() {
-                                owner_step(work, check)?;
-                                charge(import.path.len(), work, check)?;
-                                unit.explicit
-                                    .entry(name.clone())
-                                    .or_default()
-                                    .insert(import.path.clone());
-                                if import.static_ {
-                                    owner_step(work, check)?;
-                                    unit.static_explicit.insert(name.clone());
-                                }
-                            }
-                        } else if import.static_ {
-                            unit.static_unknown = true;
-                        }
-                        owner_step(work, check)?;
-                        unit.imports
-                            .insert((child.start_byte(), child.end_byte()), import);
-                    } else {
-                        unit.cut = true;
-                    }
-                } else if child.kind() == "package_declaration" {
-                    unit.cut |= declaration_path(doc, child, work, check)?.is_none();
-                } else if type_declaration(child)
-                    && let Some(name) = child.child_by_field_name("name")
-                {
-                    owner_step(work, check)?;
-                    unit.top_level.insert(text(doc, name).to_owned());
-                }
-            }
+            scan_top_level(doc, root, &mut unit, work, check)?;
             scan_blockers(doc, root, &mut unit, work, check)?;
             // Syntax skipped here can hold an import, a shadow or a binding.
             unit.cut |= root.has_error();
             // So no type root is proved, nor one a hidden type of this package could shadow.
             unit.static_unknown |= unit.cut
                 || crate::syntax_bounds::scan(root, check)?.is_some()
-                || result.unplaced.contains(&doc.key.source_set_id)
-                || result
+                || self.unplaced.contains(&doc.key.source_set_id)
+                || self
                     .packages
                     .get(&(doc.key.source_set_id.clone(), unit.package.clone()))
                     .is_some_and(|package| package.partial);
@@ -259,42 +221,55 @@ impl Catalog {
                 blockers.finish(work, check)?;
             }
             // Merge contributors only for units whose sites will be scanned.
+            self.merge_on_demand(doc, &mut unit, work, check)?;
             let source_set = &doc.key.source_set_id;
-            let mut seen = BTreeSet::new();
-            for import in unit.imports.values() {
-                owner_step(work, check)?;
-                if !import.star || import.static_ {
-                    continue;
-                }
-                charge(import.path.len(), work, check)?;
-                if !seen.insert(import.path.clone()) {
-                    continue;
-                }
-                if result.type_prefix(source_set, &import.path, work, check)? {
-                    unit.static_unknown = true;
-                }
-                if let Some(package) = result
-                    .packages
-                    .get(&(source_set.clone(), import.path.clone()))
-                {
-                    unit.static_unknown |= package.partial;
-                    for (name, bucket) in &package.exports {
+            owner_step(work, check)?;
+            self.units.insert(document, unit);
+            owner_step(work, check)?;
+            self.source_sets.insert(document, source_set.clone());
+        }
+        Ok(())
+    }
+
+    /// Merges into a unit the exports of each package it imports on demand, once per package.
+    fn merge_on_demand(
+        &self,
+        doc: &DocumentInput,
+        unit: &mut Unit,
+        work: &mut Work,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let source_set = &doc.key.source_set_id;
+        let mut seen = BTreeSet::new();
+        for import in unit.imports.values() {
+            owner_step(work, check)?;
+            if !import.star || import.static_ {
+                continue;
+            }
+            charge(import.path.len(), work, check)?;
+            if !seen.insert(import.path.clone()) {
+                continue;
+            }
+            if self.type_prefix(source_set, &import.path, work, check)? {
+                unit.static_unknown = true;
+            }
+            if let Some(package) = self
+                .packages
+                .get(&(source_set.clone(), import.path.clone()))
+            {
+                unit.static_unknown |= package.partial;
+                for (name, bucket) in &package.exports {
+                    owner_step(work, check)?;
+                    let merged = unit.on_demand.entry(name.clone()).or_default();
+                    merged.unknown |= bucket.unknown;
+                    for candidate in &bucket.declarations {
                         owner_step(work, check)?;
-                        let merged = unit.on_demand.entry(name.clone()).or_default();
-                        merged.unknown |= bucket.unknown;
-                        for candidate in &bucket.declarations {
-                            owner_step(work, check)?;
-                            merged.declarations.insert(candidate.clone());
-                        }
+                        merged.declarations.insert(candidate.clone());
                     }
                 }
             }
-            owner_step(work, check)?;
-            result.units.insert(document, unit);
-            owner_step(work, check)?;
-            result.source_sets.insert(document, source_set.clone());
         }
-        Ok(result)
+        Ok(())
     }
 
     pub(super) fn resolve(
@@ -499,6 +474,118 @@ impl Catalog {
     }
 }
 
+/// One file's top-level types into its package: every name it declares, and each public one
+/// as an export, proved only by a single non-test declaration.
+fn export_types(
+    doc: &DocumentInput,
+    root: Node<'_>,
+    document: usize,
+    native: &BTreeMap<(usize, usize), Vec<&Declaration>>,
+    package: &mut Package,
+    work: &mut Work,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<()> {
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        owner_step(work, check)?;
+        if !type_declaration(child) {
+            continue;
+        }
+        let Some(name) = child.child_by_field_name("name") else {
+            continue;
+        };
+        owner_step(work, check)?;
+        let name = text(doc, name).to_owned();
+        owner_step(work, check)?;
+        package.declared.insert(name.clone());
+        owner_step(work, check)?;
+        *package.declarations.entry(name.clone()).or_default() += 1;
+        if !public(child, work, check)? {
+            continue;
+        }
+        owner_step(work, check)?;
+        let bucket = package.exports.entry(name).or_default();
+        let rows = native.get(&(child.start_byte(), child.end_byte()));
+        if child.kind() == "annotation_type_declaration" {
+            bucket.unknown = true;
+        } else if let Some(rows) = rows.filter(|rows| rows.len() == 1) {
+            let row = rows[0];
+            if row.role == DeclarationRole::Test {
+                bucket.unknown = true;
+            } else {
+                owner_step(work, check)?;
+                bucket.declarations.insert(DeclarationId {
+                    document,
+                    start: row.range.start,
+                    end: row.range.end,
+                    sid: row.syntax_id.clone(),
+                });
+            }
+        } else {
+            bucket.unknown = true;
+        }
+    }
+    Ok(())
+}
+/// A selected file's top-level children into its unit: its imports, whether its package
+/// declaration is cut, and the types it declares.
+fn scan_top_level(
+    doc: &DocumentInput,
+    root: Node<'_>,
+    unit: &mut Unit,
+    work: &mut Work,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<()> {
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        owner_step(work, check)?;
+        if child.kind() == "import_declaration" {
+            if let Some(import) = import(doc, child, work, check)? {
+                record_import(import, child, unit, work, check)?;
+            } else {
+                unit.cut = true;
+            }
+        } else if child.kind() == "package_declaration" {
+            unit.cut |= declaration_path(doc, child, work, check)?.is_none();
+        } else if type_declaration(child)
+            && let Some(name) = child.child_by_field_name("name")
+        {
+            owner_step(work, check)?;
+            unit.top_level.insert(text(doc, name).to_owned());
+        }
+    }
+    Ok(())
+}
+/// An import the file spells in full: the name it binds explicitly, or that a static
+/// on-demand import can bind any name, and the import itself by its range.
+fn record_import(
+    import: Import,
+    child: Node<'_>,
+    unit: &mut Unit,
+    work: &mut Work,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<()> {
+    if !import.star {
+        if let Some(name) = import.path.last() {
+            owner_step(work, check)?;
+            charge(import.path.len(), work, check)?;
+            unit.explicit
+                .entry(name.clone())
+                .or_default()
+                .insert(import.path.clone());
+            if import.static_ {
+                owner_step(work, check)?;
+                unit.static_explicit.insert(name.clone());
+            }
+        }
+    } else if import.static_ {
+        unit.static_unknown = true;
+    }
+    owner_step(work, check)?;
+    unit.imports
+        .insert((child.start_byte(), child.end_byte()), import);
+    Ok(())
+}
 fn bucket_resolution(
     bucket: &Bucket,
     work: &mut Work,
@@ -821,11 +908,14 @@ mod tests {
     use std::sync::{Arc, atomic::AtomicBool};
 
     fn documents() -> Vec<DocumentInput> {
-        let root = tempfile::tempdir().unwrap();
-        for (path, text) in [
+        documents_with(&[
             ("Use.java", "package app; import pkg.*; class Use {}"),
             ("T.java", "package pkg; public class T {}"),
-        ] {
+        ])
+    }
+    fn documents_with(files: &[(&str, &str)]) -> Vec<DocumentInput> {
+        let root = tempfile::tempdir().unwrap();
+        for (path, text) in files {
             std::fs::write(root.path().join(path), text).unwrap();
         }
         let identity =
@@ -936,5 +1026,122 @@ mod tests {
             );
             assert_eq!(checks, 3);
         });
+    }
+
+    /// Where a build stops on its budget is a stability rule: the same documents charge the
+    /// same steps, so the same budget stops them at the same step with the same error.
+    #[test]
+    fn catalog_build_and_site_resolution_charge_exact_steps() {
+        const BUILD: usize = 176;
+        let documents = documents_with(&[
+            (
+                "Use.java",
+                "package app;\n\
+                 import pkg.T;\n\
+                 import static pkg.T.make;\n\
+                 import pkg.*;\n\
+                 import pkg.*;\n\
+                 class Use<E> {\n\
+                 \x20   class Inner {}\n\
+                 \x20   pkg.T field;\n\
+                 \x20   java.util.List<E> list;\n\
+                 }\n",
+            ),
+            ("T.java", "package pkg; public class T {}"),
+        ]);
+        let docs: Vec<_> = documents.iter().collect();
+        let trees: Vec<_> = docs
+            .iter()
+            .map(|doc| parse(doc, &mut || Ok(())).unwrap())
+            .collect();
+        assert!(trees.iter().all(|tree| !tree.root_node().has_error()));
+        let selected: Vec<_> = (0..docs.len()).collect();
+        let build = |limit| {
+            let mut work = Work::new(limit);
+            let catalog = Catalog::new(&docs, &trees, &selected, &mut work, &mut || Ok(()));
+            (catalog, work)
+        };
+        let (catalog, mut work) = build(work::reference_limit(docs.len(), 0));
+        let catalog = catalog.unwrap();
+        assert_eq!(work.used, BUILD);
+
+        let source = docs
+            .iter()
+            .position(|doc| doc.key.path == "Use.java")
+            .unwrap();
+        let sites = extract(docs[source], &trees[source], &mut work, &mut || Ok(())).unwrap();
+        let extracted = work.used - BUILD;
+        let resolved: Vec<_> = sites
+            .iter()
+            .map(|site| {
+                let before = work.used;
+                catalog
+                    .resolve(
+                        source,
+                        site,
+                        &mut BTreeMap::new(),
+                        &mut work,
+                        &mut || Ok(()),
+                    )
+                    .unwrap();
+                (site.spelling.as_str(), work.used - before)
+            })
+            .collect();
+        assert_eq!(extracted, 76);
+        assert_eq!(
+            resolved,
+            [
+                ("import pkg.T;", 6),
+                ("import static pkg.T.make;", 1),
+                ("import pkg.*;", 3),
+                ("import pkg.*;", 3),
+                ("pkg.T", 6),
+                ("java.util.List", 14),
+            ]
+        );
+
+        // One step short of the build's charge fails typed, on the step that exceeds it.
+        let (stopped, work) = build(BUILD - 1);
+        assert_eq!(
+            stopped.err().expect("budget stop").to_string(),
+            "bounded_work: reference owner lookup"
+        );
+        assert_eq!(work.used, BUILD);
+        assert!(build(BUILD).0.is_ok());
+    }
+
+    /// A type name its package declares twice exports nothing proved, and a unit that imports
+    /// the package on demand must see that mark.
+    #[test]
+    fn on_demand_import_of_a_twice_declared_type_is_ambiguous() {
+        let documents = documents_with(&[
+            ("Use.java", "package app; import dup.*; class Use {}"),
+            ("D.java", "package dup; public class D {}"),
+            ("Other.java", "package dup; class D {}"),
+        ]);
+        let docs: Vec<_> = documents.iter().collect();
+        let trees: Vec<_> = docs
+            .iter()
+            .map(|doc| parse(doc, &mut || Ok(())).unwrap())
+            .collect();
+        assert!(trees.iter().all(|tree| !tree.root_node().has_error()));
+        let mut work = Work::new(work::reference_limit(docs.len(), 0));
+        let selected: Vec<_> = (0..docs.len()).collect();
+        let catalog = Catalog::new(&docs, &trees, &selected, &mut work, &mut || Ok(())).unwrap();
+        let source = docs
+            .iter()
+            .position(|doc| doc.key.path == "Use.java")
+            .unwrap();
+        let sites = extract(docs[source], &trees[source], &mut work, &mut || Ok(())).unwrap();
+        let [import] = sites.as_slice() else {
+            panic!("one import site");
+        };
+        let resolution = catalog
+            .resolve(source, import, &mut BTreeMap::new(), &mut work, &mut || {
+                Ok(())
+            })
+            .unwrap();
+        assert!(resolution.targets.is_empty());
+        assert_eq!(resolution.residual, Some("java_wildcard_name_ambiguous"));
     }
 }

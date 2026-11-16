@@ -307,12 +307,12 @@ pub struct ProcessIdentity {
 impl ProcessIdentity {
     pub fn capture(pid: libc::pid_t) -> Option<Self> {
         (pid > 1).then_some(())?;
-        let start_time = crate::producer::process_info::start_time(pid)?;
+        let start_time = crate::process_info::start_time(pid)?;
         Some(Self { pid, start_time })
     }
 
     pub fn matches(&self) -> bool {
-        self.pid > 1 && crate::producer::process_info::start_time(self.pid) == Some(self.start_time)
+        self.pid > 1 && crate::process_info::start_time(self.pid) == Some(self.start_time)
     }
 
     /// Recheck immediately before signaling. This is an identity check, not an

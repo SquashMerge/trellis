@@ -1,24 +1,20 @@
 //! SQLite index snapshots and request queues. Connections are never shared between threads.
 pub mod anchors;
-mod architecture_core;
+pub(crate) mod batch_input;
 pub(crate) mod captured_witness;
-mod graph_read;
 pub(crate) mod id_codec;
 pub(crate) mod mcp_read;
 mod native_join_budget;
-#[cfg(any(test, feature = "test-support"))]
-pub use native_first::set_semantic_step_slice_for_tests;
-pub(crate) use native_first::{
-    SemanticContinuation, SemanticUnitOutcome, step_slice as semantic_step_slice,
-};
 mod published_admission;
+#[cfg(feature = "test-support")]
+pub(crate) mod read_counters;
 pub mod requests;
 mod search;
 mod search_startup;
-mod semantic_display;
-mod semantic_payload;
+pub(crate) mod semantic_display;
+pub(crate) mod semantic_payload;
 mod semantic_retention;
-mod sequence_hops;
+pub mod staging;
 pub(crate) use search::SEARCH_CARD_BATCH_SIZE;
 pub use search::{
     HeadSearchCard, HeadSearchCards, McpSearchCandidates, SearchDeltaColdRebuild,
@@ -31,21 +27,14 @@ pub use semantic_display::set_architecture_semantic_rows_for_tests;
 #[cfg(feature = "test-support")]
 pub(crate) use semantic_display::status_semantic_projections_on_thread_for_tests;
 pub use semantic_display::{
-    AutoRunLabels, CallSemantic, CoverageDocument, LANGUAGE_NOTE, LanguagePending, LanguageTier,
-    McpSemantic, NO_PRODUCER_NOTE, ProducerNotPublished, ProducerSelection,
-    multiple_producers_note, relabel_status,
+    AutoRunLabels, CallSemantic, CoverageDocument, LanguagePending, LanguageTier, McpSemantic,
+    ProducerNotPublished, ProducerSelection, relabel_status,
 };
 pub use semantic_retention::AutoRunHead;
-pub(crate) use sequence_hops::{InterfaceEvidence, call_ids as sequence_call_ids};
 pub(crate) mod symbol_trigrams;
 pub mod topology;
 use crate::model::*;
-use crate::native_evidence::DeclarationRole;
 use anyhow::{Context, Result, ensure};
-pub(crate) use architecture_core::{
-    ArchitectureArguments, ArchitectureCore, ArchitectureMetrics, ArchitectureProgress,
-    ArchitectureSummary, ArchitectureView, CoreFailure,
-};
 pub use requests::{MaintenanceQueueProbe, MaintenanceQueueState, QueueProbeAdmission};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
@@ -67,7 +56,7 @@ type TestStreamPreflightHook = Box<dyn FnOnce(&crate::native_evidence::FullDocum
 /// When a metrics document's test hook runs.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MetricsDocumentStage {
+pub(crate) enum MetricsDocumentStage {
     /// Its metrics work is starting.
     Start,
     /// That work has returned, with success or failure.
@@ -504,19 +493,19 @@ pub type RetentionStateForTests = ((String, i64, i64), (i64, i64));
 #[doc(hidden)]
 pub struct PrivateStageObservation {
     pub pin: IndexPin,
-    pub semantic: crate::semantic_evidence::SemanticSnapshot,
-    pub native_revision: crate::native_evidence::Revision,
-    pub declarations: Vec<crate::native_evidence::Declaration>,
-    pub calls: Vec<crate::native_evidence::Call>,
+    pub semantic: crate::semantic_records::SemanticSnapshot,
+    pub native_revision: crate::native_records::Revision,
+    pub declarations: Vec<crate::native_records::Declaration>,
+    pub calls: Vec<crate::native_records::Call>,
 }
 
 /// A retained tuple is presented at its own native revision. Freshness is a
 /// separate comparison with the requested pin; captured provenance is unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SemanticHistory {
-    pub coverage: crate::semantic_evidence::Coverage,
-    pub provenance: Vec<crate::semantic_evidence::Provenance>,
-    pub presentation_freshness: crate::semantic_evidence::Freshness,
+    pub coverage: crate::semantic_records::Coverage,
+    pub provenance: Vec<crate::semantic_records::Provenance>,
+    pub presentation_freshness: crate::semantic_records::Freshness,
 }
 
 /// Test-support switches for one store's semantic publication (#893): the file S writes its
@@ -576,7 +565,7 @@ pub struct Store {
     // selected reconciliation was observed committed under the synced EX.
     reconciled_writer: Arc<Mutex<Option<uuid::Uuid>>>,
     retention_clock: Arc<Mutex<RetentionClock>>,
-    metrics_memo: Arc<Mutex<crate::metrics::MetricsMemo>>,
+    pub(crate) metrics_memo: Arc<Mutex<crate::metrics::MetricsMemo>>,
     /// Set only on an `EvidenceResponse`'s own Store, which is used only with
     /// that response's read snapshot: the pin it admitted and that revision's
     /// header values. A later read of the same pin in the response shares
@@ -834,6 +823,7 @@ macro_rules! selected_ensure {
         }
     };
 }
+pub(crate) use selected_ensure;
 pub(crate) mod native_first;
 macro_rules! control_ensure {
     ($condition:expr, $message:expr $(,)?) => {
@@ -866,6 +856,15 @@ enum ActivationStage {
     AfterJournalBackupBeforeDirFsync,
     AfterRenameBeforeDirFsync,
 }
+/// The full capture and document spool that exceptional recreation publishes, measured by
+/// the indexing caller (`index_coordinator::recreate_capture`). Recreation calls it once, at
+/// its own point under the recovery lock: for an in-place rebuild after the use lock is
+/// downgraded to shared and the publication baseline is read, and for a replacement after the
+/// private stage exists while use is still exclusive.
+pub(crate) type RecreateCapture<'a> = dyn FnMut() -> Result<(
+        crate::capture::Capture,
+        crate::native_evidence::FullDocumentSpool,
+    )> + 'a;
 // Serde's compact JSON serializer writes exactly the bytes persisted by `json()`.
 // Count and abort while streaming; never build an over-limit encoded source.
 struct EncodedSourceBudget {
@@ -1062,7 +1061,7 @@ CREATE TABLE semantic_release_candidate_payloads(revision_id TEXT NOT NULL REFER
 
 "#;
 /// A normal connection keeps the verified index use lock until SQLite closes.
-struct IndexConnection {
+pub(crate) struct IndexConnection {
     db: ProtectedSqliteConnection,
     _use_guard: topology::UseGuard,
 }
@@ -1132,7 +1131,7 @@ fn take_selected_read_counts() -> SelectedReadCounts {
 
 /// One selected document's manifest row, after its SQL row and byte budgets
 /// passed and before the rows they bound are read.
-struct SelectedHeader {
+pub(crate) struct SelectedHeader {
     path: String,
     language: String,
     hash: String,
@@ -1146,32 +1145,32 @@ struct SelectedHeader {
 /// One selected document's stored source and native rows,
 /// read from one snapshot. The indexer validated them before publishing, so
 /// reads trust them (owner ruling 2026-10-23, #261).
-struct FetchedDocument {
-    file: SourceFile,
-    declarations: Vec<crate::native_evidence::Declaration>,
-    calls: Vec<crate::native_evidence::Call>,
-    regions: Vec<crate::native_evidence::ControlRegion>,
-    stored_bytes: u64,
+pub(crate) struct FetchedDocument {
+    pub(crate) file: SourceFile,
+    pub(crate) declarations: Vec<crate::native_records::Declaration>,
+    pub(crate) calls: Vec<crate::native_records::Call>,
+    pub(crate) regions: Vec<crate::native_records::ControlRegion>,
+    pub(crate) stored_bytes: u64,
 }
 
 /// Header of a retained native revision: everything but the document inventory.
 pub struct NativeHeader {
-    pub source_set: crate::native_evidence::SourceSet,
-    pub revision: crate::native_evidence::Revision,
-    pub producer: crate::native_evidence::Producer,
+    pub source_set: crate::native_records::SourceSet,
+    pub revision: crate::native_records::Revision,
+    pub producer: crate::native_records::Producer,
 }
 
 /// One retained native document: its exact source bytes and measured native rows.
 pub struct NativeDocumentRows {
     pub source: Vec<u8>,
-    pub coverage: crate::native_evidence::Coverage,
-    pub provenance: crate::native_evidence::Provenance,
-    pub declarations: Vec<crate::native_evidence::Declaration>,
-    pub calls: Vec<crate::native_evidence::Call>,
-    pub control_regions: Vec<crate::native_evidence::ControlRegion>,
-    pub references: Vec<crate::native_evidence::Reference>,
-    pub capability_report: crate::native_evidence::CapabilityReport,
-    pub search_cards: Vec<crate::search_capture::CapturedCard>,
+    pub coverage: crate::native_records::Coverage,
+    pub provenance: crate::native_records::Provenance,
+    pub declarations: Vec<crate::native_records::Declaration>,
+    pub calls: Vec<crate::native_records::Call>,
+    pub control_regions: Vec<crate::native_records::ControlRegion>,
+    pub references: Vec<crate::native_records::Reference>,
+    pub capability_report: crate::native_records::CapabilityReport,
+    pub search_cards: Vec<crate::search_card_records::CapturedCard>,
 }
 
 #[derive(Default)]
@@ -1194,7 +1193,7 @@ impl NativeReader<'_> {
 
     pub(crate) fn reuse_project_roots(
         &self,
-        descriptor: &crate::semantic_batch::descriptor::Descriptor,
+        descriptor: &crate::batch_descriptor::Descriptor,
     ) -> Result<Vec<String>> {
         let workspace_uri = crate::scip_admission::file_uri(&self.store.identity.root)?;
         Ok(descriptor.reuse_project_roots(&workspace_uri, &self.store.identity.root_key))
@@ -1226,14 +1225,14 @@ impl NativeReader<'_> {
     }
 
     /// The retained source bytes of one inventory entry, checked against its identity.
-    pub fn source_bytes(&self, document: &crate::native_evidence::Document) -> Result<Vec<u8>> {
+    pub fn source_bytes(&self, document: &crate::native_records::Document) -> Result<Vec<u8>> {
         self.store
             .read_native_source(self.db, self.selected, document)
     }
 
     pub fn document(
         &self,
-        document: &crate::native_evidence::Document,
+        document: &crate::native_records::Document,
     ) -> Result<NativeDocumentRows> {
         self.store
             .read_native_document(self.db, self.selected, document)
@@ -1243,7 +1242,7 @@ impl NativeReader<'_> {
     /// never reads control regions or search cards, so they are not loaded (left empty).
     pub(crate) fn join_document(
         &self,
-        document: &crate::native_evidence::Document,
+        document: &crate::native_records::Document,
     ) -> Result<NativeDocumentRows> {
         self.store
             .read_native_document_rows(self.db, self.selected, document, false)
@@ -1252,7 +1251,7 @@ impl NativeReader<'_> {
     /// Logical peak estimate for native document loading, before owning its row bodies.
     pub(crate) fn document_reservation_bytes(
         &self,
-        document: &crate::native_evidence::Document,
+        document: &crate::native_records::Document,
     ) -> Result<u64> {
         native_join_budget::document_bytes(self.db, self.selected, document)
     }
@@ -1262,7 +1261,7 @@ impl NativeReader<'_> {
         &self,
         cursor: &mut CanonicalInventoryCursor,
         limit: usize,
-    ) -> Result<Vec<crate::native_evidence::Document>> {
+    ) -> Result<Vec<crate::native_records::Document>> {
         ensure!(limit > 0, "inventory page limit must be positive");
         let header = self.header()?;
         let mut documents = Vec::new();
@@ -1297,8 +1296,8 @@ impl NativeReader<'_> {
             let exhausted = rows.len() < remaining;
             for (path, content_hash, byte_length) in rows {
                 cursor.after_path.clone_from(&path);
-                documents.push(crate::native_evidence::Document {
-                    key: crate::native_evidence::DocumentKey {
+                documents.push(crate::native_records::Document {
+                    key: crate::native_records::DocumentKey {
                         source_set_id: header.source_set.id.clone(),
                         language: language.clone(),
                         path,
@@ -1370,7 +1369,7 @@ impl InventoryStream<'_> {
         }
     }
 
-    pub fn next_document(&mut self) -> Result<Option<crate::native_evidence::Document>> {
+    pub fn next_document(&mut self) -> Result<Option<crate::native_records::Document>> {
         loop {
             match self.state {
                 InventoryState::Done => return Ok(None),
@@ -1420,18 +1419,18 @@ impl InventoryStream<'_> {
 
 /// One selected document's source and native rows with the graph projected
 /// from them once.
-struct SelectedDocument {
-    file: SourceFile,
-    nodes: Vec<Symbol>,
-    graph_calls: Vec<CallSite>,
+pub(crate) struct SelectedDocument {
+    pub(crate) file: SourceFile,
+    pub(crate) nodes: Vec<Symbol>,
+    pub(crate) graph_calls: Vec<CallSite>,
     graph_regions: Vec<ControlRegion>,
 }
 
 /// Immutable revision chosen inside an admitted read transaction. This is not
 /// a surrogate for control metadata: status, root and schema remain live-only.
-struct ReadRevision {
-    pin: IndexPin,
-    key: String,
+pub(crate) struct ReadRevision {
+    pub(crate) pin: IndexPin,
+    pub(crate) key: String,
     /// Header rows of this immutable selected revision, read once per snapshot
     /// and shared by every document read in it.
     headers: Arc<SelectedHeaders>,
@@ -1447,6 +1446,11 @@ impl ReadRevision {
             key,
             headers: Arc::default(),
         }
+    }
+    /// [`Self::new`] for the query-layer tests that read through a selected revision.
+    #[cfg(test)]
+    pub(crate) fn for_tests(pin: IndexPin, key: String) -> Self {
+        Self::new(pin, key)
     }
     /// `selected_producer_hash`, computed once for this selected revision.
     /// A failure is not memoized: it fails the read and is recomputed if retried.
@@ -1476,195 +1480,14 @@ impl ReadRevision {
     }
 }
 
-/// Validated transport options for one pinned metrics projection.
-#[derive(Debug, Clone)]
-pub struct MetricsOptions {
-    pub pin: Option<IndexPin>,
-    pub role: String,
-    pub workbench: bool,
-    pub scope: String,
-    pub source_set_id: Option<String>,
-    pub language: Option<String>,
-    pub path: Option<String>,
-    pub sid: Option<String>,
-    pub aggregate: String,
-    /// Empty means all metrics; transport rejects an explicitly empty list.
-    pub metrics: Vec<String>,
-    pub top_cognitive: Option<usize>,
-}
-impl Default for MetricsOptions {
-    fn default() -> Self {
-        Self {
-            pin: None,
-            scope: "revision".into(),
-            role: "all".into(),
-            workbench: false,
-            source_set_id: None,
-            language: None,
-            path: None,
-            sid: None,
-            aggregate: "sum".into(),
-            metrics: vec![],
-            top_cognitive: None,
-        }
-    }
-}
-impl MetricsOptions {
-    pub fn validate(&self) -> Result<()> {
-        ensure!(
-            matches!(self.role.as_str(), "production" | "all" | "test"),
-            "invalid role"
-        );
-        ensure!(
-            matches!(
-                self.scope.as_str(),
-                "revision" | "directory" | "file" | "declaration"
-            ),
-            "invalid scope"
-        );
-        ensure!(
-            matches!(self.aggregate.as_str(), "sum" | "max" | "mean"),
-            "invalid aggregate"
-        );
-        ensure!(
-            self.metrics
-                .iter()
-                .all(|m| crate::metrics::METRIC_ORDER.contains(&m.as_str()))
-                && self.metrics.iter().collect::<BTreeSet<_>>().len() == self.metrics.len(),
-            "invalid metrics"
-        );
-        ensure!(
-            self.top_cognitive
-                .is_none_or(|count| (1..=10).contains(&count)),
-            "invalid top cognitive count"
-        );
-        let located = self.scope != "revision";
-        ensure!(
-            self.source_set_id.is_some() == located && self.path.is_some() == located,
-            "invalid metrics selector"
-        );
-        ensure!(
-            self.language.is_some() == (self.scope == "file"),
-            "invalid metrics language"
-        );
-        ensure!(
-            self.sid.is_some() == (self.scope == "declaration"),
-            "invalid metrics sid"
-        );
-        if let Some(path) = &self.path {
-            ensure!(
-                !path.starts_with('/')
-                    && !path
-                        .split('/')
-                        .any(|s| s == "." || s == ".." || s.is_empty())
-                    || (self.scope == "directory" && path.is_empty()),
-                "invalid metrics path"
-            );
-        }
-        Ok(())
-    }
-}
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MetricsFileRow {
-    pub source_set_id: String,
-    pub language: String,
-    pub path: String,
-    pub physical_lines: usize,
-    pub file_role: DeclarationRole,
-    pub role_counts: MetricsRoleCounts,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub excluded_reason: Option<&'static str>,
-    pub declaration_count: usize,
-    pub metrics: serde_json::Value,
-}
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MetricsRoleCounts {
-    pub production: usize,
-    pub test: usize,
-}
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MetricsDirectoryRow {
-    pub source_set_id: String,
-    pub path: String,
-    pub declaration_count: usize,
-    pub metrics: serde_json::Value,
-}
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MetricsDeclarationRow {
-    pub role: DeclarationRole,
-    pub source_set_id: String,
-    pub language: String,
-    pub path: String,
-    pub sid: String,
-    pub range: crate::native_evidence::Range,
-    pub metrics: serde_json::Value,
-}
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MetricsTopCognitiveRow {
-    pub role: DeclarationRole,
-    pub source_set_id: String,
-    pub language: String,
-    pub path: String,
-    pub sid: String,
-    pub range: crate::native_evidence::Range,
-    pub name: Option<String>,
-    pub kind: String,
-    pub metrics: MetricsTopCognitiveScore,
-}
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MetricsTopCognitiveScore {
-    pub cognitive: usize,
-    pub cyclomatic: usize,
-    pub max_nesting: usize,
-}
-const LAYER_EXCLUSIONS_WARNING: &str =
-    "Rules unavailable; layer-based heat exclusions were not applied.";
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MetricsPayload {
-    pub metrics_version: &'static str,
-    pub role: String,
-    pub workbench: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub layer_exclusions_warning: Option<&'static str>,
-    pub index_generation: String,
-    pub index_revision: u64,
-    pub scope: String,
-    pub aggregate: String,
-    pub selected_metrics: Vec<String>,
-    pub declarations: Vec<MetricsDeclarationRow>,
-    pub files: Vec<MetricsFileRow>,
-    pub directories: Vec<MetricsDirectoryRow>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_cognitive: Option<Vec<MetricsTopCognitiveRow>>,
-    /// Selected files whose syntax exceeds the traversal bounds (#554); absent when none.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub partial_files: Vec<crate::syntax_bounds::PartialFile>,
-}
-
-/// How one architecture operation evaluates rules over its references.
-type EvaluateRules<'a> = dyn FnMut(
-        &crate::rules::Config,
-        &crate::references::Projection,
-        &mut (dyn FnMut() -> Result<()> + Send),
-    ) -> Result<serde_json::Value>
-    + 'a;
-
 /// One coherent native read snapshot retained until its owned result passes T03.
 pub struct EvidenceResponse {
-    store: Store,
-    db: IndexConnection,
+    pub(crate) store: Store,
+    pub(crate) db: IndexConnection,
     fence: ReadFence,
     optional_recovery: OptionalRecovery,
     stable_lookup_keys: std::cell::RefCell<
-        BTreeMap<crate::native_evidence::DocumentKey, Arc<BTreeMap<String, String>>>,
+        BTreeMap<crate::native_records::DocumentKey, Arc<BTreeMap<String, String>>>,
     >,
     /// Runtime labels for automatic producer re-runs (#660); empty unless the daemon sets them.
     auto_run: AutoRunLabels,
@@ -1733,208 +1556,6 @@ impl ReadFence {
 }
 type TreeOverlays = Vec<(usize, String, usize)>;
 
-// Adapt the read helpers' boolean progress seam without erasing the caller's
-// original typed cancellation/deadline error. The request thread and the
-// metrics workers share it: the caller's check runs on whichever thread asks,
-// one at a time, and its first failure stops every later check.
-struct MetricsReadCheck<'a> {
-    check: Mutex<&'a mut (dyn FnMut() -> Result<()> + Send)>,
-    failure: Mutex<Option<anyhow::Error>>,
-    stopped: AtomicBool,
-}
-impl MetricsReadCheck<'_> {
-    /// The caller's check; its failure is kept for `result` to report.
-    fn expired(&self) -> bool {
-        if self.stopped.load(Ordering::Acquire) {
-            return true;
-        }
-        let mut check = self.check.lock().unwrap_or_else(|e| e.into_inner());
-        if self.stopped.load(Ordering::Acquire) {
-            return true;
-        }
-        match (*check)() {
-            Ok(()) => false,
-            Err(error) => {
-                self.failure
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .get_or_insert(error);
-                self.stopped.store(true, Ordering::Release);
-                true
-            }
-        }
-    }
-    /// `expired` on every `every`-th call through `calls`, else only whether
-    /// a check already failed. Concurrent workers poll the caller's check this
-    /// way so they don't serialize on it; the poll interval is a few rows or
-    /// parser steps.
-    fn expired_every(&self, calls: &std::cell::Cell<u32>, every: u32) -> bool {
-        let n = calls.get().wrapping_add(1);
-        calls.set(n);
-        if n.is_multiple_of(every) {
-            self.expired()
-        } else {
-            self.stopped.load(Ordering::Acquire)
-        }
-    }
-    fn check(&self) -> Result<()> {
-        if self.expired() {
-            return self.result(Err(anyhow::anyhow!("cancelled")));
-        }
-        Ok(())
-    }
-    /// The caller's check failure, if one happened, else `result`.
-    fn result<T>(&self, result: Result<T>) -> Result<T> {
-        if let Some(error) = self
-            .failure
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-        {
-            return Err(error);
-        }
-        result
-    }
-}
-
-impl Store {
-    /// Metrics of one document's stored source and native rows.
-    fn metrics_document(
-        &self,
-        key: &crate::native_evidence::DocumentKey,
-        file: &SourceFile,
-        declarations: &[crate::native_evidence::Declaration],
-        calls: &[crate::native_evidence::Call],
-        regions: &[crate::native_evidence::ControlRegion],
-        expired: &dyn Fn() -> bool,
-    ) -> std::result::Result<MetricsComputedDocument, MetricsDocumentFailure> {
-        // Metrics use the stored source and native rows as fetched.
-        if file.language != key.language {
-            return Err(MetricsDocumentFailure::Other(
-                SelectedIntegrity("incompatible_index: metrics language mismatch".into()).into(),
-            ));
-        }
-        if expired() {
-            return Err(MetricsDocumentFailure::Stopped);
-        }
-        let mut roots = declarations
-            .iter()
-            .filter(|row| row.kind == "module" && row.ancestors.is_empty());
-        let file_role = roots.next().map(|row| row.role);
-        let Some(file_role) = file_role.filter(|_| roots.next().is_none()) else {
-            return Err(MetricsDocumentFailure::Read(
-                SelectedIntegrity("incompatible_index: metrics file module".into()).into(),
-            ));
-        };
-        let physical_lines = file.text.lines().count();
-        let source = crate::metrics::SourceInput {
-            language: &key.language,
-            path: &key.path,
-            content_hash: &file.hash,
-            text: &file.text,
-        };
-        let cached = self
-            .metrics_memo
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .lookup(&source);
-        crate::metrics::compute_with_cached(
-            cached,
-            source,
-            declarations,
-            calls,
-            regions,
-            &mut || {
-                if expired() {
-                    anyhow::bail!("cancelled")
-                }
-                Ok(())
-            },
-        )
-        .map(|computed| MetricsComputedDocument {
-            computed,
-            physical_lines,
-            physical_bytes: file.text.len(),
-            file_role,
-        })
-        .map_err(MetricsDocumentFailure::Other)
-    }
-}
-
-/// Metrics and file metadata from one fetched indexed document.
-struct MetricsComputedDocument {
-    computed: crate::metrics::Computed,
-    physical_lines: usize,
-    physical_bytes: usize,
-    file_role: DeclarationRole,
-}
-
-/// Why one revision document did not produce metrics.
-enum MetricsDocumentFailure {
-    /// Reading the selected document failed; reported as a selected-read failure.
-    Read(anyhow::Error),
-    /// Any other failure.
-    Other(anyhow::Error),
-    /// The caller's check failed before this document's work.
-    Stopped,
-}
-
-/// How often a metrics worker polls the caller's check, in progress steps.
-/// A single-document request runs inline and checks at every step.
-const METRICS_WORKER_CHECK_EVERY: u32 = 64;
-/// At most this many documents are read into one chunk for the workers.
-const METRICS_FETCH_DOCUMENTS: usize = 64;
-/// The two overlapping metrics chunks together have at most this much
-/// read-ahead charge. Each chunk has at most half the budget, except that a
-/// document over half is computed alone. Deriving graph DTOs before charging
-/// can also leave one fully fetched lookahead document carried across a chunk
-/// boundary. Thus the held charge is pending + current + carried: at most
-/// 64 MiB for the two ordinary chunks, plus one document within the existing
-/// per-document source, ancillary, graph and F typed envelopes. This charge
-/// counts derived graph bytes once; it is not a bound on decoded Rust RSS.
-const METRICS_FETCH_BYTES: u64 = 64 * 1024 * 1024;
-
-/// Test overrides for one metrics request on this thread.
-#[cfg(test)]
-#[derive(Clone, Copy)]
-struct MetricsTestPlan {
-    workers: usize,
-    fetch_bytes: u64,
-}
-/// What one metrics request on this thread held between its reads and
-/// its acceptance of each document.
-#[cfg(test)]
-#[derive(Debug, Default)]
-struct MetricsFetchTrace {
-    /// Each fetched document's read-ahead charge, in manifest order.
-    charges: Vec<u64>,
-    /// The most documents read and not yet accepted at once.
-    max_resident_documents: usize,
-    /// The most read-ahead charge held at once, including a fetched lookahead.
-    max_resident_bytes: u64,
-    /// (pending, current, carried) charges when a document crosses a boundary.
-    boundaries: Vec<(u64, u64, u64)>,
-}
-#[cfg(test)]
-thread_local! {
-    static METRICS_TEST_PLAN: std::cell::Cell<Option<MetricsTestPlan>> =
-        const { std::cell::Cell::new(None) };
-    static METRICS_FETCH_TRACE: std::cell::RefCell<MetricsFetchTrace> =
-        std::cell::RefCell::default();
-}
-#[cfg(test)]
-fn trace_metrics_resident(documents: usize, bytes: u64) {
-    METRICS_FETCH_TRACE.with_borrow_mut(|trace| {
-        trace.max_resident_documents = trace.max_resident_documents.max(documents);
-        trace.max_resident_bytes = trace.max_resident_bytes.max(bytes);
-    });
-}
-
-/// What every `trellis_endpoints` answer says of its rows (#851).
-const ENDPOINTS_LIMITATION: &str = "Endpoints are structural matches of registered routes and client call sites by method and path template, not proof of what runs: a route with no call site, or a call with no route, does not prove it unused or missing.";
-/// The note of a checkout whose interfaces were not extracted (#851).
-const ENDPOINTS_NOT_EXTRACTED: &str = "not extracted: fewer than two apps";
-
 impl EvidenceResponse {
     /// Carry the runtime automatic re-run labels into `mcp_language_tiers` (#660).
     pub fn with_auto_run_labels(mut self, labels: AutoRunLabels) -> Self {
@@ -1942,993 +1563,8 @@ impl EvidenceResponse {
         self
     }
 
-    /// The checked arguments of one architecture operation.
-    pub(crate) fn architecture_arguments(
-        kind: &str,
-        arguments: &serde_json::Value,
-    ) -> Result<ArchitectureArguments> {
-        ensure!(
-            matches!(
-                kind,
-                "references" | "check" | "explain" | "prompt" | "endpoints" | "apps"
-            ),
-            "invalid_request"
-        );
-        let pin = arguments
-            .get("expectedBasis")
-            .map(|value| {
-                serde_json::from_value::<IndexPin>(value.clone())
-                    .map_err(|_| anyhow::anyhow!("invalid_request: expectedBasis"))
-            })
-            .transpose()?;
-        let paths: Vec<String> = arguments
-            .get("paths")
-            .map(|value| {
-                serde_json::from_value(value.clone())
-                    .map_err(|_| anyhow::anyhow!("invalid_request: paths"))
-            })
-            .transpose()?
-            .unwrap_or_default();
-        ensure!(
-            paths
-                .iter()
-                .all(|path| crate::references::valid_path_glob(path)),
-            "invalid_request: paths"
-        );
-        let sample_limit = arguments
-            .get("limit")
-            .map(|value| {
-                value
-                    .as_u64()
-                    .filter(|limit| (1..=50).contains(limit))
-                    .map(|limit| limit as usize)
-                    .ok_or_else(|| anyhow::anyhow!("invalid_request: limit"))
-            })
-            .transpose()?
-            .unwrap_or(5);
-        // #837: a references read may keep only the sources under a directory, and group
-        // by app, which needs each file's app.
-        let references = kind == "references";
-        let prefix = match arguments.get("prefix").filter(|_| references) {
-            None => None,
-            Some(value) => Some(
-                value
-                    .as_str()
-                    .and_then(crate::references::directory_prefix)
-                    .context("invalid_request: prefix")?
-                    .to_owned(),
-            ),
-        };
-        let endpoints = kind == "endpoints";
-        let apps = (references
-            && arguments.get("groupBy").and_then(|by| by.as_str()) == Some("package"))
-            || endpoints
-            || kind == "apps";
-        // #851: an app name or manifest path, and the endpoint a read keeps.
-        let text = |field: &str, kinds: &[&str]| -> Result<Option<String>> {
-            match arguments.get(field).filter(|_| kinds.contains(&kind)) {
-                None => Ok(None),
-                Some(value) => value
-                    .as_str()
-                    .filter(|text| !text.is_empty() && text.len() <= 4096)
-                    .map(|text| Some(text.to_owned()))
-                    .with_context(|| format!("invalid_request: {field}")),
-            }
-        };
-        Ok(ArchitectureArguments {
-            pin,
-            paths,
-            prefix,
-            apps,
-            app: text("app", &["references", "check", "endpoints", "apps"])?,
-            method: text("method", &["endpoints"])?,
-            path_template: text("pathTemplate", &["endpoints"])?,
-            sample_limit,
-        })
-    }
-
-    /// Materialize one captured-source architecture view in this admitted snapshot.
-    pub fn architecture_response(
-        &self,
-        kind: &str,
-        arguments: &serde_json::Value,
-        check: &mut (impl FnMut() -> Result<()> + Send),
-    ) -> Result<serde_json::Value> {
-        let parsed = Self::architecture_arguments(kind, arguments)?;
-        check()?;
-        let config = self.architecture_config(kind, &parsed)?;
-        let selected = self.selected(parsed.pin)?;
-        let core = self.architecture_core_at(
-            selected.pin,
-            config.as_ref(),
-            false,
-            &mut *check,
-            &|_: ArchitectureProgress| {},
-        )?;
-        self.architecture_response_at(kind, arguments, &parsed, config.as_ref(), &core, check)
-    }
-
-    /// The rules this operation reads; a check or explanation fails without them. References
-    /// read them only to group by app (#837), and work without them.
-    pub(crate) fn architecture_config(
-        &self,
-        kind: &str,
-        parsed: &ArchitectureArguments,
-    ) -> Result<Option<crate::rules::Config>> {
-        let config = if kind == "references" && !parsed.apps() {
-            None
-        } else {
-            crate::rules::load(Path::new(self.store.workspace_root()))?
-        };
-        if matches!(kind, "check" | "explain") && config.is_none() {
-            anyhow::bail!("rules_not_found");
-        }
-        Ok(config)
-    }
-
-    /// One architecture operation over a computed core.
-    pub(crate) fn architecture_response_at(
-        &self,
-        kind: &str,
-        arguments: &serde_json::Value,
-        parsed: &ArchitectureArguments,
-        config: Option<&crate::rules::Config>,
-        core: &ArchitectureCore,
-        check: &mut (impl FnMut() -> Result<()> + Send),
-    ) -> Result<serde_json::Value> {
-        if kind == "endpoints" {
-            return Self::endpoints_at(parsed, config, core, check);
-        }
-        // #851: an `app` filter assigns files as an unfiltered check does.
-        let assigned = match &parsed.app {
-            Some(app) => {
-                let (assignment, whole) = Self::app_assignment_at(config, core, check)?;
-                let named = assignment.named(app)?;
-                Some((assignment, whole, named))
-            }
-            None => None,
-        };
-        let app_files = match (&assigned, kind) {
-            (Some((assignment, whole, named)), "references") => {
-                Some(Self::app_files(assignment, whole, named, check)?)
-            }
-            _ => None,
-        };
-        let references = core.references_in(parsed, app_files.as_ref(), check)?;
-        let apps = if kind == "prompt" {
-            Some(crate::rules::prompt_apps(
-                config,
-                core.app_candidates()?,
-                check,
-            )?)
-        } else {
-            None
-        };
-        // #837: app groups follow the whole checkout's evaluation, so they fail exactly when
-        // an unfiltered `trellis_rules_check` does, whatever sources the read selects.
-        let path_apps = match (parsed.apps, config) {
-            (false, _) => None,
-            (true, Some(config)) => {
-                let base = core.rules(config)?;
-                let whole = core.references(&[], 5, check)?;
-                let evaluated = crate::rules::evaluate_prepared(config, base, &whole, &[], check)?;
-                Some(crate::rules::path_apps(
-                    Some(config),
-                    base.apps(),
-                    &evaluated.layers,
-                    &references,
-                    check,
-                )?)
-            }
-            (true, None) => Some(crate::rules::path_apps(
-                None,
-                &crate::rules::unruled_apps(core.app_candidates()?),
-                &Default::default(),
-                &references,
-                check,
-            )?),
-        };
-        let mut evaluate =
-            |config: &crate::rules::Config,
-             references: &crate::references::Projection,
-             check: &mut (dyn FnMut() -> Result<()> + Send)| {
-                let mut check = || check();
-                Ok(crate::rules::evaluate_prepared(
-                    config,
-                    core.rules(config)?,
-                    references,
-                    &parsed.paths,
-                    &mut check,
-                )?
-                .data)
-            };
-        let mut payload = Self::architecture_payload(
-            kind,
-            arguments,
-            config,
-            references,
-            core.pin,
-            &mut evaluate,
-            check,
-        )?;
-        if let Some(apps) = apps {
-            payload["apps"] = serde_json::Value::Array(apps);
-        }
-        if let Some(path_apps) = path_apps {
-            payload[crate::rules::PATH_APPS] = path_apps;
-        }
-        if kind == "check"
-            && let Some((assignment, _, named)) = &assigned
-        {
-            Self::check_rows_in(&mut payload, assignment, named, check)?;
-        }
-        Ok(payload)
-    }
-
-    /// #851: each file's app at a core, from the same whole-checkout evaluation an unfiltered
-    /// `trellis_rules_check` runs, and that whole projection. Without a rules file every
-    /// detected manifest is an app and files go by root.
-    pub(crate) fn app_assignment_at<'c>(
-        config: Option<&'c crate::rules::Config>,
-        core: &'c ArchitectureCore,
-        check: &mut (impl FnMut() -> Result<()> + Send),
-    ) -> Result<(
-        crate::rules::AppAssignment<'c>,
-        crate::references::Projection,
-    )> {
-        let whole = core.references(&[], 5, check)?;
-        let assignment = match config {
-            Some(config) => {
-                let base = core.rules(config)?;
-                let evaluated = crate::rules::evaluate_prepared(config, base, &whole, &[], check)?;
-                crate::rules::AppAssignment::new(
-                    Some(config),
-                    base.apps().to_vec(),
-                    &evaluated.layers,
-                )
-            }
-            None => crate::rules::AppAssignment::new(
-                None,
-                crate::rules::unruled_apps(core.app_candidates()?),
-                &BTreeMap::new(),
-            ),
-        };
-        Ok((assignment, whole))
-    }
-
-    /// The module paths of `whole` whose app is one of `named` (#851).
-    pub(crate) fn app_files(
-        assignment: &crate::rules::AppAssignment<'_>,
-        whole: &crate::references::Projection,
-        named: &BTreeSet<usize>,
-        check: &mut impl FnMut() -> Result<()>,
-    ) -> Result<BTreeSet<String>> {
-        let mut files = BTreeSet::new();
-        for module in &whole.modules {
-            check()?;
-            let path = module["identity"]["path"]
-                .as_str()
-                .context("store_unavailable: module path absent")?;
-            if assignment
-                .file(path)
-                .is_some_and(|app| named.contains(&app))
-            {
-                files.insert(path.to_owned());
-            }
-        }
-        Ok(files)
-    }
-
-    /// #851: the effective app inventory for `trellis_workspace_describe`, each app with its
-    /// languages and file count, and the files in no app. A file in an authored hidden layer
-    /// counts but adds no language (#909).
-    pub(crate) fn app_inventory(
-        assignment: &crate::rules::AppAssignment<'_>,
-        whole: &crate::references::Projection,
-        check: &mut impl FnMut() -> Result<()>,
-    ) -> Result<serde_json::Value> {
-        let apps = assignment.apps();
-        let mut files = vec![(0usize, BTreeSet::new()); apps.len()];
-        let mut no_app = 0usize;
-        for module in &whole.modules {
-            check()?;
-            let identity = &module["identity"];
-            let path = identity["path"]
-                .as_str()
-                .context("store_unavailable: module path absent")?;
-            match assignment.file(path) {
-                Some(app) => {
-                    files[app].0 += 1;
-                    let language = identity["language"]
-                        .as_str()
-                        .context("store_unavailable: module language")?;
-                    if assignment.counts_language(path) {
-                        files[app].1.insert(language.to_owned());
-                    }
-                }
-                None => no_app += 1,
-            }
-        }
-        let items: Vec<_> = apps
-            .iter()
-            .zip(files)
-            .map(|(app, (count, languages))| {
-                serde_json::json!({
-                    "name": app.name, "source": app.source, "kind": app.kind,
-                    "manifest": app.manifest, "roots": app.roots, "entries": app.entries,
-                    "languages": crate::semantic_evidence::LANGUAGE_ORDER
-                        .iter()
-                        .filter(|language| languages.contains(**language))
-                        .collect::<Vec<_>>(),
-                    "fileCount": count,
-                })
-            })
-            .collect();
-        Ok(serde_json::json!({"state": "ready", "items": items, "noApp": {"fileCount": no_app}}))
-    }
-
-    /// #851: a check's rows in the `named` apps. Instances and test-only rows are kept when
-    /// they count under one of them (`apps[].counts`), unassigned native files when they lie
-    /// in one; external packages, which are in no app, leave `unassigned`. Counts stay whole.
-    fn check_rows_in(
-        payload: &mut serde_json::Value,
-        assignment: &crate::rules::AppAssignment<'_>,
-        named: &BTreeSet<usize>,
-        check: &mut impl FnMut() -> Result<()>,
-    ) -> Result<()> {
-        for field in ["instances", "testOnly"] {
-            let rows = payload[field]
-                .as_array_mut()
-                .context("store_unavailable: rule instances absent")?;
-            check()?;
-            rows.retain(|row| {
-                assignment
-                    .bucket(row)
-                    .is_some_and(|app| named.contains(&app))
-            });
-        }
-        let unassigned = payload["unassigned"]
-            .as_array_mut()
-            .context("store_unavailable: unassigned catalog absent")?;
-        unassigned.retain(|identity| {
-            identity["path"]
-                .as_str()
-                .and_then(|path| assignment.file(path))
-                .is_some_and(|app| named.contains(&app))
-        });
-        check()
-    }
-
-    /// #851: one `trellis_endpoints` answer at a core, every row before paging.
-    fn endpoints_at(
-        parsed: &ArchitectureArguments,
-        config: Option<&crate::rules::Config>,
-        core: &ArchitectureCore,
-        check: &mut (impl FnMut() -> Result<()> + Send),
-    ) -> Result<serde_json::Value> {
-        // Whether a core extracts depends on its rules file's authored apps, so its extraction
-        // answers only the file it was built for, or no file (#851). The owner never hands a
-        // read another file's core; a core of another file here is refused, never projected.
-        ensure!(
-            core.rules_hash() == config.map(|config| config.content_hash.as_str()),
-            "store_unavailable: architecture core of another rules file"
-        );
-        let extraction = core.interfaces()?;
-        let (assignment, _) = Self::app_assignment_at(config, core, check)?;
-        let named = parsed
-            .app
-            .as_deref()
-            .map(|app| assignment.named(app))
-            .transpose()?;
-        let extracted = architecture_core::interfaces_extracted(config, core.app_candidates()?);
-        let rows = crate::interfaces::endpoints(
-            extraction,
-            &assignment,
-            &crate::interfaces::EndpointQuery {
-                apps: named.as_ref(),
-                method: parsed.method.as_deref(),
-                path_template: parsed.path_template.as_deref(),
-            },
-            check,
-        )?;
-        let mut limitations = vec![ENDPOINTS_LIMITATION];
-        if !extracted {
-            limitations.push(ENDPOINTS_NOT_EXTRACTED);
-        }
-        check()?;
-        Ok(serde_json::json!({
-            "evidence": "structural",
-            "extracted": extracted,
-            "limitations": limitations,
-            "endpoints": rows,
-            "indexGeneration": core.pin.index_generation.to_string(),
-            "indexRevision": core.pin.index_revision,
-        }))
-    }
-
-    /// One path-scoped operation computed from its own scope, under the budgets of that
-    /// scope. For a revision too large for a core.
-    pub(crate) fn architecture_response_scoped(
-        &self,
-        kind: &str,
-        arguments: &serde_json::Value,
-        parsed: &ArchitectureArguments,
-        config: Option<&crate::rules::Config>,
-        check: &mut (impl FnMut() -> Result<()> + Send),
-    ) -> Result<serde_json::Value> {
-        let snapshot = self
-            .architecture_snapshot(parsed.pin, check)
-            .map_err(|error| self.store.report_index_failure(error))?;
-        // #851: an `app` filter assigns every document of the snapshot.
-        let assigned = match &parsed.app {
-            Some(app) => {
-                let candidates = crate::rules::app_candidates(&snapshot, check)?;
-                let paths: Vec<&str> = snapshot
-                    .documents
-                    .iter()
-                    .map(|document| document.key.path.as_str())
-                    .collect();
-                let assignment = match config {
-                    Some(config) => {
-                        let base = crate::rules::prepare(config, &snapshot, &mut *check)?;
-                        crate::rules::AppAssignment::for_paths(
-                            config,
-                            base.apps().to_vec(),
-                            &paths,
-                            check,
-                        )?
-                    }
-                    None => crate::rules::AppAssignment::new(
-                        None,
-                        crate::rules::unruled_apps(&candidates),
-                        &BTreeMap::new(),
-                    ),
-                };
-                let named = assignment.named(app)?;
-                let files: BTreeSet<String> = paths
-                    .iter()
-                    .filter(|path| {
-                        assignment
-                            .file(path)
-                            .is_some_and(|app| named.contains(&app))
-                    })
-                    .map(|path| (*path).to_owned())
-                    .collect();
-                Some((assignment, named, files))
-            }
-            None => None,
-        };
-        let references = crate::references::project_where(
-            &snapshot,
-            &parsed.paths,
-            parsed.prefix.as_deref(),
-            assigned
-                .as_ref()
-                .filter(|_| kind == "references")
-                .map(|(_, _, files)| files),
-            parsed.sample_limit,
-            check,
-        )?;
-        let apps = if kind == "prompt" {
-            let candidates = crate::rules::app_candidates(&snapshot, check)?;
-            Some(crate::rules::prompt_apps(config, &candidates, check)?)
-        } else {
-            None
-        };
-        // #837: as in `architecture_response_at`, check's whole-checkout validity. Layer
-        // assignment covers every module of the projection, whatever its sources.
-        let path_apps = match (parsed.apps, config) {
-            (false, _) => None,
-            (true, Some(config)) => {
-                let base = crate::rules::prepare(config, &snapshot, &mut *check)?;
-                let evaluated =
-                    crate::rules::evaluate_prepared(config, &base, &references, &[], check)?;
-                Some(crate::rules::path_apps(
-                    Some(config),
-                    base.apps(),
-                    &evaluated.layers,
-                    &references,
-                    check,
-                )?)
-            }
-            (true, None) => {
-                let candidates = crate::rules::app_candidates(&snapshot, check)?;
-                Some(crate::rules::path_apps(
-                    None,
-                    &crate::rules::unruled_apps(&candidates),
-                    &Default::default(),
-                    &references,
-                    check,
-                )?)
-            }
-        };
-        let mut evaluate =
-            |config: &crate::rules::Config,
-             references: &crate::references::Projection,
-             check: &mut (dyn FnMut() -> Result<()> + Send)| {
-                let mut check = || check();
-                crate::rules::evaluate(config, &snapshot, references, &parsed.paths, &mut check)
-            };
-        let mut payload = Self::architecture_payload(
-            kind,
-            arguments,
-            config,
-            references,
-            snapshot.pin,
-            &mut evaluate,
-            check,
-        )?;
-        if let Some(apps) = apps {
-            payload["apps"] = serde_json::Value::Array(apps);
-        }
-        if let Some(path_apps) = path_apps {
-            payload[crate::rules::PATH_APPS] = path_apps;
-        }
-        if kind == "check"
-            && let Some((assignment, named, _)) = &assigned
-        {
-            Self::check_rows_in(&mut payload, assignment, named, check)?;
-        }
-        Ok(payload)
-    }
-
-    /// One operation's answer from its references and its way of evaluating the rules.
-    fn architecture_payload(
-        kind: &str,
-        arguments: &serde_json::Value,
-        config: Option<&crate::rules::Config>,
-        references: crate::references::Projection,
-        pin: IndexPin,
-        evaluate: &mut EvaluateRules<'_>,
-        check: &mut (impl FnMut() -> Result<()> + Send),
-    ) -> Result<serde_json::Value> {
-        let mut payload = match kind {
-            "references" => references.data,
-            "prompt" => serde_json::json!({
-                "rulesText": config.map(|config| &config.text),
-                "rulesFile": config.map(crate::rules::descriptor),
-                "references": references.data,
-            }),
-            "check" | "explain" => {
-                let config = config.expect("checked rules presence");
-                let result = evaluate(config, &references, &mut *check)?;
-                if kind == "explain" {
-                    crate::rules::explain(
-                        result,
-                        arguments["rule"]
-                            .as_str()
-                            .context("invalid_request: rule")?,
-                        arguments.get("target").context("invalid_request: target")?,
-                        arguments.get("destination"),
-                        check,
-                    )?
-                } else {
-                    result
-                }
-            }
-            _ => unreachable!(),
-        };
-        payload["indexGeneration"] = serde_json::json!(pin.index_generation.to_string());
-        payload["indexRevision"] = serde_json::json!(pin.index_revision);
-        check()?;
-        Ok(payload)
-    }
-
-    /// Browser-only layer summary, references and metrics from this admitted read.
-    pub fn architecture_view(
-        &self,
-        options: &MetricsOptions,
-        check: &mut (impl FnMut() -> Result<()> + Send),
-    ) -> Result<serde_json::Value> {
-        options.validate()?;
-        check()?;
-        let config = crate::rules::load(Path::new(self.store.workspace_root()))?;
-        let view = self.architecture_view_head(options, config.as_ref())?;
-        let pin = match &view {
-            ArchitectureView::Ready { pin, .. } => *pin,
-            ArchitectureView::Done(payload) => {
-                check()?;
-                return Ok(payload.clone());
-            }
-        };
-        let core = self.architecture_core_at(
-            pin,
-            config.as_ref(),
-            true,
-            &mut *check,
-            &|_: ArchitectureProgress| {},
-        )?;
-        let summary = self.architecture_view_at(
-            options,
-            view,
-            config.as_ref().expect("ready config"),
-            &core,
-            check,
-        )?;
-        Ok(summary.as_ref().clone())
-    }
-
-    /// The summary's revision and rules state. Only a ready summary needs a core.
-    pub(crate) fn architecture_view_head(
-        &self,
-        options: &MetricsOptions,
-        config: Option<&crate::rules::Config>,
-    ) -> Result<ArchitectureView> {
-        let selected = self.selected(options.pin)?;
-        let layers = config.map(crate::rules::view_layers).unwrap_or_default();
-        let payload = serde_json::json!({
-            "indexGeneration": selected.pin.index_generation.to_string(),
-            "indexRevision": selected.pin.index_revision,
-            "state": if config.is_none() { "missing_rules" } else if layers.is_empty() { "no_layers" } else { "ready" },
-            "rulesFile": config.map(crate::rules::descriptor),
-            "exceptionCount": config.map(crate::rules::Config::exception_count),
-            "aggregate": options.aggregate, "metricsVersion": "metrics:v1",
-            "role": options.role, "workbench": options.workbench, "evidenceTier": "syntax", "semanticComplete": false,
-            "layers": layers, "modules": [], "edges": [], "references": null, "rules": null,
-            "apps": [], "noApp": null, "interfaces": []
-        });
-        Ok(if payload["state"] == "ready" {
-            ArchitectureView::Ready {
-                pin: selected.pin,
-                payload,
-            }
-        } else {
-            ArchitectureView::Done(payload)
-        })
-    }
-
-    /// The summary at a computed core. A core serves each role and aggregate once.
-    pub(crate) fn architecture_view_at(
-        &self,
-        options: &MetricsOptions,
-        view: ArchitectureView,
-        config: &crate::rules::Config,
-        core: &ArchitectureCore,
-        check: &mut (impl FnMut() -> Result<()> + Send),
-    ) -> Result<Arc<serde_json::Value>> {
-        let key = (
-            options.role.clone(),
-            options.aggregate.clone(),
-            options.workbench,
-        );
-        if let Some(summary) = core.summary(&key) {
-            return Ok(summary);
-        }
-        let ArchitectureView::Ready { mut payload, .. } = view else {
-            anyhow::bail!("store_unavailable: architecture summary state");
-        };
-        let references = core.references(&[], 5, check)?;
-        let evaluated =
-            crate::rules::evaluate_prepared(config, core.rules(config)?, &references, &[], check)?;
-        payload["evidenceTier"] = references.data["evidenceTier"].clone();
-        payload["partialFiles"] = references.data["partialFiles"].clone();
-        let references_coverage = &references.coverage;
-        let rules = evaluated.data;
-        let assignments = evaluated.layers;
-        let base = core.rules(config)?;
-        let scope = crate::rules::AppScope::new(config, base.apps());
-        let no_app_counts = rules["noApp"]["counts"].clone();
-        let app_rules = rules["apps"]
-            .as_array()
-            .context("store_unavailable: per-app counts")?;
-        ensure!(
-            app_rules.len() == base.apps().len(),
-            "store_unavailable: per-app counts"
-        );
-        let metrics = self.metrics_at_with_config(
-            &MetricsOptions {
-                pin: Some(core.pin),
-                role: options.role.clone(),
-                workbench: options.workbench,
-                aggregate: options.aggregate.clone(),
-                ..MetricsOptions::default()
-            },
-            Some(config),
-            true,
-            Some(core.metrics()?),
-            check,
-        )?;
-        let files: BTreeMap<_, _> = metrics
-            .files
-            .iter()
-            .map(|file| {
-                (
-                    (
-                        file.source_set_id.as_str(),
-                        file.language.as_str(),
-                        file.path.as_str(),
-                    ),
-                    file,
-                )
-            })
-            .collect();
-        let mut modules = Vec::new();
-        let mut app_files = vec![(0usize, 0usize, BTreeSet::new()); base.apps().len()];
-        let mut unassigned_files = 0usize;
-        for module in &references.modules {
-            check()?;
-            let target = &module["identity"];
-            let key = (
-                target["sourceSetId"]
-                    .as_str()
-                    .context("store_unavailable: module source set")?,
-                target["language"]
-                    .as_str()
-                    .context("store_unavailable: module language")?,
-                target["path"]
-                    .as_str()
-                    .context("store_unavailable: module path")?,
-            );
-            let file = files
-                .get(&key)
-                .context("store_unavailable: architecture metrics join")?;
-            let mut row = module.clone();
-            row["layer"] = serde_json::json!(
-                assignments
-                    .get(key.2)
-                    .context("store_unavailable: architecture layer assignment absent")?
-            );
-            let layer = assignments.get(key.2).copied().flatten();
-            let app = scope.file(key.2, layer);
-            row["app"] = serde_json::json!(app.and_then(|index| scope.name(index)));
-            match app {
-                Some(index) => {
-                    let entry = &mut app_files[index];
-                    entry.0 += 1;
-                    entry.1 += usize::from(layer.is_none());
-                    // #909: hidden tooling, test-harness and fixture layers add no language.
-                    if !layer.is_some_and(|layer| crate::rules::hidden_layer(config, layer)) {
-                        entry.2.insert(key.1);
-                    }
-                }
-                None => unassigned_files += usize::from(layer.is_none()),
-            }
-            row["physicalLines"] = serde_json::json!(file.physical_lines);
-            row["declarationCount"] = serde_json::json!(file.declaration_count);
-            row["roleCounts"] = serde_json::json!(file.role_counts);
-            row["metrics"] = file.metrics.clone();
-            if let Some(reason) = file.excluded_reason {
-                row["excludedReason"] = serde_json::json!(reason);
-            }
-            modules.push(row);
-        }
-        // Keep policy and exception contributions separate even on the same pair. An edge's
-        // pairs and their sampled sites are paged by the details route's `edge` kind (#917).
-        type SummaryKey = (String, String, String, String, bool, Option<String>);
-        let mut summaries: BTreeMap<SummaryKey, serde_json::Value> = BTreeMap::new();
-        crate::architecture_details::edge_pairs(
-            &references.data,
-            &rules,
-            &mut *check,
-            |role, edge, pair| {
-                let summary = summaries
-                    .entry((
-                        edge.source.into(),
-                        edge.destination.into(),
-                        role.into(),
-                        edge.status.into(),
-                        edge.excepted,
-                        edge.reason.map(str::to_owned),
-                    ))
-                    .or_insert_with(|| {
-                        serde_json::json!({
-                            "key": edge.key(role),
-                            "sourceLayer": edge.source, "destinationLayer": edge.destination,
-                            "role": role, "status": edge.status, "excepted": edge.excepted,
-                            "exceptionReason": edge.reason, "count": 0, "semanticSites": 0
-                        })
-                    });
-                summary["count"] = serde_json::json!(
-                    summary["count"].as_u64().unwrap_or(0)
-                        + pair["count"]
-                            .as_u64()
-                            .context("store_unavailable: reference count")?
-                );
-                summary["semanticSites"] = serde_json::json!(
-                    summary["semanticSites"].as_u64().unwrap_or(0)
-                        + pair["semanticSites"]
-                            .as_u64()
-                            .context("store_unavailable: reference semantic count")?
-                );
-                Ok(())
-            },
-        )?;
-        // Undrawn detail (sites, pairs, instances) is served by paged detail reads (#448).
-        let (mut references, mut rules) = crate::architecture_details::summary(
-            &references.data,
-            &rules,
-            &crate::architecture_details::Layers::new(&assignments, &rules),
-        )?;
-        // Exact site coverage per source layer and role, so drawn counts can be read as
-        // lower bounds next to their arrows (#449). One row per (layer, role).
-        let mut coverage: BTreeMap<(Option<&str>, bool), crate::references::SiteCoverage> =
-            BTreeMap::new();
-        for ((path, test), counted) in references_coverage {
-            check()?;
-            let layer = assignments.get(path.as_str()).copied().flatten();
-            let row = coverage.entry((layer, *test)).or_default();
-            row.sites += counted.sites;
-            row.mapped += counted.mapped;
-            row.unresolved += counted.unresolved;
-            row.semantic += counted.semantic;
-        }
-        let coverage_row = |row: &crate::references::SiteCoverage| {
-            serde_json::json!({
-                "sites": row.sites, "mappedSites": row.mapped, "unresolvedSites": row.unresolved,
-                "semanticSites": row.semantic
-            })
-        };
-        // Each arrow carries its evidence tier and its source layer's coverage: its count is
-        // exact (`complete`) only when no site of that layer and role stayed unresolved (#523).
-        for summary in summaries.values_mut() {
-            check()?;
-            let test = summary["role"] == "test";
-            let row = coverage
-                .get(&(summary["sourceLayer"].as_str(), test))
-                .copied()
-                .unwrap_or_default();
-            let count = summary["count"].as_u64().unwrap_or(0);
-            let semantic = summary["semanticSites"].as_u64().unwrap_or(0);
-            summary["evidenceTier"] = serde_json::json!(match semantic {
-                0 => "syntax",
-                n if n == count => "semantic",
-                _ => "mixed",
-            });
-            let mut covered = coverage_row(&row);
-            covered["complete"] = serde_json::json!(row.unresolved == 0);
-            summary["coverage"] = covered;
-        }
-        references["coverage"] = serde_json::json!(
-            coverage
-                .into_iter()
-                .map(|((layer, test), row)| {
-                    let mut value = coverage_row(&row);
-                    value["layer"] = serde_json::json!(layer);
-                    value["role"] = serde_json::json!(if test { "test" } else { "production" });
-                    value
-                })
-                .collect::<Vec<_>>()
-        );
-        let apps: Vec<_> = base
-            .apps()
-            .iter()
-            .zip(app_rules)
-            .zip(&app_files)
-            .map(|((app, counted), (file_count, unassigned, languages))| {
-                serde_json::json!({
-                    "name": app.name, "kind": app.kind, "manifest": app.manifest,
-                    "roots": app.roots, "entries": app.entries,
-                    "languages": crate::semantic_evidence::LANGUAGE_ORDER
-                        .iter()
-                        .filter(|language| languages.contains(**language))
-                        .collect::<Vec<_>>(),
-                    "fileCount": file_count, "source": app.source,
-                    "counts": counted["counts"], "unassignedFileCount": unassigned
-                })
-            })
-            .collect();
-        let no_app = serde_json::json!({
-            "counts": no_app_counts, "unassignedFileCount": unassigned_files
-        });
-        let interfaces =
-            crate::interfaces::project(core.interfaces()?, &scope, &assignments, check)?.summary();
-        drop(assignments);
-        for value in [&mut references, &mut rules] {
-            value["indexGeneration"] = serde_json::json!(core.pin.index_generation.to_string());
-            value["indexRevision"] = serde_json::json!(core.pin.index_revision);
-        }
-        payload["modules"] = serde_json::json!(modules);
-        payload["edges"] = serde_json::json!(summaries.into_values().collect::<Vec<_>>());
-        payload["references"] = references;
-        payload["rules"] = rules;
-        payload["apps"] = serde_json::json!(apps);
-        payload["noApp"] = no_app;
-        payload["interfaces"] = serde_json::json!(interfaces);
-        check()?;
-        Ok(core.remember_summary(key, payload))
-    }
-
-    /// One bounded page of Architecture detail at the summary's pin and rules hash.
-    /// A different rules file fails `rules_conflict`; a stale pin fails like the summary.
-    pub fn architecture_details(
-        &self,
-        query: &crate::architecture_details::Query,
-        check: &mut (impl FnMut() -> Result<()> + Send),
-    ) -> Result<serde_json::Value> {
-        check()?;
-        let config = self.architecture_details_config(query)?;
-        let core = self.architecture_core_at(
-            query.pin,
-            Some(&config),
-            false,
-            &mut *check,
-            &|_: ArchitectureProgress| {},
-        )?;
-        self.architecture_details_at(query, &config, &core, check)
-    }
-
-    /// The rules file a detail read pins, or `rules_conflict`.
-    pub(crate) fn architecture_details_config(
-        &self,
-        query: &crate::architecture_details::Query,
-    ) -> Result<crate::rules::Config> {
-        let config = crate::rules::load(Path::new(self.store.workspace_root()))?
-            .context("rules_conflict: rules file missing")?;
-        ensure!(
-            config.content_hash == query.rules_hash,
-            "rules_conflict: rules changed since the summary"
-        );
-        self.selected(Some(query.pin))?;
-        Ok(config)
-    }
-
-    /// One bounded detail page at a computed core.
-    pub(crate) fn architecture_details_at(
-        &self,
-        query: &crate::architecture_details::Query,
-        config: &crate::rules::Config,
-        core: &ArchitectureCore,
-        check: &mut (impl FnMut() -> Result<()> + Send),
-    ) -> Result<serde_json::Value> {
-        let references = core.references(&[], 5, check)?;
-        let evaluated =
-            crate::rules::evaluate_prepared(config, core.rules(config)?, &references, &[], check)?;
-        let layers =
-            crate::architecture_details::Layers::new(&evaluated.layers, &evaluated.data).with_apps(
-                crate::rules::AppScope::new(config, core.rules(config)?.apps()),
-            );
-        let interfaces = if query.kind == crate::architecture_details::Kind::Interfaces {
-            Some(crate::interfaces::project(
-                core.interfaces()?,
-                &crate::rules::AppScope::new(config, core.rules(config)?.apps()),
-                &evaluated.layers,
-                check,
-            )?)
-        } else {
-            None
-        };
-        let page = crate::architecture_details::page(
-            query,
-            &references.data,
-            &evaluated.data,
-            &layers,
-            interfaces.as_ref(),
-            check,
-        )?;
-        check()?;
-        Ok(page)
-    }
-
-    /// Browser rule authoring validates the entire proposal against one admitted
-    /// snapshot. Nothing here publishes or changes index state.
-    pub(crate) fn validate_rules_edit(
-        &self,
-        pin: IndexPin,
-        base: &crate::rules::Config,
-        proposed: &crate::rules::Config,
-        request: &crate::rules_edit::Request,
-        check: &mut (impl FnMut() -> Result<()> + Send),
-    ) -> Result<()> {
-        let snapshot = self
-            .architecture_snapshot(Some(pin), check)
-            .map_err(|error| self.store.report_index_failure(error))?;
-        let references = crate::references::project(&snapshot, &[], 5, check)?;
-        let evaluated =
-            crate::rules::evaluate_with_layers(base, &snapshot, &references, &[], check)?;
-        crate::rules_edit::validate_selection(request, &evaluated.data, &evaluated.layers, check)?;
-        crate::rules::evaluate(proposed, &snapshot, &references, &[], check)?;
-        Ok(())
-    }
-
-    pub(crate) fn rules_edit_inventory(&self, pin: IndexPin) -> Result<serde_json::Value> {
-        self.selected(Some(pin))?;
-        let config = crate::rules::load(Path::new(self.store.workspace_root()))?
-            .context("not_found: rules file missing")?;
-        crate::rules_edit::inventory(&config, pin)
-    }
-
     /// Read each selected native document once; never reopen source from the checkout.
-    fn architecture_snapshot(
+    pub(crate) fn architecture_snapshot(
         &self,
         pin: Option<IndexPin>,
         check: &mut (impl FnMut() -> Result<()> + Send),
@@ -2938,16 +1574,16 @@ impl EvidenceResponse {
     }
 
     /// The snapshot and each document's control regions, in snapshot order.
-    fn architecture_snapshot_regions(
+    pub(crate) fn architecture_snapshot_regions(
         &self,
         pin: Option<IndexPin>,
         check: &mut (impl FnMut() -> Result<()> + Send),
         progress: &dyn Fn(usize, usize),
     ) -> Result<(
         crate::references::Snapshot,
-        Vec<Vec<crate::native_evidence::ControlRegion>>,
+        Vec<Vec<crate::native_records::ControlRegion>>,
     )> {
-        use crate::native_evidence::DocumentKey;
+        use crate::native_records::DocumentKey;
         check()?;
         let selected = self.selected(pin)?;
         let total = self.db.query_row(
@@ -3335,621 +1971,6 @@ impl EvidenceResponse {
         ))
     }
 
-    /// Compute metrics from one selected revision in this response's read transaction.
-    pub fn metrics_at(
-        &self,
-        options: &MetricsOptions,
-        check: &mut (impl FnMut() -> Result<()> + Send),
-    ) -> Result<MetricsPayload> {
-        self.metrics_at_prepared(options, None, check)
-    }
-
-    /// `metrics_at`, taking this revision's rows from `prepared` when it has them.
-    pub(crate) fn metrics_at_prepared(
-        &self,
-        options: &MetricsOptions,
-        prepared: Option<&ArchitectureMetrics>,
-        check: &mut (impl FnMut() -> Result<()> + Send),
-    ) -> Result<MetricsPayload> {
-        options.validate()?;
-        check()?;
-        let (config, invalid_rules) = if options.workbench {
-            match crate::rules::load(Path::new(self.store.workspace_root())) {
-                Ok(config) => (config, false),
-                Err(error) if crate::rules::diagnostic(&error).is_some() => (None, true),
-                Err(error) => return Err(error),
-            }
-        } else {
-            (None, false)
-        };
-        let mut payload =
-            self.metrics_at_with_config(options, config.as_ref(), false, prepared, check)?;
-        if invalid_rules {
-            payload.layer_exclusions_warning = Some(LAYER_EXCLUSIONS_WARNING);
-        }
-        Ok(payload)
-    }
-
-    fn metrics_at_with_config(
-        &self,
-        options: &MetricsOptions,
-        config: Option<&crate::rules::Config>,
-        strict_rules: bool,
-        prepared: Option<&ArchitectureMetrics>,
-        check: &mut (impl FnMut() -> Result<()> + Send),
-    ) -> Result<MetricsPayload> {
-        let progress = MetricsReadCheck {
-            check: Mutex::new(check),
-            failure: Mutex::new(None),
-            stopped: AtomicBool::new(false),
-        };
-        progress.check()?;
-        let selected = self.selected(options.pin)?;
-        let selected_metrics: Vec<String> = crate::metrics::METRIC_ORDER
-            .iter()
-            .filter(|name| {
-                options.metrics.is_empty() || options.metrics.iter().any(|m| m == **name)
-            })
-            .map(|name| (*name).to_owned())
-            .collect();
-        let names: Vec<&str> = selected_metrics.iter().map(String::as_str).collect();
-        use crate::native_evidence::DocumentKey;
-        let mut stmt = self.db.prepare(
-            "SELECT r.source_set_id,m.language,m.path,m.coverage_diagnostic
-            FROM revision_documents m
-            JOIN native_revisions r ON r.id=m.revision_id
-            WHERE m.revision_id=?1 ORDER BY r.source_set_id,m.language,m.path",
-        )?;
-        let mut documents = Vec::new();
-        let mut evidence_gaps = BTreeMap::new();
-        let mut cursor = stmt.query([&selected.key])?;
-        while let Some(row) = cursor.next()? {
-            progress.check()?;
-            let key = DocumentKey {
-                source_set_id: row.get(0)?,
-                language: row.get(1)?,
-                path: row.get(2)?,
-            };
-            if let Some(reason) = crate::syntax_bounds::module_only_reason(
-                row.get::<_, Option<String>>(3)?.as_deref(),
-            ) {
-                evidence_gaps.insert(key.clone(), reason);
-            }
-            documents.push(key);
-        }
-        progress.check()?;
-        // Existence is decided from the manifest, not from callable rows.
-        let included: Vec<&DocumentKey> = documents
-            .iter()
-            .filter(|key| match options.scope.as_str() {
-                "revision" => true,
-                "directory" => {
-                    options.source_set_id.as_ref() == Some(&key.source_set_id)
-                        && options.path.as_ref().is_some_and(|path| {
-                            path.is_empty() || key.path.starts_with(&format!("{path}/"))
-                        })
-                }
-                "file" => {
-                    options.source_set_id.as_ref() == Some(&key.source_set_id)
-                        && options.language.as_ref() == Some(&key.language)
-                        && options.path.as_ref() == Some(&key.path)
-                }
-                "declaration" => {
-                    options.source_set_id.as_ref() == Some(&key.source_set_id)
-                        && options.path.as_ref() == Some(&key.path)
-                }
-                _ => false,
-            })
-            .collect();
-        if options.scope != "revision" && included.is_empty() {
-            anyhow::bail!("not_found: metrics selector");
-        }
-        let mut layer_exclusions_warning = None;
-        let hidden_layers = if options.workbench && options.role == "production" {
-            if let Some(config) = config {
-                match crate::rules::hidden_layer_paths(
-                    config,
-                    &included
-                        .iter()
-                        .map(|key| key.path.as_str())
-                        .collect::<Vec<_>>(),
-                    &mut || progress.check(),
-                ) {
-                    Ok(paths) => paths,
-                    Err(error) if !strict_rules && crate::rules::diagnostic(&error).is_some() => {
-                        layer_exclusions_warning = Some(LAYER_EXCLUSIONS_WARNING);
-                        BTreeSet::new()
-                    }
-                    Err(error) => return Err(error),
-                }
-            } else {
-                BTreeSet::new()
-            }
-        } else {
-            BTreeSet::new()
-        };
-        let mut declarations = Vec::new();
-        let mut files = Vec::new();
-        let mut top_cognitive = options
-            .top_cognitive
-            .map(|_| Vec::<MetricsTopCognitiveRow>::new());
-        let mut directories: BTreeMap<(String, String), crate::metrics::Accumulator> =
-            BTreeMap::new();
-        // Read source and native rows only from the selected version.
-        // Every SQL read runs in order on this request's connection and snapshot.
-        // Metrics run on workers, a chunk behind the
-        // reads, and are accepted strictly in manifest order: the first failure
-        // in that order is the one reported, and nothing after it is accepted.
-        let workers = if included.len() > 1 {
-            crate::parallel::default_workers()
-        } else {
-            1
-        };
-        #[cfg(test)]
-        let workers = METRICS_TEST_PLAN
-            .get()
-            .map_or(workers, |plan| plan.workers.min(included.len().max(1)));
-        let fetch_bytes = METRICS_FETCH_BYTES;
-        #[cfg(test)]
-        let fetch_bytes = METRICS_TEST_PLAN
-            .get()
-            .map_or(fetch_bytes, |plan| plan.fetch_bytes);
-        let expired = || progress.expired();
-        let check_every = if workers == 1 {
-            1
-        } else {
-            METRICS_WORKER_CHECK_EVERY
-        };
-        let store = &self.store;
-        let compute_document =
-            |fetched: FetchedDocument,
-             key: &DocumentKey|
-             -> std::result::Result<MetricsComputedDocument, MetricsDocumentFailure> {
-                let calls = std::cell::Cell::new(0);
-                let expired = || progress.expired_every(&calls, check_every);
-                store.metrics_document(
-                    key,
-                    &fetched.file,
-                    &fetched.declarations,
-                    &fetched.calls,
-                    &fetched.regions,
-                    &expired,
-                )
-            };
-        let compute = |fetched: FetchedDocument, key: &DocumentKey| {
-            #[cfg(test)]
-            store.run_metrics_document_hook(&key.path, MetricsDocumentStage::Start);
-            let outcome = compute_document(fetched, key);
-            #[cfg(test)]
-            store.run_metrics_document_hook(&key.path, MetricsDocumentStage::Done);
-            outcome
-        };
-        let mut partial_files = Vec::new();
-        let mut accept = |key: &DocumentKey,
-                          outcome: Option<
-            std::result::Result<MetricsComputedDocument, MetricsDocumentFailure>,
-        >|
-         -> Result<()> {
-            let MetricsComputedDocument {
-                computed,
-                physical_lines,
-                physical_bytes,
-                file_role,
-            } = match outcome {
-                Some(Ok(computed)) => computed,
-                Some(Err(MetricsDocumentFailure::Read(error))) => {
-                    return progress.result(Err(self.store.report_index_failure(error)));
-                }
-                Some(Err(MetricsDocumentFailure::Other(error))) => {
-                    return progress.result(Err(error));
-                }
-                // A document a worker never started was skipped after a check failed.
-                Some(Err(MetricsDocumentFailure::Stopped)) | None => {
-                    return progress.result(Err(anyhow::anyhow!("cancelled")));
-                }
-            };
-            partial_files.extend(
-                evidence_gaps
-                    .get(key)
-                    .map(|&reason| {
-                        crate::syntax_bounds::SyntaxGap::module_only(reason, physical_bytes)
-                            .file(key)
-                    })
-                    .or_else(|| computed.gap().map(|gap| gap.file(key))),
-            );
-            let mut rows = computed.commit(
-                &mut self
-                    .store
-                    .metrics_memo
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()),
-            )?;
-            let mut role_counts = MetricsRoleCounts {
-                production: 0,
-                test: 0,
-            };
-            for row in &rows {
-                progress.check()?;
-                match row.role {
-                    DeclarationRole::Production => role_counts.production += 1,
-                    DeclarationRole::Test => role_counts.test += 1,
-                }
-            }
-            // Workbench population only: stored roles, file identity and policy stay intact.
-            // Validate and measure every file before excluding its callable contributions.
-            let excluded_reason = if !options.workbench {
-                None
-            } else if key.path.starts_with("web/vendor/") {
-                Some("vendored")
-            } else if options.role == "production"
-                && (key.path.starts_with("tests/fixtures/")
-                    || key.path.starts_with("tools/synthetic-cohorts/templates/"))
-            {
-                Some("fixture")
-            } else if hidden_layers.contains(&key.path) {
-                Some("hidden_layer")
-            } else {
-                None
-            };
-            rows.retain(|row| {
-                excluded_reason.is_none()
-                    && (options.role == "all" || options.role == row.role.as_str())
-            });
-            let mut file_fold = crate::metrics::Accumulator::default();
-            let mut parents = vec![String::new()];
-            let mut directory = String::new();
-            for segment in key
-                .path
-                .split('/')
-                .collect::<Vec<_>>()
-                .split_last()
-                .map(|(_, parents)| parents)
-                .unwrap_or(&[])
-            {
-                if !directory.is_empty() {
-                    directory.push('/');
-                }
-                directory.push_str(segment);
-                parents.push(directory.clone());
-            }
-            if options.scope == "directory" {
-                let selected_path = options.path.as_deref().unwrap_or_default();
-                parents.retain(|path| {
-                    selected_path.is_empty()
-                        || path == selected_path
-                        || path.starts_with(&format!("{selected_path}/"))
-                });
-            }
-            for path in &parents {
-                directories
-                    .entry((key.source_set_id.clone(), path.clone()))
-                    .or_default();
-            }
-            for row in &rows {
-                progress.check()?;
-                file_fold.push(&row.metrics)?;
-                for path in &parents {
-                    directories
-                        .get_mut(&(key.source_set_id.clone(), path.clone()))
-                        .expect("inserted directory")
-                        .push(&row.metrics)?;
-                }
-            }
-            for row in rows {
-                let selected_callable =
-                    options.scope != "declaration" || options.sid.as_ref() == Some(&row.sid);
-                if selected_callable
-                    && let (Some(count), Some(top)) = (options.top_cognitive, &mut top_cognitive)
-                {
-                    top.push(MetricsTopCognitiveRow {
-                        role: row.role,
-                        source_set_id: row.source_set_id.clone(),
-                        language: row.language.clone(),
-                        path: row.path.clone(),
-                        sid: row.sid.clone(),
-                        range: row.range.clone(),
-                        name: row.name.clone(),
-                        kind: row.kind.clone(),
-                        metrics: MetricsTopCognitiveScore {
-                            cognitive: row.metrics.cognitive,
-                            cyclomatic: row.metrics.cyclomatic,
-                            max_nesting: row.metrics.max_nesting,
-                        },
-                    });
-                    top.sort_by(|a, b| {
-                        b.metrics.cognitive.cmp(&a.metrics.cognitive).then_with(|| {
-                            (
-                                &a.source_set_id,
-                                &a.language,
-                                &a.path,
-                                a.range.start,
-                                a.range.end,
-                                &a.sid,
-                            )
-                                .cmp(&(
-                                    &b.source_set_id,
-                                    &b.language,
-                                    &b.path,
-                                    b.range.start,
-                                    b.range.end,
-                                    &b.sid,
-                                ))
-                        })
-                    });
-                    top.truncate(count);
-                }
-                if options.scope == "file" || (options.scope == "declaration" && selected_callable)
-                {
-                    let mut projected = serde_json::to_value(&row.metrics)?;
-                    projected
-                        .as_object_mut()
-                        .expect("metric score object")
-                        .retain(|name, _| selected_metrics.iter().any(|selected| selected == name));
-                    declarations.push(MetricsDeclarationRow {
-                        role: row.role,
-                        source_set_id: row.source_set_id,
-                        language: row.language,
-                        path: row.path,
-                        sid: row.sid,
-                        range: row.range,
-                        metrics: projected,
-                    });
-                }
-            }
-            if options.scope != "declaration" {
-                files.push(MetricsFileRow {
-                    source_set_id: key.source_set_id.clone(),
-                    language: key.language.clone(),
-                    path: key.path.clone(),
-                    physical_lines,
-                    file_role,
-                    role_counts,
-                    excluded_reason,
-                    declaration_count: file_fold.count(),
-                    metrics: file_fold.project(&options.aggregate, &names)?,
-                });
-            }
-            Ok(())
-        };
-        if let Some(prepared) = prepared {
-            for &key in &included {
-                let document = prepared
-                    .get(key)
-                    .context("store_unavailable: prepared metrics document")?;
-                progress.check()?;
-                accept(
-                    key,
-                    Some(Ok(MetricsComputedDocument {
-                        computed: crate::metrics::Computed::ready(
-                            document.rows.clone(),
-                            document.gap.clone(),
-                        ),
-                        physical_lines: document.physical_lines,
-                        physical_bytes: document.physical_bytes,
-                        file_role: document.file_role,
-                    })),
-                )?;
-            }
-        }
-        std::thread::scope(|scope| -> Result<()> {
-            if prepared.is_some() {
-                return Ok(());
-            }
-            type Fetched = std::result::Result<FetchedDocument, MetricsDocumentFailure>;
-            let mut remaining = included.iter();
-            let mut exhausted = false;
-            // A document whose rows did not fit beside what is already held.
-            let mut carried: Option<(&DocumentKey, FetchedDocument)> = None;
-            let mut pending: Option<(
-                Vec<&DocumentKey>,
-                std::thread::ScopedJoinHandle<'_, Vec<Option<_>>>,
-            )> = None;
-            // The read-ahead charge of the chunk the workers hold, for the trace.
-            #[cfg(test)]
-            let mut pending_bytes = 0u64;
-            let chunk_bytes = fetch_bytes / 2;
-            loop {
-                // Read the next chunk while the workers compute the previous one.
-                // The two ordinary chunks together stay within the budget.
-                // A document is charged its stored rows once fetched, so one
-                // fully fetched document may be carried past that budget.
-                // A document over half the budget is computed alone.
-                let mut keys: Vec<&DocumentKey> = Vec::new();
-                let mut fetched: Vec<std::sync::Mutex<Option<Fetched>>> = Vec::new();
-                let mut bytes = 0u64;
-                let mut alone = false;
-                while keys.len() < METRICS_FETCH_DOCUMENTS {
-                    let (key, item) = match carried.take() {
-                        Some(carry) => carry,
-                        None => {
-                            if exhausted {
-                                break;
-                            }
-                            let Some(&key) = remaining.next() else {
-                                exhausted = true;
-                                break;
-                            };
-                            let item = if progress.expired() {
-                                Err(MetricsDocumentFailure::Stopped)
-                            } else {
-                                self.store
-                                    .fetch_selected_header(
-                                        &self.db,
-                                        &key.path,
-                                        &selected,
-                                        Some(&expired),
-                                    )
-                                    .and_then(|header| {
-                                        self.store.fetch_selected_rows(
-                                            &self.db,
-                                            header,
-                                            &selected,
-                                            Some(&expired),
-                                        )
-                                    })
-                                    .map_err(MetricsDocumentFailure::Read)
-                            };
-                            match item {
-                                Ok(item) => (key, item),
-                                Err(failure) => {
-                                    keys.push(key);
-                                    fetched.push(std::sync::Mutex::new(Some(Err(failure))));
-                                    exhausted = true;
-                                    break;
-                                }
-                            }
-                        }
-                    };
-                    let charge = item.stored_bytes;
-                    // The newly fetched item is resident before deciding whether
-                    // it fits: count pending + current + this lookahead even if
-                    // pending is about to be joined and accepted.
-                    #[cfg(test)]
-                    trace_metrics_resident(
-                        fetched.len() + pending.as_ref().map_or(0, |(keys, _)| keys.len()) + 1,
-                        pending_bytes.saturating_add(bytes).saturating_add(charge),
-                    );
-                    let oversized = charge > chunk_bytes;
-                    if !keys.is_empty() && (oversized || bytes.saturating_add(charge) > chunk_bytes)
-                    {
-                        #[cfg(test)]
-                        METRICS_FETCH_TRACE.with_borrow_mut(|trace| {
-                            trace.boundaries.push((pending_bytes, bytes, charge));
-                        });
-                        carried = Some((key, item));
-                        break;
-                    }
-                    if oversized && pending.is_some() {
-                        #[cfg(test)]
-                        METRICS_FETCH_TRACE.with_borrow_mut(|trace| {
-                            trace.boundaries.push((pending_bytes, bytes, charge));
-                        });
-                        carried = Some((key, item));
-                        break;
-                    }
-                    keys.push(key);
-                    fetched.push(std::sync::Mutex::new(Some(Ok(item))));
-                    bytes = bytes.saturating_add(charge);
-                    #[cfg(test)]
-                    {
-                        METRICS_FETCH_TRACE.with_borrow_mut(|trace| trace.charges.push(charge));
-                    }
-                    if oversized {
-                        alone = true;
-                        break;
-                    }
-                }
-                if let Some((keys, handle)) = pending.take() {
-                    #[cfg(test)]
-                    {
-                        pending_bytes = 0;
-                    }
-                    let outcomes = handle
-                        .join()
-                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-                    for (key, outcome) in keys.into_iter().zip(outcomes) {
-                        accept(key, outcome)?;
-                    }
-                }
-                if keys.is_empty() {
-                    if carried.is_some() {
-                        continue;
-                    }
-                    return Ok(());
-                }
-                let run = {
-                    let compute = &compute;
-                    let stopped = &progress.stopped;
-                    let keys = keys.clone();
-                    move || {
-                        crate::parallel::map_ordered(&fetched, workers, stopped, |index, item| {
-                            let item = item
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .take()
-                                .expect("each fetched document is computed once");
-                            item.and_then(|document| compute(document, keys[index]))
-                        })
-                    }
-                };
-                if workers == 1 || alone {
-                    // Nothing else is read while this chunk is held.
-                    for (key, outcome) in keys.into_iter().zip(run()) {
-                        accept(key, outcome)?;
-                    }
-                } else {
-                    #[cfg(test)]
-                    {
-                        pending_bytes = bytes;
-                    }
-                    pending = Some((keys, scope.spawn(run)));
-                }
-            }
-        })?;
-        if options.scope == "declaration" {
-            if declarations.is_empty() {
-                anyhow::bail!("not_found: metrics declaration");
-            }
-            selected_ensure!(
-                declarations.len() == 1,
-                "incompatible_index: ambiguous metrics declaration"
-            );
-        }
-        declarations.sort_by(|a, b| {
-            (
-                &a.source_set_id,
-                &a.language,
-                &a.path,
-                a.range.start,
-                a.range.end,
-                &a.sid,
-            )
-                .cmp(&(
-                    &b.source_set_id,
-                    &b.language,
-                    &b.path,
-                    b.range.start,
-                    b.range.end,
-                    &b.sid,
-                ))
-        });
-        files.sort_by(|a, b| {
-            (&a.source_set_id, &a.language, &a.path).cmp(&(&b.source_set_id, &b.language, &b.path))
-        });
-        let directory_rows = if matches!(options.scope.as_str(), "revision" | "directory") {
-            directories
-                .into_iter()
-                .map(|((source_set_id, path), fold)| {
-                    progress.check()?;
-                    Ok(MetricsDirectoryRow {
-                        source_set_id,
-                        path,
-                        declaration_count: fold.count(),
-                        metrics: fold.project(&options.aggregate, &names)?,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            vec![]
-        };
-        progress.check()?;
-        Ok(MetricsPayload {
-            metrics_version: crate::metrics::VERSION,
-            role: options.role.clone(),
-            workbench: options.workbench,
-            layer_exclusions_warning,
-            index_generation: selected.pin.index_generation.to_string(),
-            index_revision: selected.pin.index_revision,
-            scope: options.scope.clone(),
-            aggregate: options.aggregate.clone(),
-            selected_metrics,
-            declarations,
-            files,
-            directories: directory_rows,
-            top_cognitive,
-            partial_files,
-        })
-    }
     pub(crate) fn report_index_failure(&self, error: anyhow::Error) -> anyhow::Error {
         self.store.report_index_failure(error)
     }
@@ -3978,7 +1999,7 @@ impl EvidenceResponse {
     }
     /// The response's selected revision: its admitted head, or `pin` after the
     /// usual conflict and expiry checks, without re-validating the index.
-    fn selected(&self, pin: Option<IndexPin>) -> Result<ReadRevision> {
+    pub(crate) fn selected(&self, pin: Option<IndexPin>) -> Result<ReadRevision> {
         self.store.read_revision_for(&self.db, pin, true)
     }
     pub fn source_at(
@@ -3992,22 +2013,10 @@ impl EvidenceResponse {
             .selected_source_row_for(&self.db, path, &selected)?;
         Ok(source.map(|source| (selected.pin, source)))
     }
-    pub fn query_view(&self, query: &ViewQuery) -> Result<Option<ViewResult>> {
-        self.query_view_at(query, None)
-    }
-    pub fn query_view_at(
-        &self,
-        query: &ViewQuery,
-        expected: Option<&IndexPin>,
-    ) -> Result<Option<ViewResult>> {
-        query.validate()?;
-        self.store
-            .query_view_in_for(&self.db, query, expected, true)
-    }
     pub fn tree_metadata(
         &self,
         root: &Path,
-        items: &mut [crate::file_tree::Entry],
+        items: &mut [crate::source_dir::Entry],
     ) -> Result<(IndexPin, String)> {
         let (revision, workspace_root, overlays) =
             self.store.tree_metadata_in(&self.db, root, items, true)?;
@@ -4045,63 +2054,6 @@ impl EvidenceResponse {
         expected: Option<IndexPin>,
     ) -> Result<Option<serde_json::Value>> {
         self.store.methods_in(&self.db, path, expected, true)
-    }
-    pub fn file_symbols_at(
-        &self,
-        path: &str,
-        expected: IndexPin,
-        offset: usize,
-        limit: usize,
-    ) -> Result<Option<crate::files_view::Outline>> {
-        self.store
-            .file_symbols_in(&self.db, path, expected, offset, limit, true)
-    }
-    pub fn syntax_matches_at(
-        &self,
-        request: &crate::files_view::SyntaxMatchesRequest,
-    ) -> Result<Option<crate::files_view::SyntaxMatches>> {
-        self.store.syntax_matches_in(&self.db, request, true)
-    }
-    pub fn sequence_at(
-        &self,
-        seed: &str,
-        expected: IndexPin,
-        show_all: bool,
-    ) -> Result<Option<crate::behavior::SequenceView>> {
-        self.store
-            .sequence_in(&self.db, seed, expected, show_all, false, true)
-    }
-    /// The candidates of the browser's Interactions view (#663): see [`Store::sequence_interactions_at`].
-    pub fn sequence_interactions_at(
-        &self,
-        seed: &str,
-        expected: IndexPin,
-    ) -> Result<Option<crate::behavior::SequenceView>> {
-        self.store
-            .sequence_in(&self.db, seed, expected, false, true, true)
-    }
-    pub fn classes_at(
-        &self,
-        path: Option<&str>,
-        query: &str,
-        expected: Option<IndexPin>,
-        offset: usize,
-        limit: usize,
-    ) -> Result<crate::class_diagram::ClassPage> {
-        self.store
-            .classes_in(&self.db, path, query, expected, (offset, limit), true)
-    }
-    pub fn navigation_at(
-        &self,
-        request: &crate::navigation::NavigationRequest,
-    ) -> Result<crate::navigation::NavigationResult> {
-        self.store.navigation_in(&self.db, request, true)
-    }
-    pub fn class_diagram_at(
-        &self,
-        request: &crate::class_diagram::ClassDiagramRequest,
-    ) -> Result<crate::class_diagram::ClassDiagram> {
-        self.store.class_diagram_in(&self.db, request, true)
     }
     pub fn symbols_at(&self, query: &str, limit: usize) -> Result<(IndexPin, Vec<Symbol>)> {
         self.store.symbols_in(&self.db, query, limit, true)
@@ -5532,13 +3484,7 @@ pub fn terminal_status_sqlite_contention(error: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod admit_once_tests;
 #[cfg(test)]
-mod architecture_apps_tests;
-#[cfg(test)]
 mod published_admission_tests;
-#[cfg(test)]
-mod sequence_callback_hops_tests;
-#[cfg(test)]
-mod sequence_hops_tests;
 #[cfg(test)]
 mod terminal_status_contention_tests;
 #[cfg(test)]
@@ -5933,7 +3879,10 @@ fn validate_graph(graph: &Graph, cancel: &CancelFlag) -> Result<IndexStats> {
     Ok(stats)
 }
 
-fn class_metadata(db: &Connection, selected: &ReadRevision) -> Result<(Vec<String>, bool)> {
+pub(crate) fn class_metadata(
+    db: &Connection,
+    selected: &ReadRevision,
+) -> Result<(Vec<String>, bool)> {
     let length: i64 = db.query_row(
         "SELECT length(CAST(class_warnings AS BLOB)) FROM native_revisions WHERE id=?1",
         [&selected.key],
@@ -5964,195 +3913,6 @@ fn class_metadata(db: &Connection, selected: &ReadRevision) -> Result<(Vec<Strin
     }
     Ok((visible, truncated))
 }
-/// Read at most 64 KiB of class JSON into Rust. Large member arrays are
-/// clipped in SQLite, without materializing their full strings in the API.
-/// IDs, class metadata, and source ranges remain exact; only member arrays shrink.
-fn presentation_class(
-    store: &Store,
-    db: &Connection,
-    id: &str,
-    selected: &ReadRevision,
-) -> Result<Option<(crate::model::ClassDefinition, usize, bool)>> {
-    use crate::class_diagram::CLASS_BYTES;
-    let size: Option<i64> = db
-        .query_row(
-            "SELECT length(CAST(payload AS BLOB)) FROM classes JOIN revision_documents m ON m.revision_id=?2 AND m.cid=classes.cid WHERE classes.id=?1",
-            params![id_codec::encode_sid(id), selected.key],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(|error| store.report_index_failure(error.into()))?;
-    let Some(size) = size else {
-        return Ok(None);
-    };
-    let valid: bool = db
-        .query_row(
-            "SELECT json_valid(payload) FROM classes JOIN revision_documents m ON m.revision_id=?2 AND m.cid=classes.cid WHERE classes.id=?1",
-            params![id_codec::encode_sid(id), selected.key],
-            |r| r.get(0),
-        )
-        .map_err(|error| store.report_index_failure(error.into()))?;
-    if !valid {
-        return Err(store.report_index_failure(
-            SelectedIntegrity("incompatible_index: selected class JSON invalid".into()).into(),
-        ));
-    }
-    if size <= CLASS_BYTES as i64 {
-        let payload: String = db
-            .query_row("SELECT payload FROM classes JOIN revision_documents m ON m.revision_id=?2 AND m.cid=classes.cid WHERE classes.id=?1", params![id_codec::encode_sid(id), selected.key], |r| {
-                r.get(0)
-            })
-            .map_err(|error| store.report_index_failure(error.into()))?;
-        let class = serde_json::from_str(&payload)
-            .context(SelectedIntegrity(
-                "incompatible_index: stored JSON decode failed".into(),
-            ))
-            .map_err(|error| store.report_index_failure(error))?;
-        return Ok(Some((class, payload.len(), false)));
-    }
-    let clip_shape: bool = db
-        .query_row(
-            "SELECT json_type(payload,'$.fields')='array'
-                AND json_type(payload,'$.methods')='array'
-                AND NOT EXISTS(SELECT 1 FROM json_each(payload,'$.fields') WHERE type!='object')
-                AND NOT EXISTS(SELECT 1 FROM json_each(payload,'$.methods') WHERE type!='object')
-             FROM classes JOIN revision_documents m ON m.revision_id=?2 AND m.cid=classes.cid WHERE classes.id=?1",
-            params![id_codec::encode_sid(id), selected.key],
-            |r| r.get(0),
-        )
-        .map_err(|error| store.report_index_failure(error.into()))?;
-    if !clip_shape {
-        return Err(store.report_index_failure(
-            SelectedIntegrity("incompatible_index: selected class member JSON invalid".into())
-                .into(),
-        ));
-    }
-    for count in [32, 16, 8, 4, 2, 1, 0] {
-        let payload: Option<String> = db.query_row("WITH clipped AS (
-            SELECT json_set(payload,
-                '$.fields',(SELECT json_group_array(json(value)) FROM json_each(classes.payload,'$.fields') WHERE key < ?2),
-                '$.methods',(SELECT json_group_array(json(value)) FROM json_each(classes.payload,'$.methods') WHERE key < ?2),
-                '$.truncated',json('true')) AS payload FROM classes JOIN revision_documents m ON m.revision_id=?4 AND m.cid=classes.cid WHERE classes.id=?1)
-            SELECT CASE WHEN length(CAST(payload AS BLOB)) <= ?3 THEN payload ELSE NULL END FROM clipped",
-            params![id_codec::encode_sid(id), count, CLASS_BYTES as i64, selected.key], |r| r.get(0))
-            .map_err(|error| store.report_index_failure(error.into()))?;
-        if let Some(payload) = payload {
-            let class = serde_json::from_str(&payload)
-                .context(SelectedIntegrity(
-                    "incompatible_index: stored JSON decode failed".into(),
-                ))
-                .map_err(|error| store.report_index_failure(error))?;
-            return Ok(Some((class, payload.len(), true)));
-        }
-    }
-    // Pathological non-member metadata cannot fit without changing identity.
-    Ok(None)
-}
-fn resolve_class_id(
-    store: &Store,
-    db: &Connection,
-    id: &str,
-    selected: &ReadRevision,
-) -> Result<String> {
-    let lexical = lexical_class_id(store, db, id, selected);
-    match &lexical {
-        Ok(_) => return lexical,
-        // Only a missing class ancestor falls back; storage and integrity
-        // failures stay what they are.
-        Err(error)
-            if error
-                .downcast_ref::<crate::class_diagram::InvalidRequest>()
-                .is_none() =>
-        {
-            return lexical;
-        }
-        Err(_) => {}
-    }
-    // A Rust method's measured parent is its `impl` block, which is not a class.
-    // Composition recorded the method on exactly one class (#452): use it.
-    let owners: Vec<Vec<u8>> = db
-        .prepare(
-            "SELECT DISTINCT c.id FROM classes c JOIN revision_documents m ON m.revision_id=?2 AND m.cid=c.cid,
-             json_each(c.payload,'$.methods') j WHERE m.language='rust' AND json_extract(j.value,'$.symbolId')=?1 LIMIT 2",
-        )
-        .map_err(|error| store.report_index_failure(error.into()))?
-        .query_map(params![id, selected.key], |r| r.get(0))
-        .map_err(|error| store.report_index_failure(error.into()))?
-        .collect::<rusqlite::Result<_>>()
-        .map_err(|error| store.report_index_failure(error.into()))?;
-    match owners.as_slice() {
-        [owner] => id_codec::decode_sid(owner).context(SelectedIntegrity(
-            "incompatible_index: stored class id decode failed".into(),
-        )),
-        _ => lexical,
-    }
-}
-fn lexical_class_id(
-    store: &Store,
-    db: &Connection,
-    id: &str,
-    selected: &ReadRevision,
-) -> Result<String> {
-    use crate::class_diagram::InvalidRequest;
-    let mut current = id.to_owned();
-    let mut seen = BTreeSet::new();
-    let mut document: Option<SelectedDocument> = None;
-    for depth in 0..64 {
-        ensure!(
-            seen.insert(current.clone()),
-            InvalidRequest("The selected symbol has a cyclic class ancestry.")
-        );
-        if depth > 0 {
-            ensure!(
-                document
-                    .as_ref()
-                    .is_some_and(|doc| doc.nodes.iter().any(|node| node.id == current)),
-                InvalidRequest("Choose an indexed class or method.")
-            );
-        }
-        if db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM classes c JOIN revision_documents m ON m.revision_id=?2 AND m.cid=c.cid WHERE c.id=?1)",
-            params![id_codec::encode_sid(&current), selected.key],
-            |r| r.get::<_, bool>(0),
-        )? {
-            return Ok(current);
-        }
-        if document.is_none() {
-            let path: Option<String> = db.query_row(
-                "SELECT m.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.gid=n.gid WHERE n.id=?1",
-                params![id_codec::encode_sid(&current), selected.key], |r| r.get(0),
-            ).optional().map_err(|error| store.report_index_failure(error.into()))?;
-            document = path
-                .map(|path| store.selected_graph_document_for(db, &path, selected))
-                .transpose()?;
-        }
-        let symbol = document
-            .as_ref()
-            .and_then(|doc| doc.nodes.iter().find(|node| node.id == current))
-            .ok_or(InvalidRequest("Choose an indexed class or method."))?;
-        ensure!(
-            depth > 0 || matches!(symbol.kind, SymbolKind::Method | SymbolKind::Function),
-            InvalidRequest("Choose an indexed class or method.")
-        );
-        current = symbol.parent.clone().ok_or(InvalidRequest(
-            "The selected method has no supported enclosing class.",
-        ))?;
-    }
-    Err(InvalidRequest("The selected symbol exceeds the class ancestry limit.").into())
-}
-
-fn resolve_class(
-    store: &Store,
-    db: &Connection,
-    id: &str,
-    selected: &ReadRevision,
-) -> Result<(crate::model::ClassDefinition, bool)> {
-    let id = resolve_class_id(store, db, id, selected)?;
-    let (class, _, clipped) = presentation_class(store, db, &id, selected)?.ok_or(
-        crate::class_diagram::InvalidRequest("Class metadata exceeds the presentation byte limit."),
-    )?;
-    Ok((class, clipped))
-}
 
 fn v8_id(prefix: &str, domain: &[u8], value: serde_json::Value) -> String {
     format!(
@@ -6178,16 +3938,16 @@ struct PublicationRows<'a> {
     regions: Vec<&'a ControlRegion>,
     classes: Vec<&'a crate::model::ClassDefinition>,
     relations: Vec<&'a crate::model::ClassRelation>,
-    native_declarations: Vec<&'a crate::native_evidence::Declaration>,
-    native_calls: Vec<&'a crate::native_evidence::Call>,
-    native_regions: Vec<&'a crate::native_evidence::ControlRegion>,
-    native_references: Vec<&'a crate::native_evidence::Reference>,
-    capability_report: Option<&'a crate::native_evidence::CapabilityReport>,
+    native_declarations: Vec<&'a crate::native_records::Declaration>,
+    native_calls: Vec<&'a crate::native_records::Call>,
+    native_regions: Vec<&'a crate::native_records::ControlRegion>,
+    native_references: Vec<&'a crate::native_records::Reference>,
+    capability_report: Option<&'a crate::native_records::CapabilityReport>,
 }
 fn publication_native_witness(
-    document: &crate::native_evidence::Document,
-    producer: &crate::native_evidence::Producer,
-    coverage: &crate::native_evidence::Coverage,
+    document: &crate::native_records::Document,
+    producer: &crate::native_records::Producer,
+    coverage: &crate::native_records::Coverage,
     grouped: &PublicationRows<'_>,
 ) -> Result<String> {
     crate::native_evidence::document_witness(
@@ -6207,7 +3967,7 @@ fn publication_native_witness(
 #[cfg(test)]
 #[test]
 fn publication_witness_requires_capability_report() {
-    use crate::native_evidence::{Coverage, Document, DocumentKey, Producer};
+    use crate::native_records::{Coverage, Document, DocumentKey, Producer};
 
     let document = Document {
         key: DocumentKey {
@@ -6220,8 +3980,8 @@ fn publication_witness_requires_capability_report() {
         byte_length: 0,
     };
     let producer = Producer {
-        id: crate::native_evidence::PRODUCER.into(),
-        version: crate::native_evidence::NATIVE_VERSION.into(),
+        id: crate::native_records::PRODUCER.into(),
+        version: crate::native_records::NATIVE_VERSION.into(),
         executable_hash: "e".repeat(64),
         kind: "native".into(),
         languages: vec!["javascript".into()],
@@ -6248,7 +4008,7 @@ fn publication_witness_requires_capability_report() {
 
 fn publication_rows<'a>(
     graph: &'a Graph,
-    native: &'a crate::native_evidence::Artifact,
+    native: &'a crate::native_records::Artifact,
     classes: &'a crate::classes::Catalog,
 ) -> Result<BTreeMap<&'a str, PublicationRows<'a>>> {
     let mut rows = BTreeMap::<&str, PublicationRows>::new();
@@ -6409,7 +4169,7 @@ fn v8_class_projection(graph_id: &str, grouped: &PublicationRows<'_>) -> (String
 
 fn v8_document_projection(
     file: &SourceFile,
-    native: &crate::native_evidence::Artifact,
+    native: &crate::native_records::Artifact,
     grouped: &PublicationRows<'_>,
 ) -> Result<V8DocumentProjection> {
     let context = crate::native_evidence::native_extraction_context(
@@ -6473,10 +4233,10 @@ struct PreflightReuse {
 pub(crate) struct LocalPrepared {
     pub(crate) changed_paths: BTreeSet<String>,
     removed_paths: BTreeSet<String>,
-    pub(crate) native: crate::native_evidence::Artifact,
+    pub(crate) native: crate::native_records::Artifact,
     prior_pin: IndexPin,
     prior_ids: BTreeMap<String, V8DocumentProjection>,
-    prior_coverage: BTreeMap<String, crate::native_evidence::Coverage>,
+    prior_coverage: BTreeMap<String, crate::native_records::Coverage>,
     prior_summaries: BTreeMap<String, crate::classes::FileSummary>,
     prior_class_complete: BTreeMap<String, bool>,
     old_stats: IndexStats,
@@ -6981,10 +4741,10 @@ type PrecomputedDocument = (Option<Result<V8DocumentProjection>>, Option<Result<
 /// One document's projection and witness, under write_native's reuse conditions.
 fn precompute_document(
     file: &SourceFile,
-    native: &crate::native_evidence::Artifact,
+    native: &crate::native_records::Artifact,
     grouped: Option<&PublicationRows<'_>>,
-    document: Option<&crate::native_evidence::Document>,
-    coverage: Option<&crate::native_evidence::Coverage>,
+    document: Option<&crate::native_records::Document>,
+    coverage: Option<&crate::native_records::Coverage>,
     reuse: &PreflightReuse,
 ) -> PrecomputedDocument {
     let projection = if reuse.existing_ids.contains_key(&file.path) {
@@ -7030,10 +4790,10 @@ fn semantic_variant<T: Serialize>(value: &T) -> Result<String> {
 /// The stored columns of a target. An internal target at the writing revision stores NULL,
 /// which reads as the reading revision's native revision (D1).
 fn semantic_target_values(
-    target: &crate::semantic_evidence::Target,
+    target: &crate::semantic_records::Target,
     writing: &str,
 ) -> Result<Vec<rusqlite::types::Value>> {
-    use crate::semantic_evidence::Target;
+    use crate::semantic_records::Target;
     use rusqlite::types::Value;
     Ok(match target {
         Target::Internal {
@@ -7107,7 +4867,7 @@ fn insert_semantic_target(
     db: &Connection,
     table: &str,
     parent: &[rusqlite::types::Value],
-    target: &crate::semantic_evidence::Target,
+    target: &crate::semantic_records::Target,
     writing: &str,
 ) -> Result<()> {
     let mut values = parent.to_vec();
@@ -7130,15 +4890,15 @@ pub(crate) struct AttestedProfileProducer {
     id: String,
     version: String,
     executable_hash: String,
-    position_encoding: crate::semantic_evidence::PositionEncoding,
-    languages: Vec<crate::semantic_evidence::Language>,
+    position_encoding: crate::semantic_records::PositionEncoding,
+    languages: Vec<crate::semantic_records::Language>,
 }
 
 impl AttestedProfileProducer {
     /// The profile pin of `producer`, for tests that run the whole-publication validator over a
     /// publication without a stored raw batch.
     #[cfg(feature = "test-support")]
-    pub(crate) fn pinned_for_tests(producer: &crate::semantic_evidence::Producer) -> Self {
+    pub(crate) fn pinned_for_tests(producer: &crate::semantic_records::Producer) -> Self {
         Self {
             id: producer.id.clone(),
             version: producer.version.clone(),
@@ -7148,12 +4908,12 @@ impl AttestedProfileProducer {
         }
     }
 
-    pub(crate) fn matches(&self, producer: &crate::semantic_evidence::Producer) -> bool {
+    pub(crate) fn matches(&self, producer: &crate::semantic_records::Producer) -> bool {
         producer.id == self.id
             && producer.version == self.version
             && producer.executable_hash == self.executable_hash
             && producer.position_encoding == self.position_encoding
-            && producer.kind == crate::semantic_evidence::SemanticKind::Semantic
+            && producer.kind == crate::semantic_records::SemanticKind::Semantic
             && producer.languages == self.languages
     }
 }
@@ -7179,21 +4939,19 @@ fn captured_artifacts(raw: &SelectedRawBatch) -> BTreeMap<(String, String), Vec<
 fn authenticate_stored_batch(
     raw: &SelectedRawBatch,
     inventory: &crate::scip_raw::CapturedScipInventory,
-    captured: &crate::semantic_evidence::CapturedComponents,
-    r1: &crate::native_evidence::Artifact,
-    sources: &BTreeMap<crate::native_evidence::DocumentKey, Vec<u8>>,
+    captured: &crate::semantic_records::CapturedComponents,
+    r1: &crate::native_records::Artifact,
+    sources: &BTreeMap<crate::native_records::DocumentKey, Vec<u8>>,
     store: &Store,
     cancel: &CancelFlag,
 ) -> Result<AttestedProfileProducer> {
     let identity = &*store.identity;
+    use crate::batch_descriptor::{FORMAT_VERSION, SourceManifestHasher};
     use crate::native_ids::digest;
     use crate::scip_raw::{
         self, AuthenticatedArtifact, AuthenticatedScipDocument, DocumentSource, VecSink,
     };
-    use crate::semantic_batch::{
-        BatchCounters,
-        descriptor::{FORMAT_VERSION, SourceManifestHasher},
-    };
+    use crate::semantic_batch::counters::BatchCounters;
     let descriptor = &raw.descriptor;
     ensure!(
         descriptor.format_version == FORMAT_VERSION
@@ -7412,13 +5170,13 @@ pub struct SelectedRawCapture {
 /// the original capture, not the subset that contributed selected provenance.
 #[derive(Debug, Clone)]
 pub struct SelectedRawBatch {
-    pub producer: crate::semantic_evidence::Producer,
-    pub requested_documents: Vec<crate::native_evidence::DocumentKey>,
+    pub producer: crate::semantic_records::Producer,
+    pub requested_documents: Vec<crate::native_records::DocumentKey>,
     pub producer_id: String,
     pub source_set_id: String,
     pub captured_revision: String,
     pub batch_id: i64,
-    pub descriptor: crate::semantic_batch::descriptor::Descriptor,
+    pub descriptor: crate::batch_descriptor::Descriptor,
     pub source_manifest_hash: String,
     pub decoder_version: String,
     /// In ordinal order.
@@ -7435,7 +5193,7 @@ pub struct SelectedRawBatch {
 impl SelectedRawBatch {
     /// The artifact that carries a document's basis (§4.4 e): its assigned artifact when
     /// covered, otherwise the lowest-ordinal artifact of its language, otherwise artifact 0.
-    pub fn artifact_hash_for(&self, doc: &crate::native_evidence::DocumentKey) -> &str {
+    pub fn artifact_hash_for(&self, doc: &crate::native_records::DocumentKey) -> &str {
         let assigned = self
             .documents
             .get(&(doc.language.clone(), doc.path.clone()))
@@ -7445,7 +5203,7 @@ impl SelectedRawBatch {
                     .find(|capture| capture.capture_id == *capture_id)
             })
             .map(|capture| capture.ordinal);
-        let ordinal = crate::semantic_batch::descriptor::basis_artifact_ordinal(
+        let ordinal = crate::batch_descriptor::basis_artifact_ordinal(
             &self.descriptor.artifacts,
             &doc.language,
             assigned,
@@ -7459,8 +5217,8 @@ impl SelectedRawBatch {
 }
 
 type SelectedRawBatchResult = (
-    crate::semantic_evidence::Producer,
-    Vec<crate::native_evidence::DocumentKey>,
+    crate::semantic_records::Producer,
+    Vec<crate::native_records::DocumentKey>,
     Result<SelectedRawBatch>,
 );
 
@@ -7533,7 +5291,7 @@ fn pending_release_reheld(db: &Connection, revision: &str) -> Result<bool> {
     )?)
 }
 
-fn semantic_pin_key(pin: IndexPin) -> String {
+pub(crate) fn semantic_pin_key(pin: IndexPin) -> String {
     format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision)
 }
 
@@ -7634,9 +5392,9 @@ fn semantic_target_read(
     row: &rusqlite::Row<'_>,
     start: usize,
     scope: &semantic_payload::TargetScope<'_>,
-) -> Result<Option<crate::semantic_evidence::Target>> {
+) -> Result<Option<crate::semantic_records::Target>> {
     let source_set = scope.source_set;
-    use crate::semantic_evidence as sem;
+    use crate::semantic_records as sem;
     let kind: Option<String> = row.get(start)?;
     Ok(match kind.as_deref() {
         None => {
@@ -7655,7 +5413,7 @@ fn semantic_target_read(
                 syntax_id: id_codec::decode_sid(&id).context(SelectedIntegrity(
                     "incompatible_index: corrupt semantic internal ID".into(),
                 ))?,
-                document: crate::native_evidence::DocumentKey {
+                document: crate::native_records::DocumentKey {
                     source_set_id: source_set.into(),
                     language: row.get(start + 2)?,
                     path: row.get(start + 3)?,
@@ -7674,7 +5432,7 @@ fn semantic_target_read(
                     symbol: row.get(start + 6)?,
                     scope: semantic_enum(row.get(start + 7)?)?,
                     document: match (language, path) {
-                        (Some(language), Some(path)) => Some(crate::native_evidence::DocumentKey {
+                        (Some(language), Some(path)) => Some(crate::native_records::DocumentKey {
                             source_set_id: source_set.into(),
                             language,
                             path,
@@ -7708,7 +5466,7 @@ fn semantic_targets(
     start: usize,
     values: &[&dyn rusqlite::ToSql],
     scope: &semantic_payload::TargetScope<'_>,
-) -> Result<Vec<crate::semantic_evidence::Target>> {
+) -> Result<Vec<crate::semantic_records::Target>> {
     let rows = stmt
         .query_map(values, |row| {
             let target = semantic_target_read(row, start, scope).map_err(|e| {
@@ -7778,13 +5536,13 @@ fn semantic_symbol_key_read(
     language: Option<String>,
     path: Option<String>,
     source_set: &str,
-) -> Result<crate::semantic_evidence::SymbolKey> {
-    use crate::semantic_evidence as sem;
+) -> Result<crate::semantic_records::SymbolKey> {
+    use crate::semantic_records as sem;
     let scope = semantic_enum(scope)?;
     let document = match (scope, language, path) {
         (sem::SymbolScope::Global, None, None) => None,
         (sem::SymbolScope::Document | sem::SymbolScope::Target, Some(language), Some(path)) => {
-            Some(crate::native_evidence::DocumentKey {
+            Some(crate::native_records::DocumentKey {
                 source_set_id: source_set.into(),
                 language,
                 path,
@@ -7808,7 +5566,7 @@ fn semantic_symbol_keys(
     stmt: &mut rusqlite::Statement<'_>,
     id: i64,
     source_set: &str,
-) -> Result<Vec<crate::semantic_evidence::SymbolKey>> {
+) -> Result<Vec<crate::semantic_records::SymbolKey>> {
     let rows = stmt
         .query_map([id], |row| {
             Ok((
@@ -7868,7 +5626,7 @@ fn read_coverage_reasons(
     db: &Connection,
     payload: Option<i64>,
     tuple: i64,
-) -> Result<Option<crate::semantic_evidence::CoverageReasons>> {
+) -> Result<Option<crate::semantic_records::CoverageReasons>> {
     let row: Option<([i64; 4], [bool; 3])> = db
         .prepare_cached(
             "SELECT macro_invocation,attribute_item,macro_definition,other,capped,omitted,captured_diagnostics
@@ -7888,7 +5646,7 @@ fn read_coverage_reasons(
                 "incompatible_index: invalid stored coverage reason count".into(),
             ))?;
         }
-        Ok(crate::semantic_evidence::CoverageReasons::new(
+        Ok(crate::semantic_records::CoverageReasons::new(
             counts,
             capped,
             omitted,
@@ -7898,17 +5656,17 @@ fn read_coverage_reasons(
     .transpose()
 }
 
-fn read_semantic(db: &Connection, key: &str) -> Result<crate::semantic_evidence::SemanticSnapshot> {
+fn read_semantic(db: &Connection, key: &str) -> Result<crate::semantic_records::SemanticSnapshot> {
     read_semantic_tuple(db, key, None, None, false)
 }
 
-fn read_semantic_tuple(
+pub(crate) fn read_semantic_tuple(
     db: &Connection,
     key: &str,
     selected_tuple: Option<i64>,
     history_syntax: Option<&str>,
     trusted_admitted_raw: bool,
-) -> Result<crate::semantic_evidence::SemanticSnapshot> {
+) -> Result<crate::semantic_records::SemanticSnapshot> {
     read_semantic_tuple_for_call(
         db,
         key,
@@ -7919,14 +5677,14 @@ fn read_semantic_tuple(
     )
 }
 
-fn read_semantic_tuple_for_call(
+pub(crate) fn read_semantic_tuple_for_call(
     db: &Connection,
     key: &str,
     selected_tuple: Option<i64>,
     history_syntax: Option<&str>,
     trusted_admitted_raw: bool,
     call_id: Option<&[u8]>,
-) -> Result<crate::semantic_evidence::SemanticSnapshot> {
+) -> Result<crate::semantic_records::SemanticSnapshot> {
     let source_set: String = db.query_row(
         "SELECT source_set_id FROM native_revisions WHERE id=?1",
         [key],
@@ -7950,7 +5708,7 @@ fn read_semantic_tuple_for_call(
 #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
 struct ReadAs<'a> {
     native: &'a str,
-    freshness: &'a BTreeMap<i64, crate::semantic_evidence::Freshness>,
+    freshness: &'a BTreeMap<i64, crate::semantic_records::Freshness>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7964,9 +5722,9 @@ fn read_semantic_tuple_with_reasons(
     with_reasons: bool,
     source_set: String,
     read_as: Option<ReadAs<'_>>,
-) -> Result<crate::semantic_evidence::SemanticSnapshot> {
-    use crate::native_evidence::DocumentKey;
-    use crate::semantic_evidence as sem;
+) -> Result<crate::semantic_records::SemanticSnapshot> {
+    use crate::native_records::DocumentKey;
+    use crate::semantic_records as sem;
     let mut result = sem::SemanticSnapshot {
         producers: vec![],
         coverage: vec![],
@@ -8204,15 +5962,15 @@ fn read_semantic_tuple_with_reasons(
     Ok(result)
 }
 
-fn read_semantic_history(
+pub(crate) fn read_semantic_history(
     db: &Connection,
     key: &str,
     index_revision: u64,
     producer_id: &str,
-    document: &crate::native_evidence::DocumentKey,
+    document: &crate::native_records::DocumentKey,
     syntax_id: &str,
 ) -> Result<Option<SemanticHistory>> {
-    use crate::semantic_evidence::{CoverageState, Freshness};
+    use crate::semantic_records::{CoverageState, Freshness};
     let source_set: String = db.query_row(
         "SELECT source_set_id FROM native_revisions WHERE id=?1",
         [key],
@@ -8355,11 +6113,11 @@ fn read_semantic_history(
 fn read_semantic_facts(
     db: &Connection,
     projection: &semantic_payload::PayloadProjection<'_>,
-    document: &crate::native_evidence::DocumentKey,
-    result: &mut crate::semantic_evidence::SemanticSnapshot,
+    document: &crate::native_records::DocumentKey,
+    result: &mut crate::semantic_records::SemanticSnapshot,
     selected_call: Option<&[u8]>,
 ) -> Result<()> {
-    use crate::semantic_evidence as sem;
+    use crate::semantic_records as sem;
     let source_set = &document.source_set_id;
     let Some(tuple) = projection.payload_id else {
         return Ok(());
@@ -8429,14 +6187,14 @@ fn read_semantic_facts(
             symbols: semantic_symbol_keys(&mut declaration_symbols, id, source_set)?,
             join: sem::Join {
                 anchor: sem::MeasuredAnchor {
-                    document: crate::native_evidence::DocumentKey {
+                    document: crate::native_records::DocumentKey {
                         source_set_id: source_set.clone(),
                         language,
                         path,
                     },
                     revision_id: projection.revision(revision_id),
                     content_hash,
-                    range: crate::native_evidence::Range {
+                    range: crate::native_records::Range {
                         start: start.try_into().context(SelectedIntegrity(
                             "incompatible_index: invalid semantic start".into(),
                         ))?,
@@ -8521,7 +6279,7 @@ fn read_semantic_facts(
             ))?,
             document: document.clone(),
             revision_id: projection.native().to_owned(),
-            range: crate::native_evidence::Range {
+            range: crate::native_records::Range {
                 start: start.try_into().context(SelectedIntegrity(
                     "incompatible_index: invalid semantic start".into(),
                 ))?,
@@ -8590,11 +6348,11 @@ fn read_semantic_facts(
 fn read_semantic_call_facts(
     db: &Connection,
     projection: &semantic_payload::PayloadProjection<'_>,
-    document: &crate::native_evidence::DocumentKey,
-    result: &mut crate::semantic_evidence::SemanticSnapshot,
+    document: &crate::native_records::DocumentKey,
+    result: &mut crate::semantic_records::SemanticSnapshot,
     selected_call: Option<&[u8]>,
 ) -> Result<()> {
-    use crate::semantic_evidence as sem;
+    use crate::semantic_records as sem;
     let source_set = &document.source_set_id;
     let Some(tuple) = projection.payload_id else {
         return Ok(());
@@ -8678,14 +6436,14 @@ fn read_semantic_call_facts(
                 .transpose()?,
             join: sem::Join {
                 anchor: sem::MeasuredAnchor {
-                    document: crate::native_evidence::DocumentKey {
+                    document: crate::native_records::DocumentKey {
                         source_set_id: source_set.clone(),
                         language,
                         path,
                     },
                     revision_id: projection.revision(revision_id),
                     content_hash,
-                    range: crate::native_evidence::Range {
+                    range: crate::native_records::Range {
                         start: start.try_into().context(SelectedIntegrity(
                             "incompatible_index: invalid semantic start".into(),
                         ))?,
@@ -8719,9 +6477,9 @@ fn read_semantic_call_facts(
 
 /// The pinned identity kind of a producer id; every producer outside the synthetic pin is an executable.
 fn producer_identity_kind(producer_id: &str) -> &'static str {
-    crate::scip_admission::pinned_producer_by_id(producer_id)
+    crate::producer_pin::pinned_producer_by_id(producer_id)
         .map_or(
-            crate::semantic_batch::descriptor::IdentityKind::Executable,
+            crate::batch_descriptor::IdentityKind::Executable,
             |pinned| pinned.identity_kind,
         )
         .as_str()
@@ -8744,7 +6502,7 @@ fn insert_coverage_reasons(
     db: &Connection,
     payload: Option<i64>,
     tuple: Option<i64>,
-    reasons: &crate::semantic_evidence::CoverageReasons,
+    reasons: &crate::semantic_records::CoverageReasons,
 ) -> Result<()> {
     let gaps = reasons.gaps();
     execute_cached(
@@ -8766,7 +6524,7 @@ fn insert_coverage_reasons(
 }
 
 /// The columns that identify a basis, plus its lookup dependencies.
-fn basis_identity(basis: &crate::semantic_evidence::SemanticBasis) -> Result<Vec<String>> {
+fn basis_identity(basis: &crate::semantic_records::SemanticBasis) -> Result<Vec<String>> {
     let mut identity = vec![
         basis.producer_id.clone(),
         basis.producer_version.clone(),
@@ -8791,11 +6549,11 @@ fn basis_identity(basis: &crate::semantic_evidence::SemanticBasis) -> Result<Vec
 fn write_import_coverage(
     db: &Connection,
     key: &str,
-    publication: &crate::semantic_evidence::SemanticPublication,
+    publication: &crate::semantic_records::SemanticPublication,
     batch: Option<(i64, &str)>,
     inputs: &semantic_payload::KeyInputs,
 ) -> Result<()> {
-    use crate::semantic_evidence as sem;
+    use crate::semantic_records as sem;
     let native: String = query_row_cached(
         db,
         "SELECT native_revision_id FROM native_revisions WHERE id=?1",
@@ -9143,8 +6901,8 @@ pub fn batch_publication_statements_for_tests() -> Vec<String> {
 /// batch id.
 fn write_staged_raw_rows(
     db: &Connection,
-    stage: &crate::semantic_batch::staging::Stage,
-    descriptor: &crate::semantic_batch::descriptor::Descriptor,
+    stage: &crate::store::staging::Stage,
+    descriptor: &crate::batch_descriptor::Descriptor,
     descriptor_bytes: &[u8],
     descriptor_sha256: &str,
     gate: &dyn Fn() -> Result<()>,
@@ -9216,7 +6974,7 @@ fn write_staged_raw_rows(
 fn write_staged_semantic(
     db: &Connection,
     key: &str,
-    producer: &crate::semantic_evidence::Producer,
+    producer: &crate::semantic_records::Producer,
     batch: i64,
     captured_pin: &str,
     inputs: &semantic_payload::KeyInputs,
@@ -9250,7 +7008,7 @@ impl std::error::Error for RejoinOracleMismatch {}
 /// document, FULL in whole-publication order.
 #[cfg(feature = "test-support")]
 fn sorted_publication_rows(
-    publication: &crate::semantic_evidence::SemanticPublication,
+    publication: &crate::semantic_records::SemanticPublication,
 ) -> Result<Vec<Vec<Vec<u8>>>> {
     fn sorted<T: serde::Serialize>(rows: &[T]) -> Result<Vec<Vec<u8>>> {
         let mut rows = rows
@@ -9360,7 +7118,7 @@ fn decoded_selected_inventory(
 fn write_producer_descriptor(
     db: &Connection,
     key: &str,
-    producer: &crate::semantic_evidence::Producer,
+    producer: &crate::semantic_records::Producer,
 ) -> Result<()> {
     db.execute(
         "INSERT OR IGNORE INTO semantic_producers VALUES(?1,?2,?3,?4,?5,?6)",
@@ -9421,12 +7179,12 @@ fn write_producer_descriptor(
 
 fn write_semantic(
     db: &Connection,
-    native: &crate::native_evidence::Artifact,
+    native: &crate::native_records::Artifact,
     prior: Option<IndexPin>,
     pin: IndexPin,
     supplied: Option<(
-        &crate::semantic_evidence::SemanticPublication,
-        &crate::semantic_evidence::CapturedComponents,
+        &crate::semantic_records::SemanticPublication,
+        &crate::semantic_records::CapturedComponents,
     )>,
     inputs: &semantic_payload::KeyInputs,
 ) -> Result<()> {
@@ -9509,8 +7267,8 @@ fn write_semantic_tuple(
     db: &Connection,
     payload: i64,
     native: &str,
-    coverage: &crate::semantic_evidence::Coverage,
-    publication: &crate::semantic_evidence::SemanticPublication,
+    coverage: &crate::semantic_records::Coverage,
+    publication: &crate::semantic_records::SemanticPublication,
     owns: &BTreeSet<&str>,
     dependencies: &[semantic_payload::DependencyRecord],
 ) -> Result<BTreeMap<String, i64>> {
@@ -10037,7 +7795,7 @@ fn release_semantic_tuple(db: &Connection, revision: &str) -> Result<bool> {
 fn write_native(
     db: &Connection,
     bundle: (
-        &crate::native_evidence::Artifact,
+        &crate::native_records::Artifact,
         &crate::capture::Capture,
         &Graph,
         &crate::classes::Catalog,
@@ -10639,7 +8397,7 @@ fn write_native(
             }
         };
         let callee_lookup_key =
-            crate::native_evidence::verified_callee_lookup(&document.key.language, c, source);
+            crate::native_records::verified_callee_lookup(&document.key.language, c, source);
         immutable.insert(
             db,
             "INSERT INTO native_version_calls VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
@@ -10835,8 +8593,8 @@ fn revision_producer_binding(db: &Connection, revision_key: &str) -> Result<(Str
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
     )?;
     selected_ensure!(
-        producer_id == crate::native_evidence::PRODUCER
-            && producer_version == crate::native_evidence::NATIVE_VERSION
+        producer_id == crate::native_records::PRODUCER
+            && producer_version == crate::native_records::NATIVE_VERSION
             && kind == "native"
             && encoding == "utf8",
         "incompatible_index: selected native producer descriptor differs"
@@ -10856,8 +8614,8 @@ fn revision_producer_binding(db: &Connection, revision_key: &str) -> Result<(Str
             key.len() <= 8192 && raw.len() <= 8192,
             "incompatible_index: selected producer input byte budget exceeded"
         );
-        let observation: crate::capture::CaptureInputObservation = serde_json::from_str(&raw)
-            .context(SelectedIntegrity(
+        let observation: crate::capture_records::CaptureInputObservation =
+            serde_json::from_str(&raw).context(SelectedIntegrity(
                 "incompatible_index: stored JSON decode failed".into(),
             ))?;
         selected_ensure!(
@@ -10866,17 +8624,18 @@ fn revision_producer_binding(db: &Connection, revision_key: &str) -> Result<(Str
         );
         if let Some(relative) = key.strip_prefix("toolchain:") {
             selected_ensure!(
-                crate::capture::is_root_toolchain_input(relative)
+                crate::capture_records::is_root_toolchain_input(relative)
                     && selectors.insert(relative.to_owned())
                     && matches!(
                         observation,
-                        crate::capture::CaptureInputObservation::Present { .. }
-                            | crate::capture::CaptureInputObservation::Absent
+                        crate::capture_records::CaptureInputObservation::Present { .. }
+                            | crate::capture_records::CaptureInputObservation::Absent
                     ),
                 "incompatible_index: selected producer selector role differs"
             );
         } else if let Some(path) = key.strip_prefix("executable:") {
-            let crate::capture::CaptureInputObservation::Present { ref hash, .. } = observation
+            let crate::capture_records::CaptureInputObservation::Present { ref hash, .. } =
+                observation
             else {
                 return Err(SelectedIntegrity(
                     "incompatible_index: selected executable input absent".into(),
@@ -10901,7 +8660,7 @@ fn revision_producer_binding(db: &Connection, revision_key: &str) -> Result<(Str
         identities.push(serde_json::json!({"key":key,"observation":observation}));
     }
     selected_ensure!(
-        selectors.len() == crate::capture::ROOT_TOOLCHAIN_INPUTS.len()
+        selectors.len() == crate::capture_records::ROOT_TOOLCHAIN_INPUTS.len()
             && identities.len() == selectors.len() + 1,
         "incompatible_index: selected producer input inventory incomplete"
     );
@@ -11075,7 +8834,7 @@ fn validate_paired_metadata(
     let producer_version = one_row(db, "SELECT id,version FROM native_producers LIMIT 2")?;
     if producer_version
         .as_ref()
-        .is_some_and(|(_, version)| version != crate::native_evidence::NATIVE_VERSION)
+        .is_some_and(|(_, version)| version != crate::native_records::NATIVE_VERSION)
     {
         return Err(NativeProducerIncompatible.into());
     }
@@ -11210,11 +8969,11 @@ fn skipped_config_diagnostics(db: &Connection, status: &mut IndexStatus) -> Resu
     while let Some(row) = rows.next()? {
         let key: String = row.get(0)?;
         let payload: String = row.get(1)?;
-        let observation: crate::capture::CaptureInputObservation = serde_json::from_str(&payload)
-            .context(SelectedIntegrity(
-            "incompatible_index: stored JSON decode failed".into(),
-        ))?;
-        if let crate::capture::CaptureInputObservation::Present { hash, .. } = observation
+        let observation: crate::capture_records::CaptureInputObservation =
+            serde_json::from_str(&payload).context(SelectedIntegrity(
+                "incompatible_index: stored JSON decode failed".into(),
+            ))?;
+        if let crate::capture_records::CaptureInputObservation::Present { hash, .. } = observation
             && hash == placeholder
         {
             let (code, message) = if key.starts_with("ignore:") {
@@ -11238,8 +8997,10 @@ fn skipped_config_diagnostics(db: &Connection, status: &mut IndexStatus) -> Resu
     Ok(())
 }
 
-pub(crate) type SourceObservations = BTreeMap<String, (String, crate::capture::CaptureStat)>;
-pub(crate) type InputObservations = BTreeMap<String, crate::capture::CaptureInputObservation>;
+pub(crate) type SourceObservations =
+    BTreeMap<String, (String, crate::capture_records::CaptureStat)>;
+pub(crate) type InputObservations =
+    BTreeMap<String, crate::capture_records::CaptureInputObservation>;
 
 pub(crate) fn compare_capture_observations(
     previous_sources: &SourceObservations,
@@ -11247,7 +9008,7 @@ pub(crate) fn compare_capture_observations(
     previous_inputs: &InputObservations,
     current_inputs: &InputObservations,
 ) -> ScanComparison {
-    let uncertain = |stat: &crate::capture::CaptureStat| {
+    let uncertain = |stat: &crate::capture_records::CaptureStat| {
         stat.mtime_seconds.is_none()
             || stat.mtime_nanoseconds.is_none()
             || stat.ctime_seconds.is_none()
@@ -11294,11 +9055,11 @@ pub(crate) fn compare_capture_observations(
             (Some(_), None) => comparison.deleted += 1,
             (Some(old), Some(new)) => match (old, new) {
                 (
-                    crate::capture::CaptureInputObservation::Present {
+                    crate::capture_records::CaptureInputObservation::Present {
                         stat: old_stat,
                         hash: old_hash,
                     },
-                    crate::capture::CaptureInputObservation::Present {
+                    crate::capture_records::CaptureInputObservation::Present {
                         stat: new_stat,
                         hash: new_hash,
                     },
@@ -11311,20 +9072,20 @@ pub(crate) fn compare_capture_observations(
                         usize::from(uncertain(old_stat) || uncertain(new_stat));
                 }
                 (
-                    crate::capture::CaptureInputObservation::Directory { stat: old },
-                    crate::capture::CaptureInputObservation::Directory { stat: new },
+                    crate::capture_records::CaptureInputObservation::Directory { stat: old },
+                    crate::capture_records::CaptureInputObservation::Directory { stat: new },
                 )
                 | (
-                    crate::capture::CaptureInputObservation::Root { stat: old },
-                    crate::capture::CaptureInputObservation::Root { stat: new },
+                    crate::capture_records::CaptureInputObservation::Root { stat: old },
+                    crate::capture_records::CaptureInputObservation::Root { stat: new },
                 ) => comparison.stat_changed += usize::from(old != new),
                 (
-                    crate::capture::CaptureInputObservation::Absent,
-                    crate::capture::CaptureInputObservation::Absent,
+                    crate::capture_records::CaptureInputObservation::Absent,
+                    crate::capture_records::CaptureInputObservation::Absent,
                 ) => {}
                 (
-                    crate::capture::CaptureInputObservation::Extractor { hash: old },
-                    crate::capture::CaptureInputObservation::Extractor { hash: new },
+                    crate::capture_records::CaptureInputObservation::Extractor { hash: old },
+                    crate::capture_records::CaptureInputObservation::Extractor { hash: new },
                 ) => comparison.hash_changed += usize::from(old != new),
                 _ => comparison.stat_changed += 1,
             },
@@ -11396,7 +9157,7 @@ fn compare_capture_snapshot_inner(
             SelectedIntegrity("incompatible_index: selected reused source missing".into())
         })?;
         let stat: String = row.get(2)?;
-        let stat: crate::capture::CaptureStat = serde_json::from_str(&stat).context(
+        let stat: crate::capture_records::CaptureStat = serde_json::from_str(&stat).context(
             SelectedIntegrity("incompatible_index: stored JSON decode failed".into()),
         )?;
         if unchanged.is_some() {
@@ -11435,10 +9196,10 @@ fn compare_capture_snapshot_inner(
     })?;
     for row in rows {
         let (key, payload) = row?;
-        let observation: crate::capture::CaptureInputObservation = serde_json::from_str(&payload)
-            .context(SelectedIntegrity(
-            "incompatible_index: stored JSON decode failed".into(),
-        ))?;
+        let observation: crate::capture_records::CaptureInputObservation =
+            serde_json::from_str(&payload).context(SelectedIntegrity(
+                "incompatible_index: stored JSON decode failed".into(),
+            ))?;
         selected_ensure!(
             previous_inputs.insert(key, observation).is_none(),
             "incompatible_index: duplicate captured input observation"
@@ -11473,8 +9234,8 @@ fn compare_capture_snapshot_inner(
             selected_ensure!(
                 graph.as_deref() == Some("ready")
                     && class.as_deref() == Some("ready")
-                    && producer == crate::native_evidence::PRODUCER
-                    && version == crate::native_evidence::NATIVE_VERSION
+                    && producer == crate::native_records::PRODUCER
+                    && version == crate::native_records::NATIVE_VERSION
                     && context
                         == &crate::native_evidence::declared_selected_extraction_context(
                             producer,
@@ -11488,7 +9249,10 @@ fn compare_capture_snapshot_inner(
     Ok(comparison)
 }
 
-fn validate_capture_stat(stat: &crate::capture::CaptureStat, expected_kind: &str) -> Result<()> {
+fn validate_capture_stat(
+    stat: &crate::capture_records::CaptureStat,
+    expected_kind: &str,
+) -> Result<()> {
     let nanos = |value: Option<i64>| value.is_some_and(|n| (0..1_000_000_000).contains(&n));
     control_ensure!(
         stat.version == 1
@@ -11529,7 +9293,7 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
     )?;
     let options = options
         .ok_or_else(|| ControlIntegrity("incompatible_index: missing reconcile options".into()))?;
-    let decoded_options: crate::indexer::ReconcileOptions = serde_json::from_str(&options)
+    let decoded_options: crate::model::ReconcileOptions = serde_json::from_str(&options)
         .context(SelectedIntegrity(
             "incompatible_index: stored JSON decode failed".into(),
         ))
@@ -11558,7 +9322,7 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
             "incompatible_index: duplicate captured source path"
         );
         let payload: String = row.get(1)?;
-        let decoded: crate::capture::CaptureStat = serde_json::from_str(&payload)
+        let decoded: crate::capture_records::CaptureStat = serde_json::from_str(&payload)
             .context(SelectedIntegrity(
                 "incompatible_index: stored JSON decode failed".into(),
             ))
@@ -11583,20 +9347,21 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
             !key.is_empty() && key.len() <= 8192 && actual.insert(key.clone()),
             "incompatible_index: invalid capture input key"
         );
-        let observation: crate::capture::CaptureInputObservation = serde_json::from_str(&payload)
-            .context(SelectedIntegrity(
-                "incompatible_index: stored JSON decode failed".into(),
-            ))
-            .context("incompatible_index: invalid capture input")?;
+        let observation: crate::capture_records::CaptureInputObservation =
+            serde_json::from_str(&payload)
+                .context(SelectedIntegrity(
+                    "incompatible_index: stored JSON decode failed".into(),
+                ))
+                .context("incompatible_index: invalid capture input")?;
         control_ensure!(
             json(&observation)? == payload,
             "incompatible_index: noncanonical capture input"
         );
         match (&key[..], &observation) {
-            ("root:.", crate::capture::CaptureInputObservation::Root { stat }) => {
+            ("root:.", crate::capture_records::CaptureInputObservation::Root { stat }) => {
                 validate_capture_stat(stat, "directory")?;
             }
-            (key, crate::capture::CaptureInputObservation::Directory { stat })
+            (key, crate::capture_records::CaptureInputObservation::Directory { stat })
                 if key.starts_with("directory:") =>
             {
                 validate_capture_stat(stat, "directory")?;
@@ -11611,7 +9376,7 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
                 );
                 directories.insert(relative.to_owned());
             }
-            (key, crate::capture::CaptureInputObservation::Present { stat, hash })
+            (key, crate::capture_records::CaptureInputObservation::Present { stat, hash })
                 if key.starts_with("config:")
                     || key.starts_with("toolchain:")
                     || key.starts_with("ignore:")
@@ -11632,8 +9397,8 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
                     );
                 }
             }
-            (key, crate::capture::CaptureInputObservation::Extractor { hash })
-                if key == crate::capture::EXTRACTOR_INPUT_KEY =>
+            (key, crate::capture_records::CaptureInputObservation::Extractor { hash })
+                if key == crate::capture_records::EXTRACTOR_INPUT_KEY =>
             {
                 control_ensure!(
                     hash.len() == 64
@@ -11643,7 +9408,7 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
                     "incompatible_index: invalid extractor producer hash"
                 );
             }
-            (key, crate::capture::CaptureInputObservation::Absent)
+            (key, crate::capture_records::CaptureInputObservation::Absent)
                 if key.starts_with("config:")
                     || key.starts_with("toolchain:")
                     || key.starts_with("ignore:") => {}
@@ -11677,10 +9442,10 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
         }
     }
     let mut expected = BTreeSet::from(["root:.".to_owned()]);
-    for name in crate::capture::ROOT_CONFIG_INPUTS {
+    for name in crate::capture_records::ROOT_CONFIG_INPUTS {
         expected.insert(format!("config:{name}"));
     }
-    for name in crate::capture::ROOT_TOOLCHAIN_INPUTS {
+    for name in crate::capture_records::ROOT_TOOLCHAIN_INPUTS {
         expected.insert(format!("toolchain:{name}"));
     }
     for directory in &directories {
@@ -11693,13 +9458,13 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
         }
         expected.insert(format!("directory:{directory}"));
     }
-    // The nested config inputs above each source (`capture::NESTED_CONFIG_INPUTS`); a
+    // The nested config inputs above each source (`capture_records::NESTED_CONFIG_INPUTS`); a
     // non-regular one is not admitted.
     for source in &source_paths {
         let Some(extension) = Path::new(source).extension().and_then(|x| x.to_str()) else {
             continue;
         };
-        for manifest in crate::capture::nested_config_names(extension) {
+        for manifest in crate::capture_records::nested_config_names(extension) {
             for dir in Path::new(source).ancestors().skip(1) {
                 let key = format!("config:{}/{manifest}", dir.to_string_lossy());
                 if !dir.as_os_str().is_empty() && actual.contains(&key) {
@@ -11715,8 +9480,8 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
     );
     // Revisions published before the extractor producer hash lack it; they
     // stay readable and simply never qualify for rebuilt-executable reuse.
-    if actual.contains(crate::capture::EXTRACTOR_INPUT_KEY) {
-        expected.insert(crate::capture::EXTRACTOR_INPUT_KEY.to_owned());
+    if actual.contains(crate::capture_records::EXTRACTOR_INPUT_KEY) {
+        expected.insert(crate::capture_records::EXTRACTOR_INPUT_KEY.to_owned());
     }
     control_ensure!(
         actual == expected,
@@ -11831,16 +9596,35 @@ fn validate_paired_rows(db: &Connection) -> Result<()> {
 }
 
 #[derive(Clone)]
-struct V8NativeScope {
+pub(crate) struct V8NativeScope {
     revision_key: String, // internal pin:v1 generation/revision key
-    version_id: String,
-    vid: i64,
-    key: crate::native_evidence::DocumentKey,
-    native_revision_id: String,
-    producer_id: String,
+    pub(crate) version_id: String,
+    pub(crate) vid: i64,
+    pub(crate) key: crate::native_records::DocumentKey,
+    pub(crate) native_revision_id: String,
+    pub(crate) producer_id: String,
 }
 impl V8NativeScope {
-    fn proof_id(&self) -> String {
+    /// A scope built field by field, for the query-layer tests that read through one.
+    #[cfg(test)]
+    pub(crate) fn for_tests(
+        revision_key: String,
+        version_id: String,
+        vid: i64,
+        key: crate::native_records::DocumentKey,
+        native_revision_id: String,
+        producer_id: String,
+    ) -> Self {
+        Self {
+            revision_key,
+            version_id,
+            vid,
+            key,
+            native_revision_id,
+            producer_id,
+        }
+    }
+    pub(crate) fn proof_id(&self) -> String {
         format!(
             "native-proof:v1:{}",
             crate::native_ids::digest(
@@ -11855,7 +9639,7 @@ impl V8NativeScope {
 }
 // Decode compact ID columns at the SQLite row boundary. A malformed stored
 // BLOB is a corrupt index, not a malformed caller selector.
-fn stored_id_row(
+pub(crate) fn stored_id_row(
     row: &rusqlite::Row<'_>,
     index: usize,
     occurrence: bool,
@@ -11888,9 +9672,9 @@ fn optional_stored_id_row(
     stored_id_row(row, index, occurrence).map(Some)
 }
 
-fn v8_native_scope_for(
+pub(crate) fn v8_native_scope_for(
     db: &Connection,
-    key: &crate::native_evidence::DocumentKey,
+    key: &crate::native_records::DocumentKey,
     selected: &ReadRevision,
 ) -> Result<Option<V8NativeScope>> {
     let mut stmt = db.prepare_cached(
@@ -11930,12 +9714,12 @@ fn v8_native_scope_for(
     ))
 }
 
-fn v8_owner_scope_for(
+pub(crate) fn v8_owner_scope_for(
     db: &Connection,
     owner: &str,
     selected: &ReadRevision,
 ) -> Result<Option<V8NativeScope>> {
-    use crate::native_evidence::DocumentKey;
+    use crate::native_records::DocumentKey;
     let mut stmt = db.prepare_cached(
         "SELECT r.source_set_id,m.language,m.path
         FROM native_version_declarations d JOIN revision_documents m
@@ -11990,7 +9774,7 @@ fn decode_signature(
     present: bool,
     count: Option<i64>,
     variadic: Option<bool>,
-) -> Result<Option<crate::native_evidence::Signature>> {
+) -> Result<Option<crate::native_records::Signature>> {
     let values = types.remove(id).unwrap_or_default();
     if !present {
         selected_ensure!(
@@ -11999,7 +9783,7 @@ fn decode_signature(
         );
         return Ok(None);
     }
-    Ok(Some(crate::native_evidence::Signature {
+    Ok(Some(crate::native_records::Signature {
         parameter_types: values,
         type_parameter_count: usize::try_from(
             count.ok_or_else(|| SelectedIntegrity("missing native signature count".into()))?,
@@ -12011,12 +9795,12 @@ fn decode_signature(
 }
 // This reads the WHOLE selected version, checks every child, THEN filters lookup keys.
 // It cannot accidentally skip bad children attached to a declaration outside a lookup filter.
-fn read_native_declarations_v8(
+pub(crate) fn read_native_declarations_v8(
     db: &Connection,
     scope: &V8NativeScope,
     lookup_key: Option<&str>,
     all_lookup_keys: bool,
-) -> Result<Vec<crate::native_evidence::Declaration>> {
+) -> Result<Vec<crate::native_records::Declaration>> {
     read_native_declarations_v8_inner(db, scope, lookup_key, all_lookup_keys, None)
 }
 
@@ -12026,7 +9810,7 @@ fn read_native_declarations_v8_optional(
     lookup_key: Option<&str>,
     all_lookup_keys: bool,
     expired: &dyn Fn() -> bool,
-) -> Result<Vec<crate::native_evidence::Declaration>> {
+) -> Result<Vec<crate::native_records::Declaration>> {
     read_native_declarations_v8_inner(db, scope, lookup_key, all_lookup_keys, Some(expired))
 }
 
@@ -12036,7 +9820,7 @@ fn fetch_native_declarations_v8(
     db: &Connection,
     scope: &V8NativeScope,
     progress: Option<&dyn Fn() -> bool>,
-) -> Result<impl Decode<Vec<crate::native_evidence::Declaration>> + use<>> {
+) -> Result<impl Decode<Vec<crate::native_records::Declaration>> + use<>> {
     optional_hint_check(progress)?;
     let v = &scope.vid;
     let rows0 = db.prepare_cached("SELECT syntax_id,ordinal,type_name FROM native_version_own_signature_types WHERE vid=?1 ORDER BY syntax_id,ordinal")?
@@ -12090,7 +9874,7 @@ fn fetch_native_declarations_v8(
         .collect::<Result<Vec<_>>>()?;
     let scope = scope.clone();
     Ok(decoder(move |progress| {
-        use crate::native_evidence::{Declaration, Header, Key, Parameter, Range};
+        use crate::native_records::{Declaration, Header, Key, Parameter, Range};
         optional_hint_check(progress)?;
         let mut own_types: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for row in rows0 {
@@ -12203,7 +9987,7 @@ fn fetch_native_declarations_v8(
                 name_start,
                 name_end,
             ) = row;
-            let role = crate::native_evidence::DeclarationRole::from_stored(&role)
+            let role = crate::native_records::DeclarationRole::from_stored(&role)
                 .map_err(|error| SelectedIntegrity(error.to_string()))?;
             selected_ensure!(
                 recorded_owners.insert(id.clone(), owner).is_none(),
@@ -12228,7 +10012,7 @@ fn fetch_native_declarations_v8(
                     selected_ensure!(sig_types.is_empty(), "orphan ancestor signature types");
                 }
                 let signature = if present {
-                    Some(crate::native_evidence::Signature {
+                    Some(crate::native_records::Signature {
                         parameter_types: sig_types,
                         type_parameter_count: usize::try_from(count.ok_or_else(|| {
                             SelectedIntegrity("missing ancestor signature count".into())
@@ -12339,7 +10123,7 @@ fn read_native_declarations_v8_inner(
     lookup_key: Option<&str>,
     all_lookup_keys: bool,
     progress: Option<&dyn Fn() -> bool>,
-) -> Result<Vec<crate::native_evidence::Declaration>> {
+) -> Result<Vec<crate::native_records::Declaration>> {
     let mut result = fetch_native_declarations_v8(db, scope, progress)?(progress)?;
     if !all_lookup_keys {
         result.retain(|d| d.lookup_key.as_deref() == lookup_key);
@@ -12347,11 +10131,11 @@ fn read_native_declarations_v8_inner(
     Ok(result)
 }
 
-fn read_native_coverage_v8(
+pub(crate) fn read_native_coverage_v8(
     db: &Connection,
     scope: &V8NativeScope,
-) -> Result<crate::native_evidence::Coverage> {
-    use crate::native_evidence::Coverage;
+) -> Result<crate::native_records::Coverage> {
+    use crate::native_records::Coverage;
     let (requested,selected,state,diagnostic):(bool,bool,String,Option<String>)=
         db.query_row("SELECT coverage_requested,coverage_selected,coverage_state,coverage_diagnostic FROM revision_documents WHERE revision_id=?1 AND language=?2 AND path=?3 AND vid=?4",
             params![scope.revision_key,scope.key.language,scope.key.path,scope.vid],
@@ -12378,11 +10162,11 @@ fn read_native_coverage_v8(
     })
 }
 // Reads all version rows, verifies all child edges, then selects the requested owner.
-fn read_native_calls_v8(
+pub(crate) fn read_native_calls_v8(
     db: &Connection,
     scope: &V8NativeScope,
     owner: Option<&str>,
-) -> Result<Vec<crate::native_evidence::Call>> {
+) -> Result<Vec<crate::native_records::Call>> {
     read_native_calls_v8_inner(db, scope, owner, None)
 }
 /// Read every row of one selected version; the returned decoder checks and
@@ -12391,7 +10175,7 @@ fn fetch_native_calls_v8(
     db: &Connection,
     scope: &V8NativeScope,
     progress: Option<&dyn Fn() -> bool>,
-) -> Result<impl Decode<Vec<crate::native_evidence::Call>> + use<>> {
+) -> Result<impl Decode<Vec<crate::native_records::Call>> + use<>> {
     optional_hint_check(progress)?;
     let version = &scope.vid;
     let rows0 = db
@@ -12431,7 +10215,7 @@ fn fetch_native_calls_v8(
     let scope = scope.clone();
     Ok(decoder(move |progress| {
         optional_hint_check(progress)?;
-        use crate::native_evidence::{Call, Range};
+        use crate::native_records::{Call, Range};
         let mut known = BTreeSet::new();
         for row in rows0 {
             optional_hint_check(progress)?;
@@ -12532,7 +10316,7 @@ fn read_native_calls_v8_inner(
     scope: &V8NativeScope,
     owner: Option<&str>,
     progress: Option<&dyn Fn() -> bool>,
-) -> Result<Vec<crate::native_evidence::Call>> {
+) -> Result<Vec<crate::native_records::Call>> {
     let calls = fetch_native_calls_v8(db, scope, progress)?(progress)?;
     if owner.is_none() {
         optional_hint_check(progress)?;
@@ -12551,7 +10335,7 @@ fn read_native_control_regions_v8(
     db: &Connection,
     scope: &V8NativeScope,
     owner: Option<&str>,
-) -> Result<Vec<crate::native_evidence::ControlRegion>> {
+) -> Result<Vec<crate::native_records::ControlRegion>> {
     read_native_control_regions_v8_inner(db, scope, owner, None)
 }
 /// Read every row of one selected version; the returned decoder checks and
@@ -12560,7 +10344,7 @@ fn fetch_native_control_regions_v8(
     db: &Connection,
     scope: &V8NativeScope,
     progress: Option<&dyn Fn() -> bool>,
-) -> Result<impl Decode<Vec<crate::native_evidence::ControlRegion>> + use<>> {
+) -> Result<impl Decode<Vec<crate::native_records::ControlRegion>> + use<>> {
     optional_hint_check(progress)?;
     let rows0 = db
         .prepare_cached("SELECT syntax_id FROM native_version_declarations WHERE vid=?1")?
@@ -12580,7 +10364,7 @@ fn fetch_native_control_regions_v8(
     let scope = scope.clone();
     Ok(decoder(move |progress| {
         optional_hint_check(progress)?;
-        use crate::native_evidence::{ControlRegion, Range};
+        use crate::native_records::{ControlRegion, Range};
         let mut known = BTreeSet::new();
         for row in rows0 {
             optional_hint_check(progress)?;
@@ -12642,7 +10426,7 @@ fn read_native_control_regions_v8_inner(
     scope: &V8NativeScope,
     owner: Option<&str>,
     progress: Option<&dyn Fn() -> bool>,
-) -> Result<Vec<crate::native_evidence::ControlRegion>> {
+) -> Result<Vec<crate::native_records::ControlRegion>> {
     let regions = fetch_native_control_regions_v8(db, scope, progress)?(progress)?;
     if owner.is_none() {
         optional_hint_check(progress)?;
@@ -12662,8 +10446,8 @@ fn read_native_references(
     db: &Connection,
     scope: &V8NativeScope,
     owner: Option<&str>,
-) -> Result<Vec<crate::native_evidence::Reference>> {
-    use crate::native_evidence::{Range, Reference};
+) -> Result<Vec<crate::native_records::Reference>> {
+    use crate::native_records::{Range, Reference};
     let mut known = BTreeSet::new();
     for row in db
         .prepare("SELECT syntax_id FROM native_version_declarations WHERE vid=?1")?
@@ -12700,8 +10484,8 @@ fn read_native_references(
 fn read_native_capability_report(
     db: &Connection,
     scope: &V8NativeScope,
-) -> Result<crate::native_evidence::CapabilityReport> {
-    use crate::native_evidence::{
+) -> Result<crate::native_records::CapabilityReport> {
+    use crate::native_records::{
         CapabilityReport, MeasurementGap, MeasurementKind, MeasurementSupport, Range,
     };
     let mut families = vec![];
@@ -12814,7 +10598,7 @@ impl Store {
     /// Signal waiters after a confirmed terminal request COMMIT.
     pub(crate) fn notify_terminal_waiters(&self) {
         self.publication_gate.notify_terminal();
-        crate::index_coordinator::diagnostic_marker(
+        crate::diagnostic_markers::diagnostic_marker(
             "-",
             "terminal_notify",
             &format!("generation={}", self.terminal_generation()),
@@ -13250,7 +11034,7 @@ impl Store {
             ensure!(revision > 0, "index_not_ready: no published revision");
             let raw_options =
                 raw_options.context("incompatible_index: missing reconcile options")?;
-            let options: crate::indexer::ReconcileOptions = serde_json::from_str(&raw_options)
+            let options: crate::model::ReconcileOptions = serde_json::from_str(&raw_options)
                 .context(SelectedIntegrity(
                     "incompatible_index: stored JSON decode failed".into(),
                 ))
@@ -13509,19 +11293,25 @@ impl Store {
         Ok(())
     }
     /// Only an already-classified corrupt index under a fresh exclusive leader may enter.
+    /// `capture_and_spool` is the caller's full capture; see [`RecreateCapture`] for where it
+    /// runs.
     pub(crate) fn recreate_index_exclusive(
         &self,
-        options: &crate::indexer::IndexOptions,
+        options: &crate::model::IndexOptions,
         leader: &mut topology::WriterGuard,
         cancel: &CancelFlag,
+        capture_and_spool: &mut RecreateCapture<'_>,
     ) -> Result<IndexPin> {
-        self.recreate_index_exclusive_with_hook(options, leader, cancel, |_| Ok(()))
+        self.recreate_index_exclusive_with_hook(options, leader, cancel, capture_and_spool, |_| {
+            Ok(())
+        })
     }
     fn recreate_index_exclusive_with_hook(
         &self,
-        options: &crate::indexer::IndexOptions,
+        options: &crate::model::IndexOptions,
         leader: &mut topology::WriterGuard,
         cancel: &CancelFlag,
+        capture_and_spool: &mut RecreateCapture<'_>,
         mut at: impl FnMut(ActivationStage) -> Result<()>,
     ) -> Result<IndexPin> {
         ensure!(
@@ -13648,17 +11438,7 @@ impl Store {
                 .map_err(|_| anyhow::anyhow!("recovery_required: disposition changed under EX"))?;
             let _publication = self.enter_publication(cancel, Duration::from_millis(250))?;
             let expected = self.publication_index_baseline()?;
-            let capture = crate::capture::Capture::admit(options, cancel, &|_| {})?;
-            let spool = crate::native_evidence::spool_full_capture(
-                options,
-                &capture,
-                &self.identity.root,
-                self.root_id(),
-                cancel,
-                &|_| {},
-                |_, _| {},
-                &self.native_spool_dir()?,
-            )?;
+            let (capture, spool) = capture_and_spool()?;
             return self
                 .publish_validated_stream_recovery(&spool, &capture, leader, expected, cancel);
         } else {
@@ -13679,17 +11459,7 @@ impl Store {
             // Rebuild from the same bounded, sorted document spool as a normal
             // full publication. No facts or projections from the old index are
             // usable here; the private stage remains the sole SQL target.
-            let capture = crate::capture::Capture::admit(options, cancel, &|_| {})?;
-            let spool = crate::native_evidence::spool_full_capture(
-                options,
-                &capture,
-                &self.identity.root,
-                self.root_id(),
-                cancel,
-                &|_| {},
-                |_, _| {},
-                &self.native_spool_dir()?,
-            )?;
+            let (capture, spool) = capture_and_spool()?;
             let pin =
                 self.publish_validated_stream_to_stage(&spool, &capture, &stage, leader, cancel)?;
             ensure!(
@@ -14669,7 +12439,7 @@ impl Store {
     pub fn state_topology(&self) -> (&topology::TopologyRoots, &topology::WorkspaceIdentity) {
         (&self.roots, &self.identity)
     }
-    pub fn recorded_index_options(&self) -> Result<Option<crate::indexer::IndexOptions>> {
+    pub fn recorded_index_options(&self) -> Result<Option<crate::model::IndexOptions>> {
         (|| {
             let mut db = self.cache()?;
             let tx = storage_result(db.transaction())?;
@@ -14706,7 +12476,7 @@ impl Store {
             let payload = payload.ok_or_else(|| {
                 ControlIntegrity("incompatible_index: missing reconcile options".into())
             })?;
-            let options: crate::indexer::ReconcileOptions = serde_json::from_str(&payload)
+            let options: crate::model::ReconcileOptions = serde_json::from_str(&payload)
                 .context(SelectedIntegrity(
                     "incompatible_index: stored JSON decode failed".into(),
                 ))
@@ -14716,7 +12486,7 @@ impl Store {
                 "incompatible_index: unsupported reconcile options"
             );
             let mut result =
-                crate::indexer::IndexOptions::new(Path::new(&self.workspace_root).to_owned());
+                crate::model::IndexOptions::new(Path::new(&self.workspace_root).to_owned());
             result.max_file_bytes = options.max_file_bytes;
             Ok(Some(result))
         })()
@@ -14756,8 +12526,9 @@ impl Store {
     }
     pub(crate) fn recreate_pending_writer_session(
         &self,
-        options: &crate::indexer::IndexOptions,
+        options: &crate::model::IndexOptions,
         cancel: &CancelFlag,
+        capture_and_spool: &mut RecreateCapture<'_>,
     ) -> Result<(IndexPin, Arc<topology::WriterSession>)> {
         ensure!(
             self.is_recreate_pending(),
@@ -14773,7 +12544,7 @@ impl Store {
             .writer_under_exclusive(self.identity.clone(), exclusive)?;
         #[cfg(test)]
         self.test_exclusive_recovery_hook.run();
-        let pin = self.recreate_index_exclusive(options, &mut writer, cancel)?;
+        let pin = self.recreate_index_exclusive(options, &mut writer, cancel, capture_and_spool)?;
         let session = Arc::new(topology::WriterSession::writer(writer));
         self.verify_writer_session(&session)?;
         ensure!(
@@ -14920,7 +12691,7 @@ impl Store {
     /// root here; no caller-supplied path is ever a root.
     pub fn producer_generation_dir(
         &self,
-        origin: crate::semantic_batch::descriptor::GenerationOrigin,
+        origin: crate::semantic_batch::origin::GenerationOrigin,
         generation_id: &str,
     ) -> Result<std::path::PathBuf> {
         ensure!(
@@ -15017,15 +12788,21 @@ impl Store {
         self.evidence_response_daemon_local()
     }
 
+    /// Where this checkout's index database is, for tests that edit it directly.
     #[cfg(test)]
-    fn set_metrics_document_hook(
+    pub(crate) fn index_db_path_for_tests(&self) -> std::path::PathBuf {
+        self.roots.index_db(&self.identity)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_metrics_document_hook(
         &self,
         hook: impl Fn(&str, MetricsDocumentStage) + Send + Sync + 'static,
     ) {
         *self.test_metrics_document_hook.lock().unwrap() = Some(Arc::new(hook));
     }
     #[cfg(test)]
-    fn run_metrics_document_hook(&self, path: &str, stage: MetricsDocumentStage) {
+    pub(crate) fn run_metrics_document_hook(&self, path: &str, stage: MetricsDocumentStage) {
         let hook = self.test_metrics_document_hook.lock().unwrap().clone();
         if let Some(hook) = hook {
             hook(path, stage);
@@ -15038,7 +12815,10 @@ impl Store {
         self.metrics_memo.lock().unwrap().len()
     }
 
-    fn with_evidence<T>(&self, read: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    pub(crate) fn with_evidence<T>(
+        &self,
+        read: impl FnOnce(&Connection) -> Result<T>,
+    ) -> Result<T> {
         self.with_evidence_hook(read, || Ok(()))
     }
     fn with_evidence_hook<T>(
@@ -15136,7 +12916,7 @@ impl Store {
         &self,
         graph: &Graph,
         capture: &crate::capture::Capture,
-        native: &crate::native_evidence::Artifact,
+        native: &crate::native_records::Artifact,
         leader: &topology::WriterGuard,
         expected_revision: IndexPin,
         cancel: &CancelFlag,
@@ -15160,7 +12940,7 @@ impl Store {
         &self,
         graph: &Graph,
         capture: &crate::capture::Capture,
-        native: &crate::native_evidence::Artifact,
+        native: &crate::native_records::Artifact,
         leader: &topology::WriterGuard,
         cancel: &CancelFlag,
     ) -> Result<IndexPin> {
@@ -15181,8 +12961,8 @@ impl Store {
     /// report in a single transaction against `expected`.
     pub fn publish_semantic_batch(
         &self,
-        joined: &crate::semantic_batch::JoinedBatch,
-        stage: &mut crate::semantic_batch::staging::Stage,
+        joined: &batch_input::JoinedBatch,
+        stage: &mut crate::store::staging::Stage,
         expected: IndexPin,
         leader: &topology::WriterGuard,
         cancel: &CancelFlag,
@@ -15194,8 +12974,8 @@ impl Store {
     #[doc(hidden)]
     pub fn publish_semantic_batch_with_fault_for_tests(
         &self,
-        joined: &crate::semantic_batch::JoinedBatch,
-        stage: &mut crate::semantic_batch::staging::Stage,
+        joined: &batch_input::JoinedBatch,
+        stage: &mut crate::store::staging::Stage,
         expected: IndexPin,
         leader: &topology::WriterGuard,
         cancel: &CancelFlag,
@@ -15249,8 +13029,8 @@ impl Store {
     #[doc(hidden)]
     pub fn publish_semantic_batch_observing_for_tests(
         &self,
-        joined: &crate::semantic_batch::JoinedBatch,
-        stage: &mut crate::semantic_batch::staging::Stage,
+        joined: &batch_input::JoinedBatch,
+        stage: &mut crate::store::staging::Stage,
         expected: IndexPin,
         leader: &topology::WriterGuard,
         cancel: &CancelFlag,
@@ -15271,8 +13051,8 @@ impl Store {
     #[allow(clippy::too_many_arguments)]
     fn publish_semantic_batch_inner(
         &self,
-        joined: &crate::semantic_batch::JoinedBatch,
-        stage: &mut crate::semantic_batch::staging::Stage,
+        joined: &batch_input::JoinedBatch,
+        stage: &mut crate::store::staging::Stage,
         expected: IndexPin,
         leader: &topology::WriterGuard,
         cancel: &CancelFlag,
@@ -15294,15 +13074,15 @@ impl Store {
     #[allow(clippy::too_many_arguments)]
     fn publish_semantic_batch_statements(
         &self,
-        joined: &crate::semantic_batch::JoinedBatch,
-        stage: &mut crate::semantic_batch::staging::Stage,
+        joined: &batch_input::JoinedBatch,
+        stage: &mut crate::store::staging::Stage,
         expected: IndexPin,
         leader: &topology::WriterGuard,
         cancel: &CancelFlag,
         mut before_commit: impl FnMut(&Connection) -> Result<()>,
         commit_loss: Option<CommitLoss>,
     ) -> Result<IndexPin> {
-        use crate::semantic_batch::{descriptor::Descriptor, limits};
+        use crate::{batch_descriptor::Descriptor, semantic_batch::limits};
         leader.belongs_to(&self.identity)?;
         self.identity.verify()?;
         check_cancel(cancel)?;
@@ -15679,9 +13459,9 @@ impl Store {
         &self,
         graph: &Graph,
         capture: &crate::capture::Capture,
-        native: &crate::native_evidence::Artifact,
-        semantic: &crate::semantic_evidence::SemanticPublication,
-        captured: &crate::semantic_evidence::CapturedComponents,
+        native: &crate::native_records::Artifact,
+        semantic: &crate::semantic_records::SemanticPublication,
+        captured: &crate::semantic_records::CapturedComponents,
         leader: &topology::WriterGuard,
         expected_revision: IndexPin,
         cancel: &CancelFlag,
@@ -15706,9 +13486,9 @@ impl Store {
         evidence: (
             &Graph,
             &crate::capture::Capture,
-            &crate::native_evidence::Artifact,
-            &crate::semantic_evidence::SemanticPublication,
-            &crate::semantic_evidence::CapturedComponents,
+            &crate::native_records::Artifact,
+            &crate::semantic_records::SemanticPublication,
+            &crate::semantic_records::CapturedComponents,
         ),
         leader: &topology::WriterGuard,
         expected_revision: IndexPin,
@@ -15741,9 +13521,9 @@ impl Store {
         evidence: (
             &Graph,
             &crate::capture::Capture,
-            &crate::native_evidence::Artifact,
-            &crate::semantic_evidence::SemanticPublication,
-            &crate::semantic_evidence::CapturedComponents,
+            &crate::native_records::Artifact,
+            &crate::semantic_records::SemanticPublication,
+            &crate::semantic_records::CapturedComponents,
         ),
         leader: &topology::WriterGuard,
         expected_revision: IndexPin,
@@ -15771,9 +13551,9 @@ impl Store {
         &self,
         graph: &Graph,
         capture: &crate::capture::Capture,
-        native: &crate::native_evidence::Artifact,
-        semantic: &crate::semantic_evidence::SemanticPublication,
-        captured: &crate::semantic_evidence::CapturedComponents,
+        native: &crate::native_records::Artifact,
+        semantic: &crate::semantic_records::SemanticPublication,
+        captured: &crate::semantic_records::CapturedComponents,
         leader: &topology::WriterGuard,
         expected_revision: IndexPin,
         cancel: &CancelFlag,
@@ -15887,8 +13667,8 @@ impl Store {
         target: PublicationTarget<'_>,
         cancel: &CancelFlag,
         semantic: Option<(
-            &crate::semantic_evidence::SemanticPublication,
-            &crate::semantic_evidence::CapturedComponents,
+            &crate::semantic_records::SemanticPublication,
+            &crate::semantic_records::CapturedComponents,
         )>,
         during_tx: impl FnMut(PublishStage, &Connection) -> Result<()>,
     ) -> Result<IndexPin> {
@@ -15902,7 +13682,7 @@ impl Store {
                 && capture
                     .source_operations
                     .values()
-                    .all(crate::capture::SourceOperations::read_once),
+                    .all(crate::capture_records::SourceOperations::read_once),
             "native_evidence_required: each source must open and read at most once, and hash once"
         );
         ensure!(
@@ -15963,10 +13743,10 @@ impl Store {
     #[doc(hidden)]
     pub fn publish_private_stage_semantic_for_tests(
         &self,
-        options: &crate::indexer::IndexOptions,
+        options: &crate::model::IndexOptions,
         capture: &crate::capture::Capture,
-        semantic: &crate::semantic_evidence::SemanticPublication,
-        captured: &crate::semantic_evidence::CapturedComponents,
+        semantic: &crate::semantic_records::SemanticPublication,
+        captured: &crate::semantic_records::CapturedComponents,
         cancel: &CancelFlag,
         fail_before_commit: bool,
     ) -> Result<PrivateStageObservation> {
@@ -15983,7 +13763,7 @@ impl Store {
     #[doc(hidden)]
     pub fn publish_private_stage_native_for_tests(
         &self,
-        options: &crate::indexer::IndexOptions,
+        options: &crate::model::IndexOptions,
         capture: &crate::capture::Capture,
         cancel: &CancelFlag,
     ) -> Result<PrivateStageObservation> {
@@ -15993,11 +13773,11 @@ impl Store {
     #[cfg(feature = "test-support")]
     fn publish_private_stage_for_tests(
         &self,
-        options: &crate::indexer::IndexOptions,
+        options: &crate::model::IndexOptions,
         capture: &crate::capture::Capture,
         semantic: Option<(
-            &crate::semantic_evidence::SemanticPublication,
-            &crate::semantic_evidence::CapturedComponents,
+            &crate::semantic_records::SemanticPublication,
+            &crate::semantic_records::CapturedComponents,
         )>,
         cancel: &CancelFlag,
         fail_before_commit: bool,
@@ -16078,8 +13858,8 @@ impl Store {
                  WHERE m.revision_id=?1 ORDER BY m.language,m.path",
                 )?
                 .query_map([&key], |row| {
-                    Ok(crate::native_evidence::Document {
-                        key: crate::native_evidence::DocumentKey {
+                    Ok(crate::native_records::Document {
+                        key: crate::native_records::DocumentKey {
                             source_set_id: source_set_id.clone(),
                             language: row.get(0)?,
                             path: row.get(1)?,
@@ -16099,7 +13879,7 @@ impl Store {
                 declarations.extend(read_native_declarations_v8(&staged, &scope, None, true)?);
                 calls.extend(read_native_calls_v8(&staged, &scope, None)?);
             }
-            let revision = crate::native_evidence::Revision {
+            let revision = crate::native_records::Revision {
                 id: native_revision_id,
                 source_set_id,
                 documents,
@@ -16121,41 +13901,13 @@ impl Store {
 
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
-    pub fn publish_stream_native_only_for_tests(
-        &self,
-        options: &crate::indexer::IndexOptions,
-        capture: &crate::capture::Capture,
-        leader: &topology::WriterGuard,
-        cancel: &CancelFlag,
-    ) -> Result<IndexPin> {
-        let spool = crate::native_evidence::spool_full_capture(
-            options,
-            capture,
-            Path::new(&self.workspace_root),
-            self.root_id(),
-            cancel,
-            &|_| {},
-            |_, _| {},
-            &self.native_spool_dir()?,
-        )?;
-        self.publish_validated_stream_recovery(
-            &spool,
-            capture,
-            leader,
-            self.publication_index_baseline()?,
-            cancel,
-        )
-    }
-
-    #[cfg(feature = "test-support")]
-    #[doc(hidden)]
     #[allow(clippy::too_many_arguments)]
     pub fn publish_stream_semantic_for_tests(
         &self,
-        options: &crate::indexer::IndexOptions,
+        options: &crate::model::IndexOptions,
         capture: &crate::capture::Capture,
-        semantic: &crate::semantic_evidence::SemanticPublication,
-        captured: &crate::semantic_evidence::CapturedComponents,
+        semantic: &crate::semantic_records::SemanticPublication,
+        captured: &crate::semantic_records::CapturedComponents,
         leader: &topology::WriterGuard,
         cancel: &CancelFlag,
         fail_before_commit: bool,
@@ -16194,7 +13946,7 @@ impl Store {
         &self,
         graph: &Graph,
         capture: &crate::capture::Capture,
-        native: &crate::native_evidence::Artifact,
+        native: &crate::native_records::Artifact,
         leader: &topology::WriterGuard,
         cancel: &CancelFlag,
     ) -> Result<IndexPin> {
@@ -16209,9 +13961,9 @@ impl Store {
         &self,
         graph: &Graph,
         capture: &crate::capture::Capture,
-        native: &crate::native_evidence::Artifact,
-        semantic: &crate::semantic_evidence::SemanticPublication,
-        captured: &crate::semantic_evidence::CapturedComponents,
+        native: &crate::native_records::Artifact,
+        semantic: &crate::semantic_records::SemanticPublication,
+        captured: &crate::semantic_records::CapturedComponents,
         leader: &topology::WriterGuard,
         cancel: &CancelFlag,
         fail_before_commit: bool,
@@ -16237,33 +13989,6 @@ impl Store {
             },
             Some((semantic, captured)),
         )
-    }
-
-    /// A document-local native publication, which rejoins selected batches through the
-    /// witness path where it applies.
-    #[cfg(feature = "test-support")]
-    #[doc(hidden)]
-    pub fn publish_local_for_tests(
-        &self,
-        options: &crate::indexer::IndexOptions,
-        capture: &crate::capture::Capture,
-        leader: &topology::WriterGuard,
-        cancel: &CancelFlag,
-    ) -> Result<IndexPin> {
-        let expected = self.publication_index_baseline()?;
-        let prepared = self
-            .prepare_local_revision(capture, &expected, cancel)?
-            .context("document-local publication unavailable")?;
-        let changed = crate::indexer::project_native_documents(
-            options,
-            capture,
-            &prepared.native,
-            &prepared.changed_paths,
-            cancel,
-            &|_| {},
-        )?;
-        let graph = self.compose_local_revision(capture, &prepared, changed, cancel)?;
-        self.publish_local_native_recovery(&graph, capture, prepared, leader, expected, cancel)
     }
 
     /// Keep the synchronous, same-thread oracle mismatch hook active across N and S.
@@ -16306,10 +14031,10 @@ impl Store {
     #[allow(clippy::too_many_arguments)]
     pub fn publish_local_semantic_for_tests(
         &self,
-        options: &crate::indexer::IndexOptions,
+        options: &crate::model::IndexOptions,
         capture: &crate::capture::Capture,
-        semantic: &crate::semantic_evidence::SemanticPublication,
-        captured: &crate::semantic_evidence::CapturedComponents,
+        semantic: &crate::semantic_records::SemanticPublication,
+        captured: &crate::semantic_records::CapturedComponents,
         leader: &topology::WriterGuard,
         cancel: &CancelFlag,
         fail_before_commit: bool,
@@ -16344,7 +14069,7 @@ impl Store {
         &self,
         graph: &Graph,
         capture: &crate::capture::Capture,
-        native: &crate::native_evidence::Artifact,
+        native: &crate::native_records::Artifact,
         leader: &topology::WriterGuard,
         expected: RecoveryBaseline,
         cancel: &CancelFlag,
@@ -16383,8 +14108,8 @@ impl Store {
         expected: RecoveryBaseline,
         cancel: &CancelFlag,
         semantic: Option<(
-            &crate::semantic_evidence::SemanticPublication,
-            &crate::semantic_evidence::CapturedComponents,
+            &crate::semantic_records::SemanticPublication,
+            &crate::semantic_records::CapturedComponents,
         )>,
         fail_before_commit: bool,
     ) -> Result<IndexPin> {
@@ -16399,7 +14124,7 @@ impl Store {
                 && capture
                     .source_operations
                     .values()
-                    .all(crate::capture::SourceOperations::read_once),
+                    .all(crate::capture_records::SourceOperations::read_once),
             "native_evidence_required: incomplete selected capture"
         );
         let mut native = prepared.native.clone();
@@ -16503,7 +14228,7 @@ impl Store {
         &self,
         graph: &Graph,
         capture: &crate::capture::Capture,
-        native: &crate::native_evidence::Artifact,
+        native: &crate::native_records::Artifact,
         leader: &topology::WriterGuard,
         expected: ExpectedPublication,
         cancel: &CancelFlag,
@@ -16516,7 +14241,7 @@ impl Store {
         &self,
         graph: &Graph,
         capture: &crate::capture::Capture,
-        native: &crate::native_evidence::Artifact,
+        native: &crate::native_records::Artifact,
         cancel: &CancelFlag,
     ) -> Result<()> {
         self.validate_native_bundle_with_mode(graph, capture, native, cancel, false)
@@ -16525,7 +14250,7 @@ impl Store {
         &self,
         graph: &Graph,
         capture: &crate::capture::Capture,
-        native: &crate::native_evidence::Artifact,
+        native: &crate::native_records::Artifact,
         cancel: &CancelFlag,
         selective: bool,
     ) -> Result<()> {
@@ -16550,7 +14275,7 @@ impl Store {
         &self,
         graph: &Graph,
         capture: &crate::capture::Capture,
-        native: &crate::native_evidence::Artifact,
+        native: &crate::native_records::Artifact,
         cancel: &CancelFlag,
     ) -> Result<()> {
         ensure!(
@@ -16562,7 +14287,7 @@ impl Store {
                 && capture
                     .source_operations
                     .values()
-                    .all(crate::capture::SourceOperations::read_once),
+                    .all(crate::capture_records::SourceOperations::read_once),
             "native_evidence_required: each source must open and read at most once, and hash once"
         );
         crate::indexer::validate_native_graph(graph, capture, native, cancel)?;
@@ -16576,7 +14301,7 @@ impl Store {
         bundle: (
             &Graph,
             &crate::capture::Capture,
-            &crate::native_evidence::Artifact,
+            &crate::native_records::Artifact,
         ),
         stage: &StagedIndex,
         leader: &topology::WriterGuard,
@@ -16633,7 +14358,7 @@ impl Store {
         &self,
         graph: &Graph,
         capture: &crate::capture::Capture,
-        native: &crate::native_evidence::Artifact,
+        native: &crate::native_records::Artifact,
         leader: &topology::WriterGuard,
         expected: ExpectedPublication,
         cancel: &CancelFlag,
@@ -16751,7 +14476,7 @@ impl Store {
         bundle: (
             &Graph,
             &crate::capture::Capture,
-            &crate::native_evidence::Artifact,
+            &crate::native_records::Artifact,
         ),
         leader: &topology::WriterGuard,
         expected_revision: IndexPin,
@@ -16775,7 +14500,7 @@ impl Store {
         bundle: (
             &Graph,
             &crate::capture::Capture,
-            &crate::native_evidence::Artifact,
+            &crate::native_records::Artifact,
         ),
         leader: &topology::WriterGuard,
         expected_revision: IndexPin,
@@ -16797,7 +14522,7 @@ impl Store {
         bundle: (
             &Graph,
             &crate::capture::Capture,
-            &crate::native_evidence::Artifact,
+            &crate::native_records::Artifact,
         ),
         leader: &topology::WriterGuard,
         expected: ExpectedPublication,
@@ -16848,14 +14573,17 @@ impl Store {
     /// Read a prior immutable native version without running the native parser.
     /// Its source bytes must be exactly the newly admitted immutable source. The
     /// normalized rows are checked against the witness written at full admission.
+    /// Only the test seam `prepare_local_native` calls it.
+    #[cfg(test)]
     fn selected_reusable_native(
         &self,
         db: &Connection,
         selected: &ReadRevision,
         file: &SourceFile,
     ) -> Result<crate::native_evidence::SelectedDocument> {
-        use crate::native_evidence::{
-            Document, DocumentKey, Producer, Provenance, Revision, SelectedDocument, SourceSet,
+        use crate::native_evidence::SelectedDocument;
+        use crate::native_records::{
+            Document, DocumentKey, Producer, Provenance, Revision, SourceSet,
         };
         use sha2::{Digest, Sha256};
         let key = DocumentKey {
@@ -16903,7 +14631,7 @@ impl Store {
                         &file.language,
                     )?
                 && producer_id == scope.producer_id
-                && producer_version == crate::native_evidence::NATIVE_VERSION,
+                && producer_version == crate::native_records::NATIVE_VERSION,
             "incompatible_index: reusable native source/context differs from capture"
         );
         let (_origin, kind, position_encoding): (String, String, String) = db.query_row(
@@ -16915,7 +14643,7 @@ impl Store {
         let executable_hash = selected_producer_hash(db, selected)?;
         let producer = Producer { id:producer_id,version:producer_version,executable_hash,
             kind,languages:db.prepare("SELECT language FROM native_producer_languages WHERE producer_id=?1 AND producer_version=?2 ORDER BY ordinal")?
-                .query_map(params![scope.producer_id,crate::native_evidence::NATIVE_VERSION],|r|r.get(0))?
+                .query_map(params![scope.producer_id,crate::native_records::NATIVE_VERSION],|r|r.get(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?,position_encoding };
         let source_set = SourceSet { id:key.source_set_id.clone(),root_id:self.root_id().to_owned(),
             languages:db.prepare("SELECT language FROM native_source_set_languages WHERE source_set_id=?1 ORDER BY ordinal")?
@@ -17025,7 +14753,7 @@ impl Store {
                 && capture
                     .source_operations
                     .values()
-                    .all(crate::capture::SourceOperations::read_once),
+                    .all(crate::capture_records::SourceOperations::read_once),
             "native_evidence_required: final inventory must freshly read and hash every admitted source"
         );
         leader.belongs_to(&self.identity)?;
@@ -17099,7 +14827,7 @@ impl Store {
                 && capture
                     .source_operations
                     .values()
-                    .all(crate::capture::SourceOperations::read_once),
+                    .all(crate::capture_records::SourceOperations::read_once),
             "native_evidence_required: every unchanged source must be read and hashed"
         );
         let db = self.cache_write()?;
@@ -17386,7 +15114,7 @@ impl Store {
             // The selected head is a prior validated publication. Do not decode
             // its unchanged fact/projection rows; the changed captured source
             // bytes are checked below.
-            let previous_options: crate::indexer::ReconcileOptions = db.query_row(
+            let previous_options: crate::model::ReconcileOptions = db.query_row(
                 "SELECT reconcile_options FROM index_metadata WHERE singleton=1", [],
                 |r| r.get::<_, String>(0))?.parse::<serde_json::Value>()
                     .and_then(serde_json::from_value).context(SelectedIntegrity("incompatible_index: stored capture decode failed".into()))?;
@@ -17412,8 +15140,8 @@ impl Store {
             let mut prior_summaries = BTreeMap::new();
             let mut prior_class_complete = BTreeMap::new();
             let source_set_id = format!("source-set:v1:{}", self.root_id());
-            let producer_id = crate::native_evidence::PRODUCER;
-            let producer_version = crate::native_evidence::NATIVE_VERSION;
+            let producer_id = crate::native_records::PRODUCER;
+            let producer_version = crate::native_records::NATIVE_VERSION;
             // Unchanged prior documents are trusted by their stored, validated
             // content hash (owner ruling, #141): their bytes are not read,
             // re-hashed or decoded here. Only the changed document's bytes are
@@ -17456,7 +15184,7 @@ impl Store {
                     version_id:version_id.clone(), graph_id, class_id:class_id.context(SelectedIntegrity("class projection missing".into()))?,
                     graph_hash,class_hash:class_hash.context(SelectedIntegrity("class hash missing".into()))?,
                 }).is_none(),"incompatible_index: duplicate local manifest path");
-                prior_coverage.insert(path.clone(), native_evidence::Coverage {
+                prior_coverage.insert(path.clone(), crate::native_records::Coverage {
                     producer_id:producer_id.to_owned(),language:language.clone(),
                     source_set_id:source_set_id.clone(),document_path:path.clone(),
                     revision_id:String::new(),requested,selected:covered,state,diagnostic,
@@ -17601,13 +15329,13 @@ impl Store {
 
     /// Produce a selectively assembled native revision only for a proved local edit
     /// (or unchanged captured sources). Other changes use the full native path.
-    #[allow(dead_code)] // Test seam; the production fast path admits changed-only facts.
+    #[cfg(test)] // Test seam; the production fast path admits changed-only facts.
     pub(crate) fn prepare_local_native(
         &self,
         capture: &crate::capture::Capture,
         expected: &RecoveryBaseline,
         cancel: &CancelFlag,
-    ) -> Result<Option<crate::native_evidence::Artifact>> {
+    ) -> Result<Option<crate::native_records::Artifact>> {
         use crate::native_evidence;
         if !expected.compatible
             || self.disposition() != RecoveryDisposition::Ready
@@ -17628,7 +15356,7 @@ impl Store {
             }
             // Actual selected reuse is authenticated by selected_reusable_native below;
             // unrelated retained versions must not be decoded.
-            let previous_options:crate::indexer::ReconcileOptions = db.query_row(
+            let previous_options:crate::model::ReconcileOptions = db.query_row(
                 "SELECT reconcile_options FROM index_metadata WHERE singleton=1",[],
                 |r|r.get::<_,String>(0))?.parse::<serde_json::Value>()
                     .and_then(serde_json::from_value).context(SelectedIntegrity("incompatible_index: stored capture decode failed".into()))?;
@@ -17871,7 +15599,7 @@ impl Store {
     fn preflight_reuse(
         &self,
         graph: &Graph,
-        native: &crate::native_evidence::Artifact,
+        native: &crate::native_records::Artifact,
         extractions: &BTreeMap<String, crate::model::FileExtraction>,
         expected: &ExpectedPublication,
         rows: &BTreeMap<&str, PublicationRows<'_>>,
@@ -18274,7 +16002,7 @@ impl Store {
         bundle: (
             &Graph,
             &crate::capture::Capture,
-            &crate::native_evidence::Artifact,
+            &crate::native_records::Artifact,
         ),
         leader: &topology::WriterGuard,
         plan: PublicationPlan<'_>,
@@ -18299,7 +16027,7 @@ impl Store {
         bundle: (
             &Graph,
             &crate::capture::Capture,
-            &crate::native_evidence::Artifact,
+            &crate::native_records::Artifact,
         ),
         leader: &topology::WriterGuard,
         plan: PublicationPlan<'_>,
@@ -18311,8 +16039,8 @@ impl Store {
         ),
         mut during_tx: impl FnMut(PublishStage, &Connection) -> Result<()>,
         semantic: Option<(
-            &crate::semantic_evidence::SemanticPublication,
-            &crate::semantic_evidence::CapturedComponents,
+            &crate::semantic_records::SemanticPublication,
+            &crate::semantic_records::CapturedComponents,
         )>,
     ) -> Result<IndexPin> {
         let PublicationPlan { expected, target } = plan;
@@ -19196,7 +16924,7 @@ impl Store {
     fn read_revision(&self, db: &Connection, expected: Option<IndexPin>) -> Result<ReadRevision> {
         self.read_revision_for(db, expected, false)
     }
-    fn read_revision_for(
+    pub(crate) fn read_revision_for(
         &self,
         db: &Connection,
         expected: Option<IndexPin>,
@@ -19445,7 +17173,7 @@ impl Store {
                 "SELECT ordinal,language FROM semantic_requested_producer_languages WHERE revision_id=?1 AND id=?2 ORDER BY ordinal",
                 &[&selected.key, &producer_id],
             )?;
-            let producer = crate::semantic_evidence::Producer {
+            let producer = crate::semantic_records::Producer {
                 id: producer_id.clone(),
                 version,
                 executable_hash,
@@ -19460,7 +17188,7 @@ impl Store {
             )?;
             let requested_documents = db.prepare(
                 "SELECT language,path FROM semantic_coverage WHERE revision_id=?1 AND producer_id=?2 AND requested=1 ORDER BY language,path"
-            )?.query_map(params![selected.key,producer_id], |r| Ok(crate::native_evidence::DocumentKey { source_set_id:selected_source_set.clone(), language:r.get(0)?, path:r.get(1)? }))?
+            )?.query_map(params![selected.key,producer_id], |r| Ok(crate::native_records::DocumentKey { source_set_id:selected_source_set.clone(), language:r.get(0)?, path:r.get(1)? }))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             let input = (|| -> Result<SelectedRawBatch> {
                 let batch = db.query_row(
@@ -19481,13 +17209,10 @@ impl Store {
                     raw_producer == producer_id,
                     "incompatible_index: selected batch producer mismatch"
                 );
-                let descriptor =
-                    crate::semantic_batch::descriptor::Descriptor::parse(&descriptor_bytes)
-                        .map_err(|_| {
-                            SelectedIntegrity(
-                                "incompatible_index: selected batch descriptor".into(),
-                            )
-                        })?;
+                let descriptor = crate::batch_descriptor::Descriptor::parse(&descriptor_bytes)
+                    .map_err(|_| {
+                        SelectedIntegrity("incompatible_index: selected batch descriptor".into())
+                    })?;
                 let captures = db.prepare(
                     if omit_binary {
                         "SELECT capture_id,ordinal,languages,artifact_hash,X'' FROM semantic_raw_captures WHERE batch_id=?1 ORDER BY ordinal"
@@ -19586,7 +17311,7 @@ impl Store {
     }
 
     /// Materialize the complete normalized semantic tree owned by this selected pin.
-    pub fn semantic_at(&self, pin: IndexPin) -> Result<crate::semantic_evidence::SemanticSnapshot> {
+    pub fn semantic_at(&self, pin: IndexPin) -> Result<crate::semantic_records::SemanticSnapshot> {
         self.native_at(pin, |db, selected| {
             let projected: bool = db.query_row(
                 "SELECT EXISTS(SELECT 1 FROM semantic_projection_origins WHERE revision_id=?1)",
@@ -19609,7 +17334,7 @@ impl Store {
         &self,
         pin: IndexPin,
         producer_id: &str,
-        document: &crate::native_evidence::DocumentKey,
+        document: &crate::native_records::DocumentKey,
         syntax_id: &str,
     ) -> Result<Option<SemanticHistory>> {
         ensure!(
@@ -19865,18 +17590,18 @@ impl Store {
     /// unknown key is an error.
     pub(crate) fn batch_limits(
         &self,
-    ) -> std::result::Result<crate::semantic_batch::BatchLimits, String> {
+    ) -> std::result::Result<crate::semantic_batch::limits::BatchLimits, String> {
         #[cfg(feature = "test-support")]
         if let Some(text) = self.semantic_test_hooks().semantic_limits {
             return serde_json::from_str(&text).map_err(|_| "test limits".to_string());
         }
-        Ok(crate::semantic_batch::BatchLimits::PRODUCTION)
+        Ok(crate::semantic_batch::limits::BatchLimits::PRODUCTION)
     }
 
     /// Limits the publication measures disk growth against.
-    fn batch_publication_limits(&self) -> crate::semantic_batch::BatchLimits {
+    fn batch_publication_limits(&self) -> crate::semantic_batch::limits::BatchLimits {
         self.batch_limits()
-            .unwrap_or(crate::semantic_batch::BatchLimits::PRODUCTION)
+            .unwrap_or(crate::semantic_batch::limits::BatchLimits::PRODUCTION)
     }
 
     /// The build's key inputs under this store's limits, without the payload-reuse seams.
@@ -20487,7 +18212,7 @@ impl Store {
     }
     /// Read one selected document and project its graph once from the stored
     /// native rows.
-    fn selected_graph_document_for(
+    pub(crate) fn selected_graph_document_for(
         &self,
         db: &Connection,
         path: &str,
@@ -20502,7 +18227,7 @@ impl Store {
     /// those budgets pass, the rows they bound (`fetch_selected_rows`). Stored
     /// rows are decoded as they are read; a row that does not decode fails
     /// typed. They are not compared with the source (#261).
-    fn fetch_selected_header(
+    pub(crate) fn fetch_selected_header(
         &self,
         db: &Connection,
         path: &str,
@@ -20511,7 +18236,7 @@ impl Store {
     ) -> Result<SelectedHeader> {
         #[cfg(test)]
         count_selected_read(|counts| counts.document_reads += 1);
-        use crate::native_evidence::DocumentKey;
+        use crate::native_records::DocumentKey;
         optional_hint_check(progress)?;
         let sql = "SELECT r.source_set_id,m.language,m.path,d.id,g.graph_hash,
             c.content_hash,d.content_hash,d.byte_length,length(d.source_bytes),
@@ -20608,7 +18333,7 @@ impl Store {
                 && class_id.len() <= 16 * 1024
                 && (if crate::classes::supports_language(&language) {
                     f_length.is_some_and(|n| {
-                        (0..=crate::evidence_budget::CLASS_EXTRACTION as i64).contains(&n)
+                        (0..=crate::evidence_limits::CLASS_EXTRACTION as i64).contains(&n)
                     })
                 } else {
                     f_length.is_none()
@@ -20635,7 +18360,7 @@ impl Store {
             scope.version_id == version_id && scope.native_revision_id == native_revision_id,
             "incompatible_index: selected native manifest mismatch"
         );
-        let row_limit = crate::evidence_budget::row_limit(bytes);
+        let row_limit = crate::evidence_limits::row_limit(bytes);
         let counts_sql = "SELECT (SELECT count(*) FROM graph_nodes WHERE gid=?1),
             (SELECT count(*) FROM graph_display_labels WHERE gid=?1),
             (SELECT count(*) FROM native_version_calls WHERE vid=?3),
@@ -20673,9 +18398,9 @@ impl Store {
             max_row >= 0
                 && native_bytes >= 0
                 && class_bytes >= 0
-                && max_row <= crate::evidence_budget::max_row(bytes)
-                && native_bytes <= crate::evidence_budget::total(bytes)
-                && class_bytes <= crate::evidence_budget::total(bytes),
+                && max_row <= crate::evidence_limits::max_row(bytes)
+                && native_bytes <= crate::evidence_limits::total(bytes)
+                && class_bytes <= crate::evidence_limits::total(bytes),
             "incompatible_index: selected evidence byte budget exceeded"
         );
         let total_bytes = native_bytes.saturating_add(class_bytes);
@@ -20695,7 +18420,7 @@ impl Store {
             stored_bytes,
         })
     }
-    fn fetch_selected_rows(
+    pub(crate) fn fetch_selected_rows(
         &self,
         db: &Connection,
         header: SelectedHeader,
@@ -20759,7 +18484,7 @@ impl Store {
 
     /// Project one fetched document's graph from its stored native rows with
     /// the indexer's shared projector, within the graph byte budget.
-    fn project_fetched(fetched: FetchedDocument) -> Result<SelectedDocument> {
+    pub(crate) fn project_fetched(fetched: FetchedDocument) -> Result<SelectedDocument> {
         let FetchedDocument {
             file,
             declarations,
@@ -20801,7 +18526,7 @@ impl Store {
         pin: IndexPin,
         language: &str,
         lookup_key: &str,
-    ) -> Result<Vec<crate::native_evidence::Declaration>> {
+    ) -> Result<Vec<crate::native_records::Declaration>> {
         self.native_at(pin, |db, selected| {
             Self::read_native_declarations_for(
                 db,
@@ -20820,8 +18545,8 @@ impl Store {
         selected_path: Option<&str>,
         all_lookup_keys: bool,
         selected: &ReadRevision,
-    ) -> Result<Vec<crate::native_evidence::Declaration>> {
-        use crate::native_evidence::DocumentKey;
+    ) -> Result<Vec<crate::native_records::Declaration>> {
+        use crate::native_records::DocumentKey;
         let mut stmt = db.prepare(
             "SELECT DISTINCT r.source_set_id,m.language,m.path
             FROM revision_documents m JOIN native_revisions r ON r.id=m.revision_id
@@ -20944,8 +18669,8 @@ impl Store {
         &self,
         pin: IndexPin,
     ) -> Result<(
-        crate::native_evidence::Artifact,
-        BTreeMap<crate::native_evidence::DocumentKey, Vec<u8>>,
+        crate::native_records::Artifact,
+        BTreeMap<crate::native_records::DocumentKey, Vec<u8>>,
     )> {
         self.retained_native_snapshot_at_with(pin, false)
     }
@@ -20955,8 +18680,8 @@ impl Store {
         pin: IndexPin,
         reconciling: bool,
     ) -> Result<(
-        crate::native_evidence::Artifact,
-        BTreeMap<crate::native_evidence::DocumentKey, Vec<u8>>,
+        crate::native_records::Artifact,
+        BTreeMap<crate::native_records::DocumentKey, Vec<u8>>,
     )> {
         self.retained_native_snapshot_selected_at_with(pin, reconciling, None)
     }
@@ -20965,10 +18690,10 @@ impl Store {
         &self,
         pin: IndexPin,
         reconciling: bool,
-        loaded_docs: Option<&BTreeSet<crate::native_evidence::DocumentKey>>,
+        loaded_docs: Option<&BTreeSet<crate::native_records::DocumentKey>>,
     ) -> Result<(
-        crate::native_evidence::Artifact,
-        BTreeMap<crate::native_evidence::DocumentKey, Vec<u8>>,
+        crate::native_records::Artifact,
+        BTreeMap<crate::native_records::DocumentKey, Vec<u8>>,
     )> {
         let read = |db: &Connection, selected: &ReadRevision| {
             self.retained_native_snapshot_from_db(db, selected, loaded_docs)
@@ -20984,14 +18709,14 @@ impl Store {
         &self,
         db: &Connection,
         selected: &ReadRevision,
-        loaded_docs: Option<&BTreeSet<crate::native_evidence::DocumentKey>>,
+        loaded_docs: Option<&BTreeSet<crate::native_records::DocumentKey>>,
     ) -> Result<(
-        crate::native_evidence::Artifact,
-        BTreeMap<crate::native_evidence::DocumentKey, Vec<u8>>,
+        crate::native_records::Artifact,
+        BTreeMap<crate::native_records::DocumentKey, Vec<u8>>,
     )> {
-        use crate::native_evidence as n;
+        use crate::native_records as n;
         #[cfg(feature = "test-support")]
-        crate::semantic_batch::testing::note_whole_snapshot_read();
+        read_counters::note_whole_snapshot_read();
         let inventory: String = db.query_row(
             "SELECT source_inventory FROM native_revisions WHERE id=?1",
             [&selected.key],
@@ -21061,7 +18786,7 @@ impl Store {
 
     /// Header rows of a retained native revision. The document inventory is not read.
     fn read_native_header(db: &Connection, selected: &ReadRevision) -> Result<NativeHeader> {
-        use crate::native_evidence as n;
+        use crate::native_records as n;
         let (source_set_id, native_id, toolchain_hash, config_hash, dependency_hash): (String,String,String,String,String) = db.query_row("SELECT source_set_id,native_revision_id,toolchain_hash,config_hash,dependency_hash FROM native_revisions WHERE id=?1",[&selected.key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
         let producer_id = n::PRODUCER.to_owned();
         let producer_version = n::NATIVE_VERSION.to_owned();
@@ -21114,7 +18839,7 @@ impl Store {
         &self,
         db: &Connection,
         selected: &ReadRevision,
-        document: &crate::native_evidence::Document,
+        document: &crate::native_records::Document,
     ) -> Result<NativeDocumentRows> {
         self.read_native_document_rows(db, selected, document, true)
     }
@@ -21125,14 +18850,14 @@ impl Store {
         &self,
         db: &Connection,
         selected: &ReadRevision,
-        document: &crate::native_evidence::Document,
+        document: &crate::native_records::Document,
         complete: bool,
     ) -> Result<NativeDocumentRows> {
-        use crate::native_evidence as n;
+        use crate::native_records as n;
         #[cfg(feature = "test-support")]
         crate::semantic_import::note_selected_original_native_row(&document.key);
         #[cfg(feature = "test-support")]
-        crate::semantic_batch::testing::note_native_document_load();
+        read_counters::note_native_document_load();
         let scope = v8_native_scope_for(db, &document.key, selected)?.context(
             SelectedIntegrity("incompatible_index: retained native document absent".into()),
         )?;
@@ -21173,7 +18898,7 @@ impl Store {
         &self,
         db: &Connection,
         selected: &ReadRevision,
-        document: &crate::native_evidence::Document,
+        document: &crate::native_records::Document,
     ) -> Result<Vec<u8>> {
         let source = self
             .selected_source_row_for(db, &document.key.path, selected)?
@@ -21197,9 +18922,9 @@ impl Store {
     pub fn native_source_at(
         &self,
         pin: IndexPin,
-        key: &crate::native_evidence::DocumentKey,
-    ) -> Result<Option<(crate::native_evidence::Document, Vec<u8>)>> {
-        use crate::native_evidence::Document;
+        key: &crate::native_records::DocumentKey,
+    ) -> Result<Option<(crate::native_records::Document, Vec<u8>)>> {
+        use crate::native_records::Document;
         self.native_at(pin, |db, selected| {
             let Some(scope) = v8_native_scope_for(db, key, selected)? else {
                 let path_exists: bool = db.query_row(
@@ -21234,17 +18959,17 @@ impl Store {
     pub fn native_coverage_at(
         &self,
         pin: IndexPin,
-        key: &crate::native_evidence::DocumentKey,
-    ) -> Result<Option<crate::native_evidence::Coverage>> {
+        key: &crate::native_records::DocumentKey,
+    ) -> Result<Option<crate::native_records::Coverage>> {
         self.native_at(pin, |db, selected| {
             Self::read_native_coverage_for(db, key, selected)
         })
     }
     fn read_native_coverage_for(
         db: &Connection,
-        key: &crate::native_evidence::DocumentKey,
+        key: &crate::native_records::DocumentKey,
         selected: &ReadRevision,
-    ) -> Result<Option<crate::native_evidence::Coverage>> {
+    ) -> Result<Option<crate::native_records::Coverage>> {
         v8_native_scope_for(db, key, selected)?
             .map(|scope| read_native_coverage_v8(db, &scope))
             .transpose()
@@ -21255,8 +18980,8 @@ impl Store {
     pub fn native_capability_report_at(
         &self,
         pin: IndexPin,
-        key: &crate::native_evidence::DocumentKey,
-    ) -> Result<Option<crate::native_evidence::CapabilityReport>> {
+        key: &crate::native_records::DocumentKey,
+    ) -> Result<Option<crate::native_records::CapabilityReport>> {
         self.native_at(pin, |db, selected| {
             v8_native_scope_for(db, key, selected)?
                 .map(|scope| read_native_capability_report(db, &scope))
@@ -21270,7 +18995,7 @@ impl Store {
         &self,
         pin: IndexPin,
         owner: &str,
-    ) -> Result<Vec<crate::native_evidence::Reference>> {
+    ) -> Result<Vec<crate::native_records::Reference>> {
         self.native_at(pin, |db, selected| {
             if let Some(scope) = v8_owner_scope_for(db, owner, selected)? {
                 read_native_references(db, &scope, Some(owner))
@@ -21288,7 +19013,7 @@ impl Store {
         &self,
         pin: IndexPin,
         owner: &str,
-    ) -> Result<Vec<crate::native_evidence::Call>> {
+    ) -> Result<Vec<crate::native_records::Call>> {
         self.native_at(pin, |db, selected| {
             if let Some(scope) = v8_owner_scope_for(db, owner, selected)? {
                 read_native_calls_v8(db, &scope, Some(owner))
@@ -21307,7 +19032,7 @@ impl Store {
         &self,
         pin: IndexPin,
         owner: &str,
-    ) -> Result<Vec<crate::native_evidence::ControlRegion>> {
+    ) -> Result<Vec<crate::native_records::ControlRegion>> {
         self.native_at(pin, |db, selected| {
             if let Some(scope)=v8_owner_scope_for(db,owner,selected)? {
                 read_native_control_regions_v8(db,&scope,Some(owner))
@@ -21320,341 +19045,6 @@ impl Store {
                 Ok(vec![])
             }
         })
-    }
-    /// Search only the persisted projection. Wildcards are literal user text.
-    /// One read snapshot and revision guard; no source reads or catalog rebuilds.
-    pub fn navigation_at(
-        &self,
-        request: &crate::navigation::NavigationRequest,
-    ) -> Result<crate::navigation::NavigationResult> {
-        self.with_evidence(|tx| self.navigation_in(tx, request, false))
-    }
-    fn navigation_in(
-        &self,
-        tx: &Connection,
-        request: &crate::navigation::NavigationRequest,
-        pre_startup: bool,
-    ) -> Result<crate::navigation::NavigationResult> {
-        request.validate()?;
-        let selected =
-            self.read_revision_for(tx, Some(request.expected_revision()), pre_startup)?;
-        let revision = selected.pin;
-        // Policy selection is local to this exact selected snapshot, never the head.
-        // The policy selects the source document language's sole covering producer (#483).
-        let mut producer_bytes = Vec::new();
-        let mut multiple_producers = None;
-        let effective_request = match request {
-            crate::navigation::NavigationRequest::Source(selector)
-                if selector.semantic_producer_policy.is_some() =>
-            {
-                let language: Option<String> = tx
-                    .query_row(
-                        "SELECT language FROM revision_documents WHERE revision_id=?1 AND path=?2 ORDER BY language LIMIT 1",
-                        params![selected.key, selector.path],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                let mut ids = Vec::new();
-                if let Some(language) = &language {
-                    let selection = semantic_display::select_producers(tx, &selected.key, None)?;
-                    for producer in selection.covering(language).iter().take(2) {
-                        let bytes = serde_json::to_vec(producer)?.len();
-                        selected_ensure!(
-                            bytes <= crate::navigation::RECORD_BYTES as usize,
-                            "selected semantic producer exceeds navigation budget"
-                        );
-                        producer_bytes.push(bytes);
-                        ids.push(producer.clone());
-                    }
-                }
-                if ids.len() > 1 {
-                    multiple_producers = language.as_deref().map(multiple_producers_note);
-                }
-                let mut selector = selector.clone();
-                selector.semantic_producer_policy = None;
-                selector.semantic_producer_id = if ids.len() == 1 { ids.pop() } else { None };
-                Some(crate::navigation::NavigationRequest::Source(selector))
-            }
-            _ => None,
-        };
-        let request = effective_request.as_ref().unwrap_or(request);
-        // Navigation's source selector counts lines from the stored source BLOB,
-        // and its member selector reads versioned class/node rows. Before either
-        // consumes a selected document, authenticate it against that source BLOB
-        // in this same read transaction. Never scan the entire workspace here.
-        let selected_path: Option<String> = match request {
-            crate::navigation::NavigationRequest::Source(s) => Some(s.path.clone()),
-            crate::navigation::NavigationRequest::Member(s) => {
-                // The member's measured declaration lives in the member's own
-                // document, which a Rust impl merge (#452) can make another file
-                // than the class's. Read it from the one recorded member row.
-                let paths: Vec<String> = tx
-                    .prepare(
-                        "SELECT DISTINCT json_extract(m.value,'$.path') FROM classes c
-                         JOIN revision_documents d ON d.revision_id=?5 AND d.cid=c.cid,
-                         json_each(c.payload) a, json_each(a.value) m
-                         WHERE c.id=?1 AND a.key IN ('fields','methods')
-                         AND json_extract(m.value,'$.name')=?2
-                         AND json_extract(m.value,'$.range.startByte')=?3 AND json_extract(m.value,'$.range.endByte')=?4
-                         AND (?6 IS NULL OR json_extract(m.value,'$.path')=?6) LIMIT 2",
-                    )?
-                    .query_map(
-                        params![
-                            id_codec::encode_sid(&s.class_id),
-                            s.member_name,
-                            s.start_byte as i64,
-                            s.end_byte as i64,
-                            selected.key,
-                            s.member_path
-                        ],
-                        |row| row.get::<_, Option<String>>(0),
-                    )?
-                    .filter_map(|row| row.transpose())
-                    .collect::<rusqlite::Result<_>>()?;
-                if let [path] = paths.as_slice() {
-                    Some(path.clone())
-                } else {
-                    // Locate the class document by identity, not the
-                    // materialized kind; `member` then refuses an absent or
-                    // ambiguous selector.
-                    tx.query_row(
-                        "SELECT m.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.gid=n.gid WHERE n.id=?1 LIMIT 1",
-                        params![id_codec::encode_sid(&s.class_id), selected.key],
-                        |row| row.get(0),
-                    )
-                    .optional()?
-                }
-            }
-        };
-        let mut selected_document = None;
-        if let Some(path) = selected_path {
-            // Gate allocation of the selected JSON/BLOB before decoding either.
-            // This reads only SQLite byte lengths, not every workspace document.
-            let sizes: Option<(i64, i64)> = tx
-                .query_row(
-                    "SELECT length(d.source_bytes),length(d.source_bytes) FROM revision_documents m
-                 JOIN document_versions d ON d.vid=m.vid
-                 WHERE m.revision_id=?2 AND m.path=?1",
-                    params![path, selected.key],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
-            if let Some((graph_len, native_len)) = sizes {
-                if graph_len > 2 * 1024 * 1024 || native_len > 2 * 1024 * 1024 {
-                    return Err(self.report_index_failure(
-                        SelectedIntegrity(
-                            "incompatible_index: selected navigation source exceeds budget".into(),
-                        )
-                        .into(),
-                    ));
-                }
-                selected_document = Some(self.selected_graph_document_for(tx, &path, &selected)?);
-            } else {
-                let graph_file: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM revision_documents WHERE revision_id=?2 AND path=?1)",
-                    params![path, selected.key],
-                    |row| row.get(0),
-                )?;
-                if graph_file {
-                    return Err(self.report_index_failure(
-                        SelectedIntegrity(
-                            "incompatible_index: selected native document missing".into(),
-                        )
-                        .into(),
-                    ));
-                }
-            }
-        }
-        crate::navigation::navigate(
-            tx,
-            request,
-            revision,
-            &selected.key,
-            selected_document
-                .as_ref()
-                .map(|document| document.nodes.as_slice()),
-            &mut |reader, selector| {
-                if let Some(note) = &multiple_producers {
-                    reader.warn(note);
-                }
-                for bytes in &producer_bytes {
-                    if !reader.charge(*bytes) {
-                        return Ok(());
-                    }
-                }
-                graph_read::navigation_calls(
-                    self,
-                    tx,
-                    &selected,
-                    selected_document.as_ref(),
-                    selector,
-                    reader,
-                )
-            },
-        )
-    }
-
-    pub fn classes_at(
-        &self,
-        path: Option<&str>,
-        query: &str,
-        expected: Option<IndexPin>,
-        offset: usize,
-        limit: usize,
-    ) -> Result<crate::class_diagram::ClassPage> {
-        self.with_evidence(|tx| self.classes_in(tx, path, query, expected, (offset, limit), false))
-    }
-    fn classes_in(
-        &self,
-        tx: &Connection,
-        path: Option<&str>,
-        query: &str,
-        expected: Option<IndexPin>,
-        pagination: (usize, usize),
-        pre_startup: bool,
-    ) -> Result<crate::class_diagram::ClassPage> {
-        use crate::class_diagram::ClassPage;
-        let (offset, limit) = pagination;
-        use crate::class_diagram::InvalidRequest;
-        let path = path.filter(|path| !path.is_empty());
-        ensure!(
-            (1..=100).contains(&limit)
-                && offset <= 1_000_000
-                && query.len() <= 512
-                && !query.contains('\0'),
-            InvalidRequest("Class search allows 1–100 results and a query of at most 512 bytes.")
-        );
-        if let Some(path) = path {
-            ensure!(
-                !path.is_empty()
-                    && path.len() <= 8192
-                    && !path.contains(['\0', '\\', ':'])
-                    && !path
-                        .split('/')
-                        .any(|part| part.is_empty() || part == "." || part == ".."),
-                InvalidRequest("Choose a workspace-relative class source path.")
-            );
-        }
-        let selected_revision = self.read_revision_for(tx, expected, pre_startup)?;
-        let revision = selected_revision.pin;
-        let (mut warnings, truncated) = class_metadata(tx, &selected_revision)?;
-        let pattern = format!(
-            "%{}%",
-            query
-                .replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_")
-        );
-        let mut stmt = tx.prepare("SELECT c.id FROM classes c JOIN revision_documents m ON m.revision_id=?6 AND m.cid=c.cid WHERE (?1 IS NULL OR c.path=?1)
-            AND (c.name LIKE ?2 ESCAPE '\\' OR c.qualified_name LIKE ?2 ESCAPE '\\' OR ('sid:v1:'||lower(hex(c.id)))=?3)
-            ORDER BY CASE WHEN lower(c.name)=lower(?3) THEN 0 ELSE 1 END,c.qualified_name,c.path,c.id LIMIT ?4 OFFSET ?5")?;
-        let ids = stmt
-            .query_map(
-                params![
-                    path,
-                    pattern,
-                    query,
-                    (limit + 1) as i64,
-                    offset as i64,
-                    selected_revision.key
-                ],
-                |r| stored_id_row(r, 0, false),
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut items = Vec::new();
-        let mut consumed = 0;
-        let mut bytes = 0;
-        let mut byte_limited = false;
-        for id in ids.iter().take(limit) {
-            let Some((class, size, clipped)) =
-                presentation_class(self, tx, id, &selected_revision)?
-            else {
-                // Consume an individually oversized row so pagination always progresses.
-                consumed += 1;
-                byte_limited = true;
-                continue;
-            };
-            if bytes + size > crate::class_diagram::PAGE_BYTES {
-                byte_limited = true;
-                break;
-            }
-            bytes += size;
-            consumed += 1;
-            byte_limited |= clipped;
-            items.push(class);
-        }
-        let next_offset = (consumed < ids.len()).then_some(offset + consumed);
-        if byte_limited {
-            warnings.push(crate::class_diagram::BYTE_NOTICE.into());
-        }
-        let truncated = truncated || byte_limited;
-        if let Some(path) = path
-            && !crate::capture::language_of_path(Path::new(path))
-                .is_some_and(crate::classes::supports_language)
-        {
-            warnings.push(
-                "Class diagrams currently support Java, Python, JavaScript, TypeScript and Rust declarations only."
-                    .into(),
-            );
-        }
-        Ok(ClassPage {
-            revision,
-            items,
-            next_offset,
-            truncated,
-            warnings,
-            require_index: false,
-            supported_languages: crate::classes::SUPPORTED_LANGUAGES
-                .iter()
-                .map(|language| (*language).to_owned())
-                .collect(),
-        })
-    }
-
-    /// Bounded one-hop relation reads and seed resolution share a revision-pinned
-    /// read transaction. No filesystem access or graph/provider augmentation.
-    pub fn class_diagram_at(
-        &self,
-        request: &crate::class_diagram::ClassDiagramRequest,
-    ) -> Result<crate::class_diagram::ClassDiagram> {
-        request.validate()?;
-        self.with_evidence(|tx| self.class_diagram_in(tx, request, false))
-    }
-    fn class_diagram_in(
-        &self,
-        tx: &Connection,
-        request: &crate::class_diagram::ClassDiagramRequest,
-        pre_startup: bool,
-    ) -> Result<crate::class_diagram::ClassDiagram> {
-        use crate::class_diagram::{self, InvalidRequest};
-        let selected = self.read_revision_for(tx, Some(request.expected_revision), pre_startup)?;
-        let revision = selected.pin;
-        let (warnings, truncated) = class_metadata(tx, &selected)?;
-        let (seed, clipped) = resolve_class(self, tx, &request.seed, &selected)?;
-        // Explicitly selected measured declarations are independent roots, never
-        // connected by lexical type-name matches or candidate relationships.
-        let mut seeds = vec![seed.symbol.id.clone()];
-        let mut classes = BTreeMap::from([(seed.symbol.id.clone(), seed)]);
-        for expanded in &request.expanded {
-            let (class, _) = resolve_class(self, tx, expanded, &selected)?;
-            if !classes.contains_key(&class.symbol.id) {
-                ensure!(
-                    classes.len() < class_diagram::MAX_NODES,
-                    InvalidRequest("Too many selected classes.")
-                );
-                seeds.push(class.symbol.id.clone());
-                classes.insert(class.symbol.id.clone(), class);
-            }
-        }
-        class_diagram::project(
-            revision,
-            &seeds,
-            &classes,
-            vec![],
-            vec![],
-            warnings,
-            truncated || clipped,
-        )
     }
 
     pub fn symbols(&self, query: &str, limit: usize) -> Result<Vec<Symbol>> {
@@ -21864,7 +19254,7 @@ impl Store {
         Ok(Some((hash, bytes)))
     }
 
-    fn selected_source_row_for(
+    pub(crate) fn selected_source_row_for(
         &self,
         db: &Connection,
         path: &str,
@@ -22004,14 +19394,14 @@ impl Store {
     pub fn tree_metadata(
         &self,
         root: &Path,
-        items: &mut [crate::file_tree::Entry],
+        items: &mut [crate::source_dir::Entry],
     ) -> Result<(IndexPin, String)> {
         self.tree_metadata_with_finish_hook(root, items, || Ok(()))
     }
     fn tree_metadata_with_finish_hook(
         &self,
         root: &Path,
-        items: &mut [crate::file_tree::Entry],
+        items: &mut [crate::source_dir::Entry],
         before_finish: impl FnOnce() -> Result<()>,
     ) -> Result<(IndexPin, String)> {
         let (revision, workspace_root, overlays) = self.with_evidence_hook(|tx| {
@@ -22043,7 +19433,7 @@ impl Store {
         &self,
         tx: &Connection,
         root: &Path,
-        items: &mut [crate::file_tree::Entry],
+        items: &mut [crate::source_dir::Entry],
         pre_startup: bool,
     ) -> Result<(IndexPin, String, TreeOverlays)> {
         let revision = self.read_status_for(tx, pre_startup)?.revision;
@@ -22219,336 +19609,6 @@ impl Store {
         ))
     }
 
-    /// All measured declarations in one cached file, retaining their exact native IDs.
-    pub fn file_symbols_at(
-        &self,
-        path: &str,
-        expected: IndexPin,
-        offset: usize,
-        limit: usize,
-    ) -> Result<Option<crate::files_view::Outline>> {
-        self.with_evidence(|tx| self.file_symbols_in(tx, path, expected, offset, limit, false))
-    }
-    fn file_symbols_in(
-        &self,
-        tx: &Connection,
-        path: &str,
-        expected: IndexPin,
-        offset: usize,
-        limit: usize,
-        pre_startup: bool,
-    ) -> Result<Option<crate::files_view::Outline>> {
-        use crate::files_view::{InvalidRequest, Outline, OutlineItem, RESPONSE_LIMIT};
-        ensure!(
-            crate::files_view::valid_path(path)
-                && (1..=200).contains(&limit)
-                && offset <= i64::MAX as usize,
-            InvalidRequest
-        );
-        let selected = self.read_revision_for(tx, Some(expected), pre_startup)?;
-        let exists: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM revision_documents WHERE revision_id=?1 AND path=?2)",
-            params![selected.key, path],
-            |row| row.get(0),
-        )?;
-        if !exists {
-            return Ok(None);
-        }
-        let header = self.fetch_selected_header(tx, path, &selected, None)?;
-        let fetched = self.fetch_selected_rows(tx, header, &selected, None)?;
-        let mut metadata: BTreeMap<_, _> = fetched
-            .declarations
-            .iter()
-            .map(|d| (d.syntax_id.clone(), (d.kind.clone(), d.header.clone())))
-            .collect();
-        let mut nodes = Self::project_fetched(fetched)?.nodes;
-        nodes.sort_by(|a, b| (a.range.start_byte, &a.id).cmp(&(b.range.start_byte, &b.id)));
-        let count = nodes.len();
-        let mut result = Outline {
-            revision: selected.pin,
-            path: path.into(),
-            items: vec![],
-            next_offset: None,
-            truncated: false,
-            warnings: vec![],
-        };
-        // Bindings and impl blocks are read from the parsed cached file (#526), only when the
-        // page has one.
-        let page: Vec<_> = nodes.into_iter().skip(offset).take(limit).collect();
-        let syntax = if page.iter().any(|symbol| {
-            metadata
-                .get(&symbol.id)
-                .is_some_and(|(kind, _)| kind == "variable" || kind == "implementation")
-        }) {
-            let impl_blocks: Vec<_> = page
-                .iter()
-                .filter(|symbol| {
-                    metadata
-                        .get(&symbol.id)
-                        .is_some_and(|(kind, _)| kind == "implementation")
-                })
-                .map(|symbol| (symbol.range.start_byte, symbol.range.end_byte))
-                .collect();
-            self.selected_source_row_for(tx, path, &selected)?
-                .and_then(|file| crate::files_view::outline_syntax(&file, &impl_blocks))
-        } else {
-            None
-        };
-        for symbol in page {
-            let (native_kind, header) = metadata.remove(&symbol.id).context(SelectedIntegrity(
-                "incompatible_index: outline native declaration missing".into(),
-            ))?;
-            let range = (symbol.range.start_byte, symbol.range.end_byte);
-            let callable_initializer = native_kind == "variable"
-                && syntax
-                    .as_ref()
-                    .is_some_and(|syntax| syntax.callable_initializers.contains(&range));
-            let impl_target = (native_kind == "implementation")
-                .then(|| syntax.as_ref()?.impl_targets.get(&range).cloned())
-                .flatten();
-            result.items.push(OutlineItem {
-                symbol,
-                native_kind,
-                header,
-                callable_initializer,
-                impl_target,
-            });
-            let next = offset + result.items.len();
-            result.next_offset = (next < count).then_some(next);
-            result.truncated = result.next_offset.is_some();
-            if serde_json::to_vec(&result)?.len() > RESPONSE_LIMIT {
-                result.items.pop();
-                ensure!(
-                    !result.items.is_empty(),
-                    "response_too_large: Files outline item"
-                );
-                result.next_offset = Some(offset + result.items.len());
-                result.truncated = true;
-                break;
-            }
-        }
-        ensure!(
-            serde_json::to_vec(&result)?.len() <= RESPONSE_LIMIT,
-            "response_too_large: Files outline"
-        );
-        Ok(Some(result))
-    }
-    pub fn syntax_matches_at(
-        &self,
-        request: &crate::files_view::SyntaxMatchesRequest,
-    ) -> Result<Option<crate::files_view::SyntaxMatches>> {
-        request.validate()?;
-        self.with_evidence(|tx| self.syntax_matches_in(tx, request, false))
-    }
-    fn syntax_matches_in(
-        &self,
-        tx: &Connection,
-        request: &crate::files_view::SyntaxMatchesRequest,
-        pre_startup: bool,
-    ) -> Result<Option<crate::files_view::SyntaxMatches>> {
-        use crate::files_view::{self, MatchScope, SyntaxMatches};
-        request.validate()?;
-        let selected = self.read_revision_for(tx, Some(request.expected_revision), pre_startup)?;
-        let Some(scope) = v8_owner_scope_for(tx, &request.symbol_id, &selected)? else {
-            return Ok(None);
-        };
-        // Decode the selected document's native rows strictly, including noncallables.
-        let declaration = read_native_declarations_v8(tx, &scope, None, true)?
-            .into_iter()
-            .find(|d| d.syntax_id == request.symbol_id)
-            .context(SelectedIntegrity(
-                "incompatible_index: match declaration missing".into(),
-            ))?;
-        let mut result = SyntaxMatches::new(
-            request,
-            MatchScope {
-                source_set_id: scope.key.source_set_id.clone(),
-                language: scope.key.language.clone(),
-                spelling: declaration.name.clone(),
-            },
-        );
-        if declaration.name_range.is_none()
-            || declaration.name.as_ref().is_none_or(|n| n.is_empty())
-        {
-            result.scope.spelling = None;
-            result.warn("Selected declaration has no captured identifier name; syntax matching unavailable.");
-            result.bounded()?;
-            return Ok(Some(result));
-        }
-        if let Some(cursor) = &request.continuation {
-            let present: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM revision_documents m
-                 JOIN native_revisions r ON r.id=m.revision_id WHERE m.revision_id=?1
-                 AND m.path=?2 AND m.language=?3 AND r.source_set_id=?4)",
-                params![
-                    selected.key,
-                    cursor.path,
-                    scope.key.language,
-                    scope.key.source_set_id
-                ],
-                |row| row.get(0),
-            )?;
-            ensure!(present, files_view::InvalidRequest);
-        }
-        let started = Instant::now();
-        let mut bytes = 0usize;
-        let mut after: Option<String> = None;
-        // Read manifest entries one at a time. Never materialize a checkout graph/catalog.
-        let mut entries = tx.prepare(
-            "SELECT m.path,length(d.source_bytes),d.byte_length FROM revision_documents m
-             JOIN native_revisions r ON r.id=m.revision_id
-             LEFT JOIN document_versions d ON d.vid=m.vid AND d.language=m.language AND d.path=m.path
-             WHERE m.revision_id=?1 AND m.language=?2 AND (?3 IS NULL OR m.path>=?3)
-             AND (?4 IS NULL OR m.path>?4) AND r.source_set_id=?5 ORDER BY m.path LIMIT 1")?;
-        loop {
-            let entry: Option<(String, Option<i64>, Option<i64>)> = entries
-                .query_row(
-                    params![
-                        selected.key,
-                        scope.key.language,
-                        request.continuation.as_ref().map(|c| c.path.as_str()),
-                        after,
-                        scope.key.source_set_id
-                    ],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .optional()?;
-            let Some((path, size, recorded)) = entry else {
-                break;
-            };
-            let (Some(size), Some(recorded)) = (size, recorded) else {
-                return Err(
-                    SelectedIntegrity("incompatible_index: match source absent".into()).into(),
-                );
-            };
-            selected_ensure!(
-                size >= 0 && size == recorded,
-                "incompatible_index: match source length invalid"
-            );
-            let start = request
-                .continuation
-                .as_ref()
-                .filter(|c| c.path == path)
-                .map_or(0, |c| c.offset);
-            ensure!(start <= size as usize, files_view::InvalidRequest);
-            if started.elapsed() >= files_view::TOTAL_TIME_LIMIT {
-                result.warnings.push(
-                    "Request syntax scan budget reached; continue for remaining cached files."
-                        .into(),
-                );
-                result.resume(&path, start);
-                break;
-            }
-            if size as usize > files_view::FILE_INPUT_LIMIT {
-                ensure!(start == 0, files_view::InvalidRequest);
-                result.warn("Cached file exceeds 2 MiB syntax scan input; file skipped and coverage incomplete.");
-                after = Some(path);
-                continue;
-            }
-            if bytes.saturating_add(size as usize) > files_view::TOTAL_INPUT_LIMIT {
-                result.warnings.push(
-                    "Request syntax scan budget reached; continue for remaining cached files."
-                        .into(),
-                );
-                result.resume(&path, start);
-                break;
-            }
-            bytes += size as usize;
-            let file = self
-                .selected_source_row_for(tx, &path, &selected)?
-                .context(SelectedIntegrity(
-                    "incompatible_index: match source missing".into(),
-                ))?;
-            ensure!(
-                file.text.is_char_boundary(start),
-                files_view::InvalidRequest
-            );
-            let excluded = (path == scope.key.path)
-                .then_some(declaration.name_range.as_ref())
-                .flatten()
-                .map(|r| (r.start, r.end));
-            if files_view::scan_file(&mut result, request, &file, start, excluded, started)? {
-                break;
-            }
-            after = Some(path);
-        }
-        result.bounded()?;
-        Ok(Some(result))
-    }
-
-    /// Only cached source and measured calls from the same snapshot are used.
-    pub fn sequence_at(
-        &self,
-        seed: &str,
-        expected: IndexPin,
-        show_all: bool,
-    ) -> Result<Option<crate::behavior::SequenceView>> {
-        self.with_evidence(|tx| self.sequence_in(tx, seed, expected, show_all, false, false))
-    }
-    /// The candidates of the browser's Interactions view (#663): an enriched view with a
-    /// shown call is kept within the work, depth and participant bounds but not yet the
-    /// visible step bound, which counts internal steps Interactions never draw. The browser
-    /// bounds the arrows it draws after filtering. Any other view is [`Self::sequence_at`].
-    pub fn sequence_interactions_at(
-        &self,
-        seed: &str,
-        expected: IndexPin,
-    ) -> Result<Option<crate::behavior::SequenceView>> {
-        self.with_evidence(|tx| self.sequence_in(tx, seed, expected, false, true, false))
-    }
-    fn sequence_in(
-        &self,
-        tx: &Connection,
-        seed: &str,
-        expected: IndexPin,
-        show_all: bool,
-        interactions: bool,
-        pre_startup: bool,
-    ) -> Result<Option<crate::behavior::SequenceView>> {
-        let selected_revision = self.read_revision_for(tx, Some(expected), pre_startup)?;
-        let revision = selected_revision.pin;
-        let path: Option<String> = tx
-            .query_row(
-                "SELECT m.path FROM graph_nodes n JOIN revision_documents m
-             ON m.revision_id=?2 AND m.gid=n.gid WHERE n.id=?1",
-                params![id_codec::encode_sid(seed), selected_revision.key],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let Some(path) = path else { return Ok(None) };
-        let document = self.selected_graph_document_for(tx, &path, &selected_revision)?;
-        let symbol = document
-            .nodes
-            .iter()
-            .find(|node| node.id == seed)
-            .ok_or_else(|| {
-                SelectedIntegrity("incompatible_index: selected sequence seed missing".into())
-            })?;
-        ensure!(
-            matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method),
-            "invalid sequence symbol kind"
-        );
-        let mut calls = document.graph_calls;
-        calls.sort_by(|a, b| (a.range.start_byte, &a.id).cmp(&(b.range.start_byte, &b.id)));
-        let file = document.file;
-        // Enrichment applies the visible step bound once incidental calls are hidden (#536).
-        let mut view =
-            crate::behavior::build_sequence_work(revision, symbol, &file, &calls, show_all)?;
-        graph_read::sequence_calls(
-            self,
-            tx,
-            &selected_revision,
-            &mut view,
-            show_all,
-            interactions,
-        )?;
-        // #888: a syntax-only view's callbacks can hold only a hop, decided by the read.
-        if view.semantic.tier == crate::behavior::EvidenceTier::Syntax {
-            graph_read::syntax_callbacks(self, tx, &selected_revision, &mut view, show_all)?;
-        }
-        Ok(Some(view))
-    }
-
     fn read_graph_for(&self, db: &Connection, selected: &ReadRevision) -> Result<Graph> {
         let (stats_type, stats_len, diagnostics_type, diagnostics_len): (String, i64, String, i64) =
             db.query_row(
@@ -22595,7 +19655,7 @@ impl Store {
             regions.extend(document.graph_regions);
         }
         nodes.sort_by(|a, b| a.id.cmp(&b.id));
-        calls.sort_by(crate::indexer::compare_reader_calls);
+        calls.sort_by(crate::model::compare_reader_calls);
         regions.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(Graph {
             schema_version: SCHEMA_VERSION,
@@ -22638,73 +19698,6 @@ impl Store {
             ))?;
             Ok((revision, pending))
         })
-    }
-
-    pub fn query_view(&self, query: &ViewQuery) -> Result<Option<ViewResult>> {
-        self.query_view_at(query, None)
-    }
-
-    pub fn query_view_at(
-        &self,
-        query: &ViewQuery,
-        expected_pin: Option<&IndexPin>,
-    ) -> Result<Option<ViewResult>> {
-        query.validate()?;
-        self.with_evidence(|tx| self.query_view_in(tx, query, expected_pin))
-    }
-    fn query_view_in(
-        &self,
-        tx: &Connection,
-        query: &ViewQuery,
-        expected_pin: Option<&IndexPin>,
-    ) -> Result<Option<ViewResult>> {
-        self.query_view_in_for(tx, query, expected_pin, false)
-    }
-    fn query_view_in_for(
-        &self,
-        tx: &Connection,
-        query: &ViewQuery,
-        expected_pin: Option<&IndexPin>,
-        pre_startup: bool,
-    ) -> Result<Option<ViewResult>> {
-        let selected = self.read_revision_for(tx, expected_pin.copied(), pre_startup)?;
-        let revision = selected.pin;
-        let selected_path: Option<String> = tx
-            .query_row("SELECT m.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.gid=n.gid WHERE n.id=?1", params![id_codec::encode_sid(&query.seed), selected.key], |r| {
-                r.get(0)
-            })
-            .optional()?;
-        let Some(path) = selected_path else {
-            return Ok(None);
-        };
-        let seed_document = self.selected_graph_document_for(tx, &path, &selected)?;
-        let seed = seed_document
-            .nodes
-            .iter()
-            .find(|symbol| symbol.id == query.seed)
-            .cloned()
-            .ok_or_else(|| {
-                SelectedIntegrity("incompatible_index: selected view seed missing".into())
-            })?;
-        let walk = semantic_display::view_walk(self, tx, &selected, query, seed_document, seed)?;
-        let mut warnings = Vec::new();
-        if walk.truncated {
-            warnings.push("Measured calls truncated at the request limit.".into());
-        }
-        if walk.omitted_nodes > 0 {
-            warnings.push("Node limit reached; additional targets are not shown.".into());
-        }
-        Ok(Some(ViewResult {
-            revision,
-            query: query.clone(),
-            nodes: walk.nodes,
-            calls: walk.calls,
-            regions: walk.regions,
-            truncated: walk.truncated || walk.omitted_nodes > 0,
-            omitted_nodes: walk.omitted_nodes,
-            warnings,
-            semantic: walk.semantic,
-        }))
     }
 }
 
@@ -23001,6 +19994,8 @@ mod selected_manifest_query_plan_tests;
 #[cfg(test)]
 mod rebaseline_fault_tests;
 #[cfg(test)]
+mod recreate_capture_point_tests;
+#[cfg(test)]
 mod recreate_spool_tests;
 
 #[cfg(test)]
@@ -23009,15 +20004,13 @@ mod sqlite_schema_race_tests;
 #[cfg(test)]
 mod corruption_recovery_tests;
 #[cfg(test)]
-mod metrics_parallel_tests;
-#[cfg(test)]
 mod prior_corruption_tests;
 #[cfg(test)]
 mod review_recovery_tests;
 #[cfg(test)]
 mod review_typed_recovery_tests;
 #[cfg(test)]
-mod selected_read_once_tests;
+pub(crate) mod selected_read_once_tests;
 #[cfg(test)]
 mod selected_source_budget_tests;
 

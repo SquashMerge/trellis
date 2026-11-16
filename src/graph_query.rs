@@ -18,6 +18,8 @@ use std::{
     sync::Arc,
 };
 
+pub use crate::model::BoundaryReason;
+
 pub const DEFAULT_DEPTH: u64 = 2;
 pub const MAX_DEPTH: u64 = 5;
 pub const DEFAULT_MAX_NODES: u64 = 150;
@@ -39,33 +41,6 @@ pub enum Visit {
     New,
     Seen,
     Boundary,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum BoundaryReason {
-    None,
-    External,
-    Unresolved,
-    Ambiguous,
-    Dispatch,
-    Stale,
-    NodeLimit,
-    MissingEvidence,
-    CatchingUp,
-    /// No retained raw input will catch the document up; its language needs re-import.
-    NeedsReimport,
-}
-
-impl BoundaryReason {
-    /// The boundary a pending (`catchingUp` or `needsReimport`) document imposes.
-    pub fn pending(status: crate::model::SemanticStatus) -> Self {
-        if status == crate::model::SemanticStatus::NeedsReimport {
-            Self::NeedsReimport
-        } else {
-            Self::CatchingUp
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -785,21 +760,52 @@ fn select_binding<'a>(
         .filter(|b| b.join.anchor.document == call.document)
         .filter_map(|b| Some((b, semantic.provenance.get(&b.provenance_id)?)))
         .collect();
-    // Contradictory evidence at one call site is published as one ambiguous row per
-    // provenance, each carrying the full candidate union (contract-v1 "Duplicate
-    // contradictory exact bindings ... both provenances remain"). All rows here belong to
-    // one producer coverage tuple. The lowest provenance ID represents the call; evidence
-    // selection gathers the other ambiguous proofs. Any other multi-match is corrupt.
-    if matches.len() > 1
-        && !matches
+    // A call has one row per producer fact that joins it (contract-v1: "their separate
+    // provenance is preserved"). Publication admits two shapes. Rows that assert at most one
+    // distinct target between them agree: scip-typescript gives one occurrence per declaration
+    // of a merged library symbol, so `new Set()` is four unresolved rows (#1102). Rows that
+    // assert more are contradictory evidence, published as one ambiguous row per provenance,
+    // each with the full candidate union (#466). Anything else was never published.
+    if matches.len() > 1 {
+        let mut asserted = Vec::<&Target>::new();
+        for target in matches
             .iter()
-            .all(|(b, _)| b.resolution == Resolution::Ambiguous)
-    {
-        return Err(integrity("multiple call bindings match one call"));
+            .flat_map(|(b, _)| b.declared_target.iter().chain(&b.candidates))
+        {
+            if !asserted.contains(&target) {
+                asserted.push(target);
+            }
+        }
+        if asserted.len() > 1
+            && !matches
+                .iter()
+                .all(|(b, _)| b.resolution == Resolution::Ambiguous)
+        {
+            return Err(integrity("contradictory call bindings match one call"));
+        }
     }
     Ok(matches
         .into_iter()
-        .min_by(|(a, _), (b, _)| a.provenance_id.cmp(&b.provenance_id)))
+        .min_by_key(|(binding, proof)| representative_key(binding.resolution, proof)))
+}
+
+/// Orders the rows of one call; the least represents it. A row that asserts the call's target
+/// comes before an unresolved one, which asserts none and so contradicts nothing. Equal rows
+/// follow their raw producer fact's digest, which depends only on the imported evidence: a
+/// minted provenance ID also hashes the native revision, so it changes with the build. The ID
+/// only separates rows the digest cannot. `store::semantic_display` orders its rows the same way.
+fn representative_key(
+    resolution: Resolution,
+    proof: &sem::Provenance,
+) -> (bool, Option<&str>, &str) {
+    (
+        resolution == Resolution::Unresolved,
+        proof
+            .derived_from
+            .as_ref()
+            .map(|raw| raw.fact_digest.as_str()),
+        proof.id.as_str(),
+    )
 }
 
 fn boundary_reason(binding: &CallBinding, proof: &sem::Provenance) -> BoundaryReason {
@@ -915,12 +921,20 @@ pub(crate) fn call_disposition<'a>(
     })
 }
 
-/// Evaluates one rooted graph request. The outer error covers read failures, aborts and
-/// [`GraphIntegrity`]; the inner one is a contract failure.
-pub fn evaluate(
+/// What a graph request reads: the root's document, the default producers when the request
+/// names none, and the languages with producer evidence.
+type Scope = (
+    DocumentKey,
+    Option<DefaultProducers>,
+    Option<BTreeSet<String>>,
+);
+
+/// Checks the request against the snapshot and resolves its root and producer scope. The inner
+/// error is a contract failure.
+fn resolve_scope(
     request: &GraphRequest,
     source: &mut dyn GraphSource,
-) -> Result<std::result::Result<GraphResult, GraphError>> {
+) -> Result<std::result::Result<Scope, GraphError>> {
     if let Err(e) = request.validate() {
         return Ok(Err(e));
     }
@@ -963,6 +977,19 @@ pub fn evaluate(
             }
         },
     };
+    Ok(Ok((root_document, defaults, scope)))
+}
+
+/// Evaluates one rooted graph request. The outer error covers read failures, aborts and
+/// [`GraphIntegrity`]; the inner one is a contract failure.
+pub fn evaluate(
+    request: &GraphRequest,
+    source: &mut dyn GraphSource,
+) -> Result<std::result::Result<GraphResult, GraphError>> {
+    let (root_document, defaults, scope) = match resolve_scope(request, source)? {
+        Ok(resolved) => resolved,
+        Err(e) => return Ok(Err(e)),
+    };
     let scope = scope.as_ref();
 
     let root = source
@@ -971,141 +998,138 @@ pub fn evaluate(
         .get(&request.root_syntax_id)
         .cloned()
         .ok_or_else(|| integrity("root declaration missing from located document"))?;
-    let mut nodes = vec![GraphNode {
-        declaration: root,
-        depth: 0,
-    }];
-    let mut admitted = BTreeSet::from([request.root_syntax_id.clone()]);
+    let mut expansion = Expansion::new(request, root);
+    expansion.run(request, source, scope)?;
+    shortest_depths(&mut expansion.nodes, &expansion.edges);
+    Ok(Ok(finish(
+        request,
+        source,
+        scope,
+        defaults.as_ref(),
+        expansion.nodes,
+        expansion.edges,
+        expansion.frontier,
+        expansion.filtered_hints,
+    )?))
+}
+
+/// The working state of one bounded best-first expansion from the root.
+struct Expansion {
+    nodes: Vec<GraphNode>,
+    admitted: BTreeSet<String>,
     // Declarations admitted only as a dispatch boundary's target (#557): never expanded.
-    let mut declared_only = BTreeSet::new();
-    let mut edges = Vec::new();
-    let mut frontier = Vec::new();
-    let mut filtered_hints: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let mut pending: Vec<Candidate> = Vec::new();
-    let mut head = 0;
-    loop {
-        // Each admitted owner is inspected once. Only the best remaining edge groups
-        // are kept; discarded candidates contribute measured-site omissions immediately.
-        while head < nodes.len() {
-            source.check()?;
-            let node = &nodes[head];
-            let node_id = node.declaration.syntax_id.clone();
-            let node_depth = node.depth;
-            head += 1;
-            if declared_only.contains(&node_id) {
+    declared_only: BTreeSet<String>,
+    edges: Vec<GraphEdge>,
+    frontier: Vec<Frontier>,
+    filtered_hints: BTreeMap<String, BTreeSet<String>>,
+    pending: Vec<Candidate>,
+    /// The next node of `nodes` to inspect.
+    head: usize,
+}
+
+impl Expansion {
+    fn new(request: &GraphRequest, root: native::Declaration) -> Self {
+        Self {
+            nodes: vec![GraphNode {
+                declaration: root,
+                depth: 0,
+            }],
+            admitted: BTreeSet::from([request.root_syntax_id.clone()]),
+            declared_only: BTreeSet::new(),
+            edges: Vec::new(),
+            frontier: Vec::new(),
+            filtered_hints: BTreeMap::new(),
+            pending: Vec::new(),
+            head: 0,
+        }
+    }
+
+    /// Inspects every admitted owner, then admits the best pending candidate, until none is left.
+    fn run(
+        &mut self,
+        request: &GraphRequest,
+        source: &mut dyn GraphSource,
+        scope: Option<&BTreeSet<String>>,
+    ) -> Result<()> {
+        loop {
+            // Each admitted owner is inspected once. Only the best remaining edge groups
+            // are kept; discarded candidates contribute measured-site omissions immediately.
+            while self.head < self.nodes.len() {
+                self.inspect_owner(request, source, scope)?;
+            }
+            if self.pending.is_empty() {
+                return Ok(());
+            }
+            self.admit(request, source)?;
+        }
+    }
+
+    /// Inspects the next admitted owner: its calls, in source order, become pending candidates,
+    /// filtered omissions or call-limit omissions.
+    fn inspect_owner(
+        &mut self,
+        request: &GraphRequest,
+        source: &mut dyn GraphSource,
+        scope: Option<&BTreeSet<String>>,
+    ) -> Result<()> {
+        source.check()?;
+        let node = &self.nodes[self.head];
+        let node_id = node.declaration.syntax_id.clone();
+        let node_depth = node.depth;
+        self.head += 1;
+        if self.declared_only.contains(&node_id) {
+            return Ok(());
+        }
+        let doc = source.document(&node.declaration.document)?;
+        let mut local: Vec<_> = doc
+            .calls
+            .get(&node_id)
+            .map(|calls| calls.iter().collect())
+            .unwrap_or_default();
+        local.sort_by_key(|call| {
+            (
+                &call.document.path,
+                call.range.start,
+                call.range.end,
+                &call.id,
+            )
+        });
+        if node_depth == request.depth {
+            if !local.is_empty() {
+                add_omission(
+                    &mut self.frontier,
+                    &node_id,
+                    FrontierReason::Depth,
+                    local.len() as u64,
+                );
+            }
+            return Ok(());
+        }
+        let owner_test = node_id != request.root_syntax_id
+            && node.declaration.role == native::DeclarationRole::Test;
+        let semantic = semantic(scope, &doc)?;
+        for call in local {
+            source.check_work()?;
+            let class = classify(request, source, &doc, semantic, owner_test, call)?;
+            if self.filtered(request, &node_id, &class) {
                 continue;
             }
-            let doc = source.document(&node.declaration.document)?;
-            let mut local: Vec<_> = doc
-                .calls
-                .get(&node_id)
-                .map(|calls| calls.iter().collect())
-                .unwrap_or_default();
-            local.sort_by_key(|call| {
-                (
-                    &call.document.path,
-                    call.range.start,
-                    call.range.end,
-                    &call.id,
-                )
-            });
-            if node_depth == request.depth {
-                if !local.is_empty() {
-                    add_omission(
-                        &mut frontier,
-                        &node_id,
-                        FrontierReason::Depth,
-                        local.len() as u64,
-                    );
-                }
+            let group = group_key(&class)?;
+            if let Some(existing) = self.pending.iter_mut().find(|candidate| {
+                candidate.edge.from == node_id && group.is_some() && candidate.group == group
+            }) {
+                existing.edge.call_site_count += 1;
                 continue;
             }
-            let semantic = semantic(scope, &doc)?;
-            for call in local {
-                source.check_work()?;
-                let disposition = call_disposition(semantic, call, source)?;
-                let selected = disposition.selected;
-                let reason = if let Some(projection) =
-                    doc.projection.as_ref().filter(|projection| {
-                        semantic.is_none() && projection.semantic_status.is_pending()
-                    }) {
-                    BoundaryReason::pending(projection.semantic_status)
-                } else {
-                    disposition.boundary_reason
-                };
-                let exact_target = disposition.exact_target;
-                let external = selected.is_some_and(|(b, _)| b.resolution == Resolution::External);
-                let target_role = exact_target
-                    .map(|(id, key)| source.declaration_role(key, id))
-                    .transpose()?;
-                let test = (node_id != request.root_syntax_id
-                    && node.declaration.role == native::DeclarationRole::Test)
-                    || target_role == Some(native::DeclarationRole::Test);
-                let outside_app = request.app_paths.as_ref().is_some_and(|files| {
-                    exact_target.is_some_and(|(_, key)| !files.contains(&key.path))
-                });
-                if (external && !request.include_external)
-                    || (test && !request.include_tests)
-                    || outside_app
-                {
-                    add_omission(&mut frontier, &node_id, FrontierReason::Filtered, 1);
-                    let hints = filtered_hints.entry(node_id.clone()).or_default();
-                    if outside_app {
-                        hints.insert("app".to_string());
-                    }
-                    if external && !request.include_external {
-                        hints.insert("includeExternal".to_string());
-                    }
-                    if test && !request.include_tests {
-                        hints.insert("includeTests".to_string());
-                    }
-                    continue;
-                }
-                let group = if exact_target.is_some() {
-                    selected
-                        .map(|(b, proof)| {
-                            serde_json::to_string(&(
-                                &b.resolution,
-                                &b.declared_target,
-                                &b.candidates,
-                                &b.dispatch,
-                                &b.possible_dispatch,
-                                b.possible_dispatch_complete,
-                                b.stale_target,
-                                &b.provenance_id,
-                                &b.join.status,
-                                &b.join.diagnostic,
-                                proof,
-                                reason,
-                                external,
-                                test,
-                            ))
-                        })
-                        .transpose()?
-                } else {
-                    None
-                };
-                if let Some(existing) = pending.iter_mut().find(|candidate| {
-                    candidate.edge.from == node_id && group.is_some() && candidate.group == group
-                }) {
-                    existing.edge.call_site_count += 1;
-                    continue;
-                }
-                // #778 (owner-ratified 2026-11-07): semantic bindings take precedence, so a
-                // bound boundary keeps the third rank. Only an unbound call is ordered by
-                // name: one whose callee names a declaration in the snapshot (likely the
-                // project's own) ranks before those that name none (constructors,
-                // standard-library methods).
-                let rank = if reason == BoundaryReason::None {
-                    0
-                } else if external {
-                    1
-                } else if selected.is_some() || source.names_declaration(call)? {
-                    2
-                } else {
-                    3
-                };
-                pending.push(Candidate {
+            let rank = rank(&class, call, source)?;
+            let CallClass {
+                selected,
+                reason,
+                exact_target,
+                ..
+            } = class;
+            self.offer(
+                Candidate {
                     rank,
                     owner_depth: node_depth,
                     owner_document: doc.key.clone(),
@@ -1132,40 +1156,79 @@ pub fn evaluate(
                         visit: Visit::Boundary,
                         boundary_reason: reason,
                     },
-                });
-                pending.sort_by(|a, b| a.key().cmp(&b.key()));
-                if pending.len() > (request.max_calls as usize).saturating_sub(edges.len()) {
-                    let discarded = pending.pop().expect("one pending candidate");
-                    add_omission(
-                        &mut frontier,
-                        &discarded.edge.from,
-                        FrontierReason::CallLimit,
-                        discarded.edge.call_site_count,
-                    );
-                }
+                },
+                request.max_calls,
+            );
+        }
+        Ok(())
+    }
+
+    /// Records a call that the request filters out, with the hint that would include it.
+    /// Returns whether the call was filtered.
+    fn filtered(&mut self, request: &GraphRequest, node_id: &str, class: &CallClass<'_>) -> bool {
+        let CallClass {
+            external,
+            test,
+            outside_app,
+            ..
+        } = *class;
+        if (external && !request.include_external)
+            || (test && !request.include_tests)
+            || outside_app
+        {
+            add_omission(&mut self.frontier, node_id, FrontierReason::Filtered, 1);
+            let hints = self.filtered_hints.entry(node_id.to_string()).or_default();
+            if outside_app {
+                hints.insert("app".to_string());
             }
+            if external && !request.include_external {
+                hints.insert("includeExternal".to_string());
+            }
+            if test && !request.include_tests {
+                hints.insert("includeTests".to_string());
+            }
+            return true;
         }
-        if pending.is_empty() {
-            break;
+        false
+    }
+
+    /// Adds a candidate in rank order. Past the call limit, the last one is discarded and
+    /// counted as a call-limit omission of its owner.
+    fn offer(&mut self, candidate: Candidate, max_calls: u64) {
+        self.pending.push(candidate);
+        self.pending.sort_by(|a, b| a.key().cmp(&b.key()));
+        if self.pending.len() > (max_calls as usize).saturating_sub(self.edges.len()) {
+            let discarded = self.pending.pop().expect("one pending candidate");
+            add_omission(
+                &mut self.frontier,
+                &discarded.edge.from,
+                FrontierReason::CallLimit,
+                discarded.edge.call_site_count,
+            );
         }
-        let mut candidate = pending.remove(0);
+    }
+
+    /// Admits the best pending candidate as an edge, and its target as a node when it is new
+    /// and the node limit allows.
+    fn admit(&mut self, request: &GraphRequest, source: &mut dyn GraphSource) -> Result<()> {
+        let mut candidate = self.pending.remove(0);
         // A dispatch boundary shows its exact declaration as its target and stays a boundary:
         // no fan-out, no expansion (#557). It ranks after every eligible edge, so no later
         // edge can need to expand a declaration admitted this way.
         let boundary = candidate.edge.boundary_reason == BoundaryReason::Dispatch;
         if let Some((id, key)) = candidate.target {
-            if admitted.contains(&id) {
+            if self.admitted.contains(&id) {
                 candidate.edge.to = Some(id);
                 if !boundary {
                     candidate.edge.visit = Visit::Seen;
                 }
-            } else if nodes.len() as u64 == request.max_nodes {
+            } else if self.nodes.len() as u64 == request.max_nodes {
                 if boundary {
-                    edges.push(candidate.edge);
-                    continue;
+                    self.edges.push(candidate.edge);
+                    return Ok(());
                 }
                 candidate.edge.boundary_reason = BoundaryReason::NodeLimit;
-                frontier.push(Frontier {
+                self.frontier.push(Frontier {
                     reason: FrontierReason::NodeLimit,
                     node_id: candidate.edge.from.clone(),
                     call_id: Some(candidate.edge.call.id.clone()),
@@ -1180,32 +1243,132 @@ pub fn evaluate(
                     .get(&id)
                     .cloned()
                     .ok_or_else(|| integrity("target declaration missing from document"))?;
-                admitted.insert(id.clone());
-                nodes.push(GraphNode {
+                self.admitted.insert(id.clone());
+                self.nodes.push(GraphNode {
                     declaration,
                     depth: candidate.owner_depth + 1,
                 });
                 candidate.edge.to = Some(id.clone());
                 if boundary {
-                    declared_only.insert(id);
+                    self.declared_only.insert(id);
                 } else {
                     candidate.edge.visit = Visit::New;
                 }
             }
         }
-        edges.push(candidate.edge);
+        self.edges.push(candidate.edge);
+        Ok(())
     }
-    shortest_depths(&mut nodes, &edges);
-    Ok(Ok(finish(
-        request,
-        source,
-        scope,
-        defaults.as_ref(),
-        nodes,
-        edges,
-        frontier,
-        filtered_hints,
-    )?))
+}
+
+/// One call occurrence of an inspected owner, classified before grouping and ranking.
+#[derive(Clone, Copy)]
+struct CallClass<'a> {
+    selected: Option<(&'a CallBinding, &'a sem::Provenance)>,
+    reason: BoundaryReason,
+    exact_target: Option<(&'a String, &'a DocumentKey)>,
+    external: bool,
+    test: bool,
+    outside_app: bool,
+}
+
+fn classify<'a>(
+    request: &GraphRequest,
+    source: &mut dyn GraphSource,
+    doc: &'a DocumentFacts,
+    semantic: Option<&'a SemanticDocument>,
+    owner_test: bool,
+    call: &native::Call,
+) -> Result<CallClass<'a>> {
+    let disposition = call_disposition(semantic, call, source)?;
+    let selected = disposition.selected;
+    let reason = if let Some(projection) = doc
+        .projection
+        .as_ref()
+        .filter(|projection| semantic.is_none() && projection.semantic_status.is_pending())
+    {
+        BoundaryReason::pending(projection.semantic_status)
+    } else {
+        disposition.boundary_reason
+    };
+    let exact_target = disposition.exact_target;
+    let external = selected.is_some_and(|(b, _)| b.resolution == Resolution::External);
+    let target_role = exact_target
+        .map(|(id, key)| source.declaration_role(key, id))
+        .transpose()?;
+    let test = owner_test || target_role == Some(native::DeclarationRole::Test);
+    let outside_app = request
+        .app_paths
+        .as_ref()
+        .is_some_and(|files| exact_target.is_some_and(|(_, key)| !files.contains(&key.path)));
+    Ok(CallClass {
+        selected,
+        reason,
+        exact_target,
+        external,
+        test,
+        outside_app,
+    })
+}
+
+/// The grouping identity of a call with an exact target: calls of one owner with the same key
+/// are one edge.
+fn group_key(class: &CallClass<'_>) -> Result<Option<String>> {
+    let CallClass {
+        selected,
+        reason,
+        exact_target,
+        external,
+        test,
+        ..
+    } = *class;
+    Ok(if exact_target.is_some() {
+        selected
+            .map(|(b, proof)| {
+                serde_json::to_string(&(
+                    &b.resolution,
+                    &b.declared_target,
+                    &b.candidates,
+                    &b.dispatch,
+                    &b.possible_dispatch,
+                    b.possible_dispatch_complete,
+                    b.stale_target,
+                    &b.provenance_id,
+                    &b.join.status,
+                    &b.join.diagnostic,
+                    proof,
+                    reason,
+                    external,
+                    test,
+                ))
+            })
+            .transpose()?
+    } else {
+        None
+    })
+}
+
+fn rank(class: &CallClass<'_>, call: &native::Call, source: &mut dyn GraphSource) -> Result<u8> {
+    let CallClass {
+        selected,
+        reason,
+        external,
+        ..
+    } = *class;
+    // #778 (owner-ratified 2026-11-07): semantic bindings take precedence, so a
+    // bound boundary keeps the third rank. Only an unbound call is ordered by
+    // name: one whose callee names a declaration in the snapshot (likely the
+    // project's own) ranks before those that name none (constructors,
+    // standard-library methods).
+    Ok(if reason == BoundaryReason::None {
+        0
+    } else if external {
+        1
+    } else if selected.is_some() || source.names_declaration(call)? {
+        2
+    } else {
+        3
+    })
 }
 
 struct Candidate {

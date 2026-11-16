@@ -21,7 +21,7 @@ pub mod install;
 pub mod pickup;
 pub mod pickup_watch;
 pub mod plan;
-pub mod process_info;
+pub use crate::process_info;
 pub mod profiles;
 pub(crate) mod retention;
 pub mod run;

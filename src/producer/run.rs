@@ -7,7 +7,7 @@ use super::approval;
 use super::batch::{self, ARTIFACT_PATH, BatchSpec};
 use super::exec::{self, Ending, Hooks, ProducerSpec};
 use super::failure;
-use super::import::{self, ImportOutcome};
+use super::import::{self, ImportOutcome, ImportScheduler};
 use super::plan::{self, PlanRequest, Prepared};
 use super::profiles::{self, Stub};
 use super::state::{
@@ -19,7 +19,6 @@ use super::{
     ProcessIdentity, ROOT_CHANGED,
 };
 use crate::{
-    http::DaemonState,
     semantic_batch::{
         BatchCounters, StageInput, StageOwner, descriptor::GenerationOrigin, stage_batch,
     },
@@ -137,7 +136,7 @@ impl CancelRequest {
 /// What a run needs from its checkout.
 pub struct RunContext<'a> {
     pub store: &'a Store,
-    pub scheduler: &'a DaemonState,
+    pub scheduler: &'a dyn ImportScheduler,
     pub stub: Option<&'a Stub>,
 }
 

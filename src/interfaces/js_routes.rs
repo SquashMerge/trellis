@@ -562,13 +562,11 @@ impl<'w> Extractor<'w, '_> {
         self.keys
             .entry(doc)
             .or_insert_with(|| {
-                crate::symbol_lookup::keys_from_source(
+                crate::symbol_lookup::keys_by_name(
                     &source.key.path,
                     &source.key.language,
-                    &source.file.text,
                     &source.declarations,
                 )
-                .unwrap_or_default()
             })
             .get(syntax_id)
             .cloned()

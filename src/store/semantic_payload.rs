@@ -5,7 +5,7 @@
 //! revision r goes through [`project_payload`], the single projection, which supplies r's
 //! native revision, r's rejoined provenance IDs and r's freshness.
 use super::*;
-use crate::semantic_evidence as sem;
+use crate::semantic_records as sem;
 use std::cell::RefCell;
 
 /// The provenance IDs of `coverage`'s own tuple: the rows the tuple owns in `publication`.
@@ -228,7 +228,7 @@ impl KeyInputs {
 
     /// The running build's digest: the hash of its join modules (`build/semantic_join_inputs.rs`)
     /// and of the join `limits` this operation applies.
-    pub(in crate::store) fn current(limits: &crate::semantic_batch::BatchLimits) -> Self {
+    pub(in crate::store) fn current(limits: &crate::semantic_batch::limits::BatchLimits) -> Self {
         Self {
             join_inputs: crate::native_ids::digest(
                 b"trellis.semantic-join-inputs.v1\0",
@@ -300,7 +300,7 @@ pub(in crate::store) fn payload_key(
 }
 
 /// Where a projection takes provenance freshness from.
-pub(in crate::store) enum FreshnessSource<'a> {
+pub(crate) enum FreshnessSource<'a> {
     /// The freshness rows stored for the reading revision.
     Stored,
     /// Freshness a publication supplies before its rows are stored.
@@ -315,17 +315,17 @@ pub(in crate::store) struct TargetScope<'a> {
 }
 
 /// How one payload is read as evidence of one revision (C).
-pub(in crate::store) struct PayloadProjection<'a> {
+pub(crate) struct PayloadProjection<'a> {
     db: &'a Connection,
     native: String,
     pub(in crate::store) source_set: String,
-    pub(in crate::store) payload_id: Option<i64>,
+    pub(crate) payload_id: Option<i64>,
     freshness: BTreeMap<i64, sem::Freshness>,
     ids: RefCell<BTreeMap<i64, String>>,
 }
 
 /// The projection of the payload named by manifest row `tuple_id` of `revision_key`.
-pub(in crate::store) fn project_payload<'a>(
+pub(crate) fn project_payload<'a>(
     db: &'a Connection,
     revision_key: &str,
     tuple_id: i64,
@@ -384,7 +384,7 @@ impl PayloadProjection<'_> {
     }
 
     /// The reading revision's native revision.
-    pub(in crate::store) fn native(&self) -> &str {
+    pub(crate) fn native(&self) -> &str {
         &self.native
     }
 
@@ -549,7 +549,7 @@ pub(in crate::store) fn cleanup_payload_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::native_evidence::{DocumentKey, Range};
+    use crate::native_records::{DocumentKey, Range};
 
     fn document(path: &str) -> DocumentKey {
         DocumentKey {
@@ -596,11 +596,11 @@ mod tests {
         let key = |inputs: &KeyInputs| {
             payload_key(inputs, &producer, "d", "c", "javascript", "a.js", "v", &[])
         };
-        let current = KeyInputs::current(&crate::semantic_batch::BatchLimits::PRODUCTION);
+        let current = KeyInputs::current(&crate::semantic_batch::limits::BatchLimits::PRODUCTION);
         assert_eq!(
             key(&current),
             key(&KeyInputs::current(
-                &crate::semantic_batch::BatchLimits::PRODUCTION
+                &crate::semantic_batch::limits::BatchLimits::PRODUCTION
             ))
         );
         assert_ne!(
@@ -771,7 +771,7 @@ mod tests {
             "key",
             &publication,
             None,
-            &KeyInputs::current(&crate::semantic_batch::BatchLimits::PRODUCTION),
+            &KeyInputs::current(&crate::semantic_batch::limits::BatchLimits::PRODUCTION),
         )
         .unwrap_err();
         assert!(
@@ -817,7 +817,7 @@ mod tests {
             "key",
             &publication,
             None,
-            &KeyInputs::current(&crate::semantic_batch::BatchLimits::PRODUCTION),
+            &KeyInputs::current(&crate::semantic_batch::limits::BatchLimits::PRODUCTION),
         )
         .unwrap();
         let (rows, terms, targets): (i64, i64, i64) = db
