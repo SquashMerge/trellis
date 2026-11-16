@@ -19,6 +19,7 @@ pub(crate) mod parallel_check;
 mod python;
 mod rust;
 pub(crate) use rust::feature_name;
+mod shared;
 pub mod tsconfig;
 pub(crate) mod work;
 
