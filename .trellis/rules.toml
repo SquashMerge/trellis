@@ -27,7 +27,7 @@ paths = [
 app = "trellis"
 order = 2
 paths = [
-  "src/main.rs", "src/auth.rs", "src/http.rs", "src/http/**",
+  "src/main.rs", "src/cli/**", "src/daemon_main/**", "src/auth.rs", "src/http.rs", "src/http/**",
   "src/daemon/**", "src/mcp/**",
 ]
 
