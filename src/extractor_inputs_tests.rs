@@ -135,6 +135,14 @@ const NON_NATIVE_SOURCE_PARSERS: &[(&str, &str)] = &[
         "post-native semantic relationships from authenticated source",
     ),
     (
+        "src/semantic_import/relationships.rs",
+        "post-native semantic relationships from authenticated source: the type-relationship passes, moved out of `semantic_import`",
+    ),
+    (
+        "src/semantic_import/role_sites.rs",
+        "post-native semantic relationships from authenticated source: direct bases and role sites, moved out of `semantic_import`",
+    ),
+    (
         "src/scip_raw/cargo_targets.rs",
         "post-native semantic admission: module declarations naming each Rust document's Cargo target (#394)",
     ),
