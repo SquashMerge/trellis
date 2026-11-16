@@ -8,7 +8,7 @@ const {APP_SCRIPTS} = require("./support/app-scripts.js");
 const vm = require("node:vm");
 // No DOM parser here: the adapter double keeps the real Pele projection and installs one
 // selectable node per projected row (tests/support/sequence-adapter-double.js).
-const source = ["../web/index-pin.js", "../web/source-witness.js", "../web/sequence-model.js", "../web/sequence.js", "../web/pele-svg.js", "../web/sequence-pele.js", "support/sequence-adapter-double.js", "../web/shell.js", "../web/files.js", ...APP_SCRIPTS.map(file => "../web/" + file)].map(file => fs.readFileSync(path.join(__dirname, file), "utf8")).join("\n");
+const source = ["../web/index-pin.js", "../web/dto-core.js", "../web/source-witness.js", "../web/sequence-model.js", "../web/sequence.js", "../web/pele-svg.js", "../web/sequence-pele.js", "support/sequence-adapter-double.js", "../web/shell.js", "../web/files.js", ...APP_SCRIPTS.map(file => "../web/" + file)].map(file => fs.readFileSync(path.join(__dirname, file), "utf8")).join("\n");
 
 function deferred() {
   let resolve, reject;

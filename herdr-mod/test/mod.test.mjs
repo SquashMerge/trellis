@@ -11,7 +11,9 @@ import makeArchitecturePele from "trellis-web:architecture-pele";
 import { readFileSync } from "node:fs";
 import { draw, hit, measure, segments, summarize } from "../src/diagram.js";
 import { drawSequence } from "../src/sequence.js";
-import { TrellisError, architecturePayload, createClient, indexLabel, pinOf } from "../src/client.js";
+import { TrellisError, architecturePayload, createClient, detailPage, indexLabel, jobCause, pinLabel, pinOf, samePin } from "../src/client.js";
+import makeIndexPin from "trellis-web:index-pin";
+import makeDtoCore from "trellis-web:dto-core";
 import { state } from "./stubs/herdr.js";
 
 const { fixture } = createRequire(import.meta.url)("../../tests/fixtures/pele-1.10.0-trellis.2/architecture-fixture.cjs");
@@ -135,6 +137,68 @@ test("Architecture answers are checked against the pin, as the browser checks th
   assert.equal(architecturePayload({ payload: { state: "building", indexGeneration: pin.indexGeneration, indexRevision: 1 } }, pin).state, "building");
   assert.equal(indexLabel({ state: "available", revision: pin, catchingUp: false }).text, "Fresh · rev 12345678:1");
   assert.equal(indexLabel({ state: "unavailable", indexError: "root_changed" }).text, "Unavailable · root_changed");
+});
+
+test("W11 the browser and the pane share one pin core, and each keeps its own copy, comparison and errors", () => {
+  const window = {};
+  const core = makeIndexPin(window), web = window.TrellisIndexPin;
+  const value = { indexGeneration: "12345678-1234-4123-8123-123456789abc", indexRevision: 1, extra: true };
+  // The browser's copy is frozen; the pane's is a new object it may change.
+  const frozen = web.copy(value), mutable = pinOf(value);
+  assert.deepEqual({ ...frozen }, { indexGeneration: value.indexGeneration, indexRevision: 1 });
+  assert.deepEqual(mutable, { ...frozen });
+  assert.equal(Object.isFrozen(frozen), true);
+  assert.equal(Object.isFrozen(mutable), false);
+  mutable.indexRevision = 2;
+  assert.equal(mutable.indexRevision, 2);
+  // A malformed pair: a plain Error in the browser, a typed `invalid_revision` in the pane.
+  for (const bad of [null, "pin", {}, { ...value, indexRevision: -1 }, { ...value, indexGeneration: value.indexGeneration.toUpperCase() }]) {
+    assert.throws(() => web.copy(bad), (e) => e.constructor === Error && e.code === undefined && e.message === "Invalid index snapshot pair. Refresh status.");
+    assert.throws(() => pinOf(bad), (e) => e instanceof TrellisError && e.code === "invalid_revision" && e.message === "Invalid index snapshot pair.");
+    assert.equal(core.read(bad), null, "the shared form throws nothing");
+  }
+  // Only the browser refuses an array that carries the two fields.
+  const array = Object.assign([], { indexGeneration: value.indexGeneration, indexRevision: 1 });
+  assert.throws(() => web.copy(array), (e) => e.constructor === Error);
+  assert.deepEqual(pinOf(array), { indexGeneration: value.indexGeneration, indexRevision: 1 });
+  // The browser's label and query validate first; the pane's label spells what it is given.
+  assert.equal(web.label(value), "12345678:1");
+  assert.equal(pinLabel(value), "12345678:1");
+  assert.throws(() => web.label({ indexGeneration: "abcdefghij", indexRevision: "x" }), (e) => e.constructor === Error);
+  assert.equal(pinLabel({ indexGeneration: "abcdefghij", indexRevision: "x" }), "abcdefgh:x");
+  assert.equal(web.query(value), "indexGeneration=12345678-1234-4123-8123-123456789abc&indexRevision=1");
+  // The browser compares only well-formed fields, and null only with null; the pane compares fields, and anything falsy with anything falsy.
+  assert.equal(web.equal(value, { ...value }), true);
+  assert.equal(samePin(value, { ...value }), true);
+  assert.equal(web.equal({}, {}), false);
+  assert.equal(samePin({}, {}), true);
+  assert.equal(web.equal(null, false), false);
+  assert.equal(samePin(null, false), true);
+  assert.equal(web.equal(value, { ...value, indexRevision: 2 }), false);
+  assert.equal(samePin(value, { ...value, indexRevision: 2 }), false);
+});
+
+test("W11 the shared answer checks keep the pane's typed errors and its words for a checkout that is not available", () => {
+  const dto = makeDtoCore({});
+  const pin = pinOf({ indexGeneration: "12345678-1234-4123-8123-123456789abc", indexRevision: 1 });
+  const ready = { ...view(), ...pin, state: "ready", aggregate: "max", role: "production", workbench: true, metricsVersion: "metrics:v1", evidenceTier: "syntax", semanticComplete: false };
+  assert.equal(architecturePayload({ payload: ready }, pin), ready);
+  assert.throws(() => architecturePayload({ payload: { ...ready, role: "test" } }, pin), (e) => e instanceof TrellisError && e.code === "invalid_response" && e.message === "Invalid Architecture response. Nothing displayed.");
+  assert.throws(() => architecturePayload({ payload: { ...ready, indexRevision: 2 } }, pin), (e) => e instanceof TrellisError && e.code === "revision_conflict" && e.status === null && e.message === "Architecture snapshot changed. Refreshing.");
+  const page = { ...pin, rulesFile: { contentHash: "abc" }, kind: "instances", offset: 0, items: [], total: 0, nextOffset: null };
+  assert.equal(detailPage({ payload: page }, pin, "abc", "instances", 0), page);
+  for (const bad of [{ ...page, kind: "pairs" }, { ...page, nextOffset: 0 }, { ...page, rulesFile: { contentHash: "other" } }, { ...page, indexRevision: 2 }])
+    assert.throws(() => detailPage({ payload: bad }, pin, "abc", "instances", 0), (e) => e instanceof TrellisError && e.code === "invalid_response" && e.message === "Invalid Architecture detail response. Nothing displayed.");
+  // The pane's words for a checkout that is not available are its own; the rest of the label is shared.
+  assert.equal(indexLabel({ state: "unavailable" }).text, "Unavailable");
+  assert.equal(indexLabel({ state: "unavailable", indexError: "root_changed" }).text, "Unavailable · root_changed");
+  assert.equal(dto.checkoutIndexLabel({ state: "unavailable", indexError: "root_changed" }, () => "Failed", () => "").text, "Failed", "the browser's word, as web/app.js passes it");
+  assert.deepEqual(indexLabel({ state: "storage_busy" }), { text: "Busy", state: "failed", shape: "□" });
+  assert.deepEqual(indexLabel({ state: "available", revision: { ...pin, indexRevision: -1 }, catchingUp: false }), { text: "Index status unavailable", state: "unknown", shape: "◇" });
+  // One jobCause: the pane's is the function of web/dto-core.js (each load of that script makes its own copy).
+  assert.equal(jobCause.toString(), dto.jobCause.toString());
+  assert.equal(jobCause({ error: { code: "invalid_artifact", reason: "empty range", message: "generic" } }), "invalid_artifact: empty range");
+  assert.equal(jobCause({ state: "failed" }), "cause not recorded");
 });
 
 test("yielding between drawing phases changes nothing in either drawing", async () => {
