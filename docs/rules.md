@@ -913,7 +913,11 @@ Supported mapping is deliberately narrow:
   TOML and a path dependency outside the members prove nothing and remain unknown.
   Nothing runs `cargo metadata`, and manifest parsing shares the reference work bound.
   Custom roots/`#[path]`, macro/cfg uncertainty, ambiguous ownership and depth beyond
-  four remain unknown.
+  four remain unknown. A macro call makes its module or block uncertain: its expansion
+  could bind any name, so a first path segment that scope does not bind itself is
+  unknown there. Syntax decides what a macro call is (#1163): an expression statement
+  counts when a macro call lies anywhere in it, nested blocks included, and a `!=`, a
+  unary `!` or a `!` in a string or character literal does not.
 - **JavaScript and TypeScript:** the two languages share one resolver. Static
   relative imports/reexports/side-effect imports (also `import type`,
   `export type` and `import x = require("m")`) try the extensionless candidates
