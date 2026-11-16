@@ -836,6 +836,19 @@ impl Inbox {
     }
 }
 
+/// Where `drive` reports to a test's `drive_hook`.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DrivePoint {
+    /// After the idle-matrix sweep and before `next_step` decides. `resident`
+    /// says the sweep left a matrix whose timer has not run out.
+    Swept { resident: bool },
+    /// After a claimed model idle expiry finished, before the next sweep.
+    ModelExpired,
+}
+#[cfg(test)]
+type DriveHook = Arc<dyn Fn(DrivePoint) + Send + Sync>;
+
 #[derive(Default)]
 pub(super) struct Core {
     inbox: Mutex<Inbox>,
@@ -849,6 +862,10 @@ pub(super) struct Core {
     after_notify_release: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     startup_discovery_sources: Mutex<Option<Vec<Arc<dyn FillSource>>>>,
+    /// Runs on the owner at each `DrivePoint`, with no lock held, so a test
+    /// can park it between its idle sweep and its decision (#1153).
+    #[cfg(test)]
+    drive_hook: Mutex<Option<DriveHook>>,
     changed: Condvar,
     budget: Arc<MatrixBudget>,
     touches: std::sync::atomic::AtomicU64,
@@ -1079,6 +1096,13 @@ impl Core {
     pub(super) fn wake(&self) {
         let _inbox = self.inbox.lock().unwrap();
         self.changed.notify_all();
+    }
+    #[cfg(test)]
+    fn at_drive_point(&self, point: DrivePoint) {
+        let hook = self.drive_hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(point);
+        }
     }
 }
 
@@ -1532,13 +1556,23 @@ fn drive(core: Arc<Core>, backend: Arc<dyn FillBackend>) {
         // Ranking and publication lock individual heads; the sweep takes the
         // inbox itself, so it runs before the decision, never inside it.
         let matrix_idle = core.expire_idle_matrices(backend.idle_now());
+        #[cfg(test)]
+        core.at_drive_point(DrivePoint::Swept {
+            resident: matrix_idle.is_some(),
+        });
         match core.next_step(backend.as_ref(), matrix_idle) {
             Step::Shutdown => return,
             Step::Discover(roots) => core.discover_startup(roots),
             Step::Run(job) => run_job(&core, backend.as_ref(), job),
             // Model lifetime is global. Each resident matrix has its
-            // own timer and is not invalidated by model unloading.
-            Step::ExpireModel => backend.finish_idle_expiry(),
+            // own timer and is not invalidated by model unloading. The sweep
+            // above and this claim read the clock separately, so the model
+            // can go first; the next iteration's sweep releases the matrix.
+            Step::ExpireModel => {
+                backend.finish_idle_expiry();
+                #[cfg(test)]
+                core.at_drive_point(DrivePoint::ModelExpired);
+            }
             Step::Recheck => {}
         }
     }

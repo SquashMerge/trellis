@@ -1159,7 +1159,10 @@ fn idle_matrix_and_model_expire_and_periodic_hints_do_not_reload_them() {
 
     *clock.lock().unwrap() = now + Duration::from_secs(600);
     service.wake_model_clock_for_tests();
+    // The model and each matrix have their own timers and their own published
+    // eviction; neither implies the other (#1153).
     service.wait_for_model_eviction_for_tests();
+    registration.head_slot().wait_until_evicted_for_tests();
     assert_eq!(owner.matrix_storage_bytes(), 0);
     assert_eq!(drops.load(Ordering::Acquire), 1);
 
@@ -1177,6 +1180,69 @@ fn idle_matrix_and_model_expire_and_periodic_hints_do_not_reload_them() {
     assert!(owner.matrix_storage_bytes() > 0);
     assert_eq!(loads.load(Ordering::Acquire), 2);
     assert_eq!(drops.load(Ordering::Acquire), 1);
+}
+
+/// #1153: the owner reads the clock once for its matrix sweep and again when
+/// it claims model expiry. A cutoff that falls between the two evicts the
+/// model first; the matrix follows on the owner's next sweep, with no new
+/// wake, and publishes its own eviction.
+#[test]
+fn matrix_swept_before_the_cutoff_expires_on_the_sweep_after_model_expiry() {
+    let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (_directory, mut service) = recording_service(RecordingFactory {
+        loads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        drops: drops.clone(),
+        calls: Arc::new(Mutex::new(Vec::new())),
+        pause: None,
+    });
+    let now = Instant::now();
+    let clock = Arc::new(Mutex::new(now));
+    let observed = clock.clone();
+    Arc::get_mut(&mut service)
+        .unwrap()
+        .set_model_clock_for_tests(Arc::new(move || *observed.lock().unwrap()));
+    let owner = SearchFill::start(service.clone()).unwrap();
+    // Park the owner after the first sweep that leaves a resident matrix, and
+    // again after the model expiry, before the sweep that follows it.
+    let (parked, at) = mpsc::channel();
+    let (resume, resumed) = mpsc::channel::<()>();
+    let resumed = Mutex::new(resumed);
+    let swept = AtomicBool::new(false);
+    *owner.core.drive_hook.lock().unwrap() = Some(Arc::new(move |point| {
+        let park = match point {
+            DrivePoint::Swept { resident } => resident && !swept.swap(true, Ordering::AcqRel),
+            DrivePoint::ModelExpired => true,
+        };
+        if park {
+            let _ = parked.send(point);
+            // A finished or failed test drops `resume`, which releases the owner.
+            let _ = resumed.lock().unwrap().recv();
+        }
+    }));
+    let source: Arc<dyn FillSource> = Arc::new(MatrixOnlySource);
+    let registration = owner.register_source(Arc::downgrade(&source));
+    registration.notify();
+    assert_eq!(
+        at.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap(),
+        DrivePoint::Swept { resident: true }
+    );
+
+    // The sweep saw the old clock; the model claim will see the cutoff.
+    *clock.lock().unwrap() = now + Duration::from_secs(600);
+    resume.send(()).unwrap();
+    assert_eq!(
+        at.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap(),
+        DrivePoint::ModelExpired
+    );
+    service.wait_for_model_eviction_for_tests();
+    assert_eq!(drops.load(Ordering::Acquire), 1);
+    // Proves the interleaving was produced, not a required order: model
+    // eviction is published while the matrix is still resident.
+    assert!(owner.matrix_storage_bytes() > 0);
+
+    resume.send(()).unwrap();
+    registration.head_slot().wait_until_evicted_for_tests();
+    assert_eq!(owner.matrix_storage_bytes(), 0);
 }
 
 #[test]

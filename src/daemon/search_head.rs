@@ -195,6 +195,18 @@ impl HeadSlot {
             Some(remaining)
         }
     }
+    /// Waits for the owner's eviction of this head's matrix, published under
+    /// this head's lock together with the release of its budget charge.
+    #[cfg(test)]
+    pub(super) fn wait_until_evicted_for_tests(&self) {
+        let deadline = std::time::Instant::now() + crate::testing::HANG_BACKSTOP;
+        let mut state = self.state.lock().unwrap();
+        while state.published.is_some() || !state.evicted {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!remaining.is_zero(), "idle matrix was not evicted");
+            state = self.changed.wait_timeout(state, remaining).unwrap().0;
+        }
+    }
     pub(super) fn last_touch(&self) -> u64 {
         self.touched.load(Ordering::Relaxed)
     }
