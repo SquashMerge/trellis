@@ -196,6 +196,9 @@ pub(super) struct Catalog {
     /// The extern crate names each crate root scope binds to proved Cargo workspace member
     /// libraries (#772): the library root's file scope, or `None` when bound but unproved.
     externs: BTreeMap<usize, BTreeMap<String, Option<usize>>>,
+    /// The crate root scopes whose crate is proved to be of edition 2018 or later, where a
+    /// `use` path starts in its own module (#1162). Any other crate may be edition 2015.
+    uniform: BTreeSet<usize>,
     pub(super) work: Work,
 }
 /// A crate root: a conventional root of the checkout's package, or a library or binary
@@ -233,6 +236,7 @@ impl Catalog {
             roots: BTreeMap::new(),
             ambiguous: BTreeSet::new(),
             externs: BTreeMap::new(),
+            uniform: BTreeSet::new(),
             work,
         };
         let declarations = result.index_files(docs, trees, workspace, check)?;
@@ -425,6 +429,9 @@ impl Catalog {
                 externs.insert(name, library);
             }
             self.externs.insert(scope, externs);
+            if workspace.uniform_paths(&key.source_set_id, &key.path) {
+                self.uniform.insert(scope);
+            }
         }
         Ok(())
     }
@@ -1409,10 +1416,13 @@ impl Catalog {
     }
     /// The module a path prefix names when the lookup of that same name in that same scope is
     /// already under way: `mod parse; pub use parse::parse;` asks for the prefix `parse`
-    /// while binding `parse`. Only a module continues a path, and the scope's own `mod`
-    /// item is that module whatever the import under way binds, so the prefix is proved
-    /// without the import. Only a single unconditional `mod` in a scope read whole
-    /// qualifies; for anything else `binding` answers the re-entry with unknown.
+    /// while binding `parse`. Only a module continues a path, and from edition 2018 a `use`
+    /// path starts in its own scope, whose `mod` item is that module whatever the import
+    /// under way binds, so the prefix is proved without the import. In edition 2015 the
+    /// same `use` path starts at the crate root and can name another module. So only a
+    /// single unconditional `mod`, in a scope read whole, of a crate whose manifest proves
+    /// edition 2018 or later qualifies; for anything else `binding` answers the re-entry
+    /// with unknown.
     fn declared_module(
         &mut self,
         scope: usize,
@@ -1428,7 +1438,13 @@ impl Catalog {
         let Some([binding]) = declaring.explicit.get(&key).map(Vec::as_slice) else {
             return Ok(None);
         };
-        if declaring.cut || binding.uncertain || (exported && !binding.visible(context)) {
+        if declaring.cut
+            || binding.uncertain
+            || (exported && !binding.visible(context))
+            || !self
+                .root(scope)
+                .is_some_and(|root| self.uniform.contains(&root))
+        {
             return Ok(None);
         }
         let Some(mut candidate) = binding.candidate.clone().filter(|c| c.module.is_some()) else {
@@ -2633,6 +2649,7 @@ mod cache_tests {
             file_declarations: BTreeMap::new(),
             ambiguous: BTreeSet::new(),
             externs: BTreeMap::new(),
+            uniform: BTreeSet::new(),
             work: Work::new(work::reference_limit(0, 0)),
         }
     }

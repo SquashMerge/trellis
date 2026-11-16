@@ -41,6 +41,8 @@ struct Member {
     crate_name: String,
     library: Option<String>,
     binary: Option<String>,
+    /// Every crate root of the package is proved to be of edition 2018 or later.
+    uniform_paths: bool,
     /// Dependency bindings: extern crate name to the member it names, or `None` when the
     /// name is bound to more than one crate or to an unproved one.
     bindings: BTreeMap<String, Option<usize>>,
@@ -190,8 +192,56 @@ fn member(dir: &str, table: &toml::Table) -> Option<Member> {
         crate_name,
         library,
         binary,
+        uniform_paths: false,
         bindings: BTreeMap::new(),
     })
+}
+
+/// Whether every crate root of the package `table` is proved to be of edition 2018 or later,
+/// where a `use` path starts in its own module and not at the crate root. Only a literal
+/// `[package] edition`, or one inherited from the `[workspace.package]` of the checkout's
+/// root manifest, proves it: a missing key is edition 2015, and an edition this list does
+/// not name, a `[lib]` or `[[bin]]` with an edition of its own and a package that names
+/// another workspace root prove nothing.
+fn uniform_paths(table: &toml::Table, root: &toml::Table) -> bool {
+    const UNIFORM: [&str; 3] = ["2018", "2021", "2024"];
+    let known = |edition: Option<&toml::Value>| {
+        edition
+            .and_then(toml::Value::as_str)
+            .is_some_and(|edition| UNIFORM.contains(&edition))
+    };
+    let own_edition = |target: &toml::Value| {
+        target
+            .as_table()
+            .is_none_or(|target| target.contains_key("edition"))
+    };
+    let targets = table.get("lib").into_iter().chain(
+        table
+            .get("bin")
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten(),
+    );
+    let Some(package) = table.get("package").and_then(toml::Value::as_table) else {
+        return false;
+    };
+    if targets.into_iter().any(own_edition) || package.contains_key("workspace") {
+        return false;
+    }
+    match package.get("edition") {
+        Some(toml::Value::Table(inherit)) => {
+            inherit.len() == 1
+                && inherit.get("workspace").and_then(toml::Value::as_bool) == Some(true)
+                && known(
+                    root.get("workspace")
+                        .and_then(toml::Value::as_table)
+                        .and_then(|workspace| workspace.get("package"))
+                        .and_then(toml::Value::as_table)
+                        .and_then(|package| package.get("edition")),
+                )
+        }
+        edition => known(edition),
+    }
 }
 
 /// Each dependency table of a manifest that crate sources can name: `[dependencies]` and
@@ -254,14 +304,16 @@ impl Workspace {
                 continue;
             };
             let mut tables = Vec::new();
-            if let Some(member) = member("", &root) {
+            if let Some(mut member) = member("", &root) {
+                member.uniform_paths = uniform_paths(&root, &root);
                 tables.push((member, root.clone()));
             }
             for dir in dirs {
                 super::owner_step(work, check)?;
                 if let Some(table) = parse(manifests[dir], work)?
-                    && let Some(member) = member(dir, &table)
+                    && let Some(mut member) = member(dir, &table)
                 {
+                    member.uniform_paths = uniform_paths(&table, &root);
                     tables.push((member, table));
                 }
             }
@@ -381,6 +433,15 @@ impl Workspace {
         self.sets.get(source_set)?.roots.get(path)
     }
 
+    /// Whether the crate rooted at `path` is proved to be of edition 2018 or later.
+    pub(super) fn uniform_paths(&self, source_set: &str, path: &str) -> bool {
+        self.sets.get(source_set).is_some_and(|set| {
+            set.roots
+                .get(path)
+                .is_some_and(|root| set.members[root.member].uniform_paths)
+        })
+    }
+
     /// The extern crate names the crate `from` binds to member libraries: each dependency on
     /// another member, and a binary's own library, with the library root file, or `None`
     /// when the name is bound but unproved (to two crates, or to a crate with no proved
@@ -435,6 +496,46 @@ mod tests {
     }
 
     const ROOT_TOML: &str = "[workspace]\nmembers = ['crates/*']\nexclude = ['crates/skip']\n[workspace.dependencies]\nshared = { path = 'crates/shared' }\n";
+
+    /// Edition 2018 or later is proved only by a literal or root-inherited `edition`.
+    #[test]
+    fn uniform_paths_need_a_proved_edition() {
+        let ws = workspace(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = ['*']\n[workspace.package]\nedition = '2021'\n",
+            ),
+            (
+                "inherits/Cargo.toml",
+                "[package]\nname = 'inherits'\nedition.workspace = true\n",
+            ),
+            (
+                "literal/Cargo.toml",
+                "[package]\nname = 'literal'\nedition = '2018'\n",
+            ),
+            ("absent/Cargo.toml", "[package]\nname = 'absent'\n"),
+            (
+                "old/Cargo.toml",
+                "[package]\nname = 'old'\nedition = '2015'\n",
+            ),
+            (
+                "target/Cargo.toml",
+                "[package]\nname = 'target'\nedition = '2021'\n[[bin]]\nname = 'target'\nedition = '2015'\n",
+            ),
+            (
+                "elsewhere/Cargo.toml",
+                "[package]\nname = 'elsewhere'\nedition.workspace = true\nworkspace = '../other'\n",
+            ),
+        ]);
+        let uniform = |member: &str| ws.uniform_paths("s", &format!("{member}/src/lib.rs"));
+        assert!(uniform("inherits"));
+        assert!(uniform("literal"));
+        for member in ["absent", "old", "target", "elsewhere", "unknown"] {
+            assert!(!uniform(member), "{member}");
+        }
+        assert!(ws.uniform_paths("s", "literal/src/main.rs"));
+        assert!(!ws.uniform_paths("other", "literal/src/lib.rs"));
+    }
 
     #[test]
     fn members_bind_path_renamed_and_inherited_dependencies() {

@@ -896,10 +896,19 @@ Supported mapping is deliberately narrow:
   targets, never semantic calls. An inline `crate::`/`self::`/`super::` path with no
   `use` item resolves like an import of the same path, and a `pub(crate)` module or
   item is visible throughout its own crate (#828); other restricted visibilities
-  (`pub(super)`, `pub(in ...)`) remain unknown. A re-export can share its module's
-  name (`mod parse; pub use parse::parse;`, #1162): the scope's own single,
-  unconditional `mod` item proves the path prefix, and any other binding of that
-  prefix (a conditional module, another import, a glob, a macro) stays unknown.
+  (`pub(super)`, `pub(in ...)`) remain unknown. A named re-export can share its module's
+  name (`mod parse; pub use parse::parse;`, #1162). Looking such a name up asks for
+  the path prefix `parse` in the same scope again, and that repeated lookup is
+  answered from the scope's own `mod parse` item only when all of this holds: the
+  crate's manifest proves edition 2018 or later (a literal `[package] edition` of
+  `2018`, `2021` or `2024`, or one inherited from the root manifest's
+  `[workspace.package]`, with no edition of its own on `[lib]` or a `[[bin]]`), the
+  scope has exactly one `mod` item of that name, the item is unconditional, and its
+  file was read whole. Otherwise the repeated lookup stays unknown, as it was: a
+  crate with no captured manifest, no `edition` key or edition 2015 (where a `use`
+  path starts at the crate root and can name another module), and a prefix that the
+  scope binds only through an import, a glob or a macro. The four-edge limit is
+  unchanged.
   Cargo workspace member crates (#772,
   owner-ratified 2026-11-10) are also proved roots: the members are the retained
   nested `Cargo.toml` directories that the captured root `[workspace] members`
