@@ -1,7 +1,7 @@
-//! Batch descriptor admission that needs indexing policy: the producer context profile, the
-//! generation-origin rule that applies it, and the path check against the batch directory.
-//! The grammar, the producer pin check and the checks over bytes, limits and the captured
-//! revision are in `crate::batch_descriptor`, re-exported here.
+//! Batch descriptor admission that needs indexing policy: the generation-origin rule that
+//! applies the producer context profile, and the path check against the batch directory.
+//! The grammar, the producer pin check, the context profile and the checks over bytes, limits
+//! and the captured revision are in `crate::batch_descriptor`, re-exported here.
 pub use crate::batch_descriptor::{
     ArtifactEntry, CoverageRow, Descriptor, DescriptorComponents, DescriptorMetadata,
     DescriptorProducer, DescriptorSourceSet, Disposition, ExclusionReason, FORMAT_VERSION,
@@ -18,35 +18,6 @@ use std::path::Path;
 type Result<T> = std::result::Result<T, ScipCaptureError>;
 
 impl Descriptor {
-    /// The admitted run's controlled context policy, or full captured context.
-    /// Supplied batches, pickups and the synthetic stand-in cannot narrow input dependencies.
-    pub fn context_profile(&self) -> Result<Option<crate::producer::profiles::Row>> {
-        use crate::producer::{ProducerName, TrustProfile, profiles};
-        let Some(generation) = self.generation.as_ref() else {
-            return Ok(None);
-        };
-        if generation.origin == GenerationOrigin::OwnerPickup {
-            if generation.trust_profile.is_some() {
-                return Err(admission("generation trust profile"));
-            }
-            return Ok(None);
-        }
-        let trust = match generation.trust_profile {
-            Some(GenerationTrust::Restricted) => TrustProfile::Restricted,
-            Some(GenerationTrust::Trusted) => TrustProfile::Trusted,
-            None => return Err(admission("generation trust profile")),
-        };
-        let pinned = self.check_producer()?;
-        if pinned.name == profiles::STUB_NAME {
-            return Ok(None);
-        }
-        let producer =
-            ProducerName::parse(&pinned.name).ok_or_else(|| admission("producer profile pin"))?;
-        profiles::row(profiles::Target::Real(producer), trust)
-            .map(Some)
-            .map_err(|_| admission("generation trust profile"))
-    }
-
     /// Generation-origin rule: an external import carries a null `generation`; a generated one
     /// carries exactly the origin and ID of its job.
     pub fn check_origin(&self, origin: ImportOrigin, generation_id: Option<&str>) -> Result<()> {

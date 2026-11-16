@@ -12,6 +12,7 @@ pub use crate::producer_pin::{
     PinnedProducer, pinned_producer, pinned_producer_by_id, producer_languages,
     reference_install_method,
 };
+pub use crate::producer_profiles::STUB_PRODUCER;
 pub use crate::scip_vocab::{REFERENCE_TRUST_ORIGIN, SYNTHETIC_TRUST_ORIGIN};
 pub(crate) use crate::scip_vocab::{admission, order, path};
 
@@ -20,9 +21,6 @@ pub(crate) use crate::scip_vocab::{admission, order, path};
 pub fn run_languages(producer_id: &str) -> Option<&'static [&'static str]> {
     producer_languages(producer_id).or_else(|| (producer_id == STUB_PRODUCER).then(stub_languages))
 }
-
-/// The id of the test-support stand-in producer.
-pub const STUB_PRODUCER: &str = "trellis-synthetic-scip";
 
 /// The languages the test-support stub producer's runs cover: one language.
 pub fn stub_languages() -> &'static [&'static str] {
