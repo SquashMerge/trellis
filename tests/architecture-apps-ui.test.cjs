@@ -5,7 +5,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const read = file => fs.readFileSync(path.join(__dirname, "..", file), "utf8");
-const pinSource = read("web/index-pin.js");
+// With the checks the controller shares with the Herdr mod (dto-core.js), which it reads when an answer arrives.
+const pinSource = read("web/index-pin.js") + "\n" + read("web/dto-core.js");
 const pin = {indexGeneration:"12345678-1234-4123-8123-123456789abc",indexRevision:1};
 const descendants = node => [node, ...node.children.flatMap(descendants)];
 const text = node => descendants(node).map(item => item.textContent).join(" ");

@@ -6,7 +6,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const {APP_SCRIPTS} = require("./support/app-scripts.js");
 const vm = require("node:vm");
-const source = ["index-pin.js", "source-witness.js", "sequence-model.js", "sequence.js", "shell.js", ...APP_SCRIPTS].map(file => fs.readFileSync(path.join(__dirname, "../web", file), "utf8")).join("\n");
+const source = ["index-pin.js", "dto-core.js", "source-witness.js", "sequence-model.js", "sequence.js", "shell.js", ...APP_SCRIPTS].map(file => fs.readFileSync(path.join(__dirname, "../web", file), "utf8")).join("\n");
 const KEY = "trellis.daemonToken.v1";
 const ROOT = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SCOPED = `/api/checkouts/${ROOT}`;

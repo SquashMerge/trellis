@@ -8,8 +8,8 @@ A [Herdr app](https://herdr.dev) mod that shows Trellis in a pane beside the cod
 
 Both views follow the file selected in the `trellis-files` panel. The pane talks to the Trellis daemon on the machine the shown space lives on.
 
-- `src/main.js` is the pane: the followed checkout with a pin, index status, typed error states, the diagram and the layer list.
-- `src/client.js` is the daemon client: routes, the two transports (`fetch` here, `trellis api` elsewhere) and typed errors.
+- `src/main.js` is the pane: what starts, frames and closes it (the header, the status line, typed error states). The rest of the pane's methods are in five files, which `main.js` installs on its class unchanged: `src/checkout.js` (the followed checkout with a pin, and index status), `src/agent-show.js` (an agent's `trellis_show`), `src/architecture-view.js` (the Architecture read, the drawing, the file card and the layer list), `src/deviations.js` (the Deviations tree's read) and `src/sequence-view.js` (the Sequence tab). `src/common.js` holds the intervals, bounds and small helpers they share.
+- `src/client.js` is the daemon client: routes, the two transports (`fetch` here, `trellis api` elsewhere) and typed errors. Its pin and answer checks wrap the browser's own (`web/index-pin.js`, `web/dto-core.js`, bundled unchanged) with the pane's typed errors and words.
 - `src/diagram.js` draws Architecture. It uses the browser's own `web/architecture-pele.js`, the `web/pele-svg.js` it reads, `web/metric-heat.js`, `web/architecture-display.js` (`createDisplay`), `web/architecture-apps.js`, `web/deviations-model.js` and the vendored Pele, bundled unchanged, and reads the colour tokens and the Color by choices from `web/style.css` and `web/index.html` at build time.
 - `src/architecture-ui.js` lays out the Architecture tab's native parts: controls, switcher, column headers, interface cards, legend, inspector and Deviations tree.
 - `src/sequence.js` draws Sequence. It uses `web/sequence-pele.js` and the helpers in `web/sequence-model.js`, with the `web/source-witness.js` they both read and the `web/pele-svg.js` the adapter reads, bundled unchanged.
