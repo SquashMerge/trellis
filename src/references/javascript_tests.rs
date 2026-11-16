@@ -231,13 +231,8 @@ fn default_import_bindings_shadow_commonjs_names_and_charge_like_named_imports()
     assert_eq!(write.writes, BTreeSet::from(["value".to_string()]));
 }
 
-/// Index `files` and hand the test a resolver over them, with `config` as the root
-/// tsconfig of the one source set.
-fn script_fixture(
-    files: &[(&str, &str)],
-    config: Option<&str>,
-    test: impl FnOnce(&mut Resolver<'_>, &dyn Fn(&str) -> usize, &mut Work),
-) {
+/// Index `files` into the catalog's document inputs, in key order.
+fn indexed(files: &[(&str, &str)]) -> Vec<DocumentInput> {
     let root = tempfile::tempdir().unwrap();
     for (path, text) in files {
         let path = root.path().join(path);
@@ -281,6 +276,16 @@ fn script_fixture(
         })
         .collect();
     documents.sort_by(|a, b| a.key.cmp(&b.key));
+    documents
+}
+/// Index `files` and hand the test a resolver over them, with `config` as the root
+/// tsconfig of the one source set.
+fn script_fixture(
+    files: &[(&str, &str)],
+    config: Option<&str>,
+    test: impl FnOnce(&mut Resolver<'_>, &dyn Fn(&str) -> usize, &mut Work),
+) {
+    let documents = indexed(files);
     let docs: Vec<_> = documents.iter().collect();
     let trees: Vec<_> = docs
         .iter()
@@ -859,4 +864,117 @@ fn typescript_dotted_namespace_unknown_set() {
             assert!(resolver.units[&dotted].unknown_set, "dotted namespace");
         },
     );
+}
+
+/// Where a build stops on its budget is a stability rule: the same documents charge the
+/// same steps, so the same budget stops them at the same step with the same error.
+#[test]
+fn catalog_build_and_site_resolution_charge_exact_steps() {
+    const BUILD: usize = 1024;
+    let documents = indexed(&[
+        (
+            "use.js",
+            "import { value } from './provider.js';\n\
+             export * from './provider.js';\n\
+             export * from './other.js';\n\
+             value();\n",
+        ),
+        ("provider.js", "export function value() {}\n"),
+        (
+            "other.js",
+            "import { value } from './provider.js';\nexport const other = value;\n",
+        ),
+    ]);
+    let docs: Vec<_> = documents.iter().collect();
+    let trees: Vec<_> = docs
+        .iter()
+        .map(|doc| parse(doc, &mut || Ok(())).unwrap())
+        .collect();
+    assert!(trees.iter().all(|tree| !tree.root_node().has_error()));
+    let document_map: BTreeMap<_, _> = docs
+        .iter()
+        .enumerate()
+        .map(|(i, doc)| (doc.key.clone(), i))
+        .collect();
+    let selected: Vec<_> = (0..docs.len()).collect();
+    let build = |limit, workers| {
+        let mut work = Work::new(limit);
+        let mut check = || Ok(());
+        let request = parallel_check::RequestCheck::new(&mut check);
+        let catalog = Catalog::new(
+            &docs,
+            &trees,
+            &document_map,
+            &selected,
+            &external::JavascriptPackages::default(),
+            &js_workspace::Workspaces::default(),
+            None,
+            &mut work,
+            &request,
+            workers,
+        );
+        (catalog, work)
+    };
+    let (catalog, mut work) = build(work::reference_limit(docs.len(), 0), 1);
+    let catalog = catalog.unwrap();
+    assert_eq!(work.used, BUILD);
+
+    let source = docs
+        .iter()
+        .position(|doc| doc.key.path == "use.js")
+        .unwrap();
+    let sites = extract(docs[source], &trees[source], &mut work, &mut || Ok(())).unwrap();
+    let extracted = work.used - BUILD;
+    let resolved: Vec<_> = sites
+        .iter()
+        .map(|site| {
+            let before = work.used;
+            catalog
+                .resolve(
+                    source,
+                    site,
+                    &mut BTreeMap::new(),
+                    &mut work,
+                    &mut || Ok(()),
+                )
+                .unwrap();
+            (site.spelling.as_str(), work.used - before)
+        })
+        .collect();
+    assert_eq!(extracted, 75);
+    assert_eq!(
+        resolved,
+        [
+            ("'./provider.js'", 2),
+            ("export * from './provider.js';", 3),
+            ("export * from './other.js';", 4),
+        ]
+    );
+
+    // Every budget short of the build's charge fails typed, and which error it is depends
+    // only on the budget: two workers' hazard counts are admitted against the request total.
+    let mut stops = Vec::<(String, usize)>::new();
+    for limit in 0..BUILD {
+        let (stopped, _) = build(limit, 2);
+        let error = stopped.err().expect("budget stop").to_string();
+        match stops.last_mut() {
+            Some((last, budgets)) if *last == error => *budgets += 1,
+            _ => stops.push((error, 1)),
+        }
+    }
+    let stops: Vec<_> = stops
+        .iter()
+        .map(|(error, budgets)| (error.as_str(), *budgets))
+        .collect();
+    assert_eq!(
+        stops,
+        [
+            ("bounded_work: reference owner lookup", 224),
+            ("bounded_work: reference work total", 12),
+            ("bounded_work: reference owner lookup", 788),
+        ]
+    );
+    let (catalog, work) = build(BUILD, 2);
+    assert!(catalog.is_ok());
+    assert_eq!(work.used, BUILD);
 }
