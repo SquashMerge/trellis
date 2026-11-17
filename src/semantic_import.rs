@@ -63,9 +63,6 @@ pub(crate) use staged::JoinContinuation;
 #[cfg(feature = "test-support")]
 pub(crate) use staged::cursor_sql as staged_cursor_sql;
 pub use staged::join_staged;
-pub(crate) use staged::publication::read_documents as read_staged_documents;
-#[cfg(feature = "test-support")]
-pub(crate) use staged::publication::statements as staged_publication_statements;
 #[cfg(feature = "test-support")]
 pub(crate) use staged::target_callable_sql as staged_target_callable_sql;
 #[cfg(test)]
