@@ -1202,17 +1202,11 @@ fn conventional_roots(table: &toml::map::Map<String, toml::Value>) -> Option<(bo
         }),
         None => package.get("autolib").and_then(toml::Value::as_bool) != Some(false),
     };
-    let bin = match table.get("bin") {
-        Some(bins) => bins.as_array().is_some_and(|bins| {
-            bins.iter().any(|bin| {
-                bin.as_table().is_some_and(|bin| match bin.get("path") {
-                    Some(path) => path.as_str() == Some("src/main.rs"),
-                    None => bin.get("name").and_then(toml::Value::as_str) == Some(name),
-                })
-            })
-        }),
-        None => package.get("autobins").and_then(toml::Value::as_bool) != Some(false),
-    };
+    // Cargo builds `src/main.rs` beside an explicit `[[bin]]` list unless discovery is off or
+    // a `[[bin]]` takes its name (#1190); the workspace model decides it for both readers.
+    let bin = super::cargo_workspace::main_root("", table, table)
+        .flatten()
+        .is_some();
     Some((lib, bin))
 }
 
@@ -1581,5 +1575,50 @@ target_wire={package='target-upstream',version='4'}",
             crate::references::work::reference_limit(1, input.bytes.as_ref().map_or(0, Vec::len));
         let packages = RustPackages::new(&[input], &mut Work::new(limit), &mut || Ok(())).unwrap();
         assert!(packages.resolve("source-set:test", "wire", true).is_none());
+    }
+
+    /// Cargo builds `src/main.rs` beside an explicit `[[bin]]` list unless discovery is off or
+    /// a `[[bin]]` takes the package's name for another file (#1190).
+    #[test]
+    fn src_main_keeps_attribution_beside_an_explicit_bin_list() {
+        let main_allowed = |targets: &str| {
+            let input = manifest(&format!(
+                "[package]\nname='fixture'\nversion='1.0.0'\n{targets}\n[dependencies]\nwire={{package='upstream-wire',version='1'}}"
+            ));
+            let limit = crate::references::work::reference_limit(
+                1,
+                input.bytes.as_ref().map_or(0, Vec::len),
+            );
+            let packages =
+                RustPackages::new(&[input], &mut Work::new(limit), &mut || Ok(())).unwrap();
+            assert!(
+                packages.root_allowed("source-set:test", "src/lib.rs"),
+                "{targets}"
+            );
+            packages.root_allowed("source-set:test", "src/main.rs")
+        };
+        let stub = "[[bin]]\nname='stub'\npath='src/bin/stub.rs'";
+        for allowed in [
+            format!("edition='2024'\n{stub}"),
+            format!("autobins=true\n{stub}"),
+            format!("edition.workspace=true\n{stub}\n[workspace.package]\nedition='2021'"),
+            // A `[[bin]]` naming `src/main.rs` by path or by the package's name.
+            format!("edition='2015'\n{stub}\n[[bin]]\nname='fixture'\npath='./src/main.rs'"),
+            format!("{stub}\n[[bin]]\nname='fixture'"),
+        ] {
+            assert!(main_allowed(&allowed), "{allowed}");
+        }
+        for refused in [
+            format!("edition='2024'\nautobins=false\n{stub}"),
+            // Edition 2015 turns discovery off once any `[[bin]]` is listed.
+            stub.to_owned(),
+            format!("edition='2015'\n{stub}"),
+            format!("edition.workspace=true\n{stub}\n[workspace.package]\nedition='2015'"),
+            format!("edition=2021\n{stub}"),
+            // A `[[bin]]` with the package's name and another path replaces it.
+            "edition='2021'\n[[bin]]\nname='fixture'\npath='src/bin/other.rs'".to_owned(),
+        ] {
+            assert!(!main_allowed(&refused), "{refused}");
+        }
     }
 }
