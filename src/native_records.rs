@@ -1,14 +1,18 @@
 //! The persisted native evidence records and their leaf vocabulary.
 //!
-//! Plain data, the producer constants and the pure lookup-key functions only: extraction,
-//! validation (`impl Artifact`), witnesses and the spool stay in `native_evidence`, which
-//! re-exports these names.
+//! Plain data, the producer constants, the pure lookup-key functions, the declared
+//! extraction-input inventory with the extraction contexts, and the document witness:
+//! extraction, validation (`impl Artifact`), revision headers and the spool stay in
+//! `native_evidence`, which re-exports the record names.
 
+use crate::native_ids::{canonical, digest, extraction_context};
 use crate::search_card_records::CapturedCard;
 use anyhow::{Context, Result, ensure};
 use icu_normalizer::ComposingNormalizerBorrowed;
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 
 fn required_nullable<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
 where
@@ -388,4 +392,252 @@ pub fn verified_callee_lookup(language: &str, call: &Call, source: &str) -> Opti
     (token == spelling)
         .then(|| lookup(language, token).ok())
         .flatten()
+}
+/// The native producer's declared extraction-input inventory (Decision 0003), keyed by its
+/// descriptor `(id, version)` and language. `extract` measures one document from only its own
+/// bytes, language and path; the tree-sitter grammars and Unicode normalization tables it uses
+/// are compiled into the executable and fixed by `NATIVE_VERSION`. It reads no configuration,
+/// toolchain or dependency capture, and no other source document, so every language declares
+/// the explicit empty inventory. An unlisted descriptor or language has no declaration.
+type LanguageInventory = (&'static str, &'static [&'static str]);
+pub(crate) const EXTRACTION_INPUTS: &[(&str, &str, &[LanguageInventory])] = &[(
+    PRODUCER,
+    NATIVE_VERSION,
+    &[
+        ("java", &[]),
+        ("rust", &[]),
+        ("python", &[]),
+        ("javascript", &[]),
+        ("typescript", &[]),
+    ],
+)];
+
+// Private unit-test fault injection only. Integration tests compile the ordinary
+// library, and release builds have no override, branch, or alternate inventory.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum ExtractionAuthFault {
+    Undeclared,
+    Mismatched,
+}
+#[cfg(test)]
+thread_local! {
+    static EXTRACTION_AUTH_FAULT: std::cell::RefCell<Option<(String, String, ExtractionAuthFault)>> =
+        const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(crate) struct ExtractionAuthFaultGuard;
+#[cfg(test)]
+impl Drop for ExtractionAuthFaultGuard {
+    fn drop(&mut self) {
+        EXTRACTION_AUTH_FAULT.with(|fault| *fault.borrow_mut() = None);
+    }
+}
+/// The calling thread's injected fault, so parallel workers see the same
+/// fault as the sequential code would.
+#[cfg(test)]
+pub(crate) type ExtractionAuthFaultSnapshot = Option<(String, String, ExtractionAuthFault)>;
+#[cfg(test)]
+pub(crate) fn extraction_auth_fault_snapshot() -> ExtractionAuthFaultSnapshot {
+    EXTRACTION_AUTH_FAULT.with(|slot| slot.borrow().clone())
+}
+/// Install `snapshot` on this thread until the returned scope drops.
+#[cfg(test)]
+pub(crate) fn enter_extraction_auth_fault(
+    snapshot: &ExtractionAuthFaultSnapshot,
+) -> ExtractionAuthFaultScope {
+    ExtractionAuthFaultScope(EXTRACTION_AUTH_FAULT.with(|slot| slot.replace(snapshot.clone())))
+}
+#[cfg(test)]
+pub(crate) struct ExtractionAuthFaultScope(ExtractionAuthFaultSnapshot);
+#[cfg(test)]
+impl Drop for ExtractionAuthFaultScope {
+    fn drop(&mut self) {
+        EXTRACTION_AUTH_FAULT.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
+}
+#[cfg(test)]
+pub(crate) fn inject_extraction_auth_fault(
+    revision: &str,
+    language: &str,
+    fault: ExtractionAuthFault,
+) -> ExtractionAuthFaultGuard {
+    EXTRACTION_AUTH_FAULT.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "nested extraction authentication injection"
+        );
+        *slot.borrow_mut() = Some((revision.to_owned(), language.to_owned(), fault));
+    });
+    ExtractionAuthFaultGuard
+}
+/// Authenticate the declared inventory of `producer` for `language` against the captured
+/// revision and derive the document's extraction context. This is the fail-closed
+/// precondition for minting any `occ:v2` ID: an undeclared descriptor/language or a declared
+/// component without a valid captured revision digest refuses, and nothing is minted.
+pub(crate) fn native_extraction_context(
+    producer: &Producer,
+    language: &str,
+    revision: &Revision,
+) -> Result<String> {
+    #[cfg(test)]
+    if let Some(fault) = EXTRACTION_AUTH_FAULT.with(|slot| {
+        slot.borrow().as_ref().and_then(|(id, lang, fault)| {
+            (id == &revision.id && lang == language).then_some(*fault)
+        })
+    }) {
+        return match fault {
+            ExtractionAuthFault::Undeclared => {
+                anyhow::bail!("undeclared native extraction-input inventory")
+            }
+            ExtractionAuthFault::Mismatched => authenticated_extraction_context(
+                language,
+                &["config"],
+                &[("config", Some(b"test-only mismatched captured config"))],
+                revision,
+            ),
+        };
+    }
+    let inventory = declared_extraction_inputs(&producer.id, &producer.version, language)?;
+    // The v4 parser reads no external component: all grammars and normalization tables are
+    // fixed in this executable. Other captured inputs affect revision admission, not syntax.
+    authenticated_extraction_context(language, inventory, &[], revision)
+}
+pub(crate) fn declared_extraction_inputs(
+    producer_id: &str,
+    producer_version: &str,
+    language: &str,
+) -> Result<&'static [&'static str]> {
+    EXTRACTION_INPUTS
+        .iter()
+        .find(|(id, version, _)| *id == producer_id && *version == producer_version)
+        .and_then(|(_, _, languages)| languages.iter().find(|(l, _)| *l == language))
+        .map(|(_, inventory)| *inventory)
+        .context("undeclared native extraction-input inventory")
+}
+
+/// Verify the descriptor's declared inventory before matching a stored witness.
+/// This v4 producer declares no external per-document inputs. Should a future
+/// producer declare any, selected reuse MUST supply captured bytes rather than
+/// silently comparing against the old empty extraction context.
+pub(crate) fn declared_selected_extraction_context(
+    producer_id: &str,
+    producer_version: &str,
+    language: &str,
+) -> Result<String> {
+    let inventory = declared_extraction_inputs(producer_id, producer_version, language)?;
+    selected_extraction_context_for_inventory(language, inventory)
+}
+
+pub(crate) fn selected_extraction_context_for_inventory(
+    language: &str,
+    inventory: &[&str],
+) -> Result<String> {
+    ensure!(
+        inventory.is_empty(),
+        "external native extraction inputs require captured selected-reuse proof"
+    );
+    extraction_context(language, &[])
+}
+
+pub(crate) fn authenticated_extraction_context(
+    language: &str,
+    inventory: &[&str],
+    observed: &[(&str, Option<&[u8]>)],
+    revision: &Revision,
+) -> Result<String> {
+    let mut declared = BTreeSet::new();
+    for name in inventory {
+        ensure!(
+            matches!(*name, "toolchain" | "config" | "dependency") && declared.insert(*name),
+            "unsupported or duplicate native extraction component: {name}"
+        );
+    }
+    let mut captured = BTreeMap::new();
+    for (name, bytes) in observed {
+        ensure!(
+            declared.contains(name) && captured.insert(*name, *bytes).is_none(),
+            "undeclared or duplicate captured native extraction component: {name}"
+        );
+    }
+    let mut components = Vec::with_capacity(inventory.len());
+    for name in inventory {
+        let bytes = captured
+            .get(name)
+            .context("absent native extraction component capture")?
+            .context("absent native extraction component bytes")?;
+        let expected = match *name {
+            "toolchain" => &revision.toolchain_hash,
+            "config" => &revision.config_hash,
+            "dependency" => &revision.dependency_hash,
+            _ => unreachable!(),
+        };
+        ensure!(
+            valid_hash(expected) && hash(bytes) == *expected,
+            "mismatched native extraction component: {name}"
+        );
+        components.push(((*name).to_owned(), expected.clone()));
+    }
+    components.sort();
+    extraction_context(language, &components)
+}
+pub(crate) fn hash(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+pub(crate) fn valid_hash(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+pub(crate) fn stable_witness_rows<'a, T: Serialize + 'a>(
+    items: impl IntoIterator<Item = &'a T>,
+) -> Result<Vec<Value>> {
+    let mut facts: Vec<Value> = items
+        .into_iter()
+        .map(|item| {
+            let mut value = serde_json::to_value(item)?;
+            if let Some(object) = value.as_object_mut() {
+                object.remove("revisionId");
+                object.remove("provenanceId");
+            }
+            Ok(value)
+        })
+        .collect::<Result<_>>()?;
+    // Canonicalization walks and sorts nested JSON. Compute each sort key
+    // once; recalculating it for every comparison dominates reuse checks.
+    facts.sort_by_cached_key(canonical);
+    Ok(facts)
+}
+
+/// Canonical evidence checksum for a document version. Revision-scoped proof IDs are
+/// deliberately projected at the requested pin rather than stored in this witness.
+/// The caller must independently bind source bytes, producer and manifest identity.
+#[allow(clippy::too_many_arguments)] // Bind each measured family explicitly to the document witness.
+pub(crate) fn document_witness<'a>(
+    document: &Document,
+    producer: &Producer,
+    coverage: &Coverage,
+    declarations: impl IntoIterator<Item = &'a Declaration>,
+    calls: impl IntoIterator<Item = &'a Call>,
+    regions: impl IntoIterator<Item = &'a ControlRegion>,
+    references: impl IntoIterator<Item = &'a Reference>,
+    capability_report: &CapabilityReport,
+) -> Result<String> {
+    let mut coverage = serde_json::to_value(coverage)?;
+    coverage
+        .as_object_mut()
+        .context("invalid coverage")?
+        .remove("revisionId");
+    Ok(digest(
+        b"trellis.native-version-witness.v1\0",
+        &canonical(&json!({
+            "documentKey": document.key, "contentHash": document.content_hash,
+            "byteLength": document.byte_length, "producerId": producer.id,
+            "producerVersion": producer.version,
+            "extractionContext": extraction_context(&document.key.language, &[])?,
+            "coverage": coverage, "declarations": stable_witness_rows(declarations)?,
+            "calls": stable_witness_rows(calls)?, "regions": stable_witness_rows(regions)?,
+            "references": stable_witness_rows(references)?, "capabilityReports": stable_witness_rows(std::slice::from_ref(capability_report))?,
+        })),
+    ))
 }

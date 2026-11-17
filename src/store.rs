@@ -3950,7 +3950,7 @@ fn publication_native_witness(
     coverage: &crate::native_records::Coverage,
     grouped: &PublicationRows<'_>,
 ) -> Result<String> {
-    crate::native_evidence::document_witness(
+    crate::native_records::document_witness(
         document,
         producer,
         coverage,
@@ -4172,7 +4172,7 @@ fn v8_document_projection(
     native: &crate::native_records::Artifact,
     grouped: &PublicationRows<'_>,
 ) -> Result<V8DocumentProjection> {
-    let context = crate::native_evidence::native_extraction_context(
+    let context = crate::native_records::native_extraction_context(
         &native.producer,
         &file.language,
         &native.revision,
@@ -8045,7 +8045,7 @@ fn write_native(
                 .take()
                 .unwrap_or_else(|| v8_document_projection(file, a, grouped))?
         };
-        let context = crate::native_evidence::native_extraction_context(
+        let context = crate::native_records::native_extraction_context(
             &a.producer,
             &file.language,
             &a.revision,
@@ -9237,7 +9237,7 @@ fn compare_capture_snapshot_inner(
                     && producer == crate::native_records::PRODUCER
                     && version == crate::native_records::NATIVE_VERSION
                     && context
-                        == &crate::native_evidence::declared_selected_extraction_context(
+                        == &crate::native_records::declared_selected_extraction_context(
                             producer,
                             version,
                             &source.language,
@@ -14625,7 +14625,7 @@ impl Store {
                 && length == bytes.len() as i64
                 && hash == hex::encode(Sha256::digest(&bytes))
                 && context
-                    == crate::native_evidence::declared_selected_extraction_context(
+                    == crate::native_records::declared_selected_extraction_context(
                         &producer_id,
                         &producer_version,
                         &file.language,
@@ -14682,7 +14682,7 @@ impl Store {
         let control_regions = read_native_control_regions_v8(db, &scope, None)?;
         let references = read_native_references(db, &scope, None)?;
         let capability_report = read_native_capability_report(db, &scope)?;
-        let observed = crate::native_evidence::document_witness(
+        let observed = crate::native_records::document_witness(
             &document,
             &producer,
             &coverage,
@@ -15173,7 +15173,7 @@ impl Store {
                 selected_ensure!(length >= 0 && hash.len() == 64,
                     "incompatible_index: prior captured source witness mismatch");
                 selected_ensure!(id == producer_id && version == producer_version
-                    && context == crate::native_evidence::declared_selected_extraction_context(
+                    && context == crate::native_records::declared_selected_extraction_context(
                         &id, &version, &language,
                     )?
                     && class_id.is_some() && class_hash.is_some(),
@@ -15533,7 +15533,7 @@ impl Store {
                         && producer_id == prepared.native.producer.id
                         && producer_version == prepared.native.producer.version
                         && context
-                            == crate::native_evidence::native_extraction_context(
+                            == crate::native_records::native_extraction_context(
                                 &prepared.native.producer,
                                 &language,
                                 &prepared.native.revision,

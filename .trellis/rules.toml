@@ -123,7 +123,8 @@ paths = [
   # The stored search-card records and their eligibility predicate (S1b, #1000).
   "src/search_card_records.rs",
   # The persisted native evidence records, the producer constants and the pure lookup-key
-  # functions (S2, #1001). Extraction, validation and the spool stay in native_evidence.rs.
+  # functions (S2, #1001); the extraction-input inventory, the extraction contexts and the
+  # document witness (S15). Extraction, validation and the spool stay in native_evidence.rs.
   "src/native_records.rs",
   # Card preparation and serialization over shared records and native_ids only; storage
   # renders stored cards with it (S2, #1001). Capture stays in search_capture.rs.
