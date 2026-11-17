@@ -1570,7 +1570,7 @@ impl EvidenceResponse {
         &self,
         pin: Option<IndexPin>,
         check: &mut (impl FnMut() -> Result<()> + Send),
-    ) -> Result<crate::references::Snapshot> {
+    ) -> Result<crate::architecture_inputs::Snapshot> {
         self.architecture_snapshot_regions(pin, check, &|_, _| {})
             .map(|(snapshot, _)| snapshot)
     }
@@ -1582,7 +1582,7 @@ impl EvidenceResponse {
         check: &mut (impl FnMut() -> Result<()> + Send),
         progress: &dyn Fn(usize, usize),
     ) -> Result<(
-        crate::references::Snapshot,
+        crate::architecture_inputs::Snapshot,
         Vec<Vec<crate::native_records::ControlRegion>>,
     )> {
         use crate::native_records::DocumentKey;
@@ -1713,7 +1713,7 @@ impl EvidenceResponse {
                     "incompatible_index: architecture language mismatch"
                 );
                 regions.push(fetched.regions);
-                documents.push(crate::references::DocumentInput {
+                documents.push(crate::architecture_inputs::DocumentInput {
                     key,
                     file: fetched.file,
                     declarations: fetched.declarations,
@@ -1815,7 +1815,7 @@ impl EvidenceResponse {
             };
             manifests.insert(
                 path.to_owned(),
-                crate::references::external::ManifestInput {
+                crate::architecture_inputs::ManifestInput {
                     source_set_id: source_set_id.clone(),
                     native_revision_id: native_revision_id.clone(),
                     dependency_hash: dependency_hash.clone(),
@@ -1875,7 +1875,7 @@ impl EvidenceResponse {
             SelectedIntegrity("incompatible_index: corrupt retained config".into()),
         )?;
         check()?;
-        let mut root_tsconfig: Option<crate::references::tsconfig::RootTsconfigInput> = None;
+        let mut root_tsconfig: Option<crate::architecture_inputs::RootTsconfigInput> = None;
         for entry in configs {
             check()?;
             let ConfigEntry {
@@ -1939,7 +1939,7 @@ impl EvidenceResponse {
                     manifests
                         .insert(
                             path.to_owned(),
-                            crate::references::external::ManifestInput {
+                            crate::architecture_inputs::ManifestInput {
                                 source_set_id: source_set_id.clone(),
                                 native_revision_id: native_revision_id.clone(),
                                 dependency_hash: dependency_hash.clone(),
@@ -1953,7 +1953,7 @@ impl EvidenceResponse {
                 );
                 continue;
             }
-            root_tsconfig = Some(crate::references::tsconfig::RootTsconfigInput {
+            root_tsconfig = Some(crate::architecture_inputs::RootTsconfigInput {
                 source_set_id: source_set_id.clone(),
                 path: path.to_owned(),
                 bytes,
@@ -1962,7 +1962,7 @@ impl EvidenceResponse {
         semantic_display::architecture_semantic(&self.db, &selected.key, &mut documents, check)?;
         check()?;
         Ok((
-            crate::references::Snapshot {
+            crate::architecture_inputs::Snapshot {
                 pin: selected.pin,
                 documents,
                 manifests: manifests.into_values().collect(),
