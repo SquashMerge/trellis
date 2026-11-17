@@ -23,6 +23,10 @@ const NON_EXTRACTION_ITEMS: &[(&str, &str)] = &[
         "the admitted inputs; source bytes enter facts only through per-document content hashes",
     ),
     (
+        "store::admitted_capture::AdmittedCapture",
+        "storage's trait over the admitted inputs above: the same reads, by delegation",
+    ),
+    (
         "capture::ROOT_CONFIG_INPUTS",
         "revision-header config inputs, captured and compared per revision",
     ),
