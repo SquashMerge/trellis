@@ -8,11 +8,12 @@
 /// these modules uses a crate module that is neither listed here nor named in
 /// its explicit non-extraction allowlist.
 ///
-/// - `native_evidence`: tree-sitter measurement, witnesses, revision headers.
+/// - `native_evidence`: tree-sitter measurement, revision headers.
 /// - `native_evidence/extract`, `native_evidence/validate`: the per-document walk and the
 ///   structural checks, moved out of `native_evidence`.
-/// - `native_records`: the native record types, the producer descriptor constants and the
-///   lookup-key normalization, moved out of `native_evidence`.
+/// - `native_records`: the native record types, the producer descriptor constants, the
+///   lookup-key normalization, the extraction-input inventory and contexts and the document
+///   witness, moved out of `native_evidence`.
 /// - `native_ids`: canonical JSON, digests and ID minting.
 /// - `indexer*`: graph projection and per-language native kinds.
 /// - `classes`: class extraction and the class catalog.
