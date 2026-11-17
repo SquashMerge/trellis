@@ -5,13 +5,7 @@ pub(crate) use crate::jsonc::parse_jsonc;
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-/// The captured bytes of the selected root config of one source set.
-#[derive(Clone, Debug)]
-pub struct RootTsconfigInput {
-    pub source_set_id: String,
-    pub path: String,
-    pub bytes: Vec<u8>,
-}
+pub use crate::architecture_inputs::RootTsconfigInput;
 
 /// The reason reported for bare specifiers when the root config cannot be read.
 pub(super) const UNREADABLE: &str = "tsconfig_unreadable";
