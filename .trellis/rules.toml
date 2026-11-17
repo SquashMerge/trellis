@@ -78,7 +78,8 @@ order = 4
 paths = [
   "src/indexer.rs", "src/indexer_java.rs", "src/indexer_python.rs", "src/indexer_rust.rs",
   "src/indexer_ts.rs",
-  # A tree-sitter extractor run at capture time, plus the persisted Catalog record (#998).
+  # A tree-sitter extractor run at capture time (#998). The persisted Catalog record and its
+  # composition are in src/class_catalog.rs, shared (S13).
   "src/classes.rs", "src/classes/**",
   "src/index_coordinator.rs", "src/index_coordinator/**", "src/capture.rs", "src/watch.rs",
   "src/native_evidence.rs", "src/native_evidence/**", "src/native_capture.rs",
@@ -168,6 +169,11 @@ paths = [
   # model and native records. Storage builds them for one revision; the references read
   # (query) takes them in and re-exports them at their old paths.
   "src/architecture_inputs.rs",
+  # The class catalog's composition (S13): the persisted Catalog record, its limits and
+  # per-file summaries, the ordered bounded composer, the complete-catalog plan and the fit
+  # to the per-document budgets. Pure over model records and evidence_limits. Storage
+  # composes at publication; the tree-sitter extraction stays in src/classes.rs (indexing).
+  "src/class_catalog.rs",
   # The persisted producer records' vocabulary (S8 part 3, #1071): the producer-state error
   # codes and the process identity, exit, diagnostics, group status and failure summary that
   # `run.json` and run replies carry. Serde types and constants only, no I/O. Storage persists
