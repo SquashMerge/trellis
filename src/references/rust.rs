@@ -1267,7 +1267,9 @@ impl Catalog {
     /// or later is read the 2018 way alone. The root binds the name by an item, `extern
     /// crate` included, by a named import or possibly by a glob, or, when it cannot be read
     /// whole, by anything. The root's `std` and `core` are the crates of those names, as the
-    /// `extern crate` the compiler adds to a 2015 crate root binds them.
+    /// `extern crate` the compiler adds to a 2015 crate root binds them, even in a root that
+    /// cannot be read whole: a macro there defining another item of either name is not
+    /// detected.
     fn root_reading(
         &mut self,
         scope: usize,
