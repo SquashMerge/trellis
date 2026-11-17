@@ -16,6 +16,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub use crate::model::WatcherWitness;
+
 const MAX_DIRTY_PATHS: usize = 256;
 const QUIET: Duration = Duration::from_millis(75);
 const MAX_WAIT: Duration = Duration::from_millis(250);
@@ -36,19 +38,6 @@ pub struct WatcherHealth {
     degradations: AtomicU64,
     #[cfg(test)]
     after_load: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
-}
-
-/// One coherent reading of watcher health, for measurement (Decision 0009
-/// §5): watching stayed healthy between two readings only if they are equal
-/// and the first is native and not degraded. The current bit alone can
-/// return to healthy unseen, with a new epoch or between readings.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WatcherWitness {
-    pub epoch: u64,
-    pub native: bool,
-    pub degraded: bool,
-    pub degradations: u64,
 }
 
 impl std::fmt::Debug for WatcherHealth {
