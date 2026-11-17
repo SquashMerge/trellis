@@ -4,7 +4,7 @@
 //! producer module that executes.
 
 use super::Diagnostics;
-use serde::{Deserialize, Serialize};
+pub use crate::producer_records::Failure;
 
 /// The reason for a Node producer that V8 aborted at its heap limit.
 pub const NODE_HEAP_EXHAUSTED: &str = "node_heap_exhausted";
@@ -12,17 +12,6 @@ pub const NODE_HEAP_EXHAUSTED: &str = "node_heap_exhausted";
 pub const MAX_LINES: usize = 10;
 /// Each kept line is cut to at most this many bytes, on a character boundary.
 pub const MAX_LINE_BYTES: usize = 512;
-
-/// The `failure` of a run reply, `run.json` and `lastRun`.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct Failure {
-    pub reason: Option<String>,
-    /// `code <n>` or `signal <NAME>`.
-    pub exit: String,
-    pub peak_rss_bytes: u64,
-    pub stderr_lines: Vec<String>,
-}
 
 /// Producers that `node` runs; the test stub stands in for one.
 fn node_launched(producer: &str) -> bool {

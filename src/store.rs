@@ -6,6 +6,8 @@ pub(crate) mod captured_witness;
 pub(crate) mod id_codec;
 pub(crate) mod mcp_read;
 mod native_join_budget;
+pub(crate) mod producer_retention;
+pub(crate) mod producer_state;
 mod published_admission;
 #[cfg(feature = "test-support")]
 pub(crate) mod read_counters;
@@ -13253,7 +13255,7 @@ impl Store {
         for language in &descriptor.producer.languages {
             tx.execute("DELETE FROM semantic_reimport WHERE revision_id=?1 AND producer='' AND language=?2",params![next_key,language])?;
         }
-        crate::producer::retention::publish_run(&tx, &retained_state, &descriptor, &header_sha)?;
+        producer_retention::publish_run(&tx, &retained_state, &descriptor, &header_sha)?;
         search::publish_head(&tx, &next_key)?;
         let published_at = self.retention_time()?;
         stamp_predecessor(&tx, &old_key, published_at.as_secs() as i64)?;
@@ -14952,7 +14954,7 @@ impl Store {
         let mut db = db;
         let retained_state = match self.attach_retention(&db) {
             Ok(state) => Some(state),
-            Err(error) if crate::producer::retention::unavailable_catalog(&error) => {
+            Err(error) if producer_retention::unavailable_catalog(&error) => {
                 let _ = db.execute_batch("DETACH DATABASE retained");
                 None
             }
@@ -16270,7 +16272,7 @@ impl Store {
             // Retention is disposable. An unavailable catalog cannot block native recovery.
             let retained_state = match self.attach_retention(&db) {
                 Ok(state) => Some(state),
-                Err(error) if crate::producer::retention::unavailable_catalog(&error) => {
+                Err(error) if producer_retention::unavailable_catalog(&error) => {
                     let _ = db.execute_batch("DETACH DATABASE retained");
                     None
                 }

@@ -19,7 +19,6 @@ store-open src/native_evidence_full_document_spool_tests.rs * -- no daemon, regi
 store-open src/native_evidence_parallel_extraction_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
 store-open src/producer/batch_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
 store-open src/producer/plan_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
-store-open src/producer/retention.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
 store-open src/producer/run_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
 store-open src/semantic_import/staged/continuation.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
 store-open src/store/admit_once_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
@@ -28,6 +27,7 @@ store-open src/store/corruption_recovery_tests.rs * -- no daemon, registry or Tr
 store-open src/store/mcp_read.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
 store-open src/store/preflight_hash_reuse_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
 store-open src/store/prior_corruption_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
+store-open src/store/producer_retention.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
 store-open src/store/rebuild_in_progress_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
 store-open src/store/recreate_spool_tests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner
 store-open src/store/requests.rs * -- no daemon, registry or Trellis child: the test's own code is the only index owner

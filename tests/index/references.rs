@@ -2631,9 +2631,12 @@ fn references_rust_public_local_star_forwarding_survives_dependency_star() {
         ("src/facade.rs", "pub use crate::origin::*; pub use dep::*;"),
         ("src/origin.rs", "pub fn a() {}"),
     ]);
+    // Edition 2018 or later: in a 2015 crate `dep::*` would start at the crate root, whose
+    // glob could bind `dep` (#1166).
     retain_rust_manifest(
         &mut input,
-        b"[package]\nname = 'fixture'\nversion = '0.1.0'\n[dependencies]\ndep = '1'\n",
+        b"[package]\nname = 'fixture'\nversion = '0.1.0'\nedition = '2021'\n\
+          [dependencies]\ndep = '1'\n",
     );
     let data = project_rust_source(&input, 20);
     assert!(has_edge(&data, "src/lib.rs", "src/origin.rs"), "{data}");
@@ -8642,4 +8645,249 @@ fn references_rust_reexport_sharing_a_name_stays_unknown_without_a_proved_module
             );
         }
     }
+}
+
+/// The crate of #1166: in edition 2015 the `use` path `other::differs` inside `parent`
+/// starts at the crate root and names the root's `other::differs`; from edition 2018 it
+/// starts in `parent` and names the child's. The crate compiles under both.
+const ROOT_AND_CHILD_BIND_OTHER: [(&str, &str); 5] = [
+    ("src/lib.rs", "mod other; mod parent; mod caller;"),
+    ("src/other.rs", "pub fn differs() -> u8 { 1 }"),
+    ("src/parent.rs", "mod other;\npub use other::differs;"),
+    ("src/parent/other.rs", "pub fn differs() -> bool { false }"),
+    (
+        "src/caller.rs",
+        "pub fn selected() { let _ = crate::parent::differs(); }",
+    ),
+];
+const PACKAGE: &str = "[package]\nname = 'fixture'\nversion = '0.1.0'\n";
+
+/// Asserts that neither reading of `other::differs` in `parent` is chosen.
+fn assert_neither_reading(data: &Value, case: &str) {
+    let unresolved = unresolved_spellings(data);
+    for spelling in ["crate::parent::differs", "other::differs"] {
+        assert!(unresolved.contains(&spelling), "{case}: {spelling}: {data}");
+    }
+    for (source, target) in [
+        ("src/caller.rs", "src/parent/other.rs"),
+        ("src/caller.rs", "src/other.rs"),
+        ("src/parent.rs", "src/parent/other.rs"),
+        ("src/parent.rs", "src/other.rs"),
+    ] {
+        assert!(
+            !has_edge(data, source, target),
+            "{case}: {source} -> {target}"
+        );
+    }
+}
+
+/// A crate whose manifest does not prove edition 2018 or later may be of edition 2015, and
+/// there the root's `mod other` answers the `use` path in `parent`. Both readings exist, so
+/// neither is chosen: the path is unknown, not the child's module (#1166).
+#[test]
+fn references_rust_2015_use_path_the_crate_root_also_binds_stays_unknown() {
+    for (case, manifest) in [
+        ("edition 2015", Some(format!("{PACKAGE}edition = '2015'\n"))),
+        ("no edition key, so 2015", Some(PACKAGE.to_owned())),
+        ("no captured manifest", None),
+    ] {
+        let mut input = snapshot(&ROOT_AND_CHILD_BIND_OTHER);
+        if let Some(manifest) = &manifest {
+            input = with_cargo_manifest(input, manifest);
+        }
+        assert_neither_reading(&project(&input), case);
+    }
+}
+
+/// The crate root binds `other` by something other than a module, or may bind it: a renamed
+/// `extern crate`, a named import, a glob or a macro. A 2015 crate reads the root's binding,
+/// so the child's module is not chosen; with a glob or a macro whether the root binds the
+/// name is not known, and the answer is unknown too.
+#[test]
+fn references_rust_2015_use_path_stays_unknown_whatever_binds_it_at_the_crate_root() {
+    let manifest = format!("{PACKAGE}edition = '2015'\n");
+    for (case, root, extra) in [
+        (
+            "renamed extern crate",
+            "extern crate dep as other; mod parent; mod caller;",
+            None,
+        ),
+        (
+            "named import",
+            "mod elsewhere; use elsewhere::other; mod parent; mod caller;",
+            Some(("src/elsewhere.rs", "pub mod other { pub fn differs() {} }")),
+        ),
+        (
+            "glob import",
+            "mod elsewhere; use elsewhere::*; mod parent; mod caller;",
+            Some(("src/elsewhere.rs", "pub fn unrelated() {}")),
+        ),
+        (
+            "macro invocation",
+            "declare_modules!(); mod parent; mod caller;",
+            None,
+        ),
+    ] {
+        let mut files = ROOT_AND_CHILD_BIND_OTHER.to_vec();
+        files[0] = ("src/lib.rs", root);
+        files.retain(|(path, _)| *path != "src/other.rs");
+        files.extend(extra);
+        let data = project(&with_cargo_manifest(snapshot(&files), &manifest));
+        assert_neither_reading(&data, case);
+    }
+}
+
+/// Where the manifest proves edition 2018 or later, the `use` path starts in its own module
+/// and names the child's `other::differs`, as before.
+#[test]
+fn references_rust_2018_use_path_names_its_own_modules_child() {
+    for edition in ["2018", "2021", "2024"] {
+        let manifest = format!("{PACKAGE}edition = '{edition}'\n");
+        let data = project(&with_cargo_manifest(
+            snapshot(&ROOT_AND_CHILD_BIND_OTHER),
+            &manifest,
+        ));
+        assert_eq!(unresolved_spellings(&data), Vec::<&str>::new(), "{edition}");
+        assert_eq!(
+            mapped_spellings(&data, "src/caller.rs", "src/parent/other.rs"),
+            ["crate::parent::differs"],
+            "{edition}"
+        );
+        assert_eq!(
+            mapped_spellings(&data, "src/parent.rs", "src/parent/other.rs"),
+            ["other::differs"],
+            "{edition}"
+        );
+        assert!(
+            !has_edge(&data, "src/caller.rs", "src/other.rs"),
+            "{edition}"
+        );
+    }
+}
+
+/// When the crate root binds nothing named `other`, a 2015 crate could not compile the
+/// root's reading, so the readings cannot differ and the child's module is chosen, as before.
+/// The same holds for a manifest that is not captured.
+#[test]
+fn references_rust_2015_use_path_the_crate_root_does_not_bind_resolves_as_before() {
+    let mut files = ROOT_AND_CHILD_BIND_OTHER.to_vec();
+    files[0] = ("src/lib.rs", "mod parent; mod caller;");
+    files.retain(|(path, _)| *path != "src/other.rs");
+    for (case, manifest) in [
+        ("edition 2015", Some(format!("{PACKAGE}edition = '2015'\n"))),
+        ("no captured manifest", None),
+    ] {
+        let mut input = snapshot(&files);
+        if let Some(manifest) = &manifest {
+            input = with_cargo_manifest(input, manifest);
+        }
+        let data = project(&input);
+        assert_eq!(unresolved_spellings(&data), Vec::<&str>::new(), "{case}");
+        assert_eq!(
+            mapped_spellings(&data, "src/caller.rs", "src/parent/other.rs"),
+            ["crate::parent::differs"],
+            "{case}"
+        );
+    }
+}
+
+/// In the crate root's own scope both editions start a `use` path at the crate root, and so
+/// do they in a block of the root module that does not bind the name itself: the root's
+/// `other::differs` is chosen in a 2015 crate, as before.
+#[test]
+fn references_rust_2015_use_path_in_the_crate_root_module_resolves_as_before() {
+    let files = [
+        (
+            "src/lib.rs",
+            "mod other; mod caller; pub use other::differs;\n\
+             pub fn local() -> u8 { use other::differs as inner; inner() }",
+        ),
+        ("src/other.rs", "pub fn differs() -> u8 { 1 }"),
+        (
+            "src/caller.rs",
+            "pub fn selected() { let _ = crate::differs(); }",
+        ),
+    ];
+    let data = project(&with_cargo_manifest(
+        snapshot(&files),
+        &format!("{PACKAGE}edition = '2015'\n"),
+    ));
+    assert_eq!(unresolved_spellings(&data), Vec::<&str>::new(), "{data}");
+    assert_eq!(
+        mapped_spellings(&data, "src/caller.rs", "src/other.rs"),
+        ["crate::differs"]
+    );
+    assert_eq!(
+        mapped_spellings(&data, "src/lib.rs", "src/other.rs"),
+        ["other::differs", "other::differs as inner"]
+    );
+}
+
+/// A 2015 crate root binds `std` to the standard library, as the 2018 extern prelude does, so
+/// a `use std::...` in a child module keeps its standard library target. A child that binds
+/// `std` itself has the 2018 reading only, which a 2015 crate does not take: unknown.
+#[test]
+fn references_rust_2015_use_path_through_the_crate_roots_own_extern_crate() {
+    let files = [
+        (
+            "src/lib.rs",
+            "#![deny(missing_docs)] mod plain; mod shadowing;",
+        ),
+        ("src/plain.rs", "use std::fmt::Display;"),
+        (
+            "src/shadowing.rs",
+            "mod std { pub mod fmt { pub trait Display {} } }\nuse std::fmt::Display;",
+        ),
+    ];
+    let data = project(&with_cargo_manifest(
+        snapshot(&files),
+        &format!("{PACKAGE}edition = '2015'\n"),
+    ));
+    let standard: Vec<_> = data["production"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|pair| pair["target"]["standardLibrary"] == true)
+        .map(|pair| pair["source"]["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(standard, ["src/plain.rs"], "{data}");
+    assert_eq!(unresolved_spellings(&data), ["std::fmt::Display"], "{data}");
+    assert!(!has_edge(&data, "src/shadowing.rs", "src/shadowing.rs"));
+}
+
+/// A 2015 crate root that binds a dependency's name to its own module reads a `use` path of
+/// that name in a child module as that module, not as the dependency: unknown, where the
+/// 2018 reading would name the package. With `extern crate dep;` at the root both readings
+/// name the package.
+#[test]
+fn references_rust_2015_use_path_of_a_dependency_name_the_crate_root_binds() {
+    let manifest = format!("{PACKAGE}edition = '2015'\n[dependencies]\ndep = '1'\n");
+    let packages = |data: &Value| -> Vec<String> {
+        data["production"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|pair| pair["target"]["kind"] == "externalPackage")
+            .map(|pair| pair["target"]["package"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let files = |root| {
+        snapshot(&[
+            ("src/lib.rs", root),
+            ("src/dep.rs", "pub fn item() {}"),
+            ("src/child.rs", "use dep::item;"),
+        ])
+    };
+    let data = project(&with_cargo_manifest(
+        files("mod dep; mod child;"),
+        &manifest,
+    ));
+    assert_eq!(packages(&data), Vec::<String>::new(), "{data}");
+    assert_eq!(unresolved_spellings(&data), ["dep::item"], "{data}");
+    assert!(!has_edge(&data, "src/child.rs", "src/dep.rs"));
+    let data = project(&with_cargo_manifest(
+        files("extern crate dep; mod child;"),
+        &manifest,
+    ));
+    assert_eq!(packages(&data), ["dep"], "{data}");
 }
