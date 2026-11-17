@@ -3,6 +3,7 @@ use crate::{
     capture::Capture,
     model::{CancelFlag, Diagnostic, IndexProgress, IndexStats, SourceFile},
     native_ids::{IdentityRegistry, OccurrenceInputRef, canonical, digest, extraction_context},
+    store::admitted_capture::AdmittedCapture,
 };
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -482,7 +483,7 @@ pub enum FullNativeStage {
 /// executable rebuild with an unchanged extractor hash keeps every selected
 /// document's validated facts (Decision 0005).
 pub(crate) fn captured_revision_header(
-    capture: &Capture,
+    capture: &dyn AdmittedCapture,
     root: &Path,
     root_id: &str,
 ) -> Result<(SourceSet, Revision)> {
@@ -493,7 +494,7 @@ pub(crate) fn captured_revision_header(
 /// The canonical captured root-input components used in the native revision ID.
 /// Store retains these original values for imports after mutable files change.
 pub(crate) fn captured_components(
-    capture: &Capture,
+    capture: &dyn AdmittedCapture,
     executable_hash: &str,
 ) -> Result<(Value, Vec<Value>, Vec<Value>)> {
     let root = capture.physical_root();
@@ -542,7 +543,7 @@ pub(crate) fn captured_components(
 /// The full captured revision header is shared by full and selected measurement.
 /// Selecting one file must never change the source-set, producer or revision ID.
 fn build_native_header<'a>(
-    capture: &'a Capture,
+    capture: &'a dyn AdmittedCapture,
     root: &Path,
     root_id: &str,
 ) -> Result<(Artifact, Vec<&'a SourceFile>)> {
@@ -573,7 +574,7 @@ fn build_native_header<'a>(
         dependencies: vec![],
     };
     let (toolchain, config, dependencies) = captured_components(capture, &executable_hash)?;
-    let mut files: Vec<_> = capture.files.iter().collect();
+    let mut files: Vec<_> = capture.files().iter().collect();
     files.sort_by(|a, b| {
         language_order(&a.language)
             .unwrap()
@@ -1424,7 +1425,7 @@ pub(crate) fn measure_captured_document(
 /// Unchanged documents retain their validated stored facts; an empty selection
 /// represents a deletion-only publication.
 pub(crate) fn measure_captured_documents(
-    capture: &Capture,
+    capture: &dyn AdmittedCapture,
     root: &Path,
     root_id: &str,
     paths: &BTreeSet<String>,
@@ -1459,7 +1460,7 @@ pub(crate) fn measure_captured_documents(
             "indexing cancelled"
         );
         ensure!(
-            capture.hashes.get(&file.path) == Some(&file.hash)
+            capture.hashes().get(&file.path) == Some(&file.hash)
                 && file.hash == hash(file.text.as_bytes()),
             "selected native source bytes/hash mismatch"
         );
@@ -1807,7 +1808,7 @@ impl Artifact {
     /// and checks all resulting IDs, ownership and structure without re-extraction.
     pub(crate) fn validate_selective(
         &self,
-        capture: &Capture,
+        capture: &dyn AdmittedCapture,
         root: &Path,
         root_id: &str,
         cancel: &CancelFlag,
@@ -1820,7 +1821,7 @@ impl Artifact {
                 && self.revision == header.revision,
             "selective native header differs from captured revision"
         );
-        self.validate_structure(&capture.files)?;
+        self.validate_structure(capture.files())?;
         capture.verify(cancel)
     }
     /// The artifact is this process's own `build_native` output for exactly
@@ -1837,7 +1838,7 @@ impl Artifact {
     /// Honors the caller's cancellation before and after validation.
     pub fn validate(
         &self,
-        capture: &Capture,
+        capture: &dyn AdmittedCapture,
         root: &Path,
         root_id: &str,
         cancel: &CancelFlag,
