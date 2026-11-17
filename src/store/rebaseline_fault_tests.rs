@@ -137,10 +137,10 @@ fn selective_publication_faults_rollback_and_retry_same_expected_pin() {
             .prepare_local_revision(&capture, &baseline, &cancel)
             .unwrap()
             .expect("same-leaf edit has local selected projection");
-        let inventory_fault = crate::native_evidence::inject_extraction_auth_fault(
+        let inventory_fault = crate::native_records::inject_extraction_auth_fault(
             &prepared.native.revision.id,
             "java",
-            crate::native_evidence::ExtractionAuthFault::Mismatched,
+            crate::native_records::ExtractionAuthFault::Mismatched,
         );
         let mismatch = store
             .preflight_local_reuse(
