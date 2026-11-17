@@ -556,11 +556,18 @@ struct RunningExecutable {
 
 impl RunningExecutable {
     fn open() -> Result<Self> {
-        let path = std::env::current_exe()?;
+        Self::open_invoked(std::env::current_exe()?)
+    }
+    /// `path` is the executable's pathname as the process reports it.
+    fn open_invoked(path: PathBuf) -> Result<Self> {
         // procfs opens the executing inode even after an atomic pathname swap.
         // On macOS retain an open descriptor before any later upgrade.
         #[cfg(target_os = "linux")]
         let file = fs::File::open("/proc/self/exe")?;
+        // macOS reports the pathname the process was invoked by, which may be a
+        // symlink to the binary (#1173): resolve it once, then open the binary itself.
+        #[cfg(not(target_os = "linux"))]
+        let path = fs::canonicalize(&path)?;
         #[cfg(not(target_os = "linux"))]
         let file = {
             let mut options = fs::OpenOptions::new();
@@ -1726,6 +1733,23 @@ mod tests {
             error.to_string().contains("executable"),
             "changing the pinned inode must fail its stat check: {error:#}"
         );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn running_executable_opens_through_a_symlink_to_it() {
+        // macOS reports the invoked pathname, so `trellis` run through a symlink to
+        // its binary must still pin the binary's own inode (#1173).
+        let real = std::env::current_exe().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("trellis");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let image = RunningExecutable::open_invoked(link.clone()).unwrap();
+        image.verify_stat().unwrap();
+        let direct = running_executable().unwrap();
+        assert_eq!(image.initial, direct.initial);
+        assert_eq!(image.digest, direct.digest);
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(image.path, fs::canonicalize(&real).unwrap());
     }
     #[test]
     fn missing_executable_refuses_admission() {
