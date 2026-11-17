@@ -188,12 +188,17 @@ lint() {
   cargo clippy --locked --all-targets --features test-support -- -D warnings
 }
 browser() {
-  cargo build --locked --features test-support --bin trellis
-  cp "$target_dir/debug/trellis" "$target_dir/debug/trellis-navigation-fixture"
+  # The navigation suite needs the test-support binary and the other suites the
+  # production one. Both builds place `trellis` at the same `debug/trellis`, so
+  # the test-support binary gets its own artifact directory, which no production
+  # build writes (#1177). `build-dir` keeps its intermediate files in `target`
+  # with the production build's, so nothing is compiled twice.
+  fixture_dir=$target_dir/navigation-fixture
+  CARGO_BUILD_BUILD_DIR="$target_dir" cargo build --locked --features test-support --bin trellis --target-dir "$fixture_dir"
   cargo build --locked --bin trellis
   python3 tools/verify-40-query-performance.py --smoke --binary "$target_dir/debug/trellis"
   browser_system_deps
-  TRELLIS_NAVIGATION_FIXTURE_BINARY="$target_dir/debug/trellis-navigation-fixture" TRELLIS_SUITE_BINARY="$target_dir/debug/trellis" node --test --test-concurrency=1 tests/browser/sequence-harness.test.cjs tests/browser/pele-block-labels.test.cjs tests/browser/sequence-pele.test.cjs tests/browser/sequence-readable.test.cjs tests/browser/sequence-interactions.test.cjs tests/browser/sequence-hops.test.cjs tests/browser/sequence-hops-app.test.cjs tests/browser/sequence-callbacks.test.cjs tests/browser/sequence-callbacks-app.test.cjs tests/browser/sequence.test.cjs tests/browser/sequence-cost.test.cjs tests/browser/brand.test.cjs tests/browser/connect.test.cjs tests/browser/stall-recovery.test.cjs tests/browser/viewer-shell.test.cjs tests/browser/files.test.cjs tests/browser/architecture-pele.test.cjs tests/browser/architecture.test.cjs tests/browser/architecture-apps.test.cjs tests/browser/architecture-routing.test.cjs tests/browser/app-switcher.test.cjs tests/browser/treemap.test.cjs tests/browser/classes-pele.test.cjs tests/browser/classes-app.test.cjs tests/browser/classes-languages.test.cjs tests/browser/navigation-resolved.test.cjs
+  TRELLIS_NAVIGATION_FIXTURE_BINARY="$fixture_dir/debug/trellis" TRELLIS_SUITE_BINARY="$target_dir/debug/trellis" node --test --test-concurrency=1 tests/browser/sequence-harness.test.cjs tests/browser/pele-block-labels.test.cjs tests/browser/sequence-pele.test.cjs tests/browser/sequence-readable.test.cjs tests/browser/sequence-interactions.test.cjs tests/browser/sequence-hops.test.cjs tests/browser/sequence-hops-app.test.cjs tests/browser/sequence-callbacks.test.cjs tests/browser/sequence-callbacks-app.test.cjs tests/browser/sequence.test.cjs tests/browser/sequence-cost.test.cjs tests/browser/brand.test.cjs tests/browser/connect.test.cjs tests/browser/stall-recovery.test.cjs tests/browser/viewer-shell.test.cjs tests/browser/files.test.cjs tests/browser/architecture-pele.test.cjs tests/browser/architecture.test.cjs tests/browser/architecture-apps.test.cjs tests/browser/architecture-routing.test.cjs tests/browser/app-switcher.test.cjs tests/browser/treemap.test.cjs tests/browser/classes-pele.test.cjs tests/browser/classes-app.test.cjs tests/browser/classes-languages.test.cjs tests/browser/navigation-resolved.test.cjs
 }
 rust() {
   lint
