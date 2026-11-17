@@ -141,9 +141,10 @@ paths = [
   "src/capture_records.rs",
   # The batch descriptor and page grammar: the serde types, the format version, the checks
   # over bytes, limits and the captured revision, the row order and the source-manifest hash
-  # (S8, #1071). Producers write it, admission and storage read it. The checks that consult
-  # the producer registry, the producer profiles or the filesystem stay in
-  # semantic_batch/descriptor.rs.
+  # (S8, #1071). Producers write it, admission and storage read it. It also holds the pin
+  # check and the context profile (`check_producer`, `context_profile`), which read the
+  # static vocabulary below. The checks that consult the filesystem or apply the
+  # generation-origin rule stay in semantic_batch/descriptor.rs.
   "src/batch_descriptor.rs",
   # The checked-in producer pin and its registry (S8, #1071; owner ruling 2026-11-14: the
   # pin is vocabulary). `PinnedProducer`, the lookups by declaration and by id, and the table
@@ -152,6 +153,14 @@ paths = [
   # configuration read. Storage checks the pin at publish time through
   # `Descriptor::check_producer`, which is in the grammar file above.
   "src/producer_pin.rs",
+  # The static producer-context vocabulary (S15; section 12 ruling 1 extended to the profile
+  # table, 2026-11-16): the four pinned producers, the stub's id, the two trust profiles, the
+  # closed producer x trust-profile table with each row's worktree omissions and generated
+  # files, and `context_hash`, a pure digest whose source test is the caller's closure. No
+  # I/O, environment or worktree read. Storage validates stored producer context against it
+  # at publish time (store/native_first/context.rs). Producer commands, settings and the
+  # controlled worktree stay in src/producer/.
+  "src/producer_profiles.rs",
   # The proof that batch admission ran (S8, #1071): one zero-sized type with no dependency.
   # Admission creates it and the storage-owned `AdmittedBatch` (store/batch_input.rs) is
   # built from it. It is a module of `semantic_batch` because Rust privacy is by module

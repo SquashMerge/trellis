@@ -1,51 +1,26 @@
 //! The closed producer x trust-profile table (§3.3): the only source of a
 //! producer command, its child environment and `PATH`, its worktree omissions
-//! and additions, its policy reports and its generation provenance (D4).
+//! and additions, its policy reports and its generation provenance (D4). The table's
+//! static vocabulary (`Target`, `Row`, `row`, `rules` and the rule types) is in
+//! `crate::producer_profiles`, re-exported here.
 
 use super::detect::{Declared, Resolution, RuntimeExecutable, rustup_toolchain};
-use super::{PROFILE_UNSUPPORTED, ProducerName, TrustProfile};
+use super::{ProducerName, TrustProfile};
+pub use crate::producer_profiles::{
+    Generated, Omission, Row, Rules, SCIP_TYPESCRIPT_TSCONFIG, STUB_NAME, Target, refusal, row,
+    rows, rules,
+};
 use crate::scip_admission::PinnedProducer;
-use anyhow::{Result, anyhow};
 use serde::Serialize;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
 };
 
-/// The pin id of the test-support stand-in producer.
-pub const STUB_NAME: &str = crate::scip_admission::STUB_PRODUCER;
-const RUST_REFUSAL: &str = "rust-analyzer cannot disable build scripts or proc macros";
-/// The root build files and, as `*/` patterns, the nested module build files capture retains
-/// above Java sources (#854).
-const JAVA_BUILD_FILES: [&str; 9] = [
-    "pom.xml",
-    "build.gradle",
-    "build.gradle.kts",
-    "settings.gradle",
-    "settings.gradle.kts",
-    "gradle.properties",
-    "*/pom.xml",
-    "*/build.gradle",
-    "*/build.gradle.kts",
-];
 const SYSTEM_PATH: [&str; 2] = ["/usr/bin", "/bin"];
 
-/// A producer the table has rows for: one of the four pinned producers, or
-/// the test stub when the daemon registered one.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Target {
-    Real(ProducerName),
-    Stub,
-}
-
+/// A test-support build reads the stub's language from the environment, so this stays here.
 impl Target {
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Real(producer) => producer.as_str(),
-            Self::Stub => STUB_NAME,
-        }
-    }
-
     /// The languages its artifact covers.
     pub fn languages(self) -> &'static [&'static str] {
         match self {
@@ -54,25 +29,6 @@ impl Target {
             }
             Self::Stub => crate::scip_admission::stub_languages(),
         }
-    }
-
-    pub fn parse(name: &str, stub_registered: bool) -> Option<Self> {
-        if name == STUB_NAME {
-            return stub_registered.then_some(Self::Stub);
-        }
-        ProducerName::parse(name).map(Self::Real)
-    }
-
-    pub fn all(stub_registered: bool) -> Vec<Self> {
-        ProducerName::ALL
-            .into_iter()
-            .map(Self::Real)
-            .chain(stub_registered.then_some(Self::Stub))
-            .collect()
-    }
-
-    pub fn pin(self) -> Option<PinnedProducer> {
-        crate::scip_admission::pinned_producer_by_id(self.name())
     }
 }
 
@@ -111,38 +67,6 @@ impl Stub {
         #[cfg(not(feature = "test-support"))]
         None
     }
-}
-
-/// One supported producer x trust-profile row.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Row {
-    pub target: Target,
-    pub trust: TrustProfile,
-}
-
-/// The row for `target` under `trust`, or the typed refusal.
-pub fn row(target: Target, trust: TrustProfile) -> Result<Row> {
-    if target == Target::Real(ProducerName::RustAnalyzer) && trust == TrustProfile::Restricted {
-        return Err(anyhow!("{PROFILE_UNSUPPORTED}: {RUST_REFUSAL}"));
-    }
-    Ok(Row { target, trust })
-}
-
-/// Every supported row.
-pub fn rows(stub_registered: bool) -> Vec<Row> {
-    Target::all(stub_registered)
-        .into_iter()
-        .flat_map(|target| {
-            [TrustProfile::Restricted, TrustProfile::Trusted]
-                .into_iter()
-                .filter_map(move |trust| row(target, trust).ok())
-        })
-        .collect()
-}
-
-/// Why `row` refuses a trust profile, for status.
-pub fn refusal(target: Target, trust: TrustProfile) -> Option<String> {
-    row(target, trust).err().map(|_| RUST_REFUSAL.to_owned())
 }
 
 /// A symlink in the run's private `bin/`.
@@ -341,112 +265,6 @@ pub fn command(
         argv,
         env,
         bin_links,
-    }
-}
-
-/// A file Trellis writes for the run, relative to the run directory.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Generated {
-    pub path: String,
-    pub bytes: Vec<u8>,
-    /// A default under `worktree/`: written only when the retained revision has no root input
-    /// at that worktree path, which then wins.
-    pub default_only: bool,
-}
-
-/// The scip-typescript project config when the checkout has no root `tsconfig.json` (owner
-/// ruling 2026-11-03, #652). `--infer-tsconfig` would write `{"compilerOptions":{"allowJs":true}}`,
-/// whose ES5 default target cannot parse ES2015+ identifiers (an escaped astral name gave a
-/// zero-width definition); this keeps its defaults but targets ES2022. With the ES2015+
-/// target, `module` defaults to ES2015 and classic resolution, so `commonjs` keeps the
-/// node10 resolution `--infer-tsconfig` had. `jsx: preserve` lets `.tsx` parse, and
-/// `allowJs` keeps `.js` in the same program as `.ts` (#683).
-pub const SCIP_TYPESCRIPT_TSCONFIG: &[u8] =
-    br#"{"compilerOptions":{"allowJs":true,"jsx":"preserve","target":"es2022","module":"commonjs"}}"#;
-
-/// A captured root input the row leaves out of the worktree. A `path` of `*/name` leaves out
-/// every nested input of that file name.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Omission {
-    pub path: &'static str,
-    pub reason: String,
-}
-
-impl Omission {
-    /// Whether this omission leaves out the input at `path`.
-    pub fn matches(&self, path: &str) -> bool {
-        match self.path.strip_prefix('*') {
-            Some(suffix) => path.ends_with(suffix),
-            None => self.path == path,
-        }
-    }
-}
-
-/// The row's worktree omissions and additions.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct Rules {
-    pub omit: Vec<Omission>,
-    pub generated: Vec<Generated>,
-    /// Producer flags and their values that the project's settings set (#717).
-    pub args: Vec<(&'static str, String)>,
-}
-
-impl Rules {
-    /// The value the settings give `flag`, if any.
-    pub fn arg(&self, flag: &str) -> Option<&str> {
-        self.args
-            .iter()
-            .find(|(name, _)| *name == flag)
-            .map(|(_, value)| value.as_str())
-    }
-}
-
-pub fn rules(row: &Row) -> Rules {
-    match (row.target, row.trust) {
-        (Target::Real(ProducerName::ScipJava), TrustProfile::Restricted) => Rules {
-            omit: JAVA_BUILD_FILES
-                .map(|path| Omission {
-                    path,
-                    reason: "java build logic is denied in the restricted profile".into(),
-                })
-                .into_iter()
-                .chain([Omission {
-                    path: "lsif-java.json",
-                    reason: "the restricted profile writes its own lsif-java.json; the checkout's can name dependencies to fetch".into(),
-                }])
-                .collect(),
-            generated: vec![Generated {
-                path: "worktree/lsif-java.json".into(),
-                bytes: br#"{"dependencies":[]}"#.to_vec(),
-                default_only: false,
-            }],
-            args: Vec::new(),
-        },
-        (Target::Real(ProducerName::ScipPython), TrustProfile::Restricted) => Rules {
-            omit: ["pyproject.toml", "pyrightconfig.json"]
-                .map(|path| Omission {
-                    path,
-                    reason: "a captured file that can configure the interpreter pyright uses"
-                        .into(),
-                })
-                .to_vec(),
-            generated: vec![Generated {
-                path: "producer-config/environment.json".into(),
-                bytes: b"[]".to_vec(),
-                default_only: false,
-            }],
-            args: Vec::new(),
-        },
-        (Target::Real(ProducerName::ScipTypescript), _) => Rules {
-            omit: Vec::new(),
-            generated: vec![Generated {
-                path: "worktree/tsconfig.json".into(),
-                bytes: SCIP_TYPESCRIPT_TSCONFIG.to_vec(),
-                default_only: true,
-            }],
-            args: Vec::new(),
-        },
-        _ => Rules::default(),
     }
 }
 

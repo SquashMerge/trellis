@@ -6,9 +6,13 @@
 //! present entry of the dependency component. The first insert of a path
 //! wins. The row then removes its omissions and adds its generated files.
 
-use super::profiles::{BinLink, Generated, Omission, Rules};
+use super::profiles::{BinLink, Rules};
+/// The controlled-profile input digest, at its old path for the tests that name it there.
+#[cfg(test)]
+pub(crate) use crate::producer_profiles::context_hash;
+use crate::producer_profiles::{check_cancel, omission, replaced, supplied};
 use crate::store::NativeReader;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
@@ -17,7 +21,7 @@ use std::{
     io::Write,
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::AtomicBool,
 };
 
 /// The retained revision as the worktree needs it.
@@ -109,20 +113,6 @@ pub struct Layout {
     pub generated: Vec<Listed>,
 }
 
-fn omission<'a>(rules: &'a Rules, path: &str) -> Option<&'a Omission> {
-    rules.omit.iter().find(|omission| omission.matches(path))
-}
-
-/// Sources, config, then dependency inputs claim a path only once.
-fn supplied(rules: &Rules, path: &str, already_present: bool) -> bool {
-    omission(rules, path).is_none() && !already_present
-}
-
-/// Whether a default-only generated file gives way to a root input at its worktree path.
-fn replaced(file: &Generated, present: impl Fn(&str) -> bool) -> bool {
-    file.default_only && file.path.strip_prefix("worktree/").is_some_and(present)
-}
-
 /// The listing for `rules`. Omitted paths leave the config and dependency
 /// lists and appear under `omitted` once, in sorted order.
 pub fn layout(inputs: &RetainedInputs, rules: &Rules) -> Layout {
@@ -164,74 +154,6 @@ pub fn layout(inputs: &RetainedInputs, rules: &Rules) -> Layout {
     }
 }
 
-/// A controlled profile's effective non-source context. Native identity and freshness
-/// keep their full captured hashes; this digest is only for P-to-N pending eligibility.
-/// Entries borrow retained metadata, including encoded bytes, without decoding file bodies.
-pub(crate) fn context_hash(
-    rules: &Rules,
-    config: &[Value],
-    dependencies: &[Value],
-    is_source: &dyn Fn(&str) -> Result<bool>,
-    cancel: &AtomicBool,
-) -> Result<String> {
-    let mut files = BTreeMap::new();
-    let mut metadata = Vec::new();
-    for entry in config.iter().chain(dependencies) {
-        check_cancel(cancel)?;
-        let Some(path) = entry["path"].as_str() else {
-            metadata.push(entry);
-            continue;
-        };
-        if omission(rules, path).is_some() {
-            continue;
-        }
-        match entry["type"].as_str() {
-            Some("absent") => {}
-            Some("present") => {
-                if supplied(rules, path, files.contains_key(path)) && !is_source(path)? {
-                    files.insert(path, entry);
-                }
-            }
-            _ => metadata.push(entry),
-        }
-    }
-    let mut hash = Sha256::new();
-    hash.update(b"controlled-worktree-context:v1\0files[");
-    for entry in files.values() {
-        check_cancel(cancel)?;
-        crate::native_ids::canonical_into(entry, &mut |bytes| hash.update(bytes));
-        hash.update(b",");
-    }
-    hash.update(b"]metadata[");
-    for entry in metadata {
-        check_cancel(cancel)?;
-        crate::native_ids::canonical_into(entry, &mut |bytes| hash.update(bytes));
-        hash.update(b",");
-    }
-    hash.update(b"]generated[");
-    for file in &rules.generated {
-        check_cancel(cancel)?;
-        let present = if file.default_only {
-            match file.path.strip_prefix("worktree/") {
-                Some(path) if omission(rules, path).is_none() => {
-                    files.contains_key(path) || is_source(path)?
-                }
-                _ => false,
-            }
-        } else {
-            false
-        };
-        if !replaced(file, |_| present) {
-            crate::native_ids::canonical_string_into(&file.path, &mut |bytes| hash.update(bytes));
-            hash.update(Sha256::digest(&file.bytes));
-            hash.update(b",");
-        }
-    }
-    hash.update(b"]");
-    check_cancel(cancel)?;
-    Ok(hex::encode(hash.finalize()))
-}
-
 fn private_dirs(path: &Path) -> Result<()> {
     fs::DirBuilder::new()
         .recursive(true)
@@ -253,11 +175,6 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
         .with_context(|| format!("create {}", path.display()))?;
     file.write_all(bytes)
         .with_context(|| format!("write {}", path.display()))
-}
-
-fn check_cancel(cancel: &AtomicBool) -> Result<()> {
-    ensure!(!cancel.load(Ordering::SeqCst), "cancelled");
-    Ok(())
 }
 
 /// Write `<run_dir>/worktree/` from `source` and the row's `rules`, then the

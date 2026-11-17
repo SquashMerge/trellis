@@ -5,6 +5,7 @@
 //! #660). `install` runs a pinned install command only from the explicit
 //! `producer install` CLI command (#880).
 
+pub use crate::producer_profiles::{PROFILE_UNSUPPORTED, ProducerName, TrustProfile};
 use serde::{Deserialize, Serialize};
 
 pub mod approval;
@@ -64,7 +65,6 @@ mod tsconfig_tests;
 mod worktree_tests;
 
 pub const PRODUCER_UNAVAILABLE: &str = "producer_unavailable";
-pub const PROFILE_UNSUPPORTED: &str = "profile_unsupported";
 pub const PLAN_CHANGED: &str = "plan_changed";
 pub const PRODUCER_BUSY: &str = "producer_busy";
 pub const NOT_CANCELLABLE: &str = "not_cancellable";
@@ -78,49 +78,6 @@ pub const PRODUCER_OUTPUT_INVALID: &str = "producer_output_invalid";
 pub const PRODUCER_STATE_CORRUPT: &str = "producer_state_corrupt";
 /// Refusal for producer state that is symlinked, foreign or not private.
 pub const UNSAFE_STATE: &str = "invalid_request: unsafe producer state";
-
-/// The four producers pinned in the reference hardware profile.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum ProducerName {
-    #[serde(rename = "scip-java")]
-    ScipJava,
-    #[serde(rename = "scip-typescript")]
-    ScipTypescript,
-    #[serde(rename = "scip-python")]
-    ScipPython,
-    #[serde(rename = "rust-analyzer")]
-    RustAnalyzer,
-}
-
-impl ProducerName {
-    pub const ALL: [Self; 4] = [
-        Self::ScipJava,
-        Self::ScipTypescript,
-        Self::ScipPython,
-        Self::RustAnalyzer,
-    ];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::ScipJava => "scip-java",
-            Self::ScipTypescript => "scip-typescript",
-            Self::ScipPython => "scip-python",
-            Self::RustAnalyzer => "rust-analyzer",
-        }
-    }
-
-    pub fn parse(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|p| p.as_str() == name)
-    }
-}
-
-/// `restricted` (the default) runs no repository code; `trusted` allows it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum TrustProfile {
-    Restricted,
-    Trusted,
-}
 
 /// A producer's process group, recorded with the leader's start time so a
 /// later sweep never signals a reused process ID.
