@@ -6890,9 +6890,7 @@ pub fn batch_publication_statements_for_tests() -> Vec<String> {
         RAW_EXCLUSIONS_SQL.to_owned(),
         with_capture_ids("(0,1)", RAW_PROOFS_SQL),
     ];
-    statements.extend(crate::semantic_import::staged_publication_statements(
-        "stage.",
-    ));
+    statements.extend(staging::publication::statements("stage."));
     statements
 }
 
@@ -6983,7 +6981,7 @@ fn write_staged_semantic(
     // The tuple writers' statements, each target table's included, stay prepared.
     db.set_prepared_statement_cache_capacity(64);
     let mut index = 0u64;
-    crate::semantic_import::read_staged_documents(db, "stage.", producer, &mut |publication| {
+    staging::publication::read_documents(db, "stage.", producer, &mut |publication| {
         write_import_coverage(db, key, &publication, Some((batch, captured_pin)), inputs)?;
         if index % 1000 == 999 {
             gate()?;

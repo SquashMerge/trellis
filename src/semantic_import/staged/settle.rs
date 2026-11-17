@@ -4,9 +4,9 @@
 //! that document, validated row by row and written to `out_*`. Every rule that settlement reads
 //! is document-local: a fact's raw proof, its reference and call site all belong to the
 //! document; only target authority (`nat_declarations`, captured exact definitions) is global.
-use super::codec;
 use super::streaming::{self, CompletedGlobal};
 use super::*;
+use crate::store::staging::codec;
 
 /// A document's validation index and its live charge, built on the first validated row.
 type ValidationIndex = std::cell::OnceCell<(semantic::NativeIndex, Reservation)>;
