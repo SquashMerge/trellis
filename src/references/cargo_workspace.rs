@@ -199,8 +199,9 @@ fn member(dir: &str, table: &toml::Table, root: &toml::Table) -> Option<Member> 
 /// with no `path` by the package's name. Otherwise Cargo discovers it beside the explicit
 /// `[[bin]]` entries unless one of them takes the package's name for another file, or
 /// discovery is off: `autobins = false`, or, without an `autobins` key, a package of edition
-/// 2015 (or one not proved later) that lists `[[bin]]` at all. Cargo's edition 2015 fallback
-/// paths for a `[[bin]]` with no `path` are not followed, so they only ever prove less.
+/// 2015 (or one not proved later) that lists `[[bin]]` at all. Cargo's edition 2015 legacy
+/// fallback paths for a `[[bin]]` with no `path` are not modelled, and the shortcut that a
+/// `[[bin]]` with no `path` and the package's name is `src/main.rs` is inherited unchanged.
 pub(super) fn main_root(
     dir: &str,
     table: &toml::Table,
