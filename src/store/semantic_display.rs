@@ -1495,10 +1495,10 @@ fn architecture_derived_from(
 pub(super) fn architecture_semantic(
     db: &Connection,
     revision_key: &str,
-    documents: &mut [crate::references::DocumentInput],
+    documents: &mut [crate::architecture_inputs::DocumentInput],
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<()> {
-    use crate::references::{SemanticAnchor, SemanticOutcome, SemanticRelationship};
+    use crate::architecture_inputs::{SemanticAnchor, SemanticOutcome, SemanticRelationship};
     let defaults = default_producers(db, revision_key)?;
     let pin_text = revision_key
         .strip_prefix("pin:v1:")

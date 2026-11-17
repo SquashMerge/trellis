@@ -1,6 +1,6 @@
-//! Admission helpers for pinned semantic producers: the run and witness language tables, the
-//! selected-role path check and the root URI. The checked-in producer pin registry is in
-//! `crate::producer_pin`, re-exported here.
+//! Admission helpers for pinned semantic producers: the run and witness language tables and the
+//! selected-role path check. The checked-in producer pin registry is in `crate::producer_pin`
+//! and the root URI in `crate::scip_vocab`, both re-exported here.
 pub use crate::scip_raw::{
     CapturedClaim, CapturedScipFactV1, CapturedScipInventory, Completion, Exclusion,
     ScipCaptureError,
@@ -14,7 +14,7 @@ pub use crate::producer_pin::{
 };
 pub use crate::producer_profiles::STUB_PRODUCER;
 pub use crate::scip_vocab::{REFERENCE_TRUST_ORIGIN, SYNTHETIC_TRUST_ORIGIN};
-pub(crate) use crate::scip_vocab::{admission, order, path};
+pub(crate) use crate::scip_vocab::{admission, file_uri, order, path};
 
 /// The languages a `producer run` of `producer_id` covers: a real reference producer's, or
 /// the test stub's (#664). `None` for an unknown producer.
@@ -65,21 +65,6 @@ fn relative(root: &Path, p: &Path) -> Result<String, ScipCaptureError> {
         }
     }
     Ok(r.into())
-}
-pub(crate) fn file_uri(root: &Path) -> Result<String, ScipCaptureError> {
-    let s = root
-        .to_str()
-        .filter(|s| s.starts_with('/'))
-        .ok_or_else(|| admission("non-UTF8 physical root"))?;
-    let mut out = String::from("file://");
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~' | b'/') {
-            out.push(char::from(b));
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    Ok(out)
 }
 #[cfg(test)]
 mod tests {

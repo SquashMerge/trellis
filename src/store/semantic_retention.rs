@@ -1,6 +1,6 @@
 //! Revision-owned recovery status. Readers only consult their admitted SQLite snapshot.
 use super::*;
-use crate::producer::{retention, state::StateDir};
+use super::{producer_retention, producer_state::StateDir};
 
 // Only an exact retained selection on the same native executable belongs to ordinary S work.
 const ORDINARY_RETAINED_PENDING: &str = "WITH ordinary_retained_pending AS (
@@ -186,7 +186,7 @@ impl Store {
     pub(crate) fn attach_retention(&self, db: &Connection) -> Result<StateDir> {
         let state = StateDir::open(&self.roots, &self.identity)?;
         // Never `st_dev`: APFS renumbers it across reboots (#811).
-        retention::attach(db, &state, &retention_root_key(&self.identity))?;
+        producer_retention::attach(db, &state, &retention_root_key(&self.identity))?;
         Ok(state)
     }
 
@@ -199,7 +199,7 @@ impl Store {
         previous: Option<&str>,
     ) -> Result<()> {
         if let Some(state) = state {
-            let slots = retention::slots(db)?;
+            let slots = producer_retention::slots(db)?;
             let published_or_pending_sql = format!(
                 "{ORDINARY_RETAINED_PENDING}SELECT EXISTS(
                     SELECT 1 FROM semantic_coverage
@@ -208,8 +208,8 @@ impl Store {
                     SELECT 1 FROM ordinary_retained_pending WHERE producer_id=?3
                 )"
             );
-            let configured = retention::configured_languages(state, &slots);
-            for retention::RetainedRun {
+            let configured = crate::producer::retention::configured_languages(state, &slots);
+            for producer_retention::RetainedRun {
                 producer,
                 languages,
                 options,
@@ -236,7 +236,7 @@ impl Store {
                         params![producer, previous, key],
                     )?;
                 }
-                let reason = retention::recovery_reason(db, key, &options)?;
+                let reason = producer_retention::recovery_reason(db, key, &options)?;
                 for language in languages {
                     db.execute(
                         "INSERT OR REPLACE INTO semantic_reimport VALUES(?1,?2,?3,?4)",
@@ -304,7 +304,7 @@ impl Store {
         let db = self.cache_write()?;
         match self.attach_retention(&db) {
             Ok(_) => {}
-            Err(error) if retention::unavailable_catalog(&error) => return Ok(false),
+            Err(error) if producer_retention::unavailable_catalog(&error) => return Ok(false),
             Err(error) => return Err(error),
         }
         let needed: bool = db.query_row(
@@ -313,73 +313,8 @@ impl Store {
             |row| row.get(0),
         )?;
         Ok(needed
-            && retention::slots(&db)?
+            && producer_retention::slots(&db)?
                 .iter()
                 .any(|slot| slot.producer == producer && slot.options == *options))
-    }
-
-    /// Called by the single checkout worker after native reconciliation, before the FIFO.
-    /// This is admission into the existing queue, not a second retry owner.
-    pub(crate) fn enqueue_retained_runs(&self) -> Result<()> {
-        let db = self.cache_write()?;
-        match self.attach_retention(&db) {
-            Ok(_) => {}
-            Err(error) if nonterminal_storage_busy(&error) => return Err(error),
-            Err(error) if retention::unavailable_catalog(&error) => return Ok(()),
-            Err(error) => return Err(typed_storage_full(error)),
-        }
-        let pin = self.index_baseline()?;
-        let key = semantic_pin_key(pin);
-        let generation = pin.index_generation.to_string();
-        let pending = self.pending_generation_ids()?;
-        for retention::RetainedRun {
-            producer,
-            options,
-            attempted_generation,
-            ..
-        } in retention::slots(&db)?
-        {
-            let needed: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM semantic_reimport WHERE revision_id=?1 AND producer=?2)",params![key,producer], |row| row.get(0))?;
-            if !needed || attempted_generation.as_deref() == Some(&generation) {
-                continue;
-            }
-            let present = retention::inputs_present(&options)?;
-            if present
-                && !retention::descriptor_admissible(&options, &self.batch_publication_limits())?
-            {
-                // An inadmissible retained descriptor is a missing input: its needs-reimport
-                // row stays published, and the slot goes so it is never queued again (#811).
-                // Releasing the hold lets cleanup strip the run's inputs.
-                db.execute(
-                    "DELETE FROM retained.retained_runs WHERE producer=?1",
-                    [&producer],
-                )?;
-                continue;
-            }
-            if present
-                && !pending
-                    .iter()
-                    .any(|(origin, id)| *origin == options.origin && *id == options.generation_id)
-            {
-                match self
-                    .enqueue_generated_semantic_import(Path::new(self.workspace_root()), &options)
-                {
-                    Ok(_) => {}
-                    Err(error) if nonterminal_storage_busy(&error) => return Err(error),
-                    // Missing input is already published as needs-reimport. Do not retry it
-                    // forever, and never rewrite the original captured identity.
-                    Err(error)
-                        if error
-                            .to_string()
-                            .starts_with("invalid_request: generation directory") => {}
-                    Err(error) => return Err(error),
-                }
-            }
-            db.execute(
-                "UPDATE retained.retained_runs SET attempted_generation=?1 WHERE producer=?2",
-                params![generation, producer],
-            )?;
-        }
-        Ok(())
     }
 }
