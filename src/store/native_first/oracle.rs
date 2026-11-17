@@ -21,7 +21,7 @@ pub(super) fn check(
     let result = (|| -> Result<sem::SemanticPublication> {
         check_cancel(cancel)?;
         let mut actual = crate::semantic_import::empty_publication(producer);
-        crate::semantic_import::read_staged_documents(
+        crate::store::staging::publication::read_documents(
             admitted.join_parts()?.conn,
             "",
             producer,

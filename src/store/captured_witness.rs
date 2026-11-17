@@ -19,7 +19,7 @@ pub(crate) fn stage_documents(conn: &Connection, producer: &sem::Producer) -> Re
     let mut insert = conn.prepare(
         "INSERT INTO capture_witness_documents(language,path,snapshot_json) VALUES(?1,?2,?3)",
     )?;
-    crate::semantic_import::read_staged_documents(conn, "", producer, &mut |publication| {
+    crate::store::staging::publication::read_documents(conn, "", producer, &mut |publication| {
         let (language, path, json) = snapshot_row(publication)?;
         insert.execute(params![language, path, json])?;
         Ok(())
