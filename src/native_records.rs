@@ -400,7 +400,7 @@ pub fn verified_callee_lookup(language: &str, call: &Call, source: &str) -> Opti
 /// toolchain or dependency capture, and no other source document, so every language declares
 /// the explicit empty inventory. An unlisted descriptor or language has no declaration.
 type LanguageInventory = (&'static str, &'static [&'static str]);
-pub(crate) const EXTRACTION_INPUTS: &[(&str, &str, &[LanguageInventory])] = &[(
+const EXTRACTION_INPUTS: &[(&str, &str, &[LanguageInventory])] = &[(
     PRODUCER,
     NATIVE_VERSION,
     &[
@@ -529,10 +529,7 @@ pub(crate) fn declared_selected_extraction_context(
     selected_extraction_context_for_inventory(language, inventory)
 }
 
-pub(crate) fn selected_extraction_context_for_inventory(
-    language: &str,
-    inventory: &[&str],
-) -> Result<String> {
+fn selected_extraction_context_for_inventory(language: &str, inventory: &[&str]) -> Result<String> {
     ensure!(
         inventory.is_empty(),
         "external native extraction inputs require captured selected-reuse proof"
@@ -540,7 +537,7 @@ pub(crate) fn selected_extraction_context_for_inventory(
     extraction_context(language, &[])
 }
 
-pub(crate) fn authenticated_extraction_context(
+fn authenticated_extraction_context(
     language: &str,
     inventory: &[&str],
     observed: &[(&str, Option<&[u8]>)],
@@ -589,7 +586,7 @@ pub(crate) fn valid_hash(s: &str) -> bool {
         && s.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
-pub(crate) fn stable_witness_rows<'a, T: Serialize + 'a>(
+fn stable_witness_rows<'a, T: Serialize + 'a>(
     items: impl IntoIterator<Item = &'a T>,
 ) -> Result<Vec<Value>> {
     let mut facts: Vec<Value> = items
@@ -641,3 +638,11 @@ pub(crate) fn document_witness<'a>(
         })),
     ))
 }
+
+#[cfg(test)]
+#[path = "native_records_tests.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "native_records_borrowed_witness_tests.rs"]
+mod borrowed_witness_tests;

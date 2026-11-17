@@ -34,9 +34,8 @@ use crate::native_ids::extraction_context;
 use crate::native_records::declared_extraction_inputs;
 #[cfg(test)]
 use crate::native_records::{
-    EXTRACTION_INPUTS, ExtractionAuthFault, authenticated_extraction_context,
-    declared_selected_extraction_context, document_witness, inject_extraction_auth_fault,
-    selected_extraction_context_for_inventory, stable_witness_rows,
+    ExtractionAuthFault, declared_selected_extraction_context, document_witness,
+    inject_extraction_auth_fault,
 };
 use crate::native_records::{hash, native_extraction_context, valid_hash};
 
@@ -1612,10 +1611,6 @@ impl Artifact {
         self.validate_selective(capture, root, root_id, cancel)
     }
 }
-
-#[cfg(test)]
-#[path = "native_evidence_borrowed_witness_tests.rs"]
-mod borrowed_witness_tests;
 
 #[cfg(test)]
 #[path = "native_evidence_occurrence_identity_tests.rs"]
