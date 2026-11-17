@@ -17,6 +17,7 @@ mod search_startup;
 pub(crate) mod semantic_display;
 pub(crate) mod semantic_payload;
 mod semantic_retention;
+pub(crate) mod spool_reader;
 pub mod staging;
 pub(crate) use search::SEARCH_CARD_BATCH_SIZE;
 pub use search::{
@@ -42,6 +43,7 @@ use anyhow::{Context, Result, ensure};
 pub use requests::{MaintenanceQueueProbe, MaintenanceQueueState, QueueProbeAdmission};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
+use spool_reader::SpoolReader;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     ops::{Deref, DerefMut},
@@ -56,7 +58,7 @@ use std::{
 #[cfg(test)]
 type TestMetricsDocumentHook = Arc<dyn Fn(&str, MetricsDocumentStage) + Send + Sync>;
 #[cfg(test)]
-type TestStreamPreflightHook = Box<dyn FnOnce(&crate::native_evidence::FullDocumentSpool) + Send>;
+type TestStreamPreflightHook = Box<dyn FnOnce(&dyn SpoolReader) + Send>;
 /// When a metrics document's test hook runs.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -865,8 +867,7 @@ enum ActivationStage {
 /// its own point under the recovery lock: for an in-place rebuild after the use lock is
 /// downgraded to shared and the publication baseline is read, and for a replacement after the
 /// private stage exists while use is still exclusive.
-pub(crate) type RecreateCapture<'a, C> =
-    dyn FnMut() -> Result<(C, crate::native_evidence::FullDocumentSpool)> + 'a;
+pub(crate) type RecreateCapture<'a, C, S> = dyn FnMut() -> Result<(C, S)> + 'a;
 // Serde's compact JSON serializer writes exactly the bytes persisted by `json()`.
 // Count and abort while streaming; never build an over-limit encoded source.
 struct EncodedSourceBudget {
@@ -1570,7 +1571,7 @@ impl EvidenceResponse {
         &self,
         pin: Option<IndexPin>,
         check: &mut (impl FnMut() -> Result<()> + Send),
-    ) -> Result<crate::references::Snapshot> {
+    ) -> Result<crate::architecture_inputs::Snapshot> {
         self.architecture_snapshot_regions(pin, check, &|_, _| {})
             .map(|(snapshot, _)| snapshot)
     }
@@ -1582,7 +1583,7 @@ impl EvidenceResponse {
         check: &mut (impl FnMut() -> Result<()> + Send),
         progress: &dyn Fn(usize, usize),
     ) -> Result<(
-        crate::references::Snapshot,
+        crate::architecture_inputs::Snapshot,
         Vec<Vec<crate::native_records::ControlRegion>>,
     )> {
         use crate::native_records::DocumentKey;
@@ -1713,7 +1714,7 @@ impl EvidenceResponse {
                     "incompatible_index: architecture language mismatch"
                 );
                 regions.push(fetched.regions);
-                documents.push(crate::references::DocumentInput {
+                documents.push(crate::architecture_inputs::DocumentInput {
                     key,
                     file: fetched.file,
                     declarations: fetched.declarations,
@@ -1815,7 +1816,7 @@ impl EvidenceResponse {
             };
             manifests.insert(
                 path.to_owned(),
-                crate::references::external::ManifestInput {
+                crate::architecture_inputs::ManifestInput {
                     source_set_id: source_set_id.clone(),
                     native_revision_id: native_revision_id.clone(),
                     dependency_hash: dependency_hash.clone(),
@@ -1875,7 +1876,7 @@ impl EvidenceResponse {
             SelectedIntegrity("incompatible_index: corrupt retained config".into()),
         )?;
         check()?;
-        let mut root_tsconfig: Option<crate::references::tsconfig::RootTsconfigInput> = None;
+        let mut root_tsconfig: Option<crate::architecture_inputs::RootTsconfigInput> = None;
         for entry in configs {
             check()?;
             let ConfigEntry {
@@ -1939,7 +1940,7 @@ impl EvidenceResponse {
                     manifests
                         .insert(
                             path.to_owned(),
-                            crate::references::external::ManifestInput {
+                            crate::architecture_inputs::ManifestInput {
                                 source_set_id: source_set_id.clone(),
                                 native_revision_id: native_revision_id.clone(),
                                 dependency_hash: dependency_hash.clone(),
@@ -1953,7 +1954,7 @@ impl EvidenceResponse {
                 );
                 continue;
             }
-            root_tsconfig = Some(crate::references::tsconfig::RootTsconfigInput {
+            root_tsconfig = Some(crate::architecture_inputs::RootTsconfigInput {
                 source_set_id: source_set_id.clone(),
                 path: path.to_owned(),
                 bytes,
@@ -1962,7 +1963,7 @@ impl EvidenceResponse {
         semantic_display::architecture_semantic(&self.db, &selected.key, &mut documents, check)?;
         check()?;
         Ok((
-            crate::references::Snapshot {
+            crate::architecture_inputs::Snapshot {
                 pin: selected.pin,
                 documents,
                 manifests: manifests.into_values().collect(),
@@ -11294,23 +11295,23 @@ impl Store {
     /// Only an already-classified corrupt index under a fresh exclusive leader may enter.
     /// `capture_and_spool` is the caller's full capture; see [`RecreateCapture`] for where it
     /// runs.
-    pub(crate) fn recreate_index_exclusive<C: AdmittedCapture>(
+    pub(crate) fn recreate_index_exclusive<C: AdmittedCapture, S: SpoolReader>(
         &self,
         options: &crate::model::IndexOptions,
         leader: &mut topology::WriterGuard,
         cancel: &CancelFlag,
-        capture_and_spool: &mut RecreateCapture<'_, C>,
+        capture_and_spool: &mut RecreateCapture<'_, C, S>,
     ) -> Result<IndexPin> {
         self.recreate_index_exclusive_with_hook(options, leader, cancel, capture_and_spool, |_| {
             Ok(())
         })
     }
-    fn recreate_index_exclusive_with_hook<C: AdmittedCapture>(
+    fn recreate_index_exclusive_with_hook<C: AdmittedCapture, S: SpoolReader>(
         &self,
         options: &crate::model::IndexOptions,
         leader: &mut topology::WriterGuard,
         cancel: &CancelFlag,
-        capture_and_spool: &mut RecreateCapture<'_, C>,
+        capture_and_spool: &mut RecreateCapture<'_, C, S>,
         mut at: impl FnMut(ActivationStage) -> Result<()>,
     ) -> Result<IndexPin> {
         ensure!(
@@ -12523,11 +12524,11 @@ impl Store {
             RecoveryDisposition::RecreatePending | RecoveryDisposition::RootReplaced
         ) && self.recovery_required.load(Ordering::Acquire)
     }
-    pub(crate) fn recreate_pending_writer_session<C: AdmittedCapture>(
+    pub(crate) fn recreate_pending_writer_session<C: AdmittedCapture, S: SpoolReader>(
         &self,
         options: &crate::model::IndexOptions,
         cancel: &CancelFlag,
-        capture_and_spool: &mut RecreateCapture<'_, C>,
+        capture_and_spool: &mut RecreateCapture<'_, C, S>,
     ) -> Result<(IndexPin, Arc<topology::WriterSession>)> {
         ensure!(
             self.is_recreate_pending(),
@@ -13586,7 +13587,7 @@ impl Store {
     /// all-or-nothing revision transaction.
     pub(crate) fn publish_validated_stream_recovery(
         &self,
-        spool: &crate::native_evidence::FullDocumentSpool,
+        spool: &dyn SpoolReader,
         capture: &dyn AdmittedCapture,
         leader: &topology::WriterGuard,
         expected: RecoveryBaseline,
@@ -13608,7 +13609,7 @@ impl Store {
     /// particular, it never consults corrupt live rows for reuse or baseline.
     fn publish_validated_stream_to_stage(
         &self,
-        spool: &crate::native_evidence::FullDocumentSpool,
+        spool: &dyn SpoolReader,
         capture: &dyn AdmittedCapture,
         stage: &StagedIndex,
         leader: &topology::WriterGuard,
@@ -13659,7 +13660,7 @@ impl Store {
     #[allow(clippy::too_many_arguments)]
     fn publish_validated_stream_target(
         &self,
-        spool: &crate::native_evidence::FullDocumentSpool,
+        spool: &dyn SpoolReader,
         capture: &dyn AdmittedCapture,
         leader: &topology::WriterGuard,
         expected: RecoveryBaseline,
@@ -15801,7 +15802,7 @@ impl Store {
     }
 
     fn prepare_stream_class_catalog(
-        spool: &crate::native_evidence::FullDocumentSpool,
+        spool: &dyn SpoolReader,
         order: &[usize],
         cancel: &CancelFlag,
     ) -> Result<(crate::classes::Catalog, bool)> {
@@ -15845,7 +15846,7 @@ impl Store {
 
     fn preflight_stream_reuse(
         &self,
-        spool: &crate::native_evidence::FullDocumentSpool,
+        spool: &dyn SpoolReader,
         order: &[usize],
         classes: &crate::classes::Catalog,
         expected: &ExpectedPublication,
@@ -16034,7 +16035,7 @@ impl Store {
         (max_graph_json_bytes, local, stream): (
             usize,
             Option<&LocalPrepared>,
-            Option<&crate::native_evidence::FullDocumentSpool>,
+            Option<&dyn SpoolReader>,
         ),
         mut during_tx: impl FnMut(PublishStage, &Connection) -> Result<()>,
         semantic: Option<(

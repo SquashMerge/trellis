@@ -1,6 +1,7 @@
 pub(crate) mod apps;
 mod architecture_core;
 pub mod architecture_details;
+mod architecture_inputs;
 mod architecture_read;
 pub mod auth;
 pub mod batch_descriptor;
@@ -59,6 +60,7 @@ pub mod native_evidence;
 pub mod native_ids;
 pub mod native_records;
 mod native_rust_macros;
+mod native_spool_reader;
 #[cfg(test)]
 mod native_typescript_tests;
 pub mod navigation;
