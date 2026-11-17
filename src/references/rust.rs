@@ -152,11 +152,27 @@ struct Binding {
     /// `pub(crate)`: visible in its own crate only.
     crate_only: bool,
     uncertain: bool,
+    /// An `extern crate name;` that keeps the crate's own name (#1166).
+    own_crate: bool,
 }
 impl Binding {
     fn visible(&self, context: ResolveContext<'_, '_>) -> bool {
         self.public && !(self.crate_only && context.foreign)
     }
+}
+/// How the crate root reads the first segment of a `use` path under edition 2015, where
+/// such a path starts at the crate root and not in its own scope (#1166).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RootReading {
+    /// Both editions read the path alike: the crate is proved to be of edition 2018 or
+    /// later, the `use` is in the root's own scope, or the root binds nothing of that name,
+    /// where the 2015 reading would not compile.
+    Same,
+    /// The root binds the name only by an `extern crate` of that very name: the crate the
+    /// edition 2018 reading reaches through the extern prelude when no nearer scope binds it.
+    OwnCrate,
+    /// Anything else, or a root scope that cannot rule the name out.
+    Other,
 }
 struct Scope {
     document: usize,
@@ -766,6 +782,7 @@ impl Catalog {
                     public: visibility(doc, child).is_some(),
                     crate_only: false,
                     uncertain: true,
+                    own_crate: child.child_by_field_name("alias").is_none(),
                 });
         }
     }
@@ -856,6 +873,7 @@ impl Catalog {
                         || restricted
                         || item_custom
                         || declaration.is_some_and(|d| d.role == DeclarationRole::Test),
+                    own_crate: false,
                 });
         }
         Ok(name)
@@ -986,6 +1004,7 @@ impl Catalog {
                                 public: false,
                                 crate_only: false,
                                 uncertain: true,
+                                own_crate: false,
                             });
                     }
                 }
@@ -1127,6 +1146,7 @@ impl Catalog {
                 self.path(
                     scope,
                     &import.path,
+                    true,
                     depth + 1,
                     route,
                     ResolveContext {
@@ -1266,10 +1286,64 @@ impl Catalog {
         }
         Ok(false)
     }
+    /// How the crate root of `scope` reads `first`, the first segment of a `use` path in
+    /// `scope`, under edition 2015 (#1166). Only a crate whose manifest proves edition 2018
+    /// or later is read the 2018 way alone. The root binds the name by an item, `extern
+    /// crate` included, by a named import or possibly by a glob, or, when it cannot be read
+    /// whole, by anything. The root's `std` and `core` are the crates of those names, as the
+    /// `extern crate` the compiler adds to a 2015 crate root binds them, even in a root that
+    /// cannot be read whole: a macro there defining another item of either name is not
+    /// detected.
+    fn root_reading(
+        &mut self,
+        scope: usize,
+        first: &str,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<RootReading> {
+        self.step(check)?;
+        let Some(root) = self.root(scope) else {
+            return Ok(RootReading::Same);
+        };
+        if scope == root || self.uniform.contains(&root) {
+            return Ok(RootReading::Same);
+        }
+        let types = (TYPE, first.to_owned());
+        let values = (VALUE, first.to_owned());
+        let root_scope = &self.scopes[root];
+        if root_scope.explicit.contains_key(&types) || root_scope.explicit.contains_key(&values) {
+            let bindings = root_scope.explicit.get(&types).map_or(0, Vec::len);
+            let own = !root_scope.cut
+                && !root_scope.explicit.contains_key(&values)
+                && root_scope.explicit[&types].iter().all(|b| b.own_crate);
+            self.charge(bindings, check)?;
+            return Ok(if own {
+                RootReading::OwnCrate
+            } else {
+                RootReading::Other
+            });
+        }
+        if root_scope.imports.named(first).next().is_some()
+            || root_scope.imports.stars().next().is_some()
+        {
+            return Ok(RootReading::Other);
+        }
+        if matches!(first, "std" | "core") {
+            return Ok(RootReading::OwnCrate);
+        }
+        Ok(if root_scope.opaque {
+            RootReading::Other
+        } else {
+            RootReading::Same
+        })
+    }
+    /// The names `path` resolves to from `scope`. `import` says it is the path of a `use`
+    /// item, which edition 2015 starts at the crate root (#1166).
+    #[allow(clippy::too_many_arguments)] // The lookup's captured context and route, as `binding`.
     fn path(
         &mut self,
         scope: usize,
         path: &[String],
+        import: bool,
         depth: usize,
         route: &mut Route,
         mut context: ResolveContext<'_, '_>,
@@ -1313,6 +1387,13 @@ impl Catalog {
                 lexical = true;
             }
         }
+        // A 2015 `use` path starts at the crate root: where the 2018 reading finds its first
+        // segment elsewhere and the root binds it too, the two editions can differ.
+        let reading = if import && lexical {
+            self.root_reading(scope, &path[0], check)?
+        } else {
+            RootReading::Same
+        };
         if index == path.len() {
             return Ok(self.module_name(current, &path[index - 1], depth));
         }
@@ -1370,7 +1451,10 @@ impl Catalog {
                     .and_then(|externs| externs.get(&path[0]))
                     .copied()
             {
-                let Some(library) = library else {
+                // Under edition 2015 the root's own binding of the name answers instead.
+                let Some(library) =
+                    library.filter(|_| reading != RootReading::Other || current == crate_root)
+                else {
                     return Ok(Names {
                         unknown_set: true,
                         ..Names::default()
@@ -1385,6 +1469,14 @@ impl Catalog {
                     return Ok(self.module_name(current, &path[0], depth));
                 }
                 continue;
+            }
+            // The 2018 reading found the first segment in a scope below the crate root, where
+            // the 2015 one takes the root's binding.
+            if lexical && reading != RootReading::Same && current != crate_root {
+                return Ok(Names {
+                    unknown_set: true,
+                    ..Names::default()
+                });
             }
             lexical = false;
             for bucket in found.names.values_mut() {
@@ -1539,6 +1631,7 @@ impl Catalog {
         let target = self.path(
             scope,
             &import.path,
+            true,
             depth,
             route,
             ResolveContext {
@@ -1787,6 +1880,15 @@ impl Catalog {
         if matches!(first.as_str(), "crate" | "self" | "super") || self.root(scope).is_none() {
             return Ok(None);
         }
+        // `excluding` is the import whose path this is: a `use` path, which edition 2015
+        // starts at the crate root (#1166). The walk below reads the scopes of its module,
+        // which in the root module include the root's own.
+        if excluding.is_some()
+            && self.root(scope) != Some(self.scopes[scope].module)
+            && self.root_reading(scope, first, check)? == RootReading::Other
+        {
+            return Ok(None);
+        }
         let mut current = Some(scope);
         while let Some(current_scope) = current {
             self.step(check)?;
@@ -1992,11 +2094,11 @@ impl Catalog {
                     check,
                 )?
             } else {
-                self.path(scope, &import.path, 1, &mut route, context, check)?
+                self.path(scope, &import.path, true, 1, &mut route, context, check)?
             }
         } else {
             match parts(&site.spelling) {
-                Some(path) => self.path(scope, &path, 1, &mut route, context, check)?,
+                Some(path) => self.path(scope, &path, false, 1, &mut route, context, check)?,
                 None => return Ok(SiteResolution::unknown("rust_path_unsupported")),
             }
         };
@@ -2152,7 +2254,7 @@ impl Catalog {
                     ..Names::default()
                 }
             } else {
-                self.path(scope, &named.path, 1, route, context, check)?
+                self.path(scope, &named.path, true, 1, route, context, check)?
             };
             explicit |= resolved.unknown_set
                 || resolved
@@ -2649,6 +2751,7 @@ mod cache_tests {
                 public: true,
                 crate_only: false,
                 uncertain: false,
+                own_crate: false,
             }],
         );
     }
