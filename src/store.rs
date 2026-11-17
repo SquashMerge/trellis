@@ -1,4 +1,5 @@
 //! SQLite index snapshots and request queues. Connections are never shared between threads.
+pub mod admitted_capture;
 pub mod anchors;
 pub(crate) mod batch_input;
 pub(crate) mod captured_witness;
@@ -34,6 +35,7 @@ pub use semantic_retention::AutoRunHead;
 pub(crate) mod symbol_trigrams;
 pub mod topology;
 use crate::model::*;
+use admitted_capture::AdmittedCapture;
 use anyhow::{Context, Result, ensure};
 pub use requests::{MaintenanceQueueProbe, MaintenanceQueueState, QueueProbeAdmission};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -861,10 +863,8 @@ enum ActivationStage {
 /// its own point under the recovery lock: for an in-place rebuild after the use lock is
 /// downgraded to shared and the publication baseline is read, and for a replacement after the
 /// private stage exists while use is still exclusive.
-pub(crate) type RecreateCapture<'a> = dyn FnMut() -> Result<(
-        crate::capture::Capture,
-        crate::native_evidence::FullDocumentSpool,
-    )> + 'a;
+pub(crate) type RecreateCapture<'a, C> =
+    dyn FnMut() -> Result<(C, crate::native_evidence::FullDocumentSpool)> + 'a;
 // Serde's compact JSON serializer writes exactly the bytes persisted by `json()`.
 // Count and abort while streaming; never build an over-limit encoded source.
 struct EncodedSourceBudget {
@@ -7795,7 +7795,7 @@ fn write_native(
     db: &Connection,
     bundle: (
         &crate::native_records::Artifact,
-        &crate::capture::Capture,
+        &dyn AdmittedCapture,
         &Graph,
         &crate::classes::Catalog,
         &BTreeMap<String, crate::model::FileExtraction>,
@@ -7970,7 +7970,7 @@ fn write_native(
     let captured_by_key: HashMap<(&str, &str), &SourceFile> =
         if captured_file.is_none() && !graph.files.is_empty() {
             capture
-                .files
+                .files()
                 .iter()
                 .map(|source| ((source.language.as_str(), source.path.as_str()), source))
                 .collect()
@@ -9100,7 +9100,7 @@ const SELECTED_CAPTURE_SNAPSHOT_SQL: &str = "SELECT d.path,v.content_hash,d.capt
 
 fn compare_capture_snapshot(
     db: &Connection,
-    capture: &crate::capture::Capture,
+    capture: &dyn AdmittedCapture,
 ) -> Result<ScanComparison> {
     compare_capture_snapshot_with(db, capture, true)
 }
@@ -9109,7 +9109,7 @@ fn compare_capture_snapshot(
 /// Fresh Capture hashes are still compared; stored source BLOBs are not read.
 fn compare_capture_snapshot_for_unchanged(
     db: &Connection,
-    capture: &crate::capture::Capture,
+    capture: &dyn AdmittedCapture,
     include_executable: bool,
     cancel: &CancelFlag,
 ) -> Result<ScanComparison> {
@@ -9118,7 +9118,7 @@ fn compare_capture_snapshot_for_unchanged(
 
 fn compare_capture_snapshot_with(
     db: &Connection,
-    capture: &crate::capture::Capture,
+    capture: &dyn AdmittedCapture,
     include_executable: bool,
 ) -> Result<ScanComparison> {
     compare_capture_snapshot_inner(db, capture, include_executable, None)
@@ -9126,7 +9126,7 @@ fn compare_capture_snapshot_with(
 
 fn compare_capture_snapshot_inner(
     db: &Connection,
-    capture: &crate::capture::Capture,
+    capture: &dyn AdmittedCapture,
     include_executable: bool,
     unchanged: Option<&CancelFlag>,
 ) -> Result<ScanComparison> {
@@ -9180,7 +9180,7 @@ fn compare_capture_snapshot_inner(
         );
     }
     let mut current_sources = BTreeMap::new();
-    for source in &capture.files {
+    for source in capture.files() {
         current_sources.insert(
             source.path.clone(),
             (source.hash.clone(), capture.source_stat(&source.path)?),
@@ -9218,7 +9218,7 @@ fn compare_capture_snapshot_inner(
     if !comparison.changed()
         && let Some(cancel) = unchanged
     {
-        for source in &capture.files {
+        for source in capture.files() {
             check_cancel(cancel)?;
             let (language, path, length, graph, class, context, producer, version) =
                 reuse_metadata.get(&source.path).ok_or_else(|| {
@@ -11294,23 +11294,23 @@ impl Store {
     /// Only an already-classified corrupt index under a fresh exclusive leader may enter.
     /// `capture_and_spool` is the caller's full capture; see [`RecreateCapture`] for where it
     /// runs.
-    pub(crate) fn recreate_index_exclusive(
+    pub(crate) fn recreate_index_exclusive<C: AdmittedCapture>(
         &self,
         options: &crate::model::IndexOptions,
         leader: &mut topology::WriterGuard,
         cancel: &CancelFlag,
-        capture_and_spool: &mut RecreateCapture<'_>,
+        capture_and_spool: &mut RecreateCapture<'_, C>,
     ) -> Result<IndexPin> {
         self.recreate_index_exclusive_with_hook(options, leader, cancel, capture_and_spool, |_| {
             Ok(())
         })
     }
-    fn recreate_index_exclusive_with_hook(
+    fn recreate_index_exclusive_with_hook<C: AdmittedCapture>(
         &self,
         options: &crate::model::IndexOptions,
         leader: &mut topology::WriterGuard,
         cancel: &CancelFlag,
-        capture_and_spool: &mut RecreateCapture<'_>,
+        capture_and_spool: &mut RecreateCapture<'_, C>,
         mut at: impl FnMut(ActivationStage) -> Result<()>,
     ) -> Result<IndexPin> {
         ensure!(
@@ -12523,11 +12523,11 @@ impl Store {
             RecoveryDisposition::RecreatePending | RecoveryDisposition::RootReplaced
         ) && self.recovery_required.load(Ordering::Acquire)
     }
-    pub(crate) fn recreate_pending_writer_session(
+    pub(crate) fn recreate_pending_writer_session<C: AdmittedCapture>(
         &self,
         options: &crate::model::IndexOptions,
         cancel: &CancelFlag,
-        capture_and_spool: &mut RecreateCapture<'_>,
+        capture_and_spool: &mut RecreateCapture<'_, C>,
     ) -> Result<(IndexPin, Arc<topology::WriterSession>)> {
         ensure!(
             self.is_recreate_pending(),
@@ -12903,7 +12903,7 @@ impl Store {
     pub fn publish_captured(
         &self,
         graph: &Graph,
-        capture: &crate::capture::Capture,
+        capture: &dyn AdmittedCapture,
         leader: &topology::WriterGuard,
         expected_revision: IndexPin,
         cancel: &CancelFlag,
@@ -12914,7 +12914,7 @@ impl Store {
     pub fn publish_native(
         &self,
         graph: &Graph,
-        capture: &crate::capture::Capture,
+        capture: &dyn AdmittedCapture,
         native: &crate::native_records::Artifact,
         leader: &topology::WriterGuard,
         expected_revision: IndexPin,
@@ -12938,7 +12938,7 @@ impl Store {
     pub fn publish_native_recovery_for_tests(
         &self,
         graph: &Graph,
-        capture: &crate::capture::Capture,
+        capture: &dyn AdmittedCapture,
         native: &crate::native_records::Artifact,
         leader: &topology::WriterGuard,
         cancel: &CancelFlag,
@@ -13457,7 +13457,7 @@ impl Store {
     pub fn publish_native_semantic(
         &self,
         graph: &Graph,
-        capture: &crate::capture::Capture,
+        capture: &dyn AdmittedCapture,
         native: &crate::native_records::Artifact,
         semantic: &crate::semantic_records::SemanticPublication,
         captured: &crate::semantic_records::CapturedComponents,
@@ -13484,7 +13484,7 @@ impl Store {
         &self,
         evidence: (
             &Graph,
-            &crate::capture::Capture,
+            &dyn AdmittedCapture,
             &crate::native_records::Artifact,
             &crate::semantic_records::SemanticPublication,
             &crate::semantic_records::CapturedComponents,
@@ -13519,7 +13519,7 @@ impl Store {
         &self,
         evidence: (
             &Graph,
-            &crate::capture::Capture,
+            &dyn AdmittedCapture,
             &crate::native_records::Artifact,
             &crate::semantic_records::SemanticPublication,
             &crate::semantic_records::CapturedComponents,
@@ -13549,7 +13549,7 @@ impl Store {
     fn publish_native_semantic_with_tx_hook(
         &self,
         graph: &Graph,
-        capture: &crate::capture::Capture,
+        capture: &dyn AdmittedCapture,
         native: &crate::native_records::Artifact,
         semantic: &crate::semantic_records::SemanticPublication,
         captured: &crate::semantic_records::CapturedComponents,
@@ -13587,7 +13587,7 @@ impl Store {
     pub(crate) fn publish_validated_stream_recovery(
         &self,
         spool: &crate::native_evidence::FullDocumentSpool,
-        capture: &crate::capture::Capture,
+        capture: &dyn AdmittedCapture,
         leader: &topology::WriterGuard,
         expected: RecoveryBaseline,
         cancel: &CancelFlag,
@@ -13609,7 +13609,7 @@ impl Store {
     fn publish_validated_stream_to_stage(
         &self,
         spool: &crate::native_evidence::FullDocumentSpool,
-        capture: &crate::capture::Capture,
+        capture: &dyn AdmittedCapture,
         stage: &StagedIndex,
         leader: &topology::WriterGuard,
         cancel: &CancelFlag,
@@ -13660,7 +13660,7 @@ impl Store {
     fn publish_validated_stream_target(
         &self,
         spool: &crate::native_evidence::FullDocumentSpool,
-        capture: &crate::capture::Capture,
+        capture: &dyn AdmittedCapture,
         leader: &topology::WriterGuard,
         expected: RecoveryBaseline,
         target: PublicationTarget<'_>,
@@ -13677,16 +13677,16 @@ impl Store {
             "native_evidence_required: capture must have one graph projection"
         );
         ensure!(
-            capture.source_operations.len() == capture.files.len()
+            capture.source_operations().len() == capture.files().len()
                 && capture
-                    .source_operations
+                    .source_operations()
                     .values()
                     .all(crate::capture_records::SourceOperations::read_once),
             "native_evidence_required: each source must open and read at most once, and hash once"
         );
         ensure!(
             spool.len() == spool.header().revision.documents.len()
-                && spool.len() == capture.files.len(),
+                && spool.len() == capture.files().len(),
             "native_evidence_required: streamed document count mismatch"
         );
         let documents: BTreeMap<_, _> = spool
@@ -13708,7 +13708,7 @@ impl Store {
             ..Graph::default()
         };
         let mut unique_paths = BTreeSet::new();
-        for source in &capture.files {
+        for source in capture.files() {
             ensure!(
                 unique_paths.insert(source.path.as_str()),
                 "native_evidence_required: duplicate captured source path"
@@ -13944,7 +13944,7 @@ impl Store {
     pub fn publish_native_recovery_selective_for_tests(
         &self,
         graph: &Graph,
-        capture: &crate::capture::Capture,
+        capture: &dyn AdmittedCapture,
         native: &crate::native_records::Artifact,
         leader: &topology::WriterGuard,
         cancel: &CancelFlag,
@@ -13959,7 +13959,7 @@ impl Store {
     pub fn publish_selective_semantic_for_tests(
         &self,
         graph: &Graph,
-        capture: &crate::capture::Capture,
+        capture: &dyn AdmittedCapture,
         native: &crate::native_records::Artifact,
         semantic: &crate::semantic_records::SemanticPublication,
         captured: &crate::semantic_records::CapturedComponents,
@@ -14067,7 +14067,7 @@ impl Store {
     pub(crate) fn publish_native_recovery_selective(
         &self,
         graph: &Graph,
-        capture: &crate::capture::Capture,
+        capture: &dyn AdmittedCapture,
         native: &crate::native_records::Artifact,
         leader: &topology::WriterGuard,
         expected: RecoveryBaseline,
@@ -14086,7 +14086,7 @@ impl Store {
     pub(crate) fn publish_local_native_recovery(
         &self,
         graph: &Graph,
-        capture: &crate::capture::Capture,
+        capture: &dyn AdmittedCapture,
         prepared: LocalPrepared,
         leader: &topology::WriterGuard,
         expected: RecoveryBaseline,
@@ -14101,7 +14101,7 @@ impl Store {
     fn publish_local_native_recovery_with_semantic(
         &self,
         graph: &Graph,
-        capture: &crate::capture::Capture,
+        capture: &dyn AdmittedCapture,
         prepared: LocalPrepared,
         leader: &topology::WriterGuard,
         expected: RecoveryBaseline,
@@ -14113,15 +14113,15 @@ impl Store {
         fail_before_commit: bool,
     ) -> Result<IndexPin> {
         ensure!(
-            capture.files == graph.files && expected.pin() == Some(prepared.prior_pin),
+            capture.files() == graph.files && expected.pin() == Some(prepared.prior_pin),
             "revision conflict: changed-only graph or expected head differs"
         );
         capture.claim_graph_projection()?;
         ensure!(
             capture.graph_projection_count() == 1
-                && capture.source_operations.len() == capture.files.len()
+                && capture.source_operations().len() == capture.files().len()
                 && capture
-                    .source_operations
+                    .source_operations()
                     .values()
                     .all(crate::capture_records::SourceOperations::read_once),
             "native_evidence_required: incomplete selected capture"
@@ -14179,7 +14179,7 @@ impl Store {
                 Ok(())
             })?;
         } else {
-            for file in &capture.files {
+            for file in capture.files() {
                 if prepared.changed_paths.contains(&file.path) {
                     continue;
                 }
@@ -14226,7 +14226,7 @@ impl Store {
     fn publish_native_expected(
         &self,
         graph: &Graph,
-        capture: &crate::capture::Capture,
+        capture: &dyn AdmittedCapture,
         native: &crate::native_records::Artifact,
         leader: &topology::WriterGuard,
         expected: ExpectedPublication,
@@ -14239,7 +14239,7 @@ impl Store {
     fn validate_native_bundle(
         &self,
         graph: &Graph,
-        capture: &crate::capture::Capture,
+        capture: &dyn AdmittedCapture,
         native: &crate::native_records::Artifact,
         cancel: &CancelFlag,
     ) -> Result<()> {
@@ -14248,7 +14248,7 @@ impl Store {
     fn validate_native_bundle_with_mode(
         &self,
         graph: &Graph,
-        capture: &crate::capture::Capture,
+        capture: &dyn AdmittedCapture,
         native: &crate::native_records::Artifact,
         cancel: &CancelFlag,
         selective: bool,
@@ -14273,7 +14273,7 @@ impl Store {
     fn validate_bundle_projection(
         &self,
         graph: &Graph,
-        capture: &crate::capture::Capture,
+        capture: &dyn AdmittedCapture,
         native: &crate::native_records::Artifact,
         cancel: &CancelFlag,
     ) -> Result<()> {
@@ -14282,9 +14282,9 @@ impl Store {
             "native_evidence_required: capture must have one graph projection"
         );
         ensure!(
-            capture.source_operations.len() == capture.files.len()
+            capture.source_operations().len() == capture.files().len()
                 && capture
-                    .source_operations
+                    .source_operations()
                     .values()
                     .all(crate::capture_records::SourceOperations::read_once),
             "native_evidence_required: each source must open and read at most once, and hash once"
@@ -14299,7 +14299,7 @@ impl Store {
         &self,
         bundle: (
             &Graph,
-            &crate::capture::Capture,
+            &dyn AdmittedCapture,
             &crate::native_records::Artifact,
         ),
         stage: &StagedIndex,
@@ -14356,7 +14356,7 @@ impl Store {
     fn publish_inner_expected(
         &self,
         graph: &Graph,
-        capture: &crate::capture::Capture,
+        capture: &dyn AdmittedCapture,
         native: &crate::native_records::Artifact,
         leader: &topology::WriterGuard,
         expected: ExpectedPublication,
@@ -14474,7 +14474,7 @@ impl Store {
         &self,
         bundle: (
             &Graph,
-            &crate::capture::Capture,
+            &dyn AdmittedCapture,
             &crate::native_records::Artifact,
         ),
         leader: &topology::WriterGuard,
@@ -14498,7 +14498,7 @@ impl Store {
         &self,
         bundle: (
             &Graph,
-            &crate::capture::Capture,
+            &dyn AdmittedCapture,
             &crate::native_records::Artifact,
         ),
         leader: &topology::WriterGuard,
@@ -14520,7 +14520,7 @@ impl Store {
         &self,
         bundle: (
             &Graph,
-            &crate::capture::Capture,
+            &dyn AdmittedCapture,
             &crate::native_records::Artifact,
         ),
         leader: &topology::WriterGuard,
@@ -14735,7 +14735,7 @@ impl Store {
     /// This read-only guard is not an explicit-request completion path.
     pub(crate) fn selected_capture_unchanged(
         &self,
-        capture: &crate::capture::Capture,
+        capture: &dyn AdmittedCapture,
         leader: &topology::WriterGuard,
         expected: &RecoveryBaseline,
         cancel: &CancelFlag,
@@ -14748,9 +14748,9 @@ impl Store {
         }
         check_cancel(cancel)?;
         ensure!(
-            capture.source_operations.len() == capture.files.len()
+            capture.source_operations().len() == capture.files().len()
                 && capture
-                    .source_operations
+                    .source_operations()
                     .values()
                     .all(crate::capture_records::SourceOperations::read_once),
             "native_evidence_required: final inventory must freshly read and hash every admitted source"
@@ -14807,7 +14807,7 @@ impl Store {
 
     pub(crate) fn reuse_unchanged_native_head(
         &self,
-        capture: &crate::capture::Capture,
+        capture: &dyn AdmittedCapture,
         leader: &topology::WriterGuard,
         expected: &RecoveryBaseline,
         cancel: &CancelFlag,
@@ -14822,9 +14822,9 @@ impl Store {
         leader.belongs_to(&self.identity)?;
         self.identity.verify()?;
         ensure!(
-            capture.source_operations.len() == capture.files.len()
+            capture.source_operations().len() == capture.files().len()
                 && capture
-                    .source_operations
+                    .source_operations()
                     .values()
                     .all(crate::capture_records::SourceOperations::read_once),
             "native_evidence_required: every unchanged source must be read and hashed"
@@ -15026,7 +15026,7 @@ impl Store {
             params![revision_key, selected.key],
         )?;
         selected_ensure!(
-            copied == capture.files.len(),
+            copied == capture.files().len(),
             "incompatible_index: incomplete unchanged revision manifest"
         );
         tx.execute(
@@ -15090,7 +15090,7 @@ impl Store {
 
     pub(crate) fn prepare_local_revision(
         &self,
-        capture: &crate::capture::Capture,
+        capture: &dyn AdmittedCapture,
         expected: &RecoveryBaseline,
         cancel: &CancelFlag,
     ) -> Result<Option<LocalPrepared>> {
@@ -15201,7 +15201,7 @@ impl Store {
             }
             let Some(affected_paths) = crate::indexer::measure_persisted_change(
                 &previous, &previous_options, &previous_inputs, capture)? else { return Ok(None); };
-            let current_paths: BTreeSet<_> = capture.files.iter().map(|f| f.path.clone()).collect();
+            let current_paths: BTreeSet<_> = capture.files().iter().map(|f| f.path.clone()).collect();
             let changed_paths: BTreeSet<_> = affected_paths.intersection(&current_paths).cloned().collect();
             let removed_paths: BTreeSet<_> = affected_paths.difference(&current_paths).cloned().collect();
             let mut old_changed_counts = (0_usize, 0_usize, 0_usize);
@@ -15247,7 +15247,7 @@ impl Store {
     /// Compose full revision summaries from changed facts and the selected head.
     pub(crate) fn compose_local_revision(
         &self,
-        capture: &crate::capture::Capture,
+        capture: &dyn AdmittedCapture,
         prepared: &LocalPrepared,
         changed: Graph,
         cancel: &CancelFlag,
@@ -15283,7 +15283,7 @@ impl Store {
             .count();
         let calls = delta(prepared.old_stats.calls, old_calls, changed.stats.calls)?;
         let stats = IndexStats {
-            files: capture.files.len(),
+            files: capture.files().len(),
             symbols: delta(prepared.old_stats.symbols, old_nodes, changed.stats.symbols)?,
             calls,
             regions: delta(
@@ -15316,7 +15316,7 @@ impl Store {
             .collect();
         diagnostics.sort_by_key(|d| d.path.as_deref().and_then(|path| order.get(path)).copied());
         Ok(Graph {
-            files: capture.files.clone(),
+            files: capture.files().to_vec(),
             nodes: changed.nodes,
             calls: changed.calls,
             regions: changed.regions,
@@ -15384,7 +15384,7 @@ impl Store {
                 &previous,&previous_options,&previous_inputs,capture)? else { return Ok(None); };
             let root=Path::new(&self.workspace_root);
             let mut measured=vec![];
-            for file in &capture.files {
+            for file in capture.files() {
                 if selected_paths.contains(&file.path) {
                     let changed=native_evidence::measure_captured_document(
                         capture,root,self.root_id(),&file.path,cancel, |_| {})?;
@@ -16000,7 +16000,7 @@ impl Store {
         &self,
         bundle: (
             &Graph,
-            &crate::capture::Capture,
+            &dyn AdmittedCapture,
             &crate::native_records::Artifact,
         ),
         leader: &topology::WriterGuard,
@@ -16025,7 +16025,7 @@ impl Store {
         &self,
         bundle: (
             &Graph,
-            &crate::capture::Capture,
+            &dyn AdmittedCapture,
             &crate::native_records::Artifact,
         ),
         leader: &topology::WriterGuard,
@@ -16052,7 +16052,7 @@ impl Store {
         }
         let (graph, capture, native) = bundle;
         let source_files = if stream.is_some() {
-            capture.files.as_slice()
+            capture.files()
         } else {
             graph.files.as_slice()
         };
@@ -16232,7 +16232,7 @@ impl Store {
             (stats, classes, extractions, complete)
         };
         let source_bytes: BTreeMap<&str, usize> = capture
-            .files
+            .files()
             .iter()
             .map(|file| (file.path.as_str(), file.text.len()))
             .collect();
@@ -16393,7 +16393,7 @@ impl Store {
                     .push(doc);
             }
             let mut captured_by_key: HashMap<(&str, &str), Vec<_>> = HashMap::new();
-            for source in &capture.files {
+            for source in capture.files() {
                 captured_by_key
                     .entry((source.language.as_str(), source.path.as_str()))
                     .or_default()
