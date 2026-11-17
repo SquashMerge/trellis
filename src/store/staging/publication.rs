@@ -2,7 +2,7 @@
 //! Every family is emitted document-major, so one cursor per family in `ord` order is merged
 //! against the coverage rows: memory holds one document, and no per-document index is read.
 use super::codec;
-use crate::semantic_evidence as semantic;
+use crate::semantic_records as semantic;
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, Rows};
 
