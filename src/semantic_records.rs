@@ -1,9 +1,10 @@
 //! The persisted semantic evidence records and their leaf vocabulary.
 //!
-//! Plain data, the closed vocabularies, the coverage-reason arithmetic and the language order
-//! only: validation, the native index and the emission validator stay in `semantic_evidence`,
-//! which re-exports these names.
+//! Plain data, the closed vocabularies, the coverage-reason arithmetic, the language order and
+//! the rejoined provenance ID only: validation, the native index and the emission validator
+//! stay in `semantic_evidence`, which re-exports the record names.
 
+use crate::native_ids;
 use crate::native_records as native;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
@@ -220,4 +221,15 @@ pub const LANGUAGE_ORDER: [&str; 5] = ["java", "rust", "python", "javascript", "
 
 pub fn language_order(language: &str) -> Option<usize> {
     LANGUAGE_ORDER.iter().position(|name| *name == language)
+}
+
+/// The provenance ID of a rejoined fact: a digest of the raw proof, the destination revision
+/// and the evidence kind, so it needs no lookup table.
+pub(crate) fn rejoin_provenance_id(raw_id: &str, revision_id: &str, kind: EvidenceKind) -> String {
+    native_ids::digest(
+        b"trellis.semantic-rejoin.v1\0",
+        &native_ids::canonical(
+            &serde_json::json!({"proof":raw_id,"revision":revision_id,"kind":kind}),
+        ),
+    )
 }

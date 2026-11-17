@@ -2,7 +2,7 @@ use super::*;
 use crate::indexer::{IndexOptions, index_workspace_bundle};
 use std::{fs, sync::atomic::AtomicBool};
 
-use crate::evidence_budget::graph_bytes as derived_graph_bytes;
+use crate::evidence_limits::graph_bytes as derived_graph_bytes;
 
 #[test]
 fn derived_graph_row_byte_budget_accepts_under_and_rejects_over() {

@@ -1197,7 +1197,7 @@ impl NativeReader<'_> {
         &self,
         descriptor: &crate::batch_descriptor::Descriptor,
     ) -> Result<Vec<String>> {
-        let workspace_uri = crate::scip_admission::file_uri(&self.store.identity.root)?;
+        let workspace_uri = crate::scip_vocab::file_uri(&self.store.identity.root)?;
         Ok(descriptor.reuse_project_roots(&workspace_uri, &self.store.identity.root_key))
     }
 
@@ -4966,8 +4966,7 @@ fn authenticate_stored_batch(
         .context("raw producer not pinned")?;
     // Every spelling admission accepts for the descriptor's origin is accepted here, so a
     // batch that was admitted can always be re-authenticated against its retained root.
-    let workspace_uri =
-        crate::scip_admission::file_uri(&identity.root).context("raw project root")?;
+    let workspace_uri = crate::scip_vocab::file_uri(&identity.root).context("raw project root")?;
     descriptor
         .bind_header(
             &descriptor.reuse_project_roots(&workspace_uri, &identity.root_key),
@@ -7382,7 +7381,7 @@ fn write_semantic_tuple(
         if let Some(derived) = derived {
             ensure!(
                 proof.id
-                    == crate::semantic_import::rejoin_provenance_id(
+                    == crate::semantic_records::rejoin_provenance_id(
                         &derived.provenance_id,
                         native,
                         proof.evidence_kind
@@ -18504,7 +18503,7 @@ impl Store {
         .context(SelectedIntegrity(
             "incompatible_index: selected graph derivation failed".into(),
         ))?;
-        crate::evidence_budget::graph_bytes(
+        crate::evidence_limits::graph_bytes(
             &nodes,
             &graph_calls,
             &graph_regions,
