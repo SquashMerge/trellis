@@ -3,10 +3,10 @@
 //!
 //! Parsing is serde only and never admits: native rejoin re-parses stored `descriptor_bytes`
 //! through the same type. Admission is the separate `check_*` family, run in wire-format order.
-//! The checks here need only the bytes, the limits, the captured revision and the checked-in
-//! producer pin (`crate::producer_pin`). The ones that consult the producer profiles or the
-//! filesystem (`context_profile`, `check_origin`, `check_paths`) are in
-//! `semantic_batch::descriptor`.
+//! The checks here need only the bytes, the limits, the captured revision, the checked-in
+//! producer pin (`crate::producer_pin`) and the producer profile table
+//! (`crate::producer_profiles`). The ones that apply the generation-origin rule or consult the
+//! filesystem (`check_origin`, `check_paths`) are in `semantic_batch::descriptor`.
 pub use crate::semantic_batch::origin::GenerationOrigin;
 use crate::{
     native_ids::canonical_into,
@@ -280,6 +280,35 @@ impl Descriptor {
             pinned_producer
         };
         check(&self.trust_origin, &self.profile_id, &self.producer)
+    }
+
+    /// The admitted run's controlled context policy, or full captured context.
+    /// Supplied batches, pickups and the synthetic stand-in cannot narrow input dependencies.
+    pub fn context_profile(&self) -> Result<Option<crate::producer_profiles::Row>> {
+        use crate::producer_profiles::{self as profiles, ProducerName, TrustProfile};
+        let Some(generation) = self.generation.as_ref() else {
+            return Ok(None);
+        };
+        if generation.origin == GenerationOrigin::OwnerPickup {
+            if generation.trust_profile.is_some() {
+                return Err(admission("generation trust profile"));
+            }
+            return Ok(None);
+        }
+        let trust = match generation.trust_profile {
+            Some(GenerationTrust::Restricted) => TrustProfile::Restricted,
+            Some(GenerationTrust::Trusted) => TrustProfile::Trusted,
+            None => return Err(admission("generation trust profile")),
+        };
+        let pinned = self.check_producer()?;
+        if pinned.name == profiles::STUB_NAME {
+            return Ok(None);
+        }
+        let producer =
+            ProducerName::parse(&pinned.name).ok_or_else(|| admission("producer profile pin"))?;
+        profiles::row(profiles::Target::Real(producer), trust)
+            .map(Some)
+            .map_err(|_| admission("generation trust profile"))
     }
 
     /// The project-root spellings a stored batch may bind to on store reuse. Every spelling
