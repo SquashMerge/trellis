@@ -7,8 +7,9 @@
 //!   the root package when the root manifest has `[package]`.
 //! - A member's library crate root is `[lib] path`, else `src/lib.rs`, relative to the member
 //!   (none when `autolib = false` without `[lib]`); its crate name is `[lib] name`, else the
-//!   package name with `-` replaced by `_`. Its binary crate root is `src/main.rs`, which
-//!   Cargo discovers unless `autobins = false` (then a `[[bin]]` must name it).
+//!   package name with `-` replaced by `_`. Its binary crate root is `src/main.rs` when Cargo
+//!   builds it as a binary target, which [`main_root`] decides by Cargo's target
+//!   auto-discovery (#1190).
 //! - A member binds another member's library by a dependency in `[dependencies]` or
 //!   `[dev-dependencies]` (also under `[target.*]`) whose `path`, or the root
 //!   `[workspace.dependencies]` entry it inherits with `workspace = true`, is that member's
@@ -149,7 +150,7 @@ fn member_dirs<'a>(root: &toml::Table, dirs: &[&'a str]) -> Option<Vec<&'a str>>
 }
 
 /// The member parsed from `table`, or `None` when it is not a proved package.
-fn member(dir: &str, table: &toml::Table) -> Option<Member> {
+fn member(dir: &str, table: &toml::Table, root: &toml::Table) -> Option<Member> {
     let package = table.get("package")?.as_table()?;
     let name = package.get("name")?.as_str()?;
     if name.is_empty() {
@@ -180,22 +181,7 @@ fn member(dir: &str, table: &toml::Table) -> Option<Member> {
     {
         return None;
     }
-    // As in Cargo, `src/main.rs` is discovered unless `autobins = false`, beside any explicit
-    // `[[bin]]`; with discovery off, a `[[bin]]` must name it.
-    let main = join(dir, "src/main.rs")?;
-    let bins = match table.get("bin") {
-        None => &Vec::new(),
-        Some(toml::Value::Array(bins)) => bins,
-        Some(_) => return None,
-    };
-    let declared = bins.iter().any(|bin| {
-        bin.as_table().is_some_and(|bin| match bin.get("path") {
-            Some(path) => path.as_str().and_then(|p| join(dir, p)).as_ref() == Some(&main),
-            None => bin.get("name").and_then(toml::Value::as_str) == Some(name),
-        })
-    });
-    let discovered = package.get("autobins").and_then(toml::Value::as_bool) != Some(false);
-    let binary = (declared || discovered).then_some(main);
+    let binary = main_root(dir, table, root)?;
     Some(Member {
         dir: dir.to_owned(),
         package: name.to_owned(),
@@ -205,6 +191,70 @@ fn member(dir: &str, table: &toml::Table) -> Option<Member> {
         uniform_paths: false,
         bindings: BTreeMap::new(),
     })
+}
+
+/// The binary crate root `src/main.rs` of the package manifest `table` in `dir`, when Cargo
+/// builds it as a binary target, by Cargo's target auto-discovery (#1190); `None` when `table`
+/// is no package or its `bin` is not an array. A `[[bin]]` names the file by its `path`, or
+/// with no `path` by the package's name. Otherwise Cargo discovers it beside the explicit
+/// `[[bin]]` entries unless one of them takes the package's name for another file, or
+/// discovery is off: `autobins = false`, or, without an `autobins` key, a package of edition
+/// 2015 (or one not proved later) that lists `[[bin]]` at all. Cargo's edition 2015 legacy
+/// fallback paths for a `[[bin]]` with no `path` are not modelled, and the shortcut that a
+/// `[[bin]]` with no `path` and the package's name is `src/main.rs` is inherited unchanged.
+pub(super) fn main_root(
+    dir: &str,
+    table: &toml::Table,
+    root: &toml::Table,
+) -> Option<Option<String>> {
+    let package = table.get("package")?.as_table()?;
+    let name = package.get("name")?.as_str()?;
+    let main = join(dir, "src/main.rs")?;
+    let bins = match table.get("bin") {
+        None => None,
+        Some(toml::Value::Array(bins)) => Some(bins),
+        Some(_) => return None,
+    };
+    let mut named = false;
+    for bin in bins.into_iter().flatten().filter_map(toml::Value::as_table) {
+        let bin_name = bin.get("name").and_then(toml::Value::as_str);
+        let names_main = match bin.get("path") {
+            Some(path) => path.as_str().and_then(|p| join(dir, p)).as_ref() == Some(&main),
+            None => bin_name == Some(name),
+        };
+        if names_main {
+            return Some(Some(main));
+        }
+        named |= bin_name == Some(name);
+    }
+    let discovered = match package.get("autobins").and_then(toml::Value::as_bool) {
+        Some(autobins) => autobins,
+        None => bins.is_none() || edition(package, root).is_some_and(|e| e != "2015"),
+    };
+    Some((discovered && !named).then_some(main))
+}
+
+/// The package's edition: a literal string, or the one a sole `edition.workspace = true`
+/// inherits from the `[workspace.package]` of the checkout's root manifest. A missing key is
+/// `"2015"`; anything else is `None`.
+fn edition<'a>(package: &'a toml::Table, root: &'a toml::Table) -> Option<&'a str> {
+    match package.get("edition") {
+        None => Some("2015"),
+        Some(toml::Value::Table(inherit)) => {
+            if inherit.len() != 1
+                || inherit.get("workspace").and_then(toml::Value::as_bool) != Some(true)
+            {
+                return None;
+            }
+            root.get("workspace")?
+                .as_table()?
+                .get("package")?
+                .as_table()?
+                .get("edition")?
+                .as_str()
+        }
+        Some(edition) => edition.as_str(),
+    }
 }
 
 /// Whether every target of the package `table` is proved to be of edition 2018 or later,
@@ -220,11 +270,6 @@ fn member(dir: &str, table: &toml::Table) -> Option<Member> {
 /// another workspace root proves nothing either.
 fn uniform_paths(table: &toml::Table, root: &toml::Table) -> bool {
     const UNIFORM: [&str; 3] = ["2018", "2021", "2024"];
-    let known = |edition: Option<&toml::Value>| {
-        edition
-            .and_then(toml::Value::as_str)
-            .is_some_and(|edition| UNIFORM.contains(&edition))
-    };
     let own_edition = |section: &toml::Value| match section {
         toml::Value::Table(section) => section.contains_key("edition"),
         toml::Value::Array(entries) => entries.iter().any(|entry| {
@@ -244,20 +289,7 @@ fn uniform_paths(table: &toml::Table, root: &toml::Table) -> bool {
     {
         return false;
     }
-    match package.get("edition") {
-        Some(toml::Value::Table(inherit)) => {
-            inherit.len() == 1
-                && inherit.get("workspace").and_then(toml::Value::as_bool) == Some(true)
-                && known(
-                    root.get("workspace")
-                        .and_then(toml::Value::as_table)
-                        .and_then(|workspace| workspace.get("package"))
-                        .and_then(toml::Value::as_table)
-                        .and_then(|package| package.get("edition")),
-                )
-        }
-        edition => known(edition),
-    }
+    edition(package, root).is_some_and(|edition| UNIFORM.contains(&edition))
 }
 
 /// Whether the package manifest `table` names a target root, a target `path` or a string
@@ -401,7 +433,7 @@ impl Workspace {
             let mut discovered = target_dirs("", &root);
             let mut absolute = absolute_target(&root);
             let mut tables = Vec::new();
-            if let Some(mut member) = member("", &root) {
+            if let Some(mut member) = member("", &root, &root) {
                 member.uniform_paths = uniform_paths(&root, &root);
                 tables.push((member, root.clone()));
             }
@@ -417,7 +449,7 @@ impl Workspace {
                 discovered.extend(target_dirs(dir, &table));
                 absolute |= absolute_target(&table);
                 if dirs.contains(&dir)
-                    && let Some(mut member) = member(dir, &table)
+                    && let Some(mut member) = member(dir, &table, &root)
                 {
                     member.uniform_paths = uniform_paths(&table, &root);
                     tables.push((member, table));
@@ -806,7 +838,7 @@ mod tests {
     fn a_binary_binds_its_own_library_beside_explicit_bins() {
         let ws = workspace(&[(
             "Cargo.toml",
-            "[package]\nname = 'my-tool'\n[[bin]]\nname = 'stub'\npath = 'src/bin/stub.rs'\n",
+            "[package]\nname = 'my-tool'\nedition = '2021'\n[[bin]]\nname = 'stub'\npath = 'src/bin/stub.rs'\n",
         )]);
         let main = ws.crate_root("s", "src/main.rs").unwrap().clone();
         assert!(!main.library);
@@ -821,6 +853,49 @@ mod tests {
             "[package]\nname = 'my-tool'\nautobins = false\n[[bin]]\nname = 'stub'\npath = 'src/bin/stub.rs'\n",
         )]);
         assert!(ws.crate_root("s", "src/main.rs").is_none());
+    }
+
+    /// `src/main.rs` follows Cargo's target auto-discovery beside explicit `[[bin]]` entries
+    /// (#1190): one root when a `[[bin]]` also names it, none when a `[[bin]]` takes the
+    /// package's name for another file or edition 2015 turns discovery off.
+    #[test]
+    fn src_main_follows_cargo_auto_discovery_beside_explicit_bins() {
+        let main = |manifest: &str| {
+            workspace(&[("Cargo.toml", manifest)])
+                .crate_root("s", "src/main.rs")
+                .cloned()
+        };
+        let stub = "[[bin]]\nname = 'stub'\npath = 'src/bin/stub.rs'\n";
+        for named in [
+            format!("[package]\nname = 'tool'\nedition = '2021'\n{stub}"),
+            format!(
+                "[package]\nname = 'tool'\nedition = '2021'\n{stub}[[bin]]\nname = 'tool'\npath = 'src/main.rs'\n"
+            ),
+            format!("[package]\nname = 'tool'\nedition = '2021'\n{stub}[[bin]]\nname = 'tool'\n"),
+            format!(
+                "[package]\nname = 'tool'\n{stub}[[bin]]\nname = 'main'\npath = 'src/main.rs'\n"
+            ),
+            format!("[package]\nname = 'tool'\nautobins = true\n{stub}"),
+        ] {
+            let root = main(&named).unwrap_or_else(|| panic!("{named}"));
+            assert_eq!(
+                root,
+                CrateRoot {
+                    member: 0,
+                    library: false
+                },
+                "{named}"
+            );
+        }
+        for unbuilt in [
+            format!("[package]\nname = 'tool'\nedition = '2021'\nautobins = false\n{stub}"),
+            format!("[package]\nname = 'tool'\n{stub}"),
+            format!("[package]\nname = 'tool'\nedition = '2015'\n{stub}"),
+            "[package]\nname = 'tool'\nedition = '2021'\n[[bin]]\nname = 'tool'\npath = 'src/bin/tool.rs'\n".to_owned(),
+        ] {
+            assert!(main(&unbuilt).is_none(), "{unbuilt}");
+        }
+        assert!(main("[package]\nname = 'tool'\n").is_some());
     }
 
     #[test]
