@@ -1550,6 +1550,99 @@ fn references_rust_shadowing_obeys_lexical_scope_and_constructor_namespace() {
     assert_eq!(data["counts"]["unresolvedSites"], 1);
 }
 
+/// The lines of `src/a.rs` whose `m::g` resolved to `src/m.rs`, and the unresolved site count.
+fn macro_opacity_lines(body: &str) -> (Vec<u64>, u64) {
+    let source = format!("use crate::m;\n{body}");
+    let input = snapshot(&[
+        ("src/lib.rs", "mod m; mod a;"),
+        ("src/m.rs", "pub fn g() {}"),
+        ("src/a.rs", &source),
+    ]);
+    let data = references::project(&input, &["src/a.rs".into()], 20, &mut || Ok(()))
+        .unwrap()
+        .data;
+    let mut lines: Vec<u64> = data["production"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|pair| pair["source"]["path"] == "src/a.rs" && pair["target"]["path"] == "src/m.rs")
+        .flat_map(|pair| pair["sites"].as_array().unwrap())
+        .map(|site| site["lines"]["start"].as_u64().unwrap())
+        .filter(|&line| line > 1)
+        .collect();
+    lines.sort_unstable();
+    (lines, data["counts"]["unresolvedSites"].as_u64().unwrap())
+}
+
+/// #1163: only a macro call makes a block opaque. A `!=` is not one.
+#[test]
+fn references_rust_block_is_opaque_for_a_macro_call_not_for_a_bang() {
+    let (lines, unresolved) = macro_opacity_lines(
+        "fn plain() { m::g(); }\n\
+         fn nested(x: u8) { if x == 1 { m::g(); } }\n\
+         fn negate(x: bool) { let _y = !x; m::g(); }\n\
+         fn compare(x: u8) { if x != 1 { return; } m::g(); }\n\
+         fn with_macro() { println!(\"x\"); m::g(); }\n",
+    );
+    assert_eq!(lines, [2, 3, 4, 5]);
+    assert_eq!(unresolved, 1);
+}
+
+#[test]
+fn references_rust_bang_operators_and_literals_keep_their_block_resolvable() {
+    let bodies = [
+        "!flag; m::g();",
+        "if !flag { return; } m::g();",
+        "drop(\"a!\"); m::g();",
+        "drop('!'); m::g();",
+        "while x != 1 { if flag { m::g(); } }",
+    ];
+    let measured: Vec<_> = bodies
+        .iter()
+        .map(|body| macro_opacity_lines(&format!("fn f(x: u8, flag: bool) {{ {body} }}\n")))
+        .collect();
+    assert_eq!(measured, vec![(vec![2], 0); bodies.len()], "{bodies:?}");
+}
+
+/// The block inside a `!=` statement has its own scope, as inside `==`: the `m` it binds is
+/// not `src/m.rs`, so line 4 does not resolve there.
+#[test]
+fn references_rust_block_inside_a_bang_statement_has_its_own_scope() {
+    let nested = "fn f(x: u8) {\n\
+                  if x != 1 { mod m { pub fn g() {} }\n\
+                  m::g(); }\n\
+                  m::g(); }\n";
+    assert_eq!(macro_opacity_lines(nested), (vec![5], 1));
+    assert_eq!(
+        macro_opacity_lines(&nested.replace("!=", "==")),
+        (vec![5], 1)
+    );
+}
+
+/// The recorded limit: a macro call anywhere in a statement keeps the block unknown.
+#[test]
+fn references_rust_macro_call_inside_a_statement_keeps_its_block_unknown() {
+    let bodies = [
+        "println!(\"x\"); m::g();",
+        "f(vec![1]); m::g();",
+        "x.max(y!()); m::g();",
+        "if x != 1 { println!(\"x\"); } m::g();",
+        "let _v = vec![1]; m::g();",
+        "let _v = f(y!()); m::g();",
+        "m::g(); y!()",
+    ];
+    let measured: Vec<_> = bodies
+        .iter()
+        .map(|body| macro_opacity_lines(&format!("fn f(x: u8) {{ {body} }}\n")))
+        .collect();
+    assert_eq!(measured, vec![(vec![], 1); bodies.len()], "{bodies:?}");
+    // A `let` already confines a macro call to the nested block that holds it.
+    assert_eq!(
+        macro_opacity_lines("fn f(x: u8) { let _y = if x == 1 { y!() } else { 0 }; m::g(); }\n"),
+        (vec![2], 0)
+    );
+}
+
 #[test]
 fn references_rust_named_module_export_uses_declaration_owner_not_members() {
     let input = snapshot(&[
