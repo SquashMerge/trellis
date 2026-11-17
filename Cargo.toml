@@ -70,17 +70,22 @@ proptest = "1"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 
-# Debug-profile speed for the verify suite. Only codegen optimization changes:
-# debug assertions, overflow checks and debuginfo keep their dev defaults.
-# Dependencies (sqlite, tree-sitter grammars, sha2, serde_json, ...) build once
-# and are cached, so optimize them fully.
+# Debug-profile speed for the verify suite. Debug assertions and overflow
+# checks keep their dev defaults. Dependencies (sqlite, tree-sitter grammars,
+# sha2, serde_json, ...) build once and are cached, so optimize them fully.
 [profile.dev]
 # Line tables keep file:line in panics and backtraces while cutting debug-build
 # compile and link time for the many test binaries (CI already builds this way).
 debug = "line-tables-only"
 
+# Dependencies carry no debug info: on Linux the DWARF is embedded in the
+# executable, and with it the lib test binary would exceed the 512 MiB bound
+# the running executable is checked against when it hashes itself
+# (`RunningExecutable::from_file`). Frames inside dependencies lose file:line;
+# Trellis's own frames keep it.
 [profile.dev.package."*"]
 opt-level = 3
+debug = false
 
 # Light optimization of the crate itself makes its heavy indexing and publish
 # tests several times faster for a modest rebuild cost.
