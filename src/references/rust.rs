@@ -641,6 +641,17 @@ impl Catalog {
                 self.note_attribute(doc, child, scope, &mut pending, &mut scope_uncertain);
                 continue;
             }
+            // A `static` or `const` initializer is an expression, which binds no item in
+            // the scope holding it (#1191): a macro call there makes only its own scope
+            // opaque.
+            let scope = if matches!(node.kind(), "const_item" | "static_item")
+                && node.child_by_field_name("value") == Some(child)
+            {
+                let directory = self.scopes[scope].directory.clone();
+                self.add_scope(document, child, Some(scope), directory, false, check)?
+            } else {
+                scope
+            };
             let Pending {
                 uncertain,
                 custom_path: item_custom,
