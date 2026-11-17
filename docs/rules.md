@@ -917,7 +917,24 @@ Supported mapping is deliberately narrow:
   file was read whole. Otherwise the repeated lookup stays unknown, as it was: a
   crate with no captured manifest, no `edition` key or edition 2015 (where a `use`
   path starts at the crate root and can name another module), and a prefix that the
-  scope binds only through an import, a glob or a macro. The edition proof covers
+  scope binds only through an import, a glob or a macro. The same proof decides where
+  any other `use` path starts (#1166, owner ruling 2026-11-16): a `use` path whose
+  first segment is not `crate`, `self` or `super` starts in its own scope from
+  edition 2018, and at the crate root in edition 2015. Inline paths start in their own
+  scope in both editions and are not affected. In a crate whose manifest does not prove
+  edition 2018 or later, a crate with no captured manifest included, such a `use` path
+  outside the crate root's own scope is unknown when the two readings can differ: the
+  2018 reading finds the first segment below the crate root (in the `use`'s module or a
+  block of it), or as a dependency, and the crate root binds that name too, or may bind
+  it through a glob import, a macro or an attribute this catalog does not read (an
+  inner `#![...]` other than `cfg` and `cfg_attr` included). Only an `extern crate`
+  that keeps its crate's own name (`extern crate dep;`, not `extern crate dep as
+  other;`) at the root names the same crate as the 2018 reading's dependency, so a
+  dependency path through it keeps its package target; the root's `std` and `core` are
+  taken to be those crates, as the `extern crate` that the compiler adds to a 2015 crate
+  root binds them, and a macro at the root that defines another item of either name is
+  not detected. When the crate root binds nothing of that name, a 2015 crate could not
+  compile the root's reading, and the path resolves as before. The edition proof covers
   what manifests claim; a file that another crate pulls in from source
   (`#[path = ...] mod`, `include!`) is not detected, which is a stated limit. The
   four-edge limit is unchanged.
