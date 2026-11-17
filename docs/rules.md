@@ -963,12 +963,14 @@ Supported mapping is deliberately narrow:
   item, or an inner `#![...]` on a module or block, makes that scope opaque in the same
   way unless the catalog reads it (owner ruling 2026-11-17): `cfg` and `cfg_attr` make
   the item or scope conditional, `#[test]` the item, and `#[path = ...]` a custom root;
-  `derive` and the built-in attributes that bind no name, `allow`, `warn`, `deny`,
-  `forbid`, `expect`, `doc`, `inline`, `repr`, `must_use`, `cold`, `no_mangle`,
-  `ignore`, `should_panic`, `track_caller`, `non_exhaustive`, `deprecated`, `link`,
+  the built-in attributes that bind no name, `allow`, `warn`, `deny`, `forbid`,
+  `expect`, `doc`, `inline`, `repr`, `must_use`, `cold`, `no_mangle`, `ignore`,
+  `should_panic`, `track_caller`, `non_exhaustive`, `deprecated`, `link`,
   `recursion_limit`, `no_main`, `global_allocator` and the tool attributes `rustfmt::`
   and `clippy::`, change nothing, in the outer and the inner form (a macro cannot be
-  used as an attribute under one of those names). A derive helper changes nothing on
+  used as an attribute under one of those names); `#[derive(...)]` changes nothing in
+  its outer form only, as it applies only to an item, and an inner `#![derive(...)]`
+  makes its scope opaque. A derive helper changes nothing on
   an item when a `#[derive(...)]` written earlier on the same item names a derive that
   registers it, by the derive's last path segment: `serde` after `Serialize` or
   `Deserialize`; `clap`, `command`, `arg` and `group` after `Parser`, `Args` or
