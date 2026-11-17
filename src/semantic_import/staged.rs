@@ -34,7 +34,7 @@ use crate::{
     store::{
         NativeHeader, NativeReader, Store,
         batch_input::JoinParts,
-        staging::{JOIN_TABLES, claim_from_stage},
+        staging::{JOIN_TABLES, claim_from_stage, codec},
     },
 };
 use anyhow::{Context, Result};
@@ -51,11 +51,9 @@ use std::{
 mod claim_size;
 mod continuation;
 pub(crate) use continuation::JoinContinuation;
-pub(crate) mod codec;
 pub(super) mod group_size;
 pub(super) mod heap;
 mod live;
-pub(crate) mod publication;
 mod settle;
 pub(super) mod sizes;
 mod streaming;
