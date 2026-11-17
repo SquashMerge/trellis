@@ -6,6 +6,8 @@ pub(crate) mod captured_witness;
 pub(crate) mod id_codec;
 pub(crate) mod mcp_read;
 mod native_join_budget;
+pub(crate) mod producer_retention;
+pub(crate) mod producer_state;
 mod published_admission;
 #[cfg(feature = "test-support")]
 pub(crate) mod read_counters;
@@ -1195,7 +1197,7 @@ impl NativeReader<'_> {
         &self,
         descriptor: &crate::batch_descriptor::Descriptor,
     ) -> Result<Vec<String>> {
-        let workspace_uri = crate::scip_admission::file_uri(&self.store.identity.root)?;
+        let workspace_uri = crate::scip_vocab::file_uri(&self.store.identity.root)?;
         Ok(descriptor.reuse_project_roots(&workspace_uri, &self.store.identity.root_key))
     }
 
@@ -4964,8 +4966,7 @@ fn authenticate_stored_batch(
         .context("raw producer not pinned")?;
     // Every spelling admission accepts for the descriptor's origin is accepted here, so a
     // batch that was admitted can always be re-authenticated against its retained root.
-    let workspace_uri =
-        crate::scip_admission::file_uri(&identity.root).context("raw project root")?;
+    let workspace_uri = crate::scip_vocab::file_uri(&identity.root).context("raw project root")?;
     descriptor
         .bind_header(
             &descriptor.reuse_project_roots(&workspace_uri, &identity.root_key),
@@ -7380,7 +7381,7 @@ fn write_semantic_tuple(
         if let Some(derived) = derived {
             ensure!(
                 proof.id
-                    == crate::semantic_import::rejoin_provenance_id(
+                    == crate::semantic_records::rejoin_provenance_id(
                         &derived.provenance_id,
                         native,
                         proof.evidence_kind
@@ -13254,7 +13255,7 @@ impl Store {
         for language in &descriptor.producer.languages {
             tx.execute("DELETE FROM semantic_reimport WHERE revision_id=?1 AND producer='' AND language=?2",params![next_key,language])?;
         }
-        crate::producer::retention::publish_run(&tx, &retained_state, &descriptor, &header_sha)?;
+        producer_retention::publish_run(&tx, &retained_state, &descriptor, &header_sha)?;
         search::publish_head(&tx, &next_key)?;
         let published_at = self.retention_time()?;
         stamp_predecessor(&tx, &old_key, published_at.as_secs() as i64)?;
@@ -14953,7 +14954,7 @@ impl Store {
         let mut db = db;
         let retained_state = match self.attach_retention(&db) {
             Ok(state) => Some(state),
-            Err(error) if crate::producer::retention::unavailable_catalog(&error) => {
+            Err(error) if producer_retention::unavailable_catalog(&error) => {
                 let _ = db.execute_batch("DETACH DATABASE retained");
                 None
             }
@@ -16271,7 +16272,7 @@ impl Store {
             // Retention is disposable. An unavailable catalog cannot block native recovery.
             let retained_state = match self.attach_retention(&db) {
                 Ok(state) => Some(state),
-                Err(error) if crate::producer::retention::unavailable_catalog(&error) => {
+                Err(error) if producer_retention::unavailable_catalog(&error) => {
                     let _ = db.execute_batch("DETACH DATABASE retained");
                     None
                 }
@@ -18502,7 +18503,7 @@ impl Store {
         .context(SelectedIntegrity(
             "incompatible_index: selected graph derivation failed".into(),
         ))?;
-        crate::evidence_budget::graph_bytes(
+        crate::evidence_limits::graph_bytes(
             &nodes,
             &graph_calls,
             &graph_regions,

@@ -7,6 +7,7 @@
 use crate::model::SourceFile;
 use crate::native_evidence::{Declaration, Key};
 
+use crate::evidence_limits::graph_bytes;
 pub(crate) use crate::evidence_limits::{CLASS_EXTRACTION, DIAGNOSTIC, max_row, row_limit, total};
 
 /// `document:v1:` and a hex digest: the stored document-version ID each native row is charged.
@@ -222,42 +223,4 @@ pub(crate) fn exceeded(file: &SourceFile, source_set_id: &str, facts: Facts<'_>)
     );
     projected
         .is_ok_and(|(nodes, calls, regions)| graph_bytes(&nodes, &calls, &regions, source).is_err())
-}
-
-/// The former graph-row SQL charge: key text bytes plus the compact JSON payload.
-pub(crate) fn graph_bytes(
-    nodes: &[crate::model::Symbol],
-    calls: &[crate::model::CallSite],
-    regions: &[crate::model::ControlRegion],
-    source_bytes: i64,
-) -> anyhow::Result<u64> {
-    fn encoded<T: serde::Serialize>(value: &T) -> anyhow::Result<usize> {
-        Ok(serde_json::to_vec(value)?.len())
-    }
-    let mut largest = 0u64;
-    let mut sum = 0u64;
-    let mut add = |row: usize| {
-        largest = largest.max(row as u64);
-        sum = sum.saturating_add(row as u64);
-    };
-    for node in nodes {
-        add(node.id.len() + node.name.len() + node.path.len() + encoded(node)?);
-    }
-    for call in calls {
-        add(call.id.len() + call.caller.len() + call.path.len() + encoded(call)?);
-    }
-    for region in regions {
-        add(region.id.len() + region.owner.len() + region.path.len() + encoded(region)?);
-    }
-    let bytes = source_bytes.max(0) as u64;
-    anyhow::ensure!(
-        largest
-            <= bytes
-                .saturating_mul(6)
-                .saturating_add(16 * 1024)
-                .min(256 * 1024 * 1024 + 16 * 1024)
-            && sum <= total(source_bytes.max(0)) as u64,
-        "incompatible_index: selected graph row byte budget exceeded"
-    );
-    Ok(sum)
 }
