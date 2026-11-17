@@ -3,7 +3,7 @@
 //! other text is stored as text. The two forms never compare equal in SQLite, so lookups by
 //! the encoded value are exact, and decoding returns the original text. A BLOB of the wrong
 //! length is a corrupt stage row.
-use crate::semantic_evidence as semantic;
+use crate::semantic_records as semantic;
 use anyhow::{Result, ensure};
 use rusqlite::types::{Value, ValueRef};
 

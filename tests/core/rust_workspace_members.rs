@@ -208,6 +208,41 @@ fn a_renamed_path_dependency_binds_its_key() {
     );
 }
 
+/// The members here have no `edition` key, so they are edition 2015, where a `use` path
+/// starts at the crate root (#1166). A root that binds the member crate's name to a module of
+/// its own is what `acme_core::model::Model` in `view` names there, not the member crate:
+/// unknown. A root `extern crate acme_core;` names the member crate under both editions.
+#[test]
+fn a_2015_member_whose_root_binds_the_crate_name_otherwise_stays_unknown() {
+    let (_state, _root, store, pin) = fixture(&[
+        ("crates/app/src/lib.rs", "pub mod view;\nmod acme_core;\n"),
+        (
+            "crates/app/src/acme_core.rs",
+            "pub mod model {\n    pub struct Model;\n}\n",
+        ),
+    ]);
+    let data = read(&store, "references", pin);
+    assert!(
+        unresolved(&data, "crates/app/src/view.rs", "acme_core::model::Model").is_some(),
+        "{data}"
+    );
+    for target in ["crates/core/src/model.rs", "crates/app/src/acme_core.rs"] {
+        assert!(
+            !has_edge(&data, "crates/app/src/view.rs", target),
+            "{target}"
+        );
+    }
+    let (_state, _root, store, pin) = fixture(&[(
+        "crates/app/src/lib.rs",
+        "extern crate acme_core;\npub mod view;\n",
+    )]);
+    let data = read(&store, "references", pin);
+    assert!(
+        has_edge(&data, "crates/app/src/view.rs", "crates/core/src/model.rs"),
+        "{data}"
+    );
+}
+
 #[test]
 fn a_crate_outside_the_workspace_members_stays_unknown() {
     let (_state, _root, store, pin) =

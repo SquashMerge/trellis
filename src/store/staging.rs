@@ -9,6 +9,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub(crate) mod codec;
+pub(crate) mod publication;
+
 /// A reusable witness is unavailable; the caller must run bounded FULL admission/join.
 #[derive(Debug)]
 pub(crate) struct WitnessFallback(pub &'static str);
@@ -38,7 +41,7 @@ const STAGE_DB: &str = "stage.db";
 /// Compact join tables. Documents are integers: `sources.ord` for `g_*` owners and local
 /// symbol scopes (`-1` for none), `nat_docs.ord` for native declarations, and the document's
 /// `out_coverage.ord` (`doc`) for every output row. Native syntax IDs and 64-hex provenance IDs
-/// are stored as their bytes when canonical, as text otherwise (`staged::codec`).
+/// are stored as their bytes when canonical, as text otherwise (`staging::codec`).
 /// `nat_docs.reserve` is a document's native load reservation, filled on its first load.
 /// `g_definitions.callable` is the owner declaration's `TargetCallable` code (#470): a function
 /// of `(side, owner_doc, syntax_id)`, so every row of one definition target carries the same value.
