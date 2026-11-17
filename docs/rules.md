@@ -976,9 +976,30 @@ Supported mapping is deliberately narrow:
   `Deserialize`; `clap`, `command`, `arg` and `group` after `Parser`, `Args` or
   `Subcommand`; `clap` and `value` after `ValueEnum`; `error` after `Error`. Written
   before that derive, after another derive or with none, the helper's name is an
-  attribute macro and the scope is opaque. Any other attribute, `tokio::main`,
-  `tokio::test`, `async_trait`, `no_std`, `no_implicit_prelude` and `macro_use`
-  included, makes its scope opaque. A glob re-export of a module that
+  attribute macro and the scope is opaque. Two attribute macros change nothing once
+  their package is proved (owner ruling 2026-11-17), because their expansion re-emits
+  the item alone and binds no name its paths can see: `#[tokio::main]` and
+  `#[tokio::test]`, with any arguments and with or without a leading `::`, on a
+  function whose body has no inner attribute (tokio-macros lifts those onto the
+  function); and `#[async_trait]`, `#[async_trait(?Send)]` and
+  `#[async_trait::async_trait]` on a trait or a trait impl that spells no `__self`
+  (the binding that takes the place of `self` in its method bodies). The package is
+  proved when the path's first segment, read from the item's scope as a dependency
+  path is (no nearer item, import, glob or opaque scope binds it), is a root manifest
+  dependency of package `tokio` or `async-trait` without a rename, and the crate root
+  binds that name by nothing but an `extern crate` of the same name (`extern crate
+  other as tokio;` would take its place). A bare `#[async_trait]` is proved only
+  through exactly one `use async_trait::async_trait;` in the nearest scope binding
+  `async_trait`, with no item, glob or opaque scope before it: a re-export such as
+  `use axum::async_trait;` is not read. A leading `::` in a crate not proved to be of
+  edition 2018 or later also needs the crate root not to bind the name otherwise.
+  `#[tokio::test]` makes its function exist in test builds only, as `#[test]` does.
+  When any of this is not proved, the attribute makes its scope opaque as any other
+  does. The proof trusts the package name: a `[patch]`, a git dependency or a source
+  replacement that names another crate `tokio` or `async-trait` is not detected (a
+  recorded limit). Any other attribute, `tokio::main` or `async_trait` without that
+  proof, `no_std`, `no_implicit_prelude` and `macro_use` included, makes its scope
+  opaque. A glob re-export of a module that
   declares an item of the module's own name (`mod same; pub use same::*;` where `same`
   declares `fn same`) does not get the answer a named re-export gets (#1162): that item,
   reached through the glob (`crate::parent::same`), stays unknown. This is a recorded

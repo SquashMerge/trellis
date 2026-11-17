@@ -286,6 +286,7 @@ fn independent_catalog_jobs_overlap() {
                 &trees,
                 &documents,
                 &cargo_workspace::Workspace::default(),
+                &packages,
                 work,
                 &mut check,
             )?;
