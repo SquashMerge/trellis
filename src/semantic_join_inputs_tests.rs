@@ -102,7 +102,7 @@ const NON_OUTPUT_ITEMS: &[(&str, &str)] = &[
         "scheduling and copy streams around the join; they move bytes and never shape rows",
     ),
     (
-        "producer",
+        "producer_profiles",
         "producer profiles gate context validity (pending or failed), never a row's content",
     ),
     ("test_alloc", "test-only allocation measurement"),
