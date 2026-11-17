@@ -926,8 +926,8 @@ Supported mapping is deliberately narrow:
   outside the crate root's own scope is unknown when the two readings can differ: the
   2018 reading finds the first segment below the crate root (in the `use`'s module or a
   block of it), or as a dependency, and the crate root binds that name too, or may bind
-  it through a glob import, a macro or an attribute this catalog does not read (an
-  inner `#![...]` other than `cfg` and `cfg_attr` included). Only an `extern crate`
+  it through a glob import, a macro or an attribute that makes its scope opaque (see
+  below; an inner `#![...]` it does not read included). Only an `extern crate`
   that keeps its crate's own name (`extern crate dep;`, not `extern crate dep as
   other;`) at the root names the same crate as the 2018 reading's dependency, so a
   dependency path through it keeps its package target; the root's `std` and `core` are
@@ -959,7 +959,29 @@ Supported mapping is deliberately narrow:
   could bind any name, so a first path segment that scope does not bind itself is
   unknown there. Syntax decides what a macro call is (#1163): an expression statement
   counts when a macro call lies anywhere in it, nested blocks included, and a `!=`, a
-  unary `!` or a `!` in a string or character literal does not.
+  unary `!` or a `!` in a string or character literal does not. An attribute on an
+  item, or an inner `#![...]` on a module or block, makes that scope opaque in the same
+  way unless the catalog reads it (owner ruling 2026-11-17): `cfg` and `cfg_attr` make
+  the item or scope conditional, `#[test]` the item, and `#[path = ...]` a custom root;
+  `derive` and the built-in attributes that bind no name, `allow`, `warn`, `deny`,
+  `forbid`, `expect`, `doc`, `inline`, `repr`, `must_use`, `cold`, `no_mangle`,
+  `ignore`, `should_panic`, `track_caller`, `non_exhaustive`, `deprecated`, `link`,
+  `recursion_limit`, `no_main`, `global_allocator` and the tool attributes `rustfmt::`
+  and `clippy::`, change nothing, in the outer and the inner form (a macro cannot be
+  used as an attribute under one of those names). A derive helper changes nothing on
+  an item when a `#[derive(...)]` written earlier on the same item names a derive that
+  registers it, by the derive's last path segment: `serde` after `Serialize` or
+  `Deserialize`; `clap`, `command`, `arg` and `group` after `Parser`, `Args` or
+  `Subcommand`; `clap` and `value` after `ValueEnum`; `error` after `Error`. Written
+  before that derive, after another derive or with none, the helper's name is an
+  attribute macro and the scope is opaque. Any other attribute, `tokio::main`,
+  `tokio::test`, `async_trait`, `no_std`, `no_implicit_prelude` and `macro_use`
+  included, makes its scope opaque. A glob re-export of a module that
+  declares an item of the module's own name (`mod same; pub use same::*;` where `same`
+  declares `fn same`) does not get the answer a named re-export gets (#1162): that item,
+  reached through the glob (`crate::parent::same`), stays unknown. This is a recorded
+  limit (owner ruling 2026-11-17): no occurrence was found in this repository or in a
+  second real checkout.
 - **JavaScript and TypeScript:** the two languages share one resolver. Static
   relative imports/reexports/side-effect imports (also `import type`,
   `export type` and `import x = require("m")`) try the extensionless candidates

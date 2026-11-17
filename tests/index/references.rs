@@ -2438,6 +2438,178 @@ fn references_rust_unsupported_attribute_item_cannot_prove_explicit_availability
     assert_eq!(data["unresolved"].as_array().unwrap().len(), 2);
 }
 
+/// Whether `use crate::n::*;` in `src/m.rs` resolves to `src/n.rs` when `src/m.rs` is
+/// `source`. The glob is the only binding of the `g` that `src/m.rs` spells, so an attribute
+/// that makes the module opaque (it could be a macro that binds `g`) leaves it ambiguous.
+fn resolves_past_attribute(source: &str) -> bool {
+    let input = snapshot(&[
+        ("src/lib.rs", "mod m; mod n;"),
+        ("src/m.rs", source),
+        ("src/n.rs", "pub fn g() {}"),
+    ]);
+    let data = references::project(&input, &["src/m.rs".into()], 20, &mut || Ok(()))
+        .unwrap()
+        .data;
+    let unknown: Vec<_> = data["unresolved"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|site| site["site"]["spelling"].as_str().unwrap())
+        .collect();
+    assert!(unknown.is_empty() || unknown == ["crate::n::*"], "{data}");
+    assert_eq!(has_edge(&data, "src/m.rs", "src/n.rs"), unknown.is_empty());
+    unknown.is_empty()
+}
+/// The attributes of `rows` that leave the glob unknown when they precede `item` in
+/// `src/m.rs` (an outer attribute) or open the file (an inner one).
+fn attributes_hiding_g(rows: &[&str], item: &str) -> Vec<String> {
+    rows.iter()
+        .filter(|attributes| {
+            let source = if attributes.starts_with("#!") {
+                format!("{attributes}\nuse crate::n::*;\n{item}\nfn f() {{ g(); }}\n")
+            } else {
+                format!("use crate::n::*;\n{attributes} {item}\nfn f() {{ g(); }}\n")
+            };
+            !resolves_past_attribute(&source)
+        })
+        .map(|attributes| (*attributes).to_owned())
+        .collect()
+}
+const BUILT_IN_INERT: &[&str] = &[
+    "allow(dead_code)",
+    "warn(unused)",
+    "deny(unused)",
+    "forbid(unsafe_code)",
+    "expect(dead_code)",
+    "doc = \"x\"",
+    "ignore",
+    "should_panic(expected = \"x\")",
+    "track_caller",
+    "non_exhaustive",
+    "deprecated(note = \"x\")",
+    "link(name = \"x\")",
+    "recursion_limit = \"256\"",
+    "no_main",
+    "global_allocator",
+    "rustfmt::skip",
+    "clippy::msrv = \"1.80\"",
+];
+
+/// Owner ruling 2026-11-17 (a): a built-in inert attribute or a tool attribute binds no
+/// name, so its outer form leaves the scope resolvable. Before, only `allow`, `warn`,
+/// `deny`, `forbid` and `doc` did.
+#[test]
+fn references_rust_built_in_inert_outer_attributes_keep_their_scope_resolvable() {
+    let rows: Vec<_> = BUILT_IN_INERT.iter().map(|a| format!("#[{a}]")).collect();
+    let rows: Vec<_> = rows.iter().map(String::as_str).collect();
+    assert_eq!(
+        attributes_hiding_g(&rows, "pub fn b() {}"),
+        Vec::<String>::new()
+    );
+}
+
+/// Owner ruling 2026-11-17 (a): the inner form of the same attributes leaves its module
+/// resolvable. Before, every inner attribute other than `cfg` and `cfg_attr` made it opaque.
+#[test]
+fn references_rust_built_in_inert_inner_attributes_keep_their_module_resolvable() {
+    let rows: Vec<_> = BUILT_IN_INERT.iter().map(|a| format!("#![{a}]")).collect();
+    let rows: Vec<_> = rows.iter().map(String::as_str).collect();
+    assert_eq!(attributes_hiding_g(&rows, ""), Vec::<String>::new());
+}
+
+/// Owner ruling 2026-11-17 (b): a derive helper is inert after a derive on the same item
+/// that registers it, also through a path, a list or another attribute in between.
+#[test]
+fn references_rust_derive_helper_after_its_registering_derive_keeps_its_scope_resolvable() {
+    let rows = [
+        "#[derive(Serialize)] #[serde(rename_all = \"camelCase\")]",
+        "#[derive(Debug, serde::Deserialize)] #[serde(default)]",
+        "#[derive(Serialize)] #[allow(dead_code)] #[serde(default)]",
+        "#[derive(Parser)] #[command(version)]",
+        "#[derive(clap::Parser)] #[arg(long)]",
+        "#[derive(Args)] #[group(id = \"g\")]",
+        "#[derive(Subcommand)] #[clap(rename_all = \"kebab\")]",
+        "#[derive(ValueEnum)] #[value(rename_all = \"lower\")]",
+        "#[derive(thiserror::Error)] #[error(\"x\")]",
+    ];
+    assert_eq!(
+        attributes_hiding_g(&rows, "pub struct S {}"),
+        Vec::<String>::new()
+    );
+}
+
+/// Owner ruling 2026-11-17 (b): without a derive that registers it, a helper's name is an
+/// ordinary attribute macro, which could bind any name.
+#[test]
+fn references_rust_derive_helper_without_a_registering_derive_keeps_its_scope_unknown() {
+    let rows = [
+        "#[serde(default)]",
+        "#[command(version)]",
+        "#[arg(long)]",
+        "#[value(rename_all = \"lower\")]",
+        "#[group(id = \"g\")]",
+        "#[clap(rename_all = \"kebab\")]",
+        "#[error(\"x\")]",
+        "#![serde(default)]",
+        // A derive under `cfg_attr` is not read.
+        "#[cfg_attr(feature = \"x\", derive(Serialize))] #[serde(default)]",
+    ];
+    assert_eq!(attributes_hiding_g(&rows, "pub struct S {}"), rows);
+    // The derive belongs to the item it precedes, not to the next one.
+    assert!(!resolves_past_attribute(
+        "use crate::n::*;\n#[derive(Serialize)] pub struct T {}\n\
+         #[serde(default)] pub struct S {}\nfn f() { g(); }\n"
+    ));
+    assert!(resolves_past_attribute(
+        "use crate::n::*;\n#[derive(Serialize)] pub struct T {}\n\
+         #[derive(Serialize)] #[serde(default)] pub struct S {}\nfn f() { g(); }\n"
+    ));
+}
+
+/// Owner ruling 2026-11-17 (b): a helper written before the derive that registers it is
+/// not inert yet.
+#[test]
+fn references_rust_derive_helper_before_its_derive_keeps_its_scope_unknown() {
+    let rows = [
+        "#[serde(default)] #[derive(Serialize)]",
+        "#[command(version)] #[derive(Parser)]",
+        "#[error(\"x\")] #[derive(Error)]",
+    ];
+    assert_eq!(attributes_hiding_g(&rows, "pub struct S {}"), rows);
+}
+
+/// Owner ruling 2026-11-17 (b): a derive registers only its own helpers.
+#[test]
+fn references_rust_derive_helper_after_a_derive_that_does_not_register_it_keeps_its_scope_unknown()
+{
+    let rows = [
+        "#[derive(Debug)] #[serde(default)]",
+        "#[derive(Serialize)] #[error(\"x\")]",
+        "#[derive(Error)] #[serde(default)]",
+        "#[derive(ValueEnum)] #[command(version)]",
+        "#[derive(Subcommand)] #[value(rename_all = \"lower\")]",
+    ];
+    assert_eq!(attributes_hiding_g(&rows, "pub struct S {}"), rows);
+}
+
+/// Owner ruling 2026-11-17: attribute macros and the attributes the ruling leaves out
+/// still make their scope opaque, and a built-in's name is matched whole.
+#[test]
+fn references_rust_attribute_macros_outside_the_ruling_keep_their_scope_unknown() {
+    let rows = [
+        "#[tokio::main]",
+        "#[tokio::test]",
+        "#[async_trait]",
+        "#[macro_use]",
+        "#![no_std]",
+        "#![no_implicit_prelude]",
+        "#[docs]",
+        "#[inline_always]",
+        "#[::allow(dead_code)]",
+    ];
+    assert_eq!(attributes_hiding_g(&rows, "pub fn b() {}"), rows);
+}
+
 #[test]
 fn references_rust_root_only_standard_library_import_does_not_shadow_itself() {
     let input = snapshot(&[("src/lib.rs", "use std;")]);
@@ -8607,6 +8779,7 @@ fn references_rust_reexport_sharing_a_name_stays_unknown_without_a_proved_module
             "use crate::elsewhere::*; pub use same::same;",
             Some(("src/elsewhere.rs", "pub mod same { pub fn same() {} }")),
         ),
+        // A recorded limit (owner ruling 2026-11-17, docs/rules.md).
         (
             "glob re-export of the same-named item",
             "mod same; pub use same::*;",
