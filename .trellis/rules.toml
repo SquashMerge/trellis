@@ -161,6 +161,11 @@ paths = [
   # at publish time (store/native_first/context.rs). Producer commands, settings and the
   # controlled worktree stay in src/producer/.
   "src/producer_profiles.rs",
+  # The architecture snapshot inputs (S15): `Snapshot`, its documents with their selected
+  # semantic evidence, the retained manifests and the root tsconfig. Plain data over the
+  # model and native records. Storage builds them for one revision; the references read
+  # (query) takes them in and re-exports them at their old paths.
+  "src/architecture_inputs.rs",
   # The proof that batch admission ran (S8, #1071): one zero-sized type with no dependency.
   # Admission creates it and the storage-owned `AdmittedBatch` (store/batch_input.rs) is
   # built from it. It is a module of `semantic_batch` because Rust privacy is by module
