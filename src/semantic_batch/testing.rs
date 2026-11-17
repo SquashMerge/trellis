@@ -664,7 +664,7 @@ pub fn staged_publication(batch: &mut AdmittedBatch) -> Result<semantic::Semanti
         call_bindings: vec![],
         type_relationships: vec![],
     };
-    crate::semantic_import::read_staged_documents(conn, "", &producer, &mut |document| {
+    crate::store::staging::publication::read_documents(conn, "", &producer, &mut |document| {
         publication.coverage.extend(document.coverage);
         publication.provenance.extend(document.provenance);
         publication.symbols.extend(document.symbols);

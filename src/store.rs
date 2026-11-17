@@ -6,6 +6,8 @@ pub(crate) mod captured_witness;
 pub(crate) mod id_codec;
 pub(crate) mod mcp_read;
 mod native_join_budget;
+pub(crate) mod producer_retention;
+pub(crate) mod producer_state;
 mod published_admission;
 #[cfg(feature = "test-support")]
 pub(crate) mod read_counters;
@@ -15,6 +17,7 @@ mod search_startup;
 pub(crate) mod semantic_display;
 pub(crate) mod semantic_payload;
 mod semantic_retention;
+pub(crate) mod spool_reader;
 pub mod staging;
 pub(crate) use search::SEARCH_CARD_BATCH_SIZE;
 pub use search::{
@@ -40,6 +43,7 @@ use anyhow::{Context, Result, ensure};
 pub use requests::{MaintenanceQueueProbe, MaintenanceQueueState, QueueProbeAdmission};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
+use spool_reader::SpoolReader;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     ops::{Deref, DerefMut},
@@ -54,7 +58,7 @@ use std::{
 #[cfg(test)]
 type TestMetricsDocumentHook = Arc<dyn Fn(&str, MetricsDocumentStage) + Send + Sync>;
 #[cfg(test)]
-type TestStreamPreflightHook = Box<dyn FnOnce(&crate::native_evidence::FullDocumentSpool) + Send>;
+type TestStreamPreflightHook = Box<dyn FnOnce(&dyn SpoolReader) + Send>;
 /// When a metrics document's test hook runs.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -863,8 +867,7 @@ enum ActivationStage {
 /// its own point under the recovery lock: for an in-place rebuild after the use lock is
 /// downgraded to shared and the publication baseline is read, and for a replacement after the
 /// private stage exists while use is still exclusive.
-pub(crate) type RecreateCapture<'a, C> =
-    dyn FnMut() -> Result<(C, crate::native_evidence::FullDocumentSpool)> + 'a;
+pub(crate) type RecreateCapture<'a, C, S> = dyn FnMut() -> Result<(C, S)> + 'a;
 // Serde's compact JSON serializer writes exactly the bytes persisted by `json()`.
 // Count and abort while streaming; never build an over-limit encoded source.
 struct EncodedSourceBudget {
@@ -1195,7 +1198,7 @@ impl NativeReader<'_> {
         &self,
         descriptor: &crate::batch_descriptor::Descriptor,
     ) -> Result<Vec<String>> {
-        let workspace_uri = crate::scip_admission::file_uri(&self.store.identity.root)?;
+        let workspace_uri = crate::scip_vocab::file_uri(&self.store.identity.root)?;
         Ok(descriptor.reuse_project_roots(&workspace_uri, &self.store.identity.root_key))
     }
 
@@ -1568,7 +1571,7 @@ impl EvidenceResponse {
         &self,
         pin: Option<IndexPin>,
         check: &mut (impl FnMut() -> Result<()> + Send),
-    ) -> Result<crate::references::Snapshot> {
+    ) -> Result<crate::architecture_inputs::Snapshot> {
         self.architecture_snapshot_regions(pin, check, &|_, _| {})
             .map(|(snapshot, _)| snapshot)
     }
@@ -1580,7 +1583,7 @@ impl EvidenceResponse {
         check: &mut (impl FnMut() -> Result<()> + Send),
         progress: &dyn Fn(usize, usize),
     ) -> Result<(
-        crate::references::Snapshot,
+        crate::architecture_inputs::Snapshot,
         Vec<Vec<crate::native_records::ControlRegion>>,
     )> {
         use crate::native_records::DocumentKey;
@@ -1711,7 +1714,7 @@ impl EvidenceResponse {
                     "incompatible_index: architecture language mismatch"
                 );
                 regions.push(fetched.regions);
-                documents.push(crate::references::DocumentInput {
+                documents.push(crate::architecture_inputs::DocumentInput {
                     key,
                     file: fetched.file,
                     declarations: fetched.declarations,
@@ -1813,7 +1816,7 @@ impl EvidenceResponse {
             };
             manifests.insert(
                 path.to_owned(),
-                crate::references::external::ManifestInput {
+                crate::architecture_inputs::ManifestInput {
                     source_set_id: source_set_id.clone(),
                     native_revision_id: native_revision_id.clone(),
                     dependency_hash: dependency_hash.clone(),
@@ -1873,7 +1876,7 @@ impl EvidenceResponse {
             SelectedIntegrity("incompatible_index: corrupt retained config".into()),
         )?;
         check()?;
-        let mut root_tsconfig: Option<crate::references::tsconfig::RootTsconfigInput> = None;
+        let mut root_tsconfig: Option<crate::architecture_inputs::RootTsconfigInput> = None;
         for entry in configs {
             check()?;
             let ConfigEntry {
@@ -1937,7 +1940,7 @@ impl EvidenceResponse {
                     manifests
                         .insert(
                             path.to_owned(),
-                            crate::references::external::ManifestInput {
+                            crate::architecture_inputs::ManifestInput {
                                 source_set_id: source_set_id.clone(),
                                 native_revision_id: native_revision_id.clone(),
                                 dependency_hash: dependency_hash.clone(),
@@ -1951,7 +1954,7 @@ impl EvidenceResponse {
                 );
                 continue;
             }
-            root_tsconfig = Some(crate::references::tsconfig::RootTsconfigInput {
+            root_tsconfig = Some(crate::architecture_inputs::RootTsconfigInput {
                 source_set_id: source_set_id.clone(),
                 path: path.to_owned(),
                 bytes,
@@ -1960,7 +1963,7 @@ impl EvidenceResponse {
         semantic_display::architecture_semantic(&self.db, &selected.key, &mut documents, check)?;
         check()?;
         Ok((
-            crate::references::Snapshot {
+            crate::architecture_inputs::Snapshot {
                 pin: selected.pin,
                 documents,
                 manifests: manifests.into_values().collect(),
@@ -3950,7 +3953,7 @@ fn publication_native_witness(
     coverage: &crate::native_records::Coverage,
     grouped: &PublicationRows<'_>,
 ) -> Result<String> {
-    crate::native_evidence::document_witness(
+    crate::native_records::document_witness(
         document,
         producer,
         coverage,
@@ -4172,7 +4175,7 @@ fn v8_document_projection(
     native: &crate::native_records::Artifact,
     grouped: &PublicationRows<'_>,
 ) -> Result<V8DocumentProjection> {
-    let context = crate::native_evidence::native_extraction_context(
+    let context = crate::native_records::native_extraction_context(
         &native.producer,
         &file.language,
         &native.revision,
@@ -4964,8 +4967,7 @@ fn authenticate_stored_batch(
         .context("raw producer not pinned")?;
     // Every spelling admission accepts for the descriptor's origin is accepted here, so a
     // batch that was admitted can always be re-authenticated against its retained root.
-    let workspace_uri =
-        crate::scip_admission::file_uri(&identity.root).context("raw project root")?;
+    let workspace_uri = crate::scip_vocab::file_uri(&identity.root).context("raw project root")?;
     descriptor
         .bind_header(
             &descriptor.reuse_project_roots(&workspace_uri, &identity.root_key),
@@ -6890,9 +6892,7 @@ pub fn batch_publication_statements_for_tests() -> Vec<String> {
         RAW_EXCLUSIONS_SQL.to_owned(),
         with_capture_ids("(0,1)", RAW_PROOFS_SQL),
     ];
-    statements.extend(crate::semantic_import::staged_publication_statements(
-        "stage.",
-    ));
+    statements.extend(staging::publication::statements("stage."));
     statements
 }
 
@@ -6983,7 +6983,7 @@ fn write_staged_semantic(
     // The tuple writers' statements, each target table's included, stay prepared.
     db.set_prepared_statement_cache_capacity(64);
     let mut index = 0u64;
-    crate::semantic_import::read_staged_documents(db, "stage.", producer, &mut |publication| {
+    staging::publication::read_documents(db, "stage.", producer, &mut |publication| {
         write_import_coverage(db, key, &publication, Some((batch, captured_pin)), inputs)?;
         if index % 1000 == 999 {
             gate()?;
@@ -7382,7 +7382,7 @@ fn write_semantic_tuple(
         if let Some(derived) = derived {
             ensure!(
                 proof.id
-                    == crate::semantic_import::rejoin_provenance_id(
+                    == crate::semantic_records::rejoin_provenance_id(
                         &derived.provenance_id,
                         native,
                         proof.evidence_kind
@@ -8045,7 +8045,7 @@ fn write_native(
                 .take()
                 .unwrap_or_else(|| v8_document_projection(file, a, grouped))?
         };
-        let context = crate::native_evidence::native_extraction_context(
+        let context = crate::native_records::native_extraction_context(
             &a.producer,
             &file.language,
             &a.revision,
@@ -9237,7 +9237,7 @@ fn compare_capture_snapshot_inner(
                     && producer == crate::native_records::PRODUCER
                     && version == crate::native_records::NATIVE_VERSION
                     && context
-                        == &crate::native_evidence::declared_selected_extraction_context(
+                        == &crate::native_records::declared_selected_extraction_context(
                             producer,
                             version,
                             &source.language,
@@ -11295,23 +11295,23 @@ impl Store {
     /// Only an already-classified corrupt index under a fresh exclusive leader may enter.
     /// `capture_and_spool` is the caller's full capture; see [`RecreateCapture`] for where it
     /// runs.
-    pub(crate) fn recreate_index_exclusive<C: AdmittedCapture>(
+    pub(crate) fn recreate_index_exclusive<C: AdmittedCapture, S: SpoolReader>(
         &self,
         options: &crate::model::IndexOptions,
         leader: &mut topology::WriterGuard,
         cancel: &CancelFlag,
-        capture_and_spool: &mut RecreateCapture<'_, C>,
+        capture_and_spool: &mut RecreateCapture<'_, C, S>,
     ) -> Result<IndexPin> {
         self.recreate_index_exclusive_with_hook(options, leader, cancel, capture_and_spool, |_| {
             Ok(())
         })
     }
-    fn recreate_index_exclusive_with_hook<C: AdmittedCapture>(
+    fn recreate_index_exclusive_with_hook<C: AdmittedCapture, S: SpoolReader>(
         &self,
         options: &crate::model::IndexOptions,
         leader: &mut topology::WriterGuard,
         cancel: &CancelFlag,
-        capture_and_spool: &mut RecreateCapture<'_, C>,
+        capture_and_spool: &mut RecreateCapture<'_, C, S>,
         mut at: impl FnMut(ActivationStage) -> Result<()>,
     ) -> Result<IndexPin> {
         ensure!(
@@ -12524,11 +12524,11 @@ impl Store {
             RecoveryDisposition::RecreatePending | RecoveryDisposition::RootReplaced
         ) && self.recovery_required.load(Ordering::Acquire)
     }
-    pub(crate) fn recreate_pending_writer_session<C: AdmittedCapture>(
+    pub(crate) fn recreate_pending_writer_session<C: AdmittedCapture, S: SpoolReader>(
         &self,
         options: &crate::model::IndexOptions,
         cancel: &CancelFlag,
-        capture_and_spool: &mut RecreateCapture<'_, C>,
+        capture_and_spool: &mut RecreateCapture<'_, C, S>,
     ) -> Result<(IndexPin, Arc<topology::WriterSession>)> {
         ensure!(
             self.is_recreate_pending(),
@@ -13256,7 +13256,7 @@ impl Store {
         for language in &descriptor.producer.languages {
             tx.execute("DELETE FROM semantic_reimport WHERE revision_id=?1 AND producer='' AND language=?2",params![next_key,language])?;
         }
-        crate::producer::retention::publish_run(&tx, &retained_state, &descriptor, &header_sha)?;
+        producer_retention::publish_run(&tx, &retained_state, &descriptor, &header_sha)?;
         search::publish_head(&tx, &next_key)?;
         let published_at = self.retention_time()?;
         stamp_predecessor(&tx, &old_key, published_at.as_secs() as i64)?;
@@ -13587,7 +13587,7 @@ impl Store {
     /// all-or-nothing revision transaction.
     pub(crate) fn publish_validated_stream_recovery(
         &self,
-        spool: &crate::native_evidence::FullDocumentSpool,
+        spool: &dyn SpoolReader,
         capture: &dyn AdmittedCapture,
         leader: &topology::WriterGuard,
         expected: RecoveryBaseline,
@@ -13609,7 +13609,7 @@ impl Store {
     /// particular, it never consults corrupt live rows for reuse or baseline.
     fn publish_validated_stream_to_stage(
         &self,
-        spool: &crate::native_evidence::FullDocumentSpool,
+        spool: &dyn SpoolReader,
         capture: &dyn AdmittedCapture,
         stage: &StagedIndex,
         leader: &topology::WriterGuard,
@@ -13660,7 +13660,7 @@ impl Store {
     #[allow(clippy::too_many_arguments)]
     fn publish_validated_stream_target(
         &self,
-        spool: &crate::native_evidence::FullDocumentSpool,
+        spool: &dyn SpoolReader,
         capture: &dyn AdmittedCapture,
         leader: &topology::WriterGuard,
         expected: RecoveryBaseline,
@@ -14625,7 +14625,7 @@ impl Store {
                 && length == bytes.len() as i64
                 && hash == hex::encode(Sha256::digest(&bytes))
                 && context
-                    == crate::native_evidence::declared_selected_extraction_context(
+                    == crate::native_records::declared_selected_extraction_context(
                         &producer_id,
                         &producer_version,
                         &file.language,
@@ -14682,7 +14682,7 @@ impl Store {
         let control_regions = read_native_control_regions_v8(db, &scope, None)?;
         let references = read_native_references(db, &scope, None)?;
         let capability_report = read_native_capability_report(db, &scope)?;
-        let observed = crate::native_evidence::document_witness(
+        let observed = crate::native_records::document_witness(
             &document,
             &producer,
             &coverage,
@@ -14955,7 +14955,7 @@ impl Store {
         let mut db = db;
         let retained_state = match self.attach_retention(&db) {
             Ok(state) => Some(state),
-            Err(error) if crate::producer::retention::unavailable_catalog(&error) => {
+            Err(error) if producer_retention::unavailable_catalog(&error) => {
                 let _ = db.execute_batch("DETACH DATABASE retained");
                 None
             }
@@ -15173,7 +15173,7 @@ impl Store {
                 selected_ensure!(length >= 0 && hash.len() == 64,
                     "incompatible_index: prior captured source witness mismatch");
                 selected_ensure!(id == producer_id && version == producer_version
-                    && context == crate::native_evidence::declared_selected_extraction_context(
+                    && context == crate::native_records::declared_selected_extraction_context(
                         &id, &version, &language,
                     )?
                     && class_id.is_some() && class_hash.is_some(),
@@ -15533,7 +15533,7 @@ impl Store {
                         && producer_id == prepared.native.producer.id
                         && producer_version == prepared.native.producer.version
                         && context
-                            == crate::native_evidence::native_extraction_context(
+                            == crate::native_records::native_extraction_context(
                                 &prepared.native.producer,
                                 &language,
                                 &prepared.native.revision,
@@ -15802,7 +15802,7 @@ impl Store {
     }
 
     fn prepare_stream_class_catalog(
-        spool: &crate::native_evidence::FullDocumentSpool,
+        spool: &dyn SpoolReader,
         order: &[usize],
         cancel: &CancelFlag,
     ) -> Result<(crate::classes::Catalog, bool)> {
@@ -15846,7 +15846,7 @@ impl Store {
 
     fn preflight_stream_reuse(
         &self,
-        spool: &crate::native_evidence::FullDocumentSpool,
+        spool: &dyn SpoolReader,
         order: &[usize],
         classes: &crate::classes::Catalog,
         expected: &ExpectedPublication,
@@ -16035,7 +16035,7 @@ impl Store {
         (max_graph_json_bytes, local, stream): (
             usize,
             Option<&LocalPrepared>,
-            Option<&crate::native_evidence::FullDocumentSpool>,
+            Option<&dyn SpoolReader>,
         ),
         mut during_tx: impl FnMut(PublishStage, &Connection) -> Result<()>,
         semantic: Option<(
@@ -16273,7 +16273,7 @@ impl Store {
             // Retention is disposable. An unavailable catalog cannot block native recovery.
             let retained_state = match self.attach_retention(&db) {
                 Ok(state) => Some(state),
-                Err(error) if crate::producer::retention::unavailable_catalog(&error) => {
+                Err(error) if producer_retention::unavailable_catalog(&error) => {
                     let _ = db.execute_batch("DETACH DATABASE retained");
                     None
                 }
@@ -18504,7 +18504,7 @@ impl Store {
         .context(SelectedIntegrity(
             "incompatible_index: selected graph derivation failed".into(),
         ))?;
-        crate::evidence_budget::graph_bytes(
+        crate::evidence_limits::graph_bytes(
             &nodes,
             &graph_calls,
             &graph_regions,

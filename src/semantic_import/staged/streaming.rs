@@ -4,8 +4,8 @@ use super::super::{
     JoinedFacts, discover_join_claim, emit_join_symbols, emit_type_relationships, join_occurrence,
     method_target_owner_matches, scoped_key, settle_join_references,
 };
-use super::codec;
 use super::*;
+use crate::store::staging::codec;
 
 /// The `sources.ord` of a symbol's scope document (a local symbol's document, or the crate
 /// root of a Cargo-target-scoped one, #394), `-1` for a global symbol (`?3`, `?4` are its

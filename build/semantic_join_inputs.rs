@@ -23,6 +23,9 @@
 /// - `store/captured_witness`: the captured-version reads the witnessed settlement trusts.
 /// - `store/staging`: the stage database, its schema and its claim and witness writers, moved
 ///   out of `semantic_batch`.
+/// - `store/staging/codec`, `store/staging/publication`: the stored forms of the stage's join
+///   columns and fact rows, and the reader of the sealed stage's output rows, moved out of
+///   `semantic_import/staged`.
 /// - `store/batch_input`: the admitted and joined batch types and the retained re-import
 ///   destination check, moved out of `semantic_batch`.
 /// - `batch_descriptor`: the batch descriptor and page grammar and the source-manifest hash,
@@ -62,6 +65,8 @@ pub const JOIN_MODULES: &[&str] = &[
     "src/store/native_first/**",
     "src/store/semantic_payload.rs",
     "src/store/staging.rs",
+    "src/store/staging/codec.rs",
+    "src/store/staging/publication.rs",
 ];
 
 /// Test scaffolding is compiled only for tests and never writes a stored payload.

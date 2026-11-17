@@ -1330,6 +1330,12 @@ pub fn drain_one_request_observed(
     )
 }
 
+/// The checkout worker's admission of retained runs into the FIFO (#632, #811): storage's
+/// slots and queue, with the retained descriptor's check 1, which is admission.
+pub(crate) fn enqueue_retained_runs(store: &Store) -> Result<()> {
+    store.enqueue_retained_runs(crate::producer::retention::descriptor_admissible)
+}
+
 pub(crate) type OwningWatcher =
     std::sync::Mutex<Option<(std::sync::Weak<WriterSession>, WatcherWork)>>;
 

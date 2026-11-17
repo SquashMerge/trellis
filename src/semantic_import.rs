@@ -1,6 +1,7 @@
 //! Exact measured joins for authenticated, document-local SCIP claims.
 #[cfg(test)]
 use crate::scip_raw::{CapturedClaim, CapturedScipInventory};
+use crate::semantic_records::rejoin_provenance_id;
 use crate::{native_evidence as native, native_ids, semantic_evidence as semantic};
 use anyhow::Result;
 #[cfg(test)]
@@ -62,9 +63,6 @@ pub(crate) use staged::JoinContinuation;
 #[cfg(feature = "test-support")]
 pub(crate) use staged::cursor_sql as staged_cursor_sql;
 pub use staged::join_staged;
-pub(crate) use staged::publication::read_documents as read_staged_documents;
-#[cfg(feature = "test-support")]
-pub(crate) use staged::publication::statements as staged_publication_statements;
 #[cfg(feature = "test-support")]
 pub(crate) use staged::target_callable_sql as staged_target_callable_sql;
 #[cfg(test)]
@@ -232,21 +230,6 @@ pub(super) fn rejoined_dispatch(
         return Ok(semantic::Dispatch::Unknown);
     }
     Ok(dispatch)
-}
-
-/// The provenance ID of a rejoined fact: a digest of the raw proof, the destination revision
-/// and the evidence kind, so it needs no lookup table.
-pub(crate) fn rejoin_provenance_id(
-    raw_id: &str,
-    revision_id: &str,
-    kind: semantic::EvidenceKind,
-) -> String {
-    native_ids::digest(
-        b"trellis.semantic-rejoin.v1\0",
-        &native_ids::canonical(
-            &serde_json::json!({"proof":raw_id,"revision":revision_id,"kind":kind}),
-        ),
-    )
 }
 
 #[cfg(test)]

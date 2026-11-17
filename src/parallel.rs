@@ -45,12 +45,12 @@ where
     let next = AtomicUsize::new(0);
     // Unit-test fault injection is per thread; workers see the caller's.
     #[cfg(test)]
-    let fault = crate::native_evidence::extraction_auth_fault_snapshot();
+    let fault = crate::native_records::extraction_auth_fault_snapshot();
     std::thread::scope(|scope| {
         for _ in 0..workers {
             scope.spawn(|| {
                 #[cfg(test)]
-                let _fault = crate::native_evidence::enter_extraction_auth_fault(&fault);
+                let _fault = crate::native_records::enter_extraction_auth_fault(&fault);
                 loop {
                     if cancel.load(Ordering::Acquire) {
                         return;
