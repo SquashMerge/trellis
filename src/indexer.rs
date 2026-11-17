@@ -675,7 +675,7 @@ pub fn measure_document_fingerprint(
         .filter(|r| r.document == document.key)
         .map(stable_fact)
         .collect::<Result<Vec<_>>>()?;
-    let context = crate::native_evidence::native_extraction_context(
+    let context = crate::native_records::native_extraction_context(
         &native.producer,
         &file.language,
         &native.revision,
