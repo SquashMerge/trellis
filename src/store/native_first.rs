@@ -658,7 +658,7 @@ impl Store {
                         }
                         anyhow::Ok(())
                     };
-                    crate::semantic_import::read_staged_documents(
+                    crate::store::staging::publication::read_documents(
                         parts.conn,
                         "",
                         producer,
