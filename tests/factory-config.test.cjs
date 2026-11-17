@@ -362,7 +362,10 @@ fi
 # verify hands the browser suite the binary it built (#192).
 for arg in "$@"; do
   if [ "$arg" = tests/browser/sequence-harness.test.cjs ] && [ -z "\${TRELLIS_SUITE_BINARY:-}" ]; then exit 37; fi
-  if [ "$arg" = tests/browser/navigation-resolved.test.cjs ] && [ -z "\${TRELLIS_NAVIGATION_FIXTURE_BINARY:-}" ]; then exit 38; fi
+  # The navigation suite gets the test-support binary from its own artifact
+  # directory, which shares the lane's build directory (#1177).
+  if [ "$arg" = tests/browser/navigation-resolved.test.cjs ] && [ "\${TRELLIS_NAVIGATION_FIXTURE_BINARY:-}" != "$FAKE_VERIFY_TARGET/navigation-fixture/debug/trellis" ]; then exit 38; fi
+  if [ "$arg" = --target-dir ] && [ "\${CARGO_BUILD_BUILD_DIR:-}" != "$FAKE_VERIFY_TARGET" ]; then exit 39; fi
 done
 if [ "$1" = tools/verify-browser-libs.mjs ]; then
   if [ "\${FAKE_VERIFY_MISSING_LIBS:-0}" = 1 ]; then echo "verify browser libraries: missing libfake.so.1"; exit 1; fi
@@ -397,6 +400,7 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
           PATH: `${fakeDir}${delimiter}${process.env.PATH ?? ""}`,
           FAKE_VERIFY_LOG: log,
           FAKE_BROWSER_ROOT: join(fakeDir, "browser-cache"),
+          FAKE_VERIFY_TARGET: resolvePath(ROOT, process.env.CARGO_TARGET_DIR || "target"),
           // Linux CI sets this for the real verify; the fake runs opt in per case.
           TRELLIS_BROWSER_SYSTEM_DEPS: "",
           // The shared heavy-run lease needs the real python3; these runs build nothing.
@@ -415,8 +419,7 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
         ["cargo", "fmt", "--all", "--", "--check"],
         ["cargo", "clippy", "--locked", "--all-targets", "--", "-D", "warnings"],
         ["cargo", "clippy", "--locked", "--all-targets", "--features", "test-support", "--", "-D", "warnings"],
-        ["cargo", "build", "--locked", "--features", "test-support", "--bin", "trellis"],
-        ["cp", join(resolvePath(ROOT, process.env.CARGO_TARGET_DIR || "target"), "debug", "trellis"), join(resolvePath(ROOT, process.env.CARGO_TARGET_DIR || "target"), "debug", "trellis-navigation-fixture")],
+        ["cargo", "build", "--locked", "--features", "test-support", "--bin", "trellis", "--target-dir", join(resolvePath(ROOT, process.env.CARGO_TARGET_DIR || "target"), "navigation-fixture")],
         ["cargo", "build", "--locked", "--bin", "trellis"],
         ["python3", "tools/verify-40-query-performance.py", "--smoke", "--binary", join(resolvePath(ROOT, process.env.CARGO_TARGET_DIR || "target"), "debug", "trellis")],
         ["node", "--test", "--test-concurrency=1", "tests/browser/sequence-harness.test.cjs", "tests/browser/pele-block-labels.test.cjs", "tests/browser/sequence-pele.test.cjs", "tests/browser/sequence-readable.test.cjs", "tests/browser/sequence-interactions.test.cjs", "tests/browser/sequence-hops.test.cjs", "tests/browser/sequence-hops-app.test.cjs", "tests/browser/sequence-callbacks.test.cjs", "tests/browser/sequence-callbacks-app.test.cjs", "tests/browser/sequence.test.cjs", "tests/browser/sequence-cost.test.cjs", "tests/browser/brand.test.cjs", "tests/browser/connect.test.cjs", "tests/browser/stall-recovery.test.cjs", "tests/browser/viewer-shell.test.cjs", "tests/browser/files.test.cjs", "tests/browser/architecture-pele.test.cjs", "tests/browser/architecture.test.cjs", "tests/browser/architecture-apps.test.cjs", "tests/browser/architecture-routing.test.cjs", "tests/browser/app-switcher.test.cjs", "tests/browser/treemap.test.cjs", "tests/browser/classes-pele.test.cjs", "tests/browser/classes-app.test.cjs", "tests/browser/classes-languages.test.cjs", "tests/browser/navigation-resolved.test.cjs"],
