@@ -168,6 +168,12 @@ paths = [
   # model and native records. Storage builds them for one revision; the references read
   # (query) takes them in and re-exports them at their old paths.
   "src/architecture_inputs.rs",
+  # The producer selection and call-binding core (S12, #997): the per-language default
+  # producers and their notes (#483), the snapshot facts and the `GraphSource` trait the
+  # call graph reads through, and `call_disposition`, the binding selection (#466). Pure
+  # functions over shared records, no I/O. The query engine (re-exported at its old paths
+  # in graph_query.rs) and storage's semantic reads (store/semantic_display.rs) share it.
+  "src/call_selection.rs",
   # The persisted producer records' vocabulary (S8 part 3, #1071): the producer-state error
   # codes and the process identity, exit, diagnostics, group status and failure summary that
   # `run.json` and run replies carry. Serde types and constants only, no I/O. Storage persists
