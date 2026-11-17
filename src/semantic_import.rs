@@ -1,6 +1,7 @@
 //! Exact measured joins for authenticated, document-local SCIP claims.
 #[cfg(test)]
 use crate::scip_raw::{CapturedClaim, CapturedScipInventory};
+use crate::semantic_records::rejoin_provenance_id;
 use crate::{native_evidence as native, native_ids, semantic_evidence as semantic};
 use anyhow::Result;
 #[cfg(test)]
@@ -232,21 +233,6 @@ pub(super) fn rejoined_dispatch(
         return Ok(semantic::Dispatch::Unknown);
     }
     Ok(dispatch)
-}
-
-/// The provenance ID of a rejoined fact: a digest of the raw proof, the destination revision
-/// and the evidence kind, so it needs no lookup table.
-pub(crate) fn rejoin_provenance_id(
-    raw_id: &str,
-    revision_id: &str,
-    kind: semantic::EvidenceKind,
-) -> String {
-    native_ids::digest(
-        b"trellis.semantic-rejoin.v1\0",
-        &native_ids::canonical(
-            &serde_json::json!({"proof":raw_id,"revision":revision_id,"kind":kind}),
-        ),
-    )
 }
 
 #[cfg(test)]
