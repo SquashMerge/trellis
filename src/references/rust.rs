@@ -630,29 +630,23 @@ impl Catalog {
         let document = self.scopes[scope].document;
         let doc = docs[document];
         let mut cursor = node.walk();
-        let mut uncertain = false;
+        let mut pending = Pending::default();
         let mut scope_uncertain = false;
-        let mut custom_path = false;
         for child in node.named_children(&mut cursor) {
             self.step(check)?;
             if matches!(child.kind(), "line_comment" | "block_comment") {
                 continue;
             }
             if matches!(child.kind(), "attribute_item" | "inner_attribute_item") {
-                self.note_attribute(
-                    doc,
-                    child,
-                    scope,
-                    &mut uncertain,
-                    &mut scope_uncertain,
-                    &mut custom_path,
-                );
+                self.note_attribute(doc, child, scope, &mut pending, &mut scope_uncertain);
                 continue;
             }
+            let Pending {
+                uncertain,
+                custom_path: item_custom,
+                ..
+            } = std::mem::take(&mut pending);
             let item_uncertain = uncertain || scope_uncertain;
-            uncertain = false;
-            let item_custom = custom_path;
-            custom_path = false;
             let item = Item {
                 doc,
                 document,
@@ -717,50 +711,54 @@ impl Catalog {
         Ok(false)
     }
     /// What an attribute says about the item after it, or with `#!` about the whole scope.
+    /// An attribute this catalog does not read could be a macro that binds any name, so it
+    /// makes the scope opaque. A built-in inert attribute cannot be a macro: a macro of the
+    /// same name is an ambiguity error. A derive helper is inert only after a derive on the
+    /// same item that registers it; before that, or without one, the name is an ordinary
+    /// attribute macro.
     fn note_attribute(
         &mut self,
         doc: &DocumentInput,
         child: Node<'_>,
         scope: usize,
-        uncertain: &mut bool,
+        pending: &mut Pending,
         scope_uncertain: &mut bool,
-        custom_path: &mut bool,
     ) {
         let attribute: String = text(doc, child)
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect();
+        let inner = child.kind() == "inner_attribute_item";
+        let name = attribute_name(&attribute);
         if attribute.starts_with("#![cfg(") || attribute.starts_with("#![cfg_attr(") {
             *scope_uncertain = true;
         } else if attribute.starts_with("#[cfg(")
             || attribute.starts_with("#[cfg_attr(")
             || attribute == "#[test]"
         {
-            *uncertain = true;
+            pending.uncertain = true;
         } else if attribute.starts_with("#[path=") {
-            *custom_path = true;
-        } else if ![
-            "#[derive(",
-            "#[allow(",
-            "#[warn(",
-            "#[deny(",
-            "#[forbid(",
-            "#[doc",
-            "#[test]",
-            "#[inline",
-            "#[repr(",
-            "#[must_use",
-            "#[cold]",
-            "#[no_mangle]",
-        ]
-        .iter()
-        .any(|a| attribute.starts_with(a))
+            pending.custom_path = true;
+        } else if !inner && attribute.starts_with("#[derive(") {
+            if let Some(list) = attribute
+                .strip_prefix("#[derive(")
+                .and_then(|rest| rest.strip_suffix(")]"))
+            {
+                for derive in list.split(',') {
+                    let derive = derive.rsplit("::").next().unwrap_or(derive);
+                    pending.helpers.extend(derive_helpers(derive));
+                }
+            }
+        } else if !(INERT_ATTRIBUTES.contains(&name)
+            || name.starts_with("rustfmt::")
+            || name.starts_with("clippy::")
+            || (!inner && pending.helpers.contains(name)))
         {
             self.scopes[scope].opaque = true;
-            if child.kind() == "inner_attribute_item" {
+            if inner {
                 *scope_uncertain = true;
             } else {
-                *uncertain = true;
+                pending.uncertain = true;
             }
         }
     }
@@ -2322,6 +2320,61 @@ struct Item<'a, 'tree> {
     child: Node<'tree>,
     item_uncertain: bool,
     item_custom: bool,
+}
+/// What the attributes read so far say about the next item.
+#[derive(Default)]
+struct Pending {
+    uncertain: bool,
+    custom_path: bool,
+    /// The helper attributes that a derive written earlier on this item registers.
+    helpers: BTreeSet<&'static str>,
+}
+/// Built-in attributes that bind no name, in either the outer or the inner form. A macro of
+/// one of these names cannot be used as an attribute: the name is ambiguous with the
+/// built-in. `test` is read before this list; `cfg`, `cfg_attr`, `path` and `derive` have
+/// meanings of their own.
+const INERT_ATTRIBUTES: &[&str] = &[
+    "allow",
+    "warn",
+    "deny",
+    "forbid",
+    "expect",
+    "doc",
+    "inline",
+    "repr",
+    "must_use",
+    "cold",
+    "no_mangle",
+    "ignore",
+    "should_panic",
+    "track_caller",
+    "non_exhaustive",
+    "deprecated",
+    "link",
+    "recursion_limit",
+    "no_main",
+    "global_allocator",
+];
+/// The path of an attribute with its whitespace removed: `#[a::b(..)]` and `#![a::b = ..]`
+/// give `a::b`.
+fn attribute_name(attribute: &str) -> &str {
+    let rest = attribute
+        .strip_prefix("#![")
+        .or_else(|| attribute.strip_prefix("#["))
+        .unwrap_or(attribute);
+    let end = rest.find(['(', '[', '{', '=', ']']).unwrap_or(rest.len());
+    &rest[..end]
+}
+/// The helper attributes that a derive of this name registers: serde's, clap's (4.x) and
+/// thiserror's.
+fn derive_helpers(derive: &str) -> &'static [&'static str] {
+    match derive {
+        "Serialize" | "Deserialize" => &["serde"],
+        "Parser" | "Args" | "Subcommand" => &["clap", "command", "arg", "group"],
+        "ValueEnum" => &["clap", "value"],
+        "Error" => &["error"],
+        _ => &[],
+    }
 }
 /// The namespaces an item's name is bound in; none for a node that binds no name.
 fn item_namespaces(child: Node<'_>) -> &'static [u8] {
