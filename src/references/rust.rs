@@ -653,8 +653,10 @@ impl Catalog {
                 self.bind_use(item, check)?;
                 continue;
             }
+            // A macro call could bind any name in this scope (#1163: the syntax decides).
             if child.kind() == "macro_invocation"
-                || (child.kind() == "expression_statement" && text(doc, child).contains('!'))
+                || (child.kind() == "expression_statement"
+                    && self.holds_macro(doc, child, check)?)
             {
                 self.scopes[scope].opaque = true;
                 continue;
@@ -675,6 +677,28 @@ impl Catalog {
             self.descend(docs, item, declarations, edges, depth, check)?;
         }
         Ok(())
+    }
+    /// Whether a macro call lies anywhere below a statement. Every macro call spells `!`, so
+    /// a statement without one needs no walk; `!=`, a unary `!` and a `!` in a literal do.
+    fn holds_macro(
+        &mut self,
+        doc: &DocumentInput,
+        statement: Node<'_>,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<bool> {
+        if !text(doc, statement).contains('!') {
+            return Ok(false);
+        }
+        let mut pending = vec![statement];
+        while let Some(node) = pending.pop() {
+            self.step(check)?;
+            if node.kind() == "macro_invocation" {
+                return Ok(true);
+            }
+            let mut cursor = node.walk();
+            pending.extend(node.named_children(&mut cursor));
+        }
+        Ok(false)
     }
     /// What an attribute says about the item after it, or with `#!` about the whole scope.
     fn note_attribute(
