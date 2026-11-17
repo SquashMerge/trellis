@@ -1254,6 +1254,53 @@ impl Capture {
     }
 }
 
+/// Storage's view of the admitted capture (`store::admitted_capture`). Each method is the
+/// inherent method or field of the same name.
+impl crate::store::admitted_capture::AdmittedCapture for Capture {
+    fn verify(&self, cancel: &CancelFlag) -> Result<()> {
+        Capture::verify(self, cancel)
+    }
+    fn graph_projection_count(&self) -> usize {
+        Capture::graph_projection_count(self)
+    }
+    fn claim_graph_projection(&self) -> Result<()> {
+        Capture::claim_graph_projection(self)
+    }
+    fn source_operations(&self) -> &BTreeMap<String, SourceOperations> {
+        &self.source_operations
+    }
+    fn source_stat(&self, relative: &str) -> Result<CaptureStat> {
+        Capture::source_stat(self, relative)
+    }
+    fn files(&self) -> &[SourceFile] {
+        &self.files
+    }
+    fn executable_path(&self) -> &Path {
+        Capture::executable_path(self)
+    }
+    fn executable_digest(&self, path: &Path) -> Option<&str> {
+        Capture::executable_digest(self, path)
+    }
+    fn reconcile_options(&self) -> &crate::indexer::ReconcileOptions {
+        Capture::reconcile_options(self)
+    }
+    fn persisted_inputs(&self) -> Result<BTreeMap<String, CaptureInputObservation>> {
+        Capture::persisted_inputs(self)
+    }
+    fn physical_root(&self) -> &Path {
+        Capture::physical_root(self)
+    }
+    fn bytes(&self, path: &Path) -> Option<&[u8]> {
+        Capture::bytes(self, path)
+    }
+    fn admitted_inputs(&self) -> Box<dyn Iterator<Item = (&Path, Option<&[u8]>)> + '_> {
+        Box::new(Capture::admitted_inputs(self))
+    }
+    fn hashes(&self) -> &BTreeMap<String, String> {
+        &self.hashes
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

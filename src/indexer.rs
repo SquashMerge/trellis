@@ -1,6 +1,8 @@
 //! Native-only graph projection from one immutable capture and validated #22 evidence.
 //! Syntax never supplies a target, candidate edge, dispatch resolution or callback traversal.
-use crate::{capture::Capture, model::*, native_evidence};
+use crate::{
+    capture::Capture, model::*, native_evidence, store::admitted_capture::AdmittedCapture,
+};
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -515,7 +517,7 @@ pub(crate) fn measure_persisted_change(
     previous: &[SourceFile],
     previous_options: &ReconcileOptions,
     previous_inputs: &BTreeMap<String, crate::capture::CaptureInputObservation>,
-    current: &Capture,
+    current: &dyn AdmittedCapture,
 ) -> Result<Option<BTreeSet<String>>> {
     if previous_options != current.reconcile_options() {
         return Ok(None);
@@ -537,7 +539,11 @@ pub(crate) fn measure_persisted_change(
         return Ok(None);
     }
     let before: BTreeMap<_, _> = previous.iter().map(|f| (f.path.as_str(), f)).collect();
-    let after: BTreeMap<_, _> = current.files.iter().map(|f| (f.path.as_str(), f)).collect();
+    let after: BTreeMap<_, _> = current
+        .files()
+        .iter()
+        .map(|f| (f.path.as_str(), f))
+        .collect();
     let changed = before
         .keys()
         .chain(after.keys())
@@ -988,12 +994,12 @@ fn project_native_selected(
 /// Verify every public graph row against the exact captured native syntax projection.
 pub fn validate_native_graph(
     graph: &Graph,
-    capture: &Capture,
+    capture: &dyn AdmittedCapture,
     native: &native_evidence::Artifact,
     cancel: &CancelFlag,
 ) -> Result<()> {
     ensure!(
-        graph.files == capture.files,
+        graph.files == capture.files(),
         "native_evidence_required: graph source differs from capture"
     );
     validate_native_graph_records(graph, native, cancel)
