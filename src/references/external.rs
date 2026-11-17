@@ -4,15 +4,7 @@ use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-#[derive(Clone, Debug)]
-pub struct ManifestInput {
-    pub source_set_id: String,
-    pub native_revision_id: String,
-    pub dependency_hash: String,
-    pub path: String,
-    pub content_hash: Option<String>,
-    pub bytes: Option<Vec<u8>>,
-}
+pub use crate::architecture_inputs::ManifestInput;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
