@@ -161,6 +161,11 @@ paths = [
   # at publish time (store/native_first/context.rs). Producer commands, settings and the
   # controlled worktree stay in src/producer/.
   "src/producer_profiles.rs",
+  # The persisted producer records' vocabulary (S8 part 3, #1071): the producer-state error
+  # codes and the process identity, exit, diagnostics, group status and failure summary that
+  # `run.json` and run replies carry. Serde types and constants only, no I/O. Storage persists
+  # them in store/producer_state.rs; the producer commands build them.
+  "src/producer_records.rs",
   # The proof that batch admission ran (S8, #1071): one zero-sized type with no dependency.
   # Admission creates it and the storage-owned `AdmittedBatch` (store/batch_input.rs) is
   # built from it. It is a module of `semantic_batch` because Rust privacy is by module
