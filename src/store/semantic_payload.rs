@@ -415,7 +415,7 @@ impl PayloadProjection<'_> {
         ))?;
         let id = match (literal, derived) {
             (Some(id), None) => id,
-            (None, Some(raw)) => crate::semantic_import::rejoin_provenance_id(
+            (None, Some(raw)) => crate::semantic_records::rejoin_provenance_id(
                 &raw,
                 &self.native,
                 semantic_enum(kind)?,

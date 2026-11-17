@@ -69,6 +69,7 @@ pub mod process_info;
 pub mod producer;
 pub mod producer_pin;
 mod producer_profiles;
+mod producer_records;
 pub mod references;
 pub mod rules;
 mod rules_edit;

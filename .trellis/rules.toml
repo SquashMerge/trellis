@@ -89,7 +89,6 @@ paths = [
   "src/semantic_import/**",
   "src/language_set_tests.rs", "src/native_typescript_tests.rs", "src/semantic_join_inputs_tests.rs",
   # In-file test modules moved out of src/native_evidence.rs (R1, #1004).
-  "src/native_evidence_borrowed_witness_tests.rs",
   "src/native_evidence_cached_executable_digest_tests.rs",
   "src/native_evidence_declaration_role_tests.rs",
   "src/native_evidence_full_document_spool_tests.rs",
@@ -123,8 +122,9 @@ paths = [
   # The stored search-card records and their eligibility predicate (S1b, #1000).
   "src/search_card_records.rs",
   # The persisted native evidence records, the producer constants and the pure lookup-key
-  # functions (S2, #1001). Extraction, validation and the spool stay in native_evidence.rs.
-  "src/native_records.rs",
+  # functions (S2, #1001); the extraction-input inventory, the extraction contexts and the
+  # document witness (S15). Extraction, validation and the spool stay in native_evidence.rs.
+  "src/native_records.rs", "src/native_records_tests.rs", "src/native_records_borrowed_witness_tests.rs",
   # Card preparation and serialization over shared records and native_ids only; storage
   # renders stored cards with it (S2, #1001). Capture stays in search_capture.rs.
   "src/search_card.rs",
@@ -166,6 +166,11 @@ paths = [
   # model and native records. Storage builds them for one revision; the references read
   # (query) takes them in and re-exports them at their old paths.
   "src/architecture_inputs.rs",
+  # The persisted producer records' vocabulary (S8 part 3, #1071): the producer-state error
+  # codes and the process identity, exit, diagnostics, group status and failure summary that
+  # `run.json` and run replies carry. Serde types and constants only, no I/O. Storage persists
+  # them in store/producer_state.rs; the producer commands build them.
+  "src/producer_records.rs",
   # The proof that batch admission ran (S8, #1071): one zero-sized type with no dependency.
   # Admission creates it and the storage-owned `AdmittedBatch` (store/batch_input.rs) is
   # built from it. It is a module of `semantic_batch` because Rust privacy is by module
