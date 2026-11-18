@@ -722,7 +722,7 @@
                   "const": 1
                 },
                 "toolVersion": {
-                  "const": 32
+                  "const": 33
                 },
                 "watcherDegraded": {
                   "type": "boolean"
