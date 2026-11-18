@@ -133,6 +133,39 @@ fn syntax_only<'a>(tiers: &Tiers, languages: impl IntoIterator<Item = &'a str>) 
     })
 }
 
+/// The one aggregate `coverageIncomplete` warning (warnings-v1), or none when both tiers
+/// are complete. #980: its message names each incomplete tier and that tier's languages in
+/// #22 order, so a partial scope in a language the answer does not return says where it is.
+fn coverage_incomplete(syntax: &[&str], semantic: &[&str]) -> Option<Value> {
+    let named = |tier: &str, languages: &[&str]| {
+        let languages: std::collections::BTreeSet<(usize, &str)> = languages
+            .iter()
+            .map(|language| (language_rank(language), *language))
+            .collect();
+        (!languages.is_empty()).then(|| {
+            let names: Vec<&str> = languages.into_iter().map(|(_, name)| name).collect();
+            format!("{tier} coverage is incomplete for {}", names.join(", "))
+        })
+    };
+    let parts: Vec<String> = [named("syntax", syntax), named("semantic", semantic)]
+        .into_iter()
+        .flatten()
+        .collect();
+    (!parts.is_empty()).then(|| {
+        json!({"code":"coverageIncomplete","message":format!("Selected {}", parts.join("; selected ")),"provenanceId":null})
+    })
+}
+
+/// The languages of a searched scope (#156) with a selected partial or failed native tuple.
+fn scope_incomplete(scope: &[[u64; 5]; 5]) -> Vec<&'static str> {
+    LANGUAGES
+        .into_iter()
+        .zip(scope)
+        .filter(|(_, row)| row[2] != 0 || row[3] != 0)
+        .map(|(language, _)| language)
+        .collect()
+}
+
 /// `semanticStatus` (#660): each of the answer's languages whose evidence is still catching
 /// up or needs re-import, in #22 order, from the same committed per-language state describe
 /// reports. `[]` when none is pending.
@@ -282,14 +315,14 @@ pub fn declaration(
         fields.remove(field);
     }
     let doc = document_ref(&refs, &source.document)?;
-    let incomplete = result
+    let syntax: Vec<&str> = result
         .coverage
         .iter()
-        .any(|c| c.selected && c.state != "complete");
-    let mut warnings = Vec::new();
-    if incomplete {
-        warnings.push(json!({"code":"coverageIncomplete","message":"Selected syntax coverage is incomplete","provenanceId":null}));
-    }
+        .filter(|c| c.selected && c.state != "complete")
+        .map(|c| c.language.as_str())
+        .collect();
+    let incomplete = !syntax.is_empty();
+    let mut warnings: Vec<Value> = coverage_incomplete(&syntax, &[]).into_iter().collect();
     warnings.extend(syntax_only(
         tiers,
         [result.declaration.document.language.as_str()],
@@ -475,7 +508,8 @@ fn symbols(
     }
     // #156: completeness is a property of the whole searched scope, carried by
     // `scopeCoverage`; per-document coverage covers only the emitted symbols.
-    let incomplete = result.scope.iter().any(|row| row[2] != 0 || row[3] != 0);
+    let syntax = scope_incomplete(&result.scope);
+    let incomplete = !syntax.is_empty();
     // #528: `syntaxOnly` names the emitted symbols' languages without fresh selected
     // semantic evidence; with no symbols, the searched languages that have selected tuples.
     let scope_languages: Vec<&str> = LANGUAGES
@@ -495,10 +529,7 @@ fn symbols(
         }
     };
     let warnings_for = |n: usize| -> Vec<Value> {
-        let mut warnings = Vec::new();
-        if incomplete {
-            warnings.push(json!({"code":"coverageIncomplete","message":"Selected syntax coverage is incomplete","provenanceId":null}));
-        }
+        let mut warnings: Vec<Value> = coverage_incomplete(&syntax, &[]).into_iter().collect();
         warnings.extend(syntax_only(tiers, languages_for(n)));
         warnings
     };
@@ -863,25 +894,43 @@ fn compact_data(data: &mut Value, items: &str) {
     }
 }
 
+/// A semantic record's language by its #22 name.
+fn semantic_language(language: crate::semantic_records::Language) -> &'static str {
+    use crate::semantic_records::Language;
+    match language {
+        Language::Java => "java",
+        Language::Rust => "rust",
+        Language::Python => "python",
+        Language::Javascript => "javascript",
+        Language::Typescript => "typescript",
+    }
+}
+
+/// The languages of the answer's semantic documents that are not served yet (#620).
+fn pending_languages(semantic: &crate::store::McpSemantic) -> Vec<&str> {
+    semantic
+        .documents
+        .iter()
+        .filter(|status| status.projection.semantic_status.is_pending())
+        .map(|status| status.language.as_str())
+        .collect()
+}
+
 /// Warnings-v1 for the emitted calls (#467): coverage, stale evidence and targets, ambiguous
 /// bindings and, when no producer covers them, `syntaxOnly` carrying the producer note.
+/// `syntax` names the languages with incomplete selected native coverage, and `pending` the
+/// languages of semantic documents not yet served; an emitted call's partial or failed
+/// semantic tuple adds its language to the semantic tier (#980).
 fn call_warnings<'a>(
-    incomplete: bool,
+    syntax: &[&str],
+    pending: &[&str],
     semantic: &crate::store::McpSemantic,
     emitted: impl IntoIterator<Item = &'a crate::store::CallSemantic>,
 ) -> Vec<Value> {
     use crate::semantic_evidence::{Freshness, Resolution};
     use std::collections::BTreeMap;
     let mut keys: BTreeMap<(u8, Option<String>), (&str, &str)> = BTreeMap::new();
-    if incomplete {
-        keys.insert(
-            (0, None),
-            (
-                "coverageIncomplete",
-                "Selected syntax coverage is incomplete",
-            ),
-        );
-    }
+    let mut incomplete_semantic = pending.to_vec();
     for call in emitted {
         if call.coverage.selected
             && matches!(
@@ -890,10 +939,7 @@ fn call_warnings<'a>(
                     | crate::semantic_evidence::CoverageState::Partial
             )
         {
-            keys.entry((0, None)).or_insert((
-                "coverageIncomplete",
-                "Selected semantic coverage is incomplete",
-            ));
+            incomplete_semantic.push(semantic_language(call.coverage.language));
         }
         for proof in &call.proofs {
             match call
@@ -936,10 +982,11 @@ fn call_warnings<'a>(
     if let Some(note) = semantic.note.as_deref() {
         keys.insert((4, None), ("syntaxOnly", note));
     }
-    keys.into_iter()
-        .map(|((_, provenance), (code, message))| {
+    coverage_incomplete(syntax, &incomplete_semantic)
+        .into_iter()
+        .chain(keys.into_iter().map(|((_, provenance), (code, message))| {
             json!({"code":code,"message":message,"provenanceId":provenance})
-        })
+        }))
         .collect()
 }
 
@@ -1114,8 +1161,29 @@ pub fn outgoing(
         } else {
             None
         };
+        // #980: the native tuples are the owner's and its shown candidates'; the emitted
+        // calls' own semantic tuples are the semantic tier's.
+        let syntax: Vec<&str> = result
+            .owner
+            .selected
+            .coverage
+            .iter()
+            .chain(
+                result.calls[..count]
+                    .iter()
+                    .zip(shown)
+                    .flat_map(|(item, n)| {
+                        item.selected.candidates[..*n]
+                            .iter()
+                            .map(|candidate| &candidate.coverage)
+                    }),
+            )
+            .filter(|c| c.selected && c.state != "complete")
+            .map(|c| c.language.as_str())
+            .collect();
         let warnings = call_warnings(
-            incomplete,
+            &syntax,
+            &pending_languages(semantic),
             semantic,
             (0..count).filter_map(|index| semantic.call(index)),
         );
@@ -1399,7 +1467,7 @@ pub fn incoming(
     let owner = &result.selected.selected;
     let basis = json!({"indexGeneration":owner.pin.index_generation.to_string(),
         "indexRevision":owner.pin.index_revision});
-    let incomplete = result.scope.iter().any(|row| row[2] != 0 || row[3] != 0);
+    let syntax = scope_incomplete(&result.scope);
     let build = |count: usize| -> Result<Value, &'static str> {
         let (documents, refs) = document_table(
             result.calls[..count]
@@ -1518,7 +1586,8 @@ pub fn incoming(
             None
         };
         let warnings = call_warnings(
-            incomplete,
+            &syntax,
+            &[],
             semantic,
             (0..count).filter_map(|index| semantic.call(index)),
         );

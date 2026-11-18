@@ -279,12 +279,15 @@ counts and the CLI and browser shapes are unchanged.
   `status?:("conforms"|"deviates"|"unknown")[]`, with 1–3 distinct values. An empty
   array, a repeated value or any other value is `invalid_request`. The filter keeps
   the `instances` and `testOnly` rows whose `status` it lists, excepted rows included
-  (they keep their status), before the paged sequence is formed. `unassigned` and
-  `externalPackages` are not filtered and still follow the instances in the sequence.
+  (they keep their status), before the paged sequence is formed. With a filter,
+  `unassigned` and `externalPackages` are left out of the sequence, so every page has
+  them empty (#980, owner ruling 2026-11-18; previously they were not filtered and
+  followed the instances).
   - `counts`, `testCounts` and the other whole-result fields stay those of the whole
     evaluation.
   - `page` adds the required `status:("conforms"|"deviates"|"unknown")[]|null`, the
-    filter as given, or null without one. `page.total` counts the filtered sequence.
+    filter as given, or null without one. `page.total` counts the filtered sequence:
+    the matching instances only.
   - The order of the kept items is unchanged. Offsets index the filtered sequence, so
     the same arguments at the same pin page stably. A different `status` is a
     different sequence.
@@ -1426,3 +1429,13 @@ An independently returned projected proof wrapper is `{evidence:T,projection:Sem
 - **References.** `trellis_references`, and the rules check, explain, view and details that read the same projection, report a production Rust site under a named feature's gate with `role:"test"`, in `tests` instead of `production`. No field is added or removed. A references read takes only this key from the rules file, leniently, as line 5 of this document states.
 - **Catalog.** Only the `toolVersion` constant changes, from 30 to 31, which has the same width. The prompt text is not part of the tool catalog, so the `tools/list` frame size is unchanged.
 - **Unchanged:** declaration roles, `callerRole`, find, search, metrics, the treemap, every schema and every bound.
+
+## Amendment (#979, #980): `recorded`, a status filter pages only instances, and the coverage warning says where
+
+**Status: owner rulings 2026-11-13 ([#979](https://github.com/SquashMerge/trellis/issues/979)) and 2026-11-18 ([#980](https://github.com/SquashMerge/trellis/issues/980)).** `toolVersion` is **32** (previously 31, #988). The three changes share the one bump.
+
+- **`trellis_show` answers `recorded` (#979).** The outcome that records the request for the open viewers is `recorded`; `shown` is no longer an outcome. It means recorded, not applied: a pinned viewer keeps its view, and a viewer at another snapshot shows a note with Reload and show instead of navigating. Its `generation`, its message rule and the other four outcomes are unchanged. The [`trellis_show` (#818)](#trellis_show-818) text and the tool description say so.
+- **A status filter pages only instances (#980, part 1).** With `status`, `trellis_rules_check` leaves `unassigned` and `externalPackages` out of the paged sequence: every page has both arrays empty, and `page.total` counts only the matching instances. Without `status` nothing changes. This amends the [#725](#amendment-725-rule-evidence-bases-status-filter-and-instance-pages) status filter text, which is updated in place.
+- **The coverage warning names the tier and languages (#980, part 2).** The one aggregate `coverageIncomplete` warning of find, search, declaration, outgoing and incoming calls says which tier is incomplete and for which languages, in #22 order: `Selected syntax coverage is incomplete for python`, `Selected semantic coverage is incomplete for rust`, or both joined by `; `. A find or search scope can be incomplete in a language the answer does not return; the warning now says where. Its code, its key, when it appears and `partial` are unchanged; `message` is free text, so no schema changes. Syntax is the selected native tuples (the searched scope's for find, search and incoming calls; the returned tuples for declaration and outgoing calls); semantic is an emitted call's partial or failed semantic tuple, and for outgoing calls a returned semantic document still catching up or needing re-import. `trellis_call_graph` keeps its #40 message.
+- **Catalog.** The `toolVersion` constant, the `trellis_show` outcome enum, its `if` constant and description, and the `status` description change. The measured sizes at `toolVersion` 32 are: modern `tools/list` frame 210,996 bytes and legacy 210,939 bytes, 146 bytes more than at `toolVersion` 31 (210,850 and 210,793), against the unchanged 235,520-byte compacted-frame limit.
+- **Unchanged:** the browser, the CLI, the Herdr mod (none reads these MCP fields), every other field and every bound; no MCP budget changes.

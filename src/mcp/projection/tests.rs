@@ -31,6 +31,42 @@ fn semantic_status_lists_the_answers_pending_languages_in_order() {
             .is_none()
     );
 }
+
+/// #980: the one `coverageIncomplete` warning names each incomplete tier and its languages
+/// once, in #22 order, and there is none when both tiers are complete.
+#[test]
+fn coverage_incomplete_names_each_tier_and_its_languages() {
+    let message = |syntax: &[&str], semantic: &[&str]| {
+        coverage_incomplete(syntax, semantic).map(|warning| {
+            assert_eq!(warning["code"], "coverageIncomplete");
+            assert_eq!(warning["provenanceId"], Value::Null);
+            warning["message"].as_str().unwrap().to_owned()
+        })
+    };
+    assert_eq!(message(&[], &[]), None);
+    assert_eq!(
+        message(&["typescript", "java", "typescript"], &[]).unwrap(),
+        "Selected syntax coverage is incomplete for java, typescript"
+    );
+    assert_eq!(
+        message(&[], &["python"]).unwrap(),
+        "Selected semantic coverage is incomplete for python"
+    );
+    assert_eq!(
+        message(&["javascript"], &["rust"]).unwrap(),
+        "Selected syntax coverage is incomplete for javascript; \
+         selected semantic coverage is incomplete for rust"
+    );
+    // A call answer's pending semantic documents are its semantic tier, never syntax.
+    let semantic = crate::store::McpSemantic::syntax_only("note", 0);
+    let warnings = call_warnings(&[], &["javascript"], &semantic, []);
+    assert_eq!(
+        warnings[0]["message"],
+        "Selected semantic coverage is incomplete for javascript"
+    );
+    assert_eq!(warnings[1]["code"], "syntaxOnly");
+}
+
 #[test]
 fn compact_keeps_projection_and_historical_freshness() {
     let projection = json!({

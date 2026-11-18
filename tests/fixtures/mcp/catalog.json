@@ -13287,7 +13287,7 @@
               "unknown"
             ]
           },
-          "description": "List only instances with these statuses, for example [\"deviates\"]. Counts stay those of the whole check."
+          "description": "List only instances with these statuses, for example [\"deviates\"], without the unassigned files and external packages. Counts stay those of the whole check."
         },
         "app": {
           "type": "string",
