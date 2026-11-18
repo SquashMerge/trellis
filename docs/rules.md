@@ -1016,7 +1016,16 @@ Supported mapping is deliberately narrow:
   import, or along a `crate::`/`self::`/`super::` path, and as an import
   (`use crate::kinds::Kind::Unit;`). The path before the variant must prove exactly one
   certain enum declaration, as any other path segment must prove its module, and the
-  enum's body must spell the variant once, with no `cfg` or `cfg_attr` on it. This is
+  enum's body must spell the variant once, with no `cfg` or `cfg_attr` on it. The
+  attributes on the variant are read from the parsed attribute's path, comments and `r#`
+  ignored, and every one must be a known inert one (`doc`, `allow`, `warn`, `deny`,
+  `forbid`, `expect`, `deprecated`, `default`, and the helpers `serde`, `error`,
+  `command` and `value`); any other attribute, such as a `cfg` spelled through a path,
+  leaves the variant unknown. A braced variant (`V { x: u8 }`) has no value constructor
+  and binds the type namespace only, as a braced struct does: its type-position uses
+  (`Kind::V { x: 1 }`, patterns) and its import map to the enum, while a value path
+  `Kind::V`, which can name a same-named associated item, stays unknown. Tuple and unit
+  variants bind both namespaces. This is
   sound because a variant is found before any associated item of the same name, so no
   `impl` or trait can take its place; an enum body holds no macro call, and an attribute
   macro cannot apply to a variant, so the body lists every variant there is. An enum

@@ -1739,6 +1739,32 @@ fn references_rust_same_file_enum_variant_is_proved() {
     assert!(data["unresolved"].as_array().unwrap().is_empty(), "{data}");
 }
 
+/// #1207 review: a braced variant has no value constructor, so a same-named inherent item,
+/// here in another file, is what a value path names. Only its type-namespace uses and its
+/// import map to the enum; tuple and unit variants keep both namespaces.
+#[test]
+fn references_rust_braced_enum_variant_binds_only_the_type_namespace() {
+    let (mapped, unresolved) = variant_resolution(
+        "pub enum Kind { Rec { x: u8 }, Tup(u8), Unit }",
+        "use crate::kinds::Kind::Rec;\n\
+         impl Kind { #[allow(non_snake_case)] pub fn Rec(x: u8) -> Self { Kind::Tup(x) } }\n\
+         fn f() { let _ = Kind::Rec(1); let _ = Kind::Rec { x: 1 }; let _ = Kind::Unit; }",
+    );
+    assert_eq!(
+        mapped,
+        [
+            "Kind::Rec",
+            "Kind::Tup",
+            "Kind::Unit",
+            "crate::kinds::Kind::Rec"
+        ]
+    );
+    assert_eq!(
+        unresolved,
+        [("Kind::Rec".to_owned(), "rust_name_unproved".to_owned())]
+    );
+}
+
 /// #1200 guards: only a variant the enum's body certainly spells resolves. A variant under
 /// `cfg` or `cfg_attr`, a path through a type alias or `Self`, an enum under an attribute
 /// macro, an inherent or trait item and a glob over an enum stay unknown.
@@ -1750,6 +1776,35 @@ fn references_rust_enum_variant_guards_keep_uncertain_members_unknown() {
     );
     assert_eq!(mapped, ["Kind::Plain"]);
     assert_eq!(unresolved, unknown_paths(&["Kind::Attr", "Kind::Gated"]));
+
+    // #1207 review: a conditional is read from the parsed attribute's path, so a comment
+    // inside it or a raw identifier does not hide it, for `cfg` and `cfg_attr` alike; an
+    // attribute that is not a known inert one is refused. Inert helpers, raw or not, keep
+    // their variant.
+    let (mapped, unresolved) = variant_resolution(
+        "pub enum Kind {\n\
+         #[cfg /* x */ (any())] Commented,\n\
+         #[r#cfg(any())] Raw,\n\
+         #[cfg_attr /* x */ (any(), cfg(any()))] AttrCommented,\n\
+         #[r#cfg_attr(any(), cfg(any()))] AttrRaw,\n\
+         #[core::prelude::v1::cfg(any())] Pathed,\n\
+         #[unknown] Unread,\n\
+         #[serde(rename = \"h\")] #[r#allow(dead_code)] #[default] Helper }",
+        "fn f() { let _ = Kind::Commented; let _ = Kind::Raw; let _ = Kind::AttrCommented;\n\
+         let _ = Kind::AttrRaw; let _ = Kind::Pathed; let _ = Kind::Unread; let _ = Kind::Helper; }",
+    );
+    assert_eq!(mapped, ["Kind::Helper"]);
+    assert_eq!(
+        unresolved,
+        unknown_paths(&[
+            "Kind::AttrCommented",
+            "Kind::AttrRaw",
+            "Kind::Commented",
+            "Kind::Pathed",
+            "Kind::Raw",
+            "Kind::Unread",
+        ])
+    );
 
     let (mapped, unresolved) = variant_resolution(
         "pub enum Kind { A }\npub type Alias = Kind;",
