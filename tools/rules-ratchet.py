@@ -28,6 +28,12 @@ population's references, so ordinary new code raises them. The record keeps the
 deviating references of each pair and the unknown references of each of those pairs'
 source files for this comparison.
 
+Excepted pairs, the pairs a reviewed `[[exceptions]]` entry of `.trellis/rules.toml`
+approves, are in no total, but their source files are checked for lost coverage too
+(#1211): the record keeps the references of each excepted pair whose status is
+`deviates`, and the unknown references of its source file, and the same per-pair rule
+applies to them. Any other change in an excepted pair, a new one included, is a notice.
+
 A pair is its source path and its destination path; renames are not detected. A
 deviating pair whose source or destination file was renamed, split or merged is a pair
 the record does not have, so the run fails until the record is updated. The pair under
@@ -87,11 +93,15 @@ PRODUCERS = (("rust-analyzer", "trusted"), ("scip-typescript", "restricted"))
 RATCHETED = ("deviatingPairs", "deviatingReferences", "unknownReferences", "partialFiles")
 KEYS = (*RATCHETED, "comparablePairs", "conformingPairs", "unknownPairs")
 # What the per-pair comparison needs (#1140): the deviating references of each pair, as
-# {source path: {destination path: references}}, and the unknown references from each
-# source file, as {source path: references}. The record keeps the second only for the
-# sources of its deviating pairs.
-BY_PAIR, BY_SOURCE = "deviatingReferencesByPair", "unknownReferencesBySource"
-SCHEMA_VERSION = 4
+# {source path: {destination path: references}}, the same for each excepted pair (#1211),
+# and the unknown references from each source file, as {source path: references}. The
+# record keeps the last only for the sources of its deviating and excepted pairs.
+BY_PAIR, EXCEPTED = "deviatingReferencesByPair", "exceptedReferencesByPair"
+BY_SOURCE = "unknownReferencesBySource"
+# The pair maps the per-pair lost-coverage rule reads, each with how a line names it.
+PAIR_MAPS = ((BY_PAIR, "deviating references", ""),
+             (EXCEPTED, "excepted references", " (excepted)"))
+SCHEMA_VERSION = 5
 # What the record's figures count and how they were measured, written into the record
 # so it can be read without this script.
 DESCRIPTION = {
@@ -105,13 +115,18 @@ DESCRIPTION = {
     "rule": "A run fails when deviatingPairs, deviatingReferences or partialFiles is "
             "above this record, or when it measures a deviating pair that is not in "
             "deviatingReferencesByPair. It also fails as lost coverage, decided per "
-            "pair: a pair in deviatingReferencesByPair (source path, then destination "
-            "path) has fewer deviating references than recorded, or is gone, while its "
-            "source file has more unknown references than unknownReferencesBySource "
-            "records for it. Any other rise in unknown references is a notice. "
-            "unknownReferences is the sum of referenceCount over the population's "
-            "instances with status unknown; unknownReferencesBySource is that sum for "
-            "each source file of a recorded deviating pair. Pairs are compared by path "
+            "pair: a pair in deviatingReferencesByPair or exceptedReferencesByPair "
+            "(source path, then destination path) has fewer references than that map "
+            "records for it, or is gone from it, while its source file has more "
+            "unknown references than unknownReferencesBySource records for it. Any "
+            "other rise in unknown references is a notice, and so is any other change "
+            "in an excepted pair, a new one included. unknownReferences is the sum of "
+            "referenceCount over the population's instances with status unknown that "
+            "are not excepted; exceptedReferencesByPair is that sum for each excepted "
+            "instance with status deviates, a pair a reviewed exception in "
+            ".trellis/rules.toml approves, which no total counts; "
+            "unknownReferencesBySource is the unknown sum for each source file of a "
+            "recorded deviating or excepted pair. Pairs are compared by path "
             "and renames are not detected: a deviating pair whose source or "
             "destination file was renamed, split or merged is a pair this record does "
             "not have, so the run fails until the record is updated, and the pair "
@@ -217,11 +232,13 @@ def summarize(payload):
         raise Failed("rules check counts disagree with its instances")
     first_party = [row for row in instances if not is_external(row)]
     deviating, unknown = having(first_party, "deviates"), having(first_party, "unknown")
-    by_pair, by_source = {}, {}
-    for row in deviating:
-        destinations = by_pair.setdefault(row["target"]["path"], {})
-        destination = row["destination"]["path"]
-        destinations[destination] = destinations.get(destination, 0) + row["referenceCount"]
+    excepted = [row for row in first_party if row["status"] == "deviates" and row["excepted"]]
+    by_pair, by_excepted, by_source = {}, {}, {}
+    for rows, into in ((deviating, by_pair), (excepted, by_excepted)):
+        for row in rows:
+            destinations = into.setdefault(row["target"]["path"], {})
+            destination = row["destination"]["path"]
+            destinations[destination] = destinations.get(destination, 0) + row["referenceCount"]
     for row in unknown:
         source = row["target"]["path"]
         by_source[source] = by_source.get(source, 0) + row["referenceCount"]
@@ -234,6 +251,7 @@ def summarize(payload):
         "conformingPairs": len(having(first_party, "conforms")),
         "unknownPairs": len(unknown),
         BY_PAIR: by_pair,
+        EXCEPTED: by_excepted,
         BY_SOURCE: by_source,
     }, len(instances) - len(first_party)
 
@@ -241,36 +259,42 @@ def summarize(payload):
 DEVIATIONS = ("deviatingPairs", "deviatingReferences")
 
 
-def pairs(figures):
-    """The deviating pairs as {(source, destination): references}."""
+def pairs(figures, key=BY_PAIR):
+    """The deviating pairs, or with `key` EXCEPTED the excepted ones, as
+    {(source, destination): references}."""
     return {(source, destination): references
-            for source, destinations in figures[BY_PAIR].items()
+            for source, destinations in figures[key].items()
             for destination, references in destinations.items()}
 
 
 def recorded(figures):
     """The part of a measurement the record keeps, in the record's order: the totals,
-    every deviating pair, and the unknown references of those pairs' source files."""
-    by_pair = {source: dict(sorted(destinations.items()))
-               for source, destinations in sorted(figures[BY_PAIR].items())}
-    return {**{key: figures[key] for key in KEYS}, BY_PAIR: by_pair,
-            BY_SOURCE: {source: figures[BY_SOURCE].get(source, 0) for source in by_pair}}
+    every deviating and every excepted pair, and the unknown references of those pairs'
+    source files."""
+    maps = {key: {source: dict(sorted(destinations.items()))
+                  for source, destinations in sorted(figures[key].items())}
+            for key in (BY_PAIR, EXCEPTED)}
+    sources = sorted({*maps[BY_PAIR], *maps[EXCEPTED]})
+    return {**{key: figures[key] for key in KEYS}, **maps,
+            BY_SOURCE: {source: figures[BY_SOURCE].get(source, 0) for source in sources}}
 
 
 def lost_coverage(record, measured):
-    """Spec G1's lost coverage, one line per pair: a recorded pair with fewer deviating
-    references, or gone, whose source file has more unknown references than recorded.
-    The check reports observed references, not absence, and these counts are what a
-    deviating reference that became unresolvable looks like; they do not prove it is
-    the same reference."""
-    now, lines = pairs(measured), []
-    for (source, destination), references in pairs(record).items():
-        before, after = record[BY_SOURCE][source], measured[BY_SOURCE].get(source, 0)
-        if now.get((source, destination), 0) < references and after > before:
-            lines.append(f"{source} -> {destination}: deviating references recorded "
-                         f"{references}, measured {now.get((source, destination), 0)}; "
-                         f"unknown references from {source}: recorded {before}, "
-                         f"measured {after} ({after - before:+d})")
+    """Spec G1's lost coverage, one line per pair: a recorded deviating or excepted pair
+    with fewer references, or gone, whose source file has more unknown references than
+    recorded. The check reports observed references, not absence, and these counts are
+    what a reference that became unresolvable looks like; they do not prove it is the
+    same reference."""
+    lines = []
+    for key, what, mark in PAIR_MAPS:
+        now = pairs(measured, key)
+        for (source, destination), references in pairs(record, key).items():
+            before, after = record[BY_SOURCE][source], measured[BY_SOURCE].get(source, 0)
+            if now.get((source, destination), 0) < references and after > before:
+                lines.append(f"{source} -> {destination}{mark}: {what} recorded "
+                             f"{references}, measured {now.get((source, destination), 0)}; "
+                             f"unknown references from {source}: recorded {before}, "
+                             f"measured {after} ({after - before:+d})")
     return lines
 
 
@@ -285,10 +309,11 @@ def compare(record, measured):
     """Returns (verdict, lines); verdict is `fail`, `lower` or `equal`.
 
     A rise in deviating pairs, deviating references or partial files fails, and so does
-    a deviating pair the record does not have. So does lost coverage: a recorded pair
-    with fewer deviating references and more unknown references from its source file.
-    Any other rise in unknown references is a notice, as is any other difference. Pair
-    totals never fail: they move when a file is split, merged, renamed or deleted.
+    a deviating pair the record does not have. So does lost coverage: a recorded
+    deviating or excepted pair with fewer references and more unknown references from
+    its source file. Any other rise in unknown references is a notice, as is any other
+    difference, in an excepted pair too. Pair totals never fail: they move when a file
+    is split, merged, renamed or deleted.
     """
     def change(key):
         return f"{key}: recorded {record[key]}, measured {measured[key]}"
@@ -310,8 +335,8 @@ def compare(record, measured):
             lines.append(f"  {change('partialFiles')}")
         if lost:
             lines.append("rules ratchet FAILED: the comparison population lost coverage: "
-                         "fewer deviating references in a pair on more unknown "
-                         "references from its source file")
+                         "fewer deviating or excepted references in a pair on more "
+                         "unknown references from its source file")
             lines += [f"  {line}" for line in lost]
         lines.append("  Remove the added deviation or restore the coverage. A reviewed "
                      f"re-baseline or exception updates the record explicitly: {UPDATE}")
@@ -319,18 +344,21 @@ def compare(record, measured):
     if recorded(measured) != recorded(record):
         lines = ["rules ratchet NOTICE: the record can be updated"]
         lines += [f"  {change(key)}" for key in KEYS if measured[key] != record[key]]
-        lines += [f"  {source} -> {destination}: deviating references recorded {references}, "
-                  f"measured {now.get((source, destination), 0)}"
-                  for (source, destination), references in before.items()
-                  if now.get((source, destination), 0) != references]
+        for key, what, mark in PAIR_MAPS:
+            was, measured_pairs = pairs(record, key), pairs(measured, key)
+            lines += [f"  {source} -> {destination}{mark}: {what} recorded "
+                      f"{was.get((source, destination), 0)}, measured {references}"
+                      for (source, destination), references in sorted(
+                          {**{pair: 0 for pair in was}, **measured_pairs}.items())
+                      if was.get((source, destination), 0) != references]
         lines += [f"  unknown references from {source}: recorded {references}, measured "
                   f"{measured[BY_SOURCE].get(source, 0)}"
                   for source, references in record[BY_SOURCE].items()
                   if measured[BY_SOURCE].get(source, 0) != references]
         if measured["unknownReferences"] > record["unknownReferences"]:
             lines.append(f"  NOTICE: unknown references rose; {unknown_change(record, measured)}. "
-                         "Not a failure: no pair with fewer deviating references has more "
-                         "unknown references from its source file.")
+                         "Not a failure: no deviating or excepted pair with fewer "
+                         "references has more unknown references from its source file.")
         return "lower", lines + [f"  Update it: {UPDATE}"]
     return "equal", ["rules ratchet: " + ", ".join(f"{key} {measured[key]}" for key in KEYS)]
 
@@ -349,8 +377,9 @@ def update_refusal(previous, measured, accept_unknown_rise):
                                f"unknown references from the same source file, as {ACCEPT} asks",
                                *(f"  {line}" for line in lost)]
     return True, lines + [
-        "rules ratchet FAILED: the record was not rewritten: a pair has fewer deviating "
-        "references than recorded while its source file has more unknown references",
+        "rules ratchet FAILED: the record was not rewritten: a deviating or excepted pair "
+        "has fewer references than recorded while its source file has more unknown "
+        "references",
         *(f"  {line}" for line in lost),
         f"  If the rise in unknown references is reviewed and accepted: {UPDATE} {ACCEPT}"]
 
@@ -366,10 +395,11 @@ def read_record(path):
     if (record.get("schemaVersion") != SCHEMA_VERSION
             or any(record.get(key) != text for key, text in DESCRIPTION.items())
             or any(not isinstance(record.get(key), int) for key in KEYS)
-            or not isinstance(record.get(BY_PAIR), dict)
-            or not all(counts(destinations) for destinations in record[BY_PAIR].values())
+            or any(not isinstance(record.get(key), dict)
+                   or not all(counts(destinations) for destinations in record[key].values())
+                   for key in (BY_PAIR, EXCEPTED))
             or not counts(record.get(BY_SOURCE))
-            or set(record[BY_SOURCE]) != set(record[BY_PAIR])):
+            or set(record[BY_SOURCE]) != {*record[BY_PAIR], *record[EXCEPTED]}):
         raise Failed(f"{path}: not a version {SCHEMA_VERSION} rules-ratchet record; "
                      f"rewrite it with {UPDATE}")
     return record
@@ -556,9 +586,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--update", action="store_true", help="rewrite the record")
     parser.add_argument(ACCEPT, action="store_true",
-                        help="with --update: rewrite the record although a pair has fewer "
-                             "deviating references on more unknown references from its "
-                             "source file")
+                        help="with --update: rewrite the record although a deviating or "
+                             "excepted pair has fewer references on more unknown "
+                             "references from its source file")
     parser.add_argument("--require-producers", action="store_true",
                         help="fail (exit 3) when a producer is not ready, instead of "
                              "printing a notice and exiting 0")
