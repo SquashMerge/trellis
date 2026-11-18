@@ -2,12 +2,14 @@
 //! spec: like the pin, this is vocabulary). The four pinned producers and the test stub's id,
 //! the two trust profiles, the closed producer x trust-profile table (`Target`, `Row`, `row`)
 //! with each row's worktree omissions and generated files (`rules`), and `context_hash`, the
-//! controlled-profile input digest. Static data and pure functions: no file, environment,
-//! worktree or database read; `context_hash` takes the source test as the caller's closure.
+//! controlled-profile input digest; and the languages a producer's run covers (`run_languages`,
+//! `stub_languages`). Static data and pure functions: no file, worktree or database read, and
+//! no environment read except the stub's language in a `test-support` build (owner ruling
+//! 2026-11-17, D1); `context_hash` takes the source test as the caller's closure.
 //! Storage validates stored producer context against this table at publish time
 //! (`store::native_first::context`); producer commands, caches, settings and the controlled
 //! worktree stay in `crate::producer`, which re-exports these items at their old paths.
-use crate::producer_pin::PinnedProducer;
+use crate::producer_pin::{PinnedProducer, producer_languages};
 use anyhow::{Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -67,6 +69,22 @@ pub const STUB_PRODUCER: &str = "trellis-synthetic-scip";
 
 /// The pin id of the test-support stand-in producer.
 pub const STUB_NAME: &str = crate::producer_profiles::STUB_PRODUCER;
+
+/// The languages a `producer run` of `producer_id` covers: a real reference producer's, or
+/// the test stub's (#664). `None` for an unknown producer.
+pub fn run_languages(producer_id: &str) -> Option<&'static [&'static str]> {
+    producer_languages(producer_id).or_else(|| (producer_id == STUB_PRODUCER).then(stub_languages))
+}
+
+/// The languages the test-support stub producer's runs cover: one language.
+pub fn stub_languages() -> &'static [&'static str] {
+    #[cfg(feature = "test-support")]
+    if std::env::var("TRELLIS_TEST_PRODUCER_STUB_LANGUAGE").as_deref() == Ok("rust") {
+        return &["rust"];
+    }
+    &["javascript"]
+}
+
 const RUST_REFUSAL: &str = "rust-analyzer cannot disable build scripts or proc macros";
 /// The root build files and, as `*/` patterns, the nested module build files capture retains
 /// above Java sources (#854).
