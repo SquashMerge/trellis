@@ -286,6 +286,8 @@ struct Hold {
 struct Tagged {
     producer: String,
     token: SupersedeToken,
+    /// The state version the run thread read just before the launch (#1216).
+    launched_at: u64,
     outcome: LaunchOutcome,
 }
 
@@ -454,10 +456,15 @@ impl OwnerState {
                 if let Some(run_id) = run_id {
                     self.last_run_id.insert(producer.clone(), run_id);
                 }
-                self.hold = Some(Hold {
-                    version: seen,
-                    until: now + self.intervals.backstop,
-                });
+                // The outcome's own wake is one signal since the launch. Any other, such as the
+                // publication that held the index, already releases the hold: its credit is
+                // never absorbed by a hold taken when the outcome is consumed.
+                if seen <= done.launched_at.saturating_add(1) {
+                    self.hold = Some(Hold {
+                        version: seen,
+                        until: now + self.intervals.backstop,
+                    });
+                }
             }
             LaunchOutcome::Finished { run_id, outcome } => {
                 if let Some(run_id) = run_id {
@@ -1217,10 +1224,12 @@ fn spawn_run(
         let cell = cell.clone();
         let producer = producer.to_owned();
         Box::new(move || {
+            let launched_at = runtime.state_version();
             let outcome = runtime.launch(request);
             cell.put(Tagged {
                 producer,
                 token,
+                launched_at,
                 outcome,
             });
             runtime.wake();

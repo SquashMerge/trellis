@@ -153,9 +153,20 @@ fn activate(s: &mut OwnerState, producer: &str, now_ms: u64) -> SupersedeToken {
 }
 
 fn tagged(producer: &str, token: &SupersedeToken, outcome: LaunchOutcome) -> Tagged {
+    tagged_at(producer, token, 0, outcome)
+}
+
+/// A launch's end whose run thread read state version `launched_at` before launching.
+fn tagged_at(
+    producer: &str,
+    token: &SupersedeToken,
+    launched_at: u64,
+    outcome: LaunchOutcome,
+) -> Tagged {
     Tagged {
         producer: producer.to_owned(),
         token: token.clone(),
+        launched_at,
         outcome,
     }
 }
@@ -893,7 +904,7 @@ fn contention_counts_as_a_start_only_once_the_run_record_exists() {
     let mut s = ready(&[ALPHA], base);
     let token = activate(&mut s, ALPHA, NOW_MS + 20_000);
     let contended = LaunchOutcome::Contended { run_id: None };
-    assert!(s.apply(tagged(ALPHA, &token, contended), 5, base + secs(20)));
+    assert!(s.apply(tagged_at(ALPHA, &token, 4, contended), 5, base + secs(20)));
     assert_eq!(s.last_start.get(ALPHA), None);
     assert!(s.last_failure.is_empty());
     let held = at(&mut s, &Live { seen: 5, ..live() }, base, 21);
@@ -912,7 +923,7 @@ fn contention_counts_as_a_start_only_once_the_run_record_exists() {
     let contended = LaunchOutcome::Contended {
         run_id: Some("r1".into()),
     };
-    assert!(s.apply(tagged(ALPHA, &token, contended), 5, base + secs(20)));
+    assert!(s.apply(tagged_at(ALPHA, &token, 4, contended), 5, base + secs(20)));
     assert_eq!(s.last_start[ALPHA], NOW_MS + 20_000);
     assert_eq!(s.last_run_id[ALPHA], "r1");
     assert!(s.last_failure.is_empty());
@@ -1207,6 +1218,9 @@ struct Rt {
     launches: Vec<(String, String)>,
     outcomes: VecDeque<LaunchOutcome>,
     bump_on_launch: bool,
+    /// Bump the version once the launch has its outcome, before it returns: a signal that
+    /// lands between the refusal and the owner consuming it.
+    bump_before_return: bool,
     abandon: bool,
 }
 
@@ -1335,6 +1349,10 @@ impl AutoRunRuntime for FakeRuntime {
         self.changed.notify_all();
         loop {
             if let Some(outcome) = state.outcomes.pop_front() {
+                if std::mem::take(&mut state.bump_before_return) {
+                    state.version += 1;
+                    self.changed.notify_all();
+                }
                 return outcome;
             }
             if state.abandon {
@@ -1956,4 +1974,38 @@ fn loop_real_failure_stays_failed_until_the_basis_changes() {
     harness.signal();
     rt.wait_for("the rerun", |state| state.launches.len() == 2);
     assert_eq!(rt.launches()[1], (ALPHA.to_owned(), "h2".to_owned()));
+}
+
+#[test]
+fn contention_hold_keeps_the_credit_of_a_publication_before_it_is_consumed() {
+    let base = Instant::now();
+    let mut s = ready(&[ALPHA], base);
+    // Launched at version 4; the outcome's own wake makes 5 and the publication 6.
+    let token = activate(&mut s, ALPHA, NOW_MS + 20_000);
+    let contended = LaunchOutcome::Contended { run_id: None };
+    assert!(s.apply(tagged_at(ALPHA, &token, 4, contended), 6, base + secs(20)));
+    assert!(s.hold.is_none());
+    let same = Live { seen: 6, ..live() };
+    assert_eq!(
+        at(&mut s, &same, base, 20).action,
+        Action::Start(ALPHA.into())
+    );
+}
+
+#[test]
+fn loop_publication_between_refusal_and_consume_reruns_at_once() {
+    let rt = FakeRuntime::new();
+    let src = FakeSources::new(&[ALPHA], config(&[ALPHA], 10, 60));
+    // The refusal is decided, then the publication that held the index lands and signals
+    // before the run thread stores the outcome for the owner.
+    rt.with(|state| state.bump_before_return = true);
+    rt.finish(LaunchOutcome::Contended { run_id: None });
+    let harness = Harness::start(&rt, &src, immediate());
+    rt.wait_for("the first launch", |state| !state.launches.is_empty());
+    // No further signal: the publication's own credit starts the re-run at the same head.
+    rt.finish(finished(AutoOutcome::Imported));
+    rt.wait_for("the rerun", |state| state.launches.len() == 2);
+    assert_eq!(rt.launches()[1], (ALPHA.to_owned(), "h1".to_owned()));
+    assert_eq!(rt.state.lock().unwrap().expired, 0);
+    assert_eq!(harness.clock.elapsed(), Duration::ZERO);
 }
