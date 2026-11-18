@@ -1770,20 +1770,9 @@ impl Catalog {
                 .filter(|b| !b.unknown && b.candidates.len() == 1)
                 .and_then(|b| b.candidates.values().next());
             if found.unknown_set || next.and_then(|c| c.module).is_none() {
-                // `Enum::Variant` (#1200): the last segment after a proved enum.
-                if !found.unknown_set
-                    && index + 1 == path.len()
-                    && let Some(enumeration) = next
-                {
-                    let enumeration = enumeration.clone();
-                    if let Some(names) = self.variant(&enumeration, &path[index], check)? {
-                        return Ok(names);
-                    }
-                }
-                return Ok(Names {
-                    unknown_set: true,
-                    ..Names::default()
-                });
+                // Only an enum's variant (#1200) goes on from a candidate that is no module.
+                let enumeration = next.filter(|_| !found.unknown_set).cloned();
+                return self.variant(enumeration.as_ref(), &path[index..], check);
             }
             let next = next.expect("proved module candidate");
             proof.extend(next.proof.iter().copied());
@@ -1916,24 +1905,32 @@ impl Catalog {
         Ok(())
     }
     /// `Enum::Variant`: the names of the variant, which lives in the enum's own declaration,
-    /// when `enumeration` is a proved enum whose body certainly spells it (#1200). A variant
-    /// is found before any associated item of the same name, so no `impl` or trait can take
-    /// its place. Anything else (an inherent or trait item, a type alias, a conditional
-    /// variant) stays unknown.
+    /// when `enumeration` is the one proved candidate before `rest`, an enum, and `rest` is
+    /// one variant its body certainly spells (#1200). A variant is found before any
+    /// associated item of the same name, so no `impl` or trait can take its place. Anything
+    /// else (an inherent or trait item, a type alias, a conditional variant, a path that
+    /// goes on past the variant) is an unknown set.
     fn variant(
         &mut self,
-        enumeration: &Candidate,
-        name: &str,
+        enumeration: Option<&Candidate>,
+        rest: &[String],
         check: &mut impl FnMut() -> Result<()>,
-    ) -> Result<Option<Names>> {
+    ) -> Result<Names> {
         self.step(check)?;
+        let unknown = Names {
+            unknown_set: true,
+            ..Names::default()
+        };
+        let (Some(enumeration), [name]) = (enumeration, rest) else {
+            return Ok(unknown);
+        };
         let declaration = &enumeration.declaration;
         let certain = self
             .variants
             .get(&(declaration.document, declaration.start, declaration.end))
             .and_then(|variants| variants.get(name));
         if certain != Some(&true) {
-            return Ok(None);
+            return Ok(unknown);
         }
         let mut names = Names::default();
         for namespace in [TYPE, VALUE] {
@@ -1944,7 +1941,7 @@ impl Catalog {
                 .candidates
                 .insert(declaration.clone(), enumeration.clone());
         }
-        Ok(Some(names))
+        Ok(names)
     }
     /// A module prefix alone, useful as an expansion target, not a synthetic declaration.
     fn module_name(&self, module: usize, name: &str, depth: usize) -> Names {
