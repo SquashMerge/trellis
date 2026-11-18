@@ -1,6 +1,7 @@
-//! Admission helpers for pinned semantic producers: the run and witness language tables and the
-//! selected-role path check. The checked-in producer pin registry is in `crate::producer_pin`
-//! and the root URI in `crate::scip_vocab`, both re-exported here.
+//! Admission helpers for pinned semantic producers: the witness language table and the
+//! selected-role path check. The checked-in producer pin registry is in `crate::producer_pin`,
+//! the root URI in `crate::scip_vocab` and the run language table in
+//! `crate::producer_profiles`, all re-exported here.
 pub use crate::scip_raw::{
     CapturedClaim, CapturedScipFactV1, CapturedScipInventory, Completion, Exclusion,
     ScipCaptureError,
@@ -12,24 +13,9 @@ pub use crate::producer_pin::{
     PinnedProducer, pinned_producer, pinned_producer_by_id, producer_languages,
     reference_install_method,
 };
-pub use crate::producer_profiles::STUB_PRODUCER;
+pub use crate::producer_profiles::{STUB_PRODUCER, run_languages, stub_languages};
 pub use crate::scip_vocab::{REFERENCE_TRUST_ORIGIN, SYNTHETIC_TRUST_ORIGIN};
 pub(crate) use crate::scip_vocab::{admission, file_uri, order, path};
-
-/// The languages a `producer run` of `producer_id` covers: a real reference producer's, or
-/// the test stub's (#664). `None` for an unknown producer.
-pub fn run_languages(producer_id: &str) -> Option<&'static [&'static str]> {
-    producer_languages(producer_id).or_else(|| (producer_id == STUB_PRODUCER).then(stub_languages))
-}
-
-/// The languages the test-support stub producer's runs cover: one language.
-pub fn stub_languages() -> &'static [&'static str] {
-    #[cfg(feature = "test-support")]
-    if std::env::var("TRELLIS_TEST_PRODUCER_STUB_LANGUAGE").as_deref() == Ok("rust") {
-        return &["rust"];
-    }
-    &["javascript"]
-}
 
 /// The languages of each producer the witness fast path accepts. `scip-java` is omitted on
 /// purpose: its rejoin has always taken the FULL path, and that behavior is preserved.

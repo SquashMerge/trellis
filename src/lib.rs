@@ -34,6 +34,7 @@ pub mod file_tree;
 mod files_read;
 pub mod files_view;
 pub mod git_status;
+mod graph_projection;
 pub mod graph_query;
 mod graph_read;
 pub(crate) mod heap;
@@ -53,6 +54,7 @@ mod language_set_tests;
 pub mod mcp;
 pub mod metrics;
 pub mod metrics_read;
+mod metrics_records;
 pub mod model;
 pub mod model_management;
 #[cfg(feature = "test-support")]

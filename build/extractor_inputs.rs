@@ -16,6 +16,8 @@
 ///   witness, moved out of `native_evidence`.
 /// - `native_ids`: canonical JSON, digests and ID minting.
 /// - `indexer*`: graph projection and per-language native kinds.
+/// - `graph_projection`: one document's graph rows from its native facts and their
+///   write-time check, moved out of `indexer`.
 /// - `classes`: class extraction.
 /// - `class_catalog`: the class catalog's composition and budget fit, moved out of `classes`.
 /// - `evidence_budget`, `evidence_limits`: the per-document budgets and their charging.
@@ -33,6 +35,7 @@ pub const EXTRACTION_MODULES: &[&str] = &[
     "src/indexer_python.rs",
     "src/indexer_rust.rs",
     "src/indexer_ts.rs",
+    "src/graph_projection.rs",
     "src/evidence_budget.rs",
     "src/evidence_limits.rs",
     "src/model.rs",
