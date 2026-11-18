@@ -17609,6 +17609,29 @@ impl GraphMcp {
         envelope
     }
 
+    /// A call of any tool that fails with `code`; validated in `finish` like a success.
+    fn call_failure(&mut self, name: &str, arguments: Value, code: &str) -> Value {
+        self.next_id += 1;
+        let id = self.next_id;
+        writeln!(
+            self.client,
+            "{}",
+            modern(
+                json!(id),
+                "tools/call",
+                json!({"name":name,"arguments":arguments})
+            )
+        )
+        .unwrap();
+        let reply = next_reply(&mut self.reader);
+        assert_eq!(reply["id"], id);
+        tool(&reply, Some(code), true);
+        let envelope = reply["result"]["structuredContent"].clone();
+        self.pairs
+            .push(json!({"name":name,"structuredContent":envelope}));
+        envelope
+    }
+
     /// A successful call; the envelope is validated against the catalog schema in `finish`.
     fn graph(&mut self, arguments: Value) -> Value {
         let id = self.send(arguments);
@@ -19210,6 +19233,31 @@ async fn stable_lookup_recovers_moved_impl_without_changing_sid_semantics() {
             _ => unreachable!(),
         }
     }
+    mcp.finish();
+}
+
+/// Owner ruling 2026-11-18 (#1119 follow-up): a document beyond a deterministic input bound
+/// answers the non-retryable `input_bounds_exceeded`, naming the bound, and the same again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lookup_document_beyond_an_input_bound_is_refused_alike_and_not_retryable() {
+    let deep = format!(
+        "struct Store;\nimpl Store {{ fn run() {{}} }}\nfn deep() {{ {}1{} }}\n",
+        "(".repeat(128),
+        ")".repeat(128)
+    );
+    let spec = graph_fixtures::Spec::syntax_only(&[("src/lib.rs", deep.as_str())]);
+    let mut mcp = GraphMcp::start(5935, &[spec], Default::default()).await;
+    let arguments = json!({"schemaVersion":1,"lookupKey":"src/lib.rs::Store::run"});
+    let first = mcp.call_failure(
+        "trellis_declaration",
+        arguments.clone(),
+        "input_bounds_exceeded",
+    );
+    let second = mcp.call_failure("trellis_declaration", arguments, "input_bounds_exceeded");
+    assert_eq!(first["error"], second["error"]);
+    assert_eq!(first["error"]["retryable"], false);
+    let message = first["error"]["message"].as_str().unwrap();
+    assert!(message.contains("128-level depth bound"), "{message}");
     mcp.finish();
 }
 

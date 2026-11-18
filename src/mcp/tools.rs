@@ -924,6 +924,9 @@ fn details(code: &str) -> (&'static str, bool) {
         "checkout_capacity" => ("Checkout capacity reached", true),
         "daemon_unavailable" => ("Daemon is unavailable", true),
         "outcome_unknown" => ("Outcome unknown; inspect request status", false),
+        // Owner ruling 2026-11-18 (#1119 follow-up): the same document is refused on every
+        // run, so a retry cannot help. `failure_for` names the bound.
+        "input_bounds_exceeded" => ("Document is beyond a deterministic input bound", false),
         "invalid_rules" => ("Invalid architecture rules", false),
         // #769: point at the prompt that drafts the missing file.
         "rules_not_found" => (
@@ -940,6 +943,21 @@ fn details(code: &str) -> (&'static str, bool) {
         ),
         _ => ("Store is unavailable", false),
     }
+}
+/// The error-text prefix of a document beyond a deterministic input bound.
+pub(crate) const INPUT_BOUNDS_PREFIX: &str = "input_bounds_exceeded: ";
+
+/// [`failure`] for a failed read's `error`: an `input_bounds_exceeded` message names the
+/// bound the document hit (the error text after its code); every other code keeps its
+/// fixed message.
+pub fn failure_for(id: &Value, code: &str, error: &anyhow::Error) -> Value {
+    let mut envelope = failure(id, code);
+    if code == "input_bounds_exceeded"
+        && let Some(bound) = error.to_string().strip_prefix(INPUT_BOUNDS_PREFIX)
+    {
+        envelope["error"]["message"] = json!(format!("Document is beyond an input bound: {bound}"));
+    }
+    envelope
 }
 pub fn failure(id: &Value, code: &str) -> Value {
     let (message, retryable) = details(code);

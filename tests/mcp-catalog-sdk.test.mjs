@@ -366,7 +366,8 @@ test("each tool's one failure schema accepts exactly the #864 failure shape", ()
   const basis = { indexGeneration: "123e4567-e89b-42d3-a456-426614174000", indexRevision: 7 };
   const resolved = ["invalid_request", "range_too_large", "unsupported_encoding", "revision_conflict",
     "index_not_ready", "not_found", "too_many_requests", "deadline_exceeded", "rebuild_in_progress",
-    "root_changed", "store_unavailable", "checkout_capacity", "daemon_unavailable", "outcome_unknown"];
+    "root_changed", "store_unavailable", "checkout_capacity", "daemon_unavailable", "outcome_unknown",
+    "input_bounds_exceeded"];
   const reasons = ["not_absolute", "not_checkout", "identity_changed", "unavailable"];
   const architecture = ["trellis_references", "trellis_rules_check", "trellis_rules_explain",
     "trellis_endpoints"];

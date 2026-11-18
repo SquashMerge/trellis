@@ -107,6 +107,7 @@
                     "checkout_capacity",
                     "daemon_unavailable",
                     "outcome_unknown",
+                    "input_bounds_exceeded",
                     "response_too_large",
                     "workspace_selection_failed"
                   ]
@@ -1254,6 +1255,7 @@
                     "checkout_capacity",
                     "daemon_unavailable",
                     "outcome_unknown",
+                    "input_bounds_exceeded",
                     "invalid_rules",
                     "bounded_work",
                     "response_too_large",
@@ -2328,6 +2330,7 @@
                     "checkout_capacity",
                     "daemon_unavailable",
                     "outcome_unknown",
+                    "input_bounds_exceeded",
                     "invalid_rules",
                     "bounded_work",
                     "response_too_large",
@@ -3637,6 +3640,7 @@
                     "checkout_capacity",
                     "daemon_unavailable",
                     "outcome_unknown",
+                    "input_bounds_exceeded",
                     "response_too_large",
                     "workspace_selection_failed"
                   ]
@@ -5164,6 +5168,7 @@
                     "checkout_capacity",
                     "daemon_unavailable",
                     "outcome_unknown",
+                    "input_bounds_exceeded",
                     "response_too_large",
                     "workspace_selection_failed"
                   ]
@@ -6752,6 +6757,7 @@
                     "checkout_capacity",
                     "daemon_unavailable",
                     "outcome_unknown",
+                    "input_bounds_exceeded",
                     "response_too_large",
                     "workspace_selection_failed"
                   ]
@@ -8478,6 +8484,7 @@
                     "checkout_capacity",
                     "daemon_unavailable",
                     "outcome_unknown",
+                    "input_bounds_exceeded",
                     "response_too_large",
                     "workspace_selection_failed"
                   ]
@@ -9532,6 +9539,7 @@
                     "checkout_capacity",
                     "daemon_unavailable",
                     "outcome_unknown",
+                    "input_bounds_exceeded",
                     "invalid_rules",
                     "bounded_work",
                     "response_too_large",
@@ -11303,6 +11311,7 @@
                     "checkout_capacity",
                     "daemon_unavailable",
                     "outcome_unknown",
+                    "input_bounds_exceeded",
                     "invalid_rules",
                     "rules_not_found",
                     "bounded_work",
@@ -13495,6 +13504,7 @@
                     "checkout_capacity",
                     "daemon_unavailable",
                     "outcome_unknown",
+                    "input_bounds_exceeded",
                     "invalid_rules",
                     "rules_not_found",
                     "bounded_work",
@@ -16109,6 +16119,7 @@
                     "checkout_capacity",
                     "daemon_unavailable",
                     "outcome_unknown",
+                    "input_bounds_exceeded",
                     "invalid_rules",
                     "rules_not_found",
                     "bounded_work",
@@ -18401,6 +18412,7 @@
                     "checkout_capacity",
                     "daemon_unavailable",
                     "outcome_unknown",
+                    "input_bounds_exceeded",
                     "response_too_large",
                     "workspace_selection_failed"
                   ]
@@ -18801,6 +18813,7 @@
                     "checkout_capacity",
                     "daemon_unavailable",
                     "outcome_unknown",
+                    "input_bounds_exceeded",
                     "invalid_rules",
                     "rules_not_found",
                     "bounded_work",
