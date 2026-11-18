@@ -25,37 +25,54 @@ async function refreshGit() {
     if (serial === gitSerial && session === epoch && root === selectedRootKey && error.name !== "AbortError") { filesGitStatus = null; showSelectedGit(null); }
   }
 }
+// The status read is current while no later read or checkout session replaced it; each check below
+// runs where the unsplit function ran it, and the queued pair refresh runs only after the outermost read.
 async function refreshStatus(followup = false) {
   statusRefreshDepth++;
   try {
-  const serial = ++statusSerial, session = epoch;
-  let data;
-  try { data = await api("/api/status"); }
-  catch (error) {
-    if (serial === statusSerial && session === epoch) {
-      statusUnavailable = error.code !== "index_not_ready";
-      indexNotReady = error.code === "index_not_ready";
-      renderIndexStatus();
+    const serial = ++statusSerial, session = epoch;
+    const current = () => serial === statusSerial && session === epoch;
+    let data;
+    try { data = await api("/api/status"); }
+    catch (error) {
+      if (current()) {
+        statusUnavailable = error.code !== "index_not_ready";
+        indexNotReady = error.code === "index_not_ready";
+        renderIndexStatus();
+      }
+      if (error.code === "index_not_ready" && current() && selectedRootKey) showIndexNotReady(error);
+      throw error;
     }
-    if (error.code === "index_not_ready" && serial === statusSerial && session === epoch && selectedRootKey) {
-      const root = selectedRootKey, workspaceRoot = error.workspaceRoot || status?.workspaceRoot;
-      const listedRoot = selectedWorkspaceRoot, git = selectedGit;
-      resetCheckout();
-      selectedRootKey = root; selectedWorkspaceRoot = listedRoot; indexNotReady = true;
-      showSelectedGit(git);
-      void refreshGit();
-      $("checkout-select").value = root;
-      $("checkout-root").textContent = workspaceRoot || "Selected checkout · verified root unavailable until status responds";
-      $("workspace").hidden = false; $("refresh").disabled = false; $("index").disabled = false;
-      window.TrellisShell?.setConnected(true);
-      showCheckoutIndexState(checkouts.find(row => row.rootKey === root));
-      $("status").textContent = "No validated index head is available yet.";
-      $("checkout-state").textContent = "Index not ready. Retry status after indexing starts.";
-      stale("Index not ready. Retry status after indexing starts.");
-    }
-    throw error;
+    if (!current()) return;
+    const {adopted, nextPin, browseChanged} = adoptStatus(data);
+    if (browseChanged && nextPin) await reloadBrowse();
+    if (!current() || status !== adopted) return;
+    showStatus(nextPin);
+  } finally {
+    statusRefreshDepth--;
+    drainQueuedPairRefresh(followup);
   }
-  if (serial !== statusSerial || session !== epoch) return;
+}
+// A checkout with no validated head: it stays selected and says so, and its Git status is read again.
+function showIndexNotReady(error) {
+  const root = selectedRootKey, workspaceRoot = error.workspaceRoot || status?.workspaceRoot;
+  const listedRoot = selectedWorkspaceRoot, git = selectedGit;
+  resetCheckout();
+  selectedRootKey = root; selectedWorkspaceRoot = listedRoot; indexNotReady = true;
+  showSelectedGit(git);
+  void refreshGit();
+  $("checkout-select").value = root;
+  $("checkout-root").textContent = workspaceRoot || "Selected checkout · verified root unavailable until status responds";
+  $("workspace").hidden = false; $("refresh").disabled = false; $("index").disabled = false;
+  window.TrellisShell?.setConnected(true);
+  showCheckoutIndexState(checkouts.find(row => row.rootKey === root));
+  $("status").textContent = "No validated index head is available yet.";
+  $("checkout-state").textContent = "Index not ready. Retry status after indexing starts.";
+  stale("Index not ready. Retry status after indexing starts.");
+}
+// Makes a status read the page's status. A new workspace or pin clears what was read at the old one.
+// Returns the adopted status object, its pin and whether the browsed snapshot changed.
+function adoptStatus(data) {
   if (typeof data?.workspaceRoot !== "string" || !data.workspaceRoot) throw new Error("Selected checkout identity unavailable. Retry status.");
   $("checkout-root").textContent = data.workspaceRoot;
   const workspaceChanged = status && status.workspaceRoot !== data.workspaceRoot;
@@ -75,27 +92,21 @@ async function refreshStatus(followup = false) {
   window.TrellisShell?.updateWorkspace(nextPin ? status : null);
   $("catching-up").hidden = data.catchingUp !== true || !nextPin;
   updateCheckoutOptions();
-  if (browseChanged && nextPin) {
-    updateViewAvailability();
-    void viewerMetrics?.refresh();
-    void refreshAppInventory();
-    if (section === "diagrams" && (!$("architecture-panel").hidden || !$("deviations-panel").hidden)) void architecture?.refresh();
-    if (section === "diagrams" && !$("treemap-panel").hidden) void treemap?.refresh();
-    await loadTreeRoot();
-  }
-  if (serial !== statusSerial || session !== epoch || status !== data) return;
+  return {adopted:data, nextPin, browseChanged};
+}
+// A new snapshot: the open views read it again and the file tree reloads. Returns the tree's load.
+function reloadBrowse() {
+  updateViewAvailability();
+  void viewerMetrics?.refresh();
+  void refreshAppInventory();
+  if (section === "diagrams" && (!$("architecture-panel").hidden || !$("deviations-panel").hidden)) void architecture?.refresh();
+  if (section === "diagrams" && !$("treemap-panel").hidden) void treemap?.refresh();
+  return loadTreeRoot();
+}
+// The status line, Diagnostics and the stale notes for the adopted status.
+function showStatus(nextPin) {
   const stats = status.stats || {};
-  const semantic = (status.semanticLanguages || []).map(row => {
-    const documents = row.documents || [];
-    const pending = documents.filter(item => item.projection?.semanticStatus === "catchingUp").length;
-    const reimport = documents.filter(item => item.projection?.semanticStatus === "needsReimport").length;
-    const older = documents.filter(item => item.projection?.semanticStatus === "olderBasis").length;
-    const availability = [pending && `${pending} catching up`, reimport && `${reimport} need re-import`, older && `${older} older basis`].filter(Boolean).join(", ");
-    const evidence = `${row.language}: semantic evidence ${availability || row.semanticState}`;
-    return row.reimport?.state === "needsReimport"
-      ? `${evidence}; needs re-import — ${row.reimport.reason}. Re-import a current artifact.` : evidence;
-  }).join(" · ") || `Semantic evidence ${stats.semanticState || "unavailable"}`;
-  $("status").textContent = `${status.workspaceRoot} · ${status.revision ? `Revision ${IndexPin.label(status.revision)}` : "Index not ready"} · ${stats.files ?? 0} files · ${stats.symbols ?? 0} symbols · ${stats.calls ?? 0} calls · ${semantic} · Indexed: ${status.indexedAt ? new Date(Number(status.indexedAt)).toLocaleString() : "not yet"}`;
+  $("status").textContent = statusSentence(status, stats);
   $("diagnostics").textContent = describe(status.diagnostics || []);
   if (job && !activeJob(job)) showJob();
   staleMessage = ""; $("stale").hidden = true;
@@ -110,16 +121,36 @@ async function refreshStatus(followup = false) {
     if (!dependencyLoad || dependencyLoad.settled) { dependencyLoad = null; if (dependencyCatalog) dependencyCatalog.stale = true; }
     if (dependencyChoice) void ensureDependencies();
   }
-  } finally {
-    statusRefreshDepth--;
-    if (!statusRefreshDepth && pairRefreshQueued) {
-      const queued = pairRefreshQueued;
-      pairRefreshQueued = null;
-      if (!followup && queued.session === epoch &&
-          (!status || queued.key !== `${status.workspaceRoot}:${IndexPin.key(status.revision)}`)) {
-        pairRefreshFollowup = true;
-        void refreshStatus(true).catch(() => {}).finally(() => { pairRefreshFollowup = false; });
-      }
+}
+// The status line: root, pin, counts, semantic evidence and when the index was built.
+function statusSentence(status, stats) {
+  const semantic = semanticSummary(status.semanticLanguages || [], stats);
+  return `${status.workspaceRoot} · ${status.revision ? `Revision ${IndexPin.label(status.revision)}` : "Index not ready"} · ${stats.files ?? 0} files · ${stats.symbols ?? 0} symbols · ${stats.calls ?? 0} calls · ${semantic} · Indexed: ${status.indexedAt ? new Date(Number(status.indexedAt)).toLocaleString() : "not yet"}`;
+}
+// Each language's semantic evidence, with its documents that are catching up, need re-import or
+// have an older basis; without languages, the checkout-wide state.
+function semanticSummary(languages, stats) {
+  return languages.map(row => {
+    const documents = row.documents || [];
+    const pending = documents.filter(item => item.projection?.semanticStatus === "catchingUp").length;
+    const reimport = documents.filter(item => item.projection?.semanticStatus === "needsReimport").length;
+    const older = documents.filter(item => item.projection?.semanticStatus === "olderBasis").length;
+    const availability = [pending && `${pending} catching up`, reimport && `${reimport} need re-import`, older && `${older} older basis`].filter(Boolean).join(", ");
+    const evidence = `${row.language}: semantic evidence ${availability || row.semanticState}`;
+    return row.reimport?.state === "needsReimport"
+      ? `${evidence}; needs re-import — ${row.reimport.reason}. Re-import a current artifact.` : evidence;
+  }).join(" · ") || `Semantic evidence ${stats.semanticState || "unavailable"}`;
+}
+// A pair refresh unexpectedPair queued during a status read runs once the outermost read ends, unless
+// this read was itself that follow-up or status already shows the queued pair.
+function drainQueuedPairRefresh(followup) {
+  if (!statusRefreshDepth && pairRefreshQueued) {
+    const queued = pairRefreshQueued;
+    pairRefreshQueued = null;
+    if (!followup && queued.session === epoch &&
+        (!status || queued.key !== `${status.workspaceRoot}:${IndexPin.key(status.revision)}`)) {
+      pairRefreshFollowup = true;
+      void refreshStatus(true).catch(() => {}).finally(() => { pairRefreshFollowup = false; });
     }
   }
 }
