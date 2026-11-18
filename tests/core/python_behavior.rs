@@ -185,9 +185,7 @@ fn nested_definitions_class_execution_and_lambda_invocation_are_separate() {
 fn unsupported_forms_are_boundaries_not_unconditional_calls() {
     for body in [
         "    values = [work(x) for x in items() if check(x)]\n",
-        "    with context():\n        work()\n",
         "    match subject():\n        case 1:\n            work()\n",
-        "    try:\n        work()\n    except Error:\n        recover()\n    else:\n        succeeded()\n    finally:\n        cleanup()\n",
         "    for x in items():\n        work()\n    else:\n        done()\n",
         "    async for x in items():\n        work()\n",
         "    f(key=first(), *second())\n",
@@ -200,6 +198,103 @@ fn unsupported_forms_are_boundaries_not_unconditional_calls() {
         assert!(flatten(&view.steps).iter().any(|s| s.kind == "boundary"));
         assert!(!view.steps.iter().any(|s| s.label == "after"), "{body}");
     }
+}
+/// #978: a `with` body is expanded between an opaque enter step and an opaque exit step, so
+/// the calls under a lock appear in order. The context manager expressions are evaluated
+/// first, each before its own enter.
+#[test]
+fn with_bodies_show_their_calls_between_enter_and_exit() {
+    let (_, view) = fixture(
+        "def handle(key, now=None):\n    if not key:\n        return None\n    with _LOCK:\n        expire(now)\n        rec = Record(id=other.register(key))\n    after()\n",
+        "handle",
+    );
+    assert_eq!(
+        calls(&view.steps),
+        ["expire", "register", "Record", "after"]
+    );
+    let kinds: Vec<_> = flatten(&view.steps)
+        .into_iter()
+        .filter(|s| s.kind == "call" || s.label.starts_with("with "))
+        .map(|s| s.label.split(':').next().unwrap())
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "with enter",
+            "expire",
+            "register",
+            "Record",
+            "with exit",
+            "after"
+        ]
+    );
+    let exit = flatten(&view.steps)
+        .into_iter()
+        .find(|s| s.label.starts_with("with exit"))
+        .unwrap();
+    assert_eq!(exit.kind, "boundary");
+    assert!(exit.label.contains("may suppress an exception"));
+
+    let (_, view) = fixture(
+        "async def run():\n    async with open(path()) as f, lock():\n        work(f)\n    after()\n",
+        "run",
+    );
+    assert_eq!(
+        calls(&view.steps),
+        ["path", "open", "lock", "work", "after"]
+    );
+    let enters: Vec<_> = flatten(&view.steps)
+        .into_iter()
+        .filter(|s| s.label.starts_with("async with enter"))
+        .collect();
+    assert_eq!(enters.len(), 2);
+    assert!(view.steps.iter().any(|s| s.label == "after"));
+}
+/// #978: an exit may suppress an exception, so a step after a `with` whose body always
+/// leaves is still possible, behind a guard rather than unconditional.
+#[test]
+fn with_exit_may_suppress_so_the_suffix_stays_guarded() {
+    let (_, view) = fixture(
+        "def run():\n    with suppress():\n        raise failure()\n    after()\n",
+        "run",
+    );
+    assert_eq!(calls(&view.steps), ["suppress", "failure", "after"]);
+    assert!(!view.steps.iter().any(|s| s.label == "after"));
+}
+/// #978: a `try` body is a region whose calls appear under a `try` step, as JavaScript draws
+/// it; `except`, `else` and `finally` stay opaque, and a suffix after the try is guarded.
+#[test]
+fn try_bodies_show_their_calls_and_clauses_stay_opaque() {
+    let (_, view) = fixture(
+        "def run():\n    try:\n        work()\n        more()\n    except Error:\n        recover()\n    else:\n        succeeded()\n    finally:\n        cleanup()\n    after()\n",
+        "run",
+    );
+    assert_eq!(calls(&view.steps), ["work", "more", "after"]);
+    let attempt = view.steps.iter().find(|s| s.kind == "try").unwrap();
+    assert_eq!(attempt.label, "try; exception behavior unknown");
+    assert_eq!(calls(&attempt.children), ["work", "more"]);
+    let clauses: Vec<_> = attempt
+        .alternate
+        .iter()
+        .map(|s| (s.kind.as_str(), s.label.split(':').next().unwrap()))
+        .collect();
+    assert_eq!(
+        clauses,
+        [
+            ("boundary", "except"),
+            ("boundary", "else"),
+            ("boundary", "finally")
+        ]
+    );
+    assert!(attempt.alternate.iter().all(|s| s.children.is_empty()));
+    assert!(!view.steps.iter().any(|s| s.label == "after"));
+
+    // Without an except clause, a body that always returns leaves no path to the suffix.
+    let (_, view) = fixture(
+        "def run():\n    try:\n        return work()\n    finally:\n        cleanup()\n    forbidden()\n",
+        "run",
+    );
+    assert_eq!(calls(&view.steps), ["work"]);
 }
 #[test]
 fn step_participant_depth_and_width_bounds_are_explicit() {
