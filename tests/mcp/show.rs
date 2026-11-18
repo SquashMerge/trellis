@@ -182,7 +182,7 @@ async fn show_checks_targets_records_one_latest_request_and_answers_typed_outcom
     };
     let (shown, next) = ask(mcp, sequence.clone());
     mcp = next;
-    assert_eq!(shown["data"]["outcome"], "shown", "{shown}");
+    assert_eq!(shown["data"]["outcome"], "recorded", "{shown}");
     let first = shown["data"]["generation"].as_u64().unwrap();
     let head = browser(&app, &format!("{prefix}/status/head")).await;
     assert_eq!(
@@ -197,7 +197,7 @@ async fn show_checks_targets_records_one_latest_request_and_answers_typed_outcom
         json!({"schemaVersion":1,"view":"class","symbolId":area}),
     );
     mcp = next;
-    assert_eq!(class["data"]["outcome"], "shown", "{class}");
+    assert_eq!(class["data"]["outcome"], "recorded", "{class}");
     let second = class["data"]["generation"].as_u64().unwrap();
     assert!(second > first);
     let (source, next) = ask(
@@ -205,7 +205,7 @@ async fn show_checks_targets_records_one_latest_request_and_answers_typed_outcom
         json!({"schemaVersion":1,"view":"source","path":"a.js","line":3,"expectedBasis":basis}),
     );
     mcp = next;
-    assert_eq!(source["data"]["outcome"], "shown", "{source}");
+    assert_eq!(source["data"]["outcome"], "recorded", "{source}");
     let third = source["data"]["generation"].as_u64().unwrap();
     assert!(third > second);
     let status = browser(&app, &format!("{prefix}/status")).await;
@@ -284,7 +284,7 @@ async fn show_checks_targets_records_one_latest_request_and_answers_typed_outcom
                 "a failed call records nothing"
             );
         } else {
-            assert_eq!(answer["data"]["outcome"], "shown", "{answer}");
+            assert_eq!(answer["data"]["outcome"], "recorded", "{answer}");
             let generation = answer["data"]["generation"].as_u64().unwrap();
             assert!(generation > third);
             assert_eq!(status["viewRequest"]["generation"], generation);
@@ -460,7 +460,7 @@ async fn show_records_only_at_a_successful_send_decision() {
         assert!(long.get("error").is_none());
         assert_eq!(requests(), Value::Null);
         let short = mcp.show(json!({"schemaVersion":1,"view":"source","path":"long.js","line":2}));
-        assert_eq!(short["data"]["outcome"], "shown", "{short}");
+        assert_eq!(short["data"]["outcome"], "recorded", "{short}");
         let before = requests();
         assert_eq!(before["generation"], short["data"]["generation"]);
 
@@ -522,7 +522,7 @@ async fn show_records_only_at_a_successful_send_decision() {
         let answer = reply(&mut mcp);
         assert_eq!(answer["id"], id);
         let data = &answer["result"]["structuredContent"]["data"];
-        assert_eq!(data["outcome"], "shown", "{answer}");
+        assert_eq!(data["outcome"], "recorded", "{answer}");
         assert_eq!(requests()["generation"], data["generation"]);
         assert!(data["generation"].as_u64() > before["generation"].as_u64());
         assert_eq!(requests()["path"], "a.js");

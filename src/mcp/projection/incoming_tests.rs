@@ -191,6 +191,10 @@ fn incoming_scope_and_limit_are_independent_of_emitted_calls() {
     result.calls[0].caller.role = crate::native_evidence::DeclarationRole::Test;
     let envelope = project(result, true).unwrap();
     assert_eq!(envelope["warnings"][0]["code"], "coverageIncomplete");
+    assert_eq!(
+        envelope["warnings"][0]["message"],
+        "Selected syntax coverage is incomplete for javascript"
+    );
     assert_eq!(envelope["warnings"][1]["code"], "syntaxOnly");
     assert_eq!(envelope["data"]["callers"][0]["callerRole"], "test");
     assert_eq!(envelope["truncationReason"], "limit");

@@ -107,6 +107,10 @@ fn search_relevance_is_not_native_completeness() {
             .unwrap();
         assert_eq!(empty["partial"], true);
         assert_eq!(empty["warnings"][0]["code"], "coverageIncomplete");
+        assert_eq!(
+            empty["warnings"][0]["message"],
+            "Selected syntax coverage is incomplete for rust"
+        );
         assert_eq!(empty["warnings"][1]["code"], "syntaxOnly");
         assert_eq!(empty["data"]["scopeCoverage"][0]["language"], "rust");
         assert_eq!(empty["data"]["scopeCoverage"][0]["coverage"]["partial"], 1);

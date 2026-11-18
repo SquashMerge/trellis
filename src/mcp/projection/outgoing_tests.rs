@@ -206,6 +206,10 @@ fn outgoing_empty_complete_vs_incomplete_coverage_and_unresolved_boundary() {
         1
     );
     assert_eq!(incomplete["warnings"][0]["code"], "coverageIncomplete");
+    assert_eq!(
+        incomplete["warnings"][0]["message"],
+        "Selected syntax coverage is incomplete for javascript"
+    );
     assert_eq!(incomplete["partial"], true);
     assert_eq!(incomplete["truncated"], false);
     let mut complete = owner();

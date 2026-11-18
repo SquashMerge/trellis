@@ -178,6 +178,11 @@ fn zero_hits_report_scope_counts_without_document_rows() {
         assert_eq!(large["partial"], true);
         assert_eq!(large["truncated"], false);
         assert_eq!(large["warnings"][0]["code"], "coverageIncomplete");
+        // #980: the warning names the incomplete tier and language.
+        assert_eq!(
+            large["warnings"][0]["message"],
+            "Selected syntax coverage is incomplete for rust"
+        );
         assert_eq!(large["warnings"][1]["code"], "syntaxOnly");
         assert_wire(large, &id, modern);
 
@@ -196,6 +201,10 @@ fn zero_hits_report_scope_counts_without_document_rows() {
         .unwrap();
         assert_eq!(envelope["partial"], true);
         assert_eq!(envelope["warnings"][0]["code"], "coverageIncomplete");
+        assert_eq!(
+            envelope["warnings"][0]["message"],
+            "Selected syntax coverage is incomplete for python"
+        );
 
         // Unselected-only tuples (and zero-language rows) flag nothing.
         let unselected = [[0; 5], [0, 0, 0, 0, 3], [0; 5], [2, 2, 0, 0, 0], [0; 5]];
