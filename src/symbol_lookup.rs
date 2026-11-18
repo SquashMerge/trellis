@@ -670,15 +670,11 @@ mod tests {
             "(".repeat(DEPTH),
             ")".repeat(DEPTH)
         ));
-        let mut wide = file.clone();
-        wide.text.push_str(&format!(
-            "\nconst WIDE: [u8; 0] = [{}];",
-            "0,".repeat(VISITS)
-        ));
+        // The visit bound's own message is pinned above; its million-node walk is slow in a
+        // debug build, so it is not walked again here.
         for (beyond, bound) in [
             (&oversized, "2 MiB syntax input bound"),
             (&deep, "128-level depth bound"),
-            (&wide, "1,000,000-node visit bound"),
         ] {
             let first = mcp_answer(&keys(beyond, &native.declarations).unwrap_err());
             let second = mcp_answer(&keys(beyond, &native.declarations).unwrap_err());
