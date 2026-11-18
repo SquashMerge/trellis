@@ -17981,7 +17981,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Show the user one Sequence (a function or method), Class diagram (a class, or a method's class) or source line (path and 1-based line) in every open Trellis viewer of this checkout that is not pinned. The target is checked against the current index first. Changes only what viewers display; outcome shown, no_viewer, not_found, stale or invalid.",
+    "description": "Show the user one Sequence (a function or method), Class diagram (a class, or a method's class) or source line (path and 1-based line) in every open Trellis viewer of this checkout that is not pinned. The target is checked against the current index first. Changes only what viewers display; outcome recorded (sent to the open viewers; a pinned one, or one at another snapshot, keeps its view), no_viewer, not_found, stale or invalid.",
     "inputSchema": {
       "$defs": {
         "Basis": {
@@ -18369,7 +18369,7 @@
                 },
                 "outcome": {
                   "enum": [
-                    "shown",
+                    "recorded",
                     "no_viewer",
                     "not_found",
                     "stale",
@@ -18396,7 +18396,7 @@
                   "if": {
                     "properties": {
                       "outcome": {
-                        "const": "shown"
+                        "const": "recorded"
                       }
                     }
                   },

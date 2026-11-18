@@ -260,11 +260,13 @@ test("trellis_show input admits one target per view, and its outcomes are closed
   const envelope = (data) => ({ schemaVersion: 1, requestId: 1, workspace: "/repo", catchingUp: false,
     evidenceBasis: { indexGeneration: "12345678-1234-4123-8123-123456789abc", indexRevision: 1 },
     data: { view: "sequence", message: "m", ...data }, warnings: [], partial: false, truncated: false, truncationReason: null });
-  assert.ok(output(envelope({ outcome: "shown", generation: 7 })), JSON.stringify(output.errors));
+  assert.ok(output(envelope({ outcome: "recorded", generation: 7 })), JSON.stringify(output.errors));
   for (const outcome of ["no_viewer", "not_found", "stale", "invalid"]) assert.ok(output(envelope({ outcome, generation: null })), outcome);
-  assert.ok(!output(envelope({ outcome: "shown", generation: null })), "shown carries its generation");
-  assert.ok(!output(envelope({ outcome: "stale", generation: 7 })), "only shown has a generation");
+  assert.ok(!output(envelope({ outcome: "recorded", generation: null })), "recorded carries its generation");
+  assert.ok(!output(envelope({ outcome: "stale", generation: 7 })), "only recorded has a generation");
   assert.ok(!output(envelope({ outcome: "partial", generation: null })));
+  // #979: a request recorded for the viewers is `recorded`, not `shown`.
+  assert.ok(!output(envelope({ outcome: "shown", generation: 7 })), "shown is not an outcome");
 });
 
 // #798: the building error of each architecture tool takes exactly the ratified shape,
