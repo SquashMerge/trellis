@@ -12,7 +12,7 @@ use super::Work;
 use super::external::ManifestInput;
 use anyhow::{Result, ensure};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// A workspace config this cannot read: bare specifiers that resolve nowhere else get it.
 pub(super) const UNREADABLE: &str = "javascript_workspace_unreadable";
@@ -58,7 +58,8 @@ pub(super) struct Member {
 #[derive(Debug, PartialEq, Eq)]
 enum Members {
     Unreadable,
-    Names(BTreeMap<String, Option<Member>>),
+    /// Each name's member, `None` when two claim it, and every member directory.
+    Names(BTreeMap<String, Option<Member>>, BTreeSet<String>),
 }
 
 /// The workspace members of each source set.
@@ -100,6 +101,17 @@ impl Workspaces {
         Ok(result)
     }
 
+    /// Whether the nested `package.json` directory `dir` may be a member's: it is one, or
+    /// the source set's workspace config cannot be read. Its manifest then supplies no npm
+    /// labels (#773, #1088).
+    pub(super) fn may_be_member(&self, source_set_id: &str, dir: &str) -> bool {
+        match self.sets.get(source_set_id) {
+            None => false,
+            Some(Members::Unreadable) => true,
+            Some(Members::Names(_, dirs)) => dirs.contains(dir),
+        }
+    }
+
     /// The member path `specifier` names in `source_set_id`, or `None` when it names no member
     /// (and the workspace config, if any, was readable).
     pub(super) fn lookup(
@@ -113,7 +125,7 @@ impl Workspaces {
         let names = match self.sets.get(source_set_id) {
             None => return Ok(None),
             Some(Members::Unreadable) => return Ok(Some(Lookup::Unknown(UNREADABLE))),
-            Some(Members::Names(names)) => names,
+            Some(Members::Names(names, _)) => names,
         };
         let Some((name, subpath)) = split(specifier) else {
             return Ok(None);
@@ -270,6 +282,7 @@ fn members(
         return Ok(Some(Members::Unreadable));
     };
     let mut names: BTreeMap<String, Option<Member>> = BTreeMap::new();
+    let mut dirs = BTreeSet::new();
     for manifest in manifests {
         super::owner_step(work, check)?;
         let Some(dir) = manifest.path.strip_suffix("/package.json") else {
@@ -282,6 +295,7 @@ fn members(
         if !include.is_match(dir) || exclude.is_match(dir) {
             continue;
         }
+        dirs.insert(dir.to_owned());
         let bytes = manifest.bytes.as_deref().unwrap_or_default();
         charge(work, check, bytes.len())?;
         // A member manifest that cannot be read might claim any name.
@@ -304,7 +318,7 @@ fn members(
             .and_modify(|existing| *existing = None)
             .or_insert(Some(member));
     }
-    Ok(Some(Members::Names(names)))
+    Ok(Some(Members::Names(names, dirs)))
 }
 
 fn charge(work: &mut Work, check: &mut impl FnMut() -> Result<()>, amount: usize) -> Result<()> {

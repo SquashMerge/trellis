@@ -146,6 +146,7 @@ impl Catalog {
                         specifier.len()
                             + packages.resolution_work(
                                 &key.source_set_id,
+                                &key.path,
                                 specifier,
                                 &key.language,
                             ),
@@ -153,15 +154,25 @@ impl Catalog {
                         check,
                     )?;
                     if let Some(package) =
-                        packages.resolve(&key.source_set_id, specifier, &key.language)
+                        packages.resolve(&key.source_set_id, &key.path, specifier, &key.language)
                     {
                         charge_package(&package, work, check)?;
                         resolution
                             .targets
                             .insert(Target::External(package.identity.clone()));
-                        self.packages
-                            .entry(package.identity.clone())
-                            .or_insert(package);
+                        // Importers under different manifests share one identity; its
+                        // descriptor carries each manifest's evidence (#1088).
+                        match self.packages.entry(package.identity.clone()) {
+                            std::collections::btree_map::Entry::Vacant(entry) => {
+                                entry.insert(package);
+                            }
+                            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                                let evidence = &mut entry.get_mut().evidence;
+                                evidence.extend(package.evidence);
+                                evidence.sort();
+                                evidence.dedup();
+                            }
+                        }
                         resolution.residual =
                             source.star.then_some("javascript_external_members_unknown");
                     }

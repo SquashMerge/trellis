@@ -13932,7 +13932,7 @@ async fn javascript_architecture_external_descriptors_validate_in_structured_too
             ("package.json", r#"{"dependencies":{"widget":"^1.2.3"}}"#),
             (
                 "app.js",
-                "import { send } from 'widget/sub';\nimport 'fs';\nimport 'node:fs/promises';\nimport 'path';\n",
+                "import { send } from 'widget/sub';\nimport 'fs';\nimport 'node:fs/promises';\nimport 'path';\nimport 'node:sqlite';\nimport '_http_agent';\nimport 'node:test/reporters';\n",
             ),
         ],
     );
@@ -13976,7 +13976,8 @@ external = [{ language = "javascript", package = "widget", stdlib = false }]
     assert_eq!(descriptor["evidence"][0]["path"], "package.json");
     assert_eq!(descriptor["evidence"][0]["importRoot"], "widget");
     assert_eq!(descriptor["evidence"][0]["versionConstraint"], "^1.2.3");
-    for name in ["fs", "path"] {
+    // Every node-standard-library:v2 root, `_http_agent` included, fits the schema (#1088).
+    for name in ["fs", "path", "sqlite", "_http_agent", "test"] {
         let item = refs_env["data"]["externalPackages"]
             .as_array()
             .unwrap()
@@ -13987,7 +13988,7 @@ external = [{ language = "javascript", package = "widget", stdlib = false }]
         assert_eq!(
             item["evidence"],
             json!([{
-                "kind":"standardLibraryCatalog", "catalog":"node-standard-library:v1", "entry":name
+                "kind":"standardLibraryCatalog", "catalog":"node-standard-library:v2", "entry":name
             }])
         );
     }

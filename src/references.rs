@@ -713,13 +713,14 @@ fn build_catalogs(
                     .iter()
                     .any(|&i| script_family(&docs[i].key.language))
                 {
+                    let workspaces =
+                        js_workspace::Workspaces::new(&snapshot.manifests, &mut work, &mut check)?;
                     let packages = external::JavascriptPackages::new(
                         &snapshot.manifests,
+                        &workspaces,
                         &mut work,
                         &mut check,
                     )?;
-                    let workspaces =
-                        js_workspace::Workspaces::new(&snapshot.manifests, &mut work, &mut check)?;
                     Some(javascript::Catalog::new(
                         docs,
                         trees,

@@ -756,7 +756,9 @@ canonical identity, not a glob, import alias or version; `stdlib` is required an
 distinguishes standard-library targets from declared dependencies of the same
 spelling. Canonical dependency names are Cargo's upstream declared package name
 (preserving hyphens/underscores), Maven `groupId:artifactId`, PEP 503-normalized
-Python distribution name, and exact npm name or `@scope/name`. Import bindings
+Python distribution name, and exact npm name or `@scope/name`. A JavaScript or
+TypeScript standard-library package is a Node catalog root, which may keep one
+leading underscore (`_http_agent`). Import bindings
 and version constraints are evidence, not identity. Unknown fields and invalid
 identifiers are located `invalid_rules` errors. Repeats within a layer deduplicate;
 two different layers selecting one external identity are a located ambiguity.
@@ -1066,8 +1068,9 @@ Supported mapping is deliberately narrow:
   may label a package but provide no names and leave residual uncertainty;
   an explicit proved export settles only its matching name. Supported static
   literals use the resolver's documented decoding subset, not runtime execution.
-  Bare imports can label captured npm dependencies or the exact reviewed Node
-  catalog below, after `paths`/`baseUrl` fall through; the identity carries the
+  Bare imports can label npm dependencies of the nearest captured `package.json` or
+  the exact reviewed Node catalog below, after `paths`/`baseUrl` and workspace
+  members fall through; the identity carries the
   importing file's language (`javascript` or `typescript`). Relative misses never
   fall back to builtin or npm labels.
 - **Python:** captured `m.py` or `m/__init__.py` layouts at the checkout root or
@@ -1423,8 +1426,8 @@ CatalogEvidence = {kind:"standardLibraryCatalog",catalog:"rust-standard-library:
                    entry:"java"|"javax"}
                 | {kind:"standardLibraryCatalog",catalog:"python-standard-library:v2",
                    entry:<one of the pinned CPython v3.12.0 stdlib roots>}
-                | {kind:"standardLibraryCatalog",catalog:"node-standard-library:v1",
-                   entry:"fs"|"path"}
+                | {kind:"standardLibraryCatalog",catalog:"node-standard-library:v2",
+                   entry:<one of the 59 pinned Node v22.23.5 builtin roots>}
 Edge = {source:Target,target:Destination,count:UInt,kindCounts:KindCounts,sites:Site[],
         omittedSites:UInt,evidenceTier:"syntax"|"semantic"|"mixed",semanticSites:UInt}
 Unresolved = {source:Target,site:Site,reason:string}
@@ -1550,37 +1553,55 @@ No Python third-party mapping table, installed-distribution lookup or additional
 mapping-metadata capture is part of this slice.
 
 
-JavaScript and TypeScript use `ecosystem:"npm"` only for supported declarations in the captured
-root `package.json`: `dependencies`, `devDependencies`, `optionalDependencies`
-and `peerDependencies`. Constraints are literal decimal `M.m.p`, `^M.m.p` or
-`~M.m.p`, without leading-zero components, whitespace, suffixes or compound ranges.
-The original constraint is evidence, not an installed or resolved version.
+JavaScript and TypeScript use `ecosystem:"npm"` only for supported declarations in the
+captured `package.json` nearest the importing file: the one in its directory, else in
+the closest enclosing directory up to the checkout root (owner ruling 2026-11-18,
+[#1088](https://github.com/SquashMerge/trellis/issues/1088)). The capture retains a
+`package.json` in every directory above a JavaScript or TypeScript source, so no new
+input is read. Only the nearest manifest counts: when it does not declare the root,
+cannot be read or supplies no labels, the import stays unknown and never defers to an
+outer manifest. The supported sections are `dependencies`, `devDependencies`,
+`optionalDependencies` and `peerDependencies`. Constraints are literal decimal `M.m.p`,
+`^M.m.p` or `~M.m.p`, without leading-zero components, whitespace, suffixes or compound
+ranges. The original constraint is evidence, not an installed or resolved version.
 Identical keys across sections merge their evidence; unsupported competing values
 block that root. Duplicate relevant sections/keys or malformed JSON make manifest
 proof unknown, never last-wins. Aliases/protocols, workspace/link/file/Git/URL
 values, non-string constraints and unproved declarations cannot supply npm targets.
-A root `workspaces` field blocks npm inference; the root package's own `name`
-never proves a dependency/self-reference. Workspace members resolve as in-repo
-modules instead (#773, owner-ratified 2026-11-10; see the JavaScript and
-TypeScript resolution rules); their manifests' dependency sections supply no npm
-labels. Import maps, package exports maps beyond a single string and installed
-node_modules are not discovered or resolved.
+Files under different manifests that declare one package share its identity; the
+descriptor carries the evidence of each manifest that labelled an emitted edge.
+
+The #773 workspace rules are kept. A manifest with a `workspaces` field supplies no npm
+labels; a manifest's own `name` never proves a dependency/self-reference. Workspace
+members resolve as in-repo modules instead (#773, owner-ratified 2026-11-10; see the
+JavaScript and TypeScript resolution rules), and a member's `package.json` (in a
+directory the root `workspaces` or `pnpm-workspace.yaml` patterns name, with or
+without a `name`) supplies no npm labels. When the workspace config cannot be read,
+no nested `package.json` supplies npm labels, since any could be a member. A nested
+package outside the member patterns resolves against its own manifest. Nothing in
+or under a `node_modules` directory supplies or receives npm labels: installed
+node_modules are never discovered or resolved. Import maps and package exports maps
+beyond a single string are not discovered or resolved either.
 
 `pkg/sub/path` proves only declared key `pkg`; `@scope/pkg/sub` proves only
 `@scope/pkg`. Empty/traversal/query/hash/backslash/scheme forms stay unknown.
 No subpath/export/member existence is asserted. Dependency section names never
 change native source-site production/test roles. JavaScript constructor work is
 request-local, once when selected JS sources need it, charged to the existing
-work budget with cancellation. There is no new capture/table/cache/live read.
+work budget with cancellation; each lookup's walk to the nearest manifest is charged
+too. There is no new capture/table/cache/live read.
 
-Node uses `ecosystem:"node"` and `node-standard-library:v1`, exactly
-`fs`, `node:fs`, `fs/promises`, `node:fs/promises` → `fs`, and
-`path`, `node:path` → `path`. These labels take precedence over npm declarations.
-All other `node:` forms remain unknown. The separately reviewed 56 pinned bare
-builtin roots block npm labels, including their subpaths, without adding catalog
-labels. This intentionally leaves false negatives such as `http/fake` and
-`path/posix`; it is not Node execution semantics. Bare `test`/`sea` are not
-reserved (their builtins require `node:`). The
+Node uses `ecosystem:"node"` and `node-standard-library:v2` (owner ruling
+2026-11-18, #1088): every public builtin ID of the pinned Node v22.23.5 labels its
+first segment, one of 59 roots, behind `node:` and, for the 68 IDs Node also loads
+bare, without it. So `crypto` and `node:crypto` label `crypto`, `path/posix` labels
+`path`, and the scheme-only `node:sea`, `node:sqlite`, `node:test` and
+`node:test/reporters` label `sea`, `sqlite` and `test`, while bare `sea`, `sqlite`,
+`test` and `test/reporters` stay npm-inferable. These labels take precedence over npm
+declarations. All other `node:` forms remain unknown. The 56 roots of the bare IDs
+block npm labels, including their subpaths, so a bare subpath that is not a builtin
+ID, such as `http/fake`, stays unknown; this is an intentional false negative, not
+Node execution semantics. The
 [Node catalog record](node-standard-library-catalog.md) gives the fixed source
 pin, exact spellings, root exclusion inventory and provenance. No host runtime,
 `module.builtinModules`, compiler or package-manager command is consulted.
