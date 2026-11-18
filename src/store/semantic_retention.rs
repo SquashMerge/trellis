@@ -208,7 +208,7 @@ impl Store {
                     SELECT 1 FROM ordinary_retained_pending WHERE producer_id=?3
                 )"
             );
-            let configured = crate::producer::retention::configured_languages(state, &slots);
+            let configured = crate::store::producer_retention::configured_languages(state, &slots);
             for producer_retention::RetainedRun {
                 producer,
                 languages,

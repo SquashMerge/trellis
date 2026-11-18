@@ -159,8 +159,11 @@ paths = [
   # The static producer-context vocabulary (S15; section 12 ruling 1 extended to the profile
   # table, 2026-11-16): the four pinned producers, the stub's id, the two trust profiles, the
   # closed producer x trust-profile table with each row's worktree omissions and generated
-  # files, and `context_hash`, a pure digest whose source test is the caller's closure. No
-  # I/O, environment or worktree read. Storage validates stored producer context against it
+  # files, and `context_hash`, a pure digest whose source test is the caller's closure; and
+  # the languages a producer's run covers (`run_languages`, `stub_languages`), which storage's
+  # retention policy reads (store/producer_retention.rs). No I/O or worktree read, and no
+  # environment read except the test stub's language, compiled only in a `test-support`
+  # build (owner ruling 2026-11-17, D1). Storage validates stored producer context against it
   # at publish time (store/native_first/context.rs). Producer commands, settings and the
   # controlled worktree stay in src/producer/.
   "src/producer_profiles.rs",
@@ -169,11 +172,25 @@ paths = [
   # model and native records. Storage builds them for one revision; the references read
   # (query) takes them in and re-exports them at their old paths.
   "src/architecture_inputs.rs",
+  # The producer selection and call-binding core (S12, #997): the per-language default
+  # producers and their notes (#483), the snapshot facts and the `GraphSource` trait the
+  # call graph reads through, and `call_disposition`, the binding selection (#466). Pure
+  # functions over shared records, no I/O. The query engine (re-exported at its old paths
+  # in graph_query.rs) and storage's semantic reads (store/semantic_display.rs) share it.
+  "src/call_selection.rs",
   # The class catalog's composition (S13): the persisted Catalog record, its limits and
   # per-file summaries, the ordered bounded composer, the complete-catalog plan and the fit
   # to the per-document budgets. Pure over model records and evidence_limits. Storage
   # composes at publication; the tree-sitter extraction stays in src/classes.rs (indexing).
   "src/class_catalog.rs",
+  # One document's graph rows from its measured native facts, and the write-time check that
+  # a graph is exactly that projection (owner ruling 2026-11-17, D2). Pure over model and
+  # native records. Publication and selected reads project with it; src/indexer.rs keeps
+  # `validate_native_graph`, which compares the graph's sources with the capture.
+  "src/graph_projection.rs",
+  # The metrics memo and the score records it holds (owner ruling 2026-11-17, D4): plain data
+  # and a bounded FIFO. `Store` holds the memo; the scoring stays in src/metrics.rs (query).
+  "src/metrics_records.rs",
   # The persisted producer records' vocabulary (S8 part 3, #1071): the producer-state error
   # codes and the process identity, exit, diagnostics, group status and failure summary that
   # `run.json` and run replies carry. Serde types and constants only, no I/O. Storage persists
@@ -266,3 +283,36 @@ paths = [
   # it, and it includes tests/common/graph_fixtures.rs by `#[path]`.
   "src/native_navigation_fixture.rs",
 ]
+
+# Reviewed exceptions: references that are where they belong (owner ruling 2026-11-17,
+# #1198; 0.2.x spec section 12.17). Each approves one file pair. A pair that only stays
+# because moving it is not worth it now is not excepted: it stays a recorded deviation.
+[[exceptions]]
+rule = "$layers"
+target = { language = "rust", path = "src/store.rs" }
+destination = { language = "rust", path = "src/native_evidence.rs" }
+reason = "Publication validates and measures the admitted capture at the publish point: Artifact::validate and Artifact::validate_selective, captured_revision_header, captured_components (twice) and measure_captured_documents, each given the capture. These validators and measurements belong to the extractor and their code is part of the extractor hash (Decision 0005), so they stay in indexing; moving them down would put a storage name in the shared layer (owner ruling 2026-11-17, the capture hand-offs of spec section 13 ruling 5)."
+
+[[exceptions]]
+rule = "$layers"
+target = { language = "rust", path = "src/store.rs" }
+destination = { language = "rust", path = "src/indexer.rs" }
+reason = "Publication validates and measures the admitted capture at the publish point: validate_native_graph (the graph's sources against the capture) and measure_persisted_change (the prior manifest against the capture's inputs), each given the capture. They belong to the extractor and their code is part of the extractor hash (Decision 0005) (owner ruling 2026-11-17, the capture hand-offs of spec section 13 ruling 5)."
+
+[[exceptions]]
+rule = "$layers"
+target = { language = "rust", path = "src/store.rs" }
+destination = { language = "rust", path = "src/classes.rs" }
+reason = "Publication runs class extraction (FileExtraction::extract_file) on the captured input it was given, the same kind as the capture hand-offs: extraction belongs to the extractor and its code is part of the extractor hash (Decision 0005). The class catalog's composition is shared (src/class_catalog.rs, S13) (owner ruling 2026-11-17)."
+
+[[exceptions]]
+rule = "$layers"
+target = { language = "rust", path = "src/store.rs" }
+destination = { language = "rust", path = "src/semantic_evidence.rs" }
+reason = "Publication validates semantic evidence (validate_evidence) against the measured native stream inside the publication transaction, so nothing unvalidated reaches the index (owner ruling 2026-11-13, spec section 10 ruling 1; recorded by owner ruling 2026-11-17)."
+
+[[exceptions]]
+rule = "$layers"
+target = { language = "rust", path = "src/testing.rs" }
+destination = { language = "rust", path = "src/store.rs" }
+reason = "Test support: retry_admission retries only storage's typed admission contention (store::cli_read_retryable_contention), as real CLI clients do (#712). testing.rs can be neither feature-gated nor remapped to a test layer: integration tests call retry_admission ungated and production uses testing::git_executable (owner ruling 2026-11-13; recorded by owner ruling 2026-11-17)."
