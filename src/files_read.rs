@@ -104,11 +104,20 @@ impl Store {
                 })
                 .map(|symbol| (symbol.range.start_byte, symbol.range.end_byte))
                 .collect();
-            self.selected_source_row_for(tx, path, &selected)?
-                .and_then(|file| crate::files_view::outline_syntax(&file, &impl_blocks))
+            match self.selected_source_row_for(tx, path, &selected)? {
+                Some(file) => crate::files_view::outline_syntax(&file, &impl_blocks)?,
+                None => None,
+            }
         } else {
             None
         };
+        // A file beyond the outline syntax bounds says so, never a silent partial (#1119).
+        result.warnings.extend(
+            syntax
+                .as_ref()
+                .and_then(|syntax| syntax.warning)
+                .map(String::from),
+        );
         for symbol in page {
             let (native_kind, header) = metadata.remove(&symbol.id).context(SelectedIntegrity(
                 "incompatible_index: outline native declaration missing".into(),
