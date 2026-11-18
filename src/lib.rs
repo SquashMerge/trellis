@@ -16,6 +16,7 @@ mod behavior_rust;
 pub mod build_info;
 pub mod capture;
 pub mod capture_records;
+mod class_catalog;
 pub mod class_diagram;
 mod class_read;
 pub mod classes;

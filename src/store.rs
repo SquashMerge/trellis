@@ -4012,7 +4012,7 @@ fn publication_witness_requires_capability_report() {
 fn publication_rows<'a>(
     graph: &'a Graph,
     native: &'a crate::native_records::Artifact,
-    classes: &'a crate::classes::Catalog,
+    classes: &'a crate::class_catalog::Catalog,
 ) -> Result<BTreeMap<&'a str, PublicationRows<'a>>> {
     let mut rows = BTreeMap::<&str, PublicationRows>::new();
     for file in &graph.files {
@@ -4103,7 +4103,7 @@ fn publication_rows<'a>(
 /// Each relation's owner document, in `catalog.relations` order. Composition
 /// groups relations by owner document (a Rust `impl Trait for T` relation may
 /// sit in another file than T).
-fn relation_owner_paths(catalog: &crate::classes::Catalog) -> Vec<&str> {
+fn relation_owner_paths(catalog: &crate::class_catalog::Catalog) -> Vec<&str> {
     let owners: BTreeMap<&str, &str> = catalog
         .classes
         .iter()
@@ -4121,10 +4121,10 @@ fn relation_owner_paths(catalog: &crate::classes::Catalog) -> Vec<&str> {
         .collect()
 }
 fn stream_document_classes(
-    catalog: &crate::classes::Catalog,
+    catalog: &crate::class_catalog::Catalog,
     owner_paths: &[&str],
     path: &str,
-) -> crate::classes::Catalog {
+) -> crate::class_catalog::Catalog {
     // CatalogComposer::finish sorts both vectors by document path before their
     // within-document key (the same order as Catalog::compose). Keep that
     // invariant if either composer changes: partition_point requires it.
@@ -4134,7 +4134,7 @@ fn stream_document_classes(
         .classes
         .partition_point(|c| c.symbol.path.as_str() < path);
     let first_relation = owner_paths.partition_point(|owner| *owner < path);
-    crate::classes::Catalog {
+    crate::class_catalog::Catalog {
         classes: catalog.classes[first_class..]
             .iter()
             .take_while(|c| c.symbol.path == path)
@@ -4240,7 +4240,7 @@ pub(crate) struct LocalPrepared {
     prior_pin: IndexPin,
     prior_ids: BTreeMap<String, V8DocumentProjection>,
     prior_coverage: BTreeMap<String, crate::native_records::Coverage>,
-    prior_summaries: BTreeMap<String, crate::classes::FileSummary>,
+    prior_summaries: BTreeMap<String, crate::class_catalog::FileSummary>,
     prior_class_complete: BTreeMap<String, bool>,
     old_stats: IndexStats,
     old_diagnostics: Vec<Diagnostic>,
@@ -7798,7 +7798,7 @@ fn write_native(
         &crate::native_records::Artifact,
         &dyn AdmittedCapture,
         &Graph,
-        &crate::classes::Catalog,
+        &crate::class_catalog::Catalog,
         &BTreeMap<String, crate::model::FileExtraction>,
     ),
     revision: IndexPin,
@@ -8090,7 +8090,7 @@ fn write_native(
                     file.language,
                     ids.graph_hash,
                     "ready",
-                    if crate::classes::supports_language(&file.language) {
+                    if crate::class_catalog::supports_language(&file.language) {
                         "ready"
                     } else {
                         "notApplicable"
@@ -8140,7 +8140,7 @@ fn write_native(
                 coverage.diagnostic,
                 ordinal as i64,
                 (class_complete && !classes.fitted.contains(&file.path))
-                    || !crate::classes::supports_language(&file.language),
+                    || !crate::class_catalog::supports_language(&file.language),
             ],
         )?;
         for (kind, roles) in [
@@ -12629,12 +12629,12 @@ impl Store {
     fn compose_selected_class_catalog(
         graph: &Graph,
         extractions: &BTreeMap<String, crate::model::FileExtraction>,
-        limits: crate::classes::Limits,
-    ) -> Result<crate::classes::Catalog> {
+        limits: crate::class_catalog::Limits,
+    ) -> Result<crate::class_catalog::Catalog> {
         // The local graph materializes only the changed document's nodes.
         // Apply the unchanged class cap to the selected FULL revision's
         // authenticated prior+delta symbol count, not graph.nodes.len().
-        crate::classes::Catalog::compose(
+        crate::class_catalog::Catalog::compose(
             &extractions.values().cloned().collect::<Vec<_>>(),
             graph.files.len(),
             graph.stats.symbols,
@@ -15194,7 +15194,7 @@ impl Store {
                 selected_ensure!(matches!(class_complete, 0 | 1),
                     "incompatible_index: invalid class selection completeness");
                 prior_class_complete.insert(path.clone(), class_complete == 1);
-                selected_ensure!(summary.is_some() == crate::classes::supports_language(&language),
+                selected_ensure!(summary.is_some() == crate::class_catalog::supports_language(&language),
                     "incompatible_index: class summary missing or unexpected");
                 if let Some(payload) = summary {
                     prior_summaries.insert(path.clone(), serde_json::from_str(&payload).context(SelectedIntegrity("incompatible_index: stored class summary decode failed".into()))?);
@@ -15805,13 +15805,13 @@ impl Store {
         spool: &dyn SpoolReader,
         order: &[usize],
         cancel: &CancelFlag,
-    ) -> Result<(crate::classes::Catalog, bool)> {
-        let limits = crate::classes::Limits::default();
+    ) -> Result<(crate::class_catalog::Catalog, bool)> {
+        let limits = crate::class_catalog::Limits::default();
         // All class-catalog files were extracted and stored by the sorted native
         // owner before this publisher was entered. Replay in the same path
         // order to preserve catalog warning and class ordering.
         let mut composer =
-            crate::classes::CatalogComposer::new(spool.len(), spool.stats().symbols, limits);
+            crate::class_catalog::CatalogComposer::new(spool.len(), spool.stats().symbols, limits);
         let mut replay = order.to_vec();
         replay.sort_by(|a, b| {
             spool.header().revision.documents[*a]
@@ -15823,7 +15823,7 @@ impl Store {
         let mut summaries = Vec::new();
         for index in replay {
             let document = &spool.header().revision.documents[index];
-            if crate::classes::supports_language(&document.key.language) {
+            if crate::class_catalog::supports_language(&document.key.language) {
                 check_cancel(cancel)?;
                 let extraction = spool
                     .read_extraction(index)
@@ -15834,7 +15834,7 @@ impl Store {
                 }
             }
         }
-        let complete = crate::classes::plan_complete_catalog(
+        let complete = crate::class_catalog::plan_complete_catalog(
             &summaries,
             spool.len(),
             spool.stats().symbols,
@@ -15848,7 +15848,7 @@ impl Store {
         &self,
         spool: &dyn SpoolReader,
         order: &[usize],
-        classes: &crate::classes::Catalog,
+        classes: &crate::class_catalog::Catalog,
         expected: &ExpectedPublication,
         cancel: &CancelFlag,
     ) -> Result<PreflightReuse> {
@@ -15975,7 +15975,7 @@ impl Store {
                             !reused.native || prior_witness.is_some(),
                             "incompatible_index: reusable native version absent"
                         );
-                        let extraction = if crate::classes::supports_language(&file.language) {
+                        let extraction = if crate::class_catalog::supports_language(&file.language) {
                             Some(spool.read_extraction(index).map_err(native_spool_read_failure)?)
                         } else {
                             None
@@ -16107,11 +16107,11 @@ impl Store {
             };
             // Parse cached source before taking the writer lock. Projection and graph
             // still publish in one transaction with the same CAS/cancellation guard.
-            let limits = crate::classes::Limits::default();
+            let limits = crate::class_catalog::Limits::default();
             let class_paths: BTreeSet<_> = graph
                 .files
                 .iter()
-                .filter(|f| crate::classes::supports_language(&f.language))
+                .filter(|f| crate::class_catalog::supports_language(&f.language))
                 .map(|f| f.path.as_str())
                 .collect();
             // Class extraction only consumes class/method/function symbols. Supply
@@ -16175,7 +16175,7 @@ impl Store {
                 summaries.len() == class_paths.len(),
                 "incompatible_index: local class summary inventory incomplete"
             );
-            let metadata = crate::classes::plan_complete_catalog(
+            let metadata = crate::class_catalog::plan_complete_catalog(
                 summaries.values(),
                 graph.files.len(),
                 graph.stats.symbols,
@@ -16213,7 +16213,7 @@ impl Store {
             {
                 // Sparse payload: complete unchanged selections keep their immutable CID.
                 // Only changed and recovered files contribute class rows here.
-                let mut classes = crate::classes::Catalog {
+                let mut classes = crate::class_catalog::Catalog {
                     classes: Vec::new(),
                     relations: Vec::new(),
                     warnings: metadata.warnings,
@@ -16222,7 +16222,7 @@ impl Store {
                 };
                 for extraction in extractions.values() {
                     check_cancel(cancel)?;
-                    let file = crate::classes::complete_file_catalog(extraction);
+                    let file = crate::class_catalog::complete_file_catalog(extraction);
                     classes.classes.extend(file.classes);
                     classes.relations.extend(file.relations);
                 }
@@ -16555,7 +16555,8 @@ impl Store {
                         )?;
                         let selected_classes =
                             stream_document_classes(&classes, &owner_paths, &file.path);
-                        let extractions = if crate::classes::supports_language(&file.language) {
+                        let extractions = if crate::class_catalog::supports_language(&file.language)
+                        {
                             BTreeMap::from([(
                                 file.path.clone(),
                                 spool
@@ -18331,7 +18332,7 @@ impl Store {
                 && class_projection_state.as_deref() == Some("ready")
                 && class_hash.is_some()
                 && class_id.len() <= 16 * 1024
-                && (if crate::classes::supports_language(&language) {
+                && (if crate::class_catalog::supports_language(&language) {
                     f_length.is_some_and(|n| {
                         (0..=crate::evidence_limits::CLASS_EXTRACTION as i64).contains(&n)
                     })
@@ -18344,7 +18345,7 @@ impl Store {
             matches!(
                 language.as_str(),
                 "java" | "python" | "javascript" | "rust" | "typescript"
-            ) && (class_state == "ready") == crate::classes::supports_language(&language)
+            ) && (class_state == "ready") == crate::class_catalog::supports_language(&language)
                 && matches!(class_state.as_str(), "ready" | "notApplicable"),
             "incompatible_index: class extraction state invalid"
         );
