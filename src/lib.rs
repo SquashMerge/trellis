@@ -14,6 +14,7 @@ pub mod behavior_js;
 mod behavior_python;
 mod behavior_rust;
 pub mod build_info;
+mod call_selection;
 pub mod capture;
 pub mod capture_records;
 mod class_catalog;

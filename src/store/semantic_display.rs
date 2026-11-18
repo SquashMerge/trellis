@@ -9,7 +9,7 @@
 //! (#466).
 use super::*;
 use crate::{
-    graph_query::{
+    call_selection::{
         self as engine, DefaultProducers, DocumentFacts, GraphIntegrity, GraphSnapshot,
         GraphSource, HistoryFacts, SemanticDocument,
     },
