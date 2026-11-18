@@ -86,16 +86,16 @@ pub(crate) use work::{
 pub(super) enum TargetCallable {
     #[default]
     Other = 0,
-    /// A free function: a JavaScript `function` declaration or expression, or a Rust `fn`
-    /// that is not an `impl` or trait item.
+    /// A free function: a JavaScript `function` declaration or expression, a Rust `fn` that
+    /// is not an `impl` or trait item, or a Python `def` that is not directly in a class body.
     FreeFunction = 1,
-    /// A JavaScript class, or its `constructor` method.
+    /// A JavaScript class, or its `constructor` method, or a Python class.
     Constructor = 2,
     /// One fixed body: a Rust method of an inherent `impl`, or a Java `static`, `private` or
     /// `final` method.
     FixedMethod = 3,
     /// A declaration, not the runtime body: a Rust `trait` method, a JavaScript method other
-    /// than `constructor`, or any other Java method.
+    /// than `constructor`, any other Java method, or a Python `def` directly in a class body.
     DynamicMethod = 4,
 }
 
@@ -106,8 +106,17 @@ impl TargetCallable {
             declaration.document.language.as_str(),
             declaration.kind.as_str(),
         ) {
-            ("javascript" | "typescript" | "rust", "function") => Self::FreeFunction,
-            ("javascript" | "typescript", "type") => Self::Constructor,
+            // A native Python method is a `function` whose immediate parent is a class (#977).
+            ("python", "function")
+                if declaration
+                    .ancestors
+                    .last()
+                    .is_some_and(|parent| parent.kind == "type") =>
+            {
+                Self::DynamicMethod
+            }
+            ("javascript" | "typescript" | "rust" | "python", "function") => Self::FreeFunction,
+            ("javascript" | "typescript" | "python", "type") => Self::Constructor,
             ("javascript" | "typescript", "method")
                 if declaration.name.as_deref() == Some("constructor") =>
             {
