@@ -209,6 +209,9 @@ pub(super) struct Catalog {
     /// The crate root scopes whose crate is proved to be of edition 2018 or later, where a
     /// `use` path starts in its own module (#1162). Any other crate may be edition 2015.
     uniform: BTreeSet<usize>,
+    /// The items under a known attribute macro whose scope stays transparent until the
+    /// macro's path is proved to reach its own package, after the scan.
+    proofs: Vec<MacroProof>,
     pub(super) work: Work,
 }
 /// A crate root: a conventional root of the checkout's package, or a library or binary
@@ -233,6 +236,7 @@ impl Catalog {
         trees: &[Tree],
         documents: &BTreeMap<DocumentKey, usize>,
         workspace: &super::cargo_workspace::Workspace,
+        packages: &external::RustPackages,
         work: Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Self> {
@@ -247,6 +251,7 @@ impl Catalog {
             ambiguous: BTreeSet::new(),
             externs: BTreeMap::new(),
             uniform: BTreeSet::new(),
+            proofs: Vec::new(),
             work,
         };
         let declarations = result.index_files(docs, trees, workspace, check)?;
@@ -273,6 +278,7 @@ impl Catalog {
         result.assign_parents(&edges, check)?;
         result.mark_roots(docs, documents, workspace, &edges, check)?;
         result.keep_lost_owners_unknown(docs, trees, &edges, check)?;
+        result.prove_known_macros(docs, packages, check)?;
         result.build_scope_indexes(check)?;
         Ok(result)
     }
@@ -644,9 +650,26 @@ impl Catalog {
             let Pending {
                 uncertain,
                 custom_path: item_custom,
+                known,
                 ..
             } = std::mem::take(&mut pending);
-            let item_uncertain = uncertain || scope_uncertain;
+            let mut item_uncertain = uncertain || scope_uncertain;
+            // A known attribute macro keeps the scope transparent only on an item its
+            // expansion is read for, and only until its proof fails after the scan.
+            let mut proof = None;
+            if !known.is_empty() {
+                if self.known_macros_fit(doc, child, &known, check)? {
+                    proof = Some(MacroProof {
+                        scope,
+                        macros: known,
+                        bindings: Vec::new(),
+                        failed: false,
+                    });
+                } else {
+                    self.scopes[scope].opaque = true;
+                    item_uncertain = true;
+                }
+            }
             let item = Item {
                 doc,
                 document,
@@ -679,11 +702,19 @@ impl Catalog {
                 && let Some(name) = child.child_by_field_name("name")
             {
                 let name = self.bind_item(item, name, namespaces, declarations, check)?;
+                if let Some(proof) = &mut proof {
+                    for &namespace in namespaces {
+                        let key = (namespace, name.clone());
+                        let at = self.scopes[scope].explicit[&key].len() - 1;
+                        proof.bindings.push((key, at));
+                    }
+                }
                 if child.kind() == "mod_item" {
                     self.enter_module(docs, item, name, declarations, edges, depth, check)?;
                     continue;
                 }
             }
+            self.proofs.extend(proof);
             self.descend(docs, item, declarations, edges, depth, check)?;
         }
         Ok(())
@@ -715,7 +746,8 @@ impl Catalog {
     /// makes the scope opaque. A built-in inert attribute cannot be a macro: a macro of the
     /// same name is an ambiguity error. A derive helper is inert only after a derive on the
     /// same item that registers it; before that, or without one, the name is an ordinary
-    /// attribute macro.
+    /// attribute macro. A known attribute macro (`KnownMacro`) is held for the item after it
+    /// instead: `scan` checks the item and `prove_known_macros` the macro's package.
     fn note_attribute(
         &mut self,
         doc: &DocumentInput,
@@ -749,6 +781,13 @@ impl Catalog {
                     pending.helpers.extend(derive_helpers(derive));
                 }
             }
+        } else if !inner && let Some(known) = known_macro(name) {
+            // tokio-macros adds `#[::core::prelude::v1::test]` to a `#[tokio::test]`
+            // function, which then exists in test builds only, as under `#[test]`.
+            if matches!(known, KnownMacro::Tokio { test: true, .. }) {
+                pending.uncertain = true;
+            }
+            pending.known.push(known);
         } else if !(INERT_ATTRIBUTES.contains(&name)
             || name.starts_with("rustfmt::")
             || name.starts_with("clippy::")
@@ -761,6 +800,221 @@ impl Catalog {
                 pending.uncertain = true;
             }
         }
+    }
+    /// Whether the item after known attribute macros is one their expansions are read for:
+    /// for tokio a function whose body has no inner attribute, for async-trait a trait or a
+    /// trait impl that spells no `__self`.
+    fn known_macros_fit(
+        &mut self,
+        doc: &DocumentInput,
+        child: Node<'_>,
+        macros: &[KnownMacro],
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<bool> {
+        // Each shape is read once per item, however many attributes ask for it; the walk
+        // over the body's statements is charged per statement.
+        let tokio = macros
+            .iter()
+            .any(|known| matches!(known, KnownMacro::Tokio { .. }));
+        let async_trait = macros
+            .iter()
+            .any(|known| matches!(known, KnownMacro::AsyncTrait { .. }));
+        self.charge(macros.len(), check)?;
+        if tokio {
+            if child.kind() != "function_item" {
+                return Ok(false);
+            }
+            let Some(body) = child.child_by_field_name("body") else {
+                return Ok(false);
+            };
+            let mut cursor = body.walk();
+            for statement in body.named_children(&mut cursor) {
+                self.step(check)?;
+                if statement.kind() == "inner_attribute_item" {
+                    return Ok(false);
+                }
+            }
+        }
+        if async_trait
+            && !((child.kind() == "trait_item"
+                || (child.kind() == "impl_item" && child.child_by_field_name("trait").is_some()))
+                && !spells_identifier(text(doc, child), "__self"))
+        {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+    /// Proves each known attribute macro's path reaches its own package. An item whose proof
+    /// fails is read as under an attribute this catalog does not read: its scope opaque and
+    /// its names uncertain. That can change how another proof reads (a glob over the now
+    /// opaque scope), so the proofs are rechecked until none fails; each scope only turns
+    /// opaque, so this ends, and every step is charged to the work budget. The export memo
+    /// read the scopes before they turned opaque and is cleared after each pass.
+    fn prove_known_macros(
+        &mut self,
+        docs: &[&DocumentInput],
+        packages: &external::RustPackages,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        loop {
+            let mut failed = false;
+            for index in 0..self.proofs.len() {
+                self.step(check)?;
+                if self.proofs[index].failed {
+                    continue;
+                }
+                let scope = self.proofs[index].scope;
+                let mut proved = true;
+                for known in self.proofs[index].macros.clone() {
+                    if !self.proves_known_macro(scope, known, docs, packages, check)? {
+                        proved = false;
+                        break;
+                    }
+                }
+                if !proved {
+                    failed = true;
+                    let proof = &mut self.proofs[index];
+                    proof.failed = true;
+                    let bindings = std::mem::take(&mut proof.bindings);
+                    self.scopes[scope].opaque = true;
+                    for (key, at) in bindings {
+                        self.step(check)?;
+                        if let Some(binding) = self.scopes[scope]
+                            .explicit
+                            .get_mut(&key)
+                            .and_then(|bindings| bindings.get_mut(at))
+                        {
+                            binding.uncertain = true;
+                        }
+                    }
+                }
+            }
+            self.export_memo.clear();
+            if !failed {
+                return Ok(());
+            }
+        }
+    }
+    fn proves_known_macro(
+        &mut self,
+        scope: usize,
+        known: KnownMacro,
+        docs: &[&DocumentInput],
+        packages: &external::RustPackages,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<bool> {
+        let path = |a: &str, b: &str| [a.to_owned(), b.to_owned()];
+        match known {
+            KnownMacro::Tokio { test, global } => {
+                let name = if test { "test" } else { "main" };
+                let path = path("tokio", name);
+                self.proves_package(scope, &path, global, None, "tokio", docs, packages, check)
+            }
+            KnownMacro::AsyncTrait {
+                bare: false,
+                global,
+            } => {
+                let path = path("async_trait", "async_trait");
+                self.proves_package(
+                    scope,
+                    &path,
+                    global,
+                    None,
+                    "async_trait",
+                    docs,
+                    packages,
+                    check,
+                )
+            }
+            KnownMacro::AsyncTrait { bare: true, .. } => {
+                // The nearest scope that binds `async_trait` must do so by exactly one
+                // certain `use async_trait::async_trait;`: no item, glob or opaque scope
+                // before it, whose binding a re-export (`use axum::async_trait;`) or another
+                // macro could be.
+                let mut current = Some(scope);
+                while let Some(at) = current {
+                    self.step(check)?;
+                    let key = |namespace| (namespace, "async_trait".to_owned());
+                    if self.scopes[at].opaque
+                        || self.scopes[at].explicit.contains_key(&key(TYPE))
+                        || self.scopes[at].explicit.contains_key(&key(VALUE))
+                    {
+                        return Ok(false);
+                    }
+                    let (import, more) = {
+                        let mut named = self.scopes[at].imports.named("async_trait");
+                        (named.next().cloned(), named.next().is_some())
+                    };
+                    if let Some(import) = import {
+                        if more
+                            || import.uncertain
+                            || import.path != path("async_trait", "async_trait")
+                        {
+                            return Ok(false);
+                        }
+                        return self.proves_package(
+                            at,
+                            &import.path,
+                            false,
+                            Some((import.start, import.end)),
+                            "async_trait",
+                            docs,
+                            packages,
+                            check,
+                        );
+                    }
+                    if self.scopes[at].imports.stars().next().is_some() {
+                        return Ok(false);
+                    }
+                    current = if at == self.scopes[at].module {
+                        None
+                    } else {
+                        self.scopes[at].parent
+                    };
+                }
+                Ok(false)
+            }
+        }
+    }
+    /// Whether the first segment of `path`, read from `scope`, is the Cargo dependency of the
+    /// package `package`: `external_target`, strictly, finds no nearer item, import or glob
+    /// that binds it or could (a glob over another dependency could export a module of
+    /// that name), the manifest binds it without a rename, and the crate root has no `extern crate ..
+    /// as` of that name, which would take its place in the extern prelude. `global` is a
+    /// leading `::`, which edition 2015 reads from the crate root. `excluding` is the import
+    /// whose own path this is.
+    #[allow(clippy::too_many_arguments)] // The proof's scope, path and captured context.
+    fn proves_package(
+        &mut self,
+        scope: usize,
+        path: &[String],
+        global: bool,
+        excluding: Option<(usize, usize)>,
+        package: &str,
+        docs: &[&DocumentInput],
+        packages: &external::RustPackages,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<bool> {
+        self.step(check)?;
+        let Some(root) = self.root(scope) else {
+            return Ok(false);
+        };
+        let first = (TYPE, path[0].clone());
+        if self.scopes[root].cut
+            || self.scopes[root]
+                .explicit
+                .get(&first)
+                .is_some_and(|bindings| bindings.iter().any(|b| !b.own_crate))
+            || (global && self.root_reading(scope, &path[0], check)? == RootReading::Other)
+        {
+            return Ok(false);
+        }
+        let target = self.external_target(scope, path, packages, docs, excluding, true, check)?;
+        // crates.io treats `-` and `_` in a package name as the same name.
+        Ok(target.is_some_and(|target| {
+            !target.identity.standard_library
+                && target.identity.package.replace('-', "_") == package
+        }))
     }
     /// `extern crate name;` binds a name this catalog does not follow.
     fn bind_extern_crate(&mut self, item: Item<'_, '_>) {
@@ -1704,6 +1958,7 @@ impl Catalog {
                 context.packages,
                 context.docs,
                 Some((import.start, import.end)),
+                false,
                 check,
             )?
             .is_some())
@@ -1862,6 +2117,12 @@ impl Catalog {
         }
         Ok(result)
     }
+    /// The dependency the first segment of `path` names from `scope`, when no nearer scope
+    /// binds it. A glob whose exports are unknown could bind it; for external attribution
+    /// such a glob over a declared dependency is waived. `strict` waives nothing: a known
+    /// attribute macro's proof must rule out every glob, since a dependency's glob can
+    /// export a module of the same name that shadows the extern prelude.
+    #[allow(clippy::too_many_arguments)] // The lookup's scope, path, waiver and captured context.
     fn external_target(
         &mut self,
         scope: usize,
@@ -1869,6 +2130,7 @@ impl Catalog {
         packages: &external::RustPackages,
         docs: &[&DocumentInput],
         excluding: Option<(usize, usize)>,
+        strict: bool,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Option<external::ExternalPackage>> {
         self.step(check)?;
@@ -1931,6 +2193,9 @@ impl Catalog {
                         return Ok(None);
                     }
                     if expanded.unknown_set {
+                        if strict {
+                            return Ok(None);
+                        }
                         let document = self.scopes[current_scope].document;
                         let source_set = &docs[document].key.source_set_id;
                         let root = self.root(current_scope).expect("proved root");
@@ -2061,6 +2326,7 @@ impl Catalog {
                 packages,
                 docs,
                 import.as_ref().map(|i| (i.start, i.end)),
+                false,
                 check,
             )?
         {
@@ -2210,6 +2476,7 @@ impl Catalog {
                     packages,
                     docs,
                     Some((other.start, other.end)),
+                    false,
                     check,
                 )?
                 .is_some()
@@ -2328,6 +2595,66 @@ struct Pending {
     custom_path: bool,
     /// The helper attributes that a derive written earlier on this item registers.
     helpers: BTreeSet<&'static str>,
+    /// The known attribute macros on this item, in source order.
+    known: Vec<KnownMacro>,
+}
+/// An attribute macro whose expansion binds no name the item's scope can see and changes
+/// no path the item spells, once its path is proved to reach the macro's own package and
+/// the item is one its expansion is read for (owner ruling 2026-11-17). `global` is a path
+/// written with a leading `::`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum KnownMacro {
+    /// `#[tokio::main]`, `#[tokio::test]`, with any arguments. tokio-macros re-emits the
+    /// function alone (`entry.rs` `into_tokens`), its original body kept as the
+    /// initializer of `let body = async { .. };`, where `body` is not yet in scope; the
+    /// runtime is built in a sibling block whose `use` the body cannot see. It lifts inner
+    /// attributes of the body onto the function, so the body must have none.
+    Tokio { test: bool, global: bool },
+    /// `#[async_trait]` (`bare`, through an import) or `#[async_trait::async_trait]`, with
+    /// any arguments, on a trait or trait impl. async-trait re-emits the item alone, each
+    /// async method's body moved into `Box::pin(async move { .. })` after bindings that
+    /// change no path the body spells: `__ret` (not yet in scope in the body), mixed-site
+    /// `__argN` (invisible to it) and `let x = x;` (the same parameter under the same
+    /// name). The one exception is `__self`, which takes the place of `self` and is visible
+    /// to the body: so the item must not spell `__self`.
+    AsyncTrait { bare: bool, global: bool },
+}
+/// An item under known attribute macros, with the bindings it made, which the failed proof
+/// of any of them leaves uncertain, as under an attribute this catalog does not read.
+struct MacroProof {
+    scope: usize,
+    macros: Vec<KnownMacro>,
+    bindings: Vec<(Name, usize)>,
+    failed: bool,
+}
+/// The known attribute macro an outer attribute's path names, whatever its arguments.
+fn known_macro(name: &str) -> Option<KnownMacro> {
+    let (global, path) = match name.strip_prefix("::") {
+        Some(path) => (true, path),
+        None => (false, name),
+    };
+    match path {
+        "tokio::main" => Some(KnownMacro::Tokio {
+            test: false,
+            global,
+        }),
+        "tokio::test" => Some(KnownMacro::Tokio { test: true, global }),
+        // `::async_trait` alone names the crate, not its macro.
+        "async_trait" if !global => Some(KnownMacro::AsyncTrait { bare: true, global }),
+        "async_trait::async_trait" => Some(KnownMacro::AsyncTrait {
+            bare: false,
+            global,
+        }),
+        _ => None,
+    }
+}
+/// Whether `text` spells the identifier `name`, not as part of a longer identifier.
+fn spells_identifier(text: &str, name: &str) -> bool {
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    text.match_indices(name).any(|(at, _)| {
+        !text[..at].chars().next_back().is_some_and(ident)
+            && !text[at + name.len()..].chars().next().is_some_and(ident)
+    })
 }
 /// Built-in attributes that bind no name, in either the outer or the inner form. A macro of
 /// one of these names cannot be used as an attribute: the name is ambiguous with the
@@ -2836,6 +3163,7 @@ mod cache_tests {
             ambiguous: BTreeSet::new(),
             externs: BTreeMap::new(),
             uniform: BTreeSet::new(),
+            proofs: Vec::new(),
             work: Work::new(work::reference_limit(0, 0)),
         }
     }
