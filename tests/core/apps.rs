@@ -386,6 +386,12 @@ const EXTERNAL_MANIFEST: (&str, &str) = (
     "package.json",
     "{\"name\":\"scratch\",\"dependencies\":{\"widget\":\"^1.0.0\"}}\n",
 );
+// A bare import resolves against the nearest package.json (#1088), so alpha's sources
+// see `widget` only when alpha's own manifest declares it.
+const A_PACKAGE_WITH_WIDGET: (&str, &str) = (
+    "a/package.json",
+    "{\"name\":\"alpha\",\"dependencies\":{\"widget\":\"^1.0.0\"}}\n",
+);
 
 const COUNTING_RULES: &str = r#"version = 1
 [external_policy]
@@ -434,7 +440,7 @@ paths = ["common/**"]
 
 const COUNTING_FILES: [(&str, &str); 13] = [
     EXTERNAL_MANIFEST,
-    A_PACKAGE,
+    A_PACKAGE_WITH_WIDGET,
     B_PACKAGE,
     (
         "a/low.js",
@@ -594,7 +600,7 @@ external = [{ language = "javascript", package = "widget", stdlib = false }]
 "#;
     let files = [
         EXTERNAL_MANIFEST,
-        A_PACKAGE,
+        A_PACKAGE_WITH_WIDGET,
         B_PACKAGE,
         B_SOURCE,
         ("a/ext.js", "import 'widget';\n"),
