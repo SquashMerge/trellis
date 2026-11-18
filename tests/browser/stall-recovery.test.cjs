@@ -203,7 +203,7 @@ test("an agent show that a stall stopped is shown once the daemon answers again"
   try {
     await mcp.open();
     const answer = await mcp.show({view:"sequence", symbolId:helper});
-    assert.equal(answer?.data?.outcome, "shown", JSON.stringify(answer));
+    assert.equal(answer?.data?.outcome, "recorded", JSON.stringify(answer));
     await page.waitForFunction(() => /Request (failed|timed out)|Failed to fetch/.test(document.querySelector("#error")?.textContent || ""), null, {timeout:RECOVERED_MS});
     assert.ok(stall.failed.includes("sequence"), stall.failed.join());
     assert.equal(await page.locator("#agent-shown").evaluate(node => node.hidden), true, "a stopped show is not reported as shown");

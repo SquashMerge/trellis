@@ -233,6 +233,11 @@ fn scope_coverage_lists_only_the_result_languages() {
         // The Rust scope is partial although no Rust row is shown.
         assert_eq!(javascript["partial"], true);
         assert_eq!(javascript["warnings"][0]["code"], "coverageIncomplete");
+        // #980: it says where: Rust syntax, not the returned JavaScript.
+        assert_eq!(
+            javascript["warnings"][0]["message"],
+            "Selected syntax coverage is incomplete for rust"
+        );
         assert_eq!(
             languages(&find_page(mixed(), compact)),
             ["rust", "javascript"]

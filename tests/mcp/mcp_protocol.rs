@@ -6261,7 +6261,7 @@ async fn an_oversized_answer_is_typed_and_keeps_the_connection() {
     }] {
         assert_eq!(reply["result"]["isError"], false, "{reply}");
         assert_eq!(
-            reply["result"]["structuredContent"]["data"]["toolVersion"], 31,
+            reply["result"]["structuredContent"]["data"]["toolVersion"], 32,
             "{reply}"
         );
     }
@@ -12670,7 +12670,9 @@ async fn scoped_rules_check_samples_evidence_and_pages_under_the_cap() {
 }
 
 /// #725: through the daemon, `status` pages only the matching instances, `limit` counts
-/// instances per page, and every page keeps the whole evaluation's counts.
+/// instances per page, and every page keeps the whole evaluation's counts. #980: the
+/// filtered sequence leaves out `unassigned` and `externalPackages`, so `page.total` is
+/// the matching instance count.
 #[tokio::test(flavor = "current_thread")]
 async fn rules_check_status_filter_and_instance_limit_page_deviations() {
     use trellis::daemon::registry::CheckoutRegistry;
@@ -12684,6 +12686,9 @@ async fn rules_check_status_filter_and_instance_limit_page_deviations() {
         })
         .collect();
     files.push(("app_main.js".into(), "export const y = 1;\n".into()));
+    // #980: a file in no layer that imports a package, so the unfiltered sequence has
+    // `unassigned` and `externalPackages` rows.
+    files.push(("loose.js".into(), "import 'fs';\n".into()));
     let borrowed: Vec<_> = files
         .iter()
         .map(|(p, t)| (p.as_str(), t.as_str()))
@@ -12715,6 +12720,21 @@ async fn rules_check_status_filter_and_instance_limit_page_deviations() {
     let counts = whole["result"]["structuredContent"]["data"]["counts"].clone();
     assert_eq!(counts["deviates"], 20, "{counts}");
     assert!(counts["unknown"].as_u64().unwrap() > 0, "{counts}");
+    // #980: without a filter the sequence pages the unassigned files and the external
+    // packages after the instances.
+    let (mut offset, mut unassigned, mut packages) = (0, 0, 0);
+    for id in 100.. {
+        let reply = ask(id, json!({"schemaVersion":1,"offset":offset}));
+        tool(&reply, None, true);
+        let data = &reply["result"]["structuredContent"]["data"];
+        unassigned += data["unassigned"].as_array().unwrap().len();
+        packages += data["externalPackages"].as_array().unwrap().len();
+        match data["page"]["nextOffset"].as_u64() {
+            Some(next) => offset = next,
+            None => break,
+        }
+    }
+    assert!(unassigned > 0 && packages > 0, "{unassigned} {packages}");
     let mut offset = 0;
     let mut deviations = Vec::new();
     let mut sizes = Vec::new();
@@ -12728,6 +12748,12 @@ async fn rules_check_status_filter_and_instance_limit_page_deviations() {
         let data = &envelope["data"];
         assert_eq!(data["counts"], counts, "counts stay global");
         assert_eq!(data["page"]["status"], json!(["deviates"]));
+        assert_eq!(
+            data["page"]["total"], 20,
+            "only the matching instances are paged"
+        );
+        assert_eq!(data["unassigned"], json!([]), "{data}");
+        assert_eq!(data["externalPackages"], json!([]), "{data}");
         assert!(data["semanticBases"].is_array(), "{data}");
         let rows = data["instances"].as_array().unwrap();
         assert!(rows.iter().all(|row| row["status"] == "deviates"), "{data}");
@@ -14957,6 +14983,12 @@ async fn mcp_search_zero_hits_keep_incomplete_native_scope_separate_from_vectors
         assert_eq!(envelope["partial"], true);
         assert_eq!(envelope["truncated"], false);
         assert_eq!(envelope["warnings"][0]["code"], "coverageIncomplete");
+        // #980: the hit is JavaScript, whose syntax coverage is complete; the warning
+        // names the Python scope that makes the answer partial.
+        assert_eq!(
+            envelope["warnings"][0]["message"],
+            "Selected syntax coverage is incomplete for python"
+        );
         assert_eq!(envelope["warnings"][1]["code"], "syntaxOnly");
         assert_eq!(envelope["warnings"].as_array().unwrap().len(), 2);
         // #715: the hit's language only; with no hit, the searched languages. The
