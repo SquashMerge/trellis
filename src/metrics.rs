@@ -273,43 +273,12 @@ fn bind(
 /// region's parent chain (#987). An arm is as deep as its statement and an `else if` as deep
 /// as the first `if` of its chain, so neither is a level.
 ///
-/// An arm is level with its statement only when that statement is the stored region above
-/// it, which then supplies the level. Java's `try (resource)` is not stored, so its `catch`
-/// and `finally` keep theirs. It is the only statement of the five grammars that owns a
-/// stored arm kind without being stored itself.
+/// Every statement that owns a stored arm kind is stored itself (#1120), so an arm's stored
+/// parent is its own statement.
 fn max_nesting(source: &str, language: &str, owned: &[&ControlRegion]) -> usize {
     let by_id: HashMap<&str, &ControlRegion> = owned.iter().map(|r| (r.id.as_str(), *r)).collect();
     let parent_of =
         |r: &ControlRegion| r.parent_id.as_deref().and_then(|id| by_id.get(id).copied());
-    // The `catch` and `finally` of a stored `try` run to its end, one after the other. Those
-    // of a `try (resource)` directly in its body end before the `}` that closes that body.
-    let closes = |arm: &ControlRegion, statement: &ControlRegion| {
-        let mut end = arm.range.end;
-        for _ in 0..owned.len() {
-            if end == statement.range.end {
-                return true;
-            }
-            let next = owned
-                .iter()
-                .filter(|r| {
-                    matches!(r.kind.as_str(), "catch_clause" | "finally_clause")
-                        && r.parent_id.as_deref() == Some(statement.id.as_str())
-                        && r.range.start >= end
-                })
-                .min_by_key(|r| r.range.start);
-            match next {
-                Some(next)
-                    if source
-                        .get(end..next.range.start)
-                        .is_some_and(|gap| !gap.contains('}')) =>
-                {
-                    end = next.range.end;
-                }
-                _ => return false,
-            }
-        }
-        false
-    };
     let level = |r: &ControlRegion| {
         let parent = parent_of(r);
         let parent_kind = parent.map_or("", |parent| parent.kind.as_str());
@@ -323,9 +292,10 @@ fn max_nesting(source: &str, language: &str, owned: &[&ControlRegion]) -> usize 
                     | "try_statement"
             ),
             "switch_case" | "switch_default" => parent_kind == "switch_statement",
-            "catch_clause" | "finally_clause" => {
-                parent_kind == "try_statement" && parent.is_some_and(|parent| closes(r, parent))
-            }
+            "catch_clause" | "except_clause" | "finally_clause" => matches!(
+                parent_kind,
+                "try_statement" | "try_with_resources_statement"
+            ),
             _ => false,
         };
         if arm {
