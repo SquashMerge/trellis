@@ -1056,13 +1056,31 @@ fn excluded_unselected_artifact_does_not_schedule_native_work() {
     let artifact = root.join("target/index.scip");
     fs::write(&artifact, "unselected input").unwrap();
     let mut watch = WatchSignals::new(root.to_owned());
+    // This fixture drives the bounded synthetic ingress only. The OS can
+    // report the setup writes above after the acknowledgement below, so a live
+    // notify callback would race the exact generation being acknowledged.
+    watch.disable_native_watcher_for_tests();
     let initial = watch.drain();
     assert!(watch.acknowledge(&initial));
+    assert!(
+        !watch.accepted_unacked(),
+        "the acknowledgement left ingress pending: {:?}",
+        watch.drain()
+    );
+    // With native delivery off this event is the only ingress, so any
+    // acceptance below is this event.
     watch.submit_event(Ok(Event::new(EventKind::Modify(ModifyKind::Data(
         DataChange::Content,
     )))
-    .add_path(artifact)));
-    assert!(!watch.accepted_unacked());
+    .add_path(artifact.clone())));
+    assert!(
+        !watch.accepted_unacked(),
+        "the excluded artifact event for {} was accepted after acknowledged generation {}: \
+         pending {:?}",
+        artifact.display(),
+        watch.acknowledged_generation(),
+        watch.drain()
+    );
 }
 
 #[test]
