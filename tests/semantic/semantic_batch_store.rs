@@ -8007,6 +8007,158 @@ fn real_rust_analyzer_direct_calls_expand_the_call_graph_and_sequence() {
     assert!(call.children.is_empty());
 }
 
+/// #977 (owner ruling 2026-11-13): a Python call graph expands past its root. A plain call to
+/// a free function (`helper`, `audit`) and a module-attribute call to one (`lib.register`) are
+/// direct and calling a class (`Record`) is constructor, so each is followed; a member call
+/// to a method (`record.save()`) is dynamic and keeps a `dispatch` boundary showing it.
+#[test]
+fn python_direct_and_constructor_calls_expand_the_call_graph() {
+    use trellis::graph_query::{BoundaryReason, GraphQuery, Visit};
+    use trellis::semantic_evidence::Dispatch;
+    let lib = "def register(key):\n    return audit(key)\n\n\ndef audit(key):\n    return key\n";
+    let main = "from app import lib\n\n\nclass Record:\n    def __init__(self, key):\n        self.key = key\n\n    def save(self):\n        return self.key\n\n\ndef helper(key):\n    return lib.register(key)\n\n\ndef run(key):\n    record = Record(helper(key))\n    record.save()\n    return record\n";
+    let world = world(|root| {
+        write_files(
+            root,
+            &[
+                ("app/__init__.py", ""),
+                ("app/lib.py", lib),
+                ("app/main.py", main),
+            ],
+        )
+    });
+    let symbol =
+        |module: &str, name: &str| format!("scip-python python app 0 `app.{module}`/{name}");
+    let (register, audit) = (symbol("lib", "register()."), symbol("lib", "audit()."));
+    let (record, save, helper) = (
+        symbol("main", "Record#"),
+        symbol("main", "Record#save()."),
+        symbol("main", "helper()."),
+    );
+    let mut lib_doc = DocSpec::new("app/lib.py");
+    for (needle, nth, symbol, roles) in [
+        ("register", 0, &register, 1),
+        ("audit", 1, &audit, 1),
+        ("audit", 0, &audit, 0),
+    ] {
+        lib_doc = occ_at(lib_doc, lib, (needle, nth), None, symbol, roles);
+    }
+    let lib_doc = lib_doc.symbol(&register, 17, &[]).symbol(&audit, 17, &[]);
+    let mut main_doc = DocSpec::new("app/main.py");
+    for (needle, nth, symbol, roles) in [
+        ("Record", 0, &record, 1),
+        ("save", 0, &save, 1),
+        ("helper", 0, &helper, 1),
+        ("register", 0, &register, 0),
+        ("Record", 1, &record, 0),
+        ("helper", 1, &helper, 0),
+        ("save", 1, &save, 0),
+    ] {
+        main_doc = occ_at(main_doc, main, (needle, nth), None, symbol, roles);
+    }
+    let main_doc = main_doc
+        .symbol(&record, 7, &[])
+        .symbol(&save, 26, &[])
+        .symbol(&helper, 17, &[]);
+    let mut fixture = world.fixture().reference("scip-python");
+    fixture.artifact("python", vec![lib_doc, main_doc]);
+    let descriptor = world.write(&fixture);
+    let (pin, admitted, _) = world.publish(&descriptor).unwrap();
+    drop(admitted);
+    let producer = world.store.semantic_at(pin).unwrap().producers[0]
+        .id
+        .clone();
+    let (_, native, _) = index_workspace_bundle(
+        &IndexOptions::new(world.root.clone()),
+        world.store.root_id(),
+        &world.cancel,
+        |_| {},
+    )
+    .unwrap();
+    let id_of = |name: &str| {
+        let found: Vec<_> = native
+            .declarations
+            .iter()
+            .filter(|d| d.name.as_deref() == Some(name))
+            .collect();
+        assert_eq!(found.len(), 1, "{name}");
+        found[0].syntax_id.clone()
+    };
+    let [run, record, save, helper, register, audit] =
+        ["run", "Record", "save", "helper", "register", "audit"].map(id_of);
+    let graph = world
+        .store
+        .evidence_response()
+        .unwrap()
+        .graph_query(
+            &GraphQuery {
+                root_syntax_id: run.clone(),
+                semantic_producer_id: Some(producer),
+                depth: 3,
+                max_nodes: 150,
+                max_calls: 500,
+                include_external: true,
+                include_tests: true,
+                app_paths: None,
+            },
+            None,
+            &mut || Ok(()),
+        )
+        .unwrap()
+        .outcome
+        .expect("contract success");
+    let edge = |from: &str, callee: &str| {
+        let found: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.from == from && e.call.spelling.as_deref() == Some(callee))
+            .collect();
+        assert_eq!(found.len(), 1, "{callee}");
+        let e = found[0];
+        (
+            e.visit,
+            e.boundary_reason,
+            e.to.clone(),
+            e.binding.as_ref().map(|b| b.dispatch),
+        )
+    };
+    let followed = |to: &str, dispatch| {
+        (
+            Visit::New,
+            BoundaryReason::None,
+            Some(to.to_owned()),
+            Some(dispatch),
+        )
+    };
+    assert_eq!(
+        edge(&run, "Record"),
+        followed(&record, Dispatch::Constructor)
+    );
+    assert_eq!(edge(&run, "helper"), followed(&helper, Dispatch::Direct));
+    assert_eq!(
+        edge(&helper, "register"),
+        followed(&register, Dispatch::Direct)
+    );
+    assert_eq!(edge(&register, "audit"), followed(&audit, Dispatch::Direct));
+    assert_eq!(
+        edge(&run, "save"),
+        (
+            Visit::Boundary,
+            BoundaryReason::Dispatch,
+            Some(save.clone()),
+            Some(Dispatch::Dynamic)
+        )
+    );
+    let depth_of = |id: &str| {
+        graph
+            .nodes
+            .iter()
+            .find(|n| n.declaration.syntax_id == id)
+            .map(|n| n.depth)
+    };
+    assert_eq!(depth_of(&audit), Some(3));
+}
+
 // Real rust-analyzer 1.98.1 output for `tests/fixtures/scip-rust-analyzer-dispatch/workspace`,
 // Metadata unit dropped as for `RUST_ANALYZER`: inherent, trait and trait-impl methods, a
 // trait object, a type parameter and a macro argument (#557).

@@ -361,7 +361,7 @@ pub struct IndexStatus {
     pub diagnostics: Vec<Diagnostic>,
     /// The daemon's watcher-health witness for this checkout, on CLI status.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub watcher: Option<crate::watch::WatcherWitness>,
+    pub watcher: Option<WatcherWitness>,
     /// The one semantic producer whose selected bindings `stats` counts, when every
     /// selected language shares it (#467, #483).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -373,6 +373,18 @@ pub struct IndexStatus {
     /// published (#483). `stats` is their combined total.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub semantic_languages: Vec<LanguageSemantic>,
+}
+/// One coherent reading of watcher health, for measurement (Decision 0009
+/// §5): watching stayed healthy between two readings only if they are equal
+/// and the first is native and not degraded. The current bit alone can
+/// return to healthy unseen, with a new epoch or between readings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WatcherWitness {
+    pub epoch: u64,
+    pub native: bool,
+    pub degraded: bool,
+    pub degradations: u64,
 }
 /// One language's semantic producer selection and its selected bindings in status (#483).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
