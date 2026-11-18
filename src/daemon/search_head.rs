@@ -102,6 +102,10 @@ pub struct HeadSlot {
     before_rank: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(any(test, feature = "test-support"))]
     before_build: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Runs once in `settle`, before it publishes, so a test can hold the owner inside its
+    /// settle transition (#1128).
+    #[cfg(test)]
+    on_settle: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 impl HeadSlot {
     pub(super) fn new(
@@ -120,6 +124,8 @@ impl HeadSlot {
             before_rank: Mutex::new(None),
             #[cfg(any(test, feature = "test-support"))]
             before_build: Mutex::new(None),
+            #[cfg(test)]
+            on_settle: Mutex::new(None),
         }
     }
     /// A hint, not a query-owned job. Dropping a waiter never withdraws it.
@@ -253,6 +259,10 @@ impl HeadSlot {
         if let Some(hook) = hook {
             hook();
         }
+    }
+    #[cfg(test)]
+    pub(super) fn set_settle_hook_for_tests(&self, hook: Box<dyn FnOnce() + Send>) {
+        *self.on_settle.lock().unwrap() = Some(hook);
     }
     #[cfg(any(test, feature = "test-support"))]
     pub fn clear_for_tests(&self) {
@@ -405,6 +415,13 @@ impl HeadSlot {
         self.changed.notify_all();
     }
     pub(super) fn settle(&self) {
+        #[cfg(test)]
+        {
+            let hook = self.on_settle.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         self.state.lock().unwrap().building = false;
         self.changed.notify_all();
     }
