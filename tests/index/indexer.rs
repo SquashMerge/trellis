@@ -1317,13 +1317,21 @@ fn watcher_coalesces_renames_and_retains_signals_until_verified_ack() {
     use trellis::watch::WatchSignals;
     let root = tempfile::tempdir().unwrap();
     let mut watcher = WatchSignals::new(root.path().to_owned());
-    let takeover = watcher.drain();
-    assert!(takeover.full);
     if !watcher.watching() {
         assert!(watcher.degraded());
+        assert!(watcher.drain().full);
         return; // Platform has no watcher: mandatory full scans remain active.
     }
-    assert!(watcher.acknowledge(&takeover));
+    // The rest drives synthetic ingress only. Do not let a live notify
+    // callback race the exact generations being acknowledged (#1208).
+    watcher.disable_native_watcher_for_tests();
+    let takeover = watcher.drain();
+    assert!(takeover.full);
+    assert!(
+        watcher.acknowledge(&takeover),
+        "the takeover was not acknowledged: pending {:?}",
+        watcher.drain()
+    );
     let rename = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
         .add_path(root.path().join("old.js"))
         .add_path(root.path().join("new.js"));
@@ -1338,8 +1346,13 @@ fn watcher_coalesces_renames_and_retains_signals_until_verified_ack() {
     );
     let pending = watcher.drain();
     assert!(pending.full);
-    assert!(watcher.acknowledge(&pending));
-    assert!(!watcher.drain().full);
+    assert!(
+        watcher.acknowledge(&pending),
+        "the full batch was not acknowledged: pending {:?}",
+        watcher.drain()
+    );
+    let after = watcher.drain();
+    assert!(!after.full, "ingress after the acknowledgement: {after:?}");
 }
 
 #[test]
@@ -1351,15 +1364,26 @@ fn watcher_promotes_ignore_unknown_and_bulk_changes_to_full_inventory() {
     if !watcher.watching() {
         return;
     }
+    // The rest drives synthetic ingress only. Do not let a live notify
+    // callback race the exact generations being acknowledged (#1208).
+    watcher.disable_native_watcher_for_tests();
     let first = watcher.drain();
-    assert!(watcher.acknowledge(&first));
+    assert!(
+        watcher.acknowledge(&first),
+        "the takeover was not acknowledged: pending {:?}",
+        watcher.drain()
+    );
     watcher.observe_event(
         &Event::new(EventKind::Modify(ModifyKind::Any))
             .add_path(root.path().join("nested/.ignore")),
     );
     assert!(watcher.drain().full);
     let first = watcher.drain();
-    assert!(watcher.acknowledge(&first));
+    assert!(
+        watcher.acknowledge(&first),
+        "the .ignore batch was not acknowledged: pending {:?}",
+        watcher.drain()
+    );
     for n in 0..257 {
         watcher.observe_event(
             &Event::new(EventKind::Modify(ModifyKind::Any))
@@ -1542,8 +1566,15 @@ fn failed_capture_does_not_ack_relevant_input_cutoff_or_absent_input() {
             write(root.path(), "Cargo.toml", "abc");
         }
         let mut watcher = WatchSignals::new(root.path().to_owned());
+        // Synthetic ingress only: the OS can report the writes above after the
+        // acknowledgement below, racing its exact generation (#1208).
+        watcher.disable_native_watcher_for_tests();
         let initial = watcher.drain();
-        assert!(watcher.acknowledge(&initial));
+        assert!(
+            watcher.acknowledge(&initial),
+            "the initial inventory was not acknowledged: pending {:?}",
+            watcher.drain()
+        );
         let capture = Capture::admit(
             &IndexOptions::new(root.path().to_owned()),
             &cancel(),
