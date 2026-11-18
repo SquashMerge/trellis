@@ -571,7 +571,7 @@ pub struct Store {
     // selected reconciliation was observed committed under the synced EX.
     reconciled_writer: Arc<Mutex<Option<uuid::Uuid>>>,
     retention_clock: Arc<Mutex<RetentionClock>>,
-    pub(crate) metrics_memo: Arc<Mutex<crate::metrics::MetricsMemo>>,
+    pub(crate) metrics_memo: Arc<Mutex<crate::metrics_records::MetricsMemo>>,
     /// Set only on an `EvidenceResponse`'s own Store, which is used only with
     /// that response's read snapshot: the pin it admitted and that revision's
     /// header values. A later read of the same pin in the response shares
@@ -10807,7 +10807,7 @@ impl Store {
             aborted_staged_index: Arc::new(Mutex::new(None)),
             writer_counters: Arc::new(Mutex::new(None)),
             reconciled_writer: Arc::new(Mutex::new(None)),
-            metrics_memo: Arc::new(Mutex::new(crate::metrics::MetricsMemo::new(
+            metrics_memo: Arc::new(Mutex::new(crate::metrics_records::MetricsMemo::new(
                 64 * 1024 * 1024,
             ))),
             admitted: None,
@@ -13082,7 +13082,7 @@ impl Store {
         mut before_commit: impl FnMut(&Connection) -> Result<()>,
         commit_loss: Option<CommitLoss>,
     ) -> Result<IndexPin> {
-        use crate::{batch_descriptor::Descriptor, semantic_batch::limits};
+        use crate::batch_descriptor::Descriptor;
         leader.belongs_to(&self.identity)?;
         self.identity.verify()?;
         check_cancel(cancel)?;
@@ -13102,7 +13102,7 @@ impl Store {
         let conn = self.cache_write()?;
         let db: &Connection = &conn;
         #[allow(unused_mut)]
-        let mut cache_kib = i64::try_from(limits::BATCH_WRITER_CACHE_KIB)?;
+        let mut cache_kib = i64::try_from(crate::semantic_batch::limits::BATCH_WRITER_CACHE_KIB)?;
         // A tiny writer cache makes a small test batch spill like a large producer's (#905).
         #[cfg(feature = "test-support")]
         if let Some(kib) = std::env::var("TRELLIS_TEST_BATCH_WRITER_CACHE_KIB")
@@ -13118,7 +13118,7 @@ impl Store {
         storage_result(db.pragma_update(
             Some("stage"),
             "cache_size",
-            -i64::try_from(limits::STAGE_ATTACH_CACHE_KIB)?,
+            -i64::try_from(crate::semantic_batch::limits::STAGE_ATTACH_CACHE_KIB)?,
         ))?;
         let gate = || -> Result<()> {
             check_cancel(cancel)?;
@@ -15262,7 +15262,7 @@ impl Store {
                 == prepared.changed_paths,
             "selected graph must cover exactly the measured documents"
         );
-        crate::indexer::validate_native_graph_records(&changed, &prepared.native, cancel)?;
+        crate::graph_projection::validate_native_graph_records(&changed, &prepared.native, cancel)?;
         let delta = |old: usize, removed: usize, added: usize| -> Result<usize> {
             old.checked_sub(removed)
                 .and_then(|n| n.checked_add(added))
@@ -18493,10 +18493,10 @@ impl Store {
             regions,
             stored_bytes: _,
         } = fetched;
-        let (nodes, graph_calls, graph_regions) = crate::indexer::project_document(
+        let (nodes, graph_calls, graph_regions) = crate::graph_projection::project_document(
             &file.path,
             file.text.as_bytes(),
-            crate::indexer::NativeDocument {
+            crate::graph_projection::NativeDocument {
                 declarations: declarations.iter().collect(),
                 calls: calls.iter().collect(),
                 control_regions: regions.iter().collect(),
