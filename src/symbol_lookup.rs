@@ -40,8 +40,19 @@ fn keys_until(
         anyhow::ensure!(now() < backstop, HUNG);
         Ok(())
     };
-    keys_checked(path, language, text, declarations, &mut check)?
-        .ok_or_else(|| anyhow::anyhow!(EXHAUSTED))
+    let file = &Source {
+        path,
+        language,
+        text,
+    };
+    let limit = Limit {
+        check: &mut check,
+        polls: 0,
+    };
+    derive(file, declarations, limit).map_err(|refused| match refused {
+        Refused::Bound(bound) => anyhow::anyhow!(bound),
+        Refused::Stopped(error) => error,
+    })
 }
 
 /// The same keys for a view-time build (references, rules, interfaces), which must give the
