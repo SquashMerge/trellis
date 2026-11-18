@@ -42,13 +42,30 @@ returns `{revision,path,items,nextOffset,truncated,warnings}`. Each item is
 the captured native `Header`. Two optional facts come from parsing the cached file with the same
 grammars (#526), never from source regexes: `callableInitializer: true` on a JavaScript, TypeScript or Python
 binding whose whole initializer is a function or lambda, and `implTarget` on a Rust `impl` block,
-naming the last path segment of the type it implements. Both are absent when false, unknown, or
-when the file cannot be parsed within the Files budget; the outline then lists no binding as a
-callable and leaves the impl's methods at the top level. Source range and parent identity remain those of the original
-symbol. Nullable captured metadata, including `header.resultType`, stays nullable. Do not invent
+naming the last path segment of the type it implements. Both are absent when false or unknown.
+A file beyond the outline syntax bounds (below) has neither, and the answer's `warnings` says so;
+the outline then lists no binding as a callable and leaves the impl's methods at the top level.
+So does an asked `impl` block with no syntax at its measured range, with its own warning.
+Source range and parent identity remain those of the original symbol. Nullable captured metadata, including `header.resultType`, stays nullable. Do not invent
 a return type, name or finer declaration kind from source regexes or optional SCIP labels. The
 default and maximum page size are 200. Order is source order, then original symbol ID; paging
 must preserve that order. `nextOffset` identifies the next page when present.
+
+The outline's two syntax facts are bounded by the cached file alone, so the same file gives the
+same facts on any machine (the [2026-11-18 owner ruling](https://github.com/SquashMerge/trellis/issues/1119),
+which replaced the 250 ms per-file time bound for the outline):
+
+| Outline syntax bound | Limit |
+| --- | --- |
+| Cached source per parsed file | 2 MiB |
+| Syntax depth of the walk | 128 levels |
+| Syntax nodes the walk visits | 1,000,000 |
+| Re-parsed macro input (a Rust `impl` inside a measured macro) | Measurement's macro byte budget |
+| Hang backstop | 10 seconds wall clock |
+
+A file beyond a size, depth or visit bound gets the warning on every read. The hang backstop
+never decides an answer: reaching it fails the outline read typed `deadline_exceeded`, with no
+partial outline.
 
 The native declaration `SyntaxId` is already the projected graph `Symbol.id`. Callable sequence
 seeds use that exact ID, never a name join or a guessed ID translation. Retaining `nativeKind`
@@ -94,6 +111,8 @@ This is a request-time syntax scan, not a new stored reference index. Its query-
 A parser progress callback and iterative walk enforce work bounds; checking elapsed time only
 after parsing is not sufficient. These are authorized query-work limits, not new stored-row
 re-attestation or unrelated per-field read caps under [T00](local-topology.md#t00--threat-model).
+These are the syntax scan's bounds only; the outline's syntax facts have the input-only bounds
+above (#1119), with no per-file time bound.
 
 The response is `{revision,symbolId,evidenceKind,scope,items,continuation,partial,truncated,warnings}`.
 `evidenceKind` is `"syntaxMatches"`. Scope is `{sourceSetId,language,spelling}`; `spelling` may be
