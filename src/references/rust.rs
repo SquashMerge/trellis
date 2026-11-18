@@ -151,6 +151,9 @@ struct Binding {
     public: bool,
     /// `pub(crate)`: visible in its own crate only.
     crate_only: bool,
+    /// `pub(self)`, `pub(super)` or `pub(in path)`: the path of the module the item is
+    /// visible in, read from the item's own module (#1209).
+    restricted: Option<Vec<String>>,
     uncertain: bool,
     /// An `extern crate name;` that keeps the crate's own name (#1166).
     own_crate: bool,
@@ -1051,6 +1054,7 @@ impl Catalog {
                     candidate: None,
                     public: visibility(doc, child).is_some(),
                     crate_only: false,
+                    restricted: None,
                     uncertain: true,
                     own_crate: child.child_by_field_name("alias").is_none(),
                 });
@@ -1125,10 +1129,14 @@ impl Catalog {
             proof: BTreeSet::from([document]),
         });
         let public = visibility(doc, child).is_some();
-        // `pub(crate)` is visible throughout its crate (#828); other restricted
-        // visibilities are not modeled.
+        // `pub(crate)` is visible throughout its crate (#828); another restricted visibility
+        // is visible in the module its path names (#1209), and one whose path is not read
+        // is not modeled.
         let crate_only = crate_visibility(doc, child);
-        let restricted = visibility(doc, child).is_some_and(|v| v != "pub") && !crate_only;
+        let restricted = visibility(doc, child)
+            .filter(|v| *v != "pub" && !crate_only)
+            .map(restriction_path);
+        let unread = restricted.as_ref().is_some_and(Option::is_none);
         for &namespace in namespaces {
             self.step(check)?;
             self.scopes[scope]
@@ -1139,8 +1147,9 @@ impl Catalog {
                     candidate: candidate.clone(),
                     public,
                     crate_only,
+                    restricted: restricted.clone().flatten(),
                     uncertain: item_uncertain
-                        || restricted
+                        || unread
                         || item_custom
                         || declaration.is_some_and(|d| d.role == DeclarationRole::Test),
                     own_crate: false,
@@ -1273,6 +1282,7 @@ impl Catalog {
                                 candidate: None,
                                 public: false,
                                 crate_only: false,
+                                restricted: None,
                                 uncertain: true,
                                 own_crate: false,
                             });
@@ -1345,12 +1355,15 @@ impl Catalog {
     fn parent_module(&self, module: usize) -> Option<usize> {
         self.scopes[module].parent.map(|p| self.scopes[p].module)
     }
+    /// The names `scope` binds as `name`. `exported` says the lookup comes from outside the
+    /// module of `scope`, from `site` when that is known: an export set has no one site.
     #[allow(clippy::too_many_arguments)] // Captured context and route remain explicit.
     fn binding(
         &mut self,
         scope: usize,
         name: &str,
         exported: bool,
+        site: Option<usize>,
         depth: usize,
         route: &mut Route,
         context: ResolveContext<'_, '_>,
@@ -1388,7 +1401,11 @@ impl Catalog {
                 if exported && !binding.visible(context) {
                     continue;
                 }
-                if binding.uncertain {
+                let hidden = match &binding.restricted {
+                    Some(path) if exported => !self.restriction_admits(scope, path, site, check)?,
+                    _ => false,
+                };
+                if binding.uncertain || hidden {
                     bucket.unknown = true;
                 } else if let Some(mut candidate) = binding.candidate {
                     candidate.follow = candidate.follow.max(depth);
@@ -1535,6 +1552,61 @@ impl Catalog {
         }
         Ok(())
     }
+    /// Whether a restricted item of `declaring`'s module, visible in the module `path` names
+    /// (`pub(in path)`, with `pub(self)` and `pub(super)` read as `pub(in self)` and
+    /// `pub(in super)`), is visible at `site` (#1209). A lookup that has private access to
+    /// the item's module needs no proof; this is for one from outside it. The path is read
+    /// from the item's module: `crate`, `self` or `super`s, then the names of single `mod`
+    /// items down to the module the item is visible in, which must be the item's module or
+    /// one of its ancestors, as the compiler requires. The site is inside when its own
+    /// module is that module or below it. Anything else, a lookup with no one site
+    /// included, is not proved.
+    fn restriction_admits(
+        &mut self,
+        declaring: usize,
+        path: &[String],
+        site: Option<usize>,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<bool> {
+        self.step(check)?;
+        let Some(site) = site else {
+            return Ok(false);
+        };
+        let module = self.scopes[declaring].module;
+        let (mut current, mut rest) = match path.split_first() {
+            Some((first, rest)) if first == "crate" => match self.root(module) {
+                Some(root) => (root, rest),
+                None => return Ok(false),
+            },
+            Some((first, rest)) if first == "self" => (module, rest),
+            _ => (module, path),
+        };
+        while let Some((first, tail)) = rest.split_first()
+            && first == "super"
+        {
+            let Some(parent) = self.parent_module(current) else {
+                return Ok(false);
+            };
+            current = parent;
+            rest = tail;
+        }
+        for name in rest {
+            self.step(check)?;
+            let Some([binding]) = self.scopes[current]
+                .explicit
+                .get(&(TYPE, name.clone()))
+                .map(Vec::as_slice)
+            else {
+                return Ok(false);
+            };
+            let Some(child) = binding.candidate.as_ref().and_then(|c| c.module) else {
+                return Ok(false);
+            };
+            current = child;
+        }
+        Ok(self.private_access(module, current, check)?
+            && self.private_access(site, current, check)?)
+    }
     fn private_access(
         &mut self,
         site: usize,
@@ -1677,6 +1749,7 @@ impl Catalog {
                 current,
                 &path[index..],
                 exported,
+                scope,
                 depth,
                 route,
                 context,
@@ -1688,6 +1761,7 @@ impl Catalog {
                     current,
                     &path[index],
                     exported,
+                    Some(scope),
                     depth,
                     route,
                     context,
@@ -1811,6 +1885,7 @@ impl Catalog {
         scope: usize,
         rest: &[String],
         exported: bool,
+        site: usize,
         depth: usize,
         route: &Route,
         context: ResolveContext<'_, '_>,
@@ -1829,6 +1904,15 @@ impl Catalog {
         let Some([binding]) = declaring.explicit.get(&key).map(Vec::as_slice) else {
             return Ok(None);
         };
+        let restricted = binding.restricted.clone();
+        if exported
+            && let Some(path) = &restricted
+            && !self.restriction_admits(scope, path, Some(site), check)?
+        {
+            return Ok(None);
+        }
+        let declaring = &self.scopes[scope];
+        let binding = &declaring.explicit[&key][0];
         if declaring.cut
             || binding.uncertain
             || (exported && !binding.visible(context))
@@ -2219,7 +2303,7 @@ impl Catalog {
         }
         for name in spellings {
             self.step(check)?;
-            let resolved = self.binding(module, &name, true, depth, route, context, check)?;
+            let resolved = self.binding(module, &name, true, None, depth, route, context, check)?;
             result.unknown_set |= resolved.unknown_set;
             for (key, bucket) in resolved.names {
                 result.names.insert(key, bucket);
@@ -2889,6 +2973,23 @@ fn parts(value: &str) -> Option<Vec<String>> {
             .all(|p| !p.is_empty() && p.chars().all(|c| c == '_' || c.is_alphanumeric())))
     .then(|| parts.into_iter().map(str::to_owned).collect())
 }
+/// The module path of a restricted visibility other than `pub(crate)` (#1209): `pub(self)`
+/// and `pub(super)` read as `pub(in self)` and `pub(in super)`. Only a path that starts with
+/// `crate`, `self` or `super` is read, as edition 2018 requires; anything else, a comment
+/// inside the parentheses included, is `None`.
+fn restriction_path(visibility: &str) -> Option<Vec<String>> {
+    let inner = visibility
+        .strip_prefix("pub")?
+        .trim_start()
+        .strip_prefix('(')?
+        .strip_suffix(')')?
+        .trim();
+    let path = match inner.strip_prefix("in") {
+        Some(rest) if rest.starts_with(char::is_whitespace) => rest,
+        _ => inner,
+    };
+    parts(path).filter(|path| matches!(path[0].as_str(), "crate" | "self" | "super"))
+}
 /// Whether `node` is `pub(crate)`.
 fn crate_visibility(doc: &DocumentInput, node: Node<'_>) -> bool {
     visibility(doc, node).is_some_and(|v| {
@@ -3284,6 +3385,7 @@ mod cache_tests {
                 candidate: Some(candidate),
                 public: true,
                 crate_only: false,
+                restricted: None,
                 uncertain: false,
                 own_crate: false,
             }],
