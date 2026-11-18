@@ -664,6 +664,16 @@ fn change(delta: &git2::DiffDelta<'_>) -> Result<Option<GitChange>, GitReason> {
     };
     let path = if status == GitChangeKind::Deleted {
         path_string(delta.old_file().path())?
+    } else if delta.status() == Delta::Untracked
+        && let Some(nested) = delta
+            .new_file()
+            .path()
+            .and_then(Path::to_str)
+            .and_then(|path| path.strip_suffix('/'))
+    {
+        // Git reports an untracked nested repository as one `dir/` entry and never
+        // descends into it (#976): one added change, like a submodule's gitlink.
+        path_string(Some(Path::new(nested)))?
     } else {
         path_string(delta.new_file().path())?
     };
@@ -688,9 +698,11 @@ fn file_diff(
 ) -> Result<GitFileDiff, GitReason> {
     let patch = git2::Patch::from_diff(diff, index).map_err(git_error)?;
     let delta = diff.get_delta(index).ok_or(GitReason::GitChanged)?;
+    // A gitlink, or an untracked nested repository's directory entry (#976), is nontext.
+    let nontext = |mode| matches!(mode, git2::FileMode::Commit | git2::FileMode::Tree);
     let binary = delta.flags().contains(git2::DiffFlags::BINARY)
-        || delta.old_file().mode() == git2::FileMode::Commit
-        || delta.new_file().mode() == git2::FileMode::Commit;
+        || nontext(delta.old_file().mode())
+        || nontext(delta.new_file().mode());
     let mut hunks = Vec::new();
     let mut bytes = 0usize;
     if let Some(patch) = patch.filter(|_| !binary) {
