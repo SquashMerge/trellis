@@ -153,100 +153,117 @@ async function readNavigationLocation(force = false) {
   const context = navigationContext(), current = () => ticket === navigationSerial && navigationCurrent(context);
   const candidate = navigationEntries.get(window.history?.state?.trellisNavigation);
   const entry = candidate?.hash === (window.location?.hash || "") ? candidate : null;
-  // A stale history entry or link strips the URL, adding no entry, and opens the root view
-  // with no error (#951, owner ruling 2026-11-12). Malformed and other-checkout links still error.
-  const openRoot = async () => {
-    window.history?.replaceState?.(null, "", `${window.location?.pathname || ""}${window.location?.search || ""}`);
-    navigationLocation = navigationSignature();
-    $("error").hidden = true; $("error").textContent = "";
-    // Sequence starts empty, as on a fresh load: no selected method, enabled method actions or link error.
-    clearSource(); diagramSequence = null; sequenceBoundary = null; selectedMethod = null;
-    $("method-source").disabled = true; if ($("method-class")) $("method-class").disabled = true;
-    $("sequence-diagram").replaceChildren(); $("sequence-warnings").replaceChildren();
-    $("sequence-state").textContent = "Expand a file and select a method.";
-    renderFiles(); renderSequenceStart();
-    await setSection("diagrams");
-    if (!current()) return;
-    showNavigationView("architecture");
-  };
   try {
-    if (entry) {
-      // A stale entry, a Deviations tab entry (#965) included, opens the root view.
-      if (!navigationCurrent(entry)) return await openRoot();
-      if (entry.kind === "unavailable") return navigationError("This history entry has no saved source view. The current diagram remains open; use Forward to return to its link.");
-      $("error").hidden = true;
-      if (entry.kind === "source") return await restoreSourceEntry(entry, current);
-      if (entry.kind === "view") {
-        // A view with no saved selection (#818): Architecture, Treemap or Classes, as shown.
-        clearSource(); diagramSequence = null; sequenceBoundary = null;
-        await setSection("diagrams");
-        if (!current()) return;
-        return showNavigationView(entry.view);
-      }
-      if (entry.kind === "deviations") return await showDeviationsRoute(entry.filter, current);
-      if (entry.kind === "architecture") {
-        clearSource(); diagramSequence = null; sequenceBoundary = null;
-        await setSection("diagrams");
-        if (!current()) return;
-        showNavigationView(entry.architecture.inspection?.kind === "deviation" ? "deviations" : "architecture");
-        return await architecture.restore(entry.architecture, current);
-      }
-      clearSource(); diagramSequence = null;
-      await setSection("diagrams", entry.kind === "class" ? "classes" : "sequence");
-      if (!current()) return;
-      if (entry.kind === "class") return await openClasses({seed:entry.symbol.id});
-      $("all-steps").checked = entry.showAll;
-      return await selectMethod(entry.symbol, entry.admitted, current, entry.boundary);
-    }
-    const hash = window.location?.hash || "";
-    const oldKey = window.history?.state?.trellisNavigation;
-    const deviationsLink = hash === "#deviations" || hash.startsWith("#deviations?");
-    // An entry an index or checkout change dropped, a Deviations tab entry (#965) included, opens the root view.
-    if (typeof oldKey === "string" && oldKey.startsWith(`${navigationScope}:`)) return await openRoot();
-    if (!hash) return;
-    // A Deviations tab link (#965): the tab at the shown snapshot, on its app and edge.
-    if (deviationsLink) {
-      const query = new URLSearchParams(hash.slice("#deviations?".length));
-      const filter = {app:query.get("app"), edge:query.get("edge")};
-      rememberNavigation({kind:"deviations", filter}, true, hash);
-      return await showDeviationsRoute(filter, current);
-    }
-    if (!hash.startsWith("#sequence")) {
-      if (hash === "#source" || hash === "#classes" || window.history?.state?.trellisNavigation) return await openRoot();
-      return;
-    }
-    if (!hash.startsWith("#sequence?")) throw new Error("Sequence link requires a symbol ID (sid).");
-    const query = new URLSearchParams(hash.slice("#sequence?".length)), id = query.get("sid");
-    if (!id || !id.trim() || query.getAll("sid").length !== 1) throw new Error("Sequence link requires one valid symbol ID (sid).");
-    if (query.has("rootKey") && query.get("rootKey") !== selectedRootKey) throw new Error("Sequence link belongs to a different checkout. Select its checkout first.");
-    const revision = context.revision;
-    let requested = null;
-    if (query.has("indexGeneration") || query.has("indexRevision")) {
-      const value = query.get("indexRevision");
-      if (!/^(0|[1-9][0-9]*)$/.test(value || "")) throw new Error("Sequence link has an invalid index snapshot.");
-      requested = IndexPin.copy({indexGeneration:query.get("indexGeneration"), indexRevision:Number(value)});
-    }
-    const callIds = query.getAll("callId");
-    if (callIds.length && (callIds.length > SEQUENCE_LINK_CALL_IDS || new Set(callIds).size !== callIds.length || !callIds.every(callId => CALL_ID.test(callId)) ||
-        !query.has("rootKey") || !query.has("indexGeneration") || !query.has("indexRevision"))) throw new Error("Sequence link has invalid call IDs.");
-    // Only a well-formed link for this checkout can be stale.
-    if (requested && !IndexPin.equal(requested, revision)) return await openRoot();
-    const boundary = callIds.length ? {symbolId:id, callIds} : null;
-    clearSource(); diagramSequence = null;
-    await setSection("diagrams", "sequence");
-    if (!current()) return;
-    window.TrellisShell?.showView("sequence");
-    $("sequence-state").textContent = "Loading sequence link…";
-    const data = await api("/api/sequence", "POST", {seed:id, expectedRevision:revision, showAll:false, interactions:true}, current);
-    if (!current()) return;
-    if (!IndexPin.equal(data?.revision, revision) || data?.seed?.id !== id) throw new Error("Sequence link provenance mismatch. Nothing displayed.");
-    $("all-steps").checked = false;
-    // A resolved route stores only a key in browser history; seed/DTO remain in memory.
-    rememberNavigation({kind:"sequence", symbol:data.seed, admitted:data, showAll:false, boundary}, true, hash);
-    await selectMethod(data.seed, data, current, boundary);
+    return await (entry ? restoreHistoryEntry(entry, current) : openLocationHash(context, current));
   } catch (error) {
     if (current() && error.name !== "AbortError") navigationError(`Cannot open sequence: ${error.message}`);
   }
+}
+// A stale history entry or link strips the URL, adding no entry, and opens the root view
+// with no error (#951, owner ruling 2026-11-12). Malformed and other-checkout links still error.
+async function openRootView(current) {
+  window.history?.replaceState?.(null, "", `${window.location?.pathname || ""}${window.location?.search || ""}`);
+  navigationLocation = navigationSignature();
+  $("error").hidden = true; $("error").textContent = "";
+  // Sequence starts empty, as on a fresh load: no selected method, enabled method actions or link error.
+  clearSource(); diagramSequence = null; sequenceBoundary = null; selectedMethod = null;
+  $("method-source").disabled = true; if ($("method-class")) $("method-class").disabled = true;
+  $("sequence-diagram").replaceChildren(); $("sequence-warnings").replaceChildren();
+  $("sequence-state").textContent = "Expand a file and select a method.";
+  renderFiles(); renderSequenceStart();
+  await setSection("diagrams");
+  if (!current()) return;
+  showNavigationView("architecture");
+}
+// An entry this session wrote for the current URL, restored by its kind. The kinds that wait
+// return their promise; readNavigationLocation awaits it and reports what it throws.
+function restoreHistoryEntry(entry, current) {
+  // A stale entry, a Deviations tab entry (#965) included, opens the root view.
+  if (!navigationCurrent(entry)) return openRootView(current);
+  if (entry.kind === "unavailable") return navigationError("This history entry has no saved source view. The current diagram remains open; use Forward to return to its link.");
+  $("error").hidden = true;
+  if (entry.kind === "source") return restoreSourceEntry(entry, current);
+  // A view with no saved selection (#818): Architecture, Treemap or Classes, as shown.
+  if (entry.kind === "view") return restoreDiagramView(entry, current);
+  if (entry.kind === "deviations") return showDeviationsRoute(entry.filter, current);
+  if (entry.kind === "architecture") return restoreDiagramView(entry, current);
+  return restoreSymbolEntry(entry, current);
+}
+// A view entry shows its view; an Architecture entry shows Architecture or Deviations and restores its selection.
+async function restoreDiagramView(entry, current) {
+  clearSource(); diagramSequence = null; sequenceBoundary = null;
+  await setSection("diagrams");
+  if (!current()) return;
+  if (entry.kind === "view") return showNavigationView(entry.view);
+  showNavigationView(entry.architecture.inspection?.kind === "deviation" ? "deviations" : "architecture");
+  return await architecture.restore(entry.architecture, current);
+}
+// A Classes or Sequence entry: its diagram for the saved symbol.
+async function restoreSymbolEntry(entry, current) {
+  clearSource(); diagramSequence = null;
+  await setSection("diagrams", entry.kind === "class" ? "classes" : "sequence");
+  if (!current()) return;
+  if (entry.kind === "class") return await openClasses({seed:entry.symbol.id});
+  $("all-steps").checked = entry.showAll;
+  return await selectMethod(entry.symbol, entry.admitted, current, entry.boundary);
+}
+// The URL's hash when no entry of this session describes it: a dropped entry, a Deviations tab link
+// or a Sequence link. Like restoreHistoryEntry, it returns the promise of what it opens.
+function openLocationHash(context, current) {
+  const hash = window.location?.hash || "";
+  const oldKey = window.history?.state?.trellisNavigation;
+  const deviationsLink = hash === "#deviations" || hash.startsWith("#deviations?");
+  // An entry an index or checkout change dropped, a Deviations tab entry (#965) included, opens the root view.
+  if (typeof oldKey === "string" && oldKey.startsWith(`${navigationScope}:`)) return openRootView(current);
+  if (!hash) return;
+  // A Deviations tab link (#965): the tab at the shown snapshot, on its app and edge.
+  if (deviationsLink) {
+    const query = new URLSearchParams(hash.slice("#deviations?".length));
+    const filter = {app:query.get("app"), edge:query.get("edge")};
+    rememberNavigation({kind:"deviations", filter}, true, hash);
+    return showDeviationsRoute(filter, current);
+  }
+  if (!hash.startsWith("#sequence")) {
+    if (hash === "#source" || hash === "#classes" || window.history?.state?.trellisNavigation) return openRootView(current);
+    return;
+  }
+  const link = parseSequenceLink(hash), revision = context.revision;
+  // Only a well-formed link for this checkout can be stale.
+  if (link.requested && !IndexPin.equal(link.requested, revision)) return openRootView(current);
+  return openSequenceLink(hash, link, revision, current);
+}
+// A Sequence link's symbol, snapshot and call IDs. It throws the first problem, in this order:
+// the symbol ID, the checkout, the snapshot, the call IDs.
+function parseSequenceLink(hash) {
+  if (!hash.startsWith("#sequence?")) throw new Error("Sequence link requires a symbol ID (sid).");
+  const query = new URLSearchParams(hash.slice("#sequence?".length)), id = query.get("sid");
+  if (!id || !id.trim() || query.getAll("sid").length !== 1) throw new Error("Sequence link requires one valid symbol ID (sid).");
+  if (query.has("rootKey") && query.get("rootKey") !== selectedRootKey) throw new Error("Sequence link belongs to a different checkout. Select its checkout first.");
+  let requested = null;
+  if (query.has("indexGeneration") || query.has("indexRevision")) {
+    const value = query.get("indexRevision");
+    if (!/^(0|[1-9][0-9]*)$/.test(value || "")) throw new Error("Sequence link has an invalid index snapshot.");
+    requested = IndexPin.copy({indexGeneration:query.get("indexGeneration"), indexRevision:Number(value)});
+  }
+  const callIds = query.getAll("callId");
+  if (callIds.length && (callIds.length > SEQUENCE_LINK_CALL_IDS || new Set(callIds).size !== callIds.length || !callIds.every(callId => CALL_ID.test(callId)) ||
+      !query.has("rootKey") || !query.has("indexGeneration") || !query.has("indexRevision"))) throw new Error("Sequence link has invalid call IDs.");
+  return {id, requested, boundary:callIds.length ? {symbolId:id, callIds} : null};
+}
+// Reads a Sequence link's symbol at the shown snapshot and opens it, keeping only a key in history.
+async function openSequenceLink(hash, {id, boundary}, revision, current) {
+  clearSource(); diagramSequence = null;
+  await setSection("diagrams", "sequence");
+  if (!current()) return;
+  window.TrellisShell?.showView("sequence");
+  $("sequence-state").textContent = "Loading sequence link…";
+  const data = await api("/api/sequence", "POST", {seed:id, expectedRevision:revision, showAll:false, interactions:true}, current);
+  if (!current()) return;
+  if (!IndexPin.equal(data?.revision, revision) || data?.seed?.id !== id) throw new Error("Sequence link provenance mismatch. Nothing displayed.");
+  $("all-steps").checked = false;
+  // A resolved route stores only a key in browser history; seed/DTO remain in memory.
+  rememberNavigation({kind:"sequence", symbol:data.seed, admitted:data, showAll:false, boundary}, true, hash);
+  await selectMethod(data.seed, data, current, boundary);
 }
 // The Deviations tab (#965). Its link names the app and the tree's edge; no pin, so a reload shows the
 // tab at the head. Entering or leaving it by a tab, an entry point or Show on diagram adds a history
