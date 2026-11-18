@@ -1643,6 +1643,156 @@ fn references_rust_macro_call_inside_a_statement_keeps_its_block_unknown() {
     );
 }
 
+/// The sites of `src/a.rs` (after its first line) that map to `src/kinds.rs`, as spellings,
+/// and its other unresolved sites, as (spelling, reason), with `kinds` as `src/kinds.rs`.
+fn variant_resolution(kinds: &str, body: &str) -> (Vec<String>, Vec<(String, String)>) {
+    let source = format!("use crate::kinds::*;\n{body}");
+    let input = snapshot(&[
+        ("src/lib.rs", "mod kinds; mod a;"),
+        ("src/kinds.rs", kinds),
+        ("src/a.rs", &source),
+    ]);
+    let data = references::project(&input, &["src/a.rs".into()], 50, &mut || Ok(()))
+        .unwrap()
+        .data;
+    let mut mapped: Vec<String> = data["production"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|pair| {
+            pair["source"]["path"] == "src/a.rs" && pair["target"]["path"] == "src/kinds.rs"
+        })
+        .flat_map(|pair| pair["sites"].as_array().unwrap())
+        .filter(|site| site["lines"]["start"].as_u64().unwrap() > 1)
+        .map(|site| site["spelling"].as_str().unwrap().to_owned())
+        .collect();
+    mapped.sort();
+    let mut unresolved: Vec<(String, String)> = data["unresolved"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|u| u["site"]["spelling"] != "crate::kinds::*")
+        .map(|u| {
+            (
+                u["site"]["spelling"].as_str().unwrap().to_owned(),
+                u["reason"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    unresolved.sort();
+    (mapped, unresolved)
+}
+
+fn unknown_paths(spellings: &[&str]) -> Vec<(String, String)> {
+    spellings
+        .iter()
+        .map(|s| ((*s).to_owned(), "rust_export_name_set_unknown".to_owned()))
+        .collect()
+}
+
+/// #1200: `Enum::Variant` maps to the file that declares the enum, whatever the variant's
+/// shape, the site's namespace or the path that reaches the enum.
+#[test]
+fn references_rust_enum_variant_maps_to_its_enum_declaration() {
+    let (mapped, unresolved) = variant_resolution(
+        "pub enum Kind { Unit, Tuple(u8), Record { x: u8 } }\npub mod inner { pub enum Deep<T> { Leaf(T) } }",
+        "use crate::kinds::Kind as K;\n\
+         use crate::kinds::Kind::Unit;\n\
+         fn f(k: Kind) -> u8 {\n\
+         let _ = Kind::Unit; let _ = Kind::Tuple(1); let _ = Kind::Record { x: 1 };\n\
+         let _ = K::Unit; let _ = crate::kinds::Kind::Tuple; let _ = inner::Deep::Leaf(1);\n\
+         match k { Kind::Unit => 0, Kind::Tuple(x) => x, Kind::Record { x } => x } }",
+    );
+    assert_eq!(
+        mapped,
+        [
+            "K::Unit",
+            "Kind::Record",
+            "Kind::Record",
+            "Kind::Tuple",
+            "Kind::Tuple",
+            "Kind::Unit",
+            "Kind::Unit",
+            "crate::kinds::Kind as K",
+            "crate::kinds::Kind::Tuple",
+            "crate::kinds::Kind::Unit",
+            "inner::Deep::Leaf",
+        ]
+    );
+    assert_eq!(unresolved, []);
+}
+
+/// #1200: an enum declared in the site's own file resolves the same way: the variant
+/// paths that stayed unknown are now proved, with no edge to the file itself.
+#[test]
+fn references_rust_same_file_enum_variant_is_proved() {
+    let input = snapshot(&[
+        ("src/lib.rs", "mod a;"),
+        (
+            "src/a.rs",
+            "enum Local { One, Two(u8) }\nfn f(l: Local) -> u8 { match l { Local::One => 0, Local::Two(x) => x } }",
+        ),
+    ]);
+    let data = references::project(&input, &["src/a.rs".into()], 20, &mut || Ok(()))
+        .unwrap()
+        .data;
+    assert!(data["unresolved"].as_array().unwrap().is_empty(), "{data}");
+}
+
+/// #1200 guards: only a variant the enum's body certainly spells resolves. A variant under
+/// `cfg` or `cfg_attr`, a path through a type alias or `Self`, an enum under an attribute
+/// macro, an inherent or trait item and a glob over an enum stay unknown.
+#[test]
+fn references_rust_enum_variant_guards_keep_uncertain_members_unknown() {
+    let (mapped, unresolved) = variant_resolution(
+        "pub enum Kind { #[cfg(unix)] Gated, #[cfg_attr(unix, cfg(unix))] Attr, #[doc = \"x\"] Plain }",
+        "fn f() { let _ = Kind::Gated; let _ = Kind::Attr; let _ = Kind::Plain; }",
+    );
+    assert_eq!(mapped, ["Kind::Plain"]);
+    assert_eq!(unresolved, unknown_paths(&["Kind::Attr", "Kind::Gated"]));
+
+    let (mapped, unresolved) = variant_resolution(
+        "pub enum Kind { A }\npub type Alias = Kind;",
+        "fn f() { let _ = Alias::A; }",
+    );
+    assert_eq!(mapped, Vec::<String>::new());
+    assert_eq!(unresolved, unknown_paths(&["Alias::A"]));
+
+    let (mapped, unresolved) = variant_resolution(
+        "pub enum Kind { A }",
+        "impl Kind { pub fn make() -> Self { Self::A } }",
+    );
+    assert_eq!(mapped, Vec::<String>::new());
+    assert_eq!(unresolved, unknown_paths(&["Self::A"]));
+
+    // The attribute could be a macro that rewrites the enum: `Kind` itself is unknown.
+    let (mapped, unresolved) = variant_resolution(
+        "#[rewrite] pub enum Kind { A }",
+        "fn f() { let _ = Kind::A; }",
+    );
+    assert_eq!(mapped, Vec::<String>::new());
+    assert_eq!(unresolved, unknown_paths(&["Kind::A"]));
+
+    let (mapped, unresolved) = variant_resolution(
+        "pub enum Kind { A }\nimpl Kind { pub fn new() -> Self { Kind::A } }\npub trait Make { fn make(); }",
+        "fn f() { let _ = Kind::new(); Make::make(); }",
+    );
+    assert_eq!(mapped, Vec::<String>::new());
+    assert_eq!(unresolved, unknown_paths(&["Kind::new", "Make::make"]));
+
+    let (_, unresolved) = variant_resolution(
+        "pub enum Kind { A }",
+        "use crate::kinds::Kind::*;\nfn f() { let _ = A; }",
+    );
+    assert!(
+        unresolved.contains(&(
+            "crate::kinds::Kind::*".to_owned(),
+            "rust_export_name_set_unknown".to_owned()
+        )),
+        "{unresolved:?}"
+    );
+}
+
 #[test]
 fn references_rust_named_module_export_uses_declaration_owner_not_members() {
     let input = snapshot(&[

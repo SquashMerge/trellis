@@ -212,6 +212,9 @@ pub(super) struct Catalog {
     /// The items under a known attribute macro whose scope stays transparent until the
     /// macro's path is proved to reach its own package, after the scan.
     proofs: Vec<MacroProof>,
+    /// The variants each enum declaration spells, by the declaration's document and range
+    /// (#1200): `true` for a variant with no `cfg` or `cfg_attr`, which certainly exists.
+    variants: BTreeMap<(usize, usize, usize), BTreeMap<String, bool>>,
     pub(super) work: Work,
 }
 /// A crate root: a conventional root of the checkout's package, or a library or binary
@@ -252,6 +255,7 @@ impl Catalog {
             externs: BTreeMap::new(),
             uniform: BTreeSet::new(),
             proofs: Vec::new(),
+            variants: BTreeMap::new(),
             work,
         };
         let declarations = result.index_files(docs, trees, workspace, check)?;
@@ -713,6 +717,9 @@ impl Catalog {
                 && let Some(name) = child.child_by_field_name("name")
             {
                 let name = self.bind_item(item, name, namespaces, declarations, check)?;
+                if child.kind() == "enum_item" {
+                    self.record_variants(doc, document, child, check)?;
+                }
                 if let Some(proof) = &mut proof {
                     for &namespace in namespaces {
                         let key = (namespace, name.clone());
@@ -1763,6 +1770,16 @@ impl Catalog {
                 .filter(|b| !b.unknown && b.candidates.len() == 1)
                 .and_then(|b| b.candidates.values().next());
             if found.unknown_set || next.and_then(|c| c.module).is_none() {
+                // `Enum::Variant` (#1200): the last segment after a proved enum.
+                if !found.unknown_set
+                    && index + 1 == path.len()
+                    && let Some(enumeration) = next
+                {
+                    let enumeration = enumeration.clone();
+                    if let Some(names) = self.variant(&enumeration, &path[index], check)? {
+                        return Ok(names);
+                    }
+                }
                 return Ok(Names {
                     unknown_set: true,
                     ..Names::default()
@@ -1851,6 +1868,82 @@ impl Catalog {
             .or_default()
             .candidates
             .insert(candidate.declaration.clone(), candidate);
+        Ok(Some(names))
+    }
+    /// The variants an enum item spells (#1200). An enum body holds no macro call, and an
+    /// attribute macro cannot apply to a variant, so its text lists every variant there is;
+    /// only `cfg` and `cfg_attr` can leave one out. A variant written twice, or in a body
+    /// the parser could not read, is not certain.
+    fn record_variants(
+        &mut self,
+        doc: &DocumentInput,
+        document: usize,
+        item: Node<'_>,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let Some(body) = item.child_by_field_name("body") else {
+            return Ok(());
+        };
+        let readable = !body.has_error();
+        let mut variants = BTreeMap::new();
+        let mut conditional = false;
+        let mut cursor = body.walk();
+        for child in body.named_children(&mut cursor) {
+            self.step(check)?;
+            match child.kind() {
+                "attribute_item" => {
+                    let attribute: String = text(doc, child)
+                        .chars()
+                        .filter(|c| !c.is_whitespace())
+                        .collect();
+                    conditional |=
+                        attribute.starts_with("#[cfg(") || attribute.starts_with("#[cfg_attr(");
+                }
+                "enum_variant" => {
+                    if let Some(name) = child.child_by_field_name("name") {
+                        variants
+                            .entry(text(doc, name).to_owned())
+                            .and_modify(|certain| *certain = false)
+                            .or_insert(readable && !conditional);
+                    }
+                    conditional = false;
+                }
+                _ => {}
+            }
+        }
+        self.variants
+            .insert((document, item.start_byte(), item.end_byte()), variants);
+        Ok(())
+    }
+    /// `Enum::Variant`: the names of the variant, which lives in the enum's own declaration,
+    /// when `enumeration` is a proved enum whose body certainly spells it (#1200). A variant
+    /// is found before any associated item of the same name, so no `impl` or trait can take
+    /// its place. Anything else (an inherent or trait item, a type alias, a conditional
+    /// variant) stays unknown.
+    fn variant(
+        &mut self,
+        enumeration: &Candidate,
+        name: &str,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<Option<Names>> {
+        self.step(check)?;
+        let declaration = &enumeration.declaration;
+        let certain = self
+            .variants
+            .get(&(declaration.document, declaration.start, declaration.end))
+            .and_then(|variants| variants.get(name));
+        if certain != Some(&true) {
+            return Ok(None);
+        }
+        let mut names = Names::default();
+        for namespace in [TYPE, VALUE] {
+            names
+                .names
+                .entry((namespace, name.to_owned()))
+                .or_default()
+                .candidates
+                .insert(declaration.clone(), enumeration.clone());
+        }
         Ok(Some(names))
     }
     /// A module prefix alone, useful as an expansion target, not a synthetic declaration.
@@ -3175,6 +3268,7 @@ mod cache_tests {
             externs: BTreeMap::new(),
             uniform: BTreeSet::new(),
             proofs: Vec::new(),
+            variants: BTreeMap::new(),
             work: Work::new(work::reference_limit(0, 0)),
         }
     }
