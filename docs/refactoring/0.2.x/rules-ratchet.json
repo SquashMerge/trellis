@@ -5,11 +5,11 @@
   "measurement": "`python3 tools/rules-ratchet.py --update`: a debug build of this checkout, its own daemon under a private HOME, a fresh index, then rust-analyzer (trusted) and scip-typescript (restricted) imported.",
   "deviatingPairs": 12,
   "deviatingReferences": 73,
-  "unknownReferences": 5877,
+  "unknownReferences": 5867,
   "partialFiles": 0,
-  "comparablePairs": 2292,
+  "comparablePairs": 2291,
   "conformingPairs": 1998,
-  "unknownPairs": 282,
+  "unknownPairs": 281,
   "deviatingReferencesByPair": {
     "src/model.rs": {
       "src/watch.rs": 1
