@@ -1710,6 +1710,93 @@ fn hint_during_a_retried_attempt_waits_for_the_owner_retry() {
     );
 }
 
+/// #1128: an attempt whose slot was removed while it ran still wakes the waiters when it
+/// settles. The waiter is parked on the owner's condvar before the slot disappears and again
+/// before the settle; only the settle can wake it, and the backstop fails the test.
+#[test]
+fn settling_a_vanished_slot_wakes_a_parked_waiter() {
+    let core = Arc::new(Core::default());
+    let (_source, registration, job) = claimed(&core);
+    let id = registration.id;
+    // What the waiter waits for: the attempt's physical cleanup, done before its settle.
+    let cleaned = AtomicBool::new(false);
+    let (parking_tx, parking) = mpsc::channel();
+    // The waiter sends with the inbox held and releases it only by parking, so taking the
+    // inbox after a message proves the waiter is parked.
+    let parked = || {
+        parking.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap();
+        drop(core.inbox.lock().unwrap());
+    };
+    std::thread::scope(|scope| {
+        let waiter = scope.spawn(|| {
+            let mut inbox = core.inbox.lock().unwrap();
+            while !cleaned.load(Ordering::Acquire) {
+                parking_tx.send(()).unwrap();
+                let (guard, wait) = core
+                    .changed
+                    .wait_timeout(inbox, crate::testing::HANG_BACKSTOP)
+                    .unwrap();
+                assert!(!wait.timed_out(), "only the hang backstop woke the waiter");
+                inbox = guard;
+            }
+        });
+        parked();
+        // The registration drops while its attempt runs; its notification wakes the waiter,
+        // which finds no cleanup yet and parks again.
+        drop(registration);
+        parked();
+        assert!(!core.inbox.lock().unwrap().slots.contains_key(&id));
+        cleaned.store(true, Ordering::Release);
+        core.settle(
+            &job,
+            Outcome {
+                pin: Some(pin(1)),
+                cache_epoch: 0,
+                result: Ok(()),
+            },
+        );
+        waiter.join().unwrap();
+    });
+}
+
+/// #1128, #777: the exhausting settle publishes the head settled inside its inbox
+/// transition. The owner is held inside `head.settle()`; another thread finds the inbox still
+/// held there, and once the owner leaves, sees the cooldown and the settled head together.
+#[test]
+fn exhausting_settle_settles_the_head_inside_the_inbox_transition() {
+    let core = Arc::new(Core::default());
+    let (_source, registration, job) = claimed(&core);
+    core.inbox
+        .lock()
+        .unwrap()
+        .slots
+        .get_mut(&registration.id)
+        .unwrap()
+        .retries = MAX_FAULT_RETRIES;
+    let head = registration.head_slot();
+    assert!(head.pending_for(pin(1), 0));
+    let (reached_tx, reached) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    head.set_settle_hook_for_tests(Box::new(move || {
+        reached_tx.send(()).unwrap();
+        released
+            .recv_timeout(crate::testing::HANG_BACKSTOP)
+            .unwrap();
+    }));
+    std::thread::scope(|scope| {
+        let owner = scope.spawn(|| core.settle(&job, failed(StorageBusy.into())));
+        reached.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap();
+        let inbox_held = core.inbox.try_lock().is_err();
+        release.send(()).unwrap();
+        owner.join().unwrap();
+        assert!(inbox_held, "head.settle() ran after the inbox was released");
+    });
+    let inbox = core.inbox.lock().unwrap();
+    assert!(inbox.slots[&registration.id].fault_cooldown.is_some());
+    drop(inbox);
+    assert!(!head.pending_for(pin(1), 0));
+}
+
 #[test]
 fn head_change_requeues_the_slot_without_a_hint() {
     let core = Arc::new(Core::default());
