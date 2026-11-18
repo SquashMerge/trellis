@@ -5,11 +5,11 @@
   "measurement": "`python3 tools/rules-ratchet.py --update`: a debug build of this checkout, its own daemon under a private HOME, a fresh index, then rust-analyzer (trusted) and scip-typescript (restricted) imported.",
   "deviatingPairs": 2,
   "deviatingReferences": 3,
-  "unknownReferences": 3874,
+  "unknownReferences": 3805,
   "partialFiles": 0,
-  "comparablePairs": 2348,
-  "conformingPairs": 2072,
-  "unknownPairs": 269,
+  "comparablePairs": 2320,
+  "conformingPairs": 2073,
+  "unknownPairs": 240,
   "deviatingReferencesByPair": {
     "src/store/mcp_read.rs": {
       "src/symbol_lookup.rs": 1
