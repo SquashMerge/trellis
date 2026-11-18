@@ -959,7 +959,10 @@ Supported mapping is deliberately narrow:
   could bind any name, so a first path segment that scope does not bind itself is
   unknown there. Syntax decides what a macro call is (#1163): an expression statement
   counts when a macro call lies anywhere in it, nested blocks included, and a `!=`, a
-  unary `!` or a `!` in a string or character literal does not. An attribute on an
+  unary `!` or a `!` in a string or character literal does not. A macro call inside a
+  `static` or `const` initializer is an expression, which cannot bind an item (#1191):
+  it makes only that initializer uncertain, not the module or block that holds the
+  item. An attribute on an
   item, or an inner `#![...]` on a module or block, makes that scope opaque in the same
   way unless the catalog reads it (owner ruling 2026-11-17): `cfg` and `cfg_attr` make
   the item or scope conditional, `#[test]` the item, and `#[path = ...]` a custom root;

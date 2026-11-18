@@ -2611,6 +2611,62 @@ fn references_rust_attribute_macros_outside_the_ruling_keep_their_scope_unknown(
     assert_eq!(attributes_hiding_g(&rows, "pub fn b() {}"), rows);
 }
 
+/// #1191: a macro call inside a `static` or `const` initializer is an expression, which
+/// cannot bind a module item, so the module's other paths stay resolvable.
+#[test]
+fn references_rust_macro_in_a_static_or_const_initializer_keeps_its_module_resolvable() {
+    let items = [
+        "static S: String = format!(\"x\");",
+        "pub const C: usize = y!();",
+        "const C: [u8; 1] = [y!()];",
+        "const C: usize = { y!() };",
+    ];
+    let hiding: Vec<_> = items
+        .iter()
+        .filter(|item| {
+            !resolves_past_attribute(&format!("use crate::n::*;\n{item}\nfn f() {{ g(); }}\n"))
+        })
+        .collect();
+    assert_eq!(hiding, Vec::<&&str>::new());
+    // The reported shape: the module resolves, and a path beside the macro call in the
+    // initializer stays unknown.
+    let input = snapshot(&[
+        ("src/lib.rs", "mod m; mod n;"),
+        (
+            "src/m.rs",
+            "use crate::n::*;\nstatic S: Lazy<String> = Lazy::new(|| format!(\"x\"));\nfn f() { g(); }\n",
+        ),
+        ("src/n.rs", "pub fn g() {}"),
+    ]);
+    let data = references::project(&input, &["src/m.rs".into()], 20, &mut || Ok(()))
+        .unwrap()
+        .data;
+    let unknown: Vec<_> = data["unresolved"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|site| site["site"]["spelling"].as_str().unwrap())
+        .collect();
+    assert_eq!(unknown, ["Lazy::new"], "{data}");
+    assert!(has_edge(&data, "src/m.rs", "src/n.rs"), "{data}");
+    // A `const` in a block confines its initializer's macro call the same way.
+    assert_eq!(
+        macro_opacity_lines("fn f() { const C: u8 = y!(); m::g(); }\n"),
+        (vec![2], 0)
+    );
+}
+
+/// #1191 guard: a macro call standing as an item could bind any name in its module.
+#[test]
+fn references_rust_item_position_macro_keeps_its_module_unknown() {
+    for item in ["y!();", "y! { }", "static S: u8 = 0; y!();"] {
+        assert!(
+            !resolves_past_attribute(&format!("use crate::n::*;\n{item}\nfn f() {{ g(); }}\n")),
+            "{item}"
+        );
+    }
+}
+
 #[test]
 fn references_rust_root_only_standard_library_import_does_not_shadow_itself() {
     let input = snapshot(&[("src/lib.rs", "use std;")]);
