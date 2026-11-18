@@ -1848,6 +1848,140 @@ fn references_rust_enum_variant_guards_keep_uncertain_members_unknown() {
     );
 }
 
+/// A crate of restricted items for #1209: `src/outer/inner.rs` declares them, and every
+/// other file looks them up from inside or outside their scopes.
+fn restricted_crate() -> Snapshot {
+    snapshot(&[
+        (
+            "src/lib.rs",
+            "mod outer; mod other;\nfn root() { outer::inner::lifted(); }",
+        ),
+        (
+            "src/outer.rs",
+            "pub mod inner; mod sibling;\nfn top() { inner::lifted(); inner::scoped(); inner::bounded(); }",
+        ),
+        (
+            "src/outer/inner.rs",
+            "pub(super) fn lifted() {}\n\
+             pub(in crate::outer) fn scoped() {}\n\
+             pub(in super) fn bounded() {}\n\
+             pub(self) fn own() {}\n\
+             pub(in crate::outer::inner) fn narrow() {}\n\
+             pub(in crate::other) fn elsewhere() {}\n\
+             pub(in outer) fn bare() {}\n\
+             pub(/* x */ super) fn commented() {}\n\
+             pub(super) enum Value { Str(u8), Num }\n\
+             fn here(v: Value) -> u8 { own(); narrow(); match v { Value::Str(x) => x, Value::Num => 0 } }\n\
+             mod nested { fn deep() { super::lifted(); super::own(); super::narrow(); } }",
+        ),
+        (
+            "src/outer/sibling.rs",
+            "use super::inner::Value;\n\
+             fn f() { super::inner::lifted(); crate::outer::inner::scoped(); let _ = Value::Num; }\n\
+             fn g() { super::inner::narrow(); super::inner::bare(); super::inner::commented(); }",
+        ),
+        (
+            "src/other.rs",
+            "fn h() { crate::outer::inner::scoped(); crate::outer::inner::own(); crate::outer::inner::elsewhere(); }",
+        ),
+    ])
+}
+
+/// The sites of `source` that map to `target`, as spellings, and the unresolved sites of
+/// `source`, as (spelling, reason). The path inside a `pub(in ..)` is a site of its own,
+/// which #1209 does not change, so the paths `restricted_crate` writes there are left out.
+fn sites_of(input: &Snapshot, source: &str, target: &str) -> (Vec<String>, Vec<(String, String)>) {
+    let data = references::project(input, &[source.into()], 50, &mut || Ok(()))
+        .unwrap()
+        .data;
+    let mut mapped: Vec<String> = data["production"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|pair| pair["source"]["path"] == source && pair["target"]["path"] == target)
+        .flat_map(|pair| pair["sites"].as_array().unwrap())
+        .map(|site| site["spelling"].as_str().unwrap().to_owned())
+        .collect();
+    mapped.sort();
+    let mut unresolved: Vec<(String, String)> = data["unresolved"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| {
+            (
+                u["site"]["spelling"].as_str().unwrap().to_owned(),
+                u["reason"].as_str().unwrap().to_owned(),
+            )
+        })
+        .filter(|(spelling, _)| {
+            !["crate::outer", "crate::outer::inner", "crate::other"].contains(&spelling.as_str())
+        })
+        .collect();
+    unresolved.sort();
+    (mapped, unresolved)
+}
+
+/// The unresolved sites a restricted item's lookup leaves: a name whose bucket is unknown.
+fn ambiguous(spellings: &[&str]) -> Vec<(String, String)> {
+    spellings
+        .iter()
+        .map(|s| ((*s).to_owned(), "rust_name_ambiguous".to_owned()))
+        .collect()
+}
+
+/// #1209: a `pub(super)`, `pub(in path)` or `pub(self)` item looked up from a site inside
+/// the module its visibility names is certain: from its own module, from a child module,
+/// from the parent its `super` or path names and from a sibling under that parent, by an
+/// inline path, an import or an enum variant path.
+#[test]
+fn references_rust_restricted_item_inside_its_scope_is_certain() {
+    let input = restricted_crate();
+    let (_, unresolved) = sites_of(&input, "src/outer/inner.rs", "src/outer/inner.rs");
+    assert_eq!(unresolved, []);
+    let (mapped, unresolved) = sites_of(&input, "src/outer.rs", "src/outer/inner.rs");
+    assert_eq!(mapped, ["inner::bounded", "inner::lifted", "inner::scoped"]);
+    assert_eq!(unresolved, []);
+    let (mapped, unresolved) = sites_of(&input, "src/outer/sibling.rs", "src/outer/inner.rs");
+    assert_eq!(
+        mapped,
+        [
+            "Value::Num",
+            "crate::outer::inner::scoped",
+            "super::inner::Value",
+            "super::inner::lifted",
+        ]
+    );
+    assert_eq!(
+        unresolved,
+        ambiguous(&[
+            "super::inner::bare",
+            "super::inner::commented",
+            "super::inner::narrow",
+        ])
+    );
+}
+
+/// #1209 guards: a restricted item stays unknown at a site outside the module its
+/// visibility names, when that path names no ancestor of the item's module, and when the
+/// visibility is not read (a path without `crate`, `self` or `super`, or a comment in it).
+#[test]
+fn references_rust_restricted_item_outside_its_scope_stays_unknown() {
+    let input = restricted_crate();
+    let (mapped, unresolved) = sites_of(&input, "src/lib.rs", "src/outer/inner.rs");
+    assert_eq!(mapped, Vec::<String>::new());
+    assert_eq!(unresolved, ambiguous(&["outer::inner::lifted"]));
+    let (mapped, unresolved) = sites_of(&input, "src/other.rs", "src/outer/inner.rs");
+    assert_eq!(mapped, Vec::<String>::new());
+    assert_eq!(
+        unresolved,
+        ambiguous(&[
+            "crate::outer::inner::elsewhere",
+            "crate::outer::inner::own",
+            "crate::outer::inner::scoped",
+        ])
+    );
+}
+
 #[test]
 fn references_rust_named_module_export_uses_declaration_owner_not_members() {
     let input = snapshot(&[
