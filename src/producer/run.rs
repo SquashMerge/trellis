@@ -44,17 +44,33 @@ use uuid::Uuid;
 pub const PREEMPT_WAIT: Duration = Duration::from_secs(30);
 
 /// Asks one automatic run to end because the head moved on (#660). The owner raises it before
-/// it looks at the slot, so a run that installs later still finds it.
+/// it looks at the slot, so a run that installs later still finds it. The run marks it started
+/// once its `run.json` is written, so the owner can tell a run that ran from a refusal (#1216).
 #[derive(Clone, Debug, Default)]
-pub struct SupersedeToken(Arc<AtomicBool>);
+pub struct SupersedeToken(Arc<TokenFlags>);
+
+#[derive(Debug, Default)]
+struct TokenFlags {
+    requested: AtomicBool,
+    started: AtomicBool,
+}
 
 impl SupersedeToken {
     pub fn request(&self) {
-        self.0.store(true, Ordering::SeqCst);
+        self.0.requested.store(true, Ordering::SeqCst);
     }
 
     pub fn is_requested(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.0.requested.load(Ordering::SeqCst)
+    }
+
+    /// The token's run wrote its first run record.
+    pub(super) fn mark_started(&self) {
+        self.0.started.store(true, Ordering::SeqCst);
+    }
+
+    pub(super) fn started(&self) -> bool {
+        self.0.started.load(Ordering::SeqCst)
     }
 
     pub(super) fn same(&self, other: &Self) -> bool {
@@ -472,6 +488,7 @@ impl Run<'_> {
             "capture_unavailable"
             | "index_not_ready"
             | "storage_busy"
+            | "rebuild_in_progress"
             | "producer_state_corrupt"
             | "invalid_request" => Finish::failed("producer_failed", line),
             _ => {
@@ -1013,6 +1030,9 @@ impl ProducerOwner {
             origin: active.origin,
         };
         state.write_run_record(&record)?;
+        if let Some(token) = &request.supersede {
+            token.mark_started();
+        }
         let mut run = Run {
             ctx,
             prepared: &prepared,

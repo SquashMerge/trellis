@@ -100,6 +100,10 @@ pub(crate) enum LaunchOutcome {
     SlotBusy,
     /// The plan's template no longer matches the approval.
     NeedsApproval,
+    /// The launch or the run ended in storage contention (`is_contention`): not a failure. The
+    /// next attempt waits for a newer state signal, such as the publication that held the
+    /// index, or the backstop (owner ruling 2026-11-18, #1216).
+    Contended { run_id: Option<String> },
     Finished {
         run_id: Option<String>,
         outcome: AutoOutcome,
@@ -441,6 +445,20 @@ impl OwnerState {
                 self.template_refused
                     .insert(producer.clone(), active.approval);
             }
+            LaunchOutcome::Contended { run_id } => {
+                // Only a refusal before the run record counts as no start; a run that ran
+                // keeps its start for `minIntervalSecs`.
+                if !active.token.started() {
+                    restore(self);
+                }
+                if let Some(run_id) = run_id {
+                    self.last_run_id.insert(producer.clone(), run_id);
+                }
+                self.hold = Some(Hold {
+                    version: seen,
+                    until: now + self.intervals.backstop,
+                });
+            }
             LaunchOutcome::Finished { run_id, outcome } => {
                 if let Some(run_id) = run_id {
                     self.last_run_id.insert(producer.clone(), run_id);
@@ -763,15 +781,72 @@ pub(crate) fn failure_code(text: &str) -> String {
     }
 }
 
+/// The typed storage contention codes (#1216): transient, retried after the publication or
+/// lock that caused them, never a producer failure.
+const CONTENTION: [&str; 2] = ["storage_busy", "rebuild_in_progress"];
+
+/// Whether `code` (an `errorCode` or a launch error's message) is storage contention.
+pub(crate) fn is_contention(code: &str) -> bool {
+    CONTENTION.contains(&code.split(':').next().unwrap_or_default())
+}
+
 /// SD6: whether a terminal run that ended `outcome` / `error_code` backs off the next attempt.
-/// Imports, supersession, preemption, root loss and abandonment do not.
+/// Imports, supersession, preemption, root loss, abandonment and contention do not.
 pub(crate) fn is_failure(outcome: Option<&str>, error_code: Option<&str>) -> bool {
     let code = error_code.or(outcome).unwrap_or_default();
     let class = code.split(':').next().unwrap_or_default();
     !(outcome == Some("imported")
         || matches!(code, "cancelled: superseded" | "cancelled: preempted")
         || matches!(class, "abandoned" | "root_changed")
-        || matches!(outcome, Some("abandoned" | "root_changed")))
+        || matches!(outcome, Some("abandoned" | "root_changed"))
+        || is_contention(code))
+}
+
+/// How a launch that ended before a run reply did, from its typed message: contention is held,
+/// anything else is a failure bound to `basis`, the revision the launch expected.
+pub(crate) fn launch_error(message: &str, basis: &str) -> LaunchOutcome {
+    if is_contention(message) {
+        return LaunchOutcome::Contended { run_id: None };
+    }
+    LaunchOutcome::Finished {
+        run_id: None,
+        outcome: AutoOutcome::Failed {
+            code: failure_code(message),
+            basis: basis.to_owned(),
+        },
+    }
+}
+
+/// How a run that replied ended, from its terminal reply. `expected` is the launch's revision,
+/// used when the reply names none.
+pub(crate) fn run_ended(reply: &serde_json::Value, expected: &str) -> LaunchOutcome {
+    let text = |key: &str| reply[key].as_str().map(str::to_owned);
+    let (outcome, error_code) = (text("outcome"), text("errorCode"));
+    let outcome = match error_code.as_deref() {
+        _ if outcome.as_deref() == Some("imported") => AutoOutcome::Imported,
+        Some("cancelled: superseded") => AutoOutcome::Superseded,
+        Some("cancelled: preempted") => AutoOutcome::Preempted,
+        Some(code) if is_contention(code) => {
+            return LaunchOutcome::Contended {
+                run_id: text("runId"),
+            };
+        }
+        _ if is_failure(outcome.as_deref(), error_code.as_deref()) => AutoOutcome::Failed {
+            code: failure_code(
+                error_code
+                    .as_deref()
+                    .or(outcome.as_deref())
+                    .unwrap_or_default(),
+            ),
+            basis: text("sourceRevision").unwrap_or_else(|| expected.to_owned()),
+        },
+        // Lost root or abandonment: neither a failure nor a start to wait out.
+        _ => return LaunchOutcome::NotReady,
+    };
+    LaunchOutcome::Finished {
+        run_id: text("runId"),
+        outcome,
+    }
 }
 
 /// The seed of each producer: its newest automatic run record (§6.6). `runs` is newest first.

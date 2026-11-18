@@ -772,7 +772,24 @@ fn failure_outcomes_follow_sd6() {
             Some("stale_basis: head revision changed"),
             true,
         ),
-        ("import_failed", Some("storage_busy: x"), true),
+        // Contention is held, never a failure (owner ruling 2026-11-18, #1216).
+        ("import_failed", Some("storage_busy: x"), false),
+        (
+            "producer_failed",
+            Some("storage_busy: SQLite lock contention"),
+            false,
+        ),
+        (
+            "producer_failed",
+            Some("rebuild_in_progress: a publication of 3 documents has locked the index"),
+            false,
+        ),
+        ("import_failed", Some("storage_full: disk is full"), true),
+        (
+            "producer_failed",
+            Some("index_not_ready: checkout is still starting"),
+            true,
+        ),
     ] {
         assert_eq!(
             is_failure(Some(outcome), code),
@@ -780,6 +797,136 @@ fn failure_outcomes_follow_sd6() {
             "{outcome} {code:?}"
         );
     }
+}
+
+#[test]
+fn contention_codes_are_storage_busy_and_rebuild_in_progress() {
+    for code in [
+        "storage_busy",
+        "storage_busy: SQLite lock contention",
+        "rebuild_in_progress",
+        "rebuild_in_progress: retry after it commits",
+    ] {
+        assert!(is_contention(code), "{code}");
+    }
+    for code in [
+        "",
+        "index_not_ready: x",
+        "storage_full: x",
+        "producer_busy: x",
+        "producer_failed: storage_busy",
+        "storage_busy_extra: x",
+    ] {
+        assert!(!is_contention(code), "{code}");
+    }
+}
+
+#[test]
+fn a_contended_launch_or_run_is_held_not_failed() {
+    // The dogfood case: plan preparation met a spilled publication.
+    let index_held = "rebuild_in_progress: a publication of 9 documents has locked the index";
+    assert_eq!(
+        launch_error(index_held, "h1"),
+        LaunchOutcome::Contended { run_id: None }
+    );
+    assert_eq!(
+        launch_error("storage_busy: SQLite lock contention", "h1"),
+        LaunchOutcome::Contended { run_id: None }
+    );
+    assert_eq!(
+        launch_error("index_not_ready: checkout is still starting", "h1"),
+        LaunchOutcome::Finished {
+            run_id: None,
+            outcome: failed("index_not_ready", "h1"),
+        }
+    );
+    let reply = |outcome: &str, code: Option<&str>| {
+        serde_json::json!({
+            "runId": "r1",
+            "outcome": outcome,
+            "errorCode": code,
+            "sourceRevision": "h0",
+        })
+    };
+    for (outcome, code) in [
+        ("producer_failed", "storage_busy: injected"),
+        ("producer_failed", index_held),
+        ("import_failed", "storage_busy: queue busy"),
+    ] {
+        assert_eq!(
+            run_ended(&reply(outcome, Some(code)), "h1"),
+            LaunchOutcome::Contended {
+                run_id: Some("r1".into())
+            },
+            "{outcome} {code}"
+        );
+    }
+    let ended = |outcome| LaunchOutcome::Finished {
+        run_id: Some("r1".into()),
+        outcome,
+    };
+    assert_eq!(
+        run_ended(
+            &reply("producer_failed", Some("producer_failed: exit 1")),
+            "h1"
+        ),
+        ended(failed("producer_failed", "h0"))
+    );
+    assert_eq!(
+        run_ended(&reply("imported", None), "h1"),
+        ended(AutoOutcome::Imported)
+    );
+    assert_eq!(
+        run_ended(&reply("cancelled", Some("cancelled: superseded")), "h1"),
+        ended(AutoOutcome::Superseded)
+    );
+    assert_eq!(
+        run_ended(&reply("abandoned", Some("abandoned")), "h1"),
+        LaunchOutcome::NotReady
+    );
+}
+
+#[test]
+fn contention_counts_as_a_start_only_once_the_run_record_exists() {
+    let base = Instant::now();
+    // Refused before the record: no start, no failure, held until a newer signal.
+    let mut s = ready(&[ALPHA], base);
+    let token = activate(&mut s, ALPHA, NOW_MS + 20_000);
+    let contended = LaunchOutcome::Contended { run_id: None };
+    assert!(s.apply(tagged(ALPHA, &token, contended), 5, base + secs(20)));
+    assert_eq!(s.last_start.get(ALPHA), None);
+    assert!(s.last_failure.is_empty());
+    let held = at(&mut s, &Live { seen: 5, ..live() }, base, 21);
+    assert_eq!(held.action, Action::None);
+    assert_eq!(held.statuses[ALPHA].state, AutoState::Scheduled);
+    let newer = Live { seen: 6, ..live() };
+    assert_eq!(
+        at(&mut s, &newer, base, 21).action,
+        Action::Start(ALPHA.into())
+    );
+
+    // The run wrote its record and then met contention: its start holds the minimum interval.
+    let mut s = ready(&[ALPHA], base);
+    let token = activate(&mut s, ALPHA, NOW_MS + 20_000);
+    token.mark_started();
+    let contended = LaunchOutcome::Contended {
+        run_id: Some("r1".into()),
+    };
+    assert!(s.apply(tagged(ALPHA, &token, contended), 5, base + secs(20)));
+    assert_eq!(s.last_start[ALPHA], NOW_MS + 20_000);
+    assert_eq!(s.last_run_id[ALPHA], "r1");
+    assert!(s.last_failure.is_empty());
+    let waiting = at(&mut s, &newer, base, 21);
+    assert_eq!(waiting.action, Action::None);
+    assert_eq!(waiting.statuses[ALPHA].state, AutoState::Scheduled);
+    assert_eq!(
+        waiting.statuses[ALPHA].next_earliest_start,
+        Some(NOW_MS + 80_000)
+    );
+    assert_eq!(
+        at(&mut s, &newer, base, 80).action,
+        Action::Start(ALPHA.into())
+    );
 }
 
 fn record(
@@ -930,6 +1077,27 @@ fn seed_treats_abandoned_and_superseded_as_not_failures() {
         seed_from(&runs)[ALPHA].failure.as_ref().unwrap().code,
         "cancelled"
     );
+}
+
+#[test]
+fn seed_treats_contention_as_a_start_not_a_failure() {
+    for code in [
+        "storage_busy: SQLite lock contention",
+        "rebuild_in_progress: a publication of 9 documents has locked the index",
+    ] {
+        let runs = [record(
+            "a",
+            ALPHA,
+            RunOrigin::Auto,
+            800,
+            RunState::Failed,
+            Some("producer_failed"),
+            Some(code),
+        )];
+        let seed = &seed_from(&runs)[ALPHA];
+        assert_eq!(seed.failure, None, "{code}");
+        assert_eq!(seed.created_at, 800);
+    }
 }
 
 #[test]
@@ -1726,4 +1894,66 @@ fn review_old_template_refusal_must_not_poison_reloaded_approval() {
         AutoState::NeedsApproval,
         "B was loaded while A was in flight, but only A's template was refused"
     );
+}
+
+#[test]
+fn loop_contended_launch_reruns_after_the_publication_at_the_same_head() {
+    let rt = FakeRuntime::new();
+    let src = FakeSources::new(&[ALPHA], config(&[ALPHA], 10, 60));
+    let harness = Harness::start(&rt, &src, immediate());
+    rt.finish(LaunchOutcome::Contended { run_id: None });
+    rt.wait_for("the launch", |state| !state.launches.is_empty());
+    rt.outcome_applied(1);
+    // Held, not failed: the producer stays scheduled and nothing starts before a new signal.
+    let status = harness.status(ALPHA);
+    assert_eq!(status.state, AutoState::Scheduled);
+    assert_eq!(
+        status.reason.as_deref(),
+        Some(crate::store::RERUN_SCHEDULED)
+    );
+    assert_eq!(rt.launches().len(), 1);
+    let last = *rt.state.lock().unwrap().waits.last().unwrap();
+    assert_eq!(last.1, BACKSTOP);
+
+    // The rebuild publishes: a new pin at the same native head, and its state signal.
+    src.edit(|src| src.pin_revision = 2);
+    rt.finish(finished(AutoOutcome::Imported));
+    rt.bump();
+    rt.wait_for("the rerun", |state| state.launches.len() == 2);
+    assert_eq!(rt.launches()[1], (ALPHA.to_owned(), "h1".to_owned()));
+    // The signal did it: no timeout fired and the fake clock never moved.
+    assert_eq!(rt.state.lock().unwrap().expired, 0);
+    assert_eq!(harness.clock.elapsed(), Duration::ZERO);
+}
+
+#[test]
+fn loop_real_failure_stays_failed_until_the_basis_changes() {
+    let rt = FakeRuntime::new();
+    let src = FakeSources::new(&[ALPHA], config(&[ALPHA], 10, 60));
+    let harness = Harness::start(&rt, &src, immediate());
+    rt.finish(finished(failed("producer_failed", "h1")));
+    rt.wait_for("the launch", |state| !state.launches.is_empty());
+    rt.outcome_applied(1);
+    assert_eq!(harness.status(ALPHA).state, AutoState::Failed);
+
+    // A publication at the same native head ends nothing.
+    src.edit(|src| src.pin_revision = 2);
+    harness.signal();
+    harness.signal();
+    assert_eq!(rt.launches().len(), 1);
+    let status = harness.status(ALPHA);
+    assert_eq!(status.state, AutoState::Failed);
+    assert_eq!(
+        status.reason.as_deref(),
+        Some("automatic re-run failed: producer_failed")
+    );
+
+    // A new native basis does.
+    src.edit(|src| {
+        src.native = "h2".into();
+        src.pin_revision = 3;
+    });
+    harness.signal();
+    rt.wait_for("the rerun", |state| state.launches.len() == 2);
+    assert_eq!(rt.launches()[1], (ALPHA.to_owned(), "h2".to_owned()));
 }
