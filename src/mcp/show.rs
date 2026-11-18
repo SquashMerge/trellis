@@ -191,7 +191,7 @@ pub fn check(
         }
     };
     Ok(Checked::Show(
-        envelope(id, pin, view, "shown", "Shown."),
+        envelope(id, pin, view, "recorded", "Recorded."),
         target,
         pin,
     ))
@@ -226,7 +226,8 @@ pub fn record(mut envelope: Value, shown: Shown) -> Value {
         Shown::Shown(generation) => {
             data["generation"] = json!(generation);
             data["message"] = json!(
-                "Shown in the open viewers of this checkout. A pinned viewer keeps its view."
+                "Recorded for the open viewers of this checkout. A viewer follows it unless it is \
+                 pinned; one at another index snapshot shows a note instead."
             );
         }
         Shown::NoViewer => {

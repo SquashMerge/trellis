@@ -1,6 +1,6 @@
 //! Human lookup keys are separate from native syntax identity and name normalization.
 use crate::{
-    files_view::{FILE_INPUT_LIMIT, FILE_TIME_LIMIT},
+    files_view::{FILE_INPUT_LIMIT, SYNTAX_HANG_BACKSTOP},
     native_evidence::{Declaration, Key},
     syntax_bounds::{DEPTH, VISITS},
 };
@@ -13,20 +13,42 @@ use tree_sitter::Node;
 /// Anonymous containers other than Rust impls have no stable written name, so their contents
 /// have no lookup key. An incomplete Rust parse refuses the document, never a partial map.
 ///
-/// This is the MCP read's derivation: the Rust impl reparse keeps the contracted Files
-/// budget, wall clock included, and every refusal is `deadline_exceeded`.
+/// This is the MCP read's derivation. Like [`keys_checked`], the Rust impl reparse is bounded
+/// by the source size and the syntax bounds alone, so the same document gives the same answer
+/// however busy the machine is (#1119). A document beyond them is refused, typed
+/// `deadline_exceeded`, on every run. The wall clock is only a hang backstop
+/// ([`SYNTAX_HANG_BACKSTOP`]), refused with the same code.
 pub(crate) fn keys_from_source(
     path: &str,
     language: &str,
     text: &str,
     declarations: &[Declaration],
 ) -> Result<BTreeMap<String, String>> {
+    keys_until(path, language, text, declarations, &Instant::now)
+}
+
+/// [`keys_from_source`] on the clock `now`.
+fn keys_until(
+    path: &str,
+    language: &str,
+    text: &str,
+    declarations: &[Declaration],
+    now: &dyn Fn() -> Instant,
+) -> Result<BTreeMap<String, String>> {
+    let backstop = now() + SYNTAX_HANG_BACKSTOP;
+    let mut check = || {
+        anyhow::ensure!(now() < backstop, HUNG);
+        Ok(())
+    };
     let file = &Source {
         path,
         language,
         text,
     };
-    let limit = Limit::Deadline(Instant::now() + FILE_TIME_LIMIT);
+    let limit = Limit {
+        check: &mut check,
+        polls: 0,
+    };
     derive(file, declarations, limit).map_err(|refused| match refused {
         Refused::Bound(bound) => anyhow::anyhow!(bound),
         Refused::Stopped(error) => error,
@@ -52,7 +74,7 @@ pub(crate) fn keys_checked(
         language,
         text,
     };
-    match derive(file, declarations, Limit::Check { check, polls: 0 }) {
+    match derive(file, declarations, Limit { check, polls: 0 }) {
         Ok(keys) => Ok(Some(keys)),
         Err(Refused::Bound(_)) => Ok(None),
         Err(Refused::Stopped(error)) => Err(error),
@@ -77,45 +99,29 @@ pub(crate) fn keys_by_name(
 
 const EXHAUSTED: &str = "deadline_exceeded: stable lookup Rust syntax budget exhausted";
 const MISSING_IMPL: &str = "deadline_exceeded: stable lookup missing Rust impl declaration";
+const HUNG: &str = "deadline_exceeded: stable lookup Rust syntax hang backstop reached";
 
-/// What bounds one Rust impl reparse besides the source size and the syntax bounds.
-enum Limit<'a> {
-    Deadline(Instant),
-    /// Polled once in [`POLL`] steps, the first step included.
-    Check {
-        check: &'a mut dyn FnMut() -> Result<()>,
-        polls: usize,
-    },
+/// What bounds one Rust impl reparse besides the source size and the syntax bounds: the
+/// caller's check, polled once in [`POLL`] steps, the first step included.
+struct Limit<'a> {
+    check: &'a mut dyn FnMut() -> Result<()>,
+    polls: usize,
 }
 const POLL: usize = 256;
 impl Limit<'_> {
     fn step(&mut self) -> Result<(), Refused> {
-        match self {
-            Self::Deadline(deadline) if Instant::now() >= *deadline => {
-                Err(Refused::Bound(EXHAUSTED))
-            }
-            Self::Deadline(_) => Ok(()),
-            Self::Check { check, polls } => {
-                let due = *polls == 0;
-                *polls = (*polls + 1) % POLL;
-                if due {
-                    check().map_err(Refused::Stopped)?;
-                }
-                Ok(())
-            }
+        let due = self.polls == 0;
+        self.polls = (self.polls + 1) % POLL;
+        if due {
+            (self.check)().map_err(Refused::Stopped)?;
         }
-    }
-    fn deadline(&self) -> Option<Instant> {
-        match self {
-            Self::Deadline(deadline) => Some(*deadline),
-            Self::Check { .. } => None,
-        }
+        Ok(())
     }
 }
 
 /// Why a document has no key map.
 enum Refused {
-    /// A bound was reached. Under [`Limit::Check`] every bound is a property of the input.
+    /// A bound was reached. Every bound is a property of the input.
     Bound(&'static str),
     /// The caller's check stopped the reparse, or the parser could not start.
     Stopped(anyhow::Error),
@@ -245,10 +251,8 @@ fn impl_targets(
     };
     let mut visits = 0;
     bounded_tree(tree.root_node(), &mut limit, &mut visits)?;
+    // The measured byte budget bounds the expansions; no clock interrupts them.
     let mut expansions = crate::native_rust_macros::Expansions::new(file.text);
-    if let Some(deadline) = limit.deadline() {
-        expansions = expansions.with_deadline(deadline);
-    }
     let mut checked = std::collections::BTreeSet::new();
     checked.insert(tree.root_node().id());
     let mut targets = BTreeMap::new();
@@ -558,21 +562,75 @@ mod tests {
 
     const IMPL: &str = "struct Store; impl Store { fn save() {} }";
 
+    /// A clock that reads `base` once, then `later` on every read after.
+    fn clock_jumping_to(later: std::time::Duration) -> impl Fn() -> Instant {
+        let base = Instant::now();
+        let reads = std::cell::Cell::new(0);
+        move || {
+            reads.set(reads.get() + 1);
+            if reads.get() == 1 { base } else { base + later }
+        }
+    }
+
+    /// #1119: the MCP derivation no longer has a 250 ms budget. A clock that reads a second
+    /// later on every poll, past the old Files budget, changes nothing.
     #[test]
-    fn an_expired_deadline_is_a_typed_refusal_of_the_mcp_derivation() {
+    fn a_slow_machine_gets_the_same_mcp_keys() {
         let fixture = Fixture::new();
         let (file, native) = fixture.measure("store.rs", IMPL);
-        let source = Source {
-            path: &file.path,
-            language: &file.language,
-            text: &file.text,
-        };
-        let refused = derive(
-            &source,
+        let slow = clock_jumping_to(crate::files_view::FILE_TIME_LIMIT * 4);
+        let found = keys_until(
+            &file.path,
+            &file.language,
+            &file.text,
             &native.declarations,
-            Limit::Deadline(Instant::now()),
+            &slow,
+        )
+        .unwrap();
+        assert_eq!(found, keys(&file, &native.declarations).unwrap());
+        assert!(found.values().any(|key| key == "store.rs::Store::save"));
+    }
+
+    #[test]
+    fn the_hang_backstop_is_a_typed_refusal_of_the_mcp_derivation() {
+        let fixture = Fixture::new();
+        let (file, native) = fixture.measure("store.rs", IMPL);
+        let hung = clock_jumping_to(SYNTAX_HANG_BACKSTOP);
+        let error = keys_until(
+            &file.path,
+            &file.language,
+            &file.text,
+            &native.declarations,
+            &hung,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), HUNG);
+        assert!(HUNG.starts_with("deadline_exceeded:"));
+    }
+
+    /// Each syntax bound is a property of the document: the MCP derivation refuses it typed,
+    /// a checked one has no keys, on every run and on any clock.
+    #[test]
+    fn a_document_beyond_the_depth_or_visit_bound_is_refused_on_every_run() {
+        let fixture = Fixture::new();
+        let (file, native) = fixture.measure("store.rs", IMPL);
+        let deep = format!(
+            "\nfn deep() {{ {}1{} }}",
+            "(".repeat(DEPTH),
+            ")".repeat(DEPTH)
         );
-        assert!(matches!(refused, Err(Refused::Bound(EXHAUSTED))));
+        let wide = format!("\nconst WIDE: [u8; 0] = [{}];", "0,".repeat(VISITS));
+        for tail in [deep, wide] {
+            let mut beyond = file.clone();
+            beyond.text.push_str(&tail);
+            assert!(beyond.text.len() <= FILE_INPUT_LIMIT);
+            for _ in 0..2 {
+                let error = keys(&beyond, &native.declarations).unwrap_err();
+                assert_eq!(error.to_string(), EXHAUSTED);
+                let found = checked(&beyond, &native.declarations, &mut || Ok(())).unwrap();
+                assert_eq!(found, None);
+            }
+        }
     }
 
     /// #1115: a view-time derivation never reads the clock, so its answer cannot depend on

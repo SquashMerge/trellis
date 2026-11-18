@@ -1490,7 +1490,7 @@ test("#913: after an agent show and Back, the selected tab is the view on screen
   await only("architecture", "arrival");
   const id = await H.seedId(server, paths.token, "measured");
   const outcome = await agentShow(paths, {view:"sequence", symbolId:id});
-  assert.equal(outcome?.data?.outcome, "shown", JSON.stringify(outcome));
+  assert.equal(outcome?.data?.outcome, "recorded", JSON.stringify(outcome));
   await page.locator("#agent-shown:not([hidden])").waitFor({timeout:30000});
   await page.locator("#sequence-panel").waitFor({state:"visible"});
   await only("sequence", "after the show");
