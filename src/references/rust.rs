@@ -811,28 +811,36 @@ impl Catalog {
         macros: &[KnownMacro],
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<bool> {
-        for known in macros {
-            self.step(check)?;
-            let fits = match known {
-                KnownMacro::Tokio { .. } => {
-                    child.kind() == "function_item"
-                        && child.child_by_field_name("body").is_some_and(|body| {
-                            let mut cursor = body.walk();
-                            !body
-                                .named_children(&mut cursor)
-                                .any(|n| n.kind() == "inner_attribute_item")
-                        })
-                }
-                KnownMacro::AsyncTrait { .. } => {
-                    (child.kind() == "trait_item"
-                        || (child.kind() == "impl_item"
-                            && child.child_by_field_name("trait").is_some()))
-                        && !spells_identifier(text(doc, child), "__self")
-                }
-            };
-            if !fits {
+        // Each shape is read once per item, however many attributes ask for it; the walk
+        // over the body's statements is charged per statement.
+        let tokio = macros
+            .iter()
+            .any(|known| matches!(known, KnownMacro::Tokio { .. }));
+        let async_trait = macros
+            .iter()
+            .any(|known| matches!(known, KnownMacro::AsyncTrait { .. }));
+        self.charge(macros.len(), check)?;
+        if tokio {
+            if child.kind() != "function_item" {
                 return Ok(false);
             }
+            let Some(body) = child.child_by_field_name("body") else {
+                return Ok(false);
+            };
+            let mut cursor = body.walk();
+            for statement in body.named_children(&mut cursor) {
+                self.step(check)?;
+                if statement.kind() == "inner_attribute_item" {
+                    return Ok(false);
+                }
+            }
+        }
+        if async_trait
+            && !((child.kind() == "trait_item"
+                || (child.kind() == "impl_item" && child.child_by_field_name("trait").is_some()))
+                && !spells_identifier(text(doc, child), "__self"))
+        {
+            return Ok(false);
         }
         Ok(true)
     }
@@ -969,8 +977,9 @@ impl Catalog {
         }
     }
     /// Whether the first segment of `path`, read from `scope`, is the Cargo dependency of the
-    /// package `package`: `external_target` finds no nearer item, import or glob binding
-    /// it, the manifest binds it without a rename, and the crate root has no `extern crate ..
+    /// package `package`: `external_target`, strictly, finds no nearer item, import or glob
+    /// that binds it or could (a glob over another dependency could export a module of
+    /// that name), the manifest binds it without a rename, and the crate root has no `extern crate ..
     /// as` of that name, which would take its place in the extern prelude. `global` is a
     /// leading `::`, which edition 2015 reads from the crate root. `excluding` is the import
     /// whose own path this is.
@@ -1000,7 +1009,7 @@ impl Catalog {
         {
             return Ok(false);
         }
-        let target = self.external_target(scope, path, packages, docs, excluding, check)?;
+        let target = self.external_target(scope, path, packages, docs, excluding, true, check)?;
         // crates.io treats `-` and `_` in a package name as the same name.
         Ok(target.is_some_and(|target| {
             !target.identity.standard_library
@@ -1949,6 +1958,7 @@ impl Catalog {
                 context.packages,
                 context.docs,
                 Some((import.start, import.end)),
+                false,
                 check,
             )?
             .is_some())
@@ -2107,6 +2117,12 @@ impl Catalog {
         }
         Ok(result)
     }
+    /// The dependency the first segment of `path` names from `scope`, when no nearer scope
+    /// binds it. A glob whose exports are unknown could bind it; for external attribution
+    /// such a glob over a declared dependency is waived. `strict` waives nothing: a known
+    /// attribute macro's proof must rule out every glob, since a dependency's glob can
+    /// export a module of the same name that shadows the extern prelude.
+    #[allow(clippy::too_many_arguments)] // The lookup's scope, path, waiver and captured context.
     fn external_target(
         &mut self,
         scope: usize,
@@ -2114,6 +2130,7 @@ impl Catalog {
         packages: &external::RustPackages,
         docs: &[&DocumentInput],
         excluding: Option<(usize, usize)>,
+        strict: bool,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Option<external::ExternalPackage>> {
         self.step(check)?;
@@ -2176,6 +2193,9 @@ impl Catalog {
                         return Ok(None);
                     }
                     if expanded.unknown_set {
+                        if strict {
+                            return Ok(None);
+                        }
                         let document = self.scopes[current_scope].document;
                         let source_set = &docs[document].key.source_set_id;
                         let root = self.root(current_scope).expect("proved root");
@@ -2306,6 +2326,7 @@ impl Catalog {
                 packages,
                 docs,
                 import.as_ref().map(|i| (i.start, i.end)),
+                false,
                 check,
             )?
         {
@@ -2455,6 +2476,7 @@ impl Catalog {
                     packages,
                     docs,
                     Some((other.start, other.end)),
+                    false,
                     check,
                 )?
                 .is_some()
@@ -2590,9 +2612,11 @@ enum KnownMacro {
     Tokio { test: bool, global: bool },
     /// `#[async_trait]` (`bare`, through an import) or `#[async_trait::async_trait]`, with
     /// any arguments, on a trait or trait impl. async-trait re-emits the item alone, each
-    /// async method's body moved into `Box::pin(async move { .. })` behind bindings the body
-    /// cannot see (`__ret`, which is not yet in scope, and mixed-site `__argN`), except
-    /// `__self`, which takes the place of `self`: so the item must not spell `__self`.
+    /// async method's body moved into `Box::pin(async move { .. })` after bindings that
+    /// change no path the body spells: `__ret` (not yet in scope in the body), mixed-site
+    /// `__argN` (invisible to it) and `let x = x;` (the same parameter under the same
+    /// name). The one exception is `__self`, which takes the place of `self` and is visible
+    /// to the body: so the item must not spell `__self`.
     AsyncTrait { bare: bool, global: bool },
 }
 /// An item under known attribute macros, with the bindings it made, which the failed proof

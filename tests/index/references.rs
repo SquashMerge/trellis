@@ -9352,3 +9352,54 @@ fn references_rust_known_attribute_macro_proofs_are_rechecked_after_a_failure() 
         );
     }
 }
+
+/// A glob over another dependency could export a module named `tokio` or `async_trait`,
+/// which shadows the extern prelude, so the attribute could be another crate's macro.
+/// Ordinary external attribution waives such a glob; the known-macro proof does not, and
+/// the attribute's scope stays opaque. `d` reaches `run` through globs over `a` and
+/// `store`, which an opaque `a` leaves unknown (`other`'s glob is private to `a`).
+#[test]
+fn references_rust_known_attribute_macro_behind_an_external_glob_is_not_proved() {
+    for (why, source, maps) in [
+        (
+            "tokio, no external glob",
+            "pub use crate::store::*; #[tokio::main] async fn main() {}",
+            true,
+        ),
+        (
+            "tokio behind an external glob",
+            "pub use crate::store::*; use other::*; #[tokio::main] async fn main() {}",
+            false,
+        ),
+        (
+            "async_trait by path, no external glob",
+            "pub use crate::store::*; #[async_trait::async_trait] pub trait T {}",
+            true,
+        ),
+        (
+            "async_trait by path behind an external glob",
+            "pub use crate::store::*; use other::*; #[async_trait::async_trait] pub trait T {}",
+            false,
+        ),
+    ] {
+        let input = with_cargo_manifest(
+            snapshot(&[
+                ("src/lib.rs", "mod a; mod d; mod store;"),
+                ("src/a.rs", source),
+                ("src/d.rs", "use crate::a::*; fn f() { run(); }"),
+                ("src/store.rs", "pub fn run() {}"),
+            ]),
+            &format!(
+                "{EDITION_2021}[dependencies]\ntokio = '1'\nasync-trait = '0.1'\nother = '1'\n"
+            ),
+        );
+        let data = references::project(&input, &["src/d.rs".into()], 20, &mut || Ok(()))
+            .unwrap()
+            .data;
+        assert_eq!(
+            has_edge(&data, "src/d.rs", "src/store.rs"),
+            maps,
+            "{why}: {data}"
+        );
+    }
+}
