@@ -3231,3 +3231,181 @@ async fn unchanged_status_head_is_a_cheap_conditional_read() {
     // Free the new head's held catalog build before the checkout goes.
     drop(release);
 }
+
+/// #1090: a browser read through `selected_evidence` that is the first to find a damaged
+/// selected source is refused typed, with no data, and schedules the re-index
+/// (docs/local-topology.md T07), as the MCP and CLI reads do (#903). The selected-response
+/// hook records, as the read's work begins, that nothing has scheduled a re-index yet: the
+/// browser read is the one that finds the damage. The re-index then rebuilds from the working
+/// tree and the same read is answered from the new generation.
+#[cfg(feature = "test-support")]
+async fn browser_read_of_a_damaged_source_schedules_the_reindex(
+    method: &str,
+    route: &str,
+    body: impl Fn(&trellis::model::IndexPin, &Value) -> Value,
+) {
+    use std::sync::{Arc, Mutex};
+    use trellis::{
+        daemon::registry::CheckoutRegistry, http::ProvisionedBrowser,
+        store::topology::TopologyRoots,
+    };
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("checkout");
+    fs::create_dir(&root).unwrap();
+    fs::write(
+        root.join("a.js"),
+        "function helper() { return 42; }\nfunction seed() { return helper(); }\n",
+    )
+    .unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let roots =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let index_db = roots.index_db(&identity);
+    let registry = Arc::new(tokio::sync::Mutex::new(CheckoutRegistry::with_roots(roots)));
+    let runtime = {
+        let mut checked = registry.lock().await;
+        checked.attach_launch(7, &identity).unwrap();
+        checked.activate(&identity.root_key).unwrap()
+    };
+    let damaged = runtime
+        .settled_for_tests(None)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    let browser = ProvisionedBrowser::new(
+        registry.clone(),
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap();
+    let prefix = format!("/api/checkouts/{}", identity.root_key);
+    let pin_query = |pin: &trellis::model::IndexPin| {
+        format!(
+            "indexGeneration={}&indexRevision={}",
+            pin.index_generation, pin.index_revision
+        )
+    };
+    let (code, _, outline) = selected_json(
+        browser.clone().router(),
+        "GET",
+        &format!("{prefix}/symbols?path=a.js&{}", pin_query(&damaged)),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::OK, "{outline}");
+    let ids: Value = outline["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| {
+            (
+                item["symbol"]["name"].as_str().unwrap().to_owned(),
+                item["symbol"]["id"].clone(),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>()
+        .into();
+    // Same-length damage to the selected source; its recorded hash and rows stay (#1089).
+    let db = rusqlite::Connection::open(&index_db).unwrap();
+    assert_eq!(
+        db.execute(
+            "UPDATE document_versions SET source_bytes=zeroblob(length(source_bytes))
+             WHERE vid IN (SELECT m.vid FROM revision_documents m
+               JOIN native_revisions r ON r.id=m.revision_id
+               JOIN index_metadata i ON r.published_index_revision=i.index_revision)",
+            [],
+        )
+        .unwrap(),
+        1
+    );
+    drop(db);
+    let pending_at_work = Arc::new(Mutex::new(Vec::new()));
+    let (hook_runtime, hook_pending) = (runtime.clone(), pending_at_work.clone());
+    browser.set_selected_response_hook_for_tests(Arc::new(move |at| {
+        if at == "before_work" {
+            hook_pending
+                .lock()
+                .unwrap()
+                .push(hook_runtime.mcp_recovery_pending_for_tests().unwrap());
+        }
+    }));
+    let path = route
+        .replace("{prefix}", &prefix)
+        .replace("{pin}", &pin_query(&damaged));
+    let (code, _, refused) = selected_json(
+        browser.clone().router(),
+        method,
+        &path,
+        body(&damaged, &ids),
+    )
+    .await;
+    assert_eq!(*pending_at_work.lock().unwrap(), [false]);
+    assert_eq!(
+        code,
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "{refused}"
+    );
+    assert_eq!(
+        refused,
+        serde_json::json!({"error": {"code": "incompatible_index", "message": "Storage is unavailable"}})
+    );
+    let repaired = runtime
+        .settled_for_tests(None)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_ne!(repaired.index_generation, damaged.index_generation);
+    assert_eq!(repaired.index_revision, 1);
+    let path = route
+        .replace("{prefix}", &prefix)
+        .replace("{pin}", &pin_query(&repaired));
+    let (code, _, answered) = selected_json(
+        browser.clone().router(),
+        method,
+        &path,
+        body(&repaired, &ids),
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::OK, "{answered}");
+    assert_eq!(
+        answered["revision"],
+        serde_json::to_value(repaired).unwrap()
+    );
+}
+
+/// #1090: the Files view's syntax-match read.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_browser_files_read_of_a_damaged_source_schedules_the_reindex() {
+    browser_read_of_a_damaged_source_schedules_the_reindex(
+        "POST",
+        "{prefix}/syntax-matches",
+        |pin, ids| serde_json::json!({"expectedRevision": pin, "symbolId": ids["helper"]}),
+    )
+    .await;
+}
+
+/// #1090: the sequence read.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_browser_sequence_read_of_a_damaged_source_schedules_the_reindex() {
+    browser_read_of_a_damaged_source_schedules_the_reindex(
+        "POST",
+        "{prefix}/sequence",
+        |pin, ids| serde_json::json!({"seed": ids["seed"], "expectedRevision": pin}),
+    )
+    .await;
+}
+
+/// #1090: the methods read.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_browser_methods_read_of_a_damaged_source_schedules_the_reindex() {
+    browser_read_of_a_damaged_source_schedules_the_reindex(
+        "GET",
+        "{prefix}/methods?path=a.js&{pin}",
+        |_, _| Value::Null,
+    )
+    .await;
+}
