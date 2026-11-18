@@ -511,15 +511,34 @@ fn crash_diagnostics_in_run_record() {
     assert_eq!(reply["outcome"], "producer_output_missing");
 }
 
-/// V8's fatal heap-limit abort, as scip-python printed it (#957).
-const V8_OOM: &str = "\n<--- Last few GCs --->\n\n[4242:0x7f8]   143012 ms: Mark-Compact 4055.8 (4130.1) -> 4046.6 (4131.6) MB, 1520.3 / 0.0 ms  (average mu = 0.112) allocation failure; scavenge might not succeed\n\n<--- JS stacktrace --->\n\nFATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory\n 1: 0x1001 node::Abort() [node]\n";
+/// V8's last GC line in a heap-limit abort (#957).
+const V8_LAST_GC: &str = "[4242:0x7f8]   143012 ms: Mark-Compact 4055.8 (4130.1) -> 4046.6 (4131.6) MB, 1520.3 / 0.0 ms  (average mu = 0.112) allocation failure; scavenge might not succeed";
+/// V8's fatal line in a heap-limit abort (#957).
+const V8_FATAL: &str =
+    "FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory";
+
+/// V8's fatal heap-limit abort as scip-python printed it (#957): the last GCs, the fatal line,
+/// then a native stack longer than the kept lines (#975).
+fn v8_oom() -> String {
+    let mut text = format!(
+        "\n<--- Last few GCs --->\n\n[4242:0x7f8]   141490 ms: Scavenge 4050.1 (4126.3) -> 4049.2 (4130.1) MB, 8.1 / 0.0 ms  (average mu = 0.115) allocation failure;\n{V8_LAST_GC}\n\n<--- JS stacktrace --->\n\n{V8_FATAL}\n----- Native stack trace -----\n\n"
+    );
+    for frame in 1..=14 {
+        text.push_str(&format!(
+            "{frame:2}: 0x{:x} v8::internal::Execution::Call(v8::internal::Isolate*) [/usr/local/bin/node]\n",
+            0x1049_75dd0_u64 + frame
+        ));
+    }
+    text
+}
 
 /// A producer that aborts with V8's heap-limit stderr is `node_heap_exhausted`, and the reply,
-/// the record, `lastRun` and the CLI's stderr say why (#967, owner ruling 2026-11-12).
+/// the record, `lastRun` and the CLI's stderr say why (#967, owner ruling 2026-11-12). Its
+/// stderr lines are the last GC line and the fatal line, never the native stack (#975).
 #[test]
 fn v8_heap_abort_is_reported_as_node_heap_exhausted() {
     let world = World::new();
-    world.mode(json!({"stderrText": V8_OOM, "abort": true}));
+    world.mode(json!({"stderrText": v8_oom(), "abort": true}));
     let output = world.run(&[]);
     assert!(!output.status.success());
     let reply = reply(&output);
@@ -536,17 +555,7 @@ fn v8_heap_abort_is_reported_as_node_heap_exhausted() {
             failure["peakRssBytes"],
             reply["diagnostics"]["peakRssBytes"]
         );
-        let lines = failure["stderrLines"].as_array().unwrap();
-        assert!(lines.len() <= 10, "{lines:?}");
-        assert_eq!(
-            lines.last().unwrap(),
-            " 1: 0x1001 node::Abort() [node]",
-            "{lines:?}"
-        );
-        assert!(lines.iter().all(|line| !line.as_str().unwrap().is_empty()));
-        assert!(lines.contains(&json!(
-            "FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory"
-        )));
+        assert_eq!(failure["stderrLines"], json!([V8_LAST_GC, V8_FATAL]));
     }
     let status = world.producer("status", &["--run", run_id]);
     let status = crate::child::cli_json_with(&status, "producer status --run", None);

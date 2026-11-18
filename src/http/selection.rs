@@ -24,7 +24,10 @@ pub(super) async fn selected_evidence<T: Send + 'static>(
         if let Some(hook) = &hook {
             hook("before_work");
         }
-        let result = work(&response)?;
+        // Corruption this read finds schedules the re-index, as on the MCP and CLI reads
+        // (docs/local-topology.md T07, #1090). Caller and operational errors are left alone by
+        // the classification, and the reply is the same typed refusal.
+        let result = work(&response).map_err(|error| response.report_index_failure(error))?;
         if let Some(hook) = hook {
             hook("before_read_finish");
         }
