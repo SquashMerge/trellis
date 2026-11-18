@@ -109,6 +109,36 @@ test("status reports per-language re-import reasons without inventing fresh evid
   assert.match(h.get("status").textContent, /rust: semantic evidence unavailable/);
 });
 
+test("the status line counts each language's documents by semantic state and falls back to the checkout's state; a reply with no root is refused", async () => {
+  const h = harness(), routes = [];
+  const pin = {indexGeneration:"12345678-1234-4123-8123-123456789abc",indexRevision:1};
+  const documents = states => states.map(semanticStatus => ({projection:{semanticStatus}}));
+  let reply = {revision:pin, stats:{files:4,symbols:5,calls:6,semanticState:"stale"}, semanticLanguages:[
+    {language:"rust",semanticState:"fresh",documents:documents(["catchingUp","needsReimport","catchingUp","current","olderBasis"])},
+    {language:"python",semanticState:"fresh",documents:documents(["current"])}]};
+  h.context.fetch = async route => {
+    routes.push(route);
+    if (route === "/api/status") return response(reply);
+    if (route.startsWith("/api/tree")) return response({...treePage("", []), revision:pin});
+    return response(null);
+  };
+  await h.run("refreshStatus()");
+  const label = h.run("IndexPin.label(status.revision)");
+  assert.equal(h.get("status").textContent, `/synthetic · Revision ${label} · 4 files · 5 symbols · 6 calls · rust: semantic evidence 2 catching up, 1 need re-import, 1 older basis · python: semantic evidence fresh · Indexed: not yet`);
+  reply = {revision:pin, stats:{semanticState:"stale"}, semanticLanguages:[]};
+  await h.run("refreshStatus()");
+  assert.equal(h.get("status").textContent, `/synthetic · Revision ${label} · 0 files · 0 symbols · 0 calls · Semantic evidence stale · Indexed: not yet`);
+  reply = {revision:pin};
+  await h.run("refreshStatus()");
+  assert.equal(h.get("status").textContent, `/synthetic · Revision ${label} · 0 files · 0 symbols · 0 calls · Semantic evidence unavailable · Indexed: not yet`);
+  const shown = h.get("status").textContent, reads = routes.length;
+  reply = {revision:{...pin, indexRevision:2}, workspaceRoot:""};
+  await assert.rejects(h.run("refreshStatus()"), /^Error: Selected checkout identity unavailable\. Retry status\.$/);
+  assert.equal(routes.length, reads + 1, "only the status read");
+  assert.equal(h.run("status.revision.indexRevision"), 1);
+  assert.equal(h.get("status").textContent, shown);
+});
+
 test("file tree expands methods inline, backend flags filter conservatively, pagination and whole-catalog path filter", async () => {
   const h = harness(), paths = [];
   h.context.fetch = async (path) => {
@@ -1516,14 +1546,25 @@ test("sid routes wait for an admitted checkout, resolve only the requested seed,
   assert.equal(browser.history.length, 1);
 });
 
-for (const hash of ["#sequence", "#sequence?sid=", "#sequence?sid=a&sid=b", `#sequence?sid=a&rootKey=${"b".repeat(64)}`,
-  "#sequence?sid=a&indexGeneration=87654321-1234-4123-8123-123456789abc&indexRevision=x"]) {
+// The last five links also fail a later check, so their message pins the order of the checks:
+// the symbol ID, the checkout, the snapshot, then the call IDs.
+for (const [hash, message] of [
+  ["#sequence", "Sequence link requires a symbol ID (sid)."],
+  ["#sequence?sid=", "Sequence link requires one valid symbol ID (sid)."],
+  ["#sequence?sid=a&sid=b", "Sequence link requires one valid symbol ID (sid)."],
+  [`#sequence?sid=a&rootKey=${"b".repeat(64)}`, "Sequence link belongs to a different checkout. Select its checkout first."],
+  ["#sequence?sid=a&indexGeneration=87654321-1234-4123-8123-123456789abc&indexRevision=x", "Sequence link has an invalid index snapshot."],
+  [`#sequence?sid=%20&rootKey=${"b".repeat(64)}`, "Sequence link requires one valid symbol ID (sid)."],
+  [`#sequence?sid=a&rootKey=${"b".repeat(64)}&indexGeneration=12345678-1234-4123-8123-123456789abc&indexRevision=x`, "Sequence link belongs to a different checkout. Select its checkout first."],
+  [`#sequence?sid=a&rootKey=${ROOT}&indexGeneration=12345678-1234-4123-8123-123456789abc&indexRevision=01&callId=bad`, "Sequence link has an invalid index snapshot."],
+  [`#sequence?sid=a&rootKey=${ROOT}&indexGeneration=not-a-generation&indexRevision=1&callId=bad`, "Invalid index snapshot pair. Refresh status."],
+  [`#sequence?sid=a&rootKey=${ROOT}&indexGeneration=87654321-1234-4123-8123-123456789abc&indexRevision=1&callId=bad`, "Sequence link has invalid call IDs."]]) {
   test(`invalid or mismatched route refuses requests: ${hash}`, async () => {
     const h = harness(historyWindow(hash));
     await h.run("readNavigationLocation()");
     assert.equal(h.networkUrls.length, 0);
     assert.equal(h.get("error").hidden, false);
-    assert.match(h.get("sequence-state").textContent, /Cannot open sequence/);
+    assert.equal(h.get("sequence-state").textContent, `Cannot open sequence: ${message}`);
     assert.equal(h.run("selectedMethod"), null);
   });
 }
