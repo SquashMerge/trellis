@@ -1013,6 +1013,34 @@ Supported mapping is deliberately narrow:
   reached through the glob (`crate::parent::same`), stays unknown. This is a recorded
   limit (owner ruling 2026-11-17): no occurrence was found in this repository or in a
   second real checkout.
+  An enum variant path, `Enum::Variant`, maps to the file that declares the enum
+  (#1200), wherever that is: in the site's own file, through an import or a renaming
+  import, or along a `crate::`/`self::`/`super::` path, and as an import
+  (`use crate::kinds::Kind::Unit;`). The path before the variant must prove exactly one
+  certain enum declaration, as any other path segment must prove its module, and the
+  enum's body must spell the variant once, with no `cfg` or `cfg_attr` on it. The
+  attributes on the variant are read from the parsed attribute's path, comments and `r#`
+  ignored, and every one must be a known inert one (`doc`, `allow`, `warn`, `deny`,
+  `forbid`, `expect`, `deprecated`, `default`, and the helpers `serde`, `error`,
+  `command` and `value`); any other attribute, such as a `cfg` spelled through a path,
+  leaves the variant unknown. A braced variant (`V { x: u8 }`) has no value constructor
+  and binds the type namespace only, as a braced struct does: its type-position uses
+  (`Kind::V { x: 1 }`, patterns) and its import map to the enum, while a value path
+  `Kind::V`, which can name a same-named associated item, stays unknown. Tuple and unit
+  variants bind both namespaces. This is
+  sound because a variant is found before any associated item of the same name, so no
+  `impl` or trait can take its place; an enum body holds no macro call, and an attribute
+  macro cannot apply to a variant, so the body lists every variant there is. An enum
+  under an attribute the catalog does not read is itself uncertain (see above), and so
+  are its variants. A variant under `cfg` or `cfg_attr`, a variant spelled twice, and a
+  body with a parser error stay unknown, as do paths that go on past the variant. These
+  `Type::name` paths are not resolved and stay unknown (`rust_export_name_set_unknown`):
+  an inherent associated item (`Type::new`, `Type::CONST`), whose `impl` can be in any
+  module of the crate and which a trait item replaces when it is not visible from the
+  site; a trait's own item (`Trait::item`); a path through a type alias
+  (`type Alias = Enum; Alias::Variant`) or through `Self`; and a glob over an enum
+  (`use Enum::*;`), which keeps its scope's other names unknown as any glob it cannot
+  expand does.
 - **JavaScript and TypeScript:** the two languages share one resolver. Static
   relative imports/reexports/side-effect imports (also `import type`,
   `export type` and `import x = require("m")`) try the extensionless candidates

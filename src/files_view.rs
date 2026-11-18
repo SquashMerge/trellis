@@ -3,7 +3,7 @@ use crate::{
     model::{IndexPin, SourceFile, SourceRange, Symbol},
     native_records::Header,
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
@@ -12,6 +12,11 @@ pub const FILE_INPUT_LIMIT: usize = 2 * 1024 * 1024;
 pub const TOTAL_INPUT_LIMIT: usize = 16 * 1024 * 1024;
 pub const FILE_TIME_LIMIT: Duration = Duration::from_millis(250);
 pub const TOTAL_TIME_LIMIT: Duration = Duration::from_secs(1);
+/// The wall clock an outline syntax read or an MCP lookup-key derivation may run before it
+/// stops, typed `deadline_exceeded` (#1119). It is a hang backstop, not a budget: the input
+/// size, the syntax bounds and the measured macro byte budget decide every answer, and twice
+/// the MCP call deadline leaves no answer the call could still give to it.
+pub const SYNTAX_HANG_BACKSTOP: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
 pub struct InvalidRequest;
@@ -37,7 +42,7 @@ pub struct OutlineItem {
     pub native_kind: String,
     pub header: Header,
     /// A measured binding whose whole initializer is a function, from the cached file's
-    /// syntax (#526). Absent when false or when the file could not be parsed in budget.
+    /// syntax (#526). Absent when false or when the file is beyond the outline syntax bounds.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub callable_initializer: bool,
     /// The type a Rust `impl` block implements, by its last path segment, from the cached
@@ -54,83 +59,137 @@ pub(crate) struct OutlineSyntax {
     pub callable_initializers: std::collections::BTreeSet<(usize, usize)>,
     /// Rust `impl` blocks and the last path segment of the type each implements.
     pub impl_targets: std::collections::BTreeMap<(usize, usize), String>,
+    /// Why some facts are missing: the file is beyond the outline syntax bounds, or an asked
+    /// impl block has no syntax at its range. The outline reports it as a warning (#1119).
+    pub warning: Option<&'static str>,
 }
 
-/// `None` when the language has no such facts or the cached file cannot be parsed within the
-/// Files budget; callers then list no binding as callable and leave impl blocks unnamed.
-/// `impl_blocks` are the native `impl` declarations asked about. One measured inside a macro has
-/// syntax only in that macro's expansion (#551), so it alone is looked up there, within the
-/// same budget; running out leaves those blocks unnamed.
+/// A cached file over [`FILE_INPUT_LIMIT`].
+pub(crate) const OUTLINE_OVER_INPUT: &str = "Cached file exceeds 2 MiB outline syntax input; bindings are not marked callable and impl blocks are unnamed.";
+/// A cached file's syntax over the syntax bounds.
+pub(crate) const OUTLINE_OVER_BOUNDS: &str = "Cached file syntax exceeds the outline walk bounds (128 levels, 1,000,000 nodes); bindings are not marked callable and impl blocks are unnamed.";
+/// An asked impl block with no syntax at its range.
+pub(crate) const OUTLINE_IMPL_MISSING: &str =
+    "Cached file has no impl syntax at a measured impl block's range; that block is unnamed.";
+const OUTLINE_HUNG: &str = "deadline_exceeded: Files outline syntax hang backstop reached";
+
+/// `Ok(None)` when the language has no such facts. A file beyond the outline syntax bounds
+/// (its size, depth and visit count) has none, with a `warning`, on every run (#1119): no
+/// wall clock decides the answer. `impl_blocks` are the native `impl` declarations asked about.
+/// One measured inside a macro has syntax only in that macro's expansion (#551), so it alone
+/// is looked up there, within measurement's macro byte budget. [`SYNTAX_HANG_BACKSTOP`] is the
+/// only clock, and reaching it is an error, never a partial outline.
 pub(crate) fn outline_syntax(
     file: &SourceFile,
     impl_blocks: &[(usize, usize)],
-) -> Option<OutlineSyntax> {
+) -> Result<Option<OutlineSyntax>> {
+    outline_syntax_until(file, impl_blocks, &Instant::now)
+}
+
+/// [`outline_syntax`] on the clock `now`.
+fn outline_syntax_until(
+    file: &SourceFile,
+    impl_blocks: &[(usize, usize)],
+    now: &dyn Fn() -> Instant,
+) -> Result<Option<OutlineSyntax>> {
     let language: tree_sitter::Language = match file.language.as_str() {
         "javascript" => tree_sitter_javascript::LANGUAGE.into(),
         "typescript" => crate::indexer_ts::grammar(&file.path),
         "python" => tree_sitter_python::LANGUAGE.into(),
         "rust" => tree_sitter_rust::LANGUAGE.into(),
-        _ => return None,
+        _ => return Ok(None),
+    };
+    let beyond = |warning| {
+        Ok(Some(OutlineSyntax {
+            warning: Some(warning),
+            ..OutlineSyntax::default()
+        }))
     };
     if file.text.len() > FILE_INPUT_LIMIT {
-        return None;
+        return beyond(OUTLINE_OVER_INPUT);
     }
-    let started = Instant::now();
+    let backstop = now() + SYNTAX_HANG_BACKSTOP;
+    let hung = || now() >= backstop;
     let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&language).ok()?;
+    parser.set_language(&language)?;
     let mut progress = |_: &tree_sitter::ParseState| {
-        if started.elapsed() >= FILE_TIME_LIMIT {
+        if hung() {
             std::ops::ControlFlow::Break(())
         } else {
             std::ops::ControlFlow::Continue(())
         }
     };
-    let tree = parser.parse_with_options(
-        &mut |offset, _| &file.text.as_bytes()[offset..],
-        None,
-        Some(tree_sitter::ParseOptions::new().progress_callback(&mut progress)),
-    )?;
+    // Only the backstop stops a parse of a file within the input bound.
+    let tree = parser
+        .parse_with_options(
+            &mut |offset, _| &file.text.as_bytes()[offset..],
+            None,
+            Some(tree_sitter::ParseOptions::new().progress_callback(&mut progress)),
+        )
+        .context(OUTLINE_HUNG)?;
     let mut found = OutlineSyntax::default();
-    let in_budget = || started.elapsed() < FILE_TIME_LIMIT;
-    collect_outline(
-        tree.root_node(),
-        file.text.as_bytes(),
-        &mut found,
-        &in_budget,
-    )?;
+    match collect_outline(tree.root_node(), file.text.as_bytes(), &mut found, &hung) {
+        Walk::Done => {}
+        Walk::Beyond => return beyond(OUTLINE_OVER_BOUNDS),
+        Walk::Hung => anyhow::bail!(OUTLINE_HUNG),
+    }
     if file.language == "rust" {
-        let mut expansions = crate::native_rust_macros::Expansions::new(&file.text)
-            .with_deadline(started + FILE_TIME_LIMIT);
+        // Measurement's macro byte budget bounds the expansions. The backstop also stops them,
+        // and is then this read's error below, never an impl left unnamed.
+        let mut expansions =
+            crate::native_rust_macros::Expansions::new(&file.text).with_deadline(backstop);
         for &(start, end) in impl_blocks {
-            if !in_budget() {
-                break;
-            }
             if found.impl_targets.contains_key(&(start, end)) {
                 continue;
             }
             let block = expansions
                 .root_for(tree.root_node(), start, end)
                 .descendant_for_byte_range(start, end)
-                .filter(|node| node.start_byte() == start && node.end_byte() == end);
-            if let Some(name) = block.and_then(|node| impl_target(node, file.text.as_bytes())) {
-                found.impl_targets.insert((start, end), name);
+                .filter(|node| {
+                    node.kind() == "impl_item"
+                        && node.start_byte() == start
+                        && node.end_byte() == end
+                });
+            ensure!(!hung(), OUTLINE_HUNG);
+            match block {
+                Some(node) => {
+                    if let Some(name) = impl_target(node, file.text.as_bytes()) {
+                        found.impl_targets.insert((start, end), name);
+                    }
+                }
+                None => found.warning = Some(OUTLINE_IMPL_MISSING),
             }
         }
     }
-    Some(found)
+    Ok(Some(found))
 }
 
-/// Add the outline facts under `root`. `None` once `in_budget` fails.
+/// How an outline walk ended.
+enum Walk {
+    Done,
+    /// The syntax is beyond [`crate::syntax_bounds`]' depth or visit bound.
+    Beyond,
+    Hung,
+}
+
+/// Add the outline facts under `root`, within the syntax bounds, polling `hung` once in
+/// [`HUNG_POLL`] visits.
 fn collect_outline(
     root: tree_sitter::Node<'_>,
     text: &[u8],
     found: &mut OutlineSyntax,
-    in_budget: &impl Fn() -> bool,
-) -> Option<()> {
+    hung: &impl Fn() -> bool,
+) -> Walk {
+    use crate::syntax_bounds::{DEPTH, VISITS};
     let mut cursor = root.walk();
+    let (mut depth, mut visits) = (0, 0);
     loop {
-        if !in_budget() {
-            return None;
+        visits += 1;
+        if visits > VISITS || depth >= DEPTH {
+            return Walk::Beyond;
+        }
+        if visits % HUNG_POLL == 1 && hung() {
+            return Walk::Hung;
         }
         let node = cursor.node();
         let range = (node.start_byte(), node.end_byte());
@@ -155,21 +214,24 @@ fn collect_outline(
             found.impl_targets.insert(range, name);
         }
         if cursor.goto_first_child() {
+            depth += 1;
             continue;
         }
         loop {
             if cursor.node() == root {
-                return Some(());
+                return Walk::Done;
             }
             if cursor.goto_next_sibling() {
                 break;
             }
             if !cursor.goto_parent() {
-                return Some(());
+                return Walk::Done;
             }
+            depth -= 1;
         }
     }
 }
+const HUNG_POLL: usize = 256;
 /// The type an `impl` block implements, by its last path segment.
 fn impl_target(node: tree_sitter::Node<'_>, text: &[u8]) -> Option<String> {
     if node.kind() != "impl_item" {
@@ -527,7 +589,7 @@ mod outline_syntax_tests {
     use super::*;
 
     fn outline_syntax_of(file: &SourceFile) -> Option<OutlineSyntax> {
-        outline_syntax(file, &[])
+        outline_syntax(file, &[]).unwrap()
     }
 
     fn syntax(language: &str, text: &str) -> Option<OutlineSyntax> {
@@ -603,11 +665,106 @@ mod outline_syntax_tests {
             text: text.into(),
         };
         let targets: Vec<_> = outline_syntax(&file, &[(start, end)])
+            .unwrap()
             .expect("parsed in budget")
             .impl_targets
             .into_values()
             .collect();
         assert_eq!(targets, ["Meter"]);
+    }
+}
+
+#[cfg(test)]
+mod outline_bounds_tests {
+    //! #1119: the outline's syntax facts are decided by the input alone.
+    use super::*;
+    use crate::syntax_bounds::{DEPTH, VISITS};
+
+    const RUST: &str = "impl Budget { fn a() {} }\n";
+    const JAVASCRIPT: &str = "const anon = function () {};\nconst arrow = () => 1;\n";
+
+    fn file(language: &str, text: String) -> SourceFile {
+        SourceFile {
+            path: "fixture".into(),
+            hash: String::new(),
+            language: language.into(),
+            text,
+        }
+    }
+
+    /// A clock that reads `base` once, then `later` on every read after.
+    fn clock_jumping_to(later: Duration) -> impl Fn() -> Instant {
+        let base = Instant::now();
+        let reads = std::cell::Cell::new(0);
+        move || {
+            reads.set(reads.get() + 1);
+            if reads.get() == 1 { base } else { base + later }
+        }
+    }
+
+    fn facts(syntax: &OutlineSyntax) -> (Vec<(usize, usize)>, Vec<String>) {
+        (
+            syntax.callable_initializers.iter().copied().collect(),
+            syntax.impl_targets.values().cloned().collect(),
+        )
+    }
+
+    /// A clock that reads a second later on every poll, past the old 250 ms Files budget,
+    /// changes nothing: the same file gives the same facts on any machine.
+    #[test]
+    fn a_slow_machine_gets_the_same_outline_facts() {
+        for (language, text) in [("rust", RUST), ("javascript", JAVASCRIPT)] {
+            let file = file(language, text.into());
+            let blocks = [(0, RUST.find('\n').unwrap())];
+            let blocks = if language == "rust" { &blocks[..] } else { &[] };
+            let fast = outline_syntax(&file, blocks).unwrap().unwrap();
+            let slow = clock_jumping_to(FILE_TIME_LIMIT * 4);
+            let slow = outline_syntax_until(&file, blocks, &slow).unwrap().unwrap();
+            assert_eq!(facts(&slow), facts(&fast));
+            assert_eq!((slow.warning, fast.warning), (None, None));
+            assert_ne!(facts(&fast), (vec![], vec![]));
+        }
+    }
+
+    #[test]
+    fn the_hang_backstop_is_a_typed_error_never_a_partial_outline() {
+        let file = file("rust", RUST.into());
+        let hung = clock_jumping_to(SYNTAX_HANG_BACKSTOP);
+        let error = outline_syntax_until(&file, &[(0, 1)], &hung).unwrap_err();
+        assert_eq!(error.to_string(), OUTLINE_HUNG);
+        assert!(OUTLINE_HUNG.starts_with("deadline_exceeded:"));
+    }
+
+    /// Each bound's exceeded path: no facts and the bound's warning, on every run.
+    #[test]
+    fn a_file_beyond_a_bound_has_no_facts_and_says_so() {
+        let over_input = format!("{JAVASCRIPT}{}", " ".repeat(FILE_INPUT_LIMIT));
+        let deep = format!(
+            "{JAVASCRIPT}x = {}1{};\n",
+            "[".repeat(DEPTH),
+            "]".repeat(DEPTH)
+        );
+        let wide = format!("{JAVASCRIPT}x = [{}];\n", "0,".repeat(VISITS));
+        for (text, warning) in [
+            (over_input, OUTLINE_OVER_INPUT),
+            (deep, OUTLINE_OVER_BOUNDS),
+            (wide, OUTLINE_OVER_BOUNDS),
+        ] {
+            let file = file("javascript", text);
+            for _ in 0..2 {
+                let syntax = outline_syntax(&file, &[]).unwrap().unwrap();
+                assert_eq!(syntax.warning, Some(warning));
+                assert_eq!(facts(&syntax), (vec![], vec![]));
+            }
+        }
+    }
+
+    #[test]
+    fn an_asked_impl_block_without_syntax_is_reported() {
+        let file = file("rust", RUST.into());
+        let syntax = outline_syntax(&file, &[(1, 5)]).unwrap().unwrap();
+        assert_eq!(syntax.warning, Some(OUTLINE_IMPL_MISSING));
+        assert_eq!(facts(&syntax).1, ["Budget"]);
     }
 }
 

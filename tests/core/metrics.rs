@@ -1212,7 +1212,7 @@ fn labeled_break_adds_flat_cognitive_without_branch() {
     }
 }
 
-fn native_rows(language: &str, filename: &str, source: &str) -> Vec<metrics::DeclarationMetrics> {
+fn native_artifact(filename: &str, source: &str) -> trellis::native_evidence::Artifact {
     use std::{
         fs,
         sync::{Arc, atomic::AtomicBool},
@@ -1227,7 +1227,11 @@ fn native_rows(language: &str, filename: &str, source: &str) -> Vec<metrics::Dec
             .unwrap();
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let capture = Capture::admit(&IndexOptions::new(root.path().into()), &cancel, &|_| {}).unwrap();
-    let artifact = from_capture(&capture, root.path(), &identity.record_id, &cancel).unwrap();
+    from_capture(&capture, root.path(), &identity.record_id, &cancel).unwrap()
+}
+
+fn native_rows(language: &str, filename: &str, source: &str) -> Vec<metrics::DeclarationMetrics> {
+    let artifact = native_artifact(filename, source);
     metrics::compute(
         language,
         source,
@@ -1756,14 +1760,18 @@ fn switch_and_try_arms_are_as_deep_as_their_statement() {
     }
 }
 
-/// #987 review: an arm is level with its statement only when that statement is itself a
-/// stored region. Java's `try (resource)` is not stored, so its arms carry the level.
+/// #1120: Java's `try (resource)` is a stored level like a plain `try`, so what its body
+/// holds is one level deeper and its `catch` and `finally` are level with it.
 #[test]
-fn arms_of_a_statement_that_is_not_stored_keep_their_level() {
+fn a_try_with_resources_is_a_level_and_its_arms_are_level_with_it() {
     for (source, expected) in [
         (
             "class Case { int calc(java.io.Reader in) { try (java.io.Reader r = in) { return r.read(); } catch (java.io.IOException e) { return -1; } } }",
             1,
+        ),
+        (
+            "class Case { int calc(java.io.Reader in, int x) { try (java.io.Reader r = in) { if (x > 0) { return x; } return r.read(); } } }",
+            2,
         ),
         (
             "class Case { int calc(java.io.Reader in, int x) { try (java.io.Reader r = in) { return r.read(); } catch (java.io.IOException e) { if (x > 0) { return x; } return -1; } } }",
@@ -1773,11 +1781,15 @@ fn arms_of_a_statement_that_is_not_stored_keep_their_level() {
             "class Case { int calc(java.io.Reader in) { try (java.io.Reader r = in) { return r.read(); } catch (java.io.IOException e) { return -1; } catch (RuntimeException e) { return -2; } finally { in = null; } } }",
             1,
         ),
-        // Inside a stored `try`, the resource statement's own `catch` is one level deeper,
-        // and the outer `catch` is still level with the outer `try`.
+        // Inside a stored `try`, the resource statement is one level deeper, its own `catch`
+        // is level with it, and the outer `catch` is level with the outer `try`.
         (
             "class Case { int calc(java.io.Reader in) { try { try (java.io.Reader r = in) { return r.read(); } catch (java.io.IOException e) { return -1; } } catch (RuntimeException e) { return -2; } } }",
             2,
+        ),
+        (
+            "class Case { int calc(java.io.Reader in, int x) { try { try (java.io.Reader r = in) { if (x > 0) { return x; } return r.read(); } } catch (RuntimeException e) { return -2; } } }",
+            3,
         ),
     ] {
         assert_eq!(
@@ -1815,4 +1827,247 @@ fn every_arm_of_a_stored_statement_is_level_with_it() {
             "{language}: {source}"
         );
     }
+}
+
+/// #1120: Rust's `while` (also `while let`) and Java's enhanced `for` are stored loops, so
+/// what they hold is one level deeper, as under any other loop.
+#[test]
+fn every_loop_form_is_a_nesting_level() {
+    for (language, filename, source) in [
+        (
+            "rust",
+            "case.rs",
+            "fn calc(xs: &[u32]) { let mut i = 0; while i < xs.len() { if xs[i] > 0 { } i += 1; } }",
+        ),
+        (
+            "rust",
+            "case.rs",
+            "fn calc(mut o: Option<u32>) { while let Some(v) = o { if v > 0 { } o = None; } }",
+        ),
+        (
+            "java",
+            "Case.java",
+            "class Case { void calc(int[] xs) { for (int v : xs) { if (v > 0) { } } } }",
+        ),
+    ] {
+        assert_eq!(
+            native_max_nesting(language, filename, source),
+            2,
+            "{language}: {source}"
+        );
+    }
+}
+
+/// #1120: Python's `except` is a stored handler and, like `catch`, an arm of its `try`: what
+/// it holds is one level below the `try`, not two.
+#[test]
+fn a_python_except_is_level_with_its_try() {
+    for (source, expected) in [
+        (
+            "def calc(x):\n    try:\n        return x()\n    except ValueError:\n        return 1\n",
+            1,
+        ),
+        (
+            "def calc(x, y):\n    try:\n        return x()\n    except ValueError:\n        if y:\n            return 1\n        return 0\n",
+            2,
+        ),
+        (
+            "def calc(x, y):\n    try:\n        return x()\n    except* ValueError:\n        if y:\n            return 1\n        return 0\n",
+            2,
+        ),
+    ] {
+        assert_eq!(
+            native_max_nesting("python", "case.py", source),
+            expected,
+            "{source}"
+        );
+    }
+}
+
+/// The kinds of the control regions native extraction stores for one document, in stored
+/// order.
+fn native_region_kinds(filename: &str, source: &str) -> Vec<String> {
+    native_artifact(filename, source)
+        .control_regions
+        .into_iter()
+        .map(|region| region.kind)
+        .collect()
+}
+
+/// One language's audit table (#1120): each body, wrapped in a callable, stores exactly the
+/// listed region kinds. Every branch, loop, switch or match, `try` and handler is a region,
+/// and so are the `else`, `elif`, `case`, `default` and `finally` arms where the grammar has
+/// them as nodes; a statement that neither branches nor loops is not. Every differing row is
+/// reported, not only the first.
+fn assert_region_table(filename: &str, wrap: impl Fn(&str) -> String, rows: &[(&str, &[&str])]) {
+    let failures: Vec<String> = rows
+        .iter()
+        .filter_map(|(body, expected)| {
+            let kinds = native_region_kinds(filename, &wrap(body));
+            (kinds[..] != expected[..])
+                .then(|| format!("{body:?}: stored {kinds:?}, expected {expected:?}"))
+        })
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn rust_control_regions_cover_every_branch_and_loop() {
+    assert_region_table(
+        "case.rs",
+        |body| format!("fn calc(x: i32, xs: &[i32], o: Option<i32>) {{ {body} }}"),
+        &[
+            ("if x > 0 { }", &["if_expression"]),
+            ("if x > 0 { } else { }", &["if_expression", "else_clause"]),
+            (
+                "if let Some(v) = o { } else if x > 0 { }",
+                &["if_expression", "else_clause", "if_expression"],
+            ),
+            ("while x > 0 { }", &["while_expression"]),
+            ("while let Some(v) = o { }", &["while_expression"]),
+            ("loop { break; }", &["loop_expression"]),
+            ("for v in xs { }", &["for_expression"]),
+            ("match x { 0 => {} _ => {} }", &["match_expression"]),
+        ],
+    );
+}
+
+#[test]
+fn java_control_regions_cover_every_branch_loop_and_handler() {
+    assert_region_table(
+        "Case.java",
+        |body| {
+            format!(
+                "class Case {{ void calc(int x, int[] xs, java.io.Reader in) throws Exception {{ {body} }} }}"
+            )
+        },
+        &[
+            ("if (x > 0) { }", &["if_statement"]),
+            // Java's `else` is a field of its `if`, not a clause of its own.
+            ("if (x > 0) { } else { }", &["if_statement"]),
+            (
+                "if (x > 0) { } else if (x < 0) { }",
+                &["if_statement", "if_statement"],
+            ),
+            ("while (x > 0) { x--; }", &["while_statement"]),
+            ("do { x--; } while (x > 0);", &["do_statement"]),
+            ("for (int i = 0; i < x; i++) { }", &["for_statement"]),
+            ("for (int v : xs) { }", &["enhanced_for_statement"]),
+            (
+                "switch (x) { case 1: break; default: break; }",
+                &["switch_expression"],
+            ),
+            (
+                "int y = switch (x) { case 1 -> 2; default -> 3; };",
+                &["switch_expression"],
+            ),
+            (
+                "try { x++; } catch (RuntimeException e) { } finally { x = 0; }",
+                &["try_statement", "catch_clause", "finally_clause"],
+            ),
+            (
+                "try (java.io.Reader r = in) { r.read(); } catch (java.io.IOException e) { } finally { x = 0; }",
+                &[
+                    "try_with_resources_statement",
+                    "catch_clause",
+                    "finally_clause",
+                ],
+            ),
+            ("int y = x > 0 ? 1 : 2;", &["ternary_expression"]),
+            // A lock neither branches nor loops.
+            ("synchronized (this) { x++; }", &[]),
+        ],
+    );
+}
+
+#[test]
+fn python_control_regions_cover_every_branch_loop_and_handler() {
+    assert_region_table(
+        "case.py",
+        |body| {
+            let body: Vec<String> = body.lines().map(|line| format!("    {line}")).collect();
+            format!("def calc(x, xs):\n{}\n", body.join("\n"))
+        },
+        &[
+            ("if x:\n    pass", &["if_statement"]),
+            (
+                "if x:\n    pass\nelif xs:\n    pass\nelse:\n    pass",
+                &["if_statement", "elif_clause", "else_clause"],
+            ),
+            (
+                "for v in xs:\n    pass\nelse:\n    pass",
+                &["for_statement", "else_clause"],
+            ),
+            (
+                "while x:\n    x -= 1\nelse:\n    pass",
+                &["while_statement", "else_clause"],
+            ),
+            (
+                "try:\n    x()\nexcept ValueError:\n    pass\nexcept (KeyError, TypeError) as e:\n    pass\nelse:\n    pass\nfinally:\n    pass",
+                &[
+                    "try_statement",
+                    "except_clause",
+                    "except_clause",
+                    "else_clause",
+                    "finally_clause",
+                ],
+            ),
+            (
+                "try:\n    x()\nexcept* ValueError:\n    pass",
+                &["try_statement", "except_clause"],
+            ),
+            (
+                "match x:\n    case 1:\n        pass\n    case _:\n        pass",
+                &["match_statement"],
+            ),
+            ("y = 1 if x else 2", &["conditional_expression"]),
+            // A context manager neither branches nor loops.
+            ("with x:\n    pass", &[]),
+        ],
+    );
+}
+
+/// The JavaScript and TypeScript grammars share these statements; the audit found none
+/// missing, so these tables pin the existing set.
+const JS_REGION_ROWS: &[(&str, &[&str])] = &[
+    ("if (x) { } else { }", &["if_statement", "else_clause"]),
+    (
+        "if (x) { } else if (xs) { }",
+        &["if_statement", "else_clause", "if_statement"],
+    ),
+    ("for (let i = 0; i < x; i++) { }", &["for_statement"]),
+    ("for (const k in xs) { }", &["for_in_statement"]),
+    ("for (const v of xs) { }", &["for_in_statement"]),
+    ("while (x) { x--; }", &["while_statement"]),
+    ("do { x--; } while (x);", &["do_statement"]),
+    (
+        "switch (x) { case 1: break; default: break; }",
+        &["switch_statement", "switch_case", "switch_default"],
+    ),
+    (
+        "try { x(); } catch (e) { } finally { x = 0; }",
+        &["try_statement", "catch_clause", "finally_clause"],
+    ),
+    ("const y = x ? 1 : 2;", &["ternary_expression"]),
+];
+
+#[test]
+fn javascript_control_regions_cover_every_branch_loop_and_handler() {
+    let mut rows = JS_REGION_ROWS.to_vec();
+    // `with` only changes scope.
+    rows.push(("with (xs) { x(); }", &[]));
+    assert_region_table(
+        "case.js",
+        |body| format!("function calc(x, xs) {{ {body} }}"),
+        &rows,
+    );
+}
+
+#[test]
+fn typescript_control_regions_cover_every_branch_loop_and_handler() {
+    assert_region_table(
+        "case.ts",
+        |body| format!("function calc(x: any, xs: any): void {{ {body} }}"),
+        JS_REGION_ROWS,
+    );
 }

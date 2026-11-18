@@ -212,6 +212,9 @@ pub(super) struct Catalog {
     /// The items under a known attribute macro whose scope stays transparent until the
     /// macro's path is proved to reach its own package, after the scan.
     proofs: Vec<MacroProof>,
+    /// The variants each enum declaration spells, by the declaration's document and range
+    /// (#1200).
+    variants: BTreeMap<(usize, usize, usize), BTreeMap<String, Variant>>,
     pub(super) work: Work,
 }
 /// A crate root: a conventional root of the checkout's package, or a library or binary
@@ -252,6 +255,7 @@ impl Catalog {
             externs: BTreeMap::new(),
             uniform: BTreeSet::new(),
             proofs: Vec::new(),
+            variants: BTreeMap::new(),
             work,
         };
         let declarations = result.index_files(docs, trees, workspace, check)?;
@@ -713,6 +717,9 @@ impl Catalog {
                 && let Some(name) = child.child_by_field_name("name")
             {
                 let name = self.bind_item(item, name, namespaces, declarations, check)?;
+                if child.kind() == "enum_item" {
+                    self.record_variants(doc, document, child, check)?;
+                }
                 if let Some(proof) = &mut proof {
                     for &namespace in namespaces {
                         let key = (namespace, name.clone());
@@ -1763,10 +1770,9 @@ impl Catalog {
                 .filter(|b| !b.unknown && b.candidates.len() == 1)
                 .and_then(|b| b.candidates.values().next());
             if found.unknown_set || next.and_then(|c| c.module).is_none() {
-                return Ok(Names {
-                    unknown_set: true,
-                    ..Names::default()
-                });
+                // Only an enum's variant (#1200) goes on from a candidate that is no module.
+                let enumeration = next.filter(|_| !found.unknown_set).cloned();
+                return self.variant(enumeration.as_ref(), &path[index..], check);
             }
             let next = next.expect("proved module candidate");
             proof.extend(next.proof.iter().copied());
@@ -1852,6 +1858,99 @@ impl Catalog {
             .candidates
             .insert(candidate.declaration.clone(), candidate);
         Ok(Some(names))
+    }
+    /// The variants an enum item spells (#1200). An enum body holds no macro call, and an
+    /// attribute macro cannot apply to a variant, so its text lists every variant there is;
+    /// only `cfg` and `cfg_attr` can leave one out. A variant is certain only when every
+    /// attribute on it is a known inert one (`inert_variant_attribute`), so no spelling of
+    /// a conditional (`#[cfg /* .. */ (..)]`, `#[r#cfg(..)]`) proves it. A variant written
+    /// twice, or in a body the parser could not read, is not certain.
+    fn record_variants(
+        &mut self,
+        doc: &DocumentInput,
+        document: usize,
+        item: Node<'_>,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let Some(body) = item.child_by_field_name("body") else {
+            return Ok(());
+        };
+        let readable = !body.has_error();
+        let mut variants = BTreeMap::new();
+        let mut conditional = false;
+        let mut cursor = body.walk();
+        for child in body.named_children(&mut cursor) {
+            self.step(check)?;
+            match child.kind() {
+                // Any attribute but a known inert one could be a `cfg`, however spelled.
+                "attribute_item" => conditional |= !inert_variant_attribute(doc, child),
+                "enum_variant" => {
+                    if let Some(name) = child.child_by_field_name("name") {
+                        let braced = child
+                            .child_by_field_name("body")
+                            .is_some_and(|b| b.kind() == "field_declaration_list");
+                        variants
+                            .entry(text(doc, name).to_owned())
+                            .and_modify(|v: &mut Variant| v.certain = false)
+                            .or_insert(Variant {
+                                certain: readable && !conditional,
+                                braced,
+                            });
+                    }
+                    conditional = false;
+                }
+                _ => {}
+            }
+        }
+        self.variants
+            .insert((document, item.start_byte(), item.end_byte()), variants);
+        Ok(())
+    }
+    /// `Enum::Variant`: the names of the variant, which lives in the enum's own declaration,
+    /// when `enumeration` is the one proved candidate before `rest`, an enum, and `rest` is
+    /// one variant its body certainly spells (#1200). A variant is found before any
+    /// associated item of the same name, so no `impl` or trait can take its place. A braced
+    /// variant (`V { x: u8 }`) has no value constructor: it binds only the type namespace,
+    /// as a braced struct does, so a value path `Enum::V` can name an associated item `V`
+    /// and is not proved here. Anything
+    /// else (an inherent or trait item, a type alias, a conditional variant, a path that
+    /// goes on past the variant) is an unknown set.
+    fn variant(
+        &mut self,
+        enumeration: Option<&Candidate>,
+        rest: &[String],
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<Names> {
+        self.step(check)?;
+        let unknown = Names {
+            unknown_set: true,
+            ..Names::default()
+        };
+        let (Some(enumeration), [name]) = (enumeration, rest) else {
+            return Ok(unknown);
+        };
+        let declaration = &enumeration.declaration;
+        let Some(&Variant {
+            certain: true,
+            braced,
+        }) = self
+            .variants
+            .get(&(declaration.document, declaration.start, declaration.end))
+            .and_then(|variants| variants.get(name))
+        else {
+            return Ok(unknown);
+        };
+        let mut names = Names::default();
+        let namespaces: &[u8] = if braced { &[TYPE] } else { &[TYPE, VALUE] };
+        for &namespace in namespaces {
+            names
+                .names
+                .entry((namespace, name.to_owned()))
+                .or_default()
+                .candidates
+                .insert(declaration.clone(), enumeration.clone());
+        }
+        Ok(names)
     }
     /// A module prefix alone, useful as an expansion target, not a synthetic declaration.
     fn module_name(&self, module: usize, name: &str, depth: usize) -> Names {
@@ -2630,6 +2729,15 @@ enum KnownMacro {
     /// to the body: so the item must not spell `__self`.
     AsyncTrait { bare: bool, global: bool },
 }
+/// One variant an enum body spells (#1200).
+#[derive(Clone, Copy)]
+struct Variant {
+    /// No attribute on it but known inert ones, and spelled once in a readable body: it
+    /// certainly exists.
+    certain: bool,
+    /// A braced (record) variant, which binds the type namespace only.
+    braced: bool,
+}
 /// An item under known attribute macros, with the bindings it made, which the failed proof
 /// of any of them leaves uncertain, as under an attribute this catalog does not read.
 struct MacroProof {
@@ -2658,6 +2766,41 @@ fn known_macro(name: &str) -> Option<KnownMacro> {
         }),
         _ => None,
     }
+}
+/// The attributes a variant can carry that never make it conditional (#1200): built-in
+/// inert attributes and the variant helpers of serde, thiserror and clap. The path is read
+/// from the parsed attribute, one identifier with any `r#` removed, so comments and raw
+/// spellings change nothing; any other path, `cfg` and `cfg_attr` included, is refused.
+fn inert_variant_attribute(doc: &DocumentInput, item: Node<'_>) -> bool {
+    const INERT: &[&str] = &[
+        "doc",
+        "allow",
+        "warn",
+        "deny",
+        "forbid",
+        "expect",
+        "deprecated",
+        "default",
+        "serde",
+        "error",
+        "command",
+        "value",
+    ];
+    let mut cursor = item.walk();
+    let Some(attribute) = item
+        .named_children(&mut cursor)
+        .find(|n| n.kind() == "attribute")
+    else {
+        return false;
+    };
+    let mut cursor = attribute.walk();
+    let path = attribute
+        .named_children(&mut cursor)
+        .find(|n| !matches!(n.kind(), "line_comment" | "block_comment"));
+    path.is_some_and(|path| {
+        let name = text(doc, path);
+        path.kind() == "identifier" && INERT.contains(&name.strip_prefix("r#").unwrap_or(name))
+    })
 }
 /// Whether `text` spells the identifier `name`, not as part of a longer identifier.
 fn spells_identifier(text: &str, name: &str) -> bool {
@@ -3175,6 +3318,7 @@ mod cache_tests {
             externs: BTreeMap::new(),
             uniform: BTreeSet::new(),
             proofs: Vec::new(),
+            variants: BTreeMap::new(),
             work: Work::new(work::reference_limit(0, 0)),
         }
     }
