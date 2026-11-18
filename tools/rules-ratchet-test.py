@@ -17,36 +17,50 @@ SPEC = importlib.util.spec_from_file_location(
 RR = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(RR)
 
-# A record of three deviating pairs from two source files. Its unknown references are
-# 20 from src/store.rs, 5 from src/http.rs and 25 from files with no deviating pair.
+# A record of three deviating pairs from two source files and two excepted pairs, one
+# from a source file with deviating pairs and one from a file with none (#1211). Its
+# unknown references are 20 from src/store.rs, 5 from src/http.rs, 8 from src/testing.rs
+# and 17 from files with no deviating or excepted pair.
 RECORD = {"deviatingPairs": 3, "deviatingReferences": 10, "unknownReferences": 50,
           "partialFiles": 1, "comparablePairs": 40, "conformingPairs": 30, "unknownPairs": 7,
           "deviatingReferencesByPair": {"src/http.rs": {"src/storage.rs": 1},
                                         "src/store.rs": {"src/capture.rs": 6, "src/indexer.rs": 3}},
-          "unknownReferencesBySource": {"src/http.rs": 5, "src/store.rs": 20}}
-UNRELATED = {"src/cli.rs": 15, "src/daemon.rs": 10}
+          "exceptedReferencesByPair": {"src/store.rs": {"src/classes.rs": 4},
+                                       "src/testing.rs": {"src/store.rs": 2}},
+          "unknownReferencesBySource": {"src/http.rs": 5, "src/store.rs": 20, "src/testing.rs": 8}}
+UNRELATED = {"src/cli.rs": 15, "src/daemon.rs": 2}
 
 
-def figures(pairs=None, unknown=None, **totals):
-    """A measurement of RECORD's tree after changes: `pairs` gives (source, destination)
-    pairs new reference counts, 0 for a pair that is gone, and `unknown` gives source
-    files new unknown-reference counts. The deviation and unknown totals follow."""
-    flat = {**RR.pairs(RECORD), **(pairs or {})}
-    by_pair = {}
+def by_source_map(flat):
+    """{(source, destination): references} as the record's nested map, without the
+    pairs that are gone."""
+    nested = {}
     for (source, destination), references in flat.items():
         if references:
-            by_pair.setdefault(source, {})[destination] = references
+            nested.setdefault(source, {})[destination] = references
+    return nested
+
+
+def figures(pairs=None, unknown=None, excepted=None, **totals):
+    """A measurement of RECORD's tree after changes: `pairs` and `excepted` give
+    (source, destination) deviating and excepted pairs new reference counts, 0 for a
+    pair that is gone, and `unknown` gives source files new unknown-reference counts.
+    The deviation and unknown totals follow."""
+    by_pair = by_source_map({**RR.pairs(RECORD), **(pairs or {})})
+    by_excepted = by_source_map({**RR.pairs(RECORD, RR.EXCEPTED), **(excepted or {})})
     by_source = {**RECORD["unknownReferencesBySource"], **UNRELATED, **(unknown or {})}
     return {**RECORD, "deviatingPairs": sum(map(len, by_pair.values())),
             "deviatingReferences": sum(sum(each.values()) for each in by_pair.values()),
             "unknownReferences": sum(by_source.values()),
-            "deviatingReferencesByPair": by_pair, "unknownReferencesBySource": by_source,
-            **totals}
+            "deviatingReferencesByPair": by_pair, "exceptedReferencesByPair": by_excepted,
+            "unknownReferencesBySource": by_source, **totals}
 
 
 CAPTURE = ("src/store.rs", "src/capture.rs")
 INDEXER = ("src/store.rs", "src/indexer.rs")
 STORAGE = ("src/http.rs", "src/storage.rs")
+CLASSES = ("src/store.rs", "src/classes.rs")  # excepted
+RETRY = ("src/testing.rs", "src/store.rs")  # excepted
 
 NATIVE = {"sourceSetId": "source-set:v1:0", "language": "rust", "path": "src/storage.rs",
           "sid": "sid:v1:0"}
@@ -84,8 +98,8 @@ TREE = (row("deviates", 4), row("conforms", 9), row("conforms", 1),
 
 
 class Ratchet(unittest.TestCase):
-    def verdict(self, pairs=None, unknown=None, **totals):
-        return RR.compare(RECORD, figures(pairs, unknown, **totals))
+    def verdict(self, pairs=None, unknown=None, excepted=None, **totals):
+        return RR.compare(RECORD, figures(pairs, unknown, excepted, **totals))
 
     def test_the_same_figures_pass(self):
         verdict, lines = self.verdict()
@@ -162,6 +176,56 @@ class Ratchet(unittest.TestCase):
         self.assertEqual(verdict, "fail")
         self.assertIn("lost coverage", lines[0])
 
+    def test_an_excepted_pair_that_turns_unknown_with_a_rise_from_its_source_is_lost_coverage(self):
+        # #1211: the excepted pair's references become unknown references of its source,
+        # which has no deviating pair; no total that fails rises.
+        verdict, lines = self.verdict(excepted={RETRY: 0}, unknown={"src/testing.rs": 10})
+        self.assertEqual(verdict, "fail")
+        self.assertIn("lost coverage", lines[0])
+        self.assertEqual(lines[1], "  src/testing.rs -> src/store.rs (excepted): excepted "
+                         "references recorded 2, measured 0; unknown references from "
+                         "src/testing.rs: recorded 8, measured 10 (+2)")
+        self.assertEqual(len([line for line in lines if " -> " in line]), 1)
+
+    def test_an_excepted_pair_beside_deviating_pairs_is_named_alone(self):
+        # The source file also has deviating pairs, which did not fall.
+        verdict, lines = self.verdict(excepted={CLASSES: 1}, unknown={"src/store.rs": 23})
+        self.assertEqual(verdict, "fail")
+        self.assertIn("lost coverage", lines[0])
+        self.assertEqual(lines[1], "  src/store.rs -> src/classes.rs (excepted): excepted "
+                         "references recorded 4, measured 1; unknown references from "
+                         "src/store.rs: recorded 20, measured 23 (+3)")
+        self.assertFalse(any("src/capture.rs" in line or "src/indexer.rs" in line
+                             for line in lines))
+
+    def test_other_changes_in_excepted_pairs_are_a_notice(self):
+        # A fall with a rise only elsewhere, a fall on fewer unknown references from its
+        # source, a rise, and a new excepted pair: none is lost coverage or a deviation.
+        for changed, line in (
+                ({"excepted": {RETRY: 0}, "unknown": {"src/cli.rs": 17}},
+                 "  src/testing.rs -> src/store.rs (excepted): excepted references recorded 2, "
+                 "measured 0"),
+                ({"excepted": {RETRY: 1}, "unknown": {"src/testing.rs": 7}},
+                 "  src/testing.rs -> src/store.rs (excepted): excepted references recorded 2, "
+                 "measured 1"),
+                ({"excepted": {CLASSES: 9}},
+                 "  src/store.rs -> src/classes.rs (excepted): excepted references recorded 4, "
+                 "measured 9"),
+                ({"excepted": {("src/http.rs", "src/store.rs"): 1}},
+                 "  src/http.rs -> src/store.rs (excepted): excepted references recorded 0, "
+                 "measured 1")):
+            verdict, lines = self.verdict(**changed)
+            self.assertEqual(verdict, "lower", changed)
+            self.assertIn("the record can be updated", lines[0])
+            self.assertIn(line, lines)
+            self.assertFalse(any("FAILED" in each for each in lines))
+
+    def test_an_excepted_pair_that_becomes_deviating_fails_as_a_new_pair(self):
+        # Its exception was removed: the pair is deviating and the record does not have it.
+        verdict, lines = self.verdict(excepted={RETRY: 0}, pairs={RETRY: 2})
+        self.assertEqual(verdict, "fail")
+        self.assertIn("  new deviating pair: src/testing.rs -> src/store.rs (2 references)", lines)
+
     def test_a_rise_in_unknown_references_without_a_fall_is_a_notice(self):
         for unknown in ({"src/cli.rs": 18}, {"src/store.rs": 23}):
             verdict, lines = self.verdict(unknown=unknown)
@@ -193,6 +257,14 @@ class Ratchet(unittest.TestCase):
         self.assertIn("(+1)", lines[0])
         self.assertIn("--accept-unknown-rise", lines[1])
         self.assertIn("src/store.rs -> src/capture.rs", lines[2])
+
+    def test_an_update_that_loses_an_excepted_pairs_coverage_is_refused_without_the_flag(self):
+        measured = figures(excepted={RETRY: 1}, unknown={"src/testing.rs": 9})
+        refused, lines = RR.update_refusal(RECORD, measured, False)
+        self.assertTrue(refused)
+        self.assertIn("not rewritten", lines[1])
+        self.assertIn("src/testing.rs -> src/store.rs (excepted)", lines[2])
+        self.assertFalse(RR.update_refusal(RECORD, measured, True)[0])
 
     def test_other_updates_are_not_refused_and_print_the_unknown_change(self):
         for changed, delta in (
@@ -239,7 +311,21 @@ class Ratchet(unittest.TestCase):
             "partialFiles": 1, "comparablePairs": 6, "conformingPairs": 2,
             "unknownPairs": 1,
             "deviatingReferencesByPair": {"src/http.rs": {"src/storage.rs": 10}},
+            "exceptedReferencesByPair": {"src/http.rs": {"src/storage.rs": 5}},
             "unknownReferencesBySource": {"src/http.rs": 2}}, 2))
+
+    def test_only_excepted_deviations_are_excepted_pairs(self):
+        # An excepted instance keeps its status: an excepted unknown or conforming one is
+        # in no pair map, and an excepted unknown one in no unknown count.
+        measured, _ = RR.summarize(payload(
+            row("deviates", 3, excepted=True, source="src/testing.rs"),
+            row("unknown", 4, excepted=True, destination=None, source="src/testing.rs"),
+            row("conforms", 2, excepted=True, source="src/testing.rs"),
+            row("deviates", 1, excepted=True, destination=stdlib("os"), source="src/testing.rs")))
+        self.assertEqual(measured["exceptedReferencesByPair"],
+                         {"src/testing.rs": {"src/storage.rs": 3}})
+        self.assertEqual(measured["unknownReferencesBySource"], {})
+        self.assertEqual(RR.recorded(measured)["unknownReferencesBySource"], {"src/testing.rs": 0})
 
     def test_a_payload_is_summarized_by_pair_and_by_source_file(self):
         # A pair is the instance's `target` path and its destination's path; an unknown
@@ -297,6 +383,24 @@ class Ratchet(unittest.TestCase):
                          "recorded 4, measured 0; unknown references from src/http.rs: "
                          "recorded 2, measured 6 (+4)")
 
+    def test_an_excepted_reference_that_becomes_unresolved_is_lost_coverage(self):
+        # #1211 regression, from payloads: src/testing.rs has only an excepted pair, its
+        # reference turns unknown, and its unknown count rises.
+        tree = (*TREE, row("deviates", 2, excepted=True, source="src/testing.rs"))
+        record, _ = RR.summarize(payload(*tree))
+        self.assertEqual(RR.recorded(record)["unknownReferencesBySource"],
+                         {"src/http.rs": 2, "src/testing.rs": 0})
+        measured, _ = RR.summarize(payload(
+            *TREE, row("unknown", 2, destination=None, source="src/testing.rs")))
+        self.assertEqual((measured["deviatingPairs"], measured["deviatingReferences"]),
+                         (record["deviatingPairs"], record["deviatingReferences"]))
+        verdict, lines = RR.compare(RR.recorded(record), measured)
+        self.assertEqual(verdict, "fail")
+        self.assertIn("lost coverage", lines[0])
+        self.assertEqual(lines[1], "  src/testing.rs -> src/storage.rs (excepted): excepted "
+                         "references recorded 2, measured 0; unknown references from "
+                         "src/testing.rs: recorded 0, measured 2 (+2)")
+
     def test_a_file_split_that_adds_an_unknown_pair_passes(self):
         # One source's unresolved references become two sources' (#1087): one more
         # unknown pair, the same unknown references.
@@ -321,6 +425,10 @@ class Ratchet(unittest.TestCase):
             written = RR.read_record(path)
             self.assertEqual({key: written[key] for key in RECORD}, RECORD)
             self.assertEqual(list(written["deviatingReferencesByPair"]), ["src/http.rs", "src/store.rs"])
+            # The unknown references of every deviating or excepted pair's source, and of
+            # no other file.
+            self.assertEqual(written["unknownReferencesBySource"],
+                             {"src/http.rs": 5, "src/store.rs": 20, "src/testing.rs": 8})
             self.assertEqual(RR.compare(written, measured)[0], "equal")
             RR.write_record(path, RR.read_record(path))
             self.assertEqual(path.read_bytes(), first)
@@ -331,17 +439,25 @@ class Ratchet(unittest.TestCase):
             RR.write_record(path, RECORD)
             written = json.loads(path.read_text())
             self.assertEqual(list(written), ["schemaVersion", "population", "rule", "measurement", *RR.KEYS,
-                                             "deviatingReferencesByPair", "unknownReferencesBySource"])
+                                             "deviatingReferencesByPair", "exceptedReferencesByPair",
+                                             "unknownReferencesBySource"])
             self.assertIn("externalPackage", written["population"])
             self.assertIn("--accept-unknown-rise", written["rule"])
             self.assertIn("renames are not detected", written["rule"])
+            self.assertIn("deviatingReferencesByPair or exceptedReferencesByPair", written["rule"])
             # A record of an earlier version or shape is refused: version 3 had the
-            # totals only (#1140).
+            # totals only (#1140), version 4 no excepted pairs (#1211).
             totals = {key: RECORD[key] for key in RR.KEYS}
+            version_4 = {key: value for key, value in written.items()
+                         if key != "exceptedReferencesByPair"}
             for old in ({**written, "schemaVersion": 3}, {"schemaVersion": 3, **totals},
+                        {**version_4, "schemaVersion": 4,
+                         "unknownReferencesBySource": {"src/http.rs": 5, "src/store.rs": 20}},
                         {key: value for key, value in written.items()
                          if key != "unknownReferencesBySource"},
-                        {**written, "unknownReferencesBySource": {"src/store.rs": 20}}):
+                        {**written, "unknownReferencesBySource": {"src/store.rs": 20,
+                                                                  "src/http.rs": 5}},
+                        {**written, "exceptedReferencesByPair": {"src/testing.rs": {"src/store.rs": -1}}}):
                 path.write_text(json.dumps(old))
                 with self.assertRaisesRegex(RR.Failed, "--update"):
                     RR.read_record(path)

@@ -897,8 +897,17 @@ Supported mapping is deliberately narrow:
   Captured Cargo declarations and reviewed `std/core/alloc` roots prove package
   targets, never semantic calls. An inline `crate::`/`self::`/`super::` path with no
   `use` item resolves like an import of the same path, and a `pub(crate)` module or
-  item is visible throughout its own crate (#828); other restricted visibilities
-  (`pub(super)`, `pub(in ...)`) remain unknown. A named re-export can share its module's
+  item is visible throughout its own crate (#828). A `pub(self)`, `pub(super)` or
+  `pub(in path)` item is certain where it is visible (#1209, owner ruling 2026-11-18):
+  in its own module and every module below it, and at a site whose module is the
+  module the visibility names or below it. That module is read from the item's own
+  module: `crate`, `self` or `super`s, then the names of single `mod` items, and it
+  must be the item's module or one of that module's ancestors. Anything not proved
+  stays unknown: a site outside that module, a path that names no such ancestor, a
+  path that does not start with `crate`, `self` or `super`, a visibility the walk does
+  not read (a comment inside it), a lookup from another workspace member, a glob's
+  export set (which no one site reads) and a restricted `use`. The path inside
+  `pub(in ...)` is itself a site and is not changed. A named re-export can share its module's
   name (`mod parse; pub use parse::parse;`, #1162). Looking such a name up asks for
   the path prefix `parse` in the same scope again, and that repeated lookup is
   answered from the scope's own `mod parse` item only when all of this holds: the
