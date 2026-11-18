@@ -42,6 +42,9 @@ fn is_call(lang: &str, n: Node<'_>) -> bool {
         && matches!(n.kind(), "call_expression" | "new_expression")
         && !crate::indexer_ts::in_type_context(n))
 }
+/// A stored control region: each grammar's branches (ternaries included), loops, switches
+/// and matches, `try` statements and `catch`/`except` handlers, and the `else`, `elif`,
+/// `case`, `default` and `finally` arms its grammar has as nodes (#1120 audit).
 fn is_region(n: Node<'_>) -> bool {
     matches!(
         n.kind(),
@@ -50,8 +53,10 @@ fn is_region(n: Node<'_>) -> bool {
             | "else_clause"
             | "elif_clause"
             | "while_statement"
+            | "while_expression"
             | "do_statement"
             | "for_statement"
+            | "enhanced_for_statement"
             | "for_in_statement"
             | "for_expression"
             | "loop_expression"
@@ -62,7 +67,9 @@ fn is_region(n: Node<'_>) -> bool {
             | "switch_case"
             | "switch_default"
             | "try_statement"
+            | "try_with_resources_statement"
             | "catch_clause"
+            | "except_clause"
             | "finally_clause"
             | "conditional_expression"
             | "ternary_expression"

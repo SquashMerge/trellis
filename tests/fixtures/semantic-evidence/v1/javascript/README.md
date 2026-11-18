@@ -1,4 +1,4 @@
-# JavaScript conformance corpus — native-v18 DRAFT
+# JavaScript conformance corpus — native-v19 DRAFT
 
 An independently authored event-processing workbench for #28: ten ES modules
 cover parsing, normalization, stages, editing, history and runtime extensions.
@@ -18,7 +18,7 @@ family, dropped record or artificial tagged-template gap is used to meet a floor
 - 10 production capability reports; every family is available with no gaps.
 - Two independent command runs are byte-identical. Semantic counts remain zero.
 
-The raw capture comes from Trellis's actual `trellis.native.syntax@native-v18`
+The raw capture comes from Trellis's actual `trellis.native.syntax@native-v19`
 extractor through the #95 `native-capture` command. It uses UTF-8 byte coordinates,
 not the old helper's UTF-16 offsets. Native identifier-site candidates carry no
 inferred semantic role or target. Narrow explicit renamed imports have measured
@@ -31,7 +31,20 @@ barrel. Zero calls is not unsupported. Annotations contain native coverage only;
 scenario arrays, semantic artifacts, dispositions, callable negatives and rooted
 answers are empty. `generated/manifest.json` selects the content-addressed bundle.
 
-## Current native-v18 recapture
+## Current native-v19 recapture
+
+native-v19 (#1120) stores Rust `while`, Java's enhanced `for` and `try (resource)`, and Python's
+`except` as control regions (Decision 0003 item 3: region membership is a measured field). No
+JavaScript or TypeScript region kind changed. The production `native-capture` command re-ran
+twice on these unchanged snapshots using pinned Rust 1.99.1 and `test-support`. Both outputs were
+byte-identical (SHA-256
+`8f375b5214bbac279b7a6388b3831f0634529806b17f325a8166214661f318ae`). Only the producer version,
+extractor hash and occurrence IDs (which include the producer version) differ from the native-v18
+capture. The compiled native extractor hash is
+`04843b02754ab7ef924b6274f88f2d5979ccd79ded4132847ec4aa3b2086268b`,
+pinned as `trellis-native-v19-javascript-test-support` in the hardware profile.
+
+## Historical native-v18 recapture
 
 native-v18 is the deliberate tree-sitter runtime upgrade from 0.27.1 to 0.27.2 (Decision 0003:
 the runtime's `has_error`, byte child lookup and reverse cursor fixes can reach native
@@ -165,7 +178,7 @@ No executable, parser archive or fixture-local replacement extractor is vendored
 The obsolete TypeScript capture script and script-plus-parser archive pins are
 removed. F7's Python/tarfile reproducibility dependency no longer exists.
 
-## Reproduce the current native-v18 capture
+## Reproduce the current native-v19 capture
 
 The commands below reproduce the current capture, not the historical native-v10
 or native-v11 hashes above. From the repository root, use an owned target directory and the
