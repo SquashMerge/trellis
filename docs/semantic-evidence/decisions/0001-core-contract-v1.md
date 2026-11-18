@@ -41,6 +41,10 @@ This is **prospective ratification**, not a statement that production implements
 
 Resolved semantic calls carried `dispatch=unknown` (#453), so the static-expansion rule in item 5 above never admitted them and every resolved callee was a dead-end boundary. By owner ruling, a call binding's dispatch is now classified from the **measured native call shape plus the exact bound target's native declaration kind**, with no inference: a plain call (JavaScript identifier callee; Rust identifier or path callee such as `foo()` or `crate::m::foo()`) whose resolved internal target is a free function is `direct`; a JavaScript `new X()` whose target is a class or its constructor is `constructor`; member and method-call syntax (`obj.m()`, `a?.b()`, `super.m()`, Rust `x.m()`) stays `unknown` because the receiver type is not measured, and Rust trait dispatch remains #14. Ambiguous, external, unresolved and stale-target bindings never get `direct` or `constructor`. Item 5's eligibility rule is otherwise unchanged; the classification itself is specified in `contract-v1.md` § Dispatch.
 
+### Amendment: Python dispatch (owner ruling 2026-11-13, #977)
+
+Every Python call stayed `unknown`, so a Python call graph never expanded past its root. By owner ruling, extending #470 and #557 with the same measured facts and preconditions: a plain or module-attribute call to a free function is `direct`; calling a class is `constructor`; a member call to a method is `dynamic`; anything else stays `unknown`. A method is a native Python `function` whose immediate parent is a class; any other Python `function` is a free function. The rows are specified in `contract-v1.md` § Dispatch.
+
 ## Rejected alternatives
 
 | Alternative | Reason rejected |

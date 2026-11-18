@@ -17,6 +17,7 @@ pub mod build_info;
 mod call_selection;
 pub mod capture;
 pub mod capture_records;
+mod class_catalog;
 pub mod class_diagram;
 mod class_read;
 pub mod classes;

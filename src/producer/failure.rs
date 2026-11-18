@@ -50,6 +50,20 @@ fn cut(line: &str) -> String {
     line[..end].to_owned()
 }
 
+/// A V8 GC trace line: `[pid:0x...]   143012 ms: Mark-Compact ...`.
+fn v8_gc(line: &str) -> bool {
+    line.trim_start().starts_with('[') && line.contains(" ms: ")
+}
+
+/// The lines that say why V8 aborted at its heap limit (#975): its last GC line and its
+/// `FATAL ERROR` line, never the native stack frames it prints after them. `None` without
+/// a fatal line, which keeps the last-lines rule.
+fn heap_lines<'a>(lines: &[&'a str]) -> Option<Vec<&'a str>> {
+    let fatal = lines.iter().find(|line| line.starts_with("FATAL ERROR"))?;
+    let last_gc = lines.iter().rev().find(|line| v8_gc(line));
+    Some(last_gc.into_iter().chain([fatal]).copied().collect())
+}
+
 /// The summary of a run that ended `failed` or `cancelled` with diagnostics; `None` otherwise.
 pub fn summarize(
     producer: &str,
@@ -62,9 +76,13 @@ pub fn summarize(
         .lines()
         .filter(|line| !line.trim().is_empty())
         .collect();
-    let kept = &lines[lines.len().saturating_sub(MAX_LINES)..];
+    let heap = node_heap_exhausted(producer, diagnostics);
+    let kept = heap
+        .then(|| heap_lines(&lines))
+        .flatten()
+        .unwrap_or_else(|| lines[lines.len().saturating_sub(MAX_LINES)..].to_vec());
     Some(Failure {
-        reason: node_heap_exhausted(producer, diagnostics).then(|| NODE_HEAP_EXHAUSTED.to_owned()),
+        reason: heap.then(|| NODE_HEAP_EXHAUSTED.to_owned()),
         exit: exit_text(diagnostics),
         peak_rss_bytes: diagnostics.peak_rss_bytes,
         stderr_lines: kept.iter().map(|line| cut(line)).collect(),

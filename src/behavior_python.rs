@@ -11,6 +11,12 @@ const MAX_STEPS: usize = crate::behavior::MAX_WORK_STEPS;
 const MAX_VISITS: usize = 4800;
 const MAX_PARTICIPANTS: usize = 20;
 const MAX_DEPTH: usize = 24;
+const CONTEXT_MATCH_BOUNDARY: &str =
+    "Context-manager/match boundary: implicit protocol and conditional execution not expanded.";
+const WITH_ENTER: &str = "with enter: __enter__ protocol and as-target binding unresolved.";
+const ASYNC_WITH_ENTER: &str = "async with enter: awaited __aenter__ (possible suspension); protocol and as-target binding unresolved.";
+const WITH_EXIT: &str = "with exit: __exit__ protocol unresolved; it may suppress an exception, so later steps may run after the body stops early.";
+const ASYNC_WITH_EXIT: &str = "async with exit: awaited __aexit__ (possible suspension); it may suppress an exception, so later steps may run after the body stops early.";
 fn bounded(s: &str) -> String {
     let mut out: String = s.chars().take(180).collect();
     if s.chars().count() > 180 {
@@ -371,10 +377,9 @@ impl Builder<'_> {
                 "Class definition boundary: bases, decorators, metaclass and class-body execution not expanded; method bodies do not execute here."),
             "list_comprehension" | "set_comprehension" | "dictionary_comprehension" | "generator_expression" => self.unknown(n,
                 "Comprehension/generator boundary: iteration, filters and deferred execution not expanded."),
-            "try_statement" => self.unknown(n,
-                "Try boundary: exception selection, else and finally execution/transfers not expanded."),
-            "with_statement" | "match_statement" => self.unknown(n,
-                "Context-manager/match boundary: implicit protocol and conditional execution not expanded."),
+            "try_statement" => self.try_step(n, depth),
+            "with_statement" => self.with_step(n, depth),
+            "match_statement" => self.unknown(n, CONTEXT_MATCH_BOUNDARY),
             "for_statement" if n.child(0).is_some_and(|c| c.kind() == "async") => self.unknown(n,
                 "Async iteration boundary: protocol and suspension not expanded."),
             "block" | "expression_statement" | "parenthesized_expression" | "argument_list"
@@ -606,6 +611,92 @@ impl Builder<'_> {
             result.steps.push(step);
         }
         self.then(init, result, n)
+    }
+    // #978: a `with` keeps its context-manager protocol opaque but expands its body: each
+    // item's expression, then an opaque enter, then the body, then one opaque exit. An exit
+    // may suppress an exception, so the suffix stays possible even after a body that leaves.
+    fn with_step(&mut self, n: Node<'_>, depth: usize) -> Flow {
+        let Some(clause) = named(n).into_iter().find(|c| c.kind() == "with_clause") else {
+            return self.unknown(n, CONTEXT_MATCH_BOUNDARY);
+        };
+        let mut expressions = vec![];
+        for item in named(clause) {
+            match item.kind() {
+                "comment" => continue,
+                "with_item" => {}
+                _ => return self.unknown(n, CONTEXT_MATCH_BOUNDARY),
+            }
+            // `value as target`: the target's binding belongs to the opaque enter step.
+            let expression = item.child_by_field_name("value").and_then(|value| {
+                if value.kind() == "as_pattern" {
+                    value.named_child(0)
+                } else {
+                    Some(value)
+                }
+            });
+            let Some(expression) = expression else {
+                return self.unknown(n, CONTEXT_MATCH_BOUNDARY);
+            };
+            expressions.push((item, expression));
+        }
+        if expressions.is_empty() {
+            return self.unknown(n, CONTEXT_MATCH_BOUNDARY);
+        }
+        let (enter, exit) = if n.child(0).is_some_and(|c| c.kind() == "async") {
+            (ASYNC_WITH_ENTER, ASYNC_WITH_EXIT)
+        } else {
+            (WITH_ENTER, WITH_EXIT)
+        };
+        self.warn("A with block's exit may suppress an exception: later steps can run after its body stops early.");
+        let mut entered = Flow::empty();
+        for (item, expression) in expressions {
+            let value = self.walk(expression, depth + 1);
+            let step = self.event(item, "boundary", enter);
+            let step = self.then(value, step, item);
+            entered = self.then(entered, step, item);
+        }
+        if !entered.continues {
+            return entered;
+        }
+        let mut body = self.field(n, "body", depth);
+        body.steps.extend(self.step(n, "boundary", exit));
+        body.exits |= !body.continues;
+        body.continues = true;
+        self.then(entered, body, n)
+    }
+    // #978: a `try` body is a region, as JavaScript draws it, and may stop at any step. Its
+    // `except`, `else` and `finally` clauses stay opaque: one boundary each, in source order.
+    fn try_step(&mut self, n: Node<'_>, depth: usize) -> Flow {
+        self.warn("Exception paths are possible, not proven: a try body may stop at any step; except, else and finally clauses are not expanded.");
+        let mut out = Flow {
+            exits: true,
+            ..Flow::empty()
+        };
+        let Some(mut step) = self.step(n, "try", "try; exception behavior unknown") else {
+            return out;
+        };
+        let body = self.field(n, "body", depth);
+        out.continues = body.continues;
+        step.children = body.steps;
+        for clause in named(n) {
+            let label = match clause.kind() {
+                "block" | "comment" => continue,
+                // A handler may complete normally, so the suffix stays possible.
+                "except_clause" => {
+                    out.continues = true;
+                    "except: only if a matching exception reaches this handler; not expanded."
+                }
+                "else_clause" => "else: only if the try body completes normally; not expanded.",
+                "finally_clause" => "finally: on both normal and abrupt completion; not expanded.",
+                _ => {
+                    out.continues = true;
+                    "Unsupported try clause: behavior unknown; not expanded."
+                }
+            };
+            step.alternate.extend(self.step(clause, "boundary", label));
+        }
+        out.steps.push(step);
+        out
     }
     fn assignment_target(&mut self, n: Node<'_>, depth: usize) -> Flow {
         match n.kind() {

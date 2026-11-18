@@ -2,7 +2,7 @@
 use super::*;
 use crate::{
     capture::Capture,
-    classes::{Catalog, Limits},
+    class_catalog::{Catalog, Limits},
     index_coordinator::IndexJobCoordinator,
     indexer::IndexOptions,
     model::FileExtraction,
@@ -145,10 +145,10 @@ fn both_full_routes_persist_summaries_and_unchanged_copies_completeness() {
         ))).unwrap() {
             let (language, extraction, summary, complete) = row.unwrap();
             assert!(complete);
-            if crate::classes::supports_language(&language) {
+            if crate::class_catalog::supports_language(&language) {
                 ready += 1;
                 let extraction: FileExtraction = serde_json::from_str(&extraction.unwrap()).unwrap();
-                let summary: crate::classes::FileSummary = serde_json::from_str(&summary.unwrap()).unwrap();
+                let summary: crate::class_catalog::FileSummary = serde_json::from_str(&summary.unwrap()).unwrap();
                 assert_eq!(summary, extraction.summary());
             } else {
                 assert!(extraction.is_none() && summary.is_none());

@@ -147,11 +147,11 @@ fn selective_publication_faults_rollback_and_retry_same_expected_pin() {
                 &graph,
                 &prepared,
                 &BTreeMap::new(),
-                crate::classes::plan_complete_catalog(
+                crate::class_catalog::plan_complete_catalog(
                     prepared.prior_summaries.values(),
                     graph.files.len(),
                     graph.stats.symbols,
-                    crate::classes::Limits::default(),
+                    crate::class_catalog::Limits::default(),
                 )
                 .is_some(),
             )
@@ -597,15 +597,15 @@ fn canonical_cohort_produced_native_fact_floors() {
 
 #[test]
 fn local_class_catalog_cap_uses_selected_full_revision_symbol_summary() {
-    let limits = crate::classes::Limits::default();
+    let limits = crate::class_catalog::Limits::default();
     let mut local = Graph::default();
     // Materialized graph has only one changed document, but the trusted
     // selected-revision summary is above the unchanged 1M-symbol cap.
     local.stats.symbols = limits.symbols + 1;
     let actual = Store::compose_selected_class_catalog(&local, &BTreeMap::new(), limits).unwrap();
-    let full = crate::classes::Catalog::compose(&[], 0, local.stats.symbols, limits).unwrap();
+    let full = crate::class_catalog::Catalog::compose(&[], 0, local.stats.symbols, limits).unwrap();
     let incorrect_changed_only =
-        crate::classes::Catalog::compose(&[], 0, local.nodes.len(), limits).unwrap();
+        crate::class_catalog::Catalog::compose(&[], 0, local.nodes.len(), limits).unwrap();
     assert_eq!(actual.warnings, full.warnings);
     assert!(actual.truncated && full.truncated);
     assert_ne!(actual.warnings, incorrect_changed_only.warnings);
@@ -635,9 +635,9 @@ fn local_class_projection_refreshes_unchanged_file_when_cap_moves() {
     .unwrap();
     let (after, after_native, _) =
         index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
-    let limits = crate::classes::Limits {
+    let limits = crate::class_catalog::Limits {
         classes: 2,
-        ..crate::classes::Limits::default()
+        ..crate::class_catalog::Limits::default()
     };
     let old_catalog =
         crate::classes::Catalog::build_with_limits(&before.files, &before.nodes, &cancel, limits)
@@ -2544,19 +2544,19 @@ fn local_class_only_refresh_writes_new_class_rows_and_rolls_back_atomically() {
             changed_file,
             &graph.nodes,
             &cancel,
-            crate::classes::Limits::default(),
+            crate::class_catalog::Limits::default(),
         )
         .unwrap(),
     );
-    let limits = crate::classes::Limits {
+    let limits = crate::class_catalog::Limits {
         records: 1,
-        ..crate::classes::Limits::default()
+        ..crate::class_catalog::Limits::default()
     };
     let summaries: Vec<_> = extractions
         .values()
         .map(|extraction| extraction.summary())
         .collect();
-    let class_complete = crate::classes::plan_complete_catalog(
+    let class_complete = crate::class_catalog::plan_complete_catalog(
         &summaries,
         graph.files.len(),
         graph.stats.symbols,

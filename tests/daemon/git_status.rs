@@ -650,6 +650,59 @@ async fn staged_addition_removed_from_worktree_is_not_a_net_change() {
     );
 }
 
+/// #976: Git reports an untracked nested repository as one `nested/` entry. It is one
+/// added, nontext change; the rest of the working tree still reports, and a path that
+/// is really unsupported still fails the whole change set.
+#[tokio::test]
+async fn untracked_nested_repository_is_one_added_nontext_change() {
+    let f = Fixture::new();
+    let nested = f.root().join("nested");
+    Repository::init(&nested).unwrap();
+    fs::write(nested.join("inner.txt"), "inside the nested checkout\n").unwrap();
+    f.write("tracked.txt", "edited\n");
+    let summary = serde_json::to_value(reader().summary(f.root()).await).unwrap();
+    assert_eq!(
+        summary["workingTree"],
+        serde_json::json!({"state": "available", "changedFiles": 2}),
+        "{summary}"
+    );
+    let changes = reader().status(f.root()).await.changes.unwrap();
+    let listed: Vec<_> = changes
+        .iter()
+        .map(|c| (c.path.as_str(), c.status))
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            ("nested", GitChangeKind::Added),
+            ("tracked.txt", GitChangeKind::Modified)
+        ]
+    );
+    let file = reader()
+        .diff(f.root(), "nested")
+        .await
+        .unwrap()
+        .file
+        .unwrap();
+    assert_eq!(
+        (file.path.as_str(), file.status),
+        ("nested", GitChangeKind::Added)
+    );
+    assert!(file.binary);
+    assert!(file.hunks.is_empty());
+    assert_eq!(
+        reader().diff(f.root(), "nested/inner.txt").await,
+        Err(GitRequestError::NotFound)
+    );
+    f.write("back\\slash.txt", "unsupported spelling\n");
+    let summary = serde_json::to_value(reader().summary(f.root()).await).unwrap();
+    assert_eq!(
+        summary["workingTree"],
+        serde_json::json!({"state": "unavailable", "reason": "unsupported_path"}),
+        "{summary}"
+    );
+}
+
 #[tokio::test]
 async fn ignored_index_tracked_addition_is_measured_and_can_be_a_rename_target() {
     let f = Fixture::new();

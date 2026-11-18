@@ -16,7 +16,8 @@
 ///   witness, moved out of `native_evidence`.
 /// - `native_ids`: canonical JSON, digests and ID minting.
 /// - `indexer*`: graph projection and per-language native kinds.
-/// - `classes`: class extraction and the class catalog.
+/// - `classes`: class extraction.
+/// - `class_catalog`: the class catalog's composition and budget fit, moved out of `classes`.
 /// - `evidence_budget`, `evidence_limits`: the per-document budgets and their charging.
 /// - `search_card`, `search_capture`, `search_card_records`: the stored search cards,
 ///   their capture and their record types.
@@ -25,6 +26,7 @@
 /// - `parallel` (addition): the ordered worker map whose ordering contract
 ///   keeps extraction output byte-identical to a sequential run.
 pub const EXTRACTION_MODULES: &[&str] = &[
+    "src/class_catalog.rs",
     "src/classes.rs",
     "src/indexer.rs",
     "src/indexer_java.rs",

@@ -21,7 +21,8 @@ pub(super) enum CallShape {
     Path,
     /// A JavaScript `new` expression whose constructor is an identifier or dotted name.
     New,
-    /// The callee token follows a `.`: `x.m()`, `self.m()`, `a?.b()`, Java `this.m()`.
+    /// The callee token follows a `.`: `x.m()`, `self.m()`, `a?.b()`, Java `this.m()`, Python
+    /// `module.f()`.
     Member,
     /// A compound callee, a call without a measured callee token, or anything not proved above.
     Other,
@@ -68,7 +69,7 @@ pub(super) fn call_shape(language: &str, call: &native::Call, source: &[u8]) -> 
         {
             CallShape::Path
         }
-        "rust" | "java" if member_prefix(prefix) => CallShape::Member,
+        "rust" | "java" | "python" if member_prefix(prefix) => CallShape::Member,
         _ => CallShape::Other,
     }
 }
@@ -85,7 +86,9 @@ fn member_prefix(prefix: &[u8]) -> bool {
 /// Rust member or path call to an inherent method and a Java plain or member call to a
 /// `static`, `private` or `final` method; a JavaScript `new` of a class or its constructor is
 /// `constructor`; a Rust trait method, a JavaScript member call to a method and any other Java
-/// method call is `dynamic`; everything else stays `unknown`.
+/// method call is `dynamic`; everything else stays `unknown`. For Python (owner ruling
+/// 2026-11-13, #977), a plain or module-attribute call to a free function is `direct`, calling
+/// a class is `constructor` and a member call to a method is `dynamic`.
 pub(super) fn call_dispatch(
     language: &str,
     shape: CallShape,
@@ -97,11 +100,14 @@ pub(super) fn call_dispatch(
         ("javascript" | "typescript", Plain, FreeFunction)
         | ("rust", Plain | Path, FreeFunction)
         | ("rust", Member | Path, FixedMethod)
-        | ("java", Plain | Member, FixedMethod) => semantic::Dispatch::Direct,
-        ("javascript" | "typescript", New, Constructor) => semantic::Dispatch::Constructor,
+        | ("java", Plain | Member, FixedMethod)
+        | ("python", Plain | Member, FreeFunction) => semantic::Dispatch::Direct,
+        ("javascript" | "typescript", New, Constructor)
+        | ("python", Plain | Member, Constructor) => semantic::Dispatch::Constructor,
         ("javascript" | "typescript", Member, DynamicMethod)
         | ("rust", Member | Path, DynamicMethod)
-        | ("java", Plain | Member, DynamicMethod) => semantic::Dispatch::Dynamic,
+        | ("java", Plain | Member, DynamicMethod)
+        | ("python", Member, DynamicMethod) => semantic::Dispatch::Dynamic,
         _ => semantic::Dispatch::Unknown,
     }
 }
