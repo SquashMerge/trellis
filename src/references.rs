@@ -685,8 +685,15 @@ fn build_catalogs(
                     external::RustPackages::new(&snapshot.manifests, &mut work, &mut check)?;
                 let workspace =
                     cargo_workspace::Workspace::new(&snapshot.manifests, &mut work, &mut check)?;
-                let catalog =
-                    rust::Catalog::new(docs, trees, document_map, &workspace, work, &mut check)?;
+                let catalog = rust::Catalog::new(
+                    docs,
+                    trees,
+                    document_map,
+                    &workspace,
+                    &packages,
+                    work,
+                    &mut check,
+                )?;
                 let used = catalog.work.used;
                 return Ok((CatalogJob::Rust(Box::new((catalog, packages))), used));
             }
