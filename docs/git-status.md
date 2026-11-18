@@ -73,7 +73,8 @@ not staged plus unstaged totals: each changed path counts once, a rename counts
 once, and a staged change undone in the working tree counts zero. Paths have
 modified, added, deleted or renamed status; a rename carries its previous path. A submodule is reported as one nontext gitlink change, never as
 nested changed paths. Libgit2 may inspect its dirtiness to classify that gitlink;
-the same child deadline applies. Conflicts and unsupported or unreadable repository
+the same child deadline applies. An untracked nested repository, which Git reports as one
+`dir/` entry, is likewise one added nontext change at `dir`, never nested paths (#976). Conflicts and unsupported or unreadable repository
 state are typed unavailable, not silently clean.
 
 Paths are lossless UTF-8 or the read fails explicitly; absolute/traversing paths

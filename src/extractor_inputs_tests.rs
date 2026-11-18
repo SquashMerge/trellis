@@ -58,10 +58,6 @@ const NON_EXTRACTION_ITEMS: &[(&str, &str)] = &[
         "store::topology::WorkspaceIdentity",
         "root identity; a different root has different IDs",
     ),
-    (
-        "watch::WatcherWitness",
-        "a watcher report type in `model`, never stored as a fact",
-    ),
 ];
 
 /// Modules outside native extraction that parse source. They compute read-time
