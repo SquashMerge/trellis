@@ -166,6 +166,29 @@ fn outline_retains_native_alias_and_implementation_without_callable_coercion() {
     }
 }
 
+/// #1119: a file beyond the outline syntax bounds says so in the answer, never a silent
+/// partial, and a file within them carries no warning.
+#[test]
+fn outline_beyond_the_syntax_bounds_warns_instead_of_dropping_facts_silently() {
+    let binding = "const anon = function () {};\n";
+    let deep = format!("{binding}x = {}1{};\n", "[".repeat(200), "]".repeat(200));
+    let (_temp, store, _graph, _session) = fixture(&[("deep.js", &deep), ("flat.js", binding)]);
+    let pin = store.status().unwrap().revision;
+    let outline = |path| store.file_symbols_at(path, pin, 0, 200).unwrap().unwrap();
+    let flat = outline("flat.js");
+    assert!(flat.warnings.is_empty(), "{:?}", flat.warnings);
+    assert!(flat.items.iter().any(|item| item.callable_initializer));
+    let deep = outline("deep.js");
+    assert!(deep.items.iter().any(|item| item.native_kind == "variable"));
+    assert!(deep.items.iter().all(|item| !item.callable_initializer));
+    assert_eq!(deep.warnings.len(), 1);
+    assert!(
+        deep.warnings[0].contains("outline walk bounds"),
+        "{:?}",
+        deep.warnings
+    );
+}
+
 #[test]
 fn syntax_matches_cached_utf8_paging_scope_and_spelling_are_not_bindings() {
     let a = "function chosen(p) { return p; }\n// chosen ignored\nconst literal = 'chosen';\nfunction other() { const é = 1; chosen(é); chosen(2); longerchosen(); }\nconst template = `chosen ${chosen(3)}`;\n";
