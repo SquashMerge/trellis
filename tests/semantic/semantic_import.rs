@@ -1597,6 +1597,123 @@ fn java_fixed_methods_are_direct_and_other_methods_dynamic() {
     }
 }
 
+/// The #977 dispatch fixture: a class with a method, a free function holding a nested one,
+/// a module-level variable bound to a function, and `run`'s calls.
+const PYTHON_DISPATCH: &str = "class Record:
+    def method(self):
+        pass
+
+def helper():
+    def inner():
+        pass
+    inner()
+
+cb = helper
+
+def run(r, other):
+    helper()
+    other.helper()
+    Record()
+    other.Record()
+    r.method()
+    Record.method(r)
+    method()
+    cb()
+";
+
+/// Joins [`PYTHON_DISPATCH`] and returns each call's `(resolution, dispatch)` keyed by the
+/// needle that finds it: `(needle, offset of the callee token in it)`.
+fn python_dispatch(uses: &[(&str, usize)]) -> Vec<(semantic::Resolution, semantic::Dispatch)> {
+    let source = PYTHON_DISPATCH;
+    let at = |needle: &str, inner: usize| source.find(needle).unwrap() + inner;
+    let symbol = |name: &str| format!("scip-python python pkg 0 `src.A`/{name}");
+    let names = [
+        ("Record", "class Record", 6, symbol("Record#"), 7),
+        ("method", "def method", 4, symbol("Record#method()."), 26),
+        ("helper", "def helper", 4, symbol("helper()."), 17),
+        ("inner", "def inner", 4, symbol("helper().inner()."), 17),
+        ("cb", "cb = ", 0, symbol("cb."), 0),
+    ];
+    let symbol_of = |callee: &str| &names.iter().find(|n| n.0 == callee).unwrap().3;
+    let mut occurrences: Vec<_> = names
+        .iter()
+        .map(|(name, needle, inner, symbol, _)| {
+            let start = at(needle, *inner);
+            (start, start + name.len(), symbol.as_str(), 1)
+        })
+        .collect();
+    let starts: Vec<_> = uses
+        .iter()
+        .map(|(needle, inner)| {
+            let start = at(needle, *inner);
+            let callee = source[start..].split('(').next().unwrap();
+            occurrences.push((start, start + callee.len(), symbol_of(callee).as_str(), 0));
+            start
+        })
+        .collect();
+    let (_root, native, sources, inventory) = admitted_case(
+        "python",
+        source,
+        occurrences,
+        names
+            .iter()
+            .map(|(_, _, _, symbol, kind)| (symbol.as_str(), *kind, vec![]))
+            .collect(),
+    );
+    let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+    starts
+        .iter()
+        .map(|start| {
+            let binding = output
+                .call_bindings
+                .iter()
+                .find(|b| b.join.anchor.range.start == *start)
+                .unwrap_or_else(|| panic!("binding at {start}"));
+            (binding.resolution, binding.dispatch)
+        })
+        .collect()
+}
+
+/// Owner ruling 2026-11-13 (#977): a plain or module-attribute call to a free function is
+/// `direct`, a nested function included.
+#[test]
+fn python_plain_and_module_attribute_calls_to_free_functions_are_direct() {
+    use semantic::{Dispatch::Direct, Resolution::Resolved};
+    let uses = [
+        ("    helper()", 4),
+        ("other.helper(", 6),
+        ("    inner()", 4),
+    ];
+    assert_eq!(python_dispatch(&uses), [(Resolved, Direct); 3]);
+}
+
+/// Owner ruling 2026-11-13 (#977): calling a class, plainly or through a module attribute,
+/// is `constructor`.
+#[test]
+fn python_calls_to_a_class_are_constructor() {
+    use semantic::{Dispatch::Constructor, Resolution::Resolved};
+    let uses = [("    Record()", 4), ("other.Record(", 6)];
+    assert_eq!(python_dispatch(&uses), [(Resolved, Constructor); 2]);
+}
+
+/// Owner ruling 2026-11-13 (#977): a member call to a method is `dynamic`, whatever the
+/// receiver: an instance or the class.
+#[test]
+fn python_member_calls_to_methods_are_dynamic() {
+    use semantic::{Dispatch::Dynamic, Resolution::Resolved};
+    let uses = [("r.method(", 2), ("Record.method(", 7)];
+    assert_eq!(python_dispatch(&uses), [(Resolved, Dynamic); 2]);
+}
+
+/// Owner ruling 2026-11-13 (#977): anything else stays `unknown`: a plain call bound to a
+/// method and a call bound to a variable.
+#[test]
+fn python_other_resolved_calls_stay_unknown() {
+    use semantic::{Dispatch::Unknown, Resolution::Resolved};
+    let uses = [("    method()", 4), ("    cb()", 4)];
+    assert_eq!(python_dispatch(&uses), [(Resolved, Unknown); 2]);
+}
+
 /// An empty range is valid only on a module marker. Since #652 (owner ruling 2026-11-03) any
 /// other empty occurrence excludes its document with no claims instead of the artifact.
 #[test]
