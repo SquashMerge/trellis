@@ -2,8 +2,7 @@
 
 **Version:** `0.2.1`. **Release date:** on tag. These notes cover pull requests merged
 after the [0.2.0 release](release-notes-0.2.md) (tag `v0.2.0`) through
-[PR #1243](https://github.com/SquashMerge/trellis/pull/1243). <!-- TO CONFIRM: PR #1243 is the last 0.2.1 merge; if it is not, name the last merged PR here. -->
-This is a fix release.
+[PR #1243](https://github.com/SquashMerge/trellis/pull/1243). This is a fix release.
 Most of it makes reference and rules evidence more accurate, mainly for Rust: far fewer
 references are `unknown`, and rust-analyzer's struct, trait, union, enum variant and
 module definitions now bind. The MCP contract changes: `toolVersion` goes from **30 to
@@ -249,9 +248,8 @@ labelled as external packages and so are no longer counted as unknown
   tracks the sources of excepted pairs
   ([#1217](https://github.com/SquashMerge/trellis/pull/1217)), and its nightly outcomes
   are reported distinctly ([#1125](https://github.com/SquashMerge/trellis/pull/1125)).
-  <!-- TO CONFIRM when PR #1243 merges: -->
-  **[To confirm: PR #1243]** The rules ratchet no longer counts the synthetic-cohort
-  templates ([#1243](https://github.com/SquashMerge/trellis/pull/1243)).
+  It no longer counts the synthetic-cohort templates
+  ([#1243](https://github.com/SquashMerge/trellis/pull/1243)).
 - **Tooling:** verify shares one browser and npm cache across checkouts
   ([#1033](https://github.com/SquashMerge/trellis/pull/1033)) and can take a shared
   heavy-run lease ([#1150](https://github.com/SquashMerge/trellis/pull/1150)).
