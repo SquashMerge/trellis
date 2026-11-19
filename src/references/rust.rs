@@ -228,6 +228,15 @@ pub(super) struct Catalog {
     /// The variants each enum declaration spells, by the declaration's document and range
     /// (#1200).
     variants: BTreeMap<(usize, usize, usize), BTreeMap<String, Variant>>,
+    /// What across the checkout could give a standard-library statement macro's bare name
+    /// another meaning (#1210).
+    shadows: MacroShadows,
+    /// The standard-library statement macro calls read as binding nothing until a proof
+    /// fails (#1210).
+    statement_macros: Vec<StatementMacro>,
+    /// While `scan` is inside an expression statement whose macro calls are all
+    /// standard-library statement macros: the scope of the outermost such statement.
+    statement_owner: Option<usize>,
     pub(super) work: Work,
 }
 /// A crate root: a conventional root of the checkout's package, or a library or binary
@@ -273,8 +282,12 @@ impl Catalog {
             uniform: BTreeSet::new(),
             proofs: Vec::new(),
             variants: BTreeMap::new(),
+            shadows: MacroShadows::default(),
+            statement_macros: Vec::new(),
+            statement_owner: None,
             work,
         };
+        result.read_macro_rules(docs, trees, check)?;
         let declarations = result.index_files(docs, trees, workspace, check)?;
         let mut edges = Vec::new();
         for (&document, &scope) in &result.files.clone() {
@@ -718,13 +731,32 @@ impl Catalog {
                 self.bind_use(item, check)?;
                 continue;
             }
-            // A macro call could bind any name in this scope (#1163: the syntax decides).
-            if child.kind() == "macro_invocation"
-                || (child.kind() == "expression_statement"
-                    && self.holds_macro(doc, child, check)?)
-            {
-                self.scopes[scope].opaque = true;
-                continue;
+            // A macro call could bind any name in this scope (#1163: the syntax decides),
+            // unless it is a standard-library statement macro (#1210), held for its proof.
+            if matches!(child.kind(), "macro_invocation" | "expression_statement") {
+                match self.macro_calls(doc, child, check)? {
+                    MacroCalls::None => {}
+                    MacroCalls::Other => {
+                        self.scopes[scope].opaque = true;
+                        continue;
+                    }
+                    MacroCalls::Statement if child.kind() == "macro_invocation" => {
+                        self.hold_statement_macro(doc, child, scope, check)?;
+                        continue;
+                    }
+                    MacroCalls::Statement => {
+                        // Read as any other statement, its nested blocks scopes of their own;
+                        // its calls are held as `scan` reaches them, each failed proof making
+                        // this scope opaque too, as the statement's macro call did before.
+                        let outer = self.statement_owner;
+                        self.statement_owner = Some(outer.unwrap_or(scope));
+                        self.proofs.extend(proof);
+                        let descended = self.descend(docs, item, declarations, edges, depth, check);
+                        self.statement_owner = outer;
+                        descended?;
+                        continue;
+                    }
+                }
             }
             if opaque(child) {
                 continue;
@@ -754,27 +786,123 @@ impl Catalog {
         }
         Ok(())
     }
-    /// Whether a macro call lies anywhere below a statement. Every macro call spells `!`, so
-    /// a statement without one needs no walk; `!=`, a unary `!` and a `!` in a literal do.
-    fn holds_macro(
+    /// Which macro calls lie anywhere below a statement, nested blocks included: none, only
+    /// standard-library statement macros (#1210), or another. Every macro call spells `!`,
+    /// so a statement without one needs no walk; `!=`, a unary `!` and a `!` in a literal do.
+    /// A call's own arguments are tokens, not read.
+    fn macro_calls(
         &mut self,
         doc: &DocumentInput,
         statement: Node<'_>,
         check: &mut impl FnMut() -> Result<()>,
-    ) -> Result<bool> {
+    ) -> Result<MacroCalls> {
         if !text(doc, statement).contains('!') {
-            return Ok(false);
+            return Ok(MacroCalls::None);
         }
+        let mut found = MacroCalls::None;
         let mut pending = vec![statement];
         while let Some(node) = pending.pop() {
             self.step(check)?;
             if node.kind() == "macro_invocation" {
-                return Ok(true);
+                if statement_macro(doc, node).is_none() {
+                    return Ok(MacroCalls::Other);
+                }
+                found = MacroCalls::Statement;
+                continue;
             }
             let mut cursor = node.walk();
             pending.extend(node.named_children(&mut cursor));
         }
-        Ok(false)
+        Ok(found)
+    }
+    /// Holds a standard-library statement macro call in `scope` for its proof. A
+    /// `thread_local!` declares each `static` it spells, as a constant this catalog does not
+    /// follow: an uncertain value binding.
+    fn hold_statement_macro(
+        &mut self,
+        doc: &DocumentInput,
+        call: Node<'_>,
+        scope: usize,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        self.step(check)?;
+        let Some((source, path, global)) = statement_macro(doc, call) else {
+            self.scopes[scope].opaque = true;
+            return Ok(());
+        };
+        if path.last().is_some_and(|name| name == "thread_local") {
+            let mut cursor = call.walk();
+            let arguments = call
+                .named_children(&mut cursor)
+                .find(|node| node.kind() == "token_tree");
+            let tokens: Vec<Node<'_>> = arguments
+                .map(|node| node.children(&mut node.walk()).collect())
+                .unwrap_or_default();
+            for (at, token) in tokens.iter().enumerate() {
+                self.step(check)?;
+                // `static NAME:`, and not the `static` of a `'static` lifetime.
+                let declares = at >= 1
+                    && token.kind() == "identifier"
+                    && text(doc, tokens[at - 1]) == "static"
+                    && (at < 2 || text(doc, tokens[at - 2]) != "'");
+                if declares {
+                    self.scopes[scope]
+                        .explicit
+                        .entry((VALUE, text(doc, *token).to_owned()))
+                        .or_default()
+                        .push(Binding {
+                            candidate: None,
+                            public: true,
+                            crate_only: false,
+                            restricted: None,
+                            uncertain: true,
+                            own_crate: false,
+                        });
+                }
+            }
+        }
+        self.statement_macros.push(StatementMacro {
+            scope,
+            owner: self.statement_owner.unwrap_or(scope),
+            source,
+            path,
+            global,
+            settled: false,
+            failed: false,
+        });
+        Ok(())
+    }
+    /// Reads, from every Rust file's text, each name a `macro_rules!` definition could take
+    /// (#1210). The reading is textual, so a definition inside another macro's arguments, a
+    /// comment or a string counts too; a file whose text was not read could define any.
+    fn read_macro_rules(
+        &mut self,
+        docs: &[&DocumentInput],
+        trees: &[Tree],
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        for (document, doc) in docs.iter().enumerate() {
+            if doc.key.language != "rust" {
+                continue;
+            }
+            self.step(check)?;
+            let text = doc.file.text.as_str();
+            if crate::skipped_source::skipped(&doc.file.language, text).is_some() {
+                self.shadows.unread = true;
+                continue;
+            }
+            for name in macro_rules_names(text) {
+                self.step(check)?;
+                self.shadows.rules.insert(name);
+            }
+            // An attribute a parser error hides is read from the text instead.
+            if trees[document].root_node().has_error()
+                && (text.contains("macro_use") || text.contains("decl_macro"))
+            {
+                self.shadows.unread = true;
+            }
+        }
+        Ok(())
     }
     /// What an attribute says about the item after it, or with `#!` about the whole scope.
     /// An attribute this catalog does not read could be a macro that binds any name, so it
@@ -797,6 +925,10 @@ impl Catalog {
             .collect();
         let inner = child.kind() == "inner_attribute_item";
         let name = attribute_name(&attribute);
+        // Either could give a standard-library statement macro's bare name another meaning
+        // (#1210): `macro_use`, and the `decl_macro` feature, which allows a `macro` item.
+        self.shadows.macro_use |= name == "macro_use";
+        self.shadows.decl_macro |= inner && spells_identifier(&attribute, "decl_macro");
         if attribute.starts_with("#![cfg(") || attribute.starts_with("#![cfg_attr(") {
             *scope_uncertain = true;
         } else if attribute.starts_with("#[cfg(")
@@ -879,12 +1011,14 @@ impl Catalog {
         }
         Ok(true)
     }
-    /// Proves each known attribute macro's path reaches its own package. An item whose proof
+    /// Proves each known attribute macro's path reaches its own package, and each held
+    /// statement macro call reaches the standard library's (#1210). An item whose proof
     /// fails is read as under an attribute this catalog does not read: its scope opaque and
-    /// its names uncertain. That can change how another proof reads (a glob over the now
-    /// opaque scope), so the proofs are rechecked until none fails; each scope only turns
-    /// opaque, so this ends, and every step is charged to the work budget. The memos read
-    /// the scopes before they turned opaque and are cleared after each pass.
+    /// its names uncertain; a failed call makes its own scope and its outermost statement's
+    /// opaque, as any other macro call. That can change how another proof reads (a glob over
+    /// the now opaque scope), so the proofs are rechecked until none fails; each scope only
+    /// turns opaque, so this ends, and every step is charged to the work budget. The memos
+    /// read the scopes before they turned opaque and are cleared after each pass.
     fn prove_known_macros(
         &mut self,
         docs: &[&DocumentInput],
@@ -922,6 +1056,20 @@ impl Catalog {
                             binding.uncertain = true;
                         }
                     }
+                }
+            }
+            for index in 0..self.statement_macros.len() {
+                self.step(check)?;
+                let held = &self.statement_macros[index];
+                if held.failed || held.settled {
+                    continue;
+                }
+                let (scope, owner) = (held.scope, held.owner);
+                if !self.proves_statement_macro(index, docs, packages, check)? {
+                    failed = true;
+                    self.statement_macros[index].failed = true;
+                    self.scopes[scope].opaque = true;
+                    self.scopes[owner].opaque = true;
                 }
             }
             self.forget_reads();
@@ -1018,12 +1166,7 @@ impl Catalog {
         }
     }
     /// Whether the first segment of `path`, read from `scope`, is the Cargo dependency of the
-    /// package `package`: `external_target`, strictly, finds no nearer item, import or glob
-    /// that binds it or could (a glob over another dependency could export a module of
-    /// that name), the manifest binds it without a rename, and the crate root has no `extern crate ..
-    /// as` of that name, which would take its place in the extern prelude. `global` is a
-    /// leading `::`, which edition 2015 reads from the crate root. `excluding` is the import
-    /// whose own path this is.
+    /// package `package`, as `proved_dependency` proves it.
     #[allow(clippy::too_many_arguments)] // The proof's scope, path and captured context.
     fn proves_package(
         &mut self,
@@ -1036,9 +1179,36 @@ impl Catalog {
         packages: &external::RustPackages,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<bool> {
+        let target =
+            self.proved_dependency(scope, path, global, excluding, docs, packages, check)?;
+        // crates.io treats `-` and `_` in a package name as the same name.
+        Ok(target.is_some_and(|target| {
+            !target.identity.standard_library
+                && target.identity.package.replace('-', "_") == package
+        }))
+    }
+    /// The package the first segment of `path`, read from `scope`, is proved to name:
+    /// `external_target`, strictly, finds no nearer item, import or glob that binds it or
+    /// could (a glob over another dependency could export a module of that name), and the
+    /// crate root has no `extern crate .. as` of that name, which would take its place in the
+    /// extern prelude. A manifest dependency of that name is the package it binds, and `std`,
+    /// `core` or `alloc` otherwise the standard library. `global` is a leading `::`, which
+    /// edition 2015 reads from the crate root. `excluding` is the import whose own path this
+    /// is.
+    #[allow(clippy::too_many_arguments)] // The proof's scope, path and captured context.
+    fn proved_dependency(
+        &mut self,
+        scope: usize,
+        path: &[String],
+        global: bool,
+        excluding: Option<(usize, usize)>,
+        docs: &[&DocumentInput],
+        packages: &external::RustPackages,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<Option<external::ExternalPackage>> {
         self.step(check)?;
         let Some(root) = self.root(scope) else {
-            return Ok(false);
+            return Ok(None);
         };
         let first = (TYPE, path[0].clone());
         if self.scopes[root].cut
@@ -1048,14 +1218,68 @@ impl Catalog {
                 .is_some_and(|bindings| bindings.iter().any(|b| !b.own_crate))
             || (global && self.root_reading(scope, &path[0], check)? == RootReading::Other)
         {
+            return Ok(None);
+        }
+        self.external_target(scope, path, packages, docs, excluding, true, check)
+    }
+    /// Whether a held statement macro call reaches its source's macro (#1210), by the
+    /// source and the path written. A proof that reads nothing a failed proof changes marks
+    /// the call settled, proved once.
+    fn proves_statement_macro(
+        &mut self,
+        index: usize,
+        docs: &[&DocumentInput],
+        packages: &external::RustPackages,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<bool> {
+        let held = &self.statement_macros[index];
+        let (scope, global, source) = (held.scope, held.global, held.source);
+        let path = held.path.clone();
+        match (source, path.as_slice()) {
+            (MacroSource::StandardLibrary, [name]) => {
+                // Read from imports and facts no pass changes.
+                let proved = self.proves_bare_statement_macro(scope, name, check)?;
+                self.statement_macros[index].settled = proved;
+                Ok(proved)
+            }
+            (MacroSource::StandardLibrary, _) => Ok(self
+                .proved_dependency(scope, &path, global, None, docs, packages, check)?
+                .is_some_and(|target| target.identity.standard_library)),
+        }
+    }
+    /// Whether a standard-library statement macro's bare name, called in `scope`, reaches
+    /// the standard library's macro (#1210). On a checkout that compiles, only a literal
+    /// `macro_rules!` of the name, `#[macro_use]`, a `macro` item (the `decl_macro` feature)
+    /// or a named import of it can silently take its place; a glob import, or an import that
+    /// a macro's expansion writes, is an ambiguity error (E0659), and a `macro_rules!` that
+    /// another macro's expansion defines does not shadow it. So: no `macro_rules!` anywhere
+    /// could define the name, no `#[macro_use]` or `decl_macro` is read, every file was
+    /// read, and no scope from the call's up to its module has a named import of it or
+    /// skipped anything.
+    fn proves_bare_statement_macro(
+        &mut self,
+        scope: usize,
+        name: &str,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<bool> {
+        let shadows = &self.shadows;
+        if shadows.unread || shadows.macro_use || shadows.decl_macro || shadows.rules.contains(name)
+        {
             return Ok(false);
         }
-        let target = self.external_target(scope, path, packages, docs, excluding, true, check)?;
-        // crates.io treats `-` and `_` in a package name as the same name.
-        Ok(target.is_some_and(|target| {
-            !target.identity.standard_library
-                && target.identity.package.replace('-', "_") == package
-        }))
+        let mut current = Some(scope);
+        while let Some(at) = current {
+            self.step(check)?;
+            if self.scopes[at].cut || self.scopes[at].imports.named(name).next().is_some() {
+                return Ok(false);
+            }
+            current = if at == self.scopes[at].module {
+                None
+            } else {
+                self.scopes[at].parent
+            };
+        }
+        Ok(true)
     }
     /// `extern crate name;` binds a name this catalog does not follow.
     fn bind_extern_crate(&mut self, item: Item<'_, '_>) {
@@ -2969,6 +3193,193 @@ struct MacroProof {
     bindings: Vec<(Name, usize)>,
     failed: bool,
 }
+/// Where a statement macro's name must be proved to lead before its call is read as binding
+/// nothing (#1210). Each source has its table of names below, an arm in `macro_source`, the
+/// paths `statement_macro` accepts for it and an arm in `proves_statement_macro`: a
+/// dependency's statement macros (#1223) are a source proved by `proves_package`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MacroSource {
+    /// `STANDARD_LIBRARY_MACROS`, bare or under `std`, `core` or `alloc`.
+    StandardLibrary,
+}
+/// The source whose macro a statement macro of this name would be, if any.
+fn macro_source(name: &str) -> Option<MacroSource> {
+    STANDARD_LIBRARY_MACROS
+        .contains(&name)
+        .then_some(MacroSource::StandardLibrary)
+}
+/// The standard library's statement macros (#1210, owner ruling 2026-11-18): each expands
+/// to an expression and binds no name, except `thread_local!`, which declares exactly the
+/// statics it spells. `include!` is not one: its expansion is another file's items.
+const STANDARD_LIBRARY_MACROS: &[&str] = &[
+    "format",
+    "format_args",
+    "print",
+    "println",
+    "eprint",
+    "eprintln",
+    "write",
+    "writeln",
+    "vec",
+    "matches",
+    "assert",
+    "assert_eq",
+    "assert_ne",
+    "debug_assert",
+    "debug_assert_eq",
+    "debug_assert_ne",
+    "panic",
+    "unreachable",
+    "todo",
+    "unimplemented",
+    "concat",
+    "stringify",
+    "include_str",
+    "include_bytes",
+    "env",
+    "option_env",
+    "line",
+    "column",
+    "file",
+    "module_path",
+    "cfg",
+    "dbg",
+    "thread_local",
+];
+/// The macro calls below a statement.
+enum MacroCalls {
+    None,
+    /// Standard-library statement macros only.
+    Statement,
+    /// Another macro, which could bind any name.
+    Other,
+}
+/// What across the checkout could give a standard-library statement macro's bare name
+/// another meaning (#1210).
+#[derive(Default)]
+struct MacroShadows {
+    /// Every name a `macro_rules!` in a file's text could define.
+    rules: BTreeSet<String>,
+    /// A parsed `#[macro_use]` or `#![macro_use]`.
+    macro_use: bool,
+    /// A parsed inner attribute naming the `decl_macro` feature.
+    decl_macro: bool,
+    /// A Rust file whose text was not read, or a file with a parser error that spells
+    /// either attribute: it could define anything.
+    unread: bool,
+}
+/// A standard-library statement macro call held until its proof (#1210).
+struct StatementMacro {
+    /// The scope the call stands in.
+    scope: usize,
+    /// The scope of the outermost expression statement holding the call, or `scope`.
+    owner: usize,
+    /// What the call's name must be proved to lead to.
+    source: MacroSource,
+    /// `[name]`, or the path written before it, as `[std, name]`.
+    path: Vec<String>,
+    /// Written with a leading `::`.
+    global: bool,
+    /// A bare name proved once: its proof reads nothing a failed proof changes.
+    settled: bool,
+    failed: bool,
+}
+/// The source, path and leading `::` of a statement macro call: a bare name of a source's
+/// table, or a path that source accepts (for the standard library, the name under `std`,
+/// `core` or `alloc`). A `thread_local!` must stand as a statement of a block or module,
+/// where it declares its statics.
+fn statement_macro(
+    doc: &DocumentInput,
+    call: Node<'_>,
+) -> Option<(MacroSource, Vec<String>, bool)> {
+    let spelled: String = text(doc, call.child_by_field_name("macro")?)
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let global = spelled.starts_with("::");
+    let path = parts(spelled.strip_prefix("::").unwrap_or(&spelled))?;
+    let (name, prefix) = path.split_last()?;
+    let source = macro_source(name)?;
+    let accepted = match (source, prefix) {
+        (_, []) => !global,
+        (MacroSource::StandardLibrary, [first]) => {
+            matches!(first.as_str(), "std" | "core" | "alloc")
+        }
+        _ => false,
+    };
+    if !accepted {
+        return None;
+    }
+    if name == "thread_local" {
+        let holder = |node: Option<Node<'_>>| {
+            node.is_some_and(|node| {
+                matches!(node.kind(), "block" | "source_file" | "declaration_list")
+            })
+        };
+        let parent = call.parent();
+        let statement = holder(parent)
+            || parent.is_some_and(|p| p.kind() == "expression_statement" && holder(p.parent()));
+        if !statement {
+            return None;
+        }
+    }
+    Some((source, path, global))
+}
+/// Every name a `macro_rules!` definition in `text` could take: an identifier, `r#` removed,
+/// after `macro_rules` and `!`, with any whitespace or comments between.
+fn macro_rules_names(text: &str) -> BTreeSet<String> {
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    let mut names = BTreeSet::new();
+    for (at, keyword) in text.match_indices("macro_rules") {
+        if text[..at].chars().next_back().is_some_and(ident) {
+            continue;
+        }
+        let Some(rest) = skip_trivia(&text[at + keyword.len()..]).strip_prefix('!') else {
+            continue;
+        };
+        let rest = skip_trivia(rest);
+        let rest = rest.strip_prefix("r#").unwrap_or(rest);
+        let name: String = rest.chars().take_while(|&c| ident(c)).collect();
+        if !name.is_empty() {
+            names.insert(name);
+        }
+    }
+    names
+}
+/// `text` after any leading whitespace and comments (block comments nest).
+fn skip_trivia(mut text: &str) -> &str {
+    loop {
+        let trimmed = text.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("//") {
+            text = rest.find('\n').map_or("", |end| &rest[end..]);
+        } else if trimmed.starts_with("/*") {
+            let mut depth = 0usize;
+            let mut end = trimmed.len();
+            let bytes = trimmed.as_bytes();
+            let mut at = 0;
+            while at + 1 < bytes.len() {
+                match &bytes[at..at + 2] {
+                    b"/*" => {
+                        depth += 1;
+                        at += 2;
+                    }
+                    b"*/" => {
+                        depth -= 1;
+                        at += 2;
+                        if depth == 0 {
+                            end = at;
+                            break;
+                        }
+                    }
+                    _ => at += 1,
+                }
+            }
+            text = &trimmed[end..];
+        } else {
+            return trimmed;
+        }
+    }
+}
 /// The known attribute macro an outer attribute's path names, whatever its arguments.
 fn known_macro(name: &str) -> Option<KnownMacro> {
     let (global, path) = match name.strip_prefix("::") {
@@ -3563,6 +3974,9 @@ mod cache_tests {
             uniform: BTreeSet::new(),
             proofs: Vec::new(),
             variants: BTreeMap::new(),
+            shadows: MacroShadows::default(),
+            statement_macros: Vec::new(),
+            statement_owner: None,
             work: Work::new(work::reference_limit(0, 0)),
         }
     }
@@ -4114,6 +4528,27 @@ mod memo_tests {
             .unwrap();
         assert!(resolved.targets.is_empty());
         assert!(resolved.residual.is_some());
+    }
+}
+
+#[cfg(test)]
+mod macro_rules_name_tests {
+    use super::*;
+
+    /// #1210: every name a definition can take, behind whitespace and (nested) comments and
+    /// with `r#`; another macro's name ending in `macro_rules`, and a `macro_rules!` that no
+    /// name follows, define nothing.
+    #[test]
+    fn macro_rules_names_reads_each_spelling_of_a_definition() {
+        let text = "macro_rules! a {}\n\
+                    macro_rules ! /* x /* nested */ */ b {}\n\
+                    macro_rules!\n// comment\nr#c {}\n\
+                    my_macro_rules! d {}\n\
+                    \"macro_rules!\" e\n\
+                    macro_rules!($x) {}\n\
+                    macro_rules! /* unterminated";
+        let names: Vec<String> = macro_rules_names(text).into_iter().collect();
+        assert_eq!(names, ["a", "b", "c"]);
     }
 }
 
