@@ -999,7 +999,27 @@ Supported mapping is deliberately narrow:
   module. When a proof fails, the call makes its own scope and the scope of the outermost
   statement holding it opaque, as any macro call does. `include!`, every other macro and a
   call under any other path stay opaque, and so does a statement holding one.
-  Dependencies' macros, such as `anyhow!` or `json!`, are not read (#1223). A macro call inside a
+  Four dependencies' statement macros are read the same way (#1223, owner ruling
+  2026-11-19): serde_json `json!`, rusqlite `params!` and `named_params!`, anyhow
+  `anyhow!`, `bail!` and `ensure!`, and tracing `trace!`, `debug!`, `info!`, `warn!` and
+  `error!`, each of which expands to an expression or an early return and binds no name.
+  The path form `package::name!`, with or without a leading `::`, is proved as a known
+  attribute macro's package is (below): the first segment must read that manifest
+  dependency. A bare name needs the three checkout-wide checks above (no literal
+  `macro_rules!` of the name, no `#[macro_use]`, no `decl_macro`) and, in the nearest scope
+  from the call's up to its module that imports the name by name, exactly one certain
+  `use package::name;` whose path is proved the same way; with no such import in those
+  scopes, one certain glob among them over an ancestor module (`super::*`,
+  `super::super::*` or `crate::*`) whose own named import of the name is that one. On a
+  checkout that compiles nothing else can take the name's place: a macro of the name that
+  another glob, an outer scope's import or an import another macro's expansion writes
+  brings in is ambiguous (E0659), and a `macro_rules!` that another macro's expansion
+  defines does not shadow the import (rustc probes on editions 2021 and 2024, recorded
+  with #1223). These proofs read which scopes are opaque, so they are rechecked after any
+  proof fails. A chain of two globs or more, an alias (`use tracing::info as note;`), a
+  re-export through the checkout's own modules, a renamed dependency and an
+  integration-test crate under `tests/` without a proved crate root stay unknown. A macro
+  call inside a
   `static` or `const` initializer is an expression, which cannot bind an item (#1191):
   it makes only that initializer uncertain, not the module or block that holds the
   item. An attribute on an

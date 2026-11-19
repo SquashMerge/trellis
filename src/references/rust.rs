@@ -209,6 +209,9 @@ pub(super) struct Catalog {
     /// A site's own path's names, by the first scope that could bind its first segment and
     /// the path (#1210): every site whose scope climbs to it reads the same answer.
     path_memo: BTreeMap<(usize, Vec<String>), std::sync::Arc<Names>>,
+    /// Whether a dependency's statement macro's import reads its package, by the import's
+    /// scope and start (#1223), within one pass of `prove_known_macros`.
+    import_memo: BTreeMap<(usize, usize), bool>,
     /// Tests read without the two memos above, to compare the answers.
     #[cfg(test)]
     memos: bool,
@@ -228,14 +231,14 @@ pub(super) struct Catalog {
     /// The variants each enum declaration spells, by the declaration's document and range
     /// (#1200).
     variants: BTreeMap<(usize, usize, usize), BTreeMap<String, Variant>>,
-    /// What across the checkout could give a standard-library statement macro's bare name
-    /// another meaning (#1210).
+    /// What across the checkout could give a statement macro's bare name another meaning
+    /// (#1210).
     shadows: MacroShadows,
-    /// The standard-library statement macro calls read as binding nothing until a proof
-    /// fails (#1210).
+    /// The statement macro calls, the standard library's (#1210) and dependencies' (#1223),
+    /// read as binding nothing until a proof fails.
     statement_macros: Vec<StatementMacro>,
     /// While `scan` is inside an expression statement whose macro calls are all
-    /// standard-library statement macros: the scope of the outermost such statement.
+    /// statement macros: the scope of the outermost such statement.
     statement_owner: Option<usize>,
     pub(super) work: Work,
 }
@@ -272,6 +275,7 @@ impl Catalog {
             export_traces: Vec::new(),
             prelude_memo: BTreeMap::new(),
             path_memo: BTreeMap::new(),
+            import_memo: BTreeMap::new(),
             #[cfg(test)]
             memos: true,
             files: BTreeMap::new(),
@@ -732,7 +736,7 @@ impl Catalog {
                 continue;
             }
             // A macro call could bind any name in this scope (#1163: the syntax decides),
-            // unless it is a standard-library statement macro (#1210), held for its proof.
+            // unless it is a statement macro (#1210, #1223), held for its proof.
             if matches!(child.kind(), "macro_invocation" | "expression_statement") {
                 match self.macro_calls(doc, child, check)? {
                     MacroCalls::None => {}
@@ -787,7 +791,7 @@ impl Catalog {
         Ok(())
     }
     /// Which macro calls lie anywhere below a statement, nested blocks included: none, only
-    /// standard-library statement macros (#1210), or another. Every macro call spells `!`,
+    /// statement macros (#1210, #1223), or another. Every macro call spells `!`,
     /// so a statement without one needs no walk; `!=`, a unary `!` and a `!` in a literal do.
     /// A call's own arguments are tokens, not read.
     fn macro_calls(
@@ -815,7 +819,7 @@ impl Catalog {
         }
         Ok(found)
     }
-    /// Holds a standard-library statement macro call in `scope` for its proof. A
+    /// Holds a statement macro call in `scope` for its proof. A
     /// `thread_local!` declares each `static` it spells, as a constant this catalog does not
     /// follow: an uncertain value binding.
     fn hold_statement_macro(
@@ -925,7 +929,7 @@ impl Catalog {
             .collect();
         let inner = child.kind() == "inner_attribute_item";
         let name = attribute_name(&attribute);
-        // Either could give a standard-library statement macro's bare name another meaning
+        // Either could give a statement macro's bare name another meaning
         // (#1210): `macro_use`, and the `decl_macro` feature, which allows a `macro` item.
         self.shadows.macro_use |= name == "macro_use";
         self.shadows.decl_macro |= inner && spells_identifier(&attribute, "decl_macro");
@@ -1012,7 +1016,7 @@ impl Catalog {
         Ok(true)
     }
     /// Proves each known attribute macro's path reaches its own package, and each held
-    /// statement macro call reaches the standard library's (#1210). An item whose proof
+    /// statement macro call reaches its source's (#1210, #1223). An item whose proof
     /// fails is read as under an attribute this catalog does not read: its scope opaque and
     /// its names uncertain; a failed call makes its own scope and its outermost statement's
     /// opaque, as any other macro call. That can change how another proof reads (a glob over
@@ -1083,6 +1087,7 @@ impl Catalog {
         self.export_memo.clear();
         self.prelude_memo.clear();
         self.path_memo.clear();
+        self.import_memo.clear();
     }
     fn proves_known_macro(
         &mut self,
@@ -1245,7 +1250,139 @@ impl Catalog {
             (MacroSource::StandardLibrary, _) => Ok(self
                 .proved_dependency(scope, &path, global, None, docs, packages, check)?
                 .is_some_and(|target| target.identity.standard_library)),
+            // `proves_package` reads which scopes are opaque, so these are rechecked each pass.
+            (MacroSource::Package(package), [name]) => {
+                self.proves_bare_package_macro(scope, package, name, docs, packages, check)
+            }
+            (MacroSource::Package(package), _) => {
+                self.proves_package(scope, &path, global, None, package, docs, packages, check)
+            }
         }
+    }
+    /// Whether a dependency's statement macro's bare name, called in `scope`, reaches the
+    /// package's macro (#1223). Nothing checkout-wide may shadow the name, as for a
+    /// standard-library macro, and the nearest scope from the call's up to its module that
+    /// imports the name by name must do so by exactly one certain `use package::name;`,
+    /// proved to read the package. With none, one glob in those scopes over an ancestor
+    /// module (`super::*`, `super::super::*`, `crate::*`) may bring in that module's own
+    /// such import. On a checkout that compiles nothing else can take the name's place: a
+    /// macro of the name that another glob, an outer scope's import or an import another
+    /// macro's expansion writes brings in is ambiguous (E0659), and a `macro_rules!` that
+    /// another macro's expansion defines does not shadow the import (rustc probes on editions
+    /// 2021 and 2024, recorded with #1223). A chain of two globs or more is not followed.
+    fn proves_bare_package_macro(
+        &mut self,
+        scope: usize,
+        package: &str,
+        name: &str,
+        docs: &[&DocumentInput],
+        packages: &external::RustPackages,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<bool> {
+        if self.shadows.shadow(name) {
+            return Ok(false);
+        }
+        let wanted = [package.to_owned(), name.to_owned()];
+        let mut chain = Vec::new();
+        let mut current = Some(scope);
+        while let Some(at) = current {
+            self.step(check)?;
+            if self.scopes[at].cut {
+                return Ok(false);
+            }
+            if self.scopes[at].imports.named(name).next().is_some() {
+                return match self.sole_import(at, name, &wanted) {
+                    Some(import) => {
+                        self.proves_import(at, import, &wanted, package, docs, packages, check)
+                    }
+                    None => Ok(false),
+                };
+            }
+            chain.push(at);
+            current = if at == self.scopes[at].module {
+                None
+            } else {
+                self.scopes[at].parent
+            };
+        }
+        for at in chain {
+            let globs: Vec<Vec<String>> = (self.scopes[at].imports.stars())
+                .filter(|star| !star.uncertain)
+                .map(|star| star.path.clone())
+                .collect();
+            for glob in globs {
+                self.step(check)?;
+                let Some(module) = self.ancestor_module(at, &glob) else {
+                    continue;
+                };
+                if self.scopes[module].cut {
+                    continue;
+                }
+                if let Some(import) = self.sole_import(module, name, &wanted) {
+                    return self
+                        .proves_import(module, import, &wanted, package, docs, packages, check);
+                }
+            }
+        }
+        Ok(false)
+    }
+    /// The range of scope `at`'s named import of `name` when it is the only one, certain,
+    /// and imports `wanted`.
+    fn sole_import(&self, at: usize, name: &str, wanted: &[String]) -> Option<(usize, usize)> {
+        let mut named = self.scopes[at].imports.named(name);
+        let import = named.next()?;
+        (named.next().is_none() && !import.uncertain && import.path == wanted)
+            .then_some((import.start, import.end))
+    }
+    /// Whether the import of `path` at `import` in scope `at` reads `package`, by
+    /// `proves_package`. Every call through one import reads the same answer, so within a
+    /// pass of `prove_known_macros` it is remembered; a hit is charged its step.
+    #[allow(clippy::too_many_arguments)] // As `proves_package`.
+    fn proves_import(
+        &mut self,
+        at: usize,
+        import: (usize, usize),
+        path: &[String],
+        package: &str,
+        docs: &[&DocumentInput],
+        packages: &external::RustPackages,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<bool> {
+        self.step(check)?;
+        let key = (at, import.0);
+        if self.memos()
+            && let Some(&proved) = self.import_memo.get(&key)
+        {
+            return Ok(proved);
+        }
+        let proved = self.proves_package(
+            at,
+            path,
+            false,
+            Some(import),
+            package,
+            docs,
+            packages,
+            check,
+        )?;
+        self.import_memo.insert(key, proved);
+        Ok(proved)
+    }
+    /// The module a glob's path names when it is an ancestor of `scope`'s module, read as
+    /// `path` reads it: `crate`, or one or more `super`, in a module of one proved root.
+    fn ancestor_module(&self, scope: usize, path: &[String]) -> Option<usize> {
+        let root = self.root(scope)?;
+        if path == ["crate"] {
+            return Some(root);
+        }
+        if path.is_empty() || path.iter().any(|segment| segment != "super") {
+            return None;
+        }
+        let mut at = self.scopes[scope].module;
+        for _ in path {
+            at = self.parent_module(at)?;
+        }
+        Some(at)
     }
     /// Whether a standard-library statement macro's bare name, called in `scope`, reaches
     /// the standard library's macro (#1210). On a checkout that compiles, only a literal
@@ -1262,9 +1399,7 @@ impl Catalog {
         name: &str,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<bool> {
-        let shadows = &self.shadows;
-        if shadows.unread || shadows.macro_use || shadows.decl_macro || shadows.rules.contains(name)
-        {
+        if self.shadows.shadow(name) {
             return Ok(false);
         }
         let mut current = Some(scope);
@@ -3195,19 +3330,33 @@ struct MacroProof {
 }
 /// Where a statement macro's name must be proved to lead before its call is read as binding
 /// nothing (#1210). Each source has its table of names below, an arm in `macro_source`, the
-/// paths `statement_macro` accepts for it and an arm in `proves_statement_macro`: a
-/// dependency's statement macros (#1223) are a source proved by `proves_package`.
+/// paths `statement_macro` accepts for it and an arm in `proves_statement_macro`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum MacroSource {
     /// `STANDARD_LIBRARY_MACROS`, bare or under `std`, `core` or `alloc`.
     StandardLibrary,
+    /// A dependency's statement macro (#1223), from `PACKAGE_MACROS`: the package's crate
+    /// name, which `proves_package` proves, bare through an import or under that name.
+    Package(&'static str),
 }
 /// The source whose macro a statement macro of this name would be, if any.
 fn macro_source(name: &str) -> Option<MacroSource> {
-    STANDARD_LIBRARY_MACROS
-        .contains(&name)
-        .then_some(MacroSource::StandardLibrary)
+    if STANDARD_LIBRARY_MACROS.contains(&name) {
+        return Some(MacroSource::StandardLibrary);
+    }
+    PACKAGE_MACROS
+        .iter()
+        .find(|(_, names)| names.contains(&name))
+        .map(|&(package, _)| MacroSource::Package(package))
 }
+/// Dependencies' statement macros (#1223, owner ruling 2026-11-19), by package: each
+/// expands to an expression, or to an early `return`, and binds no name.
+const PACKAGE_MACROS: &[(&str, &[&str])] = &[
+    ("serde_json", &["json"]),
+    ("rusqlite", &["params", "named_params"]),
+    ("anyhow", &["anyhow", "bail", "ensure"]),
+    ("tracing", &["trace", "debug", "info", "warn", "error"]),
+];
 /// The standard library's statement macros (#1210, owner ruling 2026-11-18): each expands
 /// to an expression and binds no name, except `thread_local!`, which declares exactly the
 /// statics it spells. `include!` is not one: its expansion is another file's items.
@@ -3249,13 +3398,13 @@ const STANDARD_LIBRARY_MACROS: &[&str] = &[
 /// The macro calls below a statement.
 enum MacroCalls {
     None,
-    /// Standard-library statement macros only.
+    /// Statement macros only.
     Statement,
     /// Another macro, which could bind any name.
     Other,
 }
-/// What across the checkout could give a standard-library statement macro's bare name
-/// another meaning (#1210).
+/// What across the checkout could give a statement macro's bare name another meaning
+/// (#1210).
 #[derive(Default)]
 struct MacroShadows {
     /// Every name a `macro_rules!` in a file's text could define.
@@ -3268,7 +3417,13 @@ struct MacroShadows {
     /// either attribute: it could define anything.
     unread: bool,
 }
-/// A standard-library statement macro call held until its proof (#1210).
+impl MacroShadows {
+    /// Whether any of these could give a statement macro's bare name another meaning.
+    fn shadow(&self, name: &str) -> bool {
+        self.unread || self.macro_use || self.decl_macro || self.rules.contains(name)
+    }
+}
+/// A statement macro call held until its proof (#1210).
 struct StatementMacro {
     /// The scope the call stands in.
     scope: usize,
@@ -3286,7 +3441,7 @@ struct StatementMacro {
 }
 /// The source, path and leading `::` of a statement macro call: a bare name of a source's
 /// table, or a path that source accepts (for the standard library, the name under `std`,
-/// `core` or `alloc`). A `thread_local!` must stand as a statement of a block or module,
+/// `core` or `alloc`; for a package, under its crate name). A `thread_local!` must stand as a statement of a block or module,
 /// where it declares its statics.
 fn statement_macro(
     doc: &DocumentInput,
@@ -3305,6 +3460,7 @@ fn statement_macro(
         (MacroSource::StandardLibrary, [first]) => {
             matches!(first.as_str(), "std" | "core" | "alloc")
         }
+        (MacroSource::Package(package), [first]) => first == package,
         _ => false,
     };
     if !accepted {

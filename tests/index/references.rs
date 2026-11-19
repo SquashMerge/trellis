@@ -1890,6 +1890,338 @@ fn references_rust_thread_local_binds_exactly_its_statics() {
     assert_eq!(lines, [4, 4, 5, 5], "{data}");
 }
 
+/// The four packages whose statement macros #1223 reads, as manifest dependencies.
+const MACRO_PACKAGES: &str = "serde_json = '1'\nrusqlite = '0.32'\nanyhow = '1'\ntracing = '0.1'\n";
+
+/// As `macro_lines_beside`, with a manifest of `dependencies` (edition 2021): the lines of
+/// `src/a.rs` (after its first line, `use crate::m;`) whose `m::g` resolved, and the
+/// unresolved site count. `lib` follows `mod m; mod a;` in the crate root.
+fn dependency_macro_lines(
+    dependencies: &str,
+    lib: &str,
+    files: &[(&str, &str)],
+    body: &str,
+) -> (Vec<u64>, u64) {
+    let source = format!("use crate::m;\n{body}");
+    let lib = format!("mod m; mod a; {lib}");
+    let mut all = vec![
+        ("src/lib.rs", lib.as_str()),
+        ("src/m.rs", "pub fn g() {}"),
+        ("src/a.rs", source.as_str()),
+    ];
+    all.extend_from_slice(files);
+    let input = with_cargo_manifest(
+        snapshot(&all),
+        &format!("{EDITION_2021}[dependencies]\n{dependencies}"),
+    );
+    let data = references::project(&input, &["src/a.rs".into()], 20, &mut || Ok(()))
+        .unwrap()
+        .data;
+    let mut lines: Vec<u64> = data["production"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|pair| pair["source"]["path"] == "src/a.rs" && pair["target"]["path"] == "src/m.rs")
+        .flat_map(|pair| pair["sites"].as_array().unwrap())
+        .map(|site| site["lines"]["start"].as_u64().unwrap())
+        .filter(|&line| line > 1)
+        .collect();
+    lines.sort_unstable();
+    (lines, data["counts"]["unresolvedSites"].as_u64().unwrap())
+}
+
+/// #1223 (owner ruling 2026-11-19): a call to a dependency's statement macro (serde_json
+/// `json!`, rusqlite `params!` and `named_params!`, anyhow `anyhow!`, `bail!` and `ensure!`,
+/// tracing `trace!`, `debug!`, `info!`, `warn!` and `error!`) binds no name, so the scope
+/// holding it stays transparent: by its bare name through a certain `use package::name;`,
+/// or under the package's name, with or without a leading `::`.
+#[test]
+fn references_rust_dependency_statement_macros_bind_nothing() {
+    let bodies = [
+        "use serde_json::json;\nfn f(x: u8) { let _v = json!({\"a\": x}); m::g(); }",
+        "fn f(x: u8) { let _v = serde_json::json!([x]); m::g(); }",
+        "use rusqlite::params;\nfn f(x: u8) { let _p = params![x]; m::g(); }",
+        "use rusqlite::{named_params, params};\nfn f() { let _p = (named_params! {\":a\": 1}, params![]); m::g(); }",
+        "fn f() { let _p = (rusqlite::named_params! {\":a\": 1}, ::rusqlite::params![2]); m::g(); }",
+        "use anyhow::{bail, ensure};\n\
+         fn f(x: u8) { ensure!(x > 0, \"x\"); if x == 1 { bail!(\"x\"); } m::g(); }",
+        "use anyhow::anyhow;\nfn f() { let _e = anyhow!(\"x\"); m::g(); }",
+        "fn f(x: u8) { anyhow::ensure!(x > 0); if x == 1 { ::anyhow::bail!(\"x\"); } m::g(); }",
+        "use tracing::{debug, error, info, trace, warn};\n\
+         fn f(x: u8) { trace!(x); debug!(\"{x}\"); info!(a = x, \"x\"); warn!(\"x\"); error!(\"x\"); m::g(); }",
+        "fn f(x: u8) { tracing::info!(x); ::tracing::warn!(\"x\"); m::g(); }",
+        // Mixed with a standard-library statement macro, and inside another call's statement.
+        "use anyhow::bail;\nfn f(x: u8) { if x != 1 { println!(\"x\"); bail!(format!(\"x\")); } m::g(); }",
+    ];
+    for body in bodies {
+        let (lines, unresolved) = dependency_macro_lines(MACRO_PACKAGES, "", &[], body);
+        assert_eq!((lines.len(), unresolved), (1, 0), "{body}");
+    }
+}
+
+/// #1223: the path form `package::name!` is proved by the package's manifest dependency, as
+/// a known attribute macro's path is; anything else leaves the call opaque, as before.
+#[test]
+fn references_rust_dependency_statement_macro_path_needs_its_package_proved() {
+    let call = "fn f() { anyhow::bail!(\"x\"); m::g(); }";
+    let rows = [
+        ("proved", MACRO_PACKAGES, call.to_owned(), true),
+        (
+            "no anyhow dependency",
+            "tracing = '0.1'\n",
+            call.to_owned(),
+            false,
+        ),
+        (
+            "anyhow renamed to another package",
+            "anyhow = { package = 'anyhow-fork', version = '1' }\n",
+            call.to_owned(),
+            false,
+        ),
+        (
+            "a local module named anyhow",
+            MACRO_PACKAGES,
+            format!("mod anyhow {{}}\n{call}"),
+            false,
+        ),
+        (
+            "an import named anyhow",
+            MACRO_PACKAGES,
+            format!("use crate::m as anyhow;\n{call}"),
+            false,
+        ),
+        (
+            "another package's name",
+            MACRO_PACKAGES,
+            "fn f() { serde_json::bail!(\"x\"); m::g(); }".to_owned(),
+            false,
+        ),
+        (
+            "a longer path",
+            MACRO_PACKAGES,
+            "fn f() { tracing::macros::info!(\"x\"); m::g(); }".to_owned(),
+            false,
+        ),
+    ];
+    for (why, dependencies, body, resolves) in rows {
+        let (lines, _) = dependency_macro_lines(dependencies, "", &[], &body);
+        assert_eq!(!lines.is_empty(), resolves, "{why}");
+    }
+}
+
+/// #1223: a bare name needs exactly one certain named import `package::name` in the nearest
+/// scope, from the call's up to its module, that imports the name, proved to read the
+/// package; with none there, the call stays opaque.
+#[test]
+fn references_rust_dependency_statement_macro_bare_name_needs_its_import() {
+    let rows = [
+        (
+            "imported",
+            MACRO_PACKAGES,
+            "use tracing::info;\nfn f() { info!(\"x\"); m::g(); }",
+            true,
+        ),
+        (
+            "imported in the call's block",
+            MACRO_PACKAGES,
+            "fn f() { use tracing::info; info!(\"x\"); m::g(); }",
+            true,
+        ),
+        (
+            "not imported",
+            MACRO_PACKAGES,
+            "fn f() { info!(\"x\"); m::g(); }",
+            false,
+        ),
+        (
+            "imported without the dependency",
+            "anyhow = '1'\n",
+            "use tracing::info;\nfn f() { info!(\"x\"); m::g(); }",
+            false,
+        ),
+        (
+            "imported from another package",
+            "log = '0.4'\ntracing = '0.1'\n",
+            "use log::info;\nfn f() { info!(\"x\"); m::g(); }",
+            false,
+        ),
+        (
+            "imported through a local re-export",
+            MACRO_PACKAGES,
+            "use crate::m::info;\nfn f() { info!(\"x\"); m::g(); }",
+            false,
+        ),
+        (
+            "an uncertain import",
+            MACRO_PACKAGES,
+            "#[cfg(feature = \"t\")]\nuse tracing::info;\nfn f() { info!(\"x\"); m::g(); }",
+            false,
+        ),
+        (
+            "two imports of the name",
+            MACRO_PACKAGES,
+            "#[cfg(unix)]\nuse tracing::info;\n#[cfg(not(unix))]\nuse tracing::info;\nfn f() { info!(\"x\"); m::g(); }",
+            false,
+        ),
+        // The nearest scope that imports the name decides.
+        (
+            "a nearer import from elsewhere",
+            MACRO_PACKAGES,
+            "use tracing::info;\nfn f() { use crate::m::info; info!(\"x\"); m::g(); }",
+            false,
+        ),
+        (
+            "a nearer import from the package",
+            MACRO_PACKAGES,
+            "use crate::m::info;\nfn f() { use tracing::info; info!(\"x\"); m::g(); }",
+            true,
+        ),
+        // A recorded limit: `use anyhow::anyhow;` binds the name `anyhow` in its scope, which
+        // the catalog does not know is anyhow's macro alone, so `anyhow` there is not proved
+        // the package for the other imports.
+        (
+            "beside an import of anyhow's anyhow!",
+            MACRO_PACKAGES,
+            "use anyhow::{anyhow, bail};\nfn f() { bail!(\"x\"); m::g(); }",
+            false,
+        ),
+        (
+            "an alias is not the name",
+            MACRO_PACKAGES,
+            "use tracing::info as note;\nfn f() { note!(\"x\"); m::g(); }",
+            false,
+        ),
+        (
+            "the package's name bound locally",
+            MACRO_PACKAGES,
+            "use tracing::info;\nmod tracing { pub fn info() {} }\nfn f() { info!(\"x\"); m::g(); }",
+            false,
+        ),
+    ];
+    for (why, dependencies, body, resolves) in rows {
+        let (lines, _) = dependency_macro_lines(dependencies, "", &[], body);
+        assert_eq!(!lines.is_empty(), resolves, "{why}");
+    }
+    // The crate root's import is not in `a`'s scopes.
+    let (lines, _) = dependency_macro_lines(
+        MACRO_PACKAGES,
+        "use tracing::info;",
+        &[],
+        "fn f() { info!(\"x\"); m::g(); }",
+    );
+    assert!(lines.is_empty(), "{lines:?}");
+}
+
+/// #1223: the three literal shadows of #1210 fail a dependency's bare macro name too: a
+/// literal `macro_rules!` of the name anywhere, `#[macro_use]` anywhere and a `decl_macro`
+/// feature. The path form is still proved by its path.
+#[test]
+fn references_rust_dependency_statement_macro_literal_shadows_keep_the_bare_call_unknown() {
+    let bare = "use anyhow::bail;\nfn f() { bail!(\"x\"); m::g(); }";
+    let path = "fn f() { anyhow::bail!(\"x\"); m::g(); }";
+    let other = rules_of("other");
+    let rules = rules_of("bail");
+    for (why, defs, fails) in [
+        ("another name", other.as_str(), false),
+        ("macro_rules! bail", rules.as_str(), true),
+        ("#[macro_use]", "#[macro_use]\nmod inner {}\n", true),
+        ("decl_macro", "#![feature(decl_macro)]\n", true),
+    ] {
+        let files = [("src/defs.rs", defs)];
+        let (lines, _) = dependency_macro_lines(MACRO_PACKAGES, "mod defs;", &files, bare);
+        assert_eq!(lines.is_empty(), fails, "{why}");
+        let (lines, _) = dependency_macro_lines(MACRO_PACKAGES, "mod defs;", &files, path);
+        assert!(!lines.is_empty(), "{why}: path form");
+    }
+}
+
+/// #1223: with no named import of the name in the call's scopes, one glob over an ancestor
+/// module whose own import is `package::name` brings in the package's macro; any other
+/// source would be an ambiguity error (E0659). A chain of two globs is a recorded limit.
+#[test]
+fn references_rust_dependency_statement_macro_through_one_glob_over_an_ancestor() {
+    let call = "fn f() { bail!(\"x\"); m::g(); }";
+    let rows = [
+        (
+            "super::*",
+            "use anyhow::bail;",
+            format!("use super::*;\n{call}"),
+            true,
+        ),
+        (
+            "crate::*",
+            "use anyhow::bail;",
+            format!("use crate::*;\n{call}"),
+            true,
+        ),
+        (
+            "a glob in the call's block",
+            "use anyhow::bail;",
+            "fn f() { use super::*; bail!(\"x\"); m::g(); }".to_owned(),
+            true,
+        ),
+        (
+            "super::super::* from a child module",
+            "use anyhow::bail;",
+            "mod t { use crate::m; use super::super::*; fn f() { bail!(\"x\"); m::g(); } }"
+                .to_owned(),
+            true,
+        ),
+        (
+            "two globs: the recorded limit",
+            "use anyhow::bail;",
+            "mod t { use crate::m; use super::*; fn f() { bail!(\"x\"); m::g(); } }".to_owned(),
+            false,
+        ),
+        (
+            "the ancestor imports another package's",
+            "use crate::m::g as bail;",
+            format!("use super::*;\n{call}"),
+            false,
+        ),
+        (
+            "an uncertain glob",
+            "use anyhow::bail;",
+            format!("#[cfg(test)]\nuse super::*;\n{call}"),
+            false,
+        ),
+        (
+            "an uncertain import in the ancestor",
+            "#[cfg(test)] use anyhow::bail;",
+            format!("use super::*;\n{call}"),
+            false,
+        ),
+        (
+            "a glob over a module that is not an ancestor",
+            "mod other { pub use anyhow::bail; }",
+            format!("use crate::other::*;\n{call}"),
+            false,
+        ),
+    ];
+    for (why, lib, body, resolves) in rows {
+        let (lines, _) = dependency_macro_lines(MACRO_PACKAGES, lib, &[], &body);
+        assert_eq!(!lines.is_empty(), resolves, "{why}");
+    }
+}
+
+/// #1223: a dependency's macro is proved through `proves_package`, which reads which scopes
+/// are opaque, so it is rechecked after another proof fails. Here `bail!` is held, and
+/// proved, before the module-level `thread_local!` fails (a literal `macro_rules!` of its
+/// name) and makes module `a` opaque; the recheck then reads `anyhow` past the opaque module
+/// as unproved, and `f`'s block turns opaque, so its `m::g` is unknown.
+#[test]
+fn references_rust_dependency_statement_macro_is_rechecked_after_a_failure() {
+    let body = "use anyhow::bail;\nfn f() { bail!(\"x\"); m::g(); }\n\
+                thread_local! { static C: u8 = 0; }";
+    let other = rules_of("other");
+    let shadowed = rules_of("thread_local");
+    for (defs, resolves) in [(other.as_str(), true), (shadowed.as_str(), false)] {
+        let files = [("src/defs.rs", defs)];
+        let (lines, _) = dependency_macro_lines(MACRO_PACKAGES, "mod defs;", &files, body);
+        assert_eq!(!lines.is_empty(), resolves, "{defs}");
+    }
+}
+
 /// The sites of `src/a.rs` (after its first line) that map to `src/kinds.rs`, as spellings,
 /// and its other unresolved sites, as (spelling, reason), with `kinds` as `src/kinds.rs`.
 fn variant_resolution(kinds: &str, body: &str) -> (Vec<String>, Vec<(String, String)>) {
