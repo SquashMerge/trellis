@@ -1582,7 +1582,7 @@ fn references_rust_block_is_opaque_for_a_macro_call_not_for_a_bang() {
          fn nested(x: u8) { if x == 1 { m::g(); } }\n\
          fn negate(x: bool) { let _y = !x; m::g(); }\n\
          fn compare(x: u8) { if x != 1 { return; } m::g(); }\n\
-         fn with_macro() { println!(\"x\"); m::g(); }\n",
+         fn with_macro() { y!(\"x\"); m::g(); }\n",
     );
     assert_eq!(lines, [2, 3, 4, 5]);
     assert_eq!(unresolved, 1);
@@ -1619,17 +1619,24 @@ fn references_rust_block_inside_a_bang_statement_has_its_own_scope() {
     );
 }
 
-/// The recorded limit: a macro call anywhere in a statement keeps the block unknown.
+/// The recorded limit: a macro call anywhere in a statement keeps the block unknown, unless
+/// every call in it is a standard-library statement macro (#1210).
 #[test]
 fn references_rust_macro_call_inside_a_statement_keeps_its_block_unknown() {
     let bodies = [
-        "println!(\"x\"); m::g();",
-        "f(vec![1]); m::g();",
+        "y!(\"x\"); m::g();",
+        "f(z![1]); m::g();",
         "x.max(y!()); m::g();",
-        "if x != 1 { println!(\"x\"); } m::g();",
-        "let _v = vec![1]; m::g();",
+        "if x != 1 { y!(\"x\"); } m::g();",
+        "let _v = z![1]; m::g();",
         "let _v = f(y!()); m::g();",
         "m::g(); y!()",
+        // One call that is not a statement macro is enough, wherever it stands.
+        "f(vec![1], y!()); m::g();",
+        "if x != 1 { println!(\"x\"); } else { y!(); } m::g();",
+        "include!(\"other.rs\"); m::g();",
+        "other::println!(\"x\"); m::g();",
+        "let _v = thread_local!(); m::g();",
     ];
     let measured: Vec<_> = bodies
         .iter()
@@ -1641,6 +1648,314 @@ fn references_rust_macro_call_inside_a_statement_keeps_its_block_unknown() {
         macro_opacity_lines("fn f(x: u8) { let _y = if x == 1 { y!() } else { 0 }; m::g(); }\n"),
         (vec![2], 0)
     );
+}
+
+/// The lines of `src/a.rs` whose `m::g` resolved to `src/m.rs`, and the unresolved site
+/// count, with `files` beside it in the crate (each declared by `lib`).
+fn macro_lines_beside(lib: &str, files: &[(&str, &str)], body: &str) -> (Vec<u64>, u64) {
+    let source = format!("use crate::m;\n{body}");
+    let lib = format!("mod m; mod a; {lib}");
+    let mut all = vec![
+        ("src/lib.rs", lib.as_str()),
+        ("src/m.rs", "pub fn g() {}"),
+        ("src/a.rs", source.as_str()),
+    ];
+    all.extend_from_slice(files);
+    let input = snapshot(&all);
+    let data = references::project(&input, &["src/a.rs".into()], 20, &mut || Ok(()))
+        .unwrap()
+        .data;
+    let mut lines: Vec<u64> = data["production"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|pair| pair["source"]["path"] == "src/a.rs" && pair["target"]["path"] == "src/m.rs")
+        .flat_map(|pair| pair["sites"].as_array().unwrap())
+        .map(|site| site["lines"]["start"].as_u64().unwrap())
+        .filter(|&line| line > 1)
+        .collect();
+    lines.sort_unstable();
+    (lines, data["counts"]["unresolvedSites"].as_u64().unwrap())
+}
+
+/// A literal macro definition, spelled so that this file's own text defines nothing: the
+/// catalog reads every Rust file of the checkout it indexes, this one included (#1210).
+fn rules_of(name: &str) -> String {
+    format!(
+        "{}! {name} {{ ($($t:tt)*) => {{}} }}\n",
+        concat!("macro_", "rules")
+    )
+}
+
+/// #1210 (owner ruling 2026-11-18): a call to a standard-library statement macro binds no
+/// name, so the scope holding it stays transparent, by its bare name or under `std`, `core`
+/// or `alloc`, as a statement or inside one.
+#[test]
+fn references_rust_standard_library_statement_macros_bind_nothing() {
+    let bodies = [
+        "println!(\"x\"); m::g();",
+        "f(vec![1]); m::g();",
+        "let _v = vec![1]; m::g();",
+        "if x != 1 { println!(\"x\"); } m::g();",
+        "let _s = format!(\"{x}\"); eprintln!(\"{_s}\"); m::g();",
+        "assert_eq!(x, 1); debug_assert!(x > 0, \"{}\", x); m::g();",
+        "if matches!(x, 1 | 2) { m::g(); }",
+        "let _ = write!(out, \"x\"); m::g();",
+        "let _s = concat!(\"a\", stringify!(x), file!(), line!()); m::g();",
+        "let _e = (env!(\"A\"), option_env!(\"B\"), include_str!(\"a.txt\"), cfg!(test)); m::g();",
+        "dbg!(x); m::g(); if x == 0 { unreachable!() } else { todo!() }",
+        // A call in another call's arguments is an argument: the outer call is read alone.
+        "f(vec![y!()]); m::g();",
+        "std::println!(\"x\"); m::g();",
+        "::core::assert!(true); m::g();",
+        "let _v = alloc::vec![1]; m::g();",
+    ];
+    let measured: Vec<_> = bodies
+        .iter()
+        .map(|body| macro_opacity_lines(&format!("fn f(x: u8) {{ {body} }}\n")))
+        .collect();
+    assert_eq!(measured, vec![(vec![2], 0); bodies.len()], "{bodies:?}");
+}
+
+/// #1210: a statement whose calls are all statement macros is read as any other statement:
+/// its nested blocks are scopes of their own, so an item a block declares is found there.
+#[test]
+fn references_rust_statement_macro_statement_keeps_its_nested_blocks() {
+    let nested = "fn f(x: u8) {\n\
+                  if x == 1 { mod m { pub fn g() {} }\n\
+                  m::g(); println!(\"x\"); }\n\
+                  m::g(); }\n";
+    assert_eq!(macro_opacity_lines(nested), (vec![5], 1));
+    // Another macro call keeps the whole statement, nested block included, unknown.
+    assert_eq!(
+        macro_opacity_lines(&nested.replace("println!", "y!")),
+        (vec![], 2)
+    );
+}
+
+/// #1210: a literal `macro_rules!` of a statement macro's name, in any file of the checkout,
+/// could be the macro the bare name calls, so the bare call makes its scope opaque again;
+/// the path form `std::name!` still reaches the standard library. The definition is read
+/// from the text, in a comment or behind whitespace and comments too.
+#[test]
+fn references_rust_literal_macro_rules_of_the_name_keeps_the_bare_call_unknown() {
+    let body = "fn f() { println!(\"x\"); m::g(); }\n";
+    let beside = |defs: &str| macro_lines_beside("mod defs;", &[("src/defs.rs", defs)], body);
+    assert_eq!(beside(&rules_of("other")), (vec![2], 0));
+    assert_eq!(beside(&rules_of("println")), (vec![], 1));
+    assert_eq!(beside(&format!("// {}", rules_of("println"))), (vec![], 1));
+    let spaced = format!(
+        "{} /* c */ ! // c\n r#println {{ () => {{}} }}\n",
+        concat!("macro_", "rules")
+    );
+    assert_eq!(beside(&spaced), (vec![], 1));
+    // Trivia past the scan's bound (#1229's nested-comment shape) could hide any name: every
+    // bare name fails, as with an unread file, and the scan stops there.
+    let keyword = format!("{} /* ", concat!("macro_", "rules"));
+    let nested = format!("/* {}{} */", keyword.repeat(2_000), "*/".repeat(2_000));
+    assert_eq!(beside(&nested), (vec![], 1));
+    // A name the definition does not take changes nothing; the path form is not read.
+    assert_eq!(beside(&rules_of("println_")), (vec![2], 0));
+    let path = "fn f() { std::println!(\"x\"); m::g(); }\n";
+    assert_eq!(
+        macro_lines_beside("mod defs;", &[("src/defs.rs", &rules_of("println"))], path),
+        (vec![2], 0)
+    );
+}
+
+/// #1210: `#[macro_use]` anywhere, or a crate's `decl_macro` feature, could give a bare
+/// statement macro name another macro, so every bare call makes its scope opaque again; a
+/// path form is still proved by its path.
+#[test]
+fn references_rust_macro_use_or_decl_macro_keeps_bare_statement_macros_unknown() {
+    let bare = "fn f() { vec![1]; m::g(); }\n";
+    let path = "fn f() { std::vec![1]; m::g(); }\n";
+    for (lib, files) in [
+        ("", vec![("src/defs.rs", "#[macro_use]\nmod inner {}\n")]),
+        ("", vec![("src/defs.rs", "mod inner { #![macro_use] }\n")]),
+        ("", vec![("src/defs.rs", "#![feature(decl_macro)]\n")]),
+        // Raw, commented and conditional spellings are `macro_use` too (#1229 review).
+        ("", vec![("src/defs.rs", "#[r#macro_use]\nmod inner {}\n")]),
+        (
+            "",
+            vec![("src/defs.rs", "#[macro_use /* note */]\nmod inner {}\n")],
+        ),
+        (
+            "",
+            vec![(
+                "src/defs.rs",
+                "#[cfg_attr(all(), macro_use)]\nmod inner {}\n",
+            )],
+        ),
+        (
+            "#[cfg_attr(all(), macro_use)] extern crate foreign;",
+            vec![("src/defs.rs", "")],
+        ),
+    ] {
+        let lib = format!("{lib} mod defs;");
+        assert_eq!(
+            macro_lines_beside(&lib, &files, bare).0,
+            Vec::<u64>::new(),
+            "{lib} {files:?}"
+        );
+        assert_eq!(
+            macro_lines_beside(&lib, &files, path),
+            (vec![2], 0),
+            "{lib}"
+        );
+    }
+    // In a string, neither is an attribute.
+    let files = [(
+        "src/defs.rs",
+        "const S: &str = \"#[macro_use] decl_macro\";\n",
+    )];
+    assert_eq!(macro_lines_beside("mod defs;", &files, bare), (vec![2], 0));
+    let files = [("src/defs.rs", "#[doc = \"macro_use\"]\nmod inner {}\n")];
+    assert_eq!(macro_lines_beside("mod defs;", &files, bare), (vec![2], 0));
+}
+
+/// #1210: a named import of the name, from the call's scope up to its module, binds it to
+/// whatever it imports; one in another module, or under another name, does not.
+#[test]
+fn references_rust_named_import_of_a_statement_macro_name_keeps_the_call_unknown() {
+    let rows = [
+        (
+            "fn f() { use crate::m::y as println; println!(\"x\"); m::g(); }",
+            false,
+        ),
+        (
+            "fn f() { { use crate::m::println; } println!(\"x\"); m::g(); }",
+            true,
+        ),
+        (
+            "use crate::m::println;\nfn f() { if true { println!(\"x\"); } m::g(); }",
+            false,
+        ),
+        (
+            "use crate::m::println as y;\nfn f() { println!(\"x\"); m::g(); }",
+            true,
+        ),
+        (
+            "mod inner { use crate::m::println; }\nfn f() { println!(\"x\"); m::g(); }",
+            true,
+        ),
+        // The import binds only its own module's scopes: `inner` calls the standard library.
+        (
+            "use crate::m::println;\nmod inner { use crate::m; fn f() { println!(\"x\"); m::g(); } }",
+            true,
+        ),
+    ];
+    for (body, resolves) in rows {
+        let (lines, _) = macro_opacity_lines(&format!("{body}\n"));
+        assert_eq!(!lines.is_empty(), resolves, "{body}");
+    }
+}
+
+/// #1210: a failed proof inside a statement makes the outermost statement's scope opaque, as
+/// the statement's macro call did before, along with the call's own scope.
+#[test]
+fn references_rust_failed_nested_statement_macro_makes_the_outer_scope_opaque() {
+    // The innermost block reads `m` through its glob, the middle one from `f`'s block.
+    let body = "fn f(x: u8) {\n\
+                if x == 1 { if x == 2 { use crate::defs::*; println!(\"x\"); m::g(); } m::g(); }\n\
+                m::g(); }\n";
+    let beside = |name: &str| {
+        let defs = format!("{}pub(crate) use crate::m;\n", rules_of(name));
+        macro_lines_beside("mod defs;", &[("src/defs.rs", &defs)], body)
+    };
+    assert_eq!(beside("other"), (vec![3, 3, 4], 0));
+    // Every `m::g`, and the glob import read in the now opaque innermost block.
+    assert_eq!(beside("println"), (vec![], 4));
+    // The path form fails when `std` is not the standard library there.
+    let shadowed =
+        "mod std { pub fn h() {} }\nfn f() { if true { std::println!(\"x\"); } m::g(); }\n";
+    assert_eq!(macro_opacity_lines(shadowed), (vec![], 1));
+}
+
+/// #1210: `thread_local!` declares exactly the statics it spells, as values this catalog
+/// does not follow: a path through one stays unknown, where a glob would otherwise answer
+/// it, and the module's other paths resolve.
+#[test]
+fn references_rust_thread_local_binds_exactly_its_statics() {
+    let input = snapshot(&[
+        ("src/lib.rs", "mod m; mod a; mod n;"),
+        ("src/m.rs", "pub fn g() {}"),
+        (
+            "src/n.rs",
+            "pub static COUNTER: u8 = 0;\npub static OTHER: u8 = 0;\npub static INNER: u8 = 0;",
+        ),
+        (
+            "src/a.rs",
+            "use crate::m;\nuse crate::n::*;\n\
+             thread_local! { #[allow(unused)] pub static COUNTER: std::cell::Cell<&'static str> = \
+             const { std::cell::Cell::new(\"x\") }; }\n\
+             fn f() { m::g(); let _ = self::COUNTER; let _ = self::OTHER; }\n\
+             fn h() { std::thread_local!(static INNER: u8 = 0); let _ = self::INNER; m::g(); }\n",
+        ),
+    ]);
+    let data = references::project(&input, &["src/a.rs".into()], 20, &mut || Ok(()))
+        .unwrap()
+        .data;
+    let unknown: Vec<_> = data["unresolved"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|site| site["site"]["spelling"].as_str().unwrap())
+        .collect();
+    assert_eq!(unknown, ["self::COUNTER"], "{data}");
+    let mut lines: Vec<u64> = data["production"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|pair| pair["target"]["path"] == "src/m.rs" || pair["target"]["path"] == "src/n.rs")
+        .flat_map(|pair| pair["sites"].as_array().unwrap())
+        .map(|site| site["lines"]["start"].as_u64().unwrap())
+        .filter(|&line| line > 2)
+        .collect();
+    lines.sort_unstable();
+    // `m::g` and `self::OTHER` in `f`; `self::INNER` (the module's, not the block's static)
+    // and `m::g` in `h`.
+    assert_eq!(lines, [4, 4, 5, 5], "{data}");
+}
+
+/// #1229 review: comments between `static` and its name, and a raw name, are the same
+/// declaration: the static still shadows the glob's, so a path through it stays unknown,
+/// while the glob's other names resolve.
+#[test]
+fn references_rust_thread_local_statics_read_past_comments_and_raw_names() {
+    for declaration in [
+        "static /* note */ COUNTER: u8 = 0;",
+        "static // note\n COUNTER: u8 = 0;",
+        "static r#COUNTER: u8 = 0;",
+        "static /* a */ // b\n r#COUNTER: u8 = 0;",
+    ] {
+        let source = format!(
+            "use crate::n::*;\nthread_local! {{ {declaration} }}\n\
+             fn f() {{ let _ = self::COUNTER; let _ = self::OTHER; }}\n"
+        );
+        let input = snapshot(&[
+            ("src/lib.rs", "mod a; mod n;"),
+            (
+                "src/n.rs",
+                "pub static COUNTER: u8 = 0;\npub static OTHER: u8 = 0;",
+            ),
+            ("src/a.rs", &source),
+        ]);
+        let data = references::project(&input, &["src/a.rs".into()], 20, &mut || Ok(()))
+            .unwrap()
+            .data;
+        let unknown: Vec<_> = data["unresolved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|site| site["site"]["spelling"].as_str().unwrap())
+            .collect();
+        assert_eq!(unknown, ["self::COUNTER"], "{declaration}: {data}");
+        assert!(
+            has_edge(&data, "src/a.rs", "src/n.rs"),
+            "{declaration}: {data}"
+        );
+    }
 }
 
 /// The sites of `src/a.rs` (after its first line) that map to `src/kinds.rs`, as spellings,

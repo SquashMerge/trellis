@@ -970,7 +970,38 @@ Supported mapping is deliberately narrow:
   could bind any name, so a first path segment that scope does not bind itself is
   unknown there. Syntax decides what a macro call is (#1163): an expression statement
   counts when a macro call lies anywhere in it, nested blocks included, and a `!=`, a
-  unary `!` or a `!` in a string or character literal does not. A macro call inside a
+  unary `!` or a `!` in a string or character literal does not. The standard library's
+  statement macros are the exception (#1210, owner ruling 2026-11-18): `format!`,
+  `format_args!`, `print!`, `println!`, `eprint!`, `eprintln!`, `write!`, `writeln!`,
+  `vec!`, `matches!`, `assert!`, `assert_eq!`, `assert_ne!`, `debug_assert!`,
+  `debug_assert_eq!`, `debug_assert_ne!`, `panic!`, `unreachable!`, `todo!`,
+  `unimplemented!`, `concat!`, `stringify!`, `include_str!`, `include_bytes!`, `env!`,
+  `option_env!`, `line!`, `column!`, `file!`, `module_path!`, `cfg!` and `dbg!` expand to
+  an expression and bind no name, and `thread_local!` declares exactly the statics it
+  spells, each read as a value the catalog does not follow, so a path through one stays
+  unknown. A call to one of them leaves its scope transparent once it is proved to reach
+  the standard library's macro, and an expression statement whose macro calls are all such
+  calls is read as any other statement, its nested blocks scopes of their own (a call in
+  another call's arguments is an argument and is not read). A bare name is proved when no
+  Rust file of the checkout spells a `macro_rules!` definition of that name (read from the
+  text, so one in a comment, a string or another macro's arguments counts; at most 128
+  bytes of whitespace and comments are read between `macro_rules`, `!` and the name, and
+  a definition that needs more, or a file whose text was not read, could define any; each
+  byte read is charged to the reference work bound), no `#[macro_use]` or `#![macro_use]` and no
+  inner attribute naming the `decl_macro` feature is read (or spelled in a file with a
+  parser error), and no scope from the call's up to its module has a named import that
+  binds the name or skipped anything. On a checkout that compiles nothing else can take
+  the name's place: rustc reports a macro of the name that a glob, or an import another
+  macro's expansion writes, brings in as ambiguous (E0659), and a `macro_rules!` that
+  another macro's expansion defines does not shadow the standard library's (rustc probes on
+  editions 2021 and 2024, recorded with #1210). `std::name!`,
+  `core::name!` and `alloc::name!`, with or without a leading `::`, are proved as a known
+  attribute macro's package is (below), with the first segment the standard library
+  instead of a dependency. A `thread_local!` counts only as a statement of a block or
+  module. When a proof fails, the call makes its own scope and the scope of the outermost
+  statement holding it opaque, as any macro call does. `include!`, every other macro and a
+  call under any other path stay opaque, and so does a statement holding one.
+  Dependencies' macros, such as `anyhow!` or `json!`, are not read (#1223). A macro call inside a
   `static` or `const` initializer is an expression, which cannot bind an item (#1191):
   it makes only that initializer uncertain, not the module or block that holds the
   item. An attribute on an
