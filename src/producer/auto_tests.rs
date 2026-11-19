@@ -130,8 +130,13 @@ impl Probes for NoProbes {
     }
 }
 
-/// Make `producer` the launch in flight, as `spawn_run` does.
+/// Make `producer` the launch in flight, as `spawn_run` does, decided at state version 0.
 fn activate(s: &mut OwnerState, producer: &str, now_ms: u64) -> SupersedeToken {
+    activate_at(s, producer, now_ms, 0)
+}
+
+/// Like `activate`, decided by a pass that read state version `decided_at`.
+fn activate_at(s: &mut OwnerState, producer: &str, now_ms: u64, decided_at: u64) -> SupersedeToken {
     let token = SupersedeToken::default();
     let basis = s.head.as_ref().unwrap().native.clone();
     let approval = match s.approvals.get(producer) {
@@ -148,25 +153,15 @@ fn activate(s: &mut OwnerState, producer: &str, now_ms: u64) -> SupersedeToken {
         supersede_requested: false,
         prev_start,
         approval,
+        decided_at,
     });
     token
 }
 
 fn tagged(producer: &str, token: &SupersedeToken, outcome: LaunchOutcome) -> Tagged {
-    tagged_at(producer, token, 0, outcome)
-}
-
-/// A launch's end whose run thread read state version `launched_at` before launching.
-fn tagged_at(
-    producer: &str,
-    token: &SupersedeToken,
-    launched_at: u64,
-    outcome: LaunchOutcome,
-) -> Tagged {
     Tagged {
         producer: producer.to_owned(),
         token: token.clone(),
-        launched_at,
         outcome,
     }
 }
@@ -456,7 +451,7 @@ fn head_moved_and_slot_busy_do_not_count_as_starts() {
         LaunchOutcome::NotReady,
     ] {
         let mut s = ready(&[ALPHA], base);
-        let token = activate(&mut s, ALPHA, NOW_MS + 20_000);
+        let token = activate_at(&mut s, ALPHA, NOW_MS + 20_000, 2);
         assert!(s.apply(tagged(ALPHA, &token, outcome), 3, base));
         assert_eq!(s.last_start.get(ALPHA), None);
         assert!(s.hold.is_some());
@@ -493,7 +488,8 @@ fn not_ready_has_no_past_deadline() {
 fn hold_after_slot_busy_lifts_on_next_signal_or_backstop() {
     let base = Instant::now();
     let mut s = ready(&[ALPHA], base);
-    let token = activate(&mut s, ALPHA, NOW_MS + 20_000);
+    // Decided at 4; the outcome's own wake makes 5.
+    let token = activate_at(&mut s, ALPHA, NOW_MS + 20_000, 4);
     s.apply(
         tagged(ALPHA, &token, LaunchOutcome::SlotBusy),
         5,
@@ -511,6 +507,44 @@ fn hold_after_slot_busy_lifts_on_next_signal_or_backstop() {
         at(&mut s, &same_signal, base, after).action,
         Action::Start(ALPHA.into())
     );
+}
+
+#[test]
+fn a_hold_consumed_before_its_own_wake_lasts_through_that_wake() {
+    let base = Instant::now();
+    for outcome in held_outcomes() {
+        let mut s = ready(&[ALPHA], base);
+        // Decided at 4 and consumed at 4: the outcome's own wake (5) has not landed yet.
+        let token = activate_at(&mut s, ALPHA, NOW_MS + 20_000, 4);
+        assert!(s.apply(tagged(ALPHA, &token, outcome.clone()), 4, base + secs(20)));
+        for seen in [4, 5] {
+            let held = at(&mut s, &Live { seen, ..live() }, base, 20);
+            assert_eq!(held.action, Action::None, "{outcome:?} at {seen}");
+            assert_eq!(held.next_deadline, Some(base + secs(20) + BACKSTOP));
+        }
+        assert_eq!(
+            at(&mut s, &Live { seen: 6, ..live() }, base, 20).action,
+            Action::Start(ALPHA.into()),
+            "{outcome:?}"
+        );
+    }
+}
+
+#[test]
+fn a_signal_the_launch_decision_did_not_see_releases_every_hold() {
+    let base = Instant::now();
+    for outcome in held_outcomes() {
+        let mut s = ready(&[ALPHA], base);
+        // Decided at 4; a publication (5) and the outcome's own wake (6) land before the consume.
+        let token = activate_at(&mut s, ALPHA, NOW_MS + 20_000, 4);
+        assert!(s.apply(tagged(ALPHA, &token, outcome.clone()), 6, base + secs(20)));
+        assert!(s.hold.is_none(), "{outcome:?}");
+        assert_eq!(
+            at(&mut s, &Live { seen: 6, ..live() }, base, 20).action,
+            Action::Start(ALPHA.into()),
+            "{outcome:?}"
+        );
+    }
 }
 
 #[test]
@@ -902,9 +936,9 @@ fn contention_counts_as_a_start_only_once_the_run_record_exists() {
     let base = Instant::now();
     // Refused before the record: no start, no failure, held until a newer signal.
     let mut s = ready(&[ALPHA], base);
-    let token = activate(&mut s, ALPHA, NOW_MS + 20_000);
+    let token = activate_at(&mut s, ALPHA, NOW_MS + 20_000, 4);
     let contended = LaunchOutcome::Contended { run_id: None };
-    assert!(s.apply(tagged_at(ALPHA, &token, 4, contended), 5, base + secs(20)));
+    assert!(s.apply(tagged(ALPHA, &token, contended), 5, base + secs(20)));
     assert_eq!(s.last_start.get(ALPHA), None);
     assert!(s.last_failure.is_empty());
     let held = at(&mut s, &Live { seen: 5, ..live() }, base, 21);
@@ -918,12 +952,12 @@ fn contention_counts_as_a_start_only_once_the_run_record_exists() {
 
     // The run wrote its record and then met contention: its start holds the minimum interval.
     let mut s = ready(&[ALPHA], base);
-    let token = activate(&mut s, ALPHA, NOW_MS + 20_000);
+    let token = activate_at(&mut s, ALPHA, NOW_MS + 20_000, 4);
     token.mark_started();
     let contended = LaunchOutcome::Contended {
         run_id: Some("r1".into()),
     };
-    assert!(s.apply(tagged_at(ALPHA, &token, 4, contended), 5, base + secs(20)));
+    assert!(s.apply(tagged(ALPHA, &token, contended), 5, base + secs(20)));
     assert_eq!(s.last_start[ALPHA], NOW_MS + 20_000);
     assert_eq!(s.last_run_id[ALPHA], "r1");
     assert!(s.last_failure.is_empty());
@@ -1218,9 +1252,15 @@ struct Rt {
     launches: Vec<(String, String)>,
     outcomes: VecDeque<LaunchOutcome>,
     bump_on_launch: bool,
-    /// Bump the version once the launch has its outcome, before it returns: a signal that
-    /// lands between the refusal and the owner consuming it.
+    /// Bump the version once the launch has its outcome, and return only once the owner has
+    /// handled that signal: a publication that lands between the refusal and the owner
+    /// consuming it, which the owner takes only after the run's own wake.
     bump_before_return: bool,
+    /// Hold the run thread in `wake`, after it stored its outcome and before it signals: a
+    /// preemption between the two.
+    pause_wake: bool,
+    /// The run thread is held in `wake`.
+    wake_paused: bool,
     abandon: bool,
 }
 
@@ -1332,10 +1372,18 @@ impl AutoRunRuntime for FakeRuntime {
     }
 
     fn wake(&self) {
-        self.with(|state| {
-            state.version += 1;
-            state.wakes += 1;
-        });
+        let mut state = self.state.lock().unwrap();
+        if state.pause_wake {
+            state.wake_paused = true;
+            self.changed.notify_all();
+            while state.pause_wake && !state.abandon {
+                state = self.changed.wait(state).unwrap();
+            }
+            state.wake_paused = false;
+        }
+        state.version += 1;
+        state.wakes += 1;
+        self.changed.notify_all();
     }
 
     fn launch(&self, request: LaunchRequest) -> LaunchOutcome {
@@ -1352,6 +1400,9 @@ impl AutoRunRuntime for FakeRuntime {
                 if std::mem::take(&mut state.bump_before_return) {
                     state.version += 1;
                     self.changed.notify_all();
+                    while state.waiting != Some((state.version, state.expired)) && !state.abandon {
+                        state = self.changed.wait(state).unwrap();
+                    }
                 }
                 return outcome;
             }
@@ -1976,36 +2027,129 @@ fn loop_real_failure_stays_failed_until_the_basis_changes() {
     assert_eq!(rt.launches()[1], (ALPHA.to_owned(), "h2".to_owned()));
 }
 
-#[test]
-fn contention_hold_keeps_the_credit_of_a_publication_before_it_is_consumed() {
-    let base = Instant::now();
-    let mut s = ready(&[ALPHA], base);
-    // Launched at version 4; the outcome's own wake makes 5 and the publication 6.
-    let token = activate(&mut s, ALPHA, NOW_MS + 20_000);
-    let contended = LaunchOutcome::Contended { run_id: None };
-    assert!(s.apply(tagged_at(ALPHA, &token, 4, contended), 6, base + secs(20)));
-    assert!(s.hold.is_none());
-    let same = Live { seen: 6, ..live() };
-    assert_eq!(
-        at(&mut s, &same, base, 20).action,
-        Action::Start(ALPHA.into())
-    );
+/// Every non-start the owner holds until the next state signal or the backstop.
+fn held_outcomes() -> [LaunchOutcome; 4] {
+    [
+        LaunchOutcome::NotReady,
+        LaunchOutcome::SlotBusy,
+        LaunchOutcome::HeadMoved,
+        LaunchOutcome::Contended { run_id: None },
+    ]
 }
 
 #[test]
 fn loop_publication_between_refusal_and_consume_reruns_at_once() {
+    let mut absorbed = Vec::new();
+    for outcome in held_outcomes() {
+        let rt = FakeRuntime::new();
+        let src = FakeSources::new(&[ALPHA], config(&[ALPHA], 10, 60));
+        // The refusal is decided, then a publication lands and signals. The owner handles that
+        // signal before the run thread stores the outcome, and takes the outcome only after
+        // the run's own wake.
+        rt.with(|state| state.bump_before_return = true);
+        rt.finish(outcome.clone());
+        let harness = Harness::start(&rt, &src, immediate());
+        rt.outcome_applied(1);
+        // No further signal: the publication's own credit starts the re-run at the same head.
+        if harness.status(ALPHA).state != AutoState::Running {
+            absorbed.push(outcome);
+            continue;
+        }
+        rt.wait_for("the rerun", |state| state.launches.len() == 2);
+        assert_eq!(rt.launches()[1], (ALPHA.to_owned(), "h1".to_owned()));
+        assert_eq!(rt.state.lock().unwrap().expired, 0);
+        assert_eq!(harness.clock.elapsed(), Duration::ZERO);
+    }
+    assert_eq!(
+        absorbed,
+        [],
+        "these holds absorbed the publication's credit"
+    );
+}
+
+#[test]
+fn loop_own_wake_after_the_consume_does_not_release_the_hold() {
+    let mut released = Vec::new();
+    for outcome in held_outcomes() {
+        let rt = FakeRuntime::new();
+        let src = FakeSources::new(&[ALPHA], config(&[ALPHA], 10, 60));
+        // The run thread stores its outcome and is preempted before its own wake.
+        rt.with(|state| state.pause_wake = true);
+        rt.finish(outcome.clone());
+        let harness = Harness::start(&rt, &src, immediate());
+        rt.wait_for("the outcome stored, its wake not yet", |state| {
+            state.wake_paused
+        });
+        rt.quiesce();
+        // A timeout wakes the owner first: it takes the outcome before that wake.
+        rt.expire();
+        rt.quiesce();
+        assert_eq!(
+            harness.status(ALPHA).state,
+            AutoState::Scheduled,
+            "{outcome:?}"
+        );
+        // The late own wake is no publication: it must not release the hold.
+        rt.with(|state| state.pause_wake = false);
+        rt.outcome_applied(1);
+        if harness.status(ALPHA).state != AutoState::Scheduled {
+            released.push(outcome);
+            continue;
+        }
+        assert_eq!(rt.launches().len(), 1);
+        let last = *rt.state.lock().unwrap().waits.last().unwrap();
+        assert_eq!(last.1, BACKSTOP);
+        // The next signal does.
+        harness.signal();
+        assert_eq!(
+            harness.status(ALPHA).state,
+            AutoState::Running,
+            "{outcome:?}"
+        );
+        rt.wait_for("the rerun", |state| state.launches.len() == 2);
+        assert_eq!(harness.clock.elapsed(), Duration::ZERO);
+    }
+    assert_eq!(released, [], "these holds were released by their own wake");
+}
+
+#[test]
+fn loop_head_move_after_the_decision_reruns_at_the_new_head_at_once() {
     let rt = FakeRuntime::new();
     let src = FakeSources::new(&[ALPHA], config(&[ALPHA], 10, 60));
-    // The refusal is decided, then the publication that held the index lands and signals
-    // before the run thread stores the outcome for the owner.
-    rt.with(|state| state.bump_before_return = true);
-    rt.finish(LaunchOutcome::Contended { run_id: None });
-    let harness = Harness::start(&rt, &src, immediate());
-    rt.wait_for("the first launch", |state| !state.launches.is_empty());
-    // No further signal: the publication's own credit starts the re-run at the same head.
-    rt.finish(finished(AutoOutcome::Imported));
+    let first = Arc::new(AtomicBool::new(true));
+    let spawn: Spawner = {
+        let (rt, src, real) = (rt.clone(), src.clone(), thread_spawner());
+        Arc::new(move |job| {
+            if !first.swap(false, Ordering::SeqCst) {
+                return real(job);
+            }
+            let (rt, src) = (rt.clone(), src.clone());
+            real(Box::new(move || {
+                // The head moves after the owner decided to launch, before the launch runs,
+                // and the owner handles that publication while the launch is in flight.
+                src.edit(|src| {
+                    src.native = "h2".into();
+                    src.pin_revision = 2;
+                });
+                rt.bump();
+                rt.quiesce();
+                job();
+            }))
+        })
+    };
+    rt.finish(LaunchOutcome::HeadMoved);
+    let harness = Harness::start_with(&rt, &src, immediate(), spawn);
+    rt.outcome_applied(1);
+    // The launch decision never saw that publication: it starts the re-run at the new head.
+    assert_eq!(harness.status(ALPHA).state, AutoState::Running);
     rt.wait_for("the rerun", |state| state.launches.len() == 2);
-    assert_eq!(rt.launches()[1], (ALPHA.to_owned(), "h1".to_owned()));
+    assert_eq!(
+        rt.launches(),
+        [
+            (ALPHA.to_owned(), "h1".to_owned()),
+            (ALPHA.to_owned(), "h2".to_owned())
+        ]
+    );
     assert_eq!(rt.state.lock().unwrap().expired, 0);
     assert_eq!(harness.clock.elapsed(), Duration::ZERO);
 }
