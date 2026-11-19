@@ -65,10 +65,11 @@ which replaced the 250 ms per-file time bound for the outline):
 | Hang backstop | 10 seconds wall clock |
 
 A file beyond a size, parse-work, depth or visit bound gets the warning on every read. The
-parse-work bound counts tree-sitter's progress callback, which the pinned tree-sitter calls once
-per 100 parse operations, so it is a property of the file and the grammar, never of the clock. A
-parse that reaches it stops there, so a pathological file is refused before its parse ends,
-however loaded the machine (the [2026-11-19 owner ruling](https://github.com/SquashMerge/trellis/issues/1220)).
+parse-work bound counts tree-sitter's progress-callback ticks, which the pinned tree-sitter fires
+roughly every 100 units of the parser's operation counter. The tick count is deterministic for a
+given file and grammar, never dependent on the clock, but it is not a measure of CPU work:
+weighted compression steps can overshoot within a tick. A parse whose count exceeds the bound is
+stopped, so a pathological file is refused before its parse ends, however loaded the machine (the [2026-11-19 owner ruling](https://github.com/SquashMerge/trellis/issues/1220)).
 The hang backstop never decides an answer: reaching it fails the outline read typed
 `deadline_exceeded`, with no partial outline.
 

@@ -17,11 +17,13 @@ pub(crate) const DEPTH: usize = 128;
 pub(crate) const VISITS: usize = 1_000_000;
 /// Parse work, in tree-sitter progress ticks, that the MCP lookup-key derivation and the Files
 /// outline may spend on one document: its parse and its macro re-parses share it (owner ruling
-/// 2026-11-19, #1220). The pinned tree-sitter calls the progress callback once per 100 parse
-/// operations, so the count is a property of the input and the grammar, never of the clock.
-/// A parse that reaches it stops there, so a pathological document is refused before its
-/// parse ends, however loaded the machine. The largest real documents measured spend at most
-/// 52,330 ticks, and a Rust array just under the visit bound 58,842.
+/// 2026-11-19, #1220). The pinned tree-sitter fires the progress callback roughly every 100
+/// units of the parser's operation counter, which also takes weighted balance and compression
+/// increments, so a tick is not a measure of CPU work. The tick count is deterministic for a
+/// given input and grammar, never dependent on the clock. A parse whose count exceeds the bound
+/// is stopped, so a pathological document is refused before its parse ends, however loaded the
+/// machine. The largest real documents measured spend at most 52,330 ticks, and a Rust array
+/// just under the visit bound 58,842.
 pub(crate) const PARSE_TICKS: usize = 80_000;
 
 /// What one document's syntax lost.
