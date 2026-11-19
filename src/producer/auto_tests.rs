@@ -1300,7 +1300,13 @@ impl FakeRuntime {
         let mut state = self.state.lock().unwrap();
         while !ready(&state) {
             let left = deadline.saturating_duration_since(Instant::now());
-            assert!(!left.is_zero(), "{what} did not happen (hang)");
+            if left.is_zero() {
+                // Unlock first: a panic holding the guard poisons the mutex, and the harness
+                // teardown then aborts the process instead of reporting this hang (#1228).
+                let launches = state.launches.len();
+                drop(state);
+                panic!("{what} did not happen (hang); launches: {launches}");
+            }
             state = self.changed.wait_timeout(state, left).unwrap().0;
         }
     }
@@ -1984,11 +1990,15 @@ fn loop_contended_launch_reruns_after_the_publication_at_the_same_head() {
     let last = *rt.state.lock().unwrap().waits.last().unwrap();
     assert_eq!(last.1, BACKSTOP);
 
-    // The rebuild publishes: a new pin at the same native head, and its state signal.
+    // The rebuild publishes: a new pin at the same native head, and its state signal. The rerun
+    // gets no outcome and stays in flight: an ended rerun would let the owner start a third
+    // launch at the still-due fake head, and a test thread that looked late would never see
+    // exactly two (#1228).
     src.edit(|src| src.pin_revision = 2);
-    rt.finish(finished(AutoOutcome::Imported));
     rt.bump();
     rt.wait_for("the rerun", |state| state.launches.len() == 2);
+    rt.quiesce();
+    assert_eq!(rt.launches().len(), 2);
     assert_eq!(rt.launches()[1], (ALPHA.to_owned(), "h1".to_owned()));
     // The signal did it: no timeout fired and the fake clock never moved.
     assert_eq!(rt.state.lock().unwrap().expired, 0);
