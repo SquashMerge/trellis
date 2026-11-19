@@ -4206,6 +4206,7 @@ mod cache_tests {
             export_traces: Vec::new(),
             prelude_memo: BTreeMap::new(),
             path_memo: BTreeMap::new(),
+            import_memo: BTreeMap::new(),
             memos: true,
             files: BTreeMap::new(),
             file_declarations: BTreeMap::new(),
