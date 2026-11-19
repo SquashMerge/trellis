@@ -1368,7 +1368,7 @@ impl ParserState<'_> {
                 start,
                 end,
                 &position,
-                None,
+                &mut || false,
             )
             .map(|tree| (tree, start, end))
         }) else {

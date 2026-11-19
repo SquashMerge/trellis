@@ -58,14 +58,20 @@ which replaced the 250 ms per-file time bound for the outline):
 | Outline syntax bound | Limit |
 | --- | --- |
 | Cached source per parsed file | 2 MiB |
+| Parse work: the file's parse and its macro re-parses together | 80,000 tree-sitter progress ticks |
 | Syntax depth of the walk | 128 levels |
 | Syntax nodes the walk visits | 1,000,000 |
 | Re-parsed macro input (a Rust `impl` inside a measured macro) | Measurement's macro byte budget |
 | Hang backstop | 10 seconds wall clock |
 
-A file beyond a size, depth or visit bound gets the warning on every read. The hang backstop
-never decides an answer: reaching it fails the outline read typed `deadline_exceeded`, with no
-partial outline.
+A file beyond a size, parse-work, depth or visit bound gets the warning on every read. The
+parse-work bound counts tree-sitter's progress-callback ticks, which the pinned tree-sitter fires
+roughly every 100 units of the parser's operation counter. The tick count is deterministic for a
+given file and grammar, never dependent on the clock, but it is not a measure of CPU work:
+weighted compression steps can overshoot within a tick. A parse whose count exceeds the bound is
+stopped, so a pathological file is refused before its parse ends, however loaded the machine (the [2026-11-19 owner ruling](https://github.com/SquashMerge/trellis/issues/1220)).
+The hang backstop never decides an answer: reaching it fails the outline read typed
+`deadline_exceeded`, with no partial outline.
 
 The native declaration `SyntaxId` is already the projected graph `Symbol.id`. Callable sequence
 seeds use that exact ID, never a name join or a guessed ID translation. Retaining `nativeKind`

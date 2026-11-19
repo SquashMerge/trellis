@@ -9,7 +9,6 @@
 //! already a range of the original document. Anything that does not parse cleanly stays opaque.
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
-use std::time::Instant;
 
 use tree_sitter::{Node, ParseOptions, ParseState, Parser, Point, Range as TsRange, Tree};
 
@@ -105,7 +104,8 @@ pub(crate) fn byte_budget(document_len: usize) -> usize {
 pub(crate) type Position<'a> = &'a dyn Fn(usize) -> Point;
 
 /// Re-parse `token_tree` (original byte range `start..end`) as expressions. Returns `None`
-/// when the bytes cannot be wrapped (too close to the document start) or the parser fails.
+/// when the bytes cannot be wrapped (too close to the document start), the parser fails, or
+/// `stop`, asked at each tree-sitter progress tick, stops it.
 pub(crate) fn parse(
     parser: &mut Parser,
     text: &[u8],
@@ -113,7 +113,7 @@ pub(crate) fn parse(
     start: usize,
     end: usize,
     position: Position<'_>,
-    deadline: Option<Instant>,
+    stop: &mut dyn FnMut() -> bool,
 ) -> Option<Tree> {
     let (prefix, open, close): (&[u8], &[u8], &[u8]) = match form {
         MacroForm::Arguments { .. } => (ARGUMENTS_PREFIX, b"(", b")"),
@@ -160,7 +160,7 @@ pub(crate) fn parse(
         }
     };
     let mut progress = |_: &ParseState| {
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        if stop() {
             ControlFlow::Break(())
         } else {
             ControlFlow::Continue(())
@@ -253,7 +253,12 @@ pub(crate) struct Expansions<'s> {
     parser: Option<Parser>,
     line_starts: Vec<usize>,
     bytes: usize,
-    deadline: Option<Instant>,
+    /// The caller's clock check: true stops the re-parse in progress.
+    hung: Option<&'s dyn Fn() -> bool>,
+    /// Progress ticks the re-parses may still spend, when bounded.
+    ticks: Option<usize>,
+    /// A re-parse needed more ticks than were left.
+    ticks_spent: bool,
     /// By token tree range. `None` for a macro that does not expand.
     parsed: BTreeMap<(usize, usize), Option<Expansion>>,
 }
@@ -265,14 +270,26 @@ impl<'s> Expansions<'s> {
             parser: None,
             line_starts: Vec::new(),
             bytes: 0,
-            deadline: None,
+            hung: None,
+            ticks: None,
+            ticks_spent: false,
             parsed: BTreeMap::new(),
         }
     }
 
-    /// Stop parsing at `deadline`; a macro it interrupts does not expand.
-    pub(crate) fn with_deadline(mut self, deadline: Instant) -> Self {
-        self.deadline = Some(deadline);
+    /// Stop parsing once `hung` says so, asked at each progress tick after the tick bound; a
+    /// macro it interrupts does not expand. The caller's own clock decides, so a read on an
+    /// injected clock re-parses on that clock too.
+    pub(crate) fn with_hang_check(mut self, hung: &'s dyn Fn() -> bool) -> Self {
+        self.hung = Some(hung);
+        self
+    }
+
+    /// Let all re-parses together spend at most `ticks` tree-sitter progress ticks. The
+    /// re-parse that would spend more stops, and no macro expands after it: see
+    /// [`Self::root_within_ticks`].
+    pub(crate) fn with_parse_ticks(mut self, ticks: usize) -> Self {
+        self.ticks = Some(ticks);
         self
     }
 
@@ -285,6 +302,24 @@ impl<'s> Expansions<'s> {
         start: usize,
         end: usize,
     ) -> Node<'a> {
+        let innermost = self.innermost(plain, start, end);
+        self.root(plain, innermost)
+    }
+
+    /// [`Self::root_for`], or `None` once a re-parse ran out of [`Self::with_parse_ticks`]: a
+    /// macro then left unexpanded proves nothing about its syntax.
+    pub(crate) fn root_within_ticks<'a>(
+        &'a mut self,
+        plain: Node<'a>,
+        start: usize,
+        end: usize,
+    ) -> Option<Node<'a>> {
+        let innermost = self.innermost(plain, start, end);
+        (!self.ticks_spent).then(|| self.root(plain, innermost))
+    }
+
+    /// The token tree range of the innermost macro expanded on the way to `start..end`.
+    fn innermost(&mut self, plain: Node<'_>, start: usize, end: usize) -> Option<(usize, usize)> {
         let mut current = None;
         loop {
             let root = current
@@ -299,7 +334,10 @@ impl<'s> Expansions<'s> {
             current = Some(key);
         }
         current
-            .and_then(|key| self.expansion(key))
+    }
+
+    fn root<'a>(&'a self, plain: Node<'a>, key: Option<(usize, usize)>) -> Node<'a> {
+        key.and_then(|key| self.expansion(key))
             .map_or(plain, |expansion| expansion.tree.root_node())
     }
 
@@ -344,7 +382,8 @@ impl<'s> Expansions<'s> {
     }
 
     fn parse(&mut self, form: MacroForm, (start, end): (usize, usize)) -> Option<Expansion> {
-        if self.bytes.saturating_add(end - start) > byte_budget(self.text.len()) {
+        if self.ticks_spent || self.bytes.saturating_add(end - start) > byte_budget(self.text.len())
+        {
             return None;
         }
         self.bytes += end - start;
@@ -371,7 +410,18 @@ impl<'s> Expansions<'s> {
             Point::new(row, byte - lines[row])
         };
         let text = self.text.as_bytes();
-        let tree = parse(parser, text, form, start, end, &position, self.deadline)?;
+        let (hung, ticks, spent) = (self.hung, &mut self.ticks, &mut self.ticks_spent);
+        let mut stop = || {
+            if let Some(left) = ticks {
+                if *left == 0 {
+                    *spent = true;
+                    return true;
+                }
+                *left -= 1;
+            }
+            hung.is_some_and(|hung| hung())
+        };
+        let tree = parse(parser, text, form, start, end, &position, &mut stop)?;
         let expansion = Expansion::new(tree, form, start, end);
         expansion.arguments().is_some().then_some(expansion)
     }
