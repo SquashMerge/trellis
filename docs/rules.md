@@ -1018,7 +1018,9 @@ Supported mapping is deliberately narrow:
   brings in is ambiguous (E0659), and a `macro_rules!` that another macro's expansion
   defines does not shadow the import (rustc probes on editions 2021 and 2024, recorded
   with #1223). These proofs read which scopes are opaque, so they are rechecked after any
-  proof fails. A chain of two globs or more, an alias (`use tracing::info as note;`), a
+  proof fails. A raw identifier is the same name as the plain one (`r#bail` is `bail`) in
+  a declaration, an import and a path alike, and a `use` segment of any other form (a
+  leading `::` included) is not read: it leaves its scope opaque. A chain of two globs or more, an alias (`use tracing::info as note;`), a
   re-export through the checkout's own modules, a renamed dependency and an
   integration-test crate under `tests/` without a proved crate root stay unknown. A macro
   call inside a

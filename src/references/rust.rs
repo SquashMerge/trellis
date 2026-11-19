@@ -1357,14 +1357,19 @@ impl Catalog {
                 self.scopes[at].parent
             };
         }
+        // Every glob read is charged, uncertain ones too, and so is each segment of its path:
+        // the scan of a scope's globs repeats for every bare call that reaches it.
         for at in chain {
-            let globs: Vec<Vec<String>> = (self.scopes[at].imports.stars())
-                .filter(|star| !star.uncertain)
-                .map(|star| star.path.clone())
-                .collect();
-            for glob in globs {
+            for star in 0..self.scopes[at].imports.stars.len() {
                 self.step(check)?;
-                let Some(module) = self.ancestor_module(at, &glob) else {
+                let index = self.scopes[at].imports.stars[star];
+                let glob = &self.scopes[at].imports.all[index];
+                if glob.uncertain {
+                    continue;
+                }
+                self.charge(glob.path.len(), check)?;
+                let glob = &self.scopes[at].imports.all[index];
+                let Some(module) = self.ancestor_module(at, &glob.path) else {
                     continue;
                 };
                 if self.scopes[module].cut {
@@ -1479,7 +1484,7 @@ impl Catalog {
         {
             self.scopes[scope]
                 .explicit
-                .entry((TYPE, text(doc, name).to_owned()))
+                .entry((TYPE, plain_name(doc, name)))
                 .or_default()
                 .push(Binding {
                     candidate: None,
@@ -1544,7 +1549,7 @@ impl Catalog {
             item_uncertain,
             item_custom,
         } = item;
-        let name = text(doc, name).to_owned();
+        let name = plain_name(doc, name);
         let declaration = declarations
             .get(&(document, child.start_byte(), child.end_byte()))
             .and_then(|d| (d.len() == 1).then(|| d[0]));
@@ -1707,7 +1712,7 @@ impl Catalog {
                         };
                         self.scopes[scope]
                             .explicit
-                            .entry((namespace, text(doc, name).to_owned()))
+                            .entry((namespace, plain_name(doc, name)))
                             .or_default()
                             .push(Binding {
                                 candidate: None,
@@ -2405,7 +2410,7 @@ impl Catalog {
                             .child_by_field_name("body")
                             .is_some_and(|b| b.kind() == "field_declaration_list");
                         variants
-                            .entry(text(doc, name).to_owned())
+                            .entry(plain_name(doc, name))
                             .and_modify(|v: &mut Variant| v.certain = false)
                             .or_insert(Variant {
                                 certain: readable && !conditional,
@@ -3755,13 +3760,25 @@ fn visibility<'a>(doc: &'a DocumentInput, node: Node<'_>) -> Option<&'a str> {
         .find(|n| n.kind() == "visibility_modifier")
         .map(|n| text(doc, n))
 }
+/// The segments of a path, each a plain or raw identifier, a raw one canonical without its
+/// `r#` (`r#bail` is `bail`, #1223 review); `None` for any other form.
 fn parts(value: &str) -> Option<Vec<String>> {
-    let parts: Vec<_> = value.split("::").map(str::trim).collect();
-    (!parts.is_empty()
-        && parts
-            .iter()
-            .all(|p| !p.is_empty() && p.chars().all(|c| c == '_' || c.is_alphanumeric())))
-    .then(|| parts.into_iter().map(str::to_owned).collect())
+    value
+        .split("::")
+        .map(|part| identifier(part.trim()))
+        .collect()
+}
+/// The name a declaration's name node binds: `r#name` and `name` are one identifier, so it
+/// is canonical without the `r#`, as `parts` reads a path's segments (#1223 review).
+fn plain_name(doc: &DocumentInput, name: Node<'_>) -> String {
+    let name = text(doc, name);
+    name.strip_prefix("r#").unwrap_or(name).to_owned()
+}
+/// An identifier, a raw one without its `r#`; `None` for anything else.
+fn identifier(value: &str) -> Option<String> {
+    let name = value.strip_prefix("r#").unwrap_or(value);
+    (!name.is_empty() && name.chars().all(|c| c == '_' || c.is_alphanumeric()))
+        .then(|| name.to_owned())
 }
 /// The module path of a restricted visibility other than `pub(crate)` (#1209): `pub(self)`
 /// and `pub(super)` read as `pub(in self)` and `pub(in super)`. Only a path that starts with
@@ -3818,15 +3835,20 @@ fn imports(
             cut = true;
             continue;
         }
-        let combine = |value: &str| -> Vec<String> {
+        // The prefix and `value`'s segments, canonical (#1223 review). A segment of any other
+        // form (a leading `::` included) is `None`: the import is not read and the scope is
+        // cut, never read under a path with the segment dropped.
+        let combine = |value: &str| -> Option<Vec<String>> {
             let mut combined = prefix.clone();
-            if let Some(tail) = parts(value) {
-                if tail == ["self"] && !combined.is_empty() {
-                    return combined;
-                }
-                combined.extend(tail);
+            if value.trim().is_empty() {
+                return Some(combined);
             }
-            combined
+            let tail = parts(value)?;
+            if tail == ["self"] && !combined.is_empty() {
+                return Some(combined);
+            }
+            combined.extend(tail);
+            Some(combined)
         };
         match node.kind() {
             "scoped_use_list" => {
@@ -3834,8 +3856,12 @@ fn imports(
                     .child_by_field_name("path")
                     .map(|n| text(doc, n))
                     .unwrap_or("");
+                let Some(path) = combine(path) else {
+                    cut = true;
+                    continue;
+                };
                 if let Some(list) = node.child_by_field_name("list") {
-                    pending.push((list, combine(path), depth + 1));
+                    pending.push((list, path, depth + 1));
                 }
             }
             "use_list" => {
@@ -3866,10 +3892,21 @@ fn imports(
                 } else {
                     (text(doc, node), None)
                 };
+                // `as _` binds nothing; any other alias is an identifier, raw or not.
+                let alias = match alias {
+                    Some(alias) if alias == "_" => Some(alias),
+                    Some(alias) => identifier(&alias),
+                    None => Some(String::new()),
+                };
+                let (Some(path), Some(alias)) = (combine(path), alias) else {
+                    cut = true;
+                    continue;
+                };
+                let alias = (!alias.is_empty()).then_some(alias);
                 result.push(Import {
                     start: node.start_byte(),
                     end: node.end_byte(),
-                    path: combine(path),
+                    path,
                     alias,
                     star,
                     public,
@@ -4490,7 +4527,7 @@ mod memo_tests {
     use sha2::{Digest, Sha256};
 
     const MANIFEST: &str = "[package]\nname = 'fixture'\nversion = '0.1.0'\nedition = '2021'\n\
-        [dependencies]\nserde = '1'\ntokio = { version = '1', features = ['full'] }\n";
+        [dependencies]\nserde = '1'\ntokio = { version = '1', features = ['full'] }\nanyhow = '1'\n";
 
     /// A catalog of a snapshot's documents, its packages, and the documents with trees.
     struct Read<'a> {
@@ -4515,6 +4552,43 @@ mod memo_tests {
                 bytes: Some(MANIFEST.as_bytes().to_vec()),
             });
         snapshot
+    }
+
+    /// #1223 review (T00): a bare dependency macro's glob route charges every glob it reads,
+    /// for every call, uncertain ones included. Here each `bail!` in `a` reads its `GLOBS`
+    /// globs over `empty` before `use super::*`, which proves it: the work rises by at least
+    /// one step per glob and call.
+    #[test]
+    fn bare_package_macro_glob_route_charges_each_glob_it_reads() {
+        const GLOBS: usize = 30;
+        const CALLS: usize = 30;
+        let used = |globs: usize, glob: &str| {
+            let a = format!(
+                "{}use super::*;\nfn f() {{ {} }}\n",
+                glob.repeat(globs),
+                "bail!(\"x\"); ".repeat(CALLS)
+            );
+            let snapshot = snapshot(&[
+                ("src/lib.rs", "use anyhow::bail;\nmod empty {}\nmod a;\n"),
+                ("src/a.rs", &a),
+            ]);
+            let Read { catalog, .. } = read(&snapshot);
+            assert_eq!(catalog.statement_macros.len(), CALLS);
+            assert!(catalog.statement_macros.iter().all(|held| !held.failed));
+            catalog.work.used
+        };
+        // Certain globs, and uncertain ones that the route skips.
+        for glob in [
+            "use crate::empty::*;\n",
+            "#[cfg(test)]\nuse crate::empty::*;\n",
+        ] {
+            let (none, many) = (used(0, glob), used(GLOBS, glob));
+            assert!(
+                many - none >= GLOBS * CALLS,
+                "{glob:?}: {GLOBS} globs and {CALLS} calls added only {} work",
+                many - none
+            );
+        }
     }
 
     fn read(snapshot: &Snapshot) -> Read<'_> {

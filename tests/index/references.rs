@@ -2018,6 +2018,26 @@ fn references_rust_dependency_statement_macro_path_needs_its_package_proved() {
             format!("use crate::m as anyhow;\n{call}"),
             false,
         ),
+        // The renamed-dependency limit: only the package's own name is read.
+        (
+            "a renamed dependency's name",
+            "alias = { package = 'anyhow', version = '1' }\n",
+            "fn f() { alias::bail!(\"x\"); m::g(); }".to_owned(),
+            false,
+        ),
+        // #1223 review: `r#anyhow` is `anyhow`, so a raw local module or import shadows it.
+        (
+            "a local raw module named anyhow",
+            MACRO_PACKAGES,
+            format!("mod r#anyhow {{}}\n{call}"),
+            false,
+        ),
+        (
+            "an import named r#anyhow",
+            MACRO_PACKAGES,
+            format!("use crate::m as r#anyhow;\n{call}"),
+            false,
+        ),
         (
             "another package's name",
             MACRO_PACKAGES,
@@ -2110,6 +2130,39 @@ fn references_rust_dependency_statement_macro_bare_name_needs_its_import() {
             "use crate::m::info;\nfn f() { use tracing::info; info!(\"x\"); m::g(); }",
             true,
         ),
+        // #1223 review: `r#bail` is `bail`, in an alias, a path or a call, and a raw prefix
+        // segment is read, not dropped.
+        (
+            "a nearer raw alias of the name",
+            MACRO_PACKAGES,
+            "use anyhow::bail;\nfn f() { use crate::defs::replacement as r#bail; bail!(\"x\"); m::g(); }",
+            false,
+        ),
+        (
+            "a nearer plain alias of the name",
+            MACRO_PACKAGES,
+            "use anyhow::bail;\nfn f() { use crate::defs::replacement as bail; bail!(\"x\"); m::g(); }",
+            false,
+        ),
+        (
+            "a local re-export under a raw prefix",
+            MACRO_PACKAGES,
+            "mod r#foo { pub mod anyhow { pub(crate) use crate::defs::exported as bail; } }\n\
+             use r#foo::{anyhow::bail};\nfn f() { bail!(\"x\"); m::g(); }",
+            false,
+        ),
+        (
+            "raw segments of the package's path",
+            MACRO_PACKAGES,
+            "use r#anyhow::r#bail;\nfn f() { bail!(\"x\"); m::g(); }",
+            true,
+        ),
+        (
+            "a raw call name",
+            MACRO_PACKAGES,
+            "use anyhow::bail;\nfn f() { r#bail!(\"x\"); m::g(); }",
+            true,
+        ),
         // A recorded limit: `use anyhow::anyhow;` binds the name `anyhow` in its scope, which
         // the catalog does not know is anyhow's macro alone, so `anyhow` there is not proved
         // the package for the other imports.
@@ -2133,7 +2186,8 @@ fn references_rust_dependency_statement_macro_bare_name_needs_its_import() {
         ),
     ];
     for (why, dependencies, body, resolves) in rows {
-        let (lines, _) = dependency_macro_lines(dependencies, "", &[], body);
+        let files = [("src/defs.rs", "")];
+        let (lines, _) = dependency_macro_lines(dependencies, "mod defs;", &files, body);
         assert_eq!(!lines.is_empty(), resolves, "{why}");
     }
     // The crate root's import is not in `a`'s scopes.
