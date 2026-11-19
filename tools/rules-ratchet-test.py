@@ -312,7 +312,30 @@ class Ratchet(unittest.TestCase):
             "unknownPairs": 1,
             "deviatingReferencesByPair": {"src/http.rs": {"src/storage.rs": 10}},
             "exceptedReferencesByPair": {"src/http.rs": {"src/storage.rs": 5}},
-            "unknownReferencesBySource": {"src/http.rs": 2}}, 2))
+            "unknownReferencesBySource": {"src/http.rs": 2}}, (2, 0)))
+
+    def test_the_synthetic_cohort_templates_are_in_no_figure(self):
+        # #1236: an instance from one of the twelve named templates, whatever its status,
+        # is left out and counted apart; a file beside them, or under them by another
+        # name, is not a template and stays.
+        self.assertEqual(len(RR.TEMPLATES), 12)
+        template = "tools/synthetic-cohorts/templates/medium/python.py"
+        record, _ = RR.summarize(payload(*TREE))
+        measured, left_out = RR.summarize(payload(
+            *TREE, row("unknown", 2, destination=None, source=template),
+            row("deviates", 1, source="tools/synthetic-cohorts/templates/large/rust.rs"),
+            row("conforms", 3, source="tools/synthetic-cohorts/templates/small/java.java"),
+            row("unknown", 1, destination=stdlib("os"), source=template)))
+        self.assertEqual(left_out, (2, 3))
+        self.assertEqual(measured, record)
+        self.assertEqual(RR.compare(record, measured)[0], "equal")
+        for path in ("tools/synthetic-cohorts/generate.mjs",
+                     "tools/synthetic-cohorts/templates/medium/extra.py",
+                     "tests/fixtures/templates/medium/python.py"):
+            measured, left_out = RR.summarize(payload(
+                *TREE, row("unknown", 2, destination=None, source=path)))
+            self.assertEqual(left_out, (1, 0), path)
+            self.assertEqual(measured["unknownReferences"], record["unknownReferences"] + 2, path)
 
     def test_only_excepted_deviations_are_excepted_pairs(self):
         # An excepted instance keeps its status: an excepted unknown or conforming one is
@@ -350,7 +373,7 @@ class Ratchet(unittest.TestCase):
     def test_a_new_standard_library_import_in_a_tool_does_not_fail(self):
         record, _ = RR.summarize(payload(*TREE))
         added = row("unknown", 1, destination=stdlib("json"), source="tools/rules-ratchet.py")
-        measured, external = RR.summarize(payload(*TREE, added))
+        measured, (external, _) = RR.summarize(payload(*TREE, added))
         self.assertEqual(external, 2)
         self.assertEqual(measured, record)
         self.assertEqual(RR.compare(record, measured)[0], "equal")
@@ -442,6 +465,7 @@ class Ratchet(unittest.TestCase):
                                              "deviatingReferencesByPair", "exceptedReferencesByPair",
                                              "unknownReferencesBySource"])
             self.assertIn("externalPackage", written["population"])
+            self.assertIn("synthetic cohort templates", written["population"])
             self.assertIn("--accept-unknown-rise", written["rule"])
             self.assertIn("renames are not detected", written["rule"])
             self.assertIn("deviatingReferencesByPair or exceptedReferencesByPair", written["rule"])

@@ -49,7 +49,13 @@ unknown-reference change either way.
 
 A bare JavaScript import of a Node builtin (`node:crypto`, `crypto`) or of a package
 declared in the nearest `package.json` (`esbuild`) is an `externalPackage` too (#1088), so
-it is not counted either. One the tool cannot classify stays unknown.
+it is not counted either. One the tool cannot classify stays unknown: the herdr-mod's
+imports of its host's modules (`herdr`, `gpui-kit`, `gpui-base`) are such, a documented
+limit (spec G1).
+
+The twelve synthetic cohort templates (TEMPLATES) are fixtures, not product code: every
+instance whose source is one of them is left out of every figure too (owner ruling
+2026-11-19, #1236). They stay in the index; only this script leaves them out.
 
 The measurement runs through a daemon of its own under a private HOME, on a fresh index
 of this checkout with fresh rust-analyzer and scip-typescript evidence; it never touches
@@ -109,7 +115,11 @@ DESCRIPTION = {
                   "not an externalPackage: first-party sources to first-party or "
                   "unresolved destinations. Standard-library and external packages are "
                   "not counted, including bare JavaScript imports of Node builtins "
-                  "and of packages the nearest package.json declares (#1088).",
+                  "and of packages the nearest package.json declares (#1088). Nor are "
+                  "the instances whose source is one of the twelve synthetic cohort "
+                  "templates, tools/synthetic-cohorts/templates/{small,medium,large}/"
+                  "{java.java,javascript.js,python.py,rust.rs}: they are fixtures, not "
+                  "product code (owner ruling 2026-11-19, #1236).",
     "rule": "A run fails when deviatingPairs, deviatingReferences or partialFiles is "
             "above this record, or when it measures a deviating pair that is not in "
             "deviatingReferencesByPair. It also fails as lost coverage, decided per "
@@ -215,9 +225,23 @@ def is_external(row):
     return destination is not None and destination.get("kind") == "externalPackage"
 
 
+# The synthetic cohort templates (owner ruling 2026-11-19, #1236): fixtures the cohort
+# generator copies, not product code. Named one by one, so a new file there is counted
+# until it is reviewed.
+TEMPLATES = frozenset(f"tools/synthetic-cohorts/templates/{size}/{name}"
+                      for size in ("small", "medium", "large")
+                      for name in ("java.java", "javascript.js", "python.py", "rust.rs"))
+
+
+def is_template(row):
+    """Whether the instance's source file is one of the synthetic cohort templates."""
+    return row["target"]["path"] in TEMPLATES
+
+
 def summarize(payload):
-    """The record's figures from one `trellis rules check` payload, and the number of
-    instances left out because their destination is an external package."""
+    """The record's figures from one `trellis rules check` payload, and the numbers of
+    instances left out, as (external, templates): those whose destination is an
+    external package, and the others whose source is a synthetic cohort template."""
     counts, instances = payload["counts"], payload["instances"]
 
     def having(rows, status):
@@ -228,7 +252,8 @@ def summarize(payload):
             len(having(instances, status)) != counts[key]
             for status, key in (("deviates", "deviates"), ("unknown", "unknown"))):
         raise Failed("rules check counts disagree with its instances")
-    first_party = [row for row in instances if not is_external(row)]
+    internal = [row for row in instances if not is_external(row)]
+    first_party = [row for row in internal if not is_template(row)]
     deviating, unknown = having(first_party, "deviates"), having(first_party, "unknown")
     excepted = [row for row in first_party if row["status"] == "deviates" and row["excepted"]]
     by_pair, by_excepted, by_source = {}, {}, {}
@@ -251,7 +276,7 @@ def summarize(payload):
         BY_PAIR: by_pair,
         EXCEPTED: by_excepted,
         BY_SOURCE: by_source,
-    }, len(instances) - len(first_party)
+    }, (len(instances) - len(internal), len(internal) - len(first_party))
 
 
 DEVIATIONS = ("deviatingPairs", "deviatingReferences")
@@ -648,9 +673,11 @@ def check(args, target_dir, home, owned):
     payload = measure(trellis, daemon)
     if args.save_payload:
         args.save_payload.write_text(json.dumps(payload, indent=1) + "\n")
-    measured, external = summarize(payload)
+    measured, (external, templates) = summarize(payload)
     print(f"rules ratchet: {external} pairs with a standard-library or external package "
           "destination are not counted")
+    print(f"rules ratchet: {templates} pairs from a synthetic cohort template are not "
+          "counted")
     if args.update:
         if record is None:
             print("rules ratchet: no current record to compare the update with")

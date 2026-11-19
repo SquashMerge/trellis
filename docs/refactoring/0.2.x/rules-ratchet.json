@@ -1,15 +1,15 @@
 {
   "schemaVersion": 5,
-  "population": "Production instances of `trellis rules check` whose destination is not an externalPackage: first-party sources to first-party or unresolved destinations. Standard-library and external packages are not counted, including bare JavaScript imports of Node builtins and of packages the nearest package.json declares (#1088).",
+  "population": "Production instances of `trellis rules check` whose destination is not an externalPackage: first-party sources to first-party or unresolved destinations. Standard-library and external packages are not counted, including bare JavaScript imports of Node builtins and of packages the nearest package.json declares (#1088). Nor are the instances whose source is one of the twelve synthetic cohort templates, tools/synthetic-cohorts/templates/{small,medium,large}/{java.java,javascript.js,python.py,rust.rs}: they are fixtures, not product code (owner ruling 2026-11-19, #1236).",
   "rule": "A run fails when deviatingPairs, deviatingReferences or partialFiles is above this record, or when it measures a deviating pair that is not in deviatingReferencesByPair. It also fails as lost coverage, decided per pair: a pair in deviatingReferencesByPair or exceptedReferencesByPair (source path, then destination path) has fewer references than that map records for it, or is gone from it, while its source file has more unknown references than unknownReferencesBySource records for it. Any other rise in unknown references is a notice, and so is any other change in an excepted pair, a new one included. unknownReferences is the sum of referenceCount over the population's instances with status unknown that are not excepted; exceptedReferencesByPair is that sum for each excepted instance with status deviates, a pair a reviewed exception in .trellis/rules.toml approves, which no total counts; unknownReferencesBySource is the unknown sum for each source file of a recorded deviating or excepted pair. Pairs are compared by path and renames are not detected: a deviating pair whose source or destination file was renamed, split or merged is a pair this record does not have, so the run fails until the record is updated, and the pair under the old path counts as fallen. An update is refused when the measurement is lost coverage by this rule, unless --accept-unknown-rise is given. comparablePairs, conformingPairs and unknownPairs are information only: an unknown pair is one source file's aggregate, so a file split, merge, rename or deletion moves them without changing coverage.",
   "measurement": "`python3 tools/rules-ratchet.py --update`: a debug build of this checkout, its own daemon under a private HOME, a fresh index, then rust-analyzer (trusted) and scip-typescript (restricted) imported.",
   "deviatingPairs": 2,
   "deviatingReferences": 3,
-  "unknownReferences": 306,
+  "unknownReferences": 282,
   "partialFiles": 0,
-  "comparablePairs": 2291,
+  "comparablePairs": 2279,
   "conformingPairs": 2159,
-  "unknownPairs": 125,
+  "unknownPairs": 113,
   "deviatingReferencesByPair": {
     "src/store/mcp_read.rs": {
       "src/symbol_lookup.rs": 1
