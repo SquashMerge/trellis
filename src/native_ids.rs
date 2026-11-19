@@ -170,6 +170,7 @@ fn check_key(key: &StableKey, language: &str) -> Result<()> {
                 | "typeParameter"
                 | "alias"
                 | "anonymousFunction"
+                | "variant"
         ),
         "unknown native kind"
     );

@@ -4016,18 +4016,29 @@ fn typescript_new_of_a_class_without_a_constructor_is_constructor() {
 /// use-site reference's resolution and its internal targets, with the syntax ID of the native
 /// declaration the definition occurrence joins exactly.
 fn rust_type_kind_join(source: &str, kind: i32) -> (Resolution, Vec<String>, String) {
+    rust_kind_join(source, "S", "rust-analyzer cargo c 0.1.0 S#", kind)
+}
+
+/// [`rust_type_kind_join`] for the name `name`, defined by its first occurrence and used by its
+/// last, as `symbol`.
+fn rust_kind_join(
+    source: &str,
+    name: &str,
+    symbol: &str,
+    kind: i32,
+) -> (Resolution, Vec<String>, String) {
     use trellis::semantic_evidence::Target;
     let world = world(|root| write_files(root, &[("src/lib.rs", source)]));
-    let symbol = "rust-analyzer cargo c 0.1.0 S#";
+    let uses = source.matches(name).count();
     let doc = occ_at(
         DocSpec::new("src/lib.rs").symbol(symbol, kind, &[]),
         source,
-        ("S", 0),
+        (name, 0),
         None,
         symbol,
         1,
     );
-    let doc = occ_at(doc, source, ("S", 1), None, symbol, 0);
+    let doc = occ_at(doc, source, (name, uses - 1), None, symbol, 0);
     let mut fixture = world.fixture().reference("rust-analyzer");
     fixture.artifact("rust", vec![doc]);
     let descriptor = world.write(&fixture);
@@ -4047,14 +4058,14 @@ fn rust_type_kind_join(source: &str, kind: i32) -> (Resolution, Vec<String>, Str
         _ => None,
     };
     // The definition occurrence joins the native declaration exactly whatever kind it states.
-    let definition = source.find('S').unwrap();
+    let definition = source.find(name).unwrap();
     let declaration = staged
         .declaration_bindings
         .iter()
         .find(|row| row.join.anchor.range.start == definition)
         .and_then(|row| row.syntax_id.clone())
         .unwrap_or_else(|| panic!("kind {kind}: the definition joins no declaration"));
-    let use_site = source.rfind('S').unwrap();
+    let use_site = source.rfind(name).unwrap();
     let reference = staged
         .references
         .iter()
@@ -4093,6 +4104,77 @@ fn rust_trait_kind_binds_a_native_type() {
 #[test]
 fn rust_union_kind_binds_a_native_type() {
     assert_rust_type_kind_binds(59, "pub union S { a: u32 }\npub fn f(_: S) {}\n");
+}
+
+/// #1234 (owner ruling 2026-11-19): rust-analyzer 1.98.1 states `EnumMember` (12) for every enum
+/// variant, unit, tuple or struct. A native `variant` accepts it, so a use-site reference to the
+/// variant resolves to its exact declaration, identically in the batch and memory joins.
+#[test]
+fn rust_enum_member_kind_binds_a_native_variant() {
+    for (variant, source) in [
+        ("Cpu", "pub enum B { Cpu }\npub fn f() -> B { B::Cpu }\n"),
+        (
+            "Metal",
+            "pub enum B { Metal(u8) }\npub fn f() -> B { B::Metal(1) }\n",
+        ),
+        (
+            "Gpu",
+            "pub enum B { Gpu { n: u8 } }\npub fn f() -> B { B::Gpu { n: 1 } }\n",
+        ),
+    ] {
+        let symbol = format!("rust-analyzer cargo c 0.1.0 B#{variant}#");
+        let (resolution, targets, declaration) = rust_kind_join(source, variant, &symbol, 12);
+        assert_eq!(resolution, Resolution::Resolved, "{variant}");
+        assert!(!targets.is_empty(), "{variant}");
+        assert!(targets.iter().all(|id| *id == declaration), "{variant}");
+    }
+}
+
+/// #1234: an unspecified kind (0) defers to the measured native `variant` (#473).
+#[test]
+fn rust_unspecified_kind_binds_a_native_variant() {
+    let (resolution, targets, declaration) = rust_kind_join(
+        "pub enum B { Cpu }\npub fn f() -> B { B::Cpu }\n",
+        "Cpu",
+        "rust-analyzer cargo c 0.1.0 B#Cpu#",
+        0,
+    );
+    assert_eq!(resolution, Resolution::Resolved);
+    assert!(targets.iter().all(|id| *id == declaration) && !targets.is_empty());
+}
+
+/// #1234: a stated kind that conflicts with a native `variant` (`Class` 7, `Struct` 49,
+/// `Function` 17, `Field` 15) binds the symbol to no target, so the use-site reference stays
+/// unresolved and never names the variant.
+#[test]
+fn rust_variant_with_a_conflicting_stated_kind_binds_nothing() {
+    for kind in [7, 15, 17, 49] {
+        let (resolution, targets, declaration) = rust_kind_join(
+            "pub enum B { Cpu }\npub fn f() -> B { B::Cpu }\n",
+            "Cpu",
+            "rust-analyzer cargo c 0.1.0 B#Cpu#",
+            kind,
+        );
+        assert_eq!(resolution, Resolution::Unresolved, "kind {kind}");
+        assert!(!targets.contains(&declaration), "kind {kind}");
+    }
+}
+
+/// #1234: rust-analyzer 1.98.1 states `AssociatedType` (3) for a trait's associated type, now a
+/// native `alias` like an impl's `type`, so a use-site `X::Op` resolves to the trait's exact
+/// declaration, identically in the batch and memory joins.
+#[test]
+fn rust_associated_type_kind_binds_a_trait_associated_type() {
+    for source in [
+        "pub trait T { type Op; }\npub fn f<X: T>(_: X::Op) {}\n",
+        "pub trait T { type Op: Clone; }\npub fn f<X: T>(_: X::Op) {}\n",
+    ] {
+        let (resolution, targets, declaration) =
+            rust_kind_join(source, "Op", "rust-analyzer cargo c 0.1.0 T#Op#", 3);
+        assert_eq!(resolution, Resolution::Resolved, "{source}");
+        assert!(!targets.is_empty(), "{source}");
+        assert!(targets.iter().all(|id| *id == declaration), "{source}");
+    }
 }
 
 /// #473 still holds for a native Rust `type`: a stated kind that conflicts with it (`Function`,
@@ -7430,7 +7512,7 @@ async fn real_typescript_bindings_show_in_query_mcp_status_and_methods() {
     // #528: describe and scopeCoverage report the imported JavaScript evidence beside the
     // native coverage, which keeps its syntax tier; other languages have no producer.
     let describe = mcp.call("trellis_workspace_describe", json!({"schemaVersion":1}));
-    assert_eq!(describe["data"]["toolVersion"], 33);
+    assert_eq!(describe["data"]["toolVersion"], 34);
     for (scope, rows) in [
         ("describe", &describe["data"]["languages"]),
         ("incoming", &incoming["data"]["scopeCoverage"]),

@@ -139,7 +139,7 @@ fn describe_closed_ready_and_missing_head() {
     );
     assert_eq!(ready["evidenceBasis"], basis);
     assert_eq!(ready["data"]["watcherDegraded"], true);
-    assert_eq!(ready["data"]["toolVersion"], 33);
+    assert_eq!(ready["data"]["toolVersion"], 34);
     assert_eq!(
         ready["data"]["languages"][1]["coverage"],
         json!({
@@ -291,6 +291,75 @@ for (const name of ['trellis_outgoing_calls','trellis_incoming_calls']) {
             ]))
             .unwrap(),
         )
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// #1234 (owner ruling 2026-11-19): a Rust enum `variant` hit is a closed `Kind` in every tool
+/// that emits one, and the enum stays closed to other spellings.
+#[test]
+fn find_variant_hit_satisfies_the_closed_catalog_kind() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut result = super::test_support::fixture(
+        &[("Cpu".into(), "app", "src/lib.rs".into())],
+        [[0; 5]; 5],
+        false,
+    );
+    let declaration = &mut result.symbols[0].symbol.declaration;
+    declaration.syntax_id = format!("sid:v1:{}", "c".repeat(32));
+    declaration.document.language = "rust".into();
+    declaration.kind = "variant".into();
+    declaration.key.kind = "variant".into();
+    declaration.header.kind = "variant".into();
+    let found = find(
+        &json!(1),
+        result,
+        &Tiers::default(),
+        std::path::Path::new("/selected"),
+        false,
+        true,
+        false,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(found["data"]["symbols"][0]["kind"], "variant");
+    let script = r#"
+const {createRequire} = require('node:module');
+const {readFileSync} = require('node:fs');
+const local = createRequire(process.cwd() + '/tests/mcp/package.json');
+const Ajv = local('ajv/dist/2020.js').default;
+const ajv = new Ajv({strict:false});
+const catalog = JSON.parse(readFileSync('tests/fixtures/mcp/catalog.json','utf8'));
+const found = JSON.parse(readFileSync(0,'utf8'));
+const validate = ajv.compile(catalog.find(tool => tool.name === 'trellis_find_symbols').outputSchema);
+if (!validate(found)) throw Error('variant hit: ' + JSON.stringify(validate.errors));
+const renamed = JSON.parse(JSON.stringify(found));
+renamed.data.symbols[0].kind = 'enumMember';
+if (validate(renamed)) throw Error('Kind accepted enumMember');
+for (const tool of catalog) {
+  const kind = tool.outputSchema.$defs?.Kind;
+  if (kind && !kind.enum.includes('variant')) throw Error(tool.name + ': Kind lacks variant');
+}
+"#;
+    let mut child = Command::new("node")
+        .args(["-e", script])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Node is required by tools/verify");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&serde_json::to_vec(&found).unwrap())
         .unwrap();
     let output = child.wait_with_output().unwrap();
     assert!(

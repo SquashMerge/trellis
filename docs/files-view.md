@@ -46,6 +46,9 @@ naming the last path segment of the type it implements. Both are absent when fal
 A file beyond the outline syntax bounds (below) has neither, and the answer's `warnings` says so;
 the outline then lists no binding as a callable and leaves the impl's methods at the top level.
 So does an asked `impl` block with no syntax at its measured range, with its own warning.
+The outline lists types and callables; a container's members show when it is expanded: its
+fields and, for a Rust enum, its variants (`nativeKind:"variant"`, owner ruling 2026-11-19,
+#1234), with a struct-like variant's own fields under that variant.
 Source range and parent identity remain those of the original symbol. Nullable captured metadata, including `header.resultType`, stays nullable. Do not invent
 a return type, name or finer declaration kind from source regexes or optional SCIP labels. The
 default and maximum page size are 200. Order is source order, then original symbol ID; paging

@@ -79,6 +79,7 @@ fn graph_kind(kind: &str) -> Result<SymbolKind> {
         "parameter" => SymbolKind::Parameter,
         "typeParameter" => SymbolKind::TypeParameter,
         "alias" => SymbolKind::Alias,
+        "variant" => SymbolKind::Variant,
         _ => anyhow::bail!("unknown native declaration kind: {kind}"),
     })
 }

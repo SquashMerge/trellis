@@ -16,6 +16,7 @@ mod java_indexer;
 mod native_capture;
 mod native_evidence;
 mod native_id_vectors;
+mod native_rust_variants;
 mod native_search_capture;
 mod native_store;
 mod native_whitespace;

@@ -357,10 +357,11 @@ pub(super) fn w2_hits(
     w2_search().hits(db, query, lookahead, &[&revision, &query, &lookahead])
 }
 
-/// Fields, parameters and variables rank after every other kind (#665).
+/// Fields, variants, parameters and variables rank after every other kind (#665; variants by
+/// owner ruling 2026-11-19, #1234).
 macro_rules! w2_class {
     () => {
-        "CASE WHEN d.kind IN ('field','parameter','variable') THEN 1 ELSE 0 END"
+        "CASE WHEN d.kind IN ('field','variant','parameter','variable') THEN 1 ELSE 0 END"
     };
 }
 
@@ -671,6 +672,37 @@ mod tests {
             graph,
             [4, 1, 2, 6, 3, 5].map(|id| format!("sid:v1:{id:032x}"))
         );
+    }
+
+    /// #1234 (owner ruling 2026-11-19): a Rust enum `variant` ranks with fields, after types and
+    /// callables, on every search path.
+    #[test]
+    fn w2_ranks_variants_with_fields() {
+        let db = ranking_fixture();
+        for (id, name, kind) in [
+            (1, "retained", "variant"),
+            (2, "retained_runs", "function"),
+            (3, "retained", "field"),
+        ] {
+            insert_ranked(&db, id, 1, Some(name));
+            db.execute(
+                "UPDATE native_version_declarations SET kind=?1 WHERE rowid=?2",
+                rusqlite::params![kind, id],
+            )
+            .unwrap();
+        }
+        let expected = [2, 1, 3].map(|id| format!("sid:v1:{id:032x}"));
+        for limit in [1, 2, 3, 20] {
+            let actual = w2_hits(&db, "pin:v1:test:1", "retained", limit).unwrap();
+            let ids: Vec<_> = actual.iter().map(|(_, id)| id.clone()).collect();
+            assert_eq!(ids, expected[..(limit as usize).min(3)], "{limit}");
+            let literal =
+                with_literal_scan(|| w2_hits(&db, "pin:v1:test:1", "retained", limit)).unwrap();
+            assert_eq!(actual, literal, "literal {limit}");
+            let ordered =
+                with_ordered_search(|| w2_hits(&db, "pin:v1:test:1", "retained", limit)).unwrap();
+            assert_eq!(ordered, actual, "ordered {limit}");
+        }
     }
 
     #[test]
