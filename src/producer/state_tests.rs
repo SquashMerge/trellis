@@ -11,6 +11,7 @@ use std::{
     os::unix::{fs::PermissionsExt, process::CommandExt},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::mpsc,
 };
 use tempfile::TempDir;
 
@@ -435,6 +436,72 @@ fn sweep_ignores_runs_this_daemon_owns() {
         state.read_run_record(&run_id(2)).unwrap().unwrap().state,
         RunState::Running
     );
+}
+
+/// A run directory appears only with its first record (#1239). A sweep by the run's own
+/// daemon (its activation, on another thread) while the run is paused between creating its
+/// directory and writing that record leaves the run alone, and the record lands.
+#[test]
+fn a_sweep_during_run_creation_spares_the_live_run() {
+    let fixture = fixture();
+    let state = state(&fixture);
+    let (paused_tx, paused_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel::<()>();
+    let creator = state.clone();
+    let run = std::thread::spawn(move || {
+        let record = record(1, RunState::Materializing, DaemonIdentity::current());
+        creator.create_run_with_hook(&record, || {
+            paused_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+        })
+    });
+    paused_rx.recv().unwrap();
+    let report = state
+        .sweep(&DaemonIdentity::current(), &BTreeSet::new())
+        .unwrap();
+    resume_tx.send(()).unwrap();
+    let dir = run.join().unwrap().unwrap();
+    assert_eq!(dir, state.run_dir(&run_id(1)).unwrap());
+    assert!(report.abandoned_runs.is_empty());
+    assert_eq!(
+        state.read_run_record(&run_id(1)).unwrap().unwrap().state,
+        RunState::Materializing
+    );
+    let names: Vec<_> = fs::read_dir(state.path().join("runs"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(names, [run_id(1).as_str()], "no staging name is left");
+}
+
+/// What a crashed daemon left while creating a run, before or after its first record was
+/// written into the staging directory, is removed by the next daemon's sweep, as is a run
+/// directory with no record.
+#[test]
+fn sweep_removes_partial_run_dirs_a_crashed_daemon_left() {
+    let fixture = fixture();
+    let state = state(&fixture);
+    let bare = state.create_run_dir(&run_id(3)).unwrap();
+    let runs = state.path().join("runs");
+    let empty_stage = runs.join(format!(".stage-1-0-{}", run_id(1)));
+    let recorded_stage = runs.join(format!(".stage-1-0-{}", run_id(2)));
+    for stage in [&empty_stage, &recorded_stage] {
+        fs::create_dir(stage).unwrap();
+    }
+    populate(&recorded_stage, &["worktree"]);
+    fs::write(
+        recorded_stage.join("run.json"),
+        serde_json::to_vec(&record(2, RunState::Materializing, other_daemon())).unwrap(),
+    )
+    .unwrap();
+    let report = state
+        .sweep(&DaemonIdentity::current(), &BTreeSet::new())
+        .unwrap();
+    assert!(report.abandoned_runs.is_empty());
+    assert!(!empty_stage.exists());
+    assert!(!recorded_stage.exists());
+    assert!(!bare.exists());
+    assert_eq!(fs::read_dir(&runs).unwrap().count(), 0);
 }
 
 /// The inputs of a queued import, the frozen snapshot included, survive an abandoned run
