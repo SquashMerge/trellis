@@ -2058,6 +2058,12 @@ fn references_rust_dependency_statement_macro_bare_name_needs_its_import() {
             false,
         ),
         (
+            "a second, certain import of the name",
+            "log = '0.4'\nserde_json = '1'\nrusqlite = '0.32'\nanyhow = '1'\ntracing = '0.1'\n",
+            "use tracing::info;\nuse log::info;\nfn f() { info!(\"x\"); m::g(); }",
+            false,
+        ),
+        (
             "two imports of the name",
             MACRO_PACKAGES,
             "#[cfg(unix)]\nuse tracing::info;\n#[cfg(not(unix))]\nuse tracing::info;\nfn f() { info!(\"x\"); m::g(); }",
