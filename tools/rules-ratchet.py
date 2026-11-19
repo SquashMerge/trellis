@@ -47,9 +47,9 @@ changing what is known.
 that per-pair rule, unless `--accept-unknown-rise` is given. It prints the
 unknown-reference change either way.
 
-Known gap: a bare JavaScript import the tool leaves unresolved (`destination` null, such
-as `node:crypto` or `esbuild`) is not classified `externalPackage`. It stays in the
-population as unknown references (see #1088).
+A bare JavaScript import of a Node builtin (`node:crypto`, `crypto`) or of a package
+declared in the nearest `package.json` (`esbuild`) is an `externalPackage` too (#1088), so
+it is not counted either. One the tool cannot classify stays unknown.
 
 The measurement runs through a daemon of its own under a private HOME, on a fresh index
 of this checkout with fresh rust-analyzer and scip-typescript evidence; it never touches
@@ -108,10 +108,8 @@ DESCRIPTION = {
     "population": "Production instances of `trellis rules check` whose destination is "
                   "not an externalPackage: first-party sources to first-party or "
                   "unresolved destinations. Standard-library and external packages are "
-                  "not counted. Known gap: a bare JavaScript import the tool leaves "
-                  "unresolved (destination null, such as node:crypto or esbuild) is "
-                  "not an externalPackage, so it stays in the population as unknown "
-                  "references (see #1088).",
+                  "not counted, including bare JavaScript imports of Node builtins "
+                  "and of packages the nearest package.json declares (#1088).",
     "rule": "A run fails when deviatingPairs, deviatingReferences or partialFiles is "
             "above this record, or when it measures a deviating pair that is not in "
             "deviatingReferencesByPair. It also fails as lost coverage, decided per "

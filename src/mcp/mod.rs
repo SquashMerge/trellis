@@ -368,7 +368,7 @@ fn validated_expected_basis(
     })
 }
 
-fn mcp_read_error(error: &anyhow::Error) -> &'static str {
+pub(crate) fn mcp_read_error(error: &anyhow::Error) -> &'static str {
     if error.chain().any(|cause| {
         cause
             .downcast_ref::<crate::store::RebuildInProgress>()
@@ -390,6 +390,8 @@ fn mcp_read_error(error: &anyhow::Error) -> &'static str {
         "index_not_ready"
     } else if error.to_string().starts_with("deadline_exceeded:") {
         "deadline_exceeded"
+    } else if error.to_string().starts_with(tools::INPUT_BOUNDS_PREFIX) {
+        "input_bounds_exceeded"
     } else if error.to_string().starts_with("root_changed:") {
         "root_changed"
     } else {
@@ -711,7 +713,7 @@ fn evidence_read(
                 Err(error) => {
                     #[cfg(feature = "test-support")]
                     capture_evidence_error(evidence_error, id, "read", &error);
-                    tools::failure(id, evidence_failure_code(&error))
+                    tools::failure_for(id, evidence_failure_code(&error), &error)
                 }
             };
             // W8: a rejected store reports no basis; every other failure reports
@@ -1371,7 +1373,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                 show: None,
                             });
                         }
-                        envelope = tools::failure(id, code);
+                        envelope = tools::failure_for(id, code, &error);
                     }
                 }
             }
