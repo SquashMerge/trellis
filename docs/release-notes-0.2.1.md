@@ -118,7 +118,10 @@ unless a bullet says otherwise.
 On Trellis's own checkout, with rust-analyzer and scip-typescript imported, the
 production references the rules check reports as unknown fell from 7,043 when the
 rules ratchet was first recorded (2026-11-15) to 306 at
-[PR #1242](https://github.com/SquashMerge/trellis/pull/1242).
+[PR #1242](https://github.com/SquashMerge/trellis/pull/1242). Not all of that drop is
+resolution: part of it is bare imports of Node builtins and npm packages, which are now
+labelled as external packages and so are no longer counted as unknown
+([#1221](https://github.com/SquashMerge/trellis/pull/1221)).
 
 ## MCP
 
