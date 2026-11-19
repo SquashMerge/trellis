@@ -735,7 +735,9 @@ mod outline_bounds_tests {
         assert!(OUTLINE_HUNG.starts_with("deadline_exceeded:"));
     }
 
-    /// Each bound's exceeded path: no facts and the bound's warning, on every run.
+    /// Each bound's exceeded path: no facts and the bound's warning, on every run. The clock
+    /// never moves, so however loaded the machine, the hang backstop cannot answer first
+    /// (#1220).
     #[test]
     fn a_file_beyond_a_bound_has_no_facts_and_says_so() {
         let over_input = format!("{JAVASCRIPT}{}", " ".repeat(FILE_INPUT_LIMIT));
@@ -744,7 +746,9 @@ mod outline_bounds_tests {
             "[".repeat(DEPTH),
             "]".repeat(DEPTH)
         );
-        let wide = format!("{JAVASCRIPT}x = [{}];\n", "0,".repeat(VISITS));
+        // Each `0,` is two syntax nodes, so this is just over the visit bound.
+        let wide = format!("{JAVASCRIPT}x = [{}];\n", "0,".repeat(VISITS / 2 + 1));
+        let stopped = Instant::now();
         for (text, warning) in [
             (over_input, OUTLINE_OVER_INPUT),
             (deep, OUTLINE_OVER_BOUNDS),
@@ -752,7 +756,9 @@ mod outline_bounds_tests {
         ] {
             let file = file("javascript", text);
             for _ in 0..2 {
-                let syntax = outline_syntax(&file, &[]).unwrap().unwrap();
+                let syntax = outline_syntax_until(&file, &[], &|| stopped)
+                    .unwrap()
+                    .unwrap();
                 assert_eq!(syntax.warning, Some(warning));
                 assert_eq!(facts(&syntax), (vec![], vec![]));
             }

@@ -618,6 +618,22 @@ mod tests {
         assert!(HUNG.starts_with("deadline_exceeded:"));
     }
 
+    /// The MCP derivation on a clock that never moves: however loaded the machine, the hang
+    /// backstop cannot answer first, so only the input decides (#1220).
+    fn keys_on_a_stopped_clock(
+        file: &SourceFile,
+        declarations: &[Declaration],
+    ) -> Result<BTreeMap<String, String>> {
+        let stopped = Instant::now();
+        keys_until(
+            &file.path,
+            &file.language,
+            &file.text,
+            declarations,
+            &move || stopped,
+        )
+    }
+
     /// Each syntax bound is a property of the document: the MCP derivation refuses it typed,
     /// a checked one has no keys, on every run and on any clock.
     #[test]
@@ -629,13 +645,14 @@ mod tests {
             "(".repeat(DEPTH),
             ")".repeat(DEPTH)
         );
-        let wide = format!("\nconst WIDE: [u8; 0] = [{}];", "0,".repeat(VISITS));
+        // Each `0,` is two syntax nodes, so this is just over the visit bound (#1220).
+        let wide = format!("\nconst WIDE: [u8; 0] = [{}];", "0,".repeat(VISITS / 2 + 1));
         for (tail, bound) in [(deep, OVER_DEPTH), (wide, OVER_VISITS)] {
             let mut beyond = file.clone();
             beyond.text.push_str(&tail);
             assert!(beyond.text.len() <= FILE_INPUT_LIMIT);
             for _ in 0..2 {
-                let error = keys(&beyond, &native.declarations).unwrap_err();
+                let error = keys_on_a_stopped_clock(&beyond, &native.declarations).unwrap_err();
                 assert_eq!(error.to_string(), bound);
                 let found = checked(&beyond, &native.declarations, &mut || Ok(())).unwrap();
                 assert_eq!(found, None);
