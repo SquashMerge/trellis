@@ -951,7 +951,7 @@ fn javascript_fixture(manifest: &str) -> (tempfile::TempDir, tempfile::TempDir, 
 fn selected_javascript_packages_and_builtin_aliases_keep_captured_evidence_after_live_edits() {
     let (_state, root, store, pin) = javascript_fixture(JS_MANIFEST);
     let before = read(&store, "references", pin);
-    assert_eq!(before["externalPackages"].as_array().unwrap().len(), 4);
+    assert_eq!(before["externalPackages"].as_array().unwrap().len(), 5);
     let widget = package(&before, "widget");
     assert_eq!(widget["identity"]["language"], "javascript");
     assert_eq!(widget["ecosystem"], "npm");
@@ -979,13 +979,14 @@ fn selected_javascript_packages_and_builtin_aliases_keep_captured_evidence_after
     ));
     let scoped = package(&before, "@scope/tool");
     assert_eq!(scoped["evidence"][0]["importRoot"], "@scope/tool");
-    for name in ["fs", "path"] {
+    // `http` is a builtin before its npm declaration (#1088).
+    for name in ["fs", "path", "http"] {
         let builtin = package(&before, name);
         assert_eq!(builtin["ecosystem"], "node");
         assert_eq!(builtin["identity"]["standardLibrary"], true);
         assert_eq!(
             builtin["evidence"],
-            json!([{"kind":"standardLibraryCatalog", "catalog":"node-standard-library:v1", "entry":name}])
+            json!([{"kind":"standardLibraryCatalog", "catalog":"node-standard-library:v2", "entry":name}])
         );
     }
     let fs_edge = before["production"]
@@ -998,7 +999,7 @@ fn selected_javascript_packages_and_builtin_aliases_keep_captured_evidence_after
         })
         .unwrap();
     assert_eq!(fs_edge["count"], 4);
-    for unknown in ["http", "blocked", "alias", "absent", "node:invented"] {
+    for unknown in ["http/fake", "blocked", "alias", "absent", "node:invented"] {
         assert!(
             before["unresolved"]
                 .as_array()

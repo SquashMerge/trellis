@@ -107,6 +107,7 @@
                     "checkout_capacity",
                     "daemon_unavailable",
                     "outcome_unknown",
+                    "input_bounds_exceeded",
                     "response_too_large",
                     "workspace_selection_failed"
                   ]
@@ -722,7 +723,7 @@
                   "const": 1
                 },
                 "toolVersion": {
-                  "const": 32
+                  "const": 33
                 },
                 "watcherDegraded": {
                   "type": "boolean"
@@ -1254,6 +1255,7 @@
                     "checkout_capacity",
                     "daemon_unavailable",
                     "outcome_unknown",
+                    "input_bounds_exceeded",
                     "invalid_rules",
                     "bounded_work",
                     "response_too_large",
@@ -2328,6 +2330,7 @@
                     "checkout_capacity",
                     "daemon_unavailable",
                     "outcome_unknown",
+                    "input_bounds_exceeded",
                     "invalid_rules",
                     "bounded_work",
                     "response_too_large",
@@ -3637,6 +3640,7 @@
                     "checkout_capacity",
                     "daemon_unavailable",
                     "outcome_unknown",
+                    "input_bounds_exceeded",
                     "response_too_large",
                     "workspace_selection_failed"
                   ]
@@ -5164,6 +5168,7 @@
                     "checkout_capacity",
                     "daemon_unavailable",
                     "outcome_unknown",
+                    "input_bounds_exceeded",
                     "response_too_large",
                     "workspace_selection_failed"
                   ]
@@ -6752,6 +6757,7 @@
                     "checkout_capacity",
                     "daemon_unavailable",
                     "outcome_unknown",
+                    "input_bounds_exceeded",
                     "response_too_large",
                     "workspace_selection_failed"
                   ]
@@ -8478,6 +8484,7 @@
                     "checkout_capacity",
                     "daemon_unavailable",
                     "outcome_unknown",
+                    "input_bounds_exceeded",
                     "response_too_large",
                     "workspace_selection_failed"
                   ]
@@ -9532,6 +9539,7 @@
                     "checkout_capacity",
                     "daemon_unavailable",
                     "outcome_unknown",
+                    "input_bounds_exceeded",
                     "invalid_rules",
                     "bounded_work",
                     "response_too_large",
@@ -11303,6 +11311,7 @@
                     "checkout_capacity",
                     "daemon_unavailable",
                     "outcome_unknown",
+                    "input_bounds_exceeded",
                     "invalid_rules",
                     "rules_not_found",
                     "bounded_work",
@@ -12299,7 +12308,7 @@
               "then": {
                 "properties": {
                   "package": {
-                    "pattern": "^(?![._])[a-z0-9._-]+(?![\\s\\S])"
+                    "pattern": "^_?(?![._])[a-z0-9._-]+(?![\\s\\S])"
                   }
                 }
               }
@@ -12745,12 +12754,69 @@
                   "const": "standardLibraryCatalog"
                 },
                 "catalog": {
-                  "const": "node-standard-library:v1"
+                  "const": "node-standard-library:v2"
                 },
                 "entry": {
                   "enum": [
+                    "_http_agent",
+                    "_http_client",
+                    "_http_common",
+                    "_http_incoming",
+                    "_http_outgoing",
+                    "_http_server",
+                    "_stream_duplex",
+                    "_stream_passthrough",
+                    "_stream_readable",
+                    "_stream_transform",
+                    "_stream_wrap",
+                    "_stream_writable",
+                    "_tls_common",
+                    "_tls_wrap",
+                    "assert",
+                    "async_hooks",
+                    "buffer",
+                    "child_process",
+                    "cluster",
+                    "console",
+                    "constants",
+                    "crypto",
+                    "dgram",
+                    "diagnostics_channel",
+                    "dns",
+                    "domain",
+                    "events",
                     "fs",
-                    "path"
+                    "http",
+                    "http2",
+                    "https",
+                    "inspector",
+                    "module",
+                    "net",
+                    "os",
+                    "path",
+                    "perf_hooks",
+                    "process",
+                    "punycode",
+                    "querystring",
+                    "readline",
+                    "repl",
+                    "sea",
+                    "sqlite",
+                    "stream",
+                    "string_decoder",
+                    "sys",
+                    "test",
+                    "timers",
+                    "tls",
+                    "trace_events",
+                    "tty",
+                    "url",
+                    "util",
+                    "v8",
+                    "vm",
+                    "wasi",
+                    "worker_threads",
+                    "zlib"
                   ]
                 }
               },
@@ -13438,6 +13504,7 @@
                     "checkout_capacity",
                     "daemon_unavailable",
                     "outcome_unknown",
+                    "input_bounds_exceeded",
                     "invalid_rules",
                     "rules_not_found",
                     "bounded_work",
@@ -14599,7 +14666,7 @@
               "then": {
                 "properties": {
                   "package": {
-                    "pattern": "^(?![._])[a-z0-9._-]+(?![\\s\\S])"
+                    "pattern": "^_?(?![._])[a-z0-9._-]+(?![\\s\\S])"
                   }
                 }
               }
@@ -15045,12 +15112,69 @@
                   "const": "standardLibraryCatalog"
                 },
                 "catalog": {
-                  "const": "node-standard-library:v1"
+                  "const": "node-standard-library:v2"
                 },
                 "entry": {
                   "enum": [
+                    "_http_agent",
+                    "_http_client",
+                    "_http_common",
+                    "_http_incoming",
+                    "_http_outgoing",
+                    "_http_server",
+                    "_stream_duplex",
+                    "_stream_passthrough",
+                    "_stream_readable",
+                    "_stream_transform",
+                    "_stream_wrap",
+                    "_stream_writable",
+                    "_tls_common",
+                    "_tls_wrap",
+                    "assert",
+                    "async_hooks",
+                    "buffer",
+                    "child_process",
+                    "cluster",
+                    "console",
+                    "constants",
+                    "crypto",
+                    "dgram",
+                    "diagnostics_channel",
+                    "dns",
+                    "domain",
+                    "events",
                     "fs",
-                    "path"
+                    "http",
+                    "http2",
+                    "https",
+                    "inspector",
+                    "module",
+                    "net",
+                    "os",
+                    "path",
+                    "perf_hooks",
+                    "process",
+                    "punycode",
+                    "querystring",
+                    "readline",
+                    "repl",
+                    "sea",
+                    "sqlite",
+                    "stream",
+                    "string_decoder",
+                    "sys",
+                    "test",
+                    "timers",
+                    "tls",
+                    "trace_events",
+                    "tty",
+                    "url",
+                    "util",
+                    "v8",
+                    "vm",
+                    "wasi",
+                    "worker_threads",
+                    "zlib"
                   ]
                 }
               },
@@ -15839,7 +15963,7 @@
               "then": {
                 "properties": {
                   "package": {
-                    "pattern": "^(?![._])[a-z0-9._-]+(?![\\s\\S])"
+                    "pattern": "^_?(?![._])[a-z0-9._-]+(?![\\s\\S])"
                   }
                 }
               }
@@ -15995,6 +16119,7 @@
                     "checkout_capacity",
                     "daemon_unavailable",
                     "outcome_unknown",
+                    "input_bounds_exceeded",
                     "invalid_rules",
                     "rules_not_found",
                     "bounded_work",
@@ -17114,7 +17239,7 @@
               "then": {
                 "properties": {
                   "package": {
-                    "pattern": "^(?![._])[a-z0-9._-]+(?![\\s\\S])"
+                    "pattern": "^_?(?![._])[a-z0-9._-]+(?![\\s\\S])"
                   }
                 }
               }
@@ -17560,12 +17685,69 @@
                   "const": "standardLibraryCatalog"
                 },
                 "catalog": {
-                  "const": "node-standard-library:v1"
+                  "const": "node-standard-library:v2"
                 },
                 "entry": {
                   "enum": [
+                    "_http_agent",
+                    "_http_client",
+                    "_http_common",
+                    "_http_incoming",
+                    "_http_outgoing",
+                    "_http_server",
+                    "_stream_duplex",
+                    "_stream_passthrough",
+                    "_stream_readable",
+                    "_stream_transform",
+                    "_stream_wrap",
+                    "_stream_writable",
+                    "_tls_common",
+                    "_tls_wrap",
+                    "assert",
+                    "async_hooks",
+                    "buffer",
+                    "child_process",
+                    "cluster",
+                    "console",
+                    "constants",
+                    "crypto",
+                    "dgram",
+                    "diagnostics_channel",
+                    "dns",
+                    "domain",
+                    "events",
                     "fs",
-                    "path"
+                    "http",
+                    "http2",
+                    "https",
+                    "inspector",
+                    "module",
+                    "net",
+                    "os",
+                    "path",
+                    "perf_hooks",
+                    "process",
+                    "punycode",
+                    "querystring",
+                    "readline",
+                    "repl",
+                    "sea",
+                    "sqlite",
+                    "stream",
+                    "string_decoder",
+                    "sys",
+                    "test",
+                    "timers",
+                    "tls",
+                    "trace_events",
+                    "tty",
+                    "url",
+                    "util",
+                    "v8",
+                    "vm",
+                    "wasi",
+                    "worker_threads",
+                    "zlib"
                   ]
                 }
               },
@@ -18230,6 +18412,7 @@
                     "checkout_capacity",
                     "daemon_unavailable",
                     "outcome_unknown",
+                    "input_bounds_exceeded",
                     "response_too_large",
                     "workspace_selection_failed"
                   ]
@@ -18630,6 +18813,7 @@
                     "checkout_capacity",
                     "daemon_unavailable",
                     "outcome_unknown",
+                    "input_bounds_exceeded",
                     "invalid_rules",
                     "rules_not_found",
                     "bounded_work",

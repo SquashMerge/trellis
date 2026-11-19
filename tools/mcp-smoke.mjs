@@ -16,7 +16,8 @@ const callableKinds = new Set(['function', 'method', 'constructor']);
 const failureCodes = new Set(['invalid_request', 'range_too_large', 'unsupported_encoding',
   'revision_conflict', 'index_not_ready', 'not_found', 'too_many_requests', 'deadline_exceeded',
   'rebuild_in_progress', 'root_changed', 'store_unavailable', 'workspace_selection_failed',
-  'checkout_capacity', 'daemon_unavailable', 'outcome_unknown', 'invalid_rules',
+  'checkout_capacity', 'daemon_unavailable', 'outcome_unknown', 'input_bounds_exceeded',
+  'invalid_rules',
   'rules_not_found', 'bounded_work', 'response_too_large', 'storage_busy', 'building']);
 const modelReasons = new Set(['model_not_configured', 'model_load_failed', 'vector_budget_exceeded']);
 // #798: an architecture tool answers the typed `building` while the daemon computes the

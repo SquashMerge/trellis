@@ -16,8 +16,9 @@ use tree_sitter::Node;
 /// This is the MCP read's derivation. Like [`keys_checked`], the Rust impl reparse is bounded
 /// by the source size and the syntax bounds alone, so the same document gives the same answer
 /// however busy the machine is (#1119). A document beyond them is refused, typed
-/// `deadline_exceeded`, on every run. The wall clock is only a hang backstop
-/// ([`SYNTAX_HANG_BACKSTOP`]), refused with the same code.
+/// `input_bounds_exceeded` with the bound it hit, on every run, so a retry cannot help
+/// (owner ruling 2026-11-18, #1119 follow-up). The wall clock is only a hang backstop
+/// ([`SYNTAX_HANG_BACKSTOP`]), refused `deadline_exceeded`.
 pub(crate) fn keys_from_source(
     path: &str,
     language: &str,
@@ -97,8 +98,17 @@ pub(crate) fn keys_by_name(
     assemble(file, declarations, &BTreeMap::new())
 }
 
-const EXHAUSTED: &str = "deadline_exceeded: stable lookup Rust syntax budget exhausted";
-const MISSING_IMPL: &str = "deadline_exceeded: stable lookup missing Rust impl declaration";
+// Each deterministic refusal names the bound it hit; the MCP message is the text after the code.
+const OVER_SIZE: &str =
+    "input_bounds_exceeded: stable lookup source is over the 2 MiB syntax input bound";
+const OVER_DEPTH: &str =
+    "input_bounds_exceeded: stable lookup Rust syntax is over the 128-level depth bound";
+const OVER_VISITS: &str =
+    "input_bounds_exceeded: stable lookup Rust syntax is over the 1,000,000-node visit bound";
+const OVER_MACRO: &str = "input_bounds_exceeded: stable lookup found no Rust impl syntax at its measured range within the macro expansion byte budget";
+const UNPARSED: &str =
+    "input_bounds_exceeded: stable lookup Rust parse stopped short of a syntax tree";
+const MISSING_IMPL: &str = "input_bounds_exceeded: stable lookup Rust impl declaration is not in the measured declarations";
 const HUNG: &str = "deadline_exceeded: stable lookup Rust syntax hang backstop reached";
 
 /// What bounds one Rust impl reparse besides the source size and the syntax bounds: the
@@ -222,9 +232,8 @@ fn impl_targets(
     required: &BTreeMap<Vec<u8>, &Declaration>,
     mut limit: Limit<'_>,
 ) -> Result<BTreeMap<Vec<u8>, Option<String>>, Refused> {
-    let exhausted = || Refused::Bound(EXHAUSTED);
     if file.text.len() > FILE_INPUT_LIMIT {
-        return Err(exhausted());
+        return Err(Refused::Bound(OVER_SIZE));
     }
     let mut parser = tree_sitter::Parser::new();
     parser
@@ -247,7 +256,7 @@ fn impl_targets(
     let tree = match (tree, stopped) {
         (Some(tree), None) => tree,
         (_, Some(refused)) => return Err(refused),
-        (None, None) => return Err(exhausted()),
+        (None, None) => return Err(Refused::Bound(UNPARSED)),
     };
     let mut visits = 0;
     bounded_tree(tree.root_node(), &mut limit, &mut visits)?;
@@ -272,7 +281,7 @@ fn impl_targets(
                     && node.start_byte() == range.start
                     && node.end_byte() == range.end
             })
-            .ok_or_else(exhausted)?;
+            .ok_or(Refused::Bound(OVER_MACRO))?;
         let target = node
             .child_by_field_name("type")
             .and_then(|node| written_type(node, file.text.as_bytes()));
@@ -289,8 +298,11 @@ fn bounded_tree(root: Node<'_>, limit: &mut Limit<'_>, visits: &mut usize) -> Re
     let mut depth = 0;
     loop {
         *visits += 1;
-        if *visits > VISITS || depth >= DEPTH {
-            return Err(Refused::Bound(EXHAUSTED));
+        if *visits > VISITS {
+            return Err(Refused::Bound(OVER_VISITS));
+        }
+        if depth >= DEPTH {
+            return Err(Refused::Bound(OVER_DEPTH));
         }
         limit.step()?;
         if cursor.goto_first_child() {
@@ -552,12 +564,10 @@ mod tests {
         let (mut file, native) =
             fixture.measure("store.rs", "struct Store; impl Store { fn save() {} }");
         file.text.push_str(&" ".repeat(FILE_INPUT_LIMIT));
-        let error = keys(&file, &native.declarations).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .starts_with("deadline_exceeded: stable lookup")
-        );
+        for _ in 0..2 {
+            let error = keys(&file, &native.declarations).unwrap_err();
+            assert_eq!(error.to_string(), OVER_SIZE);
+        }
     }
 
     const IMPL: &str = "struct Store; impl Store { fn save() {} }";
@@ -620,17 +630,72 @@ mod tests {
             ")".repeat(DEPTH)
         );
         let wide = format!("\nconst WIDE: [u8; 0] = [{}];", "0,".repeat(VISITS));
-        for tail in [deep, wide] {
+        for (tail, bound) in [(deep, OVER_DEPTH), (wide, OVER_VISITS)] {
             let mut beyond = file.clone();
             beyond.text.push_str(&tail);
             assert!(beyond.text.len() <= FILE_INPUT_LIMIT);
             for _ in 0..2 {
                 let error = keys(&beyond, &native.declarations).unwrap_err();
-                assert_eq!(error.to_string(), EXHAUSTED);
+                assert_eq!(error.to_string(), bound);
                 let found = checked(&beyond, &native.declarations, &mut || Ok(())).unwrap();
                 assert_eq!(found, None);
             }
         }
+    }
+
+    /// The MCP answer to an error of the derivation: its code, retryability and message.
+    fn mcp_answer(error: &anyhow::Error) -> (String, bool, String) {
+        let code = crate::mcp::mcp_read_error(error);
+        let envelope = crate::mcp::tools::failure_for(&serde_json::json!(1), code, error);
+        let error = &envelope["error"];
+        (
+            error["code"].as_str().unwrap().to_owned(),
+            error["retryable"].as_bool().unwrap(),
+            error["message"].as_str().unwrap().to_owned(),
+        )
+    }
+
+    /// Owner ruling 2026-11-18 (#1119 follow-up): a document beyond an input bound answers
+    /// the non-retryable `input_bounds_exceeded`, naming the bound, the same on every run;
+    /// only the hang backstop answers the retryable `deadline_exceeded`.
+    #[test]
+    fn mcp_answers_a_bound_as_input_bounds_exceeded_and_the_backstop_as_a_deadline() {
+        let fixture = Fixture::new();
+        let (file, native) = fixture.measure("store.rs", IMPL);
+        let mut oversized = file.clone();
+        oversized.text.push_str(&" ".repeat(FILE_INPUT_LIMIT));
+        let mut deep = file.clone();
+        deep.text.push_str(&format!(
+            "\nfn deep() {{ {}1{} }}",
+            "(".repeat(DEPTH),
+            ")".repeat(DEPTH)
+        ));
+        // The visit bound's own message is pinned above; its million-node walk is slow in a
+        // debug build, so it is not walked again here.
+        for (beyond, bound) in [
+            (&oversized, "2 MiB syntax input bound"),
+            (&deep, "128-level depth bound"),
+        ] {
+            let first = mcp_answer(&keys(beyond, &native.declarations).unwrap_err());
+            let second = mcp_answer(&keys(beyond, &native.declarations).unwrap_err());
+            assert_eq!(first, second);
+            assert_eq!(first.0, "input_bounds_exceeded");
+            assert!(!first.1, "a retry gets the same refusal");
+            assert!(first.2.contains(bound), "{}", first.2);
+        }
+        let hung = clock_jumping_to(SYNTAX_HANG_BACKSTOP);
+        let error = keys_until(
+            &file.path,
+            &file.language,
+            &file.text,
+            &native.declarations,
+            &hung,
+        )
+        .unwrap_err();
+        let (code, retryable, message) = mcp_answer(&error);
+        assert_eq!(code, "deadline_exceeded");
+        assert!(retryable);
+        assert_eq!(message, "Deadline exceeded");
     }
 
     /// #1115: a view-time derivation never reads the clock, so its answer cannot depend on
