@@ -513,7 +513,8 @@ pub fn valid_package(language: &str, package: &str, standard_library: bool) -> b
             "rust" => matches!(package, "std" | "core" | "alloc"),
             "java" => matches!(package, "java" | "javax"),
             "python" => identifier(package),
-            "javascript" | "typescript" => npm_part(package) && !package.starts_with('@'),
+            // Node's `_http_agent` family keeps its one leading underscore.
+            "javascript" | "typescript" => npm_part(package.strip_prefix('_').unwrap_or(package)),
             _ => false,
         };
     }
@@ -580,65 +581,81 @@ fn npm_part(value: &str) -> bool {
         })
 }
 
-// Exact public bare roots at Node v22.0.0. Exclusion only, not label coverage.
-// Source pin and deliberate subpath false negatives: docs/node-standard-library-catalog.md.
-const NODE_BARE_ROOTS: &[&str] = &[
-    "_http_agent",
-    "_http_client",
-    "_http_common",
-    "_http_incoming",
-    "_http_outgoing",
-    "_http_server",
-    "_stream_duplex",
-    "_stream_passthrough",
-    "_stream_readable",
-    "_stream_transform",
-    "_stream_wrap",
-    "_stream_writable",
-    "_tls_common",
-    "_tls_wrap",
-    "assert",
-    "async_hooks",
-    "buffer",
-    "child_process",
-    "cluster",
-    "console",
-    "constants",
-    "crypto",
-    "dgram",
-    "diagnostics_channel",
-    "dns",
-    "domain",
-    "events",
-    "fs",
-    "http",
-    "http2",
-    "https",
-    "inspector",
-    "module",
-    "net",
-    "os",
-    "path",
-    "perf_hooks",
-    "process",
-    "punycode",
-    "querystring",
-    "readline",
-    "repl",
-    "stream",
-    "string_decoder",
-    "sys",
-    "timers",
-    "tls",
-    "trace_events",
-    "tty",
-    "url",
-    "util",
-    "v8",
-    "vm",
-    "wasi",
-    "worker_threads",
-    "zlib",
+// Every public builtin ID at Node v22.23.5, with whether it needs the `node:` scheme.
+// Source pin and provenance: docs/node-standard-library-catalog.md.
+const NODE_BUILTIN_IDS: &[(&str, bool)] = &[
+    ("_http_agent", false),
+    ("_http_client", false),
+    ("_http_common", false),
+    ("_http_incoming", false),
+    ("_http_outgoing", false),
+    ("_http_server", false),
+    ("_stream_duplex", false),
+    ("_stream_passthrough", false),
+    ("_stream_readable", false),
+    ("_stream_transform", false),
+    ("_stream_wrap", false),
+    ("_stream_writable", false),
+    ("_tls_common", false),
+    ("_tls_wrap", false),
+    ("assert", false),
+    ("assert/strict", false),
+    ("async_hooks", false),
+    ("buffer", false),
+    ("child_process", false),
+    ("cluster", false),
+    ("console", false),
+    ("constants", false),
+    ("crypto", false),
+    ("dgram", false),
+    ("diagnostics_channel", false),
+    ("dns", false),
+    ("dns/promises", false),
+    ("domain", false),
+    ("events", false),
+    ("fs", false),
+    ("fs/promises", false),
+    ("http", false),
+    ("http2", false),
+    ("https", false),
+    ("inspector", false),
+    ("inspector/promises", false),
+    ("module", false),
+    ("net", false),
+    ("os", false),
+    ("path", false),
+    ("path/posix", false),
+    ("path/win32", false),
+    ("perf_hooks", false),
+    ("process", false),
+    ("punycode", false),
+    ("querystring", false),
+    ("readline", false),
+    ("readline/promises", false),
+    ("repl", false),
+    ("sea", true),
+    ("sqlite", true),
+    ("stream", false),
+    ("stream/consumers", false),
+    ("stream/promises", false),
+    ("stream/web", false),
+    ("string_decoder", false),
+    ("sys", false),
+    ("test", true),
+    ("test/reporters", true),
+    ("timers", false),
+    ("timers/promises", false),
+    ("tls", false),
+    ("trace_events", false),
+    ("tty", false),
+    ("url", false),
+    ("util", false),
+    ("util/types", false),
+    ("v8", false),
+    ("vm", false),
+    ("wasi", false),
+    ("worker_threads", false),
+    ("zlib", false),
 ];
 
 /// Exact reviewed labels only. The caller charges lookup and descriptor allocation.
@@ -658,18 +675,32 @@ pub fn node_standard_library(
         },
         ecosystem: "node",
         evidence: vec![ExternalEvidence::StandardLibraryCatalog {
-            catalog: "node-standard-library:v1",
+            catalog: "node-standard-library:v2",
             entry: root.into(),
         }],
     })
 }
 
+/// Whether `root` is the first segment of a builtin Node loads without `node:`. Such a root
+/// and all its subpaths block npm inference, so `http/fake` stays unknown.
+fn node_bare_root(root: &str) -> bool {
+    NODE_BUILTIN_IDS
+        .iter()
+        .any(|(id, scheme_only)| !scheme_only && id.split('/').next() == Some(root))
+}
+
+/// The catalog entry of an exact builtin specifier: a public ID behind `node:`, or one
+/// without it that Node also loads bare. The entry is the ID's first segment.
 fn node_root(specifier: &str) -> Option<&'static str> {
-    match specifier {
-        "fs" | "node:fs" | "fs/promises" | "node:fs/promises" => Some("fs"),
-        "path" | "node:path" => Some("path"),
-        _ => None,
-    }
+    let (id, scheme) = match specifier.strip_prefix("node:") {
+        Some(id) => (id, true),
+        None => (specifier, false),
+    };
+    let at = NODE_BUILTIN_IDS
+        .binary_search_by(|(known, _)| known.cmp(&id))
+        .ok()?;
+    let (known, scheme_only) = NODE_BUILTIN_IDS[at];
+    (scheme || !scheme_only).then(|| known.split('/').next().unwrap_or(known))
 }
 
 const NPM_SECTIONS: &[&str] = &[
@@ -759,13 +790,21 @@ impl<'de> Deserialize<'de> for NpmManifest {
     }
 }
 
+/// The npm declarations of one captured `package.json`, or `None` when it supplies none.
+type NpmBindings = Option<BTreeMap<String, Option<ExternalPackage>>>;
+
 #[derive(Default)]
 pub struct JavascriptPackages {
-    bindings: BTreeMap<String, BTreeMap<String, Option<ExternalPackage>>>,
+    /// Per source set, every captured `package.json` by its directory (`""` is the root).
+    manifests: BTreeMap<String, BTreeMap<String, NpmBindings>>,
 }
 impl JavascriptPackages {
-    pub(crate) fn new(
+    /// Reads each captured `package.json` outside `node_modules` (#1088). A workspace
+    /// member's manifest, or any nested one when the workspace config is unreadable,
+    /// supplies no npm labels (#773).
+    pub(super) fn new(
         manifests: &[ManifestInput],
+        workspaces: &super::js_workspace::Workspaces,
         work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Self> {
@@ -773,11 +812,15 @@ impl JavascriptPackages {
         let mut seen = std::collections::BTreeSet::new();
         for manifest in manifests {
             super::owner_step(work, check)?;
-            if manifest.path != "package.json" {
+            let dir = if manifest.path == "package.json" {
+                ""
+            } else if let Some(dir) = manifest.path.strip_suffix("/package.json") {
+                dir
+            } else {
                 continue;
-            }
+            };
             ensure!(
-                seen.insert(&manifest.source_set_id),
+                seen.insert((&manifest.source_set_id, &manifest.path)),
                 "store_unavailable: duplicate architecture package manifest"
             );
             ensure!(
@@ -787,128 +830,63 @@ impl JavascriptPackages {
             let Some(bytes) = &manifest.bytes else {
                 continue;
             };
-            ensure!(
-                work.charge(bytes.len()),
-                "bounded_work: reference manifest parsing"
-            );
-            check()?;
-            let parsed = serde_json::from_slice::<NpmManifest>(bytes);
-            check()?;
-            let Ok(parsed) = parsed else {
-                continue;
+            let blocked = dir.split('/').any(|part| part == "node_modules")
+                || (!dir.is_empty() && workspaces.may_be_member(&manifest.source_set_id, dir));
+            let bindings = if blocked {
+                None
+            } else {
+                npm_bindings(manifest, bytes, work, check)?
             };
-            if parsed.workspaces {
-                continue;
-            }
-            let mut bindings = BTreeMap::<String, Option<ExternalPackage>>::new();
-            for (section, entries) in parsed.sections {
-                for (key, value) in entries.0 {
-                    super::owner_step(work, check)?;
-                    if !valid_package("javascript", &key, false) {
-                        continue;
-                    }
-                    let version = value.as_str().filter(|value| npm_constraint(value));
-                    let version = version.filter(|_| parsed.name.as_deref() != Some(key.as_str()));
-                    if let Some(version) = version {
-                        let allocation = manifest
-                            .source_set_id
-                            .len()
-                            .saturating_mul(2)
-                            .saturating_add(manifest.native_revision_id.len())
-                            .saturating_add(manifest.dependency_hash.len())
-                            .saturating_add(manifest.path.len())
-                            .saturating_add(manifest.content_hash.as_ref().map_or(0, String::len))
-                            .saturating_add(key.len().saturating_mul(3))
-                            .saturating_add(section.len())
-                            .saturating_add(version.len())
-                            .saturating_add("javascript".len());
-                        ensure!(
-                            work.charge(allocation),
-                            "bounded_work: reference package evidence"
-                        );
-                        check()?;
-                    }
-                    let descriptor = version.map(|version| ExternalPackage {
-                        identity: ExternalIdentity {
-                            kind: ExternalKind::ExternalPackage,
-                            source_set_id: manifest.source_set_id.clone(),
-                            language: "javascript".into(),
-                            package: key.clone(),
-                            standard_library: false,
-                        },
-                        ecosystem: "npm",
-                        evidence: vec![ExternalEvidence::Manifest {
-                            source_set_id: manifest.source_set_id.clone(),
-                            native_revision_id: manifest.native_revision_id.clone(),
-                            dependency_hash: manifest.dependency_hash.clone(),
-                            path: manifest.path.clone(),
-                            content_hash: manifest
-                                .content_hash
-                                .clone()
-                                .expect("present manifest hash"),
-                            import_root: key.clone(),
-                            section: section.clone(),
-                            key: key.clone(),
-                            version_constraint: Some(version.into()),
-                        }],
-                    });
-                    match bindings.entry(key) {
-                        std::collections::btree_map::Entry::Vacant(entry) => {
-                            entry.insert(descriptor);
-                        }
-                        std::collections::btree_map::Entry::Occupied(mut entry) => {
-                            match (entry.get_mut().as_mut(), descriptor) {
-                                (Some(existing), Some(additional)) => {
-                                    existing.evidence.extend(additional.evidence);
-                                    existing.evidence.sort();
-                                    existing.evidence.dedup();
-                                }
-                                _ => {
-                                    *entry.get_mut() = None;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
             result
-                .bindings
-                .insert(manifest.source_set_id.clone(), bindings);
+                .manifests
+                .entry(manifest.source_set_id.clone())
+                .or_default()
+                .insert(dir.to_owned(), bindings);
         }
         Ok(result)
     }
 
-    /// A captured root declaration relation, not node_modules/member/export-map resolution.
+    /// A declaration in the `package.json` nearest the importing `path`, never
+    /// node_modules/member/export-map resolution.
     /// Call only for supported static syntax after local/context checks and work charging.
     /// The identity carries the importing document's `language`: JavaScript and
     /// TypeScript share the npm patterns, not the identity.
     pub fn resolve(
         &self,
         source_set_id: &str,
+        path: &str,
         specifier: &str,
         language: &str,
     ) -> Option<ExternalPackage> {
         if let Some(package) = node_standard_library(source_set_id, specifier, language) {
             return Some(package);
         }
-        let mut package = self.binding(source_set_id, specifier).cloned()?;
+        let mut package = self.binding(source_set_id, path, specifier).cloned()?;
         package.identity.language = language.into();
         Some(package)
     }
 
     /// Borrow-only size of owned evidence copied by resolve, including misses.
     /// The caller charges this to the shared budget and checks cancellation first.
-    pub fn resolution_work(&self, source_set_id: &str, specifier: &str, language: &str) -> usize {
+    pub fn resolution_work(
+        &self,
+        source_set_id: &str,
+        path: &str,
+        specifier: &str,
+        language: &str,
+    ) -> usize {
         if let Some(root) = node_root(specifier) {
             return 1usize
                 .saturating_add(source_set_id.len())
                 .saturating_add(language.len())
                 .saturating_add(root.len().saturating_mul(2));
         }
-        let Some(package) = self.binding(source_set_id, specifier) else {
-            return 1;
+        // The walk to the nearest manifest compares at most the importer's path.
+        let walk = 1usize.saturating_add(path.len());
+        let Some(package) = self.binding(source_set_id, path, specifier) else {
+            return walk;
         };
-        let mut size = 1usize
+        let mut size = walk
             .saturating_add(package.identity.source_set_id.len())
             .saturating_add(language.len())
             .saturating_add(package.identity.package.len());
@@ -943,16 +921,128 @@ impl JavascriptPackages {
         size
     }
 
-    fn binding(&self, source_set_id: &str, specifier: &str) -> Option<&ExternalPackage> {
-        if specifier.starts_with("node:") {
+    fn binding(
+        &self,
+        source_set_id: &str,
+        path: &str,
+        specifier: &str,
+    ) -> Option<&ExternalPackage> {
+        if specifier.starts_with("node:") || path.split('/').any(|part| part == "node_modules") {
             return None;
         }
         let root = npm_root(specifier)?;
-        if NODE_BARE_ROOTS.binary_search(&root).is_ok() {
+        if node_bare_root(root) {
             return None;
         }
-        self.bindings.get(source_set_id)?.get(root)?.as_ref()
+        // Only the nearest manifest counts: one that does not declare `root`, or that
+        // supplies no labels, leaves it unknown rather than deferring to an outer one.
+        let manifests = self.manifests.get(source_set_id)?;
+        let mut dir = path;
+        let nearest = loop {
+            dir = dir.rfind('/').map_or("", |at| &dir[..at]);
+            if let Some(found) = manifests.get(dir) {
+                break found;
+            }
+            if dir.is_empty() {
+                return None;
+            }
+        };
+        nearest.as_ref()?.get(root)?.as_ref()
     }
+}
+
+/// One manifest's supported npm declarations; malformed or workspace-root proof is `None`.
+fn npm_bindings(
+    manifest: &ManifestInput,
+    bytes: &[u8],
+    work: &mut Work,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<NpmBindings> {
+    ensure!(
+        work.charge(bytes.len()),
+        "bounded_work: reference manifest parsing"
+    );
+    check()?;
+    let parsed = serde_json::from_slice::<NpmManifest>(bytes);
+    check()?;
+    let Ok(parsed) = parsed else {
+        return Ok(None);
+    };
+    if parsed.workspaces {
+        return Ok(None);
+    }
+    let mut bindings = BTreeMap::<String, Option<ExternalPackage>>::new();
+    for (section, entries) in parsed.sections {
+        for (key, value) in entries.0 {
+            super::owner_step(work, check)?;
+            if !valid_package("javascript", &key, false) {
+                continue;
+            }
+            let version = value.as_str().filter(|value| npm_constraint(value));
+            let version = version.filter(|_| parsed.name.as_deref() != Some(key.as_str()));
+            if let Some(version) = version {
+                let allocation = manifest
+                    .source_set_id
+                    .len()
+                    .saturating_mul(2)
+                    .saturating_add(manifest.native_revision_id.len())
+                    .saturating_add(manifest.dependency_hash.len())
+                    .saturating_add(manifest.path.len())
+                    .saturating_add(manifest.content_hash.as_ref().map_or(0, String::len))
+                    .saturating_add(key.len().saturating_mul(3))
+                    .saturating_add(section.len())
+                    .saturating_add(version.len())
+                    .saturating_add("javascript".len());
+                ensure!(
+                    work.charge(allocation),
+                    "bounded_work: reference package evidence"
+                );
+                check()?;
+            }
+            let descriptor = version.map(|version| ExternalPackage {
+                identity: ExternalIdentity {
+                    kind: ExternalKind::ExternalPackage,
+                    source_set_id: manifest.source_set_id.clone(),
+                    language: "javascript".into(),
+                    package: key.clone(),
+                    standard_library: false,
+                },
+                ecosystem: "npm",
+                evidence: vec![ExternalEvidence::Manifest {
+                    source_set_id: manifest.source_set_id.clone(),
+                    native_revision_id: manifest.native_revision_id.clone(),
+                    dependency_hash: manifest.dependency_hash.clone(),
+                    path: manifest.path.clone(),
+                    content_hash: manifest
+                        .content_hash
+                        .clone()
+                        .expect("present manifest hash"),
+                    import_root: key.clone(),
+                    section: section.clone(),
+                    key: key.clone(),
+                    version_constraint: Some(version.into()),
+                }],
+            });
+            match bindings.entry(key) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(descriptor);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    match (entry.get_mut().as_mut(), descriptor) {
+                        (Some(existing), Some(additional)) => {
+                            existing.evidence.extend(additional.evidence);
+                            existing.evidence.sort();
+                            existing.evidence.dedup();
+                        }
+                        _ => {
+                            *entry.get_mut() = None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(Some(bindings))
 }
 fn npm_constraint(value: &str) -> bool {
     let value = value.strip_prefix(['^', '~']).unwrap_or(value);
@@ -1260,92 +1350,288 @@ mod javascript_package_tests {
     use super::*;
 
     fn packages(text: &str) -> JavascriptPackages {
-        JavascriptPackages::new(
-            &[input(text)],
-            &mut Work::new(super::super::work::reference_limit(0, 0)),
-            &mut || Ok(()),
-        )
-        .unwrap()
+        tree(&[("package.json", text)])
     }
     fn input(text: &str) -> ManifestInput {
+        manifest_at("package.json", text)
+    }
+    fn manifest_at(path: &str, text: &str) -> ManifestInput {
         ManifestInput {
             source_set_id: "fixture".into(),
             native_revision_id: "revision".into(),
             dependency_hash: "dependencies".into(),
-            path: "package.json".into(),
+            path: path.into(),
             content_hash: Some("hash".into()),
             bytes: Some(text.as_bytes().to_vec()),
         }
     }
-    #[test]
-    fn node_labels_and_reserved_roots_are_exact_and_conservative() {
-        assert_eq!(NODE_BARE_ROOTS.len(), 56);
-        assert!(NODE_BARE_ROOTS.windows(2).all(|pair| pair[0] < pair[1]));
-        for (specifier, root) in [
-            ("fs", "fs"),
-            ("node:fs", "fs"),
-            ("fs/promises", "fs"),
-            ("node:fs/promises", "fs"),
-            ("path", "path"),
-            ("node:path", "path"),
-        ] {
-            let package = node_standard_library("fixture", specifier, "javascript").unwrap();
-            assert_eq!(package.identity.package, root);
+    /// The packages of captured manifests, with their #773 workspace members.
+    fn tree(files: &[(&str, &str)]) -> JavascriptPackages {
+        let manifests: Vec<_> = files
+            .iter()
+            .map(|(path, text)| manifest_at(path, text))
+            .collect();
+        let mut work = Work::new(super::super::work::reference_limit(0, 0));
+        let workspaces =
+            super::super::js_workspace::Workspaces::new(&manifests, &mut work, &mut || Ok(()))
+                .unwrap();
+        JavascriptPackages::new(&manifests, &workspaces, &mut work, &mut || Ok(())).unwrap()
+    }
+    fn label(specifier: &str) -> Option<String> {
+        node_standard_library("fixture", specifier, "javascript").map(|package| {
+            let [ExternalEvidence::StandardLibraryCatalog { catalog, entry }] =
+                &package.evidence[..]
+            else {
+                panic!("one catalog evidence");
+            };
+            assert_eq!(*catalog, "node-standard-library:v2");
+            assert_eq!(*entry, package.identity.package);
             assert!(package.identity.standard_library);
             assert_eq!(package.ecosystem, "node");
-            assert_eq!(
-                package.evidence,
-                vec![ExternalEvidence::StandardLibraryCatalog {
-                    catalog: "node-standard-library:v1",
-                    entry: root.into(),
-                }]
-            );
-        }
-        let dependencies: BTreeMap<_, _> = NODE_BARE_ROOTS
+            assert!(valid_package("javascript", entry, true), "{entry}");
+            entry.clone()
+        })
+    }
+    #[test]
+    fn node_labels_cover_every_pinned_builtin_in_both_spellings() {
+        assert_eq!(NODE_BUILTIN_IDS.len(), 72);
+        assert!(
+            NODE_BUILTIN_IDS
+                .windows(2)
+                .all(|pair| pair[0].0 < pair[1].0)
+        );
+        let roots: std::collections::BTreeSet<_> = NODE_BUILTIN_IDS
             .iter()
-            .map(|root| (*root, "1.2.3"))
+            .map(|(id, _)| id.split('/').next().unwrap())
             .collect();
-        let packages = packages(&serde_json::json!({"dependencies":dependencies}).to_string());
-        for root in NODE_BARE_ROOTS {
-            if !matches!(*root, "fs" | "path") {
-                assert!(packages.resolve("fixture", root, "javascript").is_none());
-            }
-            assert!(
-                packages
-                    .resolve("fixture", &format!("{root}/fake"), "javascript")
-                    .is_none()
+        assert_eq!(roots.len(), 59);
+        let bare: std::collections::BTreeSet<_> =
+            roots.iter().filter(|root| node_bare_root(root)).collect();
+        assert_eq!(bare.len(), 56);
+        for (id, scheme_only) in NODE_BUILTIN_IDS {
+            let root = id.split('/').next().unwrap();
+            assert_eq!(
+                label(&format!("node:{id}")).as_deref(),
+                Some(root),
+                "node:{id}"
             );
+            assert_eq!(label(id).as_deref(), (!scheme_only).then_some(root), "{id}");
+        }
+        for (specifier, root) in [
+            ("crypto", "crypto"),
+            ("node:crypto", "crypto"),
+            ("child_process", "child_process"),
+            ("node:child_process", "child_process"),
+            ("path/posix", "path"),
+            ("node:path/win32", "path"),
+            ("util/types", "util"),
+            ("node:stream/web", "stream"),
+            ("_http_agent", "_http_agent"),
+            ("node:test", "test"),
+            ("node:test/reporters", "test"),
+            ("node:sqlite", "sqlite"),
+            ("node:sea", "sea"),
+        ] {
+            assert_eq!(label(specifier).as_deref(), Some(root), "{specifier}");
         }
         for specifier in [
+            "test",
+            "test/reporters",
+            "sqlite",
+            "sea",
             "node:unknown",
-            "node:test",
-            "node:sea",
             "node:node:fs",
-            "path/posix",
-            "node:path/win32",
+            "node:fs/fake",
+            "http/fake",
+            "node:",
+            "node:internal/util",
+            "internal/util",
+            "node:eslint.config_partial",
+            "NODE:fs",
             "./fs.js",
             "../path.js",
         ] {
+            assert_eq!(label(specifier), None, "{specifier}");
+        }
+        assert!(valid_package("typescript", "_http_agent", true));
+        assert!(!valid_package("typescript", "__http_agent", true));
+        assert!(!valid_package("typescript", "._http", true));
+        assert!(!valid_package("typescript", "_http_agent", false));
+    }
+    #[test]
+    fn node_labels_precede_npm_and_bare_roots_block_npm_inference() {
+        let dependencies: BTreeMap<_, _> = NODE_BUILTIN_IDS
+            .iter()
+            .map(|(id, _)| (id.split('/').next().unwrap(), "1.2.3"))
+            .collect();
+        let packages = packages(&serde_json::json!({"dependencies":dependencies}).to_string());
+        for (id, scheme_only) in NODE_BUILTIN_IDS {
+            let root = id.split('/').next().unwrap();
+            let resolved = packages.resolve("fixture", "app.js", id, "javascript");
+            if *scheme_only {
+                // Bare `test`, `sqlite` and `sea` name npm packages, not builtins.
+                let package = resolved.unwrap();
+                assert_eq!(package.ecosystem, "npm", "{id}");
+                assert_eq!(package.identity.package, root);
+            } else {
+                assert_eq!(resolved.unwrap().ecosystem, "node", "{id}");
+            }
+            if !scheme_only {
+                assert!(
+                    packages
+                        .resolve("fixture", "app.js", &format!("{root}/fake"), "javascript")
+                        .is_none(),
+                    "{root}/fake"
+                );
+            }
+        }
+        for specifier in ["node:unknown", "node:test/fake", "node:sqlite/x"] {
             assert!(
                 packages
-                    .resolve("fixture", specifier, "javascript")
+                    .resolve("fixture", "app.js", specifier, "javascript")
                     .is_none()
             );
         }
+    }
+    #[test]
+    fn bare_specifiers_resolve_against_the_nearest_captured_package_json() {
+        let packages = tree(&[
+            (
+                "package.json",
+                r#"{"name":"root","dependencies":{"root-only":"1.0.0","shared":"1.0.0"}}"#,
+            ),
+            (
+                "tools/build/package.json",
+                r#"{"dependencies":{"esbuild":"^0.20.2","shared":"2.0.0","test":"1.0.0"}}"#,
+            ),
+            ("tools/broken/package.json", "{ invalid"),
+            (
+                "tools/node_modules/pkg/package.json",
+                r#"{"dependencies":{"esbuild":"1.0.0"}}"#,
+            ),
+        ]);
+        let manifest = |path: &str, specifier: &str| {
+            packages
+                .resolve("fixture", path, specifier, "javascript")
+                .map(|package| {
+                    assert_eq!(package.ecosystem, "npm");
+                    let paths: Vec<_> = package
+                        .evidence
+                        .iter()
+                        .map(|evidence| match evidence {
+                            ExternalEvidence::Manifest {
+                                path,
+                                version_constraint,
+                                ..
+                            } => format!("{path}@{}", version_constraint.as_deref().unwrap()),
+                            other => panic!("{other:?}"),
+                        })
+                        .collect();
+                    paths.join(",")
+                })
+        };
+        for importer in ["tools/build/build.mjs", "tools/build/lib/deep/x.js"] {
+            assert_eq!(
+                manifest(importer, "esbuild").as_deref(),
+                Some("tools/build/package.json@^0.20.2")
+            );
+            assert_eq!(
+                manifest(importer, "shared").as_deref(),
+                Some("tools/build/package.json@2.0.0")
+            );
+            // The nearest manifest decides alone: no fallback to the root's declarations.
+            assert_eq!(manifest(importer, "root-only"), None);
+            assert_eq!(
+                manifest(importer, "test").as_deref(),
+                Some("tools/build/package.json@1.0.0")
+            );
+            assert_eq!(manifest(importer, "unknown-package"), None);
+        }
+        for importer in ["app.js", "tools/other/x.js", "tools/x.js"] {
+            assert_eq!(
+                manifest(importer, "shared").as_deref(),
+                Some("package.json@1.0.0")
+            );
+            assert_eq!(manifest(importer, "esbuild"), None);
+        }
+        // A malformed nearest manifest proves nothing, and never defers to the root.
+        assert_eq!(manifest("tools/broken/x.js", "root-only"), None);
+        assert_eq!(manifest("tools/broken/x.js", "shared"), None);
+        // node_modules supplies and receives no npm labels; builtins still label.
+        for importer in [
+            "tools/node_modules/pkg/index.js",
+            "tools/node_modules/pkg/lib/x.js",
+        ] {
+            assert_eq!(manifest(importer, "esbuild"), None);
+            assert_eq!(manifest(importer, "shared"), None);
+            assert!(
+                packages
+                    .resolve("fixture", importer, "node:fs", "javascript")
+                    .is_some()
+            );
+        }
+        assert!(
+            packages
+                .resolve("other", "app.js", "shared", "javascript")
+                .is_none()
+        );
+        assert!(
+            packages.resolution_work("fixture", "tools/build/deep/x.js", "absent", "javascript")
+                > packages.resolution_work("fixture", "x.js", "absent", "javascript")
+        );
+    }
+    #[test]
+    fn workspace_roots_and_members_keep_supplying_no_npm_labels() {
+        const DEP: &str = r#""dependencies":{"widget":"1.0.0"}"#;
+        let root = format!(r#"{{"name":"acme","workspaces":["packages/*"],{DEP}}}"#);
+        let ui = format!(r#"{{"name":"@acme/ui",{DEP}}}"#);
+        let unnamed = format!("{{{DEP}}}");
+        let tool = format!("{{{DEP}}}");
+        let widget = |packages: &JavascriptPackages, path: &str| {
+            packages
+                .resolve("fixture", path, "widget", "javascript")
+                .is_some()
+        };
+        let npm = tree(&[
+            ("package.json", &root),
+            ("packages/ui/package.json", &ui),
+            ("packages/unnamed/package.json", &unnamed),
+            ("tools/package.json", &tool),
+        ]);
+        assert!(!widget(&npm, "index.js"));
+        assert!(!widget(&npm, "packages/ui/src/index.js"));
+        assert!(!widget(&npm, "packages/unnamed/index.js"));
+        // A nested package outside the members is not a member.
+        assert!(widget(&npm, "tools/x.js"));
+        let unreadable = tree(&[
+            ("package.json", &format!(r#"{{"workspaces":42,{DEP}}}"#)),
+            ("tools/package.json", &tool),
+        ]);
+        assert!(!widget(&unreadable, "index.js"));
+        assert!(!widget(&unreadable, "tools/x.js"));
+        let pnpm = tree(&[
+            ("package.json", &unnamed),
+            ("pnpm-workspace.yaml", "packages:\n  - 'packages/*'\n"),
+            ("packages/ui/package.json", &ui),
+            ("tools/package.json", &tool),
+        ]);
+        assert!(widget(&pnpm, "index.js"));
+        assert!(!widget(&pnpm, "packages/ui/src/index.js"));
+        assert!(widget(&pnpm, "tools/x.js"));
     }
     #[test]
     fn captured_bindings_merge_sections_but_never_infer_installation_or_members() {
         let packages = packages(
             r#"{"dependencies":{"widget":"^1.2.3","@scope/tool":"2.3.4","test":"1.0.0","sea":"1.0.0"},"devDependencies":{"widget":"~2.3.4"},"optionalDependencies":{"widget":"3.4.5"},"peerDependencies":{"widget":"4.5.6"}}"#,
         );
-        assert!(packages.resolution_work("fixture", "widget/sub/path", "javascript") > 4);
+        assert!(packages.resolution_work("fixture", "app.js", "widget/sub/path", "javascript") > 4);
         assert_eq!(
-            packages.resolution_work("fixture", "absent", "javascript"),
-            1
+            packages.resolution_work("fixture", "app.js", "absent", "javascript"),
+            1 + "app.js".len()
         );
-        assert!(packages.resolution_work("fixture", "node:fs", "javascript") > 1);
+        assert!(packages.resolution_work("fixture", "app.js", "node:fs", "javascript") > 1);
         let widget = packages
-            .resolve("fixture", "widget/sub/path", "javascript")
+            .resolve("fixture", "app.js", "widget/sub/path", "javascript")
             .unwrap();
         assert_eq!(widget.identity.package, "widget");
         assert!(!widget.identity.standard_library);
@@ -1368,7 +1654,7 @@ mod javascript_package_tests {
         for specifier in ["@scope/tool", "@scope/tool/sub", "test/reporters", "sea"] {
             assert!(
                 packages
-                    .resolve("fixture", specifier, "javascript")
+                    .resolve("fixture", "app.js", specifier, "javascript")
                     .is_some()
             );
         }
@@ -1387,13 +1673,13 @@ mod javascript_package_tests {
         ] {
             assert!(
                 packages
-                    .resolve("fixture", specifier, "javascript")
+                    .resolve("fixture", "app.js", specifier, "javascript")
                     .is_none()
             );
         }
         assert!(
             packages
-                .resolve("other-source-set", "widget", "javascript")
+                .resolve("other-source-set", "app.js", "widget", "javascript")
                 .is_none()
         );
     }
@@ -1402,13 +1688,15 @@ mod javascript_package_tests {
         let packages = packages(r#"{"dependencies":{"lodash":"^4.17.21"}}"#);
         for language in ["javascript", "typescript"] {
             for specifier in ["lodash/fp", "fs"] {
-                let package = packages.resolve("fixture", specifier, language).unwrap();
+                let package = packages
+                    .resolve("fixture", "app.js", specifier, language)
+                    .unwrap();
                 assert_eq!(package.identity.language, language);
             }
         }
         assert!(
-            packages.resolution_work("fixture", "lodash", "typescript")
-                > packages.resolution_work("fixture", "lodash", "ts")
+            packages.resolution_work("fixture", "app.js", "lodash", "typescript")
+                > packages.resolution_work("fixture", "app.js", "lodash", "ts")
         );
         assert!(valid_package("typescript", "fs", true));
         assert!(!valid_package("typescript", "@scope/fs", true));
@@ -1433,7 +1721,7 @@ mod javascript_package_tests {
             let text = serde_json::json!({"dependencies":{"widget":"1.2.3"}, "peerDependencies":{"widget":constraint}}).to_string();
             assert!(
                 packages(&text)
-                    .resolve("fixture", "widget", "javascript")
+                    .resolve("fixture", "app.js", "widget", "javascript")
                     .is_none(),
                 "{constraint}"
             );
@@ -1449,7 +1737,7 @@ mod javascript_package_tests {
         ] {
             assert!(
                 packages(text)
-                    .resolve("fixture", "widget", "javascript")
+                    .resolve("fixture", "app.js", "widget", "javascript")
                     .is_none(),
                 "{text}"
             );
@@ -1459,14 +1747,18 @@ mod javascript_package_tests {
     fn parsing_shares_work_budget_and_checks_cancellation() {
         let input = input(r#"{"dependencies":{"widget":"1.2.3"}}"#);
         let mut work = Work::new(0);
+        let none = super::super::js_workspace::Workspaces::default();
         let error =
-            JavascriptPackages::new(std::slice::from_ref(&input), &mut work, &mut || Ok(()))
-                .err()
-                .unwrap();
+            JavascriptPackages::new(std::slice::from_ref(&input), &none, &mut work, &mut || {
+                Ok(())
+            })
+            .err()
+            .unwrap();
         assert!(error.to_string().starts_with("bounded_work:"));
         let mut visits = 0;
         let error = JavascriptPackages::new(
             &[input],
+            &none,
             &mut Work::new(super::super::work::reference_limit(0, 0)),
             &mut || {
                 visits += 1;
