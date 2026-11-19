@@ -984,8 +984,10 @@ Supported mapping is deliberately narrow:
   calls is read as any other statement, its nested blocks scopes of their own (a call in
   another call's arguments is an argument and is not read). A bare name is proved when no
   Rust file of the checkout spells a `macro_rules!` definition of that name (read from the
-  text, so one in a comment, a string or another macro's arguments counts, and a file
-  whose text was not read could define any), no `#[macro_use]` or `#![macro_use]` and no
+  text, so one in a comment, a string or another macro's arguments counts; at most 128
+  bytes of whitespace and comments are read between `macro_rules`, `!` and the name, and
+  a definition that needs more, or a file whose text was not read, could define any; each
+  byte read is charged to the reference work bound), no `#[macro_use]` or `#![macro_use]` and no
   inner attribute naming the `decl_macro` feature is read (or spelled in a file with a
   parser error), and no scope from the call's up to its module has a named import that
   binds the name or skipped anything. On a checkout that compiles nothing else can take

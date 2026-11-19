@@ -678,6 +678,7 @@ impl Catalog {
                 continue;
             }
             if matches!(child.kind(), "attribute_item" | "inner_attribute_item") {
+                self.note_macro_use(doc, child, check)?;
                 self.note_attribute(doc, child, scope, &mut pending, &mut scope_uncertain);
                 continue;
             }
@@ -835,9 +836,15 @@ impl Catalog {
             let arguments = call
                 .named_children(&mut cursor)
                 .find(|node| node.kind() == "token_tree");
-            let tokens: Vec<Node<'_>> = arguments
+            let children: Vec<Node<'_>> = arguments
                 .map(|node| node.children(&mut node.walk()).collect())
                 .unwrap_or_default();
+            self.charge(children.len(), check)?;
+            // Comments are trivia between the tokens (#1229 review).
+            let tokens: Vec<Node<'_>> = children
+                .into_iter()
+                .filter(|node| !matches!(node.kind(), "line_comment" | "block_comment"))
+                .collect();
             for (at, token) in tokens.iter().enumerate() {
                 self.step(check)?;
                 // `static NAME:`, and not the `static` of a `'static` lifetime.
@@ -846,9 +853,12 @@ impl Catalog {
                     && text(doc, tokens[at - 1]) == "static"
                     && (at < 2 || text(doc, tokens[at - 2]) != "'");
                 if declares {
+                    // `r#NAME` and `NAME` are one name.
+                    let name = text(doc, *token);
+                    let name = name.strip_prefix("r#").unwrap_or(name);
                     self.scopes[scope]
                         .explicit
-                        .entry((VALUE, text(doc, *token).to_owned()))
+                        .entry((VALUE, name.to_owned()))
                         .or_default()
                         .push(Binding {
                             candidate: None,
@@ -874,7 +884,8 @@ impl Catalog {
     }
     /// Reads, from every Rust file's text, each name a `macro_rules!` definition could take
     /// (#1210). The reading is textual, so a definition inside another macro's arguments, a
-    /// comment or a string counts too; a file whose text was not read could define any.
+    /// comment or a string counts too; a file whose text was not read, or a definition whose
+    /// name lies past `RULES_TRIVIA` bytes of trivia, could define any. Every step is charged.
     fn read_macro_rules(
         &mut self,
         docs: &[&DocumentInput],
@@ -891,16 +902,58 @@ impl Catalog {
                 self.shadows.unread = true;
                 continue;
             }
-            for name in macro_rules_names(text) {
-                self.step(check)?;
-                self.shadows.rules.insert(name);
+            // Once a definition could take any name, every bare proof fails: none is read.
+            if self.shadows.unread {
+                continue;
             }
+            let rules = macro_rules_names(text);
+            self.charge(rules.read, check)?;
+            self.shadows.unread |= rules.unbounded;
+            self.shadows.rules.extend(rules.names);
             // An attribute a parser error hides is read from the text instead.
             if trees[document].root_node().has_error()
                 && (text.contains("macro_use") || text.contains("decl_macro"))
             {
                 self.shadows.unread = true;
             }
+        }
+        Ok(())
+    }
+    /// Whether an attribute could be `macro_use`, which could give a standard-library
+    /// statement macro's bare name another meaning (#1210): the identifier `macro_use`, `r#`
+    /// removed, anywhere in its parsed syntax outside comments and literals, so in its path
+    /// or in a `cfg_attr`'s arguments too. One the parser could not read counts when its text
+    /// spells the name. Each node read is charged.
+    fn note_macro_use(
+        &mut self,
+        doc: &DocumentInput,
+        attribute: Node<'_>,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        if self.shadows.macro_use || !text(doc, attribute).contains("macro_use") {
+            return Ok(());
+        }
+        if attribute.has_error() {
+            self.shadows.macro_use = true;
+            return Ok(());
+        }
+        let mut pending = vec![attribute];
+        while let Some(node) = pending.pop() {
+            self.step(check)?;
+            match node.kind() {
+                "line_comment" | "block_comment" | "string_literal" | "raw_string_literal"
+                | "char_literal" => continue,
+                "identifier" => {
+                    let name = text(doc, node);
+                    if name.strip_prefix("r#").unwrap_or(name) == "macro_use" {
+                        self.shadows.macro_use = true;
+                        return Ok(());
+                    }
+                }
+                _ => {}
+            }
+            let mut cursor = node.walk();
+            pending.extend(node.named_children(&mut cursor));
         }
         Ok(())
     }
@@ -925,9 +978,8 @@ impl Catalog {
             .collect();
         let inner = child.kind() == "inner_attribute_item";
         let name = attribute_name(&attribute);
-        // Either could give a standard-library statement macro's bare name another meaning
-        // (#1210): `macro_use`, and the `decl_macro` feature, which allows a `macro` item.
-        self.shadows.macro_use |= name == "macro_use";
+        // The `decl_macro` feature allows a `macro` item, which could give a
+        // standard-library statement macro's bare name another meaning (#1210).
         self.shadows.decl_macro |= inner && spells_identifier(&attribute, "decl_macro");
         if attribute.starts_with("#![cfg(") || attribute.starts_with("#![cfg_attr(") {
             *scope_uncertain = true;
@@ -3325,59 +3377,91 @@ fn statement_macro(
     }
     Some((source, path, global))
 }
+/// The whitespace and comments read between `macro_rules`, `!` and the name of one
+/// definition (#1210). A longer run is not followed: the definition could take any name.
+const RULES_TRIVIA: usize = 128;
+/// What one file's text says about its `macro_rules!` definitions (#1210).
+#[derive(Default, Debug, PartialEq, Eq)]
+struct RulesText {
+    /// Every name a definition could take.
+    names: BTreeSet<String>,
+    /// The work read: a step for each `macro_rules`, and each byte of trivia and name after
+    /// one.
+    read: usize,
+    /// A definition's trivia ran past `RULES_TRIVIA`, so it could take any name; the scan
+    /// stopped there.
+    unbounded: bool,
+}
 /// Every name a `macro_rules!` definition in `text` could take: an identifier, `r#` removed,
-/// after `macro_rules` and `!`, with any whitespace or comments between.
-fn macro_rules_names(text: &str) -> BTreeSet<String> {
+/// after `macro_rules` and `!`, with whitespace or comments between. Each occurrence reads
+/// at most `RULES_TRIVIA` bytes of trivia and its name, and one that needs more ends the
+/// scan as `unbounded`, so the work is linear in the text, and every byte read is counted.
+fn macro_rules_names(text: &str) -> RulesText {
     let ident = |c: char| c.is_alphanumeric() || c == '_';
-    let mut names = BTreeSet::new();
+    let mut result = RulesText::default();
     for (at, keyword) in text.match_indices("macro_rules") {
+        result.read += 1;
         if text[..at].chars().next_back().is_some_and(ident) {
             continue;
         }
-        let Some(rest) = skip_trivia(&text[at + keyword.len()..]).strip_prefix('!') else {
-            continue;
+        let mut budget = RULES_TRIVIA;
+        let bang = skip_trivia(&text[at + keyword.len()..], &mut budget)
+            .map(|rest| rest.strip_prefix('!'));
+        let name = match bang {
+            Some(Some(rest)) => skip_trivia(rest, &mut budget),
+            // No `!`: not a definition.
+            Some(None) => Some(""),
+            None => None,
         };
-        let rest = skip_trivia(rest);
+        result.read += RULES_TRIVIA - budget;
+        let Some(rest) = name else {
+            result.unbounded = true;
+            return result;
+        };
         let rest = rest.strip_prefix("r#").unwrap_or(rest);
         let name: String = rest.chars().take_while(|&c| ident(c)).collect();
+        result.read += name.len();
         if !name.is_empty() {
-            names.insert(name);
+            result.names.insert(name);
         }
     }
-    names
+    result
 }
-/// `text` after any leading whitespace and comments (block comments nest).
-fn skip_trivia(mut text: &str) -> &str {
+/// `text` after its leading whitespace and comments (block comments nest), reading at most
+/// `budget` bytes of them, which it spends: `None` when the run is longer. A comment that the
+/// text ends inside leaves nothing.
+fn skip_trivia<'a>(text: &'a str, budget: &mut usize) -> Option<&'a str> {
+    let bytes = text.as_bytes();
+    let (mut at, mut depth, mut line) = (0, 0usize, false);
     loop {
-        let trimmed = text.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("//") {
-            text = rest.find('\n').map_or("", |end| &rest[end..]);
-        } else if trimmed.starts_with("/*") {
-            let mut depth = 0usize;
-            let mut end = trimmed.len();
-            let bytes = trimmed.as_bytes();
-            let mut at = 0;
-            while at + 1 < bytes.len() {
-                match &bytes[at..at + 2] {
-                    b"/*" => {
-                        depth += 1;
-                        at += 2;
-                    }
-                    b"*/" => {
-                        depth -= 1;
-                        at += 2;
-                        if depth == 0 {
-                            end = at;
-                            break;
-                        }
-                    }
-                    _ => at += 1,
-                }
-            }
-            text = &trimmed[end..];
+        let Some(rest) = bytes.get(at..).filter(|rest| !rest.is_empty()) else {
+            return Some("");
+        };
+        let step = if line {
+            line = rest[0] != b'\n';
+            1
+        } else if rest.starts_with(b"/*") {
+            depth += 1;
+            2
+        } else if depth > 0 && rest.starts_with(b"*/") {
+            depth -= 1;
+            2
+        } else if depth > 0 {
+            1
+        } else if rest.starts_with(b"//") {
+            line = true;
+            2
         } else {
-            return trimmed;
+            match text[at..].chars().next() {
+                Some(c) if c.is_whitespace() => c.len_utf8(),
+                _ => return Some(&text[at..]),
+            }
+        };
+        if step > *budget {
+            return None;
         }
+        *budget -= step;
+        at += step;
     }
 }
 /// The known attribute macro an outer attribute's path names, whatever its arguments.
@@ -4546,9 +4630,46 @@ mod macro_rules_name_tests {
                     my_macro_rules! d {}\n\
                     \"macro_rules!\" e\n\
                     macro_rules!($x) {}\n\
-                    macro_rules! /* unterminated";
-        let names: Vec<String> = macro_rules_names(text).into_iter().collect();
+                    macro_rules! /\x2a unterminated";
+        let rules = macro_rules_names(text);
+        let names: Vec<&str> = rules.names.iter().map(String::as_str).collect();
         assert_eq!(names, ["a", "b", "c"]);
+        assert!(!rules.unbounded);
+    }
+
+    /// The shape #1229's review found quadratic: comment-only text that nests a comment after
+    /// each `macro_rules`. The scan reads one bounded run of trivia, finds it longer than
+    /// `RULES_TRIVIA`, and stops: the work read does not grow with the nesting.
+    #[test]
+    fn nested_comments_after_macro_rules_read_one_bounded_run() {
+        let nested = |n: usize| format!("/* {}{} */", "macro_rules /* ".repeat(n), "*/".repeat(n));
+        let small = macro_rules_names(&nested(100));
+        let large = macro_rules_names(&nested(20_000));
+        assert!(small.unbounded && large.unbounded);
+        assert!(large.names.is_empty());
+        assert!(large.read <= 1 + RULES_TRIVIA, "{}", large.read);
+        assert_eq!(large.read, small.read);
+    }
+
+    /// Many definitions, each with trivia within the bound, are read once each: the work is
+    /// at most a step per occurrence plus a step per byte of text.
+    #[test]
+    fn many_definitions_read_linear_work() {
+        let text: String = (0..2_000)
+            .map(|i| format!("macro_rules /* c */ ! /* d */ m{i} {{}}\n"))
+            .collect();
+        let rules = macro_rules_names(&text);
+        assert!(!rules.unbounded);
+        assert_eq!(rules.names.len(), 2_000);
+        assert!(
+            rules.read <= 2_000 + text.len(),
+            "{} > {}",
+            rules.read,
+            text.len()
+        );
+        // Trivia past the bound could hide any name.
+        let long = format!("macro_rules /*{}*/ ! m {{}}", " ".repeat(RULES_TRIVIA));
+        assert!(macro_rules_names(&long).unbounded);
     }
 }
 

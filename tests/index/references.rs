@@ -1749,6 +1749,11 @@ fn references_rust_literal_macro_rules_of_the_name_keeps_the_bare_call_unknown()
         concat!("macro_", "rules")
     );
     assert_eq!(beside(&spaced), (vec![], 1));
+    // Trivia past the scan's bound (#1229's nested-comment shape) could hide any name: every
+    // bare name fails, as with an unread file, and the scan stops there.
+    let keyword = format!("{} /* ", concat!("macro_", "rules"));
+    let nested = format!("/* {}{} */", keyword.repeat(2_000), "*/".repeat(2_000));
+    assert_eq!(beside(&nested), (vec![], 1));
     // A name the definition does not take changes nothing; the path form is not read.
     assert_eq!(beside(&rules_of("println_")), (vec![2], 0));
     let path = "fn f() { std::println!(\"x\"); m::g(); }\n";
@@ -1769,9 +1774,30 @@ fn references_rust_macro_use_or_decl_macro_keeps_bare_statement_macros_unknown()
         ("", vec![("src/defs.rs", "#[macro_use]\nmod inner {}\n")]),
         ("", vec![("src/defs.rs", "mod inner { #![macro_use] }\n")]),
         ("", vec![("src/defs.rs", "#![feature(decl_macro)]\n")]),
+        // Raw, commented and conditional spellings are `macro_use` too (#1229 review).
+        ("", vec![("src/defs.rs", "#[r#macro_use]\nmod inner {}\n")]),
+        (
+            "",
+            vec![("src/defs.rs", "#[macro_use /* note */]\nmod inner {}\n")],
+        ),
+        (
+            "",
+            vec![(
+                "src/defs.rs",
+                "#[cfg_attr(all(), macro_use)]\nmod inner {}\n",
+            )],
+        ),
+        (
+            "#[cfg_attr(all(), macro_use)] extern crate foreign;",
+            vec![("src/defs.rs", "")],
+        ),
     ] {
         let lib = format!("{lib} mod defs;");
-        assert_eq!(macro_lines_beside(&lib, &files, bare), (vec![], 1), "{lib}");
+        assert_eq!(
+            macro_lines_beside(&lib, &files, bare).0,
+            Vec::<u64>::new(),
+            "{lib} {files:?}"
+        );
         assert_eq!(
             macro_lines_beside(&lib, &files, path),
             (vec![2], 0),
@@ -1783,6 +1809,8 @@ fn references_rust_macro_use_or_decl_macro_keeps_bare_statement_macros_unknown()
         "src/defs.rs",
         "const S: &str = \"#[macro_use] decl_macro\";\n",
     )];
+    assert_eq!(macro_lines_beside("mod defs;", &files, bare), (vec![2], 0));
+    let files = [("src/defs.rs", "#[doc = \"macro_use\"]\nmod inner {}\n")];
     assert_eq!(macro_lines_beside("mod defs;", &files, bare), (vec![2], 0));
 }
 
@@ -1888,6 +1916,46 @@ fn references_rust_thread_local_binds_exactly_its_statics() {
     // `m::g` and `self::OTHER` in `f`; `self::INNER` (the module's, not the block's static)
     // and `m::g` in `h`.
     assert_eq!(lines, [4, 4, 5, 5], "{data}");
+}
+
+/// #1229 review: comments between `static` and its name, and a raw name, are the same
+/// declaration: the static still shadows the glob's, so a path through it stays unknown,
+/// while the glob's other names resolve.
+#[test]
+fn references_rust_thread_local_statics_read_past_comments_and_raw_names() {
+    for declaration in [
+        "static /* note */ COUNTER: u8 = 0;",
+        "static // note\n COUNTER: u8 = 0;",
+        "static r#COUNTER: u8 = 0;",
+        "static /* a */ // b\n r#COUNTER: u8 = 0;",
+    ] {
+        let source = format!(
+            "use crate::n::*;\nthread_local! {{ {declaration} }}\n\
+             fn f() {{ let _ = self::COUNTER; let _ = self::OTHER; }}\n"
+        );
+        let input = snapshot(&[
+            ("src/lib.rs", "mod a; mod n;"),
+            (
+                "src/n.rs",
+                "pub static COUNTER: u8 = 0;\npub static OTHER: u8 = 0;",
+            ),
+            ("src/a.rs", &source),
+        ]);
+        let data = references::project(&input, &["src/a.rs".into()], 20, &mut || Ok(()))
+            .unwrap()
+            .data;
+        let unknown: Vec<_> = data["unresolved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|site| site["site"]["spelling"].as_str().unwrap())
+            .collect();
+        assert_eq!(unknown, ["self::COUNTER"], "{declaration}: {data}");
+        assert!(
+            has_edge(&data, "src/a.rs", "src/n.rs"),
+            "{declaration}: {data}"
+        );
+    }
 }
 
 /// The sites of `src/a.rs` (after its first line) that map to `src/kinds.rs`, as spellings,
