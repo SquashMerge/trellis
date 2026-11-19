@@ -273,12 +273,16 @@ struct Active {
     /// `(templateSha256, approvedAt)` of the approval this launch carries. A template refusal
     /// holds back only this pair, never an approval loaded while the launch was in flight.
     approval: (String, u64),
+    /// The state version the pass that decided this launch read (#1216, #1219).
+    decided_at: u64,
 }
 
 /// The next attempt after a non-start waits for a newer signal or the backstop.
 #[derive(Clone, Copy, Debug)]
 struct Hold {
-    version: u64,
+    /// The newest state version the hold absorbs: the one the launch was decided at, plus the
+    /// outcome's own completion wake. Any later signal releases it.
+    through: u64,
     until: Instant,
 }
 
@@ -286,8 +290,6 @@ struct Hold {
 struct Tagged {
     producer: String,
     token: SupersedeToken,
-    /// The state version the run thread read just before the launch (#1216).
-    launched_at: u64,
     outcome: LaunchOutcome,
 }
 
@@ -434,13 +436,26 @@ impl OwnerState {
                 state.last_start.remove(&producer);
             }
         };
+        // A non-start retries at the next signal the launch decision did not see (#1216, #1219).
+        // The outcome's own wake is the one signal it brings itself, counted whether or not it
+        // has landed by `seen`, so the hold never depends on the order of the run thread's store
+        // and wake. Any other signal since the decision, such as a publication that landed
+        // before this outcome was consumed, already releases the hold: its credit is never
+        // absorbed into a hold taken here.
+        let through = active.decided_at.saturating_add(1);
+        let backstop = now + self.intervals.backstop;
+        let hold = |state: &mut Self| {
+            if seen <= through {
+                state.hold = Some(Hold {
+                    through,
+                    until: backstop,
+                });
+            }
+        };
         match done.outcome {
             LaunchOutcome::NotReady | LaunchOutcome::SlotBusy | LaunchOutcome::HeadMoved => {
                 restore(self);
-                self.hold = Some(Hold {
-                    version: seen,
-                    until: now + self.intervals.backstop,
-                });
+                hold(self);
             }
             LaunchOutcome::NeedsApproval => {
                 restore(self);
@@ -456,15 +471,7 @@ impl OwnerState {
                 if let Some(run_id) = run_id {
                     self.last_run_id.insert(producer.clone(), run_id);
                 }
-                // The outcome's own wake is one signal since the launch. Any other, such as the
-                // publication that held the index, already releases the hold: its credit is
-                // never absorbed by a hold taken when the outcome is consumed.
-                if seen <= done.launched_at.saturating_add(1) {
-                    self.hold = Some(Hold {
-                        version: seen,
-                        until: now + self.intervals.backstop,
-                    });
-                }
+                hold(self);
             }
             LaunchOutcome::Finished { run_id, outcome } => {
                 if let Some(run_id) = run_id {
@@ -583,7 +590,7 @@ pub(crate) fn decide(
 
     let hold_active = s
         .hold
-        .is_some_and(|hold| hold.version == live.seen && now < hold.until);
+        .is_some_and(|hold| live.seen <= hold.through && now < hold.until);
     let mut next_deadline: Option<Instant> = None;
     let mut soonest = |at: Instant| {
         if at > now {
@@ -1157,7 +1164,7 @@ pub(crate) fn run_loop(deps: Deps) {
                 if recheck.action != Action::Start(producer.clone()) {
                     continue;
                 }
-                if !spawn_run(&deps, &mut s, &cell, &producer, now_ms) {
+                if !spawn_run(&deps, &mut s, &cell, &producer, seen, now_ms) {
                     continue;
                 }
                 decision = decide_gated(&mut s, probes, &live, now, now_ms);
@@ -1188,13 +1195,15 @@ pub(crate) fn run_loop(deps: Deps) {
     }
 }
 
-/// Start the run thread for `producer`. `false`: it could not start, and the pass re-runs at
-/// once instead of waiting on a deadline computed before the spawn.
+/// Start the run thread for `producer`, decided by the pass that read state version `seen`.
+/// `false`: it could not start, and the pass re-runs at once instead of waiting on a deadline
+/// computed before the spawn.
 fn spawn_run(
     deps: &Deps,
     s: &mut OwnerState,
     cell: &Arc<RunCell>,
     producer: &str,
+    seen: u64,
     now_ms: u64,
 ) -> bool {
     let (Some(head), Some(ApprovalRead::Valid(approval))) =
@@ -1218,18 +1227,19 @@ fn spawn_run(
         supersede_requested: false,
         prev_start,
         approval: (approval.template_sha256.clone(), approval.approved_at),
+        decided_at: seen,
     });
     let job: Box<dyn FnOnce() + Send> = {
         let runtime = deps.runtime.clone();
         let cell = cell.clone();
         let producer = producer.to_owned();
         Box::new(move || {
-            let launched_at = runtime.state_version();
             let outcome = runtime.launch(request);
+            // Not atomic with the wake, and need not be: the owner may take the outcome before
+            // this wake lands, and a hold counts the wake either way (`OwnerState::apply`).
             cell.put(Tagged {
                 producer,
                 token,
-                launched_at,
                 outcome,
             });
             runtime.wake();
