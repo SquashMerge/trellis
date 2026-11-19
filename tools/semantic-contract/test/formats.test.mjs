@@ -938,3 +938,15 @@ test("FORMAT.SCHEMA_MATRIX: populated alternatives and registered precise negati
     rows.length,
   );
 });
+
+// Owner ruling 2026-11-19 (#1234): a Rust enum variant is the closed Kind `variant`; a trait
+// associated type stays `alias`. Every other spelling still fails closed.
+test("FORMAT.KIND: variant is a closed declaration Kind", () => {
+  validate("Kind", "variant");
+  validate("Kind", "alias");
+  for (const kind of ["enumMember", "Variant", "associatedType"])
+    assert.throws(
+      () => validate("Kind", kind),
+      (e) => e.assertion === "FORMAT.SHAPE",
+    );
+});

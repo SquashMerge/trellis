@@ -264,7 +264,10 @@ pub(crate) fn native_kind(n: Node<'_>) -> Option<&'static str> {
         "function_item" | "function_signature_item" => "function",
         "closure_expression" => "anonymousFunction",
         "field_declaration" => "field",
-        "type_item" => "alias",
+        // An enum variant, and a trait's associated type like an impl's `type` (owner ruling
+        // 2026-11-19, #1234).
+        "enum_variant" => "variant",
+        "type_item" | "associated_type" => "alias",
         "use_as_clause"
             if n.child_by_field_name("alias")
                 .is_some_and(|n| n.kind() == "identifier") =>

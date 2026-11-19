@@ -1,4 +1,4 @@
-# TypeScript conformance corpus — native-v19 DRAFT
+# TypeScript conformance corpus — native-v20 DRAFT
 
 Seven TypeScript sources for #683 cover interfaces, type aliases, enums, generics,
 abstract classes, parameter properties, decorators, overloads, namespaces and
@@ -28,7 +28,7 @@ used to meet a floor.
   candidates and no calls or controls, and its coverage intent requests only
   `definition`, like the call-free JavaScript `public.js` barrel.
 
-The raw capture comes from Trellis's `trellis.native.syntax@native-v19` extractor
+The raw capture comes from Trellis's `trellis.native.syntax@native-v20` extractor
 through the #95 `native-capture` command, with UTF-8 byte coordinates. Native
 identifier-site candidates carry no inferred semantic role or target. `.tsx`
 uses the tree-sitter-typescript `tsx` grammar; other paths use `typescript`.
@@ -36,16 +36,20 @@ Native measurement does no type checking, so `tsconfig.json` (`allowJs:false`,
 `include` of `src/**/*.ts` and `src/**/*.tsx`) and the dependency-free
 `package.json` describe the future semantic project, not native inputs.
 `captures/native.json` has SHA-256
-`e8bec585528b38b684bbd2cc9e3e374b59bd15dfbbb3e2d461b1725675dd0000`. The compiled
+`7ccc656e850d98be94a14a608ddf8bf8fb46fa36ad4427ee9591eeb5ed027cfb`. The compiled
 native extractor hash is
-`04843b02754ab7ef924b6274f88f2d5979ccd79ded4132847ec4aa3b2086268b`, pinned as
-`trellis-native-v19-typescript-test-support` in
-`docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json`. native-v19 (#1120) stores Rust
+`1d787cb9fdf4f32564e8fd8a76367b20543f600182a3ac117b5a4b1fcb6b4a1e`, pinned as
+`trellis-native-v20-typescript-test-support` in
+`docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json`. native-v20 (#1234) measures Rust
+enum variants as `variant` declarations and trait associated types as `alias` declarations; no
+TypeScript construct changed. Two recaptures are byte-identical and differ from the native-v19
+capture only in occurrence IDs, which include the producer version. The native anchors below are
+the native-v20 IDs.
+
+native-v19 (#1120), pinned as `trellis-native-v19-typescript-test-support`, stores Rust
 `while`, Java's enhanced `for` and `try (resource)`, and Python's `except` as control regions
 (Decision 0003 item 3: region membership is a measured field); no TypeScript region kind
-changed. Two recaptures are byte-identical and differ from the native-v18 capture only in
-occurrence IDs, which include the producer version. The native anchors below are the native-v19
-IDs.
+changed, so that recapture also changed only occurrence IDs.
 
 native-v18 was the deliberate tree-sitter runtime upgrade from 0.27.1 to 0.27.2, pinned as
 `trellis-native-v18-typescript-test-support` (Decision 0003: the runtime's `has_error`, byte

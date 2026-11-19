@@ -626,6 +626,32 @@ test("outline tree keeps types and callables, nests members and lends Rust impl 
   assert.equal(all(open).find(node => node.attrs["data-symbol-id"] === "works").attrs["aria-pressed"], "true");
 });
 
+// #1234 (owner ruling 2026-11-19): Rust enum variants are members under their enum, the way
+// fields show under a struct; a struct variant's fields are members of that variant.
+test("outline tree shows enum variants as members of their enum and variant fields under the variant", () => {
+  const h = harness();
+  const item = (id, nativeKind, parent, startLine, name = id) => ({symbol:{id, name, kind:"class", path:"src/a.rs", parent, range:{startByte:startLine * 10, endByte:startLine * 10 + 5, startLine, startColumn:1, endLine:startLine, endColumn:2}}, nativeKind, header:{}});
+  h.context.items = [
+    item("file", "module", null, 1, "src/a.rs"),
+    item("Backend", "type", "file", 2), item("Cpu", "variant", "Backend", 2), item("Metal", "variant", "Backend", 3),
+    item("Gpu", "variant", "Backend", 4), item("Gpu.n", "field", "Gpu", 4, "n"),
+    item("Store", "type", "file", 6), item("Operation", "alias", "Store", 7),
+    item("Plain", "type", "file", 9), item("Plain.w", "field", "Plain", 9, "w"),
+  ];
+  h.context.sourceText = Array.from({length:10}, () => "").join("\n");
+  const tree = h.run("window.TrellisFiles.outlineTree(items)");
+  const shape = entries => entries.map(entry => [entry.label || entry.item.symbol.name, shape(entry.children)]);
+  assert.deepEqual(JSON.parse(JSON.stringify(shape(tree))), [
+    ["Backend", [["Cpu", []], ["Metal", []], ["Gpu", [["n", []]]]]],
+    ["Store", []],
+    ["Plain", [["w", []]]],
+  ], "variants are enum members; a variant's fields nest under it; aliases stay hidden");
+  const list = h.run("document.createElement('ul')"); h.context.list = list;
+  h.run("window.TrellisFiles.outline(list, items, null, () => {}, () => true, {expanded:new Set(['Backend']), toggle:() => {}})");
+  const labels = all(list).filter(node => node.className === "files-symbol-pick").map(node => node.attrs["aria-label"]);
+  assert.deepEqual(labels, ["Backend · type · L2", "Cpu · variant · L2", "Metal · variant · L3", "Gpu · variant · L4", "Store · type · L6", "Plain · type · L9"]);
+});
+
 test("outline tree lists a binding only on the daemon's initializer evidence and attaches an impl to the type beside it", () => {
   const h = harness();
   const item = (id, nativeKind, parent, startLine, name = id) => ({symbol:{id, name, kind:"function", path:"src/a.rs", parent, range:{startByte:startLine * 10, endByte:startLine * 10 + 5, startLine, startColumn:1, endLine:startLine, endColumn:2}}, nativeKind, header:{}});

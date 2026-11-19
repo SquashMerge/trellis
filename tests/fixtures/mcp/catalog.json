@@ -723,7 +723,7 @@
                   "const": 1
                 },
                 "toolVersion": {
-                  "const": 33
+                  "const": 34
                 },
                 "watcherDegraded": {
                   "type": "boolean"
@@ -1389,7 +1389,8 @@
             "parameter",
             "typeParameter",
             "alias",
-            "anonymousFunction"
+            "anonymousFunction",
+            "variant"
           ]
         },
         "Language": {
@@ -2464,7 +2465,8 @@
             "parameter",
             "typeParameter",
             "alias",
-            "anonymousFunction"
+            "anonymousFunction",
+            "variant"
           ]
         },
         "Language": {
@@ -3842,7 +3844,8 @@
             "parameter",
             "typeParameter",
             "alias",
-            "anonymousFunction"
+            "anonymousFunction",
+            "variant"
           ]
         },
         "Language": {
@@ -5866,7 +5869,8 @@
             "parameter",
             "typeParameter",
             "alias",
-            "anonymousFunction"
+            "anonymousFunction",
+            "variant"
           ]
         },
         "LanguageStatus": {
@@ -7793,7 +7797,8 @@
             "parameter",
             "typeParameter",
             "alias",
-            "anonymousFunction"
+            "anonymousFunction",
+            "variant"
           ]
         },
         "LookupProvenance": {
@@ -9681,7 +9686,8 @@
             "parameter",
             "typeParameter",
             "alias",
-            "anonymousFunction"
+            "anonymousFunction",
+            "variant"
           ]
         },
         "Key": {
