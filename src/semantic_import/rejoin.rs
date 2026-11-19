@@ -484,7 +484,9 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
                 revision_id,
             } => {
                 let original = r1.declarations_by_id(syntax_id).iter().any(|d| {
-                    d.syntax_id == *syntax_id && d.document == *document && d.name_range.is_some()
+                    d.syntax_id == *syntax_id
+                        && d.document == *document
+                        && semantic::retargetable(d)
                 });
                 if !original {
                     return false;
@@ -496,20 +498,19 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
                     .filter(|d| {
                         d.syntax_id == *syntax_id
                             && d.document == *document
-                            && d.name_range.is_some()
+                            && semantic::retargetable(d)
                     })
                     .collect();
                 if candidates.len() != 1 || r2.source_bytes(document).is_none() {
                     return false;
                 }
                 let declaration = candidates[0];
-                let Some(name) = declaration.name_range.as_ref() else {
-                    return false;
-                };
-                if r2
-                    .source(document)
-                    .and_then(|s| s.get(name.start..name.end))
-                    != declaration.name.as_deref()
+                // A root module has no name to recheck (#1235).
+                if let Some(name) = declaration.name_range.as_ref()
+                    && r2
+                        .source(document)
+                        .and_then(|s| s.get(name.start..name.end))
+                        != declaration.name.as_deref()
                 {
                     return false;
                 }

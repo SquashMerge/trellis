@@ -1769,7 +1769,8 @@ impl StagedJoin<'_> {
     }
 
     /// Whether `syntax_id` is a captured exact definition of `document`: the anchor of an exact
-    /// declaration-name join of the captured revision, so a named captured declaration.
+    /// declaration-name join of the captured revision, so a named captured declaration or a
+    /// root module (#1235).
     fn captured_definition(&self, document: &native::DocumentKey, syntax_id: &str) -> Result<bool> {
         self.ctx.charge(1)?;
         exists(

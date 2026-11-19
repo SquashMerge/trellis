@@ -161,6 +161,37 @@ fn resolution(kind: Resolution, declared: &Option<Target>, candidates: &[Target]
     );
     Ok(())
 }
+
+/// Whether `declaration` is a root `module` declaration of its document.
+pub(crate) fn is_root_module(declaration: &native::Declaration) -> bool {
+    declaration.kind == "module" && declaration.ancestors.is_empty()
+}
+
+/// Whether an internal target at `declaration` may carry to a later revision by its stable ID:
+/// a named declaration, whose name bytes the caller rechecks, or a root module (#1235), which
+/// has no name and whose ID names its document.
+pub(crate) fn retargetable(declaration: &native::Declaration) -> bool {
+    declaration.name_range.is_some() || is_root_module(declaration)
+}
+
+/// The declaration-name anchor of a whole-document Rust module definition (owner ruling
+/// 2026-11-19, #1235, on the #443 module-marker precedent). rust-analyzer's definition
+/// occurrence of a module spans its whole file, which no native name range matches, so the
+/// whole nonempty Rust document, `0..byte_length`, names the document's root `module`
+/// declaration instead. That anchor has the candidate only when the document has exactly one
+/// root module declaration (`root_modules`); any other span, count or language has none. The
+/// import's anchor table and the publication check apply this one rule.
+pub(crate) fn whole_document_module_anchor(
+    language: &str,
+    byte_length: usize,
+    root_modules: usize,
+) -> Option<native::Range> {
+    (language == "rust" && byte_length > 0 && root_modules == 1).then_some(native::Range {
+        start: 0,
+        end: byte_length,
+    })
+}
+
 fn declaration_name_owner<'a>(
     declaration: &'a native::Declaration,
     native: &'a native::Artifact,
@@ -218,6 +249,9 @@ struct DocumentIndex {
     document: Option<usize>,
     /// Declarations by name range (those with one).
     names: Vec<Ranged>,
+    /// How many root `module` declarations the document has, and the first one's position
+    /// (#1235).
+    root_modules: (usize, Option<usize>),
     /// Calls by callee range (those with one).
     callees: Vec<Ranged>,
     /// Spelled calls without a callee range, by spelling.
@@ -344,6 +378,11 @@ impl NativeIndex {
                 entry(&mut documents, &d.document)
                     .names
                     .push(ranged(range, position));
+            }
+            if is_root_module(d) {
+                let (count, first) = &mut entry(&mut documents, &d.document).root_modules;
+                *count += 1;
+                first.get_or_insert(position);
             }
         }
         for (position, c) in native.calls.iter().enumerate() {
@@ -574,6 +613,13 @@ fn validate_join(
                 {
                     candidates.insert(d.syntax_id.clone());
                 }
+            }
+            let (roots, first) = measured.root_modules;
+            if whole_document_module_anchor(&a.document.language, source.len(), roots).as_ref()
+                == Some(&a.range)
+                && let Some(position) = first
+            {
+                candidates.insert(native.declarations[position].syntax_id.clone());
             }
         }
         JoinKind::Callee => {

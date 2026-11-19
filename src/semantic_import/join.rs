@@ -132,6 +132,9 @@ fn measure_occurrence<S: JoinStore>(
                 // rust-analyzer 1.98.1 states `TraitMethod` for a bodiless trait method and
                 // `StaticMethod` for an associated function without `self` (#557).
                 "method" => matches!(kind, 26 | 70 | 80),
+                // A root module joins only a whole-document module definition (#1235), for
+                // which rust-analyzer 1.98.1 states `Module` (29).
+                "module" => kind == 29,
                 _ => true,
             });
         if compatible {
