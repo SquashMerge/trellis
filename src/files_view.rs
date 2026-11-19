@@ -149,7 +149,7 @@ fn outline_syntax_until(
         // an impl left unnamed.
         let mut expansions = crate::native_rust_macros::Expansions::new(&file.text)
             .with_parse_ticks(PARSE_TICKS - ticks)
-            .with_deadline(backstop);
+            .with_hang_check(&hung);
         for &(start, end) in impl_blocks {
             if found.impl_targets.contains_key(&(start, end)) {
                 continue;
@@ -834,6 +834,29 @@ mod outline_bounds_tests {
             .unwrap();
         assert_eq!(syntax.warning, None);
         assert_eq!(facts(&syntax).1, ["S"]);
+    }
+
+    /// Macro re-parses run on the read's own clock (#1226 review). On a clock frozen 20 s in
+    /// the real past, an impl inside two nested macros keeps its target, and four levels still
+    /// get the parse-work bound's warning. When the re-parse read the real clock, its first
+    /// tick was already past this read's backstop, so it stopped and the impl read as missing.
+    #[test]
+    fn macro_reparses_run_on_the_reads_clock() {
+        let frozen = Instant::now()
+            .checked_sub(SYNTAX_HANG_BACKSTOP * 2)
+            .expect("an instant 20 s ago");
+        let (fits, block) = nested_macros(2);
+        let syntax = outline_syntax_until(&file("rust", fits), &[block], &|| frozen)
+            .unwrap()
+            .unwrap();
+        assert_eq!(syntax.warning, None);
+        assert_eq!(facts(&syntax).1, ["S"]);
+        let (beyond, block) = nested_macros(4);
+        let syntax = outline_syntax_until(&file("rust", beyond), &[block], &|| frozen)
+            .unwrap()
+            .unwrap();
+        assert_eq!(syntax.warning, Some(OUTLINE_OVER_BOUNDS));
+        assert_eq!(facts(&syntax), (vec![], vec![]));
     }
 
     #[test]

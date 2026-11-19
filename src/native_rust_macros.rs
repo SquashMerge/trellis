@@ -9,7 +9,6 @@
 //! already a range of the original document. Anything that does not parse cleanly stays opaque.
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
-use std::time::Instant;
 
 use tree_sitter::{Node, ParseOptions, ParseState, Parser, Point, Range as TsRange, Tree};
 
@@ -254,7 +253,8 @@ pub(crate) struct Expansions<'s> {
     parser: Option<Parser>,
     line_starts: Vec<usize>,
     bytes: usize,
-    deadline: Option<Instant>,
+    /// The caller's clock check: true stops the re-parse in progress.
+    hung: Option<&'s dyn Fn() -> bool>,
     /// Progress ticks the re-parses may still spend, when bounded.
     ticks: Option<usize>,
     /// A re-parse needed more ticks than were left.
@@ -270,16 +270,18 @@ impl<'s> Expansions<'s> {
             parser: None,
             line_starts: Vec::new(),
             bytes: 0,
-            deadline: None,
+            hung: None,
             ticks: None,
             ticks_spent: false,
             parsed: BTreeMap::new(),
         }
     }
 
-    /// Stop parsing at `deadline`; a macro it interrupts does not expand.
-    pub(crate) fn with_deadline(mut self, deadline: Instant) -> Self {
-        self.deadline = Some(deadline);
+    /// Stop parsing once `hung` says so, asked at each progress tick after the tick bound; a
+    /// macro it interrupts does not expand. The caller's own clock decides, so a read on an
+    /// injected clock re-parses on that clock too.
+    pub(crate) fn with_hang_check(mut self, hung: &'s dyn Fn() -> bool) -> Self {
+        self.hung = Some(hung);
         self
     }
 
@@ -408,7 +410,7 @@ impl<'s> Expansions<'s> {
             Point::new(row, byte - lines[row])
         };
         let text = self.text.as_bytes();
-        let (deadline, ticks, spent) = (self.deadline, &mut self.ticks, &mut self.ticks_spent);
+        let (hung, ticks, spent) = (self.hung, &mut self.ticks, &mut self.ticks_spent);
         let mut stop = || {
             if let Some(left) = ticks {
                 if *left == 0 {
@@ -417,7 +419,7 @@ impl<'s> Expansions<'s> {
                 }
                 *left -= 1;
             }
-            deadline.is_some_and(|deadline| Instant::now() >= deadline)
+            hung.is_some_and(|hung| hung())
         };
         let tree = parse(parser, text, form, start, end, &position, &mut stop)?;
         let expansion = Expansion::new(tree, form, start, end);
