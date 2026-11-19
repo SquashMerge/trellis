@@ -1003,12 +1003,6 @@ impl ProducerOwner {
         let (roots, identity) = store.state_topology();
         let state = StateDir::open(roots, identity)?;
         sweep_state(store, true);
-        let dir = fs::canonicalize(state.create_run_dir(&run_id)?)?;
-        let mut cleanup = RunCleanup {
-            state: &state,
-            run: &active,
-            armed: true,
-        };
         let record = RunRecord {
             version: 1,
             run_id: run_id.clone(),
@@ -1029,7 +1023,15 @@ impl ProducerOwner {
             failure: None,
             origin: active.origin,
         };
-        state.write_run_record(&record)?;
+        // The directory appears with its record, so a concurrent sweep (this daemon's
+        // activation) never takes it for a crash leftover (#1239).
+        let dir = state.create_run(&record)?;
+        let mut cleanup = RunCleanup {
+            state: &state,
+            run: &active,
+            armed: true,
+        };
+        let dir = fs::canonicalize(dir)?;
         if let Some(token) = &request.supersede {
             token.mark_started();
         }
