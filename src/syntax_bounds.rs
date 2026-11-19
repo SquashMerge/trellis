@@ -15,6 +15,14 @@ use tree_sitter::Node;
 pub(crate) const DEPTH: usize = 128;
 /// Syntax nodes one walk visits.
 pub(crate) const VISITS: usize = 1_000_000;
+/// Parse work, in tree-sitter progress ticks, that the MCP lookup-key derivation and the Files
+/// outline may spend on one document: its parse and its macro re-parses share it (owner ruling
+/// 2026-11-19, #1220). The pinned tree-sitter calls the progress callback once per 100 parse
+/// operations, so the count is a property of the input and the grammar, never of the clock.
+/// A parse that reaches it stops there, so a pathological document is refused before its
+/// parse ends, however loaded the machine. The largest real documents measured spend at most
+/// 52,330 ticks, and a Rust array just under the visit bound 58,842.
+pub(crate) const PARSE_TICKS: usize = 80_000;
 
 /// What one document's syntax lost.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

@@ -2,8 +2,9 @@
 use crate::{
     model::{IndexPin, SourceFile, SourceRange, Symbol},
     native_records::Header,
+    syntax_bounds::PARSE_TICKS,
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
@@ -14,8 +15,9 @@ pub const FILE_TIME_LIMIT: Duration = Duration::from_millis(250);
 pub const TOTAL_TIME_LIMIT: Duration = Duration::from_secs(1);
 /// The wall clock an outline syntax read or an MCP lookup-key derivation may run before it
 /// stops, typed `deadline_exceeded` (#1119). It is a hang backstop, not a budget: the input
-/// size, the syntax bounds and the measured macro byte budget decide every answer, and twice
-/// the MCP call deadline leaves no answer the call could still give to it.
+/// size, the parse-work bound, the syntax bounds and the measured macro byte budget decide
+/// every answer, and twice the MCP call deadline leaves no answer the call could still give to
+/// it.
 pub const SYNTAX_HANG_BACKSTOP: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
@@ -66,19 +68,20 @@ pub(crate) struct OutlineSyntax {
 
 /// A cached file over [`FILE_INPUT_LIMIT`].
 pub(crate) const OUTLINE_OVER_INPUT: &str = "Cached file exceeds 2 MiB outline syntax input; bindings are not marked callable and impl blocks are unnamed.";
-/// A cached file's syntax over the syntax bounds.
-pub(crate) const OUTLINE_OVER_BOUNDS: &str = "Cached file syntax exceeds the outline walk bounds (128 levels, 1,000,000 nodes); bindings are not marked callable and impl blocks are unnamed.";
+/// A cached file's syntax over the parse-work bound or the syntax bounds.
+pub(crate) const OUTLINE_OVER_BOUNDS: &str = "Cached file syntax exceeds the outline walk bounds (80,000 parse-work ticks, 128 levels, 1,000,000 nodes); bindings are not marked callable and impl blocks are unnamed.";
 /// An asked impl block with no syntax at its range.
 pub(crate) const OUTLINE_IMPL_MISSING: &str =
     "Cached file has no impl syntax at a measured impl block's range; that block is unnamed.";
 const OUTLINE_HUNG: &str = "deadline_exceeded: Files outline syntax hang backstop reached";
 
 /// `Ok(None)` when the language has no such facts. A file beyond the outline syntax bounds
-/// (its size, depth and visit count) has none, with a `warning`, on every run (#1119): no
-/// wall clock decides the answer. `impl_blocks` are the native `impl` declarations asked about.
-/// One measured inside a macro has syntax only in that macro's expansion (#551), so it alone
-/// is looked up there, within measurement's macro byte budget. [`SYNTAX_HANG_BACKSTOP`] is the
-/// only clock, and reaching it is an error, never a partial outline.
+/// (its size, parse work, depth and visit count) has none, with a `warning`, on every run
+/// (#1119, #1220): no wall clock decides the answer. `impl_blocks` are the native `impl`
+/// declarations asked about. One measured inside a macro has syntax only in that macro's
+/// expansion (#551), so it alone is looked up there, within measurement's macro byte budget
+/// and what is left of the parse-work bound. [`SYNTAX_HANG_BACKSTOP`] is the only clock, and
+/// reaching it is an error, never a partial outline.
 pub(crate) fn outline_syntax(
     file: &SourceFile,
     impl_blocks: &[(usize, usize)],
@@ -112,21 +115,28 @@ fn outline_syntax_until(
     let hung = || now() >= backstop;
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&language)?;
+    // The parse-work bound comes first: once it is reached, the clock cannot change the answer.
+    let mut ticks = 0;
     let mut progress = |_: &tree_sitter::ParseState| {
-        if hung() {
+        ticks += 1;
+        if ticks > PARSE_TICKS || hung() {
             std::ops::ControlFlow::Break(())
         } else {
             std::ops::ControlFlow::Continue(())
         }
     };
-    // Only the backstop stops a parse of a file within the input bound.
-    let tree = parser
-        .parse_with_options(
-            &mut |offset, _| &file.text.as_bytes()[offset..],
-            None,
-            Some(tree_sitter::ParseOptions::new().progress_callback(&mut progress)),
-        )
-        .context(OUTLINE_HUNG)?;
+    let tree = parser.parse_with_options(
+        &mut |offset, _| &file.text.as_bytes()[offset..],
+        None,
+        Some(tree_sitter::ParseOptions::new().progress_callback(&mut progress)),
+    );
+    let Some(tree) = tree else {
+        if ticks > PARSE_TICKS {
+            return beyond(OUTLINE_OVER_BOUNDS);
+        }
+        // Only the backstop stops any other parse of a file within the input bound.
+        anyhow::bail!(OUTLINE_HUNG);
+    };
     let mut found = OutlineSyntax::default();
     match collect_outline(tree.root_node(), file.text.as_bytes(), &mut found, &hung) {
         Walk::Done => {}
@@ -134,22 +144,22 @@ fn outline_syntax_until(
         Walk::Hung => anyhow::bail!(OUTLINE_HUNG),
     }
     if file.language == "rust" {
-        // Measurement's macro byte budget bounds the expansions. The backstop also stops them,
-        // and is then this read's error below, never an impl left unnamed.
-        let mut expansions =
-            crate::native_rust_macros::Expansions::new(&file.text).with_deadline(backstop);
+        // Measurement's macro byte budget and the rest of the parse-work bound bound the
+        // expansions. The backstop also stops them, and is then this read's error below, never
+        // an impl left unnamed.
+        let mut expansions = crate::native_rust_macros::Expansions::new(&file.text)
+            .with_parse_ticks(PARSE_TICKS - ticks)
+            .with_deadline(backstop);
         for &(start, end) in impl_blocks {
             if found.impl_targets.contains_key(&(start, end)) {
                 continue;
             }
-            let block = expansions
-                .root_for(tree.root_node(), start, end)
-                .descendant_for_byte_range(start, end)
-                .filter(|node| {
-                    node.kind() == "impl_item"
-                        && node.start_byte() == start
-                        && node.end_byte() == end
-                });
+            let Some(root) = expansions.root_within_ticks(tree.root_node(), start, end) else {
+                return beyond(OUTLINE_OVER_BOUNDS);
+            };
+            let block = root.descendant_for_byte_range(start, end).filter(|node| {
+                node.kind() == "impl_item" && node.start_byte() == start && node.end_byte() == end
+            });
             ensure!(!hung(), OUTLINE_HUNG);
             match block {
                 Some(node) => {
@@ -763,6 +773,67 @@ mod outline_bounds_tests {
                 assert_eq!(facts(&syntax), (vec![], vec![]));
             }
         }
+    }
+
+    /// Nested `assert!` levels around a 100,000-element array, an impl block innermost, and
+    /// that block's range.
+    fn nested_macros(levels: usize) -> (String, (usize, usize)) {
+        const BLOCK: &str = "impl S { fn f() {} }";
+        let mut inner = format!("{BLOCK} [{}]; true", "0,".repeat(100_000));
+        for _ in 0..levels {
+            inner = format!("assert!({{ {inner} }}); true");
+        }
+        let text = format!("struct S;\nfn m() -> bool {{ {inner} }}\n");
+        let start = text.find(BLOCK).unwrap();
+        (text, (start, start + BLOCK.len()))
+    }
+
+    /// Owner ruling 2026-11-19 (#1220): the parse-work bound stops a parse before it ends, and
+    /// the file has no facts and the bounds warning, on every run and on a clock that never
+    /// moves. A 2 MiB array needs more parse work than the bound allows; a large macro token
+    /// tree within the visit bound does too; and so do the re-parses of four nested macros on
+    /// the way to an asked impl block, which share the bound with the file's own parse.
+    #[test]
+    fn a_file_beyond_the_parse_work_bound_has_no_facts_and_says_so() {
+        let fill = (FILE_INPUT_LIMIT - JAVASCRIPT.len() - 8) / 2;
+        let wide = format!("{JAVASCRIPT}x = [{}];\n", "0,".repeat(fill));
+        let tokens = format!("{RUST}m! {{ {} }}\n", "0,".repeat(400_000));
+        let (nested, block) = nested_macros(4);
+        let rust_block = [(0, RUST.find('\n').unwrap())];
+        let stopped = Instant::now();
+        for (language, text, blocks) in [
+            ("javascript", wide, &[][..]),
+            ("rust", tokens, &rust_block[..]),
+            ("rust", nested, &[block][..]),
+        ] {
+            assert!(text.len() <= FILE_INPUT_LIMIT);
+            let file = file(language, text);
+            for _ in 0..2 {
+                let syntax = outline_syntax_until(&file, blocks, &|| stopped)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(syntax.warning, Some(OUTLINE_OVER_BOUNDS));
+                assert_eq!(facts(&syntax), (vec![], vec![]));
+            }
+        }
+    }
+
+    /// Ordinary files near the other bounds keep their facts (#1220): a JavaScript array just
+    /// under the visit bound, and an impl block inside two nested macros.
+    #[test]
+    fn files_near_the_other_bounds_keep_their_facts() {
+        let near = format!("{JAVASCRIPT}x = [{}];\n", "0,".repeat(VISITS / 2 - 100));
+        let syntax = outline_syntax(&file("javascript", near), &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(syntax.warning, None);
+        assert_eq!(syntax.callable_initializers.len(), 2);
+        let (nested, block) = nested_macros(2);
+        let syntax = outline_syntax(&file("rust", nested), &[block])
+            .unwrap()
+            .unwrap();
+        assert_eq!(syntax.warning, None);
+        assert_eq!(facts(&syntax).1, ["S"]);
     }
 
     #[test]
