@@ -4011,6 +4011,103 @@ fn typescript_new_of_a_class_without_a_constructor_is_constructor() {
     );
 }
 
+/// Joins one Rust document whose `S` is defined by its first occurrence and used by its second,
+/// with `kind` stated for `S`, and checks the staged join equals the memory join. Returns the
+/// use-site reference's resolution and its internal targets, with the syntax ID of the native
+/// declaration the definition occurrence joins exactly.
+fn rust_type_kind_join(source: &str, kind: i32) -> (Resolution, Vec<String>, String) {
+    use trellis::semantic_evidence::Target;
+    let world = world(|root| write_files(root, &[("src/lib.rs", source)]));
+    let symbol = "rust-analyzer cargo c 0.1.0 S#";
+    let doc = occ_at(
+        DocSpec::new("src/lib.rs").symbol(symbol, kind, &[]),
+        source,
+        ("S", 0),
+        None,
+        symbol,
+        1,
+    );
+    let doc = occ_at(doc, source, ("S", 1), None, symbol, 0);
+    let mut fixture = world.fixture().reference("rust-analyzer");
+    fixture.artifact("rust", vec![doc]);
+    let descriptor = world.write(&fixture);
+    let (mut admitted, _, _) = world
+        .join_with(
+            &descriptor,
+            &BatchLimits::PRODUCTION,
+            DestinationMutations::default(),
+        )
+        .unwrap();
+    let staged = testing::staged_publication(&mut admitted).unwrap();
+    drop(admitted);
+    let memory = world.memory_publication(&descriptor, DestinationMutations::default());
+    assert_same_publication(&staged, &memory, &format!("rust kind {kind}"));
+    let internal = |target: &Target| match target {
+        Target::Internal { syntax_id, .. } => Some(syntax_id.clone()),
+        _ => None,
+    };
+    // The definition occurrence joins the native declaration exactly whatever kind it states.
+    let definition = source.find('S').unwrap();
+    let declaration = staged
+        .declaration_bindings
+        .iter()
+        .find(|row| row.join.anchor.range.start == definition)
+        .and_then(|row| row.syntax_id.clone())
+        .unwrap_or_else(|| panic!("kind {kind}: the definition joins no declaration"));
+    let use_site = source.rfind('S').unwrap();
+    let reference = staged
+        .references
+        .iter()
+        .find(|row| row.range.start == use_site)
+        .unwrap_or_else(|| panic!("kind {kind}: no use-site reference"));
+    let targets = reference
+        .declared_target
+        .iter()
+        .chain(&reference.candidates)
+        .filter_map(internal)
+        .collect();
+    (reference.resolution, targets, declaration)
+}
+
+/// #1231 (supervisor amendment 2026-11-19 under the #473/#557 rulings): rust-analyzer 1.98.1
+/// states `Struct` (49), `Trait` (53) and `Union` (59) for what a native Rust `type` is, so the
+/// symbol binds its exact native declaration and a use-site reference to it resolves to that
+/// declaration, identically in the batch and memory joins.
+fn assert_rust_type_kind_binds(kind: i32, source: &str) {
+    let (resolution, targets, declaration) = rust_type_kind_join(source, kind);
+    assert_eq!(resolution, Resolution::Resolved, "kind {kind}");
+    assert!(!targets.is_empty(), "kind {kind}");
+    assert!(targets.iter().all(|id| *id == declaration), "kind {kind}");
+}
+
+#[test]
+fn rust_struct_kind_binds_a_native_type() {
+    assert_rust_type_kind_binds(49, "pub struct S;\npub fn f(_: S) {}\n");
+}
+
+#[test]
+fn rust_trait_kind_binds_a_native_type() {
+    assert_rust_type_kind_binds(53, "pub trait S {}\npub fn f(_: &dyn S) {}\n");
+}
+
+#[test]
+fn rust_union_kind_binds_a_native_type() {
+    assert_rust_type_kind_binds(59, "pub union S { a: u32 }\npub fn f(_: S) {}\n");
+}
+
+/// #473 still holds for a native Rust `type`: a stated kind that conflicts with it (`Function`,
+/// 17, or `Method`, 26) binds the symbol to no target, so the use-site reference stays
+/// unresolved and never names the declaration.
+#[test]
+fn rust_type_with_a_conflicting_stated_kind_binds_nothing() {
+    for kind in [17, 26] {
+        let (resolution, targets, declaration) =
+            rust_type_kind_join("pub struct S;\npub fn f(_: S) {}\n", kind);
+        assert_eq!(resolution, Resolution::Unresolved, "kind {kind}");
+        assert!(!targets.contains(&declaration), "kind {kind}");
+    }
+}
+
 /// Anchors `doc` with an occurrence of `len` bytes at `delta` into the first `anchor` in `source`.
 fn occ_in(
     doc: DocSpec,
