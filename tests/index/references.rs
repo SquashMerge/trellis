@@ -6940,6 +6940,88 @@ fn snapshot_javascript_manifest(files: &[(&str, &str)], manifest: &str) -> Snaps
     }
 }
 
+/// #1088: one identity declared by two manifests. A read selecting one importer carries only
+/// the manifest that labelled its edge, on the cached and the direct path alike.
+#[test]
+fn a_scoped_read_carries_only_the_selected_importers_manifest_evidence() {
+    const TOOLS: &str = r#"{"dependencies":{"widget":"2.0.0"}}"#;
+    let mut input = snapshot_javascript_manifest(
+        &[
+            ("app.js", "import 'widget';\n"),
+            ("tools/package.json", TOOLS),
+            ("tools/build.js", "import 'widget';\n"),
+        ],
+        r#"{"dependencies":{"widget":"1.0.0"}}"#,
+    );
+    let root = input.manifests[0].clone();
+    input.manifests.push(references::external::ManifestInput {
+        path: "tools/package.json".into(),
+        content_hash: Some(hex::encode(Sha256::digest(TOOLS.as_bytes()))),
+        bytes: Some(TOOLS.as_bytes().to_vec()),
+        ..root
+    });
+    let evidence = |data: &Value| -> Vec<String> {
+        let widget = data["externalPackages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["identity"]["package"] == "widget")
+            .unwrap();
+        widget["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                format!(
+                    "{}@{}",
+                    e["path"].as_str().unwrap(),
+                    e["versionConstraint"].as_str().unwrap()
+                )
+            })
+            .collect()
+    };
+    let sources = |data: &Value| -> Vec<String> {
+        data["production"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|edge| edge["target"]["kind"] == "externalPackage")
+            .map(|edge| edge["source"]["path"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let base = references::resolve_all(&input, &mut || Ok(())).unwrap();
+    for (paths, edges, expected) in [
+        (
+            vec!["app.js".to_owned()],
+            vec!["app.js"],
+            vec!["package.json@1.0.0"],
+        ),
+        (
+            vec!["tools/build.js".to_owned()],
+            vec!["tools/build.js"],
+            vec!["tools/package.json@2.0.0"],
+        ),
+        (
+            Vec::new(),
+            vec!["app.js", "tools/build.js"],
+            vec!["package.json@1.0.0", "tools/package.json@2.0.0"],
+        ),
+    ] {
+        let direct = references::project_where(&input, &paths, None, None, &[], 20, &mut || Ok(()))
+            .unwrap()
+            .data;
+        let cached = base
+            .select_where(&paths, None, None, &[], 20, &mut || Ok(()))
+            .unwrap()
+            .data;
+        for data in [&direct, &cached] {
+            assert_eq!(sources(data), edges, "{paths:?}");
+            assert_eq!(evidence(data), expected, "{paths:?}");
+        }
+        assert_eq!(direct, cached, "{paths:?}");
+    }
+}
+
 #[test]
 fn references_javascript_external_stars_veto_native_names_in_both_orders_but_explicit_settles() {
     for (specifier, package, stdlib) in [

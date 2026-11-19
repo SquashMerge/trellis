@@ -55,7 +55,9 @@ struct Hazards {
 }
 pub(super) struct Catalog {
     results: BTreeMap<(usize, usize, usize), SiteResolution>,
-    packages: BTreeMap<external::ExternalIdentity, external::ExternalPackage>,
+    /// Each importing document's descriptors: one document has one nearest manifest, so its
+    /// evidence is that manifest's alone (#1088). Selected sources union them.
+    packages: BTreeMap<(usize, external::ExternalIdentity), external::ExternalPackage>,
 }
 struct Resolver<'a> {
     docs: &'a [&'a DocumentInput],
@@ -160,19 +162,11 @@ impl Catalog {
                         resolution
                             .targets
                             .insert(Target::External(package.identity.clone()));
-                        // Importers under different manifests share one identity; its
-                        // descriptor carries each manifest's evidence (#1088).
-                        match self.packages.entry(package.identity.clone()) {
-                            std::collections::btree_map::Entry::Vacant(entry) => {
-                                entry.insert(package);
-                            }
-                            std::collections::btree_map::Entry::Occupied(mut entry) => {
-                                let evidence = &mut entry.get_mut().evidence;
-                                evidence.extend(package.evidence);
-                                evidence.sort();
-                                evidence.dedup();
-                            }
-                        }
+                        // Kept per importer: a read selecting some sources unions only
+                        // their manifests' evidence (#1088).
+                        self.packages
+                            .entry((document, package.identity.clone()))
+                            .or_insert(package);
                         resolution.residual =
                             source.star.then_some("javascript_external_members_unknown");
                     }
@@ -205,7 +199,7 @@ impl Catalog {
             if let Target::External(identity) = target
                 && !packages.contains_key(identity)
             {
-                let package = &self.packages[identity];
+                let package = &self.packages[&(document, identity.clone())];
                 charge_package(package, work, check)?;
                 packages.insert(identity.clone(), package.clone());
             }
