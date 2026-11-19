@@ -2,7 +2,7 @@
 use crate::{
     files_view::{FILE_INPUT_LIMIT, SYNTAX_HANG_BACKSTOP},
     native_evidence::{Declaration, Key},
-    syntax_bounds::{DEPTH, VISITS},
+    syntax_bounds::{DEPTH, PARSE_TICKS, VISITS},
 };
 use anyhow::Result;
 use std::{collections::BTreeMap, time::Instant};
@@ -14,10 +14,11 @@ use tree_sitter::Node;
 /// have no lookup key. An incomplete Rust parse refuses the document, never a partial map.
 ///
 /// This is the MCP read's derivation. Like [`keys_checked`], the Rust impl reparse is bounded
-/// by the source size and the syntax bounds alone, so the same document gives the same answer
-/// however busy the machine is (#1119). A document beyond them is refused, typed
-/// `input_bounds_exceeded` with the bound it hit, on every run, so a retry cannot help
-/// (owner ruling 2026-11-18, #1119 follow-up). The wall clock is only a hang backstop
+/// by the source size, the parse-work bound and the syntax bounds alone, so the same document
+/// gives the same answer however busy the machine is (#1119, #1220). A document beyond them is
+/// refused, typed `input_bounds_exceeded` with the bound it hit, on every run, so a retry cannot
+/// help (owner ruling 2026-11-18, #1119 follow-up). The parse-work bound stops a pathological
+/// parse before it ends (owner ruling 2026-11-19, #1220). The wall clock is only a hang backstop
 /// ([`SYNTAX_HANG_BACKSTOP`]), refused `deadline_exceeded`.
 pub(crate) fn keys_from_source(
     path: &str,
@@ -58,8 +59,8 @@ fn keys_until(
 
 /// The same keys for a view-time build (references, rules, interfaces), which must give the
 /// same answer for the same input however busy the machine is (#1115). No wall clock decides
-/// it: the Rust impl reparse is bounded by the source size and the syntax bounds alone, and
-/// `check` is the build's own abort and hang backstop.
+/// it: the Rust impl reparse is bounded by the source size, the parse-work bound and the syntax
+/// bounds alone, and `check` is the build's own abort and hang backstop.
 ///
 /// `Ok(None)` is a document beyond those bounds. It has no stable keys on any run, so a
 /// caller may keep that. An `Err` is `check`'s own error, and never an answer to keep.
@@ -106,13 +107,15 @@ const OVER_DEPTH: &str =
 const OVER_VISITS: &str =
     "input_bounds_exceeded: stable lookup Rust syntax is over the 1,000,000-node visit bound";
 const OVER_MACRO: &str = "input_bounds_exceeded: stable lookup found no Rust impl syntax at its measured range within the macro expansion byte budget";
+const OVER_PARSE: &str =
+    "input_bounds_exceeded: stable lookup Rust parse is over the 80,000-tick parse-work bound";
 const UNPARSED: &str =
     "input_bounds_exceeded: stable lookup Rust parse stopped short of a syntax tree";
 const MISSING_IMPL: &str = "input_bounds_exceeded: stable lookup Rust impl declaration is not in the measured declarations";
 const HUNG: &str = "deadline_exceeded: stable lookup Rust syntax hang backstop reached";
 
-/// What bounds one Rust impl reparse besides the source size and the syntax bounds: the
-/// caller's check, polled once in [`POLL`] steps, the first step included.
+/// What bounds one Rust impl reparse besides the input bounds: the caller's check, polled once
+/// in [`POLL`] steps, the first step included.
 struct Limit<'a> {
     check: &'a mut dyn FnMut() -> Result<()>,
     polls: usize,
@@ -239,13 +242,23 @@ fn impl_targets(
     parser
         .set_language(&tree_sitter_rust::LANGUAGE.into())
         .map_err(|error| Refused::Stopped(error.into()))?;
-    // The parser reports only that it stopped, so the reason waits here.
+    // The parser reports only that it stopped, so the reason waits here. The parse-work
+    // bound comes first: once it is reached, the clock can no longer change the answer.
     let mut stopped = None;
-    let mut progress = |_: &tree_sitter::ParseState| match limit.step() {
-        Ok(()) => std::ops::ControlFlow::Continue(()),
-        Err(refused) => {
-            stopped = Some(refused);
-            std::ops::ControlFlow::Break(())
+    let mut ticks = 0;
+    let mut progress = |_: &tree_sitter::ParseState| {
+        ticks += 1;
+        let step = if ticks > PARSE_TICKS {
+            Err(Refused::Bound(OVER_PARSE))
+        } else {
+            limit.step()
+        };
+        match step {
+            Ok(()) => std::ops::ControlFlow::Continue(()),
+            Err(refused) => {
+                stopped = Some(refused);
+                std::ops::ControlFlow::Break(())
+            }
         }
     };
     let tree = parser.parse_with_options(
@@ -260,15 +273,19 @@ fn impl_targets(
     };
     let mut visits = 0;
     bounded_tree(tree.root_node(), &mut limit, &mut visits)?;
-    // The measured byte budget bounds the expansions; no clock interrupts them.
-    let mut expansions = crate::native_rust_macros::Expansions::new(file.text);
+    // The measured byte budget and the rest of the parse-work bound bound the expansions; no
+    // clock interrupts them.
+    let mut expansions =
+        crate::native_rust_macros::Expansions::new(file.text).with_parse_ticks(PARSE_TICKS - ticks);
     let mut checked = std::collections::BTreeSet::new();
     checked.insert(tree.root_node().id());
     let mut targets = BTreeMap::new();
     for (path, declaration) in required {
         limit.step()?;
         let range = &declaration.range;
-        let root = expansions.root_for(tree.root_node(), range.start, range.end);
+        let root = expansions
+            .root_within_ticks(tree.root_node(), range.start, range.end)
+            .ok_or(Refused::Bound(OVER_PARSE))?;
         if checked.insert(root.id()) {
             bounded_tree(root, &mut limit, &mut visits)?;
         }
@@ -618,6 +635,22 @@ mod tests {
         assert!(HUNG.starts_with("deadline_exceeded:"));
     }
 
+    /// The MCP derivation on a clock that never moves: however loaded the machine, the hang
+    /// backstop cannot answer first, so only the input decides (#1220).
+    fn keys_on_a_stopped_clock(
+        file: &SourceFile,
+        declarations: &[Declaration],
+    ) -> Result<BTreeMap<String, String>> {
+        let stopped = Instant::now();
+        keys_until(
+            &file.path,
+            &file.language,
+            &file.text,
+            declarations,
+            &move || stopped,
+        )
+    }
+
     /// Each syntax bound is a property of the document: the MCP derivation refuses it typed,
     /// a checked one has no keys, on every run and on any clock.
     #[test]
@@ -629,17 +662,113 @@ mod tests {
             "(".repeat(DEPTH),
             ")".repeat(DEPTH)
         );
-        let wide = format!("\nconst WIDE: [u8; 0] = [{}];", "0,".repeat(VISITS));
+        // Each `0,` is two syntax nodes, so this is just over the visit bound (#1220).
+        let wide = format!("\nconst WIDE: [u8; 0] = [{}];", "0,".repeat(VISITS / 2 + 1));
         for (tail, bound) in [(deep, OVER_DEPTH), (wide, OVER_VISITS)] {
             let mut beyond = file.clone();
             beyond.text.push_str(&tail);
             assert!(beyond.text.len() <= FILE_INPUT_LIMIT);
             for _ in 0..2 {
-                let error = keys(&beyond, &native.declarations).unwrap_err();
+                let error = keys_on_a_stopped_clock(&beyond, &native.declarations).unwrap_err();
                 assert_eq!(error.to_string(), bound);
                 let found = checked(&beyond, &native.declarations, &mut || Ok(())).unwrap();
                 assert_eq!(found, None);
             }
+        }
+    }
+
+    /// Owner ruling 2026-11-19 (#1220): parse work is a bound of its own, counted in
+    /// tree-sitter progress ticks, never time. A 2 MiB array needs about 126,000 ticks to
+    /// parse, so it is refused by the parse-work bound, not by the visit bound its whole parse
+    /// would reach: its parse stops at 80,000. A large macro token tree is beyond it too though
+    /// it is within the visit bound. On every run, on a clock that never moves, and the same
+    /// for a checked derivation.
+    #[test]
+    fn a_document_beyond_the_parse_work_bound_is_refused_before_its_parse_ends() {
+        let fixture = Fixture::new();
+        let (file, native) = fixture.measure("store.rs", IMPL);
+        let head = "\nconst WIDE: [u8; 0] = [";
+        let fill = (FILE_INPUT_LIMIT - file.text.len() - head.len() - 2) / 2;
+        let wide = format!("{head}{}];", "0,".repeat(fill));
+        let tokens = format!("\nm! {{ {} }}", "0,".repeat(400_000));
+        for tail in [wide, tokens] {
+            let mut beyond = file.clone();
+            beyond.text.push_str(&tail);
+            assert!(beyond.text.len() <= FILE_INPUT_LIMIT);
+            for _ in 0..2 {
+                let error = keys_on_a_stopped_clock(&beyond, &native.declarations).unwrap_err();
+                assert_eq!(error.to_string(), OVER_PARSE);
+                let (code, retryable, message) = mcp_answer(&error);
+                assert_eq!((code.as_str(), retryable), ("input_bounds_exceeded", false));
+                assert!(message.contains("parse-work bound"), "{message}");
+                let found = checked(&beyond, &native.declarations, &mut || Ok(())).unwrap();
+                assert_eq!(found, None);
+            }
+        }
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tokens = format!("{IMPL}\nm! {{ {} }}", "0,".repeat(400_000));
+        let tree = parser.parse(&tokens, None).unwrap();
+        assert!(tree.root_node().descendant_count() < VISITS);
+    }
+
+    /// `levels` nested `assert!` levels around a 100,000-element array, an impl innermost.
+    /// Measurement expands them all, and the lookup re-parses each level on the way to the
+    /// impl.
+    fn nested_macros(levels: usize) -> String {
+        let mut inner = format!("impl S {{ fn f() {{}} }} [{}]; true", "0,".repeat(100_000));
+        for _ in 0..levels {
+            inner = format!("assert!({{ {inner} }}); true");
+        }
+        format!("struct S;\nfn m() -> bool {{ {inner} }}\n")
+    }
+
+    /// The document's parse and its macro re-parses share the parse-work bound (#1220): each
+    /// level re-parses the payload again (about 20,000 ticks), so four levels are refused,
+    /// deterministically, while two levels of the same payload fit and the impl has its key.
+    #[test]
+    fn macro_reparses_share_the_parse_work_bound() {
+        let fixture = Fixture::new();
+        let (file, native) = fixture.measure("store.rs", &nested_macros(2));
+        let found = keys_on_a_stopped_clock(&file, &native.declarations).unwrap();
+        assert!(
+            found.values().any(|key| key == "store.rs::m::S::f"),
+            "{found:?}"
+        );
+        let (file, native) = fixture.measure("store.rs", &nested_macros(4));
+        assert!(
+            native
+                .declarations
+                .iter()
+                .any(|d| d.name.as_deref() == Some("f")),
+            "measurement expands every level"
+        );
+        for _ in 0..2 {
+            let error = keys_on_a_stopped_clock(&file, &native.declarations).unwrap_err();
+            assert_eq!(error.to_string(), OVER_PARSE);
+            let found = checked(&file, &native.declarations, &mut || Ok(())).unwrap();
+            assert_eq!(found, None);
+        }
+    }
+
+    /// Ordinary documents near the other bounds stay within the parse-work bound (#1220): an
+    /// array just under the visit bound, the densest parse work measured within it (about
+    /// 59,000 ticks), and 2 MiB of impl blocks (about 19,000).
+    #[test]
+    fn documents_near_the_other_bounds_still_have_keys() {
+        let fixture = Fixture::new();
+        let (file, native) = fixture.measure("store.rs", IMPL);
+        let array = format!("\nconst W: [u8; 0] = [{}];", "0,".repeat(VISITS / 2 - 100));
+        let block = "\nimpl Saaaaaaaa { fn fbbbbbbbb() {} }";
+        let impls = block.repeat((FILE_INPUT_LIMIT - file.text.len()) / block.len());
+        for tail in [array, impls] {
+            let mut near = file.clone();
+            near.text.push_str(&tail);
+            assert!(near.text.len() <= FILE_INPUT_LIMIT);
+            let found = keys_on_a_stopped_clock(&near, &native.declarations).unwrap();
+            assert!(found.values().any(|key| key == "store.rs::Store::save"));
         }
     }
 
