@@ -202,6 +202,16 @@ pub(super) struct Catalog {
     scope_indexes: BTreeMap<usize, ScopeIndex>,
     export_memo: BTreeMap<(usize, usize, bool, bool), std::sync::Arc<ExportMemo>>,
     export_traces: Vec<ExportTrace>,
+    /// Whether a nearer binding blocks the extern prelude for a first segment, by the scope
+    /// `external_target`'s walk reaches, the segment and strictness (#1210): the walk from
+    /// that scope up reads the same scopes for every lookup with no import excluded.
+    prelude_memo: BTreeMap<(usize, String, bool), bool>,
+    /// A site's own path's names, by the first scope that could bind its first segment and
+    /// the path (#1210): every site whose scope climbs to it reads the same answer.
+    path_memo: BTreeMap<(usize, Vec<String>), std::sync::Arc<Names>>,
+    /// Tests read without the two memos above, to compare the answers.
+    #[cfg(test)]
+    memos: bool,
     files: BTreeMap<usize, usize>,
     file_declarations: BTreeMap<usize, DeclarationId>,
     roots: BTreeMap<usize, BTreeSet<usize>>,
@@ -251,6 +261,10 @@ impl Catalog {
             scope_indexes: BTreeMap::new(),
             export_memo: BTreeMap::new(),
             export_traces: Vec::new(),
+            prelude_memo: BTreeMap::new(),
+            path_memo: BTreeMap::new(),
+            #[cfg(test)]
+            memos: true,
             files: BTreeMap::new(),
             file_declarations: BTreeMap::new(),
             roots: BTreeMap::new(),
@@ -869,8 +883,8 @@ impl Catalog {
     /// fails is read as under an attribute this catalog does not read: its scope opaque and
     /// its names uncertain. That can change how another proof reads (a glob over the now
     /// opaque scope), so the proofs are rechecked until none fails; each scope only turns
-    /// opaque, so this ends, and every step is charged to the work budget. The export memo
-    /// read the scopes before they turned opaque and is cleared after each pass.
+    /// opaque, so this ends, and every step is charged to the work budget. The memos read
+    /// the scopes before they turned opaque and are cleared after each pass.
     fn prove_known_macros(
         &mut self,
         docs: &[&DocumentInput],
@@ -910,11 +924,17 @@ impl Catalog {
                     }
                 }
             }
-            self.export_memo.clear();
+            self.forget_reads();
             if !failed {
                 return Ok(());
             }
         }
+    }
+    /// Drops every memo of what the scopes read, once a scope has changed.
+    fn forget_reads(&mut self) {
+        self.export_memo.clear();
+        self.prelude_memo.clear();
+        self.path_memo.clear();
     }
     fn proves_known_macro(
         &mut self,
@@ -2343,81 +2363,8 @@ impl Catalog {
         {
             return Ok(None);
         }
-        let mut current = Some(scope);
-        while let Some(current_scope) = current {
-            self.step(check)?;
-            if self.scopes[current_scope].opaque {
-                return Ok(None);
-            }
-            if self.scopes[current_scope]
-                .explicit
-                .contains_key(&(TYPE, first.clone()))
-            {
-                return Ok(None);
-            }
-            let imports = self.scope_imports(current_scope, check)?;
-            for import in imports {
-                self.step(check)?;
-                if excluding == Some((import.start, import.end)) && current_scope == scope {
-                    continue;
-                }
-                if !import.star && import.binding_name() == Some(first) {
-                    return Ok(None);
-                }
-                if import.star {
-                    let expanded = self.expand(
-                        current_scope,
-                        &import,
-                        1,
-                        &mut BTreeSet::new(),
-                        ResolveContext {
-                            packages,
-                            docs,
-                            waive_external: false,
-                            foreign: false,
-                        },
-                        Some(first),
-                        check,
-                    )?;
-                    if expanded
-                        .names
-                        .get(&(TYPE, first.clone()))
-                        .is_some_and(|b| b.unknown || !b.candidates.is_empty())
-                    {
-                        return Ok(None);
-                    }
-                    if expanded.unknown_set {
-                        if strict {
-                            return Ok(None);
-                        }
-                        let document = self.scopes[current_scope].document;
-                        let source_set = &docs[document].key.source_set_id;
-                        let root = self.root(current_scope).expect("proved root");
-                        let root_path = &docs[self.scopes[root].document].key.path;
-                        let declared_external = !import.uncertain
-                            && import.path.first().is_some_and(|name| {
-                                !self.scopes[current_scope]
-                                    .explicit
-                                    .contains_key(&(TYPE, name.clone()))
-                                    && packages
-                                        .resolve(
-                                            source_set,
-                                            name,
-                                            packages.root_allowed(source_set, root_path),
-                                        )
-                                        .is_some()
-                            });
-                        if !declared_external {
-                            return Ok(None);
-                        }
-                    }
-                }
-            }
-            current = if current_scope == self.scopes[current_scope].module {
-                None
-            } else {
-                self.scopes[current_scope].parent
-            };
+        if self.prelude_blocked(scope, first, packages, docs, excluding, strict, check)? {
+            return Ok(None);
         }
         let document = self.scopes[scope].document;
         let root = self.root(scope).expect("proved root");
@@ -2428,6 +2375,130 @@ impl Catalog {
             first,
             packages.root_allowed(source_set, root_path),
         ))
+    }
+    /// Whether a scope from `scope` up to its module binds `first`, or could, before the
+    /// extern prelude, as `external_target` reads it. A walk with no import excluded reads
+    /// the same scopes from each scope it passes, so its verdict is remembered for every one
+    /// of them (#1210) and a later walk stops at the first it reaches. The verdict is
+    /// recorded only once the walk that found it was charged; a hit is charged its step.
+    #[allow(clippy::too_many_arguments)] // As `external_target`.
+    fn prelude_blocked(
+        &mut self,
+        scope: usize,
+        first: &str,
+        packages: &external::RustPackages,
+        docs: &[&DocumentInput],
+        excluding: Option<(usize, usize)>,
+        strict: bool,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<bool> {
+        let remember = excluding.is_none() && self.memos();
+        let mut visited = Vec::new();
+        let mut current = Some(scope);
+        let blocked = loop {
+            let Some(at) = current else {
+                break false;
+            };
+            self.step(check)?;
+            if remember {
+                if let Some(&blocked) = self.prelude_memo.get(&(at, first.to_owned(), strict)) {
+                    break blocked;
+                }
+                visited.push(at);
+            }
+            let excluded = excluding.filter(|_| at == scope);
+            if self.blocks_prelude(at, first, packages, docs, excluded, strict, check)? {
+                break true;
+            }
+            current = if at == self.scopes[at].module {
+                None
+            } else {
+                self.scopes[at].parent
+            };
+        };
+        for at in visited {
+            self.prelude_memo
+                .insert((at, first.to_owned(), strict), blocked);
+        }
+        Ok(blocked)
+    }
+    /// Whether scope `at` itself binds `first`, or could: by an item, a named import other
+    /// than `excluded`, or a glob that offers it or, unless waived, exports unknown names.
+    #[allow(clippy::too_many_arguments)] // As `external_target`.
+    fn blocks_prelude(
+        &mut self,
+        at: usize,
+        first: &str,
+        packages: &external::RustPackages,
+        docs: &[&DocumentInput],
+        excluded: Option<(usize, usize)>,
+        strict: bool,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<bool> {
+        if self.scopes[at].opaque
+            || self.scopes[at]
+                .explicit
+                .contains_key(&(TYPE, first.to_owned()))
+        {
+            return Ok(true);
+        }
+        let imports = self.scope_imports(at, check)?;
+        for import in imports {
+            self.step(check)?;
+            if excluded == Some((import.start, import.end)) {
+                continue;
+            }
+            if !import.star && import.binding_name() == Some(first) {
+                return Ok(true);
+            }
+            if import.star {
+                let expanded = self.expand(
+                    at,
+                    &import,
+                    1,
+                    &mut BTreeSet::new(),
+                    ResolveContext {
+                        packages,
+                        docs,
+                        waive_external: false,
+                        foreign: false,
+                    },
+                    Some(first),
+                    check,
+                )?;
+                if expanded
+                    .names
+                    .get(&(TYPE, first.to_owned()))
+                    .is_some_and(|b| b.unknown || !b.candidates.is_empty())
+                {
+                    return Ok(true);
+                }
+                if expanded.unknown_set {
+                    if strict {
+                        return Ok(true);
+                    }
+                    let document = self.scopes[at].document;
+                    let source_set = &docs[document].key.source_set_id;
+                    let root = self.root(at).expect("proved root");
+                    let root_path = &docs[self.scopes[root].document].key.path;
+                    let declared_external = !import.uncertain
+                        && import.path.first().is_some_and(|name| {
+                            !self.scopes[at].explicit.contains_key(&(TYPE, name.clone()))
+                                && packages
+                                    .resolve(
+                                        source_set,
+                                        name,
+                                        packages.root_allowed(source_set, root_path),
+                                    )
+                                    .is_some()
+                        });
+                    if !declared_external {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        Ok(false)
     }
     /// Removes from a private glob's `names` those its scope never spells, and says whether it
     /// removed any (#986). A use is an identifier anywhere in the scope outside the glob,
@@ -2556,11 +2627,79 @@ impl Catalog {
             }
         } else {
             match parts(&site.spelling) {
-                Some(path) => self.path(scope, &path, false, 1, &mut route, context, check)?,
+                Some(path) => self.site_path(scope, path, &mut route, context, check)?,
                 None => return Ok(SiteResolution::unknown("rust_path_unsupported")),
             }
         };
         self.publish_names(site, &import, names, shadowed, unused, check)
+    }
+    /// The names a site's own path reaches from `scope` (#1210). A block that cannot bind
+    /// the first segment answers nothing there, so the lexical walk would climb past it: the
+    /// answer is the one from the first scope that could bind it, the same for every site
+    /// whose scope climbs there, and remembered by that scope and the path. It is recorded
+    /// only once the walk that found it was charged; each read, the first included, is
+    /// charged a step for each block climbed and its copy, as `copy_names` charges one.
+    fn site_path(
+        &mut self,
+        scope: usize,
+        path: Vec<String>,
+        route: &mut Route,
+        context: ResolveContext<'_, '_>,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<Names> {
+        if !self.memos() {
+            return self.path(scope, &path, false, 1, route, context, check);
+        }
+        let mut start = scope;
+        if let Some(first) = path.first() {
+            while let Some(parent) = self.binds_nothing(start, first, route) {
+                self.step(check)?;
+                start = parent;
+            }
+        }
+        let key = (start, path);
+        let names = match self.path_memo.get(&key).cloned() {
+            Some(names) => names,
+            None => {
+                let names = self.path(start, &key.1, false, 1, route, context, check)?;
+                let names = std::sync::Arc::new(names);
+                self.path_memo.insert(key, names.clone());
+                names
+            }
+        };
+        self.step(check)?;
+        self.copy_names(&names, None, check)
+    }
+    /// Whether the prelude and path memos are read: always.
+    #[cfg(not(test))]
+    fn memos(&self) -> bool {
+        true
+    }
+    /// Whether the prelude and path memos are read: tests compare reads without them.
+    #[cfg(test)]
+    fn memos(&self) -> bool {
+        self.memos
+    }
+    /// The parent of block `scope` when the block cannot bind `name`: it declares nothing of
+    /// that name in either namespace and imports nothing of it, has no glob, is read whole,
+    /// and is not on the route. `binding` would find nothing there, and no export
+    /// computation traces what it consults.
+    fn binds_nothing(&self, scope: usize, name: &str, route: &Route) -> Option<usize> {
+        let at = &self.scopes[scope];
+        let key = |namespace| (namespace, name.to_owned());
+        if scope == at.module
+            || at.opaque
+            || at.cut
+            || !self.export_traces.is_empty()
+            || at.explicit.contains_key(&key(TYPE))
+            || at.explicit.contains_key(&key(VALUE))
+            || at.imports.named.contains_key(name)
+            || !at.imports.stars.is_empty()
+            || route.contains(&(scope, name.to_owned()))
+        {
+            return None;
+        }
+        at.parent
     }
     /// The import the site is, when its range is one of the scope's imports.
     fn find_import_at(
@@ -3414,6 +3553,9 @@ mod cache_tests {
             scope_indexes: BTreeMap::new(),
             export_memo: BTreeMap::new(),
             export_traces: Vec::new(),
+            prelude_memo: BTreeMap::new(),
+            path_memo: BTreeMap::new(),
+            memos: true,
             files: BTreeMap::new(),
             file_declarations: BTreeMap::new(),
             ambiguous: BTreeSet::new(),
@@ -3682,6 +3824,296 @@ mod cache_tests {
             index.enclosing(101, 102, &mut work, &mut check).unwrap(),
             None
         );
+    }
+}
+
+/// #1210: the prelude and path memos change what a read costs, never what it answers.
+#[cfg(test)]
+mod memo_tests {
+    use super::*;
+    use crate::references::{Snapshot, parallel_tests::snapshot_of};
+    use sha2::{Digest, Sha256};
+
+    const MANIFEST: &str = "[package]\nname = 'fixture'\nversion = '0.1.0'\nedition = '2021'\n\
+        [dependencies]\nserde = '1'\ntokio = { version = '1', features = ['full'] }\n";
+
+    /// A catalog of a snapshot's documents, its packages, and the documents with trees.
+    struct Read<'a> {
+        docs: Vec<&'a DocumentInput>,
+        trees: Vec<Tree>,
+        packages: external::RustPackages,
+        catalog: Catalog,
+    }
+
+    /// `files` under `MANIFEST`, its documents in key order.
+    fn snapshot(files: &[(&str, &str)]) -> Snapshot {
+        let mut snapshot = snapshot_of(files);
+        snapshot.documents.sort_by(|a, b| a.key.cmp(&b.key));
+        snapshot
+            .manifests
+            .push(super::super::external::ManifestInput {
+                source_set_id: snapshot.documents[0].key.source_set_id.clone(),
+                native_revision_id: "native".into(),
+                dependency_hash: "dependencies".into(),
+                path: "Cargo.toml".into(),
+                content_hash: Some(hex::encode(Sha256::digest(MANIFEST.as_bytes()))),
+                bytes: Some(MANIFEST.as_bytes().to_vec()),
+            });
+        snapshot
+    }
+
+    fn read(snapshot: &Snapshot) -> Read<'_> {
+        let mut check = || Ok(());
+        let docs: Vec<&DocumentInput> = snapshot.documents.iter().collect();
+        let trees: Vec<Tree> = docs
+            .iter()
+            .map(|doc| super::super::parse(doc, &mut check).unwrap())
+            .collect();
+        let documents = docs
+            .iter()
+            .enumerate()
+            .map(|(index, doc)| (doc.key.clone(), index))
+            .collect();
+        let mut work = Work::new(work::reference_limit(0, 0));
+        let packages =
+            external::RustPackages::new(&snapshot.manifests, &mut work, &mut check).unwrap();
+        let workspace = super::super::cargo_workspace::Workspace::new(
+            &snapshot.manifests,
+            &mut work,
+            &mut check,
+        )
+        .unwrap();
+        let catalog = Catalog::new(
+            &docs, &trees, &documents, &workspace, &packages, work, &mut check,
+        )
+        .unwrap();
+        Read {
+            docs,
+            trees,
+            packages,
+            catalog,
+        }
+    }
+
+    /// Every site of the snapshot, resolved in document and site order on one catalog, with
+    /// the memos or without them. Each answer is rendered with its site; the work is the
+    /// resolution's alone.
+    fn resolve_all(snapshot: &Snapshot, remember: bool) -> (Vec<String>, usize) {
+        let Read {
+            docs,
+            trees,
+            packages,
+            mut catalog,
+        } = read(snapshot);
+        catalog.memos = remember;
+        let mut check = || Ok(());
+        let before = catalog.work.used;
+        let mut external_packages = BTreeMap::new();
+        let mut answers = Vec::new();
+        for (document, doc) in docs.iter().enumerate() {
+            let mut work = Work::new(work::reference_limit(0, 0));
+            for site in extract(doc, &trees[document], &mut work, &mut check).unwrap() {
+                let resolved = catalog
+                    .resolve(
+                        document,
+                        &site,
+                        &packages,
+                        &mut external_packages,
+                        &docs,
+                        &trees[document],
+                        &mut check,
+                    )
+                    .unwrap();
+                let targets: Vec<String> = resolved
+                    .targets
+                    .iter()
+                    .map(|target| match target {
+                        Target::Native(index) => format!("native {index}"),
+                        Target::External(identity) => format!("{identity:?}"),
+                    })
+                    .collect();
+                answers.push(format!(
+                    "{} {}..{} {:?}: {targets:?} proof {:?} residual {:?}",
+                    doc.key.path,
+                    site.start,
+                    site.end,
+                    site.spelling,
+                    resolved.proof,
+                    resolved.residual
+                ));
+            }
+        }
+        answers.push(format!(
+            "{:?}",
+            external_packages.keys().collect::<Vec<_>>()
+        ));
+        (answers, catalog.work.used - before)
+    }
+
+    /// Globs (a crate glob, `use super::*` in nested test modules, a dependency's glob),
+    /// an opaque block and module, generic items, and blocks that shadow a glob's name by an
+    /// item, a named import and a glob of their own.
+    const FILES: &[(&str, &str)] = &[
+        (
+            "src/lib.rs",
+            "mod store;\nmod other;\nuse store::*;\npub use other::Thing;\n\
+             fn plain() { run(); run(); store::run(); crate::store::run(); Thing::new(); \
+               serde::de::value(); tokio::spawn(); missing::path(); }\n\
+             fn shadow() {\n\
+               fn run() {}\n\
+               run(); { run(); Thing::new(); { run(); } }\n\
+               { use other::Thing as run; run::new(); }\n\
+               { use other::*; run(); Thing::new(); }\n\
+               { let serde = 1; serde::de::value(); }\n\
+               { fn store() {} store::run(); }\n\
+               { use other::*; nested::f(); { nested::f(); } }\n\
+             }\n\
+             struct Wrapper<T>(T);\n\
+             impl<T: Into<Thing>> Wrapper<T> { fn f(&self) -> Option<Thing> { run(); \
+               { Thing::new(); store::inner::run(); } None } }\n\
+             fn generic<T: Default>() -> T { { { run(); } } store::run(); T::default() }\n\
+             mod nested { pub fn f() {} }\n\
+             fn opaque() { some_macro!(); store::run(); { store::run(); nested::f(); } }\n\
+             mod hidden { #[unknown_attribute] fn f() {} fn g() { run(); super::run(); } }\n\
+             #[cfg(test)]\n\
+             mod tests {\n\
+               use super::*;\n\
+               fn t() { run(); Thing::new(); plain(); { run(); store::run(); } }\n\
+               mod deeper { use super::*; fn u() { run(); plain(); { { run(); } } \
+                 serde::de::value(); } }\n\
+               mod globbed { use serde::*; fn v() { de::value(); run(); serde::de::value(); } }\n\
+             }\n",
+        ),
+        (
+            "src/store.rs",
+            "pub fn run() {}\npub mod inner { pub fn run() {} }\n",
+        ),
+        (
+            "src/other.rs",
+            "pub struct Thing;\nimpl Thing { pub fn new() -> Self { { Thing } } }\n\
+             pub mod nested { pub fn f() {} }\n\
+             pub fn helper() { crate::run(); super::plain(); }\n",
+        ),
+    ];
+
+    #[test]
+    fn memos_change_no_answer_and_save_work_across_sites() {
+        let snapshot = snapshot(FILES);
+        let (cold, cold_work) = resolve_all(&snapshot, false);
+        let (warm, warm_work) = resolve_all(&snapshot, true);
+        assert_eq!(warm, cold);
+        // The fixture repeats paths from the same scopes, so the memos are read.
+        assert!(warm_work < cold_work, "{warm_work} >= {cold_work}");
+        // The answers are the fixture's, not empty ones.
+        let resolved = warm.iter().filter(|a| a.contains("native")).count();
+        assert!(resolved > 10, "{warm:#?}");
+        assert!(warm.iter().any(|a| a.contains("serde")), "{warm:#?}");
+        assert!(warm.iter().any(|a| a.contains("rust_")), "{warm:#?}");
+    }
+
+    /// A walk is remembered for every scope it passes and a site's answer for the first
+    /// scope that could bind its first segment; blocks that cannot are climbed, not keys.
+    #[test]
+    fn memos_are_keyed_by_the_scopes_that_can_bind() {
+        let files = [(
+            "src/lib.rs",
+            "mod a { pub fn f() {} }\nfn f() { { { a::f(); } } a::f(); }\n\
+             fn g() { use std::fmt as a; { a::f(); } }\n",
+        )];
+        let snapshot = snapshot(&files);
+        let Read {
+            docs,
+            trees,
+            packages,
+            mut catalog,
+        } = read(&snapshot);
+        let mut check = || Ok(());
+        let mut work = Work::new(work::reference_limit(0, 0));
+        let sites = extract(docs[0], &trees[0], &mut work, &mut check).unwrap();
+        let mut external_packages = BTreeMap::new();
+        for site in &sites {
+            catalog
+                .resolve(
+                    0,
+                    site,
+                    &packages,
+                    &mut external_packages,
+                    &docs,
+                    &trees[0],
+                    &mut check,
+                )
+                .unwrap();
+        }
+        let path = vec!["a".to_owned(), "f".to_owned()];
+        let root = catalog.files[&0];
+        // The two paths in `f` climb to the crate root; the one in `g` stops at `g`'s body,
+        // whose import binds `a`.
+        let starts: Vec<usize> = catalog
+            .path_memo
+            .keys()
+            .map(|(start, key)| {
+                assert_eq!(key, &path);
+                *start
+            })
+            .collect();
+        assert_eq!(starts.len(), 2, "{starts:?}");
+        assert!(starts.contains(&root));
+        assert!(starts.iter().any(|&start| start != root));
+        // Each walk for `a` reached the root, and every scope it passed is remembered.
+        assert!(
+            catalog
+                .prelude_memo
+                .get(&(root, "a".to_owned(), false))
+                .is_some_and(|&blocked| blocked)
+        );
+        assert!(catalog.prelude_memo.len() > 2);
+    }
+
+    /// The first proof passes in the first pass, its walk remembered as reaching the root;
+    /// the second fails and turns the root opaque. The second pass must read the root as it
+    /// now is: the first proof fails too and its scope turns opaque.
+    #[test]
+    fn a_failed_proof_pass_forgets_what_the_memos_read() {
+        let files = [
+            (
+                "src/lib.rs",
+                "mod store;\nfn first() {\n  #[tokio::main] async fn inner() {}\n  store::run();\n}\n\
+             #[async_trait::async_trait] trait T { async fn f(&self); }\n",
+            ),
+            ("src/store.rs", "pub fn run() {}\n"),
+        ];
+        let snapshot = snapshot(&files);
+        let Read {
+            docs,
+            trees,
+            packages,
+            mut catalog,
+        } = read(&snapshot);
+        assert_eq!(catalog.proofs.len(), 2);
+        assert!(catalog.proofs.iter().all(|proof| proof.failed));
+        assert!(catalog.scopes[catalog.proofs[0].scope].opaque);
+        assert!(catalog.prelude_memo.is_empty());
+        assert!(catalog.path_memo.is_empty());
+        let mut check = || Ok(());
+        let mut work = Work::new(work::reference_limit(0, 0));
+        let sites = extract(docs[0], &trees[0], &mut work, &mut check).unwrap();
+        let site = sites
+            .iter()
+            .find(|site| site.spelling == "store::run")
+            .unwrap();
+        let resolved = catalog
+            .resolve(
+                0,
+                site,
+                &packages,
+                &mut BTreeMap::new(),
+                &docs,
+                &trees[0],
+                &mut check,
+            )
+            .unwrap();
+        assert!(resolved.targets.is_empty());
+        assert!(resolved.residual.is_some());
     }
 }
 
