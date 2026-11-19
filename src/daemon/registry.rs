@@ -958,7 +958,7 @@ impl CheckoutRuntime {
     /// to publish, and a head it moves supersedes the run.
     fn auto_launch(&self, request: crate::producer::auto::LaunchRequest) -> LaunchOutcome {
         use crate::producer::approval::{self, Refusal};
-        use crate::producer::auto::{AutoOutcome, failure_code, is_failure};
+        use crate::producer::auto::{launch_error, run_ended};
         let Ok(resources) = self.resources() else {
             return LaunchOutcome::NotReady;
         };
@@ -973,13 +973,6 @@ impl CheckoutRuntime {
             return LaunchOutcome::NotReady;
         }
         let expected = request.expected_revision.clone();
-        let failed = |code: &str| LaunchOutcome::Finished {
-            run_id: None,
-            outcome: AutoOutcome::Failed {
-                code: failure_code(code),
-                basis: expected.clone(),
-            },
-        };
         let stub = crate::producer::profiles::Stub::from_env();
         let run = match approval::run_request(
             &resources.store,
@@ -991,7 +984,7 @@ impl CheckoutRuntime {
             Ok(run) => run,
             Err(Refusal::HeadMoved) => return LaunchOutcome::HeadMoved,
             Err(Refusal::Template) => return LaunchOutcome::NeedsApproval,
-            Err(Refusal::Failed(code)) => return failed(&code),
+            Err(Refusal::Failed(code)) => return launch_error(&code, &expected),
         };
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let _finished = RunWatchGuard(done.clone());
@@ -1011,35 +1004,10 @@ impl CheckoutRuntime {
                     crate::producer::PLAN_CHANGED => LaunchOutcome::HeadMoved,
                     crate::producer::PRODUCER_BUSY => LaunchOutcome::SlotBusy,
                     "root_changed" => LaunchOutcome::NotReady,
-                    _ => failed(&message),
+                    _ => launch_error(&message, &expected),
                 }
             }
-            Ok(reply) => {
-                let text = |key: &str| reply[key].as_str().map(str::to_owned);
-                let (outcome, error_code) = (text("outcome"), text("errorCode"));
-                let outcome = match error_code.as_deref() {
-                    _ if outcome.as_deref() == Some("imported") => AutoOutcome::Imported,
-                    Some("cancelled: superseded") => AutoOutcome::Superseded,
-                    Some("cancelled: preempted") => AutoOutcome::Preempted,
-                    _ if is_failure(outcome.as_deref(), error_code.as_deref()) => {
-                        AutoOutcome::Failed {
-                            code: failure_code(
-                                error_code
-                                    .as_deref()
-                                    .or(outcome.as_deref())
-                                    .unwrap_or_default(),
-                            ),
-                            basis: text("sourceRevision").unwrap_or_else(|| expected.clone()),
-                        }
-                    }
-                    // Lost root or abandonment: neither a failure nor a start to wait out.
-                    _ => return LaunchOutcome::NotReady,
-                };
-                LaunchOutcome::Finished {
-                    run_id: text("runId"),
-                    outcome,
-                }
-            }
+            Ok(reply) => run_ended(&reply, &expected),
         }
     }
 
