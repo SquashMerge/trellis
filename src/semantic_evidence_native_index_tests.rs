@@ -582,3 +582,112 @@ fn indexed_joins_reject_a_contradicting_gap_on_every_join() {
         );
     }
 }
+
+/// `native` with `count` root module declarations over its whole document, its documents
+/// relabeled to `language`.
+fn with_root_modules(count: usize, language: &str, source: &[u8]) -> native::Artifact {
+    let (mut native, _) = artifact(2);
+    native.revision.documents[0].content_hash = native_ids::digest(b"", source);
+    let main = native.declarations[0].clone();
+    for ordinal in 0..count {
+        let key = native::Key {
+            kind: "module".into(),
+            name: None,
+            signature: None,
+            ordinal,
+        };
+        native.declarations.push(native::Declaration {
+            syntax_id: format!("sid:v1:{}", hex(100 + ordinal)),
+            kind: "module".into(),
+            name: None,
+            lookup_key: None,
+            ancestors: vec![],
+            key,
+            range: range(0, source.len()),
+            name_range: None,
+            header: native::Header {
+                kind: "module".into(),
+                name: None,
+                ..main.header.clone()
+            },
+            ..main.clone()
+        });
+    }
+    let documents = native
+        .revision
+        .documents
+        .iter_mut()
+        .map(|d| &mut d.key)
+        .chain(native.declarations.iter_mut().map(|d| &mut d.document))
+        .chain(native.calls.iter_mut().map(|c| &mut c.document))
+        .chain(native.references.iter_mut().map(|r| &mut r.document))
+        .chain(
+            native
+                .capability_reports
+                .iter_mut()
+                .map(|r| &mut r.document),
+        );
+    for key in documents {
+        key.language = language.into();
+    }
+    native
+}
+
+/// Owner ruling 2026-11-19 (#1235): the import's anchor table and the publication check apply
+/// one rule. A whole-document Rust anchor names the document's root module when the document
+/// has exactly one, and nothing with none or two; no other span, and no other language, names
+/// it. Each import join validates, and an exact join forged where the rule names nothing does
+/// not.
+#[test]
+fn a_whole_document_anchor_names_exactly_one_root_rust_module() {
+    let (_, source) = artifact(2);
+    let whole = range(0, source.len());
+    let module = format!("sid:v1:{}", hex(100));
+    for (count, language, span, expected) in [
+        (1, "rust", whole.clone(), vec![module.clone()]),
+        (0, "rust", whole.clone(), vec![]),
+        (2, "rust", whole.clone(), vec![]),
+        (1, "rust", range(0, source.len() - 1), vec![]),
+        (1, "rust", range(1, source.len()), vec![]),
+        (1, "python", whole.clone(), vec![]),
+    ] {
+        let case = format!("{count} root modules, {language} {span:?}");
+        let native = with_root_modules(count, language, &source);
+        let key = native.revision.documents[0].key.clone();
+        let sources = BTreeMap::from([(key.clone(), source.clone())]);
+        let imported = crate::semantic_import::MeasuredFacts::new(&native, &sources)
+            .unwrap()
+            .join(&key, span.clone(), JoinKind::DeclarationName)
+            .unwrap();
+        assert_eq!(imported.candidate_ids, expected, "{case}");
+        let index = NativeIndex::new(&native);
+        let source_of = |k: &native::DocumentKey| (*k == key).then_some(&source[..]);
+        validate_join(
+            &imported,
+            JoinKind::DeclarationName,
+            &native,
+            &index,
+            &source_of,
+        )
+        .unwrap_or_else(|e| panic!("{case}: {e:#}"));
+        if expected.is_empty() && count > 0 {
+            let mut forged = imported.clone();
+            forged.status = JoinStatus::Exact;
+            forged.candidate_ids = vec![module.clone()];
+            forged.diagnostic = None;
+            let error = validate_join(
+                &forged,
+                JoinKind::DeclarationName,
+                &native,
+                &index,
+                &source_of,
+            )
+            .unwrap_err();
+            assert_eq!(
+                format!("{error:#}"),
+                "join differs from measured candidates",
+                "{case}"
+            );
+        }
+    }
+}

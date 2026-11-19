@@ -188,8 +188,16 @@ impl<'a> MeasuredFacts<'a> {
                 .or_default()
                 .insert(id.to_owned());
         };
+        // Each document's root module declarations: their count and the first one's ID (#1235).
+        let mut root_modules: BTreeMap<usize, (usize, &str)> = BTreeMap::new();
         for d in &native.declarations {
             declarations.entry(d.syntax_id.clone()).or_default().push(d);
+            if semantic::is_root_module(d) {
+                root_modules
+                    .entry(rank(&d.document))
+                    .or_insert((0, &d.syntax_id))
+                    .0 += 1;
+            }
             if let Some(range) = &d.name_range {
                 insert(
                     rank(&d.document),
@@ -266,6 +274,25 @@ impl<'a> MeasuredFacts<'a> {
                     }),
                 }
             });
+        }
+        // A whole-document Rust module definition names its document's one root module
+        // (owner ruling 2026-11-19, #1235). The anchor is no measured name range, so it takes
+        // no part in the spelling filter or the gap contradiction check above.
+        for (rank, (count, id)) in root_modules {
+            let length = texts[rank].map_or(0, str::len);
+            if let Some(range) =
+                semantic::whole_document_module_anchor(&keys[rank].language, length, count)
+            {
+                anchors
+                    .entry((
+                        rank,
+                        range.start,
+                        range.end,
+                        semantic::JoinKind::DeclarationName,
+                    ))
+                    .or_default()
+                    .insert(id.to_owned());
+            }
         }
         let candidates = anchors;
         for ranges in raw_ranges.values_mut() {

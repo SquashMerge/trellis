@@ -4190,6 +4190,271 @@ fn rust_type_with_a_conflicting_stated_kind_binds_nothing() {
     }
 }
 
+/// A module that a SCIP definition occurrence defines over some span of its document, and a
+/// use of it in another document (#1235).
+struct ModuleJoin {
+    /// The declaration the module's definition occurrence joins exactly, if any.
+    bound: Option<String>,
+    /// The defining document's root module declaration.
+    root: String,
+    /// The use-site reference's resolution, if it has a reference row.
+    resolution: Option<Resolution>,
+    /// The use-site reference's internal targets.
+    targets: Vec<String>,
+}
+
+/// A two-line Rust module and a crate root that declares it and calls into it.
+const RUST_MODULE: (&str, &str) = ("src/detect.rs", "pub fn g() {}\npub fn h() {}\n");
+const RUST_MODULE_USER: (&str, &str) = ("src/lib.rs", "mod detect;\npub fn f() { detect::g() }\n");
+
+/// The `[startLine, startCharacter, endLine, endCharacter]` range of all of `source`.
+fn whole_document(source: &str) -> Vec<i32> {
+    let lines = source.bytes().filter(|b| *b == b'\n').count() as i32;
+    let last = source.rsplit('\n').next().unwrap().len() as i32;
+    vec![0, 0, lines, last]
+}
+
+/// A batch whose artifact defines module `symbol` (stated `kind`) by one occurrence at `range`
+/// in `module_path` and uses it at the second occurrence of `needle` in `user`.
+fn module_descriptor(
+    world: &World,
+    (producer, language): (&str, &str),
+    module_path: &str,
+    user: (&str, &str),
+    needle: &str,
+    (symbol, kind, range): (&str, i32, &[i32]),
+) -> (PathBuf, String) {
+    let definition = DocSpec::new(module_path)
+        .symbol(symbol, kind, &[])
+        .occurrence(range, &[], symbol, 1);
+    let use_site = occ_at(DocSpec::new(user.0), user.1, (needle, 1), None, symbol, 0);
+    let mut fixture = world.fixture().reference(producer);
+    fixture.artifact(language, vec![definition, use_site]);
+    world.write(&fixture)
+}
+
+/// Joins `module` (path, source), whose module symbol `symbol` (stated `kind`) one definition
+/// occurrence defines at `range`, with `user`, whose second occurrence of `needle` uses it, and
+/// checks the staged join equals the memory join and that the batch publishes.
+fn module_definition_join(
+    (producer, language): (&str, &str),
+    module: (&str, &str),
+    user: (&str, &str),
+    needle: &str,
+    (symbol, kind, range): (&str, i32, &[i32]),
+) -> (ModuleJoin, World) {
+    use trellis::semantic_evidence::{JoinStatus, Target};
+    let world = world(|root| write_files(root, &[module, user]));
+    let descriptor = module_descriptor(
+        &world,
+        (producer, language),
+        module.0,
+        user,
+        needle,
+        (symbol, kind, range),
+    );
+    let (mut admitted, _, _) = world
+        .join_with(
+            &descriptor,
+            &BatchLimits::PRODUCTION,
+            DestinationMutations::default(),
+        )
+        .unwrap();
+    let staged = testing::staged_publication(&mut admitted).unwrap();
+    drop(admitted);
+    let memory = world.memory_publication(&descriptor, DestinationMutations::default());
+    let case = format!("{language} {range:?} kind {kind}");
+    assert_same_publication(&staged, &memory, &case);
+    world.publish(&descriptor).unwrap();
+    let (native, _) = world
+        .store
+        .retained_native_snapshot_at(world.store.index_baseline().unwrap())
+        .unwrap();
+    let root = native
+        .declarations
+        .iter()
+        .find(|d| d.document.path == module.0 && d.kind == "module" && d.ancestors.is_empty())
+        .unwrap()
+        .syntax_id
+        .clone();
+    let bound = staged
+        .declaration_bindings
+        .iter()
+        .find(|row| row.join.anchor.document.path == module.0)
+        .filter(|row| row.join.status == JoinStatus::Exact)
+        .and_then(|row| row.syntax_id.clone());
+    let use_start = user.1.match_indices(needle).nth(1).unwrap().0;
+    let reference = staged
+        .references
+        .iter()
+        .find(|row| row.document.path == user.0 && row.range.start == use_start);
+    let targets = reference
+        .into_iter()
+        .flat_map(|row| row.declared_target.iter().chain(&row.candidates))
+        .filter_map(|target| match target {
+            Target::Internal { syntax_id, .. } => Some(syntax_id.clone()),
+            _ => None,
+        })
+        .collect();
+    let join = ModuleJoin {
+        bound,
+        root,
+        resolution: reference.map(|row| row.resolution),
+        targets,
+    };
+    (join, world)
+}
+
+/// A Rust module definition over `range`, with `kind` stated for the module symbol.
+fn rust_module_join(range: &[i32], kind: i32) -> (ModuleJoin, World) {
+    module_definition_join(
+        ("rust-analyzer", "rust"),
+        RUST_MODULE,
+        RUST_MODULE_USER,
+        "detect",
+        ("rust-analyzer cargo c 0.1.0 detect/", kind, range),
+    )
+}
+
+/// Owner ruling 2026-11-19 (#1235): rust-analyzer defines a module by one occurrence over its
+/// whole file, stating `Module` (29). That definition binds the document's native root module
+/// declaration, so a use of the module resolves to it, identically in the batch and memory
+/// joins, and the batch publishes.
+#[test]
+fn rust_whole_document_module_definition_binds_the_root_module() {
+    let (join, _) = rust_module_join(&whole_document(RUST_MODULE.1), 29);
+    assert_eq!(join.bound.as_ref(), Some(&join.root));
+    assert_eq!(join.resolution, Some(Resolution::Resolved));
+    assert_eq!(join.targets, vec![join.root.clone()]);
+}
+
+/// A use of a module keeps its root module target when only the module's document changes:
+/// a local edit's witnessed rejoin retargets it by its stable ID, which has no name to recheck
+/// (#1235).
+#[test]
+fn a_root_module_target_survives_a_local_edit_of_its_document() {
+    let (join, world) = rust_module_join(&whole_document(RUST_MODULE.1), 29);
+    assert_eq!(join.targets, vec![join.root.clone()]);
+    let counts = world._state.path().join("work-counts.json");
+    world.work_counts(&counts);
+    let edited = format!("{}pub fn later() {{}}\n", RUST_MODULE.1);
+    let work = local_edit(&world, RUST_MODULE.0, &edited, &counts);
+    assert_eq!(work["witnessedRejoins"], 1, "{work}");
+    assert_eq!(work["fullFallbacks"], 0, "{work}");
+    assert_use_resolves_to_root_module(&world, &join.root);
+}
+
+/// The published use of `detect` in `src/lib.rs` resolves to the root module of
+/// `src/detect.rs`.
+fn assert_use_resolves_to_root_module(world: &World, root: &str) {
+    let head = world.store.index_baseline().unwrap();
+    let published = world.store.semantic_at(head).unwrap();
+    let use_start = RUST_MODULE_USER.1.rfind("detect").unwrap();
+    let reference = published
+        .references
+        .iter()
+        .find(|row| row.document.path == RUST_MODULE_USER.0 && row.range.start == use_start)
+        .expect("the use keeps its reference row");
+    assert_eq!(reference.resolution, Resolution::Resolved);
+    assert!(matches!(
+        &reference.declared_target,
+        Some(trellis::semantic_evidence::Target::Internal { syntax_id, document, .. })
+            if syntax_id == root && document.path == RUST_MODULE.0
+    ));
+}
+
+/// A batch captured before the module's document changed still resolves the use to the root
+/// module at head. Later local edits of another document, and of the module's, keep it: their
+/// witnessed rejoin retargets it from the capture-side witness (#1235).
+#[test]
+fn a_root_module_target_survives_a_below_head_import_and_its_witness() {
+    let other = ("src/other.rs", "pub fn other() {}\n");
+    let world = world(|root| write_files(root, &[RUST_MODULE, RUST_MODULE_USER, other]));
+    let captured = world.store.index_baseline().unwrap();
+    let symbol = "rust-analyzer cargo c 0.1.0 detect/";
+    let definition = DocSpec::new(RUST_MODULE.0)
+        .symbol(symbol, 29, &[])
+        .occurrence(&whole_document(RUST_MODULE.1), &[], symbol, 1);
+    let user = RUST_MODULE_USER;
+    let use_site = occ_at(DocSpec::new(user.0), user.1, ("detect", 1), None, symbol, 0);
+    let mut fixture = world.fixture().reference("rust-analyzer");
+    fixture.artifact("rust", vec![definition, use_site, DocSpec::new(other.0)]);
+    let descriptor = world.write(&fixture);
+    let later = format!("{}pub fn later() {{}}\n", RUST_MODULE.1);
+    write_files(&world.root, &[(RUST_MODULE.0, &later)]);
+    world.republish();
+    let (pin, admitted, joined) = world.publish(&descriptor).unwrap();
+    assert_eq!(joined.captured_pin(), captured);
+    drop((admitted, joined));
+    let (native, _) = world.store.retained_native_snapshot_at(pin).unwrap();
+    let root = native
+        .declarations
+        .iter()
+        .find(|d| d.document.path == RUST_MODULE.0 && d.kind == "module")
+        .unwrap()
+        .syntax_id
+        .clone();
+    assert_use_resolves_to_root_module(&world, &root);
+    let counts = world._state.path().join("work-counts.json");
+    world.work_counts(&counts);
+    // The first edit builds the capture-side witness; the later ones rejoin from it.
+    let edits = [
+        (other.0, "pub fn other() { let _ = 1; }\n".to_owned()),
+        (other.0, "pub fn other() { let _ = 2; }\n".to_owned()),
+        (RUST_MODULE.0, format!("{later}pub fn again() {{}}\n")),
+    ];
+    for (edit, (path, edited)) in edits.iter().enumerate() {
+        let work = local_edit(&world, path, edited, &counts);
+        if edit > 0 {
+            assert_eq!(work["witnessedRejoins"], 1, "edit {edit}: {work}");
+            assert_eq!(work["fullFallbacks"], 0, "edit {edit}: {work}");
+        }
+        assert_use_resolves_to_root_module(&world, &root);
+    }
+}
+
+/// #1235 fails closed on any span but the whole document: the first line alone, all but the
+/// trailing newline, or all but the first byte binds no declaration, and the use stays
+/// unresolved.
+#[test]
+fn rust_partial_document_module_definition_binds_nothing() {
+    for range in [[0, 0, 1, 0], [0, 0, 1, 13], [0, 1, 2, 0]] {
+        let (join, _) = rust_module_join(&range, 29);
+        assert_eq!(join.bound, None, "{range:?}");
+        assert_eq!(join.resolution, Some(Resolution::Unresolved), "{range:?}");
+        assert!(join.targets.is_empty(), "{range:?}");
+    }
+}
+
+/// #473 holds for the root module: a whole-document definition whose symbol states a kind
+/// other than `Module` (`Function`, 17) binds the symbol to no target.
+#[test]
+fn rust_whole_document_definition_of_a_non_module_kind_resolves_nothing() {
+    let (join, _) = rust_module_join(&whole_document(RUST_MODULE.1), 17);
+    assert_eq!(join.resolution, Some(Resolution::Unresolved));
+    assert!(!join.targets.contains(&join.root));
+}
+
+/// #1235 is a Rust rule: a whole-document definition in a Python document binds no
+/// declaration, so the use never names the document's root module.
+#[test]
+fn python_whole_document_module_definition_binds_nothing() {
+    let module = ("src/b.py", "def g(): pass\ndef h(): pass\n");
+    let (join, _) = module_definition_join(
+        ("scip-python", "python"),
+        module,
+        ("src/a.py", "import b\nb.g()\n"),
+        "b",
+        (
+            "scip-python python c 0.1.0 b/__init__:",
+            29,
+            &whole_document(module.1),
+        ),
+    );
+    assert_eq!(join.bound, None);
+    assert!(!join.targets.contains(&join.root));
+}
+
 /// Anchors `doc` with an occurrence of `len` bytes at `delta` into the first `anchor` in `source`.
 fn occ_in(
     doc: DocSpec,

@@ -222,7 +222,10 @@ impl WitnessPreparation {
                     if let Some(row) = lookup.declaration {
                         let encoded = id_codec::encode_sid(&syntax_id)
                             .context("invalid witnessed target syntax ID")?;
-                        let named = row.name_range.is_some();
+                        // A published native `module` is its document's root module, which
+                        // retargets by its ID alone, with no name to recheck (#1235).
+                        let root = row.kind == "module";
+                        let named = row.name_range.is_some() || root;
                         crate::store::staging::charge_witness_row(conn, limits)?;
                         conn.prepare_cached(
                             "INSERT INTO witness_target_status VALUES(?1,?2,?3,?4,0,?5,?6,?7)",
@@ -233,7 +236,7 @@ impl WitnessPreparation {
                             key.path,
                             encoded,
                             named,
-                            named && row.name.is_some(),
+                            root || (named && row.name.is_some()),
                             row.kind == "method"
                         ])?;
                     }

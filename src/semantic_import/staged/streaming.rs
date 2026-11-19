@@ -417,9 +417,13 @@ fn write_target_status(
             continue;
         }
         ctx.row("nat_declarations")?;
-        let name_ok = declaration.name_range.as_ref().is_some_and(|range| {
-            group.text.get(range.start..range.end) == declaration.name.as_deref()
-        });
+        // `named` is "retargetable": a root module retargets by its ID alone, with no name to
+        // recheck (#1235).
+        let root = semantic::is_root_module(declaration);
+        let name_ok = root
+            || declaration.name_range.as_ref().is_some_and(|range| {
+                group.text.get(range.start..range.end) == declaration.name.as_deref()
+            });
         ctx.conn
             .prepare_cached("INSERT INTO nat_declarations VALUES(?1,?2,?3,?4,?5,?6,?7)")?
             .execute(params![
@@ -427,7 +431,7 @@ fn write_target_status(
                 ord,
                 codec::sid(&declaration.syntax_id),
                 i64::try_from(n)?,
-                declaration.name_range.is_some(),
+                semantic::retargetable(declaration),
                 name_ok,
                 declaration.kind == "method"
             ])?;

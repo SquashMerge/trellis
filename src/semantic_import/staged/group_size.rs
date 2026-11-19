@@ -235,10 +235,11 @@ pub(super) fn group_build(
         .iter()
         .filter(|d| d.name_range.is_some() && d.name.is_some())
         .count();
+    // A root module may anchor its whole document (#1235).
     let declaration_anchors = rows
         .declarations
         .iter()
-        .filter(|d| d.name_range.is_some())
+        .filter(|d| d.name_range.is_some() || semantic::is_root_module(d))
         .count();
     let callees = rows
         .calls
@@ -307,6 +308,8 @@ pub(super) fn group_build(
         grouped::<&native::Call>(calls, calls)?,
         map_entries::<String, Vec<&native::Reference>>(references)?,
         grouped::<&native::Reference>(references, references)?,
+        // The document's root module count (#1235).
+        map_entries::<usize, (usize, &str)>(1)?,
         // Both initial anchors and compatible candidates own ID sets; projection moves them.
         copies(
             sum(&[
@@ -355,7 +358,7 @@ pub(super) fn group_build(
             copies(declaration.syntax_id.len() as u64, 2)?,
             copies(bytes_capacity(encoded)?, 2)?,
         ])?;
-        if declaration.name_range.is_some() {
+        if declaration.name_range.is_some() || semantic::is_root_module(declaration) {
             total = sum(&[total, copies(declaration.syntax_id.len() as u64, 2)?])?;
             if let Some(name) = &declaration.name {
                 total = sum(&[total, copies(name.len() as u64, 2)?])?;

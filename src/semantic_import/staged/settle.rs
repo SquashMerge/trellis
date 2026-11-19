@@ -161,9 +161,10 @@ impl StagedJoin<'_> {
                     Some(kept) => kept,
                     None => {
                         // A captured exact definition is a named captured declaration (its
-                        // exact declaration-name join anchors on the name). An unshared pin
-                        // keeps captured status only for the other targets; a shared pin's
-                        // captured status covers every target, so it needs no probe.
+                        // exact declaration-name join anchors on the name) or a root module
+                        // (#1235). An unshared pin keeps captured status only for the other
+                        // targets; a shared pin's captured status covers every target, so it
+                        // needs no probe.
                         let original = (self.destination.rev != self.captured.rev
                             && self.captured_definition(document, syntax_id)?)
                             || self
