@@ -119,6 +119,9 @@ fn measure_occurrence<S: JoinStore>(
                 // rust-analyzer 1.98.1 states `Struct`, `Trait` and `Union` for those native
                 // Rust types (supervisor amendment 2026-11-19 under #473/#557, #1231).
                 "type" => matches!(kind, 7 | 11 | 21 | 49 | 53 | 59),
+                // rust-analyzer 1.98.1 states `EnumMember` for every enum variant (owner ruling
+                // 2026-11-19, #1234).
+                "variant" => kind == 12,
                 // Native JavaScript represents a class constructor as a method. SCIP can
                 // state either its constructor semantics or its method declaration shape.
                 "method"

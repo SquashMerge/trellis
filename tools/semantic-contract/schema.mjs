@@ -26,6 +26,8 @@ export const types = Object.freeze({
     "typeParameter",
     "alias",
     "anonymousFunction",
+    // A Rust enum variant (owner ruling 2026-11-19, #1234).
+    "variant",
   ),
   SyntaxId: "syntaxId",
   OccurrenceId: "occurrenceId",

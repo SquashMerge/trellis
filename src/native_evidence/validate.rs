@@ -233,6 +233,7 @@ impl Artifact {
                                 | "typeParameter"
                                 | "alias"
                                 | "anonymousFunction"
+                                | "variant"
                         )
                         && d.kind == d.key.kind
                         && d.name == d.key.name

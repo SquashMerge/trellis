@@ -776,7 +776,7 @@ fn four_language_noncallable_native_declarations_keep_exact_kind_and_are_not_exe
         ),
         (
             "main.rs",
-            "type Alias = u32;\nstruct RustThing { field: Alias }\nfn rust_fun(arg: Alias) { let local = arg; }\n",
+            "type Alias = u32;\nstruct RustThing { field: Alias }\nfn rust_fun(arg: Alias) { let local = arg; }\nenum RustKind { Unit, Pair(u8) }\ntrait RustTrait { type Assoc; }\n",
         ),
     ];
     for (path, text) in samples {
@@ -822,6 +822,7 @@ fn four_language_noncallable_native_declarations_keep_exact_kind_and_are_not_exe
             "parameter" => SymbolKind::Parameter,
             "typeParameter" => SymbolKind::TypeParameter,
             "alias" => SymbolKind::Alias,
+            "variant" => SymbolKind::Variant,
             other => panic!("unexpected native declaration kind: {other}"),
         };
         assert_eq!(node.kind, expected, "{} {}", node.path, node.name);
@@ -831,15 +832,15 @@ fn four_language_noncallable_native_declarations_keep_exact_kind_and_are_not_exe
     for (path, expected) in [
         (
             "main.js",
-            [
+            &[
                 ("field", SymbolKind::Field),
                 ("local", SymbolKind::Variable),
                 ("method", SymbolKind::Method),
-            ],
+            ][..],
         ),
         (
             "Main.java",
-            [
+            &[
                 ("field", SymbolKind::Field),
                 ("arg", SymbolKind::Parameter),
                 ("local", SymbolKind::Variable),
@@ -847,7 +848,7 @@ fn four_language_noncallable_native_declarations_keep_exact_kind_and_are_not_exe
         ),
         (
             "main.py",
-            [
+            &[
                 ("field", SymbolKind::Variable),
                 ("local", SymbolKind::Variable),
                 ("method", SymbolKind::Function),
@@ -855,14 +856,18 @@ fn four_language_noncallable_native_declarations_keep_exact_kind_and_are_not_exe
         ),
         (
             "main.rs",
-            [
+            // #1234: an enum variant is a graph `variant`; a trait associated type an `alias`.
+            &[
                 ("Alias", SymbolKind::Alias),
                 ("field", SymbolKind::Field),
                 ("arg", SymbolKind::Parameter),
+                ("Unit", SymbolKind::Variant),
+                ("Pair", SymbolKind::Variant),
+                ("Assoc", SymbolKind::Alias),
             ],
         ),
     ] {
-        for (name, kind) in expected {
+        for &(name, kind) in expected {
             let declaration = native
                 .declarations
                 .iter()
@@ -929,6 +934,7 @@ fn four_language_noncallable_native_declarations_keep_exact_kind_and_are_not_exe
                         | SymbolKind::Parameter
                         | SymbolKind::Alias
                         | SymbolKind::TypeParameter
+                        | SymbolKind::Variant
                 )
         }) {
             assert_eq!(store.symbol(&n.id).unwrap().unwrap().kind, n.kind);

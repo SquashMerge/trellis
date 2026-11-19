@@ -7,14 +7,15 @@
     if (cls) node.className = cls;
     return node;
   };
-  // The outline lists types and callables (#526). Fields and nested types or callables are a
-  // container's members, shown when it is expanded; parameters, locals, aliases, closures and
+  // The outline lists types and callables (#526). Fields, Rust enum variants (#1234) and nested
+  // types or callables are a container's members, shown when it is expanded; a struct-like
+  // variant's own fields are its members in turn. Parameters, locals, aliases, closures and
   // implementation blocks are not rows. A Rust `impl` block lends its methods to the type it
   // implements in this file, or else becomes a row named by that type; the daemon names the type
   // from the parsed cached file. An impl it could not name lends its methods to the top level.
   const CONTAINERS = new Set(["type", "namespace"]);
   const CALLABLES = new Set(["function", "method", "constructor"]);
-  const MEMBERS = new Set(["field"]);
+  const MEMBERS = new Set(["field", "variant"]);
   function outlineTree(items) {
     const byId = new Map(items.map(item => [item.symbol.id, item]));
     const nodes = new Map(), roots = [];
@@ -46,7 +47,7 @@
       for (let parent = byId.get(item.symbol.parent); parent && !seen.has(parent.symbol.id); parent = byId.get(parent.symbol.parent)) {
         seen.add(parent.symbol.id);
         if (callable(parent) || parent.nativeKind === "anonymousFunction") return false;
-        if (CONTAINERS.has(parent.nativeKind)) return node(parent);
+        if (CONTAINERS.has(parent.nativeKind) || parent.nativeKind === "variant") return node(parent);
         if (parent.nativeKind === "implementation") return implOwner.get(parent.symbol.id) || null;
       }
       return null;

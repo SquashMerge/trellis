@@ -198,9 +198,9 @@ contract-v1 graph records, traversal, warnings and byte-fit rules are unchanged.
   `limit` applies, and data adds `externalOmitted:UInt`, their count. Kept calls,
   warnings and completeness are computed as before over the kept calls.
 - **Find ranking.** `trellis_find_symbols` query hits list callables, types and
-  every kind other than fields, parameters and variables first, then those three;
-  within each class the exact, prefix, substring, role, name and ID order is
-  unchanged. Lookup-key resolution and search are unchanged.
+  every kind other than fields, variants, parameters and variables first, then those
+  four (variants since owner ruling 2026-11-19, #1234); within each class the exact,
+  prefix, substring, role, name and ID order is unchanged. Lookup-key resolution and search are unchanged.
 
 ## Amendment (#724): callers bound elsewhere and bounded graph spellings
 
@@ -1454,3 +1454,12 @@ An independently returned projected proof wrapper is `{evidence:T,projection:Sem
 - **Catalog.** On the three architecture tools, the Node `CatalogEvidence` branch's `catalog` constant becomes `node-standard-library:v2` and its `entry` enum the 59 roots; the standard-library JavaScript/TypeScript `package` pattern becomes `^_?(?![._])[a-z0-9._-]+(?![\s\S])`; every tool's failure `code` enum gains `input_bounds_exceeded` (below); and the `toolVersion` constant changes. The measured sizes at `toolVersion` 33 are: modern `tools/list` frame 213,233 bytes and legacy 213,176 bytes, 2,237 bytes more than at `toolVersion` 32 (210,996 and 210,939): 1,925 for the Node catalog and 312 for the new code. The 235,520-byte compacted-frame limit is unchanged.
 - **`input_bounds_exceeded` (owner ruling 2026-11-18, #1119 follow-up).** A document beyond a deterministic input bound of the lookup-key derivation answers the new non-retryable `input_bounds_exceeded`, whose message names the bound (or the missing implementation join); it used to answer the retryable `deadline_exceeded`, though a retry always got the same refusal. `deadline_exceeded` stays, retryable, for the 10-second hang backstop. Every tool's closed failure `code` enum gains `input_bounds_exceeded` after `outcome_unknown`; the [#593](#amendment-593-stable-declaration-lookup-keys) text and the error-code table are updated in place.
 - **Unchanged:** every other tool object, field and bound; the CLI and browser shapes change only in the same values; no MCP budget changes.
+
+## Amendment (#1234): Rust enum variants
+
+**Status: owner ruling 2026-11-19 ([#1234](https://github.com/SquashMerge/trellis/issues/1234), option 2).** `toolVersion` is **34** (previously 33, #1088).
+
+- **Kind.** `Symbol.kind` and every other `Kind` gains `variant`, a Rust enum variant, which the native producer measures from native-v20 ([contract-v1 #1234 amendment](semantic-evidence/contract-v1.md#1234-amendment-rust-enum-variants-and-associated-types)). A trait's associated type is an `alias`, an existing kind, so it changes no schema. A struct-like variant's fields have the variant as their parent, so their `symbolId`s differ from native-v19's.
+- **Find ranking.** `trellis_find_symbols` ranks a `variant` with fields, parameters and variables, after types and callables (the find-ranking bullet above).
+- **Catalog.** The `$defs/Kind` enum of `trellis_find_symbols`, `trellis_search_symbols`, `trellis_declaration`, `trellis_outgoing_calls`, `trellis_incoming_calls` and `trellis_call_graph` appends `variant`, and the `toolVersion` constant changes. The measured `tools/list` frame is 213,293 bytes modern and 213,236 legacy, 60 more than at `toolVersion` 33, under the unchanged 235,520-byte compacted-frame limit.
+- **Unchanged:** every other tool object, field and bound; no MCP budget changes. The browser's Files outline shows variants as members of their enum.

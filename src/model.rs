@@ -143,6 +143,8 @@ pub enum SymbolKind {
     Parameter,
     TypeParameter,
     Alias,
+    /// A Rust enum variant (owner ruling 2026-11-19, #1234).
+    Variant,
 }
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
