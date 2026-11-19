@@ -241,6 +241,23 @@ fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     result.with_context(|| format!("write {}", dir.join(name).display()))
 }
 
+/// The prefix of a run directory's name while it is created (#1239).
+const STAGE_PREFIX: &str = ".stage-";
+
+/// `.stage-<pid>-<startTime>-<runId>`: the owner's identity, then the run ID.
+fn stage_name(owner: &DaemonIdentity, run_id: &str) -> String {
+    format!("{STAGE_PREFIX}{}-{}-{run_id}", owner.pid, owner.start_time)
+}
+
+/// The owner a staging name records, or `None` when `name` is not a staging name.
+fn stage_owner(name: &str) -> Option<DaemonIdentity> {
+    let mut parts = name.strip_prefix(STAGE_PREFIX)?.splitn(3, '-');
+    let pid = parts.next()?.parse().ok()?;
+    let start_time = parts.next()?.parse().ok()?;
+    generation_id(parts.next()?).ok()?;
+    Some(DaemonIdentity { pid, start_time })
+}
+
 fn corrupt(what: &str) -> anyhow::Error {
     anyhow::anyhow!("{PRODUCER_STATE_CORRUPT}: {what}")
 }
@@ -305,12 +322,56 @@ impl StateDir {
         Ok(self.path.join("pickups").join(generation_id(generation)?))
     }
 
+    /// A bare run directory with no record, for building fixture state. A run is created
+    /// with its record by `create_run`.
     pub fn create_run_dir(&self, run_id: &str) -> Result<PathBuf> {
         let dir = self.run_dir(run_id)?;
         check_private(&self.path)?;
         ensure_private(&self.path.join("runs"))?;
         ensure_private(&dir)?;
         Ok(dir)
+    }
+
+    /// Create a run's directory with its first record (#1239). The directory is built under
+    /// a staging name carrying the owner's identity (`record.daemon`) and renamed into place
+    /// once `run.json` is written, so `runs/<runId>/` never exists without a record and a
+    /// sweep cannot take a live run for a crash leftover. A staging directory the owner
+    /// leaves by crashing is another daemon's at the next sweep, which removes it.
+    pub fn create_run(&self, record: &RunRecord) -> Result<PathBuf> {
+        self.create_run_with_hook(record, || {})
+    }
+
+    /// `create_run`, calling `before_record` once the staging directory exists and before
+    /// the record is written into it.
+    pub(crate) fn create_run_with_hook(
+        &self,
+        record: &RunRecord,
+        before_record: impl FnOnce(),
+    ) -> Result<PathBuf> {
+        let dir = self.run_dir(&record.run_id)?;
+        check_private(&self.path)?;
+        let runs = self.path.join("runs");
+        ensure_private(&runs)?;
+        let stage = runs.join(stage_name(&record.daemon, &record.run_id));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&stage)
+            .with_context(|| format!("create {}", stage.display()))?;
+        let result = (|| -> Result<()> {
+            before_record();
+            write_atomic(&stage, "run.json", &serde_json::to_vec(record)?)?;
+            fs::rename(&stage, &dir)
+                .with_context(|| format!("rename {} to {}", stage.display(), dir.display()))?;
+            fs::File::open(&runs)
+                .and_then(|runs| runs.sync_all())
+                .with_context(|| format!("sync {}", runs.display()))
+        })();
+        if result.is_err() {
+            // Nothing else names a fresh run ID: neither directory is anyone else's.
+            let _ = remove_tree(&stage);
+            let _ = remove_tree(&dir);
+        }
+        result.map(|()| dir)
     }
 
     pub fn create_pickup_dir(&self, generation: &str) -> Result<PathBuf> {
@@ -530,6 +591,18 @@ impl StateDir {
         keep.extend(super::producer_retention::held_dirs(self)?);
         let kept = |dir: &Path| kept(&keep, dir);
         let mut report = SweepReport::default();
+        // A run directory still under its staging name (#1239). This daemon's is a live run
+        // about to publish its first record; another daemon's is a crash leftover, as a
+        // non-terminal record of another daemon is.
+        if let Ok(entries) = fs::read_dir(self.path.join("runs")) {
+            for entry in entries {
+                let entry = entry?;
+                let owner = entry.file_name().to_str().and_then(stage_owner);
+                if owner.is_some_and(|owner| owner != *this_daemon) {
+                    remove_tree(&entry.path())?;
+                }
+            }
+        }
         for (run_id, record) in self.scan_runs()? {
             let dir = self.run_dir(&run_id)?;
             let mut record = match record {
