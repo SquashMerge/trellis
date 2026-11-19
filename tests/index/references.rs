@@ -2157,7 +2157,7 @@ fn references_rust_dependency_statement_macro_literal_shadows_keep_the_bare_call
     let rules = rules_of("bail");
     for (why, defs, fails) in [
         ("another name", other.as_str(), false),
-        ("macro_rules! bail", rules.as_str(), true),
+        ("a literal definition of bail", rules.as_str(), true),
         ("#[macro_use]", "#[macro_use]\nmod inner {}\n", true),
         ("decl_macro", "#![feature(decl_macro)]\n", true),
     ] {
