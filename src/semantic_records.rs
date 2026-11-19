@@ -14,55 +14,230 @@ fn nullable<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
 ) -> std::result::Result<Option<T>, D::Error> {
     Option::deserialize(d)
 }
-macro_rules! closed {
-    ($name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-        pub enum $name { $(#[serde(rename = $value)] $variant),+ }
-    };
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Language {
+    #[serde(rename = "java")]
+    Java,
+    #[serde(rename = "rust")]
+    Rust,
+    #[serde(rename = "python")]
+    Python,
+    #[serde(rename = "javascript")]
+    Javascript,
+    #[serde(rename = "typescript")]
+    Typescript,
 }
-closed!(Language { Java => "java", Rust => "rust", Python => "python", Javascript => "javascript", Typescript => "typescript" });
-closed!(PositionEncoding { Utf8 => "utf8", Utf16 => "utf16", UnicodeScalar => "unicodeScalar" });
-closed!(Role { Definition => "definition", Read => "read", Write => "write", Call => "call", Type => "type", Import => "import", Alias => "alias" });
-closed!(CoverageState { NotRequested => "notRequested", Omitted => "omitted", Unsupported => "unsupported", Failed => "failed", Partial => "partial", Complete => "complete" });
-closed!(Freshness { Fresh => "fresh", PossiblyStale => "possiblyStale", Stale => "stale" });
-closed!(EvidenceKind { MeasuredSyntax => "measuredSyntax", DeclarationBinding => "declarationBinding", SemanticReference => "semanticReference", TypeRelationship => "typeRelationship" });
-closed!(RecordKind { Occurrence => "occurrence", SymbolInformation => "symbolInformation", Relationship => "relationship" });
-closed!(SymbolScope { Global => "global", Document => "document", Target => "target" });
-closed!(JoinKind { DeclarationName => "declarationName", Callee => "callee", Invocation => "invocation", Reference => "reference" });
-closed!(JoinStatus { Exact => "exact", Ambiguous => "ambiguous", Unmatched => "unmatched", Unsupported => "unsupported" });
-closed!(Resolution { Resolved => "resolved", External => "external", Ambiguous => "ambiguous", Unresolved => "unresolved" });
-closed!(ReferenceSite { Declaration => "declaration", Use => "use" });
-closed!(Dispatch { Direct => "direct", Constructor => "constructor", Virtual => "virtual", Interface => "interface", Dynamic => "dynamic", Unknown => "unknown" });
-closed!(RelationshipKind { Extends => "extends", Implements => "implements", Overrides => "overrides" });
-macro_rules! record {
-    ($name:ident { $($(#[$attr:meta])* $field:ident : $ty:ty),* $(,)? }) => {
-        #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-        #[serde(rename_all = "camelCase", deny_unknown_fields)]
-        pub struct $name { $($(#[$attr])* pub $field: $ty),* }
-    };
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum PositionEncoding {
+    #[serde(rename = "utf8")]
+    Utf8,
+    #[serde(rename = "utf16")]
+    Utf16,
+    #[serde(rename = "unicodeScalar")]
+    UnicodeScalar,
 }
-record!(Producer { id: String, version: String, executable_hash: String, kind: SemanticKind, languages: Vec<Language>, position_encoding: PositionEncoding });
-closed!(SemanticKind { Semantic => "semantic" });
-record!(SemanticBasis { producer_id: String, producer_version: String, producer_hash: String, artifact_hash: String, language: Language, source_set_id: String, revision_id: String, source_manifest_hash: String, toolchain_hash: String, config_hash: String, dependency_hash: String, lookup_dependencies: Vec<String> });
-record!(Coverage { producer_id: String, language: Language, source_set_id: String, document_path: String, revision_id: String, requested: bool, selected: bool, state: CoverageState, supported_roles: Vec<Role>, observed_roles: Vec<Role>, #[serde(deserialize_with = "nullable")] diagnostic: Option<String>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Role {
+    #[serde(rename = "definition")]
+    Definition,
+    #[serde(rename = "read")]
+    Read,
+    #[serde(rename = "write")]
+    Write,
+    #[serde(rename = "call")]
+    Call,
+    #[serde(rename = "type")]
+    Type,
+    #[serde(rename = "import")]
+    Import,
+    #[serde(rename = "alias")]
+    Alias,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum CoverageState {
+    #[serde(rename = "notRequested")]
+    NotRequested,
+    #[serde(rename = "omitted")]
+    Omitted,
+    #[serde(rename = "unsupported")]
+    Unsupported,
+    #[serde(rename = "failed")]
+    Failed,
+    #[serde(rename = "partial")]
+    Partial,
+    #[serde(rename = "complete")]
+    Complete,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Freshness {
+    #[serde(rename = "fresh")]
+    Fresh,
+    #[serde(rename = "possiblyStale")]
+    PossiblyStale,
+    #[serde(rename = "stale")]
+    Stale,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum EvidenceKind {
+    #[serde(rename = "measuredSyntax")]
+    MeasuredSyntax,
+    #[serde(rename = "declarationBinding")]
+    DeclarationBinding,
+    #[serde(rename = "semanticReference")]
+    SemanticReference,
+    #[serde(rename = "typeRelationship")]
+    TypeRelationship,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum RecordKind {
+    #[serde(rename = "occurrence")]
+    Occurrence,
+    #[serde(rename = "symbolInformation")]
+    SymbolInformation,
+    #[serde(rename = "relationship")]
+    Relationship,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum SymbolScope {
+    #[serde(rename = "global")]
+    Global,
+    #[serde(rename = "document")]
+    Document,
+    #[serde(rename = "target")]
+    Target,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum JoinKind {
+    #[serde(rename = "declarationName")]
+    DeclarationName,
+    #[serde(rename = "callee")]
+    Callee,
+    #[serde(rename = "invocation")]
+    Invocation,
+    #[serde(rename = "reference")]
+    Reference,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum JoinStatus {
+    #[serde(rename = "exact")]
+    Exact,
+    #[serde(rename = "ambiguous")]
+    Ambiguous,
+    #[serde(rename = "unmatched")]
+    Unmatched,
+    #[serde(rename = "unsupported")]
+    Unsupported,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Resolution {
+    #[serde(rename = "resolved")]
+    Resolved,
+    #[serde(rename = "external")]
+    External,
+    #[serde(rename = "ambiguous")]
+    Ambiguous,
+    #[serde(rename = "unresolved")]
+    Unresolved,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ReferenceSite {
+    #[serde(rename = "declaration")]
+    Declaration,
+    #[serde(rename = "use")]
+    Use,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Dispatch {
+    #[serde(rename = "direct")]
+    Direct,
+    #[serde(rename = "constructor")]
+    Constructor,
+    #[serde(rename = "virtual")]
+    Virtual,
+    #[serde(rename = "interface")]
+    Interface,
+    #[serde(rename = "dynamic")]
+    Dynamic,
+    #[serde(rename = "unknown")]
+    Unknown,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum RelationshipKind {
+    #[serde(rename = "extends")]
+    Extends,
+    #[serde(rename = "implements")]
+    Implements,
+    #[serde(rename = "overrides")]
+    Overrides,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Producer {
+    pub id: String,
+    pub version: String,
+    pub executable_hash: String,
+    pub kind: SemanticKind,
+    pub languages: Vec<Language>,
+    pub position_encoding: PositionEncoding,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum SemanticKind {
+    #[serde(rename = "semantic")]
+    Semantic,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SemanticBasis {
+    pub producer_id: String,
+    pub producer_version: String,
+    pub producer_hash: String,
+    pub artifact_hash: String,
+    pub language: Language,
+    pub source_set_id: String,
+    pub revision_id: String,
+    pub source_manifest_hash: String,
+    pub toolchain_hash: String,
+    pub config_hash: String,
+    pub dependency_hash: String,
+    pub lookup_dependencies: Vec<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Coverage {
+    pub producer_id: String,
+    pub language: Language,
+    pub source_set_id: String,
+    pub document_path: String,
+    pub revision_id: String,
+    pub requested: bool,
+    pub selected: bool,
+    pub state: CoverageState,
+    pub supported_roles: Vec<Role>,
+    pub observed_roles: Vec<Role>,
+    #[serde(deserialize_with = "nullable")]
+    pub diagnostic: Option<String>,
     /// Why a `partial` tuple is partial, recorded by the import that derived it (#520). It is
     /// absent on every other state and on rows no import derived, and no graph result returns it.
-    #[serde(default, skip_serializing_if = "Option::is_none")] reasons: Option<CoverageReasons> });
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasons: Option<CoverageReasons>,
+}
 // Every reason a semantic import made one document's coverage `partial` (#520). The single
 // `Coverage.diagnostic` keeps only the reason of highest precedence; this keeps them all.
 // The four counts are the document's unsupported occurrences by the kind of native gap that
 // hid them. The flags are a per-document cap (occurrences, #394, or another wire cap, #634),
 // a dependent fact omitted for an unverified internal target, and a diagnostic the captured
 // join reported.
-record!(CoverageReasons {
-    macro_invocation: u64,
-    attribute_item: u64,
-    macro_definition: u64,
-    other: u64,
-    capped: bool,
-    omitted: bool,
-    captured_diagnostics: bool
-});
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CoverageReasons {
+    pub macro_invocation: u64,
+    pub attribute_item: u64,
+    pub macro_definition: u64,
+    pub other: u64,
+    pub capped: bool,
+    pub omitted: bool,
+    pub captured_diagnostics: bool,
+}
 /// The native gap kinds an unsupported occurrence is counted under, in `CoverageReasons` order.
 pub const GAP_KINDS: [&str; 4] = [
     "macroInvocation",
@@ -122,15 +297,51 @@ impl CoverageReasons {
         self.native_gaps() == 0 && !self.capped && !self.omitted && !self.captured_diagnostics
     }
 }
-record!(DerivedFrom {
-    provenance_id: String,
-    record_kind: RecordKind,
-    fact_digest: String
-});
-record!(Provenance { id: String, producer_id: String, document: native::DocumentKey, revision_id: String, content_hash: String, evidence_kind: EvidenceKind, #[serde(deserialize_with = "nullable")] basis: Option<SemanticBasis>, freshness: Freshness, #[serde(deserialize_with = "nullable")] derived_from: Option<DerivedFrom> });
-record!(SymbolKey { scheme: SymbolScheme, symbol: String, scope: SymbolScope, #[serde(deserialize_with = "nullable")] document: Option<native::DocumentKey> });
-closed!(SymbolScheme { Scip => "scip" });
-record!(Symbol { key: SymbolKey, #[serde(deserialize_with = "nullable")] display_name: Option<String>, declarations: Vec<Target>, provenance_id: String });
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DerivedFrom {
+    pub provenance_id: String,
+    pub record_kind: RecordKind,
+    pub fact_digest: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Provenance {
+    pub id: String,
+    pub producer_id: String,
+    pub document: native::DocumentKey,
+    pub revision_id: String,
+    pub content_hash: String,
+    pub evidence_kind: EvidenceKind,
+    #[serde(deserialize_with = "nullable")]
+    pub basis: Option<SemanticBasis>,
+    pub freshness: Freshness,
+    #[serde(deserialize_with = "nullable")]
+    pub derived_from: Option<DerivedFrom>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SymbolKey {
+    pub scheme: SymbolScheme,
+    pub symbol: String,
+    pub scope: SymbolScope,
+    #[serde(deserialize_with = "nullable")]
+    pub document: Option<native::DocumentKey>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum SymbolScheme {
+    #[serde(rename = "scip")]
+    Scip,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Symbol {
+    pub key: SymbolKey,
+    #[serde(deserialize_with = "nullable")]
+    pub display_name: Option<String>,
+    pub declarations: Vec<Target>,
+    pub provenance_id: String,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum Target {
@@ -145,30 +356,108 @@ pub enum Target {
         symbol: SymbolKey,
     },
 }
-record!(MeasuredAnchor {
-    document: native::DocumentKey,
-    revision_id: String,
-    content_hash: String,
-    range: native::Range,
-    kind: JoinKind
-});
-record!(Join { anchor: MeasuredAnchor, status: JoinStatus, candidate_ids: Vec<String>, #[serde(deserialize_with = "nullable")] diagnostic: Option<String> });
-record!(DeclarationBinding { #[serde(deserialize_with = "nullable")] syntax_id: Option<String>, symbols: Vec<SymbolKey>, join: Join, provenance_id: String });
-record!(Reference { id: String, owner_syntax_id: String, ordinal: usize, document: native::DocumentKey, revision_id: String, range: native::Range, spelling: String, lookup_key: String, site: ReferenceSite, roles: Vec<Role>, resolution: Resolution, #[serde(deserialize_with = "nullable")] declared_target: Option<Target>, candidates: Vec<Target>, provenance_id: String });
-record!(CallBinding { #[serde(deserialize_with = "nullable")] call_id: Option<String>, join: Join, resolution: Resolution, #[serde(deserialize_with = "nullable")] declared_target: Option<Target>, candidates: Vec<Target>, dispatch: Dispatch, possible_dispatch: Vec<Target>, possible_dispatch_complete: bool, #[serde(deserialize_with = "nullable")] stale_target: Option<bool>, provenance_id: String });
-record!(TypeRelationship {
-    kind: RelationshipKind,
-    source: Target,
-    target: Target,
-    provenance_id: String
-});
-record!(SemanticPublication { producers: Vec<Producer>, coverage: Vec<Coverage>, provenance: Vec<Provenance>, symbols: Vec<Symbol>, declaration_bindings: Vec<DeclarationBinding>, references: Vec<Reference>, call_bindings: Vec<CallBinding>, type_relationships: Vec<TypeRelationship> });
-record!(SemanticHead {
-    producer_id: String,
-    document: native::DocumentKey,
-    requested: bool
-});
-record!(SemanticSnapshot { producers: Vec<Producer>, coverage: Vec<Coverage>, provenance: Vec<Provenance>, symbols: Vec<Symbol>, declaration_bindings: Vec<DeclarationBinding>, references: Vec<Reference>, call_bindings: Vec<CallBinding>, type_relationships: Vec<TypeRelationship> });
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MeasuredAnchor {
+    pub document: native::DocumentKey,
+    pub revision_id: String,
+    pub content_hash: String,
+    pub range: native::Range,
+    pub kind: JoinKind,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Join {
+    pub anchor: MeasuredAnchor,
+    pub status: JoinStatus,
+    pub candidate_ids: Vec<String>,
+    #[serde(deserialize_with = "nullable")]
+    pub diagnostic: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeclarationBinding {
+    #[serde(deserialize_with = "nullable")]
+    pub syntax_id: Option<String>,
+    pub symbols: Vec<SymbolKey>,
+    pub join: Join,
+    pub provenance_id: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Reference {
+    pub id: String,
+    pub owner_syntax_id: String,
+    pub ordinal: usize,
+    pub document: native::DocumentKey,
+    pub revision_id: String,
+    pub range: native::Range,
+    pub spelling: String,
+    pub lookup_key: String,
+    pub site: ReferenceSite,
+    pub roles: Vec<Role>,
+    pub resolution: Resolution,
+    #[serde(deserialize_with = "nullable")]
+    pub declared_target: Option<Target>,
+    pub candidates: Vec<Target>,
+    pub provenance_id: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CallBinding {
+    #[serde(deserialize_with = "nullable")]
+    pub call_id: Option<String>,
+    pub join: Join,
+    pub resolution: Resolution,
+    #[serde(deserialize_with = "nullable")]
+    pub declared_target: Option<Target>,
+    pub candidates: Vec<Target>,
+    pub dispatch: Dispatch,
+    pub possible_dispatch: Vec<Target>,
+    pub possible_dispatch_complete: bool,
+    #[serde(deserialize_with = "nullable")]
+    pub stale_target: Option<bool>,
+    pub provenance_id: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TypeRelationship {
+    pub kind: RelationshipKind,
+    pub source: Target,
+    pub target: Target,
+    pub provenance_id: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SemanticPublication {
+    pub producers: Vec<Producer>,
+    pub coverage: Vec<Coverage>,
+    pub provenance: Vec<Provenance>,
+    pub symbols: Vec<Symbol>,
+    pub declaration_bindings: Vec<DeclarationBinding>,
+    pub references: Vec<Reference>,
+    pub call_bindings: Vec<CallBinding>,
+    pub type_relationships: Vec<TypeRelationship>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SemanticHead {
+    pub producer_id: String,
+    pub document: native::DocumentKey,
+    pub requested: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SemanticSnapshot {
+    pub producers: Vec<Producer>,
+    pub coverage: Vec<Coverage>,
+    pub provenance: Vec<Provenance>,
+    pub symbols: Vec<Symbol>,
+    pub declaration_bindings: Vec<DeclarationBinding>,
+    pub references: Vec<Reference>,
+    pub call_bindings: Vec<CallBinding>,
+    pub type_relationships: Vec<TypeRelationship>,
+}
 /// A read projection of one proof. The stored proof and its basis remain historical;
 /// effective freshness belongs to the native-N view, never to a new publication.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
