@@ -74,8 +74,9 @@ pub(crate) use work::{
     note_original_raw_decode, note_original_raw_envelope_parse, note_original_source_hash,
     note_parsed_role_site_document, note_producer_attempt, note_published_copy,
     note_reused_document, note_selected_original_native_row,
-    note_selected_original_raw_proof_bytes, note_selected_original_source_bytes, publication_work,
-    publication_work_checkpoint, reset_publication_work, restore_publication_work,
+    note_selected_original_raw_proof_bytes, note_selected_original_source_bytes,
+    note_witness_proof_read, publication_work, publication_work_checkpoint, reset_publication_work,
+    restore_publication_work,
 };
 
 /// How a call's exact bound target declaration can be called, measured from its native

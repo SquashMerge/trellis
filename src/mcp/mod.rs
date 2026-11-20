@@ -536,8 +536,18 @@ fn lookup_root(
         }
     }
 }
-/// Work of a tool before read admission, outside any read transaction.
-type BeforeEvidenceRead<'a> = dyn Fn(&crate::daemon::registry::CheckoutRuntime) + 'a;
+/// How a read that needs the head's Architecture core waits for the owner while it builds.
+/// The wait follows an admitted read that found the core building, and holds no read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ArchitectureWait {
+    /// The architecture tools and the prompt wait until one second before the deadline, then
+    /// answer the typed `building` from the owner's state, admitting no other read (#798,
+    /// #1252).
+    AnswersBuilding,
+    /// A find, search or call graph `app` filter waits within its deadline and fails
+    /// `deadline_exceeded` if the core is still building (#851).
+    UntilDeadline,
+}
 
 #[cfg(feature = "test-support")]
 fn capture_evidence_error(
@@ -596,7 +606,7 @@ fn evidence_read(
     id: &serde_json::Value,
     #[cfg(feature = "test-support")] evidence_error: Option<&EvidenceErrorHook>,
     query: Option<&str>,
-    before_read: Option<&BeforeEvidenceRead<'_>>,
+    architecture: Option<ArchitectureWait>,
     read: &EvidenceToolReadFn<'_>,
 ) -> anyhow::Result<(serde_json::Value, bool)> {
     let _profile = query.map(|_| crate::search_model::SearchPhaseTimer::start("search_total"));
@@ -626,9 +636,6 @@ fn evidence_read(
     };
     #[cfg(feature = "test-support")]
     runtime.run_mcp_read_hook_for_tests();
-    if let Some(before_read) = before_read {
-        before_read(&runtime);
-    }
     let search_head = query
         .and_then(|_| runtime.browser_scheduler().ok())
         .and_then(|scheduler| scheduler.search_head_slot(true));
@@ -676,6 +683,8 @@ fn evidence_read(
             }
         })
         .transpose()?;
+    // The catching-up flag the last admitted read sampled.
+    let mut last_sampled = false;
     loop {
         if cancelled() || runtime.mcp_clock_now() >= deadline {
             anyhow::bail!("deadline_exceeded: MCP selected read deadline");
@@ -686,6 +695,7 @@ fn evidence_read(
                 None => runtime.evidence_response()?,
             };
             publish(sampled);
+            last_sampled = sampled;
             #[cfg(feature = "test-support")]
             runtime.run_mcp_admitted_gate_for_tests();
             if cancelled() || runtime.mcp_clock_now() >= deadline {
@@ -732,23 +742,41 @@ fn evidence_read(
             let envelope = response.finish(envelope)?;
             Ok((envelope, sampled))
         })();
-        match attempt {
+        let building = match attempt {
             Err(ref error) if crate::store::cli_read_retryable_contention(error) => {
                 std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
             }
-            // The head moved, or the first wait could not admit. The read has ended, so this
-            // wait holds nothing; the next attempt answers from what the owner published.
-            Err(ref error)
-                if error
-                    .downcast_ref::<crate::http::architecture::ArchitectureBuilding>()
-                    .is_some() =>
-            {
-                if let Some(before_read) = before_read {
-                    before_read(&runtime);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
+            Err(error) => error.downcast::<crate::http::architecture::ArchitectureBuilding>()?,
             answer => return answer,
+        };
+        // The core is still building. The read has ended, so this wait holds nothing; the
+        // next attempt answers from what the owner published.
+        let reserve = match architecture {
+            Some(ArchitectureWait::AnswersBuilding) => ARCHITECTURE_ANSWER_TIME,
+            _ => std::time::Duration::ZERO,
+        };
+        let wait = deadline
+            .saturating_duration_since(runtime.mcp_clock_now())
+            .saturating_sub(reserve);
+        let still = runtime.architecture_still_building(&building, wait, &mut || {
+            anyhow::ensure!(!cancelled(), "cancelled");
+            Ok(())
+        });
+        match (still, architecture) {
+            // #1252: answered from the owner's state. Another admitted read could outlast the
+            // deadline on a loaded host or behind a publication's COMMIT.
+            (Some(still), Some(ArchitectureWait::AnswersBuilding)) => {
+                let pin = still.pin;
+                let mut envelope = architecture::failure(id, &anyhow::Error::new(still));
+                envelope["error"]["currentBasis"] = serde_json::json!({
+                    "indexGeneration": pin.index_generation.to_string(),
+                    "indexRevision": pin.index_revision
+                });
+                return Ok((envelope, last_sampled));
+            }
+            (Some(_), _) => anyhow::bail!("deadline_exceeded: MCP selected read deadline"),
+            (None, _) => std::thread::sleep(std::time::Duration::from_millis(1)),
         }
     }
 }
@@ -1289,30 +1317,10 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                 // #851: a find, search or call graph `app` filter reads the head's core too.
                 let app_filtered =
                     !architecture_read && args.is_some_and(|args| args.contains_key("app"));
-                let await_architecture = |runtime: &crate::daemon::registry::CheckoutRuntime| {
-                    let store_arguments = architecture::store_arguments(
-                        &name,
-                        arguments.as_ref().unwrap_or(&serde_json::Value::Null),
-                    );
-                    let wait = deadline
-                        .saturating_duration_since(runtime.mcp_clock_now())
-                        .saturating_sub(ARCHITECTURE_ANSWER_TIME);
-                    runtime.await_architecture_tool(
-                        if architecture_read {
-                            architecture::operation(&name)
-                        } else {
-                            "apps"
-                        },
-                        &store_arguments,
-                        wait,
-                        &mut || {
-                            anyhow::ensure!(
-                                !cancel.load(std::sync::atomic::Ordering::Acquire),
-                                "cancelled"
-                            );
-                            Ok(())
-                        },
-                    );
+                let architecture_wait = if architecture_read {
+                    Some(ArchitectureWait::AnswersBuilding)
+                } else {
+                    app_filtered.then_some(ArchitectureWait::UntilDeadline)
                 };
                 let publish = |sampled: bool| {
                     *resolved.lock().unwrap() = Some((root.to_owned(), sampled));
@@ -1334,8 +1342,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                             .as_str()
                             .expect("validated search query")
                     }),
-                    (architecture_read || app_filtered)
-                        .then_some(&await_architecture as &BeforeEvidenceRead<'_>),
+                    architecture_wait,
                     &*tool_read,
                 ) {
                     Ok((found, sampled)) => {

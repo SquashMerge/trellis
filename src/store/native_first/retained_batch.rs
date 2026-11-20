@@ -209,8 +209,54 @@ impl RetainedBatchRows<'_> {
         Ok(blob.read(buffer)?)
     }
 
-    /// Up to `limit` proof identities of the capture after `after`, in proof order. `each`
-    /// sees a row's borrowed fields before anything is copied out of it.
+    /// Up to `limit` proof identities of one document of the capture, `(language, path)`,
+    /// after `after` (record kind, fact digest), in the order of the capture's
+    /// `(language, path, record kind, fact digest)` index, which serves them without reading
+    /// any other document's proofs. `each` sees a row's borrowed fields before anything is
+    /// copied out of it.
+    pub(crate) fn document_proofs(
+        &self,
+        capture_id: i64,
+        document: (&str, &str),
+        after: (&str, &str),
+        limit: i64,
+        each: &mut dyn FnMut(WitnessProofRow<'_>) -> Result<()>,
+    ) -> Result<()> {
+        let mut statement = self.db.prepare_cached(
+            "SELECT proof_id,record_kind,fact_digest FROM semantic_raw_proofs WHERE capture_id=?1 AND language=?2 AND path=?3 AND (record_kind,fact_digest)>(?4,?5) ORDER BY record_kind,fact_digest LIMIT ?6",
+        )?;
+        let mut rows = statement.query(params![
+            capture_id, document.0, document.1, after.0, after.1, limit
+        ])?;
+        while let Some(row) = rows.next()? {
+            each(WitnessProofRow {
+                proof_id: row.get_ref(0)?.as_str()?,
+                record_kind: row.get_ref(1)?.as_str()?,
+                fact_digest: row.get_ref(2)?.as_str()?,
+                language: document.0,
+                path: document.1,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// How many of the capture's proof IDs follow `after`, up to `limit`, and the last of them,
+    /// read from the capture's proof-ID index alone.
+    pub(crate) fn proof_ids_after(
+        &self,
+        capture_id: i64,
+        after: &str,
+        limit: i64,
+    ) -> Result<(i64, Option<String>)> {
+        Ok(self.db.prepare_cached("SELECT count(*),max(proof_id) FROM (SELECT proof_id FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id>?2 ORDER BY proof_id LIMIT ?3)")?.query_row(
+            params![capture_id, after, limit], |row| Ok((row.get(0)?, row.get(1)?)),
+        )?)
+    }
+
+    /// Up to `limit` proof identities of the capture after `after`, in proof order: the walk
+    /// witnessed S did before #1245, kept as its tests' reference. `each` sees a row's
+    /// borrowed fields before anything is copied out of it.
+    #[cfg(test)]
     pub(crate) fn witness_proofs(
         &self,
         capture_id: i64,
