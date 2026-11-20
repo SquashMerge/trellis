@@ -54,6 +54,10 @@ pub struct DefaultProducers {
     pub by_language: BTreeMap<String, Vec<String>>,
     /// Whether the revision publishes any producer.
     pub published: bool,
+    /// The note of each language whose semantic evidence needs re-import or is catching up,
+    /// worded as status and describe word that state (#1255). It replaces the coverage note
+    /// of a language without a selected producer.
+    pub pending: BTreeMap<String, String>,
 }
 
 impl DefaultProducers {
@@ -85,8 +89,16 @@ impl DefaultProducers {
         }
     }
 
-    /// Why the language shows syntax only, or `None` when it has a producer.
+    /// Why the language shows syntax only, or `None` when it has a producer. A language whose
+    /// evidence needs re-import or is catching up says so (#1255); "does not cover this
+    /// language" is only for a language that no published producer covers.
     pub fn note(&self, language: &str) -> Option<String> {
+        if self.producer(language).is_some() {
+            return None;
+        }
+        if let Some(note) = self.pending.get(language) {
+            return Some(note.clone());
+        }
         match self.by_language.get(language).map(Vec::len) {
             Some(1) => None,
             Some(_) => Some(multiple_producers_note(language)),

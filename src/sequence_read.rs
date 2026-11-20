@@ -6,7 +6,7 @@
 //! same fence as before. This file contains SQL until the read API is narrowed (S14).
 use crate::graph_read;
 use crate::model::*;
-use crate::store::{EvidenceResponse, SelectedIntegrity, Store, id_codec};
+use crate::store::{AutoRunLabels, EvidenceResponse, SelectedIntegrity, Store, id_codec};
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -17,8 +17,15 @@ impl EvidenceResponse {
         expected: IndexPin,
         show_all: bool,
     ) -> Result<Option<crate::behavior::SequenceView>> {
-        self.store
-            .sequence_in(&self.db, seed, expected, show_all, false, true)
+        self.store.sequence_in(
+            &self.db,
+            seed,
+            expected,
+            show_all,
+            false,
+            true,
+            self.auto_run_labels(),
+        )
     }
     /// The candidates of the browser's Interactions view (#663): see [`Store::sequence_interactions_at`].
     pub fn sequence_interactions_at(
@@ -26,8 +33,15 @@ impl EvidenceResponse {
         seed: &str,
         expected: IndexPin,
     ) -> Result<Option<crate::behavior::SequenceView>> {
-        self.store
-            .sequence_in(&self.db, seed, expected, false, true, true)
+        self.store.sequence_in(
+            &self.db,
+            seed,
+            expected,
+            false,
+            true,
+            true,
+            self.auto_run_labels(),
+        )
     }
 }
 
@@ -39,7 +53,10 @@ impl Store {
         expected: IndexPin,
         show_all: bool,
     ) -> Result<Option<crate::behavior::SequenceView>> {
-        self.with_evidence(|tx| self.sequence_in(tx, seed, expected, show_all, false, false))
+        let labels = AutoRunLabels::default();
+        self.with_evidence(|tx| {
+            self.sequence_in(tx, seed, expected, show_all, false, false, &labels)
+        })
     }
     /// The candidates of the browser's Interactions view (#663): an enriched view with a
     /// shown call is kept within the work, depth and participant bounds but not yet the
@@ -50,8 +67,10 @@ impl Store {
         seed: &str,
         expected: IndexPin,
     ) -> Result<Option<crate::behavior::SequenceView>> {
-        self.with_evidence(|tx| self.sequence_in(tx, seed, expected, false, true, false))
+        let labels = AutoRunLabels::default();
+        self.with_evidence(|tx| self.sequence_in(tx, seed, expected, false, true, false, &labels))
     }
+    #[allow(clippy::too_many_arguments)]
     fn sequence_in(
         &self,
         tx: &Connection,
@@ -60,6 +79,7 @@ impl Store {
         show_all: bool,
         interactions: bool,
         pre_startup: bool,
+        labels: &AutoRunLabels,
     ) -> Result<Option<crate::behavior::SequenceView>> {
         let selected_revision = self.read_revision_for(tx, Some(expected), pre_startup)?;
         let revision = selected_revision.pin;
@@ -97,6 +117,7 @@ impl Store {
             &mut view,
             show_all,
             interactions,
+            labels,
         )?;
         // #888: a syntax-only view's callbacks can hold only a hop, decided by the read.
         if view.semantic.tier == crate::behavior::EvidenceTier::Syntax {
