@@ -1129,6 +1129,12 @@ pub(crate) struct IndexConnection {
     db: ProtectedSqliteConnection,
     _use_guard: topology::UseGuard,
 }
+impl IndexConnection {
+    /// The (device, inode) this connection's SQLite file was verified to be at open.
+    fn file_id(&self) -> (u64, u64) {
+        (self.db.key.1, self.db.key.2)
+    }
+}
 impl Deref for IndexConnection {
     type Target = Connection;
     fn deref(&self) -> &Connection {
@@ -3552,6 +3558,8 @@ pub fn terminal_status_sqlite_contention(error: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 mod admit_once_tests;
+#[cfg(test)]
+mod control_memo_tests;
 #[cfg(test)]
 mod published_admission_tests;
 #[cfg(test)]
@@ -12075,21 +12083,24 @@ impl Store {
     }
 
     fn recovery_baseline(&self, db: &Connection) -> Result<RecoveryBaseline> {
-        self.recovery_baseline_scoped(db, PairedManifestScope::Changing)
+        self.recovery_baseline_scoped(db, PairedManifestScope::Changing, None)
     }
 
     fn recovery_baseline_preflight(&self, db: &Connection) -> Result<RecoveryBaseline> {
-        self.recovery_baseline_scoped(db, PairedManifestScope::Preflight)
+        self.recovery_baseline_scoped(db, PairedManifestScope::Preflight, None)
     }
 
     fn recovery_baseline_full(&self, db: &Connection) -> Result<RecoveryBaseline> {
-        self.recovery_baseline_scoped(db, PairedManifestScope::Full)
+        self.recovery_baseline_scoped(db, PairedManifestScope::Full, None)
     }
 
+    /// `file` is the live index's (device, inode) for a read-only snapshot of it, which
+    /// lets an unchanged committed state skip bounded control validation (#1245).
     fn recovery_baseline_scoped(
         &self,
         db: &Connection,
         scope: PairedManifestScope,
+        file: Option<(u64, u64)>,
     ) -> Result<RecoveryBaseline> {
         let schema: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
         let metadata_missing: bool = db.query_row(
@@ -12218,7 +12229,7 @@ impl Store {
                     Ok(())
                 })
             } else {
-                validate_bounded_control(db, &self.identity.record_id, scope)
+                self.validate_bounded_control_once(db, file, scope)
             };
             match validation {
                 Ok(()) => true,
@@ -12413,13 +12424,14 @@ impl Store {
         (|| {
             self.ensure_not_recreate_pending()?;
             let mut db = self.cache()?;
+            let file = db.file_id();
             let tx = storage_result(db.transaction())?;
             begin_read_snapshot(
                 &tx,
                 &self.roots.index_db(&self.identity),
                 Duration::from_secs(5),
             )?;
-            self.recovery_baseline(&tx)
+            self.recovery_baseline_scoped(&tx, PairedManifestScope::Changing, Some(file))
         })()
         .map_err(|error| self.report_index_failure(error))
     }
@@ -12429,13 +12441,14 @@ impl Store {
         (|| {
             self.ensure_not_recreate_pending()?;
             let mut db = self.cache()?;
+            let file = db.file_id();
             let tx = storage_result(db.transaction())?;
             begin_read_snapshot(
                 &tx,
                 &self.roots.index_db(&self.identity),
                 Duration::from_secs(5),
             )?;
-            self.recovery_baseline_preflight(&tx)
+            self.recovery_baseline_scoped(&tx, PairedManifestScope::Preflight, Some(file))
         })()
         .map_err(|error| self.report_index_failure(error))
     }
@@ -12508,6 +12521,7 @@ impl Store {
     pub fn recorded_index_options(&self) -> Result<Option<crate::model::IndexOptions>> {
         (|| {
             let mut db = self.cache()?;
+            let file = db.file_id();
             let tx = storage_result(db.transaction())?;
             begin_read_snapshot(
                 &tx,
@@ -12522,7 +12536,11 @@ impl Store {
             // One snapshot must bind the shape, revision and options. A fresh v8
             // bootstrap has no options or evidence; a published revision never may.
             validate_cache_shape(&tx)?;
-            if self.recovery_baseline_preflight(&tx)?.pin.is_none() {
+            if self
+                .recovery_baseline_scoped(&tx, PairedManifestScope::Preflight, Some(file))?
+                .pin
+                .is_none()
+            {
                 return Ok(None);
             }
             let revision: i64 = storage_result(tx.query_row(
