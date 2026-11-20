@@ -5308,6 +5308,50 @@ fn every_live_publication_raises_its_write_intent_until_its_transaction_ends() {
     assert!(!store.semantic_catch_up_pending_for_tests().unwrap());
 }
 
+/// #1245: the Architecture read's semantic part checks its caller inside its per-row cursors,
+/// every 256 admitted rows, so a read of one large document's evidence gives way to a
+/// publication promptly. The revision has one document, whose evidence is hundreds of resolved
+/// uses: its only other checks are one per document and one per tuple, so a check that refuses
+/// every later call stops the read inside the cursors.
+#[test]
+fn the_architecture_semantic_read_checks_inside_its_row_cursors() {
+    const USES: usize = 600;
+    let source = std::iter::once("function run() {}\n".to_owned())
+        .chain((0..USES).map(|_| "run();\n".to_owned()))
+        .collect::<String>();
+    let world = world(|root| write_files(root, &[("src/A.js", &source)]));
+    let mut document = DocSpec::new("src/A.js")
+        .occurrence(&[0, 9, 12], &[], "pkg run.", 1)
+        .symbol("pkg run.", 17, &[]);
+    for line in 1..=USES as i32 {
+        document = document.occurrence(&[line, 0, 3], &[], "pkg run.", 0);
+    }
+    let descriptor = one_artifact_per_language(&world, vec![("javascript", vec![document])]);
+    world.publish(&descriptor).unwrap();
+
+    let mut checks = 0usize;
+    world
+        .store
+        .architecture_semantic_with_check_for_tests(&mut || {
+            checks += 1;
+            Ok(())
+        })
+        .unwrap();
+    assert!(checks >= 2 + USES / 256, "{checks} checks over {USES} uses");
+
+    let mut checks = 0usize;
+    let stopped = world
+        .store
+        .architecture_semantic_with_check_for_tests(&mut || {
+            checks += 1;
+            anyhow::ensure!(checks <= 2, "cancelled: a publication is writing");
+            Ok(())
+        })
+        .unwrap_err();
+    assert!(stopped.to_string().starts_with("cancelled"), "{stopped:#}");
+    assert_eq!(checks, 3, "stopped at the first check inside the cursors");
+}
+
 /// #672: status's semantic projection is remembered per published head. Repeated status at
 /// one head runs no projection; an N or an S publication is a new head and recomputes it; a
 /// status read while the S commit is open answers the still-published head, from its cache.

@@ -2111,6 +2111,27 @@ pub(super) fn architecture_semantic(
     Ok(())
 }
 
+#[cfg(feature = "test-support")]
+impl super::Store {
+    /// Run the semantic part of the head's Architecture read with `check` alone (#1245). The
+    /// documents come from a whole read first, under a check that never stops it.
+    #[doc(hidden)]
+    pub fn architecture_semantic_with_check_for_tests(
+        &self,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let response = self.evidence_response()?;
+        let (mut snapshot, _) =
+            response.architecture_snapshot_regions(None, &mut || Ok(()), &|_, _| {})?;
+        for document in &mut snapshot.documents {
+            document.semantic = Default::default();
+        }
+        let selected = response.selected(None)?;
+        architecture_semantic(&response.db, &selected.key, &mut snapshot.documents, check)?;
+        response.finish(())
+    }
+}
+
 #[cfg(test)]
 mod reimport_tests {
     use super::*;
