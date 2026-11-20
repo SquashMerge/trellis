@@ -171,11 +171,13 @@ const lastCheckoutKey = "trellis.lastCheckout.v1";
 function rememberCheckout(key) {
   try { localStorage.setItem(lastCheckoutKey, key); } catch (_) { /* A per-browser convenience only. */ }
 }
-// Arrival picks the only selectable checkout, else the one last used in this browser.
+// Arrival picks the only available checkout, else the one last used in this browser (held while it
+// is busy), else the only checkout when it is busy (#1253).
 // The agent's working directory is not observable from the browser or daemon here.
 function arrivalCheckout() {
-  const available = checkouts.filter(choosable);
+  const available = checkouts.filter(selectable), choices = checkouts.filter(choosable);
   if (available.length === 1) return available[0].rootKey;
+  if (!available.length && choices.length === 1) return choices[0].rootKey;
   let last = null;
   try { last = localStorage.getItem(lastCheckoutKey); } catch (_) { last = null; }
   return validRootKey(last) && uniqueChoosableRoot(last) ? last : null;

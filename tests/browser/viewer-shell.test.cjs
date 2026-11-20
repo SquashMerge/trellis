@@ -1213,11 +1213,15 @@ test("checkout picker uses observed branch, detached and unavailable Git labels,
     await page.locator("#token").fill(paths.token);
     await page.locator("#connect-form button[type=submit]").click();
     await page.waitForFunction(key => document.querySelector("#checkout-select").value === key, server.rootKey);
-    assert.equal(await page.locator("#checkout-select").inputValue(), server.rootKey, "the only selectable checkout opens on arrival; busy and unavailable rows do not count");
+    assert.equal(await page.locator("#checkout-select").inputValue(), server.rootKey, "the only available checkout opens on arrival; busy and unavailable rows do not count");
     const option = page.locator(`#checkout-select option[value="${server.rootKey}"]`);
     assert.equal(await option.textContent(), `workspace ⎇ ${branch} · ${shortRevision}`);
     assert.equal(await option.getAttribute("title"), observed.workspaceRoot);
-    for (const row of rows.slice(1)) assert.equal(await page.locator(`#checkout-select option[value="${row.rootKey}"]`).isDisabled(), true, `${row.state} entries cannot be selected`);
+    // A busy checkout is contention, not a failure: it can be chosen and is never "Not indexed" (#1253).
+    const busy = page.locator(`#checkout-select option[value="${rows[1].rootKey}"]`);
+    assert.equal(await busy.isDisabled(), false, "storage_busy entries can be selected");
+    assert.equal(await busy.textContent(), "busy ⎇ Git unavailable · Busy · retrying");
+    assert.equal(await page.locator(`#checkout-select option[value="${rows[2].rootKey}"]`).isDisabled(), true, "unavailable entries cannot be selected");
     assert.equal(await page.locator("#checkout-retry").isVisible(), true);
     await page.locator("#checkout-select").selectOption(server.rootKey);
     await page.waitForFunction(() => document.querySelector("#checkout-state")?.textContent === "");
