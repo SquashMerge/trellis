@@ -28,7 +28,8 @@ fn checkout() -> Checkout {
         "function a() { b(); }\nfunction b() {}\n",
     )
     .unwrap();
-    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let store =
+        crate::testing::retry_admission(|| Store::open_for_tests(state.path(), root.path()));
     let cancel = Arc::new(AtomicBool::new(false));
     let (graph, native, capture) = crate::indexer::index_workspace_bundle(
         &crate::indexer::IndexOptions::new(root.path().into()),
