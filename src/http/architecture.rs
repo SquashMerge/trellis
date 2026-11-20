@@ -40,6 +40,32 @@ pub(crate) const RETRY_AFTER_MS: u64 = 250;
 pub struct ArchitectureBuilding {
     pub pin: IndexPin,
     pub(crate) progress: Option<ArchitectureProgress>,
+    /// The rules file the read needs its core to have evaluated, so the read can wait for
+    /// that core after its read has ended (#1252).
+    pub(crate) rules: WantedRules,
+}
+
+/// An owned [`CoreRules`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum WantedRules {
+    Any,
+    Exactly(Option<String>),
+}
+impl WantedRules {
+    fn core_rules(&self) -> CoreRules<'_> {
+        match self {
+            Self::Any => CoreRules::Any,
+            Self::Exactly(hash) => CoreRules::Exactly(hash.as_deref()),
+        }
+    }
+}
+impl From<CoreRules<'_>> for WantedRules {
+    fn from(rules: CoreRules<'_>) -> Self {
+        match rules {
+            CoreRules::Any => Self::Any,
+            CoreRules::Exactly(hash) => Self::Exactly(hash.map(str::to_owned)),
+        }
+    }
 }
 impl std::fmt::Display for ArchitectureBuilding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -447,6 +473,25 @@ impl DaemonState {
         let _ = self.architecture_outcome(pin, rules, wait, check, false);
     }
 
+    /// After an admitted read found `building`'s core still being computed and ended (#1252):
+    /// wait at most `wait` on the owner, holding no lease or read. `None` when a new read
+    /// should be admitted, because the core or its kept failure is published, the owner passed
+    /// the pin, or `check` failed; otherwise the core is still building, with its progress now.
+    pub(crate) fn architecture_still_building(
+        self: &Arc<Self>,
+        building: &ArchitectureBuilding,
+        wait: Duration,
+        check: &mut impl FnMut() -> anyhow::Result<()>,
+    ) -> Option<ArchitectureBuilding> {
+        let pin = building.pin;
+        let error = self
+            .architecture_outcome(pin, building.rules.core_rules(), wait, check, false)
+            .err()?;
+        let still = error.downcast::<ArchitectureBuilding>().ok()?;
+        let passed = self.architecture.0.state.lock().unwrap().passed(pin);
+        (!passed).then_some(still)
+    }
+
     fn architecture_outcome(
         self: &Arc<Self>,
         pin: IndexPin,
@@ -488,7 +533,12 @@ impl DaemonState {
             let remaining = deadline.saturating_duration_since(Instant::now());
             // The head moved past this pin, so no build is coming: the caller reads again.
             if remaining.is_zero() || state.passed(pin) {
-                return Err(ArchitectureBuilding { pin, progress }.into());
+                return Err(ArchitectureBuilding {
+                    pin,
+                    progress,
+                    rules: rules.into(),
+                }
+                .into());
             }
             if state.shutdown {
                 anyhow::bail!("index_not_ready: checkout released");
