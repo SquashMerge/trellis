@@ -5237,6 +5237,77 @@ fn native_identity_change_external_import_reason_survives_failure_and_clears_on_
     assert_eq!(world.store.semantic_at(first).unwrap(), prior);
 }
 
+/// #1245: every live publication raises its write intent, which the Architecture read gives
+/// way to, until its transaction ends: a semantic batch import, a native publication of an
+/// edit, and that edit's S catch-up commit.
+#[test]
+fn every_live_publication_raises_its_write_intent_until_its_transaction_ends() {
+    use std::sync::atomic::Ordering;
+    use trellis::store::SemanticPublicationStage;
+
+    let world = definitions_world();
+    let store = &world.store;
+    assert!(!store.publication_writing_for_tests());
+    let (mut admitted, joined, _) = world
+        .join_with(
+            &split_definitions(&world, false),
+            &BatchLimits::PRODUCTION,
+            DestinationMutations::default(),
+        )
+        .unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    let mut importing = false;
+    store
+        .publish_semantic_batch_observing_for_tests(
+            &joined,
+            admitted.stage_mut(),
+            joined.destination_pin(),
+            &leader,
+            &world.cancel,
+            |_| {
+                importing = store.publication_writing_for_tests();
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert!(importing, "a semantic batch import raises it");
+    assert!(!store.publication_writing_for_tests());
+
+    let native = Arc::new(AtomicBool::new(false));
+    let (observer, seen) = (store.clone(), native.clone());
+    store.set_publication_before_commit_hook_for_tests(move || {
+        seen.store(observer.publication_writing_for_tests(), Ordering::Release);
+    });
+    write_files(&world.root, &[("src/C.js", "function other(){}\n")]);
+    let options = IndexOptions::new(world.root.clone());
+    let capture = trellis::capture::Capture::admit(&options, &world.cancel, &|_| {}).unwrap();
+    store
+        .publish_local_for_tests(&options, &capture, &leader, &world.cancel)
+        .unwrap();
+    drop(leader);
+    assert!(
+        native.load(Ordering::Acquire),
+        "a native publication raises it"
+    );
+    assert!(!store.publication_writing_for_tests());
+    assert!(store.semantic_catch_up_pending_for_tests().unwrap());
+
+    let catching_up = Arc::new(AtomicBool::new(false));
+    let (observer, seen) = (store.clone(), catching_up.clone());
+    store.set_semantic_publication_observer_for_tests(move |stage, _| {
+        if stage == SemanticPublicationStage::BeforeSemantic {
+            seen.store(observer.publication_writing_for_tests(), Ordering::Release);
+        }
+    });
+    store.catch_up_semantic_for_tests(&world.cancel).unwrap();
+    assert!(
+        catching_up.load(Ordering::Acquire),
+        "the S catch-up commit raises it"
+    );
+    assert!(!store.publication_writing_for_tests());
+    assert!(!store.semantic_catch_up_pending_for_tests().unwrap());
+}
+
 /// #672: status's semantic projection is remembered per published head. Repeated status at
 /// one head runs no projection; an N or an S publication is a new head and recomputes it; a
 /// status read while the S commit is open answers the still-published head, from its cache.

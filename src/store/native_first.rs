@@ -525,6 +525,8 @@ impl Store {
                 "joined batch superseded by a later join attempt"
             );
         }
+        // Declared before the connection and its transaction, so it drops after both (#1245).
+        let _intent = self.write_intent();
         let db = self.cache_write()?;
         storage_result(db.pragma_update(None, "cache_size", -PUBLICATION_CACHE_KIB))?;
         // Declared before the transaction so it drops after it: on an error or

@@ -141,6 +141,12 @@ struct PublicationGate {
     /// Signalled when `readers_blocked` clears: the publication's transaction
     /// has committed or rolled back, so readers waiting on it can retry (#674).
     readers_unblocked: Condvar,
+    /// Live publications that have raised their write intent and not yet ended their
+    /// transaction (#1245). In rollback-journal mode a COMMIT waits out every reader's
+    /// SHARED lock, so the Architecture owner's whole-checkout read gives way to these.
+    writing: Mutex<usize>,
+    /// Signalled when `writing` returns to zero: the owner may read again.
+    writing_ended: Condvar,
     #[cfg(test)]
     test_after_readers_unblocked: TestOneShotHook,
     /// Runs when a reader starts waiting on a spilled publication.
@@ -220,6 +226,61 @@ impl Store {
             .lock()
             .unwrap()
             .is_some()
+    }
+
+    /// Raise a live publication's write intent until the guard drops (#1245). Declare it
+    /// before the write transaction, so it drops after that transaction on every exit.
+    fn write_intent(&self) -> WriteIntent<'_> {
+        *self.publication_gate.writing.lock().unwrap() += 1;
+        WriteIntent(&self.publication_gate)
+    }
+
+    /// Whether a live publication has raised its write intent and not yet ended its
+    /// transaction (#1245). The Architecture owner samples this at each of its read's checks
+    /// and gives its snapshot up; the publication never waits for the owner.
+    pub(crate) fn publication_writing(&self) -> bool {
+        *self.publication_gate.writing.lock().unwrap() > 0
+    }
+
+    /// Wait on the gate's signal until no live publication is writing, at most `max`
+    /// (#1245). `false` means the bound ran out first: a liveness backstop, not a proof that
+    /// the publication ended. The caller holds no lock and no SQLite snapshot while it waits.
+    pub(crate) fn await_publications_written(&self, max: Duration) -> bool {
+        let gate = &self.publication_gate;
+        let deadline = Instant::now() + max;
+        let mut writing = gate.writing.lock().unwrap();
+        while *writing > 0 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            writing = gate
+                .writing_ended
+                .wait_timeout(writing, remaining)
+                .unwrap()
+                .0;
+        }
+        true
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn publication_writing_for_tests(&self) -> bool {
+        self.publication_writing()
+    }
+}
+
+/// One live publication's write intent (#1245), from before its write connection until its
+/// transaction has committed or rolled back. Dropping it on every exit, including errors and
+/// unwinds, signals the Architecture owner once no publication is writing.
+struct WriteIntent<'a>(&'a PublicationGate);
+impl Drop for WriteIntent<'_> {
+    fn drop(&mut self) {
+        let mut writing = self.0.writing.lock().unwrap_or_else(|e| e.into_inner());
+        *writing -= 1;
+        if *writing == 0 {
+            self.0.writing_ended.notify_all();
+        }
     }
 }
 
@@ -12599,16 +12660,28 @@ impl Store {
     /// (#813). APFS renumbers `st_dev` across reboots; spelling and inode are the persisted
     /// identity, so the index is the same root's and is kept. One UPDATE, so it is atomic;
     /// a stored identity of another spelling or inode is left for the root checks to refuse.
+    ///
+    /// It writes only when the stored device differs (#1245). An UPDATE that matches no row
+    /// still takes the write lock, and in rollback-journal mode that waits out every reader
+    /// while holding new readers out. This daemon is the only writer and the UPDATE keeps its
+    /// own guard, so a race between the look and the write can only make the write a no-op.
     fn adopt_root_device(&self, writer: &topology::WriterGuard) -> Result<()> {
         writer.belongs_to(&self.identity)?;
+        let device = self.identity.device.to_string();
+        let inode = self.identity.inode.to_string();
+        let differs: bool = storage_result(self.cache()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM index_metadata WHERE singleton=1 AND root_spelling=?2 AND root_inode=?3 AND root_device<>?1)",
+            params![device, self.workspace_root, inode],
+            |row| row.get(0),
+        ))?;
+        if !differs {
+            return Ok(());
+        }
+        let _intent = self.write_intent();
         let db = self.cache_write()?;
         storage_result(db.execute(
             "UPDATE index_metadata SET root_device=?1 WHERE singleton=1 AND root_spelling=?2 AND root_inode=?3 AND root_device<>?1",
-            params![
-                self.identity.device.to_string(),
-                self.workspace_root,
-                self.identity.inode.to_string()
-            ],
+            params![device, self.workspace_root, inode],
         ))?;
         Ok(())
     }
@@ -13099,6 +13172,8 @@ impl Store {
         // No handle on stage.db may exist while the writer has it attached.
         stage.release_connection();
         let stage_uri = stage_attach_uri(&stage.db_path());
+        // Declared before the connection and its transaction, so it drops after both (#1245).
+        let _intent = self.write_intent();
         let conn = self.cache_write()?;
         let db: &Connection = &conn;
         #[allow(unused_mut)]
@@ -14961,6 +15036,8 @@ impl Store {
             }
             Err(error) => return Err(typed_storage_full(error)),
         };
+        // Declared before the transaction, so it drops after it (#1245).
+        let _intent = self.write_intent();
         let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
         let locked = self.recovery_baseline_preflight(&tx)?;
         let locked_version: i64 =
@@ -16260,6 +16337,8 @@ impl Store {
         leader.belongs_to(&self.identity)?;
         self.identity.verify()?;
         let publication = (|| {
+            // Declared before the connection and its transaction, so it drops after both.
+            let _intent = matches!(target, PublicationTarget::Live).then(|| self.write_intent());
             let mut db = match target {
                 PublicationTarget::Live => PublicationConnection::Live(self.cache_write()?),
                 PublicationTarget::Stage(stage) => {
@@ -20032,3 +20111,5 @@ mod preflight_hash_reuse_tests;
 mod semantic_statement_lifetime_tests;
 #[cfg(test)]
 mod unchanged_trust_tests;
+#[cfg(test)]
+mod write_intent_tests;
