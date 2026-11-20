@@ -13,7 +13,7 @@ const SCOPED = `/api/checkouts/${ROOT}`;
 const response = data => ({ok:true, status:200, json:async () => data});
 const flush = () => new Promise(resolve => setImmediate(resolve));
 function harness({saved, blocked = false, routes} = {}) {
-  const elements = new Map(), requests = [], writes = [], stored = new Map(saved === undefined ? [] : [[KEY, saved]]);
+  const elements = new Map(), requests = [], writes = [], timers = [], stored = new Map(saved === undefined ? [] : [[KEY, saved]]);
   function node(tagName) {
     const classes = new Set();
     return {tagName, hidden:true, disabled:false, checked:false, value:"", textContent:"", children:[], listeners:{}, attrs:{},
@@ -30,7 +30,8 @@ function harness({saved, blocked = false, routes} = {}) {
     removeItem(key) { if (blocked) throw new Error("Storage blocked"); stored.delete(key); }
   };
   const context = vm.createContext({console, TextEncoder, DOMException, Blob, AbortController, URLSearchParams,
-    setTimeout() { return 1; }, clearTimeout() {}, localStorage:storage, window:{localStorage:storage, location:{host:"127.0.0.1:43127"}, confirm:() => true},
+    // Timers are recorded, never run on their own: a test runs one with `fire`.
+    setTimeout(fn, ms) { timers.push({fn, ms, cleared:false}); return timers.length; }, clearTimeout(id) { if (timers[id - 1]) timers[id - 1].cleared = true; }, localStorage:storage, window:{localStorage:storage, location:{host:"127.0.0.1:43127"}, confirm:() => true},
     document:{addEventListener() {}, getElementById:get, createElement:node, createElementNS:(_,tag) => node(tag), createDocumentFragment:node, createTextNode:text => ({textContent:text}), body:node()},
     fetch:async (url, options) => {
       requests.push({url,options});
@@ -63,7 +64,14 @@ function harness({saved, blocked = false, routes} = {}) {
     get("token-file").files = [{size, text:async () => text}];
     await get("token-file").listeners.change();
   }
-  return {get, context, run:code=>vm.runInContext(code,context), requests, writes, stored, connect, file};
+  // Runs the one pending timer set for `ms`, then lets its reads settle.
+  async function fire(ms) {
+    const pending = timers.filter(timer => !timer.cleared && timer.ms === ms);
+    assert.equal(pending.length, 1, `one pending ${ms} ms timer: ${JSON.stringify(timers.filter(timer => !timer.cleared).map(timer => timer.ms))}`);
+    pending[0].cleared = true; pending[0].fn();
+    for (let i = 0; i < 8; i++) await flush();
+  }
+  return {get, context, run:code=>vm.runInContext(code,context), requests, writes, stored, timers, connect, file, fire};
 }
 
 test("checkout selection and refresh load only retained services and keep current jobs",async()=>{
@@ -598,6 +606,67 @@ test("selected checkout survives typed storage_busy without scoped traffic and r
   assert.equal(h.run("sourceCache.size"),0);
   assert.doesNotMatch(h.get("source-path").textContent,/same.rs/);
   assert.ok(h.requests.slice(before).filter(({url})=>url.startsWith(`${SCOPED}/`)).every(({url})=>phase==="ready" && !url.includes("source")));
+});
+
+// #1253: a checkout whose index read meets typed contention is busy, not unindexed or unavailable.
+// It stays selectable and is held without checkout-scoped requests; the list is read again on a
+// bounded backoff, and the checkout opens without a click once it reads as available.
+function busyThenReady() {
+  const P={indexGeneration:"12345678-1234-4123-8123-123456789abc",indexRevision:1};
+  const state={phase:"busy"};
+  const h=harness({routes:url=>{
+    if(url==="/api/checkouts")return response({checkouts:[state.phase==="busy"
+      ?{rootKey:ROOT,workspaceRoot:"/synthetic",state:"storage_busy",active:true,revision:null,catchingUp:null,indexError:"storage_busy"}
+      :{rootKey:ROOT,workspaceRoot:"/synthetic",state:"available",active:true,revision:P,catchingUp:false,indexError:null}]});
+    if(url==="/api/daemon/status")return response({activeCheckouts:1});
+    if(state.phase==="busy")throw new Error(`Scoped request during typed storage_busy: ${url}`);
+    if(url===`${SCOPED}/git`)return response({git:{state:"unavailable",reason:"not_repository"},changes:null});
+    if(url===`${SCOPED}/status`)return response({workspaceRoot:"/synthetic",revision:P,catchingUp:false,stats:{}});
+    if(url.startsWith(`${SCOPED}/tree?`))return response({revision:P,path:"",root:"/synthetic",items:[],nextOffset:null});
+    if(url===`${SCOPED}/jobs/current`)return response(null);
+    if(url===`${SCOPED}/dependencies`)return response({state:"disabled",workspaceRevision:P,catalogId:null,packages:[],warnings:[]});
+    throw new Error(`Unexpected: ${url}`);
+  }});
+  return {h,state};
+}
+test("a storage_busy checkout stays selectable, reads Busy, and opens without a click once ready (#1253)", async () => {
+  const {h,state}=busyThenReady();
+  await h.connect("synthetic",false,false);
+  const option=()=>h.get("checkout-select").children.find(node=>node.value===ROOT);
+  assert.equal(option().disabled,false,"a busy checkout can be chosen");
+  assert.equal(h.get("checkout-select").disabled,false);
+  assert.equal(option().textContent,"synthetic ⎇ Git unavailable · Busy · retrying");
+  assert.doesNotMatch(option().textContent,/Not indexed/);
+  assert.equal(h.run("selectedRootKey"),ROOT,"arrival holds the only checkout while it is busy");
+  assert.equal(h.get("checkout-root").textContent,"/synthetic");
+  assert.equal(h.get("checkout-state").textContent,"Selected checkout is temporarily busy. Retrying automatically.");
+  assert.equal(h.get("workspace-index-label").textContent,"Checkout busy · retrying");
+  assert.deepEqual(h.requests.map(({url})=>url),["/api/checkouts","/api/daemon/status"],"no checkout-scoped request while busy");
+  // Still busy: the list is read again, and the next read waits twice as long.
+  await h.fire(2000);
+  assert.deepEqual(h.requests.map(({url})=>url).slice(2),["/api/checkouts"]);
+  assert.equal(h.run("selectedRootKey"),ROOT);
+  assert.equal(option().disabled,false);
+  assert.match(option().textContent,/Busy · retrying$/);
+  // Contention clears: the next read opens the checkout with no user action.
+  state.phase="ready";
+  await h.fire(4000);
+  assert.equal(h.run("selectedRootKey"),ROOT);
+  assert.equal(h.run("status.revision.indexRevision"),1);
+  assert.equal(h.get("workspace").hidden,false);
+  assert.equal(h.get("checkout-state").textContent,"");
+  assert.equal(option().textContent,"synthetic ⎇ Git unavailable · rev 12345678:1");
+  assert.equal(h.run("checkoutRetry.timer"),null,"no list read is pending once nothing is busy");
+  assert.ok(h.requests.some(({url})=>url===`${SCOPED}/status`));
+});
+test("the busy-checkout list retry backs off to 60 s and stops at Disconnect (#1253)", async () => {
+  const {h}=busyThenReady();
+  await h.connect("synthetic",false,false);
+  for(const ms of [2000,4000,8000,16000,32000,60000])await h.fire(ms);
+  assert.equal(h.timers.filter(timer=>!timer.cleared&&timer.ms===60000).length,1,"the backoff stays at 60 s");
+  h.get("logout").listeners.click();
+  assert.equal(h.run("checkoutRetry.timer"),null);
+  assert.equal(h.timers.filter(timer=>!timer.cleared&&timer.ms>=2000&&timer.ms<=60000).length,0,"Disconnect clears the pending list read");
 });
 
 for(const unavailable of ["unavailable","corrupt","missing","changed","duplicate"])

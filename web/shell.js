@@ -335,8 +335,10 @@
       : git.head?.kind === "branch" ? git.head.name
         : git.head?.kind === "detached" ? (git.head.shortCommit ? `Detached ${git.head.shortCommit}` : "Detached") : "Git unavailable";
     const pin = row?.revision;
-    const revision = pin && typeof pin.indexGeneration === "string" && Number.isSafeInteger(pin.indexRevision)
-      ? `rev ${pin.indexGeneration.slice(0, 8)}:${pin.indexRevision}` : "Not indexed";
+    // A busy checkout's index could not be read just now (typed contention); it is not unindexed (#1253).
+    const revision = row?.state === "storage_busy" ? "Busy · retrying"
+      : pin && typeof pin.indexGeneration === "string" && Number.isSafeInteger(pin.indexRevision)
+        ? `rev ${pin.indexGeneration.slice(0, 8)}:${pin.indexRevision}` : "Not indexed";
     return `${name} ⎇ ${head} · ${revision}`;
   }
   function updateCheckout(root, git) {

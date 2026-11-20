@@ -632,6 +632,7 @@ test("checkout options use short observed identity and honest Git fallbacks as t
   assert.match(h.shell.checkoutLabel({...base,git:{state:"available",head:{kind:"detached",shortCommit:"abc123"}}}), /repo ⎇ Detached abc123/);
   assert.match(h.shell.checkoutLabel({...base,git:{state:"unavailable"}}), /repo ⎇ Git unavailable/);
   assert.match(h.shell.checkoutLabel({...base,revision:null}), /Not indexed$/);
+  assert.match(h.shell.checkoutLabel({...base,revision:null,state:"storage_busy"}), /repo ⎇ Git unavailable · Busy · retrying$/, "busy is not unindexed (#1253)");
   const literal = h.shell.checkoutLabel({...base,git:{state:"available",head:{kind:"branch",name:"<img src=x>"}}});
   assert.ok(literal.includes("<img src=x>"));
   assert.ok(!literal.includes("/private/long"));
