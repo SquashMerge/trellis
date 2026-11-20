@@ -1448,6 +1448,8 @@ impl EvidenceResponse {
 
 /// At most this many semantic rows are admitted into one architecture snapshot (#523).
 const ARCHITECTURE_SEMANTIC_ROWS: usize = 2_000_000;
+/// An architecture read checks its caller this often, in admitted semantic rows (#1245).
+const CHECK_EVERY_ROWS: usize = 256;
 
 #[cfg(feature = "test-support")]
 static TEST_SEMANTIC_ROWS: std::sync::atomic::AtomicUsize =
@@ -1538,12 +1540,18 @@ pub(super) fn architecture_semantic(
             .copied()
     };
     let mut rows = 0usize;
-    let mut admit = || -> Result<()> {
+    // Every admitted row counts toward the bound, and every `CHECK_EVERY_ROWS` of them the
+    // caller's check runs, so one large payload's cursors cannot keep a read from giving
+    // way to a publication for long (#1245).
+    let mut admit = |check: &mut dyn FnMut() -> Result<()>| -> Result<()> {
         rows += 1;
         ensure!(
             rows <= semantic_rows_limit(),
             "bounded_work: architecture semantic evidence"
         );
+        if rows.is_multiple_of(CHECK_EVERY_ROWS) {
+            check()?;
+        }
         Ok(())
     };
     let sid = |bytes: Option<&[u8]>| -> Result<Option<String>> {
@@ -1822,7 +1830,7 @@ pub(super) fn architecture_semantic(
             payload, language, path, historical, key, native, tuple
         ])?;
         while let Some(row) = cursor.next()? {
-            admit()?;
+            admit(&mut *check)?;
             // A missing required freshness row is corruption, never a filtered fact.
             let basis_freshness = pp.freshness(row.get(17)?)?;
             let call_id = id_codec::decode_occ(row.get_ref(0)?.as_blob()?)
@@ -1862,7 +1870,7 @@ pub(super) fn architecture_semantic(
                 while let Some(target) = alternatives.next()? {
                     // The declared endpoint is this binding's own row, admitted above (#934).
                     if target.get_ref(10)?.as_str()? != "declared" {
-                        admit()?;
+                        admit(&mut *check)?;
                     }
                     if target.get_ref(0)?.as_str_or_null()? == Some("internal") {
                         eligible_endpoints &= endpoint(
@@ -1945,7 +1953,7 @@ pub(super) fn architecture_semantic(
         // Resolved and external use-site references: the names a site spells.
         let mut cursor = references.query(params![payload, historical, key, tuple])?;
         while let Some(row) = cursor.next()? {
-            admit()?;
+            admit(&mut *check)?;
             let basis_freshness = pp.freshness(row.get(9)?)?;
             // What a read at the basis binds: a resolved internal target in this snapshot
             // (#934), from a proof that read admits: any not `stale` (#936).
@@ -1994,7 +2002,7 @@ pub(super) fn architecture_semantic(
                 while let Some(target) = alternatives.next()? {
                     // The declared endpoint is this reference's own row, admitted above (#934).
                     if target.get_ref(10)?.as_str()? != "declared" {
-                        admit()?;
+                        admit(&mut *check)?;
                     }
                     if target.get_ref(0)?.as_str_or_null()? == Some("internal") {
                         eligible_endpoints &= endpoint(
@@ -2038,7 +2046,7 @@ pub(super) fn architecture_semantic(
         let mut found = Vec::new();
         let mut cursor = relationships.query(params![payload, historical, key, tuple, native])?;
         while let Some(row) = cursor.next()? {
-            admit()?;
+            admit(&mut *check)?;
             pp.freshness(row.get(16)?)?;
             let source = sid(row.get_ref(1)?.as_blob_or_null()?)?.context(SelectedIntegrity(
                 "corrupt semantic type relationship".into(),
@@ -2101,6 +2109,27 @@ pub(super) fn architecture_semantic(
         semantic.relationships = found;
     }
     Ok(())
+}
+
+#[cfg(feature = "test-support")]
+impl super::Store {
+    /// Run the semantic part of the head's Architecture read with `check` alone (#1245). The
+    /// documents come from a whole read first, under a check that never stops it.
+    #[doc(hidden)]
+    pub fn architecture_semantic_with_check_for_tests(
+        &self,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let response = self.evidence_response()?;
+        let (mut snapshot, _) =
+            response.architecture_snapshot_regions(None, &mut || Ok(()), &|_, _| {})?;
+        for document in &mut snapshot.documents {
+            document.semantic = Default::default();
+        }
+        let selected = response.selected(None)?;
+        architecture_semantic(&response.db, &selected.key, &mut snapshot.documents, check)?;
+        response.finish(())
+    }
 }
 
 #[cfg(test)]
