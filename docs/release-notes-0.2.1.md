@@ -114,12 +114,12 @@ unless a bullet says otherwise.
   and the daemon rebuilt the index.
   ([#1116](https://github.com/SquashMerge/trellis/pull/1116))
 
-On Trellis's own checkout, with rust-analyzer and scip-typescript imported, the
-production references the rules check reports as unknown fell from 7,043 when the
-rules ratchet was first recorded (2026-11-15) to 306 at
-[PR #1242](https://github.com/SquashMerge/trellis/pull/1242). Not all of that drop is
-resolution: part of it is bare imports of Node builtins and npm packages, which are now
-labelled as external packages and so are no longer counted as unknown
+On Trellis's own checkout, with rust-analyzer and scip-typescript imported, the rules
+ratchet's unknown production references fell from 7,043 when first recorded
+(2026-11-15) to 306 at [PR #1242](https://github.com/SquashMerge/trellis/pull/1242).
+The ratchet excludes external-package destinations and reviewed exceptions. Not all of
+that drop is resolution: part is bare imports of Node builtins and npm packages now
+labelled as external packages, which removes them from the ratchet population
 ([#1221](https://github.com/SquashMerge/trellis/pull/1221)).
 
 ## MCP
@@ -165,8 +165,10 @@ labelled as external packages and so are no longer counted as unknown
   `run.json`. ([#1240](https://github.com/SquashMerge/trellis/pull/1240))
 - **Automatic re-runs wait out storage contention:** an automatic re-run that met
   `rebuild_in_progress` or `storage_busy` was recorded as a failure that stuck until
-  the next source change. It is now held and retried at the next state change, such as
-  the publication that held the index. `index_not_ready` is still a failure
+  the next source change. It now stays scheduled and is reconsidered at the next state
+  change, such as the publication that held the index, subject to the usual start
+  gates. A run that already started still waits out `minIntervalSecs`.
+  `index_not_ready` is still a failure
   ([#1218](https://github.com/SquashMerge/trellis/pull/1218)). A held re-run is
   released by any publication after its launch was decided, instead of waiting for an
   unrelated change or the 60-second backstop
@@ -187,9 +189,10 @@ labelled as external packages and so are no longer counted as unknown
   the pin's version text, not what that binary reports. A batch from a Trellis run now
   records the version its hash-verified binary reports.
   ([#1138](https://github.com/SquashMerge/trellis/pull/1138))
-- **Node heap failures show the fatal line:** for `node_heap_exhausted`, `stderrLines`
-  holds V8's last GC line and its `FATAL ERROR` line instead of V8's native stack.
-  ([#1202](https://github.com/SquashMerge/trellis/pull/1202))
+- **Node heap failures show the fatal line:** for `node_heap_exhausted`, when V8's
+  `FATAL ERROR` line is present, `stderrLines` keeps it and the last GC line, if
+  present, instead of the native stack. Otherwise it keeps the usual last ten non-empty
+  lines. ([#1202](https://github.com/SquashMerge/trellis/pull/1202))
 - **More reads repair damage:** a CLI `symbols` or `query` read
   ([#1089](https://github.com/SquashMerge/trellis/pull/1089)) and the browser's Files,
   symbols, syntax-match, methods and Sequence reads
