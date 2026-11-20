@@ -554,6 +554,139 @@ async fn a_new_revision_supersedes_a_build_that_is_computing() {
     assert!(scheduler.architecture_builds_for_tests() - before >= 2);
 }
 
+/// #1245 (owner ruling 2026-11-20): publications never wait on the Architecture read. The
+/// build is held inside its read, after its first document, and would hold again at its next
+/// one. Inside the publication's transaction the hold is released: the read gives its snapshot
+/// up at its next check, without reading on, and the publication commits. A status read during
+/// the publication gets no `storage_busy` from the Architecture read. The yielded read
+/// published nothing for the old head, and the owner, reading again once the publication
+/// ended, builds the new head with the answer a fresh computation gives.
+#[tokio::test]
+async fn a_publication_does_not_wait_for_the_build_read_which_yields_and_reads_the_new_head() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let (base, runtime, browser, key) = fixture().await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let app = browser.clone().router();
+    let (status, missing) = request(app.clone(), &key, "").await;
+    assert_eq!(status, StatusCode::OK, "{missing}");
+    let older: trellis::model::IndexPin = serde_json::from_value(json!({
+        "indexGeneration": missing["payload"]["indexGeneration"],
+        "indexRevision": missing["payload"]["indexRevision"]
+    }))
+    .unwrap();
+    let before = scheduler.architecture_builds_for_tests();
+
+    let (reached_tx, reached_rx) = mpsc::channel();
+    let (release_first, first_gate) = mpsc::channel::<()>();
+    let (release_next, next_gate) = mpsc::channel::<()>();
+    let gates = Mutex::new((first_gate, next_gate));
+    let builds = Arc::new(AtomicUsize::new(0));
+    let documents = AtomicUsize::new(0);
+    let read_on = Arc::new(AtomicBool::new(false));
+    let yielded_in = Arc::new(AtomicUsize::new(0));
+    let (counted, went_on, yielded) = (builds.clone(), read_on.clone(), yielded_in.clone());
+    scheduler.set_architecture_hook_for_tests(Arc::new(move |point| match point {
+        "architecture_build_started" => {
+            counted.fetch_add(1, Ordering::AcqRel);
+        }
+        "reading" if counted.load(Ordering::Acquire) == 1 => {
+            let gates = gates.lock().unwrap();
+            if documents.fetch_add(1, Ordering::AcqRel) == 0 {
+                let _ = reached_tx.send(());
+                let _ = gates.0.recv_timeout(trellis::testing::HANG_BACKSTOP);
+            } else {
+                went_on.store(true, Ordering::Release);
+                let _ = gates.1.recv_timeout(trellis::testing::HANG_BACKSTOP);
+            }
+        }
+        "architecture_read_yielded" => {
+            yielded.store(counted.load(Ordering::Acquire), Ordering::Release);
+        }
+        _ => {}
+    }));
+    // Rules make this head's build eligible; it is held inside its read.
+    write_rules(&base, RULES);
+    scheduler.architecture_hint();
+    reached_rx
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .expect("the build is inside its read");
+    assert_eq!(scheduler.leases_for_tests(), 1);
+
+    // Inside the publication's transaction, its intent raised: the held read may go on, and a
+    // status read starts while the publication is in flight.
+    let (status_tx, status_rx) = mpsc::channel();
+    let reader = runtime.clone();
+    runtime.set_publication_before_commit_hook_for_tests(move || {
+        drop(release_first);
+        std::thread::spawn(move || {
+            let _ = status_tx.send(reader.cli_status());
+        });
+    });
+    let root = base.path().join("checkout");
+    std::fs::write(root.join("added.js"), "function added() {}\n").unwrap();
+    let indexing = runtime.clone();
+    let published =
+        tokio::task::spawn_blocking(move || indexing.cli_index(&IndexOptions::new(root)))
+            .await
+            .unwrap()
+            .unwrap();
+    let during = tokio::task::spawn_blocking(move || {
+        status_rx
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .expect("the status read ran")
+    })
+    .await
+    .unwrap();
+    if let Err(error) = during {
+        panic!("a status read during the publication failed: {error:#}");
+    }
+    assert!(
+        !read_on.load(Ordering::Acquire),
+        "the read gave way without reading on"
+    );
+    assert_eq!(
+        yielded_in.load(Ordering::Acquire),
+        1,
+        "the first build yielded"
+    );
+
+    // Nothing of the yielded read is published: the old head has no ruled core. (A read of
+    // that pin would ask the owner to build it, so this looks at the owner's published cores.)
+    assert!(!scheduler.architecture_ruled_core_published_for_tests(older));
+
+    // The owner read again after the publication ended, and built its head.
+    let (status, next) = summary(app, &key, "").await;
+    assert_eq!(status, StatusCode::OK, "{next}");
+    assert_eq!(
+        head(&next["payload"]),
+        head(&published["publishedRevision"])
+    );
+    assert_eq!(next["payload"]["modules"].as_array().unwrap().len(), 5);
+    assert!(scheduler.architecture_builds_for_tests() - before >= 2);
+    let pin = serde_json::from_value(json!({
+        "indexGeneration": next["payload"]["indexGeneration"],
+        "indexRevision": next["payload"]["indexRevision"]
+    }))
+    .unwrap();
+    let (fresh, _) = runtime.evidence_response().unwrap();
+    let computed = fresh
+        .architecture_view(
+            &MetricsOptions {
+                pin: Some(pin),
+                aggregate: "max".into(),
+                ..MetricsOptions::default()
+            },
+            &mut || Ok(()),
+        )
+        .unwrap();
+    fresh.finish(()).unwrap();
+    assert_eq!(
+        next["payload"], computed,
+        "the new head's answer is unchanged"
+    );
+    drop(release_next);
+}
+
 /// A read for a rules file newer than the running build waits for that file's build.
 #[tokio::test]
 async fn a_rules_edit_during_a_build_is_built_next() {

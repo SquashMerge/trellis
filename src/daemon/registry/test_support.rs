@@ -140,6 +140,21 @@ impl CheckoutRuntime {
             .hold_worker_with_watch_hint_for_tests(event, hold)
     }
 
+    /// Run `hook` once on the publishing thread, inside the next live native publication's
+    /// transaction, just before its COMMIT.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_publication_before_commit_hook_for_tests(
+        &self,
+        hook: impl FnOnce() + Send + 'static,
+    ) {
+        if let Ok(resources) = self.resources() {
+            resources
+                .store
+                .set_publication_before_commit_hook_for_tests(hook);
+        }
+    }
+
     /// Make this checkout's next completion COMMIT durable but report an error.
     #[cfg(feature = "test-support")]
     #[doc(hidden)]

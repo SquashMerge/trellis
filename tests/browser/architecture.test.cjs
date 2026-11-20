@@ -1724,6 +1724,47 @@ test("Deviations tree keeps a long function and line on one line each, truncated
   }, new Map(), base);
 });
 
+// #1254: the table takes its layout from the Deviations pane's own width, not the viewport's. Just over
+// 900px the Inspector takes a column, so the pane is too narrow for the five columns: it uses the
+// two-line layout and the File column keeps its width. 800px (narrow screen, the Inspector a drawer) and
+// 1280px (a pane wide enough beside the Inspector) keep the layouts they had.
+test("Deviations tree keeps its File column beside the open Inspector just over 900px (#1254)", {timeout:240000}, async () => {
+  const {config, base} = deviationsFixture();
+  await published(config, async ({page}) => {
+    await ready(page);
+    await openDeviations(page);
+    await chipNamed(page, /low → top/).click();
+    await expandTree(page);
+    await lineRow(page, "src/low.rs", 1).click();
+    assert.equal(await page.locator("#architecture-inspector-title").textContent(), "src/low.rs:1");
+    const measure = () => page.evaluate(() => {
+      const pane = document.querySelector("#architecture-deviations"), inspector = document.querySelector("#call-inspector");
+      const rows = [...pane.querySelectorAll(".deviation-row")];
+      const width = node => node.getBoundingClientRect().width;
+      return {pane:pane.clientWidth, inspector:getComputedStyle(inspector).display === "none" ? 0 : width(inspector),
+        head:getComputedStyle(pane.querySelector(".deviations-head")).display !== "none",
+        tracks:rows.map(row => getComputedStyle(row).gridTemplateColumns.split(" ").length),
+        file:rows.map(row => width(row.querySelector(".deviation-name"))),
+        paths:[...pane.querySelectorAll(".deviation-row .deviation-path")].map(width),
+        heights:rows.map(row => row.getBoundingClientRect().height)};
+    });
+    // At 800px the open Inspector is a drawer over the full-width pane; above 900px it takes a column.
+    for (const [width, column, wide] of [[920, true, false], [1280, true, true], [800, false, false]]) {
+      await page.setViewportSize({width, height:1000});
+      const layout = await measure(), label = `${width}px: ${JSON.stringify(layout)}`;
+      assert.ok(layout.inspector > 0, `the Inspector is open at ${label}`);
+      assert.equal(layout.pane + layout.inspector <= width, column, `the Inspector ${column ? "takes a column beside" : "is a drawer over"} the pane at ${label}`);
+      assert.ok(layout.tracks.length > 0 && layout.paths.length > 0, `rows are listed at ${label}`);
+      assert.equal(layout.head, wide, `the column headings show only in the wide layout at ${label}`);
+      assert.ok(layout.tracks.every(count => count === (wide ? 5 : 4)), `${wide ? "five columns" : "the two-line layout"} at ${label}`);
+      assert.ok(layout.file.every(size => size >= 100), `the File column keeps its width at ${label}`);
+      assert.ok(layout.paths.every(size => size > 0) && layout.heights.every(size => size > 0), `every row and file path is visible at ${label}`);
+    }
+    await page.setViewportSize({width:920, height:1000});
+    await capture(page, "architecture-deviations-920-inspector");
+  }, new Map(), base);
+});
+
 test("Deviations tree explains a selection that a filter hides", {timeout:240000}, async () => {
   const {config, base} = deviationsFixture();
   await published(config, async selected => {
