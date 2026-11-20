@@ -79,7 +79,7 @@ function resetCheckout() {
 }
 function disconnect(message) {
   tokenFileSerial++; tokenSaveFailed = false; const forgotten = forgetStoredToken();
-  resetCheckout(); checkouts = []; token = "";
+  clearCheckoutRetry(); resetCheckout(); checkouts = []; token = "";
   $("remember-token").checked = false; $("token-file").value = ""; $("token").value = "";
   $("checkout-picker").hidden = true; $("checkout-select").replaceChildren(checkoutOption("Choose a checkout", ""));
   $("app-menu").hidden = true; $("app-menu").open = false; $("connect-form").hidden = false;
@@ -102,6 +102,16 @@ function uniqueSelectableRoot(key) {
   const matches = checkouts.filter(row => row.rootKey === key);
   return matches.length === 1 && selectable(matches[0]);
 }
+// A checkout whose index read met typed contention is busy, not unavailable (#1253): it can be chosen
+// and is held, with no checkout-scoped request, until the list reads it as available.
+function busyCheckout(row) {
+  return objectValue(row) && validRootKey(row.rootKey) && row.state === "storage_busy" && typeof row.workspaceRoot === "string" && row.workspaceRoot.startsWith("/");
+}
+function choosable(row) { return selectable(row) || busyCheckout(row); }
+function uniqueChoosableRoot(key) {
+  const matches = checkouts.filter(row => row.rootKey === key);
+  return matches.length === 1 && choosable(matches[0]);
+}
 // The row's index state in the words the mod shares (dto-core.js); "Failed" is the browser's own.
 function checkoutIndexLabel(row) {
   return window.TrellisDtoCore.checkoutIndexLabel(row, () => "Failed", pin => IndexPin.label(pin));
@@ -111,7 +121,7 @@ function selectedIndexStatus() {
   const catchingUp = status?.revision && IndexPin.equal(row?.revision, status.revision) ? row.catchingUp : status?.catchingUp;
   const base = status?.revision ? checkoutIndexLabel({...row, state:"available", revision:status.revision, catchingUp}) : checkoutIndexLabel(row);
   if (!selectedRootKey) return {state:"unknown", text:"No checkout selected"};
-  if (checkoutBusy) return {state:"failed", text:"Checkout busy · retry checkout list"};
+  if (checkoutBusy) return {state:"catching-up", text:"Checkout busy · retrying"};
   if (statusUnavailable) return {state:"failed", text:"Index status unavailable · retry status"};
   if (jobUnavailable) return {state:"failed", text:"Index job unavailable · retry status"};
   if (job?.state === "failed" && !status?.revision) return {state:"failed", text:`Index failed · ${jobCause(job)}`};
@@ -161,14 +171,16 @@ const lastCheckoutKey = "trellis.lastCheckout.v1";
 function rememberCheckout(key) {
   try { localStorage.setItem(lastCheckoutKey, key); } catch (_) { /* A per-browser convenience only. */ }
 }
-// Arrival picks the only selectable checkout, else the one last used in this browser.
+// Arrival picks the only available checkout, else the one last used in this browser (held while it
+// is busy), else the only checkout when it is busy (#1253).
 // The agent's working directory is not observable from the browser or daemon here.
 function arrivalCheckout() {
-  const available = checkouts.filter(selectable);
+  const available = checkouts.filter(selectable), choices = checkouts.filter(choosable);
   if (available.length === 1) return available[0].rootKey;
+  if (!available.length && choices.length === 1) return choices[0].rootKey;
   let last = null;
   try { last = localStorage.getItem(lastCheckoutKey); } catch (_) { last = null; }
-  return validRootKey(last) && uniqueSelectableRoot(last) ? last : null;
+  return validRootKey(last) && uniqueChoosableRoot(last) ? last : null;
 }
 function storageWarning() { return tokenSaveFailed ? "Browser storage is unavailable; token was not saved." : ""; }
 function updateCheckoutOptions() {
@@ -183,10 +195,39 @@ function updateCheckoutOptions() {
 function showCheckoutIndexState() {
   renderIndexStatus();
 }
-async function loadCheckouts() {
+// A busy checkout recovers without a click (#1253). The browser gets no publication signal for a
+// checkout it cannot read: status polls and the follow timer run only for an opened checkout, and
+// the list is read only on connect and on request. So while any listed checkout is busy, the list is
+// read again after 2 s, doubling to at most 60 s, the way stall recovery backs off (#906). Disconnect
+// and a list with no busy checkout stop it. A background read leaves the picker usable.
+let checkoutRetry = {timer:null, delay:RECOVERY_FIRST_MS};
+function scheduleCheckoutRetry(busy) {
+  if (!busy || !token) { clearCheckoutRetry(); return; }
+  if (checkoutRetry.timer !== null) return;
+  const delay = checkoutRetry.delay;
+  checkoutRetry.delay = Math.min(delay * 2, RECOVERY_MAX_MS);
+  // A read superseded by a new selection schedules nothing itself; any checkout still listed busy is read again.
+  checkoutRetry.timer = setTimeout(() => {
+    checkoutRetry.timer = null;
+    if (token) void loadCheckouts(true).finally(() => scheduleCheckoutRetry(checkouts.some(busyCheckout)));
+  }, delay);
+}
+function clearCheckoutRetry() { clearTimeout(checkoutRetry.timer); checkoutRetry = {timer:null, delay:RECOVERY_FIRST_MS}; }
+// Holds a chosen busy checkout: selected, with no scoped requests, until the list reads it as available.
+function holdBusyCheckout() {
+  checkoutBusy = true;
+  $("checkout-root").textContent = selectedWorkspaceRoot;
+  $("checkout-state").textContent = "Selected checkout is temporarily busy. Retrying automatically.";
+  $("checkout-retry").hidden = false;
+  renderIndexStatus();
+  scheduleCheckoutRetry(true);
+}
+async function loadCheckouts(background = false) {
   const session = epoch, gitAtStart = gitSerial;
-  $("checkout-state").textContent = "Loading checkouts…";
-  $("checkout-select").disabled = true; $("checkout-retry").hidden = true;
+  if (!background) {
+    $("checkout-state").textContent = "Loading checkouts…";
+    $("checkout-select").disabled = true; $("checkout-retry").hidden = true;
+  }
   try {
     const data = await api("/api/checkouts");
     if (session !== epoch) return;
@@ -219,7 +260,7 @@ async function loadCheckouts() {
     for (const row of checkouts) {
       const option = checkoutOption(window.TrellisShell.checkoutLabel(row), row.rootKey);
       option.title = row.workspaceRoot || row.rootKey;
-      option.disabled = !selectable(row); select.append(option);
+      option.disabled = !choosable(row); select.append(option);
     }
     select.value = choice;
     if (choice && !busy && gitAtStart === gitSerial) {
@@ -227,10 +268,11 @@ async function loadCheckouts() {
       if (section === "files" && filesFile && filesBasis === "working") void setFilesBasis("working");
       else void refreshGit();
     }
-    select.disabled = !checkouts.some(selectable);
-    $("checkout-state").textContent = busy ? "Selected checkout is temporarily busy. Retry the checkout list."
+    select.disabled = !checkouts.some(choosable);
+    scheduleCheckoutRetry(checkouts.some(busyCheckout));
+    $("checkout-state").textContent = busy ? "Selected checkout is temporarily busy. Retrying automatically."
       : !checkouts.length ? "No checkouts found. Register a checkout, then retry."
-      : !checkouts.some(selectable) ? "No available checkouts. Unavailable or corrupt entries cannot be selected. Retry the list."
+      : !checkouts.some(choosable) ? "No available checkouts. Unavailable or corrupt entries cannot be selected. Retry the list."
       : choice ? storageWarning() : "Choose a checkout to inspect.";
     $("checkout-retry").hidden = !busy && checkouts.length > 0 && checkouts.every(selectable);
     if (choice && !busy) showCheckoutIndexState(selected);
@@ -243,6 +285,7 @@ async function loadCheckouts() {
   } catch (error) {
     if (session !== epoch || error.name === "AbortError") return;
     if (selectedRootKey) resetCheckout();
+    clearCheckoutRetry();
     checkouts = []; $("checkout-select").replaceChildren(checkoutOption("Choose a checkout", ""));
     $("checkout-select").disabled = true; $("checkout-retry").hidden = false;
     $("checkout-state").textContent = `Checkout list unavailable: ${error.message} Retry the list.`;
@@ -259,13 +302,14 @@ async function loadDaemonStatus() {
 async function selectCheckout(key) {
   resetCheckout();
   $("checkout-select").value = key;
-  if (!uniqueSelectableRoot(key)) {
+  if (!uniqueChoosableRoot(key)) {
     $("checkout-select").value = ""; $("checkout-state").textContent = "Choose an available checkout."; return;
   }
   selectedRootKey = key; rememberCheckout(key);
   const selected = checkouts.find(row => row.rootKey === key);
   selectedWorkspaceRoot = selected.workspaceRoot;
   showSelectedGit(selected.git);
+  if (busyCheckout(selected)) { holdBusyCheckout(); return; }
   showCheckoutIndexState(selected);
   $("error").hidden = true; $("error").textContent = "";
   $("checkout-root").textContent = "Verifying selected checkout…";
