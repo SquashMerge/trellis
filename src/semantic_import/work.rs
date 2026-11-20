@@ -45,6 +45,8 @@ pub(crate) struct PublicationWork {
     original_raw_proof_bytes: usize,
     original_raw_envelope_parses: usize,
     original_raw_decodes: usize,
+    /// Retained proof identities witnessed admission read (#1245).
+    witness_proof_reads: usize,
     original_source_hash_documents: Vec<native::DocumentKey>,
     parsed_role_site_documents: Vec<native::DocumentKey>,
     parsed_type_documents: Vec<native::DocumentKey>,
@@ -161,6 +163,11 @@ pub(crate) fn note_original_raw_envelope_parse() {
 #[cfg(feature = "test-support")]
 pub(crate) fn note_original_raw_decode() {
     count_publication_work(|work| work.original_raw_decodes += 1);
+}
+/// Witnessed admission read one retained proof identity of a document S does not copy.
+#[cfg(feature = "test-support")]
+pub(crate) fn note_witness_proof_read() {
+    count_publication_work(|work| work.witness_proof_reads += 1);
 }
 #[cfg(feature = "test-support")]
 pub(crate) fn note_original_source_hash(doc: &native::DocumentKey) {

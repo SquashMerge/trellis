@@ -16,6 +16,7 @@ use crate::{
         NativeReader,
         native_first::retained_batch::{
             BatchMetadata, CaptureKey, RetainedBatchRows, RetainedDocument, RetainedProof,
+            WitnessProofRow,
         },
         staging::{Stage, artifact_file},
     },

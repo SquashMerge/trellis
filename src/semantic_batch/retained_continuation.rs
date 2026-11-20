@@ -1,10 +1,7 @@
 //! Resumable retained admission. Main-index statements and blobs never survive a unit.
 use super::*;
 use crate::{model::IndexPin, scip_admission::PinnedProducer, store::CanonicalInventoryCursor};
-use std::{
-    collections::HashMap,
-    fs::{File, OpenOptions},
-};
+use std::fs::{File, OpenOptions};
 
 pub(crate) struct RetainedStageContinuation {
     stage: Option<Stage>,
@@ -52,8 +49,8 @@ pub(crate) struct RetainedStageContinuation {
     missing_found: Option<u32>,
     /// Estimated stage bytes written since the stage directory was last measured.
     unchecked: u64,
-    /// The current artifact's checked proof documents (path to source ordinal).
-    proof_documents: ProofDocuments,
+    /// Witnessed S: the current artifact's proof progress.
+    witness: WitnessCursor,
     /// Witnessed S: the documents it copies, whose proof identities are not staged.
     copy: Option<crate::store::native_first::CopyFilter>,
 }
@@ -189,7 +186,7 @@ impl RetainedStageContinuation {
             missing_proof: String::new(),
             missing_found: None,
             unchecked: 0,
-            proof_documents: ProofDocuments::default(),
+            witness: WitnessCursor::default(),
             copy: None,
         })
     }
@@ -217,7 +214,9 @@ impl RetainedStageContinuation {
             .as_mut()
             .expect("new stage")
             .conn()?
-            .execute("INSERT INTO witness_state(singleton) VALUES(1)", [])?;
+            .execute_batch(&format!(
+                "INSERT INTO witness_state(singleton) VALUES(1); {WITNESS_PENDING_TABLE}"
+            ))?;
         Ok(continuation)
     }
 
@@ -569,7 +568,7 @@ impl RetainedStageContinuation {
                     self.document_key = (String::new(), String::new());
                     self.proof_count = 0;
                     self.document_count = 0;
-                    self.proof_documents = ProofDocuments::default();
+                    self.witness = WitnessCursor::default();
                     if self.trusted {
                         self.phase = Phase::Documents;
                     } else {
@@ -639,36 +638,56 @@ impl RetainedStageContinuation {
                     self.phase = Phase::Proofs;
                 }
             }
-            Phase::Proofs => {
-                let bytes = if self.witnessed {
-                    advance_witness_proof(
-                        rows,
-                        self.capture_id,
-                        &descriptor.artifacts[self.artifact],
-                        conn,
-                        &mut self.proof_key,
-                        &self.limits,
-                        &mut self.proof_documents,
-                        self.copy
-                            .as_ref()
-                            .map(|filter| (filter, descriptor.source_set.id.as_str())),
-                    )?
-                    .map(|page| {
-                        self.proof_count += page.rows - 1;
-                        payload = page.bytes;
-                        page.high_water
-                    })
-                } else {
-                    advance_proof(
-                        rows,
-                        self.capture_id,
-                        &descriptor.artifacts[self.artifact],
-                        conn,
-                        self.trusted,
-                        &mut self.proof_cursor,
-                        &mut self.proof_key,
-                    )?
+            Phase::Proofs if self.witnessed => {
+                let copy = self.copy.as_ref();
+                let source_set_id = &descriptor.source_set.id;
+                let mut copies = |language: &str, path: &str| match copy {
+                    Some(filter) => rows.copies(
+                        filter,
+                        &crate::native_evidence::DocumentKey {
+                            source_set_id: source_set_id.clone(),
+                            language: language.to_owned(),
+                            path: path.to_owned(),
+                        },
+                    ),
+                    None => Ok(false),
                 };
+                match advance_witness(
+                    rows,
+                    self.capture_id,
+                    &descriptor.artifacts[self.artifact],
+                    conn,
+                    &mut self.witness,
+                    &self.limits,
+                    &mut copies,
+                )? {
+                    WitnessUnit::Page { high_water, bytes } => {
+                        payload = bytes.max(high_water);
+                        counters.retained_admission_bytes_high_water =
+                            counters.retained_admission_bytes_high_water.max(high_water);
+                    }
+                    WitnessUnit::Counted(proofs) => self.proof_count += proofs,
+                    WitnessUnit::Done => {
+                        // Witnessed admission is trusted (an untrusted one fell back above).
+                        conn.execute(
+                            "UPDATE artifacts SET claims=?2 WHERE ordinal=?1",
+                            params![self.artifact as i64, self.proof_count],
+                        )?;
+                        self.artifact += 1;
+                        self.phase = Phase::Artifact;
+                    }
+                }
+            }
+            Phase::Proofs => {
+                let bytes = advance_proof(
+                    rows,
+                    self.capture_id,
+                    &descriptor.artifacts[self.artifact],
+                    conn,
+                    self.trusted,
+                    &mut self.proof_cursor,
+                    &mut self.proof_key,
+                )?;
                 if let Some(bytes) = bytes {
                     payload = payload.max(bytes);
                     counters.retained_admission_bytes_high_water =
@@ -788,159 +807,194 @@ impl RetainedStageContinuation {
     }
 }
 
-/// The checked source ordinal of each proof document of the current artifact, or `None` for
-/// a document S copies, whose proof identities are not staged (#669 H1). Its storage
-/// (path bytes and two table slots per entry, as a hash table holds up to twice its entries)
-/// is charged against half the unit expansion limit, leaving the rest to the page being
-/// staged; a path past that charge is looked up again instead of being retained.
-#[derive(Default)]
-pub(super) struct ProofDocuments {
-    paths: HashMap<String, Option<i64>>,
-    bytes: u64,
-}
-
-impl ProofDocuments {
-    fn get(&self, path: &str) -> Option<&Option<i64>> {
-        self.paths.get(path)
-    }
-
-    fn insert(&mut self, path: String, ord: Option<i64>, limits: &BatchLimits) {
-        let entry = (path.len() as u64).saturating_add(
-            2 * (std::mem::size_of::<(String, Option<i64>)>() + std::mem::size_of::<u64>()) as u64,
-        );
-        let bytes = self.bytes.saturating_add(entry);
-        if bytes <= limits.unit_expansion_bytes / 2 {
-            self.bytes = bytes;
-            self.paths.insert(path, ord);
-        }
-    }
-}
-
-/// Witness proof identities staged per admission unit.
+/// Witness proof identities read or staged per admission unit, and staged documents listed.
 const WITNESS_PROOF_PAGE: i64 = 256;
+/// Retained proof IDs a witnessed unit counts, from the capture's `(capture_id, proof_id)`
+/// index alone.
+const WITNESS_COUNT_PAGE: i64 = 16_384;
 
-/// One page of witness proofs: rows staged, the largest row reservation, and the bytes
-/// reserved in all.
-struct WitnessProofPage {
-    rows: i64,
-    high_water: u64,
-    bytes: u64,
+/// Witnessed S's private table of the proof identities it read, before it stages them in
+/// proof-ID order.
+const WITNESS_PENDING_TABLE: &str = "CREATE TABLE retained_witness_pending(artifact INTEGER NOT NULL, proof_id TEXT NOT NULL, record_kind TEXT NOT NULL, fact_digest TEXT NOT NULL, source_ord INTEGER NOT NULL, PRIMARY KEY(artifact,proof_id)) WITHOUT ROWID;";
+
+/// Witnessed S's progress through one artifact's retained proofs (#1245).
+#[derive(Default)]
+struct WitnessCursor {
+    step: WitnessStep,
+    /// Read: the last staged document listed, by path.
+    document: String,
+    /// Read: the listed document S does not copy whose proofs are being read, as
+    /// `(source ordinal, language, path)`, and its last `(record kind, fact digest)`.
+    open: Option<(i64, String, String)>,
+    key: (String, String),
+    /// Stage and count: the last proof ID.
+    proof: String,
 }
 
-/// Identity-only retained read of up to [`WITNESS_PROOF_PAGE`] proofs. Reserve borrowed
-/// scalar fields before making owned strings; neither canonical proof bytes nor the SCIP
-/// binary participates in witness admission. `assigned` caches each proof document's
-/// assigned source ordinal for this artifact, after its staged document row is checked.
-#[allow(clippy::too_many_arguments)]
-fn advance_witness_proof(
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum WitnessStep {
+    /// Reads the proof identities of the documents S does not copy into the pending table.
+    #[default]
+    Read,
+    /// Stages the pending identities in proof-ID order.
+    Stage,
+    /// Counts the capture's proofs.
+    Count,
+}
+
+/// What one witnessed proof unit did.
+enum WitnessUnit {
+    /// Rows read or staged: the largest row reservation and the bytes reserved in all.
+    Page { high_water: u64, bytes: u64 },
+    /// This many more of the capture's proofs counted.
+    Counted(i64),
+    /// The artifact's proofs are staged and counted.
+    Done,
+}
+
+/// The bytes one retained proof identity reserves before its fields are copied out.
+fn witness_reservation(row: &WitnessProofRow<'_>, limits: &BatchLimits) -> Result<u64> {
+    let mut bytes = 256_u64;
+    for value in [
+        row.proof_id,
+        row.record_kind,
+        row.fact_digest,
+        row.language,
+        row.path,
+    ] {
+        bytes = bytes.saturating_add((value.len() as u64).saturating_mul(2));
+    }
+    if bytes > limits.unit_expansion_bytes {
+        return Err(ScipCaptureError::LimitExceeded("unit expansion bytes".into()).into());
+    }
+    Ok(bytes)
+}
+
+/// One bounded unit of witnessed S's proof identities for one artifact (#669 H1, #1245).
+///
+/// S stages the proof identities of only the documents it does not copy (`copies`, by
+/// language and path). It lists the artifact's staged documents and reads each such
+/// document's proofs through the capture's `(language, path, record kind, fact digest)` index,
+/// never another document's. It then stages them in proof-ID order, each with the next lower
+/// identity, as a walk of every retained proof in proof-ID order would. The documents S copies
+/// keep the rows the import validated and published (#261); their proofs are not read. The
+/// artifact's claim total counts every retained proof of the capture, copied or not, on the
+/// capture's proof-ID index.
+fn advance_witness(
     rows: &RetainedBatchRows<'_>,
     capture: i64,
     entry: &super::super::descriptor::ArtifactEntry,
     conn: &Connection,
-    key: &mut String,
+    cursor: &mut WitnessCursor,
     limits: &BatchLimits,
-    assigned: &mut ProofDocuments,
-    copy: Option<(&crate::store::native_first::CopyFilter, &str)>,
-) -> Result<Option<WitnessProofPage>> {
-    let mut page = WitnessProofPage {
-        rows: 0,
-        high_water: 0,
-        bytes: 0,
-    };
-    let mut identity: Option<i64> = None;
-    let mut insert =
-        conn.prepare_cached("INSERT INTO witness_proofs VALUES(?1,?2,?3,?4,?5,?6,?7)")?;
-    let after = key.clone();
-    rows.witness_proofs(capture, &after, WITNESS_PROOF_PAGE, &mut |row| {
-        let mut bytes = 256_u64;
-        for value in [
-            row.proof_id,
-            row.record_kind,
-            row.fact_digest,
-            row.language,
-            row.path,
-        ] {
-            bytes = bytes.saturating_add((value.len() as u64).saturating_mul(2));
-        }
-        if bytes > limits.unit_expansion_bytes {
-            return Err(ScipCaptureError::LimitExceeded("unit expansion bytes".into()).into());
-        }
-        let proof = row.proof_id.to_owned();
-        let kind = row.record_kind.to_owned();
-        let digest = row.fact_digest.to_owned();
-        let language = row.language.to_owned();
-        let path = row.path.to_owned();
-        ensure!(
-            entry.languages.contains(&language),
-            "retained proof language"
-        );
-        let cached = assigned.get(&path).copied();
-        let copied = match (cached, copy) {
-            (None, Some((filter, source_set_id))) => rows.copies(
-                filter,
-                &crate::native_evidence::DocumentKey {
-                    source_set_id: source_set_id.to_owned(),
-                    language: language.clone(),
-                    path: path.clone(),
-                },
-            )?,
-            _ => false,
-        };
-        let source = match cached {
-            Some(ord) => ord,
-            None if copied => {
-                assigned.insert(path, None, limits);
-                None
+    copies: &mut dyn FnMut(&str, &str) -> Result<bool>,
+) -> Result<WitnessUnit> {
+    let artifact = i64::from(entry.ordinal);
+    let (mut high_water, mut bytes) = (0u64, 0u64);
+    match cursor.step {
+        WitnessStep::Read => {
+            let mut insert =
+                conn.prepare_cached("INSERT INTO retained_witness_pending VALUES(?1,?2,?3,?4,?5)")?;
+            let (mut read, mut listed) = (0i64, 0i64);
+            while read < WITNESS_PROOF_PAGE && listed < WITNESS_PROOF_PAGE {
+                let Some((source, language, path)) = cursor.open.clone() else {
+                    let next: Option<(i64, String, String)> = conn
+                        .prepare_cached("SELECT d.source_ord,s.language,d.path FROM documents d JOIN sources s ON s.ord=d.source_ord WHERE d.artifact=?1 AND d.path>?2 ORDER BY d.path LIMIT 1")?
+                        .query_row(params![artifact, cursor.document], |row| {
+                            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                        })
+                        .optional()?;
+                    let Some((source, language, path)) = next else {
+                        cursor.step = WitnessStep::Stage;
+                        break;
+                    };
+                    listed += 1;
+                    cursor.document.clone_from(&path);
+                    if !copies(&language, &path)? {
+                        cursor.open = Some((source, language, path));
+                        cursor.key = (String::new(), String::new());
+                    }
+                    continue;
+                };
+                let limit = WITNESS_PROOF_PAGE - read;
+                let mut found = 0i64;
+                let after = cursor.key.clone();
+                rows.document_proofs(
+                    capture,
+                    (&language, &path),
+                    (&after.0, &after.1),
+                    limit,
+                    &mut |row| {
+                        let reserved = witness_reservation(&row, limits)?;
+                        #[cfg(feature = "test-support")]
+                        crate::semantic_import::note_witness_proof_read();
+                        insert.execute(params![
+                            artifact,
+                            row.proof_id,
+                            row.record_kind,
+                            row.fact_digest,
+                            source
+                        ])?;
+                        cursor.key = (row.record_kind.to_owned(), row.fact_digest.to_owned());
+                        found += 1;
+                        high_water = high_water.max(reserved);
+                        bytes = bytes.saturating_add(reserved);
+                        Ok(())
+                    },
+                )?;
+                read += found;
+                if found < limit {
+                    cursor.open = None;
+                }
             }
-            None => {
-                let source = crate::store::staging::lookup_assigned(conn, entry.ordinal, &path)?
-                    .ok_or_else(|| admission("retained unlisted proof"))?;
-                ensure!(source.language == language, "retained proof language");
-                let present: bool = conn
-                    .prepare_cached(
-                        "SELECT EXISTS(SELECT 1 FROM documents WHERE source_ord=?1 AND artifact=?2)",
-                    )?
-                    .query_row(params![source.ord, entry.ordinal], |row| row.get(0))?;
-                ensure!(present, "retained proof document");
-                assigned.insert(path, Some(source.ord), limits);
-                Some(source.ord)
-            }
-        };
-        page.rows += 1;
-        page.high_water = page.high_water.max(bytes);
-        page.bytes = page.bytes.saturating_add(bytes);
-        let Some(source) = source else {
-            // A copied document's proof identities are not staged; the cursor still advances.
-            *key = proof;
-            return Ok(());
-        };
-        let next = match identity {
-            Some(identity) => identity,
-            None => conn
+        }
+        WitnessStep::Stage => {
+            let page: Vec<(String, String, String, i64)> = conn
+                .prepare_cached("SELECT proof_id,record_kind,fact_digest,source_ord FROM retained_witness_pending WHERE artifact=?1 AND proof_id>?2 ORDER BY proof_id LIMIT ?3")?
+                .query_map(params![artifact, cursor.proof, WITNESS_PROOF_PAGE], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            let Some((last, ..)) = page.last() else {
+                cursor.step = WitnessStep::Count;
+                cursor.proof.clear();
+                return Ok(WitnessUnit::Page { high_water, bytes });
+            };
+            cursor.proof.clone_from(last);
+            let mut identity: i64 = conn
                 .prepare_cached(
                     "SELECT identity_id FROM witness_proofs ORDER BY identity_id LIMIT 1",
                 )?
                 .query_row([], |row| row.get(0))
                 .optional()?
-                .unwrap_or(0),
+                .unwrap_or(0);
+            let mut insert =
+                conn.prepare_cached("INSERT INTO witness_proofs VALUES(?1,?2,?3,?4,?5,?6,?7)")?;
+            for (proof, kind, digest, source) in &page {
+                identity = identity
+                    .checked_sub(1)
+                    .ok_or_else(|| admission("witness proof identity exhausted"))?;
+                crate::store::staging::charge_witness_row(conn, limits)?;
+                insert.execute(params![
+                    identity, artifact, source, kind, digest, proof, capture
+                ])?;
+                let reserved =
+                    256_u64.saturating_add(2 * (proof.len() + kind.len() + digest.len()) as u64);
+                high_water = high_water.max(reserved);
+                bytes = bytes.saturating_add(reserved);
+            }
         }
-        .checked_sub(1)
-        .ok_or_else(|| admission("witness proof identity exhausted"))?;
-        identity = Some(next);
-        crate::store::staging::charge_witness_row(conn, limits)?;
-        insert.execute(params![
-            next,
-            entry.ordinal,
-            source,
-            kind,
-            digest,
-            proof,
-            capture
-        ])?;
-        *key = proof;
-        Ok(())
-    })?;
-    Ok((page.rows > 0).then_some(page))
+        WitnessStep::Count => {
+            let (counted, last) =
+                rows.proof_ids_after(capture, &cursor.proof, WITNESS_COUNT_PAGE)?;
+            let Some(last) = last else {
+                return Ok(WitnessUnit::Done);
+            };
+            cursor.proof = last;
+            return Ok(WitnessUnit::Counted(counted));
+        }
+    }
+    Ok(WitnessUnit::Page { high_water, bytes })
 }
 
 type StagedDocumentRow = (i64, String, String, String, String, i64);
@@ -1092,20 +1146,250 @@ mod tests {
         }
     }
 
-    #[test]
-    fn proof_document_paths_are_retained_only_within_their_charge() {
-        let limits = BatchLimits {
-            unit_expansion_bytes: 400,
-            ..Default::default()
+    /// The walk witnessed S did before #1245, as it was: every retained proof of the capture in
+    /// proof-ID order, reserving and checking each, staging the proofs of the documents it does
+    /// not copy with the next lower identity. Returns the proofs it walked.
+    fn full_walk(
+        rows: &RetainedBatchRows<'_>,
+        capture: i64,
+        entry: &super::super::super::descriptor::ArtifactEntry,
+        conn: &Connection,
+        limits: &BatchLimits,
+        copied: &[&str],
+    ) -> Result<i64> {
+        let (mut key, mut walked) = (String::new(), 0i64);
+        loop {
+            let mut page = Vec::new();
+            rows.witness_proofs(capture, &key, WITNESS_PROOF_PAGE, &mut |row| {
+                witness_reservation(&row, limits)?;
+                ensure!(
+                    entry.languages.iter().any(|l| l == row.language),
+                    "retained proof language"
+                );
+                page.push((
+                    row.proof_id.to_owned(),
+                    row.record_kind.to_owned(),
+                    row.fact_digest.to_owned(),
+                    row.path.to_owned(),
+                ));
+                Ok(())
+            })?;
+            let Some((last, ..)) = page.last() else {
+                return Ok(walked);
+            };
+            key = last.clone();
+            for (proof, kind, digest, path) in page {
+                walked += 1;
+                if copied.contains(&path.as_str()) {
+                    continue;
+                }
+                let source = crate::store::staging::lookup_assigned(conn, entry.ordinal, &path)?
+                    .ok_or_else(|| admission("retained unlisted proof"))?
+                    .ord;
+                let identity: i64 = conn
+                    .query_row(
+                        "SELECT identity_id FROM witness_proofs ORDER BY identity_id LIMIT 1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .unwrap_or(0);
+                conn.execute(
+                    "INSERT INTO witness_proofs VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                    params![
+                        identity - 1,
+                        entry.ordinal,
+                        source,
+                        kind,
+                        digest,
+                        proof,
+                        capture
+                    ],
+                )?;
+            }
+        }
+    }
+
+    /// Drives [`advance_witness`] over each `(artifact, capture)` to its end. Returns each
+    /// artifact's counted proofs and the most rows one unit changed.
+    fn witness_all(
+        rows: &RetainedBatchRows<'_>,
+        conn: &Connection,
+        artifacts: &[(super::super::super::descriptor::ArtifactEntry, i64)],
+        limits: &BatchLimits,
+        copied: &[&str],
+    ) -> Result<(Vec<i64>, u64)> {
+        let (mut claims, mut most) = (Vec::new(), 0u64);
+        for (entry, capture) in artifacts {
+            let (mut cursor, mut counted) = (WitnessCursor::default(), 0i64);
+            loop {
+                let before = conn.total_changes();
+                let unit = advance_witness(
+                    rows,
+                    *capture,
+                    entry,
+                    conn,
+                    &mut cursor,
+                    limits,
+                    &mut |_, path| Ok(copied.contains(&path)),
+                )?;
+                most = most.max(conn.total_changes() - before);
+                match unit {
+                    WitnessUnit::Page { .. } => {}
+                    WitnessUnit::Counted(proofs) => counted += proofs,
+                    WitnessUnit::Done => break,
+                }
+            }
+            claims.push(counted);
+        }
+        Ok((claims, most))
+    }
+
+    /// Two artifacts, two documents each. `a.java` and `d.java` hold more proofs than one
+    /// unit reads, and every capture's proof IDs interleave its documents, so proof-ID order
+    /// differs from document order. `b.java` and `c.java` are the ones S copies.
+    fn witness_fixture() -> (
+        tempfile::TempDir,
+        Stage,
+        Connection,
+        Vec<(super::super::super::descriptor::ArtifactEntry, i64)>,
+    ) {
+        let parent = tempfile::tempdir().unwrap();
+        let mut stage = Stage::create(parent.path(), "test", "witness").unwrap();
+        stage.conn().unwrap().execute_batch(&format!("INSERT INTO witness_state(singleton) VALUES(1); {WITNESS_PENDING_TABLE} INSERT INTO sources VALUES(0,'java','a.java','h',1),(1,'java','b.java','h',1),(2,'java','c.java','h',1),(3,'java','d.java','h',1); INSERT INTO coverage VALUES(0,0,NULL),(1,0,NULL),(2,1,NULL),(3,1,NULL); INSERT INTO documents VALUES(0,0,'a.java','w',0),(1,0,'b.java','w',0),(2,1,'c.java','w',0),(3,1,'d.java','w',0)")).unwrap();
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE semantic_raw_proofs(capture_id INTEGER NOT NULL,proof_id TEXT NOT NULL,record_kind TEXT NOT NULL,fact_digest TEXT NOT NULL,language TEXT NOT NULL,path TEXT NOT NULL,canonical_bytes BLOB NOT NULL,UNIQUE(capture_id,proof_id),UNIQUE(capture_id,language,path,record_kind,fact_digest))").unwrap();
+        let kinds = ["occurrence", "symbolInformation", "relationship"];
+        // Proof IDs are unique across captures, as their artifact-bound digests are.
+        let mut k = 0u64;
+        for (capture, documents) in [
+            (10, [("a.java", 300), ("b.java", 40)]),
+            (20, [("c.java", 5), ("d.java", 270)]),
+        ] {
+            for (path, proofs) in documents {
+                for _ in 0..proofs {
+                    k += 1;
+                    // A permutation of 1..1009: proof IDs interleave the documents.
+                    db.execute(
+                        "INSERT INTO semantic_raw_proofs VALUES(?1,?2,?3,?4,'java',?5,x'00')",
+                        params![
+                            capture,
+                            format!("{:04}", k * 37 % 1009),
+                            kinds[(k % 3) as usize],
+                            format!("{k:064x}"),
+                            path
+                        ],
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        let entry = |ordinal: u32| super::super::super::descriptor::ArtifactEntry {
+            ordinal,
+            relative_path: format!("raw{ordinal}"),
+            languages: vec!["java".into()],
+            sha256: format!("hash{ordinal}"),
+            byte_length: 0,
         };
-        let mut paths = ProofDocuments::default();
-        paths.insert("a".repeat(64), Some(1), &limits);
-        assert_eq!(paths.get(&"a".repeat(64)), Some(&Some(1)));
-        assert!(paths.bytes > 64 && paths.bytes <= 200);
-        // A second entry would pass half the unit expansion limit: it is not retained.
-        paths.insert("b".repeat(64), Some(2), &limits);
-        assert_eq!(paths.get(&"b".repeat(64)), None);
-        assert_eq!(paths.paths.len(), 1);
+        (parent, stage, db, vec![(entry(0), 10), (entry(1), 20)])
+    }
+
+    type StagedWitnessRow = (i64, i64, i64, String, String, String, i64);
+
+    fn staged_witness_proofs(conn: &Connection) -> Vec<StagedWitnessRow> {
+        conn.prepare("SELECT identity_id,artifact,source_ord,record_kind,fact_digest,proof_id,capture_id FROM witness_proofs ORDER BY identity_id DESC")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// #1245: reading only the documents S does not copy stages exactly what the full
+    /// proof-ordered walk staged, with the same identities in the same order, and counts the
+    /// same claims, for one artifact and for several. No unit changes more than one page of
+    /// rows (a staged row also charges `witness_state`).
+    #[test]
+    fn witnessed_proofs_match_the_full_walk_with_its_identities() {
+        let limits = BatchLimits::PRODUCTION;
+        let copied = ["b.java", "c.java"];
+        for artifacts in [1, 2] {
+            let (_reference_dir, mut reference, db, entries) = witness_fixture();
+            let entries = &entries[..artifacts];
+            let rows = RetainedBatchRows::for_tests(&db, 1, test_pin());
+            let reference = reference.conn().unwrap();
+            let walked: Vec<i64> = entries
+                .iter()
+                .map(|(entry, capture)| {
+                    full_walk(&rows, *capture, entry, reference, &limits, &copied).unwrap()
+                })
+                .collect();
+            let expected = staged_witness_proofs(reference);
+            let (_dir, mut stage, ..) = witness_fixture();
+            let conn = stage.conn().unwrap();
+            let (claims, most) = witness_all(&rows, conn, entries, &limits, &copied).unwrap();
+            assert_eq!(claims, walked);
+            assert_eq!(staged_witness_proofs(conn), expected);
+            // The copied documents stage nothing; every proof of the others is staged.
+            let (staged, total) = if artifacts == 1 {
+                (300, 340)
+            } else {
+                (570, 615)
+            };
+            assert_eq!(expected.len(), staged);
+            assert_eq!(claims.iter().sum::<i64>(), total);
+            assert!(most <= 2 * WITNESS_PROOF_PAGE as u64, "{most}");
+        }
+    }
+
+    /// #1245, #261: S no longer reads a copied document's retained proofs, so a row there that
+    /// the full walk refused does not stop it; it is still counted. The same row in a document
+    /// S does not copy still fails typed.
+    #[test]
+    fn witnessed_proofs_read_only_documents_s_does_not_copy() {
+        let limits = BatchLimits {
+            unit_expansion_bytes: 2_000,
+            ..BatchLimits::PRODUCTION
+        };
+        let copied = ["b.java", "c.java"];
+        for (path, in_copied) in [("b.java", true), ("a.java", false)] {
+            let (_dir, mut stage, db, entries) = witness_fixture();
+            db.execute(
+                "INSERT INTO semantic_raw_proofs VALUES(10,?1,'occurrence',?2,'java',?3,x'00')",
+                params!["x".repeat(1_000), "f".repeat(64), path],
+            )
+            .unwrap();
+            let rows = RetainedBatchRows::for_tests(&db, 1, test_pin());
+            let conn = stage.conn().unwrap();
+            let entries = &entries[..1];
+            let walk = full_walk(&rows, 10, &entries[0].0, conn, &limits, &copied);
+            assert!(walk.unwrap_err().is::<ScipCaptureError>());
+            conn.execute("DELETE FROM witness_proofs", []).unwrap();
+            let admitted = witness_all(&rows, conn, entries, &limits, &copied);
+            if in_copied {
+                assert_eq!(admitted.unwrap().0, [341]);
+                assert_eq!(staged_witness_proofs(conn).len(), 300);
+            } else {
+                let error = admitted.unwrap_err();
+                assert!(
+                    matches!(
+                        error.downcast_ref::<ScipCaptureError>(),
+                        Some(ScipCaptureError::LimitExceeded(what)) if what == "unit expansion bytes"
+                    ),
+                    "{error:#}"
+                );
+            }
+        }
     }
 
     #[test]
