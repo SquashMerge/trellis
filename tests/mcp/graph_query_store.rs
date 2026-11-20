@@ -2287,3 +2287,85 @@ fn corrupt_stored_coverage_reason_count_schedules_a_rebuild() {
     );
     assert!(store.recovery_pending_for_tests());
 }
+
+/// #1255: an older-basis language keeps its selected producer, so the call graph, the Files
+/// view's sequence and the CLI view serve its labelled bindings with no coverage note; only a
+/// language without a selected producer has one.
+#[test]
+fn older_basis_language_keeps_its_bindings_and_has_no_coverage_note() {
+    use trellis::model::SemanticStatus;
+    let (state, root) = workspace();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let mut spec = Spec::new(&[("a.rs", CHAIN), ("z.rs", "fn z() {}\n")]);
+    spec.bindings = vec![bind("a", 0, "b"), bind("b", 0, "c")];
+    let basis = publisher.publish(&spec);
+    let seed = syntax_id(publisher.native(), "a");
+    // Changing z.rs leaves a.rs on its older semantic basis (#620).
+    std::fs::write(root.path().join("z.rs"), "fn z() { z(); }\n").unwrap();
+    let session = publisher.store.writer_session_for_tests().unwrap();
+    let head = trellis::index_coordinator::IndexJobCoordinator::prepare_with_session(
+        &publisher.store,
+        Some(basis),
+        session,
+    )
+    .unwrap()
+    .run_serving(
+        &trellis::indexer::IndexOptions::new(root.path().into()),
+        &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        |_| {},
+    )
+    .unwrap();
+    assert_ne!(head, basis);
+    let projection = publisher
+        .store
+        .semantic_projection_at(head, graph_fixtures::PRODUCER, "rust", "a.rs")
+        .unwrap()
+        .unwrap();
+    assert_eq!(projection.semantic_status, SemanticStatus::OlderBasis);
+    assert_eq!(projection.semantic_basis_pin, basis);
+
+    let graph = result(run(&publisher.store, &query(&seed, false)).unwrap());
+    assert!(
+        graph
+            .warnings
+            .iter()
+            .all(|warning| warning.code != WarningCode::SyntaxOnly),
+        "{:?}",
+        graph.warnings
+    );
+    assert!(graph.edges.iter().all(|edge| edge.binding.is_some()));
+
+    let sequence = publisher
+        .store
+        .sequence_at(&seed, head, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(sequence.semantic.reason, None);
+    assert_eq!(
+        sequence.semantic.producer_id.as_deref(),
+        Some(graph_fixtures::PRODUCER)
+    );
+    assert!(
+        sequence
+            .semantic
+            .documents
+            .iter()
+            .all(|doc| doc.projection.semantic_status == SemanticStatus::OlderBasis)
+    );
+
+    let view_query: trellis::model::ViewQuery =
+        serde_json::from_value(serde_json::json!({"seed": seed})).unwrap();
+    let view = publisher.store.query_view(&view_query).unwrap().unwrap();
+    assert_eq!(view.semantic.note, None);
+    assert_eq!(
+        view.semantic.producer_id.as_deref(),
+        Some(graph_fixtures::PRODUCER)
+    );
+    assert!(!view.semantic.bindings.is_empty());
+    assert!(view.semantic.bindings.iter().all(|binding| {
+        binding
+            .projection
+            .as_ref()
+            .is_some_and(|p| p.semantic_status == SemanticStatus::OlderBasis)
+    }));
+}

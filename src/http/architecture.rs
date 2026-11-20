@@ -28,6 +28,9 @@ const CHECK_WHILE_WAITING: Duration = Duration::from_millis(100);
 const CONTENTION_RETRY: Duration = Duration::from_secs(1);
 /// Then contention waits for the next hint or read, and any other fault is reported.
 const CONTENTION_RETRIES: u32 = 5;
+/// A turn waits on a live publication's own end signal before it reads (#1245); this bound
+/// is only a liveness backstop, for a publication that outlasts it.
+const PUBLICATION_WAIT_BACKSTOP: Duration = Duration::from_secs(60);
 
 /// How long a `building` answer asks its caller to wait before it reads again.
 pub(crate) const RETRY_AFTER_MS: u64 = 250;
@@ -37,6 +40,32 @@ pub(crate) const RETRY_AFTER_MS: u64 = 250;
 pub struct ArchitectureBuilding {
     pub pin: IndexPin,
     pub(crate) progress: Option<ArchitectureProgress>,
+    /// The rules file the read needs its core to have evaluated, so the read can wait for
+    /// that core after its read has ended (#1252).
+    pub(crate) rules: WantedRules,
+}
+
+/// An owned [`CoreRules`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum WantedRules {
+    Any,
+    Exactly(Option<String>),
+}
+impl WantedRules {
+    fn core_rules(&self) -> CoreRules<'_> {
+        match self {
+            Self::Any => CoreRules::Any,
+            Self::Exactly(hash) => CoreRules::Exactly(hash.as_deref()),
+        }
+    }
+}
+impl From<CoreRules<'_>> for WantedRules {
+    fn from(rules: CoreRules<'_>) -> Self {
+        match rules {
+            CoreRules::Any => Self::Any,
+            CoreRules::Exactly(hash) => Self::Exactly(hash.map(str::to_owned)),
+        }
+    }
 }
 impl std::fmt::Display for ArchitectureBuilding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -444,6 +473,25 @@ impl DaemonState {
         let _ = self.architecture_outcome(pin, rules, wait, check, false);
     }
 
+    /// After an admitted read found `building`'s core still being computed and ended (#1252):
+    /// wait at most `wait` on the owner, holding no lease or read. `None` when a new read
+    /// should be admitted, because the core or its kept failure is published, the owner passed
+    /// the pin, or `check` failed; otherwise the core is still building, with its progress now.
+    pub(crate) fn architecture_still_building(
+        self: &Arc<Self>,
+        building: &ArchitectureBuilding,
+        wait: Duration,
+        check: &mut impl FnMut() -> anyhow::Result<()>,
+    ) -> Option<ArchitectureBuilding> {
+        let pin = building.pin;
+        let error = self
+            .architecture_outcome(pin, building.rules.core_rules(), wait, check, false)
+            .err()?;
+        let still = error.downcast::<ArchitectureBuilding>().ok()?;
+        let passed = self.architecture.0.state.lock().unwrap().passed(pin);
+        (!passed).then_some(still)
+    }
+
     fn architecture_outcome(
         self: &Arc<Self>,
         pin: IndexPin,
@@ -485,7 +533,12 @@ impl DaemonState {
             let remaining = deadline.saturating_duration_since(Instant::now());
             // The head moved past this pin, so no build is coming: the caller reads again.
             if remaining.is_zero() || state.passed(pin) {
-                return Err(ArchitectureBuilding { pin, progress }.into());
+                return Err(ArchitectureBuilding {
+                    pin,
+                    progress,
+                    rules: rules.into(),
+                }
+                .into());
             }
             if state.shutdown {
                 anyhow::bail!("index_not_ready: checkout released");
@@ -559,6 +612,15 @@ impl DaemonState {
     fn architecture_step(self: &Arc<Self>, owner: &ArchitectureOwner) {
         // Before the turn admits its read: a test orders the owner's read against other work.
         owner.hook("architecture_step_started");
+        // A live publication's COMMIT waits out every reader's SHARED lock, so the read waits
+        // for the publication instead (#1245). It waits on the publication's own signal and
+        // holds no lease, lock or snapshot meanwhile; the bound is only a liveness backstop,
+        // after which the read's own checks give way again.
+        if self.store.publication_writing() {
+            owner.hook("architecture_awaiting_publication");
+            self.store
+                .await_publications_written(PUBLICATION_WAIT_BACKSTOP);
+        }
         let Some(lease) = self.background_lease() else {
             return;
         };
@@ -643,10 +705,20 @@ impl DaemonState {
             }
             owner.hook(progress.phase);
         };
-        // The transaction and lease end with the read: a publication and a retirement
-        // wait for reads, and nothing after this one uses SQLite.
+        // The read gives its snapshot up at its next check once a live publication raises its
+        // write intent (#1245): that publication supersedes this head, or, if it fails, the
+        // next turn reads the same head again. Nothing of a yielded read is published.
+        let mut read_check = || {
+            if self.store.publication_writing() {
+                owner.hook("architecture_read_yielded");
+                anyhow::bail!("cancelled: architecture read yielded to a publication");
+            }
+            check()
+        };
+        // The transaction and lease end with the read: a retirement waits for reads, and
+        // nothing after this one uses SQLite.
         let input = response
-            .architecture_input(pin, &mut check, &progress)
+            .architecture_input(pin, &mut read_check, &progress)
             .and_then(|input| response.finish(input));
         drop(response);
         drop(lease);
@@ -723,6 +795,16 @@ impl DaemonState {
     #[cfg(feature = "test-support")]
     pub fn leases_for_tests(&self) -> usize {
         self.leases()
+    }
+
+    /// Whether the owner has a core published for `pin` built with a rules file.
+    #[cfg(feature = "test-support")]
+    pub fn architecture_ruled_core_published_for_tests(&self, pin: IndexPin) -> bool {
+        let state = self.architecture.0.state.lock().unwrap();
+        state
+            .published
+            .iter()
+            .any(|p| p.key.pin == pin && p.key.rules_hash.is_some())
     }
 
     /// Builds this runtime has started.

@@ -69,6 +69,11 @@ impl ProducerSelection {
         }
     }
 
+    /// Applies the automatic re-run labels to the default's language notes (#1255).
+    pub(crate) fn relabel(&mut self, labels: &AutoRunLabels) {
+        labels.relabel(&mut self.defaults);
+    }
+
     /// The published producers that cover `language` under the default, in ID order.
     pub fn covering(&self, language: &str) -> &[String] {
         self.defaults
@@ -93,7 +98,14 @@ pub(crate) fn default_producers(db: &Connection, revision_key: &str) -> Result<D
     if rows.iter().any(|(id, _)| !engine::valid_producer_id(id)) {
         return Err(SelectedIntegrity("invalid selected semantic producer ID".into()).into());
     }
-    Ok(DefaultProducers::from_published(rows))
+    let mut defaults = DefaultProducers::from_published(rows);
+    // The re-import state status and describe report, so a language whose evidence needs
+    // re-import says so instead of "does not cover this language" (#1255).
+    defaults.pending = super::semantic_retention::semantic_reimport_at(db, revision_key)?
+        .into_iter()
+        .map(|(language, reimport)| (language, reimport_note(&reimport)))
+        .collect();
+    Ok(defaults)
 }
 
 /// The one producer selection every read surface uses (#483). An explicit producer must
@@ -587,6 +599,18 @@ fn reimport_note(reimport: &crate::model::SemanticReimport) -> String {
     }
 }
 
+/// The note of a language with pending semantic evidence (#1255): its state and reason.
+fn pending_note(pending: &LanguagePending) -> String {
+    match pending.status {
+        crate::model::SemanticStatus::CatchingUp => {
+            format!("semantic evidence catching up: {}", pending.reason)
+        }
+        _ => reimport_note(&crate::model::SemanticReimport::NeedsReimport {
+            reason: pending.reason.clone(),
+        }),
+    }
+}
+
 /// One language's selected bindings and state under its producer.
 fn language_counts(
     db: &Connection,
@@ -723,8 +747,10 @@ pub(crate) fn view_walk(
     query: &crate::model::ViewQuery,
     seed_document: SelectedDocument,
     seed: crate::model::Symbol,
+    labels: &AutoRunLabels,
 ) -> Result<ViewWalk> {
     let mut reader = SemanticCalls::new(db, selected, query.semantic_producer_id.as_deref())?;
+    reader.selection.relabel(labels);
     let seed_language = seed_document.file.language.clone();
     let mut semantic = crate::model::ViewSemantic {
         producer_id: reader.selection.named(&seed_language).map(str::to_owned),
@@ -989,6 +1015,23 @@ pub struct AutoRunLabels {
     pub failed: BTreeMap<String, String>,
 }
 
+impl AutoRunLabels {
+    /// Applies the labels to the language notes of `defaults` (#1255), by the same rules as
+    /// describe's pending state: a catching-up language says so, and a failed one needs
+    /// re-import with the failure as its reason.
+    pub(crate) fn relabel(&self, defaults: &mut DefaultProducers) {
+        let languages: BTreeSet<&String> =
+            self.catching_up.iter().chain(self.failed.keys()).collect();
+        for language in languages {
+            if let Some(pending) = apply_auto_run_labels(language, &mut [], &mut None, self) {
+                defaults
+                    .pending
+                    .insert(language.clone(), pending_note(&pending));
+            }
+        }
+    }
+}
+
 /// The reason shown for a language whose producer re-run is scheduled or running, and the
 /// `autoRun.reason` of a scheduled producer (#660): one string for both.
 pub(crate) const RERUN_SCHEDULED: &str = "producer re-run scheduled";
@@ -1148,17 +1191,17 @@ impl EvidenceResponse {
     /// (#528). Uses the per-language default producer, as status and the call tools do.
     pub fn mcp_language_tiers(&self) -> Result<[LanguageTier; 5]> {
         let selected = self.selected(None)?;
-        let defaults = default_producers(&self.db, &selected.key)?;
+        let mut defaults = default_producers(&self.db, &selected.key)?;
+        self.auto_run.relabel(&mut defaults);
         let reimports = super::semantic_retention::semantic_reimport_at(&self.db, &selected.key)?;
         let mut tiers: [LanguageTier; 5] = Default::default();
         for (tier, language) in tiers.iter_mut().zip(MCP_LANGUAGES) {
             tier.freshness = "unavailable";
             tier.reimport = reimports.get(language).cloned();
-            tier.note = tier
-                .reimport
-                .as_ref()
-                .map(reimport_note)
-                .or_else(|| defaults.note(language));
+            // The call tools' note (#1255); a selected producer's language keeps its reason.
+            tier.note = defaults
+                .note(language)
+                .or_else(|| tier.reimport.as_ref().map(reimport_note));
             let Some(producer) = defaults.producer(language) else {
                 continue;
             };
@@ -1392,6 +1435,7 @@ impl EvidenceResponse {
     ) -> Result<McpSemantic> {
         let selected = self.selected(None)?;
         let mut reader = SemanticCalls::new(&self.db, &selected, explicit)?;
+        reader.selection.relabel(&self.auto_run);
         let calls: Vec<_> = calls.into_iter().collect();
         let language = owner_document.language.as_str();
         let mut call_documents: BTreeSet<_> =
@@ -1448,6 +1492,8 @@ impl EvidenceResponse {
 
 /// At most this many semantic rows are admitted into one architecture snapshot (#523).
 const ARCHITECTURE_SEMANTIC_ROWS: usize = 2_000_000;
+/// An architecture read checks its caller this often, in admitted semantic rows (#1245).
+const CHECK_EVERY_ROWS: usize = 256;
 
 #[cfg(feature = "test-support")]
 static TEST_SEMANTIC_ROWS: std::sync::atomic::AtomicUsize =
@@ -1538,12 +1584,18 @@ pub(super) fn architecture_semantic(
             .copied()
     };
     let mut rows = 0usize;
-    let mut admit = || -> Result<()> {
+    // Every admitted row counts toward the bound, and every `CHECK_EVERY_ROWS` of them the
+    // caller's check runs, so one large payload's cursors cannot keep a read from giving
+    // way to a publication for long (#1245).
+    let mut admit = |check: &mut dyn FnMut() -> Result<()>| -> Result<()> {
         rows += 1;
         ensure!(
             rows <= semantic_rows_limit(),
             "bounded_work: architecture semantic evidence"
         );
+        if rows.is_multiple_of(CHECK_EVERY_ROWS) {
+            check()?;
+        }
         Ok(())
     };
     let sid = |bytes: Option<&[u8]>| -> Result<Option<String>> {
@@ -1822,7 +1874,7 @@ pub(super) fn architecture_semantic(
             payload, language, path, historical, key, native, tuple
         ])?;
         while let Some(row) = cursor.next()? {
-            admit()?;
+            admit(&mut *check)?;
             // A missing required freshness row is corruption, never a filtered fact.
             let basis_freshness = pp.freshness(row.get(17)?)?;
             let call_id = id_codec::decode_occ(row.get_ref(0)?.as_blob()?)
@@ -1862,7 +1914,7 @@ pub(super) fn architecture_semantic(
                 while let Some(target) = alternatives.next()? {
                     // The declared endpoint is this binding's own row, admitted above (#934).
                     if target.get_ref(10)?.as_str()? != "declared" {
-                        admit()?;
+                        admit(&mut *check)?;
                     }
                     if target.get_ref(0)?.as_str_or_null()? == Some("internal") {
                         eligible_endpoints &= endpoint(
@@ -1945,7 +1997,7 @@ pub(super) fn architecture_semantic(
         // Resolved and external use-site references: the names a site spells.
         let mut cursor = references.query(params![payload, historical, key, tuple])?;
         while let Some(row) = cursor.next()? {
-            admit()?;
+            admit(&mut *check)?;
             let basis_freshness = pp.freshness(row.get(9)?)?;
             // What a read at the basis binds: a resolved internal target in this snapshot
             // (#934), from a proof that read admits: any not `stale` (#936).
@@ -1994,7 +2046,7 @@ pub(super) fn architecture_semantic(
                 while let Some(target) = alternatives.next()? {
                     // The declared endpoint is this reference's own row, admitted above (#934).
                     if target.get_ref(10)?.as_str()? != "declared" {
-                        admit()?;
+                        admit(&mut *check)?;
                     }
                     if target.get_ref(0)?.as_str_or_null()? == Some("internal") {
                         eligible_endpoints &= endpoint(
@@ -2038,7 +2090,7 @@ pub(super) fn architecture_semantic(
         let mut found = Vec::new();
         let mut cursor = relationships.query(params![payload, historical, key, tuple, native])?;
         while let Some(row) = cursor.next()? {
-            admit()?;
+            admit(&mut *check)?;
             pp.freshness(row.get(16)?)?;
             let source = sid(row.get_ref(1)?.as_blob_or_null()?)?.context(SelectedIntegrity(
                 "corrupt semantic type relationship".into(),
@@ -2101,6 +2153,27 @@ pub(super) fn architecture_semantic(
         semantic.relationships = found;
     }
     Ok(())
+}
+
+#[cfg(feature = "test-support")]
+impl super::Store {
+    /// Run the semantic part of the head's Architecture read with `check` alone (#1245). The
+    /// documents come from a whole read first, under a check that never stops it.
+    #[doc(hidden)]
+    pub fn architecture_semantic_with_check_for_tests(
+        &self,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let response = self.evidence_response()?;
+        let (mut snapshot, _) =
+            response.architecture_snapshot_regions(None, &mut || Ok(()), &|_, _| {})?;
+        for document in &mut snapshot.documents {
+            document.semantic = Default::default();
+        }
+        let selected = response.selected(None)?;
+        architecture_semantic(&response.db, &selected.key, &mut snapshot.documents, check)?;
+        response.finish(())
+    }
 }
 
 #[cfg(test)]

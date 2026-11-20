@@ -959,9 +959,14 @@ file is never served from an older result. A daemon restart or an idle checkout'
 drops the result, and the next activation builds it again.
 
 A build reads each document once in one read transaction, ends it, and only then resolves
-references, prepares rule rows and measures metrics. A publication or a retirement waits for
-that read at most, never for the computing, and a read waits for the owner before it admits
-its own transaction. A build keeps no source text, syntax trees or semantic rows, only the
+references, prepares rule rows and measures metrics. Publications never wait on the
+Architecture read (owner ruling 2026-11-20, #1245): a live publication raises a write intent,
+the build's read gives its snapshot up at its next check, and the owner reads again only once
+the publication has ended. A read that gives way publishes nothing. During a burst of edits
+the Architecture view therefore lags, answering `building`, until the edits stop. The index
+keeps its rollback (DELETE) journal (Decision 0008). A retirement waits for that read at most,
+never for the computing, and a read waits for the owner before it admits its own transaction.
+A build keeps no source text, syntax trees or semantic rows, only the
 per-source reference rows (up to 50 sampled sites per edge, calls first), rule rows, metric rows and each
 finished summary, so a checkout holds one result, bounded by the existing reference and rule
 budgets. A checkout keeps at most two: the head's, and the one it replaced or an older retained
@@ -985,7 +990,7 @@ A build reports its progress as `{phase,completed,total}`. The phases are `readi
 | --- | --- |
 | `GET architecture` | Waits 1 s for the owner, then answers **202** with `{"state":"building","progress":{"phase","completed","total"},"retryAfterMs"}`. The view shows `Building Architecture for this revision: reading indexed files 120 of 604…` and asks again; the daemon answers as soon as the build is done. |
 | `GET architecture/details` | Waits 1 s, then answers **503** `architecture_building`. |
-| MCP `trellis_rules_check`, `trellis_rules_explain`, `trellis_references`, the layer prompt | A read, with or without `paths`, waits until one second before the 5 s call deadline, then fails with the typed retryable `building`: `{code:"building",retryable:true,message,progress:{phase,completed,total}\|null,retryAfterMs}` (#798). The message names the phase and count. The prompt carries the same error as its JSON-RPC error `data`. |
+| MCP `trellis_rules_check`, `trellis_rules_explain`, `trellis_references`, `trellis_endpoints`, the layer prompt | A read, with or without `paths`, waits until one second before the 5 s call deadline, then fails with the typed retryable `building`: `{code:"building",retryable:true,message,progress:{phase,completed,total}\|null,retryAfterMs}` (#798). The message names the phase and count. The prompt carries the same error as its JSON-RPC error `data`. The wait follows the admitted read that found the build running, and a build still running when it ends is answered from the owner's state without another read, so a slow admission never turns it into `deadline_exceeded`, the hang backstop (#1252). |
 | CLI `trellis rules check`, `trellis references` | A read, with or without paths, waits up to 30 s, then fails `deadline_exceeded` with a message that says the build is running. |
 | `metrics` (revision or directory scope) | Waits up to 5 s for a running build, then computes its own rows. It uses a published build's rows at once, and never asks for a build. |
 

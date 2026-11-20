@@ -104,7 +104,9 @@ is not fresh. It is `unavailable` when no selected complete or partial coverage 
 one row per provenance. `unresolved` counts the language's remaining measured calls. A
 language that none or several producers cover has a `semanticNote` (`semantic producer does
 not cover this language; showing syntax` or `multiple semantic producers for <language>;
-showing syntax`), `unavailable` and syntax-only counts. `stats` is the combined total:
+showing syntax`), `unavailable` and syntax-only counts. A language whose evidence needs
+re-import has `semantic evidence needs re-import: <reason>` instead (#632, #1255); "does not
+cover this language" is only for a language that no published producer covers. `stats` is the combined total:
 `stale` if any language is stale, else `fresh` if any is fresh. The top-level
 `semanticProducerId` names the producer when every selected language shares one, and
 `semanticNote` joins the multiple-producer notes. With no producer published,
@@ -212,7 +214,10 @@ whose profile covers its language. A seed language that none or several cover le
 view syntax only, with `semantic.note` `no semantic producer published; showing syntax` or
 `multiple semantic producers for <language>; showing syntax`; producers are never merged. A
 producer that does not cover the seed's language gives `semantic producer does not cover
-this language; showing syntax`. The walk follows a call whose binding has `boundaryReason`
+this language; showing syntax`. Without an explicit producer, a seed language with no
+selected producer whose evidence needs re-import or is catching up names that state instead,
+worded as status and describe word it (#1255): `semantic evidence needs re-import: <reason>`
+or `semantic evidence catching up: <reason>`, with the #660 reasons. The walk follows a call whose binding has `boundaryReason`
 `none` to its exact target, as the call graph does: depth 1 adds the seed's targets, and
 each further level inspects the previous level's calls (#483). Otherwise `semantic` is `{producerId, note: null, bindings}`. Each
 binding is `{callId, boundaryReason, targetId, freshness, binding}` for a returned call
