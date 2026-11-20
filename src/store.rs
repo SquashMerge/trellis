@@ -1627,6 +1627,11 @@ impl EvidenceResponse {
         self
     }
 
+    /// The runtime automatic re-run labels, for the reads that word a language's note (#1255).
+    pub(crate) fn auto_run_labels(&self) -> &AutoRunLabels {
+        &self.auto_run
+    }
+
     /// Read each selected native document once; never reopen source from the checkout.
     pub(crate) fn architecture_snapshot(
         &self,

@@ -30,7 +30,7 @@ pub(super) fn semantic_reimport_at(
     db: &Connection,
     key: &str,
 ) -> Result<BTreeMap<String, SemanticReimport>> {
-    let mut statement = db.prepare("SELECT language,producer,reason FROM semantic_reimport WHERE revision_id=?1 ORDER BY language,producer")?;
+    let mut statement = db.prepare_cached("SELECT language,producer,reason FROM semantic_reimport WHERE revision_id=?1 ORDER BY language,producer")?;
     let rows = statement
         .query_map([key], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(2)?))

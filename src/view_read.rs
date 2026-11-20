@@ -5,7 +5,9 @@
 //! `impl EvidenceResponse` blocks, so they run in the same read transaction and behind the
 //! same fence as before. This file contains SQL until the read API is narrowed (S14).
 use crate::model::*;
-use crate::store::{EvidenceResponse, SelectedIntegrity, Store, id_codec, semantic_display};
+use crate::store::{
+    AutoRunLabels, EvidenceResponse, SelectedIntegrity, Store, id_codec, semantic_display,
+};
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -20,7 +22,7 @@ impl EvidenceResponse {
     ) -> Result<Option<ViewResult>> {
         query.validate()?;
         self.store
-            .query_view_in_for(&self.db, query, expected, true)
+            .query_view_in_for(&self.db, query, expected, true, self.auto_run_labels())
     }
 }
 
@@ -43,7 +45,7 @@ impl Store {
         query: &ViewQuery,
         expected_pin: Option<&IndexPin>,
     ) -> Result<Option<ViewResult>> {
-        self.query_view_in_for(tx, query, expected_pin, false)
+        self.query_view_in_for(tx, query, expected_pin, false, &AutoRunLabels::default())
     }
     fn query_view_in_for(
         &self,
@@ -51,6 +53,7 @@ impl Store {
         query: &ViewQuery,
         expected_pin: Option<&IndexPin>,
         pre_startup: bool,
+        labels: &AutoRunLabels,
     ) -> Result<Option<ViewResult>> {
         let selected = self.read_revision_for(tx, expected_pin.copied(), pre_startup)?;
         let revision = selected.pin;
@@ -71,7 +74,8 @@ impl Store {
             .ok_or_else(|| {
                 SelectedIntegrity("incompatible_index: selected view seed missing".into())
             })?;
-        let walk = semantic_display::view_walk(self, tx, &selected, query, seed_document, seed)?;
+        let walk =
+            semantic_display::view_walk(self, tx, &selected, query, seed_document, seed, labels)?;
         let mut warnings = Vec::new();
         if walk.truncated {
             warnings.push("Measured calls truncated at the request limit.".into());

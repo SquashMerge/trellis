@@ -1653,6 +1653,9 @@ pub fn incoming(
 #[cfg(test)]
 mod outgoing_tests;
 
+#[cfg(test)]
+mod coverage_note_tests;
+
 /// Single complete selected source range; both serialized copies must fit.
 pub fn source(
     id: &Value,

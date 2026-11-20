@@ -69,6 +69,11 @@ impl ProducerSelection {
         }
     }
 
+    /// Applies the automatic re-run labels to the default's language notes (#1255).
+    pub(crate) fn relabel(&mut self, labels: &AutoRunLabels) {
+        labels.relabel(&mut self.defaults);
+    }
+
     /// The published producers that cover `language` under the default, in ID order.
     pub fn covering(&self, language: &str) -> &[String] {
         self.defaults
@@ -93,7 +98,14 @@ pub(crate) fn default_producers(db: &Connection, revision_key: &str) -> Result<D
     if rows.iter().any(|(id, _)| !engine::valid_producer_id(id)) {
         return Err(SelectedIntegrity("invalid selected semantic producer ID".into()).into());
     }
-    Ok(DefaultProducers::from_published(rows))
+    let mut defaults = DefaultProducers::from_published(rows);
+    // The re-import state status and describe report, so a language whose evidence needs
+    // re-import says so instead of "does not cover this language" (#1255).
+    defaults.pending = super::semantic_retention::semantic_reimport_at(db, revision_key)?
+        .into_iter()
+        .map(|(language, reimport)| (language, reimport_note(&reimport)))
+        .collect();
+    Ok(defaults)
 }
 
 /// The one producer selection every read surface uses (#483). An explicit producer must
@@ -587,6 +599,18 @@ fn reimport_note(reimport: &crate::model::SemanticReimport) -> String {
     }
 }
 
+/// The note of a language with pending semantic evidence (#1255): its state and reason.
+fn pending_note(pending: &LanguagePending) -> String {
+    match pending.status {
+        crate::model::SemanticStatus::CatchingUp => {
+            format!("semantic evidence catching up: {}", pending.reason)
+        }
+        _ => reimport_note(&crate::model::SemanticReimport::NeedsReimport {
+            reason: pending.reason.clone(),
+        }),
+    }
+}
+
 /// One language's selected bindings and state under its producer.
 fn language_counts(
     db: &Connection,
@@ -723,8 +747,10 @@ pub(crate) fn view_walk(
     query: &crate::model::ViewQuery,
     seed_document: SelectedDocument,
     seed: crate::model::Symbol,
+    labels: &AutoRunLabels,
 ) -> Result<ViewWalk> {
     let mut reader = SemanticCalls::new(db, selected, query.semantic_producer_id.as_deref())?;
+    reader.selection.relabel(labels);
     let seed_language = seed_document.file.language.clone();
     let mut semantic = crate::model::ViewSemantic {
         producer_id: reader.selection.named(&seed_language).map(str::to_owned),
@@ -989,6 +1015,23 @@ pub struct AutoRunLabels {
     pub failed: BTreeMap<String, String>,
 }
 
+impl AutoRunLabels {
+    /// Applies the labels to the language notes of `defaults` (#1255), by the same rules as
+    /// describe's pending state: a catching-up language says so, and a failed one needs
+    /// re-import with the failure as its reason.
+    pub(crate) fn relabel(&self, defaults: &mut DefaultProducers) {
+        let languages: BTreeSet<&String> =
+            self.catching_up.iter().chain(self.failed.keys()).collect();
+        for language in languages {
+            if let Some(pending) = apply_auto_run_labels(language, &mut [], &mut None, self) {
+                defaults
+                    .pending
+                    .insert(language.clone(), pending_note(&pending));
+            }
+        }
+    }
+}
+
 /// The reason shown for a language whose producer re-run is scheduled or running, and the
 /// `autoRun.reason` of a scheduled producer (#660): one string for both.
 pub(crate) const RERUN_SCHEDULED: &str = "producer re-run scheduled";
@@ -1148,17 +1191,17 @@ impl EvidenceResponse {
     /// (#528). Uses the per-language default producer, as status and the call tools do.
     pub fn mcp_language_tiers(&self) -> Result<[LanguageTier; 5]> {
         let selected = self.selected(None)?;
-        let defaults = default_producers(&self.db, &selected.key)?;
+        let mut defaults = default_producers(&self.db, &selected.key)?;
+        self.auto_run.relabel(&mut defaults);
         let reimports = super::semantic_retention::semantic_reimport_at(&self.db, &selected.key)?;
         let mut tiers: [LanguageTier; 5] = Default::default();
         for (tier, language) in tiers.iter_mut().zip(MCP_LANGUAGES) {
             tier.freshness = "unavailable";
             tier.reimport = reimports.get(language).cloned();
-            tier.note = tier
-                .reimport
-                .as_ref()
-                .map(reimport_note)
-                .or_else(|| defaults.note(language));
+            // The call tools' note (#1255); a selected producer's language keeps its reason.
+            tier.note = defaults
+                .note(language)
+                .or_else(|| tier.reimport.as_ref().map(reimport_note));
             let Some(producer) = defaults.producer(language) else {
                 continue;
             };
@@ -1392,6 +1435,7 @@ impl EvidenceResponse {
     ) -> Result<McpSemantic> {
         let selected = self.selected(None)?;
         let mut reader = SemanticCalls::new(&self.db, &selected, explicit)?;
+        reader.selection.relabel(&self.auto_run);
         let calls: Vec<_> = calls.into_iter().collect();
         let language = owner_document.language.as_str();
         let mut call_documents: BTreeSet<_> =

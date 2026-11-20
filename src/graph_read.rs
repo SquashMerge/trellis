@@ -5,8 +5,8 @@
 mod sequence_callbacks;
 use crate::model::*;
 use crate::store::{
-    EvidenceResponse, ReadRevision, SelectedDocument, SelectedIntegrity, Store, V8NativeScope,
-    id_codec, native_first, read_native_calls_v8, read_native_coverage_v8,
+    AutoRunLabels, EvidenceResponse, ReadRevision, SelectedDocument, SelectedIntegrity, Store,
+    V8NativeScope, id_codec, native_first, read_native_calls_v8, read_native_coverage_v8,
     read_native_declarations_v8, read_semantic_history, read_semantic_tuple,
     read_semantic_tuple_for_call, semantic_display, semantic_payload, semantic_pin_key,
     v8_native_scope_for, v8_owner_scope_for,
@@ -51,6 +51,8 @@ struct SnapshotGraphSource<'a> {
     declaration_roles: BTreeMap<(DocumentKey, String), crate::native_records::DeclarationRole>,
     facts: GraphFacts,
     check: &'a mut dyn FnMut() -> Result<()>,
+    /// The read's automatic re-run labels, applied to the default's language notes (#1255).
+    labels: &'a AutoRunLabels,
 }
 
 impl SnapshotGraphSource<'_> {
@@ -68,10 +70,9 @@ impl SnapshotGraphSource<'_> {
     /// The per-language default selection, read once and recorded in the facts (#483).
     fn defaults(&mut self) -> Result<&DefaultProducers> {
         if self.facts.defaults.is_none() {
-            self.facts.defaults = Some(semantic_display::default_producers(
-                self.db,
-                &self.selected.key,
-            )?);
+            let mut defaults = semantic_display::default_producers(self.db, &self.selected.key)?;
+            self.labels.relabel(&mut defaults);
+            self.facts.defaults = Some(defaults);
         }
         Ok(self.facts.defaults.as_ref().expect("defaults read"))
     }
@@ -464,6 +465,7 @@ pub(super) fn navigation_calls(
         declaration_roles: BTreeMap::new(),
         facts: GraphFacts::memo(snapshot),
         check: &mut check,
+        labels: &AutoRunLabels::default(),
     };
     let Some(languages) = source.producer_languages(producer)? else {
         return Err(crate::navigation::InvalidRequest(
@@ -612,6 +614,7 @@ pub(super) fn sequence_calls(
     view: &mut crate::behavior::SequenceView,
     show_all: bool,
     interactions: bool,
+    labels: &AutoRunLabels,
 ) -> Result<()> {
     use crate::behavior::{EvidenceTier, SequenceLimit, SequenceSemantic, cap_visible};
     use crate::graph_query::{self as engine, GraphNode};
@@ -635,6 +638,7 @@ pub(super) fn sequence_calls(
         declaration_roles: BTreeMap::new(),
         facts: GraphFacts::memo(snapshot),
         check: &mut check,
+        labels,
     };
     let key = source
         .locate(&view.seed.id)?
@@ -1524,6 +1528,7 @@ impl EvidenceResponse {
             declaration_roles: BTreeMap::new(),
             facts: GraphFacts::memo(snapshot),
             check,
+            labels: self.auto_run_labels(),
         };
         let outcome = evaluate(&requested, &mut source).map_err(engine_error)?;
         Ok(GraphAnswer {
@@ -1587,6 +1592,7 @@ mod tests {
             declaration_roles: BTreeMap::new(),
             facts: GraphFacts::memo(snapshot),
             check: &mut check,
+            labels: &AutoRunLabels::default(),
         };
         assert_eq!(
             source.declaration_role(&key, &id).unwrap(),
