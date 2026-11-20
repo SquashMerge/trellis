@@ -1466,7 +1466,7 @@ An independently returned projected proof wrapper is `{evidence:T,projection:Sem
 
 ## Amendment (#1255): the coverage note names a pending language state
 
-**Status:** implemented (#1255). It changes only the value of an existing message; no tool object, schema, field or bound changes, and `toolVersion` stays as it is.
+**Status:** implemented (supervisor-ratified, #1255). It changes only the value of an existing message; no tool object, schema, field or bound changes, and `toolVersion` stays as it is.
 
 - **Note.** The coverage note of a language without a selected producer, which `trellis_call_graph`, `trellis_outgoing_calls` and `trellis_incoming_calls` carry as the `syntaxOnly` message, the browser's Sequence `semantic.reason` and the CLI view's `semantic.note`, names the language's semantic state before any coverage reason. A language whose evidence needs re-import says `semantic evidence needs re-import: <reason>`, the note status and describe already report with the [#632](#amendment-632-retained-semantic-re-import-status) reason; with a scheduled or running automatic re-run it says `semantic evidence catching up: producer re-run scheduled`, and after a failed one `semantic evidence needs re-import: automatic re-run failed: <code>`, by the [#660](#amendment-660-semanticstatus-on-evidence-answers) labels.
 - **Reserved.** `semantic producer does not cover this language; showing syntax` and `no semantic producer published; showing syntax` are only for a language with no such state that no published producer covers.
