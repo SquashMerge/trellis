@@ -14151,3 +14151,188 @@ async fn catch_up_keeps_a_resolved_internal_site_as_its_boundary() {
         "{at_n}"
     );
 }
+
+/// #1245: a reference rust-analyzer batch over three documents that all hold proofs, in one
+/// artifact or (`artifacts == 2`) with `src/c.rs` in a second one. `src/c.rs` depends on
+/// nothing and nothing depends on it, so an edit to it leaves A and B for S to copy.
+fn witnessed_admission_world(artifacts: usize) -> (World, (PathBuf, String)) {
+    let world = world(|root| {
+        write_files(
+            root,
+            &[
+                ("src/a.rs", "fn r(s: S) { s.f(); g(); }\n"),
+                (
+                    "src/b.rs",
+                    "struct S;\nimpl S { fn f(&self) { } }\nfn g() { }\n",
+                ),
+                ("src/c.rs", "fn other() { }\n"),
+            ],
+        )
+    });
+    let symbol = |name: &str| format!("rust-analyzer cargo c 0.1.0 {name}");
+    let (r, f, g, o) = (
+        symbol("r()."),
+        symbol("impl#[S]f()."),
+        symbol("g()."),
+        symbol("other()."),
+    );
+    let a = DocSpec::new("src/a.rs")
+        .occurrence(&[0, 3, 4], &[], &r, 1)
+        .occurrence(&[0, 15, 16], &[], &f, 0)
+        .occurrence(&[0, 20, 21], &[], &g, 0)
+        .symbol(&r, 17, &[]);
+    let b = DocSpec::new("src/b.rs")
+        .occurrence(&[1, 12, 13], &[], &f, 1)
+        .occurrence(&[2, 3, 4], &[], &g, 1)
+        .symbol(&f, 26, &[])
+        .symbol(&g, 17, &[]);
+    let c = DocSpec::new("src/c.rs")
+        .occurrence(&[0, 3, 8], &[], &o, 1)
+        .symbol(&o, 17, &[]);
+    let mut fixture = world.fixture().reference("rust-analyzer");
+    if artifacts == 1 {
+        fixture.artifact("rust", vec![a, b, c]);
+    } else {
+        fixture.artifact("rust", vec![a, b]);
+        fixture.artifact("rust", vec![c]);
+    }
+    let descriptor = world.write(&fixture);
+    drop(world.publish(&descriptor).unwrap());
+    (world, descriptor)
+}
+
+fn retained_proofs(world: &World, path: &str) -> i64 {
+    world.count(&format!(
+        "SELECT COUNT(*) FROM semantic_raw_proofs WHERE path='{path}'"
+    ))
+}
+
+/// #1245: witnessed admission reads the retained proofs of only the documents S does not
+/// copy, and the head equals FULL (the in-S oracle is on). A witnessed attempt that then falls
+/// back (#826's lowered settlement limit) and a multi-artifact batch, which takes FULL, also
+/// publish what FULL does.
+#[test]
+fn witnessed_admission_reads_only_the_proofs_of_documents_it_does_not_copy() {
+    for (artifacts, reduced) in [(1, false), (1, true), (2, false)] {
+        let (world, descriptor) = witnessed_admission_world(artifacts);
+        let counts = world._state.path().join("work-counts.json");
+        issue_826_env(&world, &counts, None);
+        assert!(retained_proofs(&world, "src/a.rs") > 0 && retained_proofs(&world, "src/b.rs") > 0);
+        let (path, text) = if reduced {
+            // B's edit makes A a pending dependent whose settlement exceeds the limit.
+            (
+                "src/b.rs",
+                "struct S;\nimpl S { fn f(&self) { } }\nfn g() { }\n// edited\n",
+            )
+        } else {
+            ("src/c.rs", "fn other() { let _ = 1; }\n")
+        };
+        if reduced {
+            issue_826_witness_limit(&world);
+        }
+        let work = local_edit(&world, path, text, &counts);
+        match (artifacts, reduced) {
+            (1, false) => {
+                assert_delayed_import_witnessed(&work);
+                let copied: Vec<_> = work["copiedDocuments"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|doc| doc["path"].as_str().unwrap().to_owned())
+                    .collect();
+                assert_eq!(copied, ["src/a.rs", "src/b.rs"], "{work}");
+                assert_eq!(
+                    work["witnessProofReads"],
+                    retained_proofs(&world, "src/c.rs"),
+                    "{work}"
+                );
+            }
+            (1, true) => {
+                assert_eq!(work["witnessedRejoins"], 0, "{work}");
+                assert_eq!(
+                    work["fallbackReasons"],
+                    json!(["witness_limit_exceeded"]),
+                    "{work}"
+                );
+                // C is copied; the witnessed admission read A's and B's proofs before the
+                // settlement fell back.
+                assert_eq!(
+                    work["witnessProofReads"],
+                    retained_proofs(&world, "src/a.rs") + retained_proofs(&world, "src/b.rs"),
+                    "{work}"
+                );
+            }
+            _ => {
+                assert_eq!(
+                    work["fallbackReasons"],
+                    json!(["multi_artifact_batch"]),
+                    "{work}"
+                );
+                assert_eq!(work["witnessProofReads"], 0, "{work}");
+            }
+        }
+        assert_head_matches_full(&world, &descriptor);
+    }
+}
+
+/// #1245: a corrupt retained proof takes the typed path it took before witnessed admission
+/// stopped reading copied documents' proofs. In the edited document S does not copy, the
+/// witnessed settlement reads it: that document's coverage fails and the others publish. In a
+/// document S copies, it is trusted as published (#261): S publishes the copy, and the next
+/// read of the head finds the corruption, fails typed and schedules a re-index.
+#[test]
+fn corrupt_retained_proof_takes_the_typed_path() {
+    for corrupt in ["src/c.rs", "src/b.rs"] {
+        let (world, _descriptor) = witnessed_admission_world(1);
+        let counts = world._state.path().join("work-counts.json");
+        issue_826_env(&world, &counts, None);
+        // The oracle would (rightly) refuse the corrupt row's outcome.
+        world.full_oracle(false);
+        world
+            .store
+            .with_index_sql_for_tests(|db| {
+                db.execute(
+                    "UPDATE semantic_raw_proofs SET canonical_bytes=X'7b7d' WHERE rowid=(SELECT MAX(rowid) FROM semantic_raw_proofs WHERE path=?1)",
+                    [corrupt],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let work = local_edit(&world, "src/c.rs", "fn other() { let _ = 1; }\n", &counts);
+        let copied: Vec<_> = work["copiedDocuments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|doc| doc["path"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(copied, ["src/a.rs", "src/b.rs"], "{work}");
+        let head = world.store.index_baseline().unwrap();
+        if corrupt == "src/c.rs" {
+            assert!(!world.store.recovery_pending_for_tests());
+            let states: Vec<_> = world
+                .store
+                .semantic_at(head)
+                .unwrap()
+                .coverage
+                .iter()
+                .map(|row| (row.document_path.clone(), row.state))
+                .collect();
+            use trellis::semantic_evidence::CoverageState::{Complete, Failed};
+            assert_eq!(
+                states,
+                [
+                    ("src/a.rs".to_owned(), Complete),
+                    ("src/b.rs".to_owned(), Complete),
+                    ("src/c.rs".to_owned(), Failed)
+                ]
+            );
+        } else {
+            let error = world.store.semantic_at(head).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("incompatible_index"),
+                "{error:#}"
+            );
+            assert!(world.store.recovery_pending_for_tests());
+        }
+    }
+}

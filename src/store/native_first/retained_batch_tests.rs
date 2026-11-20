@@ -215,18 +215,28 @@ fn capture_documents_and_proofs_page_and_compare_by_value() {
 }
 
 #[test]
-fn witness_proofs_are_a_bounded_page_and_a_failing_row_stops_it() {
+fn document_proofs_are_a_bounded_page_of_one_document_and_a_failing_row_stops_it() {
     let db = fixture();
     let rows = RetainedBatchRows::for_tests(&db, 1, pin(1));
     let mut seen = Vec::new();
-    rows.witness_proofs(10, "", 2, &mut |row| {
+    let mut each = |row: WitnessProofRow<'_>| {
+        assert_eq!(row.fact_digest.len(), 64);
         seen.push(format!(
             "{} {} {} {}",
             row.proof_id, row.record_kind, row.language, row.path
         ));
-        assert_eq!(row.fact_digest.len(), 64);
         Ok(())
-    })
+    };
+    rows.document_proofs(10, ("java", "a.java"), ("", ""), 1, &mut each)
+        .unwrap();
+    // After p1's key only a.java's p2 follows: b.java's p3 is another document's.
+    rows.document_proofs(
+        10,
+        ("java", "a.java"),
+        ("occurrence", &h("1")),
+        5,
+        &mut each,
+    )
     .unwrap();
     assert_eq!(
         seen,
@@ -234,10 +244,26 @@ fn witness_proofs_are_a_bounded_page_and_a_failing_row_stops_it() {
     );
     let mut seen = 0;
     let error = rows
-        .witness_proofs(10, "p1", 2, &mut |_| {
+        .document_proofs(10, ("java", "b.java"), ("", ""), 5, &mut |_| {
             seen += 1;
             anyhow::bail!("row refused")
         })
         .unwrap_err();
     assert_eq!((seen, error.to_string().as_str()), (1, "row refused"));
+}
+
+#[test]
+fn proof_ids_after_count_a_bounded_page_of_the_capture() {
+    let db = fixture();
+    let rows = RetainedBatchRows::for_tests(&db, 1, pin(1));
+    assert_eq!(
+        rows.proof_ids_after(10, "", 2).unwrap(),
+        (2, Some("p2".into()))
+    );
+    assert_eq!(
+        rows.proof_ids_after(10, "p2", 2).unwrap(),
+        (1, Some("p3".into()))
+    );
+    assert_eq!(rows.proof_ids_after(10, "p3", 2).unwrap(), (0, None));
+    assert_eq!(rows.proof_ids_after(11, "", 2).unwrap(), (0, None));
 }
