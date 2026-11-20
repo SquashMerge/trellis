@@ -532,7 +532,8 @@ button:is(.selected, [aria-pressed="true"]) .badge { background: var(--clear); c
 #sequence-diagram [data-boundary-highlight=true] text { fill:var(--sm-amber); }
 
 /* Deviations tree (#786): production $layers deviations by file, function and line. */
-#architecture-deviations { display: flex; flex-direction: column; gap: var(--sp-2); padding: var(--sp-2) 18px; overflow: auto; overscroll-behavior: contain; font: 13px/1.5 var(--sans); }
+/* The pane is a size container: its own width, not the viewport's, picks the table layout (#1254). */
+#architecture-deviations { container: deviations / inline-size; display: flex; flex-direction: column; gap: var(--sp-2); padding: var(--sp-2) 18px; overflow: auto; overscroll-behavior: contain; font: 13px/1.5 var(--sans); }
 #architecture-deviations :is(p, span, label, button) { overflow-wrap: anywhere; }
 #architecture-deviations p { margin: 0; }
 #architecture-deviations .deviations-header { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--sp-1) var(--sp-3); }
@@ -581,7 +582,15 @@ button:is(.selected, [aria-pressed="true"]) .badge { background: var(--clear); c
 .deviation-primary:hover { background: var(--primary); border-color: var(--ink); }
 #architecture-inspector-content .deviation-primary, #architecture-inspector-content .deviation-secondary { display: block; margin-top: var(--sp-2); }
 #architecture-inspector-content .deviation-secondary { min-height: var(--control-min-height); }
+/* The two-line layout: on a narrow screen, and in any pane too narrow for the five columns, such as
+   beside the open Inspector just over 900px. There the wide layout's fixed columns (the Reaches up
+   column grows to 280px before File gets any width) left the File column 0px wide (#1254). */
 @media (max-width: 900px) {
+  #architecture-deviations .deviations-head { display: none; }
+  #architecture-deviations .deviation-row { grid-template-columns: minmax(0, 1fr) 56px 72px 32px; }
+  #architecture-deviations .deviation-reach { grid-column: 1 / -1; grid-row: 2; }
+}
+@container deviations (max-width: 640px) {
   #architecture-deviations .deviations-head { display: none; }
   #architecture-deviations .deviation-row { grid-template-columns: minmax(0, 1fr) 56px 72px 32px; }
   #architecture-deviations .deviation-reach { grid-column: 1 / -1; grid-row: 2; }
