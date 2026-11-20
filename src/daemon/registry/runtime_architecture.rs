@@ -267,7 +267,8 @@ impl CheckoutRuntime {
         }
     }
 
-    /// Before an MCP or CLI architecture read: wait at most `wait` for the owner.
+    /// Before a CLI architecture read: wait at most `wait` for the owner. An MCP read waits
+    /// after its admitted read found the core building (#1252).
     pub fn await_architecture_tool(
         &self,
         kind: &str,
@@ -287,6 +288,18 @@ impl CheckoutRuntime {
             // A scoped read waits like any other: it does not repeat the owner's build (#798).
             self.await_architecture(parsed.pin(), rules, false, wait, check);
         }
+    }
+
+    /// #1252: after an MCP read found its core building and ended, wait at most `wait` for the
+    /// owner outside any read. `None` when the read should be admitted again.
+    pub(crate) fn architecture_still_building(
+        &self,
+        building: &crate::http::architecture::ArchitectureBuilding,
+        wait: Duration,
+        check: &mut (impl FnMut() -> anyhow::Result<()> + Send),
+    ) -> Option<crate::http::architecture::ArchitectureBuilding> {
+        let scheduler = self.resources().ok()?.scheduler.clone();
+        scheduler.architecture_still_building(building, wait, check)
     }
 
     /// One read's core. The owner computes the head's once, and an admitted read does not
@@ -412,6 +425,7 @@ impl CheckoutRuntime {
                 _ => Err(crate::http::architecture::ArchitectureBuilding {
                     pin,
                     progress: None,
+                    rules: crate::http::architecture::CoreRules::Exactly(hash).into(),
                 }
                 .into()),
             };

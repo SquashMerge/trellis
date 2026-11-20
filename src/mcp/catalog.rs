@@ -543,6 +543,7 @@ mod tests {
                 completed: 1,
                 total: 3,
             }),
+            rules: crate::http::architecture::WantedRules::Any,
         });
         let rules = crate::rules::parse("[layers").err().unwrap();
         let mut invalid_workspace = failure(&id, "invalid_request");
