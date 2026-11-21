@@ -1467,6 +1467,133 @@ fn eof_and_cancellation_are_silent_for_no_pending_request() {
     peer.assert_success("trellis mcp");
 }
 
+/// #1288: MCP lets a client put `_meta` in any request's params (OpenCode
+/// always sends one). It is accepted and ignored in both modes, while tool
+/// arguments and the other params keys stay strict.
+#[test]
+fn request_meta_is_accepted_and_ignored_both_modes() {
+    for legacy in [true, false] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = checkout(tmp.path());
+        let mut peer = Peer::start(Some(&root));
+        // Params with an extra `_meta` merged in; in modern mode it sits beside
+        // the required protocol metadata.
+        let with_meta = |id: Value, method: &str, fields: Value, meta: Value| {
+            let mut value = if legacy {
+                request(id, method, fields)
+            } else {
+                modern(id, method, fields)
+            };
+            let params = value["params"].as_object_mut().unwrap();
+            match (params.get_mut("_meta"), meta) {
+                (Some(Value::Object(existing)), Value::Object(extra)) => existing.extend(extra),
+                (_, meta) => {
+                    params.insert("_meta".into(), meta);
+                }
+            }
+            value
+        };
+        if legacy {
+            let mut init = fixture()["legacyInitialize"].clone();
+            init["_meta"] = json!({"progressToken":"init"});
+            let reply = peer.ask(request(json!(1), "initialize", init));
+            assert_eq!(reply["result"]["protocolVersion"], "2025-11-25", "{reply}");
+            peer.send_raw(
+                br#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{"_meta":{}}}"#,
+            );
+        }
+        let list = |id: i64| {
+            if legacy {
+                request(json!(id), "tools/list", json!({}))
+            } else {
+                modern(json!(id), "tools/list", json!({}))
+            }
+        };
+        let plain_list = peer.ask(list(2));
+        assert!(plain_list["result"]["tools"].is_array(), "{plain_list}");
+        for meta in [json!({"progressToken":"x"}), json!({})] {
+            let reply = peer.ask(with_meta(json!(2), "tools/list", json!({}), meta));
+            assert_eq!(reply, plain_list);
+        }
+        // Wait for the first publication, so repeated reads see one state.
+        let describe = json!({"schemaVersion":1});
+        let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
+        let plain = loop {
+            let status = peer.ask(call(
+                legacy,
+                json!(3),
+                "trellis_workspace_describe",
+                describe.clone(),
+            ));
+            tool(&status, None, !legacy);
+            if status["result"]["structuredContent"]["data"]["indexState"] == "ready" {
+                break status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "checkout was not indexed"
+            );
+            std::thread::yield_now();
+        };
+        let fields = json!({"name":"trellis_workspace_describe","arguments":describe});
+        for meta in [
+            json!({"progressToken":"x"}),
+            json!({"progressToken":5}),
+            json!({}),
+        ] {
+            let reply = peer.ask(with_meta(json!(3), "tools/call", fields.clone(), meta));
+            assert_eq!(reply, plain, "a call with _meta answers as one without");
+        }
+        // Unknown keys inside the tool's arguments are still rejected.
+        let extra = json!({"name":"trellis_workspace_describe",
+            "arguments":{"schemaVersion":1,"unknownKey":true}});
+        let plain_extra = peer.ask(call(
+            legacy,
+            json!(4),
+            "trellis_workspace_describe",
+            extra["arguments"].clone(),
+        ));
+        tool(&plain_extra, Some("invalid_request"), !legacy);
+        let reply = peer.ask(with_meta(
+            json!(4),
+            "tools/call",
+            extra,
+            json!({"progressToken":"x"}),
+        ));
+        assert_eq!(reply, plain_extra);
+        // Other params keys beside `_meta` keep their protocol error.
+        let unknown_param = with_meta(
+            json!(5),
+            "tools/call",
+            json!({"name":"trellis_workspace_describe","arguments":describe,"extra":1}),
+            json!({}),
+        );
+        error(&peer.ask(unknown_param), -32602, json!(5));
+        // A non-object `_meta` is still rejected: an invalid request after
+        // legacy initialization, missing protocol metadata in modern mode.
+        for (id, meta) in [
+            (6, json!("x")),
+            (7, json!(7)),
+            (8, json!([])),
+            (9, json!(null)),
+        ] {
+            let mut bad = call(
+                legacy,
+                json!(id),
+                "trellis_workspace_describe",
+                describe.clone(),
+            );
+            bad["params"]["_meta"] = meta;
+            error(
+                &peer.ask(bad),
+                if legacy { -32600 } else { -32602 },
+                json!(id),
+            );
+        }
+        peer.assert_success("trellis mcp");
+    }
+}
+
 #[test]
 fn modern_legacy_client_info_title() {
     let tmp = tempfile::tempdir().unwrap();

@@ -85,17 +85,20 @@ impl Session {
         if key.is_none() {
             if method == "notifications/cancelled" {
                 if let Some(p) = params.as_ref().and_then(Value::as_object)
-                    && p.keys().all(|k| k == "requestId" || k == "reason")
+                    && only(p, &["requestId", "reason", "_meta"])
                     && p.get("reason").is_none_or(Value::is_string)
+                    && p.get("_meta").is_none_or(Value::is_object)
                     && let Some(value) = p.get("requestId")
                 {
                     self.cancel(value);
                 }
             } else if method == "notifications/initialized"
                 && self.mode == Mode::LegacyAwaitInitialized
-                && params
-                    .as_ref()
-                    .is_none_or(|p| p.as_object().is_some_and(|o| o.is_empty()))
+                && params.as_ref().is_none_or(|p| {
+                    p.as_object().is_some_and(|o| {
+                        only(o, &["_meta"]) && o.get("_meta").is_none_or(Value::is_object)
+                    })
+                })
             {
                 self.mode = Mode::LegacyReady;
             }
@@ -155,7 +158,8 @@ impl Session {
         } else if method == "server/discover"
             || params
                 .and_then(Value::as_object)
-                .is_some_and(|p| p.contains_key("_meta"))
+                .and_then(|p| p.get("_meta"))
+                .is_some_and(|meta| !legacy_request_meta(meta))
         {
             return Err(bad(-32600));
         }
@@ -165,34 +169,16 @@ impl Session {
             Mode::LegacyReady
         };
         let obj = params.and_then(Value::as_object);
+        // `_meta` is already checked above for either mode, so it is allowed
+        // beside every request's own parameters and otherwise ignored (#1288).
+        let only_meta = params.is_none_or(|p| p.as_object().is_some_and(|o| only(o, &["_meta"])));
         let action = match method {
-            "server/discover" if modern && obj.is_some_and(|p| only(p, &["_meta"])) => {
-                Action::Discover
-            }
-            "tools/list" if modern && obj.is_some_and(|p| only(p, &["_meta"])) => Action::List,
-            "tools/list"
-                if !modern
-                    && params.is_none_or(|p| p.as_object().is_some_and(|o| o.is_empty())) =>
-            {
-                Action::List
-            }
-            "prompts/list" if modern && obj.is_some_and(|p| only(p, &["_meta"])) => {
-                Action::PromptList
-            }
-            "prompts/list"
-                if !modern
-                    && params.is_none_or(|p| p.as_object().is_some_and(|o| o.is_empty())) =>
-            {
-                Action::PromptList
-            }
+            "server/discover" if only_meta => Action::Discover,
+            "tools/list" if only_meta => Action::List,
+            "prompts/list" if only_meta => Action::PromptList,
             "prompts/get" => {
                 let p = obj.ok_or_else(|| bad(-32602))?;
-                let allowed = if modern {
-                    &["name", "arguments", "_meta"][..]
-                } else {
-                    &["name", "arguments"][..]
-                };
-                if !only(p, allowed)
+                if !only(p, &["name", "arguments", "_meta"])
                     || p.get("name").and_then(Value::as_str)
                         != Some(super::architecture::PROMPT_NAME)
                     || !p
@@ -208,12 +194,7 @@ impl Session {
             }
             "tools/call" => {
                 let p = obj.ok_or_else(|| bad(-32602))?;
-                let allowed = if modern {
-                    &["name", "arguments", "_meta"][..]
-                } else {
-                    &["name", "arguments"][..]
-                };
-                if !only(p, allowed) {
+                if !only(p, &["name", "arguments", "_meta"]) {
                     return Err(bad(-32602));
                 }
                 let name = p
@@ -395,6 +376,15 @@ fn legacy_meta(v: &Value) -> bool {
                     .is_some_and(|n| wire::exact_json_integer(&n.to_string()))
         })],
     )
+}
+/// MCP lets every request carry `_meta`; after legacy initialization it is
+/// ignored (#1288). It must still be an object with a well-typed progress
+/// token, and modern protocol metadata on a legacy connection would switch
+/// modes, so it stays invalid.
+fn legacy_request_meta(v: &Value) -> bool {
+    legacy_meta(v)
+        && v.as_object()
+            .is_some_and(|o| !o.contains_key("io.modelcontextprotocol/protocolVersion"))
 }
 /// Err(Some(version)) is reserved for a well-typed but unsupported revision.
 fn modern_metadata(params: Option<&Value>) -> Result<bool, Option<String>> {
@@ -806,6 +796,164 @@ mod tests {
             l.accept(req("6", Mode::Modern, "server/discover", ""), |_| false),
             -32600,
             json!(6),
+        );
+    }
+    /// #1288: MCP lets any request or notification carry `_meta`. An object is
+    /// ignored; everything else about the parameters stays strict.
+    #[test]
+    fn legacy_meta_is_accepted_and_ignored() {
+        let line = |value: Value| {
+            wire::decode(wire::Frame::Line(serde_json::to_vec(&value).unwrap()))
+                .unwrap()
+                .unwrap()
+        };
+        let make = |id: i64, method: &str, params: Value| {
+            line(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
+        };
+        let mut s = Session::new();
+        admitted(s.accept(
+            make(
+                1,
+                "initialize",
+                json!({"protocolVersion":"2025-11-25","capabilities":{},
+                    "clientInfo":{"name":"x","version":"1"},"_meta":{"progressToken":"i"}}),
+            ),
+            |_| false,
+        ));
+        let initialized = line(json!({"jsonrpc":"2.0","method":"notifications/initialized",
+            "params":{"_meta":{"progressToken":"n"}}}));
+        assert!(matches!(s.accept(initialized, |_| false), Event::Ignore));
+        assert_eq!(s.mode(), Mode::LegacyReady);
+        let known = |name: &str| name == "probe";
+        let mut id = 10;
+        for meta in [
+            json!({"progressToken":"x"}),
+            json!({"progressToken":7}),
+            json!({}),
+        ] {
+            for (method, params, action) in [
+                ("tools/list", json!({}), Action::List),
+                ("prompts/list", json!({}), Action::PromptList),
+                (
+                    "tools/call",
+                    json!({"name":"probe","arguments":{"schemaVersion":1,"extra":true}}),
+                    Action::Call {
+                        name: "probe".into(),
+                        arguments: Some(json!({"schemaVersion":1,"extra":true})),
+                    },
+                ),
+                (
+                    "prompts/get",
+                    json!({"name":super::super::architecture::PROMPT_NAME}),
+                    Action::Call {
+                        name: super::super::architecture::PROMPT_NAME.into(),
+                        arguments: Some(json!({"schemaVersion":1})),
+                    },
+                ),
+            ] {
+                let mut with_meta = params.clone();
+                with_meta["_meta"] = meta.clone();
+                id += 1;
+                let admission = admitted(s.accept(make(id, method, with_meta), known));
+                // The same action as without `_meta`: unknown argument keys
+                // still reach the tool's own validation unchanged.
+                assert_eq!(admission.action, action, "{method} {meta}");
+                assert_eq!(s.mode(), Mode::LegacyReady);
+            }
+        }
+        // A non-object or ill-typed `_meta`, or modern protocol metadata on a
+        // legacy connection, is still an invalid request.
+        for meta in [
+            json!(null),
+            json!("x"),
+            json!(7),
+            json!([]),
+            json!({"progressToken":true}),
+            json!({"progressToken":1.5}),
+            json!({"io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities":{}}),
+        ] {
+            for (method, params) in [
+                ("tools/list", json!({})),
+                ("tools/call", json!({"name":"probe","arguments":{}})),
+            ] {
+                let mut with_meta = params.clone();
+                with_meta["_meta"] = meta.clone();
+                id += 1;
+                rejected(
+                    s.accept(make(id, method, with_meta), known),
+                    -32600,
+                    json!(id),
+                );
+            }
+        }
+        // Other parameter keys beside `_meta` keep their existing errors.
+        for (method, params) in [
+            ("tools/list", json!({"_meta":{},"cursor":"c"})),
+            ("prompts/list", json!({"_meta":{},"cursor":"c"})),
+            (
+                "tools/call",
+                json!({"_meta":{},"name":"probe","arguments":{},"extra":1}),
+            ),
+            (
+                "tools/call",
+                json!({"_meta":{},"name":"unknown","arguments":{}}),
+            ),
+        ] {
+            id += 1;
+            rejected(s.accept(make(id, method, params), known), -32602, json!(id));
+        }
+        // A cancellation carrying `_meta` still cancels.
+        id += 1;
+        let pending = admitted(s.accept(make(id, "tools/list", json!({"_meta":{}})), known));
+        let cancel = line(json!({"jsonrpc":"2.0","method":"notifications/cancelled",
+            "params":{"requestId":id,"_meta":{"progressToken":"c"}}}));
+        assert!(matches!(s.accept(cancel, known), Event::Ignore));
+        assert!(s.prepare(pending.token, json!({})).is_none());
+        // A non-object `_meta` leaves notifications without effect.
+        id += 1;
+        let pending = admitted(s.accept(make(id, "tools/list", json!({})), known));
+        let cancel = line(json!({"jsonrpc":"2.0","method":"notifications/cancelled",
+            "params":{"requestId":id,"_meta":"c"}}));
+        assert!(matches!(s.accept(cancel, known), Event::Ignore));
+        assert!(s.prepare(pending.token, json!({})).is_some());
+        let mut awaiting = Session::new();
+        admitted(awaiting.accept(
+            make(
+                1,
+                "initialize",
+                json!({"protocolVersion":"2025-11-25","capabilities":{},
+                    "clientInfo":{"name":"x","version":"1"}}),
+            ),
+            |_| false,
+        ));
+        let initialized = line(json!({"jsonrpc":"2.0","method":"notifications/initialized",
+            "params":{"_meta":7}}));
+        assert!(matches!(
+            awaiting.accept(initialized, |_| false),
+            Event::Ignore
+        ));
+        assert_eq!(awaiting.mode(), Mode::LegacyAwaitInitialized);
+    }
+    /// Modern requests already carry protocol `_meta`; a progress token beside
+    /// it is ignored too (#1288).
+    #[test]
+    fn modern_meta_progress_token_is_ignored() {
+        let mut s = Session::new();
+        let mut call = req(
+            "1",
+            Mode::Modern,
+            "tools/call",
+            r#","name":"probe","arguments":{"schemaVersion":1}"#,
+        );
+        call.params.as_mut().unwrap()["_meta"]["progressToken"] = json!("x");
+        let admission = admitted(s.accept(call, |name| name == "probe"));
+        assert_eq!(
+            admission.action,
+            Action::Call {
+                name: "probe".into(),
+                arguments: Some(json!({"schemaVersion":1})),
+            }
         );
     }
     #[test]
