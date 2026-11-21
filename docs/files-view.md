@@ -61,7 +61,7 @@ which replaced the 250 ms per-file time bound for the outline):
 | Outline syntax bound | Limit |
 | --- | --- |
 | Cached source per parsed file | 2 MiB |
-| Parse work: the file's parse and its macro re-parses together | 80,000 tree-sitter progress ticks |
+| Parse work: the file's parse and its macro re-parses together | 80,000 tree-sitter progress ticks; a tick of the file's own parse in error recovery counts 25 |
 | Syntax depth of the walk | 128 levels |
 | Syntax nodes the walk visits | 1,000,000 |
 | Re-parsed macro input (a Rust `impl` inside a measured macro) | Measurement's macro byte budget |
@@ -73,6 +73,20 @@ roughly every 100 units of the parser's operation counter. The tick count is det
 given file and grammar, never dependent on the clock, but it is not a measure of CPU work:
 weighted compression steps can overshoot within a tick. A parse whose count exceeds the bound is
 stopped, so a pathological file is refused before its parse ends, however loaded the machine (the [2026-11-19 owner ruling](https://github.com/SquashMerge/trellis/issues/1220)).
+Error recovery can take far longer per tick, so a tick of the file's own parse taken while
+tree-sitter's parse state reports an error counts 25, the largest average ratio of flagged to
+clean tick time measured (the [2026-11-20 owner ruling](https://github.com/SquashMerge/trellis/issues/1227)).
+The state reports one once the parser skips a token with every parse version in error recovery.
+A file without syntax errors never sets it, so a clean file's count is its tick count, and the
+count stays a property of the file alone. A file that is mostly syntax errors is then refused by
+the parse-work bound well before its parse ends. The flag only approximates recovery work: it
+misses recovery that always keeps one parse version out of error, which can still reach the
+backstop, and it can stay set after the parser has recovered, which counts that rest of the file
+at 25 too. On 1,840 large real files with an injected syntax error, the highest count was 49,330.
+The MCP lookup-key derivation shares these bounds but answers within MCP's five-second call
+deadline: under heavy load, refusing a pathological document near the parse-work bound can take
+longer than that, and the call then answers a typed `deadline_exceeded` first (a documented
+limit, [#1227](https://github.com/SquashMerge/trellis/issues/1227)).
 The hang backstop never decides an answer: reaching it fails the outline read typed
 `deadline_exceeded`, with no partial outline.
 

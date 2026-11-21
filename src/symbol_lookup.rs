@@ -2,7 +2,7 @@
 use crate::{
     files_view::{FILE_INPUT_LIMIT, SYNTAX_HANG_BACKSTOP},
     native_evidence::{Declaration, Key},
-    syntax_bounds::{DEPTH, PARSE_TICKS, VISITS},
+    syntax_bounds::{DEPTH, PARSE_TICKS, VISITS, parse_work},
 };
 use anyhow::Result;
 use std::{collections::BTreeMap, time::Instant};
@@ -243,11 +243,12 @@ fn impl_targets(
         .set_language(&tree_sitter_rust::LANGUAGE.into())
         .map_err(|error| Refused::Stopped(error.into()))?;
     // The parser reports only that it stopped, so the reason waits here. The parse-work
-    // bound comes first: once it is reached, the clock can no longer change the answer.
+    // bound comes first: once it is reached, the clock can no longer change the answer. Error
+    // recovery counts more per tick (#1227).
     let mut stopped = None;
     let mut ticks = 0;
-    let mut progress = |_: &tree_sitter::ParseState| {
-        ticks += 1;
+    let mut progress = |state: &tree_sitter::ParseState| {
+        ticks += parse_work(state);
         let step = if ticks > PARSE_TICKS {
             Err(Refused::Bound(OVER_PARSE))
         } else {
@@ -770,6 +771,40 @@ mod tests {
             let found = keys_on_a_stopped_clock(&near, &native.declarations).unwrap();
             assert!(found.values().any(|key| key == "store.rs::Store::save"));
         }
+    }
+
+    /// Owner ruling 2026-11-20 (#1227): a document that is mostly syntax errors is refused by
+    /// the parse-work bound, its error recovery counting more per tick, on every run and on a
+    /// clock that never moves, so the hang backstop has no part in it. Its ticks alone are
+    /// under the bound. A clean document of the same size counts exactly its ticks and keeps
+    /// its keys.
+    #[test]
+    fn a_document_of_syntax_errors_is_refused_by_the_parse_work_bound() {
+        use crate::syntax_bounds::parse_work_inputs::{
+            clean_of_size, syntax_errors, ticks_and_work,
+        };
+        let fixture = Fixture::new();
+        let (file, native) = fixture.measure("store.rs", IMPL);
+        let mut errors = file.clone();
+        errors.text.push_str(&syntax_errors());
+        let (ticks, work) = ticks_and_work("rust", &errors.text);
+        assert!(ticks < PARSE_TICKS && work > PARSE_TICKS, "{ticks} {work}");
+        for _ in 0..2 {
+            let error = keys_on_a_stopped_clock(&errors, &native.declarations).unwrap_err();
+            assert_eq!(error.to_string(), OVER_PARSE);
+            let (code, retryable, _) = mcp_answer(&error);
+            assert_eq!((code.as_str(), retryable), ("input_bounds_exceeded", false));
+            let found = checked(&errors, &native.declarations, &mut || Ok(())).unwrap();
+            assert_eq!(found, None);
+        }
+        let mut clean = file.clone();
+        clean.text.push('\n');
+        let tail = clean_of_size("rust", errors.text.len() - clean.text.len());
+        clean.text.push_str(&tail);
+        let (ticks, work) = ticks_and_work("rust", &clean.text);
+        assert_eq!(work, ticks);
+        let found = keys_on_a_stopped_clock(&clean, &native.declarations).unwrap();
+        assert!(found.values().any(|key| key == "store.rs::Store::save"));
     }
 
     /// The MCP answer to an error of the derivation: its code, retryability and message.
