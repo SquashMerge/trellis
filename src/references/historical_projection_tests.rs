@@ -9,7 +9,8 @@ fn anchor(outcome: SemanticOutcome) -> SemanticAnchor {
         outcome,
         basis_site: false,
         provenance_id: "proof".into(),
-        metadata: BTreeMap::from([("projection".into(), json!({"semanticStatus":"olderBasis"}))]),
+        metadata: BTreeMap::from([("projection".into(), json!({"semanticStatus":"olderBasis"}))])
+            .into(),
     }
 }
 
