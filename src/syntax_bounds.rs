@@ -26,12 +26,13 @@ pub(crate) const VISITS: usize = 1_000_000;
 /// just under the visit bound 58,842. The document's own parse counts each tick at
 /// [`parse_work`].
 pub(crate) const PARSE_TICKS: usize = 80_000;
-/// What one progress tick of a document's parse in tree-sitter error recovery counts toward
-/// [`PARSE_TICKS`] (owner ruling 2026-11-20, #1227). It is the largest ratio measured between
-/// the time of a tick the parse state flags as in error and a clean tick: about 25 for 2 MiB of
+/// What one progress tick of a document's own parse counts toward [`PARSE_TICKS`] while
+/// tree-sitter's parse state reports an error (owner ruling 2026-11-20, #1227). On 2 MiB of
+/// syntax errors, such a tick takes on average about 1 to 25 times a clean tick's time: 25 for
 /// random JavaScript tokens, 7 to 10 for random punctuation, near 1 for one long unbalanced run.
-/// So no flagged input measured reaches the bound later than a clean pathological one does, and
-/// a document that is mostly syntax errors is refused before the hang backstop.
+/// 25 also keeps the highest count measured on 1,840 large real files with an injected syntax
+/// error (49,330) as far under the bound as the largest real file (52,330). A document that is
+/// mostly syntax errors is then refused by the bound well before its parse ends.
 pub(crate) const ERROR_TICK_WEIGHT: usize = 25;
 
 /// The parse work one progress tick counts toward [`PARSE_TICKS`] (#1227): one, or
@@ -43,8 +44,7 @@ pub(crate) const ERROR_TICK_WEIGHT: usize = 25;
 /// count stays deterministic. A document without syntax errors never sets it, so its count is
 /// its tick count, as before. The flag misses recovery that always keeps one version out of
 /// error, and it can stay on after the parser has recovered, so it only approximates recovery
-/// work: on 1,840 large real files with an injected syntax error, the highest weighted count
-/// was 49,330. Macro re-parses count one per tick: each one on the way to a measured impl is a
+/// work. Macro re-parses count one per tick: each one on the way to a measured impl is a
 /// re-parse that measurement found free of errors.
 pub(crate) fn parse_work(state: &tree_sitter::ParseState) -> usize {
     if state.has_error() {

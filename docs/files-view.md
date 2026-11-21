@@ -74,12 +74,12 @@ given file and grammar, never dependent on the clock, but it is not a measure of
 weighted compression steps can overshoot within a tick. A parse whose count exceeds the bound is
 stopped, so a pathological file is refused before its parse ends, however loaded the machine (the [2026-11-19 owner ruling](https://github.com/SquashMerge/trellis/issues/1220)).
 Error recovery can take far longer per tick, so a tick of the file's own parse taken while
-tree-sitter's parse state reports an error counts 25, the largest ratio of flagged to clean tick
-time measured (the [2026-11-20 owner ruling](https://github.com/SquashMerge/trellis/issues/1227)).
+tree-sitter's parse state reports an error counts 25, the largest average ratio of flagged to
+clean tick time measured (the [2026-11-20 owner ruling](https://github.com/SquashMerge/trellis/issues/1227)).
 The state reports one once the parser skips a token with every parse version in error recovery.
 A file without syntax errors never sets it, so a clean file's count is its tick count, and the
 count stays a property of the file alone. A file that is mostly syntax errors is then refused by
-the parse-work bound before the hang backstop. The flag only approximates recovery work: it
+the parse-work bound well before its parse ends. The flag only approximates recovery work: it
 misses recovery that always keeps one parse version out of error, which can still reach the
 backstop, and it can stay set after the parser has recovered, which counts that rest of the file
 at 25 too. On 1,840 large real files with an injected syntax error, the highest count was 49,330.
