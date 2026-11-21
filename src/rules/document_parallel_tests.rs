@@ -90,7 +90,7 @@ fn detached_rule_proof_retains_historical_basis_and_revision() {
     ]);
     let proof = semantic_evidence(
         json!({"revisionId":"current-native","kind":"semanticBinding"}),
-        &metadata,
+        &crate::references::SemanticMetadata::from(metadata),
     );
     assert_eq!(proof["revisionId"], "basis-native");
     assert_eq!(proof["freshness"], "possiblyStale");
