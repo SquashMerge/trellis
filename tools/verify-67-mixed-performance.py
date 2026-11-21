@@ -2,8 +2,10 @@
 """#225 single-file LOCAL gate on the frozen #67 mixed-language corpus.
 
 Twenty observations per edit family; time from immediately before the edit
-through the whole real CLI return, including watcher debounce. Verify the actual
-LOCAL watcher/request publisher and complete selected FULL parity per family.
+through the whole real CLI return, including watcher debounce. The CLI returns
+native N; the semantic catch-up S that follows is awaited untimed before the
+next edit and holds the checked raw-linked proof. Verify the actual LOCAL
+watcher/request publisher and complete selected FULL parity per family.
 Failed evidence is retained.
 """
 import argparse
@@ -1625,9 +1627,19 @@ def main():
                 record("observed", size=size, shape=shape, run=n+1, seconds=seconds, **own)
                 require(own["publication_mode"] == "local", f"{shape} run {n+1}: not an actual LOCAL publication")
                 require(own["revision"] == expected_revision, "sample did not publish exactly the next revision")
+                # Native-first: the timed CLI returns native N, which carries no current
+                # semantic selection. Semantic S publishes N+1 afterwards; wait for it untimed,
+                # before the next edit, and check the raw-linked proof there.
+                catch_up_start = time.monotonic()
+                caught_up = wait_caught_up(home)
+                catch_up_seconds = time.monotonic() - catch_up_start
+                native_generation, native_number = own["revision"].rsplit(":", 1)
+                require(caught_up == f"{native_generation}:{int(native_number)+1}",
+                        f"{shape} run {n+1}: semantic S did not publish the revision after native N: {caught_up}")
                 with closing(sqlite3.connect(f"file:{db_for(home)}?mode=ro", uri=True)) as db:
                     check_changed_source(db, own["revision"], path, leaf.read_bytes())
-                    selected_proof(db, own["revision"], anchor.as_posix(), artifact)
+                    check_changed_source(db, caught_up, path, leaf.read_bytes())
+                    selected_proof(db, caught_up, anchor.as_posix(), artifact)
                     require(sha_file(workspace / anchor) == anchor_hash, "sample changed frozen anchor")
                     reuse = check_selected_local_ids(db, prior, own["revision"], path, size, n, shape)
                     if shape == "class-projection":
@@ -1642,10 +1654,12 @@ def main():
                 require(counters["native"]["rows"] < (100000 if size == "medium" else 1000000),
                         f"local update unexpectedly rewrote too many native rows: {counters}")
                 sample = {"seconds": seconds, **own, "reuse": reuse, "changed_path": path,
-                          "language": language, "edit_kind": kind, "old_text": old_text, "new_text": new_text}
+                          "language": language, "edit_kind": kind, "old_text": old_text, "new_text": new_text,
+                          "semantic_revision": caught_up,
+                          "untimed_semantic_catch_up_seconds": catch_up_seconds}
                 samples.append(sample)
                 record("sample_validated", size=size, shape=shape, run=n+1, **sample)
-                prior = own["revision"]
+                prior = caught_up
                 limit = 2 if size == "medium" else 5
             p95 = sorted(s["seconds"] for s in samples)[math.ceil(.95 * len(samples)) - 1]
             require(p95 <= limit, f"{size} {shape} p95 {p95}s exceeds {limit}s")
@@ -1704,7 +1718,8 @@ def main():
               "method": ("20 distinct single-file edits EACH body/declaration-surface/class-projection; "
                          "own nearest-rank p95; immediately-before-edit through complete CLI return; "
                          "actual LOCAL watcher/request publisher recorded with pin-scoped diagnostics "
-                         "and durable terminal-pin correlation; complete selected FULL parity after "
+                         "and durable terminal-pin correlation; semantic catch-up S awaited untimed "
+                         "after each native N; complete selected FULL parity after "
                          "each shape; no excluded failures"),
               "untimed_full_setup_revision": untimed_full_setup_revision,
               "selected_artifact_sha256": artifact,
