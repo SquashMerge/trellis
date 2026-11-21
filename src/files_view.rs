@@ -2,7 +2,7 @@
 use crate::{
     model::{IndexPin, SourceFile, SourceRange, Symbol},
     native_records::Header,
-    syntax_bounds::PARSE_TICKS,
+    syntax_bounds::{PARSE_TICKS, parse_work},
 };
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -116,9 +116,10 @@ fn outline_syntax_until(
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&language)?;
     // The parse-work bound comes first: once it is reached, the clock cannot change the answer.
+    // Error recovery counts more per tick (#1227).
     let mut ticks = 0;
-    let mut progress = |_: &tree_sitter::ParseState| {
-        ticks += 1;
+    let mut progress = |state: &tree_sitter::ParseState| {
+        ticks += parse_work(state);
         if ticks > PARSE_TICKS || hung() {
             std::ops::ControlFlow::Break(())
         } else {
@@ -834,6 +835,31 @@ mod outline_bounds_tests {
             .unwrap();
         assert_eq!(syntax.warning, None);
         assert_eq!(facts(&syntax).1, ["S"]);
+    }
+
+    /// Owner ruling 2026-11-20 (#1227): a file that is mostly syntax errors has no facts and
+    /// the bounds warning, refused by the parse-work bound on a clock that never moves, so the
+    /// hang backstop has no part in it. A clean file of the same size keeps its facts.
+    #[test]
+    fn a_file_of_syntax_errors_is_beyond_the_parse_work_bound() {
+        use crate::syntax_bounds::parse_work_inputs::{clean_of_size, syntax_errors};
+        let stopped = Instant::now();
+        let errors = format!("{JAVASCRIPT}{}", syntax_errors());
+        let errors = file("javascript", errors);
+        for _ in 0..2 {
+            let syntax = outline_syntax_until(&errors, &[], &|| stopped)
+                .unwrap()
+                .unwrap();
+            assert_eq!(syntax.warning, Some(OUTLINE_OVER_BOUNDS));
+            assert_eq!(facts(&syntax), (vec![], vec![]));
+        }
+        let tail = clean_of_size("javascript", errors.text.len() - JAVASCRIPT.len());
+        let clean = file("javascript", format!("{JAVASCRIPT}{tail}"));
+        let syntax = outline_syntax_until(&clean, &[], &|| stopped)
+            .unwrap()
+            .unwrap();
+        assert_eq!(syntax.warning, None);
+        assert_eq!(syntax.callable_initializers.len(), 2);
     }
 
     /// Macro re-parses run on the read's own clock (#1226 review). On a clock frozen 20 s in

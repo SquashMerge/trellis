@@ -285,8 +285,13 @@ impl Model {
             })
             .collect::<std::result::Result<Vec<_>, EmbedError>>()?;
         control.check()?;
-        let embed_tokens =
-            candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
+        // The token table stays in the file's bf16 (#1247): 311 MB rather than 622 MB in f32.
+        // `forward` widens the gathered rows, which equals gathering from a widened table.
+        let embed_tokens = candle_nn::embedding(
+            cfg.vocab_size,
+            cfg.hidden_size,
+            vb.pp("model.embed_tokens").set_dtype(DType::BF16),
+        )?;
         control.check()?;
         let norm = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
         control.check()?;
@@ -328,7 +333,8 @@ impl Model {
                 &Tensor::zeros((batch, tokens), DType::F32, device)?,
             )?
             .reshape((batch, 1, 1, tokens))?;
-        let mut x = self.embed_tokens.forward(input_ids)?;
+        // Compute is f32 from layer 0 on; only the stored table is bf16.
+        let mut x = self.embed_tokens.forward(input_ids)?.to_dtype(DType::F32)?;
         let positions = Tensor::arange(0u32, tokens as u32, device)?
             .to_dtype(DType::F32)?
             .reshape((tokens, 1))?;
@@ -353,6 +359,13 @@ mod tests {
     use std::collections::HashMap;
 
     fn toy_model() -> std::result::Result<Model, EmbedError> {
+        toy_model_with_table(Tensor::new(
+            &[[1f32, 0.], [0., 1.], [2., -1.]],
+            &Device::Cpu,
+        )?)
+    }
+
+    fn toy_model_with_table(table: Tensor) -> std::result::Result<Model, EmbedError> {
         let device = &Device::Cpu;
         let cfg = Config {
             vocab_size: 3,
@@ -373,10 +386,7 @@ mod tests {
             rope_scaling: None,
         };
         let mut weights = HashMap::new();
-        weights.insert(
-            "model.embed_tokens.weight".into(),
-            Tensor::new(&[[1f32, 0.], [0., 1.], [2., -1.]], device)?,
-        );
+        weights.insert("model.embed_tokens.weight".into(), table);
         for name in [
             "model.layers.0.input_layernorm.weight",
             "model.layers.0.post_attention_layernorm.weight",
@@ -443,6 +453,40 @@ mod tests {
         assert_eq!(
             rows,
             model.forward(&ids, &mask, &control)?.to_vec3::<f32>()?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bf16_token_table_widened_after_gather_equals_f32_table()
+    -> std::result::Result<(), EmbedError> {
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let control = EmbeddingControl::new(&cancel);
+        let device = &Device::Cpu;
+        // Values with full bf16 mantissas, as in the real table.
+        let table = Tensor::new(&[[0.1f32, -1.7], [1.2345, 2.5e-3], [-0.333, 7.77]], device)?
+            .to_dtype(DType::BF16)?;
+        let model = toy_model_with_table(table.clone())?;
+        assert_eq!(model.embed_tokens.embeddings().dtype(), DType::BF16);
+        let mut reference = toy_model_with_table(table.clone())?;
+        reference.embed_tokens = Embedding::new(table.to_dtype(DType::F32)?, 2);
+
+        let ids = Tensor::new(&[[2u32, 0, 1], [1, 2, 0]], device)?;
+        let mask = Tensor::new(&[[1u32, 1, 1], [1, 1, 0]], device)?;
+        // The layer-0 input: widened gathered rows equal the gathered rows of the widened table.
+        assert_eq!(
+            model
+                .embed_tokens
+                .forward(&ids)?
+                .to_dtype(DType::F32)?
+                .to_vec3::<f32>()?,
+            reference.embed_tokens.forward(&ids)?.to_vec3::<f32>()?
+        );
+        let output = model.forward(&ids, &mask, &control)?;
+        assert_eq!(output.dtype(), DType::F32);
+        assert_eq!(
+            output.to_vec3::<f32>()?,
+            reference.forward(&ids, &mask, &control)?.to_vec3::<f32>()?
         );
         Ok(())
     }
