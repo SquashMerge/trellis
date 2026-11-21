@@ -1765,7 +1765,7 @@ pub(super) fn architecture_semantic(
     let mut calls = db.prepare_cached(
         "SELECT b.call_id,b.join_start,b.join_end,b.resolution,b.declared_kind,
                 b.declared_internal_syntax_id,b.declared_internal_language,b.declared_internal_path,
-                b.dispatch,b.stale_target,b.provenance_ordinal,b.binding_id,b.join_status,b.join_kind,b.join_document_language,b.join_document_path,COALESCE(b.join_native_revision_id,?6),p.basis_id,p.derived_from_fact_digest
+                b.dispatch,b.stale_target,b.provenance_ordinal,b.binding_id,b.join_status,b.join_kind,b.join_document_language,b.join_document_path,COALESCE(b.join_native_revision_id,?6),p.basis_id,p.derived_from_fact_digest,b.capture_bound
          FROM semantic_call_bindings b
          JOIN semantic_provenance p ON p.payload_id=b.payload_id AND p.ordinal=b.provenance_ordinal
          LEFT JOIN semantic_coverage_freshness f ON f.revision_id=?5 AND f.tuple_id=?7 AND f.basis_id=p.basis_id
@@ -1883,7 +1883,14 @@ pub(super) fn architecture_semantic(
             let provenance_id = pp.provenance_id(ordinal)?;
             // Every row's offsets and dispatch decode strictly, used or not.
             let anchor_range = range(row.get(1)?, row.get(2)?)?;
-            let is_direct = direct(row.get_ref(8)?.as_str()?)?;
+            let is_direct = direct(row.get_ref(8)?.as_str()?)?
+                // #1279: a capture-bound `direct` reads as `unknown` while its target's
+                // document differs from the capture, through the shared projection.
+                && (!row.get::<_, bool>(19)?
+                    || pp.unchanged_since_capture(
+                        row.get_ref(6)?.as_str()?,
+                        row.get_ref(7)?.as_str()?,
+                    )?);
             let row_key: RowKey = (
                 row.get_ref(3)?.as_str()? == "unresolved",
                 row.get(18)?,

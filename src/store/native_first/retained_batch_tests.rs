@@ -16,7 +16,7 @@ fn h(c: &str) -> String {
 /// five-byte binary) and ordinal 1 (capture 11: nothing), and one excluded document.
 fn fixture() -> Connection {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V43).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V44).unwrap();
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
     db.execute(
         "INSERT INTO semantic_raw_batches VALUES(1,'producer','1','profile','set','native-1',?1,?2,x'7b7d','decoder')",

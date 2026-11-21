@@ -745,7 +745,8 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
             .get(&call.provenance_id)
             .map(|(dispatch, target)| (*dispatch, target.as_ref()));
         let original = captured_dispatch.get(call.provenance_id.as_str()).copied();
-        match rejoined_dispatch(destination, original, call, target_is_method) {
+        // The reference for reader-visible evidence applies the #557 demotion itself (#1279).
+        match rejoined_dispatch(destination, original, call, target_is_method, |_| Ok(false)) {
             Ok(dispatch) => call.dispatch = dispatch,
             Err(error) => rejoin_failure = Some(error),
         }

@@ -820,6 +820,16 @@ impl StagedJoin<'_> {
                         .iter()
                         .any(|status| status.2))
                 },
+                // The payload keeps a method's `direct` lost only to its document's change
+                // since the capture; reads demote it (#1279). Witnessed, the change is what
+                // cleared the destination row's target (`reused_source`).
+                |document| {
+                    Ok(if self.witnessed {
+                        !super::witness::reused_source(self, document)?
+                    } else {
+                        !self.unchanged(document)?
+                    })
+                },
             )?;
             #[cfg(feature = "test-support")]
             crate::semantic_batch::testing::edit_row("callResolution", &mut call)?;

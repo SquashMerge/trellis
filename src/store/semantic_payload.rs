@@ -3,7 +3,8 @@
 //!
 //! A payload stores the writing revision's native revision as NULL. Reading it as evidence of
 //! revision r goes through [`project_payload`], the single projection, which supplies r's
-//! native revision, r's rejoined provenance IDs and r's freshness.
+//! native revision, r's rejoined provenance IDs, r's freshness and, for a capture-bound call,
+//! r's dispatch (#1279, Decision 0021 D1 as amended 2026-11-21).
 use super::*;
 use crate::semantic_records as sem;
 use std::cell::RefCell;
@@ -29,7 +30,9 @@ pub(in crate::store) fn owned_provenance<'a>(
 /// A targeted syntax ID's flags: a call binding's declared target is it ([`TARGET_CALL`]), and
 /// an own symbol row declares in it ([`TARGET_DECLARATION`]).
 pub(in crate::store) type TargetFlags = u8;
-/// A call binding's declared target.
+/// A call binding's declared target. Its dependency term reads the target's declaration status,
+/// method included; whether the document changed since the capture is read at read time
+/// instead, for a capture-bound call ([`capture_bound`], #1279).
 pub(in crate::store) const TARGET_CALL: TargetFlags = 1;
 /// An own symbol row's declaration. Such a declaration in another document comes from the
 /// destination row's discovery, which keeps it only while that document is unchanged since the
@@ -126,6 +129,118 @@ pub(in crate::store) struct DependencyRecord {
     /// that document then always invalidates the payload.
     pub term: Option<String>,
     pub targets: Vec<(Vec<u8>, TargetFlags)>,
+    /// The document's content hash at the batch's capture, recorded only when the payload has a
+    /// capture-bound call into it ([`capture_bound`]); `None` there means it was absent at the
+    /// capture, so it is never unchanged.
+    pub captured_hash: Option<String>,
+}
+
+/// Whether a batch-written call binding of the tuple of `own_language`/`own_path` is
+/// capture-bound (#1279): a `direct` call whose declared target is a `method` declaration of
+/// another document D at `revision`. Its dispatch then holds only while D's content is unchanged
+/// since the capture: #557 makes it `unknown` otherwise, because the facts behind a method's
+/// `direct` (its `impl`'s bases, its modifiers) are outside its syntax ID. The payload keeps the
+/// `direct`; every read applies the demotion ([`PayloadProjection::dispatch`]). D's term records
+/// the target's declaration status, so the method status read here holds at every revision that
+/// names the payload. A call into its own document is never bound: a settled document is
+/// unchanged since the capture.
+pub(in crate::store) fn capture_bound(
+    db: &Connection,
+    revision: &str,
+    own_language: &str,
+    own_path: &str,
+    binding: &sem::CallBinding,
+) -> Result<bool> {
+    let (
+        sem::Dispatch::Direct,
+        Some(sem::Target::Internal {
+            syntax_id,
+            document,
+            ..
+        }),
+    ) = (binding.dispatch, &binding.declared_target)
+    else {
+        return Ok(false);
+    };
+    if document.language == own_language && document.path == own_path {
+        return Ok(false);
+    }
+    let syntax_id =
+        super::id_codec::encode_sid(syntax_id).context("invalid semantic call target ID")?;
+    Ok(db
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM revision_documents d JOIN native_version_declarations v ON v.vid=d.vid WHERE d.revision_id=?1 AND d.language=?2 AND d.path=?3 AND v.syntax_id=?4 AND v.kind='method')",
+        )?
+        .query_row(
+            params![revision, document.language, document.path, syntax_id],
+            |r| r.get(0),
+        )?)
+}
+
+/// The content hash of `language`/`path` at `revision`, if the revision has the document.
+pub(in crate::store) fn content_hash_at(
+    db: &Connection,
+    revision: &str,
+    language: &str,
+    path: &str,
+) -> Result<Option<String>> {
+    Ok(db
+        .prepare_cached(
+            "SELECT v.content_hash FROM revision_documents d JOIN document_versions v ON v.vid=d.vid WHERE d.revision_id=?1 AND d.language=?2 AND d.path=?3",
+        )?
+        .query_row(params![revision, language, path], |r| r.get(0))
+        .optional()?)
+}
+
+/// The capture-bound dispatch of a stored call binding row aliased `binding`, read at the
+/// revision key bound to SQL parameter `revision`, as an SQL expression: the stored dispatch
+/// while the target document's content hash equals the hash recorded at the capture, else
+/// `unknown`. The same rule as [`PayloadProjection::dispatch`], for a reader that sizes rows
+/// in SQL before decoding them.
+pub(crate) fn projected_dispatch_sql(binding: &str, revision: &str) -> String {
+    format!(
+        "CASE WHEN {binding}.capture_bound=0 OR EXISTS(SELECT 1 FROM semantic_projection_dependencies e \
+         JOIN revision_documents d ON d.revision_id={revision} AND d.language=e.language AND d.path=e.path \
+         JOIN document_versions v ON v.vid=d.vid AND v.content_hash=e.captured_hash \
+         WHERE e.payload_id={binding}.payload_id AND e.language={binding}.declared_internal_language \
+         AND e.path={binding}.declared_internal_path) THEN {binding}.dispatch ELSE 'unknown' END"
+    )
+}
+
+/// Applies the read-time demotion to a settled, not yet stored `publication` of batch-captured
+/// revision `captured`, as reading it back at `revision` would (test-support: the FULL oracle
+/// compares a staged settlement with the reader-visible in-memory rejoin).
+#[cfg(feature = "test-support")]
+pub(in crate::store) fn project_publication(
+    db: &Connection,
+    revision: &str,
+    captured: &str,
+    publication: &mut sem::SemanticPublication,
+) -> Result<()> {
+    let mut unchanged = BTreeMap::<(String, String), bool>::new();
+    for call in &mut publication.call_bindings {
+        let own = &call.join.anchor.document;
+        if !capture_bound(db, revision, &own.language, &own.path, call)? {
+            continue;
+        }
+        let Some(sem::Target::Internal { document, .. }) = &call.declared_target else {
+            continue;
+        };
+        let key = (document.language.clone(), document.path.clone());
+        let holds = match unchanged.get(&key) {
+            Some(holds) => *holds,
+            None => {
+                let at = |revision| content_hash_at(db, revision, &key.0, &key.1);
+                let holds = matches!((at(revision)?, at(captured)?), (Some(a), Some(b)) if a == b);
+                unchanged.insert(key, holds);
+                holds
+            }
+        };
+        if !holds {
+            call.dispatch = sem::Dispatch::Unknown;
+        }
+    }
+    Ok(())
 }
 
 /// How many targeted syntax IDs one pending decision may look up; beyond it every remaining
@@ -141,17 +256,22 @@ pub(in crate::store) const TERM_LOOKUP_BOUND: usize = 200_000;
 /// - for each targeted syntax ID of D, the declaration status the settlement reads
 ///   (`declaration_status`: none, or named, name matches, method), which is read by `retarget`,
 ///   `check_row`'s `known` and `rejoined_dispatch`;
-/// - only when a call binding's declared target is a method of D, whether D's content hash
-///   equals its hash at the capture. The destination row's declared target is cleared for a
-///   changed D (`staged/witness.rs` `reused_source`, FULL's `StagedSide::unchanged`), and only
-///   `rejoined_dispatch` reads it, turning a captured `Direct` call on a method into `Unknown`.
-///   It compares content hashes, not versions: a config-only change keeps the bytes and the
-///   dispatch;
-/// - the same bit when an own symbol row declares in D (#863). An own symbol with no captured
-///   exact definition in its document takes the destination row's declarations, which FULL
-///   discovers only over documents unchanged since the capture (`definitions_sql`). Such a
-///   declaration needs D's own symbol information in another artifact (#473; symbol keys are
-///   unique per artifact), and a multi-artifact batch always settles through FULL.
+/// - only when an own symbol row declares in D (#863), whether D's content hash equals its hash
+///   at the capture. An own symbol with no captured exact definition in its document takes the
+///   destination row's declarations, which FULL discovers only over documents unchanged since
+///   the capture (`definitions_sql`). Such a declaration needs D's own symbol information in
+///   another artifact (#473; symbol keys are unique per artifact), and a multi-artifact batch
+///   always settles through FULL. It compares content hashes, not versions: a config-only
+///   change keeps the bytes and the declaration.
+///
+/// A call bound to a method of D also depends on D being unchanged since the capture (#557):
+/// the destination row's declared target is cleared for a changed D (`staged/witness.rs`
+/// `reused_source`, FULL's `StagedSide::unchanged`), and `rejoined_dispatch` then turns a
+/// captured `Direct` call on a method into `Unknown`. That is not in the term (Decision 0021 D4
+/// as amended 2026-11-21, #1279): the settlement keeps the `Direct`, the writer marks the row
+/// capture-bound ([`capture_bound`]) and every read applies the demotion while D differs from
+/// the capture ([`PayloadProjection::dispatch`]), so a first edit of D or its revert leaves the
+/// dependent's payload in place.
 ///
 /// No byte offset, range or anchor of D is read or stored: anchors are own-document, targets
 /// are `(syntax_id, document)` and syntax IDs survive comment and body edits. A future
@@ -182,8 +302,7 @@ pub(in crate::store) fn dependency_term(
                 .optional()?,
             None => None,
         };
-        sensitive |= flags & TARGET_DECLARATION != 0
-            || (flags & TARGET_CALL != 0 && status.is_some_and(|(_, _, method)| method));
+        sensitive |= flags & TARGET_DECLARATION != 0;
         statuses.push(serde_json::json!([
             super::id_codec::decode_sid(syntax_id)?,
             status
@@ -317,11 +436,16 @@ pub(in crate::store) struct TargetScope<'a> {
 /// How one payload is read as evidence of one revision (C).
 pub(crate) struct PayloadProjection<'a> {
     db: &'a Connection,
+    /// The reading revision's key, whose documents decide capture-bound dispatch.
+    revision: String,
     native: String,
     pub(in crate::store) source_set: String,
     pub(crate) payload_id: Option<i64>,
     freshness: BTreeMap<i64, sem::Freshness>,
     ids: RefCell<BTreeMap<i64, String>>,
+    /// Whether each target document of a capture-bound call is unchanged since the capture at
+    /// the reading revision: one lookup per document per read.
+    unchanged: RefCell<BTreeMap<(String, String), bool>>,
 }
 
 /// The projection of the payload named by manifest row `tuple_id` of `revision_key`.
@@ -361,19 +485,82 @@ pub(crate) fn project_payload<'a>(
     };
     Ok(PayloadProjection {
         db,
+        revision: revision_key.to_owned(),
         native,
         source_set,
         payload_id,
         freshness,
         ids: RefCell::new(BTreeMap::new()),
+        unchanged: RefCell::new(BTreeMap::new()),
     })
 }
 
 impl PayloadProjection<'_> {
-    /// Reads the payload as evidence of the revision whose native revision is `native`.
-    pub(in crate::store) fn at_native(mut self, native: &str) -> Self {
+    /// Reads the payload as evidence of revision `revision`, whose native revision is `native`.
+    pub(in crate::store) fn read_as(mut self, revision: &str, native: &str) -> Self {
+        self.revision = revision.to_owned();
         self.native = native.to_owned();
         self
+    }
+
+    /// Whether `language`/`path`, the target document of a capture-bound call, has at the
+    /// reading revision the content hash it had at the payload's capture.
+    pub(in crate::store) fn unchanged_since_capture(
+        &self,
+        language: &str,
+        path: &str,
+    ) -> Result<bool> {
+        let key = (language.to_owned(), path.to_owned());
+        if let Some(unchanged) = self.unchanged.borrow().get(&key) {
+            return Ok(*unchanged);
+        }
+        let payload = self.payload_id.context(SelectedIntegrity(
+            "incompatible_index: payload-less tuple names a call".into(),
+        ))?;
+        let unchanged: Option<bool> = self
+            .db
+            .prepare_cached(
+                "SELECT e.captured_hash IS NOT NULL AND e.captured_hash IS (SELECT v.content_hash FROM revision_documents d JOIN document_versions v ON v.vid=d.vid WHERE d.revision_id=?2 AND d.language=e.language AND d.path=e.path) FROM semantic_projection_dependencies e WHERE e.payload_id=?1 AND e.language=?3 AND e.path=?4",
+            )?
+            .query_row(params![payload, self.revision, language, path], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        let unchanged = unchanged.context(SelectedIntegrity(
+            "incompatible_index: capture-bound call without its dependency".into(),
+        ))?;
+        self.unchanged.borrow_mut().insert(key, unchanged);
+        Ok(unchanged)
+    }
+
+    /// The reading revision's dispatch of a stored call binding (#1279, Decision 0021 D1 as
+    /// amended 2026-11-21): a capture-bound `direct` ([`capture_bound`]) is `unknown` while its
+    /// target document differs from the capture (#557), exactly as settling it at this revision
+    /// would make it; every other dispatch is revision-neutral.
+    pub(in crate::store) fn dispatch(
+        &self,
+        stored: sem::Dispatch,
+        capture_bound: bool,
+        target: Option<&sem::Target>,
+    ) -> Result<sem::Dispatch> {
+        if !capture_bound {
+            return Ok(stored);
+        }
+        let (sem::Dispatch::Direct, Some(sem::Target::Internal { document, .. })) =
+            (stored, target)
+        else {
+            return Err(SelectedIntegrity(
+                "incompatible_index: corrupt capture-bound call dispatch".into(),
+            )
+            .into());
+        };
+        Ok(
+            if self.unchanged_since_capture(&document.language, &document.path)? {
+                stored
+            } else {
+                sem::Dispatch::Unknown
+            },
+        )
     }
 
     pub(in crate::store) fn scope(&self) -> TargetScope<'_> {
@@ -751,7 +938,7 @@ mod tests {
     #[test]
     fn writer_rejects_dependency_endpoint_missing_from_revision() {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(CACHE_SCHEMA_V43).unwrap();
+        db.execute_batch(CACHE_SCHEMA_V44).unwrap();
         db.pragma_update(None, "foreign_keys", "OFF").unwrap();
         db.execute("INSERT INTO native_revisions VALUES('key','set',?1,?1,?1,'native','[]','[]','{}','[]','[]',NULL,'[]',0,'{}','[]',1)", ["a".repeat(64)]).unwrap();
         let (_, mut publication) = every_endpoint();
@@ -786,7 +973,7 @@ mod tests {
     #[test]
     fn unbatched_payload_records_null_terms_and_no_targets() {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(CACHE_SCHEMA_V43).unwrap();
+        db.execute_batch(CACHE_SCHEMA_V44).unwrap();
         db.pragma_update(None, "foreign_keys", "OFF").unwrap();
         db.execute("INSERT INTO native_revisions VALUES('key','set',?1,?1,?1,'native','[]','[]','{}','[]','[]',NULL,'[]',0,'{}','[]',1)", ["a".repeat(64)]).unwrap();
         let (_, mut publication) = every_endpoint();
@@ -831,7 +1018,7 @@ mod tests {
     }
 
     fn payload_with_children(db: &Connection, key: Option<&str>, symbols: usize) {
-        db.execute_batch(CACHE_SCHEMA_V43).unwrap();
+        db.execute_batch(CACHE_SCHEMA_V44).unwrap();
         db.pragma_update(None, "foreign_keys", "OFF").unwrap();
         db.execute(
             "INSERT INTO semantic_payloads(payload_id,payload_key,producer_id,producer_version,language,path,version_id,batch_id) VALUES(1,?1,'p','1','javascript','a.js','v',1)",
@@ -920,5 +1107,195 @@ mod tests {
             )
             .unwrap();
         assert_eq!(journal, 0);
+    }
+
+    /// A payload (tuple 1 at `same`, 2 at `edited`) whose one call binding is a `direct` call
+    /// from `a.js` into `d.js`, marked `bound`, with `d.js`'s capture hash `captured`. `d.js` has
+    /// hash `1…` at `same` and `2…` at `edited`.
+    fn bound_call(bound: bool, captured: Option<&str>) -> Connection {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(CACHE_SCHEMA_V44).unwrap();
+        db.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        for (tuple, revision) in [(1, "same"), (2, "edited")] {
+            db.execute("INSERT INTO native_revisions VALUES(?1,'set',?2,?2,?2,?1,'[]','[]','{}','[]','[]',NULL,'[]',0,'{}','[]',?3)", params![revision, "a".repeat(64), tuple]).unwrap();
+            db.execute("INSERT INTO document_versions(vid,id,language,path,content_hash,extraction_context,producer_id,producer_version,byte_length,source_bytes,native_witness) VALUES(?1,?2,'javascript','d.js',?3,?3,'p','1',0,x'',?3)", params![tuple, format!("v{tuple}"), tuple.to_string().repeat(64)]).unwrap();
+            db.execute("INSERT INTO revision_documents VALUES(?1,'javascript','d.js',?2,1,NULL,NULL,1,1,'complete',NULL,0,1)", params![revision, tuple]).unwrap();
+            db.execute("INSERT INTO semantic_coverage VALUES(?1,?2,'p','1','javascript','a.js',1,1,'complete',NULL,1)", params![tuple, revision]).unwrap();
+        }
+        db.execute("INSERT INTO semantic_projection_dependencies(payload_id,language,path,term,captured_hash) VALUES(1,'javascript','d.js',NULL,?1)", [captured]).unwrap();
+        db.execute("INSERT INTO semantic_call_bindings(payload_id,ordinal,join_document_language,join_document_path,join_content_hash,join_start,join_end,join_kind,join_status,resolution,declared_kind,declared_internal_syntax_id,declared_internal_language,declared_internal_path,dispatch,possible_dispatch_complete,stale_target,provenance_ordinal,capture_bound) VALUES(1,0,'javascript','a.js','h',0,1,'callee','exact','resolved','internal',?1,'javascript','d.js','direct',0,0,0,?2)", params![vec![7u8; 16], bound]).unwrap();
+        db
+    }
+
+    /// The projected dispatch at `revision` (tuple `tuple`), through the shared projection and
+    /// through its SQL form; the two must agree.
+    fn read_dispatch(db: &Connection, tuple: i64, revision: &str) -> sem::Dispatch {
+        let none = BTreeMap::new();
+        let projection =
+            project_payload(db, revision, tuple, FreshnessSource::Publication(&none)).unwrap();
+        let target = sem::Target::Internal {
+            syntax_id: format!("sid:v1:{}", "07".repeat(16)),
+            document: crate::native_records::DocumentKey {
+                source_set_id: "set".into(),
+                language: "javascript".into(),
+                path: "d.js".into(),
+            },
+            revision_id: revision.into(),
+        };
+        let bound: bool = db
+            .query_row(
+                "SELECT capture_bound FROM semantic_call_bindings",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let projected = projection
+            .dispatch(sem::Dispatch::Direct, bound, Some(&target))
+            .unwrap();
+        let sql: String = db
+            .query_row(
+                &format!(
+                    "SELECT {} FROM semantic_call_bindings b",
+                    projected_dispatch_sql("b", "?1")
+                ),
+                [revision],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(semantic_enum::<sem::Dispatch>(sql).unwrap(), projected);
+        projected
+    }
+
+    /// #1279: a capture-bound `direct` reads `direct` while its target document has its capture
+    /// hash at the reading revision and `unknown` otherwise; an unbound one is revision-neutral;
+    /// a document absent at the capture (no hash) is never unchanged.
+    #[test]
+    fn capture_bound_dispatch_follows_the_reading_revision() {
+        let db = bound_call(true, Some(&"1".repeat(64)));
+        assert_eq!(read_dispatch(&db, 1, "same"), sem::Dispatch::Direct);
+        assert_eq!(read_dispatch(&db, 2, "edited"), sem::Dispatch::Unknown);
+        let db = bound_call(false, Some(&"1".repeat(64)));
+        assert_eq!(read_dispatch(&db, 2, "edited"), sem::Dispatch::Direct);
+        let db = bound_call(true, None);
+        assert_eq!(read_dispatch(&db, 1, "same"), sem::Dispatch::Unknown);
+    }
+
+    /// A capture-bound call whose dependency row is missing, or a bound row that is not a
+    /// `direct` call to an internal target, is corruption, never an answer.
+    #[test]
+    fn corrupt_capture_bound_calls_fail_typed() {
+        let db = bound_call(true, Some(&"1".repeat(64)));
+        db.execute("DELETE FROM semantic_projection_dependencies", [])
+            .unwrap();
+        let projection = project_payload(&db, "same", 1, FreshnessSource::Stored).unwrap();
+        let target = sem::Target::Internal {
+            syntax_id: format!("sid:v1:{}", "07".repeat(16)),
+            document: crate::native_records::DocumentKey {
+                source_set_id: "set".into(),
+                language: "javascript".into(),
+                path: "d.js".into(),
+            },
+            revision_id: "same".into(),
+        };
+        let missing = projection
+            .dispatch(sem::Dispatch::Direct, true, Some(&target))
+            .unwrap_err();
+        assert!(missing.is::<SelectedIntegrity>(), "{missing:#}");
+        let not_direct = projection
+            .dispatch(sem::Dispatch::Dynamic, true, Some(&target))
+            .unwrap_err();
+        assert!(not_direct.is::<SelectedIntegrity>(), "{not_direct:#}");
+    }
+
+    /// Only a `direct` call whose declared target is a `method` of another document is
+    /// capture-bound.
+    #[test]
+    fn only_a_direct_method_call_into_another_document_is_capture_bound() {
+        let db = bound_call(false, None);
+        db.execute("INSERT INTO native_version_declarations(vid,syntax_id,kind,role,name,lookup_key,key_signature_present,key_ordinal,start_byte,end_byte,name_start,name_end) VALUES(1,?1,'method','production','m','m',0,0,0,10,1,2)", [vec![7u8; 16]]).unwrap();
+        db.execute("INSERT INTO native_version_declarations(vid,syntax_id,kind,role,name,lookup_key,key_signature_present,key_ordinal,start_byte,end_byte,name_start,name_end) VALUES(1,?1,'function','production','f','f',0,0,0,10,1,2)", [vec![8u8; 16]]).unwrap();
+        let call = |sid: u8, path: &str, dispatch: sem::Dispatch| sem::CallBinding {
+            call_id: None,
+            join: anchor("a.js", sem::JoinKind::Callee),
+            resolution: sem::Resolution::Resolved,
+            declared_target: Some(sem::Target::Internal {
+                syntax_id: format!("sid:v1:{}", format!("{sid:02x}").repeat(16)),
+                document: document(path),
+                revision_id: "native".into(),
+            }),
+            candidates: vec![],
+            dispatch,
+            possible_dispatch: vec![],
+            possible_dispatch_complete: false,
+            stale_target: Some(false),
+            provenance_id: "p".into(),
+        };
+        let bound = |binding: sem::CallBinding, own: &str| {
+            capture_bound(&db, "same", "javascript", own, &binding).unwrap()
+        };
+        assert!(bound(call(7, "d.js", sem::Dispatch::Direct), "a.js"));
+        assert!(
+            !bound(call(7, "d.js", sem::Dispatch::Direct), "d.js"),
+            "own document"
+        );
+        assert!(
+            !bound(call(8, "d.js", sem::Dispatch::Direct), "a.js"),
+            "free function"
+        );
+        assert!(
+            !bound(call(7, "d.js", sem::Dispatch::Dynamic), "a.js"),
+            "not direct"
+        );
+    }
+
+    /// Guard (#1279): every source file whose SQL names the call binding table, with how many
+    /// times. Their reads of `dispatch` go through the shared projection
+    /// ([`PayloadProjection::dispatch`], or [`projected_dispatch_sql`] for a reader that sizes
+    /// rows in SQL), or read a revision where the projection is the identity (the witness's
+    /// original import). A new mention fails here until it is reviewed against the projection.
+    #[test]
+    fn every_reader_of_call_bindings_is_reviewed_against_the_projection() {
+        let table = concat!("semantic_", "call_bindings");
+        let expected: BTreeMap<&str, usize> = [
+            // Schema, writer, tuple reader (projected), provenance selection, GC lists.
+            ("src/store.rs", 11),
+            // Navigation call budget (projected SQL) and its sizing arms.
+            ("src/graph_read.rs", 9),
+            // Architecture semantic inputs (projected) and counts that read no dispatch.
+            ("src/store/semantic_display.rs", 4),
+            // GC of unnamed payloads, and this module's projection tests.
+            ("src/store/semantic_payload.rs", 7),
+            // The original import's rows, read at the captured revision.
+            ("src/store/native_first/witness.rs", 4),
+            // A table list in a cancellation test.
+            ("src/http/normal_post_capture_cancellation_tests.rs", 1),
+        ]
+        .into_iter()
+        .collect();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut found = BTreeMap::new();
+        let mut pending = vec![root.join("src")];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let count = std::fs::read_to_string(&path)
+                        .unwrap()
+                        .matches(table)
+                        .count();
+                    if count > 0 {
+                        let relative = path.strip_prefix(root).unwrap().to_string_lossy();
+                        found.insert(relative.replace('\\', "/"), count);
+                    }
+                }
+            }
+        }
+        let expected: BTreeMap<String, usize> = expected
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v))
+            .collect();
+        assert_eq!(found, expected);
     }
 }
