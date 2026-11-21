@@ -381,6 +381,16 @@ class SchemaParity(unittest.TestCase):
         with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
             self.assertEqual(self.normalized_rows(first), self.normalized_rows(second))
 
+    def test_ownerless_impl_relation_id_is_compared_verbatim(self):
+        # A Rust impl block's extracted relation has no owner yet, so its ID is root-free.
+        view = RUNNER.SelectedView.__new__(RUNNER.SelectedView)
+        view.ids = {"class-ref": {}, "syntax": {}}
+        relation = {"Relation": {"id": "class-ref::132:134:implements:T0", "owner": ""}}
+        self.assertEqual(view.embedded(relation), relation)
+        # An owned relation ID still has to map to a selected class relation.
+        with self.assertRaisesRegex(RuntimeError, "unmapped class-ref identity"):
+            view.embedded({"id": "class-ref:sid:v1:" + "a" * 32 + ":1:2:implements:T0"})
+
 
 class ImportBatch(unittest.TestCase):
     def captured(self, root):
