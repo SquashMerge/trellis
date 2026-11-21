@@ -96,15 +96,14 @@ fn legacy_rows<T: Serialize>(items: &[T]) -> Result<Vec<Value>> {
     Ok(facts)
 }
 
+// The production normalizer's spliced bytes equal the canonical array of the legacy rows.
 fn family_parity<T: Serialize>(rows: &[T]) -> Vec<Value> {
     let legacy = legacy_rows(rows).unwrap();
-    let owned = stable_witness_rows(rows).unwrap();
+    let owned = stable_witness_bytes(rows).unwrap();
     let grouped: Vec<_> = rows.iter().collect();
-    let borrowed = stable_witness_rows(grouped.iter().copied()).unwrap();
-    assert_eq!(legacy, owned);
-    assert_eq!(legacy, borrowed);
-    assert_eq!(canonical(&json!(legacy)), canonical(&json!(owned)));
-    assert_eq!(canonical(&json!(legacy)), canonical(&json!(borrowed)));
+    let borrowed = stable_witness_bytes(grouped.iter().copied()).unwrap();
+    assert_eq!(canonical(&json!(legacy)), owned);
+    assert_eq!(canonical(&json!(legacy)), borrowed);
     legacy
 }
 
