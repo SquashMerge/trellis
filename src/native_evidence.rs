@@ -471,9 +471,10 @@ fn build_native_observed(
     )
 }
 
-/// How full extraction is spread over workers: files are extracted in
-/// chunks of `chunk`, each on up to `workers` threads, and merged in
-/// revision order after each chunk.
+/// How full extraction is spread over workers: up to `workers` threads.
+/// The in-memory build extracts in chunks of `chunk` and merges in revision
+/// order after each chunk; the spool streams, merging each file in revision
+/// order as soon as it is ready, with workers at most `chunk` files ahead.
 #[derive(Clone, Copy, Debug)]
 struct ExtractionPlan {
     workers: usize,
@@ -1008,40 +1009,40 @@ fn spool_full_capture_with(
     capture.claim_graph_projection()?;
     let mut ids = IdentityRegistry::default();
     spool.conn.execute_batch("BEGIN IMMEDIATE")?;
-    for (chunk_index, chunk) in pairs.chunks(plan.chunk.max(1)).enumerate() {
-        ensure!(
-            !cancel.load(std::sync::atomic::Ordering::Acquire),
-            "indexing cancelled"
-        );
-        // Each worker does all of one document's own work: extraction,
-        // structure and graph validation, class extraction and encoding. The
-        // ordered owner below only admits identities and writes the spool, in
-        // sorted order, so the earliest sorted file's failure is still the one
-        // reported whatever order the workers finish in.
-        let prepared =
-            crate::parallel::map_ordered(chunk, plan.workers, cancel, |_, (file, document)| {
-                let mut ids = IdentityRegistry::logged();
-                let mut facts = shell.clone();
-                let result = extract_known(&mut facts, file, document, &mut ids)
-                    .and_then(|()| after_extract(file, &ids))
-                    .and_then(|()| {
-                        prepare_spooled_document(
-                            options,
-                            capture,
-                            facts,
-                            document,
-                            file,
-                            cancel,
-                            before_validate,
-                            after_class,
-                        )
-                    });
-                (ids, result)
-            });
-        for (offset, (prepared, (_, document))) in prepared.into_iter().zip(chunk).enumerate() {
-            let (local_ids, prepared) = prepared.context("indexing cancelled")?;
+    // Each worker does all of one document's own work: extraction, structure
+    // and graph validation, class extraction and encoding. The ordered owner
+    // below only admits identities and writes the spool, in sorted order, so
+    // the earliest sorted file's failure is still the one reported whatever
+    // order the workers finish in. Workers run at most one chunk ahead of it.
+    let mut stats = IndexStats::default();
+    let mut diagnostics = Vec::new();
+    let completed = crate::parallel::map_ordered_streaming(
+        &pairs,
+        plan.workers,
+        plan.chunk,
+        cancel,
+        |_, (file, document)| {
+            let mut ids = IdentityRegistry::logged();
+            let mut facts = shell.clone();
+            let result = extract_known(&mut facts, file, document, &mut ids)
+                .and_then(|()| after_extract(file, &ids))
+                .and_then(|()| {
+                    prepare_spooled_document(
+                        options,
+                        capture,
+                        facts,
+                        document,
+                        file,
+                        cancel,
+                        before_validate,
+                        after_class,
+                    )
+                });
+            (ids, result)
+        },
+        |index, (local_ids, prepared)| -> Result<()> {
             let prepared = prepared?;
-            let index = chunk_index * plan.chunk.max(1) + offset;
+            let document = pairs[index].1;
             spool.conn.execute(
                 "INSERT INTO documents (ordinal, facts, graph) VALUES (?1, ?2, ?3)",
                 rusqlite::params![i64::try_from(index)?, prepared.facts, prepared.graph],
@@ -1055,20 +1056,24 @@ fn spool_full_capture_with(
             if let Some(extraction) = &prepared.extraction {
                 spool.write_extraction(index, extraction)?;
             }
-            spool.stats.files += prepared.stats.files;
-            spool.stats.symbols += prepared.stats.symbols;
-            spool.stats.calls += prepared.stats.calls;
-            spool.stats.regions += prepared.stats.regions;
-            spool.stats.unresolved += prepared.stats.unresolved;
-            spool.stats.parse_error_files += prepared.stats.parse_error_files;
-            spool.diagnostics.extend(prepared.diagnostics);
+            stats.files += prepared.stats.files;
+            stats.symbols += prepared.stats.symbols;
+            stats.calls += prepared.stats.calls;
+            stats.regions += prepared.stats.regions;
+            stats.unresolved += prepared.stats.unresolved;
+            stats.parse_error_files += prepared.stats.parse_error_files;
+            diagnostics.extend(prepared.diagnostics);
             progress(IndexProgress {
                 phase: "parse".into(),
                 completed: index + 1,
                 total: spool.len(),
             });
-        }
-    }
+            Ok(())
+        },
+    )?;
+    ensure!(completed, "indexing cancelled");
+    spool.stats = stats;
+    spool.diagnostics = diagnostics;
     spool.conn.execute_batch("COMMIT")?;
     drop(shell);
     capture.verify(cancel)?;
