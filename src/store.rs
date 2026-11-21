@@ -4391,10 +4391,101 @@ impl WriterCounters {
 // before reuse rather than silently accepting corrupt or incomplete evidence.
 #[derive(Default)]
 struct ImmutableAppend {
-    schema: BTreeMap<String, (Vec<String>, Vec<usize>)>,
+    shapes: HashMap<String, ImmutableShape>,
     reused: BTreeMap<String, BTreeSet<String>>,
     expected: BTreeMap<(String, String), i64>,
     counters: WriterCounters,
+}
+/// One immutable insert statement's table, key and derived statement text, built
+/// once per statement rather than once per row.
+struct ImmutableShape {
+    table: String,
+    columns: usize,
+    keys: Vec<usize>,
+    /// `SELECT EXISTS` on the natural key, bound to the key values in key order.
+    probe: String,
+    /// `SELECT EXISTS` on every column, bound to the whole row.
+    exact: String,
+    /// The caller's insert with `ON CONFLICT(<natural key>) DO NOTHING`.
+    upsert: String,
+    /// The parent surrogate lookup of the three projection parents.
+    parent: Option<&'static str>,
+}
+impl ImmutableShape {
+    fn new(db: &Connection, sql: &str) -> Result<Self> {
+        let table = ImmutableAppend::table(sql)?;
+        let mut stmt = db.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut columns = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        // Parent surrogates are SQLite rowids, not caller-supplied values.
+        // Equality and dedupe still use the canonical natural key.
+        if matches!(
+            table,
+            "document_versions" | "graph_projections" | "class_projections"
+        ) {
+            columns.remove(0);
+        }
+        let keys = if matches!(table, "graph_projections") {
+            vec![2] // graph_hash
+        } else if matches!(table, "class_projections") {
+            vec![1] // content_hash
+        } else if table == "document_versions" {
+            vec![0] // id
+        } else {
+            columns
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, order))| *order > 0)
+                .map(|(i, _)| i)
+                .collect::<Vec<_>>()
+        };
+        ensure!(
+            !keys.is_empty(),
+            "incompatible_index: immutable table has no key"
+        );
+        let names = columns.drain(..).map(|(name, _)| name).collect::<Vec<_>>();
+        let predicate = |indices: &mut dyn Iterator<Item = (usize, usize)>| {
+            indices
+                .map(|(parameter, i)| format!("{} IS ?{}", names[i], parameter + 1))
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        };
+        let key_predicate = predicate(&mut keys.iter().copied().enumerate());
+        let row_predicate = predicate(&mut (0..names.len()).map(|i| (i, i)));
+        let insert = sql.trim_end();
+        ensure!(
+            insert.starts_with("INSERT INTO ")
+                && insert.ends_with(')')
+                && !insert.to_ascii_uppercase().contains(" ON CONFLICT"),
+            "incompatible_index: immutable insert is not a plain INSERT .. VALUES"
+        );
+        let key_columns = keys
+            .iter()
+            .map(|i| names[*i].as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        Ok(Self {
+            table: table.to_owned(),
+            columns: names.len(),
+            probe: format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {key_predicate})"),
+            exact: format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {row_predicate})"),
+            upsert: format!("{insert} ON CONFLICT({key_columns}) DO NOTHING"),
+            parent: match table {
+                "document_versions" => Some("SELECT vid FROM document_versions WHERE id=?1"),
+                "graph_projections" => {
+                    Some("SELECT gid FROM graph_projections WHERE graph_hash=?1")
+                }
+                "class_projections" => {
+                    Some("SELECT cid FROM class_projections WHERE content_hash=?1")
+                }
+                _ => None,
+            },
+            keys,
+        })
+    }
 }
 impl ImmutableAppend {
     fn insert_manifest(
@@ -4453,7 +4544,21 @@ impl ImmutableAppend {
         );
         Ok(table)
     }
+    /// `CAST(? AS TEXT)` of one value. Integer and UTF-8 text keys convert in Rust;
+    /// any other value still asks SQLite.
     fn key(db: &Connection, values: &[&dyn rusqlite::ToSql], i: usize) -> Result<String> {
+        use rusqlite::types::{ToSqlOutput, Value, ValueRef};
+        match values[i].to_sql()? {
+            ToSqlOutput::Borrowed(ValueRef::Integer(value))
+            | ToSqlOutput::Owned(Value::Integer(value)) => return Ok(value.to_string()),
+            ToSqlOutput::Borrowed(ValueRef::Text(value)) => {
+                if let Ok(value) = std::str::from_utf8(value) {
+                    return Ok(value.to_owned());
+                }
+            }
+            ToSqlOutput::Owned(Value::Text(value)) => return Ok(value),
+            _ => {}
+        }
         Ok(db
             .prepare_cached("SELECT CAST(?1 AS TEXT)")?
             .query_row([values[i]], |row| row.get(0))?)
@@ -4501,68 +4606,57 @@ impl ImmutableAppend {
         sql: &str,
         values: &[&dyn rusqlite::ToSql],
     ) -> Result<usize> {
-        let table = Self::table(sql)?;
-        if !self.schema.contains_key(table) {
-            let mut stmt = db.prepare(&format!("PRAGMA table_info({table})"))?;
-            let mut columns = stmt
-                .query_map([], |row| {
-                    Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            // Parent surrogates are SQLite rowids, not caller-supplied values.
-            // Equality and dedupe still use the canonical natural key.
-            if matches!(
-                table,
-                "document_versions" | "graph_projections" | "class_projections"
-            ) {
-                columns.remove(0);
-            }
-            let keys = if matches!(table, "graph_projections") {
-                vec![2] // graph_hash
-            } else if matches!(table, "class_projections") {
-                vec![1] // content_hash
-            } else if table == "document_versions" {
-                vec![0] // id
-            } else {
-                columns
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, (_, order))| *order > 0)
-                    .map(|(i, _)| i)
-                    .collect::<Vec<_>>()
-            };
-            ensure!(
-                !keys.is_empty(),
-                "incompatible_index: immutable table has no key"
-            );
-            let names = columns.drain(..).map(|(name, _)| name).collect::<Vec<_>>();
-            self.schema.insert(table.to_owned(), (names, keys));
+        use rusqlite::types::{ToSqlOutput, Value, ValueRef};
+        if !self.shapes.contains_key(sql) {
+            let shape = ImmutableShape::new(db, sql)?;
+            self.shapes.insert(sql.to_owned(), shape);
         }
-        let (columns, keys) = &self.schema[table];
+        let shape = &self.shapes[sql];
+        let table = shape.table.as_str();
         ensure!(
-            columns.len() == values.len(),
+            shape.columns == values.len(),
             "incompatible_index: immutable column count"
         );
-        let predicate = |indices: &[usize]| {
-            indices
-                .iter()
-                .map(|i| format!("{} IS ?{}", columns[*i], i + 1))
-                .collect::<Vec<_>>()
-                .join(" AND ")
+        let key_values = shape.keys.iter().map(|i| values[*i]).collect::<Vec<_>>();
+        let stored_key = || -> Result<bool> {
+            Ok(db
+                .prepare_cached(&shape.probe)?
+                .query_row(key_values.as_slice(), |row| row.get::<_, i64>(0))?
+                != 0)
         };
-        let key_predicate = keys
-            .iter()
-            .enumerate()
-            .map(|(parameter, i)| format!("{} IS ?{}", columns[*i], parameter + 1))
-            .collect::<Vec<_>>()
-            .join(" AND ");
-        let key_values = keys.iter().map(|i| values[*i]).collect::<Vec<_>>();
-        let exists: i64 = db
-            .prepare_cached(&format!(
-                "SELECT EXISTS(SELECT 1 FROM {table} WHERE {key_predicate})"
-            ))?
-            .query_row(key_values.as_slice(), |row| row.get(0))?;
-        let inserted = if exists != 0 {
+        // A NULL key matches a stored row under `IS` but never conflicts with a
+        // uniqueness constraint, so it keeps the key probe before the plain insert.
+        let null_key = shape.keys.iter().any(|i| {
+            matches!(
+                values[*i].to_sql(),
+                Ok(ToSqlOutput::Borrowed(ValueRef::Null) | ToSqlOutput::Owned(Value::Null))
+                    | Err(_)
+            )
+        });
+        let (exists, inserted) = if null_key {
+            if stored_key()? {
+                (true, 0)
+            } else {
+                (false, db.prepare_cached(sql)?.execute(values)?)
+            }
+        } else {
+            // A skipped insert is a stored row with the same key. A row that fails
+            // another constraint (CHECK or NOT NULL run before the key's uniqueness
+            // check) is still compared when its key is stored, as the probe did.
+            match db.prepare_cached(&shape.upsert)?.execute(values) {
+                Ok(0) => (true, 0),
+                Ok(inserted) => (false, inserted),
+                Err(error)
+                    if error.sqlite_error_code()
+                        == Some(rusqlite::ErrorCode::ConstraintViolation)
+                        && stored_key()? =>
+                {
+                    (true, 0)
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+        if exists {
             if !matches!(
                 table,
                 "native_producers"
@@ -4573,21 +4667,14 @@ impl ImmutableAppend {
             ) {
                 self.counters.reused_occurrence_reads += 1;
             }
-            let all = (0..columns.len()).collect::<Vec<_>>();
             let exact: i64 = db
-                .prepare_cached(&format!(
-                    "SELECT EXISTS(SELECT 1 FROM {table} WHERE {})",
-                    predicate(&all)
-                ))?
+                .prepare_cached(&shape.exact)?
                 .query_row(values, |row| row.get(0))?;
             control_ensure!(
                 exact == 1,
                 format!("incompatible_index: immutable {table} differs from captured evidence")
             );
-            0
-        } else {
-            db.prepare_cached(sql)?.execute(values)?
-        };
+        }
         if inserted != 0 {
             let family = if table.starts_with("native_") || table == "document_versions" {
                 "native"
@@ -4606,25 +4693,21 @@ impl ImmutableAppend {
             )),
             "native_source_sets" => Some(Self::key(db, values, 0)?),
             "document_versions" | "graph_projections" | "class_projections" => {
-                let (key, column, index) = match table {
-                    "document_versions" => ("vid", "id", 0),
-                    "graph_projections" => ("gid", "graph_hash", 2),
-                    _ => ("cid", "content_hash", 1),
+                let index = match table {
+                    "document_versions" => 0,
+                    "graph_projections" => 2,
+                    _ => 1,
                 };
+                let parent = shape.parent.context("immutable parent query")?;
                 Some(
-                    db.query_row(
-                        &format!("SELECT {key} FROM {table} WHERE {column}=?1"),
-                        [values[index]],
-                        |row| row.get::<_, i64>(0),
-                    )?
-                    .to_string(),
+                    db.prepare_cached(parent)?
+                        .query_row([values[index]], |row| row.get::<_, i64>(0))?
+                        .to_string(),
                 )
             }
             _ => None,
         };
-        if exists != 0
-            && let Some(parent) = parent
-        {
+        if exists && let Some(parent) = parent {
             self.reused
                 .entry(table.to_owned())
                 .or_default()
@@ -19989,6 +20072,132 @@ fn immutable_reference_slot_rejects_changed_payload() {
             .unwrap(),
         original
     );
+}
+
+#[cfg(test)]
+fn immutable_rows(db: &Connection, table: &str) -> Vec<(Option<i64>, Option<i64>, i64, i64)> {
+    db.prepare(&format!(
+        "SELECT vid,ordinal,start_byte,end_byte FROM {table} ORDER BY rowid"
+    ))
+    .unwrap()
+    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
+}
+
+#[cfg(test)]
+#[test]
+fn immutable_append_inserts_skips_identical_and_rejects_changed_rows() {
+    let db = Connection::open_in_memory().unwrap();
+    db.execute_batch(CACHE_SCHEMA_V43).unwrap();
+    db.pragma_update(None, "foreign_keys", "OFF").unwrap();
+    let sql = "INSERT INTO native_version_macro_expansions VALUES(?1,?2,?3,?4)";
+    let mut append = ImmutableAppend::default();
+
+    // A fresh key is inserted and counted as a written native row.
+    assert_eq!(append.insert(&db, sql, params![7, 0, 2, 9]).unwrap(), 1);
+    assert_eq!(append.counters.native.rows, 1);
+    assert_eq!(append.counters.reused_occurrence_reads, 0);
+
+    // The identical row under a stored key is reused: nothing is written, no error.
+    assert_eq!(append.insert(&db, sql, params![7, 0, 2, 9]).unwrap(), 0);
+    assert_eq!(append.counters.native.rows, 1);
+    assert_eq!(append.counters.reused_occurrence_reads, 1);
+
+    // A differing row under a stored key fails typed and leaves the stored row.
+    let error = append.insert(&db, sql, params![7, 0, 2, 10]).unwrap_err();
+    assert!(
+        error.downcast_ref::<ControlIntegrity>().is_some(),
+        "{error:#}"
+    );
+    // So does one that also violates a CHECK constraint, which SQLite evaluates
+    // before the key's uniqueness.
+    let error = append.insert(&db, sql, params![7, 0, 9, 2]).unwrap_err();
+    assert!(
+        error.downcast_ref::<ControlIntegrity>().is_some(),
+        "{error:#}"
+    );
+    assert_eq!(
+        immutable_rows(&db, "native_version_macro_expansions"),
+        [(Some(7), Some(0), 2, 9)]
+    );
+
+    // A CHECK violation under a fresh key stays SQLite's constraint failure.
+    let error = append.insert(&db, sql, params![7, 1, 9, 2]).unwrap_err();
+    assert!(
+        error.downcast_ref::<ControlIntegrity>().is_none(),
+        "{error:#}"
+    );
+    assert_eq!(
+        error
+            .downcast_ref::<rusqlite::Error>()
+            .and_then(rusqlite::Error::sqlite_error_code),
+        Some(rusqlite::ErrorCode::ConstraintViolation)
+    );
+    assert_eq!(
+        immutable_rows(&db, "native_version_macro_expansions").len(),
+        1
+    );
+    assert_eq!(
+        append.expected[&("native_version_macro_expansions".to_owned(), "7".to_owned())],
+        2
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn immutable_append_null_key_keeps_the_probe() {
+    // The real schema declares every key column NOT NULL; this stand-in table
+    // does not, so a NULL key reaches ImmutableAppend. `IS` matches NULL while
+    // a uniqueness constraint never does, so without the probe the identical row
+    // would be inserted twice.
+    let db = Connection::open_in_memory().unwrap();
+    db.execute_batch(
+        "CREATE TABLE native_version_macro_expansions(vid INTEGER,ordinal INTEGER,start_byte INTEGER NOT NULL,end_byte INTEGER NOT NULL,PRIMARY KEY(vid,ordinal));",
+    )
+    .unwrap();
+    let sql = "INSERT INTO native_version_macro_expansions VALUES(?1,?2,?3,?4)";
+    let mut append = ImmutableAppend::default();
+    assert_eq!(
+        append
+            .insert(&db, sql, params![7, None::<i64>, 2, 9])
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        append
+            .insert(&db, sql, params![7, None::<i64>, 2, 9])
+            .unwrap(),
+        0
+    );
+    assert_eq!(append.counters.reused_occurrence_reads, 1);
+    let error = append
+        .insert(&db, sql, params![7, None::<i64>, 2, 10])
+        .unwrap_err();
+    assert!(
+        error.downcast_ref::<ControlIntegrity>().is_some(),
+        "{error:#}"
+    );
+    assert_eq!(
+        immutable_rows(&db, "native_version_macro_expansions"),
+        [(Some(7), None, 2, 9)]
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn immutable_append_key_text_matches_sqlite_cast() {
+    let db = Connection::open_in_memory().unwrap();
+    let cast = |value: &dyn rusqlite::ToSql| -> String {
+        db.query_row("SELECT CAST(?1 AS TEXT)", [value], |row| row.get(0))
+            .unwrap()
+    };
+    let text = String::from("source-set:\u{1f}é");
+    let values: [&dyn rusqlite::ToSql; 6] = [&0i64, &-42i64, &i64::MAX, &"rust", &text, &1.5f64];
+    for (i, value) in values.iter().enumerate() {
+        assert_eq!(ImmutableAppend::key(&db, &values, i).unwrap(), cast(*value));
+    }
 }
 
 #[cfg(test)]
