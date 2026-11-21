@@ -47,19 +47,43 @@ pub fn canonical_into(value: &Value, out: &mut dyn FnMut(&[u8])) {
     }
 }
 
-/// The canonical encoding of one string.
+/// The canonical encoding of one string: `"`, `\` and U+0000..=U+001F are escaped
+/// (controls as lowercase `\u00xx`), and every other character is its UTF-8 bytes.
+///
+/// The stretches between escapes are written as whole runs. Every escaped character
+/// is ASCII, and no ASCII byte occurs inside a multibyte UTF-8 sequence, so scanning
+/// bytes finds exactly the characters a scan by `char` would.
 pub fn canonical_string_into(s: &str, out: &mut dyn FnMut(&[u8])) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     out(b"\"");
-    for c in s.chars() {
-        match c {
-            '"' => out(b"\\\""),
-            '\\' => out(b"\\\\"),
-            '\u{0}'..='\u{1f}' => out(format!("\\u{:04x}", c as u32).as_bytes()),
-            _ => {
-                let mut bytes = [0; 4];
-                out(c.encode_utf8(&mut bytes).as_bytes());
+    let bytes = s.as_bytes();
+    let mut start = 0;
+    for (i, &byte) in bytes.iter().enumerate() {
+        let control;
+        let escape: &[u8] = match byte {
+            b'"' => b"\\\"",
+            b'\\' => b"\\\\",
+            0..=0x1f => {
+                control = [
+                    b'\\',
+                    b'u',
+                    b'0',
+                    b'0',
+                    HEX[usize::from(byte >> 4)],
+                    HEX[usize::from(byte & 0xf)],
+                ];
+                &control
             }
+            _ => continue,
+        };
+        if start < i {
+            out(&bytes[start..i]);
         }
+        out(escape);
+        start = i + 1;
+    }
+    if start < bytes.len() {
+        out(&bytes[start..]);
     }
     out(b"\"");
 }
@@ -510,6 +534,116 @@ pub fn extraction_context(language: &str, components: &[(String, String)]) -> Re
         b"trellis.extraction-context.v1\0",
         &canonical(&serde_json::json!({"language":language,"components":components})),
     ))
+}
+
+#[cfg(test)]
+mod canonical_string_tests {
+    use super::*;
+    use rand::{RngExt, SeedableRng};
+
+    /// The original escaper, one character at a time: the reference for byte identity.
+    fn reference(s: &str) -> Vec<u8> {
+        let mut out = b"\"".to_vec();
+        for c in s.chars() {
+            match c {
+                '"' => out.extend_from_slice(b"\\\""),
+                '\\' => out.extend_from_slice(b"\\\\"),
+                '\u{0}'..='\u{1f}' => {
+                    out.extend_from_slice(format!("\\u{:04x}", c as u32).as_bytes())
+                }
+                _ => out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
+            }
+        }
+        out.push(b'"');
+        out
+    }
+
+    fn assert_matches_reference(s: &str) {
+        let expected = reference(s);
+        let mut written = Vec::new();
+        canonical_string_into(s, &mut |part| {
+            assert!(!part.is_empty(), "empty write for {s:?}");
+            written.extend_from_slice(part);
+        });
+        assert_eq!(written, expected, "{s:?}");
+        assert_eq!(canonical(&Value::String(s.to_owned())), expected, "{s:?}");
+        // Object keys take the same path.
+        let mut object = expected.clone();
+        object.insert(0, b'{');
+        object.extend_from_slice(b":null}");
+        assert_eq!(
+            canonical(&serde_json::json!({ (s): null })),
+            object,
+            "{s:?}"
+        );
+        let decoded: String = serde_json::from_slice(&expected).unwrap();
+        assert_eq!(decoded, s);
+    }
+
+    #[test]
+    fn edge_cases_match_the_reference_escaper() {
+        let mut cases: Vec<String> = [
+            "",
+            "\"",
+            "\\",
+            "\"\"",
+            "\\\\\"",
+            "a",
+            "plain ascii",
+            "\u{7f}",
+            "\u{80}",
+            "é",
+            "中",
+            "\u{7ff}\u{800}\u{d7ff}\u{e000}\u{fffd}\u{ffff}",
+            "\u{10000}",
+            "😀",
+            "\u{10ffff}",
+            "\u{2028}\u{2029}",
+            "a\"b\\c\nd",
+            "\"leading",
+            "trailing\\",
+            "\u{0}\u{1f}\u{20}",
+            "é\"中\\😀\u{1}",
+        ]
+        .map(String::from)
+        .to_vec();
+        for control in 0u8..=0x1f {
+            let c = char::from(control);
+            cases.push(c.to_string());
+            cases.push(format!("{c}{c}"));
+            cases.push(format!("x{c}é"));
+            cases.push(format!("😀{c}"));
+        }
+        for case in &cases {
+            assert_matches_reference(case);
+        }
+    }
+
+    #[test]
+    fn seeded_generated_strings_match_the_reference_escaper() {
+        // Every byte-length class and every escape, weighted toward the boundaries.
+        const POOL: &str = "\"\\\u{0}\u{8}\t\n\u{c}\r\u{1f} aZ~\u{7f}\u{80}é\u{7ff}\u{800}中\u{d7ff}\u{2028}\u{2029}\u{e000}\u{ffff}\u{10000}😀\u{10ffff}";
+        let pool: Vec<char> = POOL.chars().collect();
+        for seed in [0x1246_0001_u64, 0x1246_0002, 0x1246_0003] {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            for _ in 0..2_000 {
+                let len = rng.random_range(0..48);
+                let s: String = (0..len)
+                    .map(|_| match rng.random_range(0..4) {
+                        0 => char::from(rng.random_range(0u8..=0x1f)),
+                        1 => pool[rng.random_range(0..pool.len())],
+                        2 => char::from(rng.random_range(0x20u8..=0x7f)),
+                        _ => loop {
+                            if let Some(c) = char::from_u32(rng.random_range(0..=0x10_ffff)) {
+                                break c;
+                            }
+                        },
+                    })
+                    .collect();
+                assert_matches_reference(&s);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
