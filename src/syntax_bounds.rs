@@ -23,8 +23,36 @@ pub(crate) const VISITS: usize = 1_000_000;
 /// given input and grammar, never dependent on the clock. A parse whose count exceeds the bound
 /// is stopped, so a pathological document is refused before its parse ends, however loaded the
 /// machine. The largest real documents measured spend at most 52,330 ticks, and a Rust array
-/// just under the visit bound 58,842.
+/// just under the visit bound 58,842. The document's own parse counts each tick at
+/// [`parse_work`].
 pub(crate) const PARSE_TICKS: usize = 80_000;
+/// What one progress tick of a document's own parse counts toward [`PARSE_TICKS`] while
+/// tree-sitter's parse state reports an error (owner ruling 2026-11-20, #1227). On 2 MiB of
+/// syntax errors, such a tick takes on average about 1 to 25 times a clean tick's time: 25 for
+/// random JavaScript tokens, 7 to 10 for random punctuation, near 1 for one long unbalanced run.
+/// 25 also keeps the highest count measured on 1,840 large real files with an injected syntax
+/// error (49,330) as far under the bound as the largest real file (52,330). A document that is
+/// mostly syntax errors is then refused by the bound well before its parse ends.
+pub(crate) const ERROR_TICK_WEIGHT: usize = 25;
+
+/// The parse work one progress tick counts toward [`PARSE_TICKS`] (#1227): one, or
+/// [`ERROR_TICK_WEIGHT`] while tree-sitter's parse state reports an error. That is the only
+/// error signal the progress callback gets, and it costs nothing; the parser's logger would
+/// name every recovery step, but slows every parse three to five times. The flag turns on when
+/// the parser skips a token with every parse version in error recovery, and stays on until a
+/// later skip finds a version that recovered. So it is a property of the input alone and the
+/// count stays deterministic. A document without syntax errors never sets it, so its count is
+/// its tick count, as before. The flag misses recovery that always keeps one version out of
+/// error, and it can stay on after the parser has recovered, so it only approximates recovery
+/// work. Macro re-parses count one per tick: each one on the way to a measured impl is a
+/// re-parse that measurement found free of errors.
+pub(crate) fn parse_work(state: &tree_sitter::ParseState) -> usize {
+    if state.has_error() {
+        ERROR_TICK_WEIGHT
+    } else {
+        1
+    }
+}
 
 /// What one document's syntax lost.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -173,6 +201,59 @@ fn range(node: Node<'_>) -> Range {
     }
 }
 
+/// Inputs and a counter for the parse-work weight's tests (#1227).
+#[cfg(test)]
+pub(crate) mod parse_work_inputs {
+    use super::parse_work;
+
+    /// 1 MiB of unbalanced closing brackets: tree-sitter spends almost its whole parse in error
+    /// recovery, in every grammar, and the parse state says so from its first tick. Its ticks
+    /// (about 16,000) are well under the parse-work bound.
+    pub(crate) fn syntax_errors() -> String {
+        ") ] } ".repeat((1 << 20) / 6)
+    }
+
+    /// Clean source in `language` of at most `bytes`, as close to it as whole items allow.
+    pub(crate) fn clean_of_size(language: &str, bytes: usize) -> String {
+        let item = match language {
+            "rust" => "impl Saaaaaaaa { fn fbbbbbbbb() {} }\n",
+            "python" => "def faaaaaaaa(b):\n    return b + 1\n",
+            _ => "function faaaaaaaa(b) { return b + 1; }\n",
+        };
+        item.repeat(bytes / item.len())
+    }
+
+    pub(crate) fn grammar(language: &str) -> tree_sitter::Language {
+        match language {
+            "rust" => tree_sitter_rust::LANGUAGE.into(),
+            "javascript" => tree_sitter_javascript::LANGUAGE.into(),
+            "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            "python" => tree_sitter_python::LANGUAGE.into(),
+            _ => unreachable!("{language}"),
+        }
+    }
+
+    /// A whole parse's progress ticks, and its parse work as the bounded readers count it.
+    pub(crate) fn ticks_and_work(language: &str, text: &str) -> (usize, usize) {
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&grammar(language)).unwrap();
+        let (mut ticks, mut work) = (0, 0);
+        let mut progress = |state: &tree_sitter::ParseState| {
+            ticks += 1;
+            work += parse_work(state);
+            std::ops::ControlFlow::Continue(())
+        };
+        parser
+            .parse_with_options(
+                &mut |offset, _| &text.as_bytes()[offset..],
+                None,
+                Some(tree_sitter::ParseOptions::new().progress_callback(&mut progress)),
+            )
+            .unwrap();
+        (ticks, work)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,6 +309,30 @@ mod tests {
     fn a_syntax_error_in_syntax_of_any_depth_scans_without_recursion() {
         let source = format!("{}{};", "[".repeat(200_000), ")".repeat(3));
         assert_eq!(gap(&source).unwrap().reason, "syntax_error");
+    }
+
+    /// Owner ruling 2026-11-20 (#1227): a document that is mostly syntax errors counts its
+    /// error-recovery ticks at [`ERROR_TICK_WEIGHT`], so its parse work is over the bound though
+    /// its ticks are not, in every language the bound covers. A clean document of the same size
+    /// counts exactly its ticks, as before the weight. Each count is the same on every run.
+    #[test]
+    fn error_recovery_counts_more_parse_work_and_a_clean_parse_counts_its_ticks() {
+        use parse_work_inputs::*;
+        let garbage = syntax_errors();
+        for language in ["rust", "javascript", "typescript", "python"] {
+            let count = |text: &str| {
+                let runs: Vec<_> = (0..3).map(|_| ticks_and_work(language, text)).collect();
+                assert!(runs.windows(2).all(|w| w[0] == w[1]), "{language} {runs:?}");
+                runs[0]
+            };
+            let (ticks, work) = count(&garbage);
+            assert!(
+                ticks < PARSE_TICKS && work > PARSE_TICKS,
+                "{language} {ticks} {work}"
+            );
+            let (ticks, work) = count(&clean_of_size(language, garbage.len()));
+            assert_eq!(work, ticks, "{language}");
+        }
     }
 
     #[test]
