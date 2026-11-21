@@ -302,7 +302,7 @@ fn read_join(
         revision_id: row
             .get::<_, Option<String>>(offset + 2)?
             .unwrap_or_else(|| scope.native.to_owned()),
-        content_hash: row.get(offset + 3)?,
+        content_hash: id_codec::decode_digest(row.get_ref(offset + 3)?.as_blob()?)?,
         range: Range {
             start: start as usize,
             end: end as usize,
@@ -444,7 +444,7 @@ fn cache_rows(
             "original provenance source mismatch"
         );
         let kind = semantic_variant(&derived.record_kind)?;
-        let membership:bool=db.prepare_cached("SELECT EXISTS(SELECT 1 FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id=?2 AND record_kind=?3 AND fact_digest=?4 AND language=?5 AND path=?6)")?.query_row(params![a.capture_id,derived.provenance_id,kind,derived.fact_digest,w.document.language,w.document.path],|r|r.get(0))?;
+        let membership:bool=db.prepare_cached("SELECT EXISTS(SELECT 1 FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id=?2 AND record_kind=?3 AND fact_digest=?4 AND language=?5 AND path=?6)")?.query_row(params![a.capture_id,id_codec::encode_digest(&derived.provenance_id),kind,id_codec::encode_digest(&derived.fact_digest),w.document.language,w.document.path],|r|r.get(0))?;
         selected_ensure!(membership, "original derivation identity mismatch");
         let basis_id = match bases.iter().position(|b| b == basis) {
             Some(index) => index,
@@ -913,7 +913,7 @@ fn association_unit(
             let want = limit;
             let rows = query_rows(
                 db,
-                "SELECT p.ordinal,p.content_hash,p.evidence_kind,p.ordinal,p.basis_id,p.capture_id,p.derived_from_provenance_id,p.derived_from_record_kind,p.derived_from_fact_digest,EXISTS(SELECT 1 FROM semantic_raw_proofs r WHERE r.capture_id=p.capture_id AND r.proof_id=p.derived_from_provenance_id AND r.record_kind=p.derived_from_record_kind AND r.fact_digest=p.derived_from_fact_digest AND r.language=?3 AND r.path=?4) FROM semantic_provenance p WHERE p.payload_id=?1 AND p.ordinal>?2 ORDER BY p.ordinal LIMIT ?5",
+                "SELECT p.ordinal,lower(hex(p.content_hash)),p.evidence_kind,p.ordinal,p.basis_id,p.capture_id,CASE WHEN p.derived_from_provenance_id IS NULL THEN NULL ELSE lower(hex(p.derived_from_provenance_id)) END,p.derived_from_record_kind,CASE WHEN p.derived_from_fact_digest IS NULL THEN NULL ELSE lower(hex(p.derived_from_fact_digest)) END,EXISTS(SELECT 1 FROM semantic_raw_proofs r WHERE r.capture_id=p.capture_id AND r.proof_id=p.derived_from_provenance_id AND r.record_kind=p.derived_from_record_kind AND r.fact_digest=p.derived_from_fact_digest AND r.language=?3 AND r.path=?4) FROM semantic_provenance p WHERE p.payload_id=?1 AND p.ordinal>?2 ORDER BY p.ordinal LIMIT ?5",
                 params![
                     w.payload(),
                     c.after_id,

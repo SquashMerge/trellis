@@ -3101,7 +3101,7 @@ fn parsed_sha(descriptor: &(PathBuf, String)) -> String {
 fn stored_proofs(world: &World) -> Vec<(String, String, String, String, String)> {
     world
         .db()
-        .prepare("SELECT proof_id,record_kind,fact_digest,language,path FROM semantic_raw_proofs ORDER BY proof_id")
+        .prepare("SELECT lower(hex(proof_id)),record_kind,lower(hex(fact_digest)),language,path FROM semantic_raw_proofs ORDER BY proof_id")
         .unwrap()
         .query_map([], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
@@ -3204,7 +3204,7 @@ fn identical_envelopes_are_deduplicated_per_authenticated_tuple() {
     let digests = |world: &World| -> Vec<String> {
         world
             .db()
-            .prepare("SELECT fact_digest FROM semantic_raw_proofs ORDER BY fact_digest")
+            .prepare("SELECT lower(hex(fact_digest)) FROM semantic_raw_proofs ORDER BY fact_digest")
             .unwrap()
             .query_map([], |row| row.get(0))
             .unwrap()
@@ -3530,7 +3530,7 @@ fn real_module_marker_batch(language: &str) {
     let db = world.db();
     for claim in &memory.merged.claims {
         let (kind, digest, bytes): (String, String, Vec<u8>) = db.query_row(
-            "SELECT record_kind,fact_digest,canonical_bytes FROM semantic_raw_proofs WHERE proof_id=?1",
+            "SELECT record_kind,lower(hex(fact_digest)),canonical_bytes FROM semantic_raw_proofs WHERE proof_id=unhex(?1)",
             [&claim.captured_proof_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ).unwrap();
         assert_eq!(kind, claim.envelope.record_kind);
@@ -6484,7 +6484,7 @@ fn gc_keeps_proofs_referenced_by_retained_provenance() {
     let (capture_id, proof_id): (i64, String) = world
         .db()
         .query_row(
-            "SELECT p.capture_id,p.proof_id FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE c.batch_id=?1 ORDER BY p.rowid LIMIT 1",
+            "SELECT p.capture_id,lower(hex(p.proof_id)) FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE c.batch_id=?1 ORDER BY p.rowid LIMIT 1",
             [first_batch],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -6493,7 +6493,7 @@ fn gc_keeps_proofs_referenced_by_retained_provenance() {
         .store
         .with_index_sql_for_tests(|db| {
             let changed = db.execute(
-                "UPDATE semantic_provenance SET capture_id=?1,derived_from_provenance_id=?2,derived_from_record_kind=(SELECT record_kind FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id=?2),derived_from_fact_digest=(SELECT fact_digest FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id=?2) WHERE rowid=(SELECT v.rowid FROM semantic_provenance v JOIN semantic_coverage c ON c.payload_id=v.payload_id WHERE c.revision_id=?3 AND v.capture_id IS NOT NULL LIMIT 1)",
+                "UPDATE semantic_provenance SET capture_id=?1,derived_from_provenance_id=unhex(?2),derived_from_record_kind=(SELECT record_kind FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id=unhex(?2)),derived_from_fact_digest=(SELECT fact_digest FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id=unhex(?2)) WHERE rowid=(SELECT v.rowid FROM semantic_provenance v JOIN semantic_coverage c ON c.payload_id=v.payload_id WHERE c.revision_id=?3 AND v.capture_id IS NOT NULL LIMIT 1)",
                 rusqlite::params![capture_id, proof_id, format!("pin:v1:{}:{}", head.index_generation, head.index_revision)],
             )?;
             assert_eq!(changed, 1);
@@ -6505,7 +6505,7 @@ fn gc_keeps_proofs_referenced_by_retained_provenance() {
     world.store.maintain_revisions(&leader).unwrap();
     let survivors: Vec<(i64, String)> = world
         .db()
-        .prepare("SELECT p.capture_id,p.proof_id FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE c.batch_id=?1")
+        .prepare("SELECT p.capture_id,lower(hex(p.proof_id)) FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE c.batch_id=?1")
         .unwrap()
         .query_map([first_batch], |row| Ok((row.get(0)?, row.get(1)?)))
         .unwrap()
@@ -11928,7 +11928,7 @@ fn review655_multiple_bad_documents_publication_differential() {
     assert_eq!(symbols(&snapshot).len(), 2);
     let proofs = |hash: &str, paths: &[&str]| -> Vec<(String, String, Vec<u8>)> {
         let db = world.db();
-        let mut stmt = db.prepare("SELECT p.path,p.fact_digest,p.canonical_bytes FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE c.artifact_hash=?1 ORDER BY p.path,p.canonical_bytes").unwrap();
+        let mut stmt = db.prepare("SELECT p.path,lower(hex(p.fact_digest)),p.canonical_bytes FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE c.artifact_hash=?1 ORDER BY p.path,p.canonical_bytes").unwrap();
         stmt.query_map([hash], |r| {
             Ok((
                 r.get::<_, String>(0)?,

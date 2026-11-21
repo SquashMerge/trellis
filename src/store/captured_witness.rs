@@ -160,7 +160,7 @@ mod tests {
     #[test]
     fn orphan_witness_chunk_invalidates_marker_and_allows_complete_rebuild() {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(CACHE_SCHEMA_V43).unwrap();
+        db.execute_batch(CACHE_SCHEMA_V44).unwrap();
         db.pragma_update(None, "foreign_keys", "ON").unwrap();
         db.execute(
             "INSERT INTO semantic_raw_batches VALUES(1,'producer','1','profile',
@@ -231,7 +231,7 @@ mod tests {
     #[test]
     fn orphan_witness_cleanup_defers_batches_past_the_header_chunk() {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(CACHE_SCHEMA_V43).unwrap();
+        db.execute_batch(CACHE_SCHEMA_V44).unwrap();
         db.pragma_update(None, "foreign_keys", "ON").unwrap();
         let hash = "a".repeat(64);
         // One more header than a release chunk; the first batch keeps its capture through
@@ -253,9 +253,9 @@ mod tests {
         .unwrap();
         for proof in 1..=65 {
             db.execute(
-                "INSERT INTO semantic_raw_proofs VALUES(1,?1,'occurrence',?2,
+                "INSERT INTO semantic_raw_proofs VALUES(1,unhex(?1),'occurrence',unhex(?2),
                  'rust','main.rs',X'')",
-                params![format!("proof-{proof}"), format!("{proof:064x}")],
+                params![format!("{:064x}", 1000 + proof), format!("{proof:064x}")],
             )
             .unwrap();
         }

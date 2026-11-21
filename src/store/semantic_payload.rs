@@ -404,7 +404,7 @@ impl PayloadProjection<'_> {
         let row: Option<(Option<String>, Option<String>, String)> = self
             .db
             .prepare_cached(
-                "SELECT provenance_id,derived_from_provenance_id,evidence_kind FROM semantic_provenance WHERE payload_id=?1 AND ordinal=?2",
+                "SELECT provenance_id,CASE WHEN derived_from_provenance_id IS NULL THEN NULL ELSE lower(hex(derived_from_provenance_id)) END,evidence_kind FROM semantic_provenance WHERE payload_id=?1 AND ordinal=?2",
             )?
             .query_row(params![payload, ordinal], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?))
@@ -572,7 +572,7 @@ mod tests {
             anchor: sem::MeasuredAnchor {
                 document: document(path),
                 revision_id: "native".into(),
-                content_hash: "h".into(),
+                content_hash: "c".repeat(64),
                 range: Range { start: 0, end: 1 },
                 kind,
             },
@@ -638,7 +638,7 @@ mod tests {
             producer_id: "producer".into(),
             document: document("main.js"),
             revision_id: "native".into(),
-            content_hash: "h".into(),
+            content_hash: "c".repeat(64),
             evidence_kind: sem::EvidenceKind::MeasuredSyntax,
             basis: Some(sem::SemanticBasis {
                 producer_id: "producer".into(),
@@ -751,7 +751,7 @@ mod tests {
     #[test]
     fn writer_rejects_dependency_endpoint_missing_from_revision() {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(CACHE_SCHEMA_V43).unwrap();
+        db.execute_batch(CACHE_SCHEMA_V44).unwrap();
         db.pragma_update(None, "foreign_keys", "OFF").unwrap();
         db.execute("INSERT INTO native_revisions VALUES('key','set',?1,?1,?1,'native','[]','[]','{}','[]','[]',NULL,'[]',0,'{}','[]',1)", ["a".repeat(64)]).unwrap();
         let (_, mut publication) = every_endpoint();
@@ -786,7 +786,7 @@ mod tests {
     #[test]
     fn unbatched_payload_records_null_terms_and_no_targets() {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(CACHE_SCHEMA_V43).unwrap();
+        db.execute_batch(CACHE_SCHEMA_V44).unwrap();
         db.pragma_update(None, "foreign_keys", "OFF").unwrap();
         db.execute("INSERT INTO native_revisions VALUES('key','set',?1,?1,?1,'native','[]','[]','{}','[]','[]',NULL,'[]',0,'{}','[]',1)", ["a".repeat(64)]).unwrap();
         let (_, mut publication) = every_endpoint();
@@ -831,7 +831,7 @@ mod tests {
     }
 
     fn payload_with_children(db: &Connection, key: Option<&str>, symbols: usize) {
-        db.execute_batch(CACHE_SCHEMA_V43).unwrap();
+        db.execute_batch(CACHE_SCHEMA_V44).unwrap();
         db.pragma_update(None, "foreign_keys", "OFF").unwrap();
         db.execute(
             "INSERT INTO semantic_payloads(payload_id,payload_key,producer_id,producer_version,language,path,version_id,batch_id) VALUES(1,?1,'p','1','javascript','a.js','v',1)",

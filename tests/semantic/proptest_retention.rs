@@ -265,7 +265,7 @@ impl Machine {
     }
     fn raw_proofs(&self, id: i64) -> Vec<(String, String, String, Vec<u8>)> {
         let db = self.world.db();
-        let mut q = db.prepare("SELECT p.proof_id,p.record_kind,p.fact_digest,p.canonical_bytes FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE c.batch_id=?1 ORDER BY c.ordinal,p.proof_id").unwrap();
+        let mut q = db.prepare("SELECT lower(hex(p.proof_id)),p.record_kind,lower(hex(p.fact_digest)),p.canonical_bytes FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE c.batch_id=?1 ORDER BY c.ordinal,p.proof_id").unwrap();
         q.query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
             .unwrap()
             .map(Result::unwrap)

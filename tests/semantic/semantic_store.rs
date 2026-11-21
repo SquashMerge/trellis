@@ -2484,7 +2484,7 @@ fn raw_proof_import_cas_and_selected_read_are_atomic() {
     let proof_id: String = world
         .db()
         .query_row(
-            "SELECT p.proof_id FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE c.producer_id='scip-typescript' AND p.record_kind='occurrence' LIMIT 1",
+            "SELECT lower(hex(p.proof_id)) FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE c.producer_id='scip-typescript' AND p.record_kind='occurrence' LIMIT 1",
             [],
             |r| r.get(0),
         )
@@ -2492,7 +2492,7 @@ fn raw_proof_import_cas_and_selected_read_are_atomic() {
     world
         .db()
         .execute(
-            "UPDATE semantic_raw_proofs SET record_kind='relationship' WHERE proof_id=?1",
+            "UPDATE semantic_raw_proofs SET record_kind='relationship' WHERE proof_id=unhex(?1)",
             [&proof_id],
         )
         .unwrap();
