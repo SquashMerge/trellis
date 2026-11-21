@@ -1284,6 +1284,11 @@ class SelectedView:
             for family in ("syntax", "class-ref"):
                 if family == "syntax" and value.startswith("sid:v1:"):
                     return self.map(family, bytes.fromhex(value[7:]))
+                if family == "class-ref" and value.startswith("class-ref::"):
+                    # A Rust impl block's extracted relation has no owner until
+                    # composition names one; its ID holds only path-relative bytes,
+                    # kind and type name, nothing root-derived, so compare it as is.
+                    return value
                 if family == "class-ref" and value.startswith("class-ref:"):
                     return self.map(family, value)
             return value
