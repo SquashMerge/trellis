@@ -9,7 +9,8 @@
 - **Amends:** nothing in W2's output. [`../../mcp-readonly-pilot-contract.md`](../../mcp-readonly-pilot-contract.md) § W2 keeps its literal ASCII-`lower`/`instr` rule, ranking, limits and truncation. This record adds only how candidates are found.
 - **Search-side table:** [Decision 0018](0018-semantic-symbol-retrieval.md) specifies a separate head-only split-identifier ranking table. Both trigram prefilters and all literal matching/output rules in this decision remain unchanged. Neither trigram table serves semantic-search ranking.
 - **Ranking amendment (#594):** W2 now orders stored production declarations before test declarations within each exact/prefix/substring tier, before the limit. The literal and trigram paths use this same amended rule. The browser/CLI graph search order is unchanged. Ordered W2 queries use separate production/test passes in each tier to retain the indexed name/ID early stop; the native indexes are no longer covering because they do not store the role.
-- **Compatibility:** none needed for disposable derived indexes. The new tables change the index format, so the index schema version changes and existing indexes are recreated, not migrated.
+- **Publication fill amendment (#1246):** Amended 2026-11-21 (owner, #1246): insert triggers removed; each publication fills the trigram tables explicitly in its own transaction. The tables, their contents, queries and output are unchanged. See *Storage and maintenance*.
+- **Compatibility:** none needed for disposable derived indexes. The new tables change the index format, so the index schema version changes and existing indexes are recreated, not migrated. Removing the insert triggers (#1246) advances the schema to 44 the same way.
 
 ## Decision
 
@@ -47,7 +48,8 @@
 
 - **Storage and maintenance:**
   - Both tables are contentless (`content=''`, `columnsize=0`) and keyed by the source row's `rowid`.
-  - Triggers on the source table keep them in step on insert, delete and name update, so every existing publication, retention and rebaseline path maintains them.
+  - Each publication fills them for the source rows it inserted, once, in its own transaction, after its last source row: every row above the source table's highest rowid at the start of the writes, with the same `lower`ed name. A publication only appends source rows between those points and never chooses a rowid, so those rows are exactly the ones it inserted. Every source-row insert goes through that one publication path (full, edit, stream or not, and rebaseline), so no other writer needs a fill. *(Amended 2026-11-21 (owner, #1246): insert triggers removed; each publication fills the trigram tables explicitly in its own transaction. An AFTER INSERT trigger made every source insert open a statement journal, and FTS5 then flushed its pending terms at each later statement's savepoint: about 30% of publication's SQLite insert time.)*
+  - Triggers on the source table still apply deletes and name updates, so every retention, collection and rebaseline delete maintains them. They fire only on those statements, never on publication's inserts.
   - A delete uses FTS5's `'delete'` command with the same `lower`ed name the insert wrote. `contentless_delete=1` was measured about 7× slower to insert at 10k.
 - **FTS5 settings:** phrase matching needs `detail=full`. `detail=none` and `detail=column` reject a multi-trigram string.
 - **The ID scan:** it reads an existing covering index, such as the primary keys `(version_id, syntax_id)` and `(projection_id, id)`; SQLite may pick another covering index, for example `graph_nodes_name`. Either way it never reads the wide rows. Indexing IDs as trigrams cost about 95% of the tables' size, because each ID adds about 37 near-unique trigrams.
