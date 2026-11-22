@@ -25,7 +25,8 @@ fn workspace() -> (
         .unwrap();
     }
     let options = IndexOptions::new(work.path().to_owned());
-    let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let store =
+        crate::testing::retry_admission(|| Store::open_for_tests(state.path(), work.path()));
     (state, work, store, options, batch_len)
 }
 
