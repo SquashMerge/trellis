@@ -69,6 +69,14 @@ pub(super) fn check(
         }
         let full = full_rejoin(store, db, target, selection, producer, cancel)?;
         check_cancel(cancel)?;
+        // The staged rows keep capture-bound `direct`s that the in-memory rejoin, the
+        // reader-visible reference, demotes: compare them as the head will read them (#1279).
+        semantic_payload::project_publication(
+            db,
+            &semantic_pin_key(target.pin),
+            &semantic_pin_key(selection.captured_pin),
+            &mut actual,
+        )?;
         if TEST_REJOIN_ORACLE_MISMATCH.get()
             || sorted_publication_rows(&actual)? != sorted_publication_rows(&full)?
         {
@@ -140,13 +148,14 @@ pub(in crate::store) fn check_published(
 pub(in crate::store) fn check_hit(
     db: &Connection,
     key: &str,
+    captured: &str,
     tuple: i64,
     coverage: &sem::Coverage,
     publication: &sem::SemanticPublication,
 ) -> Result<()> {
     let owns = semantic_payload::owned_provenance(coverage, publication);
     let mine = |id: &str| owns.contains(id);
-    let settled = sem::SemanticPublication {
+    let mut settled = sem::SemanticPublication {
         producers: vec![],
         coverage: vec![coverage.clone()],
         provenance: publication
@@ -186,6 +195,8 @@ pub(in crate::store) fn check_hit(
             .cloned()
             .collect(),
     };
+    // The settled rows keep capture-bound `direct`s; the read applies the demotion (#1279).
+    semantic_payload::project_publication(db, key, captured, &mut settled)?;
     let source_set: String = db.query_row(
         "SELECT source_set_id FROM native_revisions WHERE id=?1",
         [key],

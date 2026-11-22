@@ -10479,6 +10479,341 @@ fn witnessed_local_rejoin_does_not_keep_a_method_direct_in_an_edited_document() 
     assert_eq!(calls(&world), [call("f", "Unknown"), call("g", "Direct")]);
 }
 
+/// A declaration rule over the dispatch fixture: `concrete` must call `navigation_at`. Only a
+/// `direct` internal binding is a hit; any other binding leaves the rule unknown.
+const DISPATCH_RULES: &str = r#"version = 1
+[roles.concrete]
+select = { name = "concrete" }
+[roles.nav]
+select = { name = "navigation_at" }
+[[rules]]
+id = "concrete-navigates"
+for_each = "concrete"
+require = [{ calls = "nav" }]
+"#;
+
+/// #1279 (Decision 0021 D1 and D4 as amended 2026-11-21) on real rust-analyzer bytes: the first
+/// comment edit of the document declaring the inherent methods `new` and `navigation_at` leaves
+/// their caller's payload in place (S copies `src/lib.rs`), and every reader applies the #557
+/// demotion at read time, as re-settling the caller would: the tuple read (MCP declaration and
+/// show, CLI and web semantic views), the call graph's edge bindings, the sequence view, source
+/// navigation (whose call rows are sized in SQL) and the architecture rules check. While the
+/// edit stands the basis is possibly stale, so the graph, sequence and navigation stop at those
+/// calls either way; the bindings they carry still show `unknown`. A later edit reads the same;
+/// a revert to the captured bytes reads, and expands, `direct` again. The in-S oracle is on and
+/// the head equals FULL after each step.
+#[test]
+fn readers_demote_a_capture_bound_direct_after_a_first_edit_and_restore_it_on_revert() {
+    use trellis::graph_query::{BoundaryReason, GraphQuery, Visit};
+    use trellis::navigation::{NavigationRequest, SourceSelector};
+    use trellis::semantic_evidence::Dispatch;
+    let world = world(|root| copy_tree(&Path::new(RUST_ANALYZER_DISPATCH).join("workspace"), root));
+    let descriptor = rust_dispatch_batch(&world);
+    let (pin, admitted, _) = world.publish(&descriptor).unwrap();
+    drop(admitted);
+    let producer = world.store.semantic_at(pin).unwrap().producers[0]
+        .id
+        .clone();
+    let concrete = dispatch_declaration(&world, "concrete", None);
+    let methods = [
+        dispatch_declaration(&world, "new", None),
+        dispatch_declaration(&world, "navigation_at", None),
+    ];
+    let observe = |world: &World, direct: bool| {
+        let head = world.store.index_baseline().unwrap();
+        let expected = if direct {
+            Dispatch::Direct
+        } else {
+            Dispatch::Unknown
+        };
+        // Tuple reads.
+        let calls = rust_calls(world, &world.store.semantic_at(head).unwrap().call_bindings);
+        for callee in ["new", "navigation_at"] {
+            let found: Vec<_> = calls
+                .iter()
+                .filter(|call| call[0] == "src/lib.rs" && call[1] == callee)
+                .collect();
+            assert!(!found.is_empty(), "{callee}");
+            assert!(
+                found.iter().all(|call| call[3] == format!("{expected:?}")),
+                "{callee}: {found:?}"
+            );
+        }
+        // The call graph: a direct call expands, an unknown one is a dispatch boundary.
+        let graph = world
+            .store
+            .evidence_response()
+            .unwrap()
+            .graph_query(
+                &GraphQuery {
+                    root_syntax_id: concrete.clone(),
+                    semantic_producer_id: Some(producer.clone()),
+                    depth: 1,
+                    max_nodes: 150,
+                    max_calls: 500,
+                    include_external: true,
+                    include_tests: true,
+                    app_paths: None,
+                },
+                None,
+                &mut || Ok(()),
+            )
+            .unwrap()
+            .outcome
+            .expect("contract success");
+        // Matched by the binding's declared target: after an edit the basis is possibly stale,
+        // so every edge is a `stale` boundary with no `to`, and the projected dispatch shows in
+        // the binding the edge carries.
+        for method in &methods {
+            let edges: Vec<_> = graph
+                .edges
+                .iter()
+                .filter(|edge| {
+                    matches!(
+                        edge.binding.as_ref().and_then(|b| b.declared_target.as_ref()),
+                        Some(trellis::semantic_evidence::Target::Internal { syntax_id, .. })
+                            if syntax_id == method
+                    )
+                })
+                .collect();
+            assert!(!edges.is_empty(), "{method}");
+            for edge in edges {
+                assert_eq!(edge.binding.as_ref().unwrap().dispatch, expected);
+                if direct {
+                    assert_eq!(edge.to.as_deref(), Some(method.as_str()));
+                    assert_eq!(edge.boundary_reason, BoundaryReason::None);
+                } else {
+                    assert_eq!(edge.visit, Visit::Boundary);
+                    assert_ne!(edge.boundary_reason, BoundaryReason::None);
+                }
+            }
+        }
+        // The sequence view: a lane for each method only while its call is direct.
+        let view = world
+            .store
+            .sequence_at(&concrete, head, false)
+            .unwrap()
+            .unwrap();
+        for method in &methods {
+            assert_eq!(
+                view.participants.iter().any(|lane| &lane.id == method),
+                direct,
+                "{method}"
+            );
+        }
+        // Source navigation on `concrete`'s first two calls: a call target only while direct.
+        for line in [16, 17] {
+            let navigation = world
+                .store
+                .navigation_at(&NavigationRequest::Source(SourceSelector {
+                    expected_revision: head,
+                    path: "src/lib.rs".into(),
+                    line,
+                    semantic_producer_id: Some(producer.clone()),
+                    semantic_producer_policy: None,
+                }))
+                .unwrap();
+            assert_eq!(
+                navigation
+                    .targets
+                    .iter()
+                    .any(|target| target.call_id.is_some() && methods.contains(&target.symbol.id)),
+                direct,
+                "line {line}: {:?}",
+                navigation
+                    .targets
+                    .iter()
+                    .map(|target| (&target.symbol.id, &target.symbol.name, &target.call_id))
+                    .collect::<Vec<_>>()
+            );
+        }
+        // The architecture rules check: only a direct binding is a hit. The rules are read at
+        // request time; they are removed again before the next edit's capture.
+        fs::create_dir_all(world.root.join(".trellis")).unwrap();
+        fs::write(world.root.join(".trellis/rules.toml"), DISPATCH_RULES).unwrap();
+        let response = world.store.evidence_response().unwrap();
+        let check = response
+            .architecture_response("check", &json!({"expectedBasis": head}), &mut || Ok(()))
+            .unwrap();
+        let check = response.finish(check).unwrap();
+        drop(response);
+        fs::remove_dir_all(world.root.join(".trellis")).unwrap();
+        let row = check["instances"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["rule"] == "concrete-navigates")
+            .unwrap();
+        assert_eq!(
+            row["status"],
+            if direct { "conforms" } else { "unknown" },
+            "{row}"
+        );
+    };
+    observe(&world, true);
+    let counts = world._state.path().join("work-counts.json");
+    issue_826_env(&world, &counts, None);
+    let shapes = fs::read_to_string(world.root.join("src/shapes.rs")).unwrap();
+    for (edit, direct) in [
+        (format!("{shapes}// edited\n"), false),
+        (format!("{shapes}// edited twice\n"), false),
+        (shapes.clone(), true),
+    ] {
+        let work = local_edit(&world, "src/shapes.rs", &edit, &counts);
+        assert_eq!(work["witnessedRejoins"], 1, "{work}");
+        assert!(
+            copied(&work, "src/lib.rs"),
+            "the caller's payload stays: {work}"
+        );
+        assert_head_matches_full(&world, &descriptor);
+        observe(&world, direct);
+    }
+}
+
+/// #1279 (Decision 0021 D1 as amended 2026-11-21): older-basis architecture evidence reads a
+/// capture-bound call's dispatch at its semantic basis P, through the same projection as P's
+/// tuple read, in its behavior and in its `historicalDispatch` wire metadata alike. After the
+/// first comment edit of `src/shapes.rs` and its S at P, and again after the revert and its S, a
+/// native N that adds an unrelated document is published with S held, so `src/lib.rs` is
+/// older-basis evidence of P. Every `historicalDispatch` in N's references and in its rule
+/// evidence then equals P's tuple-read dispatch of that call: `unknown` while the edit stands,
+/// `direct` after the revert, never the stored `direct` alone.
+#[test]
+fn older_basis_architecture_reads_historical_dispatch_at_the_semantic_basis() {
+    use trellis::model::SemanticStatus;
+    use trellis::semantic_evidence::Dispatch;
+    // Every `(callId, historicalDispatch)` anywhere in an answer.
+    fn historical(value: &Value, out: &mut Vec<(Value, Value)>) {
+        match value {
+            Value::Object(fields) => {
+                if let Some(dispatch) = fields.get("historicalDispatch") {
+                    out.push((fields["callId"].clone(), dispatch.clone()));
+                }
+                fields.values().for_each(|v| historical(v, out));
+            }
+            Value::Array(items) => items.iter().for_each(|v| historical(v, out)),
+            _ => {}
+        }
+    }
+    let world = world(|root| copy_tree(&Path::new(RUST_ANALYZER_DISPATCH).join("workspace"), root));
+    let descriptor = rust_dispatch_batch(&world);
+    let (pin, admitted, _) = world.publish(&descriptor).unwrap();
+    drop(admitted);
+    let producer = world.store.semantic_at(pin).unwrap().producers[0]
+        .id
+        .clone();
+    let methods = [
+        dispatch_declaration(&world, "new", None),
+        dispatch_declaration(&world, "navigation_at", None),
+    ];
+    let counts = world._state.path().join("work-counts.json");
+    issue_826_env(&world, &counts, None);
+    let shapes = fs::read_to_string(world.root.join("src/shapes.rs")).unwrap();
+    for (edit, direct, unrelated) in [
+        (format!("{shapes}// edited\n"), false, "src/unrelated_a.rs"),
+        (shapes.clone(), true, "src/unrelated_b.rs"),
+    ] {
+        let work = local_edit(&world, "src/shapes.rs", &edit, &counts);
+        assert!(
+            copied(&work, "src/lib.rs"),
+            "the caller's payload stays: {work}"
+        );
+        let p = world.store.index_baseline().unwrap();
+        // P's tuple read: the projected dispatch of each of `src/lib.rs`'s calls.
+        let at_p = world.store.semantic_at(p).unwrap();
+        let expected: std::collections::BTreeMap<String, Value> = at_p
+            .call_bindings
+            .iter()
+            .filter(|binding| binding.join.anchor.document.path == "src/lib.rs")
+            .map(|binding| {
+                (
+                    binding.call_id.clone().unwrap(),
+                    serde_json::to_value(binding.dispatch).unwrap(),
+                )
+            })
+            .collect();
+        let method_calls: Vec<&String> = at_p
+            .call_bindings
+            .iter()
+            .filter(|binding| {
+                matches!(
+                    binding.declared_target.as_ref(),
+                    Some(trellis::semantic_evidence::Target::Internal { syntax_id, .. })
+                        if methods.contains(syntax_id)
+                )
+            })
+            .map(|binding| binding.call_id.as_ref().unwrap())
+            .collect();
+        assert!(!method_calls.is_empty());
+        let projected = if direct {
+            Dispatch::Direct
+        } else {
+            Dispatch::Unknown
+        };
+        for call in &method_calls {
+            assert_eq!(
+                expected[call.as_str()],
+                serde_json::to_value(projected).unwrap()
+            );
+        }
+        // N adds a document no payload names, with S held: `src/lib.rs` reads P as older basis.
+        write_files(&world.root, &[(unrelated, "pub fn unrelated() {}\n")]);
+        let (graph, native, capture) = index_workspace_bundle(
+            &IndexOptions::new(world.root.clone()),
+            world.store.root_id(),
+            &world.cancel,
+            |_| {},
+        )
+        .unwrap();
+        let leader = world.store.publication_for_tests().unwrap();
+        let n = world
+            .store
+            .publish_native(&graph, &capture, &native, &leader, p, &world.cancel)
+            .unwrap();
+        drop(leader);
+        assert_ne!(n, p);
+        let older = world
+            .store
+            .semantic_projection_at(n, &producer, "rust", "src/lib.rs")
+            .unwrap()
+            .unwrap();
+        assert_eq!(older.semantic_status, SemanticStatus::OlderBasis);
+        assert_eq!(older.semantic_basis_pin, p);
+        fs::create_dir_all(world.root.join(".trellis")).unwrap();
+        fs::write(world.root.join(".trellis/rules.toml"), DISPATCH_RULES).unwrap();
+        let response = world.store.evidence_response().unwrap();
+        let arguments = json!({"expectedBasis": n, "limit": 50});
+        let mut answers = Vec::new();
+        for kind in ["references", "check"] {
+            let answer = response
+                .architecture_response(kind, &arguments, &mut || Ok(()))
+                .unwrap();
+            answers.push((kind, response.finish(answer).unwrap()));
+        }
+        drop(response);
+        fs::remove_dir_all(world.root.join(".trellis")).unwrap();
+        for (kind, answer) in &answers {
+            let mut found = Vec::new();
+            historical(answer, &mut found);
+            let methods_found = found
+                .iter()
+                .filter(|(call, _)| method_calls.iter().any(|m| call == &json!(m)))
+                .count();
+            assert!(methods_found > 0, "{kind}: {answer}");
+            for (call, dispatch) in found {
+                let call = call.as_str().unwrap();
+                assert_eq!(
+                    Some(&dispatch),
+                    expected.get(call),
+                    "{kind}: call {call} at basis {p:?}"
+                );
+            }
+        }
+        // The next step's capture sees neither the unrelated document nor N's pending work.
+        fs::remove_file(world.root.join(unrelated)).unwrap();
+    }
+}
+
 /// The witnessed path rejoins one document at a time, so "the reused documents" must still mean
 /// all of them: a method call into a document the edit did not touch keeps its `direct`, as a
 /// full rejoin keeps it.
@@ -10605,10 +10940,12 @@ fn assert_head_matches_full(world: &World, descriptor: &(PathBuf, String)) {
 
 /// #826: a witnessed S that exceeds a resource limit takes the FULL fallback, so the head
 /// is row-equal to FULL (the in-S oracle is on) with no unavailable coverage. Control: with
-/// production limits the same edit is witnessed, so the reduced limit is what fell back.
+/// production limits the same edit is witnessed, so the reduced limit is what fell back. The edit
+/// renames `g`, so the status of the declaration A's call targets changes and A is pending
+/// (a content-only edit leaves A's payload copied, #1279).
 #[test]
 fn witness_limit_falls_back_to_full() {
-    let edit = "struct S;\nimpl S { fn f(&self) { } }\nfn g() { }\n// edited\n";
+    let edit = "struct S;\nimpl S { fn f(&self) { } }\nfn g2() { }\n";
     for reduced in [false, true] {
         let (world, descriptor) = issue_826_world();
         let counts = world._state.path().join("work-counts.json");
@@ -10838,13 +11175,17 @@ const CALLERS_865: usize = 12;
 /// #865 the witness reserved about 227 KiB for each one-line caller and fell back to FULL.
 const ISSUE_865_LIMITS: &str = r#"{"unit_expansion_bytes":196608}"#;
 
-/// #865: the first comment edit to B after the capture flips the "unchanged" bit of every
-/// caller's dependency term (their `Direct` calls to `S::f` become `Unknown`, #557), so each
-/// caller is a pending dependent. The witness settles them within the same live budget FULL
-/// needs, instead of falling back to FULL (`witness_limit_exceeded`), and the head equals FULL
-/// (the in-S oracle is on). A second comment edit leaves every term alone and rotates only B.
+/// #865, #1279 (Decision 0021 D1 and D4 as amended 2026-11-21): every caller's `Direct` call to
+/// `S::f` is capture-bound. The first comment edit to B after the capture leaves every caller's
+/// dependency term alone, so S copies every caller's payload instead of re-settling it, and the
+/// read demotes the calls to `Unknown` (#557), as a re-settlement would. A second edit copies
+/// them again; the revert to the captured bytes copies them and reads `Direct`. Renaming `f`
+/// changes the status of the declaration every caller targets, so each caller is pending, and
+/// the witness settles them within the same live budget FULL needs instead of falling back to
+/// FULL (`witness_limit_exceeded`, #865). The head equals FULL after each step (the in-S oracle
+/// is on).
 #[test]
-fn first_edit_after_capture_witnesses_many_call_sensitive_dependents() {
+fn first_edit_after_capture_copies_call_sensitive_dependents() {
     let (world, descriptor, counts) = issue_865_world(Some(ISSUE_865_LIMITS));
     let calls = |world: &World| {
         let head = world.store.index_baseline().unwrap();
@@ -10856,15 +11197,29 @@ fn first_edit_after_capture_witnesses_many_call_sensitive_dependents() {
             .map(|call| call[3].clone())
             .collect::<std::collections::BTreeSet<_>>()
     };
+    let only = |value: &str| std::collections::BTreeSet::from([value.to_owned()]);
     assert_eq!(calls(&world).len(), CALLERS_865);
-    assert_eq!(
-        dispatch(&world),
-        std::collections::BTreeSet::from(["Direct".to_owned()])
-    );
+    assert_eq!(dispatch(&world), only("Direct"));
+    for (edit, expected) in [
+        (format!("{ISSUE_865_B}// edited\n"), "Unknown"),
+        (format!("{ISSUE_865_B}// edited twice\n"), "Unknown"),
+        (ISSUE_865_B.to_owned(), "Direct"),
+    ] {
+        let work = local_edit(&world, "src/b.rs", &edit, &counts);
+        assert_eq!(work["fullFallbacks"], 0, "{work}");
+        assert_eq!(work["witnessedRejoins"], 1, "{work}");
+        assert_eq!(
+            work["copiedDocuments"].as_array().unwrap().len(),
+            CALLERS_865,
+            "every caller is copied: {work}"
+        );
+        assert_eq!(dispatch(&world), only(expected), "{edit:?}");
+        assert_head_matches_full(&world, &descriptor);
+    }
     let work = local_edit(
         &world,
         "src/b.rs",
-        &format!("{ISSUE_865_B}// edited\n"),
+        &ISSUE_865_B.replace("fn f(", "fn renamed("),
         &counts,
     );
     assert_eq!(work["fullFallbacks"], 0, "{work}");
@@ -10874,25 +11229,6 @@ fn first_edit_after_capture_witnesses_many_call_sensitive_dependents() {
         work["copiedDocuments"],
         json!([]),
         "every caller is pending: {work}"
-    );
-    assert_eq!(
-        dispatch(&world),
-        std::collections::BTreeSet::from(["Unknown".to_owned()])
-    );
-    assert_head_matches_full(&world, &descriptor);
-
-    let work = local_edit(
-        &world,
-        "src/b.rs",
-        &format!("{ISSUE_865_B}// edited twice\n"),
-        &counts,
-    );
-    assert_eq!(work["fullFallbacks"], 0, "{work}");
-    assert_eq!(work["witnessedRejoins"], 1, "{work}");
-    assert_eq!(
-        work["copiedDocuments"].as_array().unwrap().len(),
-        CALLERS_865,
-        "{work}"
     );
     assert_head_matches_full(&world, &descriptor);
 }
@@ -14219,10 +14555,11 @@ fn witnessed_admission_reads_only_the_proofs_of_documents_it_does_not_copy() {
         issue_826_env(&world, &counts, None);
         assert!(retained_proofs(&world, "src/a.rs") > 0 && retained_proofs(&world, "src/b.rs") > 0);
         let (path, text) = if reduced {
-            // B's edit makes A a pending dependent whose settlement exceeds the limit.
+            // B's edit renames the `g` A calls, so A is a pending dependent whose settlement
+            // exceeds the limit (a content-only edit leaves A copied, #1279).
             (
                 "src/b.rs",
-                "struct S;\nimpl S { fn f(&self) { } }\nfn g() { }\n// edited\n",
+                "struct S;\nimpl S { fn f(&self) { } }\nfn g2() { }\n",
             )
         } else {
             ("src/c.rs", "fn other() { let _ = 1; }\n")
