@@ -1702,9 +1702,9 @@ fn architecture_semantic_within(
     // Only selected rows are loaded. Proof identities and basis metadata are keyed by
     // tuple/provenance; raw proof bytes and full semantic snapshots are never scanned.
     let mut proof = db.prepare_cached(
-        "SELECT p.ordinal,CASE WHEN pay.content_hash IS NULL THEN NULL ELSE lower(hex(pay.content_hash)) END,p.evidence_kind,p.capture_id,
+        "SELECT p.ordinal,pay.content_hash,p.evidence_kind,p.capture_id,
                 CASE WHEN p.derived_from_provenance_id IS NULL THEN NULL ELSE lower(hex(p.derived_from_provenance_id)) END,r.record_kind,
-                CASE WHEN r.fact_digest IS NULL THEN NULL ELSE lower(hex(r.fact_digest)) END,
+                r.fact_digest,
                 b.producer_id,b.producer_version,b.producer_hash,b.artifact_hash,b.language,
                 b.source_set_id,b.captured_native_revision_id,b.source_manifest_hash,
                 b.toolchain_hash,b.config_hash,b.dependency_hash,b.basis_id
@@ -1735,20 +1735,17 @@ fn architecture_semantic_within(
         let payload = pp.payload_id.context(SelectedIntegrity(
             "incompatible_index: architecture tuple names no payload".into(),
         ))?;
-        let (mut own, basis_id, derivation, basis) =
+        let (mut own, basis_id, derivation, basis, content_hash) =
             proof.query_row(params![payload, ordinal], |row| {
                 let mut own = BTreeMap::new();
-                // NULL only for a payload stored without its content hash: corrupt.
-                own.insert(
-                    "historicalContentHash".into(),
-                    json!(row.get::<_, Option<String>>(1)?),
-                );
                 own.insert("evidenceKind".into(), json!(row.get::<_, String>(2)?));
+                // The payload's content hash and the raw proof's fact digest are BLOBs,
+                // decoded below so a wrong length fails typed (#1248 PR 2).
                 let derivation = (
                     row.get::<_, Option<i64>>(3)?,
                     row.get::<_, Option<String>>(4)?,
                     row.get::<_, Option<String>>(5)?,
-                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<Vec<u8>>>(6)?,
                 );
                 let basis_id = row.get::<_, i64>(18)?;
                 // Every row of a basis joins the same `semantic_basis` row.
@@ -1759,13 +1756,21 @@ fn architecture_semantic_within(
                         json!({"producerId":row.get::<_, String>(7)?,"producerVersion":row.get::<_, String>(8)?,"producerHash":row.get::<_, String>(9)?,"artifactHash":row.get::<_, String>(10)?,"language":row.get::<_, String>(11)?,"sourceSetId":row.get::<_, String>(12)?,"revisionId":row.get::<_, String>(13)?,"sourceManifestHash":row.get::<_, String>(14)?,"toolchainHash":row.get::<_, String>(15)?,"configHash":row.get::<_, String>(16)?,"dependencyHash":row.get::<_, String>(17)?}),
                     )
                 };
-                Ok((own, basis_id, derivation, basis))
+                Ok((
+                    own,
+                    basis_id,
+                    derivation,
+                    basis,
+                    row.get::<_, Option<Vec<u8>>>(1)?,
+                ))
             })?;
-        ensure!(
-            !own["historicalContentHash"].is_null(),
-            SelectedIntegrity(
-                "incompatible_index: semantic payload without its content hash".into()
-            )
+        // NULL only for a payload stored without its content hash: corrupt.
+        let content_hash = content_hash.context(SelectedIntegrity(
+            "incompatible_index: semantic payload without its content hash".into(),
+        ))?;
+        own.insert(
+            "historicalContentHash".into(),
+            json!(id_codec::decode_digest(&content_hash)?),
         );
         let first = basis
             .map(|basis| {
@@ -1773,6 +1778,9 @@ fn architecture_semantic_within(
             })
             .transpose()?;
         let (capture, proof, kind, digest) = derivation;
+        let digest = digest
+            .map(|digest| id_codec::decode_digest(&digest))
+            .transpose()?;
         own.insert(
             "derivedFrom".into(),
             serde_json::to_value(architecture_derived_from(capture, proof, kind, digest)?)?,
@@ -1828,7 +1836,7 @@ fn architecture_semantic_within(
     let mut calls = db.prepare_cached(
         "SELECT b.call_id,b.join_start,b.join_end,b.resolution,b.declared_kind,
                 b.declared_internal_syntax_id,b.declared_internal_language,b.declared_internal_path,
-                b.dispatch,b.stale_target,b.provenance_ordinal,b.binding_id,b.join_status,b.join_kind,b.join_document_language,b.join_document_path,COALESCE(b.join_native_revision_id,?6),p.basis_id,CASE WHEN r.fact_digest IS NULL THEN NULL ELSE lower(hex(r.fact_digest)) END,
+                b.dispatch,b.stale_target,b.provenance_ordinal,b.binding_id,b.join_status,b.join_kind,b.join_document_language,b.join_document_path,COALESCE(b.join_native_revision_id,?6),p.basis_id,r.fact_digest,
                 p.capture_id IS NOT NULL AND r.capture_id IS NULL
          FROM semantic_call_bindings b
          JOIN semantic_provenance p ON p.payload_id=b.payload_id AND p.ordinal=b.provenance_ordinal
@@ -1955,9 +1963,14 @@ fn architecture_semantic_within(
             // Every row's offsets and dispatch decode strictly, used or not.
             let anchor_range = range(row.get(1)?, row.get(2)?)?;
             let is_direct = direct(row.get_ref(8)?.as_str()?)?;
+            // The raw proof's fact digest, decoded strictly (#1248 PR 2).
+            let fact_digest = row
+                .get::<_, Option<Vec<u8>>>(18)?
+                .map(|digest| id_codec::decode_digest(&digest))
+                .transpose()?;
             let row_key: RowKey = (
                 row.get_ref(3)?.as_str()? == "unresolved",
-                row.get(18)?,
+                fact_digest,
                 provenance_id.clone(),
             );
             if by_call

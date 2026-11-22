@@ -2273,6 +2273,42 @@ impl BatchWorld {
 
 const CALL_SOURCE: &str = "function f(){g();}\n";
 
+/// A published scip-typescript batch over `CALL_SOURCE`: its provenance derives from raw proofs.
+fn derived_call_world() -> (BatchWorld, trellis::model::IndexPin) {
+    let world = batch_world(CALL_SOURCE);
+    let position = CALL_SOURCE.find('g').unwrap() as i32;
+    let mut fixture = world.fixture().reference("scip-typescript");
+    fixture.artifact(
+        "javascript",
+        vec![
+            DocSpec::new("src/A.js")
+                .occurrence(&[0, 9, 10], &[], "pkg f.", 1)
+                .occurrence(
+                    &[0, position, position + 1],
+                    &[0, position, position + 3],
+                    "external pkg g.",
+                    0,
+                )
+                .symbol("pkg f.", 17, &[]),
+        ],
+    );
+    let descriptor = world.write(&fixture);
+    let (mut admitted, joined) = world.join(&descriptor);
+    let head = world
+        .publish(&mut admitted, &joined, joined.destination_pin())
+        .unwrap();
+    (world, head)
+}
+
+/// Applies one corruption to the index file, below every constraint, as a damaged file would.
+fn corrupt(world: &BatchWorld, sql: &str) {
+    let db = world.db();
+    db.pragma_update(None, "foreign_keys", "OFF").unwrap();
+    db.pragma_update(None, "ignore_check_constraints", "ON")
+        .unwrap();
+    assert!(db.execute(sql, []).unwrap() > 0, "{sql}");
+}
+
 /// #1248 PR 2: a derived provenance row stores only the raw proof it names, and a payload stores
 /// its document's content hash once. A raw proof or a content hash missing at read time is a
 /// typed corruption failure that schedules recovery, never a partial answer.
@@ -2282,28 +2318,7 @@ fn a_missing_raw_proof_or_payload_content_hash_fails_reads_typed() {
         "DELETE FROM semantic_raw_proofs WHERE rowid IN (SELECT r.rowid FROM semantic_raw_proofs r JOIN semantic_provenance p ON p.capture_id=r.capture_id AND p.derived_from_provenance_id=r.proof_id LIMIT 1)",
         "UPDATE semantic_payloads SET content_hash=NULL WHERE payload_id IN (SELECT payload_id FROM semantic_provenance)",
     ] {
-        let world = batch_world(CALL_SOURCE);
-        let position = CALL_SOURCE.find('g').unwrap() as i32;
-        let mut fixture = world.fixture().reference("scip-typescript");
-        fixture.artifact(
-            "javascript",
-            vec![
-                DocSpec::new("src/A.js")
-                    .occurrence(&[0, 9, 10], &[], "pkg f.", 1)
-                    .occurrence(
-                        &[0, position, position + 1],
-                        &[0, position, position + 3],
-                        "external pkg g.",
-                        0,
-                    )
-                    .symbol("pkg f.", 17, &[]),
-            ],
-        );
-        let descriptor = world.write(&fixture);
-        let (mut admitted, joined) = world.join(&descriptor);
-        let head = world
-            .publish(&mut admitted, &joined, joined.destination_pin())
-            .unwrap();
+        let (world, head) = derived_call_world();
         // Before the corruption every derived row reads its raw proof's kind and digest.
         let stored = world.store.semantic_at(head).unwrap();
         let derived: Vec<_> = stored
@@ -2326,10 +2341,7 @@ fn a_missing_raw_proof_or_payload_content_hash_fails_reads_typed() {
                 (serde_json::json!(kind), digest.as_str())
             );
         }
-        let db = world.db();
-        db.pragma_update(None, "foreign_keys", "OFF").unwrap();
-        assert!(db.execute(corruption, []).unwrap() > 0, "{corruption}");
-        drop(db);
+        corrupt(&world, corruption);
         let error = world.store.semantic_at(head).unwrap_err();
         assert!(
             error.to_string().starts_with("incompatible_index:"),
