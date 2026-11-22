@@ -262,6 +262,26 @@ pub(crate) mod parse_work_inputs {
 mod tests {
     use super::*;
 
+    /// #1282: a document past measurement's parse-work budget is one more `evidence_budget`
+    /// document in reads, beside one past the stored budgets and the two kinds never read.
+    #[test]
+    fn module_only_reasons_name_every_module_only_diagnostic() {
+        use crate::skipped_source::Skip;
+        for (diagnostic, reason) in [
+            (crate::evidence_limits::DIAGNOSTIC, "evidence_budget"),
+            (crate::measured_parse::DIAGNOSTIC, "evidence_budget"),
+            (Skip::Oversized.diagnostic(), "oversized"),
+            (Skip::NotUtf8.diagnostic(), "not_utf8"),
+        ] {
+            assert_eq!(module_only_reason(Some(diagnostic)), Some(reason));
+        }
+        assert_eq!(
+            module_only_reason(Some("parser recovered from invalid source")),
+            None
+        );
+        assert_eq!(module_only_reason(None), None);
+    }
+
     fn gap(source: &str) -> Option<SyntaxGap> {
         let mut parser = tree_sitter::Parser::new();
         parser

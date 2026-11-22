@@ -1027,100 +1027,104 @@ fn a_file_past_the_evidence_budget_publishes_as_a_gap_and_needs_no_reconciliatio
 }
 
 /// #1282: a Rust source whose error recovery would take minutes is past measurement's
-/// parse-work budget. Indexing stops its parse within a bounded time, publishes it as an
-/// `evidence_budget` gap with no facts, the same way on every index, and every other file keeps
-/// its facts.
+/// parse-work budget. Indexing stops its parse within a bounded time and publishes it with only
+/// its file module, as a typed `native-coverage-partial` document (`evidence_budget` in reads),
+/// the same way on every index, and every other file keeps its facts. View-time reads still
+/// parse its stored source under their own bounds, so the other files' facts are read per file.
 #[test]
 #[cfg(feature = "test-support")]
 fn a_rust_source_past_the_parse_work_budget_publishes_as_a_gap() {
     let (_state, root, store, cancel) = fixture();
     let leader = store.publication_for_tests().unwrap();
-    // The other files' facts, as the metrics read serves them.
-    let facts = |store: &Store| {
-        let payload = store
-            .evidence_response()
-            .unwrap()
-            .metrics_at(&Default::default(), &mut || Ok(()))
-            .unwrap();
-        let rows = |rows: serde_json::Value| -> Vec<_> {
-            rows.as_array()
+    let clean_files = [
+        ("flow.js", "javascript"),
+        ("flow.java", "java"),
+        ("flow.rs", "rust"),
+        ("flow.py", "python"),
+    ];
+    // Each other file's metrics rows, read for that file alone.
+    let facts = |store: &Store, source_set_id: &str| {
+        clean_files.map(|(path, language)| {
+            let options = trellis::metrics_read::MetricsOptions {
+                scope: "file".into(),
+                source_set_id: Some(source_set_id.into()),
+                language: Some(language.into()),
+                path: Some(path.into()),
+                ..Default::default()
+            };
+            let payload = store
+                .evidence_response()
                 .unwrap()
-                .iter()
-                .filter(|row| row["path"] != "recovery.rs")
-                .cloned()
-                .collect()
-        };
-        let facts = (
-            rows(serde_json::to_value(&payload.declarations).unwrap()),
-            rows(serde_json::to_value(&payload.files).unwrap()),
-        );
-        (facts, payload.partial_files)
+                .metrics_at(&options, &mut || Ok(()))
+                .unwrap();
+            assert!(payload.partial_files.is_empty(), "{path}");
+            (
+                serde_json::to_value(&payload.declarations).unwrap(),
+                serde_json::to_value(&payload.files).unwrap(),
+            )
+        })
     };
-    let index = |store: &Store| {
+    let index = |store: &Store, leader: &trellis::store::topology::WriterGuard| {
         let started = std::time::Instant::now();
         publish(
             store,
             root.path(),
             &cancel,
             store.index_baseline().unwrap(),
-            &leader,
+            leader,
         )
         .unwrap();
         // A hang backstop only: unbounded, the two parses of this file take minutes.
         assert!(started.elapsed() < std::time::Duration::from_secs(600));
     };
-    index(&store);
-    let (clean, partial) = facts(&store);
-    assert!(partial.is_empty());
+    let outcome = |store: &Store| {
+        let status = store.status().unwrap();
+        let gaps: Vec<_> = status
+            .diagnostics
+            .iter()
+            .filter(|d| d.path.as_deref() == Some("recovery.rs"))
+            .map(|d| (d.code.clone(), d.message.clone()))
+            .collect();
+        (status.stats.files, gaps)
+    };
+    index(&store, &leader);
+    let source_set_id = store
+        .evidence_response()
+        .unwrap()
+        .metrics_at(&Default::default(), &mut || Ok(()))
+        .unwrap()
+        .files[0]
+        .source_set_id
+        .clone();
+    let clean = facts(&store, &source_set_id);
 
     let recovery = root.path().join("recovery.rs");
-    let text = "} = ) + ] * ".repeat((64 << 10) / 12);
-    fs::write(&recovery, &text).unwrap();
-    index(&store);
+    fs::write(&recovery, "} = ) + ] * ".repeat((64 << 10) / 12)).unwrap();
+    index(&store, &leader);
     // A second checkout state indexes the same files from scratch: the outcome is the same.
     let state = tempfile::tempdir().unwrap();
     let fresh = Store::open_for_tests(state.path(), root.path()).unwrap();
-    let fresh_leader = fresh.publication_for_tests().unwrap();
-    let started = std::time::Instant::now();
-    publish(
-        &fresh,
-        root.path(),
-        &cancel,
-        fresh.index_baseline().unwrap(),
-        &fresh_leader,
-    )
-    .unwrap();
-    assert!(started.elapsed() < std::time::Duration::from_secs(600));
+    index(&fresh, &fresh.publication_for_tests().unwrap());
     for store in [&store, &fresh] {
         assert!(!store.recovery_pending_for_tests());
-        let (facts, partial) = facts(store);
-        assert_eq!(facts, clean);
-        assert_eq!(partial.len(), 1);
         assert_eq!(
-            (partial[0].path.as_str(), partial[0].reason),
-            ("recovery.rs", "evidence_budget")
+            outcome(store),
+            (
+                5,
+                vec![(
+                    "native-coverage-partial".to_owned(),
+                    "source parse exceeds the per-file parse-work budget; only the file module was kept"
+                        .to_owned()
+                )]
+            )
         );
-        assert_eq!(
-            (partial[0].range.start, partial[0].range.end),
-            (0, text.len())
-        );
-        let status = store.status().unwrap();
-        assert_eq!(status.stats.files, 5);
-        assert!(
-            status
-                .diagnostics
-                .iter()
-                .any(|d| d.path.as_deref() == Some("recovery.rs")
-                    && d.message.contains("parse-work budget")),
-            "{:?}",
-            status.diagnostics
-        );
+        assert_eq!(facts(store, &source_set_id), clean);
     }
 
     // Below the budget again, it is a whole document once more.
     fs::write(&recovery, "fn recovered() {}\n").unwrap();
-    index(&store);
-    assert!(facts(&store).1.is_empty());
+    index(&store, &leader);
+    assert_eq!(outcome(&store), (5, vec![]));
 }
 
 /// #576: one source over `--max-file-bytes`, or one that isn't UTF-8, in any language, is
