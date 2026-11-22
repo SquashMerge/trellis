@@ -10670,6 +10670,150 @@ fn readers_demote_a_capture_bound_direct_after_a_first_edit_and_restore_it_on_re
     }
 }
 
+/// #1279 (Decision 0021 D1 as amended 2026-11-21): older-basis architecture evidence reads a
+/// capture-bound call's dispatch at its semantic basis P, through the same projection as P's
+/// tuple read, in its behavior and in its `historicalDispatch` wire metadata alike. After the
+/// first comment edit of `src/shapes.rs` and its S at P, and again after the revert and its S, a
+/// native N that adds an unrelated document is published with S held, so `src/lib.rs` is
+/// older-basis evidence of P. Every `historicalDispatch` in N's references and in its rule
+/// evidence then equals P's tuple-read dispatch of that call: `unknown` while the edit stands,
+/// `direct` after the revert, never the stored `direct` alone.
+#[test]
+fn older_basis_architecture_reads_historical_dispatch_at_the_semantic_basis() {
+    use trellis::model::SemanticStatus;
+    use trellis::semantic_evidence::Dispatch;
+    // Every `(callId, historicalDispatch)` anywhere in an answer.
+    fn historical(value: &Value, out: &mut Vec<(Value, Value)>) {
+        match value {
+            Value::Object(fields) => {
+                if let Some(dispatch) = fields.get("historicalDispatch") {
+                    out.push((fields["callId"].clone(), dispatch.clone()));
+                }
+                fields.values().for_each(|v| historical(v, out));
+            }
+            Value::Array(items) => items.iter().for_each(|v| historical(v, out)),
+            _ => {}
+        }
+    }
+    let world = world(|root| copy_tree(&Path::new(RUST_ANALYZER_DISPATCH).join("workspace"), root));
+    let descriptor = rust_dispatch_batch(&world);
+    let (pin, admitted, _) = world.publish(&descriptor).unwrap();
+    drop(admitted);
+    let producer = world.store.semantic_at(pin).unwrap().producers[0]
+        .id
+        .clone();
+    let methods = [
+        dispatch_declaration(&world, "new", None),
+        dispatch_declaration(&world, "navigation_at", None),
+    ];
+    let counts = world._state.path().join("work-counts.json");
+    issue_826_env(&world, &counts, None);
+    let shapes = fs::read_to_string(world.root.join("src/shapes.rs")).unwrap();
+    for (edit, direct, unrelated) in [
+        (format!("{shapes}// edited\n"), false, "src/unrelated_a.rs"),
+        (shapes.clone(), true, "src/unrelated_b.rs"),
+    ] {
+        let work = local_edit(&world, "src/shapes.rs", &edit, &counts);
+        assert!(
+            copied(&work, "src/lib.rs"),
+            "the caller's payload stays: {work}"
+        );
+        let p = world.store.index_baseline().unwrap();
+        // P's tuple read: the projected dispatch of each of `src/lib.rs`'s calls.
+        let at_p = world.store.semantic_at(p).unwrap();
+        let expected: std::collections::BTreeMap<String, Value> = at_p
+            .call_bindings
+            .iter()
+            .filter(|binding| binding.join.anchor.document.path == "src/lib.rs")
+            .map(|binding| {
+                (
+                    binding.call_id.clone().unwrap(),
+                    serde_json::to_value(binding.dispatch).unwrap(),
+                )
+            })
+            .collect();
+        let method_calls: Vec<&String> = at_p
+            .call_bindings
+            .iter()
+            .filter(|binding| {
+                matches!(
+                    binding.declared_target.as_ref(),
+                    Some(trellis::semantic_evidence::Target::Internal { syntax_id, .. })
+                        if methods.contains(syntax_id)
+                )
+            })
+            .map(|binding| binding.call_id.as_ref().unwrap())
+            .collect();
+        assert!(!method_calls.is_empty());
+        let projected = if direct {
+            Dispatch::Direct
+        } else {
+            Dispatch::Unknown
+        };
+        for call in &method_calls {
+            assert_eq!(
+                expected[call.as_str()],
+                serde_json::to_value(projected).unwrap()
+            );
+        }
+        // N adds a document no payload names, with S held: `src/lib.rs` reads P as older basis.
+        write_files(&world.root, &[(unrelated, "pub fn unrelated() {}\n")]);
+        let (graph, native, capture) = index_workspace_bundle(
+            &IndexOptions::new(world.root.clone()),
+            world.store.root_id(),
+            &world.cancel,
+            |_| {},
+        )
+        .unwrap();
+        let leader = world.store.publication_for_tests().unwrap();
+        let n = world
+            .store
+            .publish_native(&graph, &capture, &native, &leader, p, &world.cancel)
+            .unwrap();
+        drop(leader);
+        assert_ne!(n, p);
+        let older = world
+            .store
+            .semantic_projection_at(n, &producer, "rust", "src/lib.rs")
+            .unwrap()
+            .unwrap();
+        assert_eq!(older.semantic_status, SemanticStatus::OlderBasis);
+        assert_eq!(older.semantic_basis_pin, p);
+        fs::create_dir_all(world.root.join(".trellis")).unwrap();
+        fs::write(world.root.join(".trellis/rules.toml"), DISPATCH_RULES).unwrap();
+        let response = world.store.evidence_response().unwrap();
+        let arguments = json!({"expectedBasis": n, "limit": 50});
+        let mut answers = Vec::new();
+        for kind in ["references", "check"] {
+            let answer = response
+                .architecture_response(kind, &arguments, &mut || Ok(()))
+                .unwrap();
+            answers.push((kind, response.finish(answer).unwrap()));
+        }
+        drop(response);
+        fs::remove_dir_all(world.root.join(".trellis")).unwrap();
+        for (kind, answer) in &answers {
+            let mut found = Vec::new();
+            historical(answer, &mut found);
+            let methods_found = found
+                .iter()
+                .filter(|(call, _)| method_calls.iter().any(|m| call == &json!(m)))
+                .count();
+            assert!(methods_found > 0, "{kind}: {answer}");
+            for (call, dispatch) in found {
+                let call = call.as_str().unwrap();
+                assert_eq!(
+                    Some(&dispatch),
+                    expected.get(call),
+                    "{kind}: call {call} at basis {p:?}"
+                );
+            }
+        }
+        // The next step's capture sees neither the unrelated document nor N's pending work.
+        fs::remove_file(world.root.join(unrelated)).unwrap();
+    }
+}
+
 /// The witnessed path rejoins one document at a time, so "the reused documents" must still mean
 /// all of them: a method call into a document the edit did not touch keeps its `direct`, as a
 /// full rejoin keeps it.
