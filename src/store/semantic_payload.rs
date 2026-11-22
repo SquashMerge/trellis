@@ -1269,6 +1269,8 @@ mod tests {
             ("src/store/native_first/witness.rs", 4),
             // A table list in a cancellation test.
             ("src/http/normal_post_capture_cancellation_tests.rs", 1),
+            // #1248's digest storage tests: the stored join_content_hash only, no dispatch.
+            ("src/store/digest_blob_tests.rs", 4),
         ]
         .into_iter()
         .collect();
