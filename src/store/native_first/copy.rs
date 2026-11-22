@@ -293,6 +293,7 @@ pub(crate) fn copied_document(
         true,
         source_set,
         Some(ReadAs {
+            revision: &semantic_pin_key(target.pin),
             native: &destination.native_revision_id,
             freshness: &freshness,
         }),
