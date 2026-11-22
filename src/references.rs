@@ -30,8 +30,8 @@ const TOTAL_BYTES: usize = 256 * 1024 * 1024;
 const SITES: usize = 250_000;
 
 pub use crate::architecture_inputs::{
-    DocumentInput, DocumentSemantic, SemanticAnchor, SemanticOutcome, SemanticRelationship,
-    Snapshot,
+    DocumentInput, DocumentSemantic, SemanticAnchor, SemanticMetadata, SemanticOutcome,
+    SemanticRelationship, Snapshot,
 };
 #[derive(Debug)]
 pub struct Projection {
@@ -186,7 +186,7 @@ struct Site {
     /// The semantic binding's provenance; null for structural sites.
     provenance_id: Option<String>,
     #[serde(flatten)]
-    semantic_metadata: BTreeMap<String, Value>,
+    semantic_metadata: SemanticMetadata,
     /// The features of the `cfg(feature = "..")` gates on a production Rust site, sorted and
     /// distinct (#988). A read that names one as a test feature reports the site as test.
     #[serde(skip)]
@@ -1532,7 +1532,7 @@ impl SiteContext<'_> {
             call_id,
             mapping: "structural",
             provenance_id: None,
-            semantic_metadata: BTreeMap::new(),
+            semantic_metadata: SemanticMetadata::default(),
             gates,
             ordinal: 0,
         })
