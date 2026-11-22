@@ -1544,7 +1544,27 @@ pub(super) fn architecture_semantic(
     documents: &mut [crate::architecture_inputs::DocumentInput],
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<()> {
-    use crate::architecture_inputs::{SemanticAnchor, SemanticOutcome, SemanticRelationship};
+    architecture_semantic_within(
+        db,
+        revision_key,
+        documents,
+        check,
+        ARCHITECTURE_SEMANTIC_ROWS,
+    )
+}
+
+/// `architecture_semantic` with `metadata_limit` proof metadata and lookup dependency rows.
+fn architecture_semantic_within(
+    db: &Connection,
+    revision_key: &str,
+    documents: &mut [crate::architecture_inputs::DocumentInput],
+    check: &mut impl FnMut() -> Result<()>,
+    metadata_limit: usize,
+) -> Result<()> {
+    use crate::architecture_inputs::{
+        SemanticAnchor, SemanticMetadata, SemanticOutcome, SemanticRelationship,
+    };
+    use std::sync::Arc;
     let defaults = default_producers(db, revision_key)?;
     let pin_text = revision_key
         .strip_prefix("pin:v1:")
@@ -1697,83 +1717,113 @@ pub(super) fn architecture_semantic(
         "SELECT lookup_key FROM semantic_basis_lookup_dependencies WHERE basis_id=?1 ORDER BY ordinal",
     )?;
     let mut metadata_rows = 0usize;
+    // The fields a row's basis and projection determine, built at the first row of each tuple
+    // and basis and shared by the rest (#1247), with the lookup dependency rows that build
+    // read: every later row of the basis is charged them too, so the bound is unchanged.
+    type Fields = Arc<BTreeMap<String, serde_json::Value>>;
+    let mut shared_fields: HashMap<(i64, i64), (Fields, usize)> = HashMap::new();
     let mut metadata = |pp: &super::semantic_payload::PayloadProjection<'_>,
+                        tuple: i64,
                         ordinal: i64,
                         projection: Option<&crate::model::SemanticProjection>|
-     -> Result<BTreeMap<String, serde_json::Value>> {
+     -> Result<SemanticMetadata> {
         metadata_rows += 1;
         ensure!(
-            metadata_rows <= ARCHITECTURE_SEMANTIC_ROWS,
+            metadata_rows <= metadata_limit,
             "bounded_work: architecture proof metadata"
         );
         let payload = pp.payload_id.context(SelectedIntegrity(
             "incompatible_index: architecture tuple names no payload".into(),
         ))?;
-        let mut values = proof.query_row(params![payload, ordinal], |row| {
-            let mut value = BTreeMap::new();
-            // NULL only for a payload stored without its content hash: corrupt.
-            value.insert(
-                "historicalContentHash".into(),
-                json!(row.get::<_, Option<String>>(1)?),
-            );
-            value.insert("evidenceKind".into(), json!(row.get::<_, String>(2)?));
-            let derivation = (
-                row.get::<_, Option<i64>>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, Option<String>>(5)?,
-                row.get::<_, Option<String>>(6)?,
-            );
-            value.insert("basis".into(), json!({"producerId":row.get::<_, String>(7)?,"producerVersion":row.get::<_, String>(8)?,"producerHash":row.get::<_, String>(9)?,"artifactHash":row.get::<_, String>(10)?,"language":row.get::<_, String>(11)?,"sourceSetId":row.get::<_, String>(12)?,"revisionId":row.get::<_, String>(13)?,"sourceManifestHash":row.get::<_, String>(14)?,"toolchainHash":row.get::<_, String>(15)?,"configHash":row.get::<_, String>(16)?,"dependencyHash":row.get::<_, String>(17)?}));
-            Ok((value, row.get::<_, i64>(18)?, derivation))
-        })?;
+        let (mut own, basis_id, derivation, basis) =
+            proof.query_row(params![payload, ordinal], |row| {
+                let mut own = BTreeMap::new();
+                // NULL only for a payload stored without its content hash: corrupt.
+                own.insert(
+                    "historicalContentHash".into(),
+                    json!(row.get::<_, Option<String>>(1)?),
+                );
+                own.insert("evidenceKind".into(), json!(row.get::<_, String>(2)?));
+                let derivation = (
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                );
+                let basis_id = row.get::<_, i64>(18)?;
+                // Every row of a basis joins the same `semantic_basis` row.
+                let basis = if shared_fields.contains_key(&(tuple, basis_id)) {
+                    None
+                } else {
+                    Some(
+                        json!({"producerId":row.get::<_, String>(7)?,"producerVersion":row.get::<_, String>(8)?,"producerHash":row.get::<_, String>(9)?,"artifactHash":row.get::<_, String>(10)?,"language":row.get::<_, String>(11)?,"sourceSetId":row.get::<_, String>(12)?,"revisionId":row.get::<_, String>(13)?,"sourceManifestHash":row.get::<_, String>(14)?,"toolchainHash":row.get::<_, String>(15)?,"configHash":row.get::<_, String>(16)?,"dependencyHash":row.get::<_, String>(17)?}),
+                    )
+                };
+                Ok((own, basis_id, derivation, basis))
+            })?;
         ensure!(
-            !values.0["historicalContentHash"].is_null(),
+            !own["historicalContentHash"].is_null(),
             SelectedIntegrity(
                 "incompatible_index: semantic payload without its content hash".into()
             )
         );
-        let (capture, proof, kind, digest) = values.2;
-        let historical = semantic_variant(&pp.freshness(values.1)?)?;
-        values
-            .0
-            .insert("historicalFreshness".into(), json!(historical));
-        values.0.insert(
-            "freshness".into(),
-            json!(if projection.is_some() && historical != "stale" {
-                "possiblyStale"
-            } else {
-                &historical
-            }),
-        );
-        values.0.insert(
+        let first = basis
+            .map(|basis| {
+                Ok::<_, anyhow::Error>((basis, semantic_variant(&pp.freshness(basis_id)?)?))
+            })
+            .transpose()?;
+        let (capture, proof, kind, digest) = derivation;
+        own.insert(
             "derivedFrom".into(),
             serde_json::to_value(architecture_derived_from(capture, proof, kind, digest)?)?,
         );
-        let historical = values.0["historicalFreshness"]
-            .as_str()
-            .expect("stored string");
-        ensure!(
-            matches!(historical, "fresh" | "possiblyStale" | "stale"),
-            SelectedIntegrity("invalid architecture freshness".into())
-        );
-        let mut dependencies = Vec::new();
-        let mut dependency_rows = lookup_dependencies.query([values.1])?;
-        while let Some(row) = dependency_rows.next()? {
-            metadata_rows += 1;
-            ensure!(
-                metadata_rows <= ARCHITECTURE_SEMANTIC_ROWS,
-                "bounded_work: architecture lookup dependencies"
-            );
-            dependencies.push(row.get::<_, String>(0)?);
-        }
-        values.0.get_mut("basis").expect("constructed basis")["lookupDependencies"] =
-            json!(dependencies);
-        if let Some(projection) = projection {
-            values
-                .0
-                .insert("projection".into(), serde_json::to_value(projection)?);
-        }
-        Ok(values.0)
+        let shared = match first {
+            Some((mut basis, historical)) => {
+                ensure!(
+                    matches!(historical.as_str(), "fresh" | "possiblyStale" | "stale"),
+                    SelectedIntegrity("invalid architecture freshness".into())
+                );
+                let mut dependencies = Vec::new();
+                let mut dependency_rows = lookup_dependencies.query([basis_id])?;
+                while let Some(row) = dependency_rows.next()? {
+                    metadata_rows += 1;
+                    ensure!(
+                        metadata_rows <= metadata_limit,
+                        "bounded_work: architecture lookup dependencies"
+                    );
+                    dependencies.push(row.get::<_, String>(0)?);
+                }
+                let charged = dependencies.len();
+                basis["lookupDependencies"] = json!(dependencies);
+                let mut fields = BTreeMap::new();
+                fields.insert(
+                    "freshness".into(),
+                    json!(if projection.is_some() && historical != "stale" {
+                        "possiblyStale"
+                    } else {
+                        &historical
+                    }),
+                );
+                fields.insert("historicalFreshness".into(), json!(historical));
+                fields.insert("basis".into(), basis);
+                if let Some(projection) = projection {
+                    fields.insert("projection".into(), serde_json::to_value(projection)?);
+                }
+                let shared = Arc::new(fields);
+                shared_fields.insert((tuple, basis_id), (shared.clone(), charged));
+                shared
+            }
+            None => {
+                let (shared, charged) = &shared_fields[&(tuple, basis_id)];
+                metadata_rows += charged;
+                ensure!(
+                    metadata_rows <= metadata_limit,
+                    "bounded_work: architecture lookup dependencies"
+                );
+                shared.clone()
+            }
+        };
+        Ok(SemanticMetadata::new(own, shared))
     };
     let mut calls = db.prepare_cached(
         "SELECT b.call_id,b.join_start,b.join_end,b.resolution,b.declared_kind,
@@ -1916,7 +1966,7 @@ pub(super) fn architecture_semantic(
             {
                 continue;
             }
-            let mut binding_metadata = metadata(&pp, ordinal, projection.as_ref())?;
+            let mut binding_metadata = metadata(&pp, tuple, ordinal, projection.as_ref())?;
             if historical {
                 binding_metadata.insert(
                     "historicalResolution".into(),
@@ -2048,7 +2098,8 @@ pub(super) fn architecture_semantic(
                 _ => return Err(SelectedIntegrity("corrupt semantic reference".into()).into()),
             };
             let reference_ordinal: i64 = row.get(6)?;
-            let mut reference_metadata = metadata(&pp, reference_ordinal, projection.as_ref())?;
+            let mut reference_metadata =
+                metadata(&pp, tuple, reference_ordinal, projection.as_ref())?;
             if historical {
                 reference_metadata.insert(
                     "historicalResolution".into(),
@@ -2129,7 +2180,7 @@ pub(super) fn architecture_semantic(
             };
             let relationship_ordinal: i64 = row.get(6)?;
             let mut relationship_metadata =
-                metadata(&pp, relationship_ordinal, projection.as_ref())?;
+                metadata(&pp, tuple, relationship_ordinal, projection.as_ref())?;
             let source_eligible = !historical
                 || endpoint(
                     row.get_ref(7)?.as_str_or_null()?,
@@ -2194,6 +2245,36 @@ impl super::Store {
         let selected = response.selected(None)?;
         architecture_semantic(&response.db, &selected.key, &mut snapshot.documents, check)?;
         response.finish(())
+    }
+
+    /// The semantic part of the head's Architecture read, with at most `metadata_limit` proof
+    /// metadata and lookup dependency rows (#1247): each document's path and semantic inputs.
+    #[doc(hidden)]
+    pub fn architecture_semantic_for_tests(
+        &self,
+        metadata_limit: usize,
+    ) -> Result<Vec<(String, crate::architecture_inputs::DocumentSemantic)>> {
+        let response = self.evidence_response()?;
+        let (mut snapshot, _) =
+            response.architecture_snapshot_regions(None, &mut || Ok(()), &|_, _| {})?;
+        for document in &mut snapshot.documents {
+            document.semantic = Default::default();
+        }
+        let selected = response.selected(None)?;
+        architecture_semantic_within(
+            &response.db,
+            &selected.key,
+            &mut snapshot.documents,
+            &mut || Ok(()),
+            metadata_limit,
+        )?;
+        response.finish(
+            snapshot
+                .documents
+                .into_iter()
+                .map(|document| (document.key.path, document.semantic))
+                .collect(),
+        )
     }
 }
 

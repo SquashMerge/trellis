@@ -432,6 +432,94 @@ fn selective_semantics_share_native_transaction_and_reject_bad_join() {
     );
 }
 
+/// #1247: the Architecture read builds a basis's provenance fields once, and every anchor of
+/// that basis holds the same shared copy. The proof metadata bound still charges every row one
+/// metadata row plus its basis's lookup dependency rows, as when each row read its own: two
+/// call bindings of one basis with one lookup dependency fit 4 rows and no fewer, and the
+/// second binding trips the bound at the same row as before.
+#[test]
+fn architecture_anchors_of_one_basis_share_metadata_within_the_same_bound() {
+    let (_state, root, store, cancel, options) = setup();
+    fs::write(
+        root.path().join("hello.rs"),
+        "fn hello() { hello(); hello(); }\n",
+    )
+    .unwrap();
+    let (graph, native, capture) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    let (mut semantic, captured) = evidence(&native, root.path());
+    // Bind the second call the way the fixture binds the first, under a proof of its own.
+    let second_call = native
+        .calls
+        .iter()
+        .filter(|call| call.spelling.as_deref() == Some("hello") && call.callee_range.is_some())
+        .nth(1)
+        .unwrap();
+    let mut proof = semantic.provenance.last().unwrap().clone();
+    proof.id = "hello.rs:call2".into();
+    semantic.provenance.push(proof);
+    let mut binding = semantic.call_bindings[0].clone();
+    binding.call_id = Some(second_call.id.clone());
+    binding.join.anchor.range = second_call.callee_range.clone().unwrap();
+    binding.join.candidate_ids = vec![second_call.id.clone()];
+    binding.provenance_id = "hello.rs:call2".into();
+    semantic.call_bindings.push(binding);
+    let leader = store.publication_for_tests().unwrap();
+    store
+        .publish_native_semantic(
+            &graph,
+            &capture,
+            &native,
+            &semantic,
+            &captured,
+            &leader,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+
+    let documents = store.architecture_semantic_for_tests(usize::MAX).unwrap();
+    let anchors = &documents
+        .iter()
+        .find(|(path, _)| path == "hello.rs")
+        .unwrap()
+        .1
+        .anchors;
+    assert_eq!(anchors.len(), 2, "{anchors:?}");
+    let (first, second) = (&anchors[0], &anchors[1]);
+    assert_ne!(first.provenance_id, second.provenance_id);
+    assert!(first.metadata.shares_basis_with(&second.metadata));
+    assert_ne!(first.metadata.get("evidenceKind"), None);
+    assert_eq!(
+        second.metadata.get("basis").unwrap()["lookupDependencies"],
+        json!(["hello"])
+    );
+    assert_eq!(second.metadata.get("freshness"), Some(&json!("fresh")));
+
+    let bound = |limit: usize| {
+        store
+            .architecture_semantic_for_tests(limit)
+            .err()
+            .map(|error| format!("{error:#}"))
+    };
+    assert_eq!(bound(4), None);
+    // The second binding's dependency, charged from its basis's shared fields.
+    assert_eq!(
+        bound(3).as_deref(),
+        Some("bounded_work: architecture lookup dependencies")
+    );
+    // The second binding's own metadata row.
+    assert_eq!(
+        bound(2).as_deref(),
+        Some("bounded_work: architecture proof metadata")
+    );
+    // The first binding's dependency, read with its basis.
+    assert_eq!(
+        bound(1).as_deref(),
+        Some("bounded_work: architecture lookup dependencies")
+    );
+}
+
 #[test]
 fn private_stage_admits_typed_evidence_without_changing_live_head() {
     let (_state, root, store, cancel, options) = setup();

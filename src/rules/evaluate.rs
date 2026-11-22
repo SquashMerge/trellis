@@ -8,7 +8,7 @@ use super::{
     parse::{descriptor, pattern},
 };
 use crate::references::{
-    Projection, Snapshot,
+    Projection, SemanticMetadata, Snapshot,
     work::{self, Work},
 };
 use anyhow::{Context, Result, ensure};
@@ -203,8 +203,8 @@ fn unknown_kind_counts(site: &Value) -> Value {
     counts
 }
 
-pub(super) fn semantic_evidence(mut evidence: Value, metadata: &BTreeMap<String, Value>) -> Value {
-    for (key, value) in metadata {
+pub(super) fn semantic_evidence(mut evidence: Value, metadata: &SemanticMetadata) -> Value {
+    for (key, value) in metadata.iter() {
         evidence[key] = value.clone();
     }
     if let Some(revision) = evidence["projection"]["basisNativeRevisionId"].as_str() {

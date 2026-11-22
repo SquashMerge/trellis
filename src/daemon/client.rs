@@ -1601,8 +1601,9 @@ fn cancellation_id(frame: &crate::mcp::wire::Frame) -> Option<serde_json::Value>
     let params = request.params?.as_object()?.clone();
     if !params
         .keys()
-        .all(|key| key == "requestId" || key == "reason")
+        .all(|key| key == "requestId" || key == "reason" || key == "_meta")
         || params.get("reason").is_some_and(|value| !value.is_string())
+        || params.get("_meta").is_some_and(|value| !value.is_object())
     {
         return None;
     }
@@ -1614,6 +1615,34 @@ fn cancellation_id(frame: &crate::mcp::wire::Frame) -> Option<serde_json::Value>
             wire::exact_safe_integer(&number.to_string()).map(serde_json::Value::from)
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::cancellation_id;
+    use crate::mcp::wire::Frame;
+
+    fn cancel(params: &str) -> Option<serde_json::Value> {
+        let line =
+            format!(r#"{{"jsonrpc":"2.0","method":"notifications/cancelled","params":{params}}}"#);
+        cancellation_id(&Frame::Line(line.into_bytes()))
+    }
+
+    /// #1288: a cancellation may carry an object `_meta`, which is ignored.
+    #[test]
+    fn a_cancellation_with_meta_names_its_request() {
+        assert_eq!(cancel(r#"{"requestId":3}"#), Some(serde_json::json!(3)));
+        assert_eq!(
+            cancel(r#"{"requestId":"a","reason":"r","_meta":{"progressToken":"x"}}"#),
+            Some(serde_json::json!("a"))
+        );
+        assert_eq!(
+            cancel(r#"{"requestId":3,"_meta":{}}"#),
+            Some(serde_json::json!(3))
+        );
+        assert_eq!(cancel(r#"{"requestId":3,"_meta":"x"}"#), None);
+        assert_eq!(cancel(r#"{"requestId":3,"extra":1}"#), None);
     }
 }
 
