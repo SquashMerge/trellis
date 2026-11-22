@@ -1114,7 +1114,7 @@ mod tests {
     /// hash `1…` at `same` and `2…` at `edited`.
     fn bound_call(bound: bool, captured: Option<&str>) -> Connection {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(CACHE_SCHEMA_V45).unwrap();
+        db.execute_batch(CACHE_SCHEMA_V46).unwrap();
         db.pragma_update(None, "foreign_keys", "OFF").unwrap();
         for (tuple, revision) in [(1, "same"), (2, "edited")] {
             db.execute("INSERT INTO native_revisions VALUES(?1,'set',?2,?2,?2,?1,'[]','[]','{}','[]','[]',NULL,'[]',0,'{}','[]',?3)", params![revision, "a".repeat(64), tuple]).unwrap();

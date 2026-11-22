@@ -146,7 +146,17 @@ fn write(db: &Connection, publication: &sem::SemanticPublication) -> Result<()> 
         .iter()
         .map(|p| p.id.as_str())
         .collect();
-    write_semantic_tuple(db, 1, NATIVE, &coverage, publication, &owns, &[]).map(drop)
+    write_semantic_tuple(
+        db,
+        1,
+        NATIVE,
+        &coverage,
+        publication,
+        &owns,
+        &[],
+        &BTreeSet::new(),
+    )
+    .map(drop)
 }
 
 #[test]
