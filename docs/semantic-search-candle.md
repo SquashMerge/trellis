@@ -39,6 +39,8 @@ vectors. It is not a full-dimension product mode.
 - CPU is explicit; Metal requires `--features metal`. There is no backend fallback. The
   initial port uses float32 compute; the saved vectors, not an assumption about the original
   loaded weight dtype, decide whether it passes parity.
+- The token-embedding table is stored in the file's bf16, and gathered rows are widened to
+  f32 before layer 0, so compute stays float32 (#1247).
 - Cancellation is checked around bounded batches. Runtime failures and batch panics are typed.
   Daemon job ownership and lazy model lifetime are integration work, not enabled here.
 
