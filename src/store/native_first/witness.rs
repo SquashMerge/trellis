@@ -913,7 +913,7 @@ fn association_unit(
             let want = limit;
             let rows = query_rows(
                 db,
-                "SELECT p.ordinal,lower(hex(p.content_hash)),p.evidence_kind,p.ordinal,p.basis_id,p.capture_id,CASE WHEN p.derived_from_provenance_id IS NULL THEN NULL ELSE lower(hex(p.derived_from_provenance_id)) END,p.derived_from_record_kind,CASE WHEN p.derived_from_fact_digest IS NULL THEN NULL ELSE lower(hex(p.derived_from_fact_digest)) END,EXISTS(SELECT 1 FROM semantic_raw_proofs r WHERE r.capture_id=p.capture_id AND r.proof_id=p.derived_from_provenance_id AND r.record_kind=p.derived_from_record_kind AND r.fact_digest=p.derived_from_fact_digest AND r.language=?3 AND r.path=?4) FROM semantic_provenance p WHERE p.payload_id=?1 AND p.ordinal>?2 ORDER BY p.ordinal LIMIT ?5",
+                "SELECT p.ordinal,CASE WHEN pay.content_hash IS NULL THEN NULL ELSE lower(hex(pay.content_hash)) END,p.evidence_kind,p.ordinal,p.basis_id,p.capture_id,CASE WHEN p.derived_from_provenance_id IS NULL THEN NULL ELSE lower(hex(p.derived_from_provenance_id)) END,r.record_kind,CASE WHEN r.fact_digest IS NULL THEN NULL ELSE lower(hex(r.fact_digest)) END,COALESCE(r.language=?3 AND r.path=?4,0) FROM semantic_provenance p LEFT JOIN semantic_payloads pay ON pay.payload_id=p.payload_id LEFT JOIN semantic_raw_proofs r ON r.capture_id=p.capture_id AND r.proof_id=p.derived_from_provenance_id WHERE p.payload_id=?1 AND p.ordinal>?2 ORDER BY p.ordinal LIMIT ?5",
                 params![
                     w.payload(),
                     c.after_id,
@@ -934,7 +934,8 @@ fn association_unit(
                         return Err(corrupt("original proof missing derivation"));
                     };
                     selected_ensure!(
-                        capture_id == a.capture_id && row.get_ref(1)?.as_str()? == w.source_hash,
+                        capture_id == a.capture_id
+                            && row.get_ref(1)?.as_str_or_null()? == Some(w.source_hash.as_str()),
                         "original provenance source mismatch"
                     );
                     let membership: bool = row.get(9)?;
@@ -1823,7 +1824,7 @@ pub(crate) fn source_authority(
 }
 
 fn has_nonderived_original_provenance(db: &Connection, payload: Option<i64>) -> Result<bool> {
-    db.prepare_cached("SELECT EXISTS(SELECT 1 FROM semantic_provenance WHERE payload_id=?1 AND capture_id IS NULL AND derived_from_provenance_id IS NULL AND derived_from_record_kind IS NULL AND derived_from_fact_digest IS NULL)")?.query_row([payload],|row|row.get(0)).map_err(Into::into)
+    db.prepare_cached("SELECT EXISTS(SELECT 1 FROM semantic_provenance WHERE payload_id=?1 AND capture_id IS NULL AND derived_from_provenance_id IS NULL)")?.query_row([payload],|row|row.get(0)).map_err(Into::into)
 }
 
 pub(crate) fn original_document_begin(
@@ -2175,8 +2176,8 @@ mod tests {
     #[test]
     fn nonderived_original_provenance_requires_full_without_hiding_mixed_links() {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch("CREATE TABLE semantic_provenance(payload_id INTEGER,capture_id INTEGER,derived_from_provenance_id TEXT,derived_from_record_kind TEXT,derived_from_fact_digest TEXT);
-            INSERT INTO semantic_provenance VALUES(1,NULL,NULL,NULL,NULL),(2,9,'proof','occurrence','digest'),(3,9,NULL,NULL,NULL),(4,NULL,'proof',NULL,NULL);").unwrap();
+        db.execute_batch("CREATE TABLE semantic_provenance(payload_id INTEGER,capture_id INTEGER,derived_from_provenance_id BLOB);
+            INSERT INTO semantic_provenance VALUES(1,NULL,NULL),(2,9,x'00'),(3,9,NULL),(4,NULL,x'00');").unwrap();
         assert!(has_nonderived_original_provenance(&db, Some(1)).unwrap());
         for tuple in [2, 3, 4, 5] {
             assert!(!has_nonderived_original_provenance(&db, Some(tuple)).unwrap());

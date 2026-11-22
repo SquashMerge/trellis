@@ -6493,7 +6493,7 @@ fn gc_keeps_proofs_referenced_by_retained_provenance() {
         .store
         .with_index_sql_for_tests(|db| {
             let changed = db.execute(
-                "UPDATE semantic_provenance SET capture_id=?1,derived_from_provenance_id=unhex(?2),derived_from_record_kind=(SELECT record_kind FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id=unhex(?2)),derived_from_fact_digest=(SELECT fact_digest FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id=unhex(?2)) WHERE rowid=(SELECT v.rowid FROM semantic_provenance v JOIN semantic_coverage c ON c.payload_id=v.payload_id WHERE c.revision_id=?3 AND v.capture_id IS NOT NULL LIMIT 1)",
+                "UPDATE semantic_provenance SET capture_id=?1,derived_from_provenance_id=unhex(?2) WHERE rowid=(SELECT v.rowid FROM semantic_provenance v JOIN semantic_coverage c ON c.payload_id=v.payload_id WHERE c.revision_id=?3 AND v.capture_id IS NOT NULL LIMIT 1)",
                 rusqlite::params![capture_id, proof_id, format!("pin:v1:{}:{}", head.index_generation, head.index_revision)],
             )?;
             assert_eq!(changed, 1);

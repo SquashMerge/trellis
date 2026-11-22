@@ -1,6 +1,7 @@
 //! #1248: the semantic tables store their 64-hex digests as 32-byte BLOBs. Every write path
 //! stores the digest's bytes, reads give back the lowercase text, and a malformed digest fails
-//! the write typed, inside its transaction, with nothing written.
+//! the write typed, inside its transaction, with nothing written. PR 2: a payload stores its
+//! content hash once, and a derived provenance row only the raw proof it names.
 use super::*;
 use crate::native_records::{DocumentKey, Range};
 use crate::semantic_records as sem;
@@ -20,11 +21,16 @@ fn hex(digit: char) -> String {
 /// An empty index with one raw capture (7) for derived provenance to name.
 fn index() -> Connection {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V46).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V47).unwrap();
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
     db.execute(
         "INSERT INTO semantic_raw_captures VALUES(7,1,0,'[\"rust\"]','producer',?1,'set','captured',x'','decoder')",
         [hex('a')],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO semantic_payloads(payload_id,producer_id,producer_version,language,path,version_id) VALUES(1,'producer','1','rust','a.rs','v')",
+        [],
     )
     .unwrap();
     db
@@ -155,9 +161,8 @@ fn tuple_digests_are_stored_as_bytes_and_read_as_lowercase_text() {
     write(&db, &publication()).unwrap();
     let stored: Vec<(String, i64)> = db
         .prepare(
-            "SELECT typeof(content_hash),length(content_hash) FROM semantic_provenance
+            "SELECT typeof(content_hash),length(content_hash) FROM semantic_payloads
              UNION ALL SELECT typeof(derived_from_provenance_id),length(derived_from_provenance_id) FROM semantic_provenance WHERE capture_id IS NOT NULL
-             UNION ALL SELECT typeof(derived_from_fact_digest),length(derived_from_fact_digest) FROM semantic_provenance WHERE capture_id IS NOT NULL
              UNION ALL SELECT typeof(join_content_hash),length(join_content_hash) FROM semantic_declaration_bindings
              UNION ALL SELECT typeof(join_content_hash),length(join_content_hash) FROM semantic_call_bindings",
         )
@@ -166,18 +171,18 @@ fn tuple_digests_are_stored_as_bytes_and_read_as_lowercase_text() {
         .unwrap()
         .collect::<rusqlite::Result<_>>()
         .unwrap();
-    assert_eq!(stored, vec![("blob".to_owned(), 32); 6]);
-    let read: (String, String, String, String, String) = db
+    assert_eq!(stored, vec![("blob".to_owned(), 32); 4]);
+    let read: (String, String, String, String) = db
         .query_row(
-            "SELECT lower(hex(p.content_hash)),lower(hex(p.derived_from_provenance_id)),lower(hex(p.derived_from_fact_digest)),
+            "SELECT (SELECT lower(hex(content_hash)) FROM semantic_payloads WHERE payload_id=p.payload_id),lower(hex(p.derived_from_provenance_id)),
                     (SELECT lower(hex(join_content_hash)) FROM semantic_declaration_bindings),
                     (SELECT lower(hex(join_content_hash)) FROM semantic_call_bindings)
              FROM semantic_provenance p WHERE p.capture_id=7",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .unwrap();
-    assert_eq!(read, (hex('c'), hex('d'), hex('e'), hex('6'), hex('7')));
+    assert_eq!(read, (hex('c'), hex('d'), hex('6'), hex('7')));
 }
 
 /// One malformed value per converted column the tuple writer fills: uppercase, short, non-hex,
@@ -186,17 +191,14 @@ fn tuple_digests_are_stored_as_bytes_and_read_as_lowercase_text() {
 #[test]
 fn a_malformed_tuple_digest_fails_typed_and_writes_nothing() {
     type Corrupt = fn(&mut sem::SemanticPublication);
-    let cases: [(&str, Corrupt); 5] = [
-        ("semantic_provenance.content_hash", |p| {
+    let cases: [(&str, Corrupt); 4] = [
+        ("semantic_payloads.content_hash", |p| {
             p.provenance[0].content_hash = hex('C');
         }),
         ("semantic_provenance.derived_from_provenance_id", |p| {
             let raw = hex('d')[..63].to_owned();
             p.provenance[1].id = rejoin_id(&raw);
             p.provenance[1].derived_from.as_mut().unwrap().provenance_id = raw;
-        }),
-        ("semantic_provenance.derived_from_fact_digest", |p| {
-            p.provenance[1].derived_from.as_mut().unwrap().fact_digest = hex('g');
         }),
         ("semantic_declaration_bindings.join_content_hash", |p| {
             p.declaration_bindings[0].join.anchor.content_hash = String::new();
@@ -218,6 +220,32 @@ fn a_malformed_tuple_digest_fails_typed_and_writes_nothing() {
             assert_eq!(count(&db, table), 0, "{column}: {table}");
         }
     }
+}
+
+/// PR 2: every provenance row of one payload names the payload's document version, so their
+/// content hashes are one value; two differing ones fail the write typed, with nothing written.
+#[test]
+fn differing_content_hashes_in_one_payload_fail_the_write() {
+    let db = index();
+    let mut publication = publication();
+    publication.provenance[1].content_hash = hex('b');
+    {
+        let tx = db.unchecked_transaction().unwrap();
+        let error = write(&tx, &publication).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "semantic provenance content hashes differ within a payload"
+        );
+    }
+    for table in TABLES {
+        assert_eq!(count(&db, table), 0, "{table}");
+    }
+    let hash: Option<Vec<u8>> = db
+        .query_row("SELECT content_hash FROM semantic_payloads", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(hash, None);
 }
 
 /// A stage with two valid claims of artifact 0, published as capture 7.

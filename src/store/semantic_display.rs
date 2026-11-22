@@ -1682,13 +1682,15 @@ pub(super) fn architecture_semantic(
     // Only selected rows are loaded. Proof identities and basis metadata are keyed by
     // tuple/provenance; raw proof bytes and full semantic snapshots are never scanned.
     let mut proof = db.prepare_cached(
-        "SELECT p.ordinal,lower(hex(p.content_hash)),p.evidence_kind,p.capture_id,
-                CASE WHEN p.derived_from_provenance_id IS NULL THEN NULL ELSE lower(hex(p.derived_from_provenance_id)) END,p.derived_from_record_kind,
-                CASE WHEN p.derived_from_fact_digest IS NULL THEN NULL ELSE lower(hex(p.derived_from_fact_digest)) END,
+        "SELECT p.ordinal,CASE WHEN pay.content_hash IS NULL THEN NULL ELSE lower(hex(pay.content_hash)) END,p.evidence_kind,p.capture_id,
+                CASE WHEN p.derived_from_provenance_id IS NULL THEN NULL ELSE lower(hex(p.derived_from_provenance_id)) END,r.record_kind,
+                CASE WHEN r.fact_digest IS NULL THEN NULL ELSE lower(hex(r.fact_digest)) END,
                 b.producer_id,b.producer_version,b.producer_hash,b.artifact_hash,b.language,
                 b.source_set_id,b.captured_native_revision_id,b.source_manifest_hash,
                 b.toolchain_hash,b.config_hash,b.dependency_hash,b.basis_id
-         FROM semantic_provenance p JOIN semantic_basis b ON b.payload_id=p.payload_id AND b.basis_id=p.basis_id
+         FROM semantic_provenance p LEFT JOIN semantic_payloads pay ON pay.payload_id=p.payload_id
+         JOIN semantic_basis b ON b.payload_id=p.payload_id AND b.basis_id=p.basis_id
+         LEFT JOIN semantic_raw_proofs r ON r.capture_id=p.capture_id AND r.proof_id=p.derived_from_provenance_id
          WHERE p.payload_id=?1 AND p.ordinal=?2",
     )?;
     let mut lookup_dependencies = db.prepare_cached(
@@ -1709,7 +1711,11 @@ pub(super) fn architecture_semantic(
         ))?;
         let mut values = proof.query_row(params![payload, ordinal], |row| {
             let mut value = BTreeMap::new();
-            value.insert("historicalContentHash".into(), json!(row.get::<_, String>(1)?));
+            // NULL only for a payload stored without its content hash: corrupt.
+            value.insert(
+                "historicalContentHash".into(),
+                json!(row.get::<_, Option<String>>(1)?),
+            );
             value.insert("evidenceKind".into(), json!(row.get::<_, String>(2)?));
             let derivation = (
                 row.get::<_, Option<i64>>(3)?,
@@ -1720,6 +1726,12 @@ pub(super) fn architecture_semantic(
             value.insert("basis".into(), json!({"producerId":row.get::<_, String>(7)?,"producerVersion":row.get::<_, String>(8)?,"producerHash":row.get::<_, String>(9)?,"artifactHash":row.get::<_, String>(10)?,"language":row.get::<_, String>(11)?,"sourceSetId":row.get::<_, String>(12)?,"revisionId":row.get::<_, String>(13)?,"sourceManifestHash":row.get::<_, String>(14)?,"toolchainHash":row.get::<_, String>(15)?,"configHash":row.get::<_, String>(16)?,"dependencyHash":row.get::<_, String>(17)?}));
             Ok((value, row.get::<_, i64>(18)?, derivation))
         })?;
+        ensure!(
+            !values.0["historicalContentHash"].is_null(),
+            SelectedIntegrity(
+                "incompatible_index: semantic payload without its content hash".into()
+            )
+        );
         let (capture, proof, kind, digest) = values.2;
         let historical = semantic_variant(&pp.freshness(values.1)?)?;
         values
@@ -1766,9 +1778,11 @@ pub(super) fn architecture_semantic(
     let mut calls = db.prepare_cached(
         "SELECT b.call_id,b.join_start,b.join_end,b.resolution,b.declared_kind,
                 b.declared_internal_syntax_id,b.declared_internal_language,b.declared_internal_path,
-                b.dispatch,b.stale_target,b.provenance_ordinal,b.binding_id,b.join_status,b.join_kind,b.join_document_language,b.join_document_path,COALESCE(b.join_native_revision_id,?6),p.basis_id,CASE WHEN p.derived_from_fact_digest IS NULL THEN NULL ELSE lower(hex(p.derived_from_fact_digest)) END
+                b.dispatch,b.stale_target,b.provenance_ordinal,b.binding_id,b.join_status,b.join_kind,b.join_document_language,b.join_document_path,COALESCE(b.join_native_revision_id,?6),p.basis_id,CASE WHEN r.fact_digest IS NULL THEN NULL ELSE lower(hex(r.fact_digest)) END,
+                p.capture_id IS NOT NULL AND r.capture_id IS NULL
          FROM semantic_call_bindings b
          JOIN semantic_provenance p ON p.payload_id=b.payload_id AND p.ordinal=b.provenance_ordinal
+         LEFT JOIN semantic_raw_proofs r ON r.capture_id=p.capture_id AND r.proof_id=p.derived_from_provenance_id
          LEFT JOIN semantic_coverage_freshness f ON f.revision_id=?5 AND f.tuple_id=?7 AND f.basis_id=p.basis_id
          WHERE b.payload_id=?1 AND b.call_id IS NOT NULL AND (?4 OR f.basis_id IS NULL OR f.freshness<>'stale')
            AND b.join_document_language=?2 AND b.join_document_path=?3",
@@ -1878,6 +1892,12 @@ pub(super) fn architecture_semantic(
             admit(&mut *check)?;
             // A missing required freshness row is corruption, never a filtered fact.
             let basis_freshness = pp.freshness(row.get(17)?)?;
+            // A derived row's fact digest is its raw proof's (#1248 PR 2): a missing proof is
+            // corruption, never an unordered row.
+            ensure!(
+                !row.get::<_, bool>(19)?,
+                SelectedIntegrity("incompatible_index: missing raw proof".into())
+            );
             let call_id = id_codec::decode_occ(row.get_ref(0)?.as_blob()?)
                 .map_err(|_| SelectedIntegrity("invalid semantic call ID".into()))?;
             let ordinal: i64 = row.get(10)?;
