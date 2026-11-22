@@ -29,7 +29,7 @@ import importlib.util
 
 REPO = Path(__file__).resolve().parents[1]
 DECODER_VERSION = "scip-0.10.0/CapturedScipFactV1/2"
-SCHEMA_VERSION = 46
+SCHEMA_VERSION = 47
 PINNED = REPO / "tools/synthetic-cohorts/manifest-v2.json"
 GENERATOR = REPO / "tools/synthetic-cohorts/generate.mjs"
 BATCH_MODULE = REPO / "tools/semantic-contract/semantic_batch.py"
@@ -714,7 +714,8 @@ DEBT_TABLES = {"native_revision_release_debt", "native_release_candidate_version
 
 HEX_BLOB_COLUMNS = {
     "semantic_raw_proofs": ("proof_id", "fact_digest"),
-    "semantic_provenance": ("content_hash", "derived_from_provenance_id", "derived_from_fact_digest"),
+    "semantic_payloads": ("content_hash",),
+    "semantic_provenance": ("derived_from_provenance_id",),
     "semantic_declaration_bindings": ("join_content_hash",),
     "semantic_call_bindings": ("join_content_hash",),
 }
@@ -949,7 +950,7 @@ def capture_r1(db, revision):
 
 def selected_proof(db, revision, anchor_path, artifact_hash):
     rows = db.execute("""SELECT s.producer_id,c.artifact_hash,s.captured_pin,lower(hex(p.proof_id)),
-        lower(hex(v.derived_from_provenance_id)),lower(hex(v.derived_from_fact_digest)),b.artifact_hash,
+        lower(hex(v.derived_from_provenance_id)),lower(hex(p.fact_digest)),b.artifact_hash,
         cov.state,cov.selected,cov.requested,b.captured_native_revision_id,r.native_revision_id
         FROM semantic_revision_raw_selections s
         JOIN semantic_raw_captures c ON c.batch_id=s.batch_id
@@ -957,7 +958,7 @@ def selected_proof(db, revision, anchor_path, artifact_hash):
         JOIN semantic_coverage cov ON cov.revision_id=s.revision_id AND cov.producer_id=s.producer_id
             AND cov.path=p.path AND cov.language=p.language
         JOIN semantic_provenance v ON v.payload_id=cov.payload_id AND v.capture_id=c.capture_id
-            AND v.derived_from_provenance_id=p.proof_id AND v.derived_from_fact_digest=p.fact_digest
+            AND v.derived_from_provenance_id=p.proof_id
         JOIN semantic_basis b ON b.basis_id=v.basis_id AND b.payload_id=cov.payload_id
         JOIN native_revisions r ON r.id=s.revision_id
         WHERE s.revision_id=?""", (anchor_path, revision)).fetchall()

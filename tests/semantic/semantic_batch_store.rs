@@ -6493,7 +6493,7 @@ fn gc_keeps_proofs_referenced_by_retained_provenance() {
         .store
         .with_index_sql_for_tests(|db| {
             let changed = db.execute(
-                "UPDATE semantic_provenance SET capture_id=?1,derived_from_provenance_id=unhex(?2),derived_from_record_kind=(SELECT record_kind FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id=unhex(?2)),derived_from_fact_digest=(SELECT fact_digest FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id=unhex(?2)) WHERE rowid=(SELECT v.rowid FROM semantic_provenance v JOIN semantic_coverage c ON c.payload_id=v.payload_id WHERE c.revision_id=?3 AND v.capture_id IS NOT NULL LIMIT 1)",
+                "UPDATE semantic_provenance SET capture_id=?1,derived_from_provenance_id=unhex(?2) WHERE rowid=(SELECT v.rowid FROM semantic_provenance v JOIN semantic_coverage c ON c.payload_id=v.payload_id WHERE c.revision_id=?3 AND v.capture_id IS NOT NULL LIMIT 1)",
                 rusqlite::params![capture_id, proof_id, format!("pin:v1:{}:{}", head.index_generation, head.index_revision)],
             )?;
             assert_eq!(changed, 1);
@@ -9425,6 +9425,60 @@ forbid = [{ calls = "helper" }]
     assert_ne!(fresh, caught);
     assert_eq!(answers(&mut mcp, fresh), [json!("fresh")]);
     mcp.finish();
+}
+
+/// #1248 PR 2 review: the raw proof's fact digest and the payload's content hash are read as
+/// BLOBs and decoded strictly, so a stored digest of the wrong length fails the tuple read and the
+/// Architecture read as typed corruption, never as a 62-digit string. The corruption is applied
+/// below the column CHECKs, as a damaged file would hold it.
+#[test]
+fn a_wrong_length_raw_or_payload_digest_fails_reads_and_architecture_typed() {
+    let files = ["src/lib.js", "src/main.js"];
+    for corruption in [
+        "UPDATE semantic_raw_proofs SET fact_digest=substr(fact_digest,1,31) WHERE rowid IN (SELECT r.rowid FROM semantic_raw_proofs r JOIN semantic_provenance p ON p.capture_id=r.capture_id AND p.derived_from_provenance_id=r.proof_id)",
+        "UPDATE semantic_payloads SET content_hash=substr(content_hash,1,31) WHERE payload_id IN (SELECT payload_id FROM semantic_provenance)",
+    ] {
+        // Each read meets the corruption first: a typed failure also schedules recovery.
+        for read in ["architecture", "semantic_at"] {
+            let (world, _) = real_fixture_world("issue444-javascript-calls", &files);
+            let (pin, _) = publish_real_fixture(&world, "issue444-javascript-calls", &files);
+            let architecture = || {
+                world
+                    .store
+                    .evidence_response()
+                    .unwrap()
+                    .architecture_response(
+                        "references",
+                        &json!({"expectedBasis": pin}),
+                        &mut || Ok(()),
+                    )
+            };
+            // Before the corruption the Architecture read carries derived semantic evidence.
+            let before = architecture().unwrap();
+            assert!(
+                before.to_string().contains("\"derivedFrom\":{"),
+                "no derived Architecture evidence: {before}"
+            );
+            let db = rusqlite::Connection::open(&world.index_db).unwrap();
+            db.pragma_update(None, "ignore_check_constraints", "ON")
+                .unwrap();
+            assert!(db.execute(corruption, []).unwrap() > 0, "{corruption}");
+            drop(db);
+            let error = if read == "architecture" {
+                architecture().unwrap_err()
+            } else {
+                world.store.semantic_at(pin).unwrap_err()
+            };
+            assert!(
+                format!("{error:#}").contains("incompatible_index: invalid digest BLOB length"),
+                "{corruption} {read}: {error:#}"
+            );
+            assert!(
+                world.store.recovery_pending_for_tests(),
+                "{corruption} {read}"
+            );
+        }
+    }
 }
 
 /// Architecture wire evidence keeps the imported proof's identity beside native N.
