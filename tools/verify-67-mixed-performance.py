@@ -29,7 +29,7 @@ import importlib.util
 
 REPO = Path(__file__).resolve().parents[1]
 DECODER_VERSION = "scip-0.10.0/CapturedScipFactV1/2"
-SCHEMA_VERSION = 45
+SCHEMA_VERSION = 46
 PINNED = REPO / "tools/synthetic-cohorts/manifest-v2.json"
 GENERATOR = REPO / "tools/synthetic-cohorts/generate.mjs"
 BATCH_MODULE = REPO / "tools/semantic-contract/semantic_batch.py"
@@ -712,6 +712,14 @@ DEBT_TABLES = {"native_revision_release_debt", "native_release_candidate_version
                "native_release_candidate_graphs", "native_release_candidate_classes"}
 
 
+HEX_BLOB_COLUMNS = {
+    "semantic_raw_proofs": ("proof_id", "fact_digest"),
+    "semantic_provenance": ("content_hash", "derived_from_provenance_id", "derived_from_fact_digest"),
+    "semantic_declaration_bindings": ("join_content_hash",),
+    "semantic_call_bindings": ("join_content_hash",),
+}
+
+
 def typed_cells(value):
     if isinstance(value, bytes):
         return {"blob": value.hex()}
@@ -940,8 +948,8 @@ def capture_r1(db, revision):
 
 
 def selected_proof(db, revision, anchor_path, artifact_hash):
-    rows = db.execute("""SELECT s.producer_id,c.artifact_hash,s.captured_pin,p.proof_id,
-        v.derived_from_provenance_id,v.derived_from_fact_digest,b.artifact_hash,
+    rows = db.execute("""SELECT s.producer_id,c.artifact_hash,s.captured_pin,lower(hex(p.proof_id)),
+        lower(hex(v.derived_from_provenance_id)),lower(hex(v.derived_from_fact_digest)),b.artifact_hash,
         cov.state,cov.selected,cov.requested,b.captured_native_revision_id,r.native_revision_id
         FROM semantic_revision_raw_selections s
         JOIN semantic_raw_captures c ON c.batch_id=s.batch_id
@@ -1235,7 +1243,7 @@ class SelectedView:
             self.capture_bytes = descriptor_bytes
             self.r1_docs = r1_doc
             for raw, kind, language, path, fact, canonical_bytes in db.execute(
-                    "SELECT proof_id,record_kind,language,path,fact_digest,canonical_bytes "
+                    "SELECT lower(hex(proof_id)),record_kind,language,path,lower(hex(fact_digest)),canonical_bytes "
                     "FROM semantic_raw_proofs WHERE capture_id=?", (capture,)):
                 self.ids["proof"][raw] = (self.ids["capture"][capture], kind, language,
                                            path, fact, canonical_bytes.hex())
@@ -1253,7 +1261,7 @@ class SelectedView:
             self.ids["basis"][raw] = (self.ids["payload"][payload_id], producer, artifact, language,
                                        tuple(self.r1_docs))
         for payload_id, ordinal, evidence, basis, proof in db.execute(
-                "SELECT payload_id,ordinal,evidence_kind,basis_id,derived_from_provenance_id "
+                "SELECT payload_id,ordinal,evidence_kind,basis_id,CASE WHEN derived_from_provenance_id IS NULL THEN NULL ELSE lower(hex(derived_from_provenance_id)) END "
                 "FROM semantic_provenance WHERE payload_id IN "
                 "(SELECT payload_id FROM semantic_coverage WHERE revision_id=?)", (revision,)):
             require(proof in self.ids["proof"], "provenance not linked to selected raw proof")
@@ -1322,6 +1330,11 @@ class SelectedView:
 
     def row(self, table, cells):
         # A per-table selected scope is established by parity_digest before this point.
+        # The semantic tables store these digests as their 32 bytes (#1248); compare them as
+        # the lowercase hex text the wire and the identity maps use.
+        for column in HEX_BLOB_COLUMNS.get(table, ()):
+            if isinstance(cells.get(column), bytes) and len(cells[column]) == 32:
+                cells[column] = cells[column].hex()
         if table == "native_source_sets":
             require(cells["id"] == self.source_set and cells["root_id"] == self.root_id
                     and self.source_set == "source-set:v1:" + self.root_id,

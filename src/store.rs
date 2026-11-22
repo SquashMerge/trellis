@@ -984,11 +984,11 @@ SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+(
 UNION ALL
 SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+COALESCE(length(CAST(x.id AS BLOB)),0)+39+(CASE WHEN x.target IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes,1 AS class FROM class_relations x WHERE x.cid=?2
 )"#;
-const DATABASE_SCHEMA_VERSION: u32 = 45;
+const DATABASE_SCHEMA_VERSION: u32 = 46;
 const EXTRACTOR_VERSION: &str = "native-v6-delta-v1";
 const EVIDENCE_FORMAT: &str = "terminal-native-graph-v1";
-const CACHE_SCHEMA_V45: &str = r#"
-CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=45), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
+const CACHE_SCHEMA_V46: &str = r#"
+CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=46), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
 CREATE TABLE native_producers(id TEXT NOT NULL,version TEXT NOT NULL,executable_hash TEXT NOT NULL CHECK(length(executable_hash)=64),kind TEXT NOT NULL CHECK(kind='native'),position_encoding TEXT NOT NULL CHECK(position_encoding='utf8'),PRIMARY KEY(id,version));
 CREATE TABLE native_producer_languages(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,inventory_authenticated INTEGER NOT NULL CHECK(inventory_authenticated IN (0,1)),ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language),UNIQUE(producer_id,producer_version,ordinal),FOREIGN KEY(producer_id,producer_version) REFERENCES native_producers(id,version) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE native_producer_inputs(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,component_name TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language,component_name),UNIQUE(producer_id,producer_version,language,ordinal),FOREIGN KEY(producer_id,producer_version,language) REFERENCES native_producer_languages(producer_id,producer_version,language) DEFERRABLE INITIALLY DEFERRED);
@@ -1083,17 +1083,17 @@ CREATE TABLE semantic_raw_exclusions(batch_id INTEGER NOT NULL REFERENCES semant
 CREATE TABLE semantic_revision_raw_selections(revision_id TEXT NOT NULL REFERENCES native_revisions(id),producer_id TEXT NOT NULL,batch_id INTEGER NOT NULL REFERENCES semantic_raw_batches(batch_id),captured_pin TEXT NOT NULL REFERENCES native_revisions(id),PRIMARY KEY(revision_id,producer_id));
 CREATE INDEX semantic_raw_selections_batch ON semantic_revision_raw_selections(batch_id);
 CREATE INDEX semantic_raw_selections_captured_pin ON semantic_revision_raw_selections(captured_pin);
-CREATE TABLE semantic_raw_proofs(capture_id INTEGER NOT NULL REFERENCES semantic_raw_captures(capture_id),proof_id TEXT NOT NULL,record_kind TEXT NOT NULL CHECK(record_kind IN ('occurrence','symbolInformation','relationship')),fact_digest TEXT NOT NULL CHECK(length(fact_digest)=64),language TEXT NOT NULL,path TEXT NOT NULL,canonical_bytes BLOB NOT NULL,UNIQUE(capture_id,proof_id),UNIQUE(capture_id,language,path,record_kind,fact_digest));
+CREATE TABLE semantic_raw_proofs(capture_id INTEGER NOT NULL REFERENCES semantic_raw_captures(capture_id),proof_id BLOB NOT NULL CHECK(length(proof_id)=32),record_kind TEXT NOT NULL CHECK(record_kind IN ('occurrence','symbolInformation','relationship')),fact_digest BLOB NOT NULL CHECK(length(fact_digest)=32),language TEXT NOT NULL,path TEXT NOT NULL,canonical_bytes BLOB NOT NULL,UNIQUE(capture_id,proof_id),UNIQUE(capture_id,language,path,record_kind,fact_digest));
 CREATE TABLE semantic_raw_documents(capture_id INTEGER NOT NULL REFERENCES semantic_raw_captures(capture_id) ON DELETE CASCADE,language TEXT NOT NULL,path TEXT NOT NULL,source_hash TEXT NOT NULL CHECK(length(source_hash)=64),wire_digest TEXT NOT NULL CHECK(length(wire_digest)=64),capped INTEGER NOT NULL CHECK(capped IN (0,1,2,3)),PRIMARY KEY(capture_id,language,path));
 CREATE TABLE semantic_reimport(revision_id TEXT NOT NULL REFERENCES native_revisions(id) ON DELETE CASCADE,producer TEXT NOT NULL,language TEXT NOT NULL,reason TEXT NOT NULL,PRIMARY KEY(revision_id,producer,language));
 CREATE TABLE semantic_import_reports(revision_id TEXT NOT NULL REFERENCES native_revisions(id),producer_id TEXT NOT NULL,report_json TEXT NOT NULL CHECK(json_valid(report_json)),PRIMARY KEY(revision_id,producer_id));
-CREATE TABLE semantic_provenance(payload_id INTEGER NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal BETWEEN 0 AND 9007199254740991),provenance_id TEXT,content_hash TEXT NOT NULL,evidence_kind TEXT NOT NULL CHECK(evidence_kind IN ('measuredSyntax','declarationBinding','semanticReference','typeRelationship')),basis_id INTEGER NOT NULL,capture_id INTEGER,derived_from_provenance_id TEXT,derived_from_record_kind TEXT CHECK(derived_from_record_kind IN ('occurrence','symbolInformation','relationship')),derived_from_fact_digest TEXT CHECK(length(derived_from_fact_digest)=64),CHECK((capture_id IS NULL AND derived_from_provenance_id IS NULL AND derived_from_record_kind IS NULL AND derived_from_fact_digest IS NULL) OR (capture_id IS NOT NULL AND derived_from_provenance_id IS NOT NULL AND derived_from_record_kind IS NOT NULL AND derived_from_fact_digest IS NOT NULL)),CHECK((capture_id IS NULL)=(provenance_id IS NOT NULL)),PRIMARY KEY(payload_id,ordinal),UNIQUE(payload_id,provenance_id),UNIQUE(payload_id,derived_from_provenance_id,evidence_kind),FOREIGN KEY(payload_id) REFERENCES semantic_payloads(payload_id),FOREIGN KEY(payload_id,basis_id) REFERENCES semantic_basis(payload_id,basis_id),FOREIGN KEY(capture_id,derived_from_provenance_id) REFERENCES semantic_raw_proofs(capture_id,proof_id));
+CREATE TABLE semantic_provenance(payload_id INTEGER NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal BETWEEN 0 AND 9007199254740991),provenance_id TEXT,content_hash BLOB NOT NULL CHECK(length(content_hash)=32),evidence_kind TEXT NOT NULL CHECK(evidence_kind IN ('measuredSyntax','declarationBinding','semanticReference','typeRelationship')),basis_id INTEGER NOT NULL,capture_id INTEGER,derived_from_provenance_id BLOB CHECK(length(derived_from_provenance_id)=32),derived_from_record_kind TEXT CHECK(derived_from_record_kind IN ('occurrence','symbolInformation','relationship')),derived_from_fact_digest BLOB CHECK(length(derived_from_fact_digest)=32),CHECK((capture_id IS NULL AND derived_from_provenance_id IS NULL AND derived_from_record_kind IS NULL AND derived_from_fact_digest IS NULL) OR (capture_id IS NOT NULL AND derived_from_provenance_id IS NOT NULL AND derived_from_record_kind IS NOT NULL AND derived_from_fact_digest IS NOT NULL)),CHECK((capture_id IS NULL)=(provenance_id IS NOT NULL)),PRIMARY KEY(payload_id,ordinal),UNIQUE(payload_id,provenance_id),UNIQUE(payload_id,derived_from_provenance_id,evidence_kind),FOREIGN KEY(payload_id) REFERENCES semantic_payloads(payload_id),FOREIGN KEY(payload_id,basis_id) REFERENCES semantic_basis(payload_id,basis_id),FOREIGN KEY(capture_id,derived_from_provenance_id) REFERENCES semantic_raw_proofs(capture_id,proof_id));
 CREATE INDEX semantic_provenance_derived ON semantic_provenance(capture_id,derived_from_provenance_id) WHERE capture_id IS NOT NULL;
 CREATE TABLE semantic_symbols(symbol_id INTEGER PRIMARY KEY,payload_id INTEGER NOT NULL,ordinal INTEGER NOT NULL,key_scheme TEXT NOT NULL,key_symbol TEXT NOT NULL,key_scope TEXT NOT NULL CHECK(key_scope IN ('global','document','target')),key_document_language TEXT,key_document_path TEXT,display_name TEXT,provenance_ordinal INTEGER NOT NULL,UNIQUE(payload_id,ordinal),FOREIGN KEY(payload_id,provenance_ordinal) REFERENCES semantic_provenance(payload_id,ordinal));
 CREATE UNIQUE INDEX semantic_symbols_key ON semantic_symbols(payload_id,key_scheme,key_symbol,key_scope,COALESCE(key_document_language,''),COALESCE(key_document_path,''));
 CREATE TABLE semantic_symbol_targets(symbol_id INTEGER NOT NULL REFERENCES semantic_symbols(symbol_id),ordinal INTEGER NOT NULL,kind TEXT NOT NULL CHECK(kind IN ('internal','external')),internal_syntax_id BLOB,internal_language TEXT,internal_path TEXT,internal_native_revision_id TEXT,external_scheme TEXT,external_symbol TEXT,external_scope TEXT,external_language TEXT,external_path TEXT,CHECK((kind='internal' AND length(internal_syntax_id)=16 AND internal_language IS NOT NULL AND internal_path IS NOT NULL AND external_scheme IS NULL AND external_symbol IS NULL AND external_scope IS NULL AND external_language IS NULL AND external_path IS NULL) OR (kind='external' AND internal_syntax_id IS NULL AND internal_language IS NULL AND internal_path IS NULL AND internal_native_revision_id IS NULL AND external_scheme IS NOT NULL AND external_symbol IS NOT NULL AND external_scope IN ('global','document') AND ((external_scope='global' AND external_language IS NULL AND external_path IS NULL) OR (external_scope='document' AND external_language IS NOT NULL AND external_path IS NOT NULL)))),PRIMARY KEY(symbol_id,ordinal));
 CREATE INDEX semantic_symbol_targets_internal_syntax ON semantic_symbol_targets(internal_syntax_id,internal_language,internal_path,symbol_id) WHERE kind='internal';
-CREATE TABLE semantic_declaration_bindings(binding_id INTEGER PRIMARY KEY,payload_id INTEGER NOT NULL,ordinal INTEGER NOT NULL,syntax_id BLOB CHECK(syntax_id IS NULL OR length(syntax_id)=16),provenance_ordinal INTEGER NOT NULL,join_document_language TEXT NOT NULL,join_document_path TEXT NOT NULL,join_native_revision_id TEXT,join_content_hash TEXT NOT NULL,join_start INTEGER NOT NULL,join_end INTEGER NOT NULL,join_kind TEXT NOT NULL CHECK(join_kind='declarationName'),join_status TEXT NOT NULL CHECK(join_status IN ('exact','ambiguous','unmatched','unsupported')),join_diagnostic TEXT,UNIQUE(payload_id,ordinal),FOREIGN KEY(payload_id,provenance_ordinal) REFERENCES semantic_provenance(payload_id,ordinal));
+CREATE TABLE semantic_declaration_bindings(binding_id INTEGER PRIMARY KEY,payload_id INTEGER NOT NULL,ordinal INTEGER NOT NULL,syntax_id BLOB CHECK(syntax_id IS NULL OR length(syntax_id)=16),provenance_ordinal INTEGER NOT NULL,join_document_language TEXT NOT NULL,join_document_path TEXT NOT NULL,join_native_revision_id TEXT,join_content_hash BLOB NOT NULL CHECK(length(join_content_hash)=32),join_start INTEGER NOT NULL,join_end INTEGER NOT NULL,join_kind TEXT NOT NULL CHECK(join_kind='declarationName'),join_status TEXT NOT NULL CHECK(join_status IN ('exact','ambiguous','unmatched','unsupported')),join_diagnostic TEXT,UNIQUE(payload_id,ordinal),FOREIGN KEY(payload_id,provenance_ordinal) REFERENCES semantic_provenance(payload_id,ordinal));
 CREATE INDEX semantic_declaration_bindings_syntax ON semantic_declaration_bindings(payload_id,syntax_id);
 CREATE TABLE semantic_declaration_binding_symbols(binding_id INTEGER NOT NULL REFERENCES semantic_declaration_bindings(binding_id),ordinal INTEGER NOT NULL,scheme TEXT NOT NULL,symbol TEXT NOT NULL,scope TEXT NOT NULL,document_language TEXT,document_path TEXT,PRIMARY KEY(binding_id,ordinal));
 CREATE TABLE semantic_declaration_join_candidates(binding_id INTEGER NOT NULL REFERENCES semantic_declaration_bindings(binding_id),ordinal INTEGER NOT NULL,candidate_id BLOB NOT NULL CHECK(length(candidate_id)=16),PRIMARY KEY(binding_id,ordinal),UNIQUE(binding_id,candidate_id));
@@ -1101,7 +1101,7 @@ CREATE TABLE semantic_references(payload_id INTEGER NOT NULL,reference_id BLOB N
 CREATE INDEX semantic_references_owner ON semantic_references(payload_id,owner_id);
 CREATE TABLE semantic_reference_roles(payload_id INTEGER NOT NULL,reference_id BLOB NOT NULL,ordinal INTEGER NOT NULL,role TEXT NOT NULL,PRIMARY KEY(payload_id,reference_id,ordinal),UNIQUE(payload_id,reference_id,role),FOREIGN KEY(payload_id,reference_id) REFERENCES semantic_references(payload_id,reference_id));
 CREATE TABLE semantic_reference_candidates(payload_id INTEGER NOT NULL,reference_id BLOB NOT NULL,ordinal INTEGER NOT NULL,kind TEXT NOT NULL CHECK(kind IN ('internal','external')),internal_syntax_id BLOB,internal_language TEXT,internal_path TEXT,internal_native_revision_id TEXT,external_scheme TEXT,external_symbol TEXT,external_scope TEXT,external_language TEXT,external_path TEXT,CHECK((kind='internal' AND length(internal_syntax_id)=16 AND internal_language IS NOT NULL AND internal_path IS NOT NULL AND external_scheme IS NULL AND external_symbol IS NULL AND external_scope IS NULL AND external_language IS NULL AND external_path IS NULL) OR (kind='external' AND internal_syntax_id IS NULL AND internal_language IS NULL AND internal_path IS NULL AND internal_native_revision_id IS NULL AND external_scheme IS NOT NULL AND external_symbol IS NOT NULL AND external_scope IN ('global','document') AND ((external_scope='global' AND external_language IS NULL AND external_path IS NULL) OR (external_scope='document' AND external_language IS NOT NULL AND external_path IS NOT NULL)))),PRIMARY KEY(payload_id,reference_id,ordinal),FOREIGN KEY(payload_id,reference_id) REFERENCES semantic_references(payload_id,reference_id));
-CREATE TABLE semantic_call_bindings(binding_id INTEGER PRIMARY KEY,payload_id INTEGER NOT NULL,ordinal INTEGER NOT NULL,call_id BLOB CHECK(call_id IS NULL OR length(call_id)=16),join_document_language TEXT NOT NULL,join_document_path TEXT NOT NULL,join_native_revision_id TEXT,join_content_hash TEXT NOT NULL,join_start INTEGER NOT NULL,join_end INTEGER NOT NULL,join_kind TEXT NOT NULL CHECK(join_kind IN ('callee','invocation')),join_status TEXT NOT NULL,join_diagnostic TEXT,resolution TEXT NOT NULL,declared_kind TEXT CHECK(declared_kind IS NULL OR declared_kind IN ('internal','external')),declared_internal_syntax_id BLOB,declared_internal_language TEXT,declared_internal_path TEXT,declared_internal_native_revision_id TEXT,declared_external_scheme TEXT,declared_external_symbol TEXT,declared_external_scope TEXT,declared_external_language TEXT,declared_external_path TEXT,dispatch TEXT NOT NULL,possible_dispatch_complete INTEGER NOT NULL CHECK(possible_dispatch_complete=0),stale_target INTEGER CHECK(stale_target IS NULL OR stale_target=0),provenance_ordinal INTEGER NOT NULL,capture_bound INTEGER NOT NULL DEFAULT 0 CHECK(capture_bound=0 OR (capture_bound=1 AND dispatch='direct' AND declared_kind='internal')),CHECK((declared_kind IS NULL AND declared_internal_syntax_id IS NULL AND declared_internal_language IS NULL AND declared_internal_path IS NULL AND declared_internal_native_revision_id IS NULL AND declared_external_scheme IS NULL AND declared_external_symbol IS NULL AND declared_external_scope IS NULL AND declared_external_language IS NULL AND declared_external_path IS NULL) OR (declared_kind IS NOT NULL AND declared_kind='internal' AND length(declared_internal_syntax_id)=16 AND declared_internal_language IS NOT NULL AND declared_internal_path IS NOT NULL AND declared_external_scheme IS NULL AND declared_external_symbol IS NULL AND declared_external_scope IS NULL AND declared_external_language IS NULL AND declared_external_path IS NULL) OR (declared_kind IS NOT NULL AND declared_kind='external' AND declared_internal_syntax_id IS NULL AND declared_internal_language IS NULL AND declared_internal_path IS NULL AND declared_internal_native_revision_id IS NULL AND declared_external_scheme IS NOT NULL AND declared_external_symbol IS NOT NULL AND declared_external_scope IN ('global','document') AND ((declared_external_scope='global' AND declared_external_language IS NULL AND declared_external_path IS NULL) OR (declared_external_scope='document' AND declared_external_language IS NOT NULL AND declared_external_path IS NOT NULL)))),UNIQUE(payload_id,ordinal),FOREIGN KEY(payload_id,provenance_ordinal) REFERENCES semantic_provenance(payload_id,ordinal));
+CREATE TABLE semantic_call_bindings(binding_id INTEGER PRIMARY KEY,payload_id INTEGER NOT NULL,ordinal INTEGER NOT NULL,call_id BLOB CHECK(call_id IS NULL OR length(call_id)=16),join_document_language TEXT NOT NULL,join_document_path TEXT NOT NULL,join_native_revision_id TEXT,join_content_hash BLOB NOT NULL CHECK(length(join_content_hash)=32),join_start INTEGER NOT NULL,join_end INTEGER NOT NULL,join_kind TEXT NOT NULL CHECK(join_kind IN ('callee','invocation')),join_status TEXT NOT NULL,join_diagnostic TEXT,resolution TEXT NOT NULL,declared_kind TEXT CHECK(declared_kind IS NULL OR declared_kind IN ('internal','external')),declared_internal_syntax_id BLOB,declared_internal_language TEXT,declared_internal_path TEXT,declared_internal_native_revision_id TEXT,declared_external_scheme TEXT,declared_external_symbol TEXT,declared_external_scope TEXT,declared_external_language TEXT,declared_external_path TEXT,dispatch TEXT NOT NULL,possible_dispatch_complete INTEGER NOT NULL CHECK(possible_dispatch_complete=0),stale_target INTEGER CHECK(stale_target IS NULL OR stale_target=0),provenance_ordinal INTEGER NOT NULL,capture_bound INTEGER NOT NULL DEFAULT 0 CHECK(capture_bound=0 OR (capture_bound=1 AND dispatch='direct' AND declared_kind='internal')),CHECK((declared_kind IS NULL AND declared_internal_syntax_id IS NULL AND declared_internal_language IS NULL AND declared_internal_path IS NULL AND declared_internal_native_revision_id IS NULL AND declared_external_scheme IS NULL AND declared_external_symbol IS NULL AND declared_external_scope IS NULL AND declared_external_language IS NULL AND declared_external_path IS NULL) OR (declared_kind IS NOT NULL AND declared_kind='internal' AND length(declared_internal_syntax_id)=16 AND declared_internal_language IS NOT NULL AND declared_internal_path IS NOT NULL AND declared_external_scheme IS NULL AND declared_external_symbol IS NULL AND declared_external_scope IS NULL AND declared_external_language IS NULL AND declared_external_path IS NULL) OR (declared_kind IS NOT NULL AND declared_kind='external' AND declared_internal_syntax_id IS NULL AND declared_internal_language IS NULL AND declared_internal_path IS NULL AND declared_internal_native_revision_id IS NULL AND declared_external_scheme IS NOT NULL AND declared_external_symbol IS NOT NULL AND declared_external_scope IN ('global','document') AND ((declared_external_scope='global' AND declared_external_language IS NULL AND declared_external_path IS NULL) OR (declared_external_scope='document' AND declared_external_language IS NOT NULL AND declared_external_path IS NOT NULL)))),UNIQUE(payload_id,ordinal),FOREIGN KEY(payload_id,provenance_ordinal) REFERENCES semantic_provenance(payload_id,ordinal));
 CREATE INDEX semantic_call_bindings_call ON semantic_call_bindings(payload_id,call_id);
 CREATE TABLE semantic_call_candidates(binding_id INTEGER NOT NULL REFERENCES semantic_call_bindings(binding_id),ordinal INTEGER NOT NULL,kind TEXT NOT NULL CHECK(kind IN ('internal','external')),internal_syntax_id BLOB,internal_language TEXT,internal_path TEXT,internal_native_revision_id TEXT,external_scheme TEXT,external_symbol TEXT,external_scope TEXT,external_language TEXT,external_path TEXT,CHECK((kind='internal' AND length(internal_syntax_id)=16 AND internal_language IS NOT NULL AND internal_path IS NOT NULL AND external_scheme IS NULL AND external_symbol IS NULL AND external_scope IS NULL AND external_language IS NULL AND external_path IS NULL) OR (kind='external' AND internal_syntax_id IS NULL AND internal_language IS NULL AND internal_path IS NULL AND internal_native_revision_id IS NULL AND external_scheme IS NOT NULL AND external_symbol IS NOT NULL AND external_scope IN ('global','document') AND ((external_scope='global' AND external_language IS NULL AND external_path IS NULL) OR (external_scope='document' AND external_language IS NOT NULL AND external_path IS NOT NULL)))),PRIMARY KEY(binding_id,ordinal));
 CREATE TABLE semantic_call_possible_dispatch(binding_id INTEGER NOT NULL REFERENCES semantic_call_bindings(binding_id),ordinal INTEGER NOT NULL,kind TEXT NOT NULL CHECK(kind IN ('internal','external')),internal_syntax_id BLOB,internal_language TEXT,internal_path TEXT,internal_native_revision_id TEXT,external_scheme TEXT,external_symbol TEXT,external_scope TEXT,external_language TEXT,external_path TEXT,CHECK((kind='internal' AND length(internal_syntax_id)=16 AND internal_language IS NOT NULL AND internal_path IS NOT NULL AND external_scheme IS NULL AND external_symbol IS NULL AND external_scope IS NULL AND external_language IS NULL AND external_path IS NULL) OR (kind='external' AND internal_syntax_id IS NULL AND internal_language IS NULL AND internal_path IS NULL AND internal_native_revision_id IS NULL AND external_scheme IS NOT NULL AND external_symbol IS NOT NULL AND external_scope IN ('global','document') AND ((external_scope='global' AND external_language IS NULL AND external_path IS NULL) OR (external_scope='document' AND external_language IS NOT NULL AND external_path IS NOT NULL)))),PRIMARY KEY(binding_id,ordinal));
@@ -2924,7 +2924,7 @@ fn expected_cache_objects() -> Result<&'static Vec<CacheObject>> {
     #[cfg(test)]
     EXPECTED_CACHE_SHAPE_BUILDS.with(|count| count.set(count.get() + 1));
     let expected = Connection::open_in_memory()?;
-    expected.execute_batch(CACHE_SCHEMA_V45)?;
+    expected.execute_batch(CACHE_SCHEMA_V46)?;
     let built = cache_objects(&expected)?;
     Ok(EXPECTED.get_or_init(|| built))
 }
@@ -2948,7 +2948,7 @@ mod cache_shape_once_tests {
 
     fn current_schema_db() -> Connection {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(CACHE_SCHEMA_V45).unwrap();
+        db.execute_batch(CACHE_SCHEMA_V46).unwrap();
         db.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
             .unwrap();
         db
@@ -3808,6 +3808,8 @@ fn storage_result<T>(result: rusqlite::Result<T>) -> Result<T> {
         other => Ok(other?),
     }
 }
+#[cfg(test)]
+mod digest_blob_tests;
 #[cfg(test)]
 mod rebuild_in_progress_tests;
 #[cfg(test)]
@@ -5974,7 +5976,7 @@ fn read_semantic_tuple_with_reasons(
             language: language.clone(),
             path: path.clone(),
         };
-        let rows=db.prepare("SELECT p.ordinal,p.content_hash,p.evidence_kind,p.derived_from_provenance_id,b.producer_id,b.producer_version,b.producer_hash,b.artifact_hash,b.language,b.source_set_id,b.captured_native_revision_id,b.source_manifest_hash,b.toolchain_hash,b.config_hash,b.dependency_hash,b.basis_id,p.capture_id,p.derived_from_record_kind,p.derived_from_fact_digest FROM semantic_provenance p JOIN semantic_basis b ON b.payload_id=p.payload_id AND b.basis_id=p.basis_id WHERE p.payload_id=?1 AND (?5 IS NULL OR p.ordinal IN (SELECT provenance_ordinal FROM semantic_call_bindings WHERE payload_id=?1 AND call_id=?5)) AND (?2 IS NULL OR p.ordinal IN (SELECT provenance_ordinal FROM semantic_declaration_bindings WHERE payload_id=?1 AND syntax_id=?2 UNION SELECT s.provenance_ordinal FROM semantic_symbols s JOIN semantic_symbol_targets t ON t.symbol_id=s.symbol_id WHERE s.payload_id=?1 AND t.kind='internal' AND t.internal_syntax_id=?2 AND t.internal_language=?3 AND t.internal_path=?4 UNION SELECT provenance_ordinal FROM semantic_type_relationships WHERE payload_id=?1 AND source_kind='internal' AND source_internal_syntax_id=?2 AND source_internal_language=?3 AND source_internal_path=?4)) ORDER BY p.ordinal")?.query_map(params![payload, history_syntax.and_then(id_codec::encode_sid), language, path, call_id],|r|{
+        let rows=db.prepare("SELECT p.ordinal,lower(hex(p.content_hash)),p.evidence_kind,CASE WHEN p.derived_from_provenance_id IS NULL THEN NULL ELSE lower(hex(p.derived_from_provenance_id)) END,b.producer_id,b.producer_version,b.producer_hash,b.artifact_hash,b.language,b.source_set_id,b.captured_native_revision_id,b.source_manifest_hash,b.toolchain_hash,b.config_hash,b.dependency_hash,b.basis_id,p.capture_id,p.derived_from_record_kind,CASE WHEN p.derived_from_fact_digest IS NULL THEN NULL ELSE lower(hex(p.derived_from_fact_digest)) END FROM semantic_provenance p JOIN semantic_basis b ON b.payload_id=p.payload_id AND b.basis_id=p.basis_id WHERE p.payload_id=?1 AND (?5 IS NULL OR p.ordinal IN (SELECT provenance_ordinal FROM semantic_call_bindings WHERE payload_id=?1 AND call_id=?5)) AND (?2 IS NULL OR p.ordinal IN (SELECT provenance_ordinal FROM semantic_declaration_bindings WHERE payload_id=?1 AND syntax_id=?2 UNION SELECT s.provenance_ordinal FROM semantic_symbols s JOIN semantic_symbol_targets t ON t.symbol_id=s.symbol_id WHERE s.payload_id=?1 AND t.kind='internal' AND t.internal_syntax_id=?2 AND t.internal_language=?3 AND t.internal_path=?4 UNION SELECT provenance_ordinal FROM semantic_type_relationships WHERE payload_id=?1 AND source_kind='internal' AND source_internal_syntax_id=?2 AND source_internal_language=?3 AND source_internal_path=?4)) ORDER BY p.ordinal")?.query_map(params![payload, history_syntax.and_then(id_codec::encode_sid), language, path, call_id],|r|{
             Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,String>(8)?,r.get::<_,String>(9)?,r.get::<_,String>(10)?,r.get::<_,String>(11)?,r.get::<_,String>(12)?,r.get::<_,String>(13)?,r.get::<_,String>(14)?,r.get::<_,i64>(15)?,r.get::<_,Option<i64>>(16)?,r.get::<_,Option<String>>(17)?,r.get::<_,Option<String>>(18)?))
         })?.collect::<rusqlite::Result<Vec<_>>>()?;
         let mut lookup_dependencies_stmt = db.prepare_cached(
@@ -6024,8 +6026,8 @@ fn read_semantic_tuple_with_reasons(
                         String,
                     );
                     let raw: Option<RawRow> = db.query_row(
-                        "SELECT p.record_kind,p.fact_digest,p.language,p.path,p.canonical_bytes,c.producer_id,c.source_set_id,c.captured_revision,c.artifact_hash FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE p.capture_id=?1 AND p.proof_id=?2",
-                        params![capture, proof],
+                        "SELECT p.record_kind,lower(hex(p.fact_digest)),p.language,p.path,p.canonical_bytes,c.producer_id,c.source_set_id,c.captured_revision,c.artifact_hash FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE p.capture_id=?1 AND p.proof_id=?2",
+                        params![capture, id_codec::encode_digest(&proof)],
                         |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?)),
                     ).optional()?;
                     let (
@@ -6304,7 +6306,7 @@ fn read_semantic_facts(
             provenance_id: projection.provenance_id(provenance_id)?,
         });
     }
-    let binding_rows=db.prepare("SELECT binding_id,ordinal,syntax_id,provenance_ordinal,join_document_language,join_document_path,join_native_revision_id,join_content_hash,join_start,join_end,join_kind,join_status,join_diagnostic FROM semantic_declaration_bindings WHERE payload_id=?1 ORDER BY ordinal")?.query_map([tuple],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,Option<Vec<u8>>>(2)?,r.get::<_,i64>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,Option<String>>(6)?,r.get::<_,String>(7)?,r.get::<_,i64>(8)?,r.get::<_,i64>(9)?,r.get::<_,String>(10)?,r.get::<_,String>(11)?,r.get::<_,Option<String>>(12)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let binding_rows=db.prepare("SELECT binding_id,ordinal,syntax_id,provenance_ordinal,join_document_language,join_document_path,join_native_revision_id,lower(hex(join_content_hash)),join_start,join_end,join_kind,join_status,join_diagnostic FROM semantic_declaration_bindings WHERE payload_id=?1 ORDER BY ordinal")?.query_map([tuple],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,Option<Vec<u8>>>(2)?,r.get::<_,i64>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,Option<String>>(6)?,r.get::<_,String>(7)?,r.get::<_,i64>(8)?,r.get::<_,i64>(9)?,r.get::<_,String>(10)?,r.get::<_,String>(11)?,r.get::<_,Option<String>>(12)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
     let mut declaration_symbols = db.prepare_cached(
         "SELECT ordinal,scheme,symbol,scope,document_language,document_path FROM semantic_declaration_binding_symbols WHERE binding_id=?1 ORDER BY ordinal",
     )?;
@@ -6532,7 +6534,7 @@ fn read_semantic_call_facts(
                 r.get::<_, String>(4)?,
                 r.get::<_, String>(5)?,
                 r.get::<_, Option<String>>(6)?,
-                r.get::<_, String>(7)?,
+                r.get::<_, Vec<u8>>(7)?,
                 r.get::<_, i64>(8)?,
                 r.get::<_, i64>(9)?,
                 r.get::<_, String>(10)?,
@@ -6608,7 +6610,7 @@ fn read_semantic_call_facts(
                         path,
                     },
                     revision_id: projection.revision(revision_id),
-                    content_hash,
+                    content_hash: id_codec::decode_digest(&content_hash)?,
                     range: crate::native_records::Range {
                         start: start.try_into().context(SelectedIntegrity(
                             "incompatible_index: invalid semantic start".into(),
@@ -7075,10 +7077,36 @@ fn fill_capture_blob(
 /// the order that table is stored and needs no sorter.
 const RAW_DOCUMENTS_SQL: &str = "INSERT OR IGNORE INTO semantic_raw_documents SELECT m.capture_id,s.language,s.path,s.content_hash,d.wire_digest,d.capped FROM stage.documents d CROSS JOIN stage.sources s ON s.ord=d.source_ord CROSS JOIN capture_ids m ON m.ordinal=d.artifact ORDER BY d.source_ord";
 const RAW_EXCLUSIONS_SQL: &str = "INSERT OR IGNORE INTO semantic_raw_exclusions SELECT ?1,s.language,s.path,c.exclusion FROM stage.coverage c JOIN stage.sources s ON s.ord=c.source_ord WHERE c.exclusion IS NOT NULL ORDER BY c.source_ord";
-const RAW_PROOFS_SQL: &str = "INSERT OR IGNORE INTO semantic_raw_proofs SELECT m.capture_id,c.proof_id,c.record_kind,c.fact_digest,s.language,s.path,c.canonical_bytes FROM stage.claims c CROSS JOIN stage.sources s ON s.ord=c.source_ord CROSS JOIN capture_ids m ON m.ordinal=c.artifact ORDER BY c.claim_id";
+/// A proof's ID and fact digest are stored as their 32 bytes. `unhex` takes only hex digits,
+/// and lowercase ones only once the text equals its `lower`; any other staged text becomes
+/// NULL or the wrong length and fails the columns' NOT NULL and CHECK constraints. Unlike
+/// `INSERT OR IGNORE`, `ON CONFLICT DO NOTHING` skips only the uniqueness conflicts of a stored
+/// batch's refill, so a malformed staged digest fails the publication instead of dropping its
+/// row.
+const RAW_PROOFS_SQL: &str = "INSERT INTO semantic_raw_proofs SELECT m.capture_id,CASE WHEN c.proof_id=lower(c.proof_id) THEN unhex(c.proof_id) END,c.record_kind,CASE WHEN c.fact_digest=lower(c.fact_digest) THEN unhex(c.fact_digest) END,s.language,s.path,c.canonical_bytes FROM stage.claims c CROSS JOIN stage.sources s ON s.ord=c.source_ord CROSS JOIN capture_ids m ON m.ordinal=c.artifact WHERE true ORDER BY c.claim_id ON CONFLICT DO NOTHING";
 
 fn with_capture_ids(values: &str, statement: &str) -> String {
     format!("WITH capture_ids(ordinal,capture_id) AS (VALUES {values}) {statement}")
+}
+
+/// Writes the staged proofs of the captures `values` pairs (`RAW_PROOFS_SQL`). A staged row a
+/// raw proof column refuses, such as a proof ID or fact digest that is not 64 lowercase hex
+/// digits, is a typed failure of the publication, never a skipped row.
+fn write_raw_proofs(db: &Connection, values: &str) -> Result<()> {
+    match db.execute(&with_capture_ids(values, RAW_PROOFS_SQL), []) {
+        Err(rusqlite::Error::SqliteFailure(info, message))
+            if matches!(
+                info.extended_code,
+                rusqlite::ffi::SQLITE_CONSTRAINT_NOTNULL | rusqlite::ffi::SQLITE_CONSTRAINT_CHECK
+            ) =>
+        {
+            anyhow::bail!(
+                "invalid staged raw proof: {}",
+                message.unwrap_or_else(|| info.to_string())
+            )
+        }
+        result => result.map(drop).map_err(Into::into),
+    }
 }
 
 /// The statements batch publication runs against the attached stage, for query-plan tests.
@@ -7162,7 +7190,7 @@ fn write_staged_raw_rows(
     gate()?;
     db.execute(RAW_EXCLUSIONS_SQL, [batch_id])?;
     gate()?;
-    db.execute(&with_capture_ids(&values, RAW_PROOFS_SQL), [])?;
+    write_raw_proofs(db, &values)?;
     Ok(batch_id)
 }
 
@@ -7600,15 +7628,19 @@ fn write_semantic_tuple(
                 payload,
                 ordinal,
                 derived.is_none().then_some(&proof.id),
-                proof.content_hash,
+                id_codec::digest(&proof.content_hash)?,
                 semantic_variant(&proof.evidence_kind)?,
                 basis_id,
                 capture_id,
-                derived.map(|d| &d.provenance_id),
+                derived
+                    .map(|d| id_codec::digest(&d.provenance_id))
+                    .transpose()?,
                 derived
                     .map(|d| semantic_variant(&d.record_kind))
                     .transpose()?,
-                derived.map(|d| &d.fact_digest),
+                derived
+                    .map(|d| id_codec::digest(&d.fact_digest))
+                    .transpose()?,
             ],
         )?;
         provenance.insert(proof.id.as_str(), ordinal);
@@ -7682,7 +7714,7 @@ fn write_semantic_tuple(
                 anchor.document.language,
                 anchor.document.path,
                 (anchor.revision_id != native).then_some(&anchor.revision_id),
-                anchor.content_hash,
+                id_codec::digest(&anchor.content_hash)?,
                 anchor.range.start as i64,
                 anchor.range.end as i64,
                 semantic_variant(&anchor.kind)?,
@@ -7803,7 +7835,7 @@ fn write_semantic_tuple(
             (anchor.revision_id != native)
                 .then(|| anchor.revision_id.clone())
                 .into(),
-            anchor.content_hash.clone().into(),
+            id_codec::digest(&anchor.content_hash)?.into(),
             (anchor.range.start as i64).into(),
             (anchor.range.end as i64).into(),
             semantic_variant(&anchor.kind)?.into(),
@@ -8647,7 +8679,7 @@ fn validate_v8_bootstrap(db: &Connection) -> Result<()> {
         indexed_at.is_empty() && options.is_none(),
         "incompatible_index: invalid v8 bootstrap metadata"
     );
-    // Fixed identifiers from CACHE_SCHEMA_V45 only. Do not read table names from
+    // Fixed identifiers from CACHE_SCHEMA_V46 only. Do not read table names from
     // sqlite_master or treat a partial publication as a valid empty bootstrap.
     for name in [
         "class_projections",
@@ -11413,7 +11445,7 @@ impl Store {
             db.pragma_update(None, "synchronous", "FULL")?;
             db.execute_batch("BEGIN IMMEDIATE")?;
             let result = (|| -> Result<()> {
-                db.execute_batch(CACHE_SCHEMA_V45)?;
+                db.execute_batch(CACHE_SCHEMA_V46)?;
                 let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
                 ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
                 db.execute(
@@ -17308,7 +17340,7 @@ impl Store {
         proof_id: &str,
     ) -> Result<Option<StoredRawProof>> {
         self.with_evidence(|db| {
-            let row: Option<(String,String,String,String,Vec<u8>)> = db.query_row("SELECT p.record_kind,p.fact_digest,p.language,p.path,p.canonical_bytes FROM semantic_raw_captures c JOIN semantic_raw_proofs p ON p.capture_id=c.capture_id WHERE c.producer_id=?1 AND c.artifact_hash=?2 AND c.source_set_id=?3 AND c.captured_revision=?4 AND p.proof_id=?5",params![producer_id,artifact_hash,source_set_id,captured_revision,proof_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
+            let row: Option<(String,String,String,String,Vec<u8>)> = db.query_row("SELECT p.record_kind,lower(hex(p.fact_digest)),p.language,p.path,p.canonical_bytes FROM semantic_raw_captures c JOIN semantic_raw_proofs p ON p.capture_id=c.capture_id WHERE c.producer_id=?1 AND c.artifact_hash=?2 AND c.source_set_id=?3 AND c.captured_revision=?4 AND p.proof_id=?5",params![producer_id,artifact_hash,source_set_id,captured_revision,id_codec::encode_digest(proof_id)],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
             row.map(|(record_kind,fact_digest,language,path,canonical_bytes)| {
                 let envelope: serde_json::Value = serde_json::from_slice(&canonical_bytes)
                     .context(SelectedIntegrity("incompatible_index: corrupt raw proof envelope".into()))?;
@@ -17485,7 +17517,7 @@ impl Store {
                     Vec::new()
                 } else {
                     db.prepare(
-                    "SELECT p.proof_id,p.record_kind,p.fact_digest,p.language,p.path,p.canonical_bytes,c.artifact_hash FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE c.batch_id=?1 ORDER BY p.language,p.path,p.canonical_bytes"
+                    "SELECT lower(hex(p.proof_id)),p.record_kind,lower(hex(p.fact_digest)),p.language,p.path,p.canonical_bytes,c.artifact_hash FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE c.batch_id=?1 ORDER BY p.language,p.path,p.canonical_bytes"
                 )?.query_map([batch_id], |r| Ok((r.get(0)?, StoredRawProof {record_kind:r.get(1)?,fact_digest:r.get(2)?,language:r.get(3)?,path:r.get(4)?,canonical_bytes:r.get(5)?,artifact_hash:r.get(6)?})))?
                     .collect::<rusqlite::Result<Vec<_>>>()?
                 };
@@ -19943,7 +19975,7 @@ impl Store {
 #[test]
 fn selected_ancillary_budget_matches_main_text_key_bytes() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V45).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V46).unwrap();
     // The aggregate needs only synthetic child rows; FK behavior is covered by
     // publication/retention tests, not this isolated budget-SQL fixture.
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
@@ -20082,7 +20114,7 @@ fn selected_ancillary_budget_matches_main_text_key_bytes() {
 #[test]
 fn immutable_reference_slot_rejects_changed_payload() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V45).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V46).unwrap();
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
     let owner = [0x11u8; 16];
     let original = [0x22u8; 16];
@@ -20140,7 +20172,7 @@ fn immutable_rows(db: &Connection, table: &str) -> Vec<(Option<i64>, Option<i64>
 #[test]
 fn immutable_append_inserts_skips_identical_and_rejects_changed_rows() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V45).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V46).unwrap();
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
     let sql = "INSERT INTO native_version_macro_expansions VALUES(?1,?2,?3,?4)";
     let mut append = ImmutableAppend::default();

@@ -1258,7 +1258,7 @@ mod tests {
         let mut stage = Stage::create(parent.path(), "test", "witness").unwrap();
         stage.conn().unwrap().execute_batch(&format!("INSERT INTO witness_state(singleton) VALUES(1); {WITNESS_PENDING_TABLE} INSERT INTO sources VALUES(0,'java','a.java','h',1),(1,'java','b.java','h',1),(2,'java','c.java','h',1),(3,'java','d.java','h',1); INSERT INTO coverage VALUES(0,0,NULL),(1,0,NULL),(2,1,NULL),(3,1,NULL); INSERT INTO documents VALUES(0,0,'a.java','w',0),(1,0,'b.java','w',0),(2,1,'c.java','w',0),(3,1,'d.java','w',0)")).unwrap();
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch("CREATE TABLE semantic_raw_proofs(capture_id INTEGER NOT NULL,proof_id TEXT NOT NULL,record_kind TEXT NOT NULL,fact_digest TEXT NOT NULL,language TEXT NOT NULL,path TEXT NOT NULL,canonical_bytes BLOB NOT NULL,UNIQUE(capture_id,proof_id),UNIQUE(capture_id,language,path,record_kind,fact_digest))").unwrap();
+        db.execute_batch("CREATE TABLE semantic_raw_proofs(capture_id INTEGER NOT NULL,proof_id BLOB NOT NULL,record_kind TEXT NOT NULL,fact_digest BLOB NOT NULL,language TEXT NOT NULL,path TEXT NOT NULL,canonical_bytes BLOB NOT NULL,UNIQUE(capture_id,proof_id),UNIQUE(capture_id,language,path,record_kind,fact_digest))").unwrap();
         let kinds = ["occurrence", "symbolInformation", "relationship"];
         // Proof IDs are unique across captures, as their artifact-bound digests are.
         let mut k = 0u64;
@@ -1271,10 +1271,10 @@ mod tests {
                     k += 1;
                     // A permutation of 1..1009: proof IDs interleave the documents.
                     db.execute(
-                        "INSERT INTO semantic_raw_proofs VALUES(?1,?2,?3,?4,'java',?5,x'00')",
+                        "INSERT INTO semantic_raw_proofs VALUES(?1,unhex(?2),?3,unhex(?4),'java',?5,x'00')",
                         params![
                             capture,
-                            format!("{:04}", k * 37 % 1009),
+                            format!("{:064}", k * 37 % 1009),
                             kinds[(k % 3) as usize],
                             format!("{k:064x}"),
                             path
@@ -1364,9 +1364,11 @@ mod tests {
         let copied = ["b.java", "c.java"];
         for (path, in_copied) in [("b.java", true), ("a.java", false)] {
             let (_dir, mut stage, db, entries) = witness_fixture();
+            // An oversized proof ID (1,000 hex digits) that sorts before every other one, so
+            // the count's page cursor is never this row's.
             db.execute(
-                "INSERT INTO semantic_raw_proofs VALUES(10,?1,'occurrence',?2,'java',?3,x'00')",
-                params!["x".repeat(1_000), "f".repeat(64), path],
+                "INSERT INTO semantic_raw_proofs VALUES(10,zeroblob(500),'occurrence',unhex(?1),'java',?2,x'00')",
+                params!["f".repeat(64), path],
             )
             .unwrap();
             let rows = RetainedBatchRows::for_tests(&db, 1, test_pin());
@@ -1459,10 +1461,11 @@ mod tests {
         let conn = stage.conn().unwrap();
         conn.execute_batch("INSERT INTO sources VALUES(0,'java','a.java','ha',1),(1,'java','b.java','hb',1); INSERT INTO coverage VALUES(0,0,NULL),(1,0,NULL); INSERT INTO artifacts(ordinal,path,languages,sha256,byte_length) VALUES(0,'raw','[\"java\"]','hash',0)").unwrap();
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch("CREATE TABLE semantic_raw_documents(capture_id INTEGER,language TEXT,path TEXT,source_hash TEXT,wire_digest TEXT,capped INTEGER,PRIMARY KEY(capture_id,language,path)); CREATE TABLE semantic_raw_proofs(capture_id INTEGER,proof_id TEXT,record_kind TEXT,fact_digest TEXT,language TEXT,path TEXT,canonical_bytes BLOB,PRIMARY KEY(capture_id,proof_id)); INSERT INTO semantic_raw_documents VALUES(1,'java','a.java','ha','wire-a',0),(1,'java','b.java','hb','wire-b',1)").unwrap();
+        db.execute_batch("CREATE TABLE semantic_raw_documents(capture_id INTEGER,language TEXT,path TEXT,source_hash TEXT,wire_digest TEXT,capped INTEGER,PRIMARY KEY(capture_id,language,path)); CREATE TABLE semantic_raw_proofs(capture_id INTEGER,proof_id BLOB,record_kind TEXT,fact_digest BLOB,language TEXT,path TEXT,canonical_bytes BLOB,PRIMARY KEY(capture_id,proof_id)); INSERT INTO semantic_raw_documents VALUES(1,'java','a.java','ha','wire-a',0),(1,'java','b.java','hb','wire-b',1)").unwrap();
         let bytes = br#"{"formatVersion":1,"recordKind":"symbolInformation","relativePath":"a.java","positionEncoding":1,"raw":{"symbol":"A#"}}"#;
-        for proof in ["p1", "p2"] {
-            db.execute("INSERT INTO semantic_raw_proofs VALUES(1,?1,'symbolInformation',?1,'java','a.java',?2)", params![proof, bytes.as_slice()]).unwrap();
+        let (p1, p2) = ("1".repeat(64), "2".repeat(64));
+        for proof in [&p1, &p2] {
+            db.execute("INSERT INTO semantic_raw_proofs VALUES(1,unhex(?1),'symbolInformation',unhex(?1),'java','a.java',?2)", params![proof, bytes.as_slice()]).unwrap();
         }
         let rows = RetainedBatchRows::for_tests(&db, 1, test_pin());
         let entry = super::super::super::descriptor::ArtifactEntry {
@@ -1514,8 +1517,8 @@ mod tests {
         );
         let stored: Vec<u8> = conn
             .query_row(
-                "SELECT canonical_bytes FROM claims WHERE proof_id='p1'",
-                [],
+                "SELECT canonical_bytes FROM claims WHERE proof_id=?1",
+                [&p1],
                 |row| row.get(0),
             )
             .unwrap();

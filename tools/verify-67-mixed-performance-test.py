@@ -20,6 +20,8 @@ RUNNER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(RUNNER)
 
 HEX = "a" * 64
+# The semantic tables store 64-hex digests as their 32 bytes (#1248).
+PROOF = "b" * 64
 
 
 class HomeProcessCleanup(unittest.TestCase):
@@ -283,8 +285,8 @@ class SchemaParity(unittest.TestCase):
         db.execute("INSERT INTO semantic_raw_exclusions VALUES(1,'javascript','js/b.js','notRequested')")
         db.execute("INSERT INTO semantic_raw_documents VALUES(1,'javascript','js/a.js',?,?,0)",
                    (hashes[paths[0]], HEX))
-        db.execute("INSERT INTO semantic_raw_proofs VALUES(1,'proof','occurrence',?,'javascript','js/a.js',x'7b7d')",
-                   (HEX,))
+        db.execute("INSERT INTO semantic_raw_proofs VALUES(1,?,'occurrence',?,'javascript','js/a.js',x'7b7d')",
+                   (bytes.fromhex(PROOF), bytes.fromhex(HEX)))
         for name in ("import", "r2"):
             db.execute("INSERT INTO semantic_revision_raw_selections VALUES(?,'scip-typescript',1,?)",
                        (pins[name], pins["r1"]))
@@ -295,8 +297,8 @@ class SchemaParity(unittest.TestCase):
                    (tuple_id, pins["r2"], payload_id))
         db.execute("INSERT INTO semantic_basis VALUES(1,?,'scip-typescript','1',?,?,'javascript',?,?,?,?,?,?)",
                    (payload_id, HEX, artifact, source_set, natives["r1"], header["manifest_hash"], HEX, HEX, HEX))
-        db.execute("INSERT INTO semantic_provenance VALUES(?,0,NULL,?,'semanticReference',1,1,'proof','occurrence',?)",
-                   (payload_id, HEX, HEX))
+        db.execute("INSERT INTO semantic_provenance VALUES(?,0,NULL,?,'semanticReference',1,1,?,'occurrence',?)",
+                   (payload_id, bytes.fromhex(HEX), bytes.fromhex(PROOF), bytes.fromhex(HEX)))
         db.execute("INSERT INTO semantic_coverage_freshness VALUES(?,?,1,'fresh')", (pins["r2"], tuple_id))
         db.execute("INSERT INTO semantic_projection_origins VALUES(?,'scip-typescript',?)",
                    (pins["r2"], pins["import"]))

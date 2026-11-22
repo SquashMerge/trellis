@@ -244,7 +244,7 @@ impl World {
         let version: u32 = db
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 45);
+        assert_eq!(version, 46);
         db.pragma_update(None, "user_version", version - 1).unwrap();
         drop(db);
         // The real daemon establishes the new native head and owns retained FIFO work.
@@ -686,7 +686,7 @@ fn binary_only_recovery_with_drift(language: &'static str, drift: Option<(&str, 
     let original_proofs = || {
         let db =
             Connection::open_with_flags(&world.index, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-        db.prepare("SELECT COALESCE(p.provenance_id,p.derived_from_provenance_id||'/'||p.evidence_kind) AS id,f.freshness,p.derived_from_provenance_id,p.derived_from_fact_digest FROM semantic_coverage c JOIN semantic_provenance p ON p.payload_id=c.payload_id JOIN semantic_coverage_freshness f ON f.revision_id=c.revision_id AND f.tuple_id=c.tuple_id AND f.basis_id=p.basis_id WHERE c.revision_id=?1 AND c.selected=1 ORDER BY id")
+        db.prepare("SELECT COALESCE(p.provenance_id,lower(hex(p.derived_from_provenance_id))||'/'||p.evidence_kind) AS id,f.freshness,CASE WHEN p.derived_from_provenance_id IS NULL THEN NULL ELSE lower(hex(p.derived_from_provenance_id)) END,CASE WHEN p.derived_from_fact_digest IS NULL THEN NULL ELSE lower(hex(p.derived_from_fact_digest)) END FROM semantic_coverage c JOIN semantic_provenance p ON p.payload_id=c.payload_id JOIN semantic_coverage_freshness f ON f.revision_id=c.revision_id AND f.tuple_id=c.tuple_id AND f.basis_id=p.basis_id WHERE c.revision_id=?1 AND c.selected=1 ORDER BY id")
             .unwrap().query_map([&original_key], |row| Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?, row.get::<_,Option<String>>(2)?,row.get::<_,Option<String>>(3)?)))
             .unwrap().map(Result::unwrap).collect::<Vec<_>>()
     };

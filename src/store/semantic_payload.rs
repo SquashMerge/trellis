@@ -591,7 +591,7 @@ impl PayloadProjection<'_> {
         let row: Option<(Option<String>, Option<String>, String)> = self
             .db
             .prepare_cached(
-                "SELECT provenance_id,derived_from_provenance_id,evidence_kind FROM semantic_provenance WHERE payload_id=?1 AND ordinal=?2",
+                "SELECT provenance_id,CASE WHEN derived_from_provenance_id IS NULL THEN NULL ELSE lower(hex(derived_from_provenance_id)) END,evidence_kind FROM semantic_provenance WHERE payload_id=?1 AND ordinal=?2",
             )?
             .query_row(params![payload, ordinal], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?))
@@ -759,7 +759,7 @@ mod tests {
             anchor: sem::MeasuredAnchor {
                 document: document(path),
                 revision_id: "native".into(),
-                content_hash: "h".into(),
+                content_hash: "c".repeat(64),
                 range: Range { start: 0, end: 1 },
                 kind,
             },
@@ -825,7 +825,7 @@ mod tests {
             producer_id: "producer".into(),
             document: document("main.js"),
             revision_id: "native".into(),
-            content_hash: "h".into(),
+            content_hash: "c".repeat(64),
             evidence_kind: sem::EvidenceKind::MeasuredSyntax,
             basis: Some(sem::SemanticBasis {
                 producer_id: "producer".into(),
@@ -938,7 +938,7 @@ mod tests {
     #[test]
     fn writer_rejects_dependency_endpoint_missing_from_revision() {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(CACHE_SCHEMA_V45).unwrap();
+        db.execute_batch(CACHE_SCHEMA_V46).unwrap();
         db.pragma_update(None, "foreign_keys", "OFF").unwrap();
         db.execute("INSERT INTO native_revisions VALUES('key','set',?1,?1,?1,'native','[]','[]','{}','[]','[]',NULL,'[]',0,'{}','[]',1)", ["a".repeat(64)]).unwrap();
         let (_, mut publication) = every_endpoint();
@@ -973,7 +973,7 @@ mod tests {
     #[test]
     fn unbatched_payload_records_null_terms_and_no_targets() {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(CACHE_SCHEMA_V45).unwrap();
+        db.execute_batch(CACHE_SCHEMA_V46).unwrap();
         db.pragma_update(None, "foreign_keys", "OFF").unwrap();
         db.execute("INSERT INTO native_revisions VALUES('key','set',?1,?1,?1,'native','[]','[]','{}','[]','[]',NULL,'[]',0,'{}','[]',1)", ["a".repeat(64)]).unwrap();
         let (_, mut publication) = every_endpoint();
@@ -1018,7 +1018,7 @@ mod tests {
     }
 
     fn payload_with_children(db: &Connection, key: Option<&str>, symbols: usize) {
-        db.execute_batch(CACHE_SCHEMA_V45).unwrap();
+        db.execute_batch(CACHE_SCHEMA_V46).unwrap();
         db.pragma_update(None, "foreign_keys", "OFF").unwrap();
         db.execute(
             "INSERT INTO semantic_payloads(payload_id,payload_key,producer_id,producer_version,language,path,version_id,batch_id) VALUES(1,?1,'p','1','javascript','a.js','v',1)",
@@ -1114,7 +1114,7 @@ mod tests {
     /// hash `1…` at `same` and `2…` at `edited`.
     fn bound_call(bound: bool, captured: Option<&str>) -> Connection {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(CACHE_SCHEMA_V45).unwrap();
+        db.execute_batch(CACHE_SCHEMA_V46).unwrap();
         db.pragma_update(None, "foreign_keys", "OFF").unwrap();
         for (tuple, revision) in [(1, "same"), (2, "edited")] {
             db.execute("INSERT INTO native_revisions VALUES(?1,'set',?2,?2,?2,?1,'[]','[]','{}','[]','[]',NULL,'[]',0,'{}','[]',?3)", params![revision, "a".repeat(64), tuple]).unwrap();
@@ -1123,7 +1123,7 @@ mod tests {
             db.execute("INSERT INTO semantic_coverage VALUES(?1,?2,'p','1','javascript','a.js',1,1,'complete',NULL,1)", params![tuple, revision]).unwrap();
         }
         db.execute("INSERT INTO semantic_projection_dependencies(payload_id,language,path,term,captured_hash) VALUES(1,'javascript','d.js',NULL,?1)", [captured]).unwrap();
-        db.execute("INSERT INTO semantic_call_bindings(payload_id,ordinal,join_document_language,join_document_path,join_content_hash,join_start,join_end,join_kind,join_status,resolution,declared_kind,declared_internal_syntax_id,declared_internal_language,declared_internal_path,dispatch,possible_dispatch_complete,stale_target,provenance_ordinal,capture_bound) VALUES(1,0,'javascript','a.js','h',0,1,'callee','exact','resolved','internal',?1,'javascript','d.js','direct',0,0,0,?2)", params![vec![7u8; 16], bound]).unwrap();
+        db.execute("INSERT INTO semantic_call_bindings(payload_id,ordinal,join_document_language,join_document_path,join_content_hash,join_start,join_end,join_kind,join_status,resolution,declared_kind,declared_internal_syntax_id,declared_internal_language,declared_internal_path,dispatch,possible_dispatch_complete,stale_target,provenance_ordinal,capture_bound) VALUES(1,0,'javascript','a.js',zeroblob(32),0,1,'callee','exact','resolved','internal',?1,'javascript','d.js','direct',0,0,0,?2)", params![vec![7u8; 16], bound]).unwrap();
         db
     }
 
@@ -1269,6 +1269,8 @@ mod tests {
             ("src/store/native_first/witness.rs", 4),
             // A table list in a cancellation test.
             ("src/http/normal_post_capture_cancellation_tests.rs", 1),
+            // #1248's digest storage tests: the stored join_content_hash only, no dispatch.
+            ("src/store/digest_blob_tests.rs", 4),
         ]
         .into_iter()
         .collect();

@@ -1702,8 +1702,9 @@ fn architecture_semantic_within(
     // Only selected rows are loaded. Proof identities and basis metadata are keyed by
     // tuple/provenance; raw proof bytes and full semantic snapshots are never scanned.
     let mut proof = db.prepare_cached(
-        "SELECT p.ordinal,p.content_hash,p.evidence_kind,p.capture_id,
-                p.derived_from_provenance_id,p.derived_from_record_kind,p.derived_from_fact_digest,
+        "SELECT p.ordinal,lower(hex(p.content_hash)),p.evidence_kind,p.capture_id,
+                CASE WHEN p.derived_from_provenance_id IS NULL THEN NULL ELSE lower(hex(p.derived_from_provenance_id)) END,p.derived_from_record_kind,
+                CASE WHEN p.derived_from_fact_digest IS NULL THEN NULL ELSE lower(hex(p.derived_from_fact_digest)) END,
                 b.producer_id,b.producer_version,b.producer_hash,b.artifact_hash,b.language,
                 b.source_set_id,b.captured_native_revision_id,b.source_manifest_hash,
                 b.toolchain_hash,b.config_hash,b.dependency_hash,b.basis_id
@@ -1815,7 +1816,7 @@ fn architecture_semantic_within(
     let mut calls = db.prepare_cached(
         "SELECT b.call_id,b.join_start,b.join_end,b.resolution,b.declared_kind,
                 b.declared_internal_syntax_id,b.declared_internal_language,b.declared_internal_path,
-                b.dispatch,b.stale_target,b.provenance_ordinal,b.binding_id,b.join_status,b.join_kind,b.join_document_language,b.join_document_path,COALESCE(b.join_native_revision_id,?6),p.basis_id,p.derived_from_fact_digest,b.capture_bound
+                b.dispatch,b.stale_target,b.provenance_ordinal,b.binding_id,b.join_status,b.join_kind,b.join_document_language,b.join_document_path,COALESCE(b.join_native_revision_id,?6),p.basis_id,CASE WHEN p.derived_from_fact_digest IS NULL THEN NULL ELSE lower(hex(p.derived_from_fact_digest)) END,b.capture_bound
          FROM semantic_call_bindings b
          JOIN semantic_provenance p ON p.payload_id=b.payload_id AND p.ordinal=b.provenance_ordinal
          LEFT JOIN semantic_coverage_freshness f ON f.revision_id=?5 AND f.tuple_id=?7 AND f.basis_id=p.basis_id
