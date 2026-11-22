@@ -17278,8 +17278,9 @@ impl Store {
         proof_id: &str,
     ) -> Result<Option<StoredRawProof>> {
         self.with_evidence(|db| {
-            let row: Option<(String,String,String,String)> = db.query_row("SELECT p.record_kind,lower(hex(p.fact_digest)),p.language,p.path FROM semantic_raw_captures c JOIN semantic_raw_proofs p ON p.capture_id=c.capture_id WHERE c.producer_id=?1 AND c.artifact_hash=?2 AND c.source_set_id=?3 AND c.captured_revision=?4 AND p.proof_id=?5",params![producer_id,artifact_hash,source_set_id,captured_revision,id_codec::encode_digest(proof_id)],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+            let row: Option<(String,Vec<u8>,String,String)> = db.query_row("SELECT p.record_kind,p.fact_digest,p.language,p.path FROM semantic_raw_captures c JOIN semantic_raw_proofs p ON p.capture_id=c.capture_id WHERE c.producer_id=?1 AND c.artifact_hash=?2 AND c.source_set_id=?3 AND c.captured_revision=?4 AND p.proof_id=?5",params![producer_id,artifact_hash,source_set_id,captured_revision,id_codec::encode_digest(proof_id)],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
             row.map(|(record_kind,fact_digest,language,path)| {
+                let fact_digest = id_codec::decode_digest(&fact_digest)?;
                 selected_ensure!(crate::native_ids::digest(b"trellis.capture-proof.v1\0", &crate::native_ids::canonical(&serde_json::json!({"producerId":producer_id,"artifactHash":artifact_hash,"sourceSetId":source_set_id,"sourceRevision":captured_revision,"language":language,"relativePath":path,"factDigest":fact_digest}))) == proof_id,"incompatible_index: corrupt raw proof inventory");
                 Ok(StoredRawProof {record_kind,fact_digest,language,path,artifact_hash: artifact_hash.to_owned()})
             }).transpose()
@@ -17449,9 +17450,14 @@ impl Store {
                     Vec::new()
                 } else {
                     db.prepare(
-                    "SELECT lower(hex(p.proof_id)),p.record_kind,lower(hex(p.fact_digest)),p.language,p.path,c.artifact_hash FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE c.batch_id=?1 ORDER BY p.proof_id"
-                )?.query_map([batch_id], |r| Ok((r.get(0)?, StoredRawProof {record_kind:r.get(1)?,fact_digest:r.get(2)?,language:r.get(3)?,path:r.get(4)?,artifact_hash:r.get(5)?})))?
+                    "SELECT p.proof_id,p.record_kind,p.fact_digest,p.language,p.path,c.artifact_hash FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE c.batch_id=?1 ORDER BY p.proof_id"
+                )?.query_map([batch_id], |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get(1)?, r.get::<_, Vec<u8>>(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?
                     .collect::<rusqlite::Result<Vec<_>>>()?
+                    .into_iter()
+                    .map(|(id, record_kind, digest, language, path, artifact_hash)| {
+                        Ok((id_codec::decode_digest(&id)?, StoredRawProof {record_kind, fact_digest: id_codec::decode_digest(&digest)?, language, path, artifact_hash}))
+                    })
+                    .collect::<Result<Vec<_>>>()?
                 };
 
                 let documents = db.prepare(
