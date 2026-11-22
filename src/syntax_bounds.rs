@@ -66,9 +66,10 @@ pub struct SyntaxGap {
 }
 impl SyntaxGap {
     /// A document with no evidence but its file module, over the evidence budget (#564) or
-    /// not read (#576): see [`module_only_reason`]. This is the whole file. An over-budget
-    /// file's syntax can still be read, so it never makes a binding unknown by itself; a skipped
-    /// file's placeholder is a parser error, so it proves nothing.
+    /// measurement's parse-work budget (#1282), or not read (#576): see
+    /// [`module_only_reason`]. This is the whole file. An over-budget file's syntax can still be
+    /// read, so it never makes a binding unknown by itself; a skipped file's placeholder is a
+    /// parser error, so it proves nothing.
     pub(crate) fn module_only(reason: &'static str, bytes: usize) -> Self {
         Self {
             reason,
@@ -111,7 +112,10 @@ pub struct PartialFile {
 pub(crate) fn module_only_reason(diagnostic: Option<&str>) -> Option<&'static str> {
     use crate::skipped_source::Skip;
     let diagnostic = diagnostic?;
-    if diagnostic == crate::evidence_limits::DIAGNOSTIC {
+    // A parse past measurement's parse-work budget (#1282) is one more per-file budget.
+    if diagnostic == crate::evidence_limits::DIAGNOSTIC
+        || diagnostic == crate::measured_parse::DIAGNOSTIC
+    {
         return Some("evidence_budget");
     }
     [Skip::Oversized, Skip::NotUtf8]

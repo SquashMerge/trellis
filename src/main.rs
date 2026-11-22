@@ -499,6 +499,8 @@ fn cli_first_index_wait() -> Duration {
 async fn main() -> Result<()> {
     // Before any SQLite connection opens (#673).
     trellis::sqlite_config::disable_memory_statistics();
+    // Before any tree-sitter use (#1282).
+    trellis::measured_parse::install();
     let command = Cli::parse().command;
     if let Command::GitRead(args) = &command {
         trellis::git_status::write_child_response(&args.root, &args.mode, args.path.as_deref())?;

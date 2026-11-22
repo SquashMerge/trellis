@@ -539,9 +539,22 @@ pub(super) fn extract_document(
         "typescript" => crate::indexer_ts::grammar(&f.path),
         _ => anyhow::bail!("unsupported native language"),
     })?;
-    let tree = parser
-        .parse(&f.text, None)
-        .context("native parser failed")?;
+    // A Rust parse is bounded by its work (#1282). A source past the budget keeps only its file
+    // module, measured over the empty tree, as nothing of its syntax was read.
+    let mut beyond_parse_budget = false;
+    let tree = match f.language.as_str() {
+        "rust" => match crate::measured_parse::parse(&f.text, None)? {
+            crate::measured_parse::Parse::Tree(tree) => tree,
+            crate::measured_parse::Parse::Beyond => {
+                beyond_parse_budget = true;
+                parser.parse("", None).context("native parser failed")?
+            }
+            crate::measured_parse::Parse::Cancelled => anyhow::bail!("indexing cancelled"),
+        },
+        _ => parser
+            .parse(&f.text, None)
+            .context("native parser failed")?,
+    };
     let key = DocumentKey {
         source_set_id: a.source_set.id.clone(),
         language: f.language.clone(),
@@ -671,6 +684,9 @@ pub(super) fn extract_document(
     state.finish_occurrences()?;
     match skipped {
         Some(skip) => state.keep_file_module(declaration_start, skip.diagnostic()),
+        None if beyond_parse_budget => {
+            state.keep_file_module(declaration_start, crate::measured_parse::DIAGNOSTIC)
+        }
         None => state.keep_within_budget(declaration_start),
     }
     state
@@ -765,7 +781,7 @@ struct ParserState<'a> {
     bound_gaps: Vec<Range>,
     bounded: bool,
     /// Why only the document's file module was kept: its facts exceeded the stored budgets
-    /// (#564), or its source was not read (#576).
+    /// (#564), its parse the parse-work budget (#1282), or its source was not read (#576).
     module_only: Option<&'static str>,
     name_owners: BTreeMap<(usize, usize), String>,
     lexical_owners: BTreeMap<Vec<u8>, String>,

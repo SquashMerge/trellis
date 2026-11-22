@@ -242,7 +242,7 @@ impl FileExtraction {
                 file.path,
                 limits.file_bytes / (1024 * 1024)
             ));
-        } else {
+        } else if let Some(tree) = class_tree(file, cancel)? {
             for symbol in nodes.iter().filter(|s| {
                 s.path == file.path
                     && matches!(
@@ -256,29 +256,6 @@ impl FileExtraction {
                     .or_default()
                     .push(symbol);
             }
-            let mut parser = tree_sitter::Parser::new();
-            parser.set_language(&match file.language.as_str() {
-                "java" => tree_sitter_java::LANGUAGE.into(),
-                "python" => tree_sitter_python::LANGUAGE.into(),
-                "javascript" => tree_sitter_javascript::LANGUAGE.into(),
-                "rust" => tree_sitter_rust::LANGUAGE.into(),
-                "typescript" => crate::indexer_ts::grammar(&file.path),
-                other => anyhow::bail!("class catalog does not support {other}"),
-            })?;
-            let mut cancelled = |_: &tree_sitter::ParseState| {
-                if cancel.load(Ordering::Relaxed) {
-                    std::ops::ControlFlow::Break(())
-                } else {
-                    std::ops::ControlFlow::Continue(())
-                }
-            };
-            let tree = parser.parse_with_options(
-                &mut |offset, _| &file.text.as_bytes()[offset..],
-                None,
-                Some(tree_sitter::ParseOptions::new().progress_callback(&mut cancelled)),
-            );
-            check(cancel)?;
-            let tree = tree.context("class catalog parser failed")?;
             if tree.root_node().has_error() {
                 b.registry_limit(&format!(
                     "{}: recovered syntax; class catalog may be incomplete",
@@ -306,6 +283,11 @@ impl FileExtraction {
                     c.truncated = true;
                 }
             }
+        } else {
+            b.registry_limit(&format!(
+                "{}: class source exceeds the parse-work budget; skipped",
+                file.path
+            ));
         }
         b.resolve()?;
         check(cancel)?;
@@ -322,6 +304,42 @@ impl FileExtraction {
         };
         extraction.within_stored_budget()
     }
+}
+/// The class catalog's parse of `file`, or `None` for a Rust source past measurement's
+/// parse-work budget, as native extraction finds it (#1282).
+fn class_tree(file: &SourceFile, cancel: &CancelFlag) -> Result<Option<tree_sitter::Tree>> {
+    if file.language == "rust" {
+        return match crate::measured_parse::parse(&file.text, Some(cancel.as_ref()))? {
+            crate::measured_parse::Parse::Tree(tree) => Ok(Some(tree)),
+            crate::measured_parse::Parse::Beyond => Ok(None),
+            crate::measured_parse::Parse::Cancelled => {
+                check(cancel)?;
+                anyhow::bail!("indexing cancelled")
+            }
+        };
+    }
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&match file.language.as_str() {
+        "java" => tree_sitter_java::LANGUAGE.into(),
+        "python" => tree_sitter_python::LANGUAGE.into(),
+        "javascript" => tree_sitter_javascript::LANGUAGE.into(),
+        "typescript" => crate::indexer_ts::grammar(&file.path),
+        other => anyhow::bail!("class catalog does not support {other}"),
+    })?;
+    let mut cancelled = |_: &tree_sitter::ParseState| {
+        if cancel.load(Ordering::Relaxed) {
+            std::ops::ControlFlow::Break(())
+        } else {
+            std::ops::ControlFlow::Continue(())
+        }
+    };
+    let tree = parser.parse_with_options(
+        &mut |offset, _| &file.text.as_bytes()[offset..],
+        None,
+        Some(tree_sitter::ParseOptions::new().progress_callback(&mut cancelled)),
+    );
+    check(cancel)?;
+    tree.context("class catalog parser failed").map(Some)
 }
 impl Builder<'_> {
     fn registry_limit(&mut self, message: &str) {
@@ -1920,5 +1938,43 @@ mod summary_tests {
                 Catalog::compose(&[file], 1, graph.nodes.len(), Limits::default()).unwrap()
             );
         }
+    }
+
+    /// #1282: a Rust source past measurement's parse-work budget keeps no classes, with a
+    /// warning that says why, as native extraction keeps only its file module.
+    #[test]
+    fn a_rust_source_past_the_parse_work_budget_keeps_no_classes() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let file = |text: String| SourceFile {
+            path: "recovery.rs".into(),
+            hash: String::new(),
+            language: "rust".into(),
+            text,
+        };
+        let beyond = FileExtraction::extract_file(
+            &file(crate::measured_parse::inputs::recovery()),
+            &[],
+            &cancel,
+            Limits::default(),
+        )
+        .unwrap();
+        assert!(beyond.classes.is_empty() && beyond.items.is_empty());
+        assert!(beyond.registry_incomplete);
+        assert_eq!(
+            beyond.warnings,
+            ["recovery.rs: class source exceeds the parse-work budget; skipped"]
+        );
+        let clean = FileExtraction::extract_file(
+            &file("struct S;\nimpl S { fn f(&self) {} }\n".into()),
+            &[],
+            &cancel,
+            Limits::default(),
+        )
+        .unwrap();
+        assert!(
+            !clean.warnings.iter().any(|w| w.contains("parse-work")),
+            "{:?}",
+            clean.warnings
+        );
     }
 }
