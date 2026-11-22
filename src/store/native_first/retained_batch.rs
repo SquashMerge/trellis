@@ -164,7 +164,7 @@ impl RetainedBatchRows<'_> {
         ordinal: u32,
         after: &str,
     ) -> Result<Option<(String, String, String)>> {
-        Ok(self.db.prepare_cached("SELECT lower(hex(p.proof_id)),p.language,p.path FROM semantic_raw_captures c JOIN semantic_raw_proofs p ON p.capture_id=c.capture_id WHERE c.batch_id=?1 AND c.ordinal=?2 AND p.proof_id>?3 ORDER BY p.proof_id LIMIT 1")?.query_row(
+        Ok(self.db.prepare_cached("SELECT lower(hex(p.proof_id)),d.language,d.path FROM semantic_raw_captures c JOIN semantic_raw_proofs p ON p.capture_id=c.capture_id JOIN semantic_raw_proof_documents d ON d.document_id=p.document_id WHERE c.batch_id=?1 AND c.ordinal=?2 AND p.proof_id>?3 ORDER BY p.proof_id LIMIT 1")?.query_row(
             params![self.batch_id, ordinal, id_codec::digest_cursor(after)?],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ).optional()?)
@@ -210,8 +210,8 @@ impl RetainedBatchRows<'_> {
     }
 
     /// Up to `limit` proof identities of one document of the capture, `(language, path)`,
-    /// after `after` (record kind, fact digest), in the order of the capture's
-    /// `(language, path, record kind, fact digest)` index, which serves them without reading
+    /// after `after` (record kind, fact digest), in the order of the
+    /// `(document, record kind, fact digest)` index, which serves them without reading
     /// any other document's proofs. `each` sees a row's borrowed fields before anything is
     /// copied out of it.
     pub(crate) fn document_proofs(
@@ -223,7 +223,7 @@ impl RetainedBatchRows<'_> {
         each: &mut dyn FnMut(WitnessProofRow<'_>) -> Result<()>,
     ) -> Result<()> {
         let mut statement = self.db.prepare_cached(
-            "SELECT lower(hex(proof_id)),record_kind,lower(hex(fact_digest)) FROM semantic_raw_proofs WHERE capture_id=?1 AND language=?2 AND path=?3 AND (record_kind,fact_digest)>(?4,?5) ORDER BY record_kind,fact_digest LIMIT ?6",
+            "SELECT lower(hex(proof_id)),record_kind,lower(hex(fact_digest)) FROM semantic_raw_proofs WHERE document_id=(SELECT document_id FROM semantic_raw_proof_documents WHERE capture_id=?1 AND language=?2 AND path=?3) AND (record_kind,fact_digest)>(?4,?5) ORDER BY record_kind,fact_digest LIMIT ?6",
         )?;
         let mut rows = statement.query(params![
             capture_id,
@@ -270,7 +270,7 @@ impl RetainedBatchRows<'_> {
         each: &mut dyn FnMut(WitnessProofRow<'_>) -> Result<()>,
     ) -> Result<()> {
         let mut statement = self.db.prepare_cached(
-            "SELECT lower(hex(proof_id)),record_kind,lower(hex(fact_digest)),language,path FROM semantic_raw_proofs          WHERE capture_id=?1 AND proof_id>?2 ORDER BY proof_id LIMIT ?3",
+            "SELECT lower(hex(p.proof_id)),p.record_kind,lower(hex(p.fact_digest)),d.language,d.path FROM semantic_raw_proofs p JOIN semantic_raw_proof_documents d ON d.document_id=p.document_id WHERE p.capture_id=?1 AND p.proof_id>?2 ORDER BY p.proof_id LIMIT ?3",
         )?;
         let mut rows =
             statement.query(params![capture_id, id_codec::digest_cursor(after)?, limit])?;
@@ -339,7 +339,7 @@ impl RetainedBatchRows<'_> {
         capture_id: i64,
         proof: &RetainedProof,
     ) -> Result<Option<bool>> {
-        Ok(self.db.prepare_cached("SELECT record_kind=?3 AND fact_digest=?4 AND language=?5 AND path=?6 FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id=?2")?.query_row(
+        Ok(self.db.prepare_cached("SELECT p.record_kind=?3 AND p.fact_digest=?4 AND d.language=?5 AND d.path=?6 FROM semantic_raw_proofs p JOIN semantic_raw_proof_documents d ON d.document_id=p.document_id WHERE p.capture_id=?1 AND p.proof_id=?2")?.query_row(
             params![capture_id, id_codec::digest(&proof.proof_id)?, proof.record_kind, id_codec::digest(&proof.fact_digest)?, proof.language, proof.path], |row| row.get(0)).optional()?)
     }
 

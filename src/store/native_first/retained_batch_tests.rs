@@ -21,7 +21,7 @@ fn p(n: u8) -> String {
 /// five-byte binary) and ordinal 1 (capture 11: nothing), and one excluded document.
 fn fixture() -> Connection {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V48).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V49).unwrap();
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
     db.execute(
         "INSERT INTO semantic_raw_batches VALUES(1,'producer','1','profile','set','native-1',?1,?2,x'7b7d','decoder')",
@@ -48,7 +48,12 @@ fn fixture() -> Connection {
         (p(3), h("3"), "b.java"),
     ] {
         db.execute(
-            "INSERT INTO semantic_raw_proofs VALUES(10,unhex(?1),'occurrence',unhex(?2),'java',?3)",
+            "INSERT OR IGNORE INTO semantic_raw_proof_documents(capture_id,language,path) VALUES(10,'java',?1)",
+            [path],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO semantic_raw_proofs VALUES(10,unhex(?1),'occurrence',unhex(?2),(SELECT document_id FROM semantic_raw_proof_documents WHERE capture_id=10 AND path=?3))",
             params![proof, digest, path],
         )
         .unwrap();

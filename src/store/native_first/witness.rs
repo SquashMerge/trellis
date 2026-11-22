@@ -444,7 +444,7 @@ fn cache_rows(
             "original provenance source mismatch"
         );
         let kind = semantic_variant(&derived.record_kind)?;
-        let membership:bool=db.prepare_cached("SELECT EXISTS(SELECT 1 FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id=?2 AND record_kind=?3 AND fact_digest=?4 AND language=?5 AND path=?6)")?.query_row(params![a.capture_id,id_codec::encode_digest(&derived.provenance_id),kind,id_codec::encode_digest(&derived.fact_digest),w.document.language,w.document.path],|r|r.get(0))?;
+        let membership:bool=db.prepare_cached("SELECT EXISTS(SELECT 1 FROM semantic_raw_proofs p JOIN semantic_raw_proof_documents d ON d.document_id=p.document_id WHERE p.capture_id=?1 AND p.proof_id=?2 AND p.record_kind=?3 AND p.fact_digest=?4 AND d.language=?5 AND d.path=?6)")?.query_row(params![a.capture_id,id_codec::encode_digest(&derived.provenance_id),kind,id_codec::encode_digest(&derived.fact_digest),w.document.language,w.document.path],|r|r.get(0))?;
         selected_ensure!(membership, "original derivation identity mismatch");
         let basis_id = match bases.iter().position(|b| b == basis) {
             Some(index) => index,
@@ -913,7 +913,7 @@ fn association_unit(
             let want = limit;
             let rows = query_rows(
                 db,
-                "SELECT p.ordinal,pay.content_hash,p.evidence_kind,p.ordinal,p.basis_id,p.capture_id,CASE WHEN p.derived_from_provenance_id IS NULL THEN NULL ELSE lower(hex(p.derived_from_provenance_id)) END,r.record_kind,r.fact_digest,COALESCE(r.language=?3 AND r.path=?4,0) FROM semantic_provenance p LEFT JOIN semantic_payloads pay ON pay.payload_id=p.payload_id LEFT JOIN semantic_raw_proofs r ON r.capture_id=p.capture_id AND r.proof_id=p.derived_from_provenance_id WHERE p.payload_id=?1 AND p.ordinal>?2 ORDER BY p.ordinal LIMIT ?5",
+                "SELECT p.ordinal,pay.content_hash,p.evidence_kind,p.ordinal,p.basis_id,p.capture_id,CASE WHEN p.derived_from_provenance_id IS NULL THEN NULL ELSE lower(hex(p.derived_from_provenance_id)) END,r.record_kind,r.fact_digest,COALESCE(d.language=?3 AND d.path=?4,0) FROM semantic_provenance p LEFT JOIN semantic_payloads pay ON pay.payload_id=p.payload_id LEFT JOIN semantic_raw_proofs r ON r.capture_id=p.capture_id AND r.proof_id=p.derived_from_provenance_id LEFT JOIN semantic_raw_proof_documents d ON d.document_id=r.document_id WHERE p.payload_id=?1 AND p.ordinal>?2 ORDER BY p.ordinal LIMIT ?5",
                 params![
                     w.payload(),
                     c.after_id,
@@ -1867,7 +1867,7 @@ pub(crate) fn original_document_begin(
     let captured = selected_version(db, authority.captured_pin, key)?;
     let raw:Option<(String,String,i64)>=db.prepare_cached("SELECT source_hash,wire_digest,capped FROM semantic_raw_documents WHERE capture_id=?1 AND language=?2 AND path=?3")?.query_row(params![authority.capture_id,key.language,key.path],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
     let exclusion:Option<String>=db.prepare_cached("SELECT reason FROM semantic_raw_exclusions WHERE batch_id=?1 AND language=?2 AND path=?3")?.query_row(params![authority.batch_id,key.language,key.path],|r|r.get(0)).optional()?;
-    let claims:bool=db.prepare_cached("SELECT EXISTS(SELECT 1 FROM semantic_raw_proofs WHERE capture_id=?1 AND language=?2 AND path=?3)")?.query_row(params![authority.capture_id,key.language,key.path],|r|r.get(0))?;
+    let claims:bool=db.prepare_cached("SELECT EXISTS(SELECT 1 FROM semantic_raw_proofs WHERE document_id=(SELECT document_id FROM semantic_raw_proof_documents WHERE capture_id=?1 AND language=?2 AND path=?3))")?.query_row(params![authority.capture_id,key.language,key.path],|r|r.get(0))?;
     let Some(captured) = captured else {
         selected_ensure!(
             raw.is_none() && exclusion.is_none() && !claims,
