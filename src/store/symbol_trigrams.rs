@@ -3,8 +3,10 @@
 //! Symbol search keeps its literal rule: SQLite's ASCII-only `lower`, then
 //! `instr` on the name or ID. The FTS5 tables `native_declaration_trigrams`
 //! (W2) and `graph_node_trigrams` (the browser and CLI search) hold a
-//! `lower`ed copy of the **name** only, written by triggers on the source
-//! rows, under `tokenize='trigram case_sensitive 1'`. IDs are not indexed: a
+//! `lower`ed copy of the **name** only, under `tokenize='trigram case_sensitive 1'`.
+//! Each publication fills them once for the rows it inserted
+//! ([`PublicationFill`]); triggers on the source rows apply deletes and name
+//! updates. IDs are not indexed: a
 //! query that could occur in an ID adds the rows a covering scan of the ID
 //! finds. The tables never score or order, and every candidate is still
 //! checked with the literal rule, so the answer is the literal scan's answer.
@@ -419,6 +421,59 @@ fn graph_search() -> Search<'static> {
         query_parameter: 1,
         limit_parameter: 2,
         match_parameter: 3,
+    }
+}
+
+/// Fills both tables, once per publication and in its transaction, for the
+/// source rows that publication inserted (Decision 0013, amended 2026-11-21,
+/// #1246). No insert trigger maintains them: every trigger insert left FTS5
+/// pending data that each later statement's savepoint then flushed. Deletes
+/// and name updates still go through triggers.
+///
+/// [`Self::begin`] marks each source table's highest rowid and
+/// [`Self::finish`] indexes every row above the mark with the expression the
+/// insert triggers used. In between, a publication only appends source rows:
+/// it never deletes one or chooses a rowid, so SQLite gives each new row
+/// `max(rowid)+1` and the rows above the mark are exactly the rows inserted.
+pub(super) struct PublicationFill {
+    declarations: i64,
+    nodes: i64,
+}
+
+impl PublicationFill {
+    const TABLES: [(&'static str, &'static str); 2] = [
+        ("native_declaration_trigrams", "native_version_declarations"),
+        ("graph_node_trigrams", "graph_nodes"),
+    ];
+
+    pub(super) fn begin(tx: &Connection) -> Result<Self> {
+        let mark = |source: &str| -> Result<i64> {
+            Ok(tx.query_row(
+                &format!("SELECT coalesce(max(rowid),0) FROM {source}"),
+                [],
+                |row| row.get(0),
+            )?)
+        };
+        Ok(Self {
+            declarations: mark(Self::TABLES[0].1)?,
+            nodes: mark(Self::TABLES[1].1)?,
+        })
+    }
+
+    pub(super) fn finish(self, tx: &Connection) -> Result<()> {
+        for ((names, source), after) in Self::TABLES
+            .into_iter()
+            .zip([self.declarations, self.nodes])
+        {
+            tx.execute(
+                &format!(
+                    "INSERT INTO {names}(rowid,name)
+                     SELECT rowid,lower(name) FROM {source} WHERE rowid>?1 ORDER BY rowid"
+                ),
+                [after],
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -1311,43 +1366,95 @@ mod tests {
         );
     }
 
-    /// The triggers keep each table equal to its source rows through inserts,
-    /// deletes (as retention and rebaseline delete), updates and reused rowids:
-    /// for every query the table's candidates are exactly the literal name
-    /// matches.
+    /// Every `(rowid, token offset, trigram)` each table holds, compared with
+    /// the ones its source rows imply under the trigram tokenizer. This is the
+    /// tables' logical content: it ignores segment layout, and it catches both
+    /// a source row the table misses and an entry whose row is gone.
+    fn assert_tables_match_sources(db: &Connection) {
+        use std::collections::BTreeSet;
+        for (table, source) in PublicationFill::TABLES {
+            db.execute_batch(&format!(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS temp.{table}_vocab
+                    USING fts5vocab(main,{table},'instance')"
+            ))
+            .unwrap();
+            let held: BTreeSet<(i64, i64, String)> = db
+                .prepare(&format!("SELECT doc,offset,term FROM temp.{table}_vocab"))
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            let mut implied = BTreeSet::new();
+            let mut statement = db
+                .prepare(&format!(
+                    "SELECT rowid,lower(name) FROM {source} WHERE name IS NOT NULL"
+                ))
+                .unwrap();
+            let rows = statement
+                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+                .unwrap();
+            for row in rows {
+                let (rowid, name) = row.unwrap();
+                let chars: Vec<char> = name.chars().collect();
+                for (offset, window) in chars.windows(3).enumerate() {
+                    implied.insert((rowid, offset as i64, window.iter().collect::<String>()));
+                }
+            }
+            assert_eq!(held, implied, "{table}");
+        }
+    }
+
+    /// The publication fill and the delete and rename triggers keep each table
+    /// equal to its source rows through inserts, deletes (as retention and
+    /// rebaseline delete), renames and reused rowids: for every query the
+    /// table's candidates are exactly the literal name matches.
     #[test]
-    fn triggers_keep_the_tables_exact_through_deletes_updates_and_reused_rowids() {
+    fn fill_and_triggers_keep_the_tables_exact_through_deletes_updates_and_reused_rowids() {
         let db = Connection::open_in_memory().unwrap();
-        // Lone rows without their parents; this test is about the triggers.
+        // Lone rows without their parents; this test is about the tables.
         db.pragma_update(None, "foreign_keys", "OFF").unwrap();
-        db.execute_batch(super::super::CACHE_SCHEMA_V44).unwrap();
+        db.execute_batch(super::super::CACHE_SCHEMA_V46).unwrap();
         let insert = |n: i64, name: Option<&str>| {
             let id = format!("sid:v1:{n:032x}");
             let end = name.map(|_| 1);
             db.execute(
-                "INSERT INTO native_version_declarations(rowid,vid,syntax_id,kind,role,name,
+                "INSERT INTO native_version_declarations(vid,syntax_id,kind,role,name,
                     lookup_key,key_signature_present,key_ordinal,start_byte,end_byte,name_start,name_end)
-                    VALUES(?1,1,?2,'function','production',?3,?3,0,0,0,1,?4,?5)",
-                rusqlite::params![n, super::super::id_codec::encode_sid(&id).unwrap(), name, end.map(|_| 0), end],
+                    VALUES(1,?1,'function','production',?2,?2,0,0,0,1,?3,?4)",
+                rusqlite::params![super::super::id_codec::encode_sid(&id).unwrap(), name, end.map(|_| 0), end],
             )
             .unwrap();
             db.execute(
-                "INSERT INTO graph_nodes(rowid,gid,id,name,kind) VALUES(?1,1,?2,?3,'module')",
+                "INSERT INTO graph_nodes(gid,id,name,kind) VALUES(1,?1,?2,'module')",
                 rusqlite::params![
-                    n,
                     super::super::id_codec::encode_sid(&id).unwrap(),
                     name.unwrap_or("a.js")
                 ],
             )
             .unwrap();
         };
+        // An insert alone indexes nothing; the publication's fill does.
+        let fill = PublicationFill::begin(&db).unwrap();
         let names = ["AlphaBeta", "alphaGamma", "ÜNÏcode", "beta_alpha", "Gamma"];
         for (n, name) in names.iter().enumerate() {
             insert(n as i64 + 1, Some(name));
         }
         insert(6, None);
-        // Retire the highest rowids so new rows reuse them, rename one row,
-        // then delete everything the way a rebaseline does for one version.
+        for table in ["native_declaration_trigrams", "graph_node_trigrams"] {
+            let held: i64 = db
+                .query_row(
+                    &format!("SELECT count(*) FROM {table} WHERE {table} MATCH '\"alp\"'"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(held, 0, "{table}");
+        }
+        fill.finish(&db).unwrap();
+        assert_tables_match_sources(&db);
+        // Retire the highest rowids so the next publication reuses them,
+        // rename one row, then publish two more rows.
         db.execute_batch(
             "DELETE FROM native_version_declarations WHERE rowid>=5;
             DELETE FROM graph_nodes WHERE rowid>=5;
@@ -1355,16 +1462,16 @@ mod tests {
             UPDATE graph_nodes SET name='Renamed' WHERE rowid=2;",
         )
         .unwrap();
+        let fill = PublicationFill::begin(&db).unwrap();
         insert(5, Some("deltaALPHA"));
         insert(6, Some("Omega"));
+        fill.finish(&db).unwrap();
+        assert_tables_match_sources(&db);
         for query in [
             "alp", "ALPHA", "gam", "Gamma", "ren", "ünï", "ÜNÏ", "a.js", "sid:v1:", "0005", "meg",
         ] {
             let expression = match_expression(query).unwrap();
-            for (table, source) in [
-                ("native_declaration_trigrams", "native_version_declarations"),
-                ("graph_node_trigrams", "graph_nodes"),
-            ] {
+            for (table, source) in PublicationFill::TABLES {
                 let ids = |sql: &str, values: &[&dyn rusqlite::ToSql]| -> Vec<i64> {
                     db.prepare(sql)
                         .unwrap()
@@ -1388,6 +1495,7 @@ mod tests {
         }
         db.execute_batch("DELETE FROM native_version_declarations; DELETE FROM graph_nodes;")
             .unwrap();
+        assert_tables_match_sources(&db);
         for table in ["native_declaration_trigrams", "graph_node_trigrams"] {
             let left: i64 = db
                 .query_row(
@@ -1398,6 +1506,141 @@ mod tests {
                 .unwrap();
             assert_eq!(left, 0, "{table}");
         }
+    }
+
+    /// After every publication kind, and after retention deletes, each table
+    /// holds exactly its source rows' trigrams, and both searches answer what
+    /// the literal scan answers: the stream full publication, a stream edit
+    /// publication, the non-stream publication, retention's release and
+    /// collection, and a rebaseline.
+    #[test]
+    fn every_publication_kind_leaves_the_tables_exact() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        std::fs::write(
+            root.join("a.js"),
+            "function alphaOne() {}\nclass AlphaShape { betaMethod() {} }\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("b.rs"), "fn gamma_alpha() {}\nstruct BetaRow;\n").unwrap();
+        let store = super::super::Store::open_for_tests(state.path(), root).unwrap();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reconcile = || {
+            crate::index_coordinator::reconcile_workspace(
+                &store,
+                &crate::model::IndexOptions::new(root.to_owned()),
+                &cancel,
+                |_| {},
+            )
+            .unwrap();
+            store.index_baseline().unwrap()
+        };
+        let check = |step: &str, present: &[&str], absent: &[&str]| {
+            let pin = store.index_baseline().unwrap();
+            let revision = format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision);
+            let db = store.cache_write().unwrap();
+            assert_tables_match_sources(&db);
+            for query in [
+                "alpha", "ALPHA", "beta", "gamma", "delta", "epsilon", "one", "row", "sid:v1:",
+                "absent",
+            ] {
+                let graph = graph_hits(&db, query, 50).unwrap();
+                let w2 = w2_hits(&db, &revision, query, 21).unwrap();
+                let literal = with_literal_scan(|| {
+                    (
+                        graph_hits(&db, query, 50).unwrap(),
+                        w2_hits(&db, &revision, query, 21).unwrap(),
+                    )
+                });
+                assert_eq!((graph, w2), literal, "{step}: {query:?}");
+            }
+            drop(db);
+            for name in present {
+                assert!(
+                    store
+                        .symbols(name, 20)
+                        .unwrap()
+                        .iter()
+                        .any(|symbol| symbol.name == *name),
+                    "{step}: {name} missing"
+                );
+            }
+            for name in absent {
+                assert!(
+                    store.symbols(name, 20).unwrap().is_empty(),
+                    "{step}: {name} still found"
+                );
+            }
+        };
+        store.set_retention_clock_for_tests(1_000, 0);
+        let first = reconcile();
+        check(
+            "full",
+            &["alphaOne", "AlphaShape", "gamma_alpha"],
+            &["deltaAlpha"],
+        );
+
+        store.set_retention_clock_for_tests(1_001, 1);
+        std::fs::write(
+            root.join("a.js"),
+            "function deltaAlpha() {}\nclass AlphaShape { betaMethod() {} }\n",
+        )
+        .unwrap();
+        let second = reconcile();
+        assert_eq!(second.index_generation, first.index_generation);
+        assert!(second.index_revision > first.index_revision);
+        check("edit", &["deltaAlpha", "AlphaShape"], &["alphaOne"]);
+
+        store.set_retention_clock_for_tests(1_002, 2);
+        std::fs::write(root.join("c.js"), "function epsilonAlpha() {}\n").unwrap();
+        let (graph, native, capture) = crate::indexer::index_workspace_bundle(
+            &crate::indexer::IndexOptions::new(root.to_owned()),
+            store.root_id(),
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+        let third = store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                &store.writer().unwrap(),
+                store.index_baseline().unwrap(),
+                &cancel,
+            )
+            .unwrap();
+        assert_eq!(third.index_generation, first.index_generation);
+        check("non-stream", &["epsilonAlpha", "deltaAlpha"], &["alphaOne"]);
+
+        store.set_retention_clock_for_tests(1_910, 910);
+        let leader = store.writer().unwrap();
+        store.release_revision(first, &leader).unwrap();
+        store.release_revision(second, &leader).unwrap();
+        store.collect_unreferenced(&leader).unwrap();
+        drop(leader);
+        let retired: i64 = store
+            .cache_write()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM graph_nodes WHERE name='alphaOne'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(retired, 0, "retention collected the first version's rows");
+        check("retention", &["epsilonAlpha", "deltaAlpha"], &["alphaOne"]);
+
+        store.mark_recovery(super::super::RecoveryDisposition::Rebuild);
+        std::fs::write(root.join("b.rs"), "fn gamma_alpha() {}\nstruct OtherRow;\n").unwrap();
+        let rebuilt = reconcile();
+        assert_ne!(rebuilt.index_generation, first.index_generation);
+        check(
+            "rebaseline",
+            &["OtherRow", "epsilonAlpha"],
+            &["BetaRow", "alphaOne"],
+        );
     }
 
     /// Against a real trigram table, operator-shaped queries match literally

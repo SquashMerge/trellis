@@ -586,10 +586,14 @@ pub(crate) fn valid_hash(s: &str) -> bool {
         && s.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
-fn stable_witness_rows<'a, T: Serialize + 'a>(
+
+/// The canonical JSON array of `items` without their proof labels, ordered by each
+/// row's canonical bytes. Each row is canonicalized once and the sorted bytes are
+/// spliced: the same output as canonicalizing the array of rows sorted that way.
+fn stable_witness_bytes<'a, T: Serialize + 'a>(
     items: impl IntoIterator<Item = &'a T>,
-) -> Result<Vec<Value>> {
-    let mut facts: Vec<Value> = items
+) -> Result<Vec<u8>> {
+    let mut facts: Vec<Vec<u8>> = items
         .into_iter()
         .map(|item| {
             let mut value = serde_json::to_value(item)?;
@@ -597,13 +601,21 @@ fn stable_witness_rows<'a, T: Serialize + 'a>(
                 object.remove("revisionId");
                 object.remove("provenanceId");
             }
-            Ok(value)
+            Ok(canonical(&value))
         })
         .collect::<Result<_>>()?;
-    // Canonicalization walks and sorts nested JSON. Compute each sort key
-    // once; recalculating it for every comparison dominates reuse checks.
-    facts.sort_by_cached_key(canonical);
-    Ok(facts)
+    // Rows with equal bytes are interchangeable, so an unstable sort is exact.
+    facts.sort_unstable();
+    let mut out = Vec::with_capacity(facts.iter().map(|fact| fact.len() + 1).sum::<usize>() + 2);
+    out.push(b'[');
+    for (i, fact) in facts.iter().enumerate() {
+        if i != 0 {
+            out.push(b',');
+        }
+        out.extend_from_slice(fact);
+    }
+    out.push(b']');
+    Ok(out)
 }
 
 /// Canonical evidence checksum for a document version. Revision-scoped proof IDs are
@@ -625,18 +637,50 @@ pub(crate) fn document_witness<'a>(
         .as_object_mut()
         .context("invalid coverage")?
         .remove("revisionId");
-    Ok(digest(
-        b"trellis.native-version-witness.v1\0",
-        &canonical(&json!({
-            "documentKey": document.key, "contentHash": document.content_hash,
-            "byteLength": document.byte_length, "producerId": producer.id,
-            "producerVersion": producer.version,
-            "extractionContext": extraction_context(&document.key.language, &[])?,
-            "coverage": coverage, "declarations": stable_witness_rows(declarations)?,
-            "calls": stable_witness_rows(calls)?, "regions": stable_witness_rows(regions)?,
-            "references": stable_witness_rows(references)?, "capabilityReports": stable_witness_rows(std::slice::from_ref(capability_report))?,
-        })),
-    ))
+    // The canonical bytes of the object with these members, built in one pass: each
+    // member's value is canonicalized once and spliced in canonical key order.
+    let mut members: [(&str, Vec<u8>); 12] = [
+        (
+            "documentKey",
+            canonical(&serde_json::to_value(&document.key)?),
+        ),
+        ("contentHash", canonical(&json!(document.content_hash))),
+        ("byteLength", canonical(&json!(document.byte_length))),
+        ("producerId", canonical(&json!(producer.id))),
+        ("producerVersion", canonical(&json!(producer.version))),
+        (
+            "extractionContext",
+            canonical(&json!(extraction_context(&document.key.language, &[])?)),
+        ),
+        ("coverage", canonical(&coverage)),
+        ("declarations", stable_witness_bytes(declarations)?),
+        ("calls", stable_witness_bytes(calls)?),
+        ("regions", stable_witness_bytes(regions)?),
+        ("references", stable_witness_bytes(references)?),
+        (
+            "capabilityReports",
+            stable_witness_bytes(std::slice::from_ref(capability_report))?,
+        ),
+    ];
+    members.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    let mut bytes = Vec::with_capacity(
+        members
+            .iter()
+            .map(|(key, value)| key.len() + value.len() + 4)
+            .sum::<usize>()
+            + 2,
+    );
+    bytes.push(b'{');
+    for (i, (key, value)) in members.iter().enumerate() {
+        if i != 0 {
+            bytes.push(b',');
+        }
+        crate::native_ids::canonical_string_into(key, &mut |part| bytes.extend_from_slice(part));
+        bytes.push(b':');
+        bytes.extend_from_slice(value);
+    }
+    bytes.push(b'}');
+    Ok(digest(b"trellis.native-version-witness.v1\0", &bytes))
 }
 
 #[cfg(test)]
