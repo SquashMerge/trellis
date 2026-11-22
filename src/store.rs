@@ -43,7 +43,7 @@ use anyhow::{Context, Result, ensure};
 pub use requests::{MaintenanceQueueProbe, MaintenanceQueueState, QueueProbeAdmission};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
-use spool_reader::SpoolReader;
+use spool_reader::{RawSpoolDocument, SpoolDecoder, SpoolReader};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     ops::{Deref, DerefMut},
@@ -4924,6 +4924,136 @@ fn precompute_document(
             }
         };
     (projection, witness)
+}
+
+/// One streamed document, decoded from the spool and checked against the capture.
+struct StreamedDocument {
+    ordinal: usize,
+    artifact: crate::native_records::Artifact,
+    graph: Graph,
+    classes: crate::class_catalog::Catalog,
+    extractions: BTreeMap<String, crate::model::FileExtraction>,
+}
+
+/// What preparing a streamed batch reads; all of it is shared with worker threads.
+struct StreamBatchContext<'a> {
+    decoder: &'a dyn SpoolDecoder,
+    native: &'a crate::native_records::Artifact,
+    source_files: &'a [SourceFile],
+    classes: &'a crate::class_catalog::Catalog,
+    owner_paths: &'a [&'a str],
+    reuse: &'a PreflightReuse,
+    max_graph_json_bytes: usize,
+    cancel: &'a CancelFlag,
+}
+
+/// Decode and check one streamed batch's spool rows and precompute each document's
+/// projection and witness, on workers. Holds no SQLite handle. The first failure in
+/// document order is returned, at the same step as the serial publisher: a document's
+/// read, decode, revision and capture checks, admission and extraction, then the
+/// batch's rows.
+fn prepare_stream_batch(
+    context: StreamBatchContext<'_>,
+    ordinal_start: usize,
+    raws: Vec<(usize, RawSpoolDocument)>,
+) -> Result<Vec<(StreamedDocument, PrecomputedDocument)>> {
+    let StreamBatchContext {
+        decoder,
+        native,
+        source_files,
+        classes,
+        owner_paths,
+        reuse,
+        max_graph_json_bytes,
+        cancel,
+    } = context;
+    let workers = crate::parallel::default_workers();
+    // `native_spool_read_failure` keeps only the message, so a kept read failure is
+    // typed exactly as the serial `spool.read(..).map_err(..)`.
+    let read_failure =
+        |error: &anyhow::Error| native_spool_read_failure(anyhow::anyhow!("{error:#}"));
+    let decoded = crate::parallel::map_ordered(&raws, workers, cancel, |offset, (index, raw)| {
+        check_cancel(cancel)?;
+        let index = *index;
+        let ordinal = ordinal_start + offset;
+        let (facts, graph) = raw.document.as_ref().map_err(read_failure)?;
+        let (artifact, document_graph) = decoder
+            .decode(index, facts, graph)
+            .map_err(native_spool_read_failure)?;
+        ensure!(
+            artifact.producer == native.producer
+                && artifact.source_set == native.source_set
+                && artifact.revision.id == native.revision.id
+                && artifact.revision.source_set_id == native.revision.source_set_id
+                && artifact.revision.toolchain_hash == native.revision.toolchain_hash
+                && artifact.revision.config_hash == native.revision.config_hash
+                && artifact.revision.dependency_hash == native.revision.dependency_hash
+                && artifact.revision.documents.as_slice()
+                    == std::slice::from_ref(&native.revision.documents[index]),
+            "native_evidence_required: streamed revision header differs"
+        );
+        let file = document_graph
+            .files
+            .first()
+            .context("stream graph document absent")?;
+        ensure!(
+            document_graph.files.len() == 1 && source_files.get(ordinal) == Some(file),
+            "native_evidence_required: streamed graph document differs from capture"
+        );
+        Store::enforce_selected_source_admission(
+            &document_graph,
+            &document_graph.files,
+            max_graph_json_bytes,
+        )?;
+        let selected_classes = stream_document_classes(classes, owner_paths, &file.path);
+        let extractions = if crate::class_catalog::supports_language(&file.language) {
+            let payload = raw.extraction.as_ref().map_err(read_failure)?;
+            BTreeMap::from([(
+                file.path.clone(),
+                decoder
+                    .decode_extraction(index, payload)
+                    .map_err(native_spool_read_failure)?,
+            )])
+        } else {
+            BTreeMap::new()
+        };
+        Ok(StreamedDocument {
+            ordinal,
+            artifact,
+            graph: document_graph,
+            classes: selected_classes,
+            extractions,
+        })
+    })
+    .into_iter()
+    // A slot is empty only when `cancel` was set before its item started; the serial
+    // publisher's own check then fails the same way.
+    .map(|slot| slot.context("index publication cancelled")?)
+    .collect::<Result<Vec<_>>>()?;
+    // The undecoded rows are not kept beside the decoded batch.
+    drop(raws);
+    let rows = decoded
+        .iter()
+        .map(|document| publication_rows(&document.graph, &document.artifact, &document.classes))
+        .collect::<Result<Vec<_>>>()?;
+    let precomputed =
+        crate::parallel::map_ordered(&decoded, workers, cancel, |offset, document| {
+            let file = &document.graph.files[0];
+            precompute_document(
+                file,
+                &document.artifact,
+                rows[offset].get(file.path.as_str()),
+                document.artifact.revision.documents.first(),
+                document.artifact.coverage.first(),
+                reuse,
+            )
+        })
+        .into_iter()
+        .map(|slot| slot.context("indexing cancelled"))
+        .collect::<Result<Vec<_>>>()?;
+    // The rows borrow the documents; the caller derives its own after the move.
+    drop(rows);
+    Ok(decoded.into_iter().zip(precomputed).collect())
 }
 
 // The full-artifact caller writes its header and all documents together.
@@ -16772,140 +16902,129 @@ impl Store {
                     NativeWrite::Header { ordinal_start: 0 },
                     &components,
                 )?;
-                // Decode a bounded batch, hash its projections and witnesses on
-                // workers, then write it in order on this connection.
+                // Decode and check a bounded batch and hash its projections and
+                // witnesses on workers, then write it in order on this connection.
+                // Batch b+1 is prepared while batch b is written, so at most two
+                // batches are decoded at once. The spool's reads and every write
+                // stay on this thread. A batch's failures are returned only at its
+                // turn, after every earlier batch is written, and in document order
+                // within it: the serial order.
                 let batch_len = crate::parallel::default_workers() * 16;
                 let owner_paths = relation_owner_paths(&classes);
-                for (batch_index, batch) in stream_order.chunks(batch_len).enumerate() {
-                    let mut decoded = Vec::with_capacity(batch.len());
-                    for (offset, &index) in batch.iter().enumerate() {
-                        check_cancel(cancel)?;
-                        let ordinal = batch_index * batch_len + offset;
-                        let (artifact, document_graph) =
-                            spool.read(index).map_err(native_spool_read_failure)?;
-                        ensure!(
-                            artifact.producer == native.producer
-                                && artifact.source_set == native.source_set
-                                && artifact.revision.id == native.revision.id
-                                && artifact.revision.source_set_id == native.revision.source_set_id
-                                && artifact.revision.toolchain_hash
-                                    == native.revision.toolchain_hash
-                                && artifact.revision.config_hash == native.revision.config_hash
-                                && artifact.revision.dependency_hash
-                                    == native.revision.dependency_hash
-                                && artifact.revision.documents.as_slice()
-                                    == std::slice::from_ref(&native.revision.documents[index]),
-                            "native_evidence_required: streamed revision header differs"
-                        );
-                        let file = document_graph
-                            .files
-                            .first()
-                            .context("stream graph document absent")?;
-                        ensure!(
-                            document_graph.files.len() == 1
-                                && source_files.get(ordinal) == Some(file),
-                            "native_evidence_required: streamed graph document differs from capture"
-                        );
-                        Self::enforce_selected_source_admission(
-                            &document_graph,
-                            &document_graph.files,
+                let decoder = spool.decoder();
+                let prepare = |batch_index: usize, raws: Vec<(usize, RawSpoolDocument)>| {
+                    prepare_stream_batch(
+                        StreamBatchContext {
+                            decoder,
+                            native,
+                            source_files,
+                            classes: &classes,
+                            owner_paths: &owner_paths,
+                            reuse: &reuse,
                             max_graph_json_bytes,
-                        )?;
-                        let selected_classes =
-                            stream_document_classes(&classes, &owner_paths, &file.path);
-                        let extractions = if crate::class_catalog::supports_language(&file.language)
-                        {
-                            BTreeMap::from([(
-                                file.path.clone(),
-                                spool
-                                    .read_extraction(index)
-                                    .map_err(native_spool_read_failure)?,
-                            )])
-                        } else {
-                            BTreeMap::new()
-                        };
-                        decoded.push((
-                            ordinal,
-                            artifact,
-                            document_graph,
-                            selected_classes,
-                            extractions,
-                        ));
-                    }
-                    let rows = decoded
-                        .iter()
-                        .map(|(_, artifact, document_graph, selected_classes, _)| {
-                            publication_rows(document_graph, artifact, selected_classes)
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    let mut precomputed = crate::parallel::map_ordered(
-                        &decoded,
-                        crate::parallel::default_workers(),
-                        cancel,
-                        |offset, (_, artifact, document_graph, _, _)| {
-                            let file = &document_graph.files[0];
-                            precompute_document(
-                                file,
-                                artifact,
-                                rows[offset].get(file.path.as_str()),
-                                artifact.revision.documents.first(),
-                                artifact.coverage.first(),
-                                &reuse,
-                            )
-                        },
-                    )
-                    .into_iter();
-                    for ((ordinal, artifact, document_graph, _, extractions), rows) in
-                        decoded.iter().zip(&rows)
-                    {
-                        check_cancel(cancel)?;
-                        let file = &document_graph.files[0];
-                        let written = write_native(
-                            &tx,
-                            (artifact, capture, document_graph, &classes, extractions),
-                            revision,
-                            &stats,
                             cancel,
-                            &mut immutable,
-                            &reuse,
-                            rows,
-                            &graph.diagnostics,
-                            class_complete,
-                            NativeWrite::Document {
-                                ordinal: *ordinal,
-                                captured_file: source_files
-                                    .get(*ordinal)
-                                    .context("streamed captured document ordinal missing")?,
-                                precomputed: precomputed
-                                    .next()
-                                    .flatten()
-                                    .context("indexing cancelled")?,
-                            },
-                            &components,
-                        )?;
-                        let ids = written
-                            .get(&file.path)
-                            .context("missing streamed document projection")?;
-                        during_tx(PublishStage::AfterFile, &tx)?;
-                        if let Some(watch) = readers_blocked.as_mut() {
-                            watch.check(&tx);
+                        },
+                        batch_index * batch_len,
+                        raws,
+                    )
+                };
+                // Unit-test fault injection is per thread; the preparing thread sees
+                // this one's.
+                #[cfg(test)]
+                let fault = crate::native_records::extraction_auth_fault_snapshot();
+                std::thread::scope(|scope| -> Result<()> {
+                    let mut batches = stream_order.chunks(batch_len).enumerate();
+                    let mut start_next = || {
+                        batches.next().map(|(batch_index, batch)| {
+                            let raws = batch
+                                .iter()
+                                .map(|&index| (index, spool.read_raw(index)))
+                                .collect::<Vec<_>>();
+                            #[cfg(test)]
+                            let fault = &fault;
+                            let prepare = &prepare;
+                            scope.spawn(move || {
+                                #[cfg(test)]
+                                let _fault =
+                                    crate::native_records::enter_extraction_auth_fault(fault);
+                                prepare(batch_index, raws)
+                            })
+                        })
+                    };
+                    let mut next = start_next();
+                    while let Some(preparing) = next.take() {
+                        let prepared = preparing
+                            .join()
+                            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
+                        next = start_next();
+                        let (documents, precomputed): (Vec<_>, Vec<_>) =
+                            prepared.into_iter().unzip();
+                        let rows = documents
+                            .iter()
+                            .map(|document| {
+                                publication_rows(
+                                    &document.graph,
+                                    &document.artifact,
+                                    &document.classes,
+                                )
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        for ((document, rows), precomputed) in
+                            documents.iter().zip(&rows).zip(precomputed)
+                        {
+                            check_cancel(cancel)?;
+                            let file = &document.graph.files[0];
+                            let written = write_native(
+                                &tx,
+                                (
+                                    &document.artifact,
+                                    capture,
+                                    &document.graph,
+                                    &classes,
+                                    &document.extractions,
+                                ),
+                                revision,
+                                &stats,
+                                cancel,
+                                &mut immutable,
+                                &reuse,
+                                rows,
+                                &graph.diagnostics,
+                                class_complete,
+                                NativeWrite::Document {
+                                    ordinal: document.ordinal,
+                                    captured_file: source_files
+                                        .get(document.ordinal)
+                                        .context("streamed captured document ordinal missing")?,
+                                    precomputed,
+                                },
+                                &components,
+                            )?;
+                            let ids = written
+                                .get(&file.path)
+                                .context("missing streamed document projection")?;
+                            during_tx(PublishStage::AfterFile, &tx)?;
+                            if let Some(watch) = readers_blocked.as_mut() {
+                                watch.check(&tx);
+                            }
+                            let grouped = rows
+                                .get(file.path.as_str())
+                                .context("streamed publication rows missing")?;
+                            write_graph_document(
+                                &tx,
+                                grouped,
+                                ids,
+                                reuse.for_path(&file.path),
+                                &mut immutable,
+                            )?;
+                            ensure!(
+                                seen_paths.insert(file.path.clone()),
+                                "duplicate streamed document path"
+                            );
                         }
-                        let grouped = rows
-                            .get(file.path.as_str())
-                            .context("streamed publication rows missing")?;
-                        write_graph_document(
-                            &tx,
-                            grouped,
-                            ids,
-                            reuse.for_path(&file.path),
-                            &mut immutable,
-                        )?;
-                        ensure!(
-                            seen_paths.insert(file.path.clone()),
-                            "duplicate streamed document path"
-                        );
                     }
-                }
+                    Ok(())
+                })?;
                 BTreeMap::new()
             } else {
                 write_native(
@@ -20408,6 +20527,8 @@ mod catalog_summary_tests;
 mod preflight_hash_reuse_tests;
 #[cfg(test)]
 mod semantic_statement_lifetime_tests;
+#[cfg(test)]
+mod stream_pipeline_tests;
 #[cfg(test)]
 mod unchanged_trust_tests;
 #[cfg(test)]

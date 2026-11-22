@@ -689,71 +689,25 @@ impl FullDocumentSpool {
     /// Read one document with full revision identity but only its own document row.
     /// This is repeatable; no decoded document is cached between reads.
     pub(crate) fn read(&self, index: usize) -> Result<(Artifact, crate::model::Graph)> {
-        let document = self
-            .header
-            .revision
-            .documents
-            .get(index)
-            .context("native spool document index out of range")?;
+        let (facts, graph) = self.read_document_rows(index)?;
+        decode_spool_document(&self.header, index, &facts, &graph)
+    }
+    /// One document's undecoded facts and graph rows, read on the spool's own
+    /// thread; `decode_spool_document` decodes and checks them on any thread.
+    pub(crate) fn read_document_rows(&self, index: usize) -> Result<(Vec<u8>, Vec<u8>)> {
+        ensure!(
+            index < self.len(),
+            "native spool document index out of range"
+        );
         #[cfg(test)]
         if let Some(error) = self.test_read_error.borrow_mut().take() {
             return Err(error.into());
         }
-        let (facts, graph): (Vec<u8>, Vec<u8>) = self.conn.query_row(
+        Ok(self.conn.query_row(
             "SELECT facts, graph FROM documents WHERE ordinal = ?1",
             rusqlite::params![i64::try_from(index)?],
             |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        let SpoolFacts {
-            mut artifact,
-            references,
-            search_cards,
-        } = serde_json::from_slice(&facts)?;
-        artifact.search_cards = search_cards;
-        ensure!(
-            artifact.references.is_empty()
-                && artifact.revision.documents.is_empty()
-                && artifact.producer == self.header.producer
-                && artifact.source_set == self.header.source_set
-                && artifact.revision.id == self.header.revision.id
-                && artifact.coverage.len() == 1
-                && artifact.coverage[0].document_path == document.key.path,
-            "native spool document/header mismatch"
-        );
-        let proof_id = spool_proof(&artifact, document)?.to_owned();
-        artifact.references = references
-            .into_iter()
-            .map(
-                |SpoolReference(
-                    id,
-                    owner_syntax_id,
-                    ordinal,
-                    start,
-                    end,
-                    spelling,
-                    lookup_override,
-                )| {
-                    Reference {
-                        id,
-                        owner_syntax_id,
-                        ordinal,
-                        document: document.key.clone(),
-                        revision_id: artifact.revision.id.clone(),
-                        range: Range { start, end },
-                        lookup_key: lookup_override.unwrap_or_else(|| spelling.clone()),
-                        spelling,
-                        provenance_id: proof_id.clone(),
-                    }
-                },
-            )
-            .collect();
-        artifact.revision.documents.push(document.clone());
-        let graph: crate::model::Graph = serde_json::from_slice(&graph)?;
-        ensure!(
-            graph.files.len() == 1 && graph.files[0].path == document.key.path,
-            "native spool graph/document mismatch"
-        );
-        Ok((artifact, graph))
+        )?)
     }
     #[cfg(test)]
     pub(crate) fn corrupt_graph_json_for_tests(&self, index: usize) {
@@ -806,22 +760,107 @@ impl FullDocumentSpool {
         Ok(())
     }
     pub(crate) fn read_extraction(&self, index: usize) -> Result<crate::model::FileExtraction> {
+        let payload = self.read_extraction_row(index)?;
+        decode_spool_extraction(&self.header, index, &payload)
+    }
+    /// One document's undecoded class extraction row, read on the spool's own
+    /// thread; `decode_spool_extraction` decodes and checks it on any thread.
+    pub(crate) fn read_extraction_row(&self, index: usize) -> Result<Vec<u8>> {
         ensure!(
             index < self.len(),
             "native spool extraction index out of range"
         );
-        let payload: Vec<u8> = self.conn.query_row(
+        Ok(self.conn.query_row(
             "SELECT payload FROM extractions WHERE ordinal = ?1",
             rusqlite::params![i64::try_from(index)?],
             |row| row.get(0),
-        )?;
-        let extraction: crate::model::FileExtraction = serde_json::from_slice(&payload)?;
-        ensure!(
-            extraction.path == self.header.revision.documents[index].key.path,
-            "native spool extraction path mismatch"
-        );
-        Ok(extraction)
+        )?)
     }
+}
+
+/// Decode and check one spooled document's rows against the spool header. Pure:
+/// it touches no SQLite handle, so publication runs it on worker threads.
+pub(crate) fn decode_spool_document(
+    header: &Artifact,
+    index: usize,
+    facts: &[u8],
+    graph: &[u8],
+) -> Result<(Artifact, crate::model::Graph)> {
+    let document = header
+        .revision
+        .documents
+        .get(index)
+        .context("native spool document index out of range")?;
+    let SpoolFacts {
+        mut artifact,
+        references,
+        search_cards,
+    } = serde_json::from_slice(facts)?;
+    artifact.search_cards = search_cards;
+    ensure!(
+        artifact.references.is_empty()
+            && artifact.revision.documents.is_empty()
+            && artifact.producer == header.producer
+            && artifact.source_set == header.source_set
+            && artifact.revision.id == header.revision.id
+            && artifact.coverage.len() == 1
+            && artifact.coverage[0].document_path == document.key.path,
+        "native spool document/header mismatch"
+    );
+    let proof_id = spool_proof(&artifact, document)?.to_owned();
+    artifact.references = references
+        .into_iter()
+        .map(
+            |SpoolReference(
+                id,
+                owner_syntax_id,
+                ordinal,
+                start,
+                end,
+                spelling,
+                lookup_override,
+            )| {
+                Reference {
+                    id,
+                    owner_syntax_id,
+                    ordinal,
+                    document: document.key.clone(),
+                    revision_id: artifact.revision.id.clone(),
+                    range: Range { start, end },
+                    lookup_key: lookup_override.unwrap_or_else(|| spelling.clone()),
+                    spelling,
+                    provenance_id: proof_id.clone(),
+                }
+            },
+        )
+        .collect();
+    artifact.revision.documents.push(document.clone());
+    let graph: crate::model::Graph = serde_json::from_slice(graph)?;
+    ensure!(
+        graph.files.len() == 1 && graph.files[0].path == document.key.path,
+        "native spool graph/document mismatch"
+    );
+    Ok((artifact, graph))
+}
+
+/// Decode and check one spooled class extraction row against the spool header, on
+/// any thread.
+pub(crate) fn decode_spool_extraction(
+    header: &Artifact,
+    index: usize,
+    payload: &[u8],
+) -> Result<crate::model::FileExtraction> {
+    let document = header
+        .revision
+        .documents
+        .get(index)
+        .context("native spool extraction index out of range")?;
+    let extraction: crate::model::FileExtraction = serde_json::from_slice(payload)?;
+    ensure!(
+        extraction.path == document.key.path,
+        "native spool extraction path mismatch"
+    );
+    Ok(extraction)
 }
 
 /// Validate the exact one-document view while retaining the full revision ID
