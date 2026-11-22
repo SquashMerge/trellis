@@ -71,10 +71,9 @@ use work::{COMPLEXITY_WORK, ComplexityWork};
 pub(crate) use work::{
     PublicationWork, note_copied_document, note_destination_document, note_destination_index_build,
     note_local_target_lookup, note_local_target_work, note_local_witness_outcome,
-    note_original_raw_decode, note_original_raw_envelope_parse, note_original_source_hash,
-    note_parsed_role_site_document, note_producer_attempt, note_published_copy,
-    note_reused_document, note_selected_original_native_row,
-    note_selected_original_raw_proof_bytes, note_selected_original_source_bytes,
+    note_original_raw_decode, note_original_source_hash, note_parsed_role_site_document,
+    note_producer_attempt, note_published_copy, note_reused_document,
+    note_selected_original_native_row, note_selected_original_source_bytes,
     note_witness_proof_read, publication_work, publication_work_checkpoint, reset_publication_work,
     restore_publication_work,
 };

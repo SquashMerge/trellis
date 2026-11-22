@@ -1566,7 +1566,6 @@ fn selected_case(change_b: &str) {
         assert_eq!(work["destinationIndexBuilds"], 1, "{work}");
         assert_eq!(work["destinationDocumentRows"], 1, "{work}");
         assert_eq!(work["destinationRoleParses"], 0, "{work}");
-        assert_eq!(work["originalRawProofBytes"], 0, "{work}");
         assert_eq!(work["originalRawDecodes"], 0, "{work}");
         assert!(
             work["parsedRoleSiteDocuments"]
@@ -1634,7 +1633,6 @@ fn selected_case(change_b: &str) {
         assert_eq!(work["fullFallbacks"], 1, "{work}");
         // Bounded FULL authenticates the binary and probes stored proofs without loading
         // the complete original proof inventory into Rust memory.
-        assert_eq!(work["originalRawProofBytes"], 0, "{work}");
         assert!(work["originalRawDecodes"].as_u64().unwrap() > 0, "{work}");
         assert_eq!(
             work["indexPin"],
@@ -1681,8 +1679,6 @@ fn selected_case(change_b: &str) {
                 .all(|doc| doc["path"] == "src/B.js"),
             "{work}"
         );
-        assert_eq!(work["originalRawProofBytes"], 0, "{work}");
-        assert_eq!(work["originalRawEnvelopeParses"], 0, "{work}");
         assert_eq!(work["originalRawDecodes"], 0, "{work}");
         assert!(
             work["parsedRoleSiteDocuments"]
@@ -2071,15 +2067,12 @@ fn selected_case(change_b: &str) {
         change_b,
         "unmatched_both" | "oracle_unmatched_both" | "oracle_fork_unmatched_both"
     ) {
-        let selected = store.selected_raw_inputs_at(prior).unwrap();
-        let unmatched: Vec<_> = selected[0]
-            .proofs
+        // The envelopes are not stored: re-derive them from the retained binary (#1248 PR 3).
+        let claims = store.selected_raw_claims_at(prior).unwrap();
+        let unmatched: Vec<_> = claims[0]
             .iter()
-            .filter(|(_, proof)| {
-                serde_json::from_slice::<Value>(&proof.canonical_bytes).unwrap()["raw"]["symbol"]
-                    == "unmatched0#"
-            })
-            .map(|(id, _)| id.as_str())
+            .filter(|claim| claim.envelope.raw["symbol"] == "unmatched0#")
+            .map(|claim| claim.captured_proof_id.as_str())
             .collect();
         assert_eq!(unmatched.len(), 1);
         assert!(snapshot.provenance.iter().all(|proof| {
@@ -2728,7 +2721,7 @@ try:
     assert m.sha_file(workspace / anchor)==anchor_hash
     work = json.loads((scratch / 'work-counts.json').read_text())
     assert work['witnessedRejoins']==1 and work['fullFallbacks']==0, work
-    assert work['originalNativeRows']==0 and work['originalSourceBytes']==0 and work['originalRawProofBytes']==0, work
+    assert work['originalNativeRows']==0 and work['originalSourceBytes']==0, work
     assert work['destinationDocumentRows']==996, work
     # Only the anchor is a scip-typescript document: the other sentinels are other languages.
     assert len(work['reusedDocuments'])==1 and work['destinationRoleParses']==0, work

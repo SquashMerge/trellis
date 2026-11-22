@@ -76,7 +76,7 @@ struct Batch {
     epoch: usize,
     id: i64,
     raw_counts: (i64, i64),
-    proofs: Vec<(String, String, String, Vec<u8>)>,
+    proofs: Vec<(String, String, String)>,
 }
 type Rows = BTreeMap<String, (i64, String)>; // producer -> (batch, captured pin)
 type Observation = BTreeMap<String, (String, Rows)>;
@@ -263,10 +263,10 @@ impl Machine {
     fn raw_counts(&self, id: i64) -> (i64, i64) {
         self.world.db().query_row("SELECT (SELECT count(*) FROM semantic_raw_captures WHERE batch_id=?1),(SELECT count(*) FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE c.batch_id=?1)", [id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
     }
-    fn raw_proofs(&self, id: i64) -> Vec<(String, String, String, Vec<u8>)> {
+    fn raw_proofs(&self, id: i64) -> Vec<(String, String, String)> {
         let db = self.world.db();
-        let mut q = db.prepare("SELECT lower(hex(p.proof_id)),p.record_kind,lower(hex(p.fact_digest)),p.canonical_bytes FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE c.batch_id=?1 ORDER BY c.ordinal,p.proof_id").unwrap();
-        q.query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        let mut q = db.prepare("SELECT lower(hex(p.proof_id)),p.record_kind,lower(hex(p.fact_digest)) FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE c.batch_id=?1 ORDER BY c.ordinal,p.proof_id").unwrap();
+        q.query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .unwrap()
             .map(Result::unwrap)
             .collect()

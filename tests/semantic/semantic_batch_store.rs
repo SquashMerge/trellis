@@ -3529,13 +3529,13 @@ fn real_module_marker_batch(language: &str) {
     }
     let db = world.db();
     for claim in &memory.merged.claims {
-        let (kind, digest, bytes): (String, String, Vec<u8>) = db.query_row(
-            "SELECT record_kind,lower(hex(fact_digest)),canonical_bytes FROM semantic_raw_proofs WHERE proof_id=unhex(?1)",
-            [&claim.captured_proof_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        // The envelope bytes are not stored; the digest is their SHA-256 (#1248 PR 3).
+        let (kind, digest): (String, String) = db.query_row(
+            "SELECT record_kind,lower(hex(fact_digest)) FROM semantic_raw_proofs WHERE proof_id=unhex(?1)",
+            [&claim.captured_proof_id], |row| Ok((row.get(0)?, row.get(1)?)),
         ).unwrap();
         assert_eq!(kind, claim.envelope.record_kind);
         assert_eq!(digest, claim.fact_digest);
-        assert_eq!(bytes, claim.canonical_bytes);
     }
     let (stored_hash, stored): (String, Vec<u8>) = db
         .query_row(
@@ -12316,15 +12316,11 @@ fn review655_multiple_bad_documents_publication_differential() {
     };
     assert_eq!(symbols(&snapshot), symbols(&base_snapshot));
     assert_eq!(symbols(&snapshot).len(), 2);
-    let proofs = |hash: &str, paths: &[&str]| -> Vec<(String, String, Vec<u8>)> {
+    let proofs = |hash: &str, paths: &[&str]| -> Vec<(String, String)> {
         let db = world.db();
-        let mut stmt = db.prepare("SELECT p.path,lower(hex(p.fact_digest)),p.canonical_bytes FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE c.artifact_hash=?1 ORDER BY p.path,p.canonical_bytes").unwrap();
+        let mut stmt = db.prepare("SELECT p.path,lower(hex(p.fact_digest)) FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE c.artifact_hash=?1 ORDER BY p.path,p.fact_digest").unwrap();
         stmt.query_map([hash], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, Vec<u8>>(2)?,
-            ))
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })
         .unwrap()
         .map(Result::unwrap)
@@ -13912,8 +13908,9 @@ fn bounded_retained_binary_and_proof_corruption_publish_no_partial_facts_or_cach
             .store
             .with_index_sql_for_tests(|db| {
                 if proof {
+                    // A changed proof: FULL compares it with the binary by identity.
                     db.execute(
-                        "UPDATE semantic_raw_proofs SET canonical_bytes=X'7b7d' WHERE rowid=(SELECT MAX(rowid) FROM semantic_raw_proofs)",
+                        "UPDATE semantic_raw_proofs SET fact_digest=zeroblob(32) WHERE rowid=(SELECT MAX(rowid) FROM semantic_raw_proofs)",
                         [],
                     )?;
                 } else {
@@ -14683,7 +14680,7 @@ fn corrupt_retained_proof_takes_the_typed_path() {
             .store
             .with_index_sql_for_tests(|db| {
                 db.execute(
-                    "UPDATE semantic_raw_proofs SET canonical_bytes=X'7b7d' WHERE rowid=(SELECT MAX(rowid) FROM semantic_raw_proofs WHERE path=?1)",
+                    "UPDATE semantic_raw_proofs SET fact_digest=zeroblob(32) WHERE rowid=(SELECT MAX(rowid) FROM semantic_raw_proofs WHERE path=?1)",
                     [corrupt],
                 )?;
                 Ok(())

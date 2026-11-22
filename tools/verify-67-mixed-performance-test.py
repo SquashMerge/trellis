@@ -285,7 +285,7 @@ class SchemaParity(unittest.TestCase):
         db.execute("INSERT INTO semantic_raw_exclusions VALUES(1,'javascript','js/b.js','notRequested')")
         db.execute("INSERT INTO semantic_raw_documents VALUES(1,'javascript','js/a.js',?,?,0)",
                    (hashes[paths[0]], HEX))
-        db.execute("INSERT INTO semantic_raw_proofs VALUES(1,?,'occurrence',?,'javascript','js/a.js',x'7b7d')",
+        db.execute("INSERT INTO semantic_raw_proofs VALUES(1,?,'occurrence',?,'javascript','js/a.js')",
                    (bytes.fromhex(PROOF), bytes.fromhex(HEX)))
         for name in ("import", "r2"):
             db.execute("INSERT INTO semantic_revision_raw_selections VALUES(?,'scip-typescript',1,?)",

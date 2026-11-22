@@ -1060,8 +1060,6 @@ fn two_document_case(change_b: &str) {
         );
         assert_eq!(raw.fact_digest, derived.fact_digest);
         assert_eq!(raw.path, "src/A.js");
-        let envelope: Value = serde_json::from_slice(&raw.canonical_bytes).unwrap();
-        assert_eq!(envelope["relativePath"], "src/A.js");
         assert_eq!(call.join.anchor.revision_id, r2_native.revision.id);
         assert_eq!(state_of("src/A.js"), "complete");
         if change_b == "unique" {
