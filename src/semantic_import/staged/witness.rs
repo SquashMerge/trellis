@@ -834,7 +834,7 @@ pub(super) fn copied(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Result
 
 /// Whether `doc`'s source association is reused unchanged from the original import, copied
 /// or re-settled.
-fn reused_source(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Result<bool> {
+pub(super) fn reused_source(join: &StagedJoin<'_>, doc: &native::DocumentKey) -> Result<bool> {
     exists(
         join.conn(),
         "SELECT 1 FROM source_witnesses w JOIN sources s ON s.ord=w.source_ord \

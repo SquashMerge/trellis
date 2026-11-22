@@ -69,6 +69,14 @@ pub(super) fn check(
         }
         let full = full_rejoin(store, db, target, selection, producer, cancel)?;
         check_cancel(cancel)?;
+        // The staged rows keep capture-bound `direct`s that the in-memory rejoin, the
+        // reader-visible reference, demotes: compare them as the head will read them (#1279).
+        semantic_payload::project_publication(
+            db,
+            &semantic_pin_key(target.pin),
+            &semantic_pin_key(selection.captured_pin),
+            &mut actual,
+        )?;
         if TEST_REJOIN_ORACLE_MISMATCH.get()
             || sorted_publication_rows(&actual)? != sorted_publication_rows(&full)?
         {
@@ -140,13 +148,14 @@ pub(in crate::store) fn check_published(
 pub(in crate::store) fn check_hit(
     db: &Connection,
     key: &str,
+    captured: &str,
     tuple: i64,
     coverage: &sem::Coverage,
     publication: &sem::SemanticPublication,
 ) -> Result<()> {
     let owns = semantic_payload::owned_provenance(coverage, publication);
     let mine = |id: &str| owns.contains(id);
-    let settled = sem::SemanticPublication {
+    let mut settled = sem::SemanticPublication {
         producers: vec![],
         coverage: vec![coverage.clone()],
         provenance: publication
@@ -186,6 +195,8 @@ pub(in crate::store) fn check_hit(
             .cloned()
             .collect(),
     };
+    // The settled rows keep capture-bound `direct`s; the read applies the demotion (#1279).
+    semantic_payload::project_publication(db, key, captured, &mut settled)?;
     let source_set: String = db.query_row(
         "SELECT source_set_id FROM native_revisions WHERE id=?1",
         [key],
@@ -268,44 +279,19 @@ fn full_rejoin(
             && raw.captured_pin == selection.captured_pin,
         "FULL oracle selected input differs from pending selection"
     );
-    let captured_read = ReadRevision::new(
-        selection.captured_pin,
-        semantic_pin_key(selection.captured_pin),
-    );
-    let (captured_native, captured_sources) =
-        store.retained_native_snapshot_from_db(db, &captured_read, None)?;
-    let (toolchain, config, dependencies) =
-        store.retained_native_components_from_db(db, &captured_read)?;
     let (destination_native, destination_sources) =
         store.retained_native_snapshot_from_db(db, &destination_read, None)?;
     ensure!(
         destination_native.revision.id == target.native_revision_id,
         "FULL oracle destination identity mismatch"
     );
-    let inventory = decoded_selected_inventory(&raw)?;
-    let captured = sem::CapturedComponents {
-        producer_executables: BTreeMap::new(),
-        artifacts: captured_artifacts(&raw),
-        sources: captured_sources.clone(),
-        captured_revision: captured_native.revision.clone(),
-        native_toolchain: toolchain.clone(),
-        native_config: config.clone(),
-        native_dependencies: dependencies.clone(),
-        requested_producers: vec![producer.clone()],
-        toolchain: native_ids::canonical(&toolchain),
-        config: native_ids::canonical(&serde_json::json!(config)),
-        dependency: native_ids::canonical(&serde_json::json!(dependencies)),
-        native_extraction_components: BTreeMap::new(),
-    };
-    let attested = authenticate_stored_batch(
-        &raw,
-        &inventory,
-        &captured,
-        &captured_native,
-        &captured_sources,
-        store,
-        cancel,
-    )?;
+    let Authenticated {
+        captured_native,
+        captured_sources,
+        captured,
+        inventory,
+        attested,
+    } = authenticated(store, db, &raw, cancel)?;
     ensure!(
         attested.matches(producer),
         "FULL oracle producer descriptor mismatch"
@@ -358,4 +344,76 @@ fn full_rejoin(
         &attested,
     )?;
     Ok(full.publication)
+}
+
+/// A selected batch re-authenticated against its retained captured revision.
+struct Authenticated {
+    captured_native: crate::native_records::Artifact,
+    captured_sources: BTreeMap<crate::native_records::DocumentKey, Vec<u8>>,
+    captured: sem::CapturedComponents,
+    /// Its claims re-derived from the retained binary with the pinned decoder (#1248 PR 3).
+    inventory: crate::scip_raw::CapturedScipInventory,
+    attested: AttestedProfileProducer,
+}
+
+fn authenticated(
+    store: &Store,
+    db: &Connection,
+    raw: &SelectedRawBatch,
+    cancel: &CancelFlag,
+) -> Result<Authenticated> {
+    let captured_read = ReadRevision::new(raw.captured_pin, semantic_pin_key(raw.captured_pin));
+    let (captured_native, captured_sources) =
+        store.retained_native_snapshot_from_db(db, &captured_read, None)?;
+    let (toolchain, config, dependencies) =
+        store.retained_native_components_from_db(db, &captured_read)?;
+    let mut inventory = decoded_selected_inventory(raw);
+    let captured = sem::CapturedComponents {
+        producer_executables: BTreeMap::new(),
+        artifacts: captured_artifacts(raw),
+        sources: captured_sources.clone(),
+        captured_revision: captured_native.revision.clone(),
+        native_toolchain: toolchain.clone(),
+        native_config: config.clone(),
+        native_dependencies: dependencies.clone(),
+        requested_producers: vec![raw.producer.clone()],
+        toolchain: native_ids::canonical(&toolchain),
+        config: native_ids::canonical(&serde_json::json!(config)),
+        dependency: native_ids::canonical(&serde_json::json!(dependencies)),
+        native_extraction_components: BTreeMap::new(),
+    };
+    let attested = authenticate_stored_batch(
+        raw,
+        &mut inventory,
+        &captured,
+        &captured_native,
+        &captured_sources,
+        store,
+        cancel,
+    )?;
+    Ok(Authenticated {
+        captured_native,
+        captured_sources,
+        captured,
+        inventory,
+        attested,
+    })
+}
+
+impl Store {
+    /// The claims of each batch selected at `pin`, in producer order: their envelopes are not
+    /// stored (#1248 PR 3), so they are re-derived from the retained binary with the pinned
+    /// decoder, and must name exactly the stored proofs.
+    pub fn selected_raw_claims_at(
+        &self,
+        pin: IndexPin,
+    ) -> Result<Vec<Vec<crate::scip_raw::CapturedClaim>>> {
+        self.native_at(pin, |db, selected| {
+            let cancel = CancelFlag::default();
+            self.selected_raw_input_results_from_db(db, selected, pin, false, false)?
+                .into_iter()
+                .map(|(_, _, raw)| Ok(authenticated(self, db, &raw?, &cancel)?.inventory.claims))
+                .collect()
+        })
+    }
 }

@@ -1515,7 +1515,10 @@ fn request_meta_is_accepted_and_ignored_both_modes() {
             let reply = peer.ask(with_meta(json!(2), "tools/list", json!({}), meta));
             assert_eq!(reply, plain_list);
         }
-        // Wait for the first publication, so repeated reads see one state.
+        // Wait until the idle checkout has settled, so repeated reads see one
+        // state: the first publication, its apps, and no catch-up work. The
+        // index can be ready while apps are still building or catchingUp is
+        // still true, and each settles on its own.
         let describe = json!({"schemaVersion":1});
         let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
         let plain = loop {
@@ -1526,12 +1529,16 @@ fn request_meta_is_accepted_and_ignored_both_modes() {
                 describe.clone(),
             ));
             tool(&status, None, !legacy);
-            if status["result"]["structuredContent"]["data"]["indexState"] == "ready" {
+            let content = &status["result"]["structuredContent"];
+            if content["data"]["indexState"] == "ready"
+                && content["data"]["apps"]["state"] == "ready"
+                && content["catchingUp"] == false
+            {
                 break status;
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "checkout was not indexed"
+                "checkout did not settle: {status}"
             );
             std::thread::yield_now();
         };

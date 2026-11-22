@@ -42,8 +42,6 @@ pub(crate) struct PublicationWork {
     original_native_documents: Vec<native::DocumentKey>,
     original_source_bytes: usize,
     original_source_documents: Vec<native::DocumentKey>,
-    original_raw_proof_bytes: usize,
-    original_raw_envelope_parses: usize,
     original_raw_decodes: usize,
     /// Retained proof identities witnessed admission read (#1245).
     witness_proof_reads: usize,
@@ -151,14 +149,6 @@ pub(crate) fn note_selected_original_source_bytes(doc: &native::DocumentKey, len
         work.original_source_bytes += length;
         work.original_source_documents.push(doc.clone());
     });
-}
-#[cfg(feature = "test-support")]
-pub(crate) fn note_selected_original_raw_proof_bytes(length: usize) {
-    count_publication_work(|work| work.original_raw_proof_bytes += length);
-}
-#[cfg(feature = "test-support")]
-pub(crate) fn note_original_raw_envelope_parse() {
-    count_publication_work(|work| work.original_raw_envelope_parses += 1);
 }
 #[cfg(feature = "test-support")]
 pub(crate) fn note_original_raw_decode() {

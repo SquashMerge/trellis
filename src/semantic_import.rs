@@ -71,10 +71,9 @@ use work::{COMPLEXITY_WORK, ComplexityWork};
 pub(crate) use work::{
     PublicationWork, note_copied_document, note_destination_document, note_destination_index_build,
     note_local_target_lookup, note_local_target_work, note_local_witness_outcome,
-    note_original_raw_decode, note_original_raw_envelope_parse, note_original_source_hash,
-    note_parsed_role_site_document, note_producer_attempt, note_published_copy,
-    note_reused_document, note_selected_original_native_row,
-    note_selected_original_raw_proof_bytes, note_selected_original_source_bytes,
+    note_original_raw_decode, note_original_source_hash, note_parsed_role_site_document,
+    note_producer_attempt, note_published_copy, note_reused_document,
+    note_selected_original_native_row, note_selected_original_source_bytes,
     note_witness_proof_read, publication_work, publication_work_checkpoint, reset_publication_work,
     restore_publication_work,
 };
@@ -214,11 +213,20 @@ pub(super) fn settled_dispatch(
 /// behind it, its `impl`'s bases and its modifiers, are outside its syntax ID, so it does not
 /// survive without a destination classification (#557). `target_is_method` reads the
 /// destination's declaration of the settled target.
+///
+/// `kept_for_read` says whether that method's document changed since the capture and the
+/// caller writes a payload (#1279, Decision 0021 D1/D4 as amended 2026-11-21). The destination
+/// classification is then missing only because of the change: once the document returns to its
+/// captured bytes the destination branch gives the captured `direct` again. So the payload keeps
+/// the `direct`, its writer marks the call capture-bound, and every read demotes it while the
+/// document differs from the capture. The in-memory rejoin, the reference for reader-visible
+/// evidence, never keeps it.
 pub(super) fn rejoined_dispatch(
     destination: Option<(semantic::Dispatch, Option<&semantic::Target>)>,
     captured: Option<(semantic::Dispatch, Option<&semantic::Target>)>,
     settled: &semantic::CallBinding,
     target_is_method: impl FnOnce(&str, &native::DocumentKey) -> Result<bool>,
+    kept_for_read: impl FnOnce(&native::DocumentKey) -> Result<bool>,
 ) -> Result<semantic::Dispatch> {
     if let Some((dispatch, target)) = destination
         && resolves_to(target, settled)
@@ -236,6 +244,7 @@ pub(super) fn rejoined_dispatch(
             ..
         }) = target
         && target_is_method(syntax_id, document)?
+        && !kept_for_read(document)?
     {
         return Ok(semantic::Dispatch::Unknown);
     }

@@ -46,15 +46,15 @@ pub(crate) struct RetainedDocument {
     pub capped: i64,
 }
 
-/// One retained proof row.
+/// One proof's identity, as FULL catch-up stages it from the authenticated binary. The proof
+/// ID commits to the fact digest, which is the SHA-256 of the envelope's canonical bytes, so
+/// equal identities are equal envelopes (#1248 PR 3).
 pub(crate) struct RetainedProof {
-    pub rowid: i64,
     pub proof_id: String,
     pub record_kind: String,
     pub fact_digest: String,
     pub language: String,
     pub path: String,
-    pub canonical_bytes: Vec<u8>,
 }
 
 /// One retained proof's identity, borrowed from its row so the caller can reserve its size
@@ -164,8 +164,8 @@ impl RetainedBatchRows<'_> {
         ordinal: u32,
         after: &str,
     ) -> Result<Option<(String, String, String)>> {
-        Ok(self.db.prepare_cached("SELECT p.proof_id,p.language,p.path FROM semantic_raw_captures c JOIN semantic_raw_proofs p ON p.capture_id=c.capture_id WHERE c.batch_id=?1 AND c.ordinal=?2 AND p.proof_id>?3 ORDER BY p.proof_id LIMIT 1")?.query_row(
-            params![self.batch_id, ordinal, after],
+        Ok(self.db.prepare_cached("SELECT lower(hex(p.proof_id)),p.language,p.path FROM semantic_raw_captures c JOIN semantic_raw_proofs p ON p.capture_id=c.capture_id WHERE c.batch_id=?1 AND c.ordinal=?2 AND p.proof_id>?3 ORDER BY p.proof_id LIMIT 1")?.query_row(
+            params![self.batch_id, ordinal, id_codec::digest_cursor(after)?],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ).optional()?)
     }
@@ -223,10 +223,15 @@ impl RetainedBatchRows<'_> {
         each: &mut dyn FnMut(WitnessProofRow<'_>) -> Result<()>,
     ) -> Result<()> {
         let mut statement = self.db.prepare_cached(
-            "SELECT proof_id,record_kind,fact_digest FROM semantic_raw_proofs WHERE capture_id=?1 AND language=?2 AND path=?3 AND (record_kind,fact_digest)>(?4,?5) ORDER BY record_kind,fact_digest LIMIT ?6",
+            "SELECT lower(hex(proof_id)),record_kind,lower(hex(fact_digest)) FROM semantic_raw_proofs WHERE capture_id=?1 AND language=?2 AND path=?3 AND (record_kind,fact_digest)>(?4,?5) ORDER BY record_kind,fact_digest LIMIT ?6",
         )?;
         let mut rows = statement.query(params![
-            capture_id, document.0, document.1, after.0, after.1, limit
+            capture_id,
+            document.0,
+            document.1,
+            after.0,
+            id_codec::digest_cursor(after.1)?,
+            limit
         ])?;
         while let Some(row) = rows.next()? {
             each(WitnessProofRow {
@@ -248,8 +253,8 @@ impl RetainedBatchRows<'_> {
         after: &str,
         limit: i64,
     ) -> Result<(i64, Option<String>)> {
-        Ok(self.db.prepare_cached("SELECT count(*),max(proof_id) FROM (SELECT proof_id FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id>?2 ORDER BY proof_id LIMIT ?3)")?.query_row(
-            params![capture_id, after, limit], |row| Ok((row.get(0)?, row.get(1)?)),
+        Ok(self.db.prepare_cached("SELECT count(*),CASE WHEN max(proof_id) IS NULL THEN NULL ELSE lower(hex(max(proof_id))) END FROM (SELECT proof_id FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id>?2 ORDER BY proof_id LIMIT ?3)")?.query_row(
+            params![capture_id, id_codec::digest_cursor(after)?, limit], |row| Ok((row.get(0)?, row.get(1)?)),
         )?)
     }
 
@@ -265,9 +270,10 @@ impl RetainedBatchRows<'_> {
         each: &mut dyn FnMut(WitnessProofRow<'_>) -> Result<()>,
     ) -> Result<()> {
         let mut statement = self.db.prepare_cached(
-            "SELECT proof_id,record_kind,fact_digest,language,path FROM semantic_raw_proofs          WHERE capture_id=?1 AND proof_id>?2 ORDER BY proof_id LIMIT ?3",
+            "SELECT lower(hex(proof_id)),record_kind,lower(hex(fact_digest)),language,path FROM semantic_raw_proofs          WHERE capture_id=?1 AND proof_id>?2 ORDER BY proof_id LIMIT ?3",
         )?;
-        let mut rows = statement.query(params![capture_id, after, limit])?;
+        let mut rows =
+            statement.query(params![capture_id, id_codec::digest_cursor(after)?, limit])?;
         while let Some(row) = rows.next()? {
             each(WitnessProofRow {
                 proof_id: row.get_ref(0)?.as_str()?,
@@ -282,8 +288,8 @@ impl RetainedBatchRows<'_> {
 
     /// The capture's next proof ID after `after`.
     pub(crate) fn proof_id_after(&self, capture_id: i64, after: &str) -> Result<Option<String>> {
-        Ok(self.db.prepare_cached("SELECT proof_id FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id>?2 ORDER BY proof_id LIMIT 1")?.query_row(
-            params![capture_id, after], |row| row.get(0),
+        Ok(self.db.prepare_cached("SELECT lower(hex(proof_id)) FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id>?2 ORDER BY proof_id LIMIT 1")?.query_row(
+            params![capture_id, id_codec::digest_cursor(after)?], |row| row.get(0),
         ).optional()?)
     }
 
@@ -326,34 +332,15 @@ impl RetainedBatchRows<'_> {
             params![capture_id, document.language, document.path, document.source_hash, document.wire_digest, document.capped], |row| row.get(0)).optional()?)
     }
 
-    /// The capture's next proof row after `after`.
-    pub(crate) fn proof_after(
-        &self,
-        capture_id: i64,
-        after: &str,
-    ) -> Result<Option<RetainedProof>> {
-        Ok(self.db.prepare_cached("SELECT rowid,proof_id,record_kind,fact_digest,language,path,canonical_bytes FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id>?2 ORDER BY proof_id LIMIT 1")?.query_row(
-            params![capture_id, after], |row| Ok(RetainedProof {
-                rowid: row.get(0)?,
-                proof_id: row.get(1)?,
-                record_kind: row.get(2)?,
-                fact_digest: row.get(3)?,
-                language: row.get(4)?,
-                path: row.get(5)?,
-                canonical_bytes: row.get(6)?,
-            }),
-        ).optional()?)
-    }
-
     /// Whether the capture's row of `proof` records exactly it; `None` when the capture has
-    /// no such row. `proof.rowid` is not compared.
+    /// no such row.
     pub(crate) fn proof_matches(
         &self,
         capture_id: i64,
         proof: &RetainedProof,
     ) -> Result<Option<bool>> {
-        Ok(self.db.prepare_cached("SELECT record_kind=?3 AND fact_digest=?4 AND language=?5 AND path=?6 AND canonical_bytes=?7 FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id=?2")?.query_row(
-            params![capture_id, proof.proof_id, proof.record_kind, proof.fact_digest, proof.language, proof.path, proof.canonical_bytes], |row| row.get(0)).optional()?)
+        Ok(self.db.prepare_cached("SELECT record_kind=?3 AND fact_digest=?4 AND language=?5 AND path=?6 FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id=?2")?.query_row(
+            params![capture_id, id_codec::digest(&proof.proof_id)?, proof.record_kind, id_codec::digest(&proof.fact_digest)?, proof.language, proof.path], |row| row.get(0)).optional()?)
     }
 
     /// Whether S copies `document` under `filter`, read in this snapshot.

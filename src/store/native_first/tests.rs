@@ -10,7 +10,7 @@ fn pin(revision: u64) -> IndexPin {
 }
 fn fixture() -> Connection {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V44).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V48).unwrap();
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
     db.execute(
         "INSERT INTO semantic_producers VALUES('producer','1',?1,'semantic','utf8','executable')",
@@ -80,7 +80,7 @@ fn changed_documents_without_retained_input_need_reimport() {
     db.execute("DELETE FROM semantic_revision_raw_selections", [])
         .unwrap();
     db.execute(
-        "INSERT INTO semantic_projection_dependencies VALUES(2,'javascript','c.js','v')",
+        "INSERT INTO semantic_projection_dependencies(payload_id,language,path,term) VALUES(2,'javascript','c.js','v')",
         [],
     )
     .unwrap();
@@ -116,12 +116,12 @@ fn pending_uses_recorded_endpoints_not_transitive_call_paths() {
     let db = fixture();
     // A -> B and B -> C are separate evidence, not consumption derivation.
     db.execute(
-        "INSERT INTO semantic_projection_dependencies VALUES(1,'javascript','b.js','v')",
+        "INSERT INTO semantic_projection_dependencies(payload_id,language,path,term) VALUES(1,'javascript','b.js','v')",
         [],
     )
     .unwrap();
     db.execute(
-        "INSERT INTO semantic_projection_dependencies VALUES(2,'javascript','c.js','v')",
+        "INSERT INTO semantic_projection_dependencies(payload_id,language,path,term) VALUES(2,'javascript','c.js','v')",
         [],
     )
     .unwrap();
@@ -165,7 +165,7 @@ fn pending_uses_recorded_endpoints_not_transitive_call_paths() {
 fn restored_native_recomputes_flat_basis_without_mutating_retained_n() {
     let db = fixture();
     db.execute(
-        "INSERT INTO semantic_projection_dependencies VALUES(2,'javascript','c.js','v')",
+        "INSERT INTO semantic_projection_dependencies(payload_id,language,path,term) VALUES(2,'javascript','c.js','v')",
         [],
     )
     .unwrap();
@@ -551,7 +551,7 @@ fn record_term(db: &Connection, flags: semantic_payload::TargetFlags) {
     )
     .unwrap();
     db.execute(
-        "INSERT INTO semantic_projection_dependencies VALUES(2,'javascript','c.js',?1)",
+        "INSERT INTO semantic_projection_dependencies(payload_id,language,path,term) VALUES(2,'javascript','c.js',?1)",
         [term],
     )
     .unwrap();
@@ -611,13 +611,14 @@ fn dependency_whose_targeted_declaration_changed_makes_a_dependent_pending() {
     }
 }
 
-/// A call bound to a method reads whether the dependency's content changed since capture;
-/// a method called any other way, or a free function, does not. An own symbol's declaration
-/// in the dependency reads it whatever its kind (#863).
+/// Only an own symbol's declaration in the dependency reads whether the dependency's content
+/// changed since capture, whatever its kind (#863). A call bound to a method no longer does:
+/// its #557 demotion is applied at read time (Decision 0021 D4 as amended 2026-11-21, #1279),
+/// so a content-only edit leaves its dependent older-basis evidence, as for a free function.
 #[test]
-fn only_a_method_call_or_a_symbol_declaration_reads_the_dependency_content() {
+fn only_a_symbol_declaration_reads_the_dependency_content() {
     for (kind, call, pending) in [
-        ("method", TARGET_CALL, true),
+        ("method", TARGET_CALL, false),
         ("method", 0, false),
         ("function", TARGET_CALL, false),
         ("function", TARGET_DECLARATION, true),

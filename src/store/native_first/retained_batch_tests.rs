@@ -12,11 +12,16 @@ fn h(c: &str) -> String {
     c.repeat(64)
 }
 
+/// Proof IDs are 64-hex digits; `p(1) < p(2) < p(3)` in stored order.
+fn p(n: u8) -> String {
+    h(&(n + 3).to_string())
+}
+
 /// Batch 1 with two captures: ordinal 0 (capture 10: two documents, three proofs and a
 /// five-byte binary) and ordinal 1 (capture 11: nothing), and one excluded document.
 fn fixture() -> Connection {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V44).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V48).unwrap();
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
     db.execute(
         "INSERT INTO semantic_raw_batches VALUES(1,'producer','1','profile','set','native-1',?1,?2,x'7b7d','decoder')",
@@ -38,12 +43,12 @@ fn fixture() -> Connection {
         .unwrap();
     }
     for (proof, digest, path) in [
-        ("p1", h("1"), "a.java"),
-        ("p2", h("2"), "a.java"),
-        ("p3", h("3"), "b.java"),
+        (p(1), h("1"), "a.java"),
+        (p(2), h("2"), "a.java"),
+        (p(3), h("3"), "b.java"),
     ] {
         db.execute(
-            "INSERT INTO semantic_raw_proofs VALUES(10,?1,'occurrence',?2,'java',?3,x'aa')",
+            "INSERT INTO semantic_raw_proofs VALUES(10,unhex(?1),'occurrence',unhex(?2),'java',?3)",
             params![proof, digest, path],
         )
         .unwrap();
@@ -141,10 +146,14 @@ fn coverage_rows_page_by_key_within_the_batch() {
     );
     assert_eq!(rows.exclusion_after(("java", "z.java")).unwrap(), None);
     assert_eq!(
-        rows.capture_proof_document_after(0, "p2").unwrap(),
-        Some(("p3".to_owned(), "java".to_owned(), "b.java".to_owned()))
+        rows.capture_proof_document_after(0, &p(2)).unwrap(),
+        Some((p(3), "java".to_owned(), "b.java".to_owned()))
     );
-    assert_eq!(rows.capture_proof_document_after(0, "p3").unwrap(), None);
+    assert_eq!(rows.capture_proof_document_after(0, &p(3)).unwrap(), None);
+    assert_eq!(
+        rows.capture_proof_document_after(0, "").unwrap(),
+        Some((p(1), "java".to_owned(), "a.java".to_owned()))
+    );
 }
 
 #[test]
@@ -199,19 +208,43 @@ fn capture_documents_and_proofs_page_and_compare_by_value() {
     document.path = "c.java".into();
     assert_eq!(rows.document_matches(10, &document).unwrap(), None);
 
-    let mut proof = rows.proof_after(10, "").unwrap().unwrap();
-    assert_eq!(proof.proof_id, "p1");
-    assert_eq!(proof.canonical_bytes, [0xaa]);
-    assert_eq!(
-        rows.proof_id_after(10, "p1").unwrap().as_deref(),
-        Some("p2")
-    );
-    assert_eq!(rows.proof_id_after(10, "p3").unwrap(), None);
-    assert_eq!(rows.proof_matches(10, &proof).unwrap(), Some(true));
-    proof.canonical_bytes = vec![0xbb];
-    assert_eq!(rows.proof_matches(10, &proof).unwrap(), Some(false));
-    proof.proof_id = "p9".into();
+    assert_eq!(rows.proof_id_after(10, &p(1)).unwrap(), Some(p(2)));
+    assert_eq!(rows.proof_id_after(10, &p(3)).unwrap(), None);
+}
+
+fn staged_proof() -> RetainedProof {
+    RetainedProof {
+        proof_id: p(1),
+        record_kind: "occurrence".into(),
+        fact_digest: h("1"),
+        language: "java".into(),
+        path: "a.java".into(),
+    }
+}
+
+/// FULL catch-up compares a staged proof with the retained row of its ID by identity: the
+/// envelope bytes are not stored, and the fact digest is their SHA-256 (#1248 PR 3).
+#[test]
+fn proof_matches_compares_proof_identity() {
+    let db = fixture();
+    let rows = RetainedBatchRows::for_tests(&db, 1, pin(1));
+    assert_eq!(rows.proof_matches(10, &staged_proof()).unwrap(), Some(true));
+    // A changed proof differs in some part of its identity under the same ID.
+    let changes: [fn(&mut RetainedProof); 4] = [
+        |proof| proof.fact_digest = h("2"),
+        |proof| proof.record_kind = "relationship".into(),
+        |proof| proof.language = "kotlin".into(),
+        |proof| proof.path = "b.java".into(),
+    ];
+    for change in changes {
+        let mut proof = staged_proof();
+        change(&mut proof);
+        assert_eq!(rows.proof_matches(10, &proof).unwrap(), Some(false));
+    }
+    let mut proof = staged_proof();
+    proof.proof_id = h("9");
     assert_eq!(rows.proof_matches(10, &proof).unwrap(), None);
+    assert_eq!(rows.proof_matches(11, &staged_proof()).unwrap(), None);
 }
 
 #[test]
@@ -240,7 +273,10 @@ fn document_proofs_are_a_bounded_page_of_one_document_and_a_failing_row_stops_it
     .unwrap();
     assert_eq!(
         seen,
-        ["p1 occurrence java a.java", "p2 occurrence java a.java"]
+        [
+            format!("{} occurrence java a.java", p(1)),
+            format!("{} occurrence java a.java", p(2))
+        ]
     );
     let mut seen = 0;
     let error = rows
@@ -256,14 +292,42 @@ fn document_proofs_are_a_bounded_page_of_one_document_and_a_failing_row_stops_it
 fn proof_ids_after_count_a_bounded_page_of_the_capture() {
     let db = fixture();
     let rows = RetainedBatchRows::for_tests(&db, 1, pin(1));
-    assert_eq!(
-        rows.proof_ids_after(10, "", 2).unwrap(),
-        (2, Some("p2".into()))
-    );
-    assert_eq!(
-        rows.proof_ids_after(10, "p2", 2).unwrap(),
-        (1, Some("p3".into()))
-    );
-    assert_eq!(rows.proof_ids_after(10, "p3", 2).unwrap(), (0, None));
+    assert_eq!(rows.proof_ids_after(10, "", 2).unwrap(), (2, Some(p(2))));
+    assert_eq!(rows.proof_ids_after(10, &p(2), 2).unwrap(), (1, Some(p(3))));
+    assert_eq!(rows.proof_ids_after(10, &p(3), 2).unwrap(), (0, None));
     assert_eq!(rows.proof_ids_after(11, "", 2).unwrap(), (0, None));
+}
+
+/// A malformed digest cursor or staged proof fails typed; it never reads as the end of a walk
+/// or as a missing row.
+#[test]
+fn malformed_digest_cursors_and_proofs_fail() {
+    let db = fixture();
+    let rows = RetainedBatchRows::for_tests(&db, 1, pin(1));
+    for after in ["p1", "P", &h("B"), &p(1)[1..]] {
+        let cursor = |error: anyhow::Error| {
+            assert_eq!(
+                error.to_string(),
+                "invalid semantic digest cursor",
+                "{after}"
+            )
+        };
+        cursor(rows.proof_id_after(10, after).unwrap_err());
+        cursor(rows.proof_ids_after(10, after, 2).unwrap_err());
+        cursor(rows.capture_proof_document_after(0, after).unwrap_err());
+        cursor(
+            rows.document_proofs(
+                10,
+                ("java", "a.java"),
+                ("occurrence", after),
+                5,
+                &mut |_| Ok(()),
+            )
+            .unwrap_err(),
+        );
+    }
+    let mut proof = staged_proof();
+    proof.fact_digest = h("A");
+    let error = rows.proof_matches(10, &proof).unwrap_err();
+    assert_eq!(error.to_string(), "invalid semantic digest");
 }

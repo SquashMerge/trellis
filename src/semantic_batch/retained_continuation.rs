@@ -679,14 +679,15 @@ impl RetainedStageContinuation {
                 }
             }
             Phase::Proofs => {
+                // Trusted admission is witnessed (above): retained envelopes are not stored, so
+                // only FULL, which staged its claims from the binary, compares proofs here.
+                ensure!(!self.trusted, "retained trusted admission is witnessed");
                 let bytes = advance_proof(
                     rows,
                     self.capture_id,
                     &descriptor.artifacts[self.artifact],
                     conn,
-                    self.trusted,
                     &mut self.proof_cursor,
-                    &mut self.proof_key,
                 )?;
                 if let Some(bytes) = bytes {
                     payload = payload.max(bytes);
@@ -694,18 +695,9 @@ impl RetainedStageContinuation {
                         counters.retained_admission_bytes_high_water.max(bytes);
                     self.proof_count += 1;
                 } else {
-                    if self.trusted {
-                        conn.execute(
-                            "UPDATE artifacts SET claims=?2 WHERE ordinal=?1",
-                            params![self.artifact as i64, self.proof_count],
-                        )?;
-                        self.artifact += 1;
-                        self.phase = Phase::Artifact;
-                    } else {
-                        self.retained_count = 0;
-                        self.proof_key.clear();
-                        self.phase = Phase::ProofInventory;
-                    }
+                    self.retained_count = 0;
+                    self.proof_key.clear();
+                    self.phase = Phase::ProofInventory;
                 }
             }
             Phase::Documents => {
@@ -998,7 +990,7 @@ fn advance_witness(
 }
 
 type StagedDocumentRow = (i64, String, String, String, String, i64);
-type StagedProofRow = (i64, String, String, String, String, String, Vec<u8>);
+type StagedProofRow = (i64, String, String, String, String, String, i64);
 
 fn advance_document(
     rows: &RetainedBatchRows<'_>,
@@ -1059,81 +1051,33 @@ fn advance_document(
     Ok(Some(true))
 }
 
+/// FULL catch-up: the next proof staged from the authenticated binary must be the retained
+/// proof of the same identity. Trusted admission is witnessed and walks retained proof
+/// identities instead ([`advance_witness`]); retained envelopes are not stored (#1248 PR 3).
 fn advance_proof(
     rows: &RetainedBatchRows<'_>,
     capture: i64,
     entry: &super::super::descriptor::ArtifactEntry,
     conn: &Connection,
-    trusted: bool,
     cursor: &mut i64,
-    key: &mut String,
 ) -> Result<Option<u64>> {
-    let byte_length;
-    if trusted {
-        let Some(RetainedProof {
-            rowid: id,
-            proof_id: proof,
-            record_kind: kind,
-            fact_digest: digest,
-            language,
-            path,
-            canonical_bytes: bytes,
-        }) = rows.proof_after(capture, key.as_str())?
-        else {
-            return Ok(None);
-        };
-        byte_length = bytes.len() as u64;
-        ensure!(
-            entry.languages.contains(&language),
-            "retained proof language"
-        );
-        let source = crate::store::staging::lookup_assigned(conn, entry.ordinal, &path)?
-            .ok_or_else(|| admission("retained unlisted proof"))?;
-        ensure!(source.language == language, "retained proof language");
-        let present: bool = conn
-            .prepare_cached(
-                "SELECT EXISTS(SELECT 1 FROM documents WHERE source_ord=?1 AND artifact=?2)",
-            )?
-            .query_row(params![source.ord, entry.ordinal], |row| row.get(0))?;
-        ensure!(present, "retained proof document");
-        let claim = crate::store::staging::claim_from_stage(
-            &bytes,
-            digest.clone(),
-            proof.clone(),
-            language.clone(),
-            entry.sha256.clone(),
-        )?;
-        let (symbol, presence) = crate::store::staging::claim_presence(&claim);
-        let target = claim.envelope.cargo_target.as_ref();
-        conn.execute("INSERT INTO claims(artifact,source_ord,record_kind,fact_digest,proof_id,canonical_bytes,symbol,presence,target_root,target_lib,target_package,target_version) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,CASE WHEN ?9 IS NULL THEN NULL ELSE (SELECT ord FROM sources WHERE language=?10 AND path=?9) END,?11,?12,?13)",
-            params![entry.ordinal, source.ord, kind, digest, proof, bytes, symbol, presence,
-                target.map(|t| t.root.as_str()), language, target.is_some_and(|t| t.is_lib()),
-                target.map(|t| t.package.as_str()), target.and_then(|t| t.version.as_deref())])?;
-        *cursor = id;
-        *key = proof;
-    } else {
-        let row: Option<StagedProofRow> = conn.prepare_cached("SELECT c.claim_id,c.proof_id,c.record_kind,c.fact_digest,s.language,s.path,c.canonical_bytes FROM claims c JOIN sources s ON s.ord=c.source_ord WHERE c.artifact=?1 AND c.claim_id>?2 ORDER BY c.claim_id LIMIT 1")?.query_row(
-            params![entry.ordinal, *cursor], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)),
-        ).optional()?;
-        let Some((id, proof_id, record_kind, fact_digest, language, path, canonical_bytes)) = row
-        else {
-            return Ok(None);
-        };
-        byte_length = canonical_bytes.len() as u64;
-        let staged = RetainedProof {
-            rowid: id,
-            proof_id,
-            record_kind,
-            fact_digest,
-            language,
-            path,
-            canonical_bytes,
-        };
-        let same = rows.proof_matches(capture, &staged)?.unwrap_or(false);
-        ensure!(same, "retained proof differs from authenticated binary");
-        *cursor = id;
-    }
-    Ok(Some(byte_length))
+    let row: Option<StagedProofRow> = conn.prepare_cached("SELECT c.claim_id,c.proof_id,c.record_kind,c.fact_digest,s.language,s.path,length(c.canonical_bytes) FROM claims c JOIN sources s ON s.ord=c.source_ord WHERE c.artifact=?1 AND c.claim_id>?2 ORDER BY c.claim_id LIMIT 1")?.query_row(
+        params![entry.ordinal, *cursor], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)),
+    ).optional()?;
+    let Some((id, proof_id, record_kind, fact_digest, language, path, byte_length)) = row else {
+        return Ok(None);
+    };
+    let staged = RetainedProof {
+        proof_id,
+        record_kind,
+        fact_digest,
+        language,
+        path,
+    };
+    let same = rows.proof_matches(capture, &staged)?.unwrap_or(false);
+    ensure!(same, "retained proof differs from authenticated binary");
+    *cursor = id;
+    Ok(Some(u64::try_from(byte_length)?))
 }
 #[cfg(test)]
 mod tests {
@@ -1258,7 +1202,7 @@ mod tests {
         let mut stage = Stage::create(parent.path(), "test", "witness").unwrap();
         stage.conn().unwrap().execute_batch(&format!("INSERT INTO witness_state(singleton) VALUES(1); {WITNESS_PENDING_TABLE} INSERT INTO sources VALUES(0,'java','a.java','h',1),(1,'java','b.java','h',1),(2,'java','c.java','h',1),(3,'java','d.java','h',1); INSERT INTO coverage VALUES(0,0,NULL),(1,0,NULL),(2,1,NULL),(3,1,NULL); INSERT INTO documents VALUES(0,0,'a.java','w',0),(1,0,'b.java','w',0),(2,1,'c.java','w',0),(3,1,'d.java','w',0)")).unwrap();
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch("CREATE TABLE semantic_raw_proofs(capture_id INTEGER NOT NULL,proof_id TEXT NOT NULL,record_kind TEXT NOT NULL,fact_digest TEXT NOT NULL,language TEXT NOT NULL,path TEXT NOT NULL,canonical_bytes BLOB NOT NULL,UNIQUE(capture_id,proof_id),UNIQUE(capture_id,language,path,record_kind,fact_digest))").unwrap();
+        db.execute_batch("CREATE TABLE semantic_raw_proofs(capture_id INTEGER NOT NULL,proof_id BLOB NOT NULL,record_kind TEXT NOT NULL,fact_digest BLOB NOT NULL,language TEXT NOT NULL,path TEXT NOT NULL,UNIQUE(capture_id,proof_id),UNIQUE(capture_id,language,path,record_kind,fact_digest))").unwrap();
         let kinds = ["occurrence", "symbolInformation", "relationship"];
         // Proof IDs are unique across captures, as their artifact-bound digests are.
         let mut k = 0u64;
@@ -1271,10 +1215,10 @@ mod tests {
                     k += 1;
                     // A permutation of 1..1009: proof IDs interleave the documents.
                     db.execute(
-                        "INSERT INTO semantic_raw_proofs VALUES(?1,?2,?3,?4,'java',?5,x'00')",
+                        "INSERT INTO semantic_raw_proofs VALUES(?1,unhex(?2),?3,unhex(?4),'java',?5)",
                         params![
                             capture,
-                            format!("{:04}", k * 37 % 1009),
+                            format!("{:064}", k * 37 % 1009),
                             kinds[(k % 3) as usize],
                             format!("{k:064x}"),
                             path
@@ -1364,9 +1308,11 @@ mod tests {
         let copied = ["b.java", "c.java"];
         for (path, in_copied) in [("b.java", true), ("a.java", false)] {
             let (_dir, mut stage, db, entries) = witness_fixture();
+            // An oversized proof ID (1,000 hex digits) that sorts before every other one, so
+            // the count's page cursor is never this row's.
             db.execute(
-                "INSERT INTO semantic_raw_proofs VALUES(10,?1,'occurrence',?2,'java',?3,x'00')",
-                params!["x".repeat(1_000), "f".repeat(64), path],
+                "INSERT INTO semantic_raw_proofs VALUES(10,zeroblob(500),'occurrence',unhex(?1),'java',?2)",
+                params!["f".repeat(64), path],
             )
             .unwrap();
             let rows = RetainedBatchRows::for_tests(&db, 1, test_pin());
@@ -1453,17 +1399,13 @@ mod tests {
     }
 
     #[test]
-    fn trusted_rows_preserve_wire_and_canonical_identity_one_row_per_call() {
+    fn trusted_documents_preserve_wire_identity_one_row_per_call() {
         let parent = tempfile::tempdir().unwrap();
         let mut stage = Stage::create(parent.path(), "test", "trusted").unwrap();
         let conn = stage.conn().unwrap();
         conn.execute_batch("INSERT INTO sources VALUES(0,'java','a.java','ha',1),(1,'java','b.java','hb',1); INSERT INTO coverage VALUES(0,0,NULL),(1,0,NULL); INSERT INTO artifacts(ordinal,path,languages,sha256,byte_length) VALUES(0,'raw','[\"java\"]','hash',0)").unwrap();
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch("CREATE TABLE semantic_raw_documents(capture_id INTEGER,language TEXT,path TEXT,source_hash TEXT,wire_digest TEXT,capped INTEGER,PRIMARY KEY(capture_id,language,path)); CREATE TABLE semantic_raw_proofs(capture_id INTEGER,proof_id TEXT,record_kind TEXT,fact_digest TEXT,language TEXT,path TEXT,canonical_bytes BLOB,PRIMARY KEY(capture_id,proof_id)); INSERT INTO semantic_raw_documents VALUES(1,'java','a.java','ha','wire-a',0),(1,'java','b.java','hb','wire-b',1)").unwrap();
-        let bytes = br#"{"formatVersion":1,"recordKind":"symbolInformation","relativePath":"a.java","positionEncoding":1,"raw":{"symbol":"A#"}}"#;
-        for proof in ["p1", "p2"] {
-            db.execute("INSERT INTO semantic_raw_proofs VALUES(1,?1,'symbolInformation',?1,'java','a.java',?2)", params![proof, bytes.as_slice()]).unwrap();
-        }
+        db.execute_batch("CREATE TABLE semantic_raw_documents(capture_id INTEGER,language TEXT,path TEXT,source_hash TEXT,wire_digest TEXT,capped INTEGER,PRIMARY KEY(capture_id,language,path)); INSERT INTO semantic_raw_documents VALUES(1,'java','a.java','ha','wire-a',0),(1,'java','b.java','hb','wire-b',1)").unwrap();
         let rows = RetainedBatchRows::for_tests(&db, 1, test_pin());
         let entry = super::super::super::descriptor::ArtifactEntry {
             ordinal: 0,
@@ -1496,29 +1438,69 @@ mod tests {
             )
             .unwrap();
         assert_eq!(wire, "wire-b");
-        let mut proof = String::new();
-        let mut proof_cursor = 0;
-        for expected in [1, 2] {
-            assert_eq!(
-                advance_proof(&rows, 1, &entry, conn, true, &mut proof_cursor, &mut proof).unwrap(),
-                Some(bytes.len() as u64)
-            );
-            let count: i64 = conn
-                .query_row("SELECT COUNT(*) FROM claims", [], |row| row.get(0))
-                .unwrap();
-            assert_eq!(count, expected);
-        }
-        assert_eq!(
-            advance_proof(&rows, 1, &entry, conn, true, &mut proof_cursor, &mut proof).unwrap(),
-            None
+    }
+
+    /// FULL catch-up compares each claim it staged from the authenticated binary with the
+    /// retained proof of its ID by identity (kind, fact digest, language, path), one row per
+    /// call; the retained envelope bytes are not stored (#1248 PR 3). A changed proof, one
+    /// whose fact digest or path differs under the same ID, or one the capture does not
+    /// retain, fails typed.
+    #[test]
+    fn full_catch_up_compares_staged_proofs_by_identity_one_row_per_call() {
+        let (p1, p2, d1, d2) = (
+            "1".repeat(64),
+            "2".repeat(64),
+            "a".repeat(64),
+            "b".repeat(64),
         );
-        let stored: Vec<u8> = conn
-            .query_row(
-                "SELECT canonical_bytes FROM claims WHERE proof_id='p1'",
-                [],
-                |row| row.get(0),
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE semantic_raw_proofs(capture_id INTEGER,proof_id BLOB,record_kind TEXT,fact_digest BLOB,language TEXT,path TEXT,PRIMARY KEY(capture_id,proof_id))").unwrap();
+        for (proof, digest) in [(&p1, &d1), (&p2, &d2)] {
+            db.execute("INSERT INTO semantic_raw_proofs VALUES(1,unhex(?1),'symbolInformation',unhex(?2),'java','a.java')", params![proof, digest]).unwrap();
+        }
+        let rows = RetainedBatchRows::for_tests(&db, 1, test_pin());
+        let entry = super::super::super::descriptor::ArtifactEntry {
+            ordinal: 0,
+            relative_path: "raw".into(),
+            languages: vec!["java".into()],
+            sha256: "hash".into(),
+            byte_length: 0,
+        };
+        let bytes = br#"{"formatVersion":1,"recordKind":"symbolInformation","relativePath":"a.java","positionEncoding":1,"raw":{"symbol":"A#"}}"#;
+        let walk = |claims: &[(&str, &str, &str)]| -> (Vec<u64>, Option<String>) {
+            let parent = tempfile::tempdir().unwrap();
+            let mut stage = Stage::create(parent.path(), "test", "full").unwrap();
+            let conn = stage.conn().unwrap();
+            conn.execute_batch(
+                "INSERT INTO sources VALUES(0,'java','a.java','ha',1),(1,'java','b.java','hb',1)",
             )
             .unwrap();
-        assert_eq!(stored, bytes);
+            for (proof, digest, path) in claims {
+                conn.execute("INSERT INTO claims(artifact,source_ord,record_kind,fact_digest,proof_id,canonical_bytes,presence) VALUES(0,(SELECT ord FROM sources WHERE path=?3),'symbolInformation',?2,?1,?4,0)", params![proof, digest, path, bytes.as_slice()]).unwrap();
+            }
+            let (mut lengths, mut cursor) = (Vec::new(), 0);
+            loop {
+                match advance_proof(&rows, 1, &entry, conn, &mut cursor) {
+                    Ok(Some(length)) => lengths.push(length),
+                    Ok(None) => return (lengths, None),
+                    Err(error) => return (lengths, Some(error.to_string())),
+                }
+            }
+        };
+        let length = bytes.len() as u64;
+        assert_eq!(
+            walk(&[(&p1, &d1, "a.java"), (&p2, &d2, "a.java")]),
+            (vec![length, length], None)
+        );
+        let differs = Some("retained proof differs from authenticated binary".to_owned());
+        // A changed proof: the same ID with another fact digest.
+        let changed = "c".repeat(64);
+        assert_eq!(
+            walk(&[(&p1, &d1, "a.java"), (&p2, &changed, "a.java")]),
+            (vec![length], differs.clone())
+        );
+        assert_eq!(walk(&[(&p1, &d1, "b.java")]), (vec![], differs.clone()));
+        let unretained = "3".repeat(64);
+        assert_eq!(walk(&[(&unretained, &d1, "a.java")]), (vec![], differs));
     }
 }
