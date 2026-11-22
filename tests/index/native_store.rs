@@ -253,7 +253,7 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        47
+        48
     );
     let count: i64 = db
         .query_row(
@@ -855,7 +855,7 @@ fn physical_v8_native_v4_index_recreates_before_role_column_read() {
         rebuilt
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        47
+        48
     );
     let stamp: String = rebuilt
         .query_row("SELECT extractor_version FROM index_metadata", [], |row| {
@@ -3562,7 +3562,7 @@ fn schemas16_19_23_24_26_27_28_29_30_31_38_and39_recreate_exclusively_without_mi
             rebuilt
                 .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            47
+            48
         );
         assert_eq!(
             rebuilt
@@ -3571,7 +3571,7 @@ fn schemas16_19_23_24_26_27_28_29_30_31_38_and39_recreate_exclusively_without_mi
                     0
                 ))
                 .unwrap(),
-            47
+            48
         );
         for table in [
             "native_version_references",
@@ -3617,7 +3617,7 @@ fn selected_capture_keeps_r1_and_all_raw_proofs_until_last_selector_expires() {
         let capture_id = db.last_insert_rowid();
         db.execute("INSERT INTO semantic_raw_exclusions(batch_id,language,path,reason) VALUES(?1,'javascript','flow.js','failed')", [batch_id])?;
         for i in 0..70_u32 {
-            db.execute("INSERT INTO semantic_raw_proofs(capture_id,proof_id,record_kind,fact_digest,language,path,canonical_bytes) VALUES(?1,unhex(?2),'occurrence',unhex(?3),'javascript','flow.js',x'03')",rusqlite::params![capture_id,format!("{:064x}", 1000 + i),format!("{i:064x}")])?;
+            db.execute("INSERT INTO semantic_raw_proofs(capture_id,proof_id,record_kind,fact_digest,language,path) VALUES(?1,unhex(?2),'occurrence',unhex(?3),'javascript','flow.js')",rusqlite::params![capture_id,format!("{:064x}", 1000 + i),format!("{i:064x}")])?;
         }
         db.execute("INSERT INTO semantic_revision_raw_selections(revision_id,producer_id,batch_id,captured_pin) VALUES(?1,'fixture',?2,?3)",rusqlite::params![format!("pin:v1:{}:{}",r2.index_generation,r2.index_revision),batch_id,format!("pin:v1:{}:{}",r1.index_generation,r1.index_revision)])?;
         Ok((batch_id, capture_id))
@@ -3742,7 +3742,7 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(metadata_version, 47);
+    assert_eq!(metadata_version, 48);
     assert_eq!(generation, old.index_generation.to_string());
 }
 

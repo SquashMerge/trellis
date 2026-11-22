@@ -29,7 +29,7 @@ import importlib.util
 
 REPO = Path(__file__).resolve().parents[1]
 DECODER_VERSION = "scip-0.10.0/CapturedScipFactV1/2"
-SCHEMA_VERSION = 47
+SCHEMA_VERSION = 48
 PINNED = REPO / "tools/synthetic-cohorts/manifest-v2.json"
 GENERATOR = REPO / "tools/synthetic-cohorts/generate.mjs"
 BATCH_MODULE = REPO / "tools/semantic-contract/semantic_batch.py"
@@ -1243,11 +1243,10 @@ class SelectedView:
             self.ids["pin"][imported[0][0]] = "<import-pin>"
             self.capture_bytes = descriptor_bytes
             self.r1_docs = r1_doc
-            for raw, kind, language, path, fact, canonical_bytes in db.execute(
-                    "SELECT lower(hex(proof_id)),record_kind,language,path,lower(hex(fact_digest)),canonical_bytes "
+            for raw, kind, language, path, fact in db.execute(
+                    "SELECT lower(hex(proof_id)),record_kind,language,path,lower(hex(fact_digest)) "
                     "FROM semantic_raw_proofs WHERE capture_id=?", (capture,)):
-                self.ids["proof"][raw] = (self.ids["capture"][capture], kind, language,
-                                           path, fact, canonical_bytes.hex())
+                self.ids["proof"][raw] = (self.ids["capture"][capture], kind, language, path, fact)
         # A payload is identified by the first manifest row of the selected revision that names it.
         for raw, tuple_id in db.execute(
                 "SELECT payload_id,min(tuple_id) FROM semantic_coverage "

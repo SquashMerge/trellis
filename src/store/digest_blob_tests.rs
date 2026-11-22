@@ -21,7 +21,7 @@ fn hex(digit: char) -> String {
 /// An empty index with one raw capture (7) for derived provenance to name.
 fn index() -> Connection {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V47).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V48).unwrap();
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
     db.execute(
         "INSERT INTO semantic_raw_captures VALUES(7,1,0,'[\"rust\"]','producer',?1,'set','captured',x'','decoder')",

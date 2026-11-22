@@ -304,7 +304,11 @@ fn crate_paths(code: &str) -> BTreeSet<String> {
 /// bumps.
 const NON_OUTPUT_STORE_ITEMS: &[(&str, &str)] = &[
     (
-        "CACHE_SCHEMA_V47",
+        "AttestedProfileProducer",
+        "the test oracle's re-authenticated producer descriptor",
+    ),
+    (
+        "CACHE_SCHEMA_V48",
         "the schema text; a change bumps the schema version",
     ),
     (
@@ -326,6 +330,10 @@ const NON_OUTPUT_STORE_ITEMS: &[(&str, &str)] = &[
         "SelectedIntegrity",
         "a typed read failure; it can only abort",
     ),
+    (
+        "SelectedRawBatch",
+        "the test oracle's stored raw batch, read to re-authenticate it",
+    ),
     ("SemanticPublicationStage", "a test observer's stage names"),
     (
         "Store",
@@ -333,7 +341,7 @@ const NON_OUTPUT_STORE_ITEMS: &[(&str, &str)] = &[
     ),
     (
         "authenticate_stored_batch",
-        "authenticates stored raw bytes; it can only reject",
+        "re-derives the claims from the stored binary with the pinned decoder; it can only reject",
     ),
     (
         "batch_publication_limits",
@@ -349,7 +357,10 @@ const NON_OUTPUT_STORE_ITEMS: &[(&str, &str)] = &[
         "copy_semantic_manifest",
         "copies manifest rows by name; payload rows are never read or written",
     ),
-    ("decoded_selected_inventory", "decodes the stored inventory"),
+    (
+        "decoded_selected_inventory",
+        "reads the stored inventory metadata",
+    ),
     ("json", "the `serde_json::json!` macro"),
     ("publication_gate", "writer admission"),
     (

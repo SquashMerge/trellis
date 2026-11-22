@@ -2547,6 +2547,7 @@ fn raw_proof_import_cas_and_selected_read_are_atomic() {
         2
     );
     // A corrupted stored proof is a typed failure and schedules recovery, never a partial read.
+    // Its proof ID commits to its fact digest; the envelope bytes are not stored (#1248 PR 3).
     let proof_id: String = world
         .db()
         .query_row(
@@ -2558,7 +2559,7 @@ fn raw_proof_import_cas_and_selected_read_are_atomic() {
     world
         .db()
         .execute(
-            "UPDATE semantic_raw_proofs SET record_kind='relationship' WHERE proof_id=unhex(?1)",
+            "UPDATE semantic_raw_proofs SET fact_digest=zeroblob(32) WHERE proof_id=unhex(?1)",
             [&proof_id],
         )
         .unwrap();

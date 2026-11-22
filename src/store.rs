@@ -984,11 +984,11 @@ SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+(
 UNION ALL
 SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+COALESCE(length(CAST(x.id AS BLOB)),0)+39+(CASE WHEN x.target IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes,1 AS class FROM class_relations x WHERE x.cid=?2
 )"#;
-const DATABASE_SCHEMA_VERSION: u32 = 47;
+const DATABASE_SCHEMA_VERSION: u32 = 48;
 const EXTRACTOR_VERSION: &str = "native-v6-delta-v1";
 const EVIDENCE_FORMAT: &str = "terminal-native-graph-v1";
-const CACHE_SCHEMA_V47: &str = r#"
-CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=47), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
+const CACHE_SCHEMA_V48: &str = r#"
+CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=48), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
 CREATE TABLE native_producers(id TEXT NOT NULL,version TEXT NOT NULL,executable_hash TEXT NOT NULL CHECK(length(executable_hash)=64),kind TEXT NOT NULL CHECK(kind='native'),position_encoding TEXT NOT NULL CHECK(position_encoding='utf8'),PRIMARY KEY(id,version));
 CREATE TABLE native_producer_languages(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,inventory_authenticated INTEGER NOT NULL CHECK(inventory_authenticated IN (0,1)),ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language),UNIQUE(producer_id,producer_version,ordinal),FOREIGN KEY(producer_id,producer_version) REFERENCES native_producers(id,version) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE native_producer_inputs(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,component_name TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language,component_name),UNIQUE(producer_id,producer_version,language,ordinal),FOREIGN KEY(producer_id,producer_version,language) REFERENCES native_producer_languages(producer_id,producer_version,language) DEFERRABLE INITIALLY DEFERRED);
@@ -1083,7 +1083,7 @@ CREATE TABLE semantic_raw_exclusions(batch_id INTEGER NOT NULL REFERENCES semant
 CREATE TABLE semantic_revision_raw_selections(revision_id TEXT NOT NULL REFERENCES native_revisions(id),producer_id TEXT NOT NULL,batch_id INTEGER NOT NULL REFERENCES semantic_raw_batches(batch_id),captured_pin TEXT NOT NULL REFERENCES native_revisions(id),PRIMARY KEY(revision_id,producer_id));
 CREATE INDEX semantic_raw_selections_batch ON semantic_revision_raw_selections(batch_id);
 CREATE INDEX semantic_raw_selections_captured_pin ON semantic_revision_raw_selections(captured_pin);
-CREATE TABLE semantic_raw_proofs(capture_id INTEGER NOT NULL REFERENCES semantic_raw_captures(capture_id),proof_id BLOB NOT NULL CHECK(length(proof_id)=32),record_kind TEXT NOT NULL CHECK(record_kind IN ('occurrence','symbolInformation','relationship')),fact_digest BLOB NOT NULL CHECK(length(fact_digest)=32),language TEXT NOT NULL,path TEXT NOT NULL,canonical_bytes BLOB NOT NULL,UNIQUE(capture_id,proof_id),UNIQUE(capture_id,language,path,record_kind,fact_digest));
+CREATE TABLE semantic_raw_proofs(capture_id INTEGER NOT NULL REFERENCES semantic_raw_captures(capture_id),proof_id BLOB NOT NULL CHECK(length(proof_id)=32),record_kind TEXT NOT NULL CHECK(record_kind IN ('occurrence','symbolInformation','relationship')),fact_digest BLOB NOT NULL CHECK(length(fact_digest)=32),language TEXT NOT NULL,path TEXT NOT NULL,UNIQUE(capture_id,proof_id),UNIQUE(capture_id,language,path,record_kind,fact_digest));
 CREATE TABLE semantic_raw_documents(capture_id INTEGER NOT NULL REFERENCES semantic_raw_captures(capture_id) ON DELETE CASCADE,language TEXT NOT NULL,path TEXT NOT NULL,source_hash TEXT NOT NULL CHECK(length(source_hash)=64),wire_digest TEXT NOT NULL CHECK(length(wire_digest)=64),capped INTEGER NOT NULL CHECK(capped IN (0,1,2,3)),PRIMARY KEY(capture_id,language,path));
 CREATE TABLE semantic_reimport(revision_id TEXT NOT NULL REFERENCES native_revisions(id) ON DELETE CASCADE,producer TEXT NOT NULL,language TEXT NOT NULL,reason TEXT NOT NULL,PRIMARY KEY(revision_id,producer,language));
 CREATE TABLE semantic_import_reports(revision_id TEXT NOT NULL REFERENCES native_revisions(id),producer_id TEXT NOT NULL,report_json TEXT NOT NULL CHECK(json_valid(report_json)),PRIMARY KEY(revision_id,producer_id));
@@ -2924,7 +2924,7 @@ fn expected_cache_objects() -> Result<&'static Vec<CacheObject>> {
     #[cfg(test)]
     EXPECTED_CACHE_SHAPE_BUILDS.with(|count| count.set(count.get() + 1));
     let expected = Connection::open_in_memory()?;
-    expected.execute_batch(CACHE_SCHEMA_V47)?;
+    expected.execute_batch(CACHE_SCHEMA_V48)?;
     let built = cache_objects(&expected)?;
     Ok(EXPECTED.get_or_init(|| built))
 }
@@ -2948,7 +2948,7 @@ mod cache_shape_once_tests {
 
     fn current_schema_db() -> Connection {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(CACHE_SCHEMA_V47).unwrap();
+        db.execute_batch(CACHE_SCHEMA_V48).unwrap();
         db.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
             .unwrap();
         db
@@ -5098,7 +5098,7 @@ fn captured_artifacts(raw: &SelectedRawBatch) -> BTreeMap<(String, String), Vec<
 #[cfg(feature = "test-support")]
 fn authenticate_stored_batch(
     raw: &SelectedRawBatch,
-    inventory: &crate::scip_raw::CapturedScipInventory,
+    inventory: &mut crate::scip_raw::CapturedScipInventory,
     captured: &crate::semantic_records::CapturedComponents,
     r1: &crate::native_records::Artifact,
     sources: &BTreeMap<crate::native_records::DocumentKey, Vec<u8>>,
@@ -5274,9 +5274,29 @@ fn authenticate_stored_batch(
         capped.extend(sink.capped_documents().clone());
         claims.extend(sink.finish().context("raw original binary admission")?);
     }
+    // The decoded claims must name exactly the stored proofs: a proof ID commits to its fact
+    // digest, the SHA-256 of the envelope's canonical bytes (#1248 PR 3).
     claims.sort_by(|a, b| a.captured_proof_id.cmp(&b.captured_proof_id));
-    let mut retained = inventory.claims.clone();
-    retained.sort_by(|a, b| a.captured_proof_id.cmp(&b.captured_proof_id));
+    let decoded = claims.iter().map(|claim| {
+        (
+            claim.captured_proof_id.as_str(),
+            claim.envelope.record_kind.as_str(),
+            claim.fact_digest.as_str(),
+            claim.language.as_str(),
+            claim.envelope.relative_path.as_str(),
+            claim.artifact_hash.as_str(),
+        )
+    });
+    let stored = raw.proofs.iter().map(|(id, proof)| {
+        (
+            id.as_str(),
+            proof.record_kind.as_str(),
+            proof.fact_digest.as_str(),
+            proof.language.as_str(),
+            proof.path.as_str(),
+            proof.artifact_hash.as_str(),
+        )
+    });
     ensure!(
         inventory.artifact_hashes
             == raw
@@ -5289,9 +5309,24 @@ fn authenticate_stored_batch(
             && inventory.completion == descriptor.completion
             && inventory.exclusions == raw.exclusions
             && inventory.capped_documents == capped
-            && claims == retained,
+            && decoded.eq(stored),
         "raw inventory differs from authenticated binary"
     );
+    // The decoder's (language, path, canonical bytes) order, as `VecSink::finish` sorts each
+    // artifact's claims, so a rejoin meets each document's claims together (#494).
+    claims.sort_by(|a, b| {
+        (
+            a.language.as_bytes(),
+            a.envelope.relative_path.as_bytes(),
+            &a.canonical_bytes,
+        )
+            .cmp(&(
+                b.language.as_bytes(),
+                b.envelope.relative_path.as_bytes(),
+                &b.canonical_bytes,
+            ))
+    });
+    inventory.claims = claims;
     let attested = pinned.producer();
     Ok(AttestedProfileProducer {
         id: raw.producer_id.clone(),
@@ -5311,7 +5346,6 @@ pub struct StoredRawProof {
     pub fact_digest: String,
     pub language: String,
     pub path: String,
-    pub canonical_bytes: Vec<u8>,
     pub artifact_hash: String,
 }
 
@@ -6018,28 +6052,19 @@ fn read_semantic_tuple_with_reasons(
                     })
                 }
                 (Some(capture), Some(proof), Some(kind), Some(digest)) => {
-                    type RawRow = (
-                        String,
-                        String,
-                        String,
-                        String,
-                        Option<Vec<u8>>,
-                        String,
-                        String,
-                        String,
-                        String,
-                    );
+                    // Reads trust the raw proof rows admission validated and published (#261):
+                    // the envelope bytes are not stored (#1248 PR 3), so this checks only the
+                    // row's binding to its capture and the proof ID it commits to. A missing
+                    // proof fails typed.
+                    type RawRow = (String, String, String, String, String, String);
                     let raw: Option<RawRow> = db.query_row(
-                        "SELECT p.record_kind,lower(hex(p.fact_digest)),p.language,p.path,p.canonical_bytes,c.producer_id,c.source_set_id,c.captured_revision,c.artifact_hash FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE p.capture_id=?1 AND p.proof_id=?2",
+                        "SELECT p.language,p.path,c.producer_id,c.source_set_id,c.captured_revision,c.artifact_hash FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE p.capture_id=?1 AND p.proof_id=?2",
                         params![capture, id_codec::encode_digest(&proof)],
-                        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?)),
+                        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)),
                     ).optional()?;
                     let (
-                        stored_kind,
-                        stored_digest,
                         stored_language,
                         stored_path,
-                        canonical,
                         stored_producer,
                         stored_source_set,
                         stored_revision,
@@ -6047,23 +6072,9 @@ fn read_semantic_tuple_with_reasons(
                     ) = raw.context(SelectedIntegrity(
                         "incompatible_index: missing raw proof".into(),
                     ))?;
-                    let canonical = canonical.context(SelectedIntegrity(
-                        "incompatible_index: missing raw envelope".into(),
-                    ))?;
-                    let envelope: serde_json::Value = serde_json::from_slice(&canonical).context(
-                        SelectedIntegrity("incompatible_index: corrupt raw envelope".into()),
-                    )?;
+                    // The record kind and fact digest are this row's own, read by the join above.
                     selected_ensure!(
-                        envelope.get("recordKind").and_then(|v| v.as_str()) == Some(kind.as_str())
-                            && envelope.get("relativePath").and_then(|v| v.as_str())
-                                == Some(path.as_str())
-                            && envelope.get("formatVersion").and_then(|v| v.as_u64()) == Some(1),
-                        "incompatible_index: corrupt raw envelope identity"
-                    );
-                    selected_ensure!(
-                        stored_kind == kind
-                            && stored_digest == digest
-                            && stored_language == language
+                        stored_language == language
                             && stored_path == path
                             && stored_producer == producer_id
                             && stored_source_set == source_set
@@ -6072,11 +6083,9 @@ fn read_semantic_tuple_with_reasons(
                             && crate::native_ids::digest(
                                 b"trellis.capture-proof.v1\0",
                                 &crate::native_ids::canonical(
-                                    &serde_json::json!({"producerId":stored_producer,"artifactHash":stored_artifact,"sourceSetId":stored_source_set,"sourceRevision":stored_revision,"language":stored_language,"relativePath":stored_path,"factDigest":stored_digest})
+                                    &serde_json::json!({"producerId":stored_producer,"artifactHash":stored_artifact,"sourceSetId":stored_source_set,"sourceRevision":stored_revision,"language":stored_language,"relativePath":stored_path,"factDigest":digest})
                                 )
-                            ) == proof
-                            && crate::native_ids::digest(b"trellis.semantic-fact.v1\0", &canonical)
-                                == digest,
+                            ) == proof,
                         "incompatible_index: corrupt raw proof binding"
                     );
                     Some(sem::DerivedFrom {
@@ -7045,7 +7054,7 @@ const RAW_EXCLUSIONS_SQL: &str = "INSERT OR IGNORE INTO semantic_raw_exclusions 
 /// `INSERT OR IGNORE`, `ON CONFLICT DO NOTHING` skips only the uniqueness conflicts of a stored
 /// batch's refill, so a malformed staged digest fails the publication instead of dropping its
 /// row.
-const RAW_PROOFS_SQL: &str = "INSERT INTO semantic_raw_proofs SELECT m.capture_id,CASE WHEN c.proof_id=lower(c.proof_id) THEN unhex(c.proof_id) END,c.record_kind,CASE WHEN c.fact_digest=lower(c.fact_digest) THEN unhex(c.fact_digest) END,s.language,s.path,c.canonical_bytes FROM stage.claims c CROSS JOIN stage.sources s ON s.ord=c.source_ord CROSS JOIN capture_ids m ON m.ordinal=c.artifact WHERE true ORDER BY c.claim_id ON CONFLICT DO NOTHING";
+const RAW_PROOFS_SQL: &str = "INSERT INTO semantic_raw_proofs SELECT m.capture_id,CASE WHEN c.proof_id=lower(c.proof_id) THEN unhex(c.proof_id) END,c.record_kind,CASE WHEN c.fact_digest=lower(c.fact_digest) THEN unhex(c.fact_digest) END,s.language,s.path FROM stage.claims c CROSS JOIN stage.sources s ON s.ord=c.source_ord CROSS JOIN capture_ids m ON m.ordinal=c.artifact WHERE true ORDER BY c.claim_id ON CONFLICT DO NOTHING";
 
 fn with_capture_ids(values: &str, statement: &str) -> String {
     format!("WITH capture_ids(ordinal,capture_id) AS (VALUES {values}) {statement}")
@@ -7240,11 +7249,12 @@ fn rejoin_storage_error(error: anyhow::Error) -> anyhow::Error {
     }
 }
 
+/// The stored inventory of a selected batch, without its claims: their envelopes are not
+/// stored (#1248 PR 3), and [`authenticate_stored_batch`] re-derives them from the retained
+/// binary with the pinned decoder.
 #[cfg(feature = "test-support")]
-fn decoded_selected_inventory(
-    raw: &SelectedRawBatch,
-) -> Result<crate::scip_raw::CapturedScipInventory> {
-    Ok(crate::scip_raw::CapturedScipInventory {
+fn decoded_selected_inventory(raw: &SelectedRawBatch) -> crate::scip_raw::CapturedScipInventory {
+    crate::scip_raw::CapturedScipInventory {
         artifact_hashes: raw
             .captures
             .iter()
@@ -7255,50 +7265,8 @@ fn decoded_selected_inventory(
         completion: raw.descriptor.completion,
         exclusions: raw.exclusions.clone(),
         capped_documents: raw.capped_documents.clone(),
-        claims: raw
-            .proofs
-            .iter()
-            .map(|(id, proof)| {
-                Ok(crate::scip_raw::CapturedClaim {
-                    envelope: {
-                        #[cfg(feature = "test-support")]
-                        crate::semantic_import::note_original_raw_envelope_parse();
-                        let envelope: serde_json::Value =
-                            serde_json::from_slice(&proof.canonical_bytes)?;
-                        crate::scip_raw::CapturedScipFactV1 {
-                            format_version: u8::try_from(
-                                envelope["formatVersion"]
-                                    .as_u64()
-                                    .context("raw format version")?,
-                            )?,
-                            record_kind: envelope["recordKind"]
-                                .as_str()
-                                .context("raw record kind")?
-                                .to_owned(),
-                            relative_path: envelope["relativePath"]
-                                .as_str()
-                                .context("raw path")?
-                                .to_owned(),
-                            position_encoding: u8::try_from(
-                                envelope["positionEncoding"]
-                                    .as_u64()
-                                    .context("raw position encoding")?,
-                            )?,
-                            raw: envelope["raw"].clone(),
-                            cargo_target: crate::scip_raw::CapturedScipFactV1::cargo_target_from(
-                                &envelope,
-                            )?,
-                        }
-                    },
-                    canonical_bytes: proof.canonical_bytes.clone(),
-                    fact_digest: proof.fact_digest.clone(),
-                    captured_proof_id: id.clone(),
-                    language: proof.language.clone(),
-                    artifact_hash: proof.artifact_hash.clone(),
-                })
-            })
-            .collect::<Result<_>>()?,
-    })
+        claims: Vec::new(),
+    }
 }
 
 /// Records one producer descriptor, its languages and its binding to revision `key`. An
@@ -8649,7 +8617,7 @@ fn validate_v8_bootstrap(db: &Connection) -> Result<()> {
         indexed_at.is_empty() && options.is_none(),
         "incompatible_index: invalid v8 bootstrap metadata"
     );
-    // Fixed identifiers from CACHE_SCHEMA_V47 only. Do not read table names from
+    // Fixed identifiers from CACHE_SCHEMA_V48 only. Do not read table names from
     // sqlite_master or treat a partial publication as a valid empty bootstrap.
     for name in [
         "class_projections",
@@ -11415,7 +11383,7 @@ impl Store {
             db.pragma_update(None, "synchronous", "FULL")?;
             db.execute_batch("BEGIN IMMEDIATE")?;
             let result = (|| -> Result<()> {
-                db.execute_batch(CACHE_SCHEMA_V47)?;
+                db.execute_batch(CACHE_SCHEMA_V48)?;
                 let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
                 ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
                 db.execute(
@@ -17310,14 +17278,10 @@ impl Store {
         proof_id: &str,
     ) -> Result<Option<StoredRawProof>> {
         self.with_evidence(|db| {
-            let row: Option<(String,String,String,String,Vec<u8>)> = db.query_row("SELECT p.record_kind,lower(hex(p.fact_digest)),p.language,p.path,p.canonical_bytes FROM semantic_raw_captures c JOIN semantic_raw_proofs p ON p.capture_id=c.capture_id WHERE c.producer_id=?1 AND c.artifact_hash=?2 AND c.source_set_id=?3 AND c.captured_revision=?4 AND p.proof_id=?5",params![producer_id,artifact_hash,source_set_id,captured_revision,id_codec::encode_digest(proof_id)],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
-            row.map(|(record_kind,fact_digest,language,path,canonical_bytes)| {
-                let envelope: serde_json::Value = serde_json::from_slice(&canonical_bytes)
-                    .context(SelectedIntegrity("incompatible_index: corrupt raw proof envelope".into()))?;
-                selected_ensure!(envelope["recordKind"] == record_kind && envelope["relativePath"] == path
-                    && crate::native_ids::digest(b"trellis.semantic-fact.v1\0", &canonical_bytes) == fact_digest
-                    && crate::native_ids::digest(b"trellis.capture-proof.v1\0", &crate::native_ids::canonical(&serde_json::json!({"producerId":producer_id,"artifactHash":artifact_hash,"sourceSetId":source_set_id,"sourceRevision":captured_revision,"language":language,"relativePath":path,"factDigest":fact_digest}))) == proof_id,"incompatible_index: corrupt raw proof inventory");
-                Ok(StoredRawProof {record_kind,fact_digest,language,path,canonical_bytes,artifact_hash: artifact_hash.to_owned()})
+            let row: Option<(String,String,String,String)> = db.query_row("SELECT p.record_kind,lower(hex(p.fact_digest)),p.language,p.path FROM semantic_raw_captures c JOIN semantic_raw_proofs p ON p.capture_id=c.capture_id WHERE c.producer_id=?1 AND c.artifact_hash=?2 AND c.source_set_id=?3 AND c.captured_revision=?4 AND p.proof_id=?5",params![producer_id,artifact_hash,source_set_id,captured_revision,id_codec::encode_digest(proof_id)],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+            row.map(|(record_kind,fact_digest,language,path)| {
+                selected_ensure!(crate::native_ids::digest(b"trellis.capture-proof.v1\0", &crate::native_ids::canonical(&serde_json::json!({"producerId":producer_id,"artifactHash":artifact_hash,"sourceSetId":source_set_id,"sourceRevision":captured_revision,"language":language,"relativePath":path,"factDigest":fact_digest}))) == proof_id,"incompatible_index: corrupt raw proof inventory");
+                Ok(StoredRawProof {record_kind,fact_digest,language,path,artifact_hash: artifact_hash.to_owned()})
             }).transpose()
         })
     }
@@ -17478,26 +17442,17 @@ impl Store {
                 let captured_revision_number = captured_revision_number.context(
                     SelectedIntegrity("incompatible_index: selected captured pin missing".into()),
                 )?;
-                // Claims in the decoder's (language, path, canonical bytes) order, as
-                // `VecSink::finish` sorts them, so a rejoin meets each document's claims
-                // together. Its join keeps one document's role sites at a time; `proof_id` is a
-                // digest order that interleaves documents and re-parsed a source per occurrence
-                // (#494).
+                // The stored proof identities, in proof-ID order. Their envelopes are not stored
+                // (#1248 PR 3): the FULL oracle re-derives them from the retained binary with the
+                // pinned decoder and checks they name exactly these proofs.
                 let proofs = if metadata_only {
                     Vec::new()
                 } else {
                     db.prepare(
-                    "SELECT lower(hex(p.proof_id)),p.record_kind,lower(hex(p.fact_digest)),p.language,p.path,p.canonical_bytes,c.artifact_hash FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE c.batch_id=?1 ORDER BY p.language,p.path,p.canonical_bytes"
-                )?.query_map([batch_id], |r| Ok((r.get(0)?, StoredRawProof {record_kind:r.get(1)?,fact_digest:r.get(2)?,language:r.get(3)?,path:r.get(4)?,canonical_bytes:r.get(5)?,artifact_hash:r.get(6)?})))?
+                    "SELECT lower(hex(p.proof_id)),p.record_kind,lower(hex(p.fact_digest)),p.language,p.path,c.artifact_hash FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE c.batch_id=?1 ORDER BY p.proof_id"
+                )?.query_map([batch_id], |r| Ok((r.get(0)?, StoredRawProof {record_kind:r.get(1)?,fact_digest:r.get(2)?,language:r.get(3)?,path:r.get(4)?,artifact_hash:r.get(5)?})))?
                     .collect::<rusqlite::Result<Vec<_>>>()?
                 };
-                #[cfg(feature = "test-support")]
-                crate::semantic_import::note_selected_original_raw_proof_bytes(
-                    proofs
-                        .iter()
-                        .map(|(_, proof): &(String, StoredRawProof)| proof.canonical_bytes.len())
-                        .sum(),
-                );
 
                 let documents = db.prepare(
                     "SELECT d.language,d.path,d.source_hash,d.wire_digest,d.capture_id FROM semantic_raw_documents d JOIN semantic_raw_captures c ON c.capture_id=d.capture_id WHERE c.batch_id=?1 ORDER BY d.language,d.path"
@@ -19945,7 +19900,7 @@ impl Store {
 #[test]
 fn selected_ancillary_budget_matches_main_text_key_bytes() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V47).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V48).unwrap();
     // The aggregate needs only synthetic child rows; FK behavior is covered by
     // publication/retention tests, not this isolated budget-SQL fixture.
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
@@ -20084,7 +20039,7 @@ fn selected_ancillary_budget_matches_main_text_key_bytes() {
 #[test]
 fn immutable_reference_slot_rejects_changed_payload() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V47).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V48).unwrap();
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
     let owner = [0x11u8; 16];
     let original = [0x22u8; 16];
@@ -20142,7 +20097,7 @@ fn immutable_rows(db: &Connection, table: &str) -> Vec<(Option<i64>, Option<i64>
 #[test]
 fn immutable_append_inserts_skips_identical_and_rejects_changed_rows() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V47).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V48).unwrap();
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
     let sql = "INSERT INTO native_version_macro_expansions VALUES(?1,?2,?3,?4)";
     let mut append = ImmutableAppend::default();

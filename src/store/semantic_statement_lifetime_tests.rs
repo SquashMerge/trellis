@@ -4,7 +4,7 @@ use super::*;
 fn semantic_fact_children_reuse_statement_without_reprepare_per_symbol() {
     let db = Connection::open_in_memory().unwrap();
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
-    db.execute_batch(CACHE_SCHEMA_V47).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V48).unwrap();
     db.execute("INSERT INTO native_revisions VALUES('key','source-set',?1,?1,?1,'native','[]','[]','{}','[]','[]',NULL,'[]',0,'{}','[]',1)", ["a".repeat(64)]).unwrap();
     db.execute("INSERT INTO semantic_coverage VALUES(1,'key','producer','1','rust','main.rs',1,1,'complete',NULL,1)", []).unwrap();
     db.execute("INSERT INTO semantic_payloads(payload_id,producer_id,producer_version,language,path,version_id,content_hash) VALUES(1,'producer','1','rust','main.rs','v',zeroblob(32))", []).unwrap();

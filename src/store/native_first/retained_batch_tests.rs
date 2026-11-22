@@ -21,7 +21,7 @@ fn p(n: u8) -> String {
 /// five-byte binary) and ordinal 1 (capture 11: nothing), and one excluded document.
 fn fixture() -> Connection {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V47).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V48).unwrap();
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
     db.execute(
         "INSERT INTO semantic_raw_batches VALUES(1,'producer','1','profile','set','native-1',?1,?2,x'7b7d','decoder')",
@@ -48,7 +48,7 @@ fn fixture() -> Connection {
         (p(3), h("3"), "b.java"),
     ] {
         db.execute(
-            "INSERT INTO semantic_raw_proofs VALUES(10,unhex(?1),'occurrence',unhex(?2),'java',?3,x'aa')",
+            "INSERT INTO semantic_raw_proofs VALUES(10,unhex(?1),'occurrence',unhex(?2),'java',?3)",
             params![proof, digest, path],
         )
         .unwrap();
@@ -208,17 +208,43 @@ fn capture_documents_and_proofs_page_and_compare_by_value() {
     document.path = "c.java".into();
     assert_eq!(rows.document_matches(10, &document).unwrap(), None);
 
-    let mut proof = rows.proof_after(10, "").unwrap().unwrap();
-    assert_eq!(proof.proof_id, p(1));
-    assert_eq!(proof.fact_digest, h("1"));
-    assert_eq!(proof.canonical_bytes, [0xaa]);
     assert_eq!(rows.proof_id_after(10, &p(1)).unwrap(), Some(p(2)));
     assert_eq!(rows.proof_id_after(10, &p(3)).unwrap(), None);
-    assert_eq!(rows.proof_matches(10, &proof).unwrap(), Some(true));
-    proof.canonical_bytes = vec![0xbb];
-    assert_eq!(rows.proof_matches(10, &proof).unwrap(), Some(false));
+}
+
+fn staged_proof() -> RetainedProof {
+    RetainedProof {
+        proof_id: p(1),
+        record_kind: "occurrence".into(),
+        fact_digest: h("1"),
+        language: "java".into(),
+        path: "a.java".into(),
+    }
+}
+
+/// FULL catch-up compares a staged proof with the retained row of its ID by identity: the
+/// envelope bytes are not stored, and the fact digest is their SHA-256 (#1248 PR 3).
+#[test]
+fn proof_matches_compares_proof_identity() {
+    let db = fixture();
+    let rows = RetainedBatchRows::for_tests(&db, 1, pin(1));
+    assert_eq!(rows.proof_matches(10, &staged_proof()).unwrap(), Some(true));
+    // A changed proof differs in some part of its identity under the same ID.
+    let changes: [fn(&mut RetainedProof); 4] = [
+        |proof| proof.fact_digest = h("2"),
+        |proof| proof.record_kind = "relationship".into(),
+        |proof| proof.language = "kotlin".into(),
+        |proof| proof.path = "b.java".into(),
+    ];
+    for change in changes {
+        let mut proof = staged_proof();
+        change(&mut proof);
+        assert_eq!(rows.proof_matches(10, &proof).unwrap(), Some(false));
+    }
+    let mut proof = staged_proof();
     proof.proof_id = h("9");
     assert_eq!(rows.proof_matches(10, &proof).unwrap(), None);
+    assert_eq!(rows.proof_matches(11, &staged_proof()).unwrap(), None);
 }
 
 #[test]
@@ -287,7 +313,6 @@ fn malformed_digest_cursors_and_proofs_fail() {
             )
         };
         cursor(rows.proof_id_after(10, after).unwrap_err());
-        cursor(rows.proof_after(10, after).err().unwrap());
         cursor(rows.proof_ids_after(10, after, 2).unwrap_err());
         cursor(rows.capture_proof_document_after(0, after).unwrap_err());
         cursor(
@@ -301,7 +326,7 @@ fn malformed_digest_cursors_and_proofs_fail() {
             .unwrap_err(),
         );
     }
-    let mut proof = rows.proof_after(10, "").unwrap().unwrap();
+    let mut proof = staged_proof();
     proof.fact_digest = h("A");
     let error = rows.proof_matches(10, &proof).unwrap_err();
     assert_eq!(error.to_string(), "invalid semantic digest");
