@@ -913,7 +913,7 @@ fn association_unit(
             let want = limit;
             let rows = query_rows(
                 db,
-                "SELECT p.ordinal,CASE WHEN pay.content_hash IS NULL THEN NULL ELSE lower(hex(pay.content_hash)) END,p.evidence_kind,p.ordinal,p.basis_id,p.capture_id,CASE WHEN p.derived_from_provenance_id IS NULL THEN NULL ELSE lower(hex(p.derived_from_provenance_id)) END,r.record_kind,CASE WHEN r.fact_digest IS NULL THEN NULL ELSE lower(hex(r.fact_digest)) END,COALESCE(r.language=?3 AND r.path=?4,0) FROM semantic_provenance p LEFT JOIN semantic_payloads pay ON pay.payload_id=p.payload_id LEFT JOIN semantic_raw_proofs r ON r.capture_id=p.capture_id AND r.proof_id=p.derived_from_provenance_id WHERE p.payload_id=?1 AND p.ordinal>?2 ORDER BY p.ordinal LIMIT ?5",
+                "SELECT p.ordinal,pay.content_hash,p.evidence_kind,p.ordinal,p.basis_id,p.capture_id,CASE WHEN p.derived_from_provenance_id IS NULL THEN NULL ELSE lower(hex(p.derived_from_provenance_id)) END,r.record_kind,r.fact_digest,COALESCE(r.language=?3 AND r.path=?4,0) FROM semantic_provenance p LEFT JOIN semantic_payloads pay ON pay.payload_id=p.payload_id LEFT JOIN semantic_raw_proofs r ON r.capture_id=p.capture_id AND r.proof_id=p.derived_from_provenance_id WHERE p.payload_id=?1 AND p.ordinal>?2 ORDER BY p.ordinal LIMIT ?5",
                 params![
                     w.payload(),
                     c.after_id,
@@ -927,15 +927,24 @@ fn association_unit(
                     let capture: Option<i64> = row.get(5)?;
                     let raw: Option<String> = row.get(6)?;
                     let kind: Option<String> = row.get(7)?;
-                    let digest: Option<String> = row.get(8)?;
+                    // The raw proof's fact digest and the payload's content hash are BLOBs,
+                    // decoded strictly: a wrong length is corruption (#1248 PR 2).
+                    let digest = row
+                        .get::<_, Option<Vec<u8>>>(8)?
+                        .map(|digest| id_codec::decode_digest(&digest))
+                        .transpose()?;
                     let (Some(capture_id), Some(raw), Some(kind), Some(digest)) =
                         (capture, raw, kind, digest)
                     else {
                         return Err(corrupt("original proof missing derivation"));
                     };
+                    let content_hash = row
+                        .get::<_, Option<Vec<u8>>>(1)?
+                        .map(|hash| id_codec::decode_digest(&hash))
+                        .transpose()?;
                     selected_ensure!(
                         capture_id == a.capture_id
-                            && row.get_ref(1)?.as_str_or_null()? == Some(w.source_hash.as_str()),
+                            && content_hash.as_deref() == Some(w.source_hash.as_str()),
                         "original provenance source mismatch"
                     );
                     let membership: bool = row.get(9)?;
@@ -946,7 +955,7 @@ fn association_unit(
                         row.get::<_, i64>(0)?,
                         OriginalProvenance {
                             id: projection.provenance_id(row.get(0)?)?,
-                            content_hash: row.get(1)?,
+                            content_hash: content_hash.unwrap_or_default(),
                             evidence_kind: semantic_enum(row.get(2)?)?,
                             freshness: projection.freshness(basis_id)?,
                             basis_id,

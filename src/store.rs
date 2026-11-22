@@ -5975,8 +5975,8 @@ fn read_semantic_tuple_with_reasons(
             language: language.clone(),
             path: path.clone(),
         };
-        let rows=db.prepare("SELECT p.ordinal,CASE WHEN pay.content_hash IS NULL THEN NULL ELSE lower(hex(pay.content_hash)) END,p.evidence_kind,CASE WHEN p.derived_from_provenance_id IS NULL THEN NULL ELSE lower(hex(p.derived_from_provenance_id)) END,b.producer_id,b.producer_version,b.producer_hash,b.artifact_hash,b.language,b.source_set_id,b.captured_native_revision_id,b.source_manifest_hash,b.toolchain_hash,b.config_hash,b.dependency_hash,b.basis_id,p.capture_id,r.record_kind,CASE WHEN r.fact_digest IS NULL THEN NULL ELSE lower(hex(r.fact_digest)) END FROM semantic_provenance p LEFT JOIN semantic_payloads pay ON pay.payload_id=p.payload_id JOIN semantic_basis b ON b.payload_id=p.payload_id AND b.basis_id=p.basis_id LEFT JOIN semantic_raw_proofs r ON r.capture_id=p.capture_id AND r.proof_id=p.derived_from_provenance_id WHERE p.payload_id=?1 AND (?5 IS NULL OR p.ordinal IN (SELECT provenance_ordinal FROM semantic_call_bindings WHERE payload_id=?1 AND call_id=?5)) AND (?2 IS NULL OR p.ordinal IN (SELECT provenance_ordinal FROM semantic_declaration_bindings WHERE payload_id=?1 AND syntax_id=?2 UNION SELECT s.provenance_ordinal FROM semantic_symbols s JOIN semantic_symbol_targets t ON t.symbol_id=s.symbol_id WHERE s.payload_id=?1 AND t.kind='internal' AND t.internal_syntax_id=?2 AND t.internal_language=?3 AND t.internal_path=?4 UNION SELECT provenance_ordinal FROM semantic_type_relationships WHERE payload_id=?1 AND source_kind='internal' AND source_internal_syntax_id=?2 AND source_internal_language=?3 AND source_internal_path=?4)) ORDER BY p.ordinal")?.query_map(params![payload, history_syntax.and_then(id_codec::encode_sid), language, path, call_id],|r|{
-            Ok((r.get::<_,i64>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,String>(8)?,r.get::<_,String>(9)?,r.get::<_,String>(10)?,r.get::<_,String>(11)?,r.get::<_,String>(12)?,r.get::<_,String>(13)?,r.get::<_,String>(14)?,r.get::<_,i64>(15)?,r.get::<_,Option<i64>>(16)?,r.get::<_,Option<String>>(17)?,r.get::<_,Option<String>>(18)?))
+        let rows=db.prepare("SELECT p.ordinal,pay.content_hash,p.evidence_kind,CASE WHEN p.derived_from_provenance_id IS NULL THEN NULL ELSE lower(hex(p.derived_from_provenance_id)) END,b.producer_id,b.producer_version,b.producer_hash,b.artifact_hash,b.language,b.source_set_id,b.captured_native_revision_id,b.source_manifest_hash,b.toolchain_hash,b.config_hash,b.dependency_hash,b.basis_id,p.capture_id,r.record_kind,r.fact_digest FROM semantic_provenance p LEFT JOIN semantic_payloads pay ON pay.payload_id=p.payload_id JOIN semantic_basis b ON b.payload_id=p.payload_id AND b.basis_id=p.basis_id LEFT JOIN semantic_raw_proofs r ON r.capture_id=p.capture_id AND r.proof_id=p.derived_from_provenance_id WHERE p.payload_id=?1 AND (?5 IS NULL OR p.ordinal IN (SELECT provenance_ordinal FROM semantic_call_bindings WHERE payload_id=?1 AND call_id=?5)) AND (?2 IS NULL OR p.ordinal IN (SELECT provenance_ordinal FROM semantic_declaration_bindings WHERE payload_id=?1 AND syntax_id=?2 UNION SELECT s.provenance_ordinal FROM semantic_symbols s JOIN semantic_symbol_targets t ON t.symbol_id=s.symbol_id WHERE s.payload_id=?1 AND t.kind='internal' AND t.internal_syntax_id=?2 AND t.internal_language=?3 AND t.internal_path=?4 UNION SELECT provenance_ordinal FROM semantic_type_relationships WHERE payload_id=?1 AND source_kind='internal' AND source_internal_syntax_id=?2 AND source_internal_language=?3 AND source_internal_path=?4)) ORDER BY p.ordinal")?.query_map(params![payload, history_syntax.and_then(id_codec::encode_sid), language, path, call_id],|r|{
+            Ok((r.get::<_,i64>(0)?,r.get::<_,Option<Vec<u8>>>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,String>(8)?,r.get::<_,String>(9)?,r.get::<_,String>(10)?,r.get::<_,String>(11)?,r.get::<_,String>(12)?,r.get::<_,String>(13)?,r.get::<_,String>(14)?,r.get::<_,i64>(15)?,r.get::<_,Option<i64>>(16)?,r.get::<_,Option<String>>(17)?,r.get::<_,Option<Vec<u8>>>(18)?))
         })?.collect::<rusqlite::Result<Vec<_>>>()?;
         let mut lookup_dependencies_stmt = db.prepare_cached(
             "SELECT ordinal,lookup_key FROM semantic_basis_lookup_dependencies WHERE basis_id=?1 ORDER BY ordinal",
@@ -6003,9 +6003,14 @@ fn read_semantic_tuple_with_reasons(
             fact_digest,
         ) in rows
         {
-            let content_hash = content_hash.context(SelectedIntegrity(
-                "incompatible_index: semantic payload without its content hash".into(),
-            ))?;
+            // Both digests are decoded strictly: a BLOB of the wrong length is corruption.
+            let content_hash =
+                id_codec::decode_digest(&content_hash.context(SelectedIntegrity(
+                    "incompatible_index: semantic payload without its content hash".into(),
+                ))?)?;
+            let fact_digest = fact_digest
+                .map(|digest| id_codec::decode_digest(&digest))
+                .transpose()?;
             // A derived row's record kind and fact digest are its raw proof's (#1248 PR 2): a
             // missing proof leaves them NULL and fails as a corrupt raw proof link below.
             let derived_from = match (capture_id, derived, record_kind, fact_digest) {
