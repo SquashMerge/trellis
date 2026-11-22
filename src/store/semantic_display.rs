@@ -1836,7 +1836,7 @@ fn architecture_semantic_within(
     let mut calls = db.prepare_cached(
         "SELECT b.call_id,b.join_start,b.join_end,b.resolution,b.declared_kind,
                 b.declared_internal_syntax_id,b.declared_internal_language,b.declared_internal_path,
-                b.dispatch,b.stale_target,b.provenance_ordinal,b.binding_id,b.join_status,b.join_kind,b.join_document_language,b.join_document_path,COALESCE(b.join_native_revision_id,?6),p.basis_id,r.fact_digest,
+                b.dispatch,b.stale_target,b.provenance_ordinal,b.binding_id,b.join_status,b.join_kind,b.join_document_language,b.join_document_path,COALESCE(b.join_native_revision_id,?6),p.basis_id,r.fact_digest,b.capture_bound,
                 p.capture_id IS NOT NULL AND r.capture_id IS NULL
          FROM semantic_call_bindings b
          JOIN semantic_provenance p ON p.payload_id=b.payload_id AND p.ordinal=b.provenance_ordinal
@@ -1953,7 +1953,7 @@ fn architecture_semantic_within(
             // A derived row's fact digest is its raw proof's (#1248 PR 2): a missing proof is
             // corruption, never an unordered row.
             ensure!(
-                !row.get::<_, bool>(19)?,
+                !row.get::<_, bool>(20)?,
                 SelectedIntegrity("incompatible_index: missing raw proof".into())
             );
             let call_id = id_codec::decode_occ(row.get_ref(0)?.as_blob()?)
@@ -1962,7 +1962,26 @@ fn architecture_semantic_within(
             let provenance_id = pp.provenance_id(ordinal)?;
             // Every row's offsets and dispatch decode strictly, used or not.
             let anchor_range = range(row.get(1)?, row.get(2)?)?;
-            let is_direct = direct(row.get_ref(8)?.as_str()?)?;
+            // #1279: the dispatch read at this tuple's revision (the semantic basis pin for
+            // older-basis evidence), through the shared projection: a capture-bound `direct`
+            // reads as `unknown` while its target's document differs from the capture. Both
+            // the behavior and the historical wire metadata take it.
+            let stored_dispatch = row.get_ref(8)?.as_str()?;
+            let dispatch = if !row.get::<_, bool>(19)? {
+                stored_dispatch
+            } else if stored_dispatch != "direct" {
+                return Err(SelectedIntegrity(
+                    "incompatible_index: corrupt capture-bound call dispatch".into(),
+                )
+                .into());
+            } else if pp
+                .unchanged_since_capture(row.get_ref(6)?.as_str()?, row.get_ref(7)?.as_str()?)?
+            {
+                stored_dispatch
+            } else {
+                "unknown"
+            };
+            let is_direct = direct(dispatch)?;
             // The raw proof's fact digest, decoded strictly (#1248 PR 2).
             let fact_digest = row
                 .get::<_, Option<Vec<u8>>>(18)?
@@ -1985,8 +2004,7 @@ fn architecture_semantic_within(
                     "historicalResolution".into(),
                     json!(row.get::<_, String>(3)?),
                 );
-                binding_metadata
-                    .insert("historicalDispatch".into(), json!(row.get::<_, String>(8)?));
+                binding_metadata.insert("historicalDispatch".into(), json!(dispatch));
                 binding_metadata.insert("historicalJoin".into(), json!({"status":row.get::<_, String>(12)?,"kind":row.get::<_, String>(13)?,"language":row.get::<_, String>(14)?,"path":row.get::<_, String>(15)?,"revisionId":row.get::<_, String>(16)?,"range":anchor_range}));
             }
             let mut eligible_endpoints = true;
