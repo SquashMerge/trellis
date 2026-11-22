@@ -1199,6 +1199,9 @@ fn association_unit(
                             join: read_join(row, 4, &scope)?,
                             resolution: semantic_enum(row.get(13)?)?,
                             declared_target: semantic_target_read(row, 14, &scope)?,
+                            // The original import's own dispatch: that import is at the
+                            // captured revision, where every document is unchanged since the
+                            // capture, so a capture-bound `direct` reads as stored (#1279).
                             dispatch: semantic_enum(row.get(24)?)?,
                             possible_dispatch_complete: row.get(25)?,
                             stale_target: row.get(26)?,

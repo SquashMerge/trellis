@@ -984,11 +984,11 @@ SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+(
 UNION ALL
 SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+COALESCE(length(CAST(x.id AS BLOB)),0)+39+(CASE WHEN x.target IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes,1 AS class FROM class_relations x WHERE x.cid=?2
 )"#;
-const DATABASE_SCHEMA_VERSION: u32 = 44;
+const DATABASE_SCHEMA_VERSION: u32 = 45;
 const EXTRACTOR_VERSION: &str = "native-v6-delta-v1";
 const EVIDENCE_FORMAT: &str = "terminal-native-graph-v1";
-const CACHE_SCHEMA_V44: &str = r#"
-CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=44), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
+const CACHE_SCHEMA_V45: &str = r#"
+CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=45), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
 CREATE TABLE native_producers(id TEXT NOT NULL,version TEXT NOT NULL,executable_hash TEXT NOT NULL CHECK(length(executable_hash)=64),kind TEXT NOT NULL CHECK(kind='native'),position_encoding TEXT NOT NULL CHECK(position_encoding='utf8'),PRIMARY KEY(id,version));
 CREATE TABLE native_producer_languages(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,inventory_authenticated INTEGER NOT NULL CHECK(inventory_authenticated IN (0,1)),ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language),UNIQUE(producer_id,producer_version,ordinal),FOREIGN KEY(producer_id,producer_version) REFERENCES native_producers(id,version) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE native_producer_inputs(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,component_name TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language,component_name),UNIQUE(producer_id,producer_version,language,ordinal),FOREIGN KEY(producer_id,producer_version,language) REFERENCES native_producer_languages(producer_id,producer_version,language) DEFERRABLE INITIALLY DEFERRED);
@@ -1101,7 +1101,7 @@ CREATE TABLE semantic_references(payload_id INTEGER NOT NULL,reference_id BLOB N
 CREATE INDEX semantic_references_owner ON semantic_references(payload_id,owner_id);
 CREATE TABLE semantic_reference_roles(payload_id INTEGER NOT NULL,reference_id BLOB NOT NULL,ordinal INTEGER NOT NULL,role TEXT NOT NULL,PRIMARY KEY(payload_id,reference_id,ordinal),UNIQUE(payload_id,reference_id,role),FOREIGN KEY(payload_id,reference_id) REFERENCES semantic_references(payload_id,reference_id));
 CREATE TABLE semantic_reference_candidates(payload_id INTEGER NOT NULL,reference_id BLOB NOT NULL,ordinal INTEGER NOT NULL,kind TEXT NOT NULL CHECK(kind IN ('internal','external')),internal_syntax_id BLOB,internal_language TEXT,internal_path TEXT,internal_native_revision_id TEXT,external_scheme TEXT,external_symbol TEXT,external_scope TEXT,external_language TEXT,external_path TEXT,CHECK((kind='internal' AND length(internal_syntax_id)=16 AND internal_language IS NOT NULL AND internal_path IS NOT NULL AND external_scheme IS NULL AND external_symbol IS NULL AND external_scope IS NULL AND external_language IS NULL AND external_path IS NULL) OR (kind='external' AND internal_syntax_id IS NULL AND internal_language IS NULL AND internal_path IS NULL AND internal_native_revision_id IS NULL AND external_scheme IS NOT NULL AND external_symbol IS NOT NULL AND external_scope IN ('global','document') AND ((external_scope='global' AND external_language IS NULL AND external_path IS NULL) OR (external_scope='document' AND external_language IS NOT NULL AND external_path IS NOT NULL)))),PRIMARY KEY(payload_id,reference_id,ordinal),FOREIGN KEY(payload_id,reference_id) REFERENCES semantic_references(payload_id,reference_id));
-CREATE TABLE semantic_call_bindings(binding_id INTEGER PRIMARY KEY,payload_id INTEGER NOT NULL,ordinal INTEGER NOT NULL,call_id BLOB CHECK(call_id IS NULL OR length(call_id)=16),join_document_language TEXT NOT NULL,join_document_path TEXT NOT NULL,join_native_revision_id TEXT,join_content_hash TEXT NOT NULL,join_start INTEGER NOT NULL,join_end INTEGER NOT NULL,join_kind TEXT NOT NULL CHECK(join_kind IN ('callee','invocation')),join_status TEXT NOT NULL,join_diagnostic TEXT,resolution TEXT NOT NULL,declared_kind TEXT CHECK(declared_kind IS NULL OR declared_kind IN ('internal','external')),declared_internal_syntax_id BLOB,declared_internal_language TEXT,declared_internal_path TEXT,declared_internal_native_revision_id TEXT,declared_external_scheme TEXT,declared_external_symbol TEXT,declared_external_scope TEXT,declared_external_language TEXT,declared_external_path TEXT,dispatch TEXT NOT NULL,possible_dispatch_complete INTEGER NOT NULL CHECK(possible_dispatch_complete=0),stale_target INTEGER CHECK(stale_target IS NULL OR stale_target=0),provenance_ordinal INTEGER NOT NULL,CHECK((declared_kind IS NULL AND declared_internal_syntax_id IS NULL AND declared_internal_language IS NULL AND declared_internal_path IS NULL AND declared_internal_native_revision_id IS NULL AND declared_external_scheme IS NULL AND declared_external_symbol IS NULL AND declared_external_scope IS NULL AND declared_external_language IS NULL AND declared_external_path IS NULL) OR (declared_kind IS NOT NULL AND declared_kind='internal' AND length(declared_internal_syntax_id)=16 AND declared_internal_language IS NOT NULL AND declared_internal_path IS NOT NULL AND declared_external_scheme IS NULL AND declared_external_symbol IS NULL AND declared_external_scope IS NULL AND declared_external_language IS NULL AND declared_external_path IS NULL) OR (declared_kind IS NOT NULL AND declared_kind='external' AND declared_internal_syntax_id IS NULL AND declared_internal_language IS NULL AND declared_internal_path IS NULL AND declared_internal_native_revision_id IS NULL AND declared_external_scheme IS NOT NULL AND declared_external_symbol IS NOT NULL AND declared_external_scope IN ('global','document') AND ((declared_external_scope='global' AND declared_external_language IS NULL AND declared_external_path IS NULL) OR (declared_external_scope='document' AND declared_external_language IS NOT NULL AND declared_external_path IS NOT NULL)))),UNIQUE(payload_id,ordinal),FOREIGN KEY(payload_id,provenance_ordinal) REFERENCES semantic_provenance(payload_id,ordinal));
+CREATE TABLE semantic_call_bindings(binding_id INTEGER PRIMARY KEY,payload_id INTEGER NOT NULL,ordinal INTEGER NOT NULL,call_id BLOB CHECK(call_id IS NULL OR length(call_id)=16),join_document_language TEXT NOT NULL,join_document_path TEXT NOT NULL,join_native_revision_id TEXT,join_content_hash TEXT NOT NULL,join_start INTEGER NOT NULL,join_end INTEGER NOT NULL,join_kind TEXT NOT NULL CHECK(join_kind IN ('callee','invocation')),join_status TEXT NOT NULL,join_diagnostic TEXT,resolution TEXT NOT NULL,declared_kind TEXT CHECK(declared_kind IS NULL OR declared_kind IN ('internal','external')),declared_internal_syntax_id BLOB,declared_internal_language TEXT,declared_internal_path TEXT,declared_internal_native_revision_id TEXT,declared_external_scheme TEXT,declared_external_symbol TEXT,declared_external_scope TEXT,declared_external_language TEXT,declared_external_path TEXT,dispatch TEXT NOT NULL,possible_dispatch_complete INTEGER NOT NULL CHECK(possible_dispatch_complete=0),stale_target INTEGER CHECK(stale_target IS NULL OR stale_target=0),provenance_ordinal INTEGER NOT NULL,capture_bound INTEGER NOT NULL DEFAULT 0 CHECK(capture_bound=0 OR (capture_bound=1 AND dispatch='direct' AND declared_kind='internal')),CHECK((declared_kind IS NULL AND declared_internal_syntax_id IS NULL AND declared_internal_language IS NULL AND declared_internal_path IS NULL AND declared_internal_native_revision_id IS NULL AND declared_external_scheme IS NULL AND declared_external_symbol IS NULL AND declared_external_scope IS NULL AND declared_external_language IS NULL AND declared_external_path IS NULL) OR (declared_kind IS NOT NULL AND declared_kind='internal' AND length(declared_internal_syntax_id)=16 AND declared_internal_language IS NOT NULL AND declared_internal_path IS NOT NULL AND declared_external_scheme IS NULL AND declared_external_symbol IS NULL AND declared_external_scope IS NULL AND declared_external_language IS NULL AND declared_external_path IS NULL) OR (declared_kind IS NOT NULL AND declared_kind='external' AND declared_internal_syntax_id IS NULL AND declared_internal_language IS NULL AND declared_internal_path IS NULL AND declared_internal_native_revision_id IS NULL AND declared_external_scheme IS NOT NULL AND declared_external_symbol IS NOT NULL AND declared_external_scope IN ('global','document') AND ((declared_external_scope='global' AND declared_external_language IS NULL AND declared_external_path IS NULL) OR (declared_external_scope='document' AND declared_external_language IS NOT NULL AND declared_external_path IS NOT NULL)))),UNIQUE(payload_id,ordinal),FOREIGN KEY(payload_id,provenance_ordinal) REFERENCES semantic_provenance(payload_id,ordinal));
 CREATE INDEX semantic_call_bindings_call ON semantic_call_bindings(payload_id,call_id);
 CREATE TABLE semantic_call_candidates(binding_id INTEGER NOT NULL REFERENCES semantic_call_bindings(binding_id),ordinal INTEGER NOT NULL,kind TEXT NOT NULL CHECK(kind IN ('internal','external')),internal_syntax_id BLOB,internal_language TEXT,internal_path TEXT,internal_native_revision_id TEXT,external_scheme TEXT,external_symbol TEXT,external_scope TEXT,external_language TEXT,external_path TEXT,CHECK((kind='internal' AND length(internal_syntax_id)=16 AND internal_language IS NOT NULL AND internal_path IS NOT NULL AND external_scheme IS NULL AND external_symbol IS NULL AND external_scope IS NULL AND external_language IS NULL AND external_path IS NULL) OR (kind='external' AND internal_syntax_id IS NULL AND internal_language IS NULL AND internal_path IS NULL AND internal_native_revision_id IS NULL AND external_scheme IS NOT NULL AND external_symbol IS NOT NULL AND external_scope IN ('global','document') AND ((external_scope='global' AND external_language IS NULL AND external_path IS NULL) OR (external_scope='document' AND external_language IS NOT NULL AND external_path IS NOT NULL)))),PRIMARY KEY(binding_id,ordinal));
 CREATE TABLE semantic_call_possible_dispatch(binding_id INTEGER NOT NULL REFERENCES semantic_call_bindings(binding_id),ordinal INTEGER NOT NULL,kind TEXT NOT NULL CHECK(kind IN ('internal','external')),internal_syntax_id BLOB,internal_language TEXT,internal_path TEXT,internal_native_revision_id TEXT,external_scheme TEXT,external_symbol TEXT,external_scope TEXT,external_language TEXT,external_path TEXT,CHECK((kind='internal' AND length(internal_syntax_id)=16 AND internal_language IS NOT NULL AND internal_path IS NOT NULL AND external_scheme IS NULL AND external_symbol IS NULL AND external_scope IS NULL AND external_language IS NULL AND external_path IS NULL) OR (kind='external' AND internal_syntax_id IS NULL AND internal_language IS NULL AND internal_path IS NULL AND internal_native_revision_id IS NULL AND external_scheme IS NOT NULL AND external_symbol IS NOT NULL AND external_scope IN ('global','document') AND ((external_scope='global' AND external_language IS NULL AND external_path IS NULL) OR (external_scope='document' AND external_language IS NOT NULL AND external_path IS NOT NULL)))),PRIMARY KEY(binding_id,ordinal));
@@ -1114,7 +1114,7 @@ CREATE TABLE semantic_projection_documents(revision_id TEXT NOT NULL,producer_id
 CREATE TABLE semantic_pending_target(singleton INTEGER PRIMARY KEY CHECK(singleton=1),revision_id TEXT NOT NULL REFERENCES native_revisions(id),native_revision_id TEXT NOT NULL,root_id TEXT NOT NULL);
 CREATE TABLE semantic_pending_selections(revision_id TEXT NOT NULL REFERENCES native_revisions(id),producer_id TEXT NOT NULL,batch_id INTEGER NOT NULL REFERENCES semantic_raw_batches(batch_id),captured_pin TEXT NOT NULL REFERENCES native_revisions(id),basis_pin TEXT NOT NULL REFERENCES native_revisions(id),PRIMARY KEY(revision_id,producer_id));
 CREATE TABLE semantic_catchup_commits(revision_id TEXT PRIMARY KEY REFERENCES native_revisions(id),target_revision_id TEXT NOT NULL REFERENCES native_revisions(id));
-CREATE TABLE semantic_projection_dependencies(payload_id INTEGER NOT NULL REFERENCES semantic_payloads(payload_id),language TEXT NOT NULL,path TEXT NOT NULL,term TEXT,PRIMARY KEY(payload_id,language,path));
+CREATE TABLE semantic_projection_dependencies(payload_id INTEGER NOT NULL REFERENCES semantic_payloads(payload_id),language TEXT NOT NULL,path TEXT NOT NULL,term TEXT,captured_hash TEXT CHECK(captured_hash IS NULL OR length(captured_hash)=64),PRIMARY KEY(payload_id,language,path));
 CREATE INDEX semantic_projection_reverse ON semantic_projection_dependencies(language,path,payload_id);
 CREATE TABLE semantic_projection_dependency_targets(payload_id INTEGER NOT NULL REFERENCES semantic_payloads(payload_id),language TEXT NOT NULL,path TEXT NOT NULL,syntax_id BLOB NOT NULL,flags INTEGER NOT NULL CHECK(flags BETWEEN 0 AND 3),PRIMARY KEY(payload_id,language,path,syntax_id));
 CREATE TABLE semantic_projection_contexts(payload_id INTEGER PRIMARY KEY REFERENCES semantic_payloads(payload_id));
@@ -2924,7 +2924,7 @@ fn expected_cache_objects() -> Result<&'static Vec<CacheObject>> {
     #[cfg(test)]
     EXPECTED_CACHE_SHAPE_BUILDS.with(|count| count.set(count.get() + 1));
     let expected = Connection::open_in_memory()?;
-    expected.execute_batch(CACHE_SCHEMA_V44)?;
+    expected.execute_batch(CACHE_SCHEMA_V45)?;
     let built = cache_objects(&expected)?;
     Ok(EXPECTED.get_or_init(|| built))
 }
@@ -2948,7 +2948,7 @@ mod cache_shape_once_tests {
 
     fn current_schema_db() -> Connection {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(CACHE_SCHEMA_V44).unwrap();
+        db.execute_batch(CACHE_SCHEMA_V45).unwrap();
         db.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
             .unwrap();
         db
@@ -5864,6 +5864,7 @@ pub(crate) fn read_semantic_tuple_for_call(
 /// revision, and the freshness its manifest row will carry.
 #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
 struct ReadAs<'a> {
+    revision: &'a str,
     native: &'a str,
     freshness: &'a BTreeMap<i64, crate::semantic_records::Freshness>,
 }
@@ -5930,7 +5931,7 @@ fn read_semantic_tuple_with_reasons(
                 tuple,
                 semantic_payload::FreshnessSource::Publication(read_as.freshness),
             )?
-            .at_native(read_as.native),
+            .read_as(read_as.revision, read_as.native),
             None => semantic_payload::project_payload(
                 db,
                 key,
@@ -6543,6 +6544,7 @@ fn read_semantic_call_facts(
                 r.get::<_, bool>(25)?,
                 r.get::<_, Option<bool>>(26)?,
                 r.get::<_, i64>(27)?,
+                r.get::<_, bool>(28)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -6576,6 +6578,7 @@ fn read_semantic_call_facts(
             possible_dispatch_complete,
             stale_target,
             provenance_id,
+            capture_bound,
         ),
     ) in call_rows.into_iter().enumerate()
     {
@@ -6583,6 +6586,12 @@ fn read_semantic_call_facts(
             selected_call.is_some() || ordinal as i64 == stored,
             "incompatible_index: corrupt semantic call ordinal"
         );
+        // #1279: the reading revision's dispatch, through the shared projection.
+        let dispatch = projection.dispatch(
+            semantic_enum(dispatch)?,
+            capture_bound,
+            declared_target.as_ref(),
+        )?;
         result.call_bindings.push(sem::CallBinding {
             call_id: call_id
                 .map(|id| {
@@ -6617,7 +6626,7 @@ fn read_semantic_call_facts(
             resolution: semantic_enum(resolution)?,
             declared_target,
             candidates: semantic_targets(&mut call_candidates, 2, &[&id], &projection.scope())?,
-            dispatch: semantic_enum(dispatch)?,
+            dispatch,
             possible_dispatch: semantic_targets(
                 &mut possible_dispatch,
                 2,
@@ -6787,6 +6796,28 @@ fn write_import_coverage(
         let own_version = document_version_id(db, key, &language, &coverage.document_path)?
             .context("semantic document missing from its revision")?;
         let keyed = batch.filter(|_| !coverage.reasons.as_ref().is_some_and(|r| r.omitted));
+        // #1279: a capture-bound call keeps its `direct`, and every read demotes it while its
+        // target's document differs from the capture. Only a batch-written payload has a
+        // capture; keyed or not, its settlement kept such a `direct`.
+        let mut bound_calls = BTreeSet::new();
+        let mut bound_documents = BTreeSet::new();
+        if batch.is_some() {
+            for (index, call) in publication.call_bindings.iter().enumerate() {
+                if owns.contains(call.provenance_id.as_str())
+                    && semantic_payload::capture_bound(
+                        db,
+                        key,
+                        &language,
+                        &coverage.document_path,
+                        call,
+                    )?
+                    && let Some(sem::Target::Internal { document, .. }) = &call.declared_target
+                {
+                    bound_calls.insert(index);
+                    bound_documents.insert((document.language.clone(), document.path.clone()));
+                }
+            }
+        }
         let mut dependencies = Vec::new();
         for ((dep_language, dep_path), targets) in
             semantic_payload::projection_dependencies(&owns, publication)
@@ -6817,11 +6848,20 @@ fn write_import_coverage(
                 )?),
                 _ => None,
             };
+            let captured_hash = match batch {
+                Some((_, captured_pin))
+                    if bound_documents.contains(&(dep_language.clone(), dep_path.clone())) =>
+                {
+                    semantic_payload::content_hash_at(db, captured_pin, &dep_language, &dep_path)?
+                }
+                _ => None,
+            };
             dependencies.push(semantic_payload::DependencyRecord {
                 language: dep_language,
                 path: dep_path,
                 term,
                 targets,
+                captured_hash,
             });
         }
         let terms: Vec<(String, String, String)> = dependencies
@@ -6912,6 +6952,7 @@ fn write_import_coverage(
                 publication,
                 &owns,
                 &dependencies,
+                &bound_calls,
             )?;
             (payload, ids)
         };
@@ -6925,8 +6966,10 @@ fn write_import_coverage(
             )?;
         }
         #[cfg(feature = "test-support")]
-        if hit.is_some() && inputs.check_hits() {
-            native_first::oracle::check_hit(db, key, tuple, coverage, publication)?;
+        if let (Some(_), Some((_, captured))) = (hit, batch)
+            && inputs.check_hits()
+        {
+            native_first::oracle::check_hit(db, key, captured, tuple, coverage, publication)?;
         }
     }
     Ok(())
@@ -7418,6 +7461,8 @@ fn write_semantic(
 }
 
 /// Writes the payload rows of one new payload. Returns the payload's basis IDs by encoded basis.
+/// `bound_calls` are the indexes in `publication.call_bindings` of its capture-bound calls.
+#[allow(clippy::too_many_arguments)]
 fn write_semantic_tuple(
     db: &Connection,
     payload: i64,
@@ -7426,6 +7471,7 @@ fn write_semantic_tuple(
     publication: &crate::semantic_records::SemanticPublication,
     owns: &BTreeSet<&str>,
     dependencies: &[semantic_payload::DependencyRecord],
+    bound_calls: &BTreeSet<usize>,
 ) -> Result<BTreeMap<String, i64>> {
     for (kind, roles) in [
         ("supported", &coverage.supported_roles),
@@ -7445,12 +7491,13 @@ fn write_semantic_tuple(
     for dependency in dependencies {
         execute_cached(
             db,
-            "INSERT INTO semantic_projection_dependencies VALUES(?1,?2,?3,?4)",
+            "INSERT INTO semantic_projection_dependencies(payload_id,language,path,term,captured_hash) VALUES(?1,?2,?3,?4,?5)",
             params![
                 payload,
                 dependency.language,
                 dependency.path,
-                dependency.term
+                dependency.term,
+                dependency.captured_hash
             ],
         )?;
         for (syntax_id, flags) in &dependency.targets {
@@ -7730,10 +7777,11 @@ fn write_semantic_tuple(
             )?;
         }
     }
-    for (ordinal, binding) in publication
+    for (ordinal, (index, binding)) in publication
         .call_bindings
         .iter()
-        .filter(|b| provenance.contains_key(b.provenance_id.as_str()))
+        .enumerate()
+        .filter(|(_, b)| provenance.contains_key(b.provenance_id.as_str()))
         .enumerate()
     {
         let anchor = &binding.join.anchor;
@@ -7773,11 +7821,12 @@ fn write_semantic_tuple(
             (binding.possible_dispatch_complete as i64).into(),
             binding.stale_target.map(|value| value as i64).into(),
             ordinal_of(&binding.provenance_id)?.into(),
+            i64::from(bound_calls.contains(&index)).into(),
         ]);
         execute_cached(
             db,
             &format!(
-                "INSERT INTO semantic_call_bindings(payload_id,ordinal,call_id,join_document_language,join_document_path,join_native_revision_id,join_content_hash,join_start,join_end,join_kind,join_status,join_diagnostic,resolution,declared_kind,declared_internal_syntax_id,declared_internal_language,declared_internal_path,declared_internal_native_revision_id,declared_external_scheme,declared_external_symbol,declared_external_scope,declared_external_language,declared_external_path,dispatch,possible_dispatch_complete,stale_target,provenance_ordinal) VALUES({})",
+                "INSERT INTO semantic_call_bindings(payload_id,ordinal,call_id,join_document_language,join_document_path,join_native_revision_id,join_content_hash,join_start,join_end,join_kind,join_status,join_diagnostic,resolution,declared_kind,declared_internal_syntax_id,declared_internal_language,declared_internal_path,declared_internal_native_revision_id,declared_external_scheme,declared_external_symbol,declared_external_scope,declared_external_language,declared_external_path,dispatch,possible_dispatch_complete,stale_target,provenance_ordinal,capture_bound) VALUES({})",
                 (1..=values.len())
                     .map(|i| format!("?{i}"))
                     .collect::<Vec<_>>()
@@ -8598,7 +8647,7 @@ fn validate_v8_bootstrap(db: &Connection) -> Result<()> {
         indexed_at.is_empty() && options.is_none(),
         "incompatible_index: invalid v8 bootstrap metadata"
     );
-    // Fixed identifiers from CACHE_SCHEMA_V44 only. Do not read table names from
+    // Fixed identifiers from CACHE_SCHEMA_V45 only. Do not read table names from
     // sqlite_master or treat a partial publication as a valid empty bootstrap.
     for name in [
         "class_projections",
@@ -11364,7 +11413,7 @@ impl Store {
             db.pragma_update(None, "synchronous", "FULL")?;
             db.execute_batch("BEGIN IMMEDIATE")?;
             let result = (|| -> Result<()> {
-                db.execute_batch(CACHE_SCHEMA_V44)?;
+                db.execute_batch(CACHE_SCHEMA_V45)?;
                 let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
                 ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
                 db.execute(
@@ -19894,7 +19943,7 @@ impl Store {
 #[test]
 fn selected_ancillary_budget_matches_main_text_key_bytes() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V44).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V45).unwrap();
     // The aggregate needs only synthetic child rows; FK behavior is covered by
     // publication/retention tests, not this isolated budget-SQL fixture.
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
@@ -20033,7 +20082,7 @@ fn selected_ancillary_budget_matches_main_text_key_bytes() {
 #[test]
 fn immutable_reference_slot_rejects_changed_payload() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V44).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V45).unwrap();
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
     let owner = [0x11u8; 16];
     let original = [0x22u8; 16];
@@ -20091,7 +20140,7 @@ fn immutable_rows(db: &Connection, table: &str) -> Vec<(Option<i64>, Option<i64>
 #[test]
 fn immutable_append_inserts_skips_identical_and_rejects_changed_rows() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V44).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V45).unwrap();
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
     let sql = "INSERT INTO native_version_macro_expansions VALUES(?1,?2,?3,?4)";
     let mut append = ImmutableAppend::default();
