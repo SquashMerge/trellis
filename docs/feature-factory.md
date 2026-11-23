@@ -77,6 +77,12 @@ The repository configuration has four operational boundaries:
 - `resolve` reads a recognized GitHub Issue and emits the canonical factory payload.
 - `bootstrap` installs the pinned MCP conformance-test packages from `tests/mcp` in a fresh sandbox without lifecycle scripts.
 - `verify` runs the same Rust, MCP conformance, JavaScript syntax, and browser test commands as CI.
+  If `FACTORY_VERIFY_WRAPPER` is set in the factory's environment, verify runs as
+  `$FACTORY_VERIFY_WRAPPER ./tools/verify`. Use it to run verify under a machine-wide lease or queue
+  shared with other heavy jobs. Unset, verify runs `./tools/verify` directly. The value is word-split,
+  so it must not contain spaces inside a path. `verify_timeout_ms` (4 hours) covers waiting for such a
+  lease as well as the run itself.
+- `mcp_servers` names the Trellis MCP server, so specialists use it on their own worktree.
 - `publish` declares the future branch-push command. The current factory release still performs its
   guarded Git and GitHub publication flow directly.
 

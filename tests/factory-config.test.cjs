@@ -16,6 +16,7 @@ const ALLOWED = new Set([
   "bootstrap",
   "bootstrap_timeout_ms",
   "max_retries",
+  "mcp_servers",
 ]);
 
 function loadConfig() {
@@ -71,6 +72,7 @@ test("factory config uses the closed supported schema", () => {
   assert.notEqual(config.bootstrap.trim(), "");
   assert.equal(Number.isSafeInteger(config.bootstrap_timeout_ms) && config.bootstrap_timeout_ms > 0, true);
   assert.equal(config.max_retries, 5);
+  assert.deepEqual(config.mcp_servers, ["trellis"]);
 });
 
 test("verify setup refuses a cache inside the checkout before installing packages", () => {
@@ -343,9 +345,37 @@ if [ "$FAKE_FONTS" != missing ]; then echo "Liberation Sans Narrow"; echo "Liber
   }
 });
 
-test("verify is one executable command and retains all checks", () => {
+test("verify runs tools/verify, behind FACTORY_VERIFY_WRAPPER when it is set", () => {
   const config = loadConfig();
-  assert.equal(config.verify, "./tools/verify");
+  assert.equal(config.verify, "${FACTORY_VERIFY_WRAPPER:-} ./tools/verify");
+  // The factory runs verify through a shell; a stand-in checkout records what ran.
+  const dir = mkdtempSync(join(tmpdir(), "trellis-factory-wrapper-"));
+  const log = join(dir, "ran.log");
+  try {
+    mkdirSync(join(dir, "tools"));
+    const recorder = (name) => `#!/bin/sh\nprintf '%s' ${name} >> "$RAN_LOG"\nfor a in "$@"; do printf ' %s' "$a" >> "$RAN_LOG"; done\necho >> "$RAN_LOG"\n`;
+    writeFileSync(join(dir, "tools", "verify"), recorder("verify"));
+    writeFileSync(join(dir, "wrapper"), recorder("wrapper") + 'exec "$@"\n');
+    chmodSync(join(dir, "tools", "verify"), 0o755);
+    chmodSync(join(dir, "wrapper"), 0o755);
+    const run = (wrapper) => {
+      rmSync(log, { force: true });
+      const env = { ...process.env, RAN_LOG: log };
+      delete env.FACTORY_VERIFY_WRAPPER;
+      if (wrapper !== undefined) env.FACTORY_VERIFY_WRAPPER = wrapper;
+      const result = spawnSync("/bin/sh", ["-c", config.verify], { cwd: dir, encoding: "utf8", env });
+      assert.equal(result.status, 0, result.stderr);
+      return readFileSync(log, "utf8").trimEnd().split("\n");
+    };
+    assert.deepEqual(run(undefined), ["verify"]);
+    assert.deepEqual(run(""), ["verify"]);
+    assert.deepEqual(run(join(dir, "wrapper")), ["wrapper ./tools/verify", "verify"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("verify is one executable command and retains all checks", () => {
   assert.notEqual(statSync(join(ROOT, "tools/verify")).mode & 0o111, 0);
   const fakeDir = mkdtempSync(join(tmpdir(), "trellis-factory-verify-"));
   const log = join(fakeDir, "verify.log");
@@ -391,7 +421,7 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
       chmodSync(command, 0o755);
     }
     function runVerify(extraEnv = {}, timeout = undefined, args = []) {
-      const result = spawnSync(config.verify, args, {
+      const result = spawnSync("./tools/verify", args, {
         cwd: ROOT,
         timeout,
         encoding: "utf8",
