@@ -113,7 +113,7 @@ fn outline_syntax_until(
     }
     let backstop = now() + SYNTAX_HANG_BACKSTOP;
     let hung = || now() >= backstop;
-    let mut parser = tree_sitter::Parser::new();
+    let mut parser = crate::measured_parse::parser();
     parser.set_language(&language)?;
     // The parse-work bound comes first: once it is reached, the clock cannot change the answer.
     // Error recovery counts more per tick (#1227).
@@ -266,7 +266,7 @@ pub(crate) struct ImplTarget {
 /// Nor does a blanket `impl<A: X> Y for A`: `A` is no type.
 pub(crate) fn impl_block_target(block: &str) -> Option<ImplTarget> {
     let header = format!("{}{{}}", &block[..block.find('{')?]);
-    let mut parser = tree_sitter::Parser::new();
+    let mut parser = crate::measured_parse::parser();
     parser
         .set_language(&tree_sitter_rust::LANGUAGE.into())
         .ok()?;
@@ -471,7 +471,7 @@ pub(crate) fn scan_file(
     let started = Instant::now();
     let expired =
         || started.elapsed() >= FILE_TIME_LIMIT || total_started.elapsed() >= TOTAL_TIME_LIMIT;
-    let mut parser = tree_sitter::Parser::new();
+    let mut parser = crate::measured_parse::parser();
     parser.set_language(&language)?;
     let mut progress = |_: &tree_sitter::ParseState| {
         if expired() {

@@ -1026,6 +1026,107 @@ fn a_file_past_the_evidence_budget_publishes_as_a_gap_and_needs_no_reconciliatio
     assert!(!store.recovery_pending_for_tests());
 }
 
+/// #1282: a Rust source whose error recovery would take minutes is past measurement's
+/// parse-work budget. Indexing stops its parse within a bounded time and publishes it with only
+/// its file module, as a typed `native-coverage-partial` document (`evidence_budget` in reads),
+/// the same way on every index, and every other file keeps its facts. View-time reads still
+/// parse its stored source under their own bounds, so the other files' facts are read per file.
+#[test]
+#[cfg(feature = "test-support")]
+fn a_rust_source_past_the_parse_work_budget_publishes_as_a_gap() {
+    let (_state, root, store, cancel) = fixture();
+    let leader = store.publication_for_tests().unwrap();
+    let clean_files = [
+        ("flow.js", "javascript"),
+        ("flow.java", "java"),
+        ("flow.rs", "rust"),
+        ("flow.py", "python"),
+    ];
+    // Each other file's metrics rows, read for that file alone.
+    let facts = |store: &Store, source_set_id: &str| {
+        clean_files.map(|(path, language)| {
+            let options = trellis::metrics_read::MetricsOptions {
+                scope: "file".into(),
+                source_set_id: Some(source_set_id.into()),
+                language: Some(language.into()),
+                path: Some(path.into()),
+                ..Default::default()
+            };
+            let payload = store
+                .evidence_response()
+                .unwrap()
+                .metrics_at(&options, &mut || Ok(()))
+                .unwrap();
+            assert!(payload.partial_files.is_empty(), "{path}");
+            (
+                serde_json::to_value(&payload.declarations).unwrap(),
+                serde_json::to_value(&payload.files).unwrap(),
+            )
+        })
+    };
+    let index = |store: &Store, leader: &trellis::store::topology::WriterGuard| {
+        let started = std::time::Instant::now();
+        publish(
+            store,
+            root.path(),
+            &cancel,
+            store.index_baseline().unwrap(),
+            leader,
+        )
+        .unwrap();
+        // Unbounded, the two parses of this file take minutes.
+        assert!(started.elapsed() < trellis::testing::HANG_BACKSTOP);
+    };
+    let outcome = |store: &Store| {
+        let status = store.status().unwrap();
+        let gaps: Vec<_> = status
+            .diagnostics
+            .iter()
+            .filter(|d| d.path.as_deref() == Some("recovery.rs"))
+            .map(|d| (d.code.clone(), d.message.clone()))
+            .collect();
+        (status.stats.files, gaps)
+    };
+    index(&store, &leader);
+    let source_set_id = store
+        .evidence_response()
+        .unwrap()
+        .metrics_at(&Default::default(), &mut || Ok(()))
+        .unwrap()
+        .files[0]
+        .source_set_id
+        .clone();
+    let clean = facts(&store, &source_set_id);
+
+    let recovery = root.path().join("recovery.rs");
+    fs::write(&recovery, "} = ) + ] * ".repeat((64 << 10) / 12)).unwrap();
+    index(&store, &leader);
+    // A second checkout state indexes the same files from scratch: the outcome is the same.
+    let state = tempfile::tempdir().unwrap();
+    let fresh = Store::open_for_tests(state.path(), root.path()).unwrap();
+    index(&fresh, &fresh.publication_for_tests().unwrap());
+    for store in [&store, &fresh] {
+        assert!(!store.recovery_pending_for_tests());
+        assert_eq!(
+            outcome(store),
+            (
+                5,
+                vec![(
+                    "native-coverage-partial".to_owned(),
+                    "source parse exceeds the per-file parse-work budget; only the file module was kept"
+                        .to_owned()
+                )]
+            )
+        );
+        assert_eq!(facts(store, &source_set_id), clean);
+    }
+
+    // Below the budget again, it is a whole document once more.
+    fs::write(&recovery, "fn recovered() {}\n").unwrap();
+    index(&store, &leader);
+    assert_eq!(outcome(&store), (5, vec![]));
+}
+
 /// #576: one source over `--max-file-bytes`, or one that isn't UTF-8, in any language, is
 /// skipped with a typed diagnostic, the rest of the checkout publishes, and the file recovers
 /// when it changes back.
@@ -4147,7 +4248,7 @@ fn rust_scoped_non_identifier_name_has_no_verified_token_or_incoming_match() {
     let source = "fn r#super() {}\nfn caller() { module::super(); }\n";
     let expression = "module::super";
     let start = source.find(expression).unwrap();
-    let mut parser = tree_sitter::Parser::new();
+    let mut parser = trellis::measured_parse::parser();
     parser
         .set_language(&tree_sitter_rust::LANGUAGE.into())
         .unwrap();

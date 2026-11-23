@@ -106,6 +106,10 @@ const NON_OUTPUT_ITEMS: &[(&str, &str)] = &[
         "producer profiles gate context validity (pending or failed), never a row's content",
     ),
     ("test_alloc", "test-only allocation measurement"),
+    (
+        "measured_parse::parser",
+        "a plain tree-sitter parser; its allocator only counts calls and then calls libc (#1282)",
+    ),
 ];
 
 /// Rust source with comments, string and char literals blanked out, so

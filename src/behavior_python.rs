@@ -839,7 +839,7 @@ pub fn build(
         revision, seed: seed.clone(), participants: vec![Participant { declaration: None, column: None, id: seed.id.clone(), label: bounded(&seed.name), kind: "method".into(), identification: "Selected source symbol.".into() }],
         steps: vec![], warnings: vec!["Static possible paths, not a runtime trace. Python types, imports, dispatch, descriptors, operator/truthiness protocols and implicit exceptions are not resolved. Async/generator bodies show possible execution on await/iteration, not call-time execution. Unsupported definition-time effects remain opaque; function bodies are deferred.".into()], hidden_steps: 0, truncated: false, truncated_by: vec![], interfaces: None,
     }};
-    let mut parser = tree_sitter::Parser::new();
+    let mut parser = crate::measured_parse::parser();
     parser.set_language(&tree_sitter_python::LANGUAGE.into())?;
     // Bound parser input and time before walking cached syntax.
     let started = std::time::Instant::now();

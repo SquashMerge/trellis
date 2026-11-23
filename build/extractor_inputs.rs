@@ -21,6 +21,7 @@
 /// - `classes`: class extraction.
 /// - `class_catalog`: the class catalog's composition and budget fit, moved out of `classes`.
 /// - `evidence_budget`, `evidence_limits`: the per-document budgets and their charging.
+/// - `measured_parse` (addition): the parse-work budget of a Rust parse (#1282).
 /// - `search_card`, `search_capture`, `search_card_records`: the stored search cards,
 ///   their capture and their record types.
 /// - `model` (addition): the graph `Symbol`/`CallSite`/`ControlRegion` types
@@ -38,6 +39,7 @@ pub const EXTRACTION_MODULES: &[&str] = &[
     "src/graph_projection.rs",
     "src/evidence_budget.rs",
     "src/evidence_limits.rs",
+    "src/measured_parse.rs",
     "src/model.rs",
     "src/native_evidence.rs",
     "src/native_evidence/extract.rs",

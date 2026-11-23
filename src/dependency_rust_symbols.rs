@@ -51,7 +51,7 @@ pub fn extract(
             warnings: vec!["Rust source identity/path exceeds 4096 bytes; file skipped and catalog is partial.".into()],
         });
     }
-    let mut parser = tree_sitter::Parser::new();
+    let mut parser = crate::measured_parse::parser();
     parser.set_language(&tree_sitter_rust::LANGUAGE.into())?;
     let tree = parser
         .parse(text, None)

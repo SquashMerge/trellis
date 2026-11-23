@@ -115,6 +115,9 @@ shared = true
 paths = [
   "src/model.rs", "src/testing.rs", "src/native_ids.rs", "src/scip_raw.rs", "src/parallel.rs", "src/build_info.rs", "src/search_lexical.rs",
   "src/lib.rs", "src/scip_raw/**", "src/test_alloc.rs", "src/syntax_bounds.rs", "src/heap.rs",
+  # The one tree-sitter parser constructor and its counting allocator (#1282): a leaf over
+  # tree-sitter and libc that every layer parses through.
+  "src/measured_parse.rs",
   # Leaf constants, small types and pure helpers that storage and shared code use (S1, #999).
   # They reference no layer: the skipped-input placeholders, the batch resource policy with
   # its counters and generated-batch origin, and the vocabulary moved out of indexing and query.

@@ -786,7 +786,7 @@ pub fn build(
         seed.range.start_byte < seed.range.end_byte && seed.range.end_byte <= file.text.len(),
         "invalid symbol source range"
     );
-    let mut parser = tree_sitter::Parser::new();
+    let mut parser = crate::measured_parse::parser();
     parser.set_language(&tree_sitter_rust::LANGUAGE.into())?;
     let tree = parser
         .parse(&file.text, None)

@@ -723,7 +723,7 @@ pub(crate) fn callback_tree(file: &SourceFile) -> Option<CallbackTree> {
         "python" => tree_sitter_python::LANGUAGE.into(),
         _ => return None,
     };
-    let mut parser = tree_sitter::Parser::new();
+    let mut parser = crate::measured_parse::parser();
     parser.set_language(&language).ok()?;
     parser.parse(&file.text, None)
 }
