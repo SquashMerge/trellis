@@ -650,7 +650,7 @@ pub fn build(
     } else {
         ("JavaScript", tree_sitter_javascript::LANGUAGE.into())
     };
-    let mut parser = tree_sitter::Parser::new();
+    let mut parser = crate::measured_parse::parser();
     parser.set_language(&grammar)?;
     let tree = parser
         .parse(&file.text, None)

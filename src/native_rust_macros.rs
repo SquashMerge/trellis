@@ -397,7 +397,7 @@ impl<'s> Expansions<'s> {
             );
         }
         if self.parser.is_none() {
-            let mut parser = Parser::new();
+            let mut parser = crate::measured_parse::parser();
             parser
                 .set_language(&tree_sitter_rust::LANGUAGE.into())
                 .ok()?;
@@ -617,7 +617,7 @@ fn placeholder_names_argument(placeholder: &str) -> bool {
 
 #[cfg(test)]
 pub(crate) fn plain_tree_for_tests(text: &str) -> Tree {
-    let mut parser = Parser::new();
+    let mut parser = crate::measured_parse::parser();
     parser
         .set_language(&tree_sitter_rust::LANGUAGE.into())
         .unwrap();

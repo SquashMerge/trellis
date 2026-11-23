@@ -42,7 +42,7 @@ fn extract_with_limits(
     max_visits: usize,
     max_records: usize,
 ) -> Result<()> {
-    let mut parser = tree_sitter::Parser::new();
+    let mut parser = crate::measured_parse::parser();
     parser.set_language(&tree_sitter_rust::LANGUAGE.into())?;
     let mut cancelled = |_: &tree_sitter::ParseState| {
         if cancel.load(Ordering::Relaxed) {

@@ -6,7 +6,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use serde_json::{Value, json};
-use tree_sitter::{Node, Parser};
+use tree_sitter::Node;
 
 use crate::native_evidence::{Call, ControlRegion, Declaration, DeclarationRole, Range};
 use crate::native_rust_macros::Expansions;
@@ -215,7 +215,7 @@ fn bind(
             ))?
             .document;
         let language = document.language.as_str();
-        let mut parser = Parser::new();
+        let mut parser = crate::measured_parse::parser();
         parser.set_language(&grammar(language, &document.path)?)?;
         let tree = parser
             .parse(source, None)
@@ -465,7 +465,7 @@ fn compute_source(
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<SourceScores> {
     check()?;
-    let mut parser = Parser::new();
+    let mut parser = crate::measured_parse::parser();
     parser.set_language(&grammar(language, document_path(declarations))?)?;
     let mut aborted = None;
     let tree = parser.parse_with_options(

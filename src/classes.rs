@@ -318,7 +318,7 @@ fn class_tree(file: &SourceFile, cancel: &CancelFlag) -> Result<Option<tree_sitt
             }
         };
     }
-    let mut parser = tree_sitter::Parser::new();
+    let mut parser = crate::measured_parse::parser();
     parser.set_language(&match file.language.as_str() {
         "java" => tree_sitter_java::LANGUAGE.into(),
         "python" => tree_sitter_python::LANGUAGE.into(),
@@ -1438,7 +1438,7 @@ mod budget_tests {
             )
             .unwrap();
             let file = &graph.files[0];
-            let mut parser = tree_sitter::Parser::new();
+            let mut parser = crate::measured_parse::parser();
             parser
                 .set_language(&tree_sitter_java::LANGUAGE.into())
                 .unwrap();

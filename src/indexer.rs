@@ -105,7 +105,7 @@ fn proved_body_only(old: &SourceFile, new: &SourceFile) -> bool {
         "rust" => tree_sitter_rust::LANGUAGE.into(),
         _ => return false,
     };
-    let mut parser = tree_sitter::Parser::new();
+    let mut parser = crate::measured_parse::parser();
     if parser.set_language(&language).is_err() {
         return false;
     }

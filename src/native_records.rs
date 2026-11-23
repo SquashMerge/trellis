@@ -359,7 +359,7 @@ fn javascript_identifier(name: &str) -> Result<String> {
         };
         decoded.push(char::from_u32(code).context("invalid JavaScript identifier code point")?);
     }
-    let mut parser = tree_sitter::Parser::new();
+    let mut parser = crate::measured_parse::parser();
     parser.set_language(&tree_sitter_javascript::LANGUAGE.into())?;
     let tree = parser
         .parse(&decoded, None)

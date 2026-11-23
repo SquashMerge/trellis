@@ -4246,7 +4246,7 @@ fn rust_scoped_non_identifier_name_has_no_verified_token_or_incoming_match() {
     let source = "fn r#super() {}\nfn caller() { module::super(); }\n";
     let expression = "module::super";
     let start = source.find(expression).unwrap();
-    let mut parser = tree_sitter::Parser::new();
+    let mut parser = trellis::measured_parse::parser();
     parser
         .set_language(&tree_sitter_rust::LANGUAGE.into())
         .unwrap();

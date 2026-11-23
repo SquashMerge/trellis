@@ -477,7 +477,7 @@ fn parse_bases(
         "typescript" => crate::indexer_ts::grammar(&doc.key.path),
         _ => anyhow::bail!("store_unavailable: unknown selector language"),
     };
-    let mut parser = tree_sitter::Parser::new();
+    let mut parser = crate::measured_parse::parser();
     parser.set_language(&language)?;
     let source = &doc.file.text;
     let mut aborted = None;

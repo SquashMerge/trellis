@@ -239,7 +239,7 @@ pub(crate) mod parse_work_inputs {
 
     /// A whole parse's progress ticks, and its parse work as the bounded readers count it.
     pub(crate) fn ticks_and_work(language: &str, text: &str) -> (usize, usize) {
-        let mut parser = tree_sitter::Parser::new();
+        let mut parser = crate::measured_parse::parser();
         parser.set_language(&grammar(language)).unwrap();
         let (mut ticks, mut work) = (0, 0);
         let mut progress = |state: &tree_sitter::ParseState| {
@@ -283,7 +283,7 @@ mod tests {
     }
 
     fn gap(source: &str) -> Option<SyntaxGap> {
-        let mut parser = tree_sitter::Parser::new();
+        let mut parser = crate::measured_parse::parser();
         parser
             .set_language(&tree_sitter_javascript::LANGUAGE.into())
             .unwrap();
@@ -361,7 +361,7 @@ mod tests {
 
     #[test]
     fn scan_observes_cancellation() {
-        let mut parser = tree_sitter::Parser::new();
+        let mut parser = crate::measured_parse::parser();
         parser
             .set_language(&tree_sitter_javascript::LANGUAGE.into())
             .unwrap();
