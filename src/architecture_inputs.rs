@@ -47,6 +47,10 @@ pub struct DocumentSemantic {
     /// The original coverage status, including unavailable/not-requested evidence.
     pub coverage_state: Option<String>,
     pub boundary: bool,
+    /// Dependency-only checkout endpoints, before representative selection, eligibility
+    /// suppression or reference sampling. Indices address the complete snapshot.
+    #[cfg(feature = "test-support")]
+    pub endpoint_documents: BTreeSet<usize>,
 }
 
 /// One bound name or call in a document.

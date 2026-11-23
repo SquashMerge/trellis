@@ -229,3 +229,45 @@ fn the_first_difference_is_named_by_its_path() {
         Some("")
     );
 }
+
+#[test]
+fn full_reference_canonical_includes_aligned_source_facts_and_descriptor_slots() {
+    let (_state, _root, store) = checkout();
+    let canonical = core(&store).canonical().unwrap();
+    let references = &canonical["references"];
+    let sources = references["sources"].as_array().unwrap();
+    let facts = references["sourceFacts"].as_array().unwrap();
+    let descriptors = references["externalPackages"].as_array().unwrap();
+    assert_eq!(
+        sources.len(),
+        references["identities"].as_array().unwrap().len()
+    );
+    assert_eq!(sources.len(), facts.len());
+    assert_eq!(sources.len(), descriptors.len());
+    assert_eq!(references["rustCatalogDigest"].as_str().unwrap().len(), 64);
+    assert!(
+        facts
+            .iter()
+            .any(|facts| facts["sites"].as_u64().unwrap() > 0)
+    );
+    for (index, source) in sources.iter().enumerate() {
+        if source.is_null() {
+            assert!(facts[index]["plan"].is_null());
+            assert_eq!(facts[index]["work"], 0);
+            assert_eq!(facts[index]["sites"], 0);
+            assert_eq!(facts[index]["endpoints"], json!([]));
+        } else {
+            let plan = &facts[index]["plan"];
+            assert!(plan["sites"].is_array());
+            assert!(plan["prepared_work"].is_u64());
+            assert!(
+                facts[index]["work"].as_u64().unwrap() >= plan["prepared_work"].as_u64().unwrap()
+            );
+            assert_eq!(source["packages"], descriptors[index]);
+            assert_eq!(
+                source["membership"].as_array().unwrap().len(),
+                descriptors[index].as_array().unwrap().len()
+            );
+        }
+    }
+}

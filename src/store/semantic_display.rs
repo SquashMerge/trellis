@@ -1553,6 +1553,73 @@ pub(super) fn architecture_semantic(
     )
 }
 
+/// Dependency discovery is separate from output evidence admission: alternatives do not
+/// become anchors, metadata, or extra semantic-row charges. DISTINCT bounds retained data
+/// to checkout documents; the payload was validated and bounded on import.
+#[cfg(feature = "test-support")]
+fn architecture_endpoint_documents(
+    db: &Connection,
+    (revision, tuple, payload, historical): (&str, i64, i64, bool),
+    document: &crate::native_records::DocumentKey,
+    locate: &impl Fn(Option<&str>, Option<&str>) -> Option<usize>,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<std::collections::BTreeSet<usize>> {
+    let mut statement = db.prepare_cached(
+        "WITH calls AS (
+           SELECT b.* FROM semantic_call_bindings b
+           JOIN semantic_provenance p ON p.payload_id=b.payload_id AND p.ordinal=b.provenance_ordinal
+           LEFT JOIN semantic_coverage_freshness f ON f.revision_id=?1 AND f.tuple_id=?2 AND f.basis_id=p.basis_id
+           WHERE b.payload_id=?3 AND b.call_id IS NOT NULL
+             AND b.join_document_language=?5 AND b.join_document_path=?6
+             AND (?4 OR f.basis_id IS NULL OR f.freshness<>'stale')
+         ), refs AS (
+           SELECT r.* FROM semantic_references r
+           JOIN semantic_provenance p ON p.payload_id=r.payload_id AND p.ordinal=r.provenance_ordinal
+           LEFT JOIN semantic_coverage_freshness f ON f.revision_id=?1 AND f.tuple_id=?2 AND f.basis_id=p.basis_id
+           WHERE r.payload_id=?3 AND r.site='use'
+             AND (?4 OR f.basis_id IS NULL OR f.freshness<>'stale')
+         ), relationships AS (
+           SELECT t.* FROM semantic_type_relationships t
+           JOIN semantic_provenance p ON p.payload_id=t.payload_id AND p.ordinal=t.provenance_ordinal
+           LEFT JOIN semantic_coverage_freshness f ON f.revision_id=?1 AND f.tuple_id=?2 AND f.basis_id=p.basis_id
+           WHERE t.payload_id=?3 AND t.source_kind='internal' AND t.kind IN ('extends','implements')
+             AND (?4 OR f.basis_id IS NULL OR f.freshness<>'stale')
+         ), endpoints(kind,language,path) AS (
+           SELECT declared_kind,declared_internal_language,declared_internal_path FROM calls
+           UNION ALL SELECT c.kind,c.internal_language,c.internal_path FROM semantic_call_candidates c JOIN calls b ON b.binding_id=c.binding_id
+           UNION ALL SELECT c.kind,c.internal_language,c.internal_path FROM semantic_call_possible_dispatch c JOIN calls b ON b.binding_id=c.binding_id
+           UNION ALL SELECT declared_kind,declared_internal_language,declared_internal_path FROM refs
+           UNION ALL SELECT c.kind,c.internal_language,c.internal_path FROM semantic_reference_candidates c JOIN refs r ON r.payload_id=c.payload_id AND r.reference_id=c.reference_id
+           UNION ALL SELECT source_kind,source_internal_language,source_internal_path FROM relationships
+           UNION ALL SELECT target_kind,target_internal_language,target_internal_path FROM relationships
+         )
+         SELECT DISTINCT language,path FROM endpoints WHERE kind='internal' ORDER BY language,path",
+    )?;
+    let mut cursor = statement.query(params![
+        revision,
+        tuple,
+        payload,
+        historical,
+        document.language,
+        document.path
+    ])?;
+    let mut endpoints = std::collections::BTreeSet::new();
+    let mut rows = 0usize;
+    while let Some(row) = cursor.next()? {
+        if rows.is_multiple_of(CHECK_EVERY_ROWS) {
+            check()?;
+        }
+        rows += 1;
+        if let Some(target) = locate(
+            row.get_ref(0)?.as_str_or_null()?,
+            row.get_ref(1)?.as_str_or_null()?,
+        ) {
+            endpoints.insert(target);
+        }
+    }
+    Ok(endpoints)
+}
+
 /// `architecture_semantic` with `metadata_limit` proof metadata and lookup dependency rows.
 fn architecture_semantic_within(
     db: &Connection,
@@ -1945,6 +2012,14 @@ fn architecture_semantic_within(
             "incompatible_index: architecture tuple names no payload".into(),
         ))?;
         let native = pp.native().to_owned();
+        #[cfg(feature = "test-support")]
+        let endpoint_documents = architecture_endpoint_documents(
+            db,
+            (&key, tuple, payload, historical),
+            &documents[i].key,
+            &locate,
+            check,
+        )?;
         let (language, path) = (
             documents[i].key.language.clone(),
             documents[i].key.path.clone(),
@@ -2255,6 +2330,10 @@ fn architecture_semantic_within(
         }
         drop(cursor);
         let semantic = &mut documents[i].semantic;
+        #[cfg(feature = "test-support")]
+        {
+            semantic.endpoint_documents = endpoint_documents;
+        }
         semantic.producer_id = Some(producer);
         semantic.complete = complete && !historical;
         semantic.boundary |= anchors
