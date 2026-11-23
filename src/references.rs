@@ -463,8 +463,14 @@ fn resolve(
     // Parsing is unbudgeted, so one pass over every document keeps all workers busy.
     let (trees, gaps): (Vec<_>, Vec<_>) = map_all(&docs, workers, request, |doc| {
         let check = &mut request.worker();
-        let tree = parse(doc, check)?;
-        let gap = syntax_bounds::scan(tree.root_node(), check)?;
+        let (tree, unread) = syntax(doc, snapshot.unparsed.contains(&doc.key), check)?;
+        let gap = if unread {
+            Some(syntax_bounds::SyntaxGap::past_parse_work(
+                doc.file.text.len(),
+            ))
+        } else {
+            syntax_bounds::scan(tree.root_node(), check)?
+        };
         Ok((tree, gap))
     })?
     .into_iter()
@@ -1765,28 +1771,35 @@ fn grammar(key: &DocumentKey) -> Result<tree_sitter::Language> {
         _ => anyhow::bail!("store_unavailable: reference language"),
     })
 }
+/// A document's syntax, and whether it is [`syntax_bounds::unread_tree`]: the tree of a Rust
+/// source past measurement's parse-work budget, whether indexing found it so (`unparsed`, never
+/// parsed again) or this bounded parse does (#1300).
+fn syntax(
+    doc: &DocumentInput,
+    unparsed: bool,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<(Tree, bool)> {
+    let grammar = grammar(&doc.key)?;
+    let tree = if unparsed {
+        None
+    } else {
+        syntax_bounds::parse_stored(
+            &doc.key.language,
+            &grammar,
+            &doc.file.text,
+            "bounded_work: reference parser stopped",
+            check,
+        )?
+    };
+    Ok(match tree {
+        Some(tree) => (tree, false),
+        None => (syntax_bounds::unread_tree(&doc.file.text), true),
+    })
+}
+/// A document's [`syntax`], parsed.
+#[cfg(test)]
 fn parse(doc: &DocumentInput, check: &mut impl FnMut() -> Result<()>) -> Result<Tree> {
-    let mut parser = crate::measured_parse::parser();
-    parser.set_language(&grammar(&doc.key)?)?;
-    let mut aborted = None;
-    let tree = parser.parse_with_options(
-        &mut |offset, _| &doc.file.text.as_bytes()[offset..],
-        None,
-        Some(
-            tree_sitter::ParseOptions::new().progress_callback(&mut |_| {
-                if let Err(error) = check() {
-                    aborted = Some(error);
-                    std::ops::ControlFlow::Break(())
-                } else {
-                    std::ops::ControlFlow::Continue(())
-                }
-            }),
-        ),
-    );
-    if let Some(error) = aborted {
-        return Err(error);
-    }
-    tree.context("bounded_work: reference parser stopped")
+    Ok(syntax(doc, false, check)?.0)
 }
 /// Depth-first over named syntax. What lies past the bounds and inside a parser error is
 /// skipped: the projection's scan of this tree reported it.

@@ -73,6 +73,7 @@ fn snapshot(files: &[(&str, &str)]) -> Snapshot {
         manifests,
         root_tsconfig: None,
         evidence_gaps: Default::default(),
+        unparsed: Default::default(),
     }
 }
 

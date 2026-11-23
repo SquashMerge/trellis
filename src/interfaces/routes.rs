@@ -834,6 +834,7 @@ mod tests {
             manifests: vec![],
             root_tsconfig: None,
             evidence_gaps: Default::default(),
+            unparsed: Default::default(),
         }
     }
 

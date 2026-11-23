@@ -73,6 +73,29 @@ pub(crate) fn parse(text: &str, cancel: Option<&AtomicBool>) -> anyhow::Result<P
     })
 }
 
+/// The parse-work budget of one Rust parse that a reader runs with checks of its own (#1300):
+/// start it on the parse's thread after making a fresh [`parser`] and just before the parse,
+/// and stop the parse at the first progress tick where [`Meter::beyond`] holds. The count is
+/// then measurement's for the same source, as [`parse`] counts it.
+pub(crate) struct Meter {
+    start: u64,
+    limit: u64,
+}
+
+impl Meter {
+    pub(crate) fn start(bytes: usize) -> Self {
+        Self {
+            start: calls(),
+            limit: limit(bytes),
+        }
+    }
+
+    /// Whether this thread's allocator calls since [`Meter::start`] passed the budget.
+    pub(crate) fn beyond(&self) -> bool {
+        calls().wrapping_sub(self.start) > self.limit
+    }
+}
+
 thread_local! {
     static CALLS: Cell<u64> = const { Cell::new(0) };
 }

@@ -1029,8 +1029,8 @@ fn a_file_past_the_evidence_budget_publishes_as_a_gap_and_needs_no_reconciliatio
 /// #1282: a Rust source whose error recovery would take minutes is past measurement's
 /// parse-work budget. Indexing stops its parse within a bounded time and publishes it with only
 /// its file module, as a typed `native-coverage-partial` document (`evidence_budget` in reads),
-/// the same way on every index, and every other file keeps its facts. View-time reads still
-/// parse its stored source under their own bounds, so the other files' facts are read per file.
+/// the same way on every index, and every other file keeps its facts, read per file here.
+/// Whole-checkout reads of such a checkout are covered in `core::architecture_store` (#1300).
 #[test]
 #[cfg(feature = "test-support")]
 fn a_rust_source_past_the_parse_work_budget_publishes_as_a_gap() {

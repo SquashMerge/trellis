@@ -315,7 +315,9 @@ a parse makes track its work. They are counted per thread, during a parse with a
 the count is a property of the source alone, the same on every run and machine. Real Rust parses
 make at most 3 calls per byte, with or without a syntax error; `} = ) + ] * ` repeated to 64 KiB
 would make about two billion and take minutes, and is stopped after about 2.4 million. Such a
-source keeps no classes either, and reads name it with reason `evidence_budget`. It publishes its file module, `partial` coverage and a whole-file capability gap,
+source keeps no classes either, and reads name it with reason `evidence_budget`. Reads never
+parse it again, and every read's own parse of a Rust source is held to the same budget, so a
+whole-checkout read never spends on one file what indexing refused (#1300). It publishes its file module, `partial` coverage and a whole-file capability gap,
 and nothing that would make a read refuse it. A class row past its budget loses its last
 members and is marked truncated, and a file whose class extraction would pass 64 MiB keeps no
 classes. Aggregate limits fail without publishing. These are guardrails, not a proven hostile-input resource sandbox.

@@ -144,11 +144,17 @@ pub(crate) fn trivial_accessors(file: &SourceFile, nodes: &[Symbol]) -> BTreeSet
         "typescript" => crate::indexer_ts::grammar(&file.path),
         _ => return out,
     };
-    let mut parser = crate::measured_parse::parser();
-    if parser.set_language(&language).is_err() {
-        return out;
-    }
-    let Some(tree) = parser.parse(&file.text, None) else {
+    let tree = if file.language == "rust" {
+        // Past measurement's parse-work budget, no accessor is proved (#1300).
+        crate::behavior::rust_tree(&file.text)
+    } else {
+        let mut parser = crate::measured_parse::parser();
+        if parser.set_language(&language).is_err() {
+            return out;
+        }
+        parser.parse(&file.text, None)
+    };
+    let Some(tree) = tree else {
         return out;
     };
     let mut fields: std::collections::BTreeMap<&str, BTreeSet<&str>> = Default::default();

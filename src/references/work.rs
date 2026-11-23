@@ -135,6 +135,7 @@ mod tests {
             manifests: vec![manifest, present],
             root_tsconfig: None,
             evidence_gaps: Default::default(),
+            unparsed: Default::default(),
         };
         assert_eq!(snapshot_bytes(&snapshot, &mut || Ok(())).unwrap(), 4);
         let mut with_config = Snapshot {

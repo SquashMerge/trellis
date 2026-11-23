@@ -310,7 +310,10 @@ impl MetricsReadCheck<'_> {
 }
 
 impl Store {
-    /// Metrics of one document's stored source and native rows.
+    /// Metrics of one document's stored source and native rows. A `module_only` document, one
+    /// with a published module-only reason, has no callable to score and its `partialFiles` row
+    /// comes from that reason, so its source is not parsed (#1300).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn metrics_document(
         &self,
         key: &crate::native_records::DocumentKey,
@@ -318,6 +321,7 @@ impl Store {
         declarations: &[crate::native_records::Declaration],
         calls: &[crate::native_records::Call],
         regions: &[crate::native_records::ControlRegion],
+        module_only: bool,
         expired: &dyn Fn() -> bool,
     ) -> std::result::Result<MetricsComputedDocument, MetricsDocumentFailure> {
         // Metrics use the stored source and native rows as fetched.
@@ -345,11 +349,17 @@ impl Store {
             content_hash: &file.hash,
             text: &file.text,
         };
-        let cached = self
-            .metrics_memo
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .lookup(&source);
+        let cached = if module_only {
+            Some(crate::metrics_records::SourceScores {
+                scores: Vec::new(),
+                gap: None,
+            })
+        } else {
+            self.metrics_memo
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .lookup(&source)
+        };
         crate::metrics::compute_with_cached(
             cached,
             source,
@@ -621,6 +631,7 @@ impl EvidenceResponse {
                     &fetched.declarations,
                     &fetched.calls,
                     &fetched.regions,
+                    evidence_gaps.contains_key(key),
                     &expired,
                 )
             };

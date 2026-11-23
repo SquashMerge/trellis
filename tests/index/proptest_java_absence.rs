@@ -102,6 +102,7 @@ fn project(files: &Files, filter: &[String]) -> Value {
         manifests: Vec::new(),
         root_tsconfig: None,
         evidence_gaps,
+        unparsed: Default::default(),
     };
     references::project(&snapshot, filter, 20, &mut || Ok(()))
         .unwrap()

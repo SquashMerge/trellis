@@ -107,8 +107,7 @@ const OVER_DEPTH: &str =
 const OVER_VISITS: &str =
     "input_bounds_exceeded: stable lookup Rust syntax is over the 1,000,000-node visit bound";
 const OVER_MACRO: &str = "input_bounds_exceeded: stable lookup found no Rust impl syntax at its measured range within the macro expansion byte budget";
-const OVER_PARSE: &str =
-    "input_bounds_exceeded: stable lookup Rust parse is over the 80,000-tick parse-work bound";
+const OVER_PARSE: &str = "input_bounds_exceeded: stable lookup Rust parse is over the parse-work bound (80,000 ticks, or the per-file parse-work budget)";
 const UNPARSED: &str =
     "input_bounds_exceeded: stable lookup Rust parse stopped short of a syntax tree";
 const MISSING_IMPL: &str = "input_bounds_exceeded: stable lookup Rust impl declaration is not in the measured declarations";
@@ -243,13 +242,15 @@ fn impl_targets(
         .set_language(&tree_sitter_rust::LANGUAGE.into())
         .map_err(|error| Refused::Stopped(error.into()))?;
     // The parser reports only that it stopped, so the reason waits here. The parse-work
-    // bound comes first: once it is reached, the clock can no longer change the answer. Error
-    // recovery counts more per tick (#1227).
+    // bounds come first: once one is reached, the clock can no longer change the answer. Error
+    // recovery counts more per tick (#1227), and the parse is also held to measurement's
+    // parse-work budget, so a document past it is refused as indexing refused it (#1300).
+    let meter = crate::measured_parse::Meter::start(file.text.len());
     let mut stopped = None;
     let mut ticks = 0;
     let mut progress = |state: &tree_sitter::ParseState| {
         ticks += parse_work(state);
-        let step = if ticks > PARSE_TICKS {
+        let step = if ticks > PARSE_TICKS || meter.beyond() {
             Err(Refused::Bound(OVER_PARSE))
         } else {
             limit.step()
@@ -724,6 +725,32 @@ mod tests {
             inner = format!("assert!({{ {inner} }}); true");
         }
         format!("struct S;\nfn m() -> bool {{ {inner} }}\n")
+    }
+
+    /// #1300 (owner ruling 2026-11-22): a document past measurement's parse-work budget is
+    /// refused typed `input_bounds_exceeded`, as indexing refuses it, on every run and on a
+    /// clock that never moves, and a checked derivation has no keys. Its parse is within the
+    /// tick bound, so before, it ran for minutes and only the hang backstop stopped it, typed
+    /// `deadline_exceeded`.
+    #[test]
+    fn a_document_past_the_parse_work_budget_is_refused_on_every_run() {
+        let fixture = Fixture::new();
+        let (file, native) = fixture.measure("store.rs", IMPL);
+        let mut beyond = file.clone();
+        beyond
+            .text
+            .push_str(&crate::measured_parse::inputs::recovery());
+        for _ in 0..3 {
+            let started = Instant::now();
+            let error = keys_on_a_stopped_clock(&beyond, &native.declarations).unwrap_err();
+            assert_eq!(error.to_string(), OVER_PARSE);
+            let (code, retryable, message) = mcp_answer(&error);
+            assert_eq!((code.as_str(), retryable), ("input_bounds_exceeded", false));
+            assert!(message.contains("parse-work budget"), "{message}");
+            let found = checked(&beyond, &native.declarations, &mut || Ok(())).unwrap();
+            assert_eq!(found, None);
+            assert!(started.elapsed() < crate::testing::HANG_BACKSTOP);
+        }
     }
 
     /// The document's parse and its macro re-parses share the parse-work bound (#1220): each

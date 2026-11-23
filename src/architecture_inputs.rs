@@ -4,7 +4,7 @@
 use crate::model::{IndexPin, SourceFile};
 use crate::native_records::{Call, Declaration, DocumentKey};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 pub struct DocumentInput {
@@ -24,6 +24,9 @@ pub struct Snapshot {
     /// Documents published with no evidence but their file module, and their `partialFiles`
     /// reason: over the evidence budget (#564), or not read (#576).
     pub evidence_gaps: BTreeMap<DocumentKey, &'static str>,
+    /// The documents among those whose Rust parse indexing found past measurement's
+    /// parse-work budget (#1282). Their syntax was never read, so no read parses them (#1300).
+    pub unparsed: BTreeSet<DocumentKey>,
 }
 
 /// Selected producer evidence: current bindings that are not stale (fresh or possibly stale,

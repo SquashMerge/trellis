@@ -453,6 +453,7 @@ fn measure_documents(
                 &document.declarations,
                 &document.calls,
                 &regions[index],
+                snapshot.evidence_gaps.contains_key(&document.key),
                 &expired,
             );
             let mut measured = measured.lock().unwrap_or_else(|e| e.into_inner());

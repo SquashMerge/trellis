@@ -713,12 +713,12 @@ pub(crate) fn callback_block(
 pub(crate) type CallbackTree = tree_sitter::Tree;
 
 /// The syntax tree of `file` in its language, for [`passed_callable`]; `None` for a language
-/// with no callback rule.
+/// with no callback rule, or a Rust source past measurement's parse-work budget (#1300).
 pub(crate) fn callback_tree(file: &SourceFile) -> Option<CallbackTree> {
     let language: tree_sitter::Language = match file.language.as_str() {
         "javascript" => tree_sitter_javascript::LANGUAGE.into(),
         "typescript" => crate::indexer_ts::grammar(&file.path),
-        "rust" => tree_sitter_rust::LANGUAGE.into(),
+        "rust" => return rust_tree(&file.text),
         "java" => tree_sitter_java::LANGUAGE.into(),
         "python" => tree_sitter_python::LANGUAGE.into(),
         _ => return None,
@@ -726,6 +726,15 @@ pub(crate) fn callback_tree(file: &SourceFile) -> Option<CallbackTree> {
     let mut parser = crate::measured_parse::parser();
     parser.set_language(&language).ok()?;
     parser.parse(&file.text, None)
+}
+
+/// A behavior view's parse of a Rust source: `None` past measurement's parse-work budget
+/// (#1300), or if the parser fails.
+pub(crate) fn rust_tree(text: &str) -> Option<tree_sitter::Tree> {
+    match crate::measured_parse::parse(text, None).ok()? {
+        crate::measured_parse::Parse::Tree(tree) => Some(tree),
+        crate::measured_parse::Parse::Beyond | crate::measured_parse::Parse::Cancelled => None,
+    }
 }
 
 /// #888 (Prime review on #891): whether `start..end` in `tree` is a callable expression that

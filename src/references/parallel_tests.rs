@@ -82,6 +82,7 @@ pub(super) fn snapshot_of(files: &[(&str, &str)]) -> Snapshot {
         manifests: Vec::new(),
         root_tsconfig: None,
         evidence_gaps: Default::default(),
+        unparsed: Default::default(),
     }
 }
 

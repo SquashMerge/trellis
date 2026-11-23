@@ -1427,7 +1427,10 @@ its facts exceed a [per-file budget](daemon-v1.md#current-limits) (#564), or its
 exceeds measurement's parse-work budget (#1282). `range` is the whole file and
 `subtrees` is 0. Its source is still read for what others resolve through it, but it has no
 sites, scores, or declarations for rules to select, so nothing resolves to a declaration
-inside it.
+inside it. A source past the parse-work budget is never parsed again: reads take its syntax as
+one parser error over the whole file, so what others resolve through it stays unknown, as for
+a file with a syntax error (#1300). A read of a Rust source is held to the same budget, so it
+never parses one for longer than indexing did.
 
 `oversized` and `not_utf8` name a source that wasn't read, because it's larger than
 `--max-file-bytes` or isn't UTF-8 (#576). Like `evidence_budget`, it has only its file module,
