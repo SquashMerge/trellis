@@ -238,7 +238,7 @@ fn impl_targets(
     if file.text.len() > FILE_INPUT_LIMIT {
         return Err(Refused::Bound(OVER_SIZE));
     }
-    let mut parser = tree_sitter::Parser::new();
+    let mut parser = crate::measured_parse::parser();
     parser
         .set_language(&tree_sitter_rust::LANGUAGE.into())
         .map_err(|error| Refused::Stopped(error.into()))?;
@@ -706,7 +706,7 @@ mod tests {
                 assert_eq!(found, None);
             }
         }
-        let mut parser = tree_sitter::Parser::new();
+        let mut parser = crate::measured_parse::parser();
         parser
             .set_language(&tree_sitter_rust::LANGUAGE.into())
             .unwrap();

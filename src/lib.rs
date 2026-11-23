@@ -53,6 +53,7 @@ pub(crate) mod jsonc;
 #[cfg(test)]
 mod language_set_tests;
 pub mod mcp;
+pub mod measured_parse;
 pub mod metrics;
 pub mod metrics_read;
 mod metrics_records;

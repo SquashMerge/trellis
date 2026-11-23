@@ -924,7 +924,7 @@ pub(crate) fn parse(
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<tree_sitter::Tree> {
     check()?;
-    let mut parser = tree_sitter::Parser::new();
+    let mut parser = crate::measured_parse::parser();
     parser.set_language(language)?;
     let source = &doc.file.text;
     let mut aborted = None;

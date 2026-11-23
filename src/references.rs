@@ -7,7 +7,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use tree_sitter::{Node, Parser, Tree};
+use tree_sitter::{Node, Tree};
 use work::Work;
 
 pub(crate) mod callers;
@@ -1770,7 +1770,7 @@ fn grammar(key: &DocumentKey) -> Result<tree_sitter::Language> {
     })
 }
 fn parse(doc: &DocumentInput, check: &mut impl FnMut() -> Result<()>) -> Result<Tree> {
-    let mut parser = Parser::new();
+    let mut parser = crate::measured_parse::parser();
     parser.set_language(&grammar(&doc.key)?)?;
     let mut aborted = None;
     let tree = parser.parse_with_options(

@@ -253,7 +253,7 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        48
+        49
     );
     let count: i64 = db
         .query_row(
@@ -855,7 +855,7 @@ fn physical_v8_native_v4_index_recreates_before_role_column_read() {
         rebuilt
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        48
+        49
     );
     let stamp: String = rebuilt
         .query_row("SELECT extractor_version FROM index_metadata", [], |row| {
@@ -1024,6 +1024,107 @@ fn a_file_past_the_evidence_budget_publishes_as_a_gap_and_needs_no_reconciliatio
     .unwrap();
     assert_eq!(metrics(&store).partial_files.len(), 1);
     assert!(!store.recovery_pending_for_tests());
+}
+
+/// #1282: a Rust source whose error recovery would take minutes is past measurement's
+/// parse-work budget. Indexing stops its parse within a bounded time and publishes it with only
+/// its file module, as a typed `native-coverage-partial` document (`evidence_budget` in reads),
+/// the same way on every index, and every other file keeps its facts. View-time reads still
+/// parse its stored source under their own bounds, so the other files' facts are read per file.
+#[test]
+#[cfg(feature = "test-support")]
+fn a_rust_source_past_the_parse_work_budget_publishes_as_a_gap() {
+    let (_state, root, store, cancel) = fixture();
+    let leader = store.publication_for_tests().unwrap();
+    let clean_files = [
+        ("flow.js", "javascript"),
+        ("flow.java", "java"),
+        ("flow.rs", "rust"),
+        ("flow.py", "python"),
+    ];
+    // Each other file's metrics rows, read for that file alone.
+    let facts = |store: &Store, source_set_id: &str| {
+        clean_files.map(|(path, language)| {
+            let options = trellis::metrics_read::MetricsOptions {
+                scope: "file".into(),
+                source_set_id: Some(source_set_id.into()),
+                language: Some(language.into()),
+                path: Some(path.into()),
+                ..Default::default()
+            };
+            let payload = store
+                .evidence_response()
+                .unwrap()
+                .metrics_at(&options, &mut || Ok(()))
+                .unwrap();
+            assert!(payload.partial_files.is_empty(), "{path}");
+            (
+                serde_json::to_value(&payload.declarations).unwrap(),
+                serde_json::to_value(&payload.files).unwrap(),
+            )
+        })
+    };
+    let index = |store: &Store, leader: &trellis::store::topology::WriterGuard| {
+        let started = std::time::Instant::now();
+        publish(
+            store,
+            root.path(),
+            &cancel,
+            store.index_baseline().unwrap(),
+            leader,
+        )
+        .unwrap();
+        // Unbounded, the two parses of this file take minutes.
+        assert!(started.elapsed() < trellis::testing::HANG_BACKSTOP);
+    };
+    let outcome = |store: &Store| {
+        let status = store.status().unwrap();
+        let gaps: Vec<_> = status
+            .diagnostics
+            .iter()
+            .filter(|d| d.path.as_deref() == Some("recovery.rs"))
+            .map(|d| (d.code.clone(), d.message.clone()))
+            .collect();
+        (status.stats.files, gaps)
+    };
+    index(&store, &leader);
+    let source_set_id = store
+        .evidence_response()
+        .unwrap()
+        .metrics_at(&Default::default(), &mut || Ok(()))
+        .unwrap()
+        .files[0]
+        .source_set_id
+        .clone();
+    let clean = facts(&store, &source_set_id);
+
+    let recovery = root.path().join("recovery.rs");
+    fs::write(&recovery, "} = ) + ] * ".repeat((64 << 10) / 12)).unwrap();
+    index(&store, &leader);
+    // A second checkout state indexes the same files from scratch: the outcome is the same.
+    let state = tempfile::tempdir().unwrap();
+    let fresh = Store::open_for_tests(state.path(), root.path()).unwrap();
+    index(&fresh, &fresh.publication_for_tests().unwrap());
+    for store in [&store, &fresh] {
+        assert!(!store.recovery_pending_for_tests());
+        assert_eq!(
+            outcome(store),
+            (
+                5,
+                vec![(
+                    "native-coverage-partial".to_owned(),
+                    "source parse exceeds the per-file parse-work budget; only the file module was kept"
+                        .to_owned()
+                )]
+            )
+        );
+        assert_eq!(facts(store, &source_set_id), clean);
+    }
+
+    // Below the budget again, it is a whole document once more.
+    fs::write(&recovery, "fn recovered() {}\n").unwrap();
+    index(&store, &leader);
+    assert_eq!(outcome(&store), (5, vec![]));
 }
 
 /// #576: one source over `--max-file-bytes`, or one that isn't UTF-8, in any language, is
@@ -3562,7 +3663,7 @@ fn schemas16_19_23_24_26_27_28_29_30_31_38_and39_recreate_exclusively_without_mi
             rebuilt
                 .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            48
+            49
         );
         assert_eq!(
             rebuilt
@@ -3571,7 +3672,7 @@ fn schemas16_19_23_24_26_27_28_29_30_31_38_and39_recreate_exclusively_without_mi
                     0
                 ))
                 .unwrap(),
-            48
+            49
         );
         for table in [
             "native_version_references",
@@ -3616,8 +3717,10 @@ fn selected_capture_keeps_r1_and_all_raw_proofs_until_last_selector_expires() {
         db.execute("INSERT INTO semantic_raw_captures(batch_id,ordinal,languages,producer_id,artifact_hash,source_set_id,captured_revision,binary_bytes,decoder_version) SELECT ?1,0,'[\"javascript\"]','fixture',?3,source_set_id,native_revision_id,x'01','fixture' FROM native_revisions WHERE published_index_revision=?2", rusqlite::params![batch_id, r1.index_revision as i64, hash])?;
         let capture_id = db.last_insert_rowid();
         db.execute("INSERT INTO semantic_raw_exclusions(batch_id,language,path,reason) VALUES(?1,'javascript','flow.js','failed')", [batch_id])?;
+        db.execute("INSERT INTO semantic_raw_proof_documents(capture_id,language,path) VALUES(?1,'javascript','flow.js')", [capture_id])?;
+        let document_id = db.last_insert_rowid();
         for i in 0..70_u32 {
-            db.execute("INSERT INTO semantic_raw_proofs(capture_id,proof_id,record_kind,fact_digest,language,path) VALUES(?1,unhex(?2),'occurrence',unhex(?3),'javascript','flow.js')",rusqlite::params![capture_id,format!("{:064x}", 1000 + i),format!("{i:064x}")])?;
+            db.execute("INSERT INTO semantic_raw_proofs(capture_id,proof_id,record_kind,fact_digest,document_id) VALUES(?1,unhex(?2),'occurrence',unhex(?3),?4)",rusqlite::params![capture_id,format!("{:064x}", 1000 + i),format!("{i:064x}"),document_id])?;
         }
         db.execute("INSERT INTO semantic_revision_raw_selections(revision_id,producer_id,batch_id,captured_pin) VALUES(?1,'fixture',?2,?3)",rusqlite::params![format!("pin:v1:{}:{}",r2.index_generation,r2.index_revision),batch_id,format!("pin:v1:{}:{}",r1.index_generation,r1.index_revision)])?;
         Ok((batch_id, capture_id))
@@ -3716,7 +3819,7 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
         .join(identity.root_key)
         .join("index.db");
     let db = Connection::open(&path).unwrap();
-    db.execute_batch("PRAGMA user_version=49").unwrap();
+    db.execute_batch("PRAGMA user_version=50").unwrap();
     drop(db);
     let inode = fs::metadata(&path).unwrap().ino();
     let error = Store::open_for_tests(state.path(), root.path()).unwrap_err();
@@ -3736,13 +3839,13 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(version, 49);
+    assert_eq!(version, 50);
     let metadata_version: i64 = db
         .query_row("SELECT schema_version FROM index_metadata", [], |r| {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(metadata_version, 48);
+    assert_eq!(metadata_version, 49);
     assert_eq!(generation, old.index_generation.to_string());
 }
 
@@ -4145,7 +4248,7 @@ fn rust_scoped_non_identifier_name_has_no_verified_token_or_incoming_match() {
     let source = "fn r#super() {}\nfn caller() { module::super(); }\n";
     let expression = "module::super";
     let start = source.find(expression).unwrap();
-    let mut parser = tree_sitter::Parser::new();
+    let mut parser = trellis::measured_parse::parser();
     parser
         .set_language(&tree_sitter_rust::LANGUAGE.into())
         .unwrap();

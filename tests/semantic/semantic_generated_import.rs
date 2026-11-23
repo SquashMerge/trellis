@@ -1339,7 +1339,7 @@ fn typescript_pickup_binds_empty_document_language_per_source() {
                     r.get(0)
                 })?;
             let claims = db
-                .prepare("SELECT DISTINCT language FROM semantic_raw_proofs ORDER BY language")?
+                .prepare("SELECT DISTINCT d.language FROM semantic_raw_proofs p JOIN semantic_raw_proof_documents d ON d.document_id=p.document_id ORDER BY d.language")?
                 .query_map([], |r| r.get(0))?
                 .collect::<rusqlite::Result<Vec<String>>>()?;
             Ok((languages, claims))

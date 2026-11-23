@@ -307,7 +307,15 @@ through the same bounded no-follow reader as sources; a symlinked or other non-r
 file is never opened and still fails the index. Syntax past 128
 levels or 1,000,000 visits is a per-file coverage gap (#554). So is a file whose evidence exceeds a selected read's budgets: 16
 rows per source byte in a table, at most 1,000,000, and 64 bytes per source byte plus 256 KiB of
-native rows, the same of graph rows and the same of class rows (#564). It publishes its file module, `partial` coverage and a whole-file capability gap,
+native rows, the same of graph rows and the same of class rows (#564). So is a Rust source whose
+parse passes measurement's parse-work budget (#1282): 16 tree-sitter allocator calls per source
+byte plus 1,000,000. tree-sitter's error recovery can take time that grows quadratically with the
+input between two progress ticks, but nearly all of it allocates subtrees, so the allocator calls
+a parse makes track its work. They are counted per thread, during a parse with a fresh parser, so
+the count is a property of the source alone, the same on every run and machine. Real Rust parses
+make at most 3 calls per byte, with or without a syntax error; `} = ) + ] * ` repeated to 64 KiB
+would make about two billion and take minutes, and is stopped after about 2.4 million. Such a
+source keeps no classes either, and reads name it with reason `evidence_budget`. It publishes its file module, `partial` coverage and a whole-file capability gap,
 and nothing that would make a read refuse it. A class row past its budget loses its last
 members and is marked truncated, and a file whose class extraction would pass 64 MiB keeps no
 classes. Aggregate limits fail without publishing. These are guardrails, not a proven hostile-input resource sandbox.

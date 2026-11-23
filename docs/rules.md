@@ -1423,7 +1423,8 @@ Sites that survive in the recovered tree keep the resolution their language give
 intact `import` of a broken JavaScript, TypeScript or Python file still maps its literal path.
 
 `evidence_budget` names a document published with no evidence but its file module, because
-its facts exceed a [per-file budget](daemon-v1.md#current-limits) (#564). `range` is the whole file and
+its facts exceed a [per-file budget](daemon-v1.md#current-limits) (#564), or its Rust parse
+exceeds measurement's parse-work budget (#1282). `range` is the whole file and
 `subtrees` is 0. Its source is still read for what others resolve through it, but it has no
 sites, scores, or declarations for rules to select, so nothing resolves to a declaration
 inside it.

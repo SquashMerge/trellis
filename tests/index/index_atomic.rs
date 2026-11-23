@@ -623,7 +623,7 @@ fn full_reconcile_replaces_persisted_source_and_input_inventory() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        48
+        49
     );
     let files = db
         .prepare("SELECT path FROM revision_documents WHERE revision_id=?1 ORDER BY path")
@@ -739,9 +739,9 @@ fn sqlite_snapshot(
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
-    // Check exact schema-48 names before comparing evidence and the logical
+    // Check exact schema-49 names before comparing evidence and the logical
     // search corpus. FTS shadow bytes depend on publication/merge history.
-    const REQUIRED_V40_TABLES: [&str; 91] = [
+    const REQUIRED_V40_TABLES: [&str; 92] = [
         "class_projections",
         "class_relations",
         "classes",
@@ -820,6 +820,7 @@ fn sqlite_snapshot(
         "semantic_raw_captures",
         "semantic_raw_documents",
         "semantic_raw_exclusions",
+        "semantic_raw_proof_documents",
         "semantic_raw_proofs",
         "semantic_reference_candidates",
         "semantic_reference_roles",
@@ -837,7 +838,7 @@ fn sqlite_snapshot(
     assert_eq!(
         tables.iter().map(String::as_str).collect::<Vec<_>>(),
         REQUIRED_V40_TABLES,
-        "exact schema-48 evidence and search table inventory"
+        "exact schema-49 evidence and search table inventory"
     );
     if tables.contains(&"native_binding_epoch".to_string()) {
         let (first, bound): (i64, i64) = db
@@ -920,7 +921,7 @@ fn sqlite_snapshot(
                 name if name.starts_with("native_version_") =>
                     ("vid IN (SELECT vid FROM revision_documents WHERE revision_id=?1)", ""),
                 name if name.starts_with("semantic_") => ("?1 IS NOT NULL", ""),
-                _ => panic!("unhandled schema-48 evidence table: {table}"),
+                _ => panic!("unhandled schema-49 evidence table: {table}"),
             };
             // Producer descriptor columns differ: only the parent table uses id/version.
             let where_clause = if table == "native_producers" {

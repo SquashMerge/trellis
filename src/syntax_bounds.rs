@@ -66,9 +66,10 @@ pub struct SyntaxGap {
 }
 impl SyntaxGap {
     /// A document with no evidence but its file module, over the evidence budget (#564) or
-    /// not read (#576): see [`module_only_reason`]. This is the whole file. An over-budget
-    /// file's syntax can still be read, so it never makes a binding unknown by itself; a skipped
-    /// file's placeholder is a parser error, so it proves nothing.
+    /// measurement's parse-work budget (#1282), or not read (#576): see
+    /// [`module_only_reason`]. This is the whole file. An over-budget file's syntax can still be
+    /// read, so it never makes a binding unknown by itself; a skipped file's placeholder is a
+    /// parser error, so it proves nothing.
     pub(crate) fn module_only(reason: &'static str, bytes: usize) -> Self {
         Self {
             reason,
@@ -111,7 +112,10 @@ pub struct PartialFile {
 pub(crate) fn module_only_reason(diagnostic: Option<&str>) -> Option<&'static str> {
     use crate::skipped_source::Skip;
     let diagnostic = diagnostic?;
-    if diagnostic == crate::evidence_limits::DIAGNOSTIC {
+    // A parse past measurement's parse-work budget (#1282) is one more per-file budget.
+    if diagnostic == crate::evidence_limits::DIAGNOSTIC
+        || diagnostic == crate::measured_parse::DIAGNOSTIC
+    {
         return Some("evidence_budget");
     }
     [Skip::Oversized, Skip::NotUtf8]
@@ -235,7 +239,7 @@ pub(crate) mod parse_work_inputs {
 
     /// A whole parse's progress ticks, and its parse work as the bounded readers count it.
     pub(crate) fn ticks_and_work(language: &str, text: &str) -> (usize, usize) {
-        let mut parser = tree_sitter::Parser::new();
+        let mut parser = crate::measured_parse::parser();
         parser.set_language(&grammar(language)).unwrap();
         let (mut ticks, mut work) = (0, 0);
         let mut progress = |state: &tree_sitter::ParseState| {
@@ -258,8 +262,28 @@ pub(crate) mod parse_work_inputs {
 mod tests {
     use super::*;
 
+    /// #1282: a document past measurement's parse-work budget is one more `evidence_budget`
+    /// document in reads, beside one past the stored budgets and the two kinds never read.
+    #[test]
+    fn module_only_reasons_name_every_module_only_diagnostic() {
+        use crate::skipped_source::Skip;
+        for (diagnostic, reason) in [
+            (crate::evidence_limits::DIAGNOSTIC, "evidence_budget"),
+            (crate::measured_parse::DIAGNOSTIC, "evidence_budget"),
+            (Skip::Oversized.diagnostic(), "oversized"),
+            (Skip::NotUtf8.diagnostic(), "not_utf8"),
+        ] {
+            assert_eq!(module_only_reason(Some(diagnostic)), Some(reason));
+        }
+        assert_eq!(
+            module_only_reason(Some("parser recovered from invalid source")),
+            None
+        );
+        assert_eq!(module_only_reason(None), None);
+    }
+
     fn gap(source: &str) -> Option<SyntaxGap> {
-        let mut parser = tree_sitter::Parser::new();
+        let mut parser = crate::measured_parse::parser();
         parser
             .set_language(&tree_sitter_javascript::LANGUAGE.into())
             .unwrap();
@@ -337,7 +361,7 @@ mod tests {
 
     #[test]
     fn scan_observes_cancellation() {
-        let mut parser = tree_sitter::Parser::new();
+        let mut parser = crate::measured_parse::parser();
         parser
             .set_language(&tree_sitter_javascript::LANGUAGE.into())
             .unwrap();

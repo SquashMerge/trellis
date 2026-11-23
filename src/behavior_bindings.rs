@@ -439,7 +439,7 @@ mod deep_input_tests {
             "]".repeat(depth),
             ".b".repeat(depth)
         );
-        let mut parser = tree_sitter::Parser::new();
+        let mut parser = crate::measured_parse::parser();
         parser
             .set_language(&tree_sitter_javascript::LANGUAGE.into())
             .unwrap();
@@ -457,7 +457,7 @@ mod deep_input_tests {
             "var a;".repeat(10_000),
             "}".repeat(100_000)
         );
-        let mut parser = tree_sitter::Parser::new();
+        let mut parser = crate::measured_parse::parser();
         parser
             .set_language(&tree_sitter_javascript::LANGUAGE.into())
             .unwrap();
