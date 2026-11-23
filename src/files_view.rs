@@ -67,6 +67,9 @@ pub(crate) struct OutlineSyntax {
     pub warning: Option<&'static str>,
 }
 
+/// A syntax-matches file whose parse is over its budget, which is skipped.
+pub(crate) const PARSE_BUDGET_SKIPPED: &str =
+    "Cached file parse budget exceeded; file skipped and coverage incomplete.";
 /// A cached file over [`FILE_INPUT_LIMIT`].
 pub(crate) const OUTLINE_OVER_INPUT: &str = "Cached file exceeds 2 MiB outline syntax input; bindings are not marked callable and impl blocks are unnamed.";
 /// A cached file's syntax over a parse-work bound or the syntax bounds.
@@ -494,7 +497,7 @@ pub(crate) fn scan_file(
         Some(tree_sitter::ParseOptions::new().progress_callback(&mut progress)),
     );
     let Some(tree) = tree else {
-        result.warn("Cached file parse budget exceeded; file skipped and coverage incomplete.");
+        result.warn(PARSE_BUDGET_SKIPPED);
         return Ok(false);
     };
     if tree.root_node().has_error() {

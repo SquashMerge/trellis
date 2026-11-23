@@ -420,3 +420,49 @@ fn malformed_cached_source_refuses_whole_read_not_partial_matches() {
     );
     assert!(store.recovery_pending_for_tests());
 }
+
+/// #1300: a request rooted at a clean Rust declaration skips a file indexing found past
+/// measurement's parse-work budget without reading its stored source, let alone parsing it, and
+/// says the file's coverage is incomplete. Its stored bytes are made unreadable after indexing,
+/// so any read of them would refuse the whole request.
+#[test]
+fn syntax_matches_never_read_a_source_past_the_parse_work_budget() {
+    let recovery = "} = ) + ] * ".repeat((64 << 10) / 12);
+    let (temp, store, graph, _session) = fixture(&[
+        ("a.rs", "fn chosen() {}\n"),
+        ("b.rs", &recovery),
+        ("c.rs", "fn other() { chosen(); }\n"),
+    ]);
+    let pin = store.status().unwrap().revision;
+    let seed = graph.nodes.iter().find(|n| n.name == "chosen").unwrap();
+    let db_path = std::fs::read_dir(temp.path().join("state/cache/indexes"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.is_dir())
+        .unwrap()
+        .join("index.db");
+    // Keep this independent connection open until after the managed store's reads.
+    let db = rusqlite::Connection::open(db_path).unwrap();
+    db.execute(
+        "UPDATE document_versions SET source_bytes=X'FF',byte_length=1 WHERE path='b.rs'",
+        [],
+    )
+    .unwrap();
+    for _ in 0..2 {
+        let found = store
+            .syntax_matches_at(&request(pin, &seed.id, 200, Value::Null))
+            .unwrap()
+            .unwrap();
+        assert!(found.partial);
+        assert!(
+            found.warnings.iter().any(|warning| warning
+                == "Cached file parse budget exceeded; file skipped and coverage incomplete."),
+            "{:?}",
+            found.warnings
+        );
+        let paths: Vec<_> = found.items.iter().map(|item| item.path.as_str()).collect();
+        assert_eq!(paths, vec!["c.rs"]);
+    }
+    assert!(!store.recovery_pending_for_tests());
+    drop(db);
+}

@@ -219,13 +219,13 @@ impl Store {
         let mut after: Option<String> = None;
         // Read manifest entries one at a time. Never materialize a checkout graph/catalog.
         let mut entries = tx.prepare(
-            "SELECT m.path,length(d.source_bytes),d.byte_length FROM revision_documents m
+            "SELECT m.path,length(d.source_bytes),d.byte_length,m.coverage_diagnostic FROM revision_documents m
              JOIN native_revisions r ON r.id=m.revision_id
              LEFT JOIN document_versions d ON d.vid=m.vid AND d.language=m.language AND d.path=m.path
              WHERE m.revision_id=?1 AND m.language=?2 AND (?3 IS NULL OR m.path>=?3)
              AND (?4 IS NULL OR m.path>?4) AND r.source_set_id=?5 ORDER BY m.path LIMIT 1")?;
         loop {
-            let entry: Option<(String, Option<i64>, Option<i64>)> = entries
+            let entry: Option<(String, Option<i64>, Option<i64>, Option<String>)> = entries
                 .query_row(
                     params![
                         selected.key,
@@ -234,10 +234,10 @@ impl Store {
                         after,
                         scope.key.source_set_id
                     ],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .optional()?;
-            let Some((path, size, recorded)) = entry else {
+            let Some((path, size, recorded, diagnostic)) = entry else {
                 break;
             };
             let (Some(size), Some(recorded)) = (size, recorded) else {
@@ -262,6 +262,14 @@ impl Store {
                 );
                 result.resume(&path, start);
                 break;
+            }
+            // Indexing found this Rust source past measurement's parse-work budget: it is never
+            // read or parsed again, and is skipped as a parse over its budget is (#1300).
+            if crate::syntax_bounds::past_parse_work(diagnostic.as_deref()) {
+                ensure!(start == 0, files_view::InvalidRequest);
+                result.warn(files_view::PARSE_BUDGET_SKIPPED);
+                after = Some(path);
+                continue;
             }
             if size as usize > files_view::FILE_INPUT_LIMIT {
                 ensure!(start == 0, files_view::InvalidRequest);
