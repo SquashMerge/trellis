@@ -1,6 +1,7 @@
 #![cfg(feature = "test-support")]
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeSet,
     fs,
     sync::{Arc, atomic::AtomicBool},
 };
@@ -408,6 +409,302 @@ fn published(files: &[(&str, &str)]) -> (tempfile::TempDir, tempfile::TempDir, S
         .unwrap();
     drop(leader);
     (state, root, store, pin)
+}
+
+#[test]
+fn architecture_incremental_external_scoped_projection() {
+    use trellis::references;
+    let (_state, root, store, pin) = published(&[
+        (
+            "Cargo.toml",
+            "[package]\nname='fixture'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nwire={package='serde',version='1'}\n",
+        ),
+        (
+            "src/lib.rs",
+            "pub fn run() { wire::send(); std::mem::drop(1); }\n",
+        ),
+        (
+            "package.json",
+            r#"{"dependencies":{"shared":"1.0.0"},"devDependencies":{"shared":"1.0.0"}}"#,
+        ),
+        ("root.js", "import one from 'shared';\n"),
+        ("other.js", "import one from 'shared';\n"),
+        ("typed.ts", "import one from 'shared';\n"),
+        (
+            "tools/package.json",
+            r#"{"optionalDependencies":{"shared":"2.0.0"}}"#,
+        ),
+        ("tools/nested.js", "import one from 'shared';\n"),
+    ]);
+    let snapshot = store.architecture_reference_snapshot_for_tests().unwrap();
+    assert_eq!(snapshot.pin, pin);
+    let base = references::resolve_all(&snapshot, &mut || Ok(())).unwrap();
+    let frozen = base.select(&[], 5, &mut || Ok(())).unwrap().data;
+    for path in [
+        "Cargo.toml",
+        "package.json",
+        "tools/package.json",
+        "root.js",
+        "tools/nested.js",
+    ] {
+        fs::write(root.path().join(path), "not the captured input").unwrap();
+    }
+    fs::remove_file(root.path().join("other.js")).unwrap();
+    for paths in [
+        vec![],
+        vec!["root.js".into()],
+        vec!["tools/**".into()],
+        vec!["root.js".into(), "tools/nested.js".into()],
+        vec!["typed.ts".into()],
+        vec!["missing/**".into()],
+    ] {
+        for prefix in [None, Some("tools")] {
+            let selected = base
+                .select_under(&paths, prefix, 5, &mut || Ok(()))
+                .unwrap();
+            let projected =
+                references::project_under(&snapshot, &paths, prefix, 5, &mut || Ok(())).unwrap();
+            assert_eq!(selected.data, projected.data, "{paths:?} {prefix:?}");
+            if prefix.is_none() {
+                assert_eq!(
+                    selected.data,
+                    references::project(&snapshot, &paths, 5, &mut || Ok(()))
+                        .unwrap()
+                        .data
+                );
+                assert_eq!(
+                    selected.data,
+                    base.select(&paths, 5, &mut || Ok(())).unwrap().data
+                );
+            }
+            let files = BTreeSet::from([
+                "root.js".into(),
+                "typed.ts".into(),
+                "tools/nested.js".into(),
+            ]);
+            assert_eq!(
+                base.select_where(&paths, prefix, Some(&files), &[], 5, &mut || Ok(()))
+                    .unwrap()
+                    .data,
+                references::project_where(
+                    &snapshot,
+                    &paths,
+                    prefix,
+                    Some(&files),
+                    &[],
+                    5,
+                    &mut || Ok(())
+                )
+                .unwrap()
+                .data,
+            );
+        }
+    }
+    let only = base
+        .select(&["root.js".into()], 5, &mut || Ok(()))
+        .unwrap()
+        .data;
+    assert!(
+        only["externalPackages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|package| package["evidence"].as_array().unwrap())
+            .all(|evidence| evidence["path"] == "package.json")
+    );
+    let nested = base
+        .select_under(&[], Some("tools"), 5, &mut || Ok(()))
+        .unwrap()
+        .data;
+    assert!(
+        nested["externalPackages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|package| package["evidence"].as_array().unwrap())
+            .all(|evidence| evidence["path"] == "tools/package.json")
+    );
+    assert_eq!(base.select(&[], 5, &mut || Ok(())).unwrap().data, frozen);
+    assert_eq!(
+        read(&store, "references", json!({"expectedBasis":pin}))["externalPackages"],
+        frozen["externalPackages"],
+        "public fallback still uses captured descriptors"
+    );
+}
+
+#[test]
+fn architecture_dependency_endpoints_include_current_alternatives_without_evidence_charges() {
+    use crate::graph_fixtures::{Bind, Publisher, Spec, bind};
+    use trellis::semantic_evidence as s;
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let mut spec = Spec::new(&[
+        (
+            "src/lib.rs",
+            "pub mod call; pub mod a; pub mod b; pub mod c; pub mod d;\n",
+        ),
+        (
+            "src/call.rs",
+            "pub struct Source;\npub fn caller() { crate::a::first(); let value: Missing; }\n",
+        ),
+        ("src/a.rs", "pub fn first() {}\n"),
+        ("src/b.rs", "pub fn possible() {}\n"),
+        ("src/c.rs", "pub trait Trait {}\n"),
+        ("src/d.rs", "pub struct Candidate;\n"),
+    ]);
+    spec.bindings = vec![Bind {
+        resolution: s::Resolution::Ambiguous,
+        dispatch: s::Dispatch::Virtual,
+        possible: vec!["possible".into()],
+        ..bind("caller", 0, "first")
+    }];
+    spec.declaration_bindings = vec!["Source".into(), "Trait".into(), "Candidate".into()];
+    publisher.publish(&spec);
+    let use_site = publisher
+        .native()
+        .references
+        .iter()
+        .find(|reference| {
+            reference.document.path == "src/call.rs" && reference.spelling == "Missing"
+        })
+        .unwrap()
+        .clone();
+    publisher.publish_with_semantic(&spec, |semantic, _| {
+        let target = |name: &str| {
+            semantic
+                .symbols
+                .iter()
+                .find(|symbol| symbol.display_name.as_deref() == Some(name))
+                .unwrap()
+                .declarations[0]
+                .clone()
+        };
+        let (source, relationship_target, reference_target) =
+            (target("Source"), target("Trait"), target("Candidate"));
+        let external = semantic.call_bindings[0]
+            .candidates
+            .iter()
+            .find(|target| matches!(target, s::Target::External { .. }))
+            .unwrap()
+            .clone();
+        let base = semantic
+            .provenance
+            .iter()
+            .find(|proof| proof.id == "decl-Source")
+            .unwrap()
+            .clone();
+        let mut proof = base.clone();
+        proof.id = "relationship".into();
+        proof.evidence_kind = s::EvidenceKind::TypeRelationship;
+        semantic.provenance.push(proof);
+        semantic.type_relationships.push(s::TypeRelationship {
+            kind: s::RelationshipKind::Implements,
+            source,
+            target: relationship_target,
+            provenance_id: "relationship".into(),
+        });
+        let mut proof = base;
+        proof.id = "reference".into();
+        proof.evidence_kind = s::EvidenceKind::SemanticReference;
+        let revision_id = proof.revision_id.clone();
+        semantic.provenance.push(proof);
+        let mut candidates = vec![reference_target, external];
+        candidates.sort_by_key(|target| trellis::native_ids::canonical(&json!(target)));
+        semantic.references.push(s::Reference {
+            id: use_site.id.clone(),
+            owner_syntax_id: use_site.owner_syntax_id.clone(),
+            ordinal: use_site.ordinal,
+            document: use_site.document.clone(),
+            revision_id,
+            range: use_site.range.clone(),
+            spelling: use_site.spelling.clone(),
+            lookup_key: use_site.lookup_key.clone(),
+            site: s::ReferenceSite::Use,
+            roles: vec![s::Role::Read],
+            resolution: s::Resolution::Ambiguous,
+            declared_target: None,
+            candidates,
+            provenance_id: "reference".into(),
+        });
+        semantic.provenance.sort_by(|a, b| a.id.cmp(&b.id));
+        for coverage in &mut semantic.coverage {
+            coverage
+                .supported_roles
+                .extend([s::Role::Read, s::Role::Type]);
+            coverage.supported_roles.sort();
+            coverage.supported_roles.dedup();
+            if coverage.document_path == "src/call.rs" {
+                coverage
+                    .observed_roles
+                    .extend([s::Role::Read, s::Role::Type]);
+                coverage.observed_roles.sort();
+                coverage.observed_roles.dedup();
+            }
+        }
+    });
+    trellis::store::set_architecture_semantic_rows_for_tests(2);
+    let snapshot = publisher
+        .store
+        .architecture_reference_snapshot_for_tests()
+        .unwrap();
+    let source = snapshot
+        .documents
+        .iter()
+        .find(|doc| doc.key.path == "src/call.rs")
+        .unwrap();
+    let endpoints: BTreeSet<_> = source
+        .semantic
+        .endpoint_documents
+        .iter()
+        .map(|index| snapshot.documents[*index].key.path.as_str())
+        .collect();
+    assert_eq!(
+        endpoints,
+        BTreeSet::from([
+            "src/call.rs",
+            "src/a.rs",
+            "src/b.rs",
+            "src/c.rs",
+            "src/d.rs"
+        ])
+    );
+    assert!(source.semantic.projection.is_none());
+    assert_eq!(
+        source.semantic.anchors.len(),
+        1,
+        "dependency candidates do not become output anchors"
+    );
+    assert_eq!(source.semantic.relationships.len(), 1);
+    assert!(
+        source
+            .semantic
+            .anchors
+            .iter()
+            .all(|anchor| !anchor.metadata.contains_key("historicalTargets"))
+    );
+    publisher.store.architecture_semantic_for_tests(4).unwrap();
+    let error = publisher
+        .store
+        .architecture_semantic_for_tests(3)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .starts_with("bounded_work: architecture lookup dependencies"),
+        "{error:#}"
+    );
+    trellis::store::set_architecture_semantic_rows_for_tests(1);
+    let error = publisher
+        .store
+        .architecture_reference_snapshot_for_tests()
+        .err()
+        .unwrap();
+    assert_eq!(
+        error.to_string(),
+        "bounded_work: architecture semantic evidence"
+    );
+    trellis::store::set_architecture_semantic_rows_for_tests(2_000_000);
 }
 
 /// `value` without its index pin, its partial files and their limitation, its counts of what

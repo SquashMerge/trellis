@@ -16,6 +16,9 @@ impl ReferenceBase {
             identities,
             modules,
             sources,
+            external_packages,
+            rust_catalog_digest: _,
+            source_facts: _,
             producers,
             document_status,
             sample_limit,
@@ -41,8 +44,12 @@ impl ReferenceBase {
             "modules": modules,
             "sources": sources
                 .iter()
-                .map(|source| source.as_deref().map(SourceReferences::canonical))
+                .enumerate()
+                .map(|(index, source)| source.as_deref().map(|source| source.canonical(&external_packages.by_source[index])))
                 .collect::<Vec<_>>(),
+            "externalPackages": external_packages.canonical(),
+            "rustCatalogDigest": hex::encode(self.rust_catalog_digest()),
+            "sourceFacts": self.source_facts().iter().map(super::SourceFacts::canonical).collect::<Vec<_>>(),
             "producers": producers,
             "documentStatus": document_status,
             "sampleLimit": sample_limit,
@@ -57,7 +64,7 @@ impl ReferenceBase {
 }
 
 impl SourceReferences {
-    fn canonical(&self) -> Value {
+    fn canonical(&self, descriptors: &super::SourcePackageDescriptors) -> Value {
         let Self {
             projection,
             edges,
@@ -101,7 +108,8 @@ impl SourceReferences {
                 .map(|(site, reason)| json!([site.canonical(), reason]))
                 .collect::<Vec<_>>(),
             "proof": proof,
-            "packages": packages.iter().collect::<Vec<_>>(),
+            "membership": packages,
+            "packages": descriptors.iter().collect::<Vec<_>>(),
             "coverage": coverage
                 .iter()
                 .map(|((test, gates), row)| json!([test, gates, coverage_row(row)]))

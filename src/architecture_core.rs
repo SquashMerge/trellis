@@ -523,6 +523,16 @@ pub type ArchitectureReadForTests = (Vec<(String, String)>, serde_json::Value);
 
 #[cfg(feature = "test-support")]
 impl Store {
+    /// Admitted captured inputs for comparing full and scoped reference construction.
+    /// The transaction ends before either resolver runs.
+    #[doc(hidden)]
+    pub fn architecture_reference_snapshot_for_tests(&self) -> Result<crate::references::Snapshot> {
+        let response = self.evidence_response()?;
+        let pin = response.selected_pin(None)?;
+        let input = response.architecture_input(pin, &mut || Ok(()), &|_| {})?;
+        response.finish(input.snapshot)
+    }
+
     /// The head's Architecture read and core twice (#1301): read A and read B in one
     /// transaction, then each in its own. For each: every document's path and semantic rows,
     /// in debug form, and the canonical core computed from them, with metrics and no rules.
