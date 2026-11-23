@@ -1120,6 +1120,16 @@ fn a_rust_source_past_the_parse_work_budget_publishes_as_a_gap() {
         );
         assert_eq!(facts(store, &source_set_id), clean);
     }
+    let gap = outcome(&store);
+
+    // #1304: an edit that keeps it past the budget settles in bounded time, as the same gap.
+    let mut edited = fs::read_to_string(&recovery).unwrap();
+    edited.push_str("// edited\n");
+    fs::write(&recovery, edited).unwrap();
+    index(&store, &leader);
+    assert!(!store.recovery_pending_for_tests());
+    assert_eq!(outcome(&store), gap);
+    assert_eq!(facts(&store, &source_set_id), clean);
 
     // Below the budget again, it is a whole document once more.
     fs::write(&recovery, "fn recovered() {}\n").unwrap();
