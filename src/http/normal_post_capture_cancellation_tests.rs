@@ -38,7 +38,7 @@ fn pair_snapshot(index: &std::path::Path) -> PairSnapshot {
             .unwrap();
     assert_eq!(
         tables.len(),
-        91,
+        92,
         "compare exact schema-49 derived evidence inventory"
     );
     let expected = vec![

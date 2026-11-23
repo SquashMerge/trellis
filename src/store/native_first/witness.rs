@@ -1835,8 +1835,10 @@ pub(crate) fn source_authority(
     )))
 }
 
+/// Seeks the payload's non-derived rows by `(payload_id, derived_from_provenance_id)`: on the
+/// `WITHOUT ROWID` table (#1248 PR 4) the planner would otherwise scan the payload's primary key.
 fn has_nonderived_original_provenance(db: &Connection, payload: Option<i64>) -> Result<bool> {
-    db.prepare_cached("SELECT EXISTS(SELECT 1 FROM semantic_provenance WHERE payload_id=?1 AND capture_id IS NULL AND derived_from_provenance_id IS NULL)")?.query_row([payload],|row|row.get(0)).map_err(Into::into)
+    db.prepare_cached("SELECT EXISTS(SELECT 1 FROM semantic_provenance INDEXED BY semantic_provenance_derivation WHERE payload_id=?1 AND capture_id IS NULL AND derived_from_provenance_id IS NULL)")?.query_row([payload],|row|row.get(0)).map_err(Into::into)
 }
 
 pub(crate) fn original_document_begin(
@@ -2188,8 +2190,9 @@ mod tests {
     #[test]
     fn nonderived_original_provenance_requires_full_without_hiding_mixed_links() {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch("CREATE TABLE semantic_provenance(payload_id INTEGER,capture_id INTEGER,derived_from_provenance_id BLOB);
-            INSERT INTO semantic_provenance VALUES(1,NULL,NULL),(2,9,x'00'),(3,9,NULL),(4,NULL,x'00');").unwrap();
+        db.execute_batch("CREATE TABLE semantic_provenance(payload_id INTEGER,capture_id INTEGER,derived_from_provenance_id BLOB,evidence_kind TEXT);
+            CREATE UNIQUE INDEX semantic_provenance_derivation ON semantic_provenance(payload_id,derived_from_provenance_id,evidence_kind);
+            INSERT INTO semantic_provenance VALUES(1,NULL,NULL,'k'),(2,9,x'00','k'),(3,9,NULL,'k'),(4,NULL,x'00','k');").unwrap();
         assert!(has_nonderived_original_provenance(&db, Some(1)).unwrap());
         for tuple in [2, 3, 4, 5] {
             assert!(!has_nonderived_original_provenance(&db, Some(tuple)).unwrap());

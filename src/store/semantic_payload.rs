@@ -1117,7 +1117,11 @@ mod tests {
                 "INSERT INTO semantic_declaration_join_candidates VALUES(1,?1,?2)",
                 "INSERT INTO semantic_projection_dependency_targets VALUES(1,'javascript','a.js',?2,0)",
             ] {
-                db.execute(sql, params![i, id]).unwrap();
+                if sql.contains("?2") {
+                    db.execute(sql, params![i, id]).unwrap();
+                } else {
+                    db.execute(sql, [i]).unwrap();
+                }
             }
         }
         let mut calls = 0;
