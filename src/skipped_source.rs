@@ -97,7 +97,7 @@ mod tests {
     }
 
     fn parse(grammar: &tree_sitter::Language, text: &str) -> tree_sitter::Tree {
-        let mut parser = tree_sitter::Parser::new();
+        let mut parser = crate::measured_parse::parser();
         parser.set_language(grammar).unwrap();
         parser.parse(text, None).unwrap()
     }

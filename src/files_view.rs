@@ -114,7 +114,7 @@ fn outline_syntax_until(
     }
     let backstop = now() + SYNTAX_HANG_BACKSTOP;
     let hung = || now() >= backstop;
-    let mut parser = tree_sitter::Parser::new();
+    let mut parser = crate::measured_parse::parser();
     parser.set_language(&language)?;
     // The parse-work bounds come first: once one is reached, the clock cannot change the
     // answer. Error recovery counts more per tick (#1227), and a Rust parse is also held to
@@ -477,7 +477,7 @@ pub(crate) fn scan_file(
     let started = Instant::now();
     let expired =
         || started.elapsed() >= FILE_TIME_LIMIT || total_started.elapsed() >= TOTAL_TIME_LIMIT;
-    let mut parser = tree_sitter::Parser::new();
+    let mut parser = crate::measured_parse::parser();
     parser.set_language(&language)?;
     // A Rust parse past measurement's parse-work budget is skipped like one over time (#1300).
     let meter = (file.language == "rust").then(|| Meter::start(file.text.len()));

@@ -1,0 +1,10 @@
+# tree-sitter's allocator functions may only be replaced before any tree-sitter use (#1282).
+# Every tree-sitter object starts with `measured_parse::parser()`, which installs them first,
+# so the constructors that would make one without it are refused here.
+disallowed-methods = [
+  { path = "tree_sitter::Parser::new", reason = "use crate::measured_parse::parser(), which installs the allocator first (#1282)" },
+  { path = "tree_sitter::Query::new", reason = "tree-sitter allocates through measured_parse's allocator; install it first, as measured_parse::parser() does (#1282)" },
+  { path = "tree_sitter::QueryCursor::new", reason = "tree-sitter allocates through measured_parse's allocator; install it first, as measured_parse::parser() does (#1282)" },
+  { path = "tree_sitter::Language::lookahead_iterator", reason = "tree-sitter allocates through measured_parse's allocator; install it first, as measured_parse::parser() does (#1282)" },
+  { path = "tree_sitter::set_allocator", reason = "only measured_parse::install() sets tree-sitter's allocator, before any tree-sitter use (#1282)" },
+]

@@ -1,5 +1,5 @@
 use serde_json::json;
-use tree_sitter::{Language, Parser};
+use tree_sitter::Language;
 
 struct Case {
     language: &'static str,
@@ -81,7 +81,7 @@ fn expected_module_range(case: &Case) -> (usize, usize) {
 fn pinned_grammar_root_ranges_are_characterized() {
     let mut observed = Vec::new();
     for case in cases() {
-        let mut parser = Parser::new();
+        let mut parser = trellis::measured_parse::parser();
         parser.set_language(&grammar(case.language)).unwrap();
         let tree = parser.parse(case.source, None).unwrap();
         let root = tree.root_node();

@@ -530,7 +530,7 @@ pub(super) fn extract_document(
         "native document not in captured revision"
     );
     let extraction_context = native_extraction_context(&a.producer, &f.language, &a.revision)?;
-    let mut parser = tree_sitter::Parser::new();
+    let mut parser = crate::measured_parse::parser();
     parser.set_language(&match f.language.as_str() {
         "java" => tree_sitter_java::LANGUAGE.into(),
         "rust" => tree_sitter_rust::LANGUAGE.into(),
@@ -1362,7 +1362,7 @@ impl ParserState<'_> {
         use crate::native_rust_macros as macros;
         let file = self.file;
         if self.macro_parser.is_none() {
-            let mut parser = tree_sitter::Parser::new();
+            let mut parser = crate::measured_parse::parser();
             parser.set_language(&tree_sitter_rust::LANGUAGE.into())?;
             self.macro_parser = Some(parser);
         }

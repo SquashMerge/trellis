@@ -44,8 +44,7 @@ pub(crate) enum Parse {
 
 /// Parse `text` as Rust with a fresh parser, within [`limit`] and observing `cancel`.
 pub(crate) fn parse(text: &str, cancel: Option<&AtomicBool>) -> anyhow::Result<Parse> {
-    install();
-    let mut parser = tree_sitter::Parser::new();
+    let mut parser = parser();
     parser.set_language(&tree_sitter_rust::LANGUAGE.into())?;
     let limit = limit(text.len());
     let start = calls();
@@ -75,9 +74,9 @@ pub(crate) fn parse(text: &str, cancel: Option<&AtomicBool>) -> anyhow::Result<P
 }
 
 /// The parse-work budget of one Rust parse that a reader runs with checks of its own (#1300):
-/// start it on the parse's thread just before the parse, and stop the parse at the first
-/// progress tick where [`Meter::beyond`] holds. With a fresh parser, as [`parse`] uses, the
-/// count is measurement's for the same source.
+/// start it on the parse's thread after making a fresh [`parser`] and just before the parse,
+/// and stop the parse at the first progress tick where [`Meter::beyond`] holds. The count is
+/// then measurement's for the same source, as [`parse`] counts it.
 pub(crate) struct Meter {
     start: u64,
     limit: u64,
@@ -85,7 +84,6 @@ pub(crate) struct Meter {
 
 impl Meter {
     pub(crate) fn start(bytes: usize) -> Self {
-        install();
         Self {
             start: calls(),
             limit: limit(bytes),
@@ -111,16 +109,30 @@ fn count() {
     let _ = CALLS.try_with(|calls| calls.set(calls.get().wrapping_add(1)));
 }
 
-/// Install the counting allocator functions, once per process. The binary calls this first
-/// thing, before any tree-sitter use, as `ts_set_allocator` asks; [`parse`] calls it too, for
-/// tests. Either way the functions only count and then call libc, as tree-sitter's defaults
-/// do, so memory allocated before the install is freed correctly after it, and a parse that
-/// starts on another thread while it happens works with either set.
+/// A new tree-sitter parser, for any language. It is the only way Trellis makes one: it
+/// installs the counting allocator functions first, so the install happens before this
+/// parser, and any tree it makes, exists (#1282).
+pub fn parser() -> tree_sitter::Parser {
+    install();
+    #[allow(clippy::disallowed_methods)] // The one constructor, after the install.
+    tree_sitter::Parser::new()
+}
+
+static INSTALLED: std::sync::Once = std::sync::Once::new();
+
+/// Install the counting allocator functions, once per process and before any tree-sitter
+/// use, as `ts_set_allocator` asks. [`parser`] calls it before making each parser, and the
+/// binary calls it first thing in `main`. [`std::sync::Once`] makes the install happen
+/// before every later return from this function on any thread, so no thread reads
+/// tree-sitter's allocator pointers while they are written. The functions only count and
+/// then call libc, as tree-sitter's defaults do.
 pub fn install() {
-    static INSTALLED: std::sync::Once = std::sync::Once::new();
     INSTALLED.call_once(|| {
-        // SAFETY: the four functions are libc's allocator family, which tree-sitter's defaults
-        // also use, and they abort rather than return null, as the defaults do.
+        // SAFETY: no tree-sitter object exists yet: every one starts with a `parser`, which
+        // returns only after this install. The four functions are libc's allocator family,
+        // which tree-sitter's defaults also use, and they abort rather than return null, as
+        // the defaults do.
+        #[allow(clippy::disallowed_methods)] // The one install.
         unsafe {
             tree_sitter::set_allocator(Some(tree_sitter::Allocator {
                 malloc: counted_malloc,
@@ -180,8 +192,7 @@ mod tests {
     use super::*;
 
     fn calls_of(text: &str) -> (bool, u64) {
-        install();
-        let mut parser = tree_sitter::Parser::new();
+        let mut parser = parser();
         parser
             .set_language(&tree_sitter_rust::LANGUAGE.into())
             .unwrap();
@@ -222,7 +233,7 @@ mod tests {
         let Parse::Tree(tree) = parse(text, None).unwrap() else {
             panic!("a real source is within the budget");
         };
-        let mut parser = tree_sitter::Parser::new();
+        let mut parser = parser();
         parser
             .set_language(&tree_sitter_rust::LANGUAGE.into())
             .unwrap();
@@ -238,5 +249,63 @@ mod tests {
             parse(&text, Some(&cancel)).unwrap(),
             Parse::Cancelled
         ));
+    }
+
+    const FRESH_PROCESS: &str = "TRELLIS_MEASURED_PARSE_FRESH_PROCESS";
+
+    /// #1282: a process's first tree-sitter use, a Python parse on one worker, already runs
+    /// on the counting allocator, and still does after the first Rust parse runs on another
+    /// worker while the Python worker holds its parser and tree. The test reruns itself in a
+    /// child process that runs only it, so nothing in that process has used tree-sitter yet.
+    #[test]
+    fn a_first_non_rust_parse_finds_the_allocator_installed_before_any_rust_parse() {
+        if std::env::var_os(FRESH_PROCESS).is_none() {
+            let name = "measured_parse::tests::\
+                        a_first_non_rust_parse_finds_the_allocator_installed_before_any_rust_parse";
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([name, "--exact", "--test-threads=1", "--nocapture"])
+                .env(FRESH_PROCESS, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&child.stdout);
+            assert!(
+                child.status.success() && stdout.contains("1 passed"),
+                "{stdout}{}",
+                String::from_utf8_lossy(&child.stderr)
+            );
+            return;
+        }
+        assert!(
+            !INSTALLED.is_completed(),
+            "the child has used no tree-sitter"
+        );
+        let (holding, held) = std::sync::mpsc::channel();
+        let (rust_parsed, resume) = std::sync::mpsc::channel::<()>();
+        let python = std::thread::spawn(move || {
+            let mut parser = parser();
+            let installed = INSTALLED.is_completed();
+            parser
+                .set_language(&tree_sitter_python::LANGUAGE.into())
+                .unwrap();
+            let text = "def f():\n    return 1\n";
+            let start = calls();
+            let tree = parser.parse(text, None).unwrap();
+            let first = calls() - start;
+            holding.send(()).unwrap();
+            resume.recv().unwrap();
+            let start = calls();
+            let again = parser.parse(text, Some(&tree)).unwrap();
+            drop((tree, again));
+            (installed, first, calls() - start)
+        });
+        held.recv().unwrap();
+        let rust = std::thread::spawn(|| matches!(parse("fn f() {}\n", None), Ok(Parse::Tree(_))))
+            .join()
+            .unwrap();
+        rust_parsed.send(()).unwrap();
+        let (installed, first, again) = python.join().unwrap();
+        assert!(installed, "the parser existed before the install");
+        assert!(first > 0 && again > 0, "{first} {again}");
+        assert!(rust);
     }
 }

@@ -152,7 +152,7 @@ pub(crate) fn parse_stored(
     stopped: &'static str,
     check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<Option<tree_sitter::Tree>> {
-    let mut parser = tree_sitter::Parser::new();
+    let mut parser = crate::measured_parse::parser();
     parser.set_language(grammar)?;
     let meter = (language == "rust").then(|| crate::measured_parse::Meter::start(text.len()));
     let mut beyond = false;
@@ -191,7 +191,7 @@ pub(crate) fn parse_stored(
 /// syntax could hide anything, as for any file with a syntax error, and reads nothing inside
 /// it. The tree's only node boundaries are the start and end of `text`.
 pub(crate) fn unread_tree(text: &str) -> tree_sitter::Tree {
-    let mut parser = tree_sitter::Parser::new();
+    let mut parser = crate::measured_parse::parser();
     parser
         .set_language(&tree_sitter_rust::LANGUAGE.into())
         .expect("the Rust grammar loads");
@@ -328,7 +328,7 @@ pub(crate) mod parse_work_inputs {
 
     /// A whole parse's progress ticks, and its parse work as the bounded readers count it.
     pub(crate) fn ticks_and_work(language: &str, text: &str) -> (usize, usize) {
-        let mut parser = tree_sitter::Parser::new();
+        let mut parser = crate::measured_parse::parser();
         parser.set_language(&grammar(language)).unwrap();
         let (mut ticks, mut work) = (0, 0);
         let mut progress = |state: &tree_sitter::ParseState| {
@@ -372,7 +372,7 @@ mod tests {
     }
 
     fn gap(source: &str) -> Option<SyntaxGap> {
-        let mut parser = tree_sitter::Parser::new();
+        let mut parser = crate::measured_parse::parser();
         parser
             .set_language(&tree_sitter_javascript::LANGUAGE.into())
             .unwrap();
@@ -470,7 +470,7 @@ mod tests {
         let tree = parse_stored("rust", &grammar("rust"), clean, "stopped", &mut || Ok(()))
             .unwrap()
             .unwrap();
-        let mut parser = tree_sitter::Parser::new();
+        let mut parser = crate::measured_parse::parser();
         parser.set_language(&grammar("rust")).unwrap();
         let unbounded = parser.parse(clean, None).unwrap();
         assert_eq!(tree.root_node().to_sexp(), unbounded.root_node().to_sexp());
@@ -519,7 +519,7 @@ mod tests {
 
     #[test]
     fn scan_observes_cancellation() {
-        let mut parser = tree_sitter::Parser::new();
+        let mut parser = crate::measured_parse::parser();
         parser
             .set_language(&tree_sitter_javascript::LANGUAGE.into())
             .unwrap();

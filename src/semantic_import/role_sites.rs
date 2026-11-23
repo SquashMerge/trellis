@@ -58,7 +58,7 @@ pub(super) fn direct_java_types(
         None => {
             #[cfg(test)]
             complexity_work(|work| work.java_type_parses += 1);
-            let mut parser = tree_sitter::Parser::new();
+            let mut parser = crate::measured_parse::parser();
             parser.set_language(&tree_sitter_java::LANGUAGE.into())?;
             parser.parse(source, None).context("Java parser failed")?
         }
@@ -259,7 +259,7 @@ pub(super) fn source_role_sites_parsed(
         "rust" => tree_sitter_rust::LANGUAGE.into(),
         _ => return Ok((RoleSites::default(), None)),
     };
-    let mut parser = tree_sitter::Parser::new();
+    let mut parser = crate::measured_parse::parser();
     parser.set_language(&grammar)?;
     let tree = parser
         .parse(source, None)
@@ -531,7 +531,7 @@ pub(super) fn direct_ts_types(
     let tree = match parsed {
         Some(tree) => tree,
         None => {
-            let mut parser = tree_sitter::Parser::new();
+            let mut parser = crate::measured_parse::parser();
             parser.set_language(&language)?;
             parser
                 .parse(source, None)
@@ -624,7 +624,7 @@ pub(super) fn direct_script_types(
     let tree = match parsed {
         Some(tree) => tree,
         None => {
-            let mut parser = tree_sitter::Parser::new();
+            let mut parser = crate::measured_parse::parser();
             parser.set_language(&language)?;
             parser
                 .parse(source, None)
@@ -761,7 +761,7 @@ mod walk_tests {
         let sources = sources();
         assert!(sources.len() > 20, "{} sources", sources.len());
         for (language, source) in &sources {
-            let mut parser = tree_sitter::Parser::new();
+            let mut parser = crate::measured_parse::parser();
             parser.set_language(language).unwrap();
             let tree = parser.parse(source, None).unwrap();
             // Descend everywhere, and also prune by kind, as the role-site visitors do.

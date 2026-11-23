@@ -148,7 +148,7 @@ pub(crate) fn trivial_accessors(file: &SourceFile, nodes: &[Symbol]) -> BTreeSet
         // Past measurement's parse-work budget, no accessor is proved (#1300).
         crate::behavior::rust_tree(&file.text)
     } else {
-        let mut parser = tree_sitter::Parser::new();
+        let mut parser = crate::measured_parse::parser();
         if parser.set_language(&language).is_err() {
             return out;
         }
@@ -372,7 +372,7 @@ mod tests {
         };
         let start = class.find(decl).unwrap();
         let end = start + class[start..].find('}').unwrap() + 1;
-        let mut parser = tree_sitter::Parser::new();
+        let mut parser = crate::measured_parse::parser();
         parser
             .set_language(&tree_sitter_java::LANGUAGE.into())
             .unwrap();
@@ -425,7 +425,7 @@ mod tests {
         };
         let start = source.find(def).unwrap();
         let end = source.trim_end().len();
-        let mut parser = tree_sitter::Parser::new();
+        let mut parser = crate::measured_parse::parser();
         parser
             .set_language(&tree_sitter_python::LANGUAGE.into())
             .unwrap();

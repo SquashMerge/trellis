@@ -531,7 +531,7 @@ pub(crate) fn build(
         file.text.len() <= 8 * 1024 * 1024,
         "Java sequence parse budget exceeded (8 MiB source)"
     );
-    let mut parser = tree_sitter::Parser::new();
+    let mut parser = crate::measured_parse::parser();
     parser.set_language(&tree_sitter_java::LANGUAGE.into())?;
     let tree = parser
         .parse(&file.text, None)
