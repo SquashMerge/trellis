@@ -29,7 +29,7 @@ import importlib.util
 
 REPO = Path(__file__).resolve().parents[1]
 DECODER_VERSION = "scip-0.10.0/CapturedScipFactV1/2"
-SCHEMA_VERSION = 48
+SCHEMA_VERSION = 49
 PINNED = REPO / "tools/synthetic-cohorts/manifest-v2.json"
 GENERATOR = REPO / "tools/synthetic-cohorts/generate.mjs"
 BATCH_MODULE = REPO / "tools/semantic-contract/semantic_batch.py"
@@ -697,7 +697,7 @@ semantic_declaration_join_candidates semantic_references semantic_reference_role
 semantic_reference_candidates semantic_call_bindings semantic_call_candidates
 semantic_call_possible_dispatch semantic_call_join_candidates semantic_type_relationships
 semantic_raw_batches semantic_raw_captures semantic_raw_exclusions semantic_revision_raw_selections
-semantic_raw_proofs semantic_raw_documents semantic_import_reports semantic_reimport
+semantic_raw_proofs semantic_raw_proof_documents semantic_raw_documents semantic_import_reports semantic_reimport
 semantic_projection_origins semantic_projection_documents semantic_projection_dependencies
 semantic_projection_dependency_targets
 semantic_projection_contexts semantic_projection_lookup_dependencies
@@ -790,7 +790,7 @@ def selected_where(table):
         return f"binding_id IN (SELECT binding_id FROM semantic_call_bindings WHERE payload_id IN ({payloads}))"
     elif table in {"semantic_raw_batches", "semantic_raw_captures", "semantic_raw_exclusions"}:
         return "batch_id IN (SELECT batch_id FROM semantic_revision_raw_selections WHERE revision_id=?)"
-    elif table in {"semantic_raw_documents", "semantic_raw_proofs"}:
+    elif table in {"semantic_raw_documents", "semantic_raw_proof_documents", "semantic_raw_proofs"}:
         return ("capture_id IN (SELECT c.capture_id FROM semantic_raw_captures c "
                 "JOIN semantic_revision_raw_selections s ON s.batch_id=c.batch_id WHERE s.revision_id=?)")
     elif table == "semantic_import_reports":
@@ -954,9 +954,10 @@ def selected_proof(db, revision, anchor_path, artifact_hash):
         cov.state,cov.selected,cov.requested,b.captured_native_revision_id,r.native_revision_id
         FROM semantic_revision_raw_selections s
         JOIN semantic_raw_captures c ON c.batch_id=s.batch_id
-        JOIN semantic_raw_proofs p ON p.capture_id=c.capture_id AND p.path=?
+        JOIN semantic_raw_proofs p ON p.capture_id=c.capture_id
+        JOIN semantic_raw_proof_documents d ON d.document_id=p.document_id AND d.path=?
         JOIN semantic_coverage cov ON cov.revision_id=s.revision_id AND cov.producer_id=s.producer_id
-            AND cov.path=p.path AND cov.language=p.language
+            AND cov.path=d.path AND cov.language=d.language
         JOIN semantic_provenance v ON v.payload_id=cov.payload_id AND v.capture_id=c.capture_id
             AND v.derived_from_provenance_id=p.proof_id
         JOIN semantic_basis b ON b.basis_id=v.basis_id AND b.payload_id=cov.payload_id
@@ -1244,8 +1245,9 @@ class SelectedView:
             self.capture_bytes = descriptor_bytes
             self.r1_docs = r1_doc
             for raw, kind, language, path, fact in db.execute(
-                    "SELECT lower(hex(proof_id)),record_kind,language,path,lower(hex(fact_digest)) "
-                    "FROM semantic_raw_proofs WHERE capture_id=?", (capture,)):
+                    "SELECT lower(hex(p.proof_id)),p.record_kind,d.language,d.path,lower(hex(p.fact_digest)) "
+                    "FROM semantic_raw_proofs p JOIN semantic_raw_proof_documents d "
+                    "ON d.document_id=p.document_id WHERE p.capture_id=?", (capture,)):
                 self.ids["proof"][raw] = (self.ids["capture"][capture], kind, language, path, fact)
         # A payload is identified by the first manifest row of the selected revision that names it.
         for raw, tuple_id in db.execute(
@@ -1368,6 +1370,14 @@ class SelectedView:
             if "stat" in payload:
                 payload["stat"] = self.stat(payload["stat"])
             cells["payload"] = payload
+        # A raw proof's document key is internal to the index (#1248 PR 4): compare the
+        # document it names.
+        if table == "semantic_raw_proofs":
+            cells["document_id"] = list(self.db.execute(
+                "SELECT language,path FROM semantic_raw_proof_documents WHERE document_id=?",
+                (cells["document_id"],)).fetchone())
+        if table == "semantic_raw_proof_documents":
+            cells["document_id"] = "<document>"
         if table == "semantic_raw_captures":
             require(cells["binary_bytes"] == (self.db.execute(
                 "SELECT binary_bytes FROM semantic_raw_captures WHERE capture_id=?",

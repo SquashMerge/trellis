@@ -1202,7 +1202,7 @@ mod tests {
         let mut stage = Stage::create(parent.path(), "test", "witness").unwrap();
         stage.conn().unwrap().execute_batch(&format!("INSERT INTO witness_state(singleton) VALUES(1); {WITNESS_PENDING_TABLE} INSERT INTO sources VALUES(0,'java','a.java','h',1),(1,'java','b.java','h',1),(2,'java','c.java','h',1),(3,'java','d.java','h',1); INSERT INTO coverage VALUES(0,0,NULL),(1,0,NULL),(2,1,NULL),(3,1,NULL); INSERT INTO documents VALUES(0,0,'a.java','w',0),(1,0,'b.java','w',0),(2,1,'c.java','w',0),(3,1,'d.java','w',0)")).unwrap();
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch("CREATE TABLE semantic_raw_proofs(capture_id INTEGER NOT NULL,proof_id BLOB NOT NULL,record_kind TEXT NOT NULL,fact_digest BLOB NOT NULL,language TEXT NOT NULL,path TEXT NOT NULL,UNIQUE(capture_id,proof_id),UNIQUE(capture_id,language,path,record_kind,fact_digest))").unwrap();
+        db.execute_batch("CREATE TABLE semantic_raw_proof_documents(document_id INTEGER PRIMARY KEY,capture_id INTEGER NOT NULL,language TEXT NOT NULL,path TEXT NOT NULL,UNIQUE(capture_id,language,path)); INSERT INTO semantic_raw_proof_documents(capture_id,language,path) VALUES(10,'java','a.java'),(10,'java','b.java'),(20,'java','c.java'),(20,'java','d.java'); CREATE TABLE semantic_raw_proofs(capture_id INTEGER NOT NULL,proof_id BLOB NOT NULL,record_kind TEXT NOT NULL,fact_digest BLOB NOT NULL,document_id INTEGER NOT NULL,UNIQUE(capture_id,proof_id),UNIQUE(document_id,record_kind,fact_digest))").unwrap();
         let kinds = ["occurrence", "symbolInformation", "relationship"];
         // Proof IDs are unique across captures, as their artifact-bound digests are.
         let mut k = 0u64;
@@ -1215,7 +1215,7 @@ mod tests {
                     k += 1;
                     // A permutation of 1..1009: proof IDs interleave the documents.
                     db.execute(
-                        "INSERT INTO semantic_raw_proofs VALUES(?1,unhex(?2),?3,unhex(?4),'java',?5)",
+                        "INSERT INTO semantic_raw_proofs VALUES(?1,unhex(?2),?3,unhex(?4),(SELECT document_id FROM semantic_raw_proof_documents WHERE capture_id=?1 AND language='java' AND path=?5))",
                         params![
                             capture,
                             format!("{:064}", k * 37 % 1009),
@@ -1311,7 +1311,7 @@ mod tests {
             // An oversized proof ID (1,000 hex digits) that sorts before every other one, so
             // the count's page cursor is never this row's.
             db.execute(
-                "INSERT INTO semantic_raw_proofs VALUES(10,zeroblob(500),'occurrence',unhex(?1),'java',?2)",
+                "INSERT INTO semantic_raw_proofs VALUES(10,zeroblob(500),'occurrence',unhex(?1),(SELECT document_id FROM semantic_raw_proof_documents WHERE capture_id=10 AND path=?2))",
                 params!["f".repeat(64), path],
             )
             .unwrap();
@@ -1454,9 +1454,9 @@ mod tests {
             "b".repeat(64),
         );
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch("CREATE TABLE semantic_raw_proofs(capture_id INTEGER,proof_id BLOB,record_kind TEXT,fact_digest BLOB,language TEXT,path TEXT,PRIMARY KEY(capture_id,proof_id))").unwrap();
+        db.execute_batch("CREATE TABLE semantic_raw_proof_documents(document_id INTEGER PRIMARY KEY,capture_id INTEGER,language TEXT,path TEXT); INSERT INTO semantic_raw_proof_documents VALUES(7,1,'java','a.java'); CREATE TABLE semantic_raw_proofs(capture_id INTEGER,proof_id BLOB,record_kind TEXT,fact_digest BLOB,document_id INTEGER,PRIMARY KEY(capture_id,proof_id))").unwrap();
         for (proof, digest) in [(&p1, &d1), (&p2, &d2)] {
-            db.execute("INSERT INTO semantic_raw_proofs VALUES(1,unhex(?1),'symbolInformation',unhex(?2),'java','a.java')", params![proof, digest]).unwrap();
+            db.execute("INSERT INTO semantic_raw_proofs VALUES(1,unhex(?1),'symbolInformation',unhex(?2),7)", params![proof, digest]).unwrap();
         }
         let rows = RetainedBatchRows::for_tests(&db, 1, test_pin());
         let entry = super::super::super::descriptor::ArtifactEntry {

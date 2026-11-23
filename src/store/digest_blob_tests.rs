@@ -21,7 +21,7 @@ fn hex(digit: char) -> String {
 /// An empty index with one raw capture (7) for derived provenance to name.
 fn index() -> Connection {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V48).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V49).unwrap();
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
     db.execute(
         "INSERT INTO semantic_raw_captures VALUES(7,1,0,'[\"rust\"]','producer',?1,'set','captured',x'','decoder')",
@@ -258,16 +258,21 @@ fn differing_content_hashes_in_one_payload_fail_the_write() {
     assert_eq!(hash, None);
 }
 
-/// A stage with two valid claims of artifact 0, published as capture 7.
+/// A stage with two valid claims of artifact 0, published as capture 7, whose document the
+/// publication has keyed (`RAW_PROOF_DOCUMENTS_SQL`).
 fn staged() -> Connection {
     let db = index();
     db.execute_batch(
         "ATTACH DATABASE ':memory:' AS stage;
          CREATE TABLE stage.sources(ord INTEGER PRIMARY KEY, language TEXT NOT NULL, path TEXT NOT NULL);
+         CREATE TABLE stage.documents(source_ord INTEGER PRIMARY KEY, artifact INTEGER NOT NULL);
          CREATE TABLE stage.claims(claim_id INTEGER PRIMARY KEY, artifact INTEGER NOT NULL, source_ord INTEGER NOT NULL, record_kind TEXT NOT NULL, fact_digest TEXT NOT NULL, proof_id TEXT NOT NULL, canonical_bytes BLOB NOT NULL);
-         INSERT INTO stage.sources VALUES(0,'rust','a.rs');",
+         INSERT INTO stage.sources VALUES(0,'rust','a.rs'),(1,'rust','b.rs');
+         INSERT INTO stage.documents VALUES(0,0);",
     )
     .unwrap();
+    db.execute(&with_capture_ids("(0,7)", RAW_PROOF_DOCUMENTS_SQL), [])
+        .unwrap();
     for (claim, proof, digest) in [(1, hex('9'), hex('1')), (2, hex('0'), hex('2'))] {
         db.execute(
             "INSERT INTO stage.claims VALUES(?1,0,0,'occurrence',?2,?3,x'7b7d')",
@@ -308,6 +313,40 @@ fn staged_raw_proofs_are_stored_as_bytes_and_a_refill_skips_stored_rows() {
         )
         .unwrap();
     assert_eq!(types, ("blob".to_owned(), 32, "blob".to_owned(), 32));
+}
+
+/// A raw proof names its document by the publication's integer key (#1248 PR 4), never by
+/// language and path, and reads resolve it back.
+#[test]
+fn staged_raw_proofs_name_their_document_by_key() {
+    let db = staged();
+    write_raw_proofs(&db, "(0,7)").unwrap();
+    let documents: Vec<(i64, String, String)> = db
+        .prepare("SELECT p.capture_id,d.language,d.path FROM semantic_raw_proofs p JOIN semantic_raw_proof_documents d ON d.document_id=p.document_id AND d.capture_id=p.capture_id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(documents, vec![(7, "rust".into(), "a.rs".into()); 2]);
+}
+
+/// A staged claim whose document has no key would store a NULL document; it fails the
+/// publication typed instead of dropping its row, and nothing of the batch is written.
+#[test]
+fn a_staged_proof_without_a_keyed_document_fails_typed_and_writes_nothing() {
+    let db = staged();
+    db.execute("UPDATE stage.claims SET source_ord=1 WHERE claim_id=2", [])
+        .unwrap();
+    {
+        let tx = db.unchecked_transaction().unwrap();
+        let error = write_raw_proofs(&tx, "(0,7)").unwrap_err();
+        assert!(
+            error.to_string().starts_with("invalid staged raw proof: "),
+            "{error:#}"
+        );
+    }
+    assert_eq!(count(&db, "semantic_raw_proofs"), 0);
 }
 
 /// `unhex` alone would store uppercase text and, under `INSERT OR IGNORE`, silently drop a row
