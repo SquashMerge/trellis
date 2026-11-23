@@ -174,8 +174,8 @@ mod tests {
         for _ in 0..3 {
             let started = std::time::Instant::now();
             assert!(matches!(parse(&text, None).unwrap(), Parse::Beyond));
-            // A hang backstop only: unbounded, this parse takes minutes.
-            assert!(started.elapsed() < std::time::Duration::from_secs(60));
+            // Unbounded, this parse takes minutes.
+            assert!(started.elapsed() < crate::testing::HANG_BACKSTOP);
         }
         let head = &text[..1020];
         let (error, calls) = calls_of(head);

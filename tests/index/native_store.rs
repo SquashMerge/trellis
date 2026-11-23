@@ -1074,8 +1074,8 @@ fn a_rust_source_past_the_parse_work_budget_publishes_as_a_gap() {
             leader,
         )
         .unwrap();
-        // A hang backstop only: unbounded, the two parses of this file take minutes.
-        assert!(started.elapsed() < std::time::Duration::from_secs(600));
+        // Unbounded, the two parses of this file take minutes.
+        assert!(started.elapsed() < trellis::testing::HANG_BACKSTOP);
     };
     let outcome = |store: &Store| {
         let status = store.status().unwrap();
