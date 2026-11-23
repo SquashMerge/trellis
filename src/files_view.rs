@@ -1,5 +1,6 @@
 //! Pinned Files outline and same-spelling syntax evidence. No binding is inferred.
 use crate::{
+    measured_parse::Meter,
     model::{IndexPin, SourceFile, SourceRange, Symbol},
     native_records::Header,
     syntax_bounds::{PARSE_TICKS, parse_work},
@@ -68,8 +69,8 @@ pub(crate) struct OutlineSyntax {
 
 /// A cached file over [`FILE_INPUT_LIMIT`].
 pub(crate) const OUTLINE_OVER_INPUT: &str = "Cached file exceeds 2 MiB outline syntax input; bindings are not marked callable and impl blocks are unnamed.";
-/// A cached file's syntax over the parse-work bound or the syntax bounds.
-pub(crate) const OUTLINE_OVER_BOUNDS: &str = "Cached file syntax exceeds the outline walk bounds (80,000 parse-work ticks, 128 levels, 1,000,000 nodes); bindings are not marked callable and impl blocks are unnamed.";
+/// A cached file's syntax over a parse-work bound or the syntax bounds.
+pub(crate) const OUTLINE_OVER_BOUNDS: &str = "Cached file syntax exceeds the outline walk bounds (80,000 parse-work ticks or a Rust file's parse-work budget, 128 levels, 1,000,000 nodes); bindings are not marked callable and impl blocks are unnamed.";
 /// An asked impl block with no syntax at its range.
 pub(crate) const OUTLINE_IMPL_MISSING: &str =
     "Cached file has no impl syntax at a measured impl block's range; that block is unnamed.";
@@ -115,12 +116,16 @@ fn outline_syntax_until(
     let hung = || now() >= backstop;
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&language)?;
-    // The parse-work bound comes first: once it is reached, the clock cannot change the answer.
-    // Error recovery counts more per tick (#1227).
-    let mut ticks = 0;
+    // The parse-work bounds come first: once one is reached, the clock cannot change the
+    // answer. Error recovery counts more per tick (#1227), and a Rust parse is also held to
+    // measurement's parse-work budget, so a file past it is refused as indexing refused it
+    // (#1300).
+    let meter = (file.language == "rust").then(|| Meter::start(file.text.len()));
+    let (mut ticks, mut over) = (0, false);
     let mut progress = |state: &tree_sitter::ParseState| {
         ticks += parse_work(state);
-        if ticks > PARSE_TICKS || hung() {
+        over = ticks > PARSE_TICKS || meter.as_ref().is_some_and(Meter::beyond);
+        if over || hung() {
             std::ops::ControlFlow::Break(())
         } else {
             std::ops::ControlFlow::Continue(())
@@ -132,7 +137,7 @@ fn outline_syntax_until(
         Some(tree_sitter::ParseOptions::new().progress_callback(&mut progress)),
     );
     let Some(tree) = tree else {
-        if ticks > PARSE_TICKS {
+        if over {
             return beyond(OUTLINE_OVER_BOUNDS);
         }
         // Only the backstop stops any other parse of a file within the input bound.
@@ -266,11 +271,12 @@ pub(crate) struct ImplTarget {
 /// Nor does a blanket `impl<A: X> Y for A`: `A` is no type.
 pub(crate) fn impl_block_target(block: &str) -> Option<ImplTarget> {
     let header = format!("{}{{}}", &block[..block.find('{')?]);
-    let mut parser = tree_sitter::Parser::new();
-    parser
-        .set_language(&tree_sitter_rust::LANGUAGE.into())
-        .ok()?;
-    let tree = parser.parse(&header, None)?;
+    // A header past measurement's parse-work budget names nothing either (#1300).
+    let crate::measured_parse::Parse::Tree(tree) =
+        crate::measured_parse::parse(&header, None).ok()?
+    else {
+        return None;
+    };
     let root = tree.root_node();
     if root.has_error() {
         return None;
@@ -473,8 +479,10 @@ pub(crate) fn scan_file(
         || started.elapsed() >= FILE_TIME_LIMIT || total_started.elapsed() >= TOTAL_TIME_LIMIT;
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&language)?;
+    // A Rust parse past measurement's parse-work budget is skipped like one over time (#1300).
+    let meter = (file.language == "rust").then(|| Meter::start(file.text.len()));
     let mut progress = |_: &tree_sitter::ParseState| {
-        if expired() {
+        if meter.as_ref().is_some_and(Meter::beyond) || expired() {
             std::ops::ControlFlow::Break(())
         } else {
             std::ops::ControlFlow::Continue(())
@@ -816,6 +824,29 @@ mod outline_bounds_tests {
                 assert_eq!(syntax.warning, Some(OUTLINE_OVER_BOUNDS));
                 assert_eq!(facts(&syntax), (vec![], vec![]));
             }
+        }
+    }
+
+    /// #1300 (owner ruling 2026-11-22): a Rust file past measurement's parse-work budget has no
+    /// facts and the bounds warning, as indexing refuses it, on every run and on a clock that
+    /// never moves. Its parse is within the tick bound, so before, it ran for minutes and only
+    /// the hang backstop stopped it, typed `deadline_exceeded`.
+    #[test]
+    fn a_rust_file_past_the_parse_work_budget_has_no_facts_and_says_so() {
+        let file = file(
+            "rust",
+            format!("{RUST}{}", crate::measured_parse::inputs::recovery()),
+        );
+        let blocks = [(0, RUST.find('\n').unwrap())];
+        let stopped = Instant::now();
+        for _ in 0..3 {
+            let started = Instant::now();
+            let syntax = outline_syntax_until(&file, &blocks, &|| stopped)
+                .unwrap()
+                .unwrap();
+            assert_eq!(syntax.warning, Some(OUTLINE_OVER_BOUNDS));
+            assert_eq!(facts(&syntax), (vec![], vec![]));
+            assert!(started.elapsed() < crate::testing::HANG_BACKSTOP);
         }
     }
 

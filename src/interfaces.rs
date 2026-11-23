@@ -917,33 +917,23 @@ impl LineIndex {
     }
 }
 
-/// Parses one document. An abort from `check` is returned as is.
+/// Parses one document. An abort from `check` is returned as is. Extraction skips every
+/// document published with only its file module; a Rust source a read still finds past
+/// measurement's parse-work budget reads as one parser error, so nothing is extracted from it
+/// (#1300).
 pub(crate) fn parse(
     doc: &DocumentInput,
     language: &tree_sitter::Language,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<tree_sitter::Tree> {
     check()?;
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(language)?;
     let source = &doc.file.text;
-    let mut aborted = None;
-    let tree = parser.parse_with_options(
-        &mut |offset, _| &source.as_bytes()[offset..],
-        None,
-        Some(
-            tree_sitter::ParseOptions::new().progress_callback(&mut |_| {
-                if let Err(e) = check() {
-                    aborted = Some(e);
-                    std::ops::ControlFlow::Break(())
-                } else {
-                    std::ops::ControlFlow::Continue(())
-                }
-            }),
-        ),
-    );
-    if let Some(e) = aborted {
-        return Err(e);
-    }
-    tree.context("bounded_work: interface extraction parser stopped")
+    Ok(crate::syntax_bounds::parse_stored(
+        &doc.key.language,
+        language,
+        source,
+        "bounded_work: interface extraction parser stopped",
+        check,
+    )?
+    .unwrap_or_else(|| crate::syntax_bounds::unread_tree(source)))
 }

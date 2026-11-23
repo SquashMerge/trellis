@@ -382,3 +382,268 @@ fn portable_exception_matches_two_real_clones_without_replacing_native_identitie
     }
     assert_eq!(hashes[0], hashes[1]);
 }
+
+/// A checkout of `files`, indexed and published.
+fn published(files: &[(&str, &str)]) -> (tempfile::TempDir, tempfile::TempDir, Store, IndexPin) {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    for (path, source) in files {
+        let path = root.path().join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, source).unwrap();
+    }
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let baseline = store.index_baseline().unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    let (graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(root.path().into()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let pin = store
+        .publish_native(&graph, &capture, &native, &leader, baseline, &cancel)
+        .unwrap();
+    drop(leader);
+    (state, root, store, pin)
+}
+
+/// `value` without its index pin, its partial files and their limitation, its counts of what
+/// is in no layer, and any row that names `path`. Rows are sorted: syntax IDs, which can order
+/// them, differ between checkouts.
+fn without(value: &Value, path: &str) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .filter(|(key, _)| {
+                    !matches!(
+                        key.as_str(),
+                        "indexGeneration"
+                            | "indexRevision"
+                            | "partialFiles"
+                            | "limitations"
+                            | "unassignedFileCount"
+                            | "unassignedCount"
+                    )
+                })
+                .map(|(key, value)| (key.clone(), without(value, path)))
+                .collect(),
+        ),
+        Value::Array(rows) => {
+            let mut rows: Vec<_> = rows
+                .iter()
+                .filter(|row| !row.to_string().contains(path))
+                .map(|row| without(row, path))
+                .collect();
+            rows.sort_by_key(Value::to_string);
+            Value::Array(rows)
+        }
+        other => other.clone(),
+    }
+}
+
+/// Every value of `key` in `value`, in document order.
+fn values_of<'a>(value: &'a Value, key: &str) -> Vec<&'a Value> {
+    match value {
+        Value::Object(map) => map
+            .iter()
+            .flat_map(|(name, value)| {
+                if name == key {
+                    vec![value]
+                } else {
+                    values_of(value, key)
+                }
+            })
+            .collect(),
+        Value::Array(rows) => rows.iter().flat_map(|row| values_of(row, key)).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// #1300: a checkout holding a Rust source past measurement's parse-work budget (#1282) reads
+/// in bounded time. Its whole-checkout metrics, Architecture view, references and rules check
+/// each finish within the hang backstop, on every run. The file is one whole-file
+/// `evidence_budget` partial file and contributes nothing else, and every other result equals
+/// the checkout's without it. Before, each read re-parsed the file's stored source for minutes.
+#[test]
+fn whole_checkout_reads_skip_a_rust_source_past_the_parse_work_budget() {
+    const RULES: &str = r#"version = 1
+[layers.high]
+order = 1
+paths = ["src/high.rs"]
+[layers.low]
+order = 2
+paths = ["src/low.rs"]
+[roles.square]
+select = { name = "Square" }
+[roles.shape]
+select = { name = "Shape" }
+[[rules]]
+id = "squares-are-shapes"
+for_each = "square"
+require = [{ implements = "shape" }]
+"#;
+    let clean = [
+        ("src/lib.rs", "pub mod high;\npub mod low;\n"),
+        (
+            "src/high.rs",
+            "pub trait Shape {}\npub fn upper(n: u32) -> u32 { if n == 0 { 0 } else { upper(n - 1) } }\n",
+        ),
+        (
+            "src/low.rs",
+            "pub struct Square;\nimpl crate::high::Shape for Square {}\npub fn lower() { crate::high::upper(3); }\n",
+        ),
+        ("src/flow.py", "def go(x):\n    if x:\n        go(x - 1)\n"),
+        (".trellis/rules.toml", RULES),
+    ];
+    let recovery = "} = ) + ] * ".repeat((64 << 10) / 12);
+    let mut all = clean.to_vec();
+    all.push(("src/recovery.rs", &recovery));
+    let reads = |store: &Store, pin: IndexPin| {
+        let timed = |read: &dyn Fn() -> Value| {
+            let started = std::time::Instant::now();
+            let value = read();
+            // Unbounded, each read re-parses the file for minutes.
+            assert!(started.elapsed() < trellis::testing::HANG_BACKSTOP);
+            value
+        };
+        let options = trellis::metrics_read::MetricsOptions {
+            pin: Some(pin),
+            aggregate: "max".into(),
+            ..Default::default()
+        };
+        let metrics = timed(&|| {
+            let response = store.evidence_response().unwrap();
+            let payload = response.metrics_at(&options, &mut || Ok(())).unwrap();
+            serde_json::to_value(response.finish(payload).unwrap()).unwrap()
+        });
+        let view = timed(&|| {
+            let response = store.evidence_response().unwrap();
+            let value = response
+                .architecture_view(&options, &mut || Ok(()))
+                .unwrap();
+            response.finish(value).unwrap()
+        });
+        let references = timed(&|| read(store, "references", json!({"expectedBasis":pin})));
+        let check = timed(&|| read(store, "check", json!({"expectedBasis":pin})));
+        [metrics, view, references, check]
+    };
+    // The source set ID names the checkout's root, and syntax and provenance IDs hash it in, so
+    // a row of either checkout reads the same with them and the root path replaced.
+    let checkout = |root: &tempfile::TempDir, read: &Value| {
+        let id = read["files"][0]["sourceSetId"].as_str().unwrap().to_owned();
+        let root = root.path().display().to_string();
+        move |value: &Value| -> Value {
+            let text = value
+                .to_string()
+                .replace(&id, "<set>")
+                .replace(&root, "<root>");
+            serde_json::from_str(&without_digests(&text)).unwrap()
+        }
+    };
+    let (_clean_state, clean_root, clean_store, clean_pin) = published(&clean);
+    let expected = reads(&clean_store, clean_pin);
+    let expected_view = checkout(&clean_root, &expected[0]);
+    let expected: Vec<Value> = expected.iter().map(&expected_view).collect();
+    let (_state, root, store, pin) = published(&all);
+    for read in &expected {
+        assert!(
+            values_of(read, "partialFiles")
+                .iter()
+                .all(|files| **files == json!([])),
+            "{read}"
+        );
+    }
+    for _ in 0..2 {
+        let found = reads(&store, pin);
+        let found_view = checkout(&root, &found[0]);
+        let found: Vec<Value> = found.iter().map(&found_view).collect();
+        for (found, expected) in found.iter().zip(&expected) {
+            let (found_rest, expected_rest) = (
+                without(found, "src/recovery.rs"),
+                without(expected, "src/recovery.rs"),
+            );
+            assert!(
+                found_rest == expected_rest,
+                "{:?}",
+                difference(&found_rest, &expected_rest, String::new())
+            );
+            // The file is a module in no layer, like any other.
+            for key in ["unassignedFileCount", "unassignedCount"] {
+                let counts = |read: &Value| -> Vec<u64> {
+                    values_of(read, key)
+                        .into_iter()
+                        .map(|count| count.as_u64().unwrap())
+                        .collect()
+                };
+                let expected: Vec<u64> = counts(expected).into_iter().map(|n| n + 1).collect();
+                assert_eq!(counts(found), expected, "{key}");
+            }
+            let lists = values_of(found, "partialFiles");
+            assert!(!lists.is_empty(), "{found}");
+            for files in lists {
+                let [file] = files.as_array().unwrap().as_slice() else {
+                    panic!("{files}");
+                };
+                assert_eq!(
+                    (
+                        &file["path"],
+                        &file["reason"],
+                        &file["range"],
+                        &file["subtrees"]
+                    ),
+                    (
+                        &json!("src/recovery.rs"),
+                        &json!("evidence_budget"),
+                        &json!({"start": 0, "end": recovery.len()}),
+                        &json!(0)
+                    )
+                );
+            }
+        }
+    }
+}
+
+/// The first path where `a` and `b` differ, with both values there.
+fn difference(a: &Value, b: &Value, path: String) -> Option<(String, Value, Value)> {
+    match (a, b) {
+        (Value::Object(x), Value::Object(y)) => {
+            for key in x.keys().chain(y.keys()) {
+                let (u, v) = (x.get(key), y.get(key));
+                if u != v {
+                    return difference(
+                        u.unwrap_or(&Value::Null),
+                        v.unwrap_or(&Value::Null),
+                        format!("{path}/{key}"),
+                    );
+                }
+            }
+            None
+        }
+        (Value::Array(x), Value::Array(y)) if x.len() == y.len() => x
+            .iter()
+            .zip(y)
+            .enumerate()
+            .find_map(|(i, (u, v))| difference(u, v, format!("{path}/{i}"))),
+        _ => (a != b).then(|| (path, a.clone(), b.clone())),
+    }
+}
+
+/// `text` with every run of 32 or more lowercase hex digits, a digest, replaced.
+fn without_digests(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut run = String::new();
+    for c in text.chars().chain(std::iter::once(' ')) {
+        if c.is_ascii_digit() || ('a'..='f').contains(&c) {
+            run.push(c);
+            continue;
+        }
+        out.push_str(if run.len() >= 32 { "<digest>" } else { &run });
+        run.clear();
+        out.push(c);
+    }
+    out.pop();
+    out
+}

@@ -101,6 +101,7 @@ fn snapshot_at(
         manifests: Vec::new(),
         root_tsconfig: None,
         evidence_gaps: gaps,
+        unparsed: Default::default(),
     }
 }
 

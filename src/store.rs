@@ -1674,6 +1674,7 @@ impl EvidenceResponse {
         let mut documents = Vec::new();
         let mut regions = Vec::new();
         let mut evidence_gaps = BTreeMap::new();
+        let mut unparsed = BTreeSet::new();
         let mut pending = Vec::new();
         let mut source_bytes = 0u64;
         let mut stored_bytes = 0u64;
@@ -1727,6 +1728,9 @@ impl EvidenceResponse {
             };
             if let Some(reason) = crate::syntax_bounds::module_only_reason(diagnostic.as_deref()) {
                 evidence_gaps.insert(key.clone(), reason);
+            }
+            if crate::syntax_bounds::past_parse_work(diagnostic.as_deref()) {
+                unparsed.insert(key.clone());
             }
             pending.push((key, std::sync::Mutex::new(Some(fetched))));
             progress(pending.len(), total);
@@ -2039,6 +2043,7 @@ impl EvidenceResponse {
                 manifests: manifests.into_values().collect(),
                 root_tsconfig,
                 evidence_gaps,
+                unparsed,
             },
             regions,
         ))

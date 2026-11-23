@@ -4,7 +4,7 @@ use crate::native_evidence::{Declaration, Range};
 use crate::references::Snapshot;
 #[cfg(test)]
 use crate::references::work::{self, Work};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use globset::GlobSet;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -411,6 +411,15 @@ struct Bases {
     extends: Option<Vec<String>>,
     implements: Option<Vec<String>>,
 }
+impl Bases {
+    /// The known-empty bases of a declaration that is no type or impl.
+    fn none() -> Self {
+        Self {
+            extends: Some(vec![]),
+            implements: Some(vec![]),
+        }
+    }
+}
 fn children(node: tree_sitter::Node<'_>) -> Vec<tree_sitter::Node<'_>> {
     let mut c = node.walk();
     node.named_children(&mut c).collect()
@@ -477,28 +486,28 @@ fn parse_bases(
         "typescript" => crate::indexer_ts::grammar(&doc.key.path),
         _ => anyhow::bail!("store_unavailable: unknown selector language"),
     };
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&language)?;
     let source = &doc.file.text;
-    let mut aborted = None;
-    let tree = parser.parse_with_options(
-        &mut |offset, _| &source.as_bytes()[offset..],
-        None,
-        Some(
-            tree_sitter::ParseOptions::new().progress_callback(&mut |_| {
-                if let Err(e) = check() {
-                    aborted = Some(e);
-                    std::ops::ControlFlow::Break(())
-                } else {
-                    std::ops::ControlFlow::Continue(())
-                }
-            }),
-        ),
-    );
-    if let Some(e) = aborted {
-        return Err(e);
+    // Only a type or an impl reads its syntax. A document without one, such as one published
+    // with only its file module (#1300), is not parsed: every row's bases are empty.
+    let typed = |d: &crate::native_evidence::Declaration| {
+        matches!(d.kind.as_str(), "type" | "implementation")
+    };
+    if !doc.declarations.iter().any(typed) {
+        return Ok(doc
+            .declarations
+            .iter()
+            .map(|d| (d.syntax_id.clone(), Bases::none()))
+            .collect());
     }
-    let tree = tree.context("bounded_work: selector parser stopped")?;
+    // A Rust source past measurement's parse-work budget reads as one parser error (#1300).
+    let tree = crate::syntax_bounds::parse_stored(
+        &doc.key.language,
+        &language,
+        source,
+        "bounded_work: selector parser stopped",
+        check,
+    )?
+    .unwrap_or_else(|| crate::syntax_bounds::unread_tree(source));
     // A base clause inside a parser error goes unseen, so its file's bases stay unknown.
     let broken = tree.root_node().has_error();
     let mut types = BTreeMap::new();
@@ -513,14 +522,8 @@ fn parse_bases(
     let mut result = BTreeMap::new();
     for d in &doc.declarations {
         check()?;
-        if !matches!(d.kind.as_str(), "type" | "implementation") {
-            result.insert(
-                d.syntax_id.clone(),
-                Bases {
-                    extends: Some(vec![]),
-                    implements: Some(vec![]),
-                },
-            );
+        if !typed(d) {
+            result.insert(d.syntax_id.clone(), Bases::none());
             continue;
         }
         if broken {

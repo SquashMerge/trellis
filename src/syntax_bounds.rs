@@ -81,6 +81,16 @@ impl SyntaxGap {
         }
     }
 
+    /// The whole-file gap of a Rust source a read found past measurement's parse-work budget
+    /// (#1300): the `evidence_budget` gap indexing publishes for it.
+    pub(crate) fn past_parse_work(bytes: usize) -> Self {
+        Self::module_only(
+            module_only_reason(Some(crate::measured_parse::DIAGNOSTIC))
+                .expect("the parse-work diagnostic has a reason"),
+            bytes,
+        )
+    }
+
     pub(crate) fn file(&self, key: &DocumentKey) -> PartialFile {
         PartialFile {
             source_set_id: key.source_set_id.clone(),
@@ -122,6 +132,85 @@ pub(crate) fn module_only_reason(diagnostic: Option<&str>) -> Option<&'static st
         .into_iter()
         .find(|skip| skip.diagnostic() == diagnostic)
         .map(|skip| skip.reason())
+}
+
+/// Whether indexing found this document's Rust parse past measurement's parse-work budget
+/// (#1282), from its stored coverage diagnostic. Its syntax was never read, so no read parses
+/// it again (#1300): it reads as [`unread_tree`].
+pub(crate) fn past_parse_work(diagnostic: Option<&str>) -> bool {
+    diagnostic == Some(crate::measured_parse::DIAGNOSTIC)
+}
+
+/// Parse a document's stored source for a view-time read, observing `check` at every progress
+/// tick (#1300). A Rust parse is also bounded by measurement's parse-work budget, checked
+/// first, so its outcome is measurement's, whatever the clock: `Ok(None)` is a Rust source past
+/// that budget. A parse that stops for no other reason fails with `stopped`.
+pub(crate) fn parse_stored(
+    language: &str,
+    grammar: &tree_sitter::Language,
+    text: &str,
+    stopped: &'static str,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<Option<tree_sitter::Tree>> {
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(grammar)?;
+    let meter = (language == "rust").then(|| crate::measured_parse::Meter::start(text.len()));
+    let mut beyond = false;
+    let mut aborted = None;
+    let tree = parser.parse_with_options(
+        &mut |offset, _| &text.as_bytes()[offset..],
+        None,
+        Some(
+            tree_sitter::ParseOptions::new().progress_callback(&mut |_| {
+                beyond = meter.as_ref().is_some_and(|meter| meter.beyond());
+                if beyond {
+                    return std::ops::ControlFlow::Break(());
+                }
+                match check() {
+                    Ok(()) => std::ops::ControlFlow::Continue(()),
+                    Err(error) => {
+                        aborted = Some(error);
+                        std::ops::ControlFlow::Break(())
+                    }
+                }
+            }),
+        ),
+    );
+    if let Some(error) = aborted {
+        return Err(error);
+    }
+    match tree {
+        Some(tree) => Ok(Some(tree)),
+        None if beyond => Ok(None),
+        None => anyhow::bail!(stopped),
+    }
+}
+
+/// The syntax a read gives a Rust source whose parse is past the parse-work budget (#1300):
+/// one parser error over the whole file. Every reader then treats the file as one whose
+/// syntax could hide anything, as for any file with a syntax error, and reads nothing inside
+/// it. The tree's only node boundaries are the start and end of `text`.
+pub(crate) fn unread_tree(text: &str) -> tree_sitter::Tree {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .expect("the Rust grammar loads");
+    // U+0001 is a token in no grammar here (see `skipped_source`), so the tree is one parser
+    // error over one byte. The edit then stretches that byte over the whole text.
+    let mut tree = parser
+        .parse("\u{1}", None)
+        .expect("an uncancelled parse ends");
+    let lines = text.bytes().filter(|&byte| byte == b'\n').count();
+    let column = text.len() - text.rfind('\n').map_or(0, |at| at + 1);
+    tree.edit(&tree_sitter::InputEdit {
+        start_byte: 0,
+        old_end_byte: 1,
+        new_end_byte: text.len(),
+        start_position: tree_sitter::Point::new(0, 0),
+        old_end_position: tree_sitter::Point::new(0, 1),
+        new_end_position: tree_sitter::Point::new(lines, column),
+    });
+    tree
 }
 
 /// The limitation a result carries when it has partial files.
@@ -356,6 +445,75 @@ mod tests {
             );
             let (ticks, work) = count(&clean_of_size(language, garbage.len()));
             assert_eq!(work, ticks, "{language}");
+        }
+    }
+
+    /// #1300: a read's parse of a Rust source past measurement's parse-work budget ends in a
+    /// bounded time with no tree, on every run, while its own check never stops it. A clean
+    /// source gets the very tree an unbounded parse gives, and another language is not held
+    /// to the budget.
+    #[test]
+    fn a_read_parse_of_rust_is_held_to_the_parse_work_budget() {
+        let grammar = parse_work_inputs::grammar;
+        let recovery = crate::measured_parse::inputs::recovery();
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            let tree = parse_stored("rust", &grammar("rust"), &recovery, "stopped", &mut || {
+                Ok(())
+            })
+            .unwrap();
+            assert!(tree.is_none());
+            // Unbounded, this parse takes minutes.
+            assert!(started.elapsed() < crate::testing::HANG_BACKSTOP);
+        }
+        let clean = include_str!("classes.rs");
+        let tree = parse_stored("rust", &grammar("rust"), clean, "stopped", &mut || Ok(()))
+            .unwrap()
+            .unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&grammar("rust")).unwrap();
+        let unbounded = parser.parse(clean, None).unwrap();
+        assert_eq!(tree.root_node().to_sexp(), unbounded.root_node().to_sexp());
+        let garbage = parse_work_inputs::syntax_errors();
+        let tree = parse_stored(
+            "javascript",
+            &grammar("javascript"),
+            &garbage,
+            "stopped",
+            &mut || Ok(()),
+        )
+        .unwrap();
+        assert!(tree.is_some());
+        let error = parse_stored("rust", &grammar("rust"), clean, "stopped", &mut || {
+            anyhow::bail!("cancelled")
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "cancelled");
+    }
+
+    /// #1300: the unread tree is one parser error from the start of the text to its end, and
+    /// has no node boundary in between, so no reader can slice the text off a character.
+    #[test]
+    fn an_unread_tree_is_one_parser_error_over_the_whole_text() {
+        for text in [
+            "fn f() {}\n".to_owned(),
+            "é} = )\n+ ] * ü".to_owned(),
+            crate::measured_parse::inputs::recovery(),
+        ] {
+            let tree = unread_tree(&text);
+            let root = tree.root_node();
+            assert!(root.has_error());
+            assert_eq!((root.start_byte(), root.end_byte()), (0, text.len()));
+            let mut stack = vec![root];
+            while let Some(node) = stack.pop() {
+                for byte in [node.start_byte(), node.end_byte()] {
+                    assert!(byte == 0 || byte == text.len(), "{node:?}");
+                }
+                let mut cursor = node.walk();
+                stack.extend(node.children(&mut cursor));
+            }
+            let gap = scan(root, &mut || Ok(())).unwrap().unwrap();
+            assert_eq!(gap.reason, "syntax_error");
         }
     }
 

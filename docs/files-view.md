@@ -62,6 +62,7 @@ which replaced the 250 ms per-file time bound for the outline):
 | --- | --- |
 | Cached source per parsed file | 2 MiB |
 | Parse work: the file's parse and its macro re-parses together | 80,000 tree-sitter progress ticks; a tick of the file's own parse in error recovery counts 25 |
+| Parse work of a Rust file's own parse | Measurement's parse-work budget: 16 tree-sitter allocator calls per source byte, plus 1,000,000 |
 | Syntax depth of the walk | 128 levels |
 | Syntax nodes the walk visits | 1,000,000 |
 | Re-parsed macro input (a Rust `impl` inside a measured macro) | Measurement's macro byte budget |
@@ -83,6 +84,10 @@ the parse-work bound well before its parse ends. The flag only approximates reco
 misses recovery that always keeps one parse version out of error, which can still reach the
 backstop, and it can stay set after the parser has recovered, which counts that rest of the file
 at 25 too. On 1,840 large real files with an injected syntax error, the highest count was 49,330.
+A Rust file's own parse is also held to measurement's parse-work budget
+([daemon-v1.md](daemon-v1.md#current-limits), #1282), counted the same way indexing counts it. A
+file past it, such as `} = ) + ] * ` repeated, gets the warning, as indexing kept only its file
+module, instead of running into the hang backstop (the [2026-11-22 owner ruling](https://github.com/SquashMerge/trellis/issues/1300)).
 The MCP lookup-key derivation shares these bounds but answers within MCP's five-second call
 deadline: under heavy load, refusing a pathological document near the parse-work bound can take
 longer than that, and the call then answers a typed `deadline_exceeded` first (a documented

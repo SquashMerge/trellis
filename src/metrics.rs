@@ -6,7 +6,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use serde_json::{Value, json};
-use tree_sitter::{Node, Parser};
+use tree_sitter::Node;
 
 use crate::native_evidence::{Call, ControlRegion, Declaration, DeclarationRole, Range};
 use crate::native_rust_macros::Expansions;
@@ -215,11 +215,16 @@ fn bind(
             ))?
             .document;
         let language = document.language.as_str();
-        let mut parser = Parser::new();
-        parser.set_language(&grammar(language, &document.path)?)?;
-        let tree = parser
-            .parse(source, None)
-            .context("bounded_work: call syntax parse")?;
+        // A Rust source past measurement's parse-work budget reads as one parser error, where
+        // no call is unqualified (#1300).
+        let tree = crate::syntax_bounds::parse_stored(
+            language,
+            &grammar(language, &document.path)?,
+            source,
+            "bounded_work: call syntax parse",
+            check,
+        )?
+        .unwrap_or_else(|| crate::syntax_bounds::unread_tree(source));
         check()?;
         Some((tree, language == "rust"))
     } else {
@@ -465,31 +470,31 @@ fn compute_source(
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<SourceScores> {
     check()?;
-    let mut parser = Parser::new();
-    parser.set_language(&grammar(language, document_path(declarations))?)?;
-    let mut aborted = None;
-    let tree = parser.parse_with_options(
-        &mut |offset, _| &source.as_bytes()[offset..],
-        None,
-        Some(
-            tree_sitter::ParseOptions::new().progress_callback(&mut |_| {
-                #[cfg(feature = "test-support")]
-                let _parser_progress = ParserProgressMarker::enter();
-                if let Err(error) = check() {
-                    aborted = Some(error);
-                    std::ops::ControlFlow::Break(())
-                } else {
-                    std::ops::ControlFlow::Continue(())
-                }
-            }),
-        ),
-    );
-    if let Some(error) = aborted {
-        return Err(error);
-    }
+    let grammar = grammar(language, document_path(declarations))?;
+    let tree = crate::syntax_bounds::parse_stored(
+        language,
+        &grammar,
+        source,
+        "bounded_work: parser stopped",
+        &mut || {
+            #[cfg(feature = "test-support")]
+            let _parser_progress = ParserProgressMarker::enter();
+            check()
+        },
+    )?;
     check()?;
-    let tree = tree.context("bounded_work: parser stopped")?;
-    let gap = crate::syntax_bounds::scan(tree.root_node(), check)?;
+    // A Rust source past measurement's parse-work budget reads as one parser error, and is the
+    // whole-file gap indexing publishes for it (#1300).
+    let (tree, gap) = match tree {
+        Some(tree) => {
+            let gap = crate::syntax_bounds::scan(tree.root_node(), check)?;
+            (tree, gap)
+        }
+        None => (
+            crate::syntax_bounds::unread_tree(source),
+            Some(SyntaxGap::past_parse_work(source.len())),
+        ),
+    };
     let newline_offsets: Vec<usize> = source
         .bytes()
         .enumerate()

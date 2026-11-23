@@ -4,7 +4,7 @@ use crate::behavior::{
     CONTINUES_LABEL, Participant, SequenceStep, SequenceView, TRY_LABEL, fold_guard, measured_call,
 };
 use crate::model::{CallSite, IndexPin, SourceFile, SourceRange, Symbol, SymbolKind};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use sha2::{Digest, Sha256};
 use tree_sitter::Node;
 
@@ -786,11 +786,14 @@ pub fn build(
         seed.range.start_byte < seed.range.end_byte && seed.range.end_byte <= file.text.len(),
         "invalid symbol source range"
     );
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&tree_sitter_rust::LANGUAGE.into())?;
-    let tree = parser
-        .parse(&file.text, None)
-        .context("Rust parse unavailable")?;
+    // A source past measurement's parse-work budget has no sequence (#1300).
+    let tree = match crate::measured_parse::parse(&file.text, None)? {
+        crate::measured_parse::Parse::Tree(tree) => tree,
+        crate::measured_parse::Parse::Beyond => anyhow::bail!(
+            "bounded_work: Rust sequence source is past the per-file parse-work budget"
+        ),
+        crate::measured_parse::Parse::Cancelled => anyhow::bail!("Rust parse unavailable"),
+    };
     let mut expansions = crate::native_rust_macros::Expansions::new(&file.text);
     // A callable measured inside a macro has syntax only in that macro's expansion (#551).
     let mut node =
