@@ -118,6 +118,58 @@ fn two_builds_of_one_revision_are_canonically_equal_and_an_edit_is_not() {
     assert!(at.starts_with("/interfaces/routes/0"), "{at}");
 }
 
+/// `core` with `edit` applied to the first metric row of the first measured document.
+fn with_first_metric_row(
+    mut core: ArchitectureCore,
+    edit: fn(&mut DeclarationMetrics),
+) -> ArchitectureCore {
+    let Some(Ok(mut metrics)) = core.metrics.take() else {
+        panic!("the core measured its documents");
+    };
+    let (key, document) = metrics
+        .iter()
+        .find(|(_, document)| !document.rows.is_empty())
+        .map(|(key, document)| (key.clone(), document.clone()))
+        .expect("a measured declaration");
+    let mut rows = document.rows.clone();
+    edit(&mut rows[0]);
+    metrics.insert(
+        key,
+        Arc::new(MetricsDocument {
+            rows,
+            gap: document.gap.clone(),
+            physical_lines: document.physical_lines,
+            physical_bytes: document.physical_bytes,
+            file_role: document.file_role,
+        }),
+    );
+    core.metrics = Some(Ok(metrics));
+    core
+}
+
+/// A metric row's `name` and `kind` feed the top-cognitive answer though its JSON skips
+/// them: a change to either alone is a canonical difference.
+#[test]
+fn a_metric_row_name_or_kind_alone_is_a_canonical_difference() {
+    let (_state, _root, store) = checkout();
+    let base = core(&store).canonical().unwrap();
+    type RowEdit = fn(&mut DeclarationMetrics);
+    let edits: [(&str, RowEdit); 2] = [
+        ("name", |row| row.name = Some("renamed".into())),
+        ("kind", |row| row.kind = "renamedKind".into()),
+    ];
+    for (field, edit) in edits {
+        let edited = with_first_metric_row(core(&store), edit)
+            .canonical()
+            .unwrap();
+        let at = first_difference(&base, &edited).expect("the edit is a difference");
+        assert!(
+            at.starts_with("/metrics/") && at.ends_with(&format!("/{field}")),
+            "{field}: {at}"
+        );
+    }
+}
+
 #[test]
 fn a_kept_failure_is_part_of_the_canonical_core() {
     let (_state, _root, store) = checkout();

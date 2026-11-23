@@ -677,7 +677,13 @@ impl RulesBase {
             "semantic": semantic,
             "documents": documents
                 .iter()
-                .map(|rows| json!([rows.instances, rows.test_only]))
+                .map(|rows| {
+                    let DocumentRuleRows {
+                        instances,
+                        test_only,
+                    } = rows.as_ref();
+                    json!([instances, test_only])
+                })
                 .collect::<Vec<_>>(),
             "workUsed": work_used,
             "apps": apps,

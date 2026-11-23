@@ -1,6 +1,8 @@
 //! The canonical form of a [`ReferenceBase`] (#1301): every field, so two results compare
 //! equal only when every read of them answers the same. Test support only.
-use super::{EdgeSites, MAX_SAMPLE_LIMIT, ReferenceBase, Site, SourceReferences, Target};
+use super::{
+    EdgeSites, MAX_SAMPLE_LIMIT, ReferenceBase, Site, SiteCoverage, SourceReferences, Target,
+};
 use anyhow::Result;
 use serde_json::{Value, json};
 
@@ -30,16 +32,7 @@ impl ReferenceBase {
         let coverage: Vec<Value> = selected
             .coverage
             .iter()
-            .map(|((path, test), row)| {
-                json!([
-                    path,
-                    test,
-                    row.sites,
-                    row.mapped,
-                    row.unresolved,
-                    row.semantic
-                ])
-            })
+            .map(|((path, test), row)| json!([path, test, coverage_row(row)]))
             .collect();
         Ok(json!({
             "pin": pin,
@@ -111,9 +104,7 @@ impl SourceReferences {
             "packages": packages.iter().collect::<Vec<_>>(),
             "coverage": coverage
                 .iter()
-                .map(|((test, gates), row)| {
-                    json!([test, gates, row.sites, row.mapped, row.unresolved, row.semantic])
-                })
+                .map(|((test, gates), row)| json!([test, gates, coverage_row(row)]))
                 .collect::<Vec<_>>(),
             "mapped": mapped,
             "semantic": semantic,
@@ -121,12 +112,44 @@ impl SourceReferences {
     }
 }
 
+fn coverage_row(row: &SiteCoverage) -> Value {
+    // Exhaustive, so a new field fails to compile until it is compared.
+    let SiteCoverage {
+        sites,
+        mapped,
+        unresolved,
+        semantic,
+    } = row;
+    json!([sites, mapped, unresolved, semantic])
+}
+
 impl Site {
     /// The serialized site and the fields its JSON skips.
     fn canonical(&self) -> Value {
+        // Exhaustive, so a new field fails to compile until it is compared: the JSON carries
+        // every field but `gates` and `ordinal`, which are added here.
+        let Self {
+            owner_syntax_id: _,
+            role: _,
+            range: _,
+            lines: _,
+            relation_kind: _,
+            spelling: _,
+            call_id: _,
+            caller: _,
+            caller_reason: _,
+            owner: _,
+            target: _,
+            target_reason: _,
+            mapping: _,
+            provenance_id: _,
+            semantic_metadata: _,
+            gates,
+            ordinal,
+        } = self;
         let mut value = json!(self);
-        value["gates"] = json!(self.gates);
-        value["ordinal"] = json!(self.ordinal);
+        value["gates"] = json!(gates);
+        value["ordinal"] = json!(ordinal);
         value
     }
 }

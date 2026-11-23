@@ -478,14 +478,14 @@ impl ArchitectureCore {
                         physical_bytes,
                         file_role,
                     } = document.as_ref();
+                    let rows: Vec<_> = rows.iter().map(canonical_metric_row).collect();
                     json!([key, rows, gap, physical_lines, physical_bytes, file_role])
                 })
                 .collect(),
             Err(error) => failure(error),
         });
         let app_candidates = match app_candidates {
-            Ok(candidates) => candidates
-                .manifests
+            Ok(crate::apps::Candidates { manifests }) => manifests
                 .iter()
                 .map(|(path, outcome)| json!([path, format!("{outcome:?}")]))
                 .collect(),
@@ -558,6 +558,35 @@ impl Store {
         };
         Ok([read(false)?, read(true)?])
     }
+}
+
+/// Every field of one metric row, including `name` and `kind`, which its JSON skips and the
+/// top-cognitive answer reads.
+#[cfg(feature = "test-support")]
+fn canonical_metric_row(row: &DeclarationMetrics) -> serde_json::Value {
+    // Exhaustive, so a new field fails to compile until it is compared.
+    let DeclarationMetrics {
+        role,
+        source_set_id,
+        language,
+        path,
+        sid,
+        range,
+        name,
+        kind,
+        metrics,
+    } = row;
+    serde_json::json!({
+        "role": role,
+        "sourceSetId": source_set_id,
+        "language": language,
+        "path": path,
+        "sid": sid,
+        "range": range,
+        "name": name,
+        "kind": kind,
+        "metrics": metrics,
+    })
 }
 
 /// The JSON pointer of the first place `left` and `right` differ, in key and index order.
