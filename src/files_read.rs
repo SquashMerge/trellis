@@ -33,6 +33,10 @@ impl EvidenceResponse {
     }
 }
 
+/// One syntax-matches manifest entry: its path, stored and recorded source lengths, and
+/// coverage diagnostic.
+type ManifestEntry = (String, Option<i64>, Option<i64>, Option<String>);
+
 impl Store {
     /// All measured declarations in one cached file, retaining their exact native IDs.
     pub fn file_symbols_at(
@@ -225,7 +229,7 @@ impl Store {
              WHERE m.revision_id=?1 AND m.language=?2 AND (?3 IS NULL OR m.path>=?3)
              AND (?4 IS NULL OR m.path>?4) AND r.source_set_id=?5 ORDER BY m.path LIMIT 1")?;
         loop {
-            let entry: Option<(String, Option<i64>, Option<i64>, Option<String>)> = entries
+            let entry: Option<ManifestEntry> = entries
                 .query_row(
                     params![
                         selected.key,
