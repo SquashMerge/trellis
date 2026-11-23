@@ -3101,7 +3101,7 @@ fn parsed_sha(descriptor: &(PathBuf, String)) -> String {
 fn stored_proofs(world: &World) -> Vec<(String, String, String, String, String)> {
     world
         .db()
-        .prepare("SELECT lower(hex(proof_id)),record_kind,lower(hex(fact_digest)),language,path FROM semantic_raw_proofs ORDER BY proof_id")
+        .prepare("SELECT lower(hex(p.proof_id)),p.record_kind,lower(hex(p.fact_digest)),d.language,d.path FROM semantic_raw_proofs p JOIN semantic_raw_proof_documents d ON d.document_id=p.document_id ORDER BY p.proof_id")
         .unwrap()
         .query_map([], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
@@ -6493,7 +6493,7 @@ fn gc_keeps_proofs_referenced_by_retained_provenance() {
         .store
         .with_index_sql_for_tests(|db| {
             let changed = db.execute(
-                "UPDATE semantic_provenance SET capture_id=?1,derived_from_provenance_id=unhex(?2) WHERE rowid=(SELECT v.rowid FROM semantic_provenance v JOIN semantic_coverage c ON c.payload_id=v.payload_id WHERE c.revision_id=?3 AND v.capture_id IS NOT NULL LIMIT 1)",
+                "UPDATE semantic_provenance SET capture_id=?1,derived_from_provenance_id=unhex(?2) WHERE (payload_id,ordinal)=(SELECT v.payload_id,v.ordinal FROM semantic_provenance v JOIN semantic_coverage c ON c.payload_id=v.payload_id WHERE c.revision_id=?3 AND v.capture_id IS NOT NULL LIMIT 1)",
                 rusqlite::params![capture_id, proof_id, format!("pin:v1:{}:{}", head.index_generation, head.index_revision)],
             )?;
             assert_eq!(changed, 1);
@@ -6532,6 +6532,7 @@ fn assert_nothing_published(world: &World, head: IndexPin) {
         "semantic_raw_batches",
         "semantic_raw_captures",
         "semantic_raw_documents",
+        "semantic_raw_proof_documents",
         "semantic_raw_proofs",
         "semantic_raw_exclusions",
         "semantic_revision_raw_selections",
@@ -12318,7 +12319,7 @@ fn review655_multiple_bad_documents_publication_differential() {
     assert_eq!(symbols(&snapshot).len(), 2);
     let proofs = |hash: &str, paths: &[&str]| -> Vec<(String, String)> {
         let db = world.db();
-        let mut stmt = db.prepare("SELECT p.path,lower(hex(p.fact_digest)) FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE c.artifact_hash=?1 ORDER BY p.path,p.fact_digest").unwrap();
+        let mut stmt = db.prepare("SELECT d.path,lower(hex(p.fact_digest)) FROM semantic_raw_proofs p JOIN semantic_raw_proof_documents d ON d.document_id=p.document_id JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE c.artifact_hash=?1 ORDER BY d.path,p.fact_digest").unwrap();
         stmt.query_map([hash], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })
@@ -14590,7 +14591,7 @@ fn witnessed_admission_world(artifacts: usize) -> (World, (PathBuf, String)) {
 
 fn retained_proofs(world: &World, path: &str) -> i64 {
     world.count(&format!(
-        "SELECT COUNT(*) FROM semantic_raw_proofs WHERE path='{path}'"
+        "SELECT COUNT(*) FROM semantic_raw_proofs p JOIN semantic_raw_proof_documents d ON d.document_id=p.document_id WHERE d.path='{path}'"
     ))
 }
 
@@ -14680,7 +14681,7 @@ fn corrupt_retained_proof_takes_the_typed_path() {
             .store
             .with_index_sql_for_tests(|db| {
                 db.execute(
-                    "UPDATE semantic_raw_proofs SET fact_digest=zeroblob(32) WHERE rowid=(SELECT MAX(rowid) FROM semantic_raw_proofs WHERE path=?1)",
+                    "UPDATE semantic_raw_proofs SET fact_digest=zeroblob(32) WHERE rowid=(SELECT MAX(p.rowid) FROM semantic_raw_proofs p JOIN semantic_raw_proof_documents d ON d.document_id=p.document_id WHERE d.path=?1)",
                     [corrupt],
                 )?;
                 Ok(())

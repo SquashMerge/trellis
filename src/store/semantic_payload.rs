@@ -629,6 +629,21 @@ impl PayloadProjection<'_> {
     }
 }
 
+/// The key one chunk of `table`'s rows is deleted by: the primary key of a payload child stored
+/// `WITHOUT ROWID` (#1248 PR 4), else the rowid.
+fn chunk_key(table: &str) -> &'static str {
+    match table {
+        "semantic_provenance" => "payload_id,ordinal",
+        "semantic_reference_roles" => "payload_id,reference_id,ordinal",
+        "semantic_symbol_targets" => "symbol_id,ordinal",
+        "semantic_declaration_binding_symbols"
+        | "semantic_declaration_join_candidates"
+        | "semantic_call_join_candidates" => "binding_id,ordinal",
+        "semantic_projection_dependency_targets" => "payload_id,language,path,syntax_id",
+        _ => "rowid",
+    }
+}
+
 /// Collects up to 64 journaled payloads of `revision` that no manifest row names. Returns
 /// whether it made progress, which means the caller's unit continues.
 pub(in crate::store) fn cleanup_payload_candidates(
@@ -712,8 +727,9 @@ pub(in crate::store) fn cleanup_payload_candidates(
                 } else {
                     filter
                 };
+                let key = chunk_key(table);
                 let deleted = tx.execute(
-                    &format!("DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} WHERE {filter} LIMIT 256)"),
+                    &format!("DELETE FROM {table} WHERE ({key}) IN (SELECT {key} FROM {table} WHERE {filter} LIMIT 256)"),
                     [payload],
                 )?;
                 if deleted == 256 {
@@ -938,7 +954,7 @@ mod tests {
     #[test]
     fn writer_rejects_dependency_endpoint_missing_from_revision() {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(CACHE_SCHEMA_V48).unwrap();
+        db.execute_batch(CACHE_SCHEMA_V49).unwrap();
         db.pragma_update(None, "foreign_keys", "OFF").unwrap();
         db.execute("INSERT INTO native_revisions VALUES('key','set',?1,?1,?1,'native','[]','[]','{}','[]','[]',NULL,'[]',0,'{}','[]',1)", ["a".repeat(64)]).unwrap();
         let (_, mut publication) = every_endpoint();
@@ -973,7 +989,7 @@ mod tests {
     #[test]
     fn unbatched_payload_records_null_terms_and_no_targets() {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(CACHE_SCHEMA_V48).unwrap();
+        db.execute_batch(CACHE_SCHEMA_V49).unwrap();
         db.pragma_update(None, "foreign_keys", "OFF").unwrap();
         db.execute("INSERT INTO native_revisions VALUES('key','set',?1,?1,?1,'native','[]','[]','{}','[]','[]',NULL,'[]',0,'{}','[]',1)", ["a".repeat(64)]).unwrap();
         let (_, mut publication) = every_endpoint();
@@ -1018,7 +1034,7 @@ mod tests {
     }
 
     fn payload_with_children(db: &Connection, key: Option<&str>, symbols: usize) {
-        db.execute_batch(CACHE_SCHEMA_V48).unwrap();
+        db.execute_batch(CACHE_SCHEMA_V49).unwrap();
         db.pragma_update(None, "foreign_keys", "OFF").unwrap();
         db.execute(
             "INSERT INTO semantic_payloads(payload_id,payload_key,producer_id,producer_version,language,path,version_id,batch_id) VALUES(1,?1,'p','1','javascript','a.js','v',1)",
@@ -1084,6 +1100,52 @@ mod tests {
         }
     }
 
+    /// Payload children stored `WITHOUT ROWID` (#1248 PR 4) have no rowid; collection deletes
+    /// their 256-row chunks by primary key and still drains every one of them.
+    #[test]
+    fn release_collects_without_rowid_children_in_chunks() {
+        let db = Connection::open_in_memory().unwrap();
+        payload_with_children(&db, None, 1);
+        db.execute("INSERT INTO semantic_declaration_bindings(binding_id,payload_id,ordinal,provenance_ordinal,join_document_language,join_document_path,join_content_hash,join_start,join_end,join_kind,join_status) VALUES(1,1,0,0,'javascript','a.js',zeroblob(32),0,1,'declarationName','exact')", []).unwrap();
+        for i in 0..300_i64 {
+            let id = i.to_be_bytes().repeat(2);
+            for sql in [
+                "INSERT INTO semantic_provenance(payload_id,ordinal,provenance_id,evidence_kind,basis_id) VALUES(1,?1,'p'||?1,'measuredSyntax',1)",
+                "INSERT INTO semantic_reference_roles VALUES(1,?2,?1,'read')",
+                "INSERT INTO semantic_symbol_targets(symbol_id,ordinal,kind,external_scheme,external_symbol,external_scope) VALUES(1,?1,'external','scip','s','global')",
+                "INSERT INTO semantic_declaration_binding_symbols VALUES(1,?1,'scip','s','global',NULL,NULL)",
+                "INSERT INTO semantic_declaration_join_candidates VALUES(1,?1,?2)",
+                "INSERT INTO semantic_projection_dependency_targets VALUES(1,'javascript','a.js',?2,0)",
+            ] {
+                if sql.contains("?2") {
+                    db.execute(sql, params![i, id]).unwrap();
+                } else {
+                    db.execute(sql, [i]).unwrap();
+                }
+            }
+        }
+        let mut calls = 0;
+        while cleanup_payload_candidates(&db, "rev").unwrap() {
+            calls += 1;
+            assert!(calls < 40);
+        }
+        assert!(calls >= 7, "six 300-row tables take two chunks each");
+        for table in [
+            "semantic_provenance",
+            "semantic_reference_roles",
+            "semantic_symbol_targets",
+            "semantic_declaration_binding_symbols",
+            "semantic_declaration_join_candidates",
+            "semantic_projection_dependency_targets",
+            "semantic_payloads",
+        ] {
+            let rows: i64 = db
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(rows, 0, "{table}");
+        }
+    }
+
     #[test]
     fn a_payload_a_manifest_row_still_names_is_only_unjournaled() {
         let db = Connection::open_in_memory().unwrap();
@@ -1114,7 +1176,7 @@ mod tests {
     /// hash `1…` at `same` and `2…` at `edited`.
     fn bound_call(bound: bool, captured: Option<&str>) -> Connection {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(CACHE_SCHEMA_V48).unwrap();
+        db.execute_batch(CACHE_SCHEMA_V49).unwrap();
         db.pragma_update(None, "foreign_keys", "OFF").unwrap();
         for (tuple, revision) in [(1, "same"), (2, "edited")] {
             db.execute("INSERT INTO native_revisions VALUES(?1,'set',?2,?2,?2,?1,'[]','[]','{}','[]','[]',NULL,'[]',0,'{}','[]',?3)", params![revision, "a".repeat(64), tuple]).unwrap();

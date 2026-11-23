@@ -285,7 +285,8 @@ class SchemaParity(unittest.TestCase):
         db.execute("INSERT INTO semantic_raw_exclusions VALUES(1,'javascript','js/b.js','notRequested')")
         db.execute("INSERT INTO semantic_raw_documents VALUES(1,'javascript','js/a.js',?,?,0)",
                    (hashes[paths[0]], HEX))
-        db.execute("INSERT INTO semantic_raw_proofs VALUES(1,?,'occurrence',?,'javascript','js/a.js')",
+        db.execute("INSERT INTO semantic_raw_proof_documents VALUES(1,1,'javascript','js/a.js')")
+        db.execute("INSERT INTO semantic_raw_proofs VALUES(1,?,'occurrence',?,1)",
                    (bytes.fromhex(PROOF), bytes.fromhex(HEX)))
         for name in ("import", "r2"):
             db.execute("INSERT INTO semantic_revision_raw_selections VALUES(?,'scip-typescript',1,?)",
@@ -341,7 +342,8 @@ class SchemaParity(unittest.TestCase):
         view = RUNNER.SelectedView(db, revision, root)
         rows = {}
         for table in ("semantic_raw_batches", "semantic_raw_captures", "semantic_raw_exclusions",
-                      "semantic_raw_documents", "semantic_raw_proofs", "semantic_revision_raw_selections",
+                      "semantic_raw_documents", "semantic_raw_proof_documents", "semantic_raw_proofs",
+                      "semantic_revision_raw_selections",
                       "semantic_payloads", "semantic_coverage", "semantic_coverage_freshness",
                       "semantic_basis", "semantic_provenance",
                       "semantic_import_reports", "semantic_reimport", "semantic_projection_origins",
