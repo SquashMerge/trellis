@@ -318,7 +318,7 @@ fn constraint(
             }
             let Some((key, sid)) = &relationship.target else {
                 uncertain += usize::from(
-                    relationship.metadata.get("semanticBoundary") == Some(&json!(true)),
+                    relationship.metadata.get("semanticBoundary").as_deref() == Some(&json!(true)),
                 );
                 continue;
             };

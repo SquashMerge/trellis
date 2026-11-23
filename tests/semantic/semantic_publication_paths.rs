@@ -494,7 +494,10 @@ fn architecture_anchors_of_one_basis_share_metadata_within_the_same_bound() {
         second.metadata.get("basis").unwrap()["lookupDependencies"],
         json!(["hello"])
     );
-    assert_eq!(second.metadata.get("freshness"), Some(&json!("fresh")));
+    assert_eq!(
+        second.metadata.get("freshness").as_deref(),
+        Some(&json!("fresh"))
+    );
 
     let bound = |limit: usize| {
         store
