@@ -205,7 +205,7 @@ fn unknown_kind_counts(site: &Value) -> Value {
 
 pub(super) fn semantic_evidence(mut evidence: Value, metadata: &SemanticMetadata) -> Value {
     for (key, value) in metadata.iter() {
-        evidence[key] = value.clone();
+        evidence[key] = value.into_owned();
     }
     if let Some(revision) = evidence["projection"]["basisNativeRevisionId"].as_str() {
         evidence["revisionId"] = json!(revision);

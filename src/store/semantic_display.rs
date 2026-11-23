@@ -1562,7 +1562,7 @@ fn architecture_semantic_within(
     metadata_limit: usize,
 ) -> Result<()> {
     use crate::architecture_inputs::{
-        SemanticAnchor, SemanticMetadata, SemanticOutcome, SemanticRelationship,
+        RowProvenance, SemanticAnchor, SemanticMetadata, SemanticOutcome, SemanticRelationship,
     };
     use std::sync::Arc;
     let defaults = default_producers(db, revision_key)?;
@@ -1717,11 +1717,14 @@ fn architecture_semantic_within(
         "SELECT lookup_key FROM semantic_basis_lookup_dependencies WHERE basis_id=?1 ORDER BY ordinal",
     )?;
     let mut metadata_rows = 0usize;
-    // The fields a row's basis and projection determine, built at the first row of each tuple
-    // and basis and shared by the rest (#1247), with the lookup dependency rows that build
-    // read: every later row of the basis is charged them too, so the bound is unchanged.
+    // The fields a row's basis and projection determine, and its payload's content hash, built
+    // at the first row of each tuple and basis and shared by the rest (#1247), with the lookup
+    // dependency rows that build read: every later row of the basis is charged them too, so
+    // the bound is unchanged.
     type Fields = Arc<BTreeMap<String, serde_json::Value>>;
     let mut shared_fields: HashMap<(i64, i64), (Fields, usize)> = HashMap::new();
+    // Each distinct evidence kind is allocated once per read (#1247).
+    let mut evidence_kinds: HashMap<String, Arc<str>> = HashMap::new();
     let mut metadata = |pp: &super::semantic_payload::PayloadProjection<'_>,
                         tuple: i64,
                         ordinal: i64,
@@ -1735,10 +1738,9 @@ fn architecture_semantic_within(
         let payload = pp.payload_id.context(SelectedIntegrity(
             "incompatible_index: architecture tuple names no payload".into(),
         ))?;
-        let (mut own, basis_id, derivation, basis, content_hash) =
+        let (evidence_kind, basis_id, derivation, basis) =
             proof.query_row(params![payload, ordinal], |row| {
-                let mut own = BTreeMap::new();
-                own.insert("evidenceKind".into(), json!(row.get::<_, String>(2)?));
+                let evidence_kind = row.get::<_, String>(2)?;
                 // The payload's content hash and the raw proof's fact digest are BLOBs,
                 // decoded below so a wrong length fails typed (#1248 PR 2).
                 let derivation = (
@@ -1748,45 +1750,47 @@ fn architecture_semantic_within(
                     row.get::<_, Option<Vec<u8>>>(6)?,
                 );
                 let basis_id = row.get::<_, i64>(18)?;
-                // Every row of a basis joins the same `semantic_basis` row.
+                // Every row of a basis joins the same `semantic_basis` row, and every row of
+                // the payload its one `semantic_payloads` row.
                 let basis = if shared_fields.contains_key(&(tuple, basis_id)) {
                     None
                 } else {
-                    Some(
+                    Some((
                         json!({"producerId":row.get::<_, String>(7)?,"producerVersion":row.get::<_, String>(8)?,"producerHash":row.get::<_, String>(9)?,"artifactHash":row.get::<_, String>(10)?,"language":row.get::<_, String>(11)?,"sourceSetId":row.get::<_, String>(12)?,"revisionId":row.get::<_, String>(13)?,"sourceManifestHash":row.get::<_, String>(14)?,"toolchainHash":row.get::<_, String>(15)?,"configHash":row.get::<_, String>(16)?,"dependencyHash":row.get::<_, String>(17)?}),
-                    )
+                        row.get::<_, Option<Vec<u8>>>(1)?,
+                    ))
                 };
-                Ok((
-                    own,
-                    basis_id,
-                    derivation,
-                    basis,
-                    row.get::<_, Option<Vec<u8>>>(1)?,
-                ))
+                Ok((evidence_kind, basis_id, derivation, basis))
             })?;
-        // NULL only for a payload stored without its content hash: corrupt.
-        let content_hash = content_hash.context(SelectedIntegrity(
-            "incompatible_index: semantic payload without its content hash".into(),
-        ))?;
-        own.insert(
-            "historicalContentHash".into(),
-            json!(id_codec::decode_digest(&content_hash)?),
-        );
+        let evidence_kind = match evidence_kinds.get(evidence_kind.as_str()) {
+            Some(kind) => kind.clone(),
+            None => {
+                let kind: Arc<str> = Arc::from(evidence_kind.as_str());
+                evidence_kinds.insert(evidence_kind, kind.clone());
+                kind
+            }
+        };
         let first = basis
-            .map(|basis| {
-                Ok::<_, anyhow::Error>((basis, semantic_variant(&pp.freshness(basis_id)?)?))
+            .map(|(basis, content_hash)| {
+                // NULL only for a payload stored without its content hash: corrupt.
+                let content_hash = content_hash.context(SelectedIntegrity(
+                    "incompatible_index: semantic payload without its content hash".into(),
+                ))?;
+                let content_hash = id_codec::decode_digest(&content_hash)?;
+                Ok::<_, anyhow::Error>((
+                    basis,
+                    content_hash,
+                    semantic_variant(&pp.freshness(basis_id)?)?,
+                ))
             })
             .transpose()?;
         let (capture, proof, kind, digest) = derivation;
         let digest = digest
             .map(|digest| id_codec::decode_digest(&digest))
             .transpose()?;
-        own.insert(
-            "derivedFrom".into(),
-            serde_json::to_value(architecture_derived_from(capture, proof, kind, digest)?)?,
-        );
+        let derived_from = architecture_derived_from(capture, proof, kind, digest)?;
         let shared = match first {
-            Some((mut basis, historical)) => {
+            Some((mut basis, content_hash, historical)) => {
                 ensure!(
                     matches!(historical.as_str(), "fresh" | "possiblyStale" | "stale"),
                     SelectedIntegrity("invalid architecture freshness".into())
@@ -1812,6 +1816,7 @@ fn architecture_semantic_within(
                         &historical
                     }),
                 );
+                fields.insert("historicalContentHash".into(), json!(content_hash));
                 fields.insert("historicalFreshness".into(), json!(historical));
                 fields.insert("basis".into(), basis);
                 if let Some(projection) = projection {
@@ -1831,7 +1836,13 @@ fn architecture_semantic_within(
                 shared.clone()
             }
         };
-        Ok(SemanticMetadata::new(own, shared))
+        Ok(SemanticMetadata::with_row(
+            Arc::new(RowProvenance {
+                evidence_kind,
+                derived_from,
+            }),
+            shared,
+        ))
     };
     let mut calls = db.prepare_cached(
         "SELECT b.call_id,b.join_start,b.join_end,b.resolution,b.declared_kind,
@@ -2251,7 +2262,7 @@ fn architecture_semantic_within(
             .any(|a| a.outcome == SemanticOutcome::Boundary)
             || found
                 .iter()
-                .any(|r| r.metadata.get("semanticBoundary") == Some(&json!(true)));
+                .any(|r| r.metadata.get("semanticBoundary").as_deref() == Some(&json!(true)));
         semantic.anchors = anchors;
         semantic.relationships = found;
     }

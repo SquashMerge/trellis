@@ -1000,7 +1000,7 @@ fn apply_semantic(site: &mut Site, anchor: &SemanticAnchor) {
     site.mapping = "semantic";
     site.provenance_id = Some(anchor.provenance_id.clone());
     site.semantic_metadata = anchor.metadata.clone();
-    if anchor.metadata.get("semanticBoundary") == Some(&json!(true)) {
+    if anchor.metadata.get("semanticBoundary").as_deref() == Some(&json!(true)) {
         site.caller = None;
         site.caller_reason = Some("semantic_boundary");
     }
