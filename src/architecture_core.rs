@@ -73,7 +73,9 @@ pub(crate) struct MetricsDocument {
     pub(crate) physical_bytes: usize,
     pub(crate) file_role: DeclarationRole,
 }
-pub(crate) type ArchitectureMetrics = BTreeMap<DocumentKey, MetricsDocument>;
+/// Each document's rows are shared, so a later result can keep a document that did not
+/// change (#1301).
+pub(crate) type ArchitectureMetrics = BTreeMap<DocumentKey, Arc<MetricsDocument>>;
 
 /// A failure this revision and rules file will repeat: kept and answered like a result, so
 /// that a read fails as a computed read did. Contention and cancellation are never kept.
@@ -244,15 +246,28 @@ pub(crate) struct ArchitectureInput {
 }
 
 impl EvidenceResponse {
-    /// The documents a core computes from.
+    /// The documents a core computes from: read A, then read B, in this one transaction.
     pub(crate) fn architecture_input(
         &self,
         pin: IndexPin,
         check: &mut (impl FnMut() -> Result<()> + Send),
         progress: &(dyn Fn(ArchitectureProgress) + Sync),
     ) -> Result<ArchitectureInput> {
+        let mut input = self.architecture_native_input(pin, check, progress)?;
+        self.architecture_semantic_input(&mut input, check)?;
+        Ok(input)
+    }
+
+    /// Read A (#1301): every document's native rows, the retained manifests and the root
+    /// TypeScript config, reported as `reading`. The documents have no semantic rows yet.
+    pub(crate) fn architecture_native_input(
+        &self,
+        pin: IndexPin,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+        progress: &(dyn Fn(ArchitectureProgress) + Sync),
+    ) -> Result<ArchitectureInput> {
         let (snapshot, regions) = self
-            .architecture_snapshot_regions(Some(pin), check, &|completed, total| {
+            .architecture_native_regions(Some(pin), check, &|completed, total| {
                 progress(ArchitectureProgress {
                     phase: "reading",
                     completed,
@@ -261,6 +276,17 @@ impl EvidenceResponse {
             })
             .map_err(|error| self.store.report_index_failure(error))?;
         Ok(ArchitectureInput { snapshot, regions })
+    }
+
+    /// Read B (#1301): the semantic rows of every document of `input`, at its pin. This
+    /// response may be a later admitted transaction than read A's; it reads the same rows.
+    pub(crate) fn architecture_semantic_input(
+        &self,
+        input: &mut ArchitectureInput,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+    ) -> Result<()> {
+        self.architecture_semantic_rows(&mut input.snapshot, check)
+            .map_err(|error| self.store.report_index_failure(error))
     }
 
     /// Read and compute one revision's core for this one read.
@@ -395,6 +421,179 @@ impl ArchitectureCore {
     }
 }
 
+/// The path one owner build took (#1301), for tests to prove which work a build did. Every
+/// build is full until incremental builds land.
+#[cfg(feature = "test-support")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ArchitectureBuildPath {
+    Full(FullReason),
+}
+
+/// Why a build read and computed every document.
+#[cfg(feature = "test-support")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FullReason {
+    /// The build had no earlier result to start from.
+    NoBase,
+}
+
+#[cfg(feature = "test-support")]
+impl ArchitectureCore {
+    /// Every part of this core in one canonical value (#1301): two cores are equal when every
+    /// read answers the same from them. The summary cache is left out; reads fill it.
+    pub(crate) fn canonical(&self) -> Result<serde_json::Value> {
+        use serde_json::json;
+        // Exhaustive, so a new field fails to compile until it is compared.
+        let Self {
+            pin,
+            references,
+            rules,
+            metrics,
+            app_candidates,
+            interfaces,
+            summaries: _,
+        } = self;
+        let failure = |failure: &CoreFailure| {
+            let CoreFailure {
+                rule,
+                integrity,
+                message,
+            } = failure;
+            json!({"failure": {"rule": rule, "integrity": integrity, "message": message}})
+        };
+        let rules = rules.as_ref().map(|RulesPart { content_hash, base }| {
+            json!({
+                "contentHash": content_hash,
+                "base": base.as_ref().map_or_else(failure, RulesBase::canonical),
+            })
+        });
+        let metrics = metrics.as_ref().map(|metrics| match metrics {
+            Ok(metrics) => metrics
+                .iter()
+                .map(|(key, document)| {
+                    let MetricsDocument {
+                        rows,
+                        gap,
+                        physical_lines,
+                        physical_bytes,
+                        file_role,
+                    } = document.as_ref();
+                    json!([key, rows, gap, physical_lines, physical_bytes, file_role])
+                })
+                .collect(),
+            Err(error) => failure(error),
+        });
+        let app_candidates = match app_candidates {
+            Ok(candidates) => candidates
+                .manifests
+                .iter()
+                .map(|(path, outcome)| json!([path, format!("{outcome:?}")]))
+                .collect(),
+            Err(error) => failure(error),
+        };
+        let interfaces = interfaces.as_ref().map(|interfaces| match interfaces {
+            Ok(crate::interfaces::Extraction {
+                routes,
+                calls,
+                matched,
+                callees,
+            }) => json!({
+                "routes": routes.iter().map(|route| format!("{route:?}")).collect::<Vec<_>>(),
+                "calls": calls.iter().map(|call| format!("{call:?}")).collect::<Vec<_>>(),
+                "matched": matched.iter().map(|m| format!("{m:?}")).collect::<Vec<_>>(),
+                "callees": callees,
+            }),
+            Err(error) => failure(error),
+        });
+        Ok(json!({
+            "pin": pin,
+            "references": references.canonical()?,
+            "rules": rules,
+            "metrics": metrics,
+            "appCandidates": app_candidates,
+            "interfaces": interfaces,
+        }))
+    }
+}
+
+/// One Architecture read for tests: each document's path and semantic rows, in debug form,
+/// and the canonical core computed from them.
+#[cfg(feature = "test-support")]
+pub type ArchitectureReadForTests = (Vec<(String, String)>, serde_json::Value);
+
+#[cfg(feature = "test-support")]
+impl Store {
+    /// The head's Architecture read and core twice (#1301): read A and read B in one
+    /// transaction, then each in its own. For each: every document's path and semantic rows,
+    /// in debug form, and the canonical core computed from them, with metrics and no rules.
+    #[doc(hidden)]
+    pub fn architecture_split_reads_for_tests(&self) -> Result<[ArchitectureReadForTests; 2]> {
+        let read = |split: bool| -> Result<_> {
+            let response = self.evidence_response()?;
+            let pin = response.selected_pin(None)?;
+            let input = if split {
+                let mut input = response.architecture_native_input(pin, &mut || Ok(()), &|_| {})?;
+                response.finish(())?;
+                drop(response);
+                let response = self.evidence_response()?;
+                response.architecture_semantic_input(&mut input, &mut || Ok(()))?;
+                response.finish(input)?
+            } else {
+                let input = response.architecture_input(pin, &mut || Ok(()), &|_| {})?;
+                response.finish(input)?
+            };
+            let semantic = input
+                .snapshot
+                .documents
+                .iter()
+                .map(|document| {
+                    (
+                        document.key.path.clone(),
+                        format!("{:?}", document.semantic),
+                    )
+                })
+                .collect();
+            let core = ArchitectureCore::compute(self, input, None, true, &mut || Ok(()), &|_| {})?;
+            Ok((semantic, core.canonical()?))
+        };
+        Ok([read(false)?, read(true)?])
+    }
+}
+
+/// The JSON pointer of the first place `left` and `right` differ, in key and index order.
+#[cfg(feature = "test-support")]
+pub(crate) fn first_difference(
+    left: &serde_json::Value,
+    right: &serde_json::Value,
+) -> Option<String> {
+    use serde_json::Value;
+    match (left, right) {
+        (Value::Object(left_map), Value::Object(right_map)) => {
+            let keys: std::collections::BTreeSet<&String> =
+                left_map.keys().chain(right_map.keys()).collect();
+            keys.into_iter()
+                .find_map(|key| match (left_map.get(key), right_map.get(key)) {
+                    (Some(l), Some(r)) => {
+                        first_difference(l, r).map(|rest| format!("/{key}{rest}"))
+                    }
+                    _ => Some(format!("/{key}")),
+                })
+        }
+        (Value::Array(left_items), Value::Array(right_items)) => left_items
+            .iter()
+            .zip(right_items)
+            .enumerate()
+            .find_map(|(index, (l, r))| {
+                first_difference(l, r).map(|rest| format!("/{index}{rest}"))
+            })
+            .or_else(|| {
+                (left_items.len() != right_items.len())
+                    .then(|| format!("/{}", left_items.len().min(right_items.len())))
+            }),
+        _ => (left != right).then(String::new),
+    }
+}
+
 /// A part's outcome: a repeating failure is kept as the part's result, any other is returned.
 fn kept<T>(outcome: Result<T>) -> Result<std::result::Result<T, CoreFailure>> {
     match outcome {
@@ -489,18 +688,22 @@ fn measure_documents(
             computed.commit(&mut store.metrics_memo.lock().unwrap_or_else(|e| e.into_inner()))?;
         documents.insert(
             document.key.clone(),
-            MetricsDocument {
+            Arc::new(MetricsDocument {
                 rows,
                 gap,
                 physical_lines,
                 physical_bytes,
                 file_role,
-            },
+            }),
         );
     }
     progress.check()?;
     Ok(documents)
 }
+
+#[cfg(all(test, feature = "test-support"))]
+#[path = "architecture_core_tests.rs"]
+mod canonical_tests;
 
 #[cfg(test)]
 mod tests {

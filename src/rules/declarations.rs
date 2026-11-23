@@ -1,7 +1,7 @@
 //! Role selection and the per-document evaluation of declaration constraints. The
 //! tree-sitter base parse and the `DocumentEvaluation` struct stay in `rules.rs`.
 use super::{
-    Bases, Config, Constraint, DocumentEvaluation, Selector, Targets,
+    Bases, Config, Constraint, DocumentEvaluation, DocumentRuleRows, Selector, Targets,
     evaluate::{decorate, semantic_evidence},
     glob_matches, identity, native_evidence, parse_bases,
 };
@@ -12,6 +12,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 fn selection(selector: &Selector, d: &Declaration, bases: Option<&Bases>) -> Option<bool> {
     if !glob_matches(&selector.paths, &d.document.path)
@@ -91,11 +92,10 @@ impl DocumentEvaluation<'_> {
         work: &mut Work,
         workers: usize,
         check: &mut (impl FnMut() -> Result<()> + Send),
-    ) -> Result<(Vec<Value>, Vec<Value>)> {
+    ) -> Result<Vec<Arc<DocumentRuleRows>>> {
         let workers = workers.clamp(1, crate::parallel::MAX_WORKERS);
         let request = RequestCheck::new(check);
-        let mut instances = Vec::new();
-        let mut test_only = Vec::new();
+        let mut rows_by_document = Vec::with_capacity(documents.len());
         for batch in documents.chunks(workers) {
             request.result(request.check())?;
             let remaining = work.remaining();
@@ -123,12 +123,14 @@ impl DocumentEvaluation<'_> {
                     work.charge(rows.work.used),
                     "bounded_work: rules document budget"
                 );
-                instances.extend(rows.instances);
-                test_only.extend(rows.test_only);
+                rows_by_document.push(Arc::new(DocumentRuleRows {
+                    instances: rows.instances,
+                    test_only: rows.test_only,
+                }));
                 request.result(request.check())?;
             }
         }
-        Ok((instances, test_only))
+        Ok(rows_by_document)
     }
 }
 

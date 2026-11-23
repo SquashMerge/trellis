@@ -114,8 +114,7 @@ fn file_apps_charges_each_path_pattern_scan() {
         limit: 0,
         source_set: None,
         semantic: false,
-        declarations: vec![],
-        test_declarations: vec![],
+        documents: vec![],
         work_used: 0,
         unread_manifests: 0,
     };

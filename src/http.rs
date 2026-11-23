@@ -44,6 +44,8 @@ mod query;
 mod selection;
 mod state;
 mod worker;
+#[cfg(feature = "test-support")]
+pub use crate::architecture_core::{ArchitectureBuildPath, FullReason};
 use api_error::{ApiError, error, invalid, missing};
 pub use architecture::ArchitectureBuilding;
 pub use cli_api::{CLI_API_BODY_LIMIT, CLI_API_RESPONSE_LIMIT, cli_api, cli_api_route};
