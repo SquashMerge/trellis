@@ -233,6 +233,18 @@ pub(crate) struct ArchitectureOwner {
     /// Build only once a read asks, as before #798.
     #[cfg(feature = "test-support")]
     on_demand: AtomicBool,
+    /// Verify mode (#1301): on unless a test turns it off.
+    #[cfg(feature = "test-support")]
+    verify: AtomicBool,
+    /// The path each build that published took, oldest first (#1301).
+    #[cfg(feature = "test-support")]
+    paths: Mutex<Vec<(IndexPin, crate::architecture_core::ArchitectureBuildPath)>>,
+    /// Builds verify mode compared with a full build.
+    #[cfg(feature = "test-support")]
+    verified: std::sync::atomic::AtomicUsize,
+    /// The next later admission of a build fails with this integrity fault.
+    #[cfg(feature = "test-support")]
+    admission_fault: Mutex<Option<String>>,
 }
 
 impl ArchitectureOwner {
@@ -250,6 +262,14 @@ impl ArchitectureOwner {
             browser_wait: Mutex::new(None),
             #[cfg(feature = "test-support")]
             on_demand: AtomicBool::new(false),
+            #[cfg(feature = "test-support")]
+            verify: AtomicBool::new(true),
+            #[cfg(feature = "test-support")]
+            paths: Mutex::default(),
+            #[cfg(feature = "test-support")]
+            verified: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "test-support")]
+            admission_fault: Mutex::default(),
         })
     }
 
@@ -336,6 +356,17 @@ impl ArchitectureOwner {
         }
     }
 
+    /// Test support records the path of each build the owner publishes (#1301).
+    fn published_build(&self, _pin: IndexPin) {
+        #[cfg(feature = "test-support")]
+        self.paths.lock().unwrap().push((
+            _pin,
+            crate::architecture_core::ArchitectureBuildPath::Full(
+                crate::architecture_core::FullReason::NoBase,
+            ),
+        ));
+    }
+
     /// A failed build retries on a bound; a later hint or read starts over.
     fn retry_later(&self) {
         let mut state = self.state.lock().unwrap();
@@ -353,6 +384,19 @@ impl Drop for ArchitectureHandle {
     fn drop(&mut self) {
         self.0.shut_down();
     }
+}
+
+/// A stopped build: given way, superseded, retired or not admitted. Nothing of it is
+/// published, whatever cause it carries.
+fn cancelled(error: &anyhow::Error) -> bool {
+    error.to_string().starts_with("cancelled")
+}
+
+/// A failure the owner keeps as its revision's answer, with the precedence of a turn's own
+/// outcome: never a stop or contention, even over a cause that would repeat.
+#[cfg(feature = "test-support")]
+fn kept(error: &anyhow::Error) -> bool {
+    !cancelled(error) && !contention(error) && CoreFailure::repeats(error)
 }
 
 fn contention(error: &anyhow::Error) -> bool {
@@ -708,49 +752,45 @@ impl DaemonState {
         // The read gives its snapshot up at its next check once a live publication raises its
         // write intent (#1245): that publication supersedes this head, or, if it fails, the
         // next turn reads the same head again. Nothing of a yielded read is published.
-        let mut read_check = || {
+        let give_way = || {
             if self.store.publication_writing() {
                 owner.hook("architecture_read_yielded");
                 anyhow::bail!("cancelled: architecture read yielded to a publication");
             }
-            check()
+            Ok(())
         };
-        // The transaction and lease end with the read: a retirement waits for reads, and
-        // nothing after this one uses SQLite.
-        let input = response
-            .architecture_input(pin, &mut read_check, &progress)
-            .and_then(|input| response.finish(input));
-        drop(response);
-        drop(lease);
-        let built = input.and_then(|input| {
-            ArchitectureCore::compute(
-                &self.store,
-                input,
-                config.as_ref(),
-                true,
-                &mut check,
-                &progress,
-            )
-        });
+        let built = self.architecture_build(
+            (lease, response),
+            pin,
+            config.as_ref(),
+            &mut check,
+            (&give_way, &|point| owner.hook(point)),
+            &progress,
+        );
+        #[cfg(feature = "test-support")]
+        let built = self.architecture_verified(owner, pin, config.as_ref(), built);
         owner.hook("architecture_build_finished");
         let mut state = owner.state.lock().unwrap();
         state.running = None;
+        // The precedence `kept` follows: a stop, then contention, then a repeating failure.
         match built {
             Ok(core) => {
                 state.retries = 0;
+                owner.published_build(pin);
                 state.publish(Published {
                     key,
                     outcome: Ok(Arc::new(core)),
                     report_once: false,
                 });
             }
-            Err(error) if error.to_string().starts_with("cancelled") => {}
+            Err(error) if cancelled(&error) => {}
             Err(error) if contention(&error) => {
                 drop(state);
                 owner.retry_later();
                 return;
             }
             Err(error) if CoreFailure::repeats(&error) => {
+                owner.published_build(pin);
                 state.publish(Published {
                     key,
                     outcome: Err(CoreFailure::of(&error)),
@@ -763,6 +803,7 @@ impl DaemonState {
                 return;
             }
             Err(error) => {
+                owner.published_build(pin);
                 state.publish(Published {
                     key,
                     outcome: Err(CoreFailure::of(&error)),
@@ -774,6 +815,150 @@ impl DaemonState {
         state.hinted = true;
         drop(state);
         owner.changed.notify_all();
+    }
+
+    /// One build of `pin` (#1301): read A in the admitted `response`, read B in a second
+    /// admitted transaction at the same pin, then the computation, which holds no transaction.
+    /// Each read's transaction and lease end with it: a retirement waits for reads. Each read
+    /// checks `give_way`, then `check`; the computation checks `check`. `hook` marks the
+    /// point before read B's admission for tests.
+    fn architecture_build(
+        &self,
+        (lease, response): (super::AdmissionLease, crate::store::EvidenceResponse),
+        pin: IndexPin,
+        config: Option<&crate::rules::Config>,
+        check: &mut (impl FnMut() -> anyhow::Result<()> + Send),
+        (give_way, hook): (
+            &(impl Fn() -> anyhow::Result<()> + Sync),
+            &dyn Fn(&'static str),
+        ),
+        progress: &(dyn Fn(ArchitectureProgress) + Sync),
+    ) -> anyhow::Result<ArchitectureCore> {
+        let input = {
+            let mut read_check = || {
+                give_way()?;
+                check()
+            };
+            let input = response
+                .architecture_native_input(pin, &mut read_check, progress)
+                .and_then(|input| response.finish(input));
+            drop(response);
+            drop(lease);
+            let mut input = input?;
+            read_check()?;
+            hook("architecture_read_b");
+            let (lease, response) = self.architecture_admission()?;
+            let read = response
+                .architecture_semantic_input(&mut input, &mut read_check)
+                .and_then(|()| response.finish(()));
+            drop(response);
+            drop(lease);
+            read?;
+            input
+        };
+        ArchitectureCore::compute(&self.store, input, config, true, check, progress)
+    }
+
+    /// A lease and an admitted read for a build's later read. Without a lease the runtime is
+    /// retiring, and a read that cannot be admitted is retried as a turn's first read is: by
+    /// contention, or else by the next hint. Either stops this build as cancelled.
+    fn architecture_admission(
+        &self,
+    ) -> anyhow::Result<(super::AdmissionLease, crate::store::EvidenceResponse)> {
+        use anyhow::Context;
+        let lease = self
+            .background_lease()
+            .context("cancelled: architecture read retired")?;
+        let admitted = self.store.evidence_response_daemon_local();
+        // A test makes the next admission fail with an integrity fault, as a corrupt read would.
+        #[cfg(feature = "test-support")]
+        let admitted = match self.architecture.0.admission_fault.lock().unwrap().take() {
+            Some(fault) => Err(crate::store::SelectedIntegrity(fault).into()),
+            None => admitted,
+        };
+        let response = admitted.map_err(|error| {
+            if contention(&error) {
+                error
+            } else {
+                error.context("cancelled: architecture read not admitted")
+            }
+        })?;
+        Ok((lease, response))
+    }
+
+    /// Verify mode (#1301): build `pin` again in full, with its own reads, and require the
+    /// same core or the same kept failure as `built`; the full build is the one published. A
+    /// difference panics with its first differing path. A build that stopped has nothing to
+    /// compare, and neither has a full build that stopped: `built` stands.
+    #[cfg(feature = "test-support")]
+    fn architecture_verified(
+        &self,
+        owner: &ArchitectureOwner,
+        pin: IndexPin,
+        config: Option<&crate::rules::Config>,
+        built: anyhow::Result<ArchitectureCore>,
+    ) -> anyhow::Result<ArchitectureCore> {
+        if !owner.verify.load(Ordering::Acquire) || built.as_ref().is_err_and(|error| !kept(error))
+        {
+            return built;
+        }
+        let stopped = || {
+            anyhow::ensure!(
+                !owner.stop.load(Ordering::Acquire),
+                "cancelled: architecture build stopped"
+            );
+            Ok(())
+        };
+        let mut check = stopped;
+        // The full build gives way to a publication as the build did, without its hooks.
+        let give_way = || {
+            anyhow::ensure!(
+                !self.store.publication_writing(),
+                "cancelled: architecture verify read yielded to a publication"
+            );
+            Ok(())
+        };
+        let full = self.architecture_admission().and_then(|admitted| {
+            self.architecture_build(
+                admitted,
+                pin,
+                config,
+                &mut check,
+                (&give_way, &|_| {}),
+                &|_| {},
+            )
+        });
+        if full.as_ref().is_err_and(|error| !kept(error)) {
+            return built;
+        }
+        owner.verified.fetch_add(1, Ordering::AcqRel);
+        match (built, full) {
+            (Ok(built), Ok(full)) => {
+                let (built, full_value) = (
+                    built.canonical().expect("a core has a canonical form"),
+                    full.canonical().expect("a core has a canonical form"),
+                );
+                if let Some(at) = crate::architecture_core::first_difference(&built, &full_value) {
+                    panic!(
+                        "architecture verify: the build of {pin:?} differs from a full build at {at}"
+                    );
+                }
+                Ok(full)
+            }
+            (Err(built), Err(full)) => {
+                assert_eq!(
+                    format!("{built:#}"),
+                    format!("{full:#}"),
+                    "architecture verify: the build of {pin:?} failed unlike a full build"
+                );
+                Err(full)
+            }
+            (built, full) => panic!(
+                "architecture verify: the build of {pin:?} is {:?}, a full build {:?}",
+                built.map(|_| "a core"),
+                full.map(|_| "a core")
+            ),
+        }
     }
 
     /// Whether a head newer than `pin` is published. Retirement answers no.
@@ -844,6 +1029,26 @@ impl DaemonState {
     #[cfg(feature = "test-support")]
     pub fn set_architecture_on_demand_for_tests(&self) {
         self.architecture.0.on_demand.store(true, Ordering::Release);
+    }
+
+    /// Turn verify mode (#1301) on or off for this runtime's owner. It is on by default.
+    #[cfg(feature = "test-support")]
+    pub fn set_architecture_verify_incremental_for_tests(&self, on: bool) {
+        self.architecture.0.verify.store(on, Ordering::Release);
+    }
+
+    /// Builds verify mode compared with a full build of the same revision.
+    #[cfg(feature = "test-support")]
+    pub fn architecture_verified_for_tests(&self) -> usize {
+        self.architecture.0.verified.load(Ordering::Acquire)
+    }
+
+    /// The path of each build that published a core or a kept failure, oldest first.
+    #[cfg(feature = "test-support")]
+    pub fn architecture_build_paths_for_tests(
+        &self,
+    ) -> Vec<(IndexPin, crate::architecture_core::ArchitectureBuildPath)> {
+        self.architecture.0.paths.lock().unwrap().clone()
     }
 
     #[cfg(feature = "test-support")]
@@ -963,6 +1168,124 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(state.architecture_builds_for_tests(), 1);
+    }
+
+    /// What the owner has published, the paths it recorded and the comparisons it made.
+    fn published_state(state: &DaemonState) -> (usize, usize, usize) {
+        let owner = &state.architecture.0;
+        (
+            owner.state.lock().unwrap().published.len(),
+            owner.paths.lock().unwrap().len(),
+            owner.verified.load(Ordering::Acquire),
+        )
+    }
+
+    /// #1301: a stop keeps its precedence over a cause that would repeat, as in a turn's own
+    /// outcome handling.
+    #[test]
+    fn a_stopped_build_is_never_kept_whatever_its_cause() {
+        let stopped = anyhow::Error::from(crate::store::SelectedIntegrity("corrupt".into()))
+            .context("cancelled: architecture read not admitted");
+        assert!(CoreFailure::repeats(&stopped));
+        assert!(cancelled(&stopped));
+        assert!(!kept(&stopped));
+        let repeats = anyhow::Error::from(crate::store::SelectedIntegrity("corrupt".into()));
+        assert!(kept(&repeats));
+        assert!(!kept(&anyhow::anyhow!("storage_busy: index read")));
+    }
+
+    /// #1301: the runtime retires between read A and read B. Read B gets no lease, so the
+    /// build stops: nothing is published, no path is recorded, and verify mode compares
+    /// nothing.
+    #[test]
+    fn a_retirement_before_read_b_stops_the_build_and_publishes_nothing() {
+        let (_tmp, _store, state, _roots, _identity) =
+            crate::http::exceptional_recovery_tests::fixture();
+        let (reached, release) = hold_at(&state, "architecture_read_b", 0);
+        state.worker_step().unwrap();
+        reached.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap();
+        // Read A ended, so nothing holds a lease and the retirement goes ahead.
+        assert_eq!(state.leases(), 0);
+        assert!(matches!(
+            state.request_retire(|_| true),
+            RetireOutcome::Requested
+        ));
+        drop(release);
+        state.await_architecture_idle_for_tests();
+        assert_eq!(state.architecture_builds_for_tests(), 1);
+        assert_eq!(published_state(&state), (0, 0, 0));
+    }
+
+    /// #1301: read B's admission fails with an integrity cause, which the build reports as
+    /// stopped. Nothing is published or recorded for it and verify mode compares nothing; the
+    /// next turn builds the head again and publishes that.
+    #[test]
+    fn a_read_b_admission_failure_stops_the_build_and_publishes_nothing() {
+        let (_tmp, _store, state, _roots, _identity) =
+            crate::http::exceptional_recovery_tests::fixture();
+        let (reached, release) = mpsc::channel::<()>();
+        let (go, held) = mpsc::channel::<()>();
+        let held = Mutex::new(held);
+        let faulted = Arc::downgrade(&state);
+        let turns = std::sync::atomic::AtomicUsize::new(0);
+        state.set_architecture_hook_for_tests(Arc::new(move |at| match at {
+            "architecture_read_b" => {
+                if let Some(state) = faulted.upgrade() {
+                    *state.architecture.0.admission_fault.lock().unwrap() =
+                        Some("corrupt admitted read".into());
+                }
+            }
+            // The second turn: the first one's outcome has been handled.
+            "architecture_step_started" if turns.fetch_add(1, Ordering::AcqRel) == 1 => {
+                let _ = reached.send(());
+                let _ = held
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(crate::testing::HANG_BACKSTOP);
+            }
+            _ => {}
+        }));
+        state.worker_step().unwrap();
+        release.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap();
+        assert_eq!(state.architecture_builds_for_tests(), 1);
+        assert_eq!(published_state(&state), (0, 0, 0));
+        state.set_architecture_hook_for_tests(Arc::new(|_| {}));
+        drop(go);
+        state.await_architecture_idle_for_tests();
+        assert_eq!(state.architecture_builds_for_tests(), 2);
+        assert_eq!(published_state(&state), (1, 1, 1));
+    }
+
+    /// #1301: verify mode's full build fails to be admitted with an integrity cause. It
+    /// stopped, so verify compares nothing and the build stands: it is published once.
+    #[test]
+    fn a_stopped_verify_build_compares_nothing_and_the_build_stands() {
+        let (_tmp, _store, state, _roots, _identity) =
+            crate::http::exceptional_recovery_tests::fixture();
+        let faulted = Arc::downgrade(&state);
+        // After read B: the next admission is the full build's first.
+        state.set_architecture_hook_for_tests(Arc::new(move |at| {
+            if at == "resolving"
+                && let Some(state) = faulted.upgrade()
+            {
+                *state.architecture.0.admission_fault.lock().unwrap() =
+                    Some("corrupt admitted read".into());
+            }
+        }));
+        state.worker_step().unwrap();
+        state.await_architecture_idle_for_tests();
+        assert_eq!(state.architecture_builds_for_tests(), 1);
+        assert_eq!(published_state(&state), (1, 1, 0));
+        let head = head(&state);
+        let owner = state.architecture.0.state.lock().unwrap();
+        assert!(matches!(
+            owner.published.as_slice(),
+            [Published {
+                key: CoreKey { pin, .. },
+                outcome: Ok(_),
+                ..
+            }] if *pin == head
+        ));
     }
 
     /// #798: measuring reports each measured document, so a read during it sees the count

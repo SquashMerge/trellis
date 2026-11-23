@@ -958,13 +958,16 @@ the same build, and each rechecks the pin and rules hash, so a new revision or a
 file is never served from an older result. A daemon restart or an idle checkout's retirement
 drops the result, and the next activation builds it again.
 
-A build reads each document once in one read transaction, ends it, and only then resolves
-references, prepares rule rows and measures metrics. Publications never wait on the
+A build reads every document's native rows in one admitted read transaction, then the
+semantic rows of every document in a second admitted read at the same pin (#1301); a
+revision's rows are its own, so both reads see the same revision. It ends each read before the
+next starts, and only then resolves references, prepares rule rows and measures metrics. Both
+reads report `reading`. Publications never wait on the
 Architecture read (owner ruling 2026-11-20, #1245): a live publication raises a write intent,
-the build's read gives its snapshot up at its next check, and the owner reads again only once
+each of the build's reads gives its snapshot up at its next check, and the owner reads again only once
 the publication has ended. A read that gives way publishes nothing. During a burst of edits
 the Architecture view therefore lags, answering `building`, until the edits stop. The index
-keeps its rollback (DELETE) journal (Decision 0008). A retirement waits for that read at most,
+keeps its rollback (DELETE) journal (Decision 0008). A retirement waits for those reads at most,
 never for the computing, and a read waits for the owner before it admits its own transaction.
 A build keeps no source text, syntax trees or semantic rows, only the
 per-source reference rows (up to 50 sampled sites per edge, calls first), rule rows, metric rows and each

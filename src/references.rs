@@ -6,10 +6,13 @@ use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use tree_sitter::{Node, Tree};
 use work::Work;
 
 pub(crate) mod callers;
+#[cfg(feature = "test-support")]
+mod canonical;
 mod cargo_workspace;
 pub mod external;
 mod java;
@@ -60,8 +63,9 @@ pub struct ReferenceBase {
     partial_files: Vec<syntax_bounds::PartialFile>,
     identities: Vec<Identity>,
     modules: Vec<Value>,
-    /// The sources in `identities` order; a source outside the scan stays `None`.
-    sources: Vec<Option<SourceReferences>>,
+    /// The sources in `identities` order; a source outside the scan stays `None`. Each is
+    /// shared, so a later result can keep a source that did not change (#1301).
+    sources: Vec<Option<Arc<SourceReferences>>>,
     /// Language to selected producer.
     producers: BTreeMap<String, String>,
     /// How many projected documents (#620) are in each read status: older basis, catching
@@ -816,7 +820,7 @@ fn selected_references(
     catalogs: &mut Catalogs,
     locate: &impl Fn(usize, &str) -> Option<usize>,
     check: &mut impl FnMut() -> Result<()>,
-) -> Result<Vec<Option<SourceReferences>>> {
+) -> Result<Vec<Option<Arc<SourceReferences>>>> {
     let ReadContext {
         docs,
         trees,
@@ -825,7 +829,7 @@ fn selected_references(
         request,
         ..
     } = read;
-    let mut sources: Vec<Option<SourceReferences>> = Vec::new();
+    let mut sources: Vec<Option<Arc<SourceReferences>>> = Vec::new();
     sources.resize_with(docs.len(), || None);
     let mut site_count = 0usize;
     let mut target_documents: BTreeMap<usize, TargetDocument<'_>> = BTreeMap::new();
@@ -850,7 +854,7 @@ fn selected_references(
                 &mut target_documents,
                 check,
             )?;
-            sources[source] = Some(found);
+            sources[source] = Some(Arc::new(found));
         }
     }
     Ok(sources)

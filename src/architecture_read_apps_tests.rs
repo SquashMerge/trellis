@@ -286,7 +286,7 @@ fn failed_app_detection_fails_the_interfaces_part() {
         "bounded_work: app manifest parsing",
         "{candidates:#}"
     );
-    let interfaces = core.interfaces().err().expect("interfaces part fails");
+    let interfaces = core.interfaces().expect_err("interfaces part fails");
     assert_eq!(
         interfaces.to_string(),
         "bounded_work: app manifest parsing",

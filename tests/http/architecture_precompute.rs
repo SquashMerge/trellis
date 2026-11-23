@@ -520,6 +520,40 @@ async fn a_rules_read_without_rules_does_not_wait_for_a_build() {
     assert_eq!(scheduler.architecture_builds_for_tests() - before, 0);
 }
 
+/// #1301: verify mode is on in this suite. Each owner build is compared with a full build of
+/// the same revision, and reports the path it took; off, a build is not compared.
+#[tokio::test]
+async fn verify_mode_compares_each_build_with_a_full_build_and_reports_its_path() {
+    use trellis::http::{ArchitectureBuildPath, FullReason};
+    let (base, runtime, browser, key) = fixture().await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let builds = scheduler.architecture_builds_for_tests();
+    let verified = scheduler.architecture_verified_for_tests();
+    write_rules(&base, RULES);
+    let app = browser.clone().router();
+    let (status, first) = request(app.clone(), &key, "").await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["payload"]["state"], "ready");
+    assert_eq!(scheduler.architecture_builds_for_tests() - builds, 1);
+    assert_eq!(scheduler.architecture_verified_for_tests() - verified, 1);
+    let pin: trellis::model::IndexPin = serde_json::from_value(json!({
+        "indexGeneration": first["payload"]["indexGeneration"],
+        "indexRevision": first["payload"]["indexRevision"]
+    }))
+    .unwrap();
+    assert_eq!(
+        scheduler.architecture_build_paths_for_tests().last(),
+        Some(&(pin, ArchitectureBuildPath::Full(FullReason::NoBase)))
+    );
+
+    scheduler.set_architecture_verify_incremental_for_tests(false);
+    write_rules(&base, OTHER_RULES);
+    let (status, second) = request(app, &key, "").await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(scheduler.architecture_builds_for_tests() - builds, 2);
+    assert_eq!(scheduler.architecture_verified_for_tests() - verified, 1);
+}
+
 /// A running build holds no read: the head can move, and the build gives way to it.
 #[tokio::test]
 async fn a_new_revision_supersedes_a_build_that_is_computing() {

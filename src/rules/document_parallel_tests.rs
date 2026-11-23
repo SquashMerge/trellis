@@ -116,8 +116,13 @@ fn historical_complete_coverage_never_proves_forbidden_call_absence() {
         semantic_status: crate::model::SemanticStatus::OlderBasis,
     });
     let base = prepare(&config, &snapshot, &mut || Ok(())).unwrap();
-    assert!(!base.declarations.is_empty());
-    for row in &base.declarations {
+    let rows: Vec<&Value> = base
+        .documents
+        .iter()
+        .flat_map(|document| &document.instances)
+        .collect();
+    assert!(!rows.is_empty());
+    for row in rows {
         assert_eq!(row["status"], "unknown");
         assert_eq!(
             row["constraints"][0]["unresolved"][0],
@@ -147,7 +152,12 @@ fn prepared_rows_select_what_a_scoped_evaluation_returns() {
     )
     .unwrap();
     let prepared = prepare(&config, &snapshot, &mut || Ok(())).unwrap();
-    assert!(!prepared.declarations.is_empty());
+    assert!(
+        prepared
+            .documents
+            .iter()
+            .any(|document| !document.instances.is_empty())
+    );
     for paths in [
         vec![],
         vec!["src/a.rs".to_owned()],
@@ -196,11 +206,15 @@ fn document_work_overlaps_but_rows_and_counts_are_admitted_in_order() {
     }
     .run(&documents, &mut parallel_work, 4, &mut || Ok(()))
     .unwrap();
-    assert!(!serial.0.is_empty());
-    assert_eq!(
-        serde_json::to_vec(&serial).unwrap(),
-        serde_json::to_vec(&parallel).unwrap()
-    );
+    let rows = |documents: &[Arc<DocumentRuleRows>]| {
+        let rows: Vec<_> = documents
+            .iter()
+            .map(|document| (&document.instances, &document.test_only))
+            .collect();
+        serde_json::to_vec(&rows).unwrap()
+    };
+    assert!(serial.iter().any(|document| !document.instances.is_empty()));
+    assert_eq!(rows(&serial), rows(&parallel));
     assert_eq!(serial_work.used, parallel_work.used);
     assert!(serial_work.used > 0);
 

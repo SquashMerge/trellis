@@ -523,6 +523,40 @@ fn architecture_anchors_of_one_basis_share_metadata_within_the_same_bound() {
     );
 }
 
+/// #1301: read B in its own transaction reads the semantic rows the one read reads, and the
+/// core computed from them is the same.
+#[test]
+fn the_split_architecture_read_reads_the_rows_of_one_read() {
+    let (_state, root, store, cancel, options) = setup();
+    let (graph, native, capture) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    let (semantic, captured) = evidence(&native, root.path());
+    let leader = store.publication_for_tests().unwrap();
+    store
+        .publish_native_semantic(
+            &graph,
+            &capture,
+            &native,
+            &semantic,
+            &captured,
+            &leader,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+
+    let [(one_semantic, one_core), (split_semantic, split_core)] =
+        store.architecture_split_reads_for_tests().unwrap();
+    let (_, hello) = one_semantic
+        .iter()
+        .find(|(path, _)| path == "hello.rs")
+        .unwrap();
+    assert!(hello.contains("SemanticAnchor"), "{hello}");
+    assert_eq!(one_semantic, split_semantic);
+    assert_eq!(one_core, split_core);
+    assert_ne!(one_core["references"]["producers"], json!({}));
+}
+
 #[test]
 fn private_stage_admits_typed_evidence_without_changing_live_head() {
     let (_state, root, store, cancel, options) = setup();

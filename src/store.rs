@@ -1648,8 +1648,44 @@ impl EvidenceResponse {
             .map(|(snapshot, _)| snapshot)
     }
 
-    /// The snapshot and each document's control regions, in snapshot order.
+    /// The snapshot and each document's control regions, in snapshot order: read A, then
+    /// read B, in this one transaction.
     pub(crate) fn architecture_snapshot_regions(
+        &self,
+        pin: Option<IndexPin>,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+        progress: &dyn Fn(usize, usize),
+    ) -> Result<(
+        crate::architecture_inputs::Snapshot,
+        Vec<Vec<crate::native_records::ControlRegion>>,
+    )> {
+        let (mut snapshot, regions) = self.architecture_native_regions(pin, check, progress)?;
+        self.architecture_semantic_rows(&mut snapshot, check)?;
+        Ok((snapshot, regions))
+    }
+
+    /// Read B of an Architecture build (#1301): the semantic rows of `snapshot`'s documents at
+    /// its pin. Every revision's rows are its own, so this may run in a later transaction than
+    /// the read that returned `snapshot`, and reads the same rows.
+    pub(crate) fn architecture_semantic_rows(
+        &self,
+        snapshot: &mut crate::architecture_inputs::Snapshot,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+    ) -> Result<()> {
+        let selected = self.selected(Some(snapshot.pin))?;
+        semantic_display::architecture_semantic(
+            &self.db,
+            &selected.key,
+            &mut snapshot.documents,
+            check,
+        )?;
+        check()
+    }
+
+    /// Read A of an Architecture build (#1301): each selected native document once with its
+    /// control regions, the retained manifests and the root TypeScript config. Documents have
+    /// no semantic rows yet; [`Self::architecture_semantic_rows`] adds them.
+    pub(crate) fn architecture_native_regions(
         &self,
         pin: Option<IndexPin>,
         check: &mut (impl FnMut() -> Result<()> + Send),
@@ -2036,8 +2072,6 @@ impl EvidenceResponse {
                 bytes,
             });
         }
-        semantic_display::architecture_semantic(&self.db, &selected.key, &mut documents, check)?;
-        check()?;
         Ok((
             crate::architecture_inputs::Snapshot {
                 pin: selected.pin,

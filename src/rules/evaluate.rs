@@ -364,7 +364,7 @@ fn prepare_with_workers(
             }
         }
     }
-    let (declarations, test_declarations) = DocumentEvaluation {
+    let documents = DocumentEvaluation {
         config,
         targets: &targets,
         inheritance,
@@ -377,8 +377,7 @@ fn prepare_with_workers(
         limit,
         source_set: source_set.map(str::to_owned),
         semantic,
-        declarations,
-        test_declarations,
+        documents,
         work_used: work.used,
         apps: apps.0,
         unread_manifests: apps.1,
@@ -775,17 +774,21 @@ fn select_prepared(
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<()> {
     // Prepared rows carry their document in `target`.
-    for (prepared, rows) in [
-        (&base.declarations, instances),
-        (&base.test_declarations, test_only),
-    ] {
-        for row in prepared {
-            check()?;
-            let path = row["target"]["path"]
-                .as_str()
-                .context("store_unavailable: rule target path absent")?;
-            if glob_matches(filter, path) {
-                rows.push(row.clone());
+    for (test, rows) in [(false, instances), (true, test_only)] {
+        for document in &base.documents {
+            let prepared = if test {
+                &document.test_only
+            } else {
+                &document.instances
+            };
+            for row in prepared {
+                check()?;
+                let path = row["target"]["path"]
+                    .as_str()
+                    .context("store_unavailable: rule target path absent")?;
+                if glob_matches(filter, path) {
+                    rows.push(row.clone());
+                }
             }
         }
     }

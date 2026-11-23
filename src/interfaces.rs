@@ -112,7 +112,7 @@ pub(crate) enum ClientPrefix {
 /// or `httpx` call (#856), which is [`ClientPrefix::Joined`] only through an httpx base URL,
 /// or a Java client call (#857), which is [`ClientPrefix::Joined`] only under a base URL it
 /// reads.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct ClientCall {
     /// `None` when the method cannot be read.
     pub(crate) method: Option<String>,
@@ -136,7 +136,7 @@ pub(crate) struct Match {
 }
 
 /// Every route and client call of a revision, and the route each call reached.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct Extraction {
     pub(crate) routes: Vec<Route>,
     pub(crate) calls: Vec<ClientCall>,

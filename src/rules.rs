@@ -9,6 +9,7 @@ use globset::GlobSet;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use toml::Spanned;
 
 mod apps;
@@ -644,14 +645,55 @@ pub(crate) struct RulesBase {
     limit: usize,
     source_set: Option<String>,
     semantic: bool,
-    declarations: Vec<Value>,
-    test_declarations: Vec<Value>,
+    /// One entry per evaluated document, in snapshot order. Each is shared, so a later result
+    /// can keep a document that did not change (#1301).
+    documents: Vec<Arc<DocumentRuleRows>>,
     work_used: usize,
     apps: Vec<crate::apps::App>,
     unread_manifests: usize,
 }
 
+/// One document's prepared declaration rows: production and test-only.
+#[derive(Debug, Default)]
+pub(crate) struct DocumentRuleRows {
+    instances: Vec<Value>,
+    test_only: Vec<Value>,
+}
+
 impl RulesBase {
+    /// Every field, for comparing two results (#1301).
+    #[cfg(feature = "test-support")]
+    pub(crate) fn canonical(&self) -> Value {
+        // Exhaustive, so a new field fails to compile until it is compared.
+        let Self {
+            limit,
+            source_set,
+            semantic,
+            documents,
+            work_used,
+            apps,
+            unread_manifests,
+        } = self;
+        json!({
+            "limit": limit,
+            "sourceSet": source_set,
+            "semantic": semantic,
+            "documents": documents
+                .iter()
+                .map(|rows| {
+                    let DocumentRuleRows {
+                        instances,
+                        test_only,
+                    } = rows.as_ref();
+                    json!([instances, test_only])
+                })
+                .collect::<Vec<_>>(),
+            "workUsed": work_used,
+            "apps": apps,
+            "unreadManifests": unread_manifests,
+        })
+    }
+
     /// The effective apps for this snapshot (#794): authored apps by name, then the detected
     /// apps they do not shadow, in manifest-path order.
     pub(crate) fn apps(&self) -> &[crate::apps::App] {
