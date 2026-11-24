@@ -105,7 +105,9 @@ mod staged {
             hash.optional(
                 freshness.as_ref(),
                 |hash, SemanticFreshnessState { basis_pin, values }| {
-                    pin(hash, basis_pin);
+                    if projection.is_some() {
+                        pin(hash, basis_pin);
+                    }
                     hash.integer(values.len() as i64);
                     for (basis, freshness) in values {
                         hash.integer(*basis);

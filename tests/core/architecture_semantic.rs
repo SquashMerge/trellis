@@ -125,6 +125,62 @@ fn fingerprint_key(
 }
 
 #[test]
+fn architecture_incremental_current_fingerprint_survives_same_native_copy() {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let mut spec = semantic();
+    let first_pin = publisher.publish(&spec);
+    let first = publisher
+        .store
+        .architecture_fingerprints_for_tests(Some(first_pin))
+        .unwrap();
+    assert!(first.semantic_states.values().any(|state| {
+        state.tuple.is_some()
+            && state
+                .freshness
+                .as_ref()
+                .is_some_and(|freshness| freshness.values.is_empty())
+    }));
+    assert!(first.semantic_states.values().any(|state| {
+        state
+            .freshness
+            .as_ref()
+            .is_some_and(|freshness| !freshness.values.is_empty())
+    }));
+
+    // The native-first same-native branch copies current manifests and their payloads,
+    // advancing validity without introducing a historical projection.
+    spec.producer = false;
+    let copied_pin = publisher.publish(&spec);
+    assert!(copied_pin.index_revision > first_pin.index_revision);
+    let copied = publisher
+        .store
+        .architecture_fingerprints_for_tests(Some(copied_pin))
+        .unwrap();
+    for (key, before) in &first.semantic_states {
+        let after = &copied.semantic_states[key];
+        assert!(
+            before.projection.is_none() && after.projection.is_none(),
+            "{key:?}"
+        );
+        assert_eq!(before.default_producer, after.default_producer);
+        assert_eq!(before.tuple, after.tuple, "payload identity is copied");
+        let before_freshness = before.freshness.as_ref().unwrap();
+        let after_freshness = after.freshness.as_ref().unwrap();
+        assert_eq!(before_freshness.basis_pin, first_pin);
+        assert_eq!(after_freshness.basis_pin, copied_pin);
+        assert_eq!(before_freshness.values, after_freshness.values);
+        assert_eq!(
+            first.documents[key], copied.documents[key],
+            "a changed lookup pin is not changed semantic state: {key:?}"
+        );
+    }
+    assert_eq!(first.producers, copied.producers);
+    assert_eq!(first.selections, copied.selections);
+}
+
+#[test]
 fn architecture_incremental_read_a_tuple_and_freshness() {
     let (state, root, store, pin) = publish(&semantic());
     let baseline = store.architecture_fingerprints_for_tests(None).unwrap();
@@ -186,30 +242,106 @@ fn architecture_incremental_read_a_tuple_and_freshness() {
 }
 
 #[test]
-fn architecture_incremental_read_a_missing_required_freshness_and_payload() {
-    for missing in ["freshness", "payload"] {
-        let (state, root, store, _) = publish(&semantic());
+fn architecture_incremental_read_a_required_payload_and_consumed_freshness() {
+    for (reference, relationship, provenance) in [
+        (false, false, "call-lower-0"),
+        (true, false, "ref-shape"),
+        (false, true, "rel-square"),
+    ] {
+        let published = if reference || relationship {
+            shapes(reference, relationship)
+        } else {
+            publish(&semantic())
+        };
+        let (state, root, store, _) = published;
         store.architecture_fingerprints_for_tests(None).unwrap();
         drop(store);
-        let db = architecture_index_db(&state);
-        db.execute(if missing == "freshness" {
-            "DELETE FROM semantic_coverage_freshness WHERE tuple_id IN (SELECT tuple_id FROM semantic_coverage WHERE path='src/low.rs')"
-        } else {
-            "UPDATE semantic_coverage SET payload_id=NULL WHERE path='src/low.rs'"
-        }, []).unwrap();
-        drop(db);
+        delete_freshness(&state, provenance);
         let store = Store::open_for_tests(state.path(), root.path()).unwrap();
-        let error = store.architecture_fingerprints_for_tests(None).unwrap_err();
-        let text = format!("{error:#}");
-        assert!(
-            text.contains(if missing == "freshness" {
-                "semantic freshness missing"
-            } else {
-                "architecture tuple names no payload"
-            }),
-            "{text}"
-        );
+        store.architecture_fingerprints_for_tests(None).unwrap();
+        let old = store
+            .architecture_semantic_for_tests(2_000_000)
+            .unwrap_err();
+        let fingerprinted = store
+            .architecture_reference_snapshot_for_tests()
+            .err()
+            .unwrap();
+        let expected = "incompatible_index: semantic freshness missing";
+        assert_eq!(old.to_string(), expected, "{provenance}");
+        assert_eq!(fingerprinted.to_string(), expected, "{provenance}");
     }
+    let (state, root, store, _) = publish(&semantic());
+    drop(store);
+    let db = architecture_index_db(&state);
+    db.execute(
+        "UPDATE semantic_coverage SET payload_id=NULL WHERE path='src/low.rs'",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let error = store.architecture_fingerprints_for_tests(None).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "incompatible_index: architecture tuple names no payload"
+    );
+}
+
+#[test]
+fn architecture_incremental_unused_missing_freshness_preserves_full_read() {
+    let (state, root, store, pin) = shapes(false, false);
+    let before = store
+        .architecture_fingerprints_for_tests(Some(pin))
+        .unwrap();
+    let key = fingerprint_key(&before, "src/low.rs");
+    let full_before = store.architecture_semantic_for_tests(2_000_000).unwrap();
+    assert!(
+        !before.semantic_states[&key]
+            .freshness
+            .as_ref()
+            .unwrap()
+            .values
+            .is_empty()
+    );
+    drop(store);
+    delete_freshness(&state, "decl-Square");
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let after = store
+        .architecture_fingerprints_for_tests(Some(pin))
+        .unwrap();
+    assert_eq!(
+        before.semantic_states[&key].tuple,
+        after.semantic_states[&key].tuple
+    );
+    assert!(
+        after.semantic_states[&key]
+            .freshness
+            .as_ref()
+            .unwrap()
+            .values
+            .is_empty()
+    );
+    assert_ne!(
+        before.documents[&key].semantic,
+        after.documents[&key].semantic
+    );
+
+    // The first helper uses ordinary native A and unchanged all-source B; the second
+    // uses architecture_input's fingerprinted A before that same B.
+    let full = store.architecture_semantic_for_tests(2_000_000).unwrap();
+    let fingerprinted = store.architecture_reference_snapshot_for_tests().unwrap();
+    assert_eq!(fingerprinted.pin, pin);
+    let fingerprinted: Vec<_> = fingerprinted
+        .documents
+        .into_iter()
+        .map(|document| (document.key.path, document.semantic))
+        .collect();
+    assert_eq!(format!("{full_before:?}"), format!("{full:?}"));
+    assert_eq!(format!("{full:?}"), format!("{fingerprinted:?}"));
+    assert!(
+        full.iter()
+            .all(|(_, semantic)| semantic.anchors.is_empty() && semantic.relationships.is_empty())
+    );
 }
 
 #[test]

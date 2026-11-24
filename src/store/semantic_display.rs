@@ -1563,18 +1563,11 @@ pub(crate) fn architecture_document_fingerprint(
             basis_pin,
             values: freshness,
         });
+        // Read B requires freshness when it consumes a proof, not for unused bases.
         if !pending && selected && matches!(state.as_str(), "complete" | "partial") {
-            let payload = payload.context(SelectedIntegrity(
-                "incompatible_index: architecture tuple names no payload".into(),
-            ))?;
-            // Check required presence without decoding facts or introducing read-side attestation.
-            let missing: bool = db.query_row(
-                "SELECT EXISTS(SELECT 1 FROM semantic_basis b WHERE b.payload_id=?1 AND NOT EXISTS(SELECT 1 FROM semantic_coverage_freshness f WHERE f.revision_id=?2 AND f.tuple_id=?3 AND f.basis_id=b.basis_id))",
-                params![payload, key, tuple], |row| row.get(0),
-            )?;
             ensure!(
-                !missing,
-                SelectedIntegrity("incompatible_index: semantic freshness missing".into())
+                payload.is_some(),
+                SelectedIntegrity("incompatible_index: architecture tuple names no payload".into())
             );
         }
     }

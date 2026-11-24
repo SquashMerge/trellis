@@ -39,6 +39,8 @@ pub struct SemanticTupleState {
 #[cfg(feature = "test-support")]
 #[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
 pub struct SemanticFreshnessState {
+    /// The pin whose freshness map was read. For a current tuple this is a lookup pin,
+    /// not semantic identity; only a historical projection makes it a basis identity.
     pub basis_pin: IndexPin,
     pub values: BTreeMap<i64, String>,
 }
