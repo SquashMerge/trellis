@@ -939,6 +939,11 @@ fn file_references<'a>(
         sites,
     } = prepared;
     let doc = docs[source];
+    #[cfg(feature = "test-support")]
+    crate::architecture_core::architecture_execution_event(
+        crate::architecture_core::ArchitectureExecutionEvent::ReferenceInvocation,
+        &doc.key,
+    )?;
     request.check()?;
     let (before_work, before_sites) = (catalogs.rust_execution.work.used, *site_count);
     let mut plan = SourceChargePlan {

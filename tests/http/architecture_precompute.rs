@@ -12,7 +12,9 @@ use std::time::Duration;
 use trellis::daemon::registry::MetricsResponseHooks;
 use trellis::http::DaemonState;
 use trellis::http::{
-    ArchitectureAttempt, ArchitectureBuildPath, ArchitectureCoreHandle, FullReason,
+    ArchitectureAttempt, ArchitectureBuildPath, ArchitectureCoreHandle,
+    ArchitectureExecutionBranch as ExecutionBranch, ArchitectureExecutionEvent as ExecutionEvent,
+    ArchitectureExecutionTrace, FullReason,
 };
 use trellis::indexer::IndexOptions;
 use trellis::metrics_read::MetricsOptions;
@@ -188,6 +190,26 @@ fn published_attempt(scheduler: &DaemonState, pin: IndexPin) -> ArchitectureAtte
 
 fn core(scheduler: &DaemonState, pin: IndexPin) -> ArchitectureCoreHandle {
     scheduler.architecture_core_for_tests(pin).unwrap()
+}
+
+fn execution(
+    attempt: &ArchitectureAttempt,
+    branch: ExecutionBranch,
+) -> &ArchitectureExecutionTrace {
+    attempt
+        .executions
+        .get(&branch)
+        .expect("the compute branch ran")
+}
+
+fn document_keys(
+    scheduler: &DaemonState,
+    pin: IndexPin,
+) -> Vec<trellis::native_records::DocumentKey> {
+    serde_json::from_value(
+        core(scheduler, pin).canonical().unwrap()["dependencies"]["order"].clone(),
+    )
+    .unwrap()
 }
 
 fn source_paths(keys: &[trellis::native_records::DocumentKey]) -> Vec<&str> {
@@ -487,6 +509,323 @@ async fn architecture_incremental_rules_change_does_not_resurrect_a_base() {
         let pin = index_edit(&base, &runtime, &[("src/main.rs", Some(text))]).await;
         assert_incremental(&published_attempt(&scheduler, pin), &["src/main.rs"], &[]);
     }
+}
+
+#[tokio::test]
+async fn architecture_incremental_boundary_rules_observation_ends_episode() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let mut sources = NATIVE_SOURCES.to_vec();
+    sources.push((".trellis/rules.toml", RULES));
+    let (base, runtime, _, _) = super::architecture_http::fixture_exact_sources(&sources).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let original = current_pin(&scheduler);
+    let (reached, waiting) = mpsc::channel();
+    let (release, gate) = mpsc::channel();
+    let gate = Mutex::new(gate);
+    let (finished, cancelled) = mpsc::channel();
+    let (release_finish, finish_gate) = mpsc::channel();
+    let finish_gate = Mutex::new(finish_gate);
+    let changed = AtomicBool::new(false);
+    let restored = AtomicBool::new(false);
+    scheduler.set_architecture_hook_for_tests(Arc::new(move |point| {
+        if point == "architecture_before_recheck" && !changed.swap(true, Ordering::AcqRel) {
+            reached.send(()).unwrap();
+            gate.lock()
+                .unwrap()
+                .recv_timeout(trellis::testing::HANG_BACKSTOP)
+                .unwrap();
+        }
+        // The boundary has returned cancellation before this hook runs; the next
+        // turn has not yet observed A again.
+        if point == "architecture_build_finished" && !restored.swap(true, Ordering::AcqRel) {
+            finished.send(()).unwrap();
+            finish_gate
+                .lock()
+                .unwrap()
+                .recv_timeout(trellis::testing::HANG_BACKSTOP)
+                .unwrap();
+        }
+    }));
+    let paths = scheduler.architecture_build_paths_for_tests().len();
+    let compared = scheduler.architecture_verified_for_tests();
+    let pin = publish_edit(
+        &base,
+        &runtime,
+        &[("src/main.rs", Some("fn main() { let _value = 2; }\n"))],
+    )
+    .await;
+    waiting
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
+    runtime.hold_worker_step_for_tests(|| {
+        // Isolate the owner's boundary observation from watcher-step observations.
+        let rules_path = base.path().join("checkout/.trellis/rules.toml");
+        std::fs::write(&rules_path, OTHER_RULES).unwrap();
+        release.send(()).unwrap();
+        cancelled
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .unwrap();
+        std::fs::write(&rules_path, RULES).unwrap();
+        release_finish.send(()).unwrap();
+    });
+    runtime.settled_for_tests(Some(pin)).await.unwrap();
+    let attempts: Vec<_> = scheduler
+        .architecture_attempts_for_tests()
+        .into_iter()
+        .filter(|attempt| attempt.pin == pin)
+        .collect();
+    assert_eq!(attempts.len(), 2, "{attempts:?}");
+    let stopped = &attempts[0];
+    assert_eq!(stopped.base, Some(original));
+    assert_incremental(stopped, &["src/main.rs"], &[]);
+    assert!(!stopped.compared && !stopped.published);
+    assert_eq!(stopped.full_retries, 0);
+    let next = published_attempt(&scheduler, pin);
+    assert_eq!(
+        next.base, None,
+        "observed B invalidates the retained A base"
+    );
+    assert_eq!(next.path, ArchitectureBuildPath::Full(FullReason::NoBase));
+    assert_eq!(
+        scheduler.architecture_build_paths_for_tests().len(),
+        paths + 1
+    );
+    assert_eq!(scheduler.architecture_verified_for_tests(), compared + 1);
+}
+
+#[tokio::test]
+async fn architecture_execution_full_cancelled_during_measuring() {
+    let mut sources = NATIVE_SOURCES.to_vec();
+    sources.push(("typed.ts", "export function typed() { return 1; }\n"));
+    let (base, runtime, _, _) = super::architecture_http::fixture_exact_sources(&sources).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let original = current_pin(&scheduler);
+    let keys = document_keys(&scheduler, original);
+    scheduler.set_architecture_execution_hook_for_tests(Arc::new(|branch, event, _| {
+        if branch == ExecutionBranch::Candidate && event == ExecutionEvent::BeforeMetricCommit {
+            anyhow::bail!("cancelled: before the first ordered metric commit");
+        }
+        Ok(())
+    }));
+    let pin = index_edit(
+        &base,
+        &runtime,
+        &[("typed.ts", Some("export function typed() { return 2; }\n"))],
+    )
+    .await;
+    let attempts: Vec<_> = scheduler
+        .architecture_attempts_for_tests()
+        .into_iter()
+        .filter(|attempt| attempt.pin == pin)
+        .collect();
+    assert_eq!(attempts.len(), 2);
+    let stopped = &attempts[0];
+    assert_eq!(
+        stopped.path,
+        ArchitectureBuildPath::Full(FullReason::NonRustChanged)
+    );
+    assert!(!stopped.published && !stopped.compared);
+    assert_eq!(stopped.full_retries, 0);
+    assert_eq!(stopped.references.file_references, keys);
+    assert!(stopped.measured_sources.is_empty());
+    let candidate = execution(stopped, ExecutionBranch::Candidate);
+    assert_eq!(candidate.file_references, keys);
+    assert!(
+        candidate.references.is_some(),
+        "references finished before measuring stopped"
+    );
+    assert!(candidate.measured_sources.is_empty());
+    assert_eq!(
+        stopped.executions.len(),
+        1,
+        "a stopped build runs no oracle"
+    );
+    let progress = stopped.progress.last().unwrap();
+    assert_eq!(progress.phase, "measuring");
+    assert_eq!(
+        progress.completed,
+        keys.len(),
+        "worker completion is not metric commit"
+    );
+    let next = published_attempt(&scheduler, pin);
+    assert_eq!(next.base, Some(original));
+    assert_eq!(
+        next.path,
+        ArchitectureBuildPath::Full(FullReason::NonRustChanged)
+    );
+    assert_eq!(
+        next.measured_sources, keys,
+        "the scoped stop does not leak to the next turn"
+    );
+}
+
+#[tokio::test]
+async fn architecture_execution_full_metric_worker_failures_keep_only_ordered_commits() {
+    for failed in ["src/clean.rs", "src/lib.rs"] {
+        let mut sources = NATIVE_SOURCES.to_vec();
+        sources.push(("typed.ts", "export function typed() { return 1; }\n"));
+        let (base, runtime, _, _) = super::architecture_http::fixture_exact_sources(&sources).await;
+        let scheduler = runtime.browser_scheduler().unwrap();
+        let keys = document_keys(&scheduler, current_pin(&scheduler));
+        scheduler.set_architecture_execution_hook_for_tests(Arc::new(move |_, event, key| {
+            if event == ExecutionEvent::MetricWorker && key.path == failed {
+                anyhow::bail!("bounded_work: injected metric computation");
+            }
+            Ok(())
+        }));
+        let pin = index_edit(
+            &base,
+            &runtime,
+            &[("typed.ts", Some("export function typed() { return 2; }\n"))],
+        )
+        .await;
+        let attempt = published_attempt(&scheduler, pin);
+        assert_eq!(
+            attempt.path,
+            ArchitectureBuildPath::Full(FullReason::NonRustChanged)
+        );
+        assert_eq!(attempt.full_retries, 0);
+        let prefix: Vec<_> = keys
+            .iter()
+            .take_while(|key| key.path != failed)
+            .cloned()
+            .collect();
+        assert_eq!(prefix.len(), usize::from(failed == "src/lib.rs"));
+        assert_eq!(attempt.measured_sources, prefix);
+        assert_eq!(attempt.references.file_references, keys);
+        for branch in [ExecutionBranch::Candidate, ExecutionBranch::Oracle] {
+            let observed = execution(&attempt, branch);
+            assert_eq!(observed.file_references, keys);
+            assert_eq!(observed.measured_sources, prefix);
+            assert!(observed.references.is_some());
+        }
+        assert_eq!(attempt.progress.last().unwrap().completed, keys.len());
+        let value = core(&scheduler, pin).canonical().unwrap();
+        assert_eq!(
+            value["metrics"]["failure"]["message"],
+            "bounded_work: injected metric computation"
+        );
+    }
+}
+
+#[tokio::test]
+async fn architecture_execution_interrupted_incremental_references_are_actual() {
+    let (base, runtime, _, _) =
+        super::architecture_http::fixture_exact_sources(NATIVE_SOURCES).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let original = current_pin(&scheduler);
+    scheduler.set_architecture_execution_hook_for_tests(Arc::new(|branch, event, key| {
+        if branch == ExecutionBranch::Candidate
+            && event == ExecutionEvent::ReferenceInvocation
+            && key.path == "src/main.rs"
+        {
+            anyhow::bail!("cancelled: interrupted incremental reference invocation");
+        }
+        Ok(())
+    }));
+    let pin = index_edit(
+        &base,
+        &runtime,
+        &[
+            ("src/clean.rs", Some("pub fn clean() { 2; }\n")),
+            ("src/main.rs", Some("fn main() { let _value = 2; }\n")),
+        ],
+    )
+    .await;
+    let attempts: Vec<_> = scheduler
+        .architecture_attempts_for_tests()
+        .into_iter()
+        .filter(|attempt| attempt.pin == pin)
+        .collect();
+    assert_eq!(attempts.len(), 2);
+    let stopped = &attempts[0];
+    assert!(!stopped.published && !stopped.compared);
+    assert_eq!(stopped.full_retries, 0);
+    assert_eq!(
+        source_paths(&stopped.references.file_references),
+        ["src/clean.rs", "src/main.rs"]
+    );
+    let observed = execution(stopped, ExecutionBranch::Candidate);
+    assert_eq!(observed.file_references, stopped.references.file_references);
+    assert!(
+        observed.references.is_none(),
+        "partial reference accounting is not a completed trace"
+    );
+    assert!(observed.measured_sources.is_empty());
+    assert_eq!(stopped.executions.len(), 1);
+    let next = published_attempt(&scheduler, pin);
+    assert_eq!(next.base, Some(original));
+    assert_incremental(&next, &["src/clean.rs", "src/main.rs"], &[]);
+}
+
+#[tokio::test]
+async fn architecture_execution_interrupted_retry_does_not_retain_candidate_trace() {
+    let (base, runtime, _, _) =
+        super::architecture_http::fixture_exact_sources(NATIVE_SOURCES).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let original = current_pin(&scheduler);
+    scheduler.set_architecture_execution_hook_for_tests(Arc::new(|branch, event, key| {
+        if event == ExecutionEvent::ReferenceInvocation {
+            if branch == ExecutionBranch::Candidate && key.path == "src/main.rs" {
+                anyhow::bail!("store_unavailable: candidate reference invocation failed");
+            }
+            if branch == ExecutionBranch::Retry && key.path == "src/lib.rs" {
+                anyhow::bail!("cancelled: full retry reference invocation stopped");
+            }
+        }
+        Ok(())
+    }));
+    let pin = index_edit(
+        &base,
+        &runtime,
+        &[("src/main.rs", Some("fn main() { let _value = 2; }\n"))],
+    )
+    .await;
+    let attempts: Vec<_> = scheduler
+        .architecture_attempts_for_tests()
+        .into_iter()
+        .filter(|attempt| attempt.pin == pin)
+        .collect();
+    assert_eq!(attempts.len(), 2);
+    let stopped = &attempts[0];
+    assert_eq!(
+        stopped.path,
+        ArchitectureBuildPath::Full(FullReason::IncrementalFailure)
+    );
+    assert!(!stopped.published && !stopped.compared);
+    assert_eq!(
+        stopped.full_retries, 1,
+        "the ordinary failure started one independent retry"
+    );
+    let candidate = execution(stopped, ExecutionBranch::Candidate);
+    let retry = execution(stopped, ExecutionBranch::Retry);
+    assert_eq!(source_paths(&candidate.file_references), ["src/main.rs"]);
+    assert_eq!(
+        source_paths(&retry.file_references),
+        ["src/clean.rs", "src/lib.rs"]
+    );
+    assert_eq!(stopped.references.file_references, retry.file_references);
+    assert!(candidate.references.is_none() && retry.references.is_none());
+    assert!(candidate.measured_sources.is_empty() && retry.measured_sources.is_empty());
+    assert_eq!(
+        stopped.executions.len(),
+        2,
+        "no oracle ran after the interrupted retry"
+    );
+    let next = published_attempt(&scheduler, pin);
+    assert_eq!(next.base, Some(original));
+    assert_incremental(&next, &["src/main.rs"], &[]);
+    assert!(!next.executions.contains_key(&ExecutionBranch::Retry));
+    assert_eq!(
+        source_paths(&execution(&next, ExecutionBranch::Candidate).file_references),
+        ["src/main.rs"]
+    );
+    assert_eq!(
+        execution(&next, ExecutionBranch::Oracle)
+            .file_references
+            .len(),
+        5
+    );
 }
 
 #[tokio::test]

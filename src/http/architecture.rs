@@ -14,6 +14,11 @@ use crate::architecture_core::{
     ArchitectureBuildPath, ArchitectureCore, ArchitectureProgress, ArchitectureReadA, CoreFailure,
     FullReason, ReferenceWorkMargin, finish_architecture, prepare_architecture,
 };
+#[cfg(feature = "test-support")]
+use crate::architecture_core::{
+    ArchitectureExecutionBranch, ArchitectureExecutionHook, ArchitectureExecutionObserver,
+    ArchitectureExecutionScope, ArchitectureExecutionTrace,
+};
 use crate::model::IndexPin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
@@ -267,9 +272,14 @@ pub struct ArchitectureAttempt {
     pub base: Option<IndexPin>,
     pub path: ArchitectureBuildPath,
     pub semantic_sources: Vec<crate::native_records::DocumentKey>,
-    /// Fresh metric documents committed in their ordered measuring phase.
+    /// Fresh commits of Retry when present, otherwise Candidate; never worker progress.
     pub measured_sources: Vec<crate::native_records::DocumentKey>,
+    /// The same compute branch. Its accounting is complete only when that branch's
+    /// execution trace has `references: Some(...)`; invocation keys are always actual.
     pub references: crate::references::ReferenceReplayTrace,
+    /// Actual invocation/commit observations, including incomplete branches.
+    pub executions:
+        std::collections::BTreeMap<ArchitectureExecutionBranch, ArchitectureExecutionTrace>,
     pub progress: Vec<ArchitectureProgress>,
     pub full_retries: usize,
     pub compared: bool,
@@ -314,6 +324,8 @@ pub(crate) struct ArchitectureOwner {
     differences: Mutex<Vec<String>>,
     #[cfg(feature = "test-support")]
     work_limit: Mutex<Option<crate::references::ReferenceWorkLimitForTests>>,
+    #[cfg(feature = "test-support")]
+    execution_hook: Mutex<Option<ArchitectureExecutionHook>>,
 }
 
 impl ArchitectureOwner {
@@ -349,6 +361,8 @@ impl ArchitectureOwner {
             differences: Mutex::default(),
             #[cfg(feature = "test-support")]
             work_limit: Mutex::default(),
+            #[cfg(feature = "test-support")]
+            execution_hook: Mutex::default(),
         })
     }
 
@@ -502,7 +516,6 @@ fn verify_value(value: Option<&std::ffi::OsStr>) -> bool {
 struct BuildRecord {
     path: ArchitectureBuildPath,
     semantic_sources: Vec<crate::native_records::DocumentKey>,
-    measured_sources: Vec<crate::native_records::DocumentKey>,
     references: Mutex<crate::references::ReferenceReplayTrace>,
     full_retries: usize,
     compared: bool,
@@ -510,13 +523,17 @@ struct BuildRecord {
     fault: Mutex<Option<(&'static str, String)>>,
     #[cfg(feature = "test-support")]
     mismatch: Mutex<Option<String>>,
+    #[cfg(feature = "test-support")]
+    execution_hook: Option<ArchitectureExecutionHook>,
+    #[cfg(feature = "test-support")]
+    executions:
+        std::collections::BTreeMap<ArchitectureExecutionBranch, Arc<ArchitectureExecutionObserver>>,
 }
 impl Default for BuildRecord {
     fn default() -> Self {
         Self {
             path: ArchitectureBuildPath::Full(FullReason::NoBase),
             semantic_sources: Vec::new(),
-            measured_sources: Vec::new(),
             references: Mutex::default(),
             full_retries: 0,
             compared: false,
@@ -524,11 +541,26 @@ impl Default for BuildRecord {
             fault: Mutex::default(),
             #[cfg(feature = "test-support")]
             mismatch: Mutex::default(),
+            #[cfg(feature = "test-support")]
+            execution_hook: None,
+            #[cfg(feature = "test-support")]
+            executions: Default::default(),
         }
     }
 }
 
 impl BuildRecord {
+    #[cfg(feature = "test-support")]
+    fn execution_scope(
+        &mut self,
+        branch: ArchitectureExecutionBranch,
+    ) -> ArchitectureExecutionScope {
+        let observer = ArchitectureExecutionObserver::new(branch, self.execution_hook.clone());
+        let scope = observer.enter();
+        self.executions.insert(branch, observer);
+        scope
+    }
+
     fn fault(&self, _point: &'static str) -> anyhow::Result<()> {
         #[cfg(feature = "test-support")]
         {
@@ -592,7 +624,13 @@ impl DaemonState {
         let Ok(head) = self.store.index_baseline() else {
             return;
         };
-        let rules = match crate::rules::load(std::path::Path::new(self.store.workspace_root())) {
+        let loaded = crate::rules::load(std::path::Path::new(self.store.workspace_root()));
+        let observed_rules = loaded
+            .as_ref()
+            .ok()
+            .and_then(|config| config.as_ref())
+            .map(|config| config.content_hash.clone());
+        let rules = match loaded {
             Ok(config) => config.map(|config| config.content_hash),
             Err(_) => Some("unreadable".into()),
         };
@@ -600,6 +638,10 @@ impl DaemonState {
         // The head is recorded and its turn submitted under one lock, so the settled wait
         // never sees the head stepped with no turn due.
         let mut state = self.architecture.0.state.lock().unwrap();
+        state.observe_rules(&CoreKey {
+            pin: head,
+            rules_hash: observed_rules,
+        });
         if state.stepped == seen {
             return;
         }
@@ -927,6 +969,7 @@ impl DaemonState {
         {
             *record.fault.lock().unwrap() = owner.fault.lock().unwrap().take();
             *record.mismatch.lock().unwrap() = owner.mismatch.lock().unwrap().take();
+            record.execution_hook = owner.execution_hook.lock().unwrap().take();
         }
         #[cfg(feature = "test-support")]
         let base_pin = base.as_ref().map(|core| core.pin);
@@ -947,24 +990,22 @@ impl DaemonState {
         let mut state = owner.state.lock().unwrap();
         state.running = None;
         #[cfg(feature = "test-support")]
-        let progress_trace = {
-            let progress = progress_trace.into_inner().unwrap();
-            // Measuring first advances over reused documents, then commits fresh
-            // documents in key order. A stopped B has no measuring phase at all.
-            let fresh = progress
-                .last()
-                .filter(|value| value.phase == "measuring")
-                .map_or(0, |value| {
-                    let reused = if matches!(record.path, ArchitectureBuildPath::Incremental { .. })
-                    {
-                        value.total.saturating_sub(record.measured_sources.len())
-                    } else {
-                        0
-                    };
-                    value.completed.saturating_sub(reused)
-                });
-            record.measured_sources.truncate(fresh);
-            progress
+        let executions: std::collections::BTreeMap<_, _> = record
+            .executions
+            .iter()
+            .map(|(branch, observer)| (*branch, observer.snapshot()))
+            .collect();
+        #[cfg(feature = "test-support")]
+        let execution = executions
+            .get(&ArchitectureExecutionBranch::Retry)
+            .or_else(|| executions.get(&ArchitectureExecutionBranch::Candidate))
+            .cloned()
+            .unwrap_or_default();
+        #[cfg(feature = "test-support")]
+        let references = {
+            let mut references = execution.references.clone().unwrap_or_default();
+            references.file_references = execution.file_references;
+            references
         };
         #[cfg(feature = "test-support")]
         owner.attempts.lock().unwrap().push(ArchitectureAttempt {
@@ -972,9 +1013,10 @@ impl DaemonState {
             base: base_pin,
             path: record.path.clone(),
             semantic_sources: record.semantic_sources.clone(),
-            measured_sources: record.measured_sources.clone(),
-            references: record.references.lock().unwrap().clone(),
-            progress: progress_trace,
+            measured_sources: execution.measured_sources,
+            references,
+            executions,
+            progress: progress_trace.into_inner().unwrap(),
             full_retries: record.full_retries,
             compared: record.compared,
             published: built.is_ok()
@@ -1050,6 +1092,8 @@ impl DaemonState {
         ),
         (progress, record): (&(dyn Fn(ArchitectureProgress) + Sync), &mut BuildRecord),
     ) -> anyhow::Result<ArchitectureCore> {
+        #[cfg(feature = "test-support")]
+        let _execution = record.execution_scope(ArchitectureExecutionBranch::Candidate);
         let incremental = base.is_some();
         let candidate = (|| {
             let mut read_check = || {
@@ -1081,7 +1125,6 @@ impl DaemonState {
             )?;
             record.path = plan.path.clone();
             record.semantic_sources = plan.semantic_keys();
-            record.measured_sources = plan.measured_keys();
             read_check()?;
             hook("architecture_read_b");
             let (lease, response) = self.architecture_admission()?;
@@ -1123,8 +1166,10 @@ impl DaemonState {
                     pin,
                     rules_hash: config.map(|config| config.content_hash.clone()),
                 })?;
-                record.measured_sources.clear();
+                *record.references.lock().unwrap() = Default::default();
                 record.full_retries += 1;
+                #[cfg(feature = "test-support")]
+                let _execution = record.execution_scope(ArchitectureExecutionBranch::Retry);
                 self.architecture_full(pin, config, check, progress, record)
             }
             result => result,
@@ -1133,6 +1178,7 @@ impl DaemonState {
 
     fn architecture_current_rules(&self, key: &CoreKey) -> anyhow::Result<()> {
         use anyhow::Context;
+        self.architecture.0.hook("architecture_before_recheck");
         let head = self.architecture.0.state.lock().unwrap().head;
         let lease = self
             .background_lease()
@@ -1149,12 +1195,23 @@ impl DaemonState {
                 error.context("cancelled: architecture head not admitted")
             }
         })?;
+        let loaded = crate::rules::load(std::path::Path::new(self.store.workspace_root()));
+        let current = loaded.ok().flatten().map(|config| config.content_hash);
+        // An observation ends the episode even when this operation cannot publish.
+        // In particular, a later return to A must not resurrect its pre-B base.
+        self.architecture
+            .0
+            .state
+            .lock()
+            .unwrap()
+            .observe_rules(&CoreKey {
+                pin: selected,
+                rules_hash: current.clone(),
+            });
         anyhow::ensure!(
             head == Some(selected),
             "cancelled: architecture head superseded"
         );
-        let loaded = crate::rules::load(std::path::Path::new(self.store.workspace_root()));
-        let current = loaded.ok().flatten().map(|config| config.content_hash);
         anyhow::ensure!(
             current == key.rules_hash,
             "cancelled: architecture rules superseded"
@@ -1181,8 +1238,7 @@ impl DaemonState {
         drop(response);
         drop(lease);
         let mut input = input?;
-        record.measured_sources = input.document_keys();
-        record.semantic_sources = record.measured_sources.clone();
+        record.semantic_sources = input.document_keys();
         progress(ArchitectureProgress {
             phase: "resolving",
             completed: 0,
@@ -1203,7 +1259,6 @@ impl DaemonState {
         let limit = input.reference_limit(check)?;
         let core = ArchitectureCore::compute(&self.store, input, config, true, check, progress)?;
         record.semantic_sources = core.document_keys();
-        record.measured_sources = record.semantic_sources.clone();
         *record.references.lock().unwrap() = core.full_reference_trace(limit);
         Ok(core)
     }
@@ -1257,6 +1312,8 @@ impl DaemonState {
         owner.hook("architecture_verify_started");
         check()?;
         let mut oracle = BuildRecord::default();
+        #[cfg(feature = "test-support")]
+        let _execution = record.execution_scope(ArchitectureExecutionBranch::Oracle);
         #[cfg(feature = "test-support")]
         {
             *oracle.fault.lock().unwrap() = record.fault.lock().unwrap().take();
@@ -1323,13 +1380,38 @@ impl DaemonState {
             self.store
                 .evidence_response_daemon_local()
                 .and_then(|fresh| fresh.selected_pin(None))
-                .is_ok_and(|head| head != pin)
+                .is_ok_and(|head| {
+                    if head.index_generation != pin.index_generation {
+                        let rules =
+                            crate::rules::load(std::path::Path::new(self.store.workspace_root()))
+                                .ok()
+                                .flatten()
+                                .map(|config| config.content_hash);
+                        self.architecture
+                            .0
+                            .state
+                            .lock()
+                            .unwrap()
+                            .observe_rules(&CoreKey {
+                                pin: head,
+                                rules_hash: rules,
+                            });
+                    }
+                    head != pin
+                })
         })
     }
 
     #[cfg(feature = "test-support")]
     pub fn set_architecture_hook_for_tests(&self, hook: TestHook) {
         *self.architecture.0.test_hook.lock().unwrap() = Some(hook);
+    }
+
+    /// Install one operation's scoped execution hook; retries and its oracle share
+    /// the callback but record their observations independently.
+    #[cfg(feature = "test-support")]
+    pub fn set_architecture_execution_hook_for_tests(&self, hook: ArchitectureExecutionHook) {
+        *self.architecture.0.execution_hook.lock().unwrap() = Some(hook);
     }
 
     #[cfg(feature = "test-support")]

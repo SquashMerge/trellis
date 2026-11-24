@@ -50,6 +50,11 @@ pub use crate::architecture_core::{ArchitectureBuildPath, FullReason};
 pub use crate::architecture_core::{
     ArchitectureCoreHandle, ArchitectureCoreWeak, ArchitectureSharing,
 };
+#[cfg(feature = "test-support")]
+pub use crate::architecture_core::{
+    ArchitectureExecutionBranch, ArchitectureExecutionEvent, ArchitectureExecutionHook,
+    ArchitectureExecutionTrace,
+};
 use api_error::{ApiError, error, invalid, missing};
 #[cfg(feature = "test-support")]
 pub use architecture::ArchitectureAttempt;
