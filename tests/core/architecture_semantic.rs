@@ -99,12 +99,8 @@ fn architecture_incremental_projection() {
     )
     .unwrap();
     let n = fixture.native();
-    let (n_revision, derived) = fixture.revision_provenance();
-    assert!(
-        derived.is_empty(),
-        "every projection reads at its basis: {derived:?}"
-    );
-    let (attempt, before) = fixture.build(n);
+    let n_revision = fixture.native_revision();
+    let (attempt, _) = fixture.build(n);
     let paths = |keys: &[trellis::native_records::DocumentKey]| {
         keys.iter().map(|key| key.path.clone()).collect::<Vec<_>>()
     };
@@ -118,12 +114,39 @@ fn architecture_incremental_projection() {
         }
         path => panic!("expected native projection incremental, got {path:?}"),
     }
+    // #1310: a second native publication on the same basis moves only each projection's
+    // current pin, which the core rebases, so only the edited source is Dirty.
+    fs::write(
+        fixture.root.join("src/main.rs"),
+        "fn main() { let _value = 3; }\n",
+    )
+    .unwrap();
+    let n2 = fixture.native();
+    assert_ne!(fixture.native_revision(), n_revision);
+    let (attempt, before) = fixture.build(n2);
+    match &attempt.path {
+        ArchitectureBuildPath::Incremental { dirty, patched, .. } => {
+            assert_eq!(paths(dirty), ["src/main.rs"]);
+            assert!(patched.is_empty());
+            assert_eq!(paths(&attempt.references.file_references), paths(dirty));
+            assert_eq!(paths(&attempt.semantic_sources), paths(dirty));
+        }
+        path => panic!("expected projected revision incremental, got {path:?}"),
+    }
+    let canonical = before.canonical().unwrap();
+    let projections: Vec<_> = canonical["references"]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|source| source["projection"].as_object())
+        .collect();
+    assert!(!projections.is_empty());
+    for projection in projections {
+        assert_eq!(projection["currentPin"], json!(n2), "{projection:?}");
+    }
     let s = fixture.catch_up();
-    assert_eq!(s.index_revision, n.index_revision + 1);
-    // The base N has S's native revision: rejoined provenance adds no Dirty source (#1308).
-    let (s_revision, derived) = fixture.revision_provenance();
-    assert_eq!(s_revision, n_revision);
-    assert_eq!(derived, ["a.ts", "b.ts"]);
+    assert_eq!(s.index_revision, n2.index_revision + 1);
+    assert_ne!(fixture.native_revision(), n_revision);
     let (attempt, after) = fixture.build(s);
     match &attempt.path {
         ArchitectureBuildPath::Incremental { dirty, patched, .. } => {
@@ -165,8 +188,8 @@ fn architecture_incremental_import_and_catchup() {
         .architecture_fingerprints_for_tests(None)
         .unwrap()
         .selections;
-    let (imported, derived) = fixture.revision_provenance();
-    assert_eq!(derived, ["src/caller.rs", "src/target.rs", "a.ts", "b.ts"]);
+    let imported = fixture.native_revision();
+    let freshness = fixture.freshness();
     fs::write(
         fixture.root.join("src/main.rs"),
         "fn main() { let _value = 2; }\n",
@@ -183,30 +206,59 @@ fn architecture_incremental_import_and_catchup() {
             .selections,
         selection
     );
-    // The base is the import's core: a different native revision, so every source with
-    // revision-derived provenance is semantic Dirty (#1308). Catch-up stays incremental.
-    let (caught_up, current) = fixture.revision_provenance();
+    // The base is the import's core, at another native revision. The first edit after the
+    // producer run moves every rejoined provenance ID, and catch-up carries the evidence
+    // forward as possibly stale; each core rebases both (#1310), so only the edit is Dirty.
+    let caught_up = fixture.native_revision();
     assert_ne!(caught_up, imported);
-    assert_eq!(current, derived);
+    let carried = fixture.freshness();
+    for path in ["src/caller.rs", "src/target.rs", "a.ts", "b.ts"] {
+        assert_ne!(freshness[path], carried[path], "{path}: {carried:?}");
+        assert!(
+            carried[path].values().all(|value| value == "possiblyStale"),
+            "{path}: {carried:?}"
+        );
+    }
     let (_, after) = fixture.expect(
         s,
         Expected::Incremental {
-            dirty: &[
-                "src/main.rs",
-                "src/caller.rs",
-                "src/target.rs",
-                "a.ts",
-                "b.ts",
-            ],
+            dirty: &["src/main.rs"],
             patched: &[],
             native: &["src/main.rs"],
             all_b: false,
         },
     );
+    let semantic_site = |core: &trellis::http::ArchitectureCoreHandle| {
+        let canonical = core.canonical().unwrap();
+        let data = &canonical["references"]["selected"]["data"];
+        let edge = edge(data, "src/caller.rs", "src/target.rs").unwrap();
+        edge["sites"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|site| site["mapping"] == "semantic")
+            .unwrap()
+            .clone()
+    };
+    let (old_site, new_site) = (semantic_site(&before), semantic_site(&after));
+    assert_ne!(old_site["provenanceId"], new_site["provenanceId"]);
+    assert_eq!(old_site["derivedFrom"], new_site["derivedFrom"]);
+    assert_eq!(new_site["freshness"], "possiblyStale");
     for (key, sharing) in after.sharing(&before) {
         if key.path == "src/cargo.rs" || key.language == "javascript" {
             assert!(
                 sharing.source && sharing.metric && sharing.fingerprint && sharing.plan,
+                "{key:?}: {sharing:?}"
+            );
+        } else if key.path == "src/caller.rs" {
+            assert!(
+                !sharing.source && sharing.metric && sharing.fingerprint && sharing.plan,
+                "rebased, not recomputed: {key:?}: {sharing:?}"
+            );
+        } else if ["src/target.rs", "a.ts", "b.ts"].contains(&key.path.as_str()) {
+            // Their evidence binds no site, so no output carries revision-scoped metadata.
+            assert!(
+                sharing.source && sharing.metric && sharing.fingerprint,
                 "{key:?}: {sharing:?}"
             );
         }
@@ -235,12 +287,8 @@ fn architecture_incremental_import_and_catchup() {
     )
     .unwrap();
     let n = fixture.native();
-    let (native, current) = fixture.revision_provenance();
+    let native = fixture.native_revision();
     assert_ne!(native, caught_up);
-    assert!(
-        current.is_empty(),
-        "a projection reads at its basis: {current:?}"
-    );
     let (_, before) = fixture.expect(
         n,
         Expected::Incremental {
@@ -251,9 +299,11 @@ fn architecture_incremental_import_and_catchup() {
         },
     );
     let s = fixture.catch_up();
-    let (same, current) = fixture.revision_provenance();
-    assert_eq!(same, native, "catch-up keeps N's native revision");
-    assert_eq!(current, derived);
+    assert_eq!(
+        fixture.native_revision(),
+        native,
+        "catch-up keeps N's native revision"
+    );
     let (_, after) = fixture.expect(
         s,
         Expected::Incremental {
@@ -272,11 +322,11 @@ fn architecture_incremental_import_and_catchup() {
     fixture.expect(pin, Expected::Full(FullReason::RawSelectionsChanged));
 }
 
-/// AC10 under the #1308 provenance rule. The imported caller's rejoined provenance IDs are
-/// derived from the moved native revision, so it is Dirty, not patched, and its target lines
-/// equal a full build's. A caller with no producer evidence lands in Patch, but native Rust
-/// sites name no target declaration, so its patch moves no lines here; the engine-level
-/// `architecture_incremental_target_display_patch_matches_full` moves real ones.
+/// AC10 at owner level (#1310): on a captured and imported checkout, an edit above a
+/// declaration a semantically bound caller targets. The caller lands in Patch, not Dirty: its
+/// sampled target lines move, and its rejoined provenance ID is minted again at the moved
+/// native revision, both equal to a full build's. A caller with no producer evidence patches
+/// too, but native Rust sites name no target declaration, so its patch moves no lines.
 #[test]
 fn architecture_incremental_target_patch() {
     use crate::architecture_incremental_support::{CapturedArchitecture, Expected, PLAIN_CALLER};
@@ -315,8 +365,7 @@ fn architecture_incremental_target_patch() {
         caller.semantic,
         fixture.store.semantic_at(before.pin()).unwrap()
     );
-    let (base_revision, derived) = fixture.revision_provenance();
-    assert_eq!(derived, ["src/caller.rs", "src/target.rs", "a.ts", "b.ts"]);
+    let base_revision = fixture.native_revision();
     let frozen = before.canonical().unwrap();
     let old_packages = fixture.packages(&before);
     fs::write(
@@ -326,21 +375,19 @@ fn architecture_incremental_target_patch() {
     .unwrap();
     fixture.native();
     let pin = fixture.catch_up();
-    let (revision, current) = fixture.revision_provenance();
     assert_ne!(
-        revision, base_revision,
+        fixture.native_revision(),
+        base_revision,
         "the edit moved the native revision"
     );
-    // The edited target's captured offsets no longer join; it is native Dirty regardless.
-    assert_eq!(current, ["src/caller.rs", "a.ts", "b.ts"]);
-    // The plain caller has no revision-derived provenance: only its target lines change.
-    // The imported caller and the unchanged TypeScript sources carry rejoined provenance IDs
-    // derived from the moved native revision, so they are reread, not patched or reused.
+    // Both callers patch: the imported one's sampled target lines move and its rejoined
+    // provenance ID is minted at the moved revision; the unchanged TypeScript sources are
+    // reused with their IDs minted again (#1310).
     let (_, after) = fixture.expect(
         pin,
         Expected::Incremental {
-            dirty: &["src/caller.rs", "src/target.rs", "a.ts", "b.ts"],
-            patched: &["src/plain.rs"],
+            dirty: &["src/target.rs"],
+            patched: &["src/caller.rs", "src/plain.rs"],
             native: &["src/target.rs"],
             all_b: false,
         },
@@ -391,7 +438,10 @@ fn architecture_incremental_target_patch() {
                 "{key:?}: {parts:?}"
             );
         } else if key.path == "src/caller.rs" {
-            assert!(!parts.source && parts.metric, "{key:?}: {parts:?}");
+            assert!(
+                !parts.source && parts.metric && parts.fingerprint && parts.plan,
+                "{key:?}: {parts:?}"
+            );
         } else if key.path == "src/cargo.rs" || key.language == "javascript" {
             assert!(
                 parts.source && parts.metric && parts.fingerprint && parts.plan,
@@ -427,18 +477,10 @@ require = [{ calls = "target" }]
     .unwrap();
     fixture.native();
     let pin = fixture.catch_up();
-    let (_, derived) = fixture.revision_provenance();
-    assert_eq!(derived, ["src/caller.rs", "src/target.rs", "a.ts", "b.ts"]);
     let (_, after) = fixture.expect(
         pin,
         Expected::Incremental {
-            dirty: &[
-                "src/main.rs",
-                "src/caller.rs",
-                "src/target.rs",
-                "a.ts",
-                "b.ts",
-            ],
+            dirty: &["src/main.rs"],
             patched: &[],
             native: &["src/main.rs"],
             all_b: true,
@@ -515,16 +557,15 @@ fn architecture_incremental_first_edit_after_producer() {
             all_b: false,
         },
     );
-    // A second native publication still has P as basis. Its currentPin is not rewritten
-    // to P or N to make these projected sources appear reusable.
+    // A second native publication still has P as basis. Only each projection's current pin
+    // moves, which every core sets to its own, so the projected sources are reused (#1310).
     fs::write(
         fixture.root.join("src/main.rs"),
         "fn main() { let _value = 3; }\n",
     )
     .unwrap();
     let next = fixture.native();
-    let (next_revision, derived) = fixture.revision_provenance();
-    assert!(derived.is_empty(), "{derived:?}");
+    let next_revision = fixture.native_revision();
     let fingerprints = fixture
         .store
         .architecture_fingerprints_for_tests(None)
@@ -533,7 +574,7 @@ fn architecture_incremental_first_edit_after_producer() {
         if let Some(projection) = &state.projection {
             assert_eq!(projection.current_pin, next);
             assert_eq!(projection.semantic_basis_pin, basis);
-            assert_ne!(
+            assert_eq!(
                 fingerprints.documents[key].semantic,
                 current.documents[key].semantic
             );
@@ -542,7 +583,7 @@ fn architecture_incremental_first_edit_after_producer() {
     fixture.expect(
         next,
         Expected::Incremental {
-            dirty: &projected,
+            dirty: &["src/main.rs"],
             patched: &[],
             native: &["src/main.rs"],
             all_b: false,
@@ -557,10 +598,8 @@ fn architecture_incremental_first_edit_after_producer() {
             .selections,
         selection
     );
-    // S keeps the base's native revision, so its rejoined provenance cannot move (#1308).
-    let (revision, derived) = fixture.revision_provenance();
-    assert_eq!(revision, next_revision);
-    assert_eq!(derived, ["src/caller.rs", "src/target.rs", "a.ts", "b.ts"]);
+    // S keeps N's native revision; its sources stop being projections, which is Dirty.
+    assert_eq!(fixture.native_revision(), next_revision);
     fixture.expect(
         s,
         Expected::Incremental {
@@ -707,12 +746,10 @@ fn architecture_incremental_semantic_limits() {
                 (2, 2, 2),
                 "a repeated shared proof is charged on each row"
             );
-            let (published, literal) = fixture.revision_provenance();
-            assert!(literal.is_empty(), "literal provenance IDs: {literal:?}");
+            let published = fixture.native_revision();
             let copied = fixture.native();
-            // The copied pin keeps its native revision, and literal provenance IDs never
-            // derive from one, so every source stays reusable (#1308).
-            assert_eq!(fixture.revision_provenance().0, published);
+            // The copied pin keeps its native revision, so every source stays reusable.
+            assert_eq!(fixture.native_revision(), published);
             set(limit);
             if limit < total {
                 fixture.bounded_failure(copied, error);
@@ -857,9 +894,20 @@ fn architecture_incremental_read_a_tuple_and_freshness() {
     assert_eq!(input.freshness.as_ref().unwrap().basis_pin, pin);
     assert!(!input.freshness.as_ref().unwrap().values.is_empty());
     drop(store);
+    // A freshness that stays other than `stale` is metadata each core rebases (#1310).
+    let db = architecture_index_db(&state);
+    db.execute("UPDATE semantic_coverage_freshness SET freshness='possiblyStale' WHERE tuple_id IN (SELECT tuple_id FROM semantic_coverage WHERE path='src/low.rs')", []).unwrap();
+    drop(db);
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let current = store.architecture_fingerprints_for_tests(None).unwrap();
+    assert_ne!(
+        current.semantic_states[&key].freshness,
+        baseline.semantic_states[&key].freshness
+    );
+    assert_eq!(current.documents[&key], baseline.documents[&key]);
+    drop(store);
     let mut previous = baseline.documents[&key].semantic;
     for sql in [
-        "UPDATE semantic_coverage_freshness SET freshness='possiblyStale' WHERE tuple_id IN (SELECT tuple_id FROM semantic_coverage WHERE path='src/low.rs')",
         "UPDATE semantic_coverage_freshness SET freshness='stale' WHERE tuple_id IN (SELECT tuple_id FROM semantic_coverage WHERE path='src/low.rs')",
         "UPDATE semantic_coverage SET selected=0 WHERE path='src/low.rs'",
         "UPDATE semantic_coverage SET payload_id=NULL WHERE path='src/low.rs'",
@@ -999,7 +1047,20 @@ fn architecture_incremental_unused_missing_freshness_preserves_full_read() {
         .into_iter()
         .map(|document| (document.key.path, document.semantic))
         .collect();
-    assert_eq!(format!("{full_before:?}"), format!("{full:?}"));
+    // The reading records the freshness map read, which lost the unused basis: metadata a
+    // core rebases (#1310), not evidence.
+    let evidence = |documents: &[(String, trellis::references::DocumentSemantic)]| {
+        let documents: Vec<_> = documents
+            .iter()
+            .cloned()
+            .map(|(path, mut semantic)| {
+                semantic.reading = None;
+                (path, semantic)
+            })
+            .collect();
+        format!("{documents:?}")
+    };
+    assert_eq!(evidence(&full_before), evidence(&full));
     assert_eq!(format!("{full:?}"), format!("{fingerprinted:?}"));
     assert!(
         full.iter()
@@ -1060,18 +1121,21 @@ fn architecture_incremental_read_a_complete_freshness_map_and_tuple_surrogate() 
         baseline
     );
     drop(store);
-    let db = architecture_index_db(&state);
-    db.execute("UPDATE semantic_coverage_freshness SET freshness='possiblyStale' WHERE basis_id=(SELECT max(basis_id) FROM semantic_coverage_freshness WHERE tuple_id IN (SELECT tuple_id FROM semantic_coverage WHERE path='src/orphan.rs'))", []).unwrap();
-    drop(db);
-    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
-    assert_ne!(
-        store
-            .architecture_fingerprints_for_tests(None)
-            .unwrap()
-            .documents[&key]
-            .semantic,
-        baseline.documents[&key].semantic
-    );
+    // Each basis of the complete map counts: one basis turning stale changes the semantic
+    // state; one turning possibly stale is metadata each core rebases (#1310).
+    for (freshness, changed) in [("possiblyStale", false), ("stale", true)] {
+        let db = architecture_index_db(&state);
+        db.execute(&format!("UPDATE semantic_coverage_freshness SET freshness='{freshness}' WHERE basis_id=(SELECT max(basis_id) FROM semantic_coverage_freshness WHERE tuple_id IN (SELECT tuple_id FROM semantic_coverage WHERE path='src/orphan.rs'))"), []).unwrap();
+        drop(db);
+        let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+        let current = store.architecture_fingerprints_for_tests(None).unwrap();
+        assert_eq!(
+            current.documents[&key].semantic != baseline.documents[&key].semantic,
+            changed,
+            "{freshness}"
+        );
+        drop(store);
+    }
 }
 
 #[test]
@@ -1138,8 +1202,12 @@ fn architecture_incremental_read_a_projection_basis_and_pending() {
         .architecture_fingerprints_for_tests(None)
         .unwrap();
     assert_ne!(
+        next.semantic_states[&clean].projection,
+        projected.semantic_states[&clean].projection
+    );
+    assert_eq!(
         next.documents[&clean].semantic, projected.documents[&clean].semantic,
-        "full projection includes currentPin"
+        "a projection's currentPin is rebased per core, not semantic state (#1310)"
     );
     assert_eq!(
         next.semantic_states[&clean].freshness,

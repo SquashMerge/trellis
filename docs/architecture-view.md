@@ -987,23 +987,33 @@ first index, an older-revision request and a rules transition have no base; chan
 does not resurrect A's old base. Failed or stopped attempts do not displace the base. Eviction
 releases a result when no reader or in-flight computation still borrows it.
 
-Dirty is the union of native changes, semantic changes (including every currently projected
-document), and sources with endpoints in documents whose declaration-ID sets changed. Only Dirty
-sources run `file_references`.
+Dirty is the union of native changes, semantic changes, projected documents whose retained
+endpoint documents changed semantic state, and sources with endpoints in documents whose
+declaration-ID sets changed. Only Dirty sources run `file_references`.
 
-Semantic changes include revision-derived provenance (owner ruling 2026-11-24, #1308). An
-imported or rejoined provenance ID is derived from the reading revision's native revision
-(Decision 0021 D2), and the reader also breaks ties by it: a call's representative proof and the
-order of anchors at the same range. So a document whose evidence, read at the build's own pin,
-carries such provenance is semantic Dirty whenever the build's native revision differs from its
-base's, even when its payload, state and freshness are unchanged. Literal provenance IDs do not
-depend on the revision, and a projected document reads at its semantic basis and is Dirty
-anyway. The dependency index keeps each document's flag and the base's native revision. Patch and
-reuse therefore apply only to sources without such evidence, or across builds at the same native
-revision. Answers do not change. Reusing semantic sources across native revisions, by
-materializing provenance IDs per core and breaking those ties by stable proof identity, is
-#1310. Other sources whose targets changed natively enter Patch: they
-clone reference display output to update internal sampled and unresolved target lines and
+A semantic change is one that changes what Read B admits or resolves: the default producer, the
+selected tuple and payload, a projection's semantic basis and status, and which bases are
+`stale`. Revision-scoped metadata is not a semantic change (owner rulings 2026-11-24, #1308 and
+#1310). Each core rebases it for reused and patched sources from inputs they retain:
+- An imported or rejoined provenance ID is derived from the reading native revision (Decision
+  0021 D2). A source keeps each site's raw proof identity, the raw `derivedFrom` ID and evidence
+  kind, and each core mints the current ID from it and its own native revision. A projected
+  source reads at its semantic basis, so its IDs follow the basis's native revision. Literal
+  provenance IDs never change. An older core keeps the IDs it minted.
+- A basis's freshness that stays other than `stale` changes only the `freshness` and
+  `historicalFreshness` labels, which each core sets from its own freshness map.
+- A projection's `currentPin` is the core's own. A projected source's endpoints are eligible by
+  their own projection at the current pin (#934), so a projected source is Dirty when a retained
+  endpoint document's semantic state changes.
+
+The reader never breaks ties by a revision-derived ID. A call's representative proof is the least
+by resolution, then the raw fact digest, then the stable proof identity (the raw `derivedFrom` ID
+and evidence kind, else the literal ID), as in the call graph. Anchors at the same range are
+ordered by the same proof identity. Tied proofs or anchors may come back in a different order
+than before #1310, once; they then stay in that order across unrelated edits. Within one payload
+the proof identity is unique, as the provenance ID is.
+
+Other sources whose targets changed natively enter Patch: they clone reference display output to update internal sampled and unresolved target lines and
 anonymous display keys by document and syntax ID. Remaining whole-source reference Arcs are
 shared. Only native-changed documents are remeasured; unchanged metric and dependency subparts
 can be shared between the retained results.
@@ -1011,8 +1021,8 @@ can be shared between the retained results.
 Source package membership is stable reference output, not revision-dependent evidence. Every
 core owns a fresh, source-specific package descriptor table with current captured manifest
 provenance, including for clean and patched sources. Projections union descriptors only from
-selected sources; an older core keeps its original table and provenance. This is not a rebase
-of semantic freshness, historical basis or `currentPin` metadata.
+selected sources; an older core keeps its original table and provenance. Semantic metadata is
+rebased separately, as above.
 
 Clean-source reuse still performs bounded lower-level resolver replay, in original source,
 site and worker-batch order against fresh catalogs and shared memo state. Retained preparation

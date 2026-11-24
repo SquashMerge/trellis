@@ -2423,6 +2423,35 @@ fn the_representative_follows_the_raw_fact_not_the_provenance_id() {
     }
 }
 
+/// #1310: rows the raw fact's digest cannot separate follow their stable proof identity, the
+/// raw proof and evidence kind, never the minted provenance ID, so the choice survives an
+/// unrelated edit that mints new IDs.
+#[test]
+fn a_tied_representative_follows_the_raw_proof_not_the_provenance_id() {
+    for bind in [ambiguous(), direct(B)] {
+        let mut chosen = Vec::new();
+        for ids in [["p1", "p2", "p3"], ["p3", "p1", "p2"]] {
+            let rows: Vec<_> = ids.iter().map(|id| (*id, bind.clone())).collect();
+            let mut w = contradictory_call(&rows);
+            let semantic = w.doc("src/lib.rs").semantic.as_mut().unwrap();
+            for (id, raw) in ids.iter().zip(["raw-c", "raw-a", "raw-b"]) {
+                semantic.provenance.get_mut(*id).unwrap().derived_from = Some(sem::DerivedFrom {
+                    provenance_id: raw.into(),
+                    record_kind: sem::RecordKind::Occurrence,
+                    fact_digest: "aa".repeat(32),
+                });
+            }
+            let mut facts = w.build();
+            let r = run(&mut facts, &request(A, true));
+            assert_eq!(r.edges.len(), 1);
+            let id = &r.edges[0].binding.as_ref().unwrap().provenance_id;
+            let proof = r.provenance.iter().find(|p| &p.id == id).unwrap();
+            chosen.push(proof.derived_from.as_ref().unwrap().provenance_id.clone());
+        }
+        assert_eq!(chosen, ["raw-a", "raw-a"]);
+    }
+}
+
 fn historical_projection(
     status: trellis::model::SemanticStatus,
 ) -> trellis::model::SemanticProjection {

@@ -751,47 +751,6 @@ fn architecture_incremental_changed_sets_and_ordered_gates() {
         std::collections::BTreeSet::from([script.clone()]),
         "non-Rust semantic-only changes stay incremental"
     );
-    fingerprints = input.fingerprints.clone();
-    fingerprints.documents.get_mut(&script).unwrap().projected = true;
-    let changed = dependencies::changed_documents(&input.snapshot, &fingerprints, Some(&old))
-        .unwrap()
-        .unwrap();
-    assert!(
-        changed.dirty.contains(&script),
-        "every current projection is dirty"
-    );
-
-    // #1308: revision-derived provenance is semantic Dirty exactly when the reading native
-    // revision differs from the base's; literal provenance and an equal revision reuse.
-    let unchanged =
-        dependencies::changed_documents(&input.snapshot, &input.fingerprints, Some(&old))
-            .unwrap()
-            .unwrap();
-    fingerprints = input.fingerprints.clone();
-    fingerprints
-        .documents
-        .get_mut(&script)
-        .unwrap()
-        .revision_provenance = true;
-    let changed = dependencies::changed_documents(&input.snapshot, &fingerprints, Some(&old))
-        .unwrap()
-        .unwrap();
-    assert_eq!(changed.dirty, unchanged.dirty, "same native revision");
-    let mut moved = old.clone();
-    moved.native_revision.push('2');
-    let changed = dependencies::changed_documents(&input.snapshot, &fingerprints, Some(&moved))
-        .unwrap()
-        .unwrap();
-    let mut expected = unchanged.dirty.clone();
-    expected.insert(script.clone());
-    assert_eq!(changed.dirty, expected, "revision-derived provenance");
-    assert!(changed.native.is_empty() && !changed.patched.contains(&script));
-    let changed =
-        dependencies::changed_documents(&input.snapshot, &input.fingerprints, Some(&moved))
-            .unwrap()
-            .unwrap();
-    assert_eq!(changed.dirty, unchanged.dirty, "literal or no provenance");
-
     let util = rust
         .iter()
         .find(|key| key.path.ends_with("util.rs"))
@@ -800,6 +759,36 @@ fn architecture_incremental_changed_sets_and_ordered_gates() {
         .iter()
         .find(|key| key.path.ends_with("main.rs"))
         .unwrap();
+    // #1310: a projection's current pin is rebased per core, so being projected is not
+    // Dirty. A projected source reads its endpoints' eligibility at the current pin, so it is
+    // Dirty when a retained endpoint document's semantic state changes; a current one is not.
+    fingerprints = input.fingerprints.clone();
+    fingerprints.documents.get_mut(&script).unwrap().projected = true;
+    let changed = dependencies::changed_documents(&input.snapshot, &fingerprints, Some(&old))
+        .unwrap()
+        .unwrap();
+    assert!(changed.dirty.is_empty(), "a projection alone is not Dirty");
+    fingerprints = input.fingerprints.clone();
+    fingerprints.documents.get_mut(util).unwrap().semantic[0] ^= 1;
+    let changed = dependencies::changed_documents(&input.snapshot, &fingerprints, Some(&old))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        changed.dirty,
+        std::collections::BTreeSet::from([util.clone()]),
+        "a current source does not read its endpoints' eligibility"
+    );
+    assert!(changed.patched.is_empty() && changed.reused.contains(main));
+    fingerprints.documents.get_mut(main).unwrap().projected = true;
+    let changed = dependencies::changed_documents(&input.snapshot, &fingerprints, Some(&old))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        changed.dirty,
+        std::collections::BTreeSet::from([util.clone(), main.clone()]),
+        "a projected source follows its endpoints' semantic state"
+    );
+
     fingerprints = input.fingerprints.clone();
     fingerprints
         .documents
@@ -1050,6 +1039,7 @@ fn semantic_input(store: &Store, direct: bool) -> ArchitectureInput {
                 outcome: SemanticOutcome::Internal(target, sid.clone()),
                 basis_site: true,
                 provenance_id: "semantic-proof".into(),
+                proof: crate::semantic_records::ProofIdentity::Literal("semantic-proof".into()),
                 metadata: Default::default(),
             }];
         }

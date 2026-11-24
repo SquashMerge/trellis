@@ -72,10 +72,11 @@ mod staged {
         }
         let mut changed = ChangedDocuments::default();
         let mut sid = BTreeSet::new();
-        // Rejoined provenance IDs are derived from the reading native revision, and Read B
-        // orders and selects evidence by them. Until per-core provenance (#1310), a source
-        // carrying them is reread whenever that revision moves; others still reuse (#1308).
-        let revision_moved = fingerprints.native_revision != base.native_revision;
+        let mut semantic = BTreeSet::new();
+        // Revision-scoped metadata does not make a source Dirty: rejoined provenance IDs,
+        // non-stale freshness values and a projection's current pin are rebased per core from
+        // the stable inputs the source retains (#1310). Only what Read B admits or resolves
+        // differently is in the semantic fingerprint.
         for (i, key) in order.iter().enumerate() {
             let current = &fingerprints.documents[key];
             let old = &base.documents[i].fingerprint;
@@ -86,20 +87,19 @@ mod staged {
                     sid.insert(u32::try_from(i)?);
                 }
             }
-            if current.semantic != old.semantic
-                || current.projected
-                || (revision_moved && current.revision_provenance)
-            {
+            if current.semantic != old.semantic {
                 changed.dirty.insert(key.clone());
+                semantic.insert(u32::try_from(i)?);
             }
         }
         for (key, document) in order.iter().zip(&base.documents) {
-            if document
-                .references
-                .endpoints
-                .iter()
-                .any(|endpoint| sid.contains(endpoint))
-            {
+            // A projected source's endpoints are eligible by their own projection at the
+            // current pin (#934), which is in their semantic fingerprint: a projected source
+            // is Dirty when a retained endpoint document's semantic state changes (#1310).
+            let projected = fingerprints.documents[key].projected;
+            if document.references.endpoints.iter().any(|endpoint| {
+                sid.contains(endpoint) || (projected && semantic.contains(endpoint))
+            }) {
                 changed.dirty.insert(key.clone());
             }
         }
@@ -168,16 +168,17 @@ mod staged {
                 tuple,
                 freshness,
             } = self;
-            let mut hash = Fingerprint::new("architecture:semantic-document:v1");
+            // A projection's current pin and a basis's freshness other than `stale` change
+            // only metadata, which each core rebases (#1310); what they decide is hashed.
+            let mut hash = Fingerprint::new("architecture:semantic-document:v2");
             hash.optional(default_producer.as_deref(), Fingerprint::text);
             hash.optional(projection.as_ref(), |hash, projection| {
                 let crate::model::SemanticProjection {
-                    current_pin,
+                    current_pin: _,
                     semantic_basis_pin,
                     basis_native_revision_id,
                     semantic_status,
                 } = projection;
-                pin(hash, current_pin);
                 pin(hash, semantic_basis_pin);
                 hash.text(basis_native_revision_id);
                 hash.text(match semantic_status {
@@ -208,7 +209,8 @@ mod staged {
                     hash.integer(values.len() as i64);
                     for (basis, freshness) in values {
                         hash.integer(*basis);
-                        hash.text(freshness);
+                        // Read B admits a row and its basis site unless its basis is stale.
+                        hash.integer(i64::from(freshness == "stale"));
                     }
                 },
             );
@@ -285,7 +287,6 @@ mod staged {
         pub(crate) root_config: [u8; 32],
         pub(crate) producers: [u8; 32],
         pub(crate) selections: [u8; 32],
-        pub(crate) native_revision: String,
         pub(crate) global_semantic: SemanticReadCounts,
     }
 
@@ -354,7 +355,7 @@ mod staged {
                 semantic_states: _,
                 producers,
                 selections,
-                native_revision,
+                native_revision: _,
             } = fingerprints;
             let mut order: Vec<_> = snapshot
                 .documents
@@ -412,7 +413,6 @@ mod staged {
                 root_config: root_config_digest(snapshot.root_tsconfig.as_ref()),
                 producers,
                 selections,
-                native_revision,
                 global_semantic,
             })
         }
@@ -426,22 +426,21 @@ mod staged {
                 root_config,
                 producers,
                 selections,
-                native_revision,
                 global_semantic,
             } = self;
             let documents: Vec<_> = documents.iter().map(|document| {
                 let DocumentDependencies { fingerprint, references, semantic } = document.as_ref();
-                let DocumentFingerprint { native, semantic: semantic_fingerprint, sids, projected, revision_provenance } = fingerprint.as_ref();
+                let DocumentFingerprint { native, semantic: semantic_fingerprint, sids, projected } = fingerprint.as_ref();
                 let NativeFingerprint { version_id, coverage_requested, coverage_selected, coverage_state, coverage_diagnostic } = native;
                 let ReferenceDependencies { work, sites, endpoints, plan } = references.as_ref();
                 json!({"native": {"version_id": version_id, "coverage_requested": coverage_requested, "coverage_selected": coverage_selected,
                     "coverage_state": coverage_state, "coverage_diagnostic": coverage_diagnostic},
-                    "semanticFingerprint": semantic_fingerprint, "sids": sids, "projected": projected, "revisionProvenance": revision_provenance,
+                    "semanticFingerprint": semantic_fingerprint, "sids": sids, "projected": projected,
                     "references": {"work": work, "sites": sites, "endpoints": endpoints.as_ref(), "plan": plan.as_deref()}, "semantic": canonical_counts(semantic)})
             }).collect();
             json!({"order": order.as_ref(), "documents": documents, "rustCatalog": rust_catalog,
                 "manifests": manifests, "rootConfig": root_config, "producers": producers,
-                "selections": selections, "nativeRevision": native_revision, "globalSemantic": canonical_counts(global_semantic)})
+                "selections": selections, "globalSemantic": canonical_counts(global_semantic)})
         }
     }
 
@@ -599,22 +598,6 @@ mod tests {
                     .projection
                     .as_mut()
                     .unwrap()
-                    .current_pin
-                    .index_generation = uuid::Uuid::from_u128(2)
-            },
-            |state| {
-                state
-                    .projection
-                    .as_mut()
-                    .unwrap()
-                    .current_pin
-                    .index_revision += 1
-            },
-            |state| {
-                state
-                    .projection
-                    .as_mut()
-                    .unwrap()
                     .semantic_basis_pin
                     .index_generation = uuid::Uuid::from_u128(2)
             },
@@ -673,6 +656,46 @@ mod tests {
             let mut changed = state.clone();
             mutate(&mut changed);
             assert_ne!(baseline, changed.fingerprint(), "{changed:?}");
+        }
+        // Revision-scoped metadata that each core rebases is not semantic state (#1310): a
+        // projection's current pin, and a freshness value that stays other than `stale`.
+        for mutate in [
+            (|state: &mut SemanticInputState| {
+                state
+                    .projection
+                    .as_mut()
+                    .unwrap()
+                    .current_pin
+                    .index_generation = uuid::Uuid::from_u128(2)
+            }) as fn(&mut SemanticInputState),
+            |state| {
+                state
+                    .projection
+                    .as_mut()
+                    .unwrap()
+                    .current_pin
+                    .index_revision += 1
+            },
+            |state| {
+                state
+                    .freshness
+                    .as_mut()
+                    .unwrap()
+                    .values
+                    .insert(1, "possiblyStale".into());
+            },
+            |state| {
+                state
+                    .freshness
+                    .as_mut()
+                    .unwrap()
+                    .values
+                    .insert(2, "fresh".into());
+            },
+        ] {
+            let mut changed = state.clone();
+            mutate(&mut changed);
+            assert_eq!(baseline, changed.fingerprint(), "{changed:?}");
         }
         let mut empty = state.clone();
         empty.freshness.as_mut().unwrap().values.clear();

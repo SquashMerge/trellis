@@ -1501,18 +1501,14 @@ pub(crate) fn architecture_document_fingerprint(
     pin: IndexPin,
     defaults: &DefaultProducers,
     document: &DocumentKey,
-) -> Result<(
-    [u8; 32],
-    crate::architecture_inputs::SemanticInputState,
-    bool,
-)> {
+) -> Result<([u8; 32], crate::architecture_inputs::SemanticInputState)> {
     use crate::architecture_inputs::{
         SemanticFreshnessState, SemanticInputState, SemanticTupleState,
     };
     let producer = defaults.producer(&document.language);
     let Some(producer) = producer else {
         let state = SemanticInputState::default();
-        return Ok((state.fingerprint(), state, false));
+        return Ok((state.fingerprint(), state));
     };
     let projection = super::native_first::semantic_projection_for(
         db,
@@ -1550,7 +1546,6 @@ pub(crate) fn architecture_document_fingerprint(
             payload_id: *payload,
         });
     let mut freshness_state = None;
-    let mut revision_provenance = false;
     if let Some((tuple, selected, state, payload)) = tuple {
         let mut statement = db.prepare_cached(
             "SELECT basis_id,freshness FROM semantic_coverage_freshness WHERE revision_id=?1 AND tuple_id=?2 ORDER BY basis_id",
@@ -1574,21 +1569,6 @@ pub(crate) fn architecture_document_fingerprint(
                 SelectedIntegrity("incompatible_index: architecture tuple names no payload".into())
             );
         }
-        // Read B derives an imported or rejoined provenance ID from the reading revision's
-        // native revision (Decision 0021 D2), and that ID is output and a tie-break. A
-        // literal ID is not derived. A projected source reads at its semantic basis, or not
-        // at all while pending, and every projected source is semantic Dirty anyway (#1308).
-        if projection.is_none()
-            && selected
-            && matches!(state.as_str(), "complete" | "partial")
-            && let Some(payload) = payload
-        {
-            revision_provenance = db
-                .prepare_cached(
-                    "SELECT EXISTS(SELECT 1 FROM semantic_provenance WHERE payload_id=?1 AND derived_from_provenance_id IS NOT NULL)",
-                )?
-                .query_row([payload], |row| row.get(0))?;
-        }
     }
     let state = SemanticInputState {
         default_producer: Some(producer.to_owned()),
@@ -1596,7 +1576,7 @@ pub(crate) fn architecture_document_fingerprint(
         tuple: tuple_state,
         freshness: freshness_state,
     };
-    Ok((state.fingerprint(), state, revision_provenance))
+    Ok((state.fingerprint(), state))
 }
 
 #[cfg(feature = "test-support")]
@@ -1752,6 +1732,29 @@ fn architecture_endpoint_documents(
         }
     }
     Ok(endpoints)
+}
+
+/// The order of one call's binding rows, as `call_selection::representative_key` orders them:
+/// a row that asserts a target first, then the raw fact digest, then the stable proof identity,
+/// never the provenance ID minted from the reading revision (#1310). The least represents it.
+type RowKey = (bool, Option<String>, sem::ProofIdentity);
+
+fn representative_key(
+    unresolved: bool,
+    fact_digest: Option<String>,
+    proof: sem::ProofIdentity,
+) -> RowKey {
+    (unresolved, fact_digest, proof)
+}
+
+/// Orders one document's anchors independently of the storage plan and of the reading native
+/// revision: anchors at the same range follow their stable proof identity, never the provenance
+/// ID minted from the revision (#1310). The sort is stable, so a call and a reference of one
+/// proof keep the call, which is pushed first.
+fn order_anchors(anchors: &mut [crate::architecture_inputs::SemanticAnchor]) {
+    anchors.sort_by(|a, b| {
+        (a.range.start, a.range.end, &a.proof).cmp(&(b.range.start, b.range.end, &b.proof))
+    });
 }
 
 /// `architecture_semantic` with `metadata_limit` proof metadata and lookup dependency rows.
@@ -2109,20 +2112,13 @@ pub(crate) fn architecture_semantic_for_sources(
                 let charged = dependencies.len();
                 basis["lookupDependencies"] = json!(dependencies);
                 let mut fields = BTreeMap::new();
-                fields.insert(
-                    "freshness".into(),
-                    json!(if projection.is_some() && historical != "stale" {
-                        "possiblyStale"
-                    } else {
-                        &historical
-                    }),
-                );
                 fields.insert("historicalContentHash".into(), json!(content_hash));
-                fields.insert("historicalFreshness".into(), json!(historical));
                 fields.insert("basis".into(), basis);
-                if let Some(projection) = projection {
-                    fields.insert("projection".into(), serde_json::to_value(projection)?);
-                }
+                crate::architecture_inputs::set_freshness_fields(
+                    &mut fields,
+                    &historical,
+                    projection,
+                )?;
                 let shared = Arc::new(fields);
                 shared_fields.insert((tuple, basis_id), (shared.clone(), charged));
                 shared
@@ -2143,6 +2139,7 @@ pub(crate) fn architecture_semantic_for_sources(
             Arc::new(RowProvenance {
                 evidence_kind,
                 derived_from,
+                basis: basis_id,
             }),
             shared,
         ))
@@ -2261,9 +2258,8 @@ pub(crate) fn architecture_semantic_for_sources(
             documents[i].key.path.clone(),
         );
         // One binding per measured call: the row the call graph selects, in the order of its
-        // `representative_key`. An unusable one (stale, or outside this snapshot)
-        // leaves the call without a binding.
-        type RowKey = (bool, Option<String>, String);
+        // `representative_key`. An unusable one (stale, or outside this snapshot) leaves the
+        // call without a binding.
         let mut by_call: BTreeMap<String, (RowKey, Option<SemanticAnchor>)> = BTreeMap::new();
         let mut cursor = calls.query(params![
             payload, language, path, historical, key, native, tuple
@@ -2281,7 +2277,7 @@ pub(crate) fn architecture_semantic_for_sources(
             let call_id = id_codec::decode_occ(row.get_ref(0)?.as_blob()?)
                 .map_err(|_| SelectedIntegrity("invalid semantic call ID".into()))?;
             let ordinal: i64 = row.get(10)?;
-            let provenance_id = pp.provenance_id(ordinal)?;
+            let (provenance_id, proof) = pp.proof(ordinal)?;
             // Every row's offsets and dispatch decode strictly, used or not.
             let anchor_range = range(row.get(1)?, row.get(2)?)?;
             // #1279: the dispatch read at this tuple's revision (the semantic basis pin for
@@ -2309,10 +2305,10 @@ pub(crate) fn architecture_semantic_for_sources(
                 .get::<_, Option<Vec<u8>>>(18)?
                 .map(|digest| id_codec::decode_digest(&digest))
                 .transpose()?;
-            let row_key: RowKey = (
+            let row_key = representative_key(
                 row.get_ref(3)?.as_str()? == "unresolved",
                 fact_digest,
-                provenance_id.clone(),
+                proof.clone(),
             );
             if by_call
                 .get(&call_id)
@@ -2408,7 +2404,8 @@ pub(crate) fn architecture_semantic_for_sources(
                     SemanticOutcome::Boundary
                 },
                 basis_site,
-                provenance_id: provenance_id.clone(),
+                provenance_id,
+                proof,
                 metadata: binding_metadata,
             };
             by_call.insert(call_id, (row_key, Some(anchor)));
@@ -2451,6 +2448,7 @@ pub(crate) fn architecture_semantic_for_sources(
                 _ => return Err(SelectedIntegrity("corrupt semantic reference".into()).into()),
             };
             let reference_ordinal: i64 = row.get(6)?;
+            let (provenance_id, proof) = pp.proof(reference_ordinal)?;
             let mut reference_metadata =
                 metadata(&pp, tuple, reference_ordinal, projection.as_ref())?;
             if historical {
@@ -2499,19 +2497,13 @@ pub(crate) fn architecture_semantic_for_sources(
                     SemanticOutcome::Boundary
                 },
                 basis_site,
-                provenance_id: pp.provenance_id(reference_ordinal)?,
+                provenance_id,
+                proof,
                 metadata: reference_metadata,
             });
         }
         drop(cursor);
-        // A stable order independent of the storage plan.
-        anchors.sort_by(|a, b| {
-            (a.range.start, a.range.end, &a.provenance_id).cmp(&(
-                b.range.start,
-                b.range.end,
-                &b.provenance_id,
-            ))
-        });
+        order_anchors(&mut anchors);
         let mut found = Vec::new();
         let mut cursor = relationships.query(params![payload, historical, key, tuple, native])?;
         while let Some(row) = cursor.next()? {
@@ -2532,6 +2524,7 @@ pub(crate) fn architecture_semantic_for_sources(
                 _ => None,
             };
             let relationship_ordinal: i64 = row.get(6)?;
+            let (provenance_id, proof) = pp.proof(relationship_ordinal)?;
             let mut relationship_metadata =
                 metadata(&pp, tuple, relationship_ordinal, projection.as_ref())?;
             let source_eligible = !historical
@@ -2560,12 +2553,17 @@ pub(crate) fn architecture_semantic_for_sources(
                 kind: row.get(0)?,
                 source_syntax_id: source,
                 target: if source_eligible { target } else { None },
-                provenance_id: pp.provenance_id(relationship_ordinal)?,
+                provenance_id,
+                proof,
                 metadata: relationship_metadata,
             });
         }
         drop(cursor);
         let semantic = &mut documents[i].semantic;
+        semantic.reading = Some(crate::architecture_inputs::SemanticReading {
+            native,
+            freshness: pp.freshness_values()?,
+        });
         semantic.endpoint_documents = endpoint_documents;
         semantic.producer_id = Some(producer);
         semantic.complete = complete && !historical;
@@ -2658,6 +2656,98 @@ impl super::Store {
 #[cfg(test)]
 mod reimport_tests {
     use super::*;
+
+    /// Two rejoined raw proofs, and two native revisions at which their minted provenance IDs
+    /// order the other way round.
+    fn crossing_revisions() -> ([sem::ProofIdentity; 2], [String; 2]) {
+        let proofs = ["a", "b"].map(|raw| sem::ProofIdentity::Derived {
+            raw: raw.repeat(64),
+            kind: sem::EvidenceKind::SemanticReference,
+        });
+        let order =
+            |native: &str| proofs[0].provenance_id(native) < proofs[1].provenance_id(native);
+        let natives: Vec<_> = (0..64).map(|i| format!("revision:v2:{i:064}")).collect();
+        let first = natives.iter().find(|native| order(native)).unwrap();
+        let second = natives.iter().find(|native| !order(native)).unwrap();
+        (proofs, [first.clone(), second.clone()])
+    }
+
+    /// #1310: anchors at the same range keep one order across native revisions that mint
+    /// their provenance IDs in opposite orders; a call and a reference of one proof keep
+    /// the call first.
+    #[test]
+    fn tied_anchors_follow_the_raw_proof_across_revisions() {
+        use crate::architecture_inputs::{SemanticAnchor, SemanticOutcome};
+        let (proofs, natives) = crossing_revisions();
+        let anchor = |proof: &sem::ProofIdentity, native: &str, call: bool| SemanticAnchor {
+            range: crate::native_records::Range { start: 3, end: 7 },
+            call_id: call.then(|| "call".to_owned()),
+            type_role: false,
+            direct: call,
+            outcome: SemanticOutcome::Unresolved,
+            basis_site: false,
+            provenance_id: proof.provenance_id(native),
+            proof: proof.clone(),
+            metadata: Default::default(),
+        };
+        let mut orders = Vec::new();
+        for native in &natives {
+            let mut anchors = vec![
+                anchor(&proofs[1], native, true),
+                anchor(&proofs[1], native, false),
+                anchor(&proofs[0], native, false),
+            ];
+            order_anchors(&mut anchors);
+            orders.push(
+                anchors
+                    .iter()
+                    .map(|anchor| (anchor.proof.clone(), anchor.call_id.is_some()))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(
+            orders[0],
+            [
+                (proofs[0].clone(), false),
+                (proofs[1].clone(), true),
+                (proofs[1].clone(), false)
+            ]
+        );
+        assert_eq!(orders[0], orders[1]);
+    }
+
+    /// #1310: a call's rows the fact digest cannot separate are represented by the least
+    /// stable proof identity, at any native revision; the digest still decides first.
+    #[test]
+    fn tied_representatives_follow_the_raw_proof_across_revisions() {
+        let (proofs, natives) = crossing_revisions();
+        let digest = Some("d".repeat(64));
+        for native in &natives {
+            let rows = [
+                (false, digest.clone(), &proofs[1]),
+                (false, digest.clone(), &proofs[0]),
+            ];
+            let least = rows
+                .iter()
+                .min_by_key(|(unresolved, digest, proof)| {
+                    representative_key(*unresolved, digest.clone(), (*proof).clone())
+                })
+                .unwrap();
+            assert_eq!(least.2, &proofs[0], "{native}");
+            assert!(
+                representative_key(false, Some("c".repeat(64)), proofs[1].clone())
+                    < representative_key(false, digest.clone(), proofs[0].clone())
+            );
+            assert!(
+                representative_key(false, digest.clone(), proofs[1].clone())
+                    < representative_key(true, None, proofs[0].clone())
+            );
+        }
+        assert_ne!(
+            proofs[0].provenance_id(&natives[0]) < proofs[1].provenance_id(&natives[0]),
+            proofs[0].provenance_id(&natives[1]) < proofs[1].provenance_id(&natives[1])
+        );
+    }
 
     #[test]
     fn architecture_derivation_preserves_complete_null_and_corrupt_shapes() {

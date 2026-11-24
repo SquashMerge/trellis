@@ -1727,7 +1727,7 @@ impl EvidenceResponse {
         let defaults = semantic_display::default_producers(&self.db, &key)?;
         let (producers, selections) =
             native_first::architecture_inventory_fingerprints(&self.db, &key)?;
-        // The same row Read B's payload projection derives rejoined provenance IDs from.
+        // The same row Read B's payload projection mints rejoined provenance IDs from.
         let native_revision: String = self.db.query_row(
             "SELECT native_revision_id FROM native_revisions WHERE id=?1",
             [&key],
@@ -1743,13 +1743,12 @@ impl EvidenceResponse {
                 params![key, document.key.language, document.key.path],
                 |row| Ok(NativeFingerprint { version_id: row.get(0)?, coverage_requested: row.get(1)?, coverage_selected: row.get(2)?, coverage_state: row.get(3)?, coverage_diagnostic: row.get(4)? }),
             )?;
-            let (semantic, state, revision_provenance) =
-                semantic_display::architecture_document_fingerprint(
-                    &self.db,
-                    snapshot.pin,
-                    &defaults,
-                    &document.key,
-                )?;
+            let (semantic, state) = semantic_display::architecture_document_fingerprint(
+                &self.db,
+                snapshot.pin,
+                &defaults,
+                &document.key,
+            )?;
             let pending = state
                 .projection
                 .as_ref()
@@ -1757,6 +1756,8 @@ impl EvidenceResponse {
             document.semantic.producer_id = state.default_producer.clone();
             document.semantic.projection = state.projection.clone();
             document.semantic.boundary = pending;
+            document.semantic.reading =
+                crate::architecture_inputs::SemanticReading::of(&state, &native_revision);
             if !pending {
                 document.semantic.coverage_state =
                     state.tuple.as_ref().map(|tuple| tuple.state.clone());
@@ -1772,7 +1773,6 @@ impl EvidenceResponse {
                     native,
                     semantic,
                     projected: state.projection.is_some(),
-                    revision_provenance,
                     sids: crate::architecture_core::dependencies::sid_digest(
                         document
                             .declarations

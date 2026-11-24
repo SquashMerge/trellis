@@ -367,6 +367,7 @@ mod tests {
                 outcome: SemanticOutcome::Boundary,
                 basis_site: true,
                 provenance_id: "boundary".into(),
+                proof: crate::semantic_records::ProofIdentity::Literal("boundary".into()),
                 metadata: SemanticMetadata::default(),
             })
             .collect();

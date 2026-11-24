@@ -289,14 +289,15 @@ proptest! {
 
 /// Fixed seeds vary real source bytes, not scheduling or retries. Each completed pin is
 /// checked by the production owner against its independent all-source full oracle.
-/// Sources whose evidence carries provenance derived from the reading native revision are
-/// semantic Dirty whenever it differs from the base's (#1308); a plain caller still patches.
+/// A producer declares something in every Rust and TypeScript source, so every one carries
+/// rejoined provenance. Revision-scoped semantic metadata is rebased per core (#1310): only
+/// edited sources and genuine dependents are Dirty, and every caller of a moved declaration
+/// patches.
 #[test]
 fn architecture_incremental_seeded_mixed_edits() {
-    use crate::architecture_incremental_support::{CapturedArchitecture, Expected, PLAIN_CALLER};
+    use crate::architecture_incremental_support::{CapturedArchitecture, Expected};
     use trellis::http::FullReason;
 
-    const DERIVED: [&str; 4] = ["src/caller.rs", "src/target.rs", "a.ts", "b.ts"];
     const PROJECTED: [&str; 8] = [
         "src/main.rs",
         "src/lib.rs",
@@ -315,9 +316,8 @@ fn architecture_incremental_seeded_mixed_edits() {
                 .wrapping_add(1442695040888963407);
             state >> 32
         };
-        let mut fixture = CapturedArchitecture::producers_with(PLAIN_CALLER);
+        let mut fixture = CapturedArchitecture::producers_everywhere();
         fixture.stabilize();
-        assert_eq!(fixture.revision_provenance().1, DERIVED, "seed {seed}");
 
         // A body-only Rust edit, then catch-up from a base at another native revision.
         let (path, body) = if next() % 2 == 0 {
@@ -337,19 +337,17 @@ fn architecture_incremental_seeded_mixed_edits() {
         std::fs::write(fixture.root.join(path), body).unwrap();
         fixture.native();
         let pin = fixture.catch_up();
-        let mut dirty = vec![path];
-        dirty.extend(DERIVED);
         fixture.expect(
             pin,
             Expected::Incremental {
-                dirty: &dirty,
+                dirty: &[path],
                 patched: &[],
                 native: &[path],
                 all_b: false,
             },
         );
 
-        // Lines above a declaration others target: the plain caller patches.
+        // Lines above a declaration others target: both callers patch.
         let prefix = "\n".repeat(2 + (next() % 4) as usize);
         std::fs::write(
             fixture.root.join("src/target.rs"),
@@ -361,8 +359,8 @@ fn architecture_incremental_seeded_mixed_edits() {
         fixture.expect(
             pin,
             Expected::Incremental {
-                dirty: &DERIVED,
-                patched: &["src/plain.rs"],
+                dirty: &["src/target.rs"],
+                patched: &["src/caller.rs", "src/plain.rs"],
                 native: &["src/target.rs"],
                 all_b: false,
             },
