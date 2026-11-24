@@ -5,6 +5,7 @@ use crate::graph_fixtures::{
     Bind, PRODUCER, Publisher, Spec, add_second_producer, bind, syntax_id,
 };
 use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use trellis::{
     metrics_read::MetricsOptions,
@@ -99,6 +100,814 @@ fn semantic() -> Spec {
     let mut spec = Spec::new(FILES);
     spec.bindings = bindings();
     spec
+}
+
+fn architecture_index_db(state: &tempfile::TempDir) -> rusqlite::Connection {
+    let path = fs::read_dir(state.path().join("cache/indexes"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap()
+        .join("index.db");
+    rusqlite::Connection::open(path).unwrap()
+}
+
+fn fingerprint_key(
+    inputs: &trellis::store::ArchitectureFingerprints,
+    path: &str,
+) -> trellis::native_evidence::DocumentKey {
+    inputs
+        .documents
+        .keys()
+        .find(|key| key.path == path)
+        .unwrap()
+        .clone()
+}
+
+#[test]
+fn architecture_incremental_current_fingerprint_survives_same_native_copy() {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let mut spec = semantic();
+    let first_pin = publisher.publish(&spec);
+    let first = publisher
+        .store
+        .architecture_fingerprints_for_tests(Some(first_pin))
+        .unwrap();
+    assert!(first.semantic_states.values().any(|state| {
+        state.tuple.is_some()
+            && state
+                .freshness
+                .as_ref()
+                .is_some_and(|freshness| freshness.values.is_empty())
+    }));
+    assert!(first.semantic_states.values().any(|state| {
+        state
+            .freshness
+            .as_ref()
+            .is_some_and(|freshness| !freshness.values.is_empty())
+    }));
+
+    // The native-first same-native branch copies current manifests and their payloads,
+    // advancing validity without introducing a historical projection.
+    spec.producer = false;
+    let copied_pin = publisher.publish(&spec);
+    assert!(copied_pin.index_revision > first_pin.index_revision);
+    let copied = publisher
+        .store
+        .architecture_fingerprints_for_tests(Some(copied_pin))
+        .unwrap();
+    for (key, before) in &first.semantic_states {
+        let after = &copied.semantic_states[key];
+        assert!(
+            before.projection.is_none() && after.projection.is_none(),
+            "{key:?}"
+        );
+        assert_eq!(before.default_producer, after.default_producer);
+        assert_eq!(before.tuple, after.tuple, "payload identity is copied");
+        let before_freshness = before.freshness.as_ref().unwrap();
+        let after_freshness = after.freshness.as_ref().unwrap();
+        assert_eq!(before_freshness.basis_pin, first_pin);
+        assert_eq!(after_freshness.basis_pin, copied_pin);
+        assert_eq!(before_freshness.values, after_freshness.values);
+        assert_eq!(
+            first.documents[key], copied.documents[key],
+            "a changed lookup pin is not changed semantic state: {key:?}"
+        );
+    }
+    assert_eq!(first.producers, copied.producers);
+    assert_eq!(first.selections, copied.selections);
+}
+
+#[test]
+fn architecture_incremental_read_a_tuple_and_freshness() {
+    let (state, root, store, pin) = publish(&semantic());
+    let baseline = store.architecture_fingerprints_for_tests(None).unwrap();
+    let key = fingerprint_key(&baseline, "src/low.rs");
+    let input = &baseline.semantic_states[&key];
+    assert_eq!(input.default_producer.as_deref(), Some(PRODUCER));
+    assert!(input.projection.is_none());
+    assert!(input.tuple.as_ref().unwrap().selected);
+    assert_eq!(input.tuple.as_ref().unwrap().state, "complete");
+    assert!(input.tuple.as_ref().unwrap().payload_id.is_some());
+    assert_eq!(input.freshness.as_ref().unwrap().basis_pin, pin);
+    assert!(!input.freshness.as_ref().unwrap().values.is_empty());
+    drop(store);
+    let mut previous = baseline.documents[&key].semantic;
+    for sql in [
+        "UPDATE semantic_coverage_freshness SET freshness='possiblyStale' WHERE tuple_id IN (SELECT tuple_id FROM semantic_coverage WHERE path='src/low.rs')",
+        "UPDATE semantic_coverage_freshness SET freshness='stale' WHERE tuple_id IN (SELECT tuple_id FROM semantic_coverage WHERE path='src/low.rs')",
+        "UPDATE semantic_coverage SET selected=0 WHERE path='src/low.rs'",
+        "UPDATE semantic_coverage SET payload_id=NULL WHERE path='src/low.rs'",
+        "UPDATE semantic_coverage SET state='partial' WHERE path='src/low.rs'",
+        "DELETE FROM semantic_coverage_freshness WHERE tuple_id IN (SELECT tuple_id FROM semantic_coverage WHERE path='src/low.rs')",
+    ] {
+        let db = architecture_index_db(&state);
+        assert!(db.execute(sql, []).unwrap() > 0, "{sql}");
+        drop(db);
+        let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+        let current = store.architecture_fingerprints_for_tests(None).unwrap();
+        assert_ne!(previous, current.documents[&key].semantic, "{sql}");
+        assert_eq!(
+            current.documents[&key].native,
+            baseline.documents[&key].native
+        );
+        assert_eq!(current.producers, baseline.producers);
+        assert_eq!(current.selections, baseline.selections);
+        previous = current.documents[&key].semantic;
+        drop(store);
+    }
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let empty = store.architecture_fingerprints_for_tests(None).unwrap();
+    assert!(
+        empty.semantic_states[&key]
+            .freshness
+            .as_ref()
+            .unwrap()
+            .values
+            .is_empty()
+    );
+    drop(store);
+    let db = architecture_index_db(&state);
+    db.execute("DELETE FROM semantic_coverage WHERE path='src/low.rs'", [])
+        .unwrap();
+    drop(db);
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let error = store.architecture_fingerprints_for_tests(None).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("missing architecture semantic tuple"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn architecture_incremental_read_a_required_payload_and_consumed_freshness() {
+    for (reference, relationship, provenance) in [
+        (false, false, "call-lower-0"),
+        (true, false, "ref-shape"),
+        (false, true, "rel-square"),
+    ] {
+        let published = if reference || relationship {
+            shapes(reference, relationship)
+        } else {
+            publish(&semantic())
+        };
+        let (state, root, store, _) = published;
+        store.architecture_fingerprints_for_tests(None).unwrap();
+        drop(store);
+        delete_freshness(&state, provenance);
+        let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+        store.architecture_fingerprints_for_tests(None).unwrap();
+        let old = store
+            .architecture_semantic_for_tests(2_000_000)
+            .unwrap_err();
+        let fingerprinted = store
+            .architecture_reference_snapshot_for_tests()
+            .err()
+            .unwrap();
+        let expected = "incompatible_index: semantic freshness missing";
+        assert_eq!(old.to_string(), expected, "{provenance}");
+        assert_eq!(fingerprinted.to_string(), expected, "{provenance}");
+    }
+    let (state, root, store, _) = publish(&semantic());
+    drop(store);
+    let db = architecture_index_db(&state);
+    db.execute(
+        "UPDATE semantic_coverage SET payload_id=NULL WHERE path='src/low.rs'",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let error = store.architecture_fingerprints_for_tests(None).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "incompatible_index: architecture tuple names no payload"
+    );
+}
+
+#[test]
+fn architecture_incremental_unused_missing_freshness_preserves_full_read() {
+    let (state, root, store, pin) = shapes(false, false);
+    let before = store
+        .architecture_fingerprints_for_tests(Some(pin))
+        .unwrap();
+    let key = fingerprint_key(&before, "src/low.rs");
+    let full_before = store.architecture_semantic_for_tests(2_000_000).unwrap();
+    assert!(
+        !before.semantic_states[&key]
+            .freshness
+            .as_ref()
+            .unwrap()
+            .values
+            .is_empty()
+    );
+    drop(store);
+    delete_freshness(&state, "decl-Square");
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let after = store
+        .architecture_fingerprints_for_tests(Some(pin))
+        .unwrap();
+    assert_eq!(
+        before.semantic_states[&key].tuple,
+        after.semantic_states[&key].tuple
+    );
+    assert!(
+        after.semantic_states[&key]
+            .freshness
+            .as_ref()
+            .unwrap()
+            .values
+            .is_empty()
+    );
+    assert_ne!(
+        before.documents[&key].semantic,
+        after.documents[&key].semantic
+    );
+
+    // The first helper uses ordinary native A and unchanged all-source B; the second
+    // uses architecture_input's fingerprinted A before that same B.
+    let full = store.architecture_semantic_for_tests(2_000_000).unwrap();
+    let fingerprinted = store.architecture_reference_snapshot_for_tests().unwrap();
+    assert_eq!(fingerprinted.pin, pin);
+    let fingerprinted: Vec<_> = fingerprinted
+        .documents
+        .into_iter()
+        .map(|document| (document.key.path, document.semantic))
+        .collect();
+    assert_eq!(format!("{full_before:?}"), format!("{full:?}"));
+    assert_eq!(format!("{full:?}"), format!("{fingerprinted:?}"));
+    assert!(
+        full.iter()
+            .all(|(_, semantic)| semantic.anchors.is_empty() && semantic.relationships.is_empty())
+    );
+}
+
+#[test]
+fn architecture_incremental_read_a_complete_freshness_map_and_tuple_surrogate() {
+    let mut spec = semantic();
+    spec.files
+        .iter_mut()
+        .find(|(path, _)| path == "src/orphan.rs")
+        .unwrap()
+        .1 = "pub fn orphan() { crate::high::upper(); crate::high::upper(); }\n".into();
+    spec.bindings.push(bind("orphan", 1, "upper"));
+    let (state, root, store, _) = publish_with(&spec, RULES, |semantic, _| {
+        semantic
+            .provenance
+            .iter_mut()
+            .find(|proof| proof.id == "call-orphan-1")
+            .unwrap()
+            .basis
+            .as_mut()
+            .unwrap()
+            .lookup_dependencies
+            .push("other".into());
+    });
+    let baseline = store.architecture_fingerprints_for_tests(None).unwrap();
+    let key = fingerprint_key(&baseline, "src/orphan.rs");
+    assert_eq!(
+        baseline.semantic_states[&key]
+            .freshness
+            .as_ref()
+            .unwrap()
+            .values
+            .len(),
+        2
+    );
+    drop(store);
+    let db = architecture_index_db(&state);
+    db.execute_batch("BEGIN IMMEDIATE; PRAGMA defer_foreign_keys=ON")
+        .unwrap();
+    for table in [
+        "semantic_coverage",
+        "semantic_coverage_roles",
+        "semantic_coverage_reasons",
+        "semantic_coverage_freshness",
+    ] {
+        db.execute(&format!("UPDATE {table} SET tuple_id=tuple_id+10000"), [])
+            .unwrap();
+    }
+    db.execute_batch("COMMIT").unwrap();
+    drop(db);
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    assert_eq!(
+        store.architecture_fingerprints_for_tests(None).unwrap(),
+        baseline
+    );
+    drop(store);
+    let db = architecture_index_db(&state);
+    db.execute("UPDATE semantic_coverage_freshness SET freshness='possiblyStale' WHERE basis_id=(SELECT max(basis_id) FROM semantic_coverage_freshness WHERE tuple_id IN (SELECT tuple_id FROM semantic_coverage WHERE path='src/orphan.rs'))", []).unwrap();
+    drop(db);
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    assert_ne!(
+        store
+            .architecture_fingerprints_for_tests(None)
+            .unwrap()
+            .documents[&key]
+            .semantic,
+        baseline.documents[&key].semantic
+    );
+}
+
+#[test]
+fn architecture_incremental_read_a_projection_basis_and_pending() {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let basis = publisher.publish(&semantic());
+    let before = publisher
+        .store
+        .architecture_fingerprints_for_tests(None)
+        .unwrap();
+    let mut native = semantic();
+    native.producer = false;
+    native
+        .files
+        .iter_mut()
+        .find(|(path, _)| path == "src/low.rs")
+        .unwrap()
+        .1
+        .push_str("// changed\n");
+    let pin = publisher.publish(&native);
+    let projected = publisher
+        .store
+        .architecture_fingerprints_for_tests(None)
+        .unwrap();
+    let clean = fingerprint_key(&projected, "src/high.rs");
+    let changed = fingerprint_key(&projected, "src/low.rs");
+    let clean_state = &projected.semantic_states[&clean];
+    let projection = clean_state.projection.as_ref().unwrap();
+    assert_eq!(projection.current_pin, pin);
+    assert_eq!(projection.semantic_basis_pin, basis);
+    assert_eq!(
+        projection.semantic_status,
+        trellis::model::SemanticStatus::OlderBasis
+    );
+    assert_eq!(clean_state.tuple, before.semantic_states[&clean].tuple);
+    assert_eq!(clean_state.freshness.as_ref().unwrap().basis_pin, basis);
+    assert_eq!(
+        projected.documents[&clean].native,
+        before.documents[&clean].native
+    );
+    assert_ne!(
+        projected.documents[&clean].semantic,
+        before.documents[&clean].semantic
+    );
+    let pending = &projected.semantic_states[&changed];
+    assert_eq!(
+        pending.projection.as_ref().unwrap().semantic_status,
+        trellis::model::SemanticStatus::NeedsReimport
+    );
+    assert!(pending.tuple.is_none());
+    assert!(pending.freshness.is_none());
+    native
+        .files
+        .iter_mut()
+        .find(|(path, _)| path == "src/low.rs")
+        .unwrap()
+        .1
+        .push_str("// another change\n");
+    publisher.publish(&native);
+    let next = publisher
+        .store
+        .architecture_fingerprints_for_tests(None)
+        .unwrap();
+    assert_ne!(
+        next.documents[&clean].semantic, projected.documents[&clean].semantic,
+        "full projection includes currentPin"
+    );
+    assert_eq!(
+        next.semantic_states[&clean].freshness,
+        clean_state.freshness
+    );
+    assert_eq!(next.producers, before.producers);
+    assert_eq!(next.selections, before.selections);
+    drop(publisher);
+    let db = architecture_index_db(&state);
+    db.execute(
+        "DELETE FROM semantic_projection_documents WHERE path='src/high.rs'",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let error = store.architecture_fingerprints_for_tests(None).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("projection document disposition missing"),
+        "{error:#}"
+    );
+    drop(store);
+    let db = architecture_index_db(&state);
+    db.execute("INSERT INTO semantic_projection_documents SELECT o.revision_id,o.producer_id,m.language,m.path,0 FROM semantic_projection_origins o JOIN revision_documents m ON m.revision_id=o.revision_id WHERE m.path='src/high.rs'", []).unwrap();
+    db.execute("DELETE FROM semantic_coverage WHERE path='src/high.rs'", [])
+        .unwrap();
+    drop(db);
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let error = store.architecture_fingerprints_for_tests(None).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("eligible projection tuple missing"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn architecture_incremental_read_a_default_producer_presence() {
+    let (_state, _root, store, _) = publish_with(&semantic(), RULES, add_second_producer);
+    let ambiguous = store.architecture_fingerprints_for_tests(None).unwrap();
+    assert!(
+        ambiguous
+            .semantic_states
+            .values()
+            .all(|state| state.default_producer.is_none()
+                && state.tuple.is_none()
+                && state.freshness.is_none())
+    );
+    let (_state, _root, store, _) = publish(&semantic());
+    let selected = store.architecture_fingerprints_for_tests(None).unwrap();
+    assert_ne!(ambiguous.producers, selected.producers);
+    let key = fingerprint_key(&selected, "src/low.rs");
+    let ambiguous_key = fingerprint_key(&ambiguous, "src/low.rs");
+    assert_ne!(
+        selected.documents[&key].semantic,
+        ambiguous.documents[&ambiguous_key].semantic
+    );
+}
+
+#[test]
+fn architecture_incremental_read_b_selection_and_full_locate() {
+    let (_state, _root, store, _) = publish(&semantic());
+    let (full, counts) = store
+        .architecture_semantic_selection_for_tests(None, BTreeMap::new(), &mut || Ok(()))
+        .unwrap();
+    let source = full
+        .documents
+        .iter()
+        .find(|doc| doc.key.path == "src/low.rs")
+        .unwrap()
+        .key
+        .clone();
+    let (selected, selected_counts) = store
+        .architecture_semantic_selection_for_tests(
+            Some(BTreeSet::from([source.clone()])),
+            counts.sources.clone(),
+            &mut || Ok(()),
+        )
+        .unwrap();
+    assert_eq!(counts.sources, selected_counts.sources);
+    assert_eq!(counts.global, selected_counts.global);
+    assert_eq!(
+        counts.global,
+        trellis::store::SemanticReadCounts::default(),
+        "producer selection has no evidence-row charges"
+    );
+    assert_eq!(selected.documents.len(), full.documents.len());
+    let selected_source = selected
+        .documents
+        .iter()
+        .find(|doc| doc.key == source)
+        .unwrap();
+    let full_source = full.documents.iter().find(|doc| doc.key == source).unwrap();
+    assert_eq!(
+        format!("{:?}", selected_source.semantic),
+        format!("{:?}", full_source.semantic)
+    );
+    let target = match &selected_source.semantic.anchors[0].outcome {
+        trellis::references::SemanticOutcome::Internal(target, _) => *target,
+        other => panic!("expected located internal target, got {other:?}"),
+    };
+    assert_eq!(selected.documents[target].key.path, "src/high.rs");
+    assert!(selected.documents[target].semantic.anchors.is_empty());
+    assert_eq!(
+        counts.sources[&source],
+        trellis::store::SemanticReadCounts {
+            rows: 1,
+            metadata: 1,
+            lookups: 1
+        }
+    );
+    let (_, retained) = store
+        .architecture_semantic_selection_for_tests(
+            Some(BTreeSet::new()),
+            counts.sources.clone(),
+            &mut || Ok(()),
+        )
+        .unwrap();
+    assert_eq!(retained.sources, counts.sources);
+    assert!(
+        store
+            .architecture_semantic_selection_for_tests(
+                Some(BTreeSet::new()),
+                BTreeMap::new(),
+                &mut || Ok(())
+            )
+            .is_err()
+    );
+    let mut unknown = source;
+    unknown.path = "missing.rs".into();
+    assert!(
+        store
+            .architecture_semantic_selection_for_tests(
+                Some(BTreeSet::from([unknown])),
+                counts.sources,
+                &mut || Ok(())
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn architecture_incremental_read_b_retained_and_fresh_limits() {
+    use trellis::store::{
+        set_architecture_semantic_lookups_for_tests, set_architecture_semantic_metadata_for_tests,
+        set_architecture_semantic_rows_for_tests,
+    };
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            set_architecture_semantic_rows_for_tests(2_000_000);
+            set_architecture_semantic_metadata_for_tests(2_000_000);
+            set_architecture_semantic_lookups_for_tests(2_000_000);
+        }
+    }
+    let _reset = Reset;
+    let mut spec = semantic();
+    spec.files
+        .iter_mut()
+        .find(|(path, _)| path == "src/orphan.rs")
+        .unwrap()
+        .1 = "pub fn orphan() { crate::high::upper(); crate::high::upper(); }\n".into();
+    spec.bindings.push(bind("orphan", 1, "upper"));
+    let (_state, _root, store, _) = publish(&spec);
+    let (snapshot, counts) = store
+        .architecture_semantic_selection_for_tests(None, BTreeMap::new(), &mut || Ok(()))
+        .unwrap();
+    let source = snapshot
+        .documents
+        .iter()
+        .find(|doc| doc.key.path == "src/low.rs")
+        .unwrap()
+        .key
+        .clone();
+    let orphan = snapshot
+        .documents
+        .iter()
+        .find(|doc| doc.key.path == "src/orphan.rs")
+        .unwrap()
+        .key
+        .clone();
+    assert_eq!(
+        counts.sources[&orphan],
+        trellis::store::SemanticReadCounts {
+            rows: 2,
+            metadata: 2,
+            lookups: 2
+        },
+        "the shared basis's lookup is charged on both rows"
+    );
+    for (set, total) in [
+        (set_architecture_semantic_rows_for_tests as fn(usize), 3),
+        (set_architecture_semantic_metadata_for_tests, 6),
+        (set_architecture_semantic_lookups_for_tests, 3),
+    ] {
+        for limit in [total - 1, total, total + 1] {
+            set(limit);
+            let all =
+                store.architecture_semantic_selection_for_tests(None, BTreeMap::new(), &mut || {
+                    Ok(())
+                });
+            let selective = store.architecture_semantic_selection_for_tests(
+                Some(BTreeSet::from([source.clone()])),
+                counts.sources.clone(),
+                &mut || Ok(()),
+            );
+            assert_eq!(all.is_ok(), limit >= total, "full: {limit}/{total}");
+            assert_eq!(
+                selective.is_ok(),
+                all.is_ok(),
+                "retained + fresh: {limit}/{total}"
+            );
+            if let Err(error) = selective {
+                assert!(error.to_string().starts_with("bounded_work:"), "{error:#}");
+            }
+        }
+        set(2_000_000);
+    }
+}
+
+#[test]
+fn architecture_incremental_read_b_skips_only_source_payload_corruption() {
+    let (state, root, store, _) = publish(&semantic());
+    let (snapshot, counts) = store
+        .architecture_semantic_selection_for_tests(None, BTreeMap::new(), &mut || Ok(()))
+        .unwrap();
+    let source = snapshot
+        .documents
+        .iter()
+        .find(|doc| doc.key.path == "src/low.rs")
+        .unwrap()
+        .key
+        .clone();
+    drop(store);
+    let db = architecture_index_db(&state);
+    db.execute("UPDATE semantic_call_bindings SET dispatch='bogus' WHERE payload_id IN (SELECT payload_id FROM semantic_coverage WHERE path='src/orphan.rs')", []).unwrap();
+    drop(db);
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    store
+        .architecture_semantic_selection_for_tests(
+            Some(BTreeSet::from([source])),
+            counts.sources,
+            &mut || Ok(()),
+        )
+        .unwrap();
+    let error = store
+        .architecture_semantic_selection_for_tests(None, BTreeMap::new(), &mut || Ok(()))
+        .err()
+        .unwrap();
+    assert!(
+        format!("{error:#}").contains("corrupt semantic call dispatch"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn architecture_incremental_read_b_cancellation_cadence() {
+    let mut checks = Vec::new();
+    for rows in [255, 256] {
+        let mut spec = Spec::new(FILES);
+        spec.bindings = (0..rows)
+            .map(|ordinal| Bind {
+                provenance: format!("alternative-{ordinal:04}"),
+                ..bind("orphan", 0, "upper")
+            })
+            .collect();
+        let (_state, _root, store, _) = publish(&spec);
+        let mut called = 0;
+        let (_, counts) = store
+            .architecture_semantic_selection_for_tests(None, BTreeMap::new(), &mut || {
+                called += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            counts
+                .sources
+                .values()
+                .map(|count| count.rows)
+                .sum::<usize>(),
+            rows
+        );
+        checks.push(called);
+        if rows == 256 {
+            let mut called = 0;
+            let error = store
+                .architecture_semantic_selection_for_tests(None, BTreeMap::new(), &mut || {
+                    called += 1;
+                    if called == checks[0] {
+                        anyhow::bail!("cancelled: semantic row checkpoint")
+                    }
+                    Ok(())
+                })
+                .err()
+                .unwrap();
+            assert_eq!(error.to_string(), "cancelled: semantic row checkpoint");
+        }
+    }
+    assert_eq!(
+        checks[1],
+        checks[0] + 1,
+        "one check at the 256th admitted row"
+    );
+}
+
+#[test]
+fn architecture_incremental_read_b_historical_alternative_charges() {
+    for ambiguous in [false, true] {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut publisher = Publisher::open(state.path(), root.path());
+        let mut spec = semantic();
+        spec.files
+            .push(("src/isolated.rs".into(), "pub fn isolated() {}\n".into()));
+        spec.bindings = vec![Bind {
+            resolution: if ambiguous {
+                Resolution::Ambiguous
+            } else {
+                Resolution::Resolved
+            },
+            dispatch: Dispatch::Virtual,
+            possible: vec!["go".into()],
+            ..bind("orphan", 0, "upper")
+        }];
+        publisher.publish_with_semantic(&spec, |semantic, _| {
+            if ambiguous {
+                let binding = &mut semantic.call_bindings[0];
+                let target = binding.possible_dispatch[0].clone();
+                binding.candidates.push(target);
+                binding.candidates.sort_by_key(|target| {
+                    trellis::native_ids::canonical(&serde_json::to_value(target).unwrap())
+                });
+            }
+        });
+        spec.producer = false;
+        spec.files
+            .iter_mut()
+            .find(|(path, _)| path == "src/isolated.rs")
+            .unwrap()
+            .1
+            .push_str("// edit\n");
+        publisher.publish(&spec);
+        let (snapshot, counts) = publisher
+            .store
+            .architecture_semantic_selection_for_tests(None, BTreeMap::new(), &mut || Ok(()))
+            .unwrap();
+        let source = snapshot
+            .documents
+            .iter()
+            .find(|doc| doc.key.path == "src/orphan.rs")
+            .unwrap();
+        assert_eq!(
+            source.semantic.projection.as_ref().unwrap().semantic_status,
+            trellis::model::SemanticStatus::OlderBasis
+        );
+        assert_eq!(source.semantic.anchors.len(), 1);
+        assert_eq!(
+            counts.sources[&source.key],
+            trellis::store::SemanticReadCounts {
+                // The ambiguous fixture has three candidates (one external), one dispatch
+                // possibility and the binding itself; the external candidate counts too.
+                rows: if ambiguous { 5 } else { 2 },
+                metadata: 1,
+                lookups: 1
+            },
+            "candidates and possible dispatch are charged before output admission"
+        );
+        let (_, selected) = publisher
+            .store
+            .architecture_semantic_selection_for_tests(
+                Some(BTreeSet::from([source.key.clone()])),
+                counts.sources.clone(),
+                &mut || Ok(()),
+            )
+            .unwrap();
+        assert_eq!(counts.sources, selected.sources);
+    }
+}
+
+#[test]
+fn architecture_incremental_read_b_relationship_and_reference_locate() {
+    let (_state, _root, store, _) = shapes(true, true);
+    let (full, counts) = store
+        .architecture_semantic_selection_for_tests(None, BTreeMap::new(), &mut || Ok(()))
+        .unwrap();
+    let source = full
+        .documents
+        .iter()
+        .find(|doc| doc.key.path == "src/low.rs")
+        .unwrap();
+    assert_eq!(source.semantic.relationships.len(), 1);
+    assert_eq!(source.semantic.anchors.len(), 1);
+    assert_eq!(
+        counts.sources[&source.key],
+        trellis::store::SemanticReadCounts {
+            rows: 2,
+            metadata: 2,
+            lookups: 2
+        }
+    );
+    let (selected, fresh) = store
+        .architecture_semantic_selection_for_tests(
+            Some(BTreeSet::from([source.key.clone()])),
+            counts.sources.clone(),
+            &mut || Ok(()),
+        )
+        .unwrap();
+    assert_eq!(counts.sources, fresh.sources);
+    let selected_source = selected
+        .documents
+        .iter()
+        .find(|doc| doc.key == source.key)
+        .unwrap();
+    assert_eq!(
+        format!("{:?}", selected_source.semantic),
+        format!("{:?}", source.semantic)
+    );
+    let (target, _) = selected_source.semantic.relationships[0]
+        .target
+        .as_ref()
+        .unwrap();
+    assert_eq!(selected.documents[*target].key.path, "src/high.rs");
+    assert!(selected_source.semantic.endpoint_documents.contains(target));
+    assert!(
+        selected_source.semantic.endpoint_documents.contains(
+            &selected
+                .documents
+                .iter()
+                .position(|doc| doc.key == source.key)
+                .unwrap()
+        )
+    );
 }
 
 fn read(store: &Store, kind: &str, args: Value) -> Value {

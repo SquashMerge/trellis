@@ -1495,9 +1495,125 @@ const ARCHITECTURE_SEMANTIC_ROWS: usize = 2_000_000;
 /// An architecture read checks its caller this often, in admitted semantic rows (#1245).
 const CHECK_EVERY_ROWS: usize = 256;
 
+/// Read only state identities, never anchor payloads, in the admitted native transaction.
+#[cfg(feature = "test-support")]
+pub(crate) fn architecture_document_fingerprint(
+    db: &Connection,
+    pin: IndexPin,
+    defaults: &DefaultProducers,
+    document: &DocumentKey,
+) -> Result<([u8; 32], crate::architecture_inputs::SemanticInputState)> {
+    use crate::architecture_inputs::{
+        SemanticFreshnessState, SemanticInputState, SemanticTupleState,
+    };
+    let producer = defaults.producer(&document.language);
+    let Some(producer) = producer else {
+        let state = SemanticInputState::default();
+        return Ok((state.fingerprint(), state));
+    };
+    let projection = super::native_first::semantic_projection_for(
+        db,
+        pin,
+        producer,
+        &document.language,
+        &document.path,
+    )?;
+    let historical = projection
+        .as_ref()
+        .filter(|projection| !projection.semantic_status.is_pending());
+    let basis_pin = historical.map_or(pin, |projection| projection.semantic_basis_pin);
+    let key = semantic_pin_key(basis_pin);
+    let tuple: Option<(i64, bool, String, Option<i64>)> = db.query_row(
+        "SELECT tuple_id,selected,state,payload_id FROM semantic_coverage WHERE revision_id=?1 AND producer_id=?2 AND language=?3 AND path=?4",
+        params![key, producer, document.language, document.path],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    ).optional()?;
+    let pending = projection
+        .as_ref()
+        .is_some_and(|projection| projection.semantic_status.is_pending());
+    ensure!(
+        pending || tuple.is_some(),
+        SelectedIntegrity(if historical.is_some() {
+            "incompatible_index: eligible projection tuple missing".into()
+        } else {
+            "missing architecture semantic tuple".into()
+        })
+    );
+    let tuple_state = tuple
+        .as_ref()
+        .map(|(_, selected, state, payload)| SemanticTupleState {
+            selected: *selected,
+            state: state.clone(),
+            payload_id: *payload,
+        });
+    let mut freshness_state = None;
+    if let Some((tuple, selected, state, payload)) = tuple {
+        let mut statement = db.prepare_cached(
+            "SELECT basis_id,freshness FROM semantic_coverage_freshness WHERE revision_id=?1 AND tuple_id=?2 ORDER BY basis_id",
+        )?;
+        let freshness = statement
+            .query_map(params![key, tuple], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
+        for value in freshness.values() {
+            let _: sem::Freshness = semantic_enum(value.clone())?;
+        }
+        freshness_state = Some(SemanticFreshnessState {
+            basis_pin,
+            values: freshness,
+        });
+        // Read B requires freshness when it consumes a proof, not for unused bases.
+        if !pending && selected && matches!(state.as_str(), "complete" | "partial") {
+            ensure!(
+                payload.is_some(),
+                SelectedIntegrity("incompatible_index: architecture tuple names no payload".into())
+            );
+        }
+    }
+    let state = SemanticInputState {
+        default_producer: Some(producer.to_owned()),
+        projection,
+        tuple: tuple_state,
+        freshness: freshness_state,
+    };
+    Ok((state.fingerprint(), state))
+}
+
 #[cfg(feature = "test-support")]
 static TEST_SEMANTIC_ROWS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(ARCHITECTURE_SEMANTIC_ROWS);
+
+#[cfg(feature = "test-support")]
+static TEST_SEMANTIC_METADATA: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(ARCHITECTURE_SEMANTIC_ROWS);
+#[cfg(feature = "test-support")]
+static TEST_SEMANTIC_LOOKUPS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(ARCHITECTURE_SEMANTIC_ROWS);
+
+#[cfg(feature = "test-support")]
+pub fn set_architecture_semantic_metadata_for_tests(limit: usize) {
+    TEST_SEMANTIC_METADATA.store(limit, std::sync::atomic::Ordering::Release);
+}
+
+#[cfg(feature = "test-support")]
+pub fn set_architecture_semantic_lookups_for_tests(limit: usize) {
+    TEST_SEMANTIC_LOOKUPS.store(limit, std::sync::atomic::Ordering::Release);
+}
+
+pub(super) fn architecture_metadata_limit() -> usize {
+    #[cfg(feature = "test-support")]
+    return TEST_SEMANTIC_METADATA.load(std::sync::atomic::Ordering::Acquire);
+    #[cfg(not(feature = "test-support"))]
+    ARCHITECTURE_SEMANTIC_ROWS
+}
+
+fn lookups_limit() -> usize {
+    #[cfg(feature = "test-support")]
+    return TEST_SEMANTIC_LOOKUPS.load(std::sync::atomic::Ordering::Acquire);
+    #[cfg(not(feature = "test-support"))]
+    ARCHITECTURE_SEMANTIC_ROWS
+}
 
 /// Lower the semantic evidence row bound, so a test's small revision can reach it.
 #[cfg(feature = "test-support")]
@@ -1549,7 +1665,7 @@ pub(super) fn architecture_semantic(
         revision_key,
         documents,
         check,
-        ARCHITECTURE_SEMANTIC_ROWS,
+        architecture_metadata_limit(),
     )
 }
 
@@ -1628,9 +1744,46 @@ fn architecture_semantic_within(
     check: &mut impl FnMut() -> Result<()>,
     metadata_limit: usize,
 ) -> Result<()> {
+    architecture_semantic_for_sources(
+        db,
+        revision_key,
+        documents,
+        ArchitectureSemanticSources::All,
+        check,
+        metadata_limit,
+    )
+    .map(|_| ())
+}
+
+pub(crate) enum ArchitectureSemanticSources {
+    All,
+    #[cfg(feature = "test-support")]
+    Sources {
+        keys: BTreeSet<DocumentKey>,
+        retained: BTreeMap<DocumentKey, crate::architecture_core::dependencies::SemanticReadCounts>,
+    },
+}
+
+#[derive(Default, serde::Serialize)]
+pub struct ArchitectureSemanticCounts {
+    pub sources: BTreeMap<DocumentKey, crate::architecture_core::dependencies::SemanticReadCounts>,
+    /// The existing producer selection performs no evidence admission charges.
+    pub global: crate::architecture_core::dependencies::SemanticReadCounts,
+}
+
+pub(crate) fn architecture_semantic_for_sources(
+    db: &Connection,
+    revision_key: &str,
+    documents: &mut [crate::architecture_inputs::DocumentInput],
+    selection: ArchitectureSemanticSources,
+    check: &mut impl FnMut() -> Result<()>,
+    metadata_limit: usize,
+) -> Result<ArchitectureSemanticCounts> {
+    use crate::architecture_core::dependencies::SemanticReadCounts;
     use crate::architecture_inputs::{
         RowProvenance, SemanticAnchor, SemanticMetadata, SemanticOutcome, SemanticRelationship,
     };
+    use std::cell::{Cell, RefCell};
     use std::sync::Arc;
     let defaults = default_producers(db, revision_key)?;
     let pin_text = revision_key
@@ -1670,17 +1823,73 @@ fn architecture_semantic_within(
             .and_then(|paths| paths.get(path?))
             .copied()
     };
-    let mut rows = 0usize;
+    let counts = RefCell::new(vec![SemanticReadCounts::default(); documents.len()]);
+    #[cfg(feature = "test-support")]
+    if let ArchitectureSemanticSources::Sources { keys, retained } = &selection {
+        let known: BTreeSet<_> = documents.iter().map(|doc| &doc.key).collect();
+        ensure!(
+            keys.iter().all(|key| known.contains(key))
+                && retained.keys().all(|key| known.contains(key)),
+            SelectedIntegrity("unknown architecture semantic source".into())
+        );
+        for (i, document) in documents.iter().enumerate() {
+            if !keys.contains(&document.key) {
+                counts.borrow_mut()[i] = *retained.get(&document.key).context(
+                    SelectedIntegrity("missing retained architecture semantic counts".into()),
+                )?;
+            }
+        }
+    }
+    let totals = counts.borrow().iter().try_fold(
+        SemanticReadCounts::default(),
+        |mut total, count| -> Result<_> {
+            total.rows = total
+                .rows
+                .checked_add(count.rows)
+                .context("bounded_work: architecture semantic evidence")?;
+            total.metadata = total
+                .metadata
+                .checked_add(count.metadata)
+                .context("bounded_work: architecture proof metadata")?;
+            total.lookups = total
+                .lookups
+                .checked_add(count.lookups)
+                .context("bounded_work: architecture lookup dependencies")?;
+            Ok(total)
+        },
+    )?;
+    ensure!(
+        totals.rows <= semantic_rows_limit(),
+        "bounded_work: architecture semantic evidence"
+    );
+    let mut rows = totals.rows;
+    let mut metadata_rows = totals
+        .metadata
+        .checked_add(totals.lookups)
+        .context("bounded_work: architecture proof metadata")?;
+    ensure!(
+        metadata_rows <= metadata_limit,
+        "bounded_work: architecture proof metadata"
+    );
+    let mut lookup_rows = totals.lookups;
+    ensure!(
+        lookup_rows <= lookups_limit(),
+        "bounded_work: architecture lookup dependencies"
+    );
+    let source = Cell::new(0usize);
+    let mut fresh_rows = 0usize;
     // Every admitted row counts toward the bound, and every `CHECK_EVERY_ROWS` of them the
     // caller's check runs, so one large payload's cursors cannot keep a read from giving
     // way to a publication for long (#1245).
     let mut admit = |check: &mut dyn FnMut() -> Result<()>| -> Result<()> {
         rows += 1;
+        fresh_rows += 1;
+        counts.borrow_mut()[source.get()].rows += 1;
         ensure!(
             rows <= semantic_rows_limit(),
             "bounded_work: architecture semantic evidence"
         );
-        if rows.is_multiple_of(CHECK_EVERY_ROWS) {
+        if fresh_rows.is_multiple_of(CHECK_EVERY_ROWS) {
             check()?;
         }
         Ok(())
@@ -1711,6 +1920,15 @@ fn architecture_semantic_within(
     };
     let mut tuples = Vec::new();
     for (i, doc) in documents.iter_mut().enumerate() {
+        match &selection {
+            ArchitectureSemanticSources::All => {}
+            #[cfg(feature = "test-support")]
+            ArchitectureSemanticSources::Sources { keys, .. } if !keys.contains(&doc.key) => {
+                continue;
+            }
+            #[cfg(feature = "test-support")]
+            ArchitectureSemanticSources::Sources { .. } => {}
+        }
         let Some(producer) = defaults.producer(&doc.key.language) else {
             continue;
         };
@@ -1783,7 +2001,6 @@ fn architecture_semantic_within(
     let mut lookup_dependencies = db.prepare_cached(
         "SELECT lookup_key FROM semantic_basis_lookup_dependencies WHERE basis_id=?1 ORDER BY ordinal",
     )?;
-    let mut metadata_rows = 0usize;
     // The fields a row's basis and projection determine, and its payload's content hash, built
     // at the first row of each tuple and basis and shared by the rest (#1247), with the lookup
     // dependency rows that build read: every later row of the basis is charged them too, so
@@ -1798,6 +2015,7 @@ fn architecture_semantic_within(
                         projection: Option<&crate::model::SemanticProjection>|
      -> Result<SemanticMetadata> {
         metadata_rows += 1;
+        counts.borrow_mut()[source.get()].metadata += 1;
         ensure!(
             metadata_rows <= metadata_limit,
             "bounded_work: architecture proof metadata"
@@ -1866,8 +2084,10 @@ fn architecture_semantic_within(
                 let mut dependency_rows = lookup_dependencies.query([basis_id])?;
                 while let Some(row) = dependency_rows.next()? {
                     metadata_rows += 1;
+                    lookup_rows += 1;
+                    counts.borrow_mut()[source.get()].lookups += 1;
                     ensure!(
-                        metadata_rows <= metadata_limit,
+                        metadata_rows <= metadata_limit && lookup_rows <= lookups_limit(),
                         "bounded_work: architecture lookup dependencies"
                     );
                     dependencies.push(row.get::<_, String>(0)?);
@@ -1896,8 +2116,10 @@ fn architecture_semantic_within(
             None => {
                 let (shared, charged) = &shared_fields[&(tuple, basis_id)];
                 metadata_rows += charged;
+                lookup_rows += charged;
+                counts.borrow_mut()[source.get()].lookups += charged;
                 ensure!(
-                    metadata_rows <= metadata_limit,
+                    metadata_rows <= metadata_limit && lookup_rows <= lookups_limit(),
                     "bounded_work: architecture lookup dependencies"
                 );
                 shared.clone()
@@ -1959,6 +2181,7 @@ fn architecture_semantic_within(
     let eligible: std::cell::RefCell<HashMap<(String, usize, IndexPin), bool>> =
         std::cell::RefCell::default();
     for (tuple, i, producer, complete, projection) in tuples {
+        source.set(i);
         let historical = projection.is_some();
         let endpoint = |language: Option<&str>, path: Option<&str>| -> Result<Option<usize>> {
             let Some(target) = locate(language, path) else {
@@ -2345,11 +2568,40 @@ fn architecture_semantic_within(
         semantic.anchors = anchors;
         semantic.relationships = found;
     }
-    Ok(())
+    Ok(ArchitectureSemanticCounts {
+        sources: documents
+            .iter()
+            .map(|document| document.key.clone())
+            .zip(counts.into_inner())
+            .collect(),
+        global: SemanticReadCounts::default(),
+    })
 }
 
 #[cfg(feature = "test-support")]
 impl super::Store {
+    /// Select payload sources while keeping every document available to locate/eligibility.
+    #[doc(hidden)]
+    pub fn architecture_semantic_selection_for_tests(
+        &self,
+        keys: Option<BTreeSet<DocumentKey>>,
+        retained: BTreeMap<DocumentKey, crate::architecture_core::dependencies::SemanticReadCounts>,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<(
+        crate::architecture_inputs::Snapshot,
+        ArchitectureSemanticCounts,
+    )> {
+        let response = self.evidence_response()?;
+        let (mut snapshot, _) =
+            response.architecture_native_regions(None, &mut || Ok(()), &|_, _| {})?;
+        let selection = match keys {
+            Some(keys) => ArchitectureSemanticSources::Sources { keys, retained },
+            None => ArchitectureSemanticSources::All,
+        };
+        let counts = response.architecture_semantic_for_sources(&mut snapshot, selection, check)?;
+        response.finish((snapshot, counts))
+    }
+
     /// Run the semantic part of the head's Architecture read with `check` alone (#1245). The
     /// documents come from its native read first, under a check that never stops it.
     #[doc(hidden)]

@@ -68,6 +68,179 @@ fn core(store: &Store) -> ArchitectureCore {
 }
 
 #[test]
+fn architecture_incremental_canonical_index() {
+    let (_state, _root, store) = checkout();
+    let mut computed = core(&store);
+    let before = computed.canonical().unwrap();
+    let index = &computed.dependencies;
+    let inputs = store
+        .architecture_fingerprints_for_tests(Some(computed.pin))
+        .unwrap();
+    assert_eq!(
+        index.order.as_ref(),
+        inputs.documents.keys().cloned().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        index.documents.len(),
+        computed.references.source_facts().len()
+    );
+    assert_eq!(
+        hex::encode(index.rust_catalog),
+        before["references"]["rustCatalogDigest"]
+    );
+    let mut scanned_zero = false;
+    for ((key, dependency), facts) in index
+        .order
+        .iter()
+        .zip(&index.documents)
+        .zip(computed.references.source_facts())
+    {
+        assert_eq!(dependency.fingerprint.as_ref(), &inputs.documents[key]);
+        assert_eq!(dependency.references.work, facts.work);
+        assert_eq!(dependency.references.sites, facts.sites);
+        assert_eq!(dependency.references.endpoints.as_ref(), facts.endpoints);
+        assert!(facts.endpoints.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(
+            facts
+                .endpoints
+                .iter()
+                .all(|&endpoint| (endpoint as usize) < index.order.len())
+        );
+        match (&dependency.references.plan, &facts.plan) {
+            (Some(plan), Some(recorded)) => {
+                assert!(Arc::ptr_eq(plan, recorded));
+                scanned_zero |= facts.sites == 0;
+            }
+            (None, None) => {
+                assert_eq!((facts.work, facts.sites), (0, 0));
+                assert!(facts.endpoints.is_empty());
+            }
+            _ => panic!("dependency plan differs from the full source fact"),
+        }
+    }
+    assert!(scanned_zero, "zero-site scans keep a plan");
+    let source = computed
+        .references
+        .source_facts()
+        .iter()
+        .position(|fact| fact.sites > 0 && !fact.endpoints.is_empty())
+        .unwrap();
+    macro_rules! changed {
+        ($index:ident, $change:block) => {{
+            let saved = computed.dependencies.clone();
+            let $index = &mut computed.dependencies;
+            $change
+            let after = computed.canonical().unwrap();
+            assert_ne!(before, after, "{}", stringify!($change));
+            assert!(first_difference(&before, &after).unwrap().starts_with("/dependencies/"));
+            computed.dependencies = saved;
+        }};
+    }
+    changed!(index, {
+        Arc::make_mut(&mut index.order)[0].path.push('2');
+    });
+    for member in 0..5 {
+        changed!(index, {
+            let digest = match member {
+                0 => &mut index.rust_catalog,
+                1 => &mut index.manifests,
+                2 => &mut index.root_config,
+                3 => &mut index.producers,
+                _ => &mut index.selections,
+            };
+            digest[0] ^= 1;
+        });
+    }
+    for member in 0..5 {
+        changed!(index, {
+            let fingerprint =
+                Arc::make_mut(&mut Arc::make_mut(&mut index.documents[source]).fingerprint);
+            match member {
+                0 => fingerprint.native.version_id.push('2'),
+                1 => fingerprint.native.coverage_requested ^= true,
+                2 => fingerprint.native.coverage_selected ^= true,
+                3 => fingerprint.native.coverage_state.push('2'),
+                _ => fingerprint.native.coverage_diagnostic = Some("changed".into()),
+            }
+        });
+    }
+    changed!(index, {
+        Arc::make_mut(&mut Arc::make_mut(&mut index.documents[source]).fingerprint).semantic[0] ^=
+            1;
+    });
+    changed!(index, {
+        Arc::make_mut(&mut Arc::make_mut(&mut index.documents[source]).fingerprint).sids[0] ^= 1;
+    });
+    changed!(index, {
+        Arc::make_mut(&mut Arc::make_mut(&mut index.documents[source]).fingerprint).projected ^=
+            true;
+    });
+    for member in 0..6 {
+        changed!(index, {
+            let references =
+                Arc::make_mut(&mut Arc::make_mut(&mut index.documents[source]).references);
+            match member {
+                0 => references.work += 1,
+                1 => references.sites += 1,
+                2 => references.endpoints = Arc::from([]),
+                3 => references.plan = None,
+                4 => Arc::make_mut(references.plan.as_mut().unwrap()).prepared_work += 1,
+                _ => Arc::make_mut(references.plan.as_mut().unwrap())
+                    .sites
+                    .clear(),
+            }
+        });
+    }
+    for member in 0..3 {
+        changed!(index, {
+            let counts = &mut Arc::make_mut(&mut index.documents[source]).semantic;
+            match member {
+                0 => counts.rows += 1,
+                1 => counts.metadata += 1,
+                _ => counts.lookups += 1,
+            }
+        });
+        changed!(index, {
+            match member {
+                0 => index.global_semantic.rows += 1,
+                1 => index.global_semantic.metadata += 1,
+                _ => index.global_semantic.lookups += 1,
+            }
+        });
+    }
+    assert_eq!(before, computed.canonical().unwrap());
+}
+
+#[test]
+fn architecture_incremental_absent_source_has_no_plan() {
+    let (_state, _root, store) = checkout();
+    let response = store.evidence_response().unwrap();
+    let pin = response.selected_pin(None).unwrap();
+    let mut input = response
+        .architecture_input(pin, &mut || Ok(()), &|_| {})
+        .unwrap();
+    let missing = input.snapshot.documents[0].key.clone();
+    input.snapshot.unparsed.insert(missing.clone());
+    input
+        .snapshot
+        .evidence_gaps
+        .insert(missing.clone(), "evidence_budget");
+    response.finish(()).unwrap();
+    let computed =
+        ArchitectureCore::compute(&store, input, None, false, &mut || Ok(()), &|_| {}).unwrap();
+    let position = computed
+        .dependencies
+        .order
+        .iter()
+        .position(|key| key == &missing)
+        .unwrap();
+    let references = &computed.dependencies.documents[position].references;
+    assert!(references.plan.is_none());
+    assert_eq!((references.work, references.sites), (0, 0));
+    assert!(references.endpoints.is_empty());
+}
+
+#[test]
 fn two_builds_of_one_revision_are_canonically_equal_and_an_edit_is_not() {
     let (_state, root, store) = checkout();
     let first = core(&store).canonical().unwrap();
@@ -115,7 +288,11 @@ fn two_builds_of_one_revision_are_canonically_equal_and_an_edit_is_not() {
     publish(&store, root.path());
     let edited = core(&store).canonical().unwrap();
     let at = first_difference(&first, &edited).expect("an edit changes the core");
-    assert!(at.starts_with("/interfaces/routes/0"), "{at}");
+    assert!(at.starts_with("/dependencies/documents/"), "{at}");
+    assert_ne!(
+        first["interfaces"]["routes"][0],
+        edited["interfaces"]["routes"][0]
+    );
 }
 
 /// `core` with `edit` applied to the first metric row of the first measured document.
@@ -184,6 +361,7 @@ fn a_kept_failure_is_part_of_the_canonical_core() {
         app_candidates,
         interfaces,
         summaries,
+        dependencies,
     } = core;
     let rules = rules.map(|part| RulesPart {
         content_hash: part.content_hash,
@@ -197,6 +375,7 @@ fn a_kept_failure_is_part_of_the_canonical_core() {
         app_candidates,
         interfaces,
         summaries,
+        dependencies,
     }
     .canonical()
     .unwrap();

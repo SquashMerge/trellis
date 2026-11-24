@@ -18,6 +18,8 @@ use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
+pub(crate) mod dependencies;
+
 /// The checked arguments of one architecture operation.
 pub(crate) struct ArchitectureArguments {
     pub(crate) pin: Option<IndexPin>,
@@ -155,6 +157,8 @@ pub(crate) struct ArchitectureCore {
     interfaces: Option<Result<crate::interfaces::Extraction, CoreFailure>>,
     /// Finished summaries; one per valid role, aggregate and workbench choice.
     summaries: Mutex<BTreeMap<SummaryKey, Arc<serde_json::Value>>>,
+    #[cfg(feature = "test-support")]
+    dependencies: dependencies::ArchitectureDependencies,
 }
 
 impl ArchitectureCore {
@@ -243,6 +247,10 @@ impl ArchitectureCore {
 pub(crate) struct ArchitectureInput {
     snapshot: crate::references::Snapshot,
     regions: Vec<Vec<crate::native_records::ControlRegion>>,
+    #[cfg(feature = "test-support")]
+    fingerprints: crate::architecture_inputs::ArchitectureFingerprints,
+    #[cfg(feature = "test-support")]
+    semantic_counts: crate::store::semantic_display::ArchitectureSemanticCounts,
 }
 
 impl EvidenceResponse {
@@ -266,6 +274,7 @@ impl EvidenceResponse {
         check: &mut (impl FnMut() -> Result<()> + Send),
         progress: &(dyn Fn(ArchitectureProgress) + Sync),
     ) -> Result<ArchitectureInput> {
+        #[cfg(not(feature = "test-support"))]
         let (snapshot, regions) = self
             .architecture_native_regions(Some(pin), check, &|completed, total| {
                 progress(ArchitectureProgress {
@@ -275,7 +284,24 @@ impl EvidenceResponse {
                 });
             })
             .map_err(|error| self.store.report_index_failure(error))?;
-        Ok(ArchitectureInput { snapshot, regions })
+        #[cfg(feature = "test-support")]
+        let (snapshot, regions, fingerprints) = self
+            .architecture_read_a_fingerprinted(Some(pin), check, &|completed, total| {
+                progress(ArchitectureProgress {
+                    phase: "reading",
+                    completed,
+                    total,
+                });
+            })
+            .map_err(|error| self.store.report_index_failure(error))?;
+        Ok(ArchitectureInput {
+            snapshot,
+            regions,
+            #[cfg(feature = "test-support")]
+            fingerprints,
+            #[cfg(feature = "test-support")]
+            semantic_counts: Default::default(),
+        })
     }
 
     /// Read B (#1301): the semantic rows of every document of `input`, at its pin. This
@@ -285,8 +311,20 @@ impl EvidenceResponse {
         input: &mut ArchitectureInput,
         check: &mut (impl FnMut() -> Result<()> + Send),
     ) -> Result<()> {
+        #[cfg(not(feature = "test-support"))]
         self.architecture_semantic_rows(&mut input.snapshot, check)
-            .map_err(|error| self.store.report_index_failure(error))
+            .map_err(|error| self.store.report_index_failure(error))?;
+        #[cfg(feature = "test-support")]
+        {
+            input.semantic_counts = self
+                .architecture_semantic_for_sources(
+                    &mut input.snapshot,
+                    crate::store::semantic_display::ArchitectureSemanticSources::All,
+                    check,
+                )
+                .map_err(|error| self.store.report_index_failure(error))?;
+        }
+        Ok(())
     }
 
     /// Read and compute one revision's core for this one read.
@@ -320,7 +358,14 @@ impl ArchitectureCore {
         check: &mut (impl FnMut() -> Result<()> + Send),
         progress: &(dyn Fn(ArchitectureProgress) + Sync),
     ) -> Result<Self> {
-        let ArchitectureInput { snapshot, regions } = input;
+        let ArchitectureInput {
+            snapshot,
+            regions,
+            #[cfg(feature = "test-support")]
+            fingerprints,
+            #[cfg(feature = "test-support")]
+            semantic_counts,
+        } = input;
         let total = snapshot.documents.len();
         let report = |phase| {
             progress(ArchitectureProgress {
@@ -331,6 +376,14 @@ impl ArchitectureCore {
         };
         report("resolving");
         let references = crate::references::resolve_all(&snapshot, check)?;
+        #[cfg(feature = "test-support")]
+        let dependencies = dependencies::ArchitectureDependencies::full(
+            &snapshot,
+            fingerprints,
+            &semantic_counts.sources,
+            semantic_counts.global,
+            &references,
+        )?;
         report("evaluating");
         let rules = config
             .map(|config| {
@@ -417,6 +470,8 @@ impl ArchitectureCore {
             app_candidates,
             interfaces,
             summaries: Mutex::default(),
+            #[cfg(feature = "test-support")]
+            dependencies,
         })
     }
 }
@@ -452,6 +507,7 @@ impl ArchitectureCore {
             app_candidates,
             interfaces,
             summaries: _,
+            dependencies,
         } = self;
         let failure = |failure: &CoreFailure| {
             let CoreFailure {
@@ -512,6 +568,7 @@ impl ArchitectureCore {
             "metrics": metrics,
             "appCandidates": app_candidates,
             "interfaces": interfaces,
+            "dependencies": dependencies.canonical(),
         }))
     }
 }
@@ -523,6 +580,18 @@ pub type ArchitectureReadForTests = (Vec<(String, String)>, serde_json::Value);
 
 #[cfg(feature = "test-support")]
 impl Store {
+    /// Read-A identities from an admitted captured revision; no source text is retained.
+    #[doc(hidden)]
+    pub fn architecture_fingerprints_for_tests(
+        &self,
+        pin: Option<IndexPin>,
+    ) -> Result<crate::architecture_inputs::ArchitectureFingerprints> {
+        let response = self.evidence_response()?;
+        let (_, _, fingerprints) =
+            response.architecture_read_a_fingerprinted(pin, &mut || Ok(()), &|_, _| {})?;
+        response.finish(fingerprints)
+    }
+
     /// Admitted captured inputs for comparing full and scoped reference construction.
     /// The transaction ends before either resolver runs.
     #[doc(hidden)]

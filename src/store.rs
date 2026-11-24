@@ -19,6 +19,13 @@ pub(crate) mod semantic_payload;
 mod semantic_retention;
 pub(crate) mod spool_reader;
 pub mod staging;
+#[cfg(feature = "test-support")]
+pub use crate::architecture_core::dependencies::SemanticReadCounts;
+#[cfg(feature = "test-support")]
+pub use crate::architecture_inputs::{
+    ArchitectureFingerprints, DocumentFingerprint, NativeFingerprint, SemanticFreshnessState,
+    SemanticInputState, SemanticTupleState,
+};
 pub(crate) use search::SEARCH_CARD_BATCH_SIZE;
 pub use search::{
     HeadSearchCard, HeadSearchCards, McpSearchCandidates, SearchDeltaColdRebuild,
@@ -30,6 +37,11 @@ pub(crate) use semantic_display::RERUN_SCHEDULED;
 pub use semantic_display::set_architecture_semantic_rows_for_tests;
 #[cfg(feature = "test-support")]
 pub(crate) use semantic_display::status_semantic_projections_on_thread_for_tests;
+#[cfg(feature = "test-support")]
+pub use semantic_display::{
+    ArchitectureSemanticCounts, set_architecture_semantic_lookups_for_tests,
+    set_architecture_semantic_metadata_for_tests,
+};
 pub use semantic_display::{
     AutoRunLabels, CallSemantic, CoverageDocument, LanguagePending, LanguageTier, McpSemantic,
     ProducerNotPublished, ProducerSelection, relabel_status,
@@ -1680,6 +1692,104 @@ impl EvidenceResponse {
             check,
         )?;
         check()
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn architecture_semantic_for_sources(
+        &self,
+        snapshot: &mut crate::architecture_inputs::Snapshot,
+        sources: semantic_display::ArchitectureSemanticSources,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<ArchitectureSemanticCounts> {
+        let selected = self.selected(Some(snapshot.pin))?;
+        let counts = semantic_display::architecture_semantic_for_sources(
+            &self.db,
+            &selected.key,
+            &mut snapshot.documents,
+            sources,
+            check,
+            semantic_display::architecture_metadata_limit(),
+        )?;
+        check()?;
+        Ok(counts)
+    }
+
+    /// Read A and its Architecture-only sidecar under this same admitted revision.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn architecture_read_a_fingerprinted(
+        &self,
+        pin: Option<IndexPin>,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+        progress: &dyn Fn(usize, usize),
+    ) -> Result<(
+        crate::architecture_inputs::Snapshot,
+        Vec<Vec<crate::native_records::ControlRegion>>,
+        ArchitectureFingerprints,
+    )> {
+        let (mut snapshot, regions) = self.architecture_native_regions(pin, check, progress)?;
+        let key = semantic_pin_key(snapshot.pin);
+        let defaults = semantic_display::default_producers(&self.db, &key)?;
+        let (producers, selections) =
+            native_first::architecture_inventory_fingerprints(&self.db, &key)?;
+        let mut documents = BTreeMap::new();
+        let mut semantic_states = BTreeMap::new();
+        for document in &mut snapshot.documents {
+            check()?;
+            // Native read above already applied selected-header, graph and class validation.
+            let native = self.db.query_row(
+                "SELECT d.id,m.coverage_requested,m.coverage_selected,m.coverage_state,m.coverage_diagnostic FROM revision_documents m JOIN document_versions d ON d.vid=m.vid AND d.language=m.language AND d.path=m.path WHERE m.revision_id=?1 AND m.language=?2 AND m.path=?3",
+                params![key, document.key.language, document.key.path],
+                |row| Ok(NativeFingerprint { version_id: row.get(0)?, coverage_requested: row.get(1)?, coverage_selected: row.get(2)?, coverage_state: row.get(3)?, coverage_diagnostic: row.get(4)? }),
+            )?;
+            let (semantic, state) = semantic_display::architecture_document_fingerprint(
+                &self.db,
+                snapshot.pin,
+                &defaults,
+                &document.key,
+            )?;
+            let pending = state
+                .projection
+                .as_ref()
+                .is_some_and(|projection| projection.semantic_status.is_pending());
+            document.semantic.producer_id = state.default_producer.clone();
+            document.semantic.projection = state.projection.clone();
+            document.semantic.boundary = pending;
+            if !pending {
+                document.semantic.coverage_state =
+                    state.tuple.as_ref().map(|tuple| tuple.state.clone());
+                document.semantic.complete = state.projection.is_none()
+                    && state
+                        .tuple
+                        .as_ref()
+                        .is_some_and(|tuple| tuple.selected && tuple.state == "complete");
+            }
+            documents.insert(
+                document.key.clone(),
+                DocumentFingerprint {
+                    native,
+                    semantic,
+                    projected: state.projection.is_some(),
+                    sids: crate::architecture_core::dependencies::sid_digest(
+                        document
+                            .declarations
+                            .iter()
+                            .map(|declaration| declaration.syntax_id.as_str()),
+                    ),
+                },
+            );
+            semantic_states.insert(document.key.clone(), state);
+        }
+        check()?;
+        Ok((
+            snapshot,
+            regions,
+            ArchitectureFingerprints {
+                documents,
+                semantic_states,
+                producers,
+                selections,
+            },
+        ))
     }
 
     /// Read A of an Architecture build (#1301): each selected native document once with its
