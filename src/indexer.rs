@@ -109,9 +109,21 @@ fn proved_body_only(old: &SourceFile, new: &SourceFile) -> bool {
     if parser.set_language(&language).is_err() {
         return false;
     }
-    let (Some(before), Some(after)) =
-        (parser.parse(&old.text, None), parser.parse(&new.text, None))
-    else {
+    // A Rust parse runs within measurement's parse-work budget (#1304): a side past it is not
+    // proved, and indexing keeps that file module-only as `evidence_budget`.
+    let mut parse = |text: &str| {
+        if old.language != "rust" {
+            return parser.parse(text, None);
+        }
+        match crate::measured_parse::parse(text, None) {
+            Ok(crate::measured_parse::Parse::Tree(tree)) => Some(tree),
+            _ => None,
+        }
+    };
+    let Some(before) = parse(&old.text) else {
+        return false;
+    };
+    let Some(after) = parse(&new.text) else {
         return false;
     };
     if before.root_node().has_error() || after.root_node().has_error() {
@@ -877,6 +889,28 @@ mod local_classification_tests {
             ),
             "a path change is not a body edit"
         );
+    }
+
+    /// #1304: a Rust side past the parse-work budget is not proved body-only, and the check
+    /// ends in bounded time whichever side it is on.
+    #[test]
+    fn a_rust_side_past_the_parse_work_budget_is_not_proved_in_bounded_time() {
+        let recovery = crate::measured_parse::inputs::recovery();
+        let clean = "fn work() -> u32 { 1 }\n";
+        let edited = format!("{recovery}// edited\n");
+        for (before, after) in [
+            (recovery.as_str(), edited.as_str()),
+            (clean, recovery.as_str()),
+            (recovery.as_str(), clean),
+        ] {
+            let started = std::time::Instant::now();
+            assert!(!proved_body_only(
+                &file("rust", before),
+                &file("rust", after)
+            ));
+            // Unbounded, each parse of the recovery input takes minutes.
+            assert!(started.elapsed() < crate::testing::HANG_BACKSTOP);
+        }
     }
 
     #[test]
