@@ -31,7 +31,9 @@ pub(crate) use incremental::{ReferencePreparation, finish_incremental, prepare_i
 #[cfg(feature = "test-support")]
 pub(crate) use incremental::{SourceChargePlan, SourceFacts};
 #[cfg(feature = "test-support")]
-pub use work::set_reference_work_limit_for_tests;
+pub use work::{
+    ReferenceWorkLimitForTests, ReferenceWorkLimitGuardForTests, set_reference_work_limit_for_tests,
+};
 pub(crate) mod parallel_check;
 mod python;
 mod rust;

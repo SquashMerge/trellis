@@ -146,14 +146,7 @@ fn architecture_incremental_scoped_fallback() {
     )
     .unwrap();
     assert_eq!(selected.data, scoped.data);
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            references::set_reference_work_limit_for_tests(usize::MAX);
-        }
-    }
-    let _reset = Reset;
-    references::set_reference_work_limit_for_tests(work - 1);
+    let _work_limit = references::set_reference_work_limit_for_tests(work - 1);
     let error = references::resolve_all(&snapshot, &mut || Ok(()))
         .err()
         .unwrap();
@@ -190,6 +183,66 @@ fn architecture_incremental_scoped_fallback() {
     assert!(
         bounded.to_string().starts_with("bounded_work:"),
         "{bounded}"
+    );
+}
+
+#[test]
+fn architecture_incremental_preparation_failure_retries_full_read_b_first() {
+    use crate::graph_fixtures::{Publisher, Spec, bind};
+    use trellis::{
+        references::set_reference_work_limit_for_tests,
+        store::set_architecture_semantic_rows_for_tests,
+    };
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let mut spec = Spec::new(&[
+        ("src/lib.rs", "pub mod caller; pub mod target;\n"),
+        ("src/caller.rs", "pub fn run() { crate::target::f(); }\n"),
+        ("src/target.rs", "pub fn f() {}\n"),
+        ("src/idle.rs", "pub fn idle() {}\n"),
+    ]);
+    spec.bindings = vec![bind("run", 0, "f")];
+    publisher.publish(&spec);
+    let store = &publisher.store;
+    let base = store.architecture_build_for_tests(None, None).unwrap();
+    assert!(
+        base.core.canonical().unwrap()["dependencies"]["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|doc| doc["semantic"]["rows"].as_u64().unwrap() > 0)
+    );
+    let _work_limit = set_reference_work_limit_for_tests(0);
+    struct ResetRows;
+    impl Drop for ResetRows {
+        fn drop(&mut self) {
+            set_architecture_semantic_rows_for_tests(2_000_000);
+        }
+    }
+    let _rows = ResetRows;
+    set_architecture_semantic_rows_for_tests(0);
+    let full = store
+        .architecture_build_for_tests(None, None)
+        .err()
+        .unwrap();
+    assert_eq!(
+        full.to_string(),
+        "bounded_work: architecture semantic evidence"
+    );
+    let incremental = store
+        .architecture_build_for_tests(Some(&base.core), None)
+        .err()
+        .unwrap();
+    assert_eq!(
+        incremental.to_string(),
+        full.to_string(),
+        "ordinary preparation failure retries independent full A/B before full compute"
+    );
+    assert!(incremental.to_string().starts_with("bounded_work:"));
+    assert_eq!(
+        trellis::rules::diagnostic(&incremental),
+        trellis::rules::diagnostic(&full)
     );
 }
 

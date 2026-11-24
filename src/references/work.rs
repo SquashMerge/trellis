@@ -43,18 +43,65 @@ fn scaled_limit(
 pub(crate) fn reference_limit(documents: usize, bytes: usize) -> usize {
     let limit = scaled_limit(documents, bytes, 20_000, 512, REFERENCE_CEILING);
     #[cfg(feature = "test-support")]
-    let limit = limit.min(TEST_REFERENCE_LIMIT.load(std::sync::atomic::Ordering::Acquire));
+    let limit = limit.min(TEST_REFERENCE_LIMIT.get());
     limit
 }
 
 #[cfg(feature = "test-support")]
-static TEST_REFERENCE_LIMIT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(REFERENCE_CEILING);
+thread_local! {
+    static TEST_REFERENCE_LIMIT: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(REFERENCE_CEILING) };
+}
 
-/// Lower the reference budget for small boundary fixtures; the production limit is unchanged.
+/// A captured build budget. Capture on the requester thread, carry it in the build context,
+/// and call `apply` on the worker around full computation or each prepare/finish stage.
+/// Catalog and file workers receive explicit per-job limits; they do not inherit thread state.
 #[cfg(feature = "test-support")]
-pub fn set_reference_work_limit_for_tests(limit: usize) {
-    TEST_REFERENCE_LIMIT.store(limit, std::sync::atomic::Ordering::Release);
+#[derive(Clone, Copy)]
+pub struct ReferenceWorkLimitForTests(usize);
+
+#[cfg(feature = "test-support")]
+impl ReferenceWorkLimitForTests {
+    pub fn capture() -> Self {
+        Self(TEST_REFERENCE_LIMIT.get())
+    }
+
+    pub fn apply(self) -> ReferenceWorkLimitGuardForTests {
+        ReferenceWorkLimitGuardForTests {
+            previous: TEST_REFERENCE_LIMIT.replace(self.0),
+            thread: std::marker::PhantomData,
+        }
+    }
+}
+
+/// Restores the applying thread's previous budget, including on unwinding. A guard cannot
+/// move to another thread; only the captured value can cross the worker boundary.
+#[cfg(feature = "test-support")]
+#[must_use]
+pub struct ReferenceWorkLimitGuardForTests {
+    previous: usize,
+    thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(feature = "test-support")]
+impl ReferenceWorkLimitGuardForTests {
+    pub fn set(&mut self, limit: usize) {
+        TEST_REFERENCE_LIMIT.set(limit);
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl Drop for ReferenceWorkLimitGuardForTests {
+    fn drop(&mut self) {
+        TEST_REFERENCE_LIMIT.set(self.previous);
+    }
+}
+
+/// Lower this thread's reference budget until the returned guard drops. Production scaling
+/// is unchanged. For another worker, explicitly capture and apply `ReferenceWorkLimitForTests`.
+#[cfg(feature = "test-support")]
+pub fn set_reference_work_limit_for_tests(limit: usize) -> ReferenceWorkLimitGuardForTests {
+    ReferenceWorkLimitForTests(limit).apply()
 }
 pub(crate) fn rules_limit(documents: usize, bytes: usize) -> usize {
     scaled_limit(documents, bytes, 10_000, 256, RULES_CEILING)
@@ -84,6 +131,68 @@ pub(crate) fn snapshot_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn reference_work_override_is_thread_scoped_propagated_and_restored() {
+        let default = reference_limit(1, 0);
+        let mut requester = set_reference_work_limit_for_tests(11);
+        let captured = ReferenceWorkLimitForTests::capture();
+        let (ready, started) = std::sync::mpsc::channel();
+        let (resume, resumed) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            assert_eq!(
+                reference_limit(1, 0),
+                default,
+                "an unrelated worker is unchanged"
+            );
+            {
+                let mut applied = captured.apply();
+                assert_eq!(reference_limit(1, 0), 11, "explicitly propagated budget");
+                ready.send(()).unwrap();
+                resumed.recv().unwrap();
+                assert_eq!(
+                    reference_limit(1, 0),
+                    11,
+                    "requester changes are not global"
+                );
+                applied.set(7);
+                {
+                    let _nested = set_reference_work_limit_for_tests(3);
+                    assert_eq!(reference_limit(1, 0), 3);
+                }
+                assert_eq!(
+                    reference_limit(1, 0),
+                    7,
+                    "nested scope restores its predecessor"
+                );
+            }
+            assert_eq!(reference_limit(1, 0), default, "worker scope restored");
+            assert!(
+                std::panic::catch_unwind(|| {
+                    let _applied = captured.apply();
+                    panic!("unwind the budget scope");
+                })
+                .is_err()
+            );
+            assert_eq!(
+                reference_limit(1, 0),
+                default,
+                "unwinding also restores the worker"
+            );
+        });
+        started.recv().unwrap();
+        requester.set(17);
+        resume.send(()).unwrap();
+        worker.join().unwrap();
+        assert_eq!(
+            reference_limit(1, 0),
+            17,
+            "worker restoration does not change the requester"
+        );
+        drop(requester);
+        assert_eq!(reference_limit(1, 0), default);
+    }
 
     #[test]
     fn limits_grow_from_full_admission_and_round_aggregate_bytes() {

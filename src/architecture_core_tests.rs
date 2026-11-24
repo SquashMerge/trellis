@@ -830,19 +830,12 @@ fn architecture_incremental_catalog_gate_and_margin() {
         .sum();
     let margin = candidate.references.executed_work + dirty_base;
     assert!(margin > work, "fixture crosses the margin before full Work");
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            crate::references::set_reference_work_limit_for_tests(usize::MAX);
-        }
-    }
-    let _reset = Reset;
-    crate::references::set_reference_work_limit_for_tests(margin);
+    let mut work_limit = crate::references::set_reference_work_limit_for_tests(margin);
     let at = store
         .architecture_build_for_tests(Some(&changed.core), None)
         .unwrap();
     assert!(matches!(at.path, ArchitectureBuildPath::Incremental { .. }));
-    crate::references::set_reference_work_limit_for_tests(margin - 1);
+    work_limit.set(margin - 1);
     let below = store
         .architecture_build_for_tests(Some(&changed.core), None)
         .unwrap();
@@ -851,7 +844,7 @@ fn architecture_incremental_catalog_gate_and_margin() {
         ArchitectureBuildPath::Full(FullReason::ReferenceWorkMargin)
     );
     assert_eq!(below.core.canonical().unwrap(), canonical);
-    crate::references::set_reference_work_limit_for_tests(work - 1);
+    work_limit.set(work - 1);
     let incremental_error = store
         .architecture_build_for_tests(Some(&changed.core), None)
         .err()
@@ -865,7 +858,7 @@ fn architecture_incremental_catalog_gate_and_margin() {
         full_error.to_string(),
         "full chooses the kept bound failure"
     );
-    crate::references::set_reference_work_limit_for_tests(usize::MAX);
+    work_limit.set(usize::MAX);
     let base = Arc::get_mut(&mut changed.core.0).unwrap();
     let main = base
         .dependencies
@@ -932,6 +925,7 @@ fn architecture_incremental_rules_presence_and_read_b_policy() {
                 measure: true,
                 progress: &|_| {},
                 trace: &trace,
+                work_limit: crate::references::ReferenceWorkLimitForTests::capture(),
             },
             Some(base.clone()),
             &mut || Ok(()),
@@ -1073,6 +1067,7 @@ fn architecture_incremental_full_rules_and_direct_does_not_dirty_references() {
             measure: true,
             progress: &|_| {},
             trace: &trace,
+            work_limit: crate::references::ReferenceWorkLimitForTests::capture(),
         },
         Some(base.clone()),
         &mut || Ok(()),
@@ -1255,6 +1250,7 @@ fn architecture_incremental_target_display_patch_matches_full() {
             measure: true,
             progress: &|_| {},
             trace: &trace,
+            work_limit: crate::references::ReferenceWorkLimitForTests::capture(),
         },
         Some(base.clone()),
         &mut || Ok(()),
@@ -1388,6 +1384,7 @@ fn architecture_incremental_projected_global_state_and_native_only_metrics() {
             measure: true,
             progress: &|_| {},
             trace: &trace,
+            work_limit: crate::references::ReferenceWorkLimitForTests::capture(),
         },
         Some(base.clone()),
         &mut || Ok(()),
@@ -1601,4 +1598,98 @@ fn architecture_incremental_site_bound_counts_dirty_and_retained_before_sampling
         .unwrap();
     assert_eq!(attempted.to_string(), full.to_string());
     assert_eq!(full.to_string(), "bounded_work: reference site count");
+}
+
+#[test]
+fn architecture_incremental_work_context_applies_on_prepare_and_finish_workers() {
+    use crate::references::{ReferenceWorkLimitForTests, set_reference_work_limit_for_tests};
+    let (_state, _root, store) = incremental_checkout();
+    let base = Arc::new(core(&store));
+    let captured = {
+        let _requester = set_reference_work_limit_for_tests(0);
+        ReferenceWorkLimitForTests::capture()
+    };
+    let trace = Mutex::new(Default::default());
+    let input = native_input(&store);
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let _worker = set_reference_work_limit_for_tests(1_000);
+                let error = prepare_architecture(
+                    ArchitectureReadA {
+                        input,
+                        store: &store,
+                        config: None,
+                        measure: true,
+                        progress: &|_| {},
+                        trace: &trace,
+                        work_limit: captured,
+                    },
+                    Some(base),
+                    &mut || Ok(()),
+                )
+                .err()
+                .unwrap();
+                assert!(error.to_string().starts_with("bounded_work:"), "{error}");
+                assert_eq!(
+                    crate::references::work::reference_limit(1, 0),
+                    1_000,
+                    "preparation applies the captured zero and restores the worker's budget"
+                );
+            })
+            .join()
+            .unwrap();
+    });
+    let mut plan = prepare_architecture(
+        ArchitectureReadA {
+            input: native_input(&store),
+            store: &store,
+            config: None,
+            measure: true,
+            progress: &|_| {},
+            trace: &trace,
+            work_limit: captured,
+        },
+        None,
+        &mut || Ok(()),
+    )
+    .unwrap();
+    let response = store.evidence_response().unwrap();
+    let read_b = response
+        .architecture_plan_read_b(&mut plan, &mut || Ok(()))
+        .unwrap();
+    let read_b = response.finish(read_b).unwrap();
+    drop(response);
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let _worker = set_reference_work_limit_for_tests(1_000);
+                let error = finish_architecture(plan, read_b, &mut || Ok(()))
+                    .err()
+                    .unwrap();
+                assert!(error.to_string().starts_with("bounded_work:"), "{error}");
+                assert_eq!(
+                    crate::references::work::reference_limit(1, 0),
+                    1_000,
+                    "finish applies the captured zero and restores the worker's budget"
+                );
+            })
+            .join()
+            .unwrap();
+    });
+    store.architecture_build_for_tests(None, None).unwrap();
+}
+
+#[test]
+fn architecture_incremental_retry_excludes_cancelled_and_contended_errors() {
+    assert!(engine::retryable_incremental_error(&anyhow::anyhow!(
+        "bounded_work: preparation"
+    )));
+    let integrity = SelectedIntegrity("missing semantic freshness".into());
+    assert!(!engine::retryable_incremental_error(
+        &anyhow::Error::from(integrity).context("cancelled: read B")
+    ));
+    assert!(!engine::retryable_incremental_error(
+        &crate::store::topology::StorageBusy.into()
+    ));
 }

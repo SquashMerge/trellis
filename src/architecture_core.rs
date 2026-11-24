@@ -602,6 +602,9 @@ mod engine {
         pub(crate) measure: bool,
         pub(crate) progress: &'a (dyn Fn(ArchitectureProgress) + Sync),
         pub(crate) trace: &'a Mutex<crate::references::ReferenceReplayTrace>,
+        /// Captured by the requester and explicitly applied on each compute worker.
+        #[cfg(feature = "test-support")]
+        pub(crate) work_limit: crate::references::ReferenceWorkLimitForTests,
     }
 
     pub(crate) struct ArchitectureBuildPlan<'a> {
@@ -634,6 +637,8 @@ mod engine {
         base: Option<Arc<ArchitectureCore>>,
         check: &mut (impl FnMut() -> Result<()> + Send),
     ) -> Result<super::ArchitectureBuildPlan<'a>> {
+        #[cfg(feature = "test-support")]
+        let _work_limit = read_a.work_limit.apply();
         check()?;
         (read_a.progress)(ArchitectureProgress {
             phase: "resolving",
@@ -785,6 +790,8 @@ mod engine {
         read_b: ArchitectureReadB,
         check: &mut (impl FnMut() -> Result<()> + Send),
     ) -> Result<ArchitectureCore> {
+        #[cfg(feature = "test-support")]
+        let _work_limit = plan.read_a.work_limit.apply();
         check()?;
         ensure!(
             read_b.pin == plan.read_a.input.snapshot.pin,
@@ -812,6 +819,8 @@ mod engine {
             measure,
             progress,
             trace,
+            #[cfg(feature = "test-support")]
+                work_limit: _,
         } = plan.read_a;
         let Some(prepared) = plan.references else {
             let limit = crate::references::work::reference_limit(
@@ -946,6 +955,11 @@ mod engine {
         pub references: crate::references::ReferenceReplayTrace,
     }
 
+    pub(super) fn retryable_incremental_error(error: &anyhow::Error) -> bool {
+        !error.to_string().starts_with("cancelled")
+            && !crate::store::transient_storage_contention(error)
+    }
+
     impl Store {
         /// Direct supplied-base engine adapter. It owns no cache and retains no native input.
         #[doc(hidden)]
@@ -954,6 +968,8 @@ mod engine {
             base: Option<&super::ArchitectureCoreHandle>,
             config: Option<&Config>,
         ) -> Result<super::ArchitectureBuildForTests> {
+            let work_limit = crate::references::ReferenceWorkLimitForTests::capture();
+            let _work_limit = work_limit.apply();
             let progress = Mutex::new(Vec::new());
             let report = |value| {
                 progress
@@ -967,51 +983,60 @@ mod engine {
             let input = response.architecture_native_input(pin, &mut || Ok(()), &report)?;
             let input = response.finish(input)?;
             drop(response);
-            let mut plan = super::prepare_architecture(
-                super::ArchitectureReadA {
-                    input,
-                    store: self,
-                    config,
-                    measure: true,
-                    progress: &report,
-                    trace: &trace,
-                },
-                base.map(|handle| handle.0.clone()),
-                &mut || Ok(()),
-            )?;
-            let mut path = plan.path.clone();
-            let mut semantic_sources = plan.semantic_keys();
-            let measured_sources = if matches!(path, ArchitectureBuildPath::Incremental { .. }) {
-                plan.changed.native.iter().cloned().collect::<Vec<_>>()
-            } else {
-                plan.read_a
-                    .input
-                    .fingerprints
-                    .documents
-                    .keys()
-                    .cloned()
-                    .collect()
-            };
-            let response = self.evidence_response()?;
-            let read_b = response
-                .architecture_plan_read_b(&mut plan, &mut || Ok(()))
-                .and_then(|read_b| response.finish(read_b));
-            drop(response);
-            let computed =
-                read_b.and_then(|read_b| super::finish_architecture(plan, read_b, &mut || Ok(())));
+            let mut path = None;
+            let mut semantic_sources = Vec::new();
+            let mut measured_sources = Vec::new();
+            let computed = (|| {
+                let mut plan = super::prepare_architecture(
+                    super::ArchitectureReadA {
+                        input,
+                        store: self,
+                        config,
+                        measure: true,
+                        progress: &report,
+                        trace: &trace,
+                        work_limit,
+                    },
+                    base.map(|handle| handle.0.clone()),
+                    &mut || Ok(()),
+                )?;
+                path = Some(plan.path.clone());
+                semantic_sources = plan.semantic_keys();
+                measured_sources = if matches!(plan.path, ArchitectureBuildPath::Incremental { .. })
+                {
+                    plan.changed.native.iter().cloned().collect()
+                } else {
+                    plan.read_a
+                        .input
+                        .fingerprints
+                        .documents
+                        .keys()
+                        .cloned()
+                        .collect()
+                };
+                let response = self.evidence_response()?;
+                let read_b = response
+                    .architecture_plan_read_b(&mut plan, &mut || Ok(()))
+                    .and_then(|read_b| response.finish(read_b));
+                drop(response);
+                super::finish_architecture(plan, read_b?, &mut || Ok(()))
+            })();
             let core = match computed {
                 Ok(core) => core,
                 Err(error)
-                    if matches!(path, ArchitectureBuildPath::Incremental { .. })
-                        && !crate::store::transient_storage_contention(&error) =>
+                    if base.is_some()
+                        && path.as_ref().is_none_or(|path| {
+                            matches!(path, ArchitectureBuildPath::Incremental { .. })
+                        })
+                        && retryable_incremental_error(&error) =>
                 {
-                    path = ArchitectureBuildPath::Full(
+                    path = Some(ArchitectureBuildPath::Full(
                         if error.downcast_ref::<ReferenceWorkMargin>().is_some() {
                             FullReason::ReferenceWorkMargin
                         } else {
                             FullReason::IncrementalFailure
                         },
-                    );
+                    ));
                     let response = self.evidence_response()?;
                     let input = response.architecture_input(pin, &mut || Ok(()), &report)?;
                     semantic_sources = input.fingerprints.documents.keys().cloned().collect();
@@ -1036,6 +1061,7 @@ mod engine {
                 }
                 Err(error) => return Err(error),
             };
+            let path = path.context("completed architecture build path")?;
             let measured_sources = if matches!(path, ArchitectureBuildPath::Full(_)) {
                 semantic_sources.clone()
             } else {
