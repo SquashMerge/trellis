@@ -154,6 +154,17 @@ struct Running {
     pin: IndexPin,
     rules_hash: Option<String>,
     progress: Option<ArchitectureProgress>,
+    /// A borrowed base belongs to the episode at selection. Once invalidated, this
+    /// operation stays cancelled even if the live hash returns to its original value.
+    base_cancelled: Option<Arc<AtomicBool>>,
+}
+
+fn check_base_episode(cancelled: Option<&AtomicBool>) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)),
+        "cancelled: architecture base episode ended"
+    );
+    Ok(())
 }
 
 #[derive(Default)]
@@ -191,8 +202,26 @@ impl OwnerState {
         let live = (key.pin.index_generation, key.rules_hash.clone());
         if self.live_rules.as_ref() != Some(&live) {
             self.eligible.clear();
+            if let Some(cancelled) = self
+                .running
+                .as_ref()
+                .and_then(|run| run.base_cancelled.as_ref())
+            {
+                cancelled.store(true, Ordering::Release);
+            }
             self.live_rules = Some(live);
         }
+    }
+
+    /// The final admission and publication share the owner lock with observations.
+    /// A transition after the last compute check therefore cannot publish an old base.
+    fn finish_running(&mut self) -> anyhow::Result<()> {
+        let running = self.running.take();
+        check_base_episode(
+            running
+                .as_ref()
+                .and_then(|run| run.base_cancelled.as_deref()),
+        )
     }
 
     fn base(&self, key: &CoreKey) -> Option<Arc<ArchitectureCore>> {
@@ -881,7 +910,7 @@ impl DaemonState {
             pin: head,
             rules_hash: config.as_ref().map(|config| config.content_hash.clone()),
         };
-        let (key, base) = {
+        let (key, base, base_cancelled) = {
             let mut state = owner.state.lock().unwrap();
             state.head = Some(head);
             state.observe_rules(&head_key);
@@ -909,13 +938,15 @@ impl DaemonState {
             }
             owner.stop.store(false, Ordering::Release);
             owner.head_may_have_moved.store(false, Ordering::Release);
+            let base = state.base(&key);
+            let base_cancelled = base.as_ref().map(|_| Arc::new(AtomicBool::new(false)));
             state.running = Some(Running {
                 pin: key.pin,
                 rules_hash: key.rules_hash.clone(),
                 progress: None,
+                base_cancelled: base_cancelled.clone(),
             });
-            let base = state.base(&key);
-            (key, base)
+            (key, base, base_cancelled)
         };
         let pin = key.pin;
         #[cfg(feature = "test-support")]
@@ -938,10 +969,13 @@ impl DaemonState {
                 !owner.stop.load(Ordering::Acquire),
                 "cancelled: architecture build stopped"
             );
+            check_base_episode(base_cancelled.as_deref())?;
             if owner.head_may_have_moved.swap(false, Ordering::AcqRel) && self.head_moved(head) {
                 owner.hook("architecture_build_superseded");
                 anyhow::bail!("cancelled: architecture build superseded");
             }
+            // The head check can itself observe a new generation.
+            check_base_episode(base_cancelled.as_deref())?;
             Ok(())
         };
         #[cfg(feature = "test-support")]
@@ -988,7 +1022,14 @@ impl DaemonState {
         // the hook proves this operation is still current afterwards.
         let built = recheck_build(check().and(built), || self.architecture_current_rules(&key));
         let mut state = owner.state.lock().unwrap();
-        state.running = None;
+        let finished = state.finish_running();
+        let built = if built.as_ref().is_err_and(cancelled) {
+            built
+        } else {
+            // Episode cancellation outranks a carried integrity or contention error,
+            // without replacing an earlier give-way/stop.
+            finished.and(built)
+        };
         #[cfg(feature = "test-support")]
         let executions: std::collections::BTreeMap<_, _> = record
             .executions
@@ -1166,6 +1207,7 @@ impl DaemonState {
                     pin,
                     rules_hash: config.map(|config| config.content_hash.clone()),
                 })?;
+                check()?;
                 *record.references.lock().unwrap() = Default::default();
                 record.full_retries += 1;
                 #[cfg(feature = "test-support")]
@@ -1356,6 +1398,7 @@ impl DaemonState {
             pin,
             rules_hash: config.map(|config| config.content_hash.clone()),
         })?;
+        check()?;
         #[cfg(feature = "test-support")]
         owner.verified.fetch_add(1, Ordering::AcqRel);
         record.compared = true;
@@ -1684,6 +1727,89 @@ mod tests {
         )
     }
 
+    #[test]
+    fn architecture_incremental_worker_rules_observations_cancel_borrowed_base() {
+        let (_tmp, store, state, _roots, _identity) =
+            crate::http::exceptional_recovery_tests::fixture();
+        let root = std::path::Path::new(store.workspace_root());
+        std::fs::remove_file(root.join("a.js")).unwrap();
+        for (path, text) in [
+            ("main.rs", "fn main() { let value = 1; }\n"),
+            ("one.rs", "pub fn one() {}\n"),
+            ("two.rs", "pub fn two() {}\n"),
+            ("three.rs", "pub fn three() {}\n"),
+        ] {
+            std::fs::write(root.join(path), text).unwrap();
+        }
+        let rules_path = root.join(".trellis/rules.toml");
+        std::fs::create_dir_all(rules_path.parent().unwrap()).unwrap();
+        let rules_a = "version=1\n[layers.code]\norder=1\npaths=['**/*.rs']\n";
+        let rules_b = "version=1\n[layers.other]\norder=1\npaths=['**/*.rs']\n";
+        std::fs::write(&rules_path, rules_a).unwrap();
+        state.worker_step().unwrap();
+        state.await_architecture_idle_for_tests();
+        let original = head(&state);
+        let before_paths = state.architecture_build_paths_for_tests().len();
+        let before_compared = state.architecture_verified_for_tests();
+        assert_eq!(before_paths, 1);
+        assert_eq!(before_compared, 1);
+        assert!(state.architecture_differences_for_tests().is_empty());
+
+        let (reached, release) = hold_at(&state, "architecture_read_b", 0);
+        std::fs::write(root.join("main.rs"), "fn main() { let value = 2; }\n").unwrap();
+        store
+            .enqueue_request(&crate::indexer::IndexOptions::new(root.to_owned()), None)
+            .unwrap();
+        state.worker_step().unwrap();
+        reached.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap();
+        let pin = head(&state);
+        assert_ne!(pin, original);
+        assert_eq!(state.leases(), 0, "read A ended before the owner was held");
+
+        // Drive the real post-step observer at the unchanged selected head, while
+        // the owner already holds a base Arc but no read can hide the rules edits.
+        for rules in [rules_b, rules_a] {
+            std::fs::write(&rules_path, rules).unwrap();
+            state.worker_step().unwrap();
+            assert_eq!(head(&state), pin);
+            let live = crate::rules::load(root).unwrap().unwrap().content_hash;
+            assert_eq!(
+                state.architecture.0.state.lock().unwrap().live_rules,
+                Some((pin.index_generation, Some(live)))
+            );
+        }
+        drop(release);
+        state.await_architecture_idle_for_tests();
+
+        let attempts: Vec<_> = state
+            .architecture_attempts_for_tests()
+            .into_iter()
+            .filter(|attempt| attempt.pin == pin)
+            .collect();
+        let stopped = &attempts[0];
+        assert_eq!(stopped.base, Some(original));
+        assert!(
+            !stopped.compared && !stopped.published,
+            "an observed rules episode cancels the borrowed base: {stopped:?}"
+        );
+        assert_eq!(stopped.full_retries, 0);
+        assert!(matches!(
+            stopped.path,
+            ArchitectureBuildPath::Incremental { .. }
+        ));
+        assert_eq!(attempts.len(), 2, "{attempts:?}");
+        let next = &attempts[1];
+        assert_eq!(next.base, None);
+        assert_eq!(next.path, ArchitectureBuildPath::Full(FullReason::NoBase));
+        assert!(next.compared && next.published);
+        assert_eq!(
+            state.architecture_build_paths_for_tests().len(),
+            before_paths + 1
+        );
+        assert_eq!(state.architecture_verified_for_tests(), before_compared + 1);
+        assert!(state.architecture_differences_for_tests().is_empty());
+    }
+
     /// #1301: a stop keeps its precedence over a cause that would repeat, as in a turn's own
     /// outcome handling.
     #[test]
@@ -1906,6 +2032,57 @@ mod owner_state_tests {
             .iter()
             .map(|p| p.key.pin.index_revision)
             .collect()
+    }
+
+    #[test]
+    fn borrowed_base_transition_after_a_check_is_rejected_at_final_admission() {
+        let original = CoreKey {
+            pin: pin(2),
+            rules_hash: Some("A".into()),
+        };
+        let mut other_rules = original.clone();
+        other_rules.rules_hash = Some("B".into());
+        let mut other_generation = original.clone();
+        other_generation.pin.index_generation = uuid::Uuid::from_u128(1);
+        for changed in [other_rules, other_generation] {
+            let mut state = OwnerState::default();
+            state.observe_rules(&original);
+            let base_cancelled = Arc::new(AtomicBool::new(false));
+            state.running = Some(Running {
+                pin: original.pin,
+                rules_hash: original.rules_hash.clone(),
+                progress: None,
+                base_cancelled: Some(base_cancelled.clone()),
+            });
+            let mut same_episode = original.clone();
+            same_episode.pin.index_revision += 1;
+            state.observe_rules(&same_episode);
+            check_base_episode(Some(&base_cancelled)).unwrap();
+
+            // The last sampled compute check passed. Both transitions now take
+            // place before the lock-owned final admission, without another check.
+            state.observe_rules(&changed);
+            state.observe_rules(&original);
+            let error = state.finish_running().unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "cancelled: architecture base episode ended"
+            );
+            assert!(state.running.is_none());
+            assert!(base_cancelled.load(Ordering::Acquire));
+
+            // Ending that operation does not cancel a successor in the new episode.
+            let next = Arc::new(AtomicBool::new(false));
+            state.running = Some(Running {
+                pin: original.pin,
+                rules_hash: original.rules_hash.clone(),
+                progress: None,
+                base_cancelled: Some(next.clone()),
+            });
+            state.observe_rules(&original);
+            state.finish_running().unwrap();
+            assert!(!next.load(Ordering::Acquire));
+        }
     }
 
     #[test]
