@@ -29,7 +29,8 @@ pub(crate) struct ReferencePreparation {
     selected: Vec<usize>,
     catalogs: Catalogs,
     pub(crate) limit: usize,
-    pub(crate) digest: [u8; 32],
+    pub(crate) rust_digest: [u8; 32],
+    pub(crate) python_digest: [u8; 32],
     workers: usize,
 }
 
@@ -120,7 +121,8 @@ pub(super) fn prepare_with_workers(
             limit,
             check,
         )?;
-        let digest = catalogs.rust.digest();
+        let rust_digest = catalogs.rust.digest();
+        let python_digest = catalogs.python.digest();
         let mut order = vec![0; sorted.len()];
         for (original, &position) in sorted.iter().enumerate() {
             order[position] = original;
@@ -136,7 +138,8 @@ pub(super) fn prepare_with_workers(
             selected,
             catalogs,
             limit,
-            digest,
+            rust_digest,
+            python_digest,
             workers,
         })
     })();
@@ -165,7 +168,8 @@ pub(crate) fn finish_incremental(
             selected,
             mut catalogs,
             limit: _,
-            digest,
+            rust_digest,
+            python_digest,
             workers,
         } = preparation;
         ensure!(
@@ -319,7 +323,8 @@ pub(crate) fn finish_incremental(
                 modules,
                 sources,
                 external_packages,
-                rust_catalog_digest: digest,
+                rust_catalog_digest: rust_digest,
+                python_catalog_digest: python_digest,
                 source_facts: facts,
                 producers,
                 document_status: docs
@@ -563,6 +568,10 @@ impl ReferenceBase {
 
     pub(crate) fn rust_catalog_digest(&self) -> [u8; 32] {
         self.rust_catalog_digest
+    }
+
+    pub(crate) fn python_catalog_digest(&self) -> [u8; 32] {
+        self.python_catalog_digest
     }
 
     /// Every admitted document has a slot, including absent and scanned zero-site sources.

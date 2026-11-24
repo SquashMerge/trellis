@@ -719,9 +719,11 @@ pub enum FullReason {
     RootTsconfigChanged,
     ProducerSetChanged,
     RawSelectionsChanged,
+    /// A changed native document's language has no catalog digest: not Rust or Python.
     NonRustChanged,
     DirtyMajority,
     RustCatalogChanged,
+    PythonCatalogChanged,
     ReferenceWorkMargin,
     /// An ordinary incremental failure was retried through the independent full path.
     IncrementalFailure,
@@ -844,9 +846,24 @@ mod engine {
         let references =
             crate::references::prepare_incremental(&plan.read_a.input.snapshot, check)?;
         let base = plan.base.as_ref().expect("incremental decision has a base");
-        if !changed.native.is_empty() && references.digest != base.dependencies.rust_catalog {
-            plan.path = ArchitectureBuildPath::Full(FullReason::RustCatalogChanged);
-            return Ok(plan);
+        if !changed.native.is_empty() {
+            for (current, old, reason) in [
+                (
+                    references.rust_digest,
+                    base.dependencies.rust_catalog,
+                    FullReason::RustCatalogChanged,
+                ),
+                (
+                    references.python_digest,
+                    base.dependencies.python_catalog,
+                    FullReason::PythonCatalogChanged,
+                ),
+            ] {
+                if current != old {
+                    plan.path = ArchitectureBuildPath::Full(reason);
+                    return Ok(plan);
+                }
+            }
         }
         plan.all_semantic = plan.read_a.config.is_some_and(Config::has_rules)
             && plan

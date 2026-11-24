@@ -13,6 +13,7 @@ use work::Work;
 pub(crate) mod callers;
 mod canonical;
 mod cargo_workspace;
+mod catalog_digest;
 pub mod external;
 mod java;
 mod javascript;
@@ -79,6 +80,7 @@ pub struct ReferenceBase {
     sources: Vec<Option<Arc<SourceReferences>>>,
     external_packages: ExternalPackageTable,
     rust_catalog_digest: [u8; 32],
+    python_catalog_digest: [u8; 32],
     source_facts: Vec<SourceFacts>,
     /// Language to selected producer.
     producers: BTreeMap<String, String>,
@@ -536,6 +538,7 @@ fn resolve(
     };
     let mut catalogs = build_catalogs(read, limit, check)?;
     let rust_catalog_digest = catalogs.rust.digest();
+    let python_catalog_digest = catalogs.python.digest();
     let (declared, producers) = declared_targets(&docs, &mut catalogs.rust_execution.work, check)?;
     let locate = |document: usize, sid: &str| {
         sorted
@@ -558,6 +561,7 @@ fn resolve(
         sources,
         external_packages,
         rust_catalog_digest,
+        python_catalog_digest,
         source_facts,
         producers,
         document_status: docs

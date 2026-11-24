@@ -88,6 +88,10 @@ fn architecture_incremental_canonical_index() {
         hex::encode(index.rust_catalog),
         before["references"]["rustCatalogDigest"]
     );
+    assert_eq!(
+        hex::encode(index.python_catalog),
+        before["references"]["pythonCatalogDigest"]
+    );
     let mut scanned_zero = false;
     for ((key, dependency), facts) in index
         .order
@@ -139,13 +143,14 @@ fn architecture_incremental_canonical_index() {
     changed!(index, {
         Arc::make_mut(&mut index.order)[0].path.push('2');
     });
-    for member in 0..5 {
+    for member in 0..6 {
         changed!(index, {
             let digest = match member {
                 0 => &mut index.rust_catalog,
-                1 => &mut index.manifests,
-                2 => &mut index.root_config,
-                3 => &mut index.producers,
+                1 => &mut index.python_catalog,
+                2 => &mut index.manifests,
+                3 => &mut index.root_config,
+                4 => &mut index.producers,
                 _ => &mut index.selections,
             };
             digest[0] ^= 1;
@@ -449,6 +454,7 @@ fn full_reference_canonical_includes_aligned_source_facts_and_descriptor_slots()
     assert_eq!(sources.len(), facts.len());
     assert_eq!(sources.len(), descriptors.len());
     assert_eq!(references["rustCatalogDigest"].as_str().unwrap().len(), 64);
+    assert_eq!(references["pythonCatalogDigest"].as_str().unwrap().len(), 64);
     assert!(
         facts
             .iter()
