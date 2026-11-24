@@ -2540,3 +2540,268 @@ fn missing_freshness_fails_the_language_tier_typed() {
         "{text}"
     );
 }
+
+/// Stages, joins and publishes one captured batch.
+fn import_batch(
+    store: &Store,
+    root: &std::path::Path,
+    directory: &str,
+    batch: crate::semantic_batch_support::BatchFixture,
+) {
+    use std::sync::{Arc, atomic::AtomicBool};
+    use trellis::semantic_batch::{
+        BatchCounters, BatchLimits, LookupBudget, StageInput, StageOwner, stage_batch,
+    };
+    use trellis::semantic_import::{DestinationMutations, join_staged};
+    let (descriptor, hash) = batch.write(&root.join(directory));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let limits = BatchLimits::PRODUCTION;
+    let mut staged = stage_batch(
+        store,
+        &StageInput::external(root).unwrap(),
+        StageOwner {
+            request_id: "architecture",
+            incarnation: "cross-producer",
+        },
+        &descriptor,
+        &hash,
+        &limits,
+        &mut BatchCounters::default(),
+        &cancel,
+    )
+    .unwrap();
+    let joined = join_staged(
+        &mut staged,
+        store,
+        store.index_baseline().unwrap(),
+        &limits,
+        &mut LookupBudget::new(&limits),
+        &mut BatchCounters::default(),
+        DestinationMutations::default(),
+        &cancel,
+    )
+    .unwrap();
+    let writer = store.publication_for_tests().unwrap();
+    store
+        .publish_semantic_batch(
+            &joined,
+            staged.stage_mut(),
+            joined.destination_pin(),
+            &writer,
+            &cancel,
+        )
+        .unwrap();
+}
+
+/// #1310 review (Prime2, #1312): a projected JavaScript caller of producer A binds a Rust
+/// target that A and rust-analyzer both cover, so the target has no default producer. A body
+/// edit of the target leaves both documents' default semantic state and declaration IDs
+/// unchanged, but the target's projection under A, which the caller reads its endpoint's
+/// eligibility from, becomes pending. The caller must be Dirty and drop the edge, as a full
+/// build does; and catch-up afterwards must equal a full build too.
+#[test]
+fn architecture_incremental_projected_endpoint_follows_the_source_producer() {
+    use crate::semantic_batch_support::{BatchFixture, DocSpec};
+    use trellis::http::ArchitectureBuildPath;
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let mut spec = Spec::syntax_only(&[
+        ("caller.js", "function caller() { endpoint_dest(); }\n"),
+        (
+            "src/lib.rs",
+            "pub mod target; pub mod idle; pub mod spare;\n",
+        ),
+        ("src/target.rs", "pub fn endpoint_dest() { let _ = 1; }\n"),
+        ("src/idle.rs", "pub fn idle() { let _ = 1; }\n"),
+        ("src/spare.rs", "pub fn spare() {}\n"),
+    ]);
+    publisher.publish(&spec);
+    let database = fs::read_dir(state.path().join("cache/indexes"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap()
+        .join("index.db");
+    let snapshot = publisher
+        .store
+        .architecture_reference_snapshot_for_tests()
+        .unwrap();
+    let caller = snapshot
+        .documents
+        .iter()
+        .find(|d| d.key.path == "caller.js")
+        .unwrap();
+    let call = &caller.calls[0];
+    let callee = call.callee_range.as_ref().unwrap();
+    let symbol = "scip fixture architecture 1 endpoint_dest().";
+    let declaration = snapshot
+        .documents
+        .iter()
+        .find(|d| d.key.path == "src/target.rs")
+        .unwrap()
+        .declarations
+        .iter()
+        .find(|d| d.name.as_deref() == Some("endpoint_dest"))
+        .unwrap();
+    let range = |start: usize, end: usize| [0, start as i32, end as i32];
+    let target = DocSpec::new("src/target.rs")
+        .occurrence(
+            &[0, 7, 20],
+            &range(declaration.range.start, declaration.range.end),
+            symbol,
+            1,
+        )
+        .symbol(symbol, 17, &[]);
+    let usage = DocSpec::new("caller.js").occurrence(
+        &range(callee.start, callee.end),
+        &range(call.range.start, call.range.end),
+        symbol,
+        0,
+    );
+    // Producer A covers JavaScript and Rust; rust-analyzer covers Rust too.
+    let mut a = BatchFixture::from_published(&database, root.path()).synthetic();
+    a.artifact_languages(&["rust", "javascript"], vec![target.clone(), usage]);
+    import_batch(
+        &publisher.store,
+        root.path(),
+        ".trellis-semantic-batch-a",
+        a,
+    );
+    let mut b = BatchFixture::from_published(&database, root.path()).reference("rust-analyzer");
+    b.artifact("rust", vec![target]);
+    import_batch(
+        &publisher.store,
+        root.path(),
+        ".trellis-semantic-batch-b",
+        b,
+    );
+    publisher.pin = publisher.store.index_baseline().unwrap();
+    // An unrelated edit projects the caller at A's basis, OlderBasis.
+    spec.files
+        .iter_mut()
+        .find(|(path, _)| path == "src/idle.rs")
+        .unwrap()
+        .1 = "pub fn idle() { let _ = 2; }\n".into();
+    publisher.publish(&spec);
+    let before = publisher
+        .store
+        .architecture_build_for_tests(None, None)
+        .unwrap();
+    let old = publisher
+        .store
+        .architecture_fingerprints_for_tests(None)
+        .unwrap();
+    let caller_key = fingerprint_key(&old, "caller.js");
+    let target_key = fingerprint_key(&old, "src/target.rs");
+    assert!(old.semantic_states[&target_key].default_producer.is_none());
+    let producer = old.semantic_states[&caller_key]
+        .default_producer
+        .clone()
+        .unwrap();
+    assert_eq!(
+        old.semantic_states[&caller_key]
+            .projection
+            .as_ref()
+            .unwrap()
+            .semantic_status,
+        trellis::model::SemanticStatus::OlderBasis,
+    );
+    let has_edge = |value: &Value| {
+        value["references"]["selected"]["data"]["production"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|edge| {
+                edge["source"]["path"] == "caller.js" && edge["target"]["path"] == "src/target.rs"
+            })
+    };
+    assert!(has_edge(&before.core.canonical().unwrap()));
+
+    // The target's body edit: native Dirty itself; its projection under A turns pending.
+    spec.files
+        .iter_mut()
+        .find(|(path, _)| path == "src/target.rs")
+        .unwrap()
+        .1 = "pub fn endpoint_dest() { let _ = 2; }\n".into();
+    publisher.publish(&spec);
+    let current = publisher
+        .store
+        .architecture_fingerprints_for_tests(None)
+        .unwrap();
+    assert_ne!(
+        current.documents[&target_key].native,
+        old.documents[&target_key].native
+    );
+    assert_eq!(
+        current.documents[&caller_key].semantic,
+        old.documents[&caller_key].semantic
+    );
+    assert_eq!(
+        current.documents[&target_key].semantic,
+        old.documents[&target_key].semantic
+    );
+    assert_ne!(
+        current.documents[&target_key].producer_projections[&producer],
+        old.documents[&target_key].producer_projections[&producer]
+    );
+    let candidate = publisher
+        .store
+        .architecture_build_for_tests(Some(&before.core), None)
+        .unwrap();
+    let full = publisher
+        .store
+        .architecture_build_for_tests(None, None)
+        .unwrap();
+    match &candidate.path {
+        ArchitectureBuildPath::Incremental { dirty, patched, .. } => {
+            assert!(dirty.contains(&caller_key) && dirty.contains(&target_key));
+            assert!(!patched.contains(&caller_key));
+        }
+        path => panic!("expected incremental, got {path:?}"),
+    }
+    let (candidate_core, full_core) = (
+        candidate.core.canonical().unwrap(),
+        full.core.canonical().unwrap(),
+    );
+    assert!(!has_edge(&full_core));
+    assert_eq!(candidate_core, full_core);
+
+    // Catch-up keeps the native revision and settles the projections: equal to a full build.
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    publisher
+        .store
+        .catch_up_semantic_for_tests(&cancel)
+        .unwrap();
+    let caught_up = publisher
+        .store
+        .architecture_fingerprints_for_tests(None)
+        .unwrap();
+    // Recorded for the variant without a native change; asserted below once known.
+    eprintln!(
+        "catch-up: native_same={} caller_projected={} target_a_projection_changed={}",
+        caught_up.documents[&target_key].native == current.documents[&target_key].native,
+        caught_up.documents[&caller_key].projected,
+        caught_up.documents[&target_key]
+            .producer_projections
+            .get(&producer)
+            != current.documents[&target_key]
+                .producer_projections
+                .get(&producer),
+    );
+    let settled = publisher
+        .store
+        .architecture_build_for_tests(Some(&candidate.core), None)
+        .unwrap();
+    let full = publisher
+        .store
+        .architecture_build_for_tests(None, None)
+        .unwrap();
+    assert_eq!(
+        settled.core.canonical().unwrap(),
+        full.core.canonical().unwrap(),
+        "{:?}",
+        settled.path
+    );
+    eprintln!("catch-up path: {:?}", settled.path);
+}

@@ -1733,6 +1733,15 @@ impl EvidenceResponse {
             [&key],
             |row| row.get(0),
         )?;
+        // Every producer that projects at this pin: a projected source reads its endpoints'
+        // eligibility under its own producer, whatever theirs is (#934, #1310).
+        let projecting: Vec<String> = self
+            .db
+            .prepare_cached(
+                "SELECT producer_id FROM semantic_projection_origins WHERE revision_id=?1 ORDER BY producer_id",
+            )?
+            .query_map([&key], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
         let mut documents = BTreeMap::new();
         let mut semantic_states = BTreeMap::new();
         for document in &mut snapshot.documents {
@@ -1773,6 +1782,24 @@ impl EvidenceResponse {
                     native,
                     semantic,
                     projected: state.projection.is_some(),
+                    producer_projections: projecting
+                        .iter()
+                        .map(|producer| {
+                            Ok((
+                                producer.clone(),
+                                crate::architecture_core::dependencies::producer_projection_digest(
+                                    native_first::semantic_projection_for(
+                                        &self.db,
+                                        snapshot.pin,
+                                        producer,
+                                        &document.key.language,
+                                        &document.key.path,
+                                    )?
+                                    .as_ref(),
+                                ),
+                            ))
+                        })
+                        .collect::<Result<_>>()?,
                     sids: crate::architecture_core::dependencies::sid_digest(
                         document
                             .declarations
