@@ -351,6 +351,12 @@ pub(crate) struct InterfaceWrapper {
 }
 
 impl Config {
+    /// Whether evaluation needs semantic evidence for authored rules.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn has_rules(&self) -> bool {
+        !self.rules.is_empty()
+    }
+
     /// Authored `[[exceptions]]` entries, as the rules inventory lists them.
     pub fn exception_count(&self) -> usize {
         self.exceptions.len()

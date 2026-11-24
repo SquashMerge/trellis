@@ -28,7 +28,99 @@ mod staged {
     use anyhow::{Result, ensure};
     use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
-    use std::{collections::BTreeMap, sync::Arc};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        sync::Arc,
+    };
+
+    /// Positions always address the complete sorted document inventory, never a compact
+    /// dirty list. This keeps retained endpoints valid across every eligible build.
+    #[derive(Default, Debug)]
+    pub(crate) struct ChangedDocuments {
+        pub(crate) native: BTreeSet<DocumentKey>,
+        pub(crate) dirty: BTreeSet<DocumentKey>,
+        pub(crate) patched: BTreeSet<DocumentKey>,
+        pub(crate) reused: BTreeSet<DocumentKey>,
+    }
+
+    pub(crate) fn changed_documents(
+        snapshot: &Snapshot,
+        fingerprints: &ArchitectureFingerprints,
+        base: Option<&ArchitectureDependencies>,
+    ) -> Result<std::result::Result<ChangedDocuments, crate::architecture_core::FullReason>> {
+        use crate::architecture_core::FullReason;
+        let Some(base) = base else {
+            return Ok(Err(FullReason::NoBase));
+        };
+        let order: Vec<_> = fingerprints.documents.keys().cloned().collect();
+        if order.as_slice() != base.order.as_ref() {
+            return Ok(Err(FullReason::DocumentSetChanged));
+        }
+        ensure!(
+            base.documents.len() == order.len(),
+            "incomplete architecture base"
+        );
+        if manifest_digest(&snapshot.manifests) != base.manifests {
+            return Ok(Err(FullReason::ManifestsChanged));
+        }
+        if root_config_digest(snapshot.root_tsconfig.as_ref()) != base.root_config {
+            return Ok(Err(FullReason::RootTsconfigChanged));
+        }
+        if fingerprints.producers != base.producers {
+            return Ok(Err(FullReason::ProducerSetChanged));
+        }
+        if fingerprints.selections != base.selections {
+            return Ok(Err(FullReason::RawSelectionsChanged));
+        }
+        let mut changed = ChangedDocuments::default();
+        let mut sid = BTreeSet::new();
+        for (i, key) in order.iter().enumerate() {
+            let current = &fingerprints.documents[key];
+            let old = &base.documents[i].fingerprint;
+            if current.native != old.native {
+                changed.native.insert(key.clone());
+                changed.dirty.insert(key.clone());
+                if current.sids != old.sids {
+                    sid.insert(u32::try_from(i)?);
+                }
+            }
+            if current.semantic != old.semantic || current.projected {
+                changed.dirty.insert(key.clone());
+            }
+        }
+        for (key, document) in order.iter().zip(&base.documents) {
+            if document
+                .references
+                .endpoints
+                .iter()
+                .any(|endpoint| sid.contains(endpoint))
+            {
+                changed.dirty.insert(key.clone());
+            }
+        }
+        if changed.native.iter().any(|key| key.language != "rust") {
+            return Ok(Err(FullReason::NonRustChanged));
+        }
+        if changed.dirty.len() > order.len() / 2 {
+            return Ok(Err(FullReason::DirtyMajority));
+        }
+        for (key, document) in order.iter().zip(&base.documents) {
+            if changed.dirty.contains(key) {
+                continue;
+            }
+            let patch = document.references.endpoints.iter().any(|&endpoint| {
+                order
+                    .get(endpoint as usize)
+                    .is_some_and(|key| changed.native.contains(key))
+            });
+            if patch {
+                changed.patched.insert(key.clone());
+            } else {
+                changed.reused.insert(key.clone());
+            }
+        }
+        Ok(Ok(changed))
+    }
 
     /// Typed, length-delimited SHA encoding. SQL NULL and empty values never alias.
     pub(crate) struct Fingerprint(Sha256);
@@ -207,6 +299,43 @@ mod staged {
     }
 
     impl ArchitectureDependencies {
+        /// Reuse immutable subparts independently: fresh memo warmth can change only q_s
+        /// while the source's fingerprint, request plan and endpoint array remain shared.
+        pub(crate) fn share_unchanged(&mut self, base: &Self) {
+            if self.order.as_ref() != base.order.as_ref() {
+                return;
+            }
+            self.order = base.order.clone();
+            for (current, old) in self.documents.iter_mut().zip(&base.documents) {
+                let document = Arc::make_mut(current);
+                if document.fingerprint == old.fingerprint {
+                    document.fingerprint = old.fingerprint.clone();
+                }
+                let references = Arc::make_mut(&mut document.references);
+                if references.endpoints == old.references.endpoints {
+                    references.endpoints = old.references.endpoints.clone();
+                }
+                let same_plan = match (&references.plan, &old.references.plan) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                    _ => false,
+                };
+                if references.work == old.references.work
+                    && references.sites == old.references.sites
+                    && references.endpoints == old.references.endpoints
+                    && same_plan
+                {
+                    document.references = old.references.clone();
+                }
+                if Arc::ptr_eq(&document.fingerprint, &old.fingerprint)
+                    && Arc::ptr_eq(&document.references, &old.references)
+                    && document.semantic == old.semantic
+                {
+                    *current = old.clone();
+                }
+            }
+        }
+
         pub(crate) fn full(
             snapshot: &Snapshot,
             fingerprints: ArchitectureFingerprints,

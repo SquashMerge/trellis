@@ -25,7 +25,15 @@ mod incremental;
 #[cfg(all(test, feature = "test-support"))]
 mod incremental_tests;
 #[cfg(feature = "test-support")]
+pub use incremental::ReferenceReplayTrace;
+#[cfg(feature = "test-support")]
+pub(crate) use incremental::{ReferencePreparation, finish_incremental, prepare_incremental};
+#[cfg(feature = "test-support")]
 pub(crate) use incremental::{SourceChargePlan, SourceFacts};
+#[cfg(feature = "test-support")]
+pub use work::{
+    ReferenceWorkLimitForTests, ReferenceWorkLimitGuardForTests, set_reference_work_limit_for_tests,
+};
 pub(crate) mod parallel_check;
 mod python;
 mod rust;
@@ -90,6 +98,7 @@ pub struct ReferenceBase {
     work_used: usize,
 }
 /// One source document's resolved sites.
+#[derive(Clone)]
 struct SourceReferences {
     projection: Option<crate::model::SemanticProjection>,
     /// By target, stored role (test = true) and the sites' feature gates.
@@ -104,7 +113,7 @@ struct SourceReferences {
     semantic: usize,
 }
 /// The sites of one (target, role) edge: exact counts, and call-first samples (R5).
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct EdgeSites {
     count: usize,
     semantic: usize,
@@ -1020,12 +1029,14 @@ fn file_references<'a>(
             *site_count <= site_limit(),
             "bounded_work: reference site count"
         );
-        if let (true, Some(SemanticOutcome::Internal(document, sid))) =
-            (site.mapping == "semantic", anchor.map(|a| &a.outcome))
-            && let Some(target) = locate(*document, sid)
-            && resolution.targets.contains(&Target::Native(target))
-        {
-            owner_step(&mut catalogs.rust_execution.work, check)?;
+        if let Some((target, sid)) = internal_target_charge(
+            semantic,
+            anchor.map(|a| &a.outcome),
+            &resolution,
+            locate,
+            &mut catalogs.rust_execution.work,
+            check,
+        )? {
             let entry = target_documents
                 .entry(target)
                 .or_insert_with(|| TargetDocument::new(docs[target]));
@@ -1068,6 +1079,25 @@ fn file_references<'a>(
                 .collect::<std::result::Result<_, _>>()?,
         },
     })
+}
+
+/// The lookup admission shared by output construction and compact charge replay.
+fn internal_target_charge<'a>(
+    semantic: bool,
+    outcome: Option<&'a SemanticOutcome>,
+    resolution: &SiteResolution,
+    locate: &impl Fn(usize, &str) -> Option<usize>,
+    work: &mut Work,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<Option<(usize, &'a String)>> {
+    if let (true, Some(SemanticOutcome::Internal(document, sid))) = (semantic, outcome)
+        && let Some(target) = locate(*document, sid)
+        && resolution.targets.contains(&Target::Native(target))
+    {
+        owner_step(work, check)?;
+        return Ok(Some((target, sid)));
+    }
+    Ok(None)
 }
 
 /// What a semantic binding makes of the site it resolves: the mapping, the provenance and
