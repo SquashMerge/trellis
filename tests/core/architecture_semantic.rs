@@ -2777,18 +2777,22 @@ fn architecture_incremental_projected_endpoint_follows_the_source_producer() {
         .store
         .architecture_fingerprints_for_tests(None)
         .unwrap();
-    // Recorded for the variant without a native change; asserted below once known.
-    eprintln!(
-        "catch-up: native_same={} caller_projected={} target_a_projection_changed={}",
-        caught_up.documents[&target_key].native == current.documents[&target_key].native,
-        caught_up.documents[&caller_key].projected,
+    // The variant without a native change: catch-up moves the target's projection under A
+    // while its bytes stay, but it settles the caller too, so the caller is Dirty by its own
+    // semantic state and no projected source is left to read the moved eligibility.
+    assert_eq!(
+        caught_up.documents[&target_key].native,
+        current.documents[&target_key].native
+    );
+    assert_ne!(
         caught_up.documents[&target_key]
             .producer_projections
+            .get(&producer),
+        current.documents[&target_key]
+            .producer_projections
             .get(&producer)
-            != current.documents[&target_key]
-                .producer_projections
-                .get(&producer),
     );
+    assert!(!caught_up.documents[&caller_key].projected);
     let settled = publisher
         .store
         .architecture_build_for_tests(Some(&candidate.core), None)
@@ -2803,5 +2807,10 @@ fn architecture_incremental_projected_endpoint_follows_the_source_producer() {
         "{:?}",
         settled.path
     );
-    eprintln!("catch-up path: {:?}", settled.path);
+    assert!(
+        matches!(&settled.path, ArchitectureBuildPath::Incremental { dirty, patched, .. }
+            if *dirty == [caller_key.clone()] && patched.is_empty()),
+        "{:?}",
+        settled.path
+    );
 }
