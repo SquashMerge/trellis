@@ -50,10 +50,14 @@ pub struct DocumentFingerprint {
     pub native: NativeFingerprint,
     pub semantic: [u8; 32],
     pub sids: [u8; 32],
-    /// A historical projection (#620). Its evidence is read at its semantic basis, and its
-    /// endpoints' eligibility at the current pin, so it is also Dirty when the semantic state
-    /// of a retained endpoint document changes (#1310).
+    /// A historical projection (#620) under the default producer. Its evidence is read at
+    /// its semantic basis, and its endpoints' eligibility at the current pin.
     pub projected: bool,
+    /// The document's projection state under every producer that projects at this pin, by
+    /// producer: a projected source of that producer reads its endpoints' eligibility from it,
+    /// so the source is Dirty when it changes for a retained endpoint (#1310). Empty at a pin
+    /// without projections.
+    pub producer_projections: BTreeMap<String, [u8; 32]>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]

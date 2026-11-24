@@ -988,8 +988,8 @@ does not resurrect A's old base. Failed or stopped attempts do not displace the 
 releases a result when no reader or in-flight computation still borrows it.
 
 Dirty is the union of native changes, semantic changes, projected documents whose retained
-endpoint documents changed semantic state, and sources with endpoints in documents whose
-declaration-ID sets changed. Only Dirty sources run `file_references`.
+endpoint documents changed projection under the projected document's producer, and sources with
+endpoints in documents whose declaration-ID sets changed. Only Dirty sources run `file_references`.
 
 A semantic change is one that changes what Read B admits or resolves: the default producer, the
 selected tuple and payload, a projection's semantic basis and status, and which bases are
@@ -1003,8 +1003,10 @@ selected tuple and payload, a projection's semantic basis and status, and which 
 - A basis's freshness that stays other than `stale` changes only the `freshness` and
   `historicalFreshness` labels, which each core sets from its own freshness map.
 - A projection's `currentPin` is the core's own. A projected source's endpoints are eligible by
-  their own projection at the current pin (#934), so a projected source is Dirty when a retained
-  endpoint document's semantic state changes.
+  their own projection at the current pin under the source's producer (#934), which need not be
+  the endpoint's default producer. Read A fingerprints every document's projection under each
+  producer that projects at the pin, and a projected source is Dirty when that projection changes
+  for a retained endpoint under its own producer.
 
 The reader never breaks ties by a revision-derived ID. A call's representative proof is the least
 by resolution, then the raw fact digest, then the stable proof identity (the raw `derivedFrom` ID

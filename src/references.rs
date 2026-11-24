@@ -959,6 +959,15 @@ fn file_references<'a>(
         sites: Vec::new(),
     };
     let mut endpoints = incremental::semantic_endpoints(read, source)?;
+    // Only a projected source reads its semantic endpoints' eligibility (#934, #1310).
+    let eligibility = if doc.semantic.projection.is_some() {
+        endpoints
+            .iter()
+            .map(|&endpoint| u32::try_from(endpoint))
+            .collect::<std::result::Result<_, _>>()?
+    } else {
+        Vec::new()
+    };
     merge_work(&mut catalogs.rust_execution.work, work.used, check)?;
     let mut found = SourceReferences {
         projection: doc.semantic.projection.clone(),
@@ -1071,6 +1080,7 @@ fn file_references<'a>(
                 .into_iter()
                 .map(u32::try_from)
                 .collect::<std::result::Result<_, _>>()?,
+            eligibility,
         },
     })
 }

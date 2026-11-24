@@ -72,7 +72,8 @@ mod staged {
         }
         let mut changed = ChangedDocuments::default();
         let mut sid = BTreeSet::new();
-        let mut semantic = BTreeSet::new();
+        // Per document, the producers whose projection of it changed.
+        let mut projections: Vec<BTreeSet<&str>> = Vec::with_capacity(order.len());
         // Revision-scoped metadata does not make a source Dirty: rejoined provenance IDs,
         // non-stale freshness values and a projection's current pin are rebased per core from
         // the stable inputs the source retains (#1310). Only what Read B admits or resolves
@@ -89,17 +90,40 @@ mod staged {
             }
             if current.semantic != old.semantic {
                 changed.dirty.insert(key.clone());
-                semantic.insert(u32::try_from(i)?);
             }
+            let (now, then) = (&current.producer_projections, &old.producer_projections);
+            projections.push(
+                now.keys()
+                    .chain(then.keys())
+                    .filter(|producer| now.get(*producer) != then.get(*producer))
+                    .map(String::as_str)
+                    .collect(),
+            );
         }
         for (key, document) in order.iter().zip(&base.documents) {
-            // A projected source's endpoints are eligible by their own projection at the
-            // current pin (#934), which is in their semantic fingerprint: a projected source
-            // is Dirty when a retained endpoint document's semantic state changes (#1310).
-            let projected = fingerprints.documents[key].projected;
-            if document.references.endpoints.iter().any(|endpoint| {
-                sid.contains(endpoint) || (projected && semantic.contains(endpoint))
-            }) {
+            // A projected source reads each endpoint's eligibility from that endpoint's
+            // projection under the source's own producer at the current pin (#934). So it is
+            // Dirty when that projection changes for a retained endpoint (#1310), whatever the
+            // endpoint's default producer is.
+            let producer = fingerprints.documents[key]
+                .projected
+                .then(|| fingerprints.semantic_states.get(key))
+                .flatten()
+                .and_then(|state| state.default_producer.as_deref());
+            let eligibility_changed = producer.is_some_and(|producer| {
+                document.references.eligibility.iter().any(|&endpoint| {
+                    projections
+                        .get(endpoint as usize)
+                        .is_some_and(|changed| changed.contains(producer))
+                })
+            });
+            if eligibility_changed
+                || document
+                    .references
+                    .endpoints
+                    .iter()
+                    .any(|endpoint| sid.contains(endpoint))
+            {
                 changed.dirty.insert(key.clone());
             }
         }
@@ -178,21 +202,7 @@ mod staged {
             // only metadata, which each core rebases (#1310); what they decide is hashed.
             let mut hash = Fingerprint::new("architecture:semantic-document:v2");
             hash.optional(default_producer.as_deref(), Fingerprint::text);
-            hash.optional(projection.as_ref(), |hash, projection| {
-                let crate::model::SemanticProjection {
-                    current_pin: _,
-                    semantic_basis_pin,
-                    basis_native_revision_id,
-                    semantic_status,
-                } = projection;
-                pin(hash, semantic_basis_pin);
-                hash.text(basis_native_revision_id);
-                hash.text(match semantic_status {
-                    crate::model::SemanticStatus::OlderBasis => "olderBasis",
-                    crate::model::SemanticStatus::CatchingUp => "catchingUp",
-                    crate::model::SemanticStatus::NeedsReimport => "needsReimport",
-                });
-            });
+            hash.optional(projection.as_ref(), projection_state);
             hash.optional(
                 tuple.as_ref(),
                 |hash,
@@ -222,6 +232,33 @@ mod staged {
             );
             hash.finish()
         }
+    }
+
+    /// A projection's state without its current pin, which each core rebases (#1310).
+    fn projection_state(hash: &mut Fingerprint, projection: &crate::model::SemanticProjection) {
+        let crate::model::SemanticProjection {
+            current_pin: _,
+            semantic_basis_pin,
+            basis_native_revision_id,
+            semantic_status,
+        } = projection;
+        pin(hash, semantic_basis_pin);
+        hash.text(basis_native_revision_id);
+        hash.text(match semantic_status {
+            crate::model::SemanticStatus::OlderBasis => "olderBasis",
+            crate::model::SemanticStatus::CatchingUp => "catchingUp",
+            crate::model::SemanticStatus::NeedsReimport => "needsReimport",
+        });
+    }
+
+    /// A document's projection under one producer, as a projected source of that producer
+    /// reads it to decide its endpoints' eligibility (#934, #1310).
+    pub(crate) fn producer_projection_digest(
+        projection: Option<&crate::model::SemanticProjection>,
+    ) -> [u8; 32] {
+        let mut hash = Fingerprint::new("architecture:producer-projection:v1");
+        hash.optional(projection, projection_state);
+        hash.finish()
     }
 
     fn pin(hash: &mut Fingerprint, pin: &crate::model::IndexPin) {
@@ -309,6 +346,8 @@ mod staged {
         pub(crate) work: usize,
         pub(crate) sites: usize,
         pub(crate) endpoints: Arc<[u32]>,
+        /// A projected source's semantic endpoint documents, whose eligibility it reads.
+        pub(crate) eligibility: Arc<[u32]>,
         pub(crate) plan: Option<Arc<SourceChargePlan>>,
     }
 
@@ -329,6 +368,9 @@ mod staged {
                 if references.endpoints == old.references.endpoints {
                     references.endpoints = old.references.endpoints.clone();
                 }
+                if references.eligibility == old.references.eligibility {
+                    references.eligibility = old.references.eligibility.clone();
+                }
                 let same_plan = match (&references.plan, &old.references.plan) {
                     (None, None) => true,
                     (Some(a), Some(b)) => Arc::ptr_eq(a, b),
@@ -337,6 +379,7 @@ mod staged {
                 if references.work == old.references.work
                     && references.sites == old.references.sites
                     && references.endpoints == old.references.endpoints
+                    && references.eligibility == old.references.eligibility
                     && same_plan
                 {
                     document.references = old.references.clone();
@@ -393,7 +436,12 @@ mod staged {
                     "invalid architecture endpoint"
                 );
                 ensure!(
-                    fact.endpoints.windows(2).all(|pair| pair[0] < pair[1]),
+                    fact.endpoints.windows(2).all(|pair| pair[0] < pair[1])
+                        && fact.eligibility.windows(2).all(|pair| pair[0] < pair[1])
+                        && fact
+                            .eligibility
+                            .iter()
+                            .all(|&endpoint| (endpoint as usize) < order.len()),
                     "unordered architecture endpoints"
                 );
                 let fingerprint = fingerprints
@@ -405,6 +453,7 @@ mod staged {
                         work: fact.work,
                         sites: fact.sites,
                         endpoints: fact.endpoints.clone().into(),
+                        eligibility: fact.eligibility.clone().into(),
                         plan: fact.plan.clone(),
                     }),
                     semantic: *counts
@@ -439,13 +488,13 @@ mod staged {
             } = self;
             let documents: Vec<_> = documents.iter().map(|document| {
                 let DocumentDependencies { fingerprint, references, semantic } = document.as_ref();
-                let DocumentFingerprint { native, semantic: semantic_fingerprint, sids, projected } = fingerprint.as_ref();
+                let DocumentFingerprint { native, semantic: semantic_fingerprint, sids, projected, producer_projections } = fingerprint.as_ref();
                 let NativeFingerprint { version_id, coverage_requested, coverage_selected, coverage_state, coverage_diagnostic } = native;
-                let ReferenceDependencies { work, sites, endpoints, plan } = references.as_ref();
+                let ReferenceDependencies { work, sites, endpoints, eligibility, plan } = references.as_ref();
                 json!({"native": {"version_id": version_id, "coverage_requested": coverage_requested, "coverage_selected": coverage_selected,
                     "coverage_state": coverage_state, "coverage_diagnostic": coverage_diagnostic},
-                    "semanticFingerprint": semantic_fingerprint, "sids": sids, "projected": projected,
-                    "references": {"work": work, "sites": sites, "endpoints": endpoints.as_ref(), "plan": plan.as_deref()}, "semantic": canonical_counts(semantic)})
+                    "semanticFingerprint": semantic_fingerprint, "sids": sids, "projected": projected, "producerProjections": producer_projections,
+                    "references": {"work": work, "sites": sites, "endpoints": endpoints.as_ref(), "eligibility": eligibility.as_ref(), "plan": plan.as_deref()}, "semantic": canonical_counts(semantic)})
             }).collect();
             json!({"order": order.as_ref(), "documents": documents, "rustCatalog": rust_catalog,
                 "pythonCatalog": python_catalog,

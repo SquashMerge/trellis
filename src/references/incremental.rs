@@ -14,6 +14,9 @@ pub(crate) struct SourceFacts {
     pub(crate) work: usize,
     pub(crate) sites: usize,
     pub(crate) endpoints: Vec<u32>,
+    /// A projected source's semantic endpoint documents: those whose eligibility its Read B
+    /// reads under its producer at the current pin (#934, #1310). Empty for a current source.
+    pub(crate) eligibility: Vec<u32>,
 }
 
 /// Build-local owned state. All document borrows and request callbacks are made on the
@@ -510,8 +513,9 @@ impl SourceFacts {
             work,
             sites,
             endpoints,
+            eligibility,
         } = self;
-        json!({ "plan": plan.as_deref(), "work": work, "sites": sites, "endpoints": endpoints })
+        json!({ "plan": plan.as_deref(), "work": work, "sites": sites, "endpoints": endpoints, "eligibility": eligibility })
     }
 }
 
