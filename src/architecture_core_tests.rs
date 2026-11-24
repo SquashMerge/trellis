@@ -392,6 +392,31 @@ fn a_kept_failure_is_part_of_the_canonical_core() {
 }
 
 #[test]
+fn architecture_incremental_base_requires_successful_metrics_and_complete_dependencies() {
+    let (_state, _root, store) = checkout();
+    let mut core = core(&store);
+    assert!(core.incremental_base_eligible());
+    let metrics = core.metrics.take().unwrap();
+    assert!(
+        !core.incremental_base_eligible(),
+        "an unmeasured core cannot seed"
+    );
+    core.metrics = Some(Err(CoreFailure::of(&anyhow::anyhow!(
+        "bounded_work: metrics"
+    ))));
+    assert!(
+        !core.incremental_base_eligible(),
+        "failed metrics cannot seed"
+    );
+    core.metrics = Some(metrics);
+    core.dependencies.documents.pop();
+    assert!(
+        !core.incremental_base_eligible(),
+        "a partial index cannot seed"
+    );
+}
+
+#[test]
 fn the_first_difference_is_named_by_its_path() {
     let base = json!({"a": [1, {"b": "x"}], "c": {"d": true}});
     assert_eq!(first_difference(&base, &base.clone()), None);

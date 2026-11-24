@@ -8,7 +8,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 /// Architecture-only identities read beside the snapshot, never required of native fixtures.
-#[cfg(feature = "test-support")]
 #[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
 pub struct ArchitectureFingerprints {
     pub documents: BTreeMap<DocumentKey, DocumentFingerprint>,
@@ -19,7 +18,6 @@ pub struct ArchitectureFingerprints {
     pub selections: [u8; 32],
 }
 
-#[cfg(feature = "test-support")]
 #[derive(Clone, Debug, Default, serde::Serialize, PartialEq, Eq)]
 pub struct SemanticInputState {
     pub default_producer: Option<String>,
@@ -28,7 +26,6 @@ pub struct SemanticInputState {
     pub freshness: Option<SemanticFreshnessState>,
 }
 
-#[cfg(feature = "test-support")]
 #[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
 pub struct SemanticTupleState {
     pub selected: bool,
@@ -36,7 +33,6 @@ pub struct SemanticTupleState {
     pub payload_id: Option<i64>,
 }
 
-#[cfg(feature = "test-support")]
 #[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
 pub struct SemanticFreshnessState {
     /// The pin whose freshness map was read. For a current tuple this is a lookup pin,
@@ -45,7 +41,6 @@ pub struct SemanticFreshnessState {
     pub values: BTreeMap<i64, String>,
 }
 
-#[cfg(feature = "test-support")]
 #[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
 pub struct DocumentFingerprint {
     pub native: NativeFingerprint,
@@ -54,7 +49,6 @@ pub struct DocumentFingerprint {
     pub projected: bool,
 }
 
-#[cfg(feature = "test-support")]
 #[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
 pub struct NativeFingerprint {
     pub version_id: String,
@@ -106,7 +100,6 @@ pub struct DocumentSemantic {
     pub boundary: bool,
     /// Dependency-only checkout endpoints, before representative selection, eligibility
     /// suppression or reference sampling. Indices address the complete snapshot.
-    #[cfg(feature = "test-support")]
     pub endpoint_documents: BTreeSet<usize>,
 }
 

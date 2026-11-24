@@ -1496,7 +1496,6 @@ const ARCHITECTURE_SEMANTIC_ROWS: usize = 2_000_000;
 const CHECK_EVERY_ROWS: usize = 256;
 
 /// Read only state identities, never anchor payloads, in the admitted native transaction.
-#[cfg(feature = "test-support")]
 pub(crate) fn architecture_document_fingerprint(
     db: &Connection,
     pin: IndexPin,
@@ -1672,7 +1671,6 @@ pub(super) fn architecture_semantic(
 /// Dependency discovery is separate from output evidence admission: alternatives do not
 /// become anchors, metadata, or extra semantic-row charges. DISTINCT bounds retained data
 /// to checkout documents; the payload was validated and bounded on import.
-#[cfg(feature = "test-support")]
 fn architecture_endpoint_documents(
     db: &Connection,
     (revision, tuple, payload, historical): (&str, i64, i64, bool),
@@ -1757,7 +1755,6 @@ fn architecture_semantic_within(
 
 pub(crate) enum ArchitectureSemanticSources {
     All,
-    #[cfg(feature = "test-support")]
     Sources {
         keys: BTreeSet<DocumentKey>,
         retained: BTreeMap<DocumentKey, crate::architecture_core::dependencies::SemanticReadCounts>,
@@ -1824,7 +1821,6 @@ pub(crate) fn architecture_semantic_for_sources(
             .copied()
     };
     let counts = RefCell::new(vec![SemanticReadCounts::default(); documents.len()]);
-    #[cfg(feature = "test-support")]
     if let ArchitectureSemanticSources::Sources { keys, retained } = &selection {
         let known: BTreeSet<_> = documents.iter().map(|doc| &doc.key).collect();
         ensure!(
@@ -1922,11 +1918,9 @@ pub(crate) fn architecture_semantic_for_sources(
     for (i, doc) in documents.iter_mut().enumerate() {
         match &selection {
             ArchitectureSemanticSources::All => {}
-            #[cfg(feature = "test-support")]
             ArchitectureSemanticSources::Sources { keys, .. } if !keys.contains(&doc.key) => {
                 continue;
             }
-            #[cfg(feature = "test-support")]
             ArchitectureSemanticSources::Sources { .. } => {}
         }
         let Some(producer) = defaults.producer(&doc.key.language) else {
@@ -2235,7 +2229,6 @@ pub(crate) fn architecture_semantic_for_sources(
             "incompatible_index: architecture tuple names no payload".into(),
         ))?;
         let native = pp.native().to_owned();
-        #[cfg(feature = "test-support")]
         let endpoint_documents = architecture_endpoint_documents(
             db,
             (&key, tuple, payload, historical),
@@ -2553,10 +2546,7 @@ pub(crate) fn architecture_semantic_for_sources(
         }
         drop(cursor);
         let semantic = &mut documents[i].semantic;
-        #[cfg(feature = "test-support")]
-        {
-            semantic.endpoint_documents = endpoint_documents;
-        }
+        semantic.endpoint_documents = endpoint_documents;
         semantic.producer_id = Some(producer);
         semantic.complete = complete && !historical;
         semantic.boundary |= anchors

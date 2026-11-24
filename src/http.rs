@@ -46,7 +46,18 @@ mod state;
 mod worker;
 #[cfg(feature = "test-support")]
 pub use crate::architecture_core::{ArchitectureBuildPath, FullReason};
+#[cfg(feature = "test-support")]
+pub use crate::architecture_core::{
+    ArchitectureCoreHandle, ArchitectureCoreWeak, ArchitectureSharing,
+};
+#[cfg(feature = "test-support")]
+pub use crate::architecture_core::{
+    ArchitectureExecutionBranch, ArchitectureExecutionEvent, ArchitectureExecutionHook,
+    ArchitectureExecutionTrace,
+};
 use api_error::{ApiError, error, invalid, missing};
+#[cfg(feature = "test-support")]
+pub use architecture::ArchitectureAttempt;
 pub use architecture::ArchitectureBuilding;
 pub use cli_api::{CLI_API_BODY_LIMIT, CLI_API_RESPONSE_LIMIT, cli_api, cli_api_route};
 pub use config::BrowserConfig;

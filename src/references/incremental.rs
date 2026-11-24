@@ -434,7 +434,7 @@ impl SourceFacts {
 }
 
 impl ReferenceBase {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-support"))]
     pub(crate) fn source_facts_mut_for_tests(&mut self) -> &mut [SourceFacts] {
         &mut self.source_facts
     }
@@ -476,6 +476,7 @@ impl ReferenceBase {
         }
     }
 
+    #[cfg(feature = "test-support")]
     pub(crate) fn source_shared(&self, source: usize, other: &Self, before: usize) -> bool {
         self.sources[source]
             .as_ref()

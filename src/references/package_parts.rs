@@ -50,7 +50,6 @@ impl ExternalPackageTable {
             .map(move |identity| (identity, &self.by_source[source][identity]))
     }
 
-    #[cfg(feature = "test-support")]
     pub(super) fn canonical(&self) -> Value {
         let Self { by_source } = self;
         json!(

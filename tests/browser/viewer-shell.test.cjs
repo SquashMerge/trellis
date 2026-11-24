@@ -1263,15 +1263,34 @@ test("checkout picker uses observed branch, detached and unavailable Git labels,
       assert.equal(await page.locator("#checkout-select").inputValue(), server.rootKey, "retry retains explicit selection of the same available checkout");
     }
     // Git remains independent of a missing semantic index; no fallback zero is invented.
+    // Disconnect cancels the busy-list timer and fences prior list/status responses.
+    // The cold phase has no busy rows, so no later list refresh can erase its status.
+    await H.reveal(page, "#logout"); await page.locator("#logout").click();
+    await page.locator("#connect-form").waitFor({state:"visible"});
+    rows.splice(1);
     rows[0].git = {...available, upstream:null, workingTree:{state:"available", changedFiles:4}};
     const statusPattern = `${server.base}${H.scoped(server.rootKey, "status")}`;
-    const coldStatus = route => route.fulfill({status:409, contentType:"application/json", body:JSON.stringify({error:{code:"index_not_ready", message:"No validated index", workspaceRoot:observed.workspaceRoot}})});
+    const coldBody = {error:{code:"index_not_ready", message:"No validated index", workspaceRoot:observed.workspaceRoot}};
+    let coldRequest;
+    const coldStatus = route => {
+      coldRequest = route.request();
+      return route.fulfill({status:409, contentType:"application/json", body:JSON.stringify(coldBody)});
+    };
     await page.route(statusPattern, coldStatus);
     try {
-      await page.locator("#checkout-select").selectOption(server.rootKey);
+      await page.locator("#token").fill(paths.token);
+      const coldResponse = page.waitForResponse(response => response.request() === coldRequest &&
+        response.url() === statusPattern && response.status() === 409);
+      await page.locator("#connect-form button[type=submit]").click();
+      assert.deepEqual(await (await coldResponse).json(), coldBody);
       await page.waitForFunction(() => document.querySelector("#checkout-state")?.textContent.includes("Index not ready"));
+      assert.equal(await page.locator("#checkout-select").inputValue(), server.rootKey, "the cold index keeps the same checkout selected");
+      assert.equal(await option.getAttribute("title"), observed.workspaceRoot);
+      assert.equal(await page.locator("#checkout-retry").isVisible(), false, "the cold phase has no busy-list retry");
       await page.waitForFunction(() => document.querySelector("#workspace-git")?.textContent.includes("4 uncommitted"));
       assert.ok((await page.locator("#workspace-git").textContent()).startsWith(branch));
+      assert.equal(await page.locator(".app-header svg, #workspace-git img").count(), 0);
+      assert.equal(await page.evaluate(() => globalThis.branchExecuted || globalThis.upstreamExecuted), undefined);
     } finally { await page.unroute(statusPattern, coldStatus); }
     assert.equal(requests.some(row => row.method === "POST" && row.url.pathname.endsWith("/index")), false);
     await capture(page, "chrome-checkout-git-unavailable");
