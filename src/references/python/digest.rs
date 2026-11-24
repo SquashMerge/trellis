@@ -482,18 +482,12 @@ mod tests {
         Catalog {
             units: BTreeMap::from([(1, unit)]),
             source_sets: BTreeMap::from([(1, "set".into())]),
-            modules: BTreeMap::from([(
-                ("set".into(), vec!["pkg".into()]),
-                vec![(1, true, 0)],
-            )]),
+            modules: BTreeMap::from([(("set".into(), vec!["pkg".into()]), vec![(1, true, 0)])]),
             membership: BTreeMap::from([(1, vec!["pkg".into()])]),
             module_proofs: BTreeMap::from([(1, BTreeSet::from([1]))]),
             child_names: BTreeMap::from([(1, BTreeSet::from(["core".into()]))]),
             roots: BTreeSet::from([("set".into(), "pkg".into())]),
-            source_roots: BTreeMap::from([(
-                "set".into(),
-                BTreeMap::from([("src".into(), 1)]),
-            )]),
+            source_roots: BTreeMap::from([("set".into(), BTreeMap::from([("src".into(), 1)]))]),
             file_declarations: BTreeMap::from([(1, declaration)]),
             test_modules: BTreeSet::from([1]),
             results: BTreeMap::from([(
@@ -593,7 +587,8 @@ mod tests {
             |c| c.modules.clear(),
             |c| {
                 let value = c.modules.pop_first().unwrap().1;
-                c.modules.insert(("other".into(), vec!["pkg".into()]), value);
+                c.modules
+                    .insert(("other".into(), vec!["pkg".into()]), value);
             },
             |c| {
                 let value = c.modules.pop_first().unwrap().1;

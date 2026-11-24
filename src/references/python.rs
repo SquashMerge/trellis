@@ -2056,19 +2056,21 @@ mod tests {
             ("provider.py", "def public_name():\n    pass\n"),
         ])
     }
-    fn documents_with(files: &[(&str, &str)]) -> Vec<DocumentInput> {
+    pub(super) fn documents_with(files: &[(&str, &str)]) -> Vec<DocumentInput> {
         documents_in(tempfile::tempdir().unwrap().path(), files)
     }
     /// The documents of `files` written under `root`, whose identity names their source set.
-    pub(super) fn documents_in(root: &std::path::Path, files: &[(&str, &str)]) -> Vec<DocumentInput> {
+    pub(super) fn documents_in(
+        root: &std::path::Path,
+        files: &[(&str, &str)],
+    ) -> Vec<DocumentInput> {
         for (path, text) in files {
             let path = root.join(path);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, text).unwrap();
         }
         let identity =
-            crate::store::topology::WorkspaceIdentity::discover(Some(root), root)
-                .unwrap();
+            crate::store::topology::WorkspaceIdentity::discover(Some(root), root).unwrap();
         let (graph, native) = crate::indexer::index_workspace_with_native(
             &crate::indexer::IndexOptions::new(root.to_owned()),
             &identity.record_id,

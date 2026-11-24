@@ -454,7 +454,10 @@ fn full_reference_canonical_includes_aligned_source_facts_and_descriptor_slots()
     assert_eq!(sources.len(), facts.len());
     assert_eq!(sources.len(), descriptors.len());
     assert_eq!(references["rustCatalogDigest"].as_str().unwrap().len(), 64);
-    assert_eq!(references["pythonCatalogDigest"].as_str().unwrap().len(), 64);
+    assert_eq!(
+        references["pythonCatalogDigest"].as_str().unwrap().len(),
+        64
+    );
     assert!(
         facts
             .iter()
