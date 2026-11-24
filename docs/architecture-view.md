@@ -989,7 +989,20 @@ releases a result when no reader or in-flight computation still borrows it.
 
 Dirty is the union of native changes, semantic changes (including every currently projected
 document), and sources with endpoints in documents whose declaration-ID sets changed. Only Dirty
-sources run `file_references`. Other sources whose targets changed natively enter Patch: they
+sources run `file_references`.
+
+Semantic changes include revision-derived provenance (owner ruling 2026-11-24, #1308). An
+imported or rejoined provenance ID is derived from the reading revision's native revision
+(Decision 0021 D2), and the reader also breaks ties by it: a call's representative proof and the
+order of anchors at the same range. So a document whose evidence, read at the build's own pin,
+carries such provenance is semantic Dirty whenever the build's native revision differs from its
+base's, even when its payload, state and freshness are unchanged. Literal provenance IDs do not
+depend on the revision, and a projected document reads at its semantic basis and is Dirty
+anyway. The dependency index keeps each document's flag and the base's native revision. Patch and
+reuse therefore apply only to sources without such evidence, or across builds at the same native
+revision. Answers do not change. Reusing semantic sources across native revisions, by
+materializing provenance IDs per core and breaking those ties by stable proof identity, is
+#1310. Other sources whose targets changed natively enter Patch: they
 clone reference display output to update internal sampled and unresolved target lines and
 anonymous display keys by document and syntax ID. Remaining whole-source reference Arcs are
 shared. Only native-changed documents are remeasured; unchanged metric and dependency subparts
@@ -1017,8 +1030,12 @@ manifest gate. The Rust digest normalizes positions to per-document ranks while 
 coincident positions and all resolution-semantic fields.
 
 A semantic import changes stable producer or raw-selection identity and therefore builds in
-full. A native N→semantic S catch-up preserves the raw selection and is not an import; it is
-eligible for incremental computation. Projected documents remain semantic Dirty even when
+full. A native N→semantic S catch-up preserves the raw selection and the native revision, and is
+not an import; it is eligible for incremental computation. From a base built at N it reuses
+every source whose semantic state did not change. From an older base at another native
+revision, its sources with revision-derived provenance are also Dirty, so until #1310 semantic
+checkouts may build near-full or full after an edit, while native-only checkouts and same-revision
+catch-up still build incrementally. Projected documents remain semantic Dirty even when
 their raw selection is unchanged: their full projection DTO and historical basis are preserved,
 not rewritten to force reuse. The first edit after a producer run can therefore be near-full
 or full under the same gates.

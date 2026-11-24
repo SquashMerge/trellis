@@ -1727,6 +1727,12 @@ impl EvidenceResponse {
         let defaults = semantic_display::default_producers(&self.db, &key)?;
         let (producers, selections) =
             native_first::architecture_inventory_fingerprints(&self.db, &key)?;
+        // The same row Read B's payload projection derives rejoined provenance IDs from.
+        let native_revision: String = self.db.query_row(
+            "SELECT native_revision_id FROM native_revisions WHERE id=?1",
+            [&key],
+            |row| row.get(0),
+        )?;
         let mut documents = BTreeMap::new();
         let mut semantic_states = BTreeMap::new();
         for document in &mut snapshot.documents {
@@ -1737,12 +1743,13 @@ impl EvidenceResponse {
                 params![key, document.key.language, document.key.path],
                 |row| Ok(NativeFingerprint { version_id: row.get(0)?, coverage_requested: row.get(1)?, coverage_selected: row.get(2)?, coverage_state: row.get(3)?, coverage_diagnostic: row.get(4)? }),
             )?;
-            let (semantic, state) = semantic_display::architecture_document_fingerprint(
-                &self.db,
-                snapshot.pin,
-                &defaults,
-                &document.key,
-            )?;
+            let (semantic, state, revision_provenance) =
+                semantic_display::architecture_document_fingerprint(
+                    &self.db,
+                    snapshot.pin,
+                    &defaults,
+                    &document.key,
+                )?;
             let pending = state
                 .projection
                 .as_ref()
@@ -1765,6 +1772,7 @@ impl EvidenceResponse {
                     native,
                     semantic,
                     projected: state.projection.is_some(),
+                    revision_provenance,
                     sids: crate::architecture_core::dependencies::sid_digest(
                         document
                             .declarations
@@ -1784,6 +1792,7 @@ impl EvidenceResponse {
                 semantic_states,
                 producers,
                 selections,
+                native_revision,
             },
         ))
     }

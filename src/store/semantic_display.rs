@@ -1501,14 +1501,18 @@ pub(crate) fn architecture_document_fingerprint(
     pin: IndexPin,
     defaults: &DefaultProducers,
     document: &DocumentKey,
-) -> Result<([u8; 32], crate::architecture_inputs::SemanticInputState)> {
+) -> Result<(
+    [u8; 32],
+    crate::architecture_inputs::SemanticInputState,
+    bool,
+)> {
     use crate::architecture_inputs::{
         SemanticFreshnessState, SemanticInputState, SemanticTupleState,
     };
     let producer = defaults.producer(&document.language);
     let Some(producer) = producer else {
         let state = SemanticInputState::default();
-        return Ok((state.fingerprint(), state));
+        return Ok((state.fingerprint(), state, false));
     };
     let projection = super::native_first::semantic_projection_for(
         db,
@@ -1546,6 +1550,7 @@ pub(crate) fn architecture_document_fingerprint(
             payload_id: *payload,
         });
     let mut freshness_state = None;
+    let mut revision_provenance = false;
     if let Some((tuple, selected, state, payload)) = tuple {
         let mut statement = db.prepare_cached(
             "SELECT basis_id,freshness FROM semantic_coverage_freshness WHERE revision_id=?1 AND tuple_id=?2 ORDER BY basis_id",
@@ -1569,6 +1574,21 @@ pub(crate) fn architecture_document_fingerprint(
                 SelectedIntegrity("incompatible_index: architecture tuple names no payload".into())
             );
         }
+        // Read B derives an imported or rejoined provenance ID from the reading revision's
+        // native revision (Decision 0021 D2), and that ID is output and a tie-break. A
+        // literal ID is not derived. A projected source reads at its semantic basis, or not
+        // at all while pending, and every projected source is semantic Dirty anyway (#1308).
+        if projection.is_none()
+            && selected
+            && matches!(state.as_str(), "complete" | "partial")
+            && let Some(payload) = payload
+        {
+            revision_provenance = db
+                .prepare_cached(
+                    "SELECT EXISTS(SELECT 1 FROM semantic_provenance WHERE payload_id=?1 AND derived_from_provenance_id IS NOT NULL)",
+                )?
+                .query_row([payload], |row| row.get(0))?;
+        }
     }
     let state = SemanticInputState {
         default_producer: Some(producer.to_owned()),
@@ -1576,7 +1596,7 @@ pub(crate) fn architecture_document_fingerprint(
         tuple: tuple_state,
         freshness: freshness_state,
     };
-    Ok((state.fingerprint(), state))
+    Ok((state.fingerprint(), state, revision_provenance))
 }
 
 #[cfg(feature = "test-support")]

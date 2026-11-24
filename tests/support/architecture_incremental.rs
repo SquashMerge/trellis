@@ -47,6 +47,19 @@ pub const SOURCES: &[(&str, &str)] = &[
     ("b.ts", "export function beta() { return 2; }\n"),
 ];
 
+/// A second caller of `target` that no producer artifact covers: its evidence carries no
+/// revision-derived provenance, so a target-line change patches it (#1308).
+pub const PLAIN_CALLER: &[(&str, &str)] = &[
+    (
+        "src/lib.rs",
+        "pub mod target; pub mod caller; pub mod cargo; pub mod plain;\n",
+    ),
+    (
+        "src/plain.rs",
+        "pub fn plain() { crate::target::target(); }\n",
+    ),
+];
+
 pub struct CapturedArchitecture {
     pub temp: tempfile::TempDir,
     pub root: PathBuf,
@@ -55,6 +68,8 @@ pub struct CapturedArchitecture {
     pub cancel: Arc<AtomicBool>,
     serial: usize,
     workspace: Option<tempfile::TempDir>,
+    /// A nonempty `[[rules]]` file with selected semantic evidence reads all of Read B.
+    rules: bool,
 }
 
 pub enum Expected<'a> {
@@ -69,10 +84,17 @@ pub enum Expected<'a> {
 
 impl CapturedArchitecture {
     pub fn new() -> Self {
+        Self::new_with(&[])
+    }
+
+    /// [`SOURCES`], with `extra` files added or replacing a source of the same path.
+    pub fn new_with(extra: &[(&str, &str)]) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("checkout");
         fs::create_dir(&root).unwrap();
-        for (path, text) in SOURCES {
+        let mut sources: BTreeMap<&str, &str> = SOURCES.iter().copied().collect();
+        sources.extend(extra.iter().copied());
+        for (path, text) in sources {
             let path = root.join(path);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, text).unwrap();
@@ -94,6 +116,9 @@ impl CapturedArchitecture {
             cancel: Arc::new(AtomicBool::new(false)),
             serial: 0,
             workspace: None,
+            rules: extra
+                .iter()
+                .any(|(path, _)| *path == trellis::rules::RULES_PATH),
         }
     }
 
@@ -114,11 +139,17 @@ impl CapturedArchitecture {
             cancel: Arc::new(AtomicBool::new(false)),
             serial: 0,
             workspace: Some(workspace),
+            rules: false,
         }
     }
 
     pub fn producers() -> Self {
-        let mut fixture = Self::new();
+        Self::producers_with(&[])
+    }
+
+    /// Native publication, then a Rust and a TypeScript import, each a full build.
+    pub fn producers_with(extra: &[(&str, &str)]) -> Self {
+        let mut fixture = Self::new_with(extra);
         fixture.package_users();
         let pin = fixture.native();
         fixture.expect(pin, Expected::Full(FullReason::NoBase));
@@ -149,10 +180,26 @@ impl CapturedArchitecture {
                 ],
                 patched: &[],
                 native: &["src/main.rs"],
-                all_b: false,
+                all_b: self.rules,
             },
         )
         .1
+    }
+
+    /// The head's reading native revision and the paths whose evidence carries provenance
+    /// IDs derived from it (#1308), from the admitted Read A fingerprints.
+    pub fn revision_provenance(&self) -> (String, Vec<String>) {
+        let fingerprints = self
+            .store
+            .architecture_fingerprints_for_tests(None)
+            .unwrap();
+        let paths = fingerprints
+            .documents
+            .iter()
+            .filter(|(_, fingerprint)| fingerprint.revision_provenance)
+            .map(|(key, _)| key.path.clone())
+            .collect();
+        (fingerprints.native_revision, paths)
     }
 
     pub fn native(&self) -> IndexPin {

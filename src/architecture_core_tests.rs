@@ -761,6 +761,37 @@ fn architecture_incremental_changed_sets_and_ordered_gates() {
         "every current projection is dirty"
     );
 
+    // #1308: revision-derived provenance is semantic Dirty exactly when the reading native
+    // revision differs from the base's; literal provenance and an equal revision reuse.
+    let unchanged =
+        dependencies::changed_documents(&input.snapshot, &input.fingerprints, Some(&old))
+            .unwrap()
+            .unwrap();
+    fingerprints = input.fingerprints.clone();
+    fingerprints
+        .documents
+        .get_mut(&script)
+        .unwrap()
+        .revision_provenance = true;
+    let changed = dependencies::changed_documents(&input.snapshot, &fingerprints, Some(&old))
+        .unwrap()
+        .unwrap();
+    assert_eq!(changed.dirty, unchanged.dirty, "same native revision");
+    let mut moved = old.clone();
+    moved.native_revision.push('2');
+    let changed = dependencies::changed_documents(&input.snapshot, &fingerprints, Some(&moved))
+        .unwrap()
+        .unwrap();
+    let mut expected = unchanged.dirty.clone();
+    expected.insert(script.clone());
+    assert_eq!(changed.dirty, expected, "revision-derived provenance");
+    assert!(changed.native.is_empty() && !changed.patched.contains(&script));
+    let changed =
+        dependencies::changed_documents(&input.snapshot, &input.fingerprints, Some(&moved))
+            .unwrap()
+            .unwrap();
+    assert_eq!(changed.dirty, unchanged.dirty, "literal or no provenance");
+
     let util = rust
         .iter()
         .find(|key| key.path.ends_with("util.rs"))

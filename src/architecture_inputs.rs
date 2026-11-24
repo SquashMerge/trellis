@@ -16,6 +16,9 @@ pub struct ArchitectureFingerprints {
     pub semantic_states: BTreeMap<DocumentKey, SemanticInputState>,
     pub producers: [u8; 32],
     pub selections: [u8; 32],
+    /// The reading revision's native revision ID. Rejoined provenance IDs read at this pin
+    /// are derived from it (Decision 0021 D2), so it is compared with the base's (#1308).
+    pub native_revision: String,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, PartialEq, Eq)]
@@ -47,6 +50,10 @@ pub struct DocumentFingerprint {
     pub semantic: [u8; 32],
     pub sids: [u8; 32],
     pub projected: bool,
+    /// The document's evidence, read at this build's own pin, has provenance whose ID is
+    /// derived from the reading native revision (imported or rejoined, not literal). Such a
+    /// source is semantic Dirty whenever the native revision differs from the base's (#1308).
+    pub revision_provenance: bool,
 }
 
 #[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]

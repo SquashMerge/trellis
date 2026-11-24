@@ -289,11 +289,24 @@ proptest! {
 
 /// Fixed seeds vary real source bytes, not scheduling or retries. Each completed pin is
 /// checked by the production owner against its independent all-source full oracle.
+/// Sources whose evidence carries provenance derived from the reading native revision are
+/// semantic Dirty whenever it differs from the base's (#1308); a plain caller still patches.
 #[test]
 fn architecture_incremental_seeded_mixed_edits() {
-    use crate::architecture_incremental_support::{CapturedArchitecture, Expected};
+    use crate::architecture_incremental_support::{CapturedArchitecture, Expected, PLAIN_CALLER};
     use trellis::http::FullReason;
 
+    const DERIVED: [&str; 4] = ["src/caller.rs", "src/target.rs", "a.ts", "b.ts"];
+    const PROJECTED: [&str; 8] = [
+        "src/main.rs",
+        "src/lib.rs",
+        "src/caller.rs",
+        "src/cargo.rs",
+        "src/plain.rs",
+        "src/target.rs",
+        "a.ts",
+        "b.ts",
+    ];
     for seed in 0_u64..20 {
         let mut state = seed + 1;
         let mut next = || {
@@ -302,26 +315,41 @@ fn architecture_incremental_seeded_mixed_edits() {
                 .wrapping_add(1442695040888963407);
             state >> 32
         };
-        let mut fixture = CapturedArchitecture::producers();
+        let mut fixture = CapturedArchitecture::producers_with(PLAIN_CALLER);
         fixture.stabilize();
-        let value = 3 + next() % 100;
-        std::fs::write(
-            fixture.root.join("src/main.rs"),
-            format!("fn main() {{ let _value = {value}; }}\n"),
-        )
-        .unwrap();
+        assert_eq!(fixture.revision_provenance().1, DERIVED, "seed {seed}");
+
+        // A body-only Rust edit, then catch-up from a base at another native revision.
+        let (path, body) = if next() % 2 == 0 {
+            (
+                "src/main.rs",
+                format!("fn main() {{ let _value = {}; }}\n", 3 + next() % 100),
+            )
+        } else {
+            (
+                "src/plain.rs",
+                format!(
+                    "pub fn plain() {{ let _value = {}; crate::target::target(); }}\n",
+                    next() % 100
+                ),
+            )
+        };
+        std::fs::write(fixture.root.join(path), body).unwrap();
         fixture.native();
         let pin = fixture.catch_up();
+        let mut dirty = vec![path];
+        dirty.extend(DERIVED);
         fixture.expect(
             pin,
             Expected::Incremental {
-                dirty: &["src/main.rs"],
+                dirty: &dirty,
                 patched: &[],
-                native: &["src/main.rs"],
+                native: &[path],
                 all_b: false,
             },
         );
 
+        // Lines above a declaration others target: the plain caller patches.
         let prefix = "\n".repeat(2 + (next() % 4) as usize);
         std::fs::write(
             fixture.root.join("src/target.rs"),
@@ -333,17 +361,20 @@ fn architecture_incremental_seeded_mixed_edits() {
         fixture.expect(
             pin,
             Expected::Incremental {
-                dirty: &["src/target.rs"],
-                patched: &["src/caller.rs"],
+                dirty: &DERIVED,
+                patched: &["src/plain.rs"],
                 native: &["src/target.rs"],
                 all_b: false,
             },
         );
 
+        // A TypeScript edit is full; its catch-up keeps N's native revision.
+        let ts = if next() % 2 == 0 { "a.ts" } else { "b.ts" };
+        let name = if ts == "a.ts" { "alpha" } else { "beta" };
         std::fs::write(
-            fixture.root.join("a.ts"),
+            fixture.root.join(ts),
             format!(
-                "export function alpha() {{ return {}; }}\n",
+                "export function {name}() {{ return {}; }}\n",
                 3 + next() % 100
             ),
         )
@@ -354,15 +385,7 @@ fn architecture_incremental_seeded_mixed_edits() {
         fixture.expect(
             pin,
             Expected::Incremental {
-                dirty: &[
-                    "src/main.rs",
-                    "src/lib.rs",
-                    "src/caller.rs",
-                    "src/cargo.rs",
-                    "src/target.rs",
-                    "a.ts",
-                    "b.ts",
-                ],
+                dirty: &PROJECTED,
                 patched: &[],
                 native: &[],
                 all_b: false,

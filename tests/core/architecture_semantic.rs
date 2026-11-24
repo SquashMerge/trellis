@@ -99,6 +99,11 @@ fn architecture_incremental_projection() {
     )
     .unwrap();
     let n = fixture.native();
+    let (n_revision, derived) = fixture.revision_provenance();
+    assert!(
+        derived.is_empty(),
+        "every projection reads at its basis: {derived:?}"
+    );
     let (attempt, before) = fixture.build(n);
     let paths = |keys: &[trellis::native_records::DocumentKey]| {
         keys.iter().map(|key| key.path.clone()).collect::<Vec<_>>()
@@ -115,6 +120,10 @@ fn architecture_incremental_projection() {
     }
     let s = fixture.catch_up();
     assert_eq!(s.index_revision, n.index_revision + 1);
+    // The base N has S's native revision: rejoined provenance adds no Dirty source (#1308).
+    let (s_revision, derived) = fixture.revision_provenance();
+    assert_eq!(s_revision, n_revision);
+    assert_eq!(derived, ["a.ts", "b.ts"]);
     let (attempt, after) = fixture.build(s);
     match &attempt.path {
         ArchitectureBuildPath::Incremental { dirty, patched, .. } => {
@@ -156,6 +165,8 @@ fn architecture_incremental_import_and_catchup() {
         .architecture_fingerprints_for_tests(None)
         .unwrap()
         .selections;
+    let (imported, derived) = fixture.revision_provenance();
+    assert_eq!(derived, ["src/caller.rs", "src/target.rs", "a.ts", "b.ts"]);
     fs::write(
         fixture.root.join("src/main.rs"),
         "fn main() { let _value = 2; }\n",
@@ -172,6 +183,11 @@ fn architecture_incremental_import_and_catchup() {
             .selections,
         selection
     );
+    // The base is the import's core: a different native revision, so every source with
+    // revision-derived provenance is semantic Dirty (#1308). Catch-up stays incremental.
+    let (caught_up, current) = fixture.revision_provenance();
+    assert_ne!(caught_up, imported);
+    assert_eq!(current, derived);
     let (_, after) = fixture.expect(
         s,
         Expected::Incremental {
@@ -201,14 +217,70 @@ fn architecture_incremental_import_and_catchup() {
         "older descriptor table is immutable"
     );
     assert_ne!(fixture.packages(&before), fixture.packages(&after));
+
+    // A catch-up whose base was built at its own native revision N: the rejoined provenance
+    // IDs cannot move, and only the semantic changes N→S are Dirty.
+    let projected = [
+        "src/main.rs",
+        "src/lib.rs",
+        "src/caller.rs",
+        "src/cargo.rs",
+        "src/target.rs",
+        "a.ts",
+        "b.ts",
+    ];
+    fs::write(
+        fixture.root.join("src/main.rs"),
+        "fn main() { let _value = 3; }\n",
+    )
+    .unwrap();
+    let n = fixture.native();
+    let (native, current) = fixture.revision_provenance();
+    assert_ne!(native, caught_up);
+    assert!(
+        current.is_empty(),
+        "a projection reads at its basis: {current:?}"
+    );
+    let (_, before) = fixture.expect(
+        n,
+        Expected::Incremental {
+            dirty: &projected,
+            patched: &[],
+            native: &["src/main.rs"],
+            all_b: false,
+        },
+    );
+    let s = fixture.catch_up();
+    let (same, current) = fixture.revision_provenance();
+    assert_eq!(same, native, "catch-up keeps N's native revision");
+    assert_eq!(current, derived);
+    let (_, after) = fixture.expect(
+        s,
+        Expected::Incremental {
+            dirty: &projected,
+            patched: &[],
+            native: &[],
+            all_b: false,
+        },
+    );
+    for (key, sharing) in after.sharing(&before) {
+        if !projected.contains(&key.path.as_str()) {
+            assert!(sharing.source && sharing.metric, "{key:?}: {sharing:?}");
+        }
+    }
     let pin = fixture.import(false);
     fixture.expect(pin, Expected::Full(FullReason::RawSelectionsChanged));
 }
 
+/// AC10 under the #1308 provenance rule. The imported caller's rejoined provenance IDs are
+/// derived from the moved native revision, so it is Dirty, not patched, and its target lines
+/// equal a full build's. A caller with no producer evidence lands in Patch, but native Rust
+/// sites name no target declaration, so its patch moves no lines here; the engine-level
+/// `architecture_incremental_target_display_patch_matches_full` moves real ones.
 #[test]
 fn architecture_incremental_target_patch() {
-    use crate::architecture_incremental_support::{CapturedArchitecture, Expected};
-    let fixture = CapturedArchitecture::producers();
+    use crate::architecture_incremental_support::{CapturedArchitecture, Expected, PLAIN_CALLER};
+    let fixture = CapturedArchitecture::producers_with(PLAIN_CALLER);
     let snapshot = fixture
         .store
         .architecture_reference_snapshot_for_tests()
@@ -243,6 +315,8 @@ fn architecture_incremental_target_patch() {
         caller.semantic,
         fixture.store.semantic_at(before.pin()).unwrap()
     );
+    let (base_revision, derived) = fixture.revision_provenance();
+    assert_eq!(derived, ["src/caller.rs", "src/target.rs", "a.ts", "b.ts"]);
     let frozen = before.canonical().unwrap();
     let old_packages = fixture.packages(&before);
     fs::write(
@@ -252,46 +326,72 @@ fn architecture_incremental_target_patch() {
     .unwrap();
     fixture.native();
     let pin = fixture.catch_up();
+    let (revision, current) = fixture.revision_provenance();
+    assert_ne!(
+        revision, base_revision,
+        "the edit moved the native revision"
+    );
+    // The edited target's captured offsets no longer join; it is native Dirty regardless.
+    assert_eq!(current, ["src/caller.rs", "a.ts", "b.ts"]);
+    // The plain caller has no revision-derived provenance: only its target lines change.
+    // The imported caller and the unchanged TypeScript sources carry rejoined provenance IDs
+    // derived from the moved native revision, so they are reread, not patched or reused.
     let (_, after) = fixture.expect(
         pin,
         Expected::Incremental {
-            dirty: &["src/target.rs"],
-            patched: &["src/caller.rs"],
+            dirty: &["src/caller.rs", "src/target.rs", "a.ts", "b.ts"],
+            patched: &["src/plain.rs"],
             native: &["src/target.rs"],
             all_b: false,
         },
     );
     let canonical = after.canonical().unwrap();
-    let before_edge = edge(
-        &frozen["references"]["selected"]["data"],
-        "src/caller.rs",
-        "src/target.rs",
-    )
-    .unwrap();
-    let after_edge = edge(
-        &canonical["references"]["selected"]["data"],
-        "src/caller.rs",
-        "src/target.rs",
-    )
-    .unwrap();
-    let target_lines = |edge: &Value| {
+    let sites = |data: &Value, source: &str| {
+        let edge = edge(
+            &data["references"]["selected"]["data"],
+            source,
+            "src/target.rs",
+        )
+        .unwrap_or_else(|| panic!("missing {source} edge"));
         edge["sites"]
             .as_array()
             .unwrap()
             .iter()
             .find(|site| site["target"]["document"]["path"] == "src/target.rs")
-            .unwrap_or_else(|| panic!("missing sampled internal target: {edge}"))["target"]["lines"]
+            .unwrap_or_else(|| panic!("missing sampled internal target from {source}: {edge}"))
             .clone()
     };
-    assert_eq!(target_lines(before_edge), json!({"start":2,"end":2}));
-    assert_eq!(target_lines(after_edge), json!({"start":3,"end":3}));
-    let sharing = after.sharing(&before);
-    for (key, parts) in sharing {
-        if key.path == "src/caller.rs" {
+    assert_eq!(
+        sites(&frozen, "src/caller.rs")["target"]["lines"],
+        json!({"start":2,"end":2})
+    );
+    assert_eq!(
+        sites(&canonical, "src/caller.rs")["target"]["lines"],
+        json!({"start":3,"end":3})
+    );
+    // Native Rust sites name no target declaration, so the plain caller's patch rewrites no
+    // lines; the literal-provenance witness below moves real sampled target lines.
+    let plain = edge(
+        &canonical["references"]["selected"]["data"],
+        "src/plain.rs",
+        "src/target.rs",
+    )
+    .unwrap();
+    assert_eq!(plain["sites"][0]["targetReason"], "unresolved", "{plain}");
+    let caller_site = sites(&canonical, "src/caller.rs");
+    assert!(
+        caller_site["provenanceId"].is_string()
+            && caller_site["provenanceId"] != sites(&frozen, "src/caller.rs")["provenanceId"],
+        "a rejoined provenance ID follows the reading revision: {caller_site}"
+    );
+    for (key, parts) in after.sharing(&before) {
+        if key.path == "src/plain.rs" {
             assert!(
                 !parts.source && parts.metric && parts.fingerprint && parts.plan,
                 "{key:?}: {parts:?}"
             );
+        } else if key.path == "src/caller.rs" {
+            assert!(!parts.source && parts.metric, "{key:?}: {parts:?}");
         } else if key.path == "src/cargo.rs" || key.language == "javascript" {
             assert!(
                 parts.source && parts.metric && parts.fingerprint && parts.plan,
@@ -301,6 +401,56 @@ fn architecture_incremental_target_patch() {
     }
     assert_ne!(old_packages, fixture.packages(&after));
     assert_eq!(before.canonical().unwrap(), frozen);
+}
+/// AC11: nonempty `[[rules]]` with selected semantic evidence read every source's semantic
+/// rows and prepare rules in full, while references still run only for Dirty sources.
+#[test]
+fn architecture_incremental_rules_semantic() {
+    use crate::architecture_incremental_support::{CapturedArchitecture, Expected};
+    const RULES_FILE: &str = r#"version = 1
+[roles.caller]
+select = { name = "caller" }
+[roles.target]
+select = { name = "target" }
+[[rules]]
+id = "caller-calls-target"
+for_each = "caller"
+require = [{ calls = "target" }]
+"#;
+    let fixture = CapturedArchitecture::producers_with(&[(trellis::rules::RULES_PATH, RULES_FILE)]);
+    let before = fixture.stabilize();
+    assert!(!before.canonical().unwrap()["rules"].is_null());
+    fs::write(
+        fixture.root.join("src/main.rs"),
+        "fn main() { let _value = 3; }\n",
+    )
+    .unwrap();
+    fixture.native();
+    let pin = fixture.catch_up();
+    let (_, derived) = fixture.revision_provenance();
+    assert_eq!(derived, ["src/caller.rs", "src/target.rs", "a.ts", "b.ts"]);
+    let (_, after) = fixture.expect(
+        pin,
+        Expected::Incremental {
+            dirty: &[
+                "src/main.rs",
+                "src/caller.rs",
+                "src/target.rs",
+                "a.ts",
+                "b.ts",
+            ],
+            patched: &[],
+            native: &["src/main.rs"],
+            all_b: true,
+        },
+    );
+    let rules = &after.canonical().unwrap()["rules"];
+    assert!(!rules.is_null(), "rules are prepared in full: {rules}");
+    for (key, sharing) in after.sharing(&before) {
+        if key.path == "src/cargo.rs" || key.language == "javascript" {
+            assert!(sharing.source && sharing.metric, "{key:?}: {sharing:?}");
+        }
+    }
 }
 
 #[test]
@@ -373,6 +523,8 @@ fn architecture_incremental_first_edit_after_producer() {
     )
     .unwrap();
     let next = fixture.native();
+    let (next_revision, derived) = fixture.revision_provenance();
+    assert!(derived.is_empty(), "{derived:?}");
     let fingerprints = fixture
         .store
         .architecture_fingerprints_for_tests(None)
@@ -405,6 +557,10 @@ fn architecture_incremental_first_edit_after_producer() {
             .selections,
         selection
     );
+    // S keeps the base's native revision, so its rejoined provenance cannot move (#1308).
+    let (revision, derived) = fixture.revision_provenance();
+    assert_eq!(revision, next_revision);
+    assert_eq!(derived, ["src/caller.rs", "src/target.rs", "a.ts", "b.ts"]);
     fixture.expect(
         s,
         Expected::Incremental {
@@ -551,7 +707,12 @@ fn architecture_incremental_semantic_limits() {
                 (2, 2, 2),
                 "a repeated shared proof is charged on each row"
             );
+            let (published, literal) = fixture.revision_provenance();
+            assert!(literal.is_empty(), "literal provenance IDs: {literal:?}");
             let copied = fixture.native();
+            // The copied pin keeps its native revision, and literal provenance IDs never
+            // derive from one, so every source stays reusable (#1308).
+            assert_eq!(fixture.revision_provenance().0, published);
             set(limit);
             if limit < total {
                 fixture.bounded_failure(copied, error);

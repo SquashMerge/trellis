@@ -72,6 +72,10 @@ mod staged {
         }
         let mut changed = ChangedDocuments::default();
         let mut sid = BTreeSet::new();
+        // Rejoined provenance IDs are derived from the reading native revision, and Read B
+        // orders and selects evidence by them. Until per-core provenance (#1310), a source
+        // carrying them is reread whenever that revision moves; others still reuse (#1308).
+        let revision_moved = fingerprints.native_revision != base.native_revision;
         for (i, key) in order.iter().enumerate() {
             let current = &fingerprints.documents[key];
             let old = &base.documents[i].fingerprint;
@@ -82,7 +86,10 @@ mod staged {
                     sid.insert(u32::try_from(i)?);
                 }
             }
-            if current.semantic != old.semantic || current.projected {
+            if current.semantic != old.semantic
+                || current.projected
+                || (revision_moved && current.revision_provenance)
+            {
                 changed.dirty.insert(key.clone());
             }
         }
@@ -278,6 +285,7 @@ mod staged {
         pub(crate) root_config: [u8; 32],
         pub(crate) producers: [u8; 32],
         pub(crate) selections: [u8; 32],
+        pub(crate) native_revision: String,
         pub(crate) global_semantic: SemanticReadCounts,
     }
 
@@ -346,6 +354,7 @@ mod staged {
                 semantic_states: _,
                 producers,
                 selections,
+                native_revision,
             } = fingerprints;
             let mut order: Vec<_> = snapshot
                 .documents
@@ -403,6 +412,7 @@ mod staged {
                 root_config: root_config_digest(snapshot.root_tsconfig.as_ref()),
                 producers,
                 selections,
+                native_revision,
                 global_semantic,
             })
         }
@@ -416,21 +426,22 @@ mod staged {
                 root_config,
                 producers,
                 selections,
+                native_revision,
                 global_semantic,
             } = self;
             let documents: Vec<_> = documents.iter().map(|document| {
                 let DocumentDependencies { fingerprint, references, semantic } = document.as_ref();
-                let DocumentFingerprint { native, semantic: semantic_fingerprint, sids, projected } = fingerprint.as_ref();
+                let DocumentFingerprint { native, semantic: semantic_fingerprint, sids, projected, revision_provenance } = fingerprint.as_ref();
                 let NativeFingerprint { version_id, coverage_requested, coverage_selected, coverage_state, coverage_diagnostic } = native;
                 let ReferenceDependencies { work, sites, endpoints, plan } = references.as_ref();
                 json!({"native": {"version_id": version_id, "coverage_requested": coverage_requested, "coverage_selected": coverage_selected,
                     "coverage_state": coverage_state, "coverage_diagnostic": coverage_diagnostic},
-                    "semanticFingerprint": semantic_fingerprint, "sids": sids, "projected": projected,
+                    "semanticFingerprint": semantic_fingerprint, "sids": sids, "projected": projected, "revisionProvenance": revision_provenance,
                     "references": {"work": work, "sites": sites, "endpoints": endpoints.as_ref(), "plan": plan.as_deref()}, "semantic": canonical_counts(semantic)})
             }).collect();
             json!({"order": order.as_ref(), "documents": documents, "rustCatalog": rust_catalog,
                 "manifests": manifests, "rootConfig": root_config, "producers": producers,
-                "selections": selections, "globalSemantic": canonical_counts(global_semantic)})
+                "selections": selections, "nativeRevision": native_revision, "globalSemantic": canonical_counts(global_semantic)})
         }
     }
 
