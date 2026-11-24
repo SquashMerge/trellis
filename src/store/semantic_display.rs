@@ -1689,69 +1689,65 @@ pub(super) fn architecture_semantic(
 }
 
 /// Dependency discovery is separate from output evidence admission: alternatives do not
-/// become anchors, metadata, or extra semantic-row charges. DISTINCT bounds retained data
-/// to checkout documents; the payload was validated and bounded on import.
-fn architecture_endpoint_documents(
+/// become anchors, metadata, or extra semantic-row charges. A document's endpoints are the
+/// checkout documents named by its fresh calls, use-site references and `extends`/`implements`
+/// relationships, and by their alternatives. The output cursors visit every row that can
+/// declare one and note it as they read it; this adds only the alternatives they never read:
+/// the candidates and possible dispatch of the bindings the call cursor visited (`bindings`),
+/// and the candidates of every fresh use-site reference. Import admits candidates only on
+/// `ambiguous` references, which the reference cursor skips outside a historical read, so
+/// this reads them here. The payload was validated and bounded on import.
+fn architecture_alternative_endpoints(
     db: &Connection,
     (revision, tuple, payload, historical): (&str, i64, i64, bool),
-    document: &crate::native_records::DocumentKey,
+    bindings: &std::collections::HashSet<i64>,
     locate: &impl Fn(Option<&str>, Option<&str>) -> Option<usize>,
+    endpoints: &mut BTreeSet<usize>,
     check: &mut impl FnMut() -> Result<()>,
-) -> Result<std::collections::BTreeSet<usize>> {
-    let mut statement = db.prepare_cached(
-        "WITH calls AS (
-           SELECT b.* FROM semantic_call_bindings b
-           JOIN semantic_provenance p ON p.payload_id=b.payload_id AND p.ordinal=b.provenance_ordinal
-           LEFT JOIN semantic_coverage_freshness f ON f.revision_id=?1 AND f.tuple_id=?2 AND f.basis_id=p.basis_id
-           WHERE b.payload_id=?3 AND b.call_id IS NOT NULL
-             AND b.join_document_language=?5 AND b.join_document_path=?6
-             AND (?4 OR f.basis_id IS NULL OR f.freshness<>'stale')
-         ), refs AS (
-           SELECT r.* FROM semantic_references r
-           JOIN semantic_provenance p ON p.payload_id=r.payload_id AND p.ordinal=r.provenance_ordinal
-           LEFT JOIN semantic_coverage_freshness f ON f.revision_id=?1 AND f.tuple_id=?2 AND f.basis_id=p.basis_id
-           WHERE r.payload_id=?3 AND r.site='use'
-             AND (?4 OR f.basis_id IS NULL OR f.freshness<>'stale')
-         ), relationships AS (
-           SELECT t.* FROM semantic_type_relationships t
-           JOIN semantic_provenance p ON p.payload_id=t.payload_id AND p.ordinal=t.provenance_ordinal
-           LEFT JOIN semantic_coverage_freshness f ON f.revision_id=?1 AND f.tuple_id=?2 AND f.basis_id=p.basis_id
-           WHERE t.payload_id=?3 AND t.source_kind='internal' AND t.kind IN ('extends','implements')
-             AND (?4 OR f.basis_id IS NULL OR f.freshness<>'stale')
-         ), endpoints(kind,language,path) AS (
-           SELECT declared_kind,declared_internal_language,declared_internal_path FROM calls
-           UNION ALL SELECT c.kind,c.internal_language,c.internal_path FROM semantic_call_candidates c JOIN calls b ON b.binding_id=c.binding_id
-           UNION ALL SELECT c.kind,c.internal_language,c.internal_path FROM semantic_call_possible_dispatch c JOIN calls b ON b.binding_id=c.binding_id
-           UNION ALL SELECT declared_kind,declared_internal_language,declared_internal_path FROM refs
-           UNION ALL SELECT c.kind,c.internal_language,c.internal_path FROM semantic_reference_candidates c JOIN refs r ON r.payload_id=c.payload_id AND r.reference_id=c.reference_id
-           UNION ALL SELECT source_kind,source_internal_language,source_internal_path FROM relationships
-           UNION ALL SELECT target_kind,target_internal_language,target_internal_path FROM relationships
-         )
-         SELECT DISTINCT language,path FROM endpoints WHERE kind='internal' ORDER BY language,path",
-    )?;
-    let mut cursor = statement.query(params![
-        revision,
-        tuple,
-        payload,
-        historical,
-        document.language,
-        document.path
-    ])?;
-    let mut endpoints = std::collections::BTreeSet::new();
+) -> Result<()> {
     let mut rows = 0usize;
+    let mut calls = db.prepare_cached(
+        "SELECT c.binding_id,c.internal_language,c.internal_path FROM semantic_call_bindings b
+           JOIN semantic_call_candidates c ON c.binding_id=b.binding_id
+           WHERE b.payload_id=?1 AND b.call_id IS NOT NULL AND c.kind='internal'
+         UNION ALL SELECT c.binding_id,c.internal_language,c.internal_path FROM semantic_call_bindings b
+           JOIN semantic_call_possible_dispatch c ON c.binding_id=b.binding_id
+           WHERE b.payload_id=?1 AND b.call_id IS NOT NULL AND c.kind='internal'",
+    )?;
+    let mut cursor = calls.query([payload])?;
     while let Some(row) = cursor.next()? {
         if rows.is_multiple_of(CHECK_EVERY_ROWS) {
             check()?;
         }
         rows += 1;
-        if let Some(target) = locate(
-            row.get_ref(0)?.as_str_or_null()?,
-            row.get_ref(1)?.as_str_or_null()?,
-        ) {
-            endpoints.insert(target);
+        if bindings.contains(&row.get::<_, i64>(0)?) {
+            endpoints.extend(locate(
+                row.get_ref(1)?.as_str_or_null()?,
+                row.get_ref(2)?.as_str_or_null()?,
+            ));
         }
     }
-    Ok(endpoints)
+    drop(cursor);
+    let mut references = db.prepare_cached(
+        "SELECT c.internal_language,c.internal_path FROM semantic_reference_candidates c
+         JOIN semantic_references r ON r.payload_id=c.payload_id AND r.reference_id=c.reference_id
+         JOIN semantic_provenance p ON p.payload_id=r.payload_id AND p.ordinal=r.provenance_ordinal
+         LEFT JOIN semantic_coverage_freshness f ON f.revision_id=?2 AND f.tuple_id=?3 AND f.basis_id=p.basis_id
+         WHERE c.payload_id=?1 AND c.kind='internal' AND r.site='use'
+           AND (?4 OR f.basis_id IS NULL OR f.freshness<>'stale')",
+    )?;
+    let mut cursor = references.query(params![payload, revision, tuple, historical])?;
+    while let Some(row) = cursor.next()? {
+        if rows.is_multiple_of(CHECK_EVERY_ROWS) {
+            check()?;
+        }
+        rows += 1;
+        endpoints.extend(locate(
+            row.get_ref(0)?.as_str_or_null()?,
+            row.get_ref(1)?.as_str_or_null()?,
+        ));
+    }
+    Ok(())
 }
 
 /// `architecture_semantic` with `metadata_limit` proof metadata and lookup dependency rows.
@@ -2163,7 +2159,7 @@ pub(crate) fn architecture_semantic_for_sources(
         "SELECT r.start_byte,r.end_byte,r.resolution,r.declared_internal_syntax_id,
                 r.declared_internal_language,r.declared_internal_path,r.provenance_ordinal,
                 EXISTS(SELECT 1 FROM semantic_reference_roles o
-                       WHERE o.payload_id=r.payload_id AND o.reference_id=r.reference_id AND o.role='type'),r.reference_id,p.basis_id
+                       WHERE o.payload_id=r.payload_id AND o.reference_id=r.reference_id AND o.role='type'),r.reference_id,p.basis_id,r.declared_kind
          FROM semantic_references r
          JOIN semantic_provenance p ON p.payload_id=r.payload_id AND p.ordinal=r.provenance_ordinal
          LEFT JOIN semantic_coverage_freshness f ON f.revision_id=?3 AND f.tuple_id=?4 AND f.basis_id=p.basis_id
@@ -2249,13 +2245,11 @@ pub(crate) fn architecture_semantic_for_sources(
             "incompatible_index: architecture tuple names no payload".into(),
         ))?;
         let native = pp.native().to_owned();
-        let endpoint_documents = architecture_endpoint_documents(
-            db,
-            (&key, tuple, payload, historical),
-            &documents[i].key,
-            &locate,
-            check,
-        )?;
+        // Dependency-only endpoints (#1308): the output cursors note each row's declared
+        // endpoints as they visit it, then `architecture_alternative_endpoints` adds the
+        // alternatives they never read.
+        let mut endpoint_documents = BTreeSet::new();
+        let mut bindings = std::collections::HashSet::new();
         let (language, path) = (
             documents[i].key.language.clone(),
             documents[i].key.path.clone(),
@@ -2270,6 +2264,13 @@ pub(crate) fn architecture_semantic_for_sources(
         ])?;
         while let Some(row) = cursor.next()? {
             admit(&mut *check)?;
+            bindings.insert(row.get::<_, i64>(11)?);
+            if row.get_ref(4)?.as_str_or_null()? == Some("internal") {
+                endpoint_documents.extend(locate(
+                    row.get_ref(6)?.as_str_or_null()?,
+                    row.get_ref(7)?.as_str_or_null()?,
+                ));
+            }
             // A missing required freshness row is corruption, never a filtered fact.
             let basis_freshness = pp.freshness(row.get(17)?)?;
             // A derived row's fact digest is its raw proof's (#1248 PR 2): a missing proof is
@@ -2414,6 +2415,15 @@ pub(crate) fn architecture_semantic_for_sources(
             by_call.insert(call_id, (row_key, Some(anchor)));
         }
         drop(cursor);
+        architecture_alternative_endpoints(
+            db,
+            (&key, tuple, payload, historical),
+            &bindings,
+            &locate,
+            &mut endpoint_documents,
+            check,
+        )?;
+        drop(bindings);
         let mut anchors: Vec<SemanticAnchor> = by_call
             .into_values()
             .filter_map(|(_, anchor)| anchor)
@@ -2422,6 +2432,14 @@ pub(crate) fn architecture_semantic_for_sources(
         let mut cursor = references.query(params![payload, historical, key, tuple])?;
         while let Some(row) = cursor.next()? {
             admit(&mut *check)?;
+            // Import admits a declared internal target only on a `resolved` reference
+            // (`semantic_evidence::resolution`), which this cursor always visits.
+            if row.get_ref(10)?.as_str_or_null()? == Some("internal") {
+                endpoint_documents.extend(locate(
+                    row.get_ref(4)?.as_str_or_null()?,
+                    row.get_ref(5)?.as_str_or_null()?,
+                ));
+            }
             let basis_freshness = pp.freshness(row.get(9)?)?;
             // What a read at the basis binds: a resolved internal target in this snapshot
             // (#934), from a proof that read admits: any not `stale` (#936).
@@ -2516,6 +2534,17 @@ pub(crate) fn architecture_semantic_for_sources(
         let mut cursor = relationships.query(params![payload, historical, key, tuple, native])?;
         while let Some(row) = cursor.next()? {
             admit(&mut *check)?;
+            // The cursor selects internal sources only.
+            endpoint_documents.extend(locate(
+                row.get_ref(7)?.as_str_or_null()?,
+                row.get_ref(8)?.as_str_or_null()?,
+            ));
+            if row.get_ref(2)?.as_str()? == "internal" {
+                endpoint_documents.extend(locate(
+                    row.get_ref(4)?.as_str_or_null()?,
+                    row.get_ref(5)?.as_str_or_null()?,
+                ));
+            }
             pp.freshness(row.get(16)?)?;
             let source = sid(row.get_ref(1)?.as_blob_or_null()?)?.context(SelectedIntegrity(
                 "corrupt semantic type relationship".into(),
