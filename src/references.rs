@@ -94,6 +94,9 @@ pub struct ReferenceBase {
 #[derive(Clone)]
 struct SourceReferences {
     projection: Option<crate::model::SemanticProjection>,
+    /// The reading this source's semantic sites were materialized for, when it has any: a
+    /// later core rebases a reused source to its own (#1310).
+    reading: Option<crate::architecture_inputs::SemanticReading>,
     /// By target, stored role (test = true) and the sites' feature gates.
     edges: BTreeMap<(Target, bool, Vec<String>), EdgeSites>,
     unresolved: Vec<(Site, &'static str)>,
@@ -202,7 +205,8 @@ struct Site {
     /// `structural` (captured syntax conventions) or `semantic` (a producer binding, labelled
     /// with its freshness).
     mapping: &'static str,
-    /// The semantic binding's provenance; null for structural sites.
+    /// The semantic binding's provenance; null for structural sites. A rejoined proof's is
+    /// minted again per core from its metadata's raw proof (#1310).
     provenance_id: Option<String>,
     #[serde(flatten)]
     semantic_metadata: SemanticMetadata,
@@ -951,9 +955,19 @@ fn file_references<'a>(
         sites: Vec::new(),
     };
     let mut endpoints = incremental::semantic_endpoints(read, source)?;
+    // Only a projected source reads its semantic endpoints' eligibility (#934, #1310).
+    let eligibility = if doc.semantic.projection.is_some() {
+        endpoints
+            .iter()
+            .map(|&endpoint| u32::try_from(endpoint))
+            .collect::<std::result::Result<_, _>>()?
+    } else {
+        Vec::new()
+    };
     merge_work(&mut catalogs.rust_execution.work, work.used, check)?;
     let mut found = SourceReferences {
         projection: doc.semantic.projection.clone(),
+        reading: None,
         edges: BTreeMap::new(),
         unresolved: Vec::new(),
         proof: BTreeSet::new(),
@@ -963,6 +977,8 @@ fn file_references<'a>(
         semantic: 0,
     };
     let mut source_packages = SourcePackageDescriptors::new();
+    // Whether a site carries semantic metadata, which a later core rebases (#1310).
+    let mut materialized = false;
     for (
         ordinal,
         PreparedSite {
@@ -1003,6 +1019,7 @@ fn file_references<'a>(
                 &mut site,
                 anchor.expect("semantic resolution has an anchor"),
             );
+            materialized = true;
         }
         *site_count += 1;
         ensure!(
@@ -1044,6 +1061,9 @@ fn file_references<'a>(
         )?;
     }
     found.packages = source_packages.keys().cloned().collect();
+    if materialized {
+        found.reading.clone_from(&doc.semantic.reading);
+    }
     Ok(CompletedFile {
         source,
         found,
@@ -1056,6 +1076,7 @@ fn file_references<'a>(
                 .into_iter()
                 .map(u32::try_from)
                 .collect::<std::result::Result<_, _>>()?,
+            eligibility,
         },
     })
 }

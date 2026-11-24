@@ -14,6 +14,9 @@ pub(crate) struct SourceFacts {
     pub(crate) work: usize,
     pub(crate) sites: usize,
     pub(crate) endpoints: Vec<u32>,
+    /// A projected source's semantic endpoint documents: those whose eligibility its Read B
+    /// reads under its producer at the current pin (#934, #1310). Empty for a current source.
+    pub(crate) eligibility: Vec<u32>,
 }
 
 /// Build-local owned state. All document borrows and request callbacks are made on the
@@ -280,11 +283,18 @@ pub(crate) fn finish_incremental(
                         "bounded_work: reference site count"
                     );
                     external_packages.complete(source, packages);
-                    sources[source] = Some(if patched.contains(&docs[source].key) {
-                        Arc::new(patch_source_targets(retained, read, &mut target_documents)?)
-                    } else {
-                        retained.clone()
-                    });
+                    let mut rewritten = patched
+                        .contains(&docs[source].key)
+                        .then(|| patch_source_targets(retained, read, &mut target_documents))
+                        .transpose()?;
+                    let semantic = &docs[source].semantic;
+                    if needs_rebase(rewritten.as_ref().unwrap_or(retained), semantic)? {
+                        rebase_source(
+                            rewritten.get_or_insert_with(|| (**retained).clone()),
+                            semantic,
+                        )?;
+                    }
+                    sources[source] = Some(rewritten.map_or_else(|| retained.clone(), Arc::new));
                     let work = catalogs.rust_execution.work.used - before;
                     facts[source] = SourceFacts {
                         work,
@@ -421,6 +431,76 @@ pub(super) fn patch_source_targets<'a>(
     Ok(found)
 }
 
+/// Whether a reused or patched source's revision-scoped semantic metadata was materialized
+/// for another reading of its document than this core's (#1310). When not, it stays shared.
+pub(super) fn needs_rebase(found: &SourceReferences, semantic: &DocumentSemantic) -> Result<bool> {
+    let reading = match (&found.reading, &semantic.reading) {
+        (None, _) => false,
+        (Some(old), Some(new)) => old != new,
+        (Some(_), None) => anyhow::bail!("incremental semantic reading without a payload"),
+    };
+    Ok(reading || found.projection != semantic.projection)
+}
+
+/// Materializes a reused or patched source's revision-scoped semantic metadata for this core's
+/// reading of its document (#1310): rejoined proofs' provenance IDs minted at this reading's
+/// native revision (Decision 0021 D2), each site's basis freshness, and the projection with
+/// this core's current pin. Everything else about the source is what Read B would read again,
+/// because its semantic fingerprint and its endpoints' are unchanged.
+pub(super) fn rebase_source(
+    found: &mut SourceReferences,
+    semantic: &DocumentSemantic,
+) -> Result<()> {
+    found.projection.clone_from(&semantic.projection);
+    if found.reading.is_none() {
+        return Ok(());
+    }
+    found.reading.clone_from(&semantic.reading);
+    let reading = semantic
+        .reading
+        .as_ref()
+        .context("incremental semantic reading without a payload")?;
+    // One rebuilt allocation per shared basis allocation, as Read B shares them (#1247).
+    let mut shared: std::collections::HashMap<
+        *const BTreeMap<String, Value>,
+        Arc<BTreeMap<String, Value>>,
+    > = std::collections::HashMap::new();
+    let projection = semantic.projection.as_ref();
+    let sampled = found
+        .edges
+        .values_mut()
+        .flat_map(|edge| edge.calls.iter_mut().chain(&mut edge.others));
+    for site in sampled.chain(found.unresolved.iter_mut().map(|(site, _)| site)) {
+        if let Some(proof) = site.semantic_metadata.derived_proof()? {
+            site.provenance_id = Some(proof.provenance_id(&reading.native));
+        }
+        let Some((basis, fields)) = site.semantic_metadata.basis_fields() else {
+            continue;
+        };
+        let key = Arc::as_ptr(fields);
+        let rebuilt = match shared.get(&key) {
+            Some(rebuilt) => rebuilt.clone(),
+            None => {
+                let freshness = reading
+                    .freshness
+                    .get(&basis)
+                    .context("incremental semantic freshness missing")?;
+                let mut rebuilt = (**fields).clone();
+                crate::architecture_inputs::set_freshness_fields(
+                    &mut rebuilt,
+                    freshness,
+                    projection,
+                )?;
+                let rebuilt = Arc::new(rebuilt);
+                shared.insert(key, rebuilt.clone());
+                rebuilt
+            }
+        };
+        site.semantic_metadata.replace_shared(rebuilt);
+    }
+    Ok(())
+}
+
 impl SourceFacts {
     pub(super) fn canonical(&self) -> Value {
         let Self {
@@ -428,8 +508,9 @@ impl SourceFacts {
             work,
             sites,
             endpoints,
+            eligibility,
         } = self;
-        json!({ "plan": plan.as_deref(), "work": work, "sites": sites, "endpoints": endpoints })
+        json!({ "plan": plan.as_deref(), "work": work, "sites": sites, "endpoints": endpoints, "eligibility": eligibility })
     }
 }
 

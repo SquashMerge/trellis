@@ -67,6 +67,7 @@ impl SourceReferences {
     fn canonical(&self, descriptors: &super::SourcePackageDescriptors) -> Value {
         let Self {
             projection,
+            reading,
             edges,
             unresolved,
             proof,
@@ -102,6 +103,7 @@ impl SourceReferences {
             .collect();
         json!({
             "projection": projection,
+            "reading": reading,
             "edges": edges,
             "unresolved": unresolved
                 .iter()
@@ -135,7 +137,8 @@ impl Site {
     /// The serialized site and the fields its JSON skips.
     fn canonical(&self) -> Value {
         // Exhaustive, so a new field fails to compile until it is compared: the JSON carries
-        // every field but `gates` and `ordinal`, which are added here.
+        // every field but `gates`, `ordinal` and the metadata's stored basis, which are added
+        // here.
         let Self {
             owner_syntax_id: _,
             role: _,
@@ -151,13 +154,14 @@ impl Site {
             target_reason: _,
             mapping: _,
             provenance_id: _,
-            semantic_metadata: _,
+            semantic_metadata,
             gates,
             ordinal,
         } = self;
         let mut value = json!(self);
         value["gates"] = json!(gates);
         value["ordinal"] = json!(ordinal);
+        value["basis"] = json!(semantic_metadata.basis_fields().map(|(basis, _)| basis));
         value
     }
 }

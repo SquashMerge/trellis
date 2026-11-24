@@ -60,6 +60,7 @@ fn bind_the_call(snapshot: &mut Snapshot, metadata: BTreeMap<String, Value>) {
             outcome: SemanticOutcome::Internal(model, go),
             basis_site: true,
             provenance_id: "binding".into(),
+            proof: crate::semantic_records::ProofIdentity::Literal("binding".into()),
             metadata: metadata.into(),
         }],
         ..DocumentSemantic::default()

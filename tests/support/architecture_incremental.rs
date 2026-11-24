@@ -60,6 +60,19 @@ pub const PLAIN_CALLER: &[(&str, &str)] = &[
     ),
 ];
 
+/// With [`PLAIN_CALLER`], a declaration in every Rust source, so a producer that covers every
+/// file can define one in each (#1310).
+pub const EVERY_FILE: &[(&str, &str)] = &[
+    (
+        "src/lib.rs",
+        "pub mod target; pub mod caller; pub mod cargo; pub mod plain;\npub fn root() {}\n",
+    ),
+    (
+        "src/plain.rs",
+        "pub fn plain() { crate::target::target(); }\n",
+    ),
+];
+
 pub struct CapturedArchitecture {
     pub temp: tempfile::TempDir,
     pub root: PathBuf,
@@ -70,6 +83,9 @@ pub struct CapturedArchitecture {
     workspace: Option<tempfile::TempDir>,
     /// A nonempty `[[rules]]` file with selected semantic evidence reads all of Read B.
     rules: bool,
+    /// The Rust import defines a declaration in every Rust source, not only the target and
+    /// its caller, so every Rust and TypeScript file carries producer evidence.
+    every_file: bool,
 }
 
 pub enum Expected<'a> {
@@ -121,6 +137,7 @@ impl CapturedArchitecture {
             rules: extra
                 .iter()
                 .any(|(path, _)| *path == trellis::rules::RULES_PATH),
+            every_file: false,
         }
     }
 
@@ -142,6 +159,7 @@ impl CapturedArchitecture {
             serial: 0,
             workspace: Some(workspace),
             rules: false,
+            every_file: false,
         }
     }
 
@@ -151,7 +169,18 @@ impl CapturedArchitecture {
 
     /// Native publication, then a Rust and a TypeScript import, each a full build.
     pub fn producers_with(extra: &[(&str, &str)]) -> Self {
-        let mut fixture = Self::new_with(extra);
+        Self::imported(Self::new_with(extra))
+    }
+
+    /// [`Self::producers_with`] over [`EVERY_FILE`], with a producer declaration in every Rust
+    /// and TypeScript source (#1310).
+    pub fn producers_everywhere() -> Self {
+        let mut fixture = Self::new_with(EVERY_FILE);
+        fixture.every_file = true;
+        Self::imported(fixture)
+    }
+
+    fn imported(mut fixture: Self) -> Self {
         fixture.package_users();
         let pin = fixture.native();
         fixture.expect(pin, Expected::Full(FullReason::NoBase));
@@ -173,13 +202,7 @@ impl CapturedArchitecture {
         self.expect(
             s,
             Expected::Incremental {
-                dirty: &[
-                    "src/main.rs",
-                    "src/caller.rs",
-                    "src/target.rs",
-                    "a.ts",
-                    "b.ts",
-                ],
+                dirty: &["src/main.rs"],
                 patched: &[],
                 native: &["src/main.rs"],
                 all_b: self.rules,
@@ -188,20 +211,24 @@ impl CapturedArchitecture {
         .1
     }
 
-    /// The head's reading native revision and the paths whose evidence carries provenance
-    /// IDs derived from it (#1308), from the admitted Read A fingerprints.
-    pub fn revision_provenance(&self) -> (String, Vec<String>) {
-        let fingerprints = self
-            .store
+    /// The head's reading native revision, from the admitted Read A fingerprints: rejoined
+    /// provenance IDs read at the head are minted from it (Decision 0021 D2).
+    pub fn native_revision(&self) -> String {
+        self.store
             .architecture_fingerprints_for_tests(None)
-            .unwrap();
-        let paths = fingerprints
-            .documents
-            .iter()
-            .filter(|(_, fingerprint)| fingerprint.revision_provenance)
-            .map(|(key, _)| key.path.clone())
-            .collect();
-        (fingerprints.native_revision, paths)
+            .unwrap()
+            .native_revision
+    }
+
+    /// The selected payloads' freshness per path, from the admitted Read A states.
+    pub fn freshness(&self) -> BTreeMap<String, BTreeMap<i64, String>> {
+        self.store
+            .architecture_fingerprints_for_tests(None)
+            .unwrap()
+            .semantic_states
+            .into_iter()
+            .filter_map(|(key, state)| Some((key.path, state.freshness?.values)))
+            .collect()
     }
 
     pub fn native(&self) -> IndexPin {
@@ -246,13 +273,12 @@ impl CapturedArchitecture {
         let start = text.find(name).unwrap();
         let line = i32::try_from(text[..start].bytes().filter(|b| *b == b'\n').count()).unwrap();
         let column = i32::try_from(start - text[..start].rfind('\n').map_or(0, |i| i + 1)).unwrap();
-        let declaration = text
-            .find(if path.ends_with(".rs") {
-                "pub fn"
-            } else {
-                "export function"
-            })
-            .unwrap();
+        let declaration = if path.ends_with(".rs") {
+            text.find("pub fn").or_else(|| text.find("fn "))
+        } else {
+            text.find("export function")
+        }
+        .unwrap();
         let end = text.rfind('}').unwrap() + 1;
         let position = |offset: usize| {
             let line = text[..offset].bytes().filter(|b| *b == b'\n').count();
@@ -275,16 +301,17 @@ impl CapturedArchitecture {
     pub fn import(&mut self, rust: bool) -> IndexPin {
         self.serial += 1;
         let mut batch = BatchFixture::from_published(&self.index_db(), &self.root);
-        let (language, docs) = if rust {
-            let text = fs::read_to_string(self.root.join("src/caller.rs")).unwrap();
-            let snapshot = self
-                .store
-                .architecture_reference_snapshot_for_tests()
-                .unwrap();
+        let snapshot = self
+            .store
+            .architecture_reference_snapshot_for_tests()
+            .unwrap();
+        // The callee and invocation of `path`'s first measured call, as SCIP ranges.
+        let first_call = |path: &str| {
+            let text = fs::read_to_string(self.root.join(path)).unwrap();
             let source = snapshot
                 .documents
                 .iter()
-                .find(|doc| doc.key.path == "src/caller.rs")
+                .find(|doc| doc.key.path == path)
                 .unwrap();
             let call = &source.calls[0];
             let callee = call.callee_range.as_ref().unwrap();
@@ -297,27 +324,62 @@ impl CapturedArchitecture {
             let [end_line, end_column] = position(callee.end);
             let [call_start_line, call_start_column] = position(call.range.start);
             let [call_line, call_column] = position(call.range.end);
+            (
+                [line, column, end_line, end_column],
+                [call_start_line, call_start_column, call_line, call_column],
+            )
+        };
+        let (languages, docs): (&[&str], _) = if rust {
+            let (callee, call) = first_call("src/caller.rs");
             let caller = self.definition("src/caller.rs", "caller").occurrence(
-                &[line, column, end_line, end_column],
-                &[call_start_line, call_start_column, call_line, call_column],
+                &callee,
+                &call,
                 "scip fixture architecture 1 target().",
                 0,
             );
-            (
-                "rust",
-                vec![self.definition("src/target.rs", "target"), caller],
-            )
+            let mut docs = vec![self.definition("src/target.rs", "target"), caller];
+            if self.every_file {
+                for (path, name) in [
+                    ("src/main.rs", "main"),
+                    ("src/lib.rs", "root"),
+                    ("src/cargo.rs", "cargo"),
+                    ("src/plain.rs", "plain"),
+                ] {
+                    docs.push(self.definition(path, name));
+                }
+            }
+            (&["rust"], docs)
         } else {
             batch = batch.reference("scip-typescript");
-            (
-                "typescript",
-                vec![
-                    self.definition("a.ts", "alpha"),
-                    self.definition("b.ts", "beta"),
-                ],
-            )
+            let mut docs = vec![
+                self.definition("a.ts", "alpha"),
+                self.definition("b.ts", "beta"),
+            ];
+            if !self.every_file {
+                (&["typescript"], docs)
+            } else {
+                // Each package user calls the external `shared` default export.
+                for path in ["npm.js"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .chain((0..7).map(|i| format!("npm{i}.js")))
+                {
+                    let (callee, call) = first_call(&path);
+                    docs.push(DocSpec::new(&path).occurrence(
+                        &callee,
+                        &call,
+                        "scip-typescript npm shared 1.0.0 `index.js`/default.",
+                        0,
+                    ));
+                }
+                (&["javascript", "typescript"], docs)
+            }
         };
-        let ordinal = batch.artifact(language, docs.clone());
+        let language = match languages {
+            [language] => *language,
+            _ => "",
+        };
+        let ordinal = batch.artifact_languages(languages, docs.clone());
         let input = self.temp.path().join(format!("input-{}.scip", self.serial));
         let output = self
             .temp

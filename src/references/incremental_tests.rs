@@ -95,6 +95,7 @@ fn anchor(snapshot: &Snapshot, outcome: SemanticOutcome) -> SemanticAnchor {
         outcome,
         basis_site: true,
         provenance_id: "proof".into(),
+        proof: crate::semantic_records::ProofIdentity::Literal("proof".into()),
         metadata: SemanticMetadata::default(),
     }
 }
@@ -478,6 +479,7 @@ fn complete_semantic_endpoints_precede_sampling_skips_and_boundary_elimination()
         source_syntax_id: "source".into(),
         target: Some((a, "target".into())),
         provenance_id: "relationship".into(),
+        proof: crate::semantic_records::ProofIdentity::Literal("relationship".into()),
         metadata: SemanticMetadata::default(),
     }];
     let base = resolve_all(&snapshot, &mut || Ok(())).unwrap();

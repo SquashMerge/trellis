@@ -1727,12 +1727,21 @@ impl EvidenceResponse {
         let defaults = semantic_display::default_producers(&self.db, &key)?;
         let (producers, selections) =
             native_first::architecture_inventory_fingerprints(&self.db, &key)?;
-        // The same row Read B's payload projection derives rejoined provenance IDs from.
+        // The same row Read B's payload projection mints rejoined provenance IDs from.
         let native_revision: String = self.db.query_row(
             "SELECT native_revision_id FROM native_revisions WHERE id=?1",
             [&key],
             |row| row.get(0),
         )?;
+        // Every producer that projects at this pin: a projected source reads its endpoints'
+        // eligibility under its own producer, whatever theirs is (#934, #1310).
+        let projecting: Vec<String> = self
+            .db
+            .prepare_cached(
+                "SELECT producer_id FROM semantic_projection_origins WHERE revision_id=?1 ORDER BY producer_id",
+            )?
+            .query_map([&key], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
         let mut documents = BTreeMap::new();
         let mut semantic_states = BTreeMap::new();
         for document in &mut snapshot.documents {
@@ -1743,13 +1752,12 @@ impl EvidenceResponse {
                 params![key, document.key.language, document.key.path],
                 |row| Ok(NativeFingerprint { version_id: row.get(0)?, coverage_requested: row.get(1)?, coverage_selected: row.get(2)?, coverage_state: row.get(3)?, coverage_diagnostic: row.get(4)? }),
             )?;
-            let (semantic, state, revision_provenance) =
-                semantic_display::architecture_document_fingerprint(
-                    &self.db,
-                    snapshot.pin,
-                    &defaults,
-                    &document.key,
-                )?;
+            let (semantic, state) = semantic_display::architecture_document_fingerprint(
+                &self.db,
+                snapshot.pin,
+                &defaults,
+                &document.key,
+            )?;
             let pending = state
                 .projection
                 .as_ref()
@@ -1757,6 +1765,8 @@ impl EvidenceResponse {
             document.semantic.producer_id = state.default_producer.clone();
             document.semantic.projection = state.projection.clone();
             document.semantic.boundary = pending;
+            document.semantic.reading =
+                crate::architecture_inputs::SemanticReading::of(&state, &native_revision);
             if !pending {
                 document.semantic.coverage_state =
                     state.tuple.as_ref().map(|tuple| tuple.state.clone());
@@ -1772,7 +1782,24 @@ impl EvidenceResponse {
                     native,
                     semantic,
                     projected: state.projection.is_some(),
-                    revision_provenance,
+                    producer_projections: projecting
+                        .iter()
+                        .map(|producer| {
+                            Ok((
+                                producer.clone(),
+                                crate::architecture_core::dependencies::producer_projection_digest(
+                                    native_first::semantic_projection_for(
+                                        &self.db,
+                                        snapshot.pin,
+                                        producer,
+                                        &document.key.language,
+                                        &document.key.path,
+                                    )?
+                                    .as_ref(),
+                                ),
+                            ))
+                        })
+                        .collect::<Result<_>>()?,
                     sids: crate::architecture_core::dependencies::sid_digest(
                         document
                             .declarations

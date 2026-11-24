@@ -512,6 +512,38 @@ pub fn language_order(language: &str) -> Option<usize> {
     LANGUAGE_ORDER.iter().position(|name| *name == language)
 }
 
+/// The stable identity of a provenance row (#1310, owner ruling 2026-11-24): a rejoined row's
+/// raw proof and evidence kind, else its literal ID. Unlike a rejoined row's provenance ID, which
+/// also hashes the reading native revision (Decision 0021 D2), it does not change with the
+/// revision, so readers order tied rows by it: a call's representative proof and anchors at the
+/// same range. Within one payload it is unique, as the provenance ID is.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ProofIdentity {
+    Literal(String),
+    Derived { raw: String, kind: EvidenceKind },
+}
+
+impl ProofIdentity {
+    /// The identity of `proof`: its raw proof when it derives from one, else its ID.
+    pub fn of(proof: &Provenance) -> Self {
+        match &proof.derived_from {
+            Some(raw) => Self::Derived {
+                raw: raw.provenance_id.clone(),
+                kind: proof.evidence_kind,
+            },
+            None => Self::Literal(proof.id.clone()),
+        }
+    }
+
+    /// The provenance ID a read whose native revision is `native` gives this row.
+    pub fn provenance_id(&self, native: &str) -> String {
+        match self {
+            Self::Literal(id) => id.clone(),
+            Self::Derived { raw, kind } => rejoin_provenance_id(raw, native, *kind),
+        }
+    }
+}
+
 /// The provenance ID of a rejoined fact: a digest of the raw proof, the destination revision
 /// and the evidence kind, so it needs no lookup table.
 pub(crate) fn rejoin_provenance_id(raw_id: &str, revision_id: &str, kind: EvidenceKind) -> String {

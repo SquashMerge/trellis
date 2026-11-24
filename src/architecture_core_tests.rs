@@ -751,47 +751,6 @@ fn architecture_incremental_changed_sets_and_ordered_gates() {
         std::collections::BTreeSet::from([script.clone()]),
         "non-Rust semantic-only changes stay incremental"
     );
-    fingerprints = input.fingerprints.clone();
-    fingerprints.documents.get_mut(&script).unwrap().projected = true;
-    let changed = dependencies::changed_documents(&input.snapshot, &fingerprints, Some(&old))
-        .unwrap()
-        .unwrap();
-    assert!(
-        changed.dirty.contains(&script),
-        "every current projection is dirty"
-    );
-
-    // #1308: revision-derived provenance is semantic Dirty exactly when the reading native
-    // revision differs from the base's; literal provenance and an equal revision reuse.
-    let unchanged =
-        dependencies::changed_documents(&input.snapshot, &input.fingerprints, Some(&old))
-            .unwrap()
-            .unwrap();
-    fingerprints = input.fingerprints.clone();
-    fingerprints
-        .documents
-        .get_mut(&script)
-        .unwrap()
-        .revision_provenance = true;
-    let changed = dependencies::changed_documents(&input.snapshot, &fingerprints, Some(&old))
-        .unwrap()
-        .unwrap();
-    assert_eq!(changed.dirty, unchanged.dirty, "same native revision");
-    let mut moved = old.clone();
-    moved.native_revision.push('2');
-    let changed = dependencies::changed_documents(&input.snapshot, &fingerprints, Some(&moved))
-        .unwrap()
-        .unwrap();
-    let mut expected = unchanged.dirty.clone();
-    expected.insert(script.clone());
-    assert_eq!(changed.dirty, expected, "revision-derived provenance");
-    assert!(changed.native.is_empty() && !changed.patched.contains(&script));
-    let changed =
-        dependencies::changed_documents(&input.snapshot, &input.fingerprints, Some(&moved))
-            .unwrap()
-            .unwrap();
-    assert_eq!(changed.dirty, unchanged.dirty, "literal or no provenance");
-
     let util = rust
         .iter()
         .find(|key| key.path.ends_with("util.rs"))
@@ -800,6 +759,110 @@ fn architecture_incremental_changed_sets_and_ordered_gates() {
         .iter()
         .find(|key| key.path.ends_with("main.rs"))
         .unwrap();
+    // #1310: a projection's current pin is rebased per core, so being projected is not
+    // Dirty.
+    fingerprints = input.fingerprints.clone();
+    fingerprints.documents.get_mut(&script).unwrap().projected = true;
+    let changed = dependencies::changed_documents(&input.snapshot, &fingerprints, Some(&old))
+        .unwrap()
+        .unwrap();
+    assert!(changed.dirty.is_empty(), "a projection alone is not Dirty");
+    // A projected source of producer `p` reads its endpoints' projections under `p` (#934),
+    // whatever their default producer: only a change there makes it Dirty (Prime2, #1312).
+    let projection = |state: u8| {
+        let mut digest = [0; 32];
+        digest[0] = state;
+        digest
+    };
+    let mut base = old.clone();
+    for document in &mut base.documents {
+        let document = Arc::make_mut(document);
+        Arc::make_mut(&mut document.fingerprint).producer_projections =
+            std::collections::BTreeMap::from([
+                ("p".into(), projection(1)),
+                ("q".into(), projection(1)),
+            ]);
+    }
+    // The projected source retains the endpoint whose eligibility its Read B read.
+    let position = |key: &crate::native_records::DocumentKey| {
+        base.order
+            .iter()
+            .position(|candidate| candidate == key)
+            .unwrap()
+    };
+    let (main_at, util_at) = (position(main), position(util));
+    Arc::make_mut(&mut Arc::make_mut(&mut base.documents[main_at]).references).eligibility =
+        Arc::from([u32::try_from(util_at).unwrap()]);
+    let mut projected = input.fingerprints.clone();
+    for document in projected.documents.values_mut() {
+        document.producer_projections = std::collections::BTreeMap::from([
+            ("p".into(), projection(1)),
+            ("q".into(), projection(1)),
+        ]);
+    }
+    projected.documents.get_mut(main).unwrap().projected = true;
+    projected
+        .semantic_states
+        .get_mut(main)
+        .unwrap()
+        .default_producer = Some("p".into());
+    let dirty = |fingerprints: &crate::architecture_inputs::ArchitectureFingerprints| {
+        dependencies::changed_documents(&input.snapshot, fingerprints, Some(&base))
+            .unwrap()
+            .unwrap()
+            .dirty
+    };
+    assert!(dirty(&projected).is_empty(), "nothing changed");
+    fingerprints = projected.clone();
+    fingerprints.documents.get_mut(util).unwrap().semantic[0] ^= 1;
+    assert_eq!(
+        dirty(&fingerprints),
+        std::collections::BTreeSet::from([util.clone()]),
+        "an endpoint's default state is not what a projected source reads"
+    );
+    fingerprints = projected.clone();
+    *fingerprints
+        .documents
+        .get_mut(util)
+        .unwrap()
+        .producer_projections
+        .get_mut("q")
+        .unwrap() = projection(2);
+    assert!(
+        dirty(&fingerprints).is_empty(),
+        "another producer's projection"
+    );
+    fingerprints = projected.clone();
+    *fingerprints
+        .documents
+        .get_mut(util)
+        .unwrap()
+        .producer_projections
+        .get_mut("p")
+        .unwrap() = projection(2);
+    assert_eq!(
+        dirty(&fingerprints),
+        std::collections::BTreeSet::from([main.clone()]),
+        "a projected source follows its endpoints' projections under its own producer"
+    );
+    fingerprints.documents.get_mut(main).unwrap().projected = false;
+    assert!(
+        dirty(&fingerprints).is_empty(),
+        "a current source does not read its endpoints' eligibility"
+    );
+    fingerprints.documents.get_mut(main).unwrap().projected = true;
+    fingerprints
+        .documents
+        .get_mut(util)
+        .unwrap()
+        .producer_projections
+        .remove("p");
+    assert_eq!(
+        dirty(&fingerprints),
+        std::collections::BTreeSet::from([main.clone()]),
+        "a projection that appears or disappears is a change"
+    );
+
     fingerprints = input.fingerprints.clone();
     fingerprints
         .documents
@@ -1050,6 +1113,7 @@ fn semantic_input(store: &Store, direct: bool) -> ArchitectureInput {
                 outcome: SemanticOutcome::Internal(target, sid.clone()),
                 basis_site: true,
                 provenance_id: "semantic-proof".into(),
+                proof: crate::semantic_records::ProofIdentity::Literal("semantic-proof".into()),
                 metadata: Default::default(),
             }];
         }

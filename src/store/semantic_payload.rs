@@ -442,7 +442,7 @@ pub(crate) struct PayloadProjection<'a> {
     pub(in crate::store) source_set: String,
     pub(crate) payload_id: Option<i64>,
     freshness: BTreeMap<i64, sem::Freshness>,
-    ids: RefCell<BTreeMap<i64, String>>,
+    ids: RefCell<BTreeMap<i64, (String, sem::ProofIdentity)>>,
     /// Whether each target document of a capture-bound call is unchanged since the capture at
     /// the reading revision: one lookup per document per read.
     unchanged: RefCell<BTreeMap<(String, String), bool>>,
@@ -582,8 +582,14 @@ impl PayloadProjection<'_> {
 
     /// The reading revision's provenance ID for the row at `ordinal`.
     pub(in crate::store) fn provenance_id(&self, ordinal: i64) -> Result<String> {
-        if let Some(id) = self.ids.borrow().get(&ordinal) {
-            return Ok(id.clone());
+        Ok(self.proof(ordinal)?.0)
+    }
+
+    /// The reading revision's provenance ID for the row at `ordinal`, and the stable identity
+    /// it is minted from (#1310).
+    pub(in crate::store) fn proof(&self, ordinal: i64) -> Result<(String, sem::ProofIdentity)> {
+        if let Some(proof) = self.ids.borrow().get(&ordinal) {
+            return Ok(proof.clone());
         }
         let payload = self.payload_id.context(SelectedIntegrity(
             "incompatible_index: payload-less tuple names provenance".into(),
@@ -600,13 +606,12 @@ impl PayloadProjection<'_> {
         let (literal, derived, kind) = row.context(SelectedIntegrity(
             "incompatible_index: semantic fact without provenance".into(),
         ))?;
-        let id = match (literal, derived) {
-            (Some(id), None) => id,
-            (None, Some(raw)) => crate::semantic_records::rejoin_provenance_id(
-                &raw,
-                &self.native,
-                semantic_enum(kind)?,
-            ),
+        let identity = match (literal, derived) {
+            (Some(id), None) => sem::ProofIdentity::Literal(id),
+            (None, Some(raw)) => sem::ProofIdentity::Derived {
+                raw,
+                kind: semantic_enum(kind)?,
+            },
             _ => {
                 return Err(SelectedIntegrity(
                     "incompatible_index: corrupt semantic provenance ID".into(),
@@ -614,8 +619,17 @@ impl PayloadProjection<'_> {
                 .into());
             }
         };
-        self.ids.borrow_mut().insert(ordinal, id.clone());
-        Ok(id)
+        let proof = (identity.provenance_id(&self.native), identity);
+        self.ids.borrow_mut().insert(ordinal, proof.clone());
+        Ok(proof)
+    }
+
+    /// The reading revision's freshness of every basis of the payload, as stored (#1310).
+    pub(in crate::store) fn freshness_values(&self) -> Result<BTreeMap<i64, String>> {
+        self.freshness
+            .iter()
+            .map(|(basis, freshness)| Ok((*basis, semantic_variant(freshness)?)))
+            .collect()
     }
 
     /// The reading revision's freshness for one basis of the payload.

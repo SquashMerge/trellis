@@ -264,20 +264,21 @@ fn select_binding<'a>(
 
 /// Orders the rows of one call; the least represents it. A row that asserts the call's target
 /// comes before an unresolved one, which asserts none and so contradicts nothing. Equal rows
-/// follow their raw producer fact's digest, which depends only on the imported evidence: a
-/// minted provenance ID also hashes the native revision, so it changes with the build. The ID
-/// only separates rows the digest cannot. `store::semantic_display` orders its rows the same way.
+/// follow their raw producer fact's digest, then their stable proof identity: a rejoined row's
+/// raw proof and evidence kind, else its literal ID (#1310). Both depend only on the imported
+/// evidence; a minted provenance ID also hashes the native revision, so it changes with the
+/// build. `store::semantic_display` orders its rows the same way.
 fn representative_key(
     resolution: Resolution,
     proof: &sem::Provenance,
-) -> (bool, Option<&str>, &str) {
+) -> (bool, Option<&str>, sem::ProofIdentity) {
     (
         resolution == Resolution::Unresolved,
         proof
             .derived_from
             .as_ref()
             .map(|raw| raw.fact_digest.as_str()),
-        proof.id.as_str(),
+        sem::ProofIdentity::of(proof),
     )
 }
 

@@ -1558,8 +1558,10 @@ replaces it. Each site and rule evidence row such a binding supports carries
 `freshness:"possiblyStale"`, and the language's semantic tier keeps reporting its
 worst freshness and counts. A call with several binding rows is represented by the row the call
 graph selects (#1102): a row that names a target before an unresolved one, then the lowest raw
-fact digest, then the lowest provenance ID; when that one is unusable the call has no
-binding. Any internal target must be a declaration of this snapshot (semantic references
+fact digest, then the lowest stable proof identity (the raw `derivedFrom` ID and evidence kind,
+else the literal provenance ID; #1310); when that one is unusable the call has no binding.
+Bindings at the same range are ordered by the same proof identity, never by a provenance ID
+derived from the reading revision. Any internal target must be a declaration of this snapshot (semantic references
 carry no separate current-target flag); its module is the declaration's file.
 
 - A structural site takes in every binding inside its range, and a call joined on a

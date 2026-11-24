@@ -17,7 +17,8 @@ pub struct ArchitectureFingerprints {
     pub producers: [u8; 32],
     pub selections: [u8; 32],
     /// The reading revision's native revision ID. Rejoined provenance IDs read at this pin
-    /// are derived from it (Decision 0021 D2), so it is compared with the base's (#1308).
+    /// are derived from it (Decision 0021 D2); each core mints its reused sources' IDs from
+    /// it again (#1310).
     pub native_revision: String,
 }
 
@@ -49,11 +50,14 @@ pub struct DocumentFingerprint {
     pub native: NativeFingerprint,
     pub semantic: [u8; 32],
     pub sids: [u8; 32],
+    /// A historical projection (#620) under the default producer. Its evidence is read at
+    /// its semantic basis, and its endpoints' eligibility at the current pin.
     pub projected: bool,
-    /// The document's evidence, read at this build's own pin, has provenance whose ID is
-    /// derived from the reading native revision (imported or rejoined, not literal). Such a
-    /// source is semantic Dirty whenever the native revision differs from the base's (#1308).
-    pub revision_provenance: bool,
+    /// The document's projection state under every producer that projects at this pin, by
+    /// producer: a projected source of that producer reads its endpoints' eligibility from it,
+    /// so the source is Dirty when it changes for a retained endpoint (#1310). Empty at a pin
+    /// without projections.
+    pub producer_projections: BTreeMap<String, [u8; 32]>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
@@ -108,6 +112,45 @@ pub struct DocumentSemantic {
     /// Dependency-only checkout endpoints, before representative selection, eligibility
     /// suppression or reference sampling. Indices address the complete snapshot.
     pub endpoint_documents: BTreeSet<usize>,
+    /// What the revision-scoped metadata of this document's selected payload is read at:
+    /// Read B's for a document it read, else Read A's for the same pin (#1310). `None`
+    /// without a selected complete or partial payload.
+    pub reading: Option<SemanticReading>,
+}
+
+/// The revision-scoped inputs of a payload's metadata (#1310). A reused source's output was
+/// materialized for one reading; a later core rebases it to its own.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SemanticReading {
+    /// The native revision rejoined provenance IDs are minted at (Decision 0021 D2): the
+    /// reading pin's, or a projection's semantic basis's.
+    pub native: String,
+    /// Each stored basis's freshness at the pin the payload is read at.
+    pub freshness: BTreeMap<i64, String>,
+}
+
+impl SemanticReading {
+    /// The reading Read B uses for a document in `state` at a pin whose native revision is
+    /// `native`: only a selected complete or partial payload, not pending, is read.
+    pub(crate) fn of(state: &SemanticInputState, native: &str) -> Option<Self> {
+        let projection = state.projection.as_ref();
+        if projection.is_some_and(|projection| projection.semantic_status.is_pending()) {
+            return None;
+        }
+        let tuple = state.tuple.as_ref()?;
+        if !(tuple.selected
+            && matches!(tuple.state.as_str(), "complete" | "partial")
+            && tuple.payload_id.is_some())
+        {
+            return None;
+        }
+        Some(Self {
+            native: projection
+                .map_or(native, |projection| &projection.basis_native_revision_id)
+                .to_owned(),
+            freshness: state.freshness.as_ref()?.values.clone(),
+        })
+    }
 }
 
 /// One bound name or call in a document.
@@ -126,7 +169,11 @@ pub struct SemanticAnchor {
     /// binding a site of its own needs at that basis. A projected binding keeps it when its
     /// endpoint is now catching up (#934).
     pub basis_site: bool,
+    /// The provenance ID at the reading native revision (Decision 0021 D2).
     pub provenance_id: String,
+    /// The stable identity that orders tied anchors and representative proofs (#1310), and
+    /// from which a later core mints `provenance_id` again at its own native revision.
+    pub proof: crate::semantic_records::ProofIdentity,
     pub metadata: SemanticMetadata,
 }
 
@@ -145,6 +192,37 @@ pub struct SemanticMetadata {
     shared: Option<Arc<BTreeMap<String, Value>>>,
 }
 
+/// Sets the shared fields that the basis's freshness at the reading pin and the document's
+/// projection determine, as Read B builds them (#936, #1247). A later core rebuilds them the
+/// same way from its own Read A state (#1310).
+pub(crate) fn set_freshness_fields(
+    fields: &mut BTreeMap<String, Value>,
+    historical: &str,
+    projection: Option<&crate::model::SemanticProjection>,
+) -> anyhow::Result<()> {
+    fields.insert(
+        "freshness".into(),
+        Value::String(if projection.is_some() && historical != "stale" {
+            "possiblyStale".into()
+        } else {
+            historical.into()
+        }),
+    );
+    fields.insert(
+        "historicalFreshness".into(),
+        Value::String(historical.into()),
+    );
+    match projection {
+        Some(projection) => {
+            fields.insert("projection".into(), serde_json::to_value(projection)?);
+        }
+        None => {
+            fields.remove("projection");
+        }
+    }
+    Ok(())
+}
+
 /// The fields of one row's own proof: `derivedFrom` and `evidenceKind`.
 #[derive(Debug)]
 pub struct RowProvenance {
@@ -152,6 +230,9 @@ pub struct RowProvenance {
     pub evidence_kind: Arc<str>,
     /// The raw proof the row derives from; JSON `null` without one.
     pub derived_from: Option<crate::semantic_records::DerivedFrom>,
+    /// The stored basis whose freshness the shared fields carry, so a later core can rebuild
+    /// them from its own freshness and projection (#1310). Never serialized.
+    pub basis: i64,
 }
 
 /// The keys of a [`RowProvenance`], in key order.
@@ -183,7 +264,7 @@ impl SemanticMetadata {
         metadata
     }
 
-    /// A row's typed proof fields over the fields it shares, which must not name them.
+    /// A row's typed proof fields over the fields its basis shares, which must not name them.
     pub fn with_row(row: Arc<RowProvenance>, shared: Arc<BTreeMap<String, Value>>) -> Self {
         debug_assert!(ROW_KEYS.iter().all(|key| !shared.contains_key(*key)));
         Self {
@@ -191,6 +272,36 @@ impl SemanticMetadata {
             own: BTreeMap::new(),
             shared: Some(shared),
         }
+    }
+
+    /// The stored basis of a row built by [`Self::with_row`], and the fields it shares.
+    pub(crate) fn basis_fields(&self) -> Option<(i64, &Arc<BTreeMap<String, Value>>)> {
+        Some((self.row.as_ref()?.basis, self.shared.as_ref()?))
+    }
+
+    /// The stable identity of a rejoined row's proof, from which a core mints its provenance
+    /// ID (#1310); `None` for a row with a literal provenance ID.
+    pub(crate) fn derived_proof(
+        &self,
+    ) -> anyhow::Result<Option<crate::semantic_records::ProofIdentity>> {
+        let Some(row) = &self.row else {
+            return Ok(None);
+        };
+        let Some(raw) = &row.derived_from else {
+            return Ok(None);
+        };
+        Ok(Some(crate::semantic_records::ProofIdentity::Derived {
+            raw: raw.provenance_id.clone(),
+            kind: serde_json::from_value(Value::String(row.evidence_kind.as_ref().to_owned()))?,
+        }))
+    }
+
+    /// Replaces the shared fields, keeping this row's own and proof fields. The new fields
+    /// must name what the old ones did, so no own field starts or stops overriding one.
+    pub(crate) fn replace_shared(&mut self, shared: Arc<BTreeMap<String, Value>>) {
+        debug_assert!(ROW_KEYS.iter().all(|key| !shared.contains_key(*key)));
+        debug_assert!(self.own.keys().all(|key| !shared.contains_key(key)));
+        self.shared = Some(shared);
     }
 
     pub fn get(&self, key: &str) -> Option<std::borrow::Cow<'_, Value>> {
@@ -322,6 +433,7 @@ pub struct SemanticRelationship {
     /// The internal target, or `None` for an external one.
     pub target: Option<(usize, String)>,
     pub provenance_id: String,
+    pub proof: crate::semantic_records::ProofIdentity,
     pub metadata: SemanticMetadata,
 }
 
@@ -480,6 +592,7 @@ mod tests {
             let provenance = Arc::new(RowProvenance {
                 evidence_kind: Arc::from("semanticReference"),
                 derived_from,
+                basis: 1,
             });
             let mut flat = (*shared).clone();
             flat.extend(row_fields(&provenance));
