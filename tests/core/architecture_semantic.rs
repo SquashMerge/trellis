@@ -432,12 +432,8 @@ fn architecture_incremental_target_patch() {
         "a rejoined provenance ID follows the reading revision: {caller_site}"
     );
     for (key, parts) in after.sharing(&before) {
-        if key.path == "src/plain.rs" {
-            assert!(
-                !parts.source && parts.metric && parts.fingerprint && parts.plan,
-                "{key:?}: {parts:?}"
-            );
-        } else if key.path == "src/caller.rs" {
+        // Both callers are patched: recomputed display output, shared everything else.
+        if key.path == "src/plain.rs" || key.path == "src/caller.rs" {
             assert!(
                 !parts.source && parts.metric && parts.fingerprint && parts.plan,
                 "{key:?}: {parts:?}"
