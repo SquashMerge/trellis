@@ -41,7 +41,20 @@ fn scaled_limit(
         .min(ceiling)
 }
 pub(crate) fn reference_limit(documents: usize, bytes: usize) -> usize {
-    scaled_limit(documents, bytes, 20_000, 512, REFERENCE_CEILING)
+    let limit = scaled_limit(documents, bytes, 20_000, 512, REFERENCE_CEILING);
+    #[cfg(feature = "test-support")]
+    let limit = limit.min(TEST_REFERENCE_LIMIT.load(std::sync::atomic::Ordering::Acquire));
+    limit
+}
+
+#[cfg(feature = "test-support")]
+static TEST_REFERENCE_LIMIT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(REFERENCE_CEILING);
+
+/// Lower the reference budget for small boundary fixtures; the production limit is unchanged.
+#[cfg(feature = "test-support")]
+pub fn set_reference_work_limit_for_tests(limit: usize) {
+    TEST_REFERENCE_LIMIT.store(limit, std::sync::atomic::Ordering::Release);
 }
 pub(crate) fn rules_limit(documents: usize, bytes: usize) -> usize {
     scaled_limit(documents, bytes, 10_000, 256, RULES_CEILING)

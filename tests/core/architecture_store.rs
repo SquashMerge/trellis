@@ -125,6 +125,75 @@ fn publish_current(store: &Store, root: &std::path::Path) {
 }
 
 #[test]
+fn architecture_incremental_scoped_fallback() {
+    use trellis::references::{self, MAX_SAMPLE_LIMIT};
+    let (_state, root, store, pin) = fixture();
+    let base = store.architecture_build_for_tests(None, None).unwrap();
+    let canonical = base.core.canonical().unwrap();
+    let work = canonical["references"]["workUsed"].as_u64().unwrap() as usize;
+    let args = json!({"expectedBasis":pin,"paths":["src/high.rs"],"sampleLimit":MAX_SAMPLE_LIMIT});
+    let before = read(&store, "references", args.clone());
+    let snapshot = store.architecture_reference_snapshot_for_tests().unwrap();
+    let all = references::resolve_all(&snapshot, &mut || Ok(())).unwrap();
+    let selected = all
+        .select(&["src/high.rs".into()], MAX_SAMPLE_LIMIT, &mut || Ok(()))
+        .unwrap();
+    let scoped = references::project(
+        &snapshot,
+        &["src/high.rs".into()],
+        MAX_SAMPLE_LIMIT,
+        &mut || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(selected.data, scoped.data);
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            references::set_reference_work_limit_for_tests(usize::MAX);
+        }
+    }
+    let _reset = Reset;
+    references::set_reference_work_limit_for_tests(work - 1);
+    let error = references::resolve_all(&snapshot, &mut || Ok(()))
+        .err()
+        .unwrap();
+    assert!(error.to_string().starts_with("bounded_work:"), "{error}");
+    assert_eq!(
+        references::project(
+            &snapshot,
+            &["src/high.rs".into()],
+            MAX_SAMPLE_LIMIT,
+            &mut || Ok(())
+        )
+        .unwrap()
+        .data,
+        selected.data,
+        "scoped Work remains scoped after the all-source bound fails"
+    );
+    fs::write(
+        root.path().join("src/high.rs"),
+        "this live edit was not captured",
+    )
+    .unwrap();
+    assert_eq!(
+        store
+            .architecture_scoped_response_for_tests("references", &args)
+            .unwrap(),
+        before,
+        "fallback uses captured inputs, not the live checkout"
+    );
+    let response = store.evidence_response().unwrap();
+    let bounded = response
+        .architecture_response("references", &json!({"expectedBasis":pin}), &mut || Ok(()))
+        .err()
+        .unwrap();
+    assert!(
+        bounded.to_string().starts_with("bounded_work:"),
+        "{bounded}"
+    );
+}
+
+#[test]
 fn architecture_incremental_version_identity() {
     let (state, root, store, pin) = fixture();
     let baseline = store
