@@ -75,6 +75,508 @@ fn bindings() -> Vec<Bind> {
     ]
 }
 
+#[test]
+fn architecture_incremental_projection() {
+    use crate::architecture_incremental_support::CapturedArchitecture;
+    use trellis::http::{ArchitectureBuildPath, FullReason};
+
+    let mut fixture = CapturedArchitecture::new();
+    let native = fixture.native();
+    let (attempt, _) = fixture.build(native);
+    assert_eq!(
+        attempt.path,
+        ArchitectureBuildPath::Full(FullReason::NoBase)
+    );
+    let imported = fixture.import(false);
+    let (attempt, _) = fixture.build(imported);
+    assert_eq!(
+        attempt.path,
+        ArchitectureBuildPath::Full(FullReason::ProducerSetChanged)
+    );
+    fs::write(
+        fixture.root.join("src/main.rs"),
+        "fn main() { let _value = 2; }\n",
+    )
+    .unwrap();
+    let n = fixture.native();
+    let (attempt, before) = fixture.build(n);
+    let paths = |keys: &[trellis::native_records::DocumentKey]| {
+        keys.iter().map(|key| key.path.clone()).collect::<Vec<_>>()
+    };
+    match &attempt.path {
+        ArchitectureBuildPath::Incremental { dirty, patched, .. } => {
+            assert_eq!(paths(dirty), ["npm.js", "src/main.rs", "a.ts", "b.ts"]);
+            assert!(patched.is_empty());
+            assert_eq!(paths(&attempt.references.file_references), paths(dirty));
+            assert_eq!(paths(&attempt.semantic_sources), paths(dirty));
+            assert_eq!(paths(&attempt.measured_sources), ["src/main.rs"]);
+        }
+        path => panic!("expected native projection incremental, got {path:?}"),
+    }
+    let s = fixture.catch_up();
+    assert_eq!(s.index_revision, n.index_revision + 1);
+    let (attempt, after) = fixture.build(s);
+    match &attempt.path {
+        ArchitectureBuildPath::Incremental { dirty, patched, .. } => {
+            assert_eq!(paths(dirty), ["npm.js", "a.ts", "b.ts"]);
+            assert!(patched.is_empty());
+            assert_eq!(paths(&attempt.references.file_references), paths(dirty));
+            assert_eq!(paths(&attempt.semantic_sources), paths(dirty));
+            assert!(attempt.measured_sources.is_empty());
+        }
+        path => panic!("expected semantic catch-up incremental, got {path:?}"),
+    }
+    let sharing = after.sharing(&before);
+    let npm = sharing
+        .iter()
+        .find(|(key, _)| key.path == "npm.js")
+        .unwrap();
+    assert!(
+        !npm.1.source,
+        "even a notRequested tuple is projected and must be recomputed: {npm:?}"
+    );
+}
+
+#[test]
+fn architecture_incremental_import_and_catchup() {
+    use crate::architecture_incremental_support::{CapturedArchitecture, Expected};
+    use trellis::http::FullReason;
+
+    let mut fixture = CapturedArchitecture::new();
+    fixture.package_users();
+    let pin = fixture.native();
+    fixture.expect(pin, Expected::Full(FullReason::NoBase));
+    let pin = fixture.import(true);
+    fixture.expect(pin, Expected::Full(FullReason::ProducerSetChanged));
+    let pin = fixture.import(false);
+    let (_, before) = fixture.expect(pin, Expected::Full(FullReason::ProducerSetChanged));
+    let old = before.canonical().unwrap();
+    let selection = fixture
+        .store
+        .architecture_fingerprints_for_tests(None)
+        .unwrap()
+        .selections;
+    fs::write(
+        fixture.root.join("src/main.rs"),
+        "fn main() { let _value = 2; }\n",
+    )
+    .unwrap();
+    let n = fixture.native();
+    let s = fixture.catch_up();
+    assert_eq!(s.index_revision, n.index_revision + 1);
+    assert_eq!(
+        fixture
+            .store
+            .architecture_fingerprints_for_tests(None)
+            .unwrap()
+            .selections,
+        selection
+    );
+    let (_, after) = fixture.expect(
+        s,
+        Expected::Incremental {
+            dirty: &[
+                "src/main.rs",
+                "src/caller.rs",
+                "src/target.rs",
+                "a.ts",
+                "b.ts",
+            ],
+            patched: &[],
+            native: &["src/main.rs"],
+            all_b: false,
+        },
+    );
+    for (key, sharing) in after.sharing(&before) {
+        if key.path == "src/cargo.rs" || key.language == "javascript" {
+            assert!(
+                sharing.source && sharing.metric && sharing.fingerprint && sharing.plan,
+                "{key:?}: {sharing:?}"
+            );
+        }
+    }
+    assert_eq!(
+        before.canonical().unwrap(),
+        old,
+        "older descriptor table is immutable"
+    );
+    assert_ne!(fixture.packages(&before), fixture.packages(&after));
+    let pin = fixture.import(false);
+    fixture.expect(pin, Expected::Full(FullReason::RawSelectionsChanged));
+}
+
+#[test]
+fn architecture_incremental_target_patch() {
+    use crate::architecture_incremental_support::{CapturedArchitecture, Expected};
+    let fixture = CapturedArchitecture::producers();
+    let snapshot = fixture
+        .store
+        .architecture_reference_snapshot_for_tests()
+        .unwrap();
+    let caller = snapshot
+        .documents
+        .iter()
+        .find(|doc| doc.key.path == "src/caller.rs")
+        .unwrap();
+    assert!(
+        caller.semantic.anchors.iter().any(|anchor| matches!(
+            anchor.outcome,
+            trellis::references::SemanticOutcome::Internal(_, _)
+        )),
+        "caller has a real admitted internal binding: {:?}; calls: {:?}",
+        caller.semantic,
+        caller.calls
+    );
+    let before = fixture.stabilize();
+    let settled = fixture
+        .store
+        .architecture_reference_snapshot_for_tests()
+        .unwrap();
+    let caller = settled
+        .documents
+        .iter()
+        .find(|doc| doc.key.path == "src/caller.rs")
+        .unwrap();
+    assert!(
+        !caller.semantic.anchors.is_empty(),
+        "unchanged caller after S: {:?}; publication: {:?}",
+        caller.semantic,
+        fixture.store.semantic_at(before.pin()).unwrap()
+    );
+    let frozen = before.canonical().unwrap();
+    let old_packages = fixture.packages(&before);
+    fs::write(
+        fixture.root.join("src/target.rs"),
+        "\n\npub fn target() {}\n",
+    )
+    .unwrap();
+    fixture.native();
+    let pin = fixture.catch_up();
+    let (_, after) = fixture.expect(
+        pin,
+        Expected::Incremental {
+            dirty: &["src/target.rs"],
+            patched: &["src/caller.rs"],
+            native: &["src/target.rs"],
+            all_b: false,
+        },
+    );
+    let canonical = after.canonical().unwrap();
+    let before_edge = edge(
+        &frozen["references"]["selected"]["data"],
+        "src/caller.rs",
+        "src/target.rs",
+    )
+    .unwrap();
+    let after_edge = edge(
+        &canonical["references"]["selected"]["data"],
+        "src/caller.rs",
+        "src/target.rs",
+    )
+    .unwrap();
+    let target_lines = |edge: &Value| {
+        edge["sites"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|site| site["target"]["document"]["path"] == "src/target.rs")
+            .unwrap_or_else(|| panic!("missing sampled internal target: {edge}"))["target"]["lines"]
+            .clone()
+    };
+    assert_eq!(target_lines(before_edge), json!({"start":2,"end":2}));
+    assert_eq!(target_lines(after_edge), json!({"start":3,"end":3}));
+    let sharing = after.sharing(&before);
+    for (key, parts) in sharing {
+        if key.path == "src/caller.rs" {
+            assert!(
+                !parts.source && parts.metric && parts.fingerprint && parts.plan,
+                "{key:?}: {parts:?}"
+            );
+        } else if key.path == "src/cargo.rs" || key.language == "javascript" {
+            assert!(
+                parts.source && parts.metric && parts.fingerprint && parts.plan,
+                "{key:?}: {parts:?}"
+            );
+        }
+    }
+    assert_ne!(old_packages, fixture.packages(&after));
+    assert_eq!(before.canonical().unwrap(), frozen);
+}
+
+#[test]
+fn architecture_incremental_first_edit_after_producer() {
+    use crate::architecture_incremental_support::{CapturedArchitecture, Expected};
+    let fixture = CapturedArchitecture::producers();
+    let basis = fixture.store.index_baseline().unwrap();
+    let original = fixture
+        .store
+        .architecture_fingerprints_for_tests(None)
+        .unwrap();
+    let selection = original.selections;
+    fs::write(
+        fixture.root.join("src/main.rs"),
+        "fn main() { let _value = 2; }\n",
+    )
+    .unwrap();
+    let n = fixture.native();
+    let current = fixture
+        .store
+        .architecture_fingerprints_for_tests(None)
+        .unwrap();
+    let projected = [
+        "src/main.rs",
+        "src/lib.rs",
+        "src/caller.rs",
+        "src/cargo.rs",
+        "src/target.rs",
+        "a.ts",
+        "b.ts",
+    ];
+    for (key, state) in &current.semantic_states {
+        if !projected.contains(&key.path.as_str()) {
+            assert!(state.projection.is_none(), "{key:?}");
+            continue;
+        }
+        let projection = state.projection.as_ref().unwrap();
+        assert_eq!(projection.current_pin, n);
+        assert_eq!(projection.semantic_basis_pin, basis);
+        assert!(current.documents[key].projected);
+        if key.path == "src/main.rs" {
+            assert_eq!(
+                projection.semantic_status,
+                trellis::model::SemanticStatus::CatchingUp
+            );
+            assert!(state.tuple.is_none() && state.freshness.is_none());
+        } else {
+            assert_eq!(
+                projection.semantic_status,
+                trellis::model::SemanticStatus::OlderBasis
+            );
+            assert_eq!(state.tuple, original.semantic_states[key].tuple);
+            assert_eq!(state.freshness.as_ref().unwrap().basis_pin, basis);
+        }
+    }
+    fixture.expect(
+        n,
+        Expected::Incremental {
+            dirty: &projected,
+            patched: &[],
+            native: &["src/main.rs"],
+            all_b: false,
+        },
+    );
+    // A second native publication still has P as basis. Its currentPin is not rewritten
+    // to P or N to make these projected sources appear reusable.
+    fs::write(
+        fixture.root.join("src/main.rs"),
+        "fn main() { let _value = 3; }\n",
+    )
+    .unwrap();
+    let next = fixture.native();
+    let fingerprints = fixture
+        .store
+        .architecture_fingerprints_for_tests(None)
+        .unwrap();
+    for (key, state) in &fingerprints.semantic_states {
+        if let Some(projection) = &state.projection {
+            assert_eq!(projection.current_pin, next);
+            assert_eq!(projection.semantic_basis_pin, basis);
+            assert_ne!(
+                fingerprints.documents[key].semantic,
+                current.documents[key].semantic
+            );
+        }
+    }
+    fixture.expect(
+        next,
+        Expected::Incremental {
+            dirty: &projected,
+            patched: &[],
+            native: &["src/main.rs"],
+            all_b: false,
+        },
+    );
+    let s = fixture.catch_up();
+    assert_eq!(
+        fixture
+            .store
+            .architecture_fingerprints_for_tests(None)
+            .unwrap()
+            .selections,
+        selection
+    );
+    fixture.expect(
+        s,
+        Expected::Incremental {
+            dirty: &projected,
+            patched: &[],
+            native: &[],
+            all_b: false,
+        },
+    );
+}
+
+#[test]
+fn architecture_incremental_producer_gate() {
+    use crate::architecture_incremental_support::{CapturedArchitecture, Expected};
+    use trellis::http::FullReason;
+
+    for change in [
+        "requested",
+        "languages",
+        "version",
+        "executable",
+        "nondefault",
+    ] {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut publisher = Publisher::open(state.path(), root.path());
+        let mut spec = semantic();
+        let second = matches!(change, "version" | "executable");
+        let first = publisher.publish_with_semantic(&spec, |publication, captured| {
+            if second {
+                add_second_producer(publication, captured);
+            }
+        });
+        let fixture = CapturedArchitecture::published(state, root, publisher.store.clone());
+        let (_, before) = fixture.expect(first, Expected::Full(FullReason::NoBase));
+        if change == "requested" {
+            spec.requested_version = "v2".into();
+        }
+        if change == "languages" {
+            spec.languages.push(s::Language::Javascript);
+        }
+        let next = publisher.publish_with_semantic(&spec, |publication, captured| {
+            if second || change == "nondefault" {
+                add_second_producer(publication, captured);
+            }
+            if second {
+                let producer = publication
+                    .producers
+                    .iter_mut()
+                    .find(|p| p.id == "semantic.second")
+                    .unwrap();
+                if change == "version" {
+                    producer.version = "v2".into();
+                }
+                if change == "executable" {
+                    producer.version = "v2".into();
+                    producer.executable_hash = trellis::native_ids::digest(b"", b"new-executable");
+                    captured
+                        .producer_executables
+                        .insert(producer.id.clone(), b"new-executable".to_vec());
+                }
+                *captured
+                    .requested_producers
+                    .iter_mut()
+                    .find(|p| p.id == producer.id)
+                    .unwrap() = producer.clone();
+            }
+            if change == "languages" {
+                publication.producers[0].version = "v2".into();
+                captured.requested_producers[0] = publication.producers[0].clone();
+                for proof in &mut publication.provenance {
+                    proof.basis.as_mut().unwrap().producer_version = "v2".into();
+                }
+            }
+        });
+        let (_, after) = fixture.expect(next, Expected::Full(FullReason::ProducerSetChanged));
+        assert_ne!(
+            before.canonical().unwrap()["dependencies"]["producers"],
+            after.canonical().unwrap()["dependencies"]["producers"],
+            "{change}"
+        );
+    }
+}
+
+#[test]
+fn architecture_incremental_semantic_limits() {
+    use crate::architecture_incremental_support::{CapturedArchitecture, Expected};
+    use trellis::{
+        http::FullReason,
+        store::{
+            set_architecture_semantic_lookups_for_tests,
+            set_architecture_semantic_metadata_for_tests, set_architecture_semantic_rows_for_tests,
+        },
+    };
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            set_architecture_semantic_rows_for_tests(2_000_000);
+            set_architecture_semantic_metadata_for_tests(2_000_000);
+            set_architecture_semantic_lookups_for_tests(2_000_000);
+        }
+    }
+    let _reset = Reset;
+    let mut spec = semantic();
+    spec.files
+        .iter_mut()
+        .find(|(path, _)| path == "src/orphan.rs")
+        .unwrap()
+        .1 = "pub fn orphan() { crate::high::upper(); crate::high::upper(); }\n".into();
+    spec.bindings.push(bind("orphan", 1, "upper"));
+    for (set, total, error) in [
+        (
+            set_architecture_semantic_rows_for_tests as fn(usize),
+            3,
+            "bounded_work: architecture semantic evidence",
+        ),
+        (
+            set_architecture_semantic_metadata_for_tests,
+            6,
+            "bounded_work: architecture lookup dependencies",
+        ),
+        (
+            set_architecture_semantic_lookups_for_tests,
+            3,
+            "bounded_work: architecture lookup dependencies",
+        ),
+    ] {
+        for limit in [total - 1, total, total + 1] {
+            let (state, root, store, pin) = publish_with(&spec, "version=1\n", |_, _| {});
+            let fixture = CapturedArchitecture::published(state, root, store);
+            let (_, before) = fixture.expect(pin, Expected::Full(FullReason::NoBase));
+            let (_, counts) = fixture
+                .store
+                .architecture_semantic_selection_for_tests(None, BTreeMap::new(), &mut || Ok(()))
+                .unwrap();
+            let orphan = counts
+                .sources
+                .iter()
+                .find(|(key, _)| key.path == "src/orphan.rs")
+                .unwrap()
+                .1;
+            assert_eq!(
+                (orphan.rows, orphan.metadata, orphan.lookups),
+                (2, 2, 2),
+                "a repeated shared proof is charged on each row"
+            );
+            let copied = fixture.native();
+            set(limit);
+            if limit < total {
+                fixture.bounded_failure(copied, error);
+            } else {
+                let (_, after) = fixture.expect(
+                    copied,
+                    Expected::Incremental {
+                        dirty: &[],
+                        patched: &[],
+                        native: &[],
+                        all_b: false,
+                    },
+                );
+                assert!(
+                    after
+                        .sharing(&before)
+                        .values()
+                        .all(|parts| parts.source && parts.metric)
+                );
+            }
+            set(2_000_000);
+        }
+    }
+}
+
 type Published = (tempfile::TempDir, tempfile::TempDir, Store, IndexPin);
 
 fn publish(spec: &Spec) -> Published {

@@ -286,3 +286,99 @@ proptest! {
         tokio::runtime::Runtime::new().unwrap().block_on(scenario(operations));
     }
 }
+
+/// Fixed seeds vary real source bytes, not scheduling or retries. Each completed pin is
+/// checked by the production owner against its independent all-source full oracle.
+#[test]
+fn architecture_incremental_seeded_mixed_edits() {
+    use crate::architecture_incremental_support::{CapturedArchitecture, Expected};
+    use trellis::http::FullReason;
+
+    for seed in 0_u64..20 {
+        let mut state = seed + 1;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 32
+        };
+        let mut fixture = CapturedArchitecture::producers();
+        fixture.stabilize();
+        let value = 3 + next() % 100;
+        std::fs::write(
+            fixture.root.join("src/main.rs"),
+            format!("fn main() {{ let _value = {value}; }}\n"),
+        )
+        .unwrap();
+        fixture.native();
+        let pin = fixture.catch_up();
+        fixture.expect(
+            pin,
+            Expected::Incremental {
+                dirty: &["src/main.rs"],
+                patched: &[],
+                native: &["src/main.rs"],
+                all_b: false,
+            },
+        );
+
+        let prefix = "\n".repeat(2 + (next() % 4) as usize);
+        std::fs::write(
+            fixture.root.join("src/target.rs"),
+            format!("{prefix}pub fn target() {{}}\n"),
+        )
+        .unwrap();
+        fixture.native();
+        let pin = fixture.catch_up();
+        fixture.expect(
+            pin,
+            Expected::Incremental {
+                dirty: &["src/target.rs"],
+                patched: &["src/caller.rs"],
+                native: &["src/target.rs"],
+                all_b: false,
+            },
+        );
+
+        std::fs::write(
+            fixture.root.join("a.ts"),
+            format!(
+                "export function alpha() {{ return {}; }}\n",
+                3 + next() % 100
+            ),
+        )
+        .unwrap();
+        let pin = fixture.native();
+        fixture.expect(pin, Expected::Full(FullReason::NonRustChanged));
+        let pin = fixture.catch_up();
+        fixture.expect(
+            pin,
+            Expected::Incremental {
+                dirty: &[
+                    "src/main.rs",
+                    "src/lib.rs",
+                    "src/caller.rs",
+                    "src/cargo.rs",
+                    "src/target.rs",
+                    "a.ts",
+                    "b.ts",
+                ],
+                patched: &[],
+                native: &[],
+                all_b: false,
+            },
+        );
+        // Import builds a new artifact from these exact edited TS bytes and current ranges.
+        let pin = fixture.import(false);
+        fixture.expect(pin, Expected::Full(FullReason::RawSelectionsChanged));
+
+        let target = std::fs::read_to_string(fixture.root.join("src/target.rs")).unwrap();
+        std::fs::write(
+            fixture.root.join("src/target.rs"),
+            format!("{target}pub fn added_{seed}() {{}}\n"),
+        )
+        .unwrap();
+        let pin = fixture.native();
+        fixture.expect(pin, Expected::Full(FullReason::RustCatalogChanged));
+    }
+}
