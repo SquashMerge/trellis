@@ -11,8 +11,1241 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::Duration;
 use trellis::daemon::registry::MetricsResponseHooks;
 use trellis::http::DaemonState;
+use trellis::http::{
+    ArchitectureAttempt, ArchitectureBuildPath, ArchitectureCoreHandle, FullReason,
+};
 use trellis::indexer::IndexOptions;
 use trellis::metrics_read::MetricsOptions;
+use trellis::model::IndexPin;
+
+const NATIVE_SOURCES: &[(&str, &str)] = &[
+    ("src/main.rs", "fn main() { let _value = 1; }\n"),
+    (
+        "src/lib.rs",
+        "pub mod worker; pub mod target; pub mod clean;\n",
+    ),
+    ("src/worker.rs", "pub fn work() { crate::target::run(); }\n"),
+    ("src/target.rs", "pub fn run() {}\n"),
+    ("src/clean.rs", "pub fn clean() {}\n"),
+];
+
+const PACKAGE_SOURCES: &[(&str, &str)] = &[
+    (
+        "Cargo.toml",
+        "[package]\nname='fixture'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nrenamed={package='vendor',version='1'}\n[dev-dependencies]\nrenamed={package='vendor',version='1'}\n",
+    ),
+    ("src/main.rs", "fn main() { let _value = 1; }\n"),
+    (
+        "src/lib.rs",
+        "pub mod worker; pub mod target; pub mod clean;\npub fn library() { renamed::run(); std::mem::drop(1); }\n",
+    ),
+    (
+        "src/worker.rs",
+        "pub fn work() { renamed::run(); std::mem::drop(1); }\n",
+    ),
+    ("src/target.rs", "pub fn run() {}\n"),
+    (
+        "src/clean.rs",
+        "pub fn clean() { renamed::run(); std::mem::drop(1); }\n",
+    ),
+    (
+        "package.json",
+        "{\"dependencies\":{\"shared\":\"1.0.0\"},\"devDependencies\":{\"shared\":\"1.0.0\"}}",
+    ),
+    (
+        "root.js",
+        "import shared from 'shared'; import another from 'shared'; import fs from 'node:fs'; shared(); another(); fs.readFile('a');\n",
+    ),
+    (
+        "other.js",
+        "import shared from 'shared'; import second from 'shared'; shared(); second();\n",
+    ),
+    (
+        "typed.ts",
+        "import shared from 'shared'; import fs from 'node:fs'; shared(); fs.readFile('a');\n",
+    ),
+    (
+        "tools/package.json",
+        "{\"dependencies\":{\"shared\":\"2.0.0\"},\"optionalDependencies\":{\"shared\":\"2.0.0\"}}",
+    ),
+    (
+        "tools/nested.js",
+        "import shared from 'shared'; shared();\n",
+    ),
+    (
+        "Example.java",
+        "import java.util.ArrayList; class Example { void run() { new ArrayList(); } }\n",
+    ),
+    ("example.py", "import json\njson.loads('{}')\n"),
+];
+
+async fn index_edit(
+    base: &tempfile::TempDir,
+    runtime: &Arc<trellis::daemon::registry::CheckoutRuntime>,
+    edits: &[(&str, Option<&str>)],
+) -> IndexPin {
+    let pin = publish_edit(base, runtime, edits).await;
+    runtime.settled_for_tests(Some(pin)).await.unwrap();
+    pin
+}
+
+async fn publish_edit(
+    base: &tempfile::TempDir,
+    runtime: &Arc<trellis::daemon::registry::CheckoutRuntime>,
+    edits: &[(&str, Option<&str>)],
+) -> IndexPin {
+    let root = base.path().join("checkout");
+    runtime.hold_worker_step_for_tests(|| {
+        for (path, text) in edits {
+            let path = root.join(path);
+            match text {
+                Some(text) => {
+                    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    std::fs::write(path, text).unwrap();
+                }
+                None => std::fs::remove_file(path).unwrap(),
+            }
+        }
+    });
+    let indexing = runtime.clone();
+    let publication =
+        tokio::task::spawn_blocking(move || indexing.cli_index(&IndexOptions::new(root)))
+            .await
+            .unwrap()
+            .unwrap();
+    serde_json::from_value(publication["publishedRevision"].clone()).unwrap()
+}
+
+async fn reference_answer(
+    runtime: &Arc<trellis::daemon::registry::CheckoutRuntime>,
+    pin: IndexPin,
+    paths: &[&str],
+    prefix: Option<&str>,
+) -> Value {
+    let runtime = runtime.clone();
+    let work_limit = trellis::references::ReferenceWorkLimitForTests::capture();
+    let mut args = json!({"expectedBasis": pin, "paths": paths});
+    if let Some(prefix) = prefix {
+        args["prefix"] = json!(prefix);
+    }
+    tokio::task::spawn_blocking(move || {
+        let _work_limit = work_limit.apply();
+        runtime.await_architecture_tool(
+            "references",
+            &args,
+            trellis::testing::HANG_BACKSTOP,
+            &mut || Ok(()),
+        );
+        let (response, _) = runtime.evidence_response().unwrap();
+        let answer = runtime
+            .architecture_tool(&response, "references", &args, &mut || Ok(()))
+            .unwrap();
+        response.finish(answer).unwrap()
+    })
+    .await
+    .unwrap()
+}
+
+async fn independent_full(
+    runtime: &Arc<trellis::daemon::registry::CheckoutRuntime>,
+    pin: IndexPin,
+) -> Value {
+    let runtime = runtime.clone();
+    let work_limit = trellis::references::ReferenceWorkLimitForTests::capture();
+    tokio::task::spawn_blocking(move || {
+        let _work_limit = work_limit.apply();
+        let (response, _) = runtime.evidence_response().unwrap();
+        let full = response.architecture_full_for_tests(pin).unwrap();
+        response.finish(full).unwrap()
+    })
+    .await
+    .unwrap()
+}
+
+fn current_pin(scheduler: &DaemonState) -> IndexPin {
+    scheduler
+        .architecture_build_paths_for_tests()
+        .last()
+        .unwrap()
+        .0
+}
+
+fn published_attempt(scheduler: &DaemonState, pin: IndexPin) -> ArchitectureAttempt {
+    let attempt = scheduler
+        .architecture_attempts_for_tests()
+        .into_iter()
+        .rev()
+        .find(|attempt| attempt.pin == pin && attempt.published)
+        .unwrap();
+    assert!(attempt.compared, "{attempt:?}");
+    assert_eq!(
+        scheduler.architecture_build_paths_for_tests().last(),
+        Some(&(pin, attempt.path.clone()))
+    );
+    assert!(scheduler.architecture_differences_for_tests().is_empty());
+    attempt
+}
+
+fn core(scheduler: &DaemonState, pin: IndexPin) -> ArchitectureCoreHandle {
+    scheduler.architecture_core_for_tests(pin).unwrap()
+}
+
+fn source_paths(keys: &[trellis::native_records::DocumentKey]) -> Vec<&str> {
+    keys.iter().map(|key| key.path.as_str()).collect()
+}
+
+fn assert_incremental(attempt: &ArchitectureAttempt, dirty: &[&str], patched: &[&str]) {
+    match &attempt.path {
+        ArchitectureBuildPath::Incremental {
+            dirty: actual,
+            patched: patches,
+            reused,
+        } => {
+            assert_eq!(source_paths(actual), dirty);
+            assert_eq!(source_paths(patches), patched);
+            assert!(!reused.is_empty());
+            let partition: std::collections::BTreeSet<_> =
+                actual.iter().chain(patches).chain(reused).collect();
+            let admitted: std::collections::BTreeSet<_> = attempt
+                .references
+                .batches
+                .iter()
+                .flat_map(|(keys, _)| keys)
+                .collect();
+            assert_eq!(
+                partition, admitted,
+                "the path partitions every admitted source"
+            );
+            assert_eq!(partition.len(), actual.len() + patches.len() + reused.len());
+            assert_eq!(partition.len(), attempt.progress.first().unwrap().total);
+            assert_eq!(source_paths(&attempt.references.file_references), dirty);
+        }
+        path => panic!("expected incremental, got {path:?}"),
+    }
+}
+
+#[tokio::test]
+async fn architecture_incremental_body_edit() {
+    let (base, runtime, _browser, _key) =
+        super::architecture_http::fixture_exact_sources(NATIVE_SOURCES).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let first = current_pin(&scheduler);
+    let initial = published_attempt(&scheduler, first);
+    assert_eq!(initial.base, None);
+    assert_eq!(
+        initial.path,
+        ArchitectureBuildPath::Full(FullReason::NoBase)
+    );
+    let before = core(&scheduler, first);
+    let pin = index_edit(
+        &base,
+        &runtime,
+        &[("src/main.rs", Some("fn main() { let _value = 2; }\n"))],
+    )
+    .await;
+    let attempt = published_attempt(&scheduler, pin);
+    assert_eq!(attempt.base, Some(first));
+    assert_incremental(&attempt, &["src/main.rs"], &[]);
+    assert_eq!(source_paths(&attempt.semantic_sources), ["src/main.rs"]);
+    assert_eq!(source_paths(&attempt.measured_sources), ["src/main.rs"]);
+    let after = core(&scheduler, pin);
+    assert_eq!(
+        after.canonical().unwrap(),
+        independent_full(&runtime, pin).await
+    );
+    for (key, sharing) in after.sharing(&before) {
+        if key.path == "src/main.rs" {
+            assert!(!sharing.source && !sharing.metric && !sharing.dependency);
+        } else {
+            assert!(
+                sharing.source
+                    && sharing.metric
+                    && sharing.dependency
+                    && sharing.fingerprint
+                    && sharing.references
+                    && sharing.endpoints
+                    && sharing.plan,
+                "{key:?}: {sharing:?}"
+            );
+        }
+    }
+    let measured: Vec<_> = attempt
+        .progress
+        .iter()
+        .filter(|value| value.phase == "measuring")
+        .map(|value| (value.completed, value.total))
+        .collect();
+    assert_eq!(measured, [(0, 5), (4, 5), (5, 5)]);
+    let phases: Vec<_> =
+        attempt
+            .progress
+            .iter()
+            .map(|value| value.phase)
+            .fold(Vec::new(), |mut phases, phase| {
+                if phases.last() != Some(&phase) {
+                    phases.push(phase);
+                }
+                phases
+            });
+    assert_eq!(phases, ["reading", "resolving", "evaluating", "measuring"]);
+}
+
+#[tokio::test]
+async fn architecture_incremental_declaration_edit() {
+    let (base, runtime, _, _) =
+        super::architecture_http::fixture_exact_sources(NATIVE_SOURCES).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let before = core(&scheduler, current_pin(&scheduler))
+        .canonical()
+        .unwrap();
+    let pin = index_edit(
+        &base,
+        &runtime,
+        &[("src/target.rs", Some("pub fn renamed() {}\n"))],
+    )
+    .await;
+    let attempt = published_attempt(&scheduler, pin);
+    assert_eq!(
+        attempt.path,
+        ArchitectureBuildPath::Full(FullReason::RustCatalogChanged)
+    );
+    let after = core(&scheduler, pin).canonical().unwrap();
+    let target = before["dependencies"]["order"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|key| key["path"] == "src/target.rs")
+        .unwrap();
+    assert_ne!(
+        before["dependencies"]["documents"][target]["sids"],
+        after["dependencies"]["documents"][target]["sids"]
+    );
+}
+
+#[tokio::test]
+async fn architecture_incremental_add_delete_and_rename() {
+    let (base, runtime, _, _) =
+        super::architecture_http::fixture_exact_sources(NATIVE_SOURCES).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    for edits in [
+        vec![("src/added.rs", Some("pub fn added() {}\n"))],
+        vec![("src/added.rs", None)],
+        vec![
+            ("src/clean.rs", None),
+            ("src/renamed.rs", Some("pub fn clean() {}\n")),
+        ],
+    ] {
+        let pin = index_edit(&base, &runtime, &edits).await;
+        let attempt = published_attempt(&scheduler, pin);
+        assert_eq!(
+            attempt.path,
+            ArchitectureBuildPath::Full(FullReason::DocumentSetChanged)
+        );
+        assert_eq!(
+            core(&scheduler, pin).canonical().unwrap(),
+            independent_full(&runtime, pin).await
+        );
+    }
+}
+
+#[tokio::test]
+async fn architecture_incremental_retention() {
+    let (base, runtime, _, _) =
+        super::architecture_http::fixture_exact_sources(NATIVE_SOURCES).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let first = current_pin(&scheduler);
+    let old = core(&scheduler, first);
+    let weak = old.downgrade();
+    let frozen = old.canonical().unwrap();
+    let second = index_edit(
+        &base,
+        &runtime,
+        &[("src/main.rs", Some("fn main() { let _value = 2; }\n"))],
+    )
+    .await;
+    assert_incremental(
+        &published_attempt(&scheduler, second),
+        &["src/main.rs"],
+        &[],
+    );
+    let middle = core(&scheduler, second);
+    assert_eq!(old.canonical().unwrap(), frozen);
+    assert!(
+        middle
+            .sharing(&old)
+            .iter()
+            .filter(|(key, _)| key.path != "src/main.rs")
+            .all(|(_, sharing)| sharing.source
+                && sharing.metric
+                && sharing.dependency
+                && sharing.plan)
+    );
+    drop(old);
+    assert!(weak.is_alive(), "the prior core is retained");
+    let third = index_edit(
+        &base,
+        &runtime,
+        &[("src/main.rs", Some("fn main() { let _value = 3; }\n"))],
+    )
+    .await;
+    let attempt = published_attempt(&scheduler, third);
+    assert_eq!(attempt.base, Some(second));
+    assert_incremental(&attempt, &["src/main.rs"], &[]);
+    assert!(
+        !weak.is_alive(),
+        "no plan, oracle or trace retains the evicted core"
+    );
+    assert!(scheduler.architecture_core_for_tests(first).is_none());
+    assert!(scheduler.architecture_core_for_tests(second).is_some());
+    assert!(scheduler.architecture_core_for_tests(third).is_some());
+}
+
+#[tokio::test]
+async fn architecture_incremental_base_selection_older_requests() {
+    let mut sources = NATIVE_SOURCES.to_vec();
+    sources.push((".trellis/rules.toml", RULES));
+    let (base, runtime, browser, key) =
+        super::architecture_http::fixture_exact_sources(&sources).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let first = current_pin(&scheduler);
+    scheduler.set_architecture_on_demand_for_tests();
+    let older = index_edit(
+        &base,
+        &runtime,
+        &[("src/main.rs", Some("fn main() { let _value = 2; }\n"))],
+    )
+    .await;
+    assert!(scheduler.architecture_core_for_tests(older).is_none());
+    let head = index_edit(
+        &base,
+        &runtime,
+        &[("src/main.rs", Some("fn main() { let _value = 3; }\n"))],
+    )
+    .await;
+    reference_answer(&runtime, head, &[], None).await;
+    runtime.settled_for_tests(Some(head)).await.unwrap();
+    let head_build = published_attempt(&scheduler, head);
+    assert_eq!(head_build.base, Some(first));
+    assert_incremental(&head_build, &["src/main.rs"], &[]);
+    // Older tool reads compute in their admitted read; a page explicitly demands
+    // the owner's retained result instead.
+    let query = format!(
+        "?indexGeneration={}&indexRevision={}",
+        older.index_generation, older.index_revision
+    );
+    let (status, answer) = summary(browser.router(), &key, &query).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    runtime.settled_for_tests(Some(head)).await.unwrap();
+    let old_build = published_attempt(&scheduler, older);
+    assert_eq!(old_build.base, None);
+    assert_eq!(
+        old_build.path,
+        ArchitectureBuildPath::Full(FullReason::NoBase)
+    );
+    assert!(
+        scheduler.architecture_core_for_tests(head).is_some(),
+        "an older request never evicts the head"
+    );
+    let next = index_edit(
+        &base,
+        &runtime,
+        &[("src/main.rs", Some("fn main() { let _value = 4; }\n"))],
+    )
+    .await;
+    let next_build = published_attempt(&scheduler, next);
+    assert_eq!(
+        next_build.base,
+        Some(head),
+        "choose the newest revision, not the most recently published older request"
+    );
+    assert_incremental(&next_build, &["src/main.rs"], &[]);
+}
+
+#[tokio::test]
+async fn architecture_incremental_rules_change_does_not_resurrect_a_base() {
+    let (base, runtime, browser, key) =
+        super::architecture_http::fixture_exact_sources(NATIVE_SOURCES).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let app = browser.router();
+    for rules in [RULES, OTHER_RULES, RULES] {
+        write_rules(&base, rules);
+        scheduler.architecture_hint();
+        let (status, body) = summary(app.clone(), &key, "").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        runtime.settled_for_tests(None).await.unwrap();
+        let attempt = published_attempt(&scheduler, current_pin(&scheduler));
+        assert_eq!(
+            attempt.path,
+            ArchitectureBuildPath::Full(FullReason::NoBase)
+        );
+        assert_eq!(attempt.base, None);
+        let text = if rules == OTHER_RULES {
+            "fn main() { let _value = 3; }\n"
+        } else {
+            "fn main() { let _value = 2; }\n"
+        };
+        let pin = index_edit(&base, &runtime, &[("src/main.rs", Some(text))]).await;
+        assert_incremental(&published_attempt(&scheduler, pin), &["src/main.rs"], &[]);
+    }
+}
+
+#[tokio::test]
+async fn architecture_incremental_native_non_rust_and_tsconfig_gates() {
+    let mut sources = NATIVE_SOURCES.to_vec();
+    sources.push(("typed.ts", "export function typed() { return 1; }\n"));
+    let (base, runtime, _, _) = super::architecture_http::fixture_exact_sources(&sources).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    for (path, text, reason) in [
+        (
+            "typed.ts",
+            "export function typed() { return 2; }\n",
+            FullReason::NonRustChanged,
+        ),
+        (
+            "tsconfig.json",
+            "{\"compilerOptions\":{\"baseUrl\":\".\"}}",
+            FullReason::RootTsconfigChanged,
+        ),
+        (
+            "tsconfig.json",
+            "{\"compilerOptions\":{\"baseUrl\":\"src\"}}",
+            FullReason::RootTsconfigChanged,
+        ),
+    ] {
+        let pin = index_edit(&base, &runtime, &[(path, Some(text))]).await;
+        assert_eq!(
+            published_attempt(&scheduler, pin).path,
+            ArchitectureBuildPath::Full(reason)
+        );
+    }
+    let pin = index_edit(
+        &base,
+        &runtime,
+        &[(
+            "jsconfig.json",
+            Some("{\"compilerOptions\":{\"baseUrl\":\".\"}}"),
+        )],
+    )
+    .await;
+    assert_incremental(&published_attempt(&scheduler, pin), &[], &[]);
+    for path in ["tsconfig.json", "jsconfig.json"] {
+        let pin = index_edit(&base, &runtime, &[(path, None)]).await;
+        assert_eq!(
+            published_attempt(&scheduler, pin).path,
+            ArchitectureBuildPath::Full(FullReason::RootTsconfigChanged)
+        );
+    }
+}
+
+#[tokio::test]
+async fn architecture_incremental_dirty_majority_is_strict() {
+    let mut sources = NATIVE_SOURCES.to_vec();
+    sources.push(("src/idle.rs", "pub fn idle() {}\n"));
+    let (base, runtime, _, _) = super::architecture_http::fixture_exact_sources(&sources).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let pin = index_edit(
+        &base,
+        &runtime,
+        &[
+            ("src/main.rs", Some("fn main() { let _value = 2; }\n")),
+            ("src/clean.rs", Some("pub fn clean() { 2; }\n")),
+            ("src/idle.rs", Some("pub fn idle() { 2; }\n")),
+        ],
+    )
+    .await;
+    assert_incremental(
+        &published_attempt(&scheduler, pin),
+        &["src/clean.rs", "src/idle.rs", "src/main.rs"],
+        &[],
+    );
+    let pin = index_edit(
+        &base,
+        &runtime,
+        &[
+            ("src/main.rs", Some("fn main() { let _value = 3; }\n")),
+            ("src/clean.rs", Some("pub fn clean() { 3; }\n")),
+            ("src/idle.rs", Some("pub fn idle() { 3; }\n")),
+            (
+                "src/worker.rs",
+                Some("pub fn work() { 3; crate::target::run(); }\n"),
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(
+        published_attempt(&scheduler, pin).path,
+        ArchitectureBuildPath::Full(FullReason::DirtyMajority)
+    );
+}
+
+#[tokio::test]
+async fn architecture_incremental_catalog_cases() {
+    for (before, after, reason) in [
+        ("fn main() { 1; }\n", "fn main() { 2; }\n", None),
+        (
+            "const MARKER: u8 = 1;\nfn main() {}\n",
+            "const MARKER: u8 = 1;\n// shifted\n\nfn main() {}\n",
+            None,
+        ),
+        (
+            "fn main() {}\n",
+            "// shifted\n\nfn main() {}\n",
+            // Rank encoding preserves equal positions: leading trivia splits the
+            // file-start/declaration-start tie, unlike the preceding position shift.
+            Some(FullReason::RustCatalogChanged),
+        ),
+        (
+            "fn main() {}\n",
+            "fn main() {}\nfn added() {}\n",
+            Some(FullReason::RustCatalogChanged),
+        ),
+        (
+            "fn main() {}\n",
+            "use std::fmt;\nfn main() {}\n",
+            Some(FullReason::RustCatalogChanged),
+        ),
+        (
+            "fn main() {}\n",
+            "mod added {}\nfn main() {}\n",
+            Some(FullReason::RustCatalogChanged),
+        ),
+        (
+            "fn main() {}\n",
+            "macro_rules! added { () => {} }\nfn main() {}\n",
+            Some(FullReason::RustCatalogChanged),
+        ),
+        (
+            "enum Kind { A }\nfn main() {}\n",
+            "enum Kind { A, B }\nfn main() {}\n",
+            Some(FullReason::RustCatalogChanged),
+        ),
+    ] {
+        let mut sources = NATIVE_SOURCES.to_vec();
+        sources[0].1 = before;
+        let (base, runtime, _, _) = super::architecture_http::fixture_exact_sources(&sources).await;
+        let scheduler = runtime.browser_scheduler().unwrap();
+        let pin = index_edit(&base, &runtime, &[("src/main.rs", Some(after))]).await;
+        let attempt = published_attempt(&scheduler, pin);
+        match reason {
+            Some(reason) => assert_eq!(attempt.path, ArchitectureBuildPath::Full(reason)),
+            None => assert_incremental(&attempt, &["src/main.rs"], &[]),
+        }
+    }
+}
+
+#[tokio::test]
+async fn architecture_incremental_ordinary_stage_failures_retry_full() {
+    for stage in ["prepare", "read_b", "finish"] {
+        let (base, runtime, _, _) =
+            super::architecture_http::fixture_exact_sources(NATIVE_SOURCES).await;
+        let scheduler = runtime.browser_scheduler().unwrap();
+        scheduler.set_architecture_fault_for_tests(
+            stage,
+            "store_unavailable: injected stage failure".into(),
+        );
+        let pin = index_edit(
+            &base,
+            &runtime,
+            &[("src/main.rs", Some("fn main() { let _value = 2; }\n"))],
+        )
+        .await;
+        let attempt = published_attempt(&scheduler, pin);
+        assert_eq!(
+            attempt.path,
+            ArchitectureBuildPath::Full(FullReason::IncrementalFailure)
+        );
+        assert_eq!(attempt.full_retries, 1, "{stage}");
+        assert_eq!(attempt.semantic_sources.len(), 5);
+        assert_eq!(attempt.references.file_references.len(), 5);
+        assert_eq!(
+            core(&scheduler, pin).canonical().unwrap(),
+            independent_full(&runtime, pin).await
+        );
+    }
+}
+
+#[tokio::test]
+async fn architecture_incremental_stop_precedence() {
+    for (stage, error) in [
+        ("read_b", "cancelled: injected plain cancellation"),
+        ("read_b", "storage_busy: injected contention"),
+        ("oracle", "cancelled: injected oracle cancellation"),
+        ("oracle", "storage_busy: injected oracle contention"),
+        (
+            "full_compute",
+            "cancelled: injected oracle computation cancellation",
+        ),
+        (
+            "full_compute",
+            "storage_busy: injected oracle computation contention",
+        ),
+        ("admission", "corrupt admitted read"),
+    ] {
+        let (base, runtime, _, _) =
+            super::architecture_http::fixture_exact_sources(NATIVE_SOURCES).await;
+        let scheduler = runtime.browser_scheduler().unwrap();
+        let original = current_pin(&scheduler);
+        if stage == "admission" {
+            scheduler.set_architecture_admission_fault_for_tests(error.into());
+        } else {
+            scheduler.set_architecture_fault_for_tests(stage, error.into());
+        }
+        let before_paths = scheduler.architecture_build_paths_for_tests().len();
+        let before_verified = scheduler.architecture_verified_for_tests();
+        let pin = index_edit(
+            &base,
+            &runtime,
+            &[("src/main.rs", Some("fn main() { let _value = 2; }\n"))],
+        )
+        .await;
+        let attempts: Vec<_> = scheduler
+            .architecture_attempts_for_tests()
+            .into_iter()
+            .filter(|attempt| attempt.pin == pin)
+            .collect();
+        assert_eq!(attempts.len(), 2, "{stage}: {attempts:?}");
+        let stopped = &attempts[0];
+        assert!(!stopped.compared && !stopped.published, "{stopped:?}");
+        assert_eq!(stopped.full_retries, 0);
+        if matches!(stage, "read_b" | "admission") {
+            assert!(stopped.measured_sources.is_empty(), "{stopped:?}");
+        }
+        assert_eq!(stopped.base, Some(original));
+        assert_eq!(attempts[1].base, Some(original));
+        assert_incremental(&published_attempt(&scheduler, pin), &["src/main.rs"], &[]);
+        assert_eq!(
+            scheduler.architecture_build_paths_for_tests().len(),
+            before_paths + 1
+        );
+        assert_eq!(
+            scheduler.architecture_verified_for_tests(),
+            before_verified + 1
+        );
+    }
+}
+
+async fn give_way_at(point: &'static str) {
+    let (base, runtime, _, _) =
+        super::architecture_http::fixture_exact_sources(NATIVE_SOURCES).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let original = current_pin(&scheduler);
+    let hold = Hold::at(&scheduler, point);
+    let superseded = publish_edit(
+        &base,
+        &runtime,
+        &[("src/main.rs", Some("fn main() { let _value = 2; }\n"))],
+    )
+    .await;
+    hold.wait_reached();
+    assert_eq!(scheduler.leases_for_tests(), 1);
+    let release = hold.clone();
+    runtime.set_publication_before_commit_hook_for_tests(move || release.release());
+    let pin = index_edit(
+        &base,
+        &runtime,
+        &[("src/main.rs", Some("fn main() { let _value = 3; }\n"))],
+    )
+    .await;
+    let attempts = scheduler.architecture_attempts_for_tests();
+    let yielded = attempts
+        .iter()
+        .find(|attempt| attempt.pin == superseded)
+        .unwrap();
+    assert!(!yielded.compared && !yielded.published);
+    assert_eq!(yielded.full_retries, 0);
+    assert_eq!(yielded.base, Some(original));
+    assert!(scheduler.architecture_core_for_tests(superseded).is_none());
+    let next = published_attempt(&scheduler, pin);
+    assert_eq!(next.base, Some(original));
+    assert_incremental(&next, &["src/main.rs"], &[]);
+}
+
+#[tokio::test]
+async fn architecture_incremental_give_way_read_a() {
+    give_way_at("reading").await;
+}
+
+#[tokio::test]
+async fn architecture_incremental_give_way_read_b() {
+    give_way_at("architecture_read_b_admitted").await;
+}
+
+#[tokio::test]
+async fn architecture_incremental_mismatch_serves_full_once() {
+    for pointer in [
+        "/dependencies/documents/0/references/work",
+        "/references/workUsed",
+    ] {
+        let (base, runtime, _, _) =
+            super::architecture_http::fixture_exact_sources(NATIVE_SOURCES).await;
+        let scheduler = runtime.browser_scheduler().unwrap();
+        let before = core(&scheduler, current_pin(&scheduler));
+        let paths = scheduler.architecture_build_paths_for_tests().len();
+        let compared = scheduler.architecture_verified_for_tests();
+        scheduler.set_architecture_mismatch_for_tests(pointer.into());
+        let pin = index_edit(
+            &base,
+            &runtime,
+            &[("src/main.rs", Some("fn main() { let _value = 2; }\n"))],
+        )
+        .await;
+        let attempt = scheduler.architecture_attempts_for_tests().pop().unwrap();
+        assert_incremental(&attempt, &["src/main.rs"], &[]);
+        assert!(attempt.published && attempt.compared);
+        assert_eq!(scheduler.architecture_differences_for_tests(), [pointer]);
+        assert_eq!(
+            scheduler.architecture_build_paths_for_tests().len(),
+            paths + 1
+        );
+        assert_eq!(scheduler.architecture_verified_for_tests(), compared + 1);
+        assert_eq!(
+            core(&scheduler, pin).canonical().unwrap(),
+            independent_full(&runtime, pin).await
+        );
+        assert!(
+            core(&scheduler, pin)
+                .sharing(&before)
+                .values()
+                .all(|sharing| !sharing.source && !sharing.metric && !sharing.dependency),
+            "a mismatch must publish the independent full core, not the candidate"
+        );
+    }
+}
+
+#[tokio::test]
+async fn architecture_incremental_external_provenance() {
+    let (base, runtime, _, _) =
+        super::architecture_http::fixture_exact_sources(PACKAGE_SOURCES).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let first = current_pin(&scheduler);
+    published_attempt(&scheduler, first);
+    let before = core(&scheduler, first);
+    let frozen = before.canonical().unwrap();
+    let old_answer = reference_answer(&runtime, first, &[], None).await;
+    let pin = index_edit(
+        &base,
+        &runtime,
+        &[("src/main.rs", Some("fn main() { let _value = 2; }\n"))],
+    )
+    .await;
+    assert_incremental(&published_attempt(&scheduler, pin), &["src/main.rs"], &[]);
+    let after = core(&scheduler, pin);
+    let canonical = after.canonical().unwrap();
+    assert_eq!(canonical, independent_full(&runtime, pin).await);
+    assert_eq!(
+        frozen["dependencies"]["manifests"],
+        canonical["dependencies"]["manifests"]
+    );
+    for (key, sharing) in after.sharing(&before) {
+        if key.path != "src/main.rs" {
+            assert!(
+                sharing.source && sharing.metric && sharing.plan,
+                "{key:?}: {sharing:?}"
+            );
+        }
+    }
+    assert_eq!(before.canonical().unwrap(), frozen);
+    assert_eq!(
+        reference_answer(&runtime, first, &[], None).await,
+        old_answer
+    );
+    let answer = reference_answer(&runtime, pin, &[], None).await;
+    let admitted = {
+        let (response, _) = runtime.evidence_response().unwrap();
+        let manifests = response.architecture_manifests_for_tests(pin).unwrap();
+        response.finish(manifests).unwrap()
+    };
+    let packages = answer["externalPackages"].as_array().unwrap();
+    let mut manifests = 0;
+    for package in packages {
+        let evidence = package["evidence"].as_array().unwrap();
+        let unique: std::collections::BTreeSet<_> = evidence.iter().map(Value::to_string).collect();
+        assert_eq!(unique.len(), evidence.len(), "{package}");
+        for proof in evidence {
+            if proof["kind"] != "manifest" {
+                continue;
+            }
+            manifests += 1;
+            assert_eq!(proof.as_object().unwrap().len(), 10, "{proof}");
+            let captured = admitted
+                .iter()
+                .find(|entry| {
+                    proof["sourceSetId"] == entry.source_set_id && proof["path"] == entry.path
+                })
+                .unwrap();
+            assert_eq!(proof["nativeRevisionId"], captured.native_revision_id);
+            assert_eq!(proof["dependencyHash"], captured.dependency_hash);
+            assert_eq!(
+                proof["contentHash"],
+                captured.content_hash.as_ref().unwrap().as_str()
+            );
+            assert!(
+                proof["importRoot"].is_string()
+                    && proof["key"].is_string()
+                    && proof["section"].is_string()
+                    && proof.get("versionConstraint").is_some()
+            );
+        }
+    }
+    assert!(manifests >= 8, "{answer}");
+    let cargo = packages
+        .iter()
+        .find(|package| package["identity"]["package"] == "vendor")
+        .unwrap();
+    assert_eq!(cargo["ecosystem"], "cargo");
+    assert_eq!(cargo["evidence"].as_array().unwrap().len(), 2);
+    assert_ne!(old_answer["externalPackages"], answer["externalPackages"]);
+}
+
+#[tokio::test]
+async fn architecture_incremental_external_source_selection() {
+    let (base, runtime, _, _) =
+        super::architecture_http::fixture_exact_sources(PACKAGE_SOURCES).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let pin = index_edit(
+        &base,
+        &runtime,
+        &[("src/main.rs", Some("fn main() { let _value = 2; }\n"))],
+    )
+    .await;
+    assert_incremental(&published_attempt(&scheduler, pin), &["src/main.rs"], &[]);
+    let snapshot = {
+        let (response, _) = runtime.evidence_response().unwrap();
+        let snapshot = response.architecture_snapshot_for_tests(pin).unwrap();
+        response.finish(snapshot).unwrap()
+    };
+    let full = trellis::references::resolve_all(&snapshot, &mut || Ok(())).unwrap();
+    for (paths, prefix, manifest_paths, language) in [
+        (vec!["root.js"], None, vec!["package.json"], "javascript"),
+        (
+            vec!["tools/nested.js"],
+            None,
+            vec!["tools/package.json"],
+            "javascript",
+        ),
+        (
+            vec!["root.js", "other.js", "tools/nested.js"],
+            None,
+            vec!["package.json", "tools/package.json"],
+            "javascript",
+        ),
+        (vec!["typed.ts"], None, vec!["package.json"], "typescript"),
+        (
+            vec![],
+            Some("tools"),
+            vec!["tools/package.json"],
+            "javascript",
+        ),
+    ] {
+        let answer = reference_answer(&runtime, pin, &paths, prefix).await;
+        let projected = full
+            .select_under(
+                &paths
+                    .iter()
+                    .map(|path| (*path).to_owned())
+                    .collect::<Vec<_>>(),
+                prefix,
+                5,
+                &mut || Ok(()),
+            )
+            .unwrap()
+            .data;
+        assert_eq!(answer["externalPackages"], projected["externalPackages"]);
+        for field in ["production", "tests", "unresolved", "counts", "modules"] {
+            assert_eq!(answer[field], projected[field], "{field}");
+        }
+        let package = answer["externalPackages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|package| package["identity"]["package"] == "shared")
+            .unwrap();
+        assert_eq!(package["identity"]["language"], language);
+        let actual: std::collections::BTreeSet<_> = package["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|proof| proof["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(actual, manifest_paths.into_iter().collect());
+        assert_eq!(
+            package["evidence"].as_array().unwrap().len(),
+            actual.len() * 2
+        );
+    }
+}
+
+#[tokio::test]
+async fn architecture_incremental_external_stdlib() {
+    let (base, runtime, _, _) =
+        super::architecture_http::fixture_exact_sources(PACKAGE_SOURCES).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let first = current_pin(&scheduler);
+    let before = core(&scheduler, first);
+    let previous = reference_answer(&runtime, first, &[], None).await;
+    let pin = index_edit(
+        &base,
+        &runtime,
+        &[("src/main.rs", Some("fn main() { let _value = 2; }\n"))],
+    )
+    .await;
+    assert_incremental(&published_attempt(&scheduler, pin), &["src/main.rs"], &[]);
+    let after = core(&scheduler, pin);
+    assert_eq!(
+        after.canonical().unwrap(),
+        independent_full(&runtime, pin).await
+    );
+    assert!(
+        after
+            .sharing(&before)
+            .iter()
+            .filter(|(key, _)| key.path != "src/main.rs")
+            .all(|(_, sharing)| sharing.source && sharing.metric)
+    );
+    let answer = reference_answer(&runtime, pin, &[], None).await;
+    let stable = |answer: &Value| -> Vec<Value> {
+        answer["externalPackages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|package| package["identity"]["standardLibrary"] == true)
+            .cloned()
+            .collect()
+    };
+    assert_eq!(stable(&previous), stable(&answer));
+    let catalogs: std::collections::BTreeSet<_> = stable(&answer)
+        .into_iter()
+        .flat_map(|package| {
+            package["evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|proof| {
+                    assert_eq!(proof["kind"], "standardLibraryCatalog");
+                    proof["catalog"].as_str().unwrap().to_owned()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        catalogs,
+        [
+            "rust-standard-library:v1",
+            "node-standard-library:v2",
+            "java-standard-library:v2",
+            "python-standard-library:v2"
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    );
+}
+
+#[tokio::test]
+async fn architecture_incremental_external_manifest_gate() {
+    let (base, runtime, _, _) =
+        super::architecture_http::fixture_exact_sources(PACKAGE_SOURCES).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    for path in ["Cargo.toml", "package.json", "tools/package.json"] {
+        let original = std::fs::read_to_string(base.path().join("checkout").join(path)).unwrap();
+        let changed = original
+            .replace("version='0.1.0'", "version='0.2.0'")
+            .replace("version='1'", "version='3'")
+            .replace("\"shared\":\"1.0.0\"", "\"shared\":\"3.0.0\"")
+            .replace("\"shared\":\"2.0.0\"", "\"shared\":\"4.0.0\"");
+        assert_ne!(changed, original);
+        let pin = index_edit(&base, &runtime, &[(path, Some(&changed))]).await;
+        assert_eq!(
+            published_attempt(&scheduler, pin).path,
+            ArchitectureBuildPath::Full(FullReason::ManifestsChanged)
+        );
+        assert_eq!(
+            core(&scheduler, pin).canonical().unwrap(),
+            independent_full(&runtime, pin).await
+        );
+    }
+}
+
+fn source_work(canonical: &Value, path: &str) -> usize {
+    let i = canonical["dependencies"]["order"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|key| key["path"] == path)
+        .unwrap();
+    canonical["dependencies"]["documents"][i]["references"]["work"]
+        .as_u64()
+        .unwrap() as usize
+}
+
+async fn work_boundaries(packages: bool) {
+    let mut sources = if packages {
+        PACKAGE_SOURCES
+    } else {
+        NATIVE_SOURCES
+    }
+    .to_vec();
+    let main = format!("fn main() {{ {} }}\n", "std::mem::drop(1);".repeat(30));
+    let initial_main = format!("{main}// z\n");
+    sources
+        .iter_mut()
+        .find(|(path, _)| *path == "src/main.rs")
+        .unwrap()
+        .1 = &initial_main;
+    let (base, runtime, _, _) = super::architecture_http::fixture_exact_sources(&sources).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let initial = core(&scheduler, current_pin(&scheduler))
+        .canonical()
+        .unwrap();
+    let edited = format!("{main}// a\n");
+    let pin = index_edit(&base, &runtime, &[("src/main.rs", Some(&edited))]).await;
+    let attempt = published_attempt(&scheduler, pin);
+    assert_incremental(&attempt, &["src/main.rs"], &[]);
+    let canonical = core(&scheduler, pin).canonical().unwrap();
+    let work = canonical["references"]["workUsed"].as_u64().unwrap() as usize;
+    let margin = attempt.references.executed_work + source_work(&initial, "src/main.rs");
+    assert!(margin > work, "margin={margin}, full={work}");
+    let mut limit = trellis::references::set_reference_work_limit_for_tests(margin);
+    scheduler.capture_architecture_work_limit_for_tests();
+    let at = format!("{main}// b\n");
+    let pin = index_edit(&base, &runtime, &[("src/main.rs", Some(&at))]).await;
+    assert_incremental(&published_attempt(&scheduler, pin), &["src/main.rs"], &[]);
+    limit.set(margin - 1);
+    scheduler.capture_architecture_work_limit_for_tests();
+    let below = format!("{main}// c\n");
+    let pin = index_edit(&base, &runtime, &[("src/main.rs", Some(&below))]).await;
+    let attempt = published_attempt(&scheduler, pin);
+    assert_eq!(
+        attempt.path,
+        ArchitectureBuildPath::Full(FullReason::ReferenceWorkMargin)
+    );
+    assert_eq!(attempt.full_retries, 1);
+    assert_eq!(
+        core(&scheduler, pin).canonical().unwrap(),
+        independent_full(&runtime, pin).await
+    );
+    let eligible = pin;
+    limit.set(work - 1);
+    scheduler.capture_architecture_work_limit_for_tests();
+    let failed = format!("{main}// d\n");
+    let pin = index_edit(&base, &runtime, &[("src/main.rs", Some(&failed))]).await;
+    let attempt = published_attempt(&scheduler, pin);
+    assert_eq!(
+        attempt.path,
+        ArchitectureBuildPath::Full(FullReason::IncrementalFailure)
+    );
+    assert_eq!(attempt.full_retries, 1);
+    assert!(scheduler.architecture_core_for_tests(pin).is_none());
+    let (response, _) = runtime.evidence_response().unwrap();
+    let full_error = response.architecture_full_for_tests(pin).unwrap_err();
+    let error = runtime
+        .architecture_tool(
+            &response,
+            "references",
+            &json!({"expectedBasis": pin}),
+            &mut || Ok(()),
+        )
+        .unwrap_err();
+    assert_eq!(error.to_string(), full_error.to_string());
+    assert!(error.to_string().starts_with("bounded_work:"), "{error:#}");
+    drop(response);
+    limit.set(usize::MAX);
+    scheduler.capture_architecture_work_limit_for_tests();
+    let recovered = format!("{main}// e\n");
+    let pin = index_edit(&base, &runtime, &[("src/main.rs", Some(&recovered))]).await;
+    let attempt = published_attempt(&scheduler, pin);
+    assert_eq!(
+        attempt.base,
+        Some(eligible),
+        "a kept failure cannot seed the next build"
+    );
+    assert_incremental(&attempt, &["src/main.rs"], &[]);
+}
+
+#[tokio::test]
+async fn architecture_incremental_work_limits() {
+    work_boundaries(false).await;
+}
+
+#[tokio::test]
+async fn architecture_incremental_byte_scale_and_extraction() {
+    let mut sources = NATIVE_SOURCES.to_vec();
+    sources[0].1 = "fn main() { std::mem::drop(1); }\n";
+    let (base, runtime, _, _) = super::architecture_http::fixture_exact_sources(&sources).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let literal = format!(
+        "fn main() {{ std::mem::drop(\"{}\"); }}\n",
+        "x".repeat(1100)
+    );
+    let pin = index_edit(&base, &runtime, &[("src/main.rs", Some(&literal))]).await;
+    assert_incremental(&published_attempt(&scheduler, pin), &["src/main.rs"], &[]);
+    let before = core(&scheduler, pin).canonical().unwrap();
+    assert_eq!(before, independent_full(&runtime, pin).await);
+    let extracted = literal.replace("); }", "); std::mem::drop(2); }");
+    let pin = index_edit(&base, &runtime, &[("src/main.rs", Some(&extracted))]).await;
+    assert_incremental(&published_attempt(&scheduler, pin), &["src/main.rs"], &[]);
+    let after = core(&scheduler, pin).canonical().unwrap();
+    assert_eq!(after, independent_full(&runtime, pin).await);
+    assert!(
+        after["references"]["workUsed"].as_u64().unwrap()
+            > before["references"]["workUsed"].as_u64().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn architecture_incremental_external_work_boundary() {
+    work_boundaries(true).await;
+}
+
+#[tokio::test]
+async fn architecture_incremental_site_limits() {
+    let (base, runtime, _, _) =
+        super::architecture_http::fixture_exact_sources(NATIVE_SOURCES).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let text = "fn main() { std::mem::drop(1); std::mem::drop(2); }\n";
+    let pin = index_edit(&base, &runtime, &[("src/main.rs", Some(text))]).await;
+    let attempt = published_attempt(&scheduler, pin);
+    assert_incremental(&attempt, &["src/main.rs"], &[]);
+    let value = core(&scheduler, pin).canonical().unwrap();
+    let sites: usize = value["references"]["sourceFacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|source| source["sites"].as_u64().unwrap() as usize)
+        .sum();
+    assert!(sites >= 3);
+    struct ResetSites;
+    impl Drop for ResetSites {
+        fn drop(&mut self) {
+            trellis::references::set_site_limit_for_tests(250_000);
+        }
+    }
+    let _reset = ResetSites;
+    trellis::references::set_site_limit_for_tests(sites);
+    let at = format!("{text}// at\n");
+    let pin = index_edit(&base, &runtime, &[("src/main.rs", Some(&at))]).await;
+    assert_incremental(&published_attempt(&scheduler, pin), &["src/main.rs"], &[]);
+    trellis::references::set_site_limit_for_tests(sites - 1);
+    let beyond = format!("{text}// beyond\n");
+    let pin = index_edit(&base, &runtime, &[("src/main.rs", Some(&beyond))]).await;
+    let attempt = published_attempt(&scheduler, pin);
+    assert_eq!(
+        attempt.path,
+        ArchitectureBuildPath::Full(FullReason::IncrementalFailure)
+    );
+    let (response, _) = runtime.evidence_response().unwrap();
+    let full = response.architecture_full_for_tests(pin).unwrap_err();
+    let kept = runtime
+        .architecture_tool(
+            &response,
+            "references",
+            &json!({"expectedBasis": pin}),
+            &mut || Ok(()),
+        )
+        .unwrap_err();
+    assert_eq!(kept.to_string(), full.to_string());
+    assert_eq!(kept.to_string(), "bounded_work: reference site count");
+}
 
 const OTHER_RULES: &str = "version=1\n[layers.other]\norder=1\npaths=['**/*.js']";
 

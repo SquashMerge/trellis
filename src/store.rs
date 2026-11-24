@@ -21,7 +21,6 @@ pub(crate) mod spool_reader;
 pub mod staging;
 #[cfg(feature = "test-support")]
 pub use crate::architecture_core::dependencies::SemanticReadCounts;
-#[cfg(feature = "test-support")]
 pub use crate::architecture_inputs::{
     ArchitectureFingerprints, DocumentFingerprint, NativeFingerprint, SemanticFreshnessState,
     SemanticInputState, SemanticTupleState,
@@ -37,14 +36,13 @@ pub(crate) use semantic_display::RERUN_SCHEDULED;
 pub use semantic_display::set_architecture_semantic_rows_for_tests;
 #[cfg(feature = "test-support")]
 pub(crate) use semantic_display::status_semantic_projections_on_thread_for_tests;
+pub use semantic_display::{
+    ArchitectureSemanticCounts, AutoRunLabels, CallSemantic, CoverageDocument, LanguagePending,
+    LanguageTier, McpSemantic, ProducerNotPublished, ProducerSelection, relabel_status,
+};
 #[cfg(feature = "test-support")]
 pub use semantic_display::{
-    ArchitectureSemanticCounts, set_architecture_semantic_lookups_for_tests,
-    set_architecture_semantic_metadata_for_tests,
-};
-pub use semantic_display::{
-    AutoRunLabels, CallSemantic, CoverageDocument, LanguagePending, LanguageTier, McpSemantic,
-    ProducerNotPublished, ProducerSelection, relabel_status,
+    set_architecture_semantic_lookups_for_tests, set_architecture_semantic_metadata_for_tests,
 };
 pub use semantic_retention::AutoRunHead;
 pub(crate) mod symbol_trigrams;
@@ -1694,7 +1692,6 @@ impl EvidenceResponse {
         check()
     }
 
-    #[cfg(feature = "test-support")]
     pub(crate) fn architecture_semantic_for_sources(
         &self,
         snapshot: &mut crate::architecture_inputs::Snapshot,
@@ -1715,7 +1712,6 @@ impl EvidenceResponse {
     }
 
     /// Read A and its Architecture-only sidecar under this same admitted revision.
-    #[cfg(feature = "test-support")]
     pub(crate) fn architecture_read_a_fingerprinted(
         &self,
         pin: Option<IndexPin>,

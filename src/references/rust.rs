@@ -3,7 +3,6 @@
 use super::shared::DeclarationId;
 use super::*;
 
-#[cfg(feature = "test-support")]
 mod digest;
 
 type RouteKey = (usize, String);

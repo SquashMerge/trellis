@@ -1,5 +1,5 @@
 //! The canonical form of a [`ReferenceBase`] (#1301): every field, so two results compare
-//! equal only when every read of them answers the same. Test support only.
+//! equal only when every read of them answers the same.
 use super::{
     EdgeSites, MAX_SAMPLE_LIMIT, ReferenceBase, Site, SiteCoverage, SourceReferences, Target,
 };

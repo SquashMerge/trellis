@@ -459,7 +459,6 @@ pub(crate) fn semantic_projection_for(
 }
 
 /// Stable inventories: selecting revision and batch surrogates are deliberately not inputs.
-#[cfg(feature = "test-support")]
 pub(crate) fn architecture_inventory_fingerprints(
     db: &Connection,
     revision: &str,

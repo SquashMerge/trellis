@@ -11,7 +11,6 @@ use tree_sitter::{Node, Tree};
 use work::Work;
 
 pub(crate) mod callers;
-#[cfg(feature = "test-support")]
 mod canonical;
 mod cargo_workspace;
 pub mod external;
@@ -20,15 +19,11 @@ mod javascript;
 mod js_workspace;
 mod package_parts;
 use package_parts::{ExternalPackageTable, SourcePackageDescriptors};
-#[cfg(feature = "test-support")]
 mod incremental;
 #[cfg(all(test, feature = "test-support"))]
 mod incremental_tests;
-#[cfg(feature = "test-support")]
 pub use incremental::ReferenceReplayTrace;
-#[cfg(feature = "test-support")]
 pub(crate) use incremental::{ReferencePreparation, finish_incremental, prepare_incremental};
-#[cfg(feature = "test-support")]
 pub(crate) use incremental::{SourceChargePlan, SourceFacts};
 #[cfg(feature = "test-support")]
 pub use work::{
@@ -83,9 +78,7 @@ pub struct ReferenceBase {
     /// shared, so a later result can keep a source that did not change (#1301).
     sources: Vec<Option<Arc<SourceReferences>>>,
     external_packages: ExternalPackageTable,
-    #[cfg(feature = "test-support")]
     rust_catalog_digest: [u8; 32],
-    #[cfg(feature = "test-support")]
     source_facts: Vec<SourceFacts>,
     /// Language to selected producer.
     producers: BTreeMap<String, String>,
@@ -538,7 +531,6 @@ fn resolve(
         request,
     };
     let mut catalogs = build_catalogs(read, limit, check)?;
-    #[cfg(feature = "test-support")]
     let rust_catalog_digest = catalogs.rust.digest();
     let (declared, producers) = declared_targets(&docs, &mut catalogs.rust_execution.work, check)?;
     let locate = |document: usize, sid: &str| {
@@ -550,8 +542,7 @@ fn resolve(
     let SelectedReferences {
         sources,
         external_packages,
-        #[cfg(feature = "test-support")]
-            facts: source_facts,
+        facts: source_facts,
     } = selected_references(read, &mut catalogs, &locate, check)?;
     external_packages.validate(&sources)?;
     drop_trees(trees, workers);
@@ -562,9 +553,7 @@ fn resolve(
         modules,
         sources,
         external_packages,
-        #[cfg(feature = "test-support")]
         rust_catalog_digest,
-        #[cfg(feature = "test-support")]
         source_facts,
         producers,
         document_status: docs
@@ -854,7 +843,6 @@ fn declared_targets<'a>(
 struct SelectedReferences {
     sources: Vec<Option<Arc<SourceReferences>>>,
     external_packages: ExternalPackageTable,
-    #[cfg(feature = "test-support")]
     facts: Vec<SourceFacts>,
 }
 
@@ -862,7 +850,6 @@ struct CompletedFile {
     source: usize,
     found: SourceReferences,
     packages: SourcePackageDescriptors,
-    #[cfg(feature = "test-support")]
     facts: SourceFacts,
 }
 
@@ -885,7 +872,6 @@ fn selected_references(
     let mut sources: Vec<Option<Arc<SourceReferences>>> = Vec::new();
     sources.resize_with(docs.len(), || None);
     let mut external_packages = ExternalPackageTable::new(docs.len());
-    #[cfg(feature = "test-support")]
     let mut facts: Vec<SourceFacts> = (0..docs.len()).map(|_| SourceFacts::default()).collect();
     let mut site_count = 0usize;
     let mut target_documents: BTreeMap<usize, TargetDocument<'_>> = BTreeMap::new();
@@ -905,8 +891,7 @@ fn selected_references(
                 source,
                 found,
                 packages,
-                #[cfg(feature = "test-support")]
-                    facts: source_facts,
+                facts: source_facts,
             } = file_references(
                 read,
                 catalogs,
@@ -921,16 +906,12 @@ fn selected_references(
                 "store_unavailable: reference package completion"
             );
             sources[source] = Some(Arc::new(found));
-            #[cfg(feature = "test-support")]
-            {
-                facts[source] = source_facts;
-            }
+            facts[source] = source_facts;
         }
     }
     Ok(SelectedReferences {
         sources,
         external_packages,
-        #[cfg(feature = "test-support")]
         facts,
     })
 }
@@ -959,14 +940,11 @@ fn file_references<'a>(
     } = prepared;
     let doc = docs[source];
     request.check()?;
-    #[cfg(feature = "test-support")]
     let (before_work, before_sites) = (catalogs.rust_execution.work.used, *site_count);
-    #[cfg(feature = "test-support")]
     let mut plan = SourceChargePlan {
         prepared_work: work.used,
         sites: Vec::new(),
     };
-    #[cfg(feature = "test-support")]
     let mut endpoints = incremental::semantic_endpoints(read, source)?;
     merge_work(&mut catalogs.rust_execution.work, work.used, check)?;
     let mut found = SourceReferences {
@@ -1010,11 +988,8 @@ fn file_references<'a>(
             locate,
             check,
         )?;
-        #[cfg(feature = "test-support")]
-        {
-            incremental::resolution_endpoints(&mut endpoints, &charged);
-            plan.push(read, charge)?;
-        }
+        incremental::resolution_endpoints(&mut endpoints, &charged);
+        plan.push(read, charge)?;
         let Some((resolution, semantic)) = charged.effective(source) else {
             continue;
         };
@@ -1068,7 +1043,6 @@ fn file_references<'a>(
         source,
         found,
         packages: source_packages,
-        #[cfg(feature = "test-support")]
         facts: SourceFacts {
             plan: Some(Arc::new(plan)),
             work: catalogs.rust_execution.work.used - before_work,

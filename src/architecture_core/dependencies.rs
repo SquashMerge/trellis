@@ -12,10 +12,8 @@ pub struct SemanticReadCounts {
     pub lookups: usize,
 }
 
-#[cfg(feature = "test-support")]
 pub(crate) use staged::*;
 
-#[cfg(feature = "test-support")]
 mod staged {
     use super::SemanticReadCounts;
     use crate::architecture_inputs::{

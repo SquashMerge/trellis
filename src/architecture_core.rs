@@ -157,11 +157,27 @@ pub(crate) struct ArchitectureCore {
     interfaces: Option<Result<crate::interfaces::Extraction, CoreFailure>>,
     /// Finished summaries; one per valid role, aggregate and workbench choice.
     summaries: Mutex<BTreeMap<SummaryKey, Arc<serde_json::Value>>>,
-    #[cfg(feature = "test-support")]
     dependencies: dependencies::ArchitectureDependencies,
 }
 
 impl ArchitectureCore {
+    pub(crate) fn incremental_base_eligible(&self) -> bool {
+        self.metrics_if_computed().is_some()
+            && self.dependencies.order.len() == self.dependencies.documents.len()
+    }
+
+    pub(crate) fn document_keys(&self) -> Vec<DocumentKey> {
+        self.dependencies.order.to_vec()
+    }
+
+    pub(crate) fn full_reference_trace(
+        &self,
+        limit: usize,
+    ) -> crate::references::ReferenceReplayTrace {
+        self.references
+            .full_trace(limit, crate::parallel::default_workers())
+    }
+
     pub(crate) fn references(
         &self,
         paths: &[String],
@@ -247,10 +263,21 @@ impl ArchitectureCore {
 pub(crate) struct ArchitectureInput {
     snapshot: crate::references::Snapshot,
     regions: Vec<Vec<crate::native_records::ControlRegion>>,
-    #[cfg(feature = "test-support")]
     fingerprints: crate::architecture_inputs::ArchitectureFingerprints,
-    #[cfg(feature = "test-support")]
     semantic_counts: crate::store::semantic_display::ArchitectureSemanticCounts,
+}
+
+impl ArchitectureInput {
+    pub(crate) fn document_keys(&self) -> Vec<DocumentKey> {
+        self.fingerprints.documents.keys().cloned().collect()
+    }
+
+    pub(crate) fn reference_limit(&self, check: &mut impl FnMut() -> Result<()>) -> Result<usize> {
+        Ok(crate::references::work::reference_limit(
+            self.snapshot.documents.len(),
+            crate::references::work::snapshot_bytes(&self.snapshot, check)?,
+        ))
+    }
 }
 
 struct CoreCompletion<'a> {
@@ -261,6 +288,37 @@ struct CoreCompletion<'a> {
 }
 
 impl EvidenceResponse {
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn architecture_snapshot_for_tests(
+        &self,
+        pin: IndexPin,
+    ) -> Result<crate::references::Snapshot> {
+        Ok(self
+            .architecture_input(pin, &mut || Ok(()), &|_| {})?
+            .snapshot)
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn architecture_full_for_tests(&self, pin: IndexPin) -> Result<serde_json::Value> {
+        let config = crate::rules::load(std::path::Path::new(self.store.workspace_root()))?;
+        self.architecture_core_at(pin, config.as_ref(), true, &mut || Ok(()), &|_| {})?
+            .canonical()
+    }
+
+    /// Expected structural provenance from this same-pin admitted native Read A.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn architecture_manifests_for_tests(
+        &self,
+        pin: IndexPin,
+    ) -> Result<Vec<crate::architecture_inputs::ManifestInput>> {
+        let (snapshot, _, _) =
+            self.architecture_read_a_fingerprinted(Some(pin), &mut || Ok(()), &|_, _| {})?;
+        Ok(snapshot.manifests)
+    }
+
     /// The documents a core computes from: read A, then read B, in this one transaction.
     pub(crate) fn architecture_input(
         &self,
@@ -281,17 +339,6 @@ impl EvidenceResponse {
         check: &mut (impl FnMut() -> Result<()> + Send),
         progress: &(dyn Fn(ArchitectureProgress) + Sync),
     ) -> Result<ArchitectureInput> {
-        #[cfg(not(feature = "test-support"))]
-        let (snapshot, regions) = self
-            .architecture_native_regions(Some(pin), check, &|completed, total| {
-                progress(ArchitectureProgress {
-                    phase: "reading",
-                    completed,
-                    total,
-                });
-            })
-            .map_err(|error| self.store.report_index_failure(error))?;
-        #[cfg(feature = "test-support")]
         let (snapshot, regions, fingerprints) = self
             .architecture_read_a_fingerprinted(Some(pin), check, &|completed, total| {
                 progress(ArchitectureProgress {
@@ -304,9 +351,7 @@ impl EvidenceResponse {
         Ok(ArchitectureInput {
             snapshot,
             regions,
-            #[cfg(feature = "test-support")]
             fingerprints,
-            #[cfg(feature = "test-support")]
             semantic_counts: Default::default(),
         })
     }
@@ -318,19 +363,13 @@ impl EvidenceResponse {
         input: &mut ArchitectureInput,
         check: &mut (impl FnMut() -> Result<()> + Send),
     ) -> Result<()> {
-        #[cfg(not(feature = "test-support"))]
-        self.architecture_semantic_rows(&mut input.snapshot, check)
+        input.semantic_counts = self
+            .architecture_semantic_for_sources(
+                &mut input.snapshot,
+                crate::store::semantic_display::ArchitectureSemanticSources::All,
+                check,
+            )
             .map_err(|error| self.store.report_index_failure(error))?;
-        #[cfg(feature = "test-support")]
-        {
-            input.semantic_counts = self
-                .architecture_semantic_for_sources(
-                    &mut input.snapshot,
-                    crate::store::semantic_display::ArchitectureSemanticSources::All,
-                    check,
-                )
-                .map_err(|error| self.store.report_index_failure(error))?;
-        }
         Ok(())
     }
 
@@ -380,7 +419,6 @@ impl ArchitectureCore {
                 measure,
                 progress,
             },
-            #[cfg(feature = "test-support")]
             None,
             check,
         )
@@ -392,10 +430,7 @@ impl ArchitectureCore {
         input: ArchitectureInput,
         references: ReferenceBase,
         context: CoreCompletion<'_>,
-        #[cfg(feature = "test-support")] reuse: Option<(
-            &ArchitectureCore,
-            &std::collections::BTreeSet<DocumentKey>,
-        )>,
+        reuse: Option<(&ArchitectureCore, &std::collections::BTreeSet<DocumentKey>)>,
         check: &mut (impl FnMut() -> Result<()> + Send),
     ) -> Result<Self> {
         let CoreCompletion {
@@ -407,9 +442,7 @@ impl ArchitectureCore {
         let ArchitectureInput {
             snapshot,
             regions,
-            #[cfg(feature = "test-support")]
             fingerprints,
-            #[cfg(feature = "test-support")]
             semantic_counts,
         } = input;
         let total = snapshot.documents.len();
@@ -420,7 +453,6 @@ impl ArchitectureCore {
                 total,
             });
         };
-        #[cfg(feature = "test-support")]
         let mut dependencies = dependencies::ArchitectureDependencies::full(
             &snapshot,
             fingerprints,
@@ -428,7 +460,6 @@ impl ArchitectureCore {
             semantic_counts.global,
             &references,
         )?;
-        #[cfg(feature = "test-support")]
         if let Some((base, _)) = reuse {
             dependencies.share_unchanged(&base.dependencies);
         }
@@ -448,7 +479,6 @@ impl ArchitectureCore {
             .transpose()?;
         let metrics = if measure {
             report("measuring");
-            #[cfg(feature = "test-support")]
             let measured = match reuse {
                 Some((base, changed)) => engine::measure_changed_documents(
                     store,
@@ -461,8 +491,6 @@ impl ArchitectureCore {
                 ),
                 None => measure_documents(store, &snapshot, &regions, check, progress),
             };
-            #[cfg(not(feature = "test-support"))]
-            let measured = measure_documents(store, &snapshot, &regions, check, progress);
             Some(match measured {
                 Ok(metrics) => Ok(metrics),
                 Err(error) if CoreFailure::repeats(&error) => Err(CoreFailure::of(&error)),
@@ -531,14 +559,12 @@ impl ArchitectureCore {
             app_candidates,
             interfaces,
             summaries: Mutex::default(),
-            #[cfg(feature = "test-support")]
             dependencies,
         })
     }
 }
 
 /// The path a supplied-base plan takes. The runtime owner selects bases separately.
-#[cfg(feature = "test-support")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ArchitectureBuildPath {
     Full(FullReason),
@@ -550,7 +576,6 @@ pub enum ArchitectureBuildPath {
 }
 
 /// Why a build read and computed every document.
-#[cfg(feature = "test-support")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FullReason {
     /// The build had no earlier result to start from.
@@ -572,7 +597,6 @@ pub enum FullReason {
 pub use engine::{
     ArchitectureBuildForTests, ArchitectureCoreHandle, ArchitectureCoreWeak, ArchitectureSharing,
 };
-#[cfg(feature = "test-support")]
 pub(crate) use engine::{
     ArchitectureBuildPlan, ArchitectureReadA, ArchitectureReadB, ReferenceWorkMargin,
     finish_architecture, prepare_architecture,
@@ -585,11 +609,11 @@ impl ArchitectureCore {
     }
 }
 
-#[cfg(feature = "test-support")]
 mod engine {
     use super::*;
     use crate::store::semantic_display::{ArchitectureSemanticCounts, ArchitectureSemanticSources};
     use anyhow::{Context, ensure};
+    #[cfg(feature = "test-support")]
     use serde::Serialize;
     use std::collections::BTreeSet;
 
@@ -719,6 +743,20 @@ mod engine {
     }
 
     impl ArchitectureBuildPlan<'_> {
+        pub(crate) fn measured_keys(&self) -> Vec<DocumentKey> {
+            if matches!(self.path, ArchitectureBuildPath::Incremental { .. }) {
+                self.changed.native.iter().cloned().collect()
+            } else {
+                self.read_a
+                    .input
+                    .fingerprints
+                    .documents
+                    .keys()
+                    .cloned()
+                    .collect()
+            }
+        }
+
         pub(crate) fn semantic_keys(&self) -> Vec<DocumentKey> {
             if self.all_semantic {
                 self.read_a
@@ -871,16 +909,20 @@ mod engine {
         )
     }
 
+    #[cfg(feature = "test-support")]
     #[derive(Clone)]
     pub struct ArchitectureCoreHandle(pub(super) Arc<ArchitectureCore>);
 
+    #[cfg(feature = "test-support")]
     pub struct ArchitectureCoreWeak(std::sync::Weak<ArchitectureCore>);
+    #[cfg(feature = "test-support")]
     impl ArchitectureCoreWeak {
         pub fn is_alive(&self) -> bool {
             self.0.strong_count() != 0
         }
     }
 
+    #[cfg(feature = "test-support")]
     #[derive(Debug, Serialize)]
     pub struct ArchitectureSharing {
         pub source: bool,
@@ -892,6 +934,7 @@ mod engine {
         pub plan: bool,
     }
 
+    #[cfg(feature = "test-support")]
     impl ArchitectureCoreHandle {
         pub fn canonical(&self) -> Result<serde_json::Value> {
             self.0.canonical()
@@ -946,6 +989,7 @@ mod engine {
         }
     }
 
+    #[cfg(feature = "test-support")]
     pub struct ArchitectureBuildForTests {
         pub core: ArchitectureCoreHandle,
         pub path: ArchitectureBuildPath,
@@ -955,11 +999,13 @@ mod engine {
         pub references: crate::references::ReferenceReplayTrace,
     }
 
+    #[cfg(feature = "test-support")]
     pub(super) fn retryable_incremental_error(error: &anyhow::Error) -> bool {
         !error.to_string().starts_with("cancelled")
             && !crate::store::transient_storage_contention(error)
     }
 
+    #[cfg(feature = "test-support")]
     impl Store {
         /// Direct supplied-base engine adapter. It owns no cache and retains no native input.
         #[doc(hidden)]
@@ -1161,7 +1207,6 @@ mod engine {
     }
 }
 
-#[cfg(feature = "test-support")]
 impl ArchitectureCore {
     /// Every part of this core in one canonical value (#1301): two cores are equal when every
     /// read answers the same from them. The summary cache is left out; reads fill it.
@@ -1330,7 +1375,6 @@ impl Store {
 
 /// Every field of one metric row, including `name` and `kind`, which its JSON skips and the
 /// top-cognitive answer reads.
-#[cfg(feature = "test-support")]
 fn canonical_metric_row(row: &DeclarationMetrics) -> serde_json::Value {
     // Exhaustive, so a new field fails to compile until it is compared.
     let DeclarationMetrics {
@@ -1358,7 +1402,6 @@ fn canonical_metric_row(row: &DeclarationMetrics) -> serde_json::Value {
 }
 
 /// The JSON pointer of the first place `left` and `right` differ, in key and index order.
-#[cfg(feature = "test-support")]
 pub(crate) fn first_difference(
     left: &serde_json::Value,
     right: &serde_json::Value,
