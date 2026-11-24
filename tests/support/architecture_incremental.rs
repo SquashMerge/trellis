@@ -100,7 +100,9 @@ impl CapturedArchitecture {
             fs::write(path, text).unwrap();
         }
         let root = fs::canonicalize(root).unwrap();
-        let store = Store::open_for_tests(&temp.path().join("state"), &root).unwrap();
+        let store = trellis::testing::retry_admission(|| {
+            Store::open_for_tests(&temp.path().join("state"), &root)
+        });
         let owner = trellis::http::new(
             store.clone(),
             IndexOptions::new(root.clone()),
