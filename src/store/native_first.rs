@@ -27,6 +27,120 @@ pub(crate) struct PendingSemanticSelection {
     pub basis_pin: IndexPin,
 }
 
+#[cfg(all(test, feature = "test-support"))]
+mod architecture_fingerprint_tests {
+    use super::*;
+
+    // Only the inventory columns are needed: this tests the stable join, not import validation.
+    fn inventory() -> Connection {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE semantic_producers(id,version,executable_hash,kind,position_encoding,identity_kind);
+             CREATE TABLE semantic_revision_producers(revision_id,id,version,context_mode,context_trust,context_input_hash);
+             CREATE TABLE semantic_producer_languages(id,version,language,ordinal);
+             CREATE TABLE semantic_requested_producers(revision_id,id,version,executable_hash);
+             CREATE TABLE semantic_requested_producer_languages(revision_id,id,language,ordinal);
+             CREATE TABLE semantic_raw_batches(batch_id,producer_id,producer_version,profile_id,source_set_id,captured_revision,source_manifest_hash,descriptor_sha256,decoder_version);
+             CREATE TABLE semantic_revision_raw_selections(revision_id,producer_id,batch_id,captured_pin);
+             INSERT INTO semantic_producers VALUES('p','v1','exe','semantic','utf8','executable'),('q','v1','exe','semantic','utf8','executable');
+             INSERT INTO semantic_revision_producers VALUES('P','p','v1','fullCaptured',NULL,NULL),('P','q','v1','fullCaptured',NULL,NULL);
+             INSERT INTO semantic_producer_languages VALUES('p','v1','rust',0),('p','v1','typescript',1),('q','v1','rust',0);
+             INSERT INTO semantic_requested_producers VALUES('P','p','v1','exe'),('P','q','v1','exe');
+             INSERT INTO semantic_requested_producer_languages VALUES('P','p','rust',0),('P','p','typescript',1),('P','q','rust',0);
+             INSERT INTO semantic_raw_batches VALUES(7,'p','v1','profile','source','captured','manifest','descriptor','decoder');
+             INSERT INTO semantic_revision_raw_selections VALUES('P','p',7,'capture-pin');"
+        ).unwrap();
+        db
+    }
+
+    #[test]
+    fn architecture_incremental_all_producer_identity_components() {
+        let db = inventory();
+        let baseline = architecture_inventory_fingerprints(&db, "P").unwrap();
+        for sql in [
+            "UPDATE semantic_producers SET id='new' WHERE id='q'; UPDATE semantic_revision_producers SET id='new' WHERE id='q'; UPDATE semantic_producer_languages SET id='new' WHERE id='q'",
+            "UPDATE semantic_producers SET version='v2' WHERE id='q'; UPDATE semantic_revision_producers SET version='v2' WHERE id='q'; UPDATE semantic_producer_languages SET version='v2' WHERE id='q'",
+            "UPDATE semantic_producers SET executable_hash='other' WHERE id='q'",
+            "UPDATE semantic_producers SET kind='other' WHERE id='q'",
+            "UPDATE semantic_producers SET position_encoding='utf16' WHERE id='q'",
+            "UPDATE semantic_producers SET identity_kind='generatorSource' WHERE id='q'",
+            "UPDATE semantic_revision_producers SET context_mode='controlledProfile',context_trust='restricted',context_input_hash='hash' WHERE id='q'",
+            "UPDATE semantic_revision_producers SET context_trust='' WHERE id='q'",
+            "UPDATE semantic_revision_producers SET context_input_hash='' WHERE id='q'",
+            "UPDATE semantic_producer_languages SET language='python' WHERE id='q'",
+            "UPDATE semantic_producer_languages SET ordinal=1-ordinal WHERE id='p'",
+            "DELETE FROM semantic_revision_producers WHERE id='q'",
+            "UPDATE semantic_requested_producers SET id='new' WHERE id='q'",
+            "UPDATE semantic_requested_producers SET version='v2' WHERE id='q'",
+            "UPDATE semantic_requested_producers SET executable_hash='other' WHERE id='q'",
+            "UPDATE semantic_requested_producer_languages SET language='python' WHERE id='q'",
+            "UPDATE semantic_requested_producer_languages SET ordinal=1-ordinal WHERE id='p'",
+            "DELETE FROM semantic_requested_producers WHERE id='q'",
+            "DELETE FROM semantic_requested_producer_languages WHERE id='q'",
+        ] {
+            db.execute_batch("SAVEPOINT changed").unwrap();
+            db.execute_batch(sql).unwrap();
+            let changed = architecture_inventory_fingerprints(&db, "P").unwrap();
+            assert_ne!(baseline.0, changed.0, "{sql}");
+            assert_eq!(baseline.1, changed.1, "{sql}");
+            db.execute_batch("ROLLBACK TO changed; RELEASE changed")
+                .unwrap();
+        }
+        // Numeric ordinals are ordering keys, not identity beyond the ordered language list.
+        db.execute_batch("UPDATE semantic_producer_languages SET ordinal=ordinal+10; UPDATE semantic_requested_producer_languages SET ordinal=ordinal+10").unwrap();
+        assert_eq!(
+            baseline,
+            architecture_inventory_fingerprints(&db, "P").unwrap()
+        );
+    }
+
+    #[test]
+    fn architecture_incremental_selection_import_vs_copied_pin() {
+        let db = inventory();
+        let baseline = architecture_inventory_fingerprints(&db, "P").unwrap();
+        for sql in [
+            "UPDATE semantic_revision_raw_selections SET captured_pin='other'",
+            "UPDATE semantic_revision_raw_selections SET producer_id='other'; UPDATE semantic_raw_batches SET producer_id='other'",
+            "UPDATE semantic_raw_batches SET producer_version='v2'",
+            "UPDATE semantic_raw_batches SET profile_id='other'",
+            "UPDATE semantic_raw_batches SET source_set_id='other'",
+            "UPDATE semantic_raw_batches SET captured_revision='other'",
+            "UPDATE semantic_raw_batches SET source_manifest_hash='other'",
+            "UPDATE semantic_raw_batches SET descriptor_sha256='other'",
+            "UPDATE semantic_raw_batches SET decoder_version='other'",
+            "DELETE FROM semantic_revision_raw_selections",
+        ] {
+            db.execute_batch("SAVEPOINT changed").unwrap();
+            db.execute_batch(sql).unwrap();
+            let changed = architecture_inventory_fingerprints(&db, "P").unwrap();
+            assert_eq!(baseline.0, changed.0, "{sql}");
+            assert_ne!(baseline.1, changed.1, "{sql}");
+            db.execute_batch("ROLLBACK TO changed; RELEASE changed")
+                .unwrap();
+        }
+        for selecting in ["N", "S"] {
+            db.execute("INSERT INTO semantic_revision_producers SELECT ?1,id,version,context_mode,context_trust,context_input_hash FROM semantic_revision_producers WHERE revision_id='P'", [selecting]).unwrap();
+            db.execute("INSERT INTO semantic_requested_producers SELECT ?1,id,version,executable_hash FROM semantic_requested_producers WHERE revision_id='P'", [selecting]).unwrap();
+            db.execute("INSERT INTO semantic_requested_producer_languages SELECT ?1,id,language,ordinal FROM semantic_requested_producer_languages WHERE revision_id='P'", [selecting]).unwrap();
+            db.execute("INSERT INTO semantic_revision_raw_selections SELECT ?1,producer_id,batch_id,captured_pin FROM semantic_revision_raw_selections WHERE revision_id='P'", [selecting]).unwrap();
+            assert_eq!(
+                baseline,
+                architecture_inventory_fingerprints(&db, selecting).unwrap()
+            );
+        }
+        db.execute_batch("UPDATE semantic_raw_batches SET batch_id=99; UPDATE semantic_revision_raw_selections SET batch_id=99").unwrap();
+        assert_eq!(
+            baseline,
+            architecture_inventory_fingerprints(&db, "S").unwrap(),
+            "stable re-import is not a new selection"
+        );
+        db.execute_batch("DELETE FROM semantic_raw_batches")
+            .unwrap();
+        let error = architecture_inventory_fingerprints(&db, "S").unwrap_err();
+        assert!(error.downcast_ref::<SelectedIntegrity>().is_some());
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PendingSemanticTarget {
     pub pin: IndexPin,
@@ -342,6 +456,85 @@ pub(crate) fn semantic_projection_for(
         })
     })
     .transpose()
+}
+
+/// Stable inventories: selecting revision and batch surrogates are deliberately not inputs.
+#[cfg(feature = "test-support")]
+pub(crate) fn architecture_inventory_fingerprints(
+    db: &Connection,
+    revision: &str,
+) -> Result<([u8; 32], [u8; 32])> {
+    use crate::architecture_core::dependencies::Fingerprint;
+    fn rows(
+        db: &Connection,
+        revision: &str,
+        sql: &str,
+        nullable: &[usize],
+        hash: &mut Fingerprint,
+    ) -> Result<()> {
+        let mut statement = db.prepare_cached(sql)?;
+        let columns = statement.column_count();
+        let mut cursor = statement.query([revision])?;
+        let mut count = 0;
+        while let Some(row) = cursor.next()? {
+            hash.integer(columns as i64);
+            for column in 0..columns {
+                match row.get_ref(column)? {
+                    rusqlite::types::ValueRef::Null => {
+                        selected_ensure!(
+                            nullable.contains(&column),
+                            "incompatible_index: missing architecture inventory identity"
+                        );
+                        hash.optional::<i64>(None, Fingerprint::integer)
+                    }
+                    rusqlite::types::ValueRef::Integer(value) => {
+                        if nullable.contains(&column) {
+                            hash.optional(Some(value), Fingerprint::integer);
+                        } else {
+                            hash.integer(value);
+                        }
+                    }
+                    rusqlite::types::ValueRef::Text(value) => {
+                        let value = std::str::from_utf8(value).map_err(|_| {
+                            SelectedIntegrity("invalid architecture inventory text".into())
+                        })?;
+                        if nullable.contains(&column) {
+                            hash.optional(Some(value), Fingerprint::text);
+                        } else {
+                            hash.text(value);
+                        }
+                    }
+                    _ => {
+                        return Err(SelectedIntegrity(
+                            "invalid architecture inventory value".into(),
+                        )
+                        .into());
+                    }
+                }
+            }
+            count += 1;
+        }
+        hash.integer(count);
+        Ok(())
+    }
+    let mut producers = Fingerprint::new("architecture:producers:v1");
+    for (ordinal, sql) in [
+        "SELECT p.id,p.version,p.context_mode,p.context_trust,p.context_input_hash,i.executable_hash,i.kind,i.position_encoding,i.identity_kind FROM semantic_revision_producers p LEFT JOIN semantic_producers i ON i.id=p.id AND i.version=p.version WHERE p.revision_id=?1 ORDER BY p.id",
+        "SELECT p.id,l.language FROM semantic_revision_producers p JOIN semantic_producer_languages l ON l.id=p.id AND l.version=p.version WHERE p.revision_id=?1 ORDER BY p.id,l.ordinal",
+        "SELECT id,version,executable_hash FROM semantic_requested_producers WHERE revision_id=?1 ORDER BY id",
+        "SELECT id,language FROM semantic_requested_producer_languages WHERE revision_id=?1 ORDER BY id,ordinal",
+    ].into_iter().enumerate() {
+        rows(db, revision, sql, if ordinal == 0 { &[3,4] } else { &[] }, &mut producers)?;
+    }
+    let mut selections = Fingerprint::new("architecture:raw-selections:v1");
+    rows(
+        db,
+        revision,
+        "SELECT s.producer_id,s.captured_pin,b.producer_id,b.producer_version,b.profile_id,b.source_set_id,b.captured_revision,b.source_manifest_hash,b.descriptor_sha256,b.decoder_version FROM semantic_revision_raw_selections s LEFT JOIN semantic_raw_batches b ON b.batch_id=s.batch_id AND b.producer_id=s.producer_id WHERE s.revision_id=?1 ORDER BY s.producer_id",
+        &[],
+        &mut selections,
+    )?;
+    Ok((producers.finish(), selections.finish()))
 }
 
 pub(crate) fn projection_tuple(

@@ -7,6 +7,61 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+/// Architecture-only identities read beside the snapshot, never required of native fixtures.
+#[cfg(feature = "test-support")]
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
+pub struct ArchitectureFingerprints {
+    pub documents: BTreeMap<DocumentKey, DocumentFingerprint>,
+    /// Admission metadata used to assemble current global state without reading clean payloads.
+    /// The finished dependency index keeps only the fingerprints, not this map.
+    pub semantic_states: BTreeMap<DocumentKey, SemanticInputState>,
+    pub producers: [u8; 32],
+    pub selections: [u8; 32],
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Clone, Debug, Default, serde::Serialize, PartialEq, Eq)]
+pub struct SemanticInputState {
+    pub default_producer: Option<String>,
+    pub projection: Option<crate::model::SemanticProjection>,
+    pub tuple: Option<SemanticTupleState>,
+    pub freshness: Option<SemanticFreshnessState>,
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
+pub struct SemanticTupleState {
+    pub selected: bool,
+    pub state: String,
+    pub payload_id: Option<i64>,
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
+pub struct SemanticFreshnessState {
+    pub basis_pin: IndexPin,
+    pub values: BTreeMap<i64, String>,
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
+pub struct DocumentFingerprint {
+    pub native: NativeFingerprint,
+    pub semantic: [u8; 32],
+    pub sids: [u8; 32],
+    pub projected: bool,
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
+pub struct NativeFingerprint {
+    pub version_id: String,
+    pub coverage_requested: bool,
+    pub coverage_selected: bool,
+    pub coverage_state: String,
+    pub coverage_diagnostic: Option<String>,
+}
+
 pub struct DocumentInput {
     pub key: DocumentKey,
     pub file: SourceFile,

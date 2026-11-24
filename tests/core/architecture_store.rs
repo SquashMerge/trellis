@@ -92,6 +92,308 @@ fn db_metadata(state: &std::path::Path) -> Vec<(String, u64, std::time::SystemTi
     result.sort();
     result
 }
+
+fn index_path(state: &std::path::Path) -> std::path::PathBuf {
+    fs::read_dir(state.join("cache/indexes"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap()
+        .join("index.db")
+}
+
+fn publish_current(store: &Store, root: &std::path::Path) {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(root.into()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &leader,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+}
+
+#[test]
+fn architecture_incremental_version_identity() {
+    let (state, root, store, pin) = fixture();
+    let baseline = store
+        .architecture_fingerprints_for_tests(Some(pin))
+        .unwrap();
+    let key = baseline
+        .documents
+        .keys()
+        .find(|key| key.path == "src/high.rs")
+        .unwrap()
+        .clone();
+    let first = baseline.documents[&key].clone();
+    drop(store);
+    let db = rusqlite::Connection::open(index_path(state.path())).unwrap();
+    let original_vid: i64 = db
+        .query_row(
+            "SELECT vid FROM document_versions WHERE id=?1",
+            [&first.native.version_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(db);
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    fs::write(
+        root.path().join("src/high.rs"),
+        "pub fn upper() { /* body edit */ }\n",
+    )
+    .unwrap();
+    publish_current(&store, root.path());
+    let edited = store
+        .architecture_fingerprints_for_tests(None)
+        .unwrap()
+        .documents[&key]
+        .clone();
+    assert_ne!(first.native.version_id, edited.native.version_id);
+    assert_eq!(
+        first.sids, edited.sids,
+        "a body comment is not a declaration identity"
+    );
+    drop(store);
+
+    // Remap both versions and every SQL foreign-key column. The changed content now owns
+    // the old surrogate, while every retained revision still names its original content.
+    let db = rusqlite::Connection::open(index_path(state.path())).unwrap();
+    let edited_vid: i64 = db
+        .query_row(
+            "SELECT vid FROM document_versions WHERE id=?1",
+            [&edited.native.version_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_ne!(original_vid, edited_vid);
+    let tables: Vec<String> = db
+        .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    let tables: Vec<_> = tables
+        .into_iter()
+        .filter(|table| {
+            db.prepare(&format!("PRAGMA table_info(\"{table}\")"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .any(|column| column.unwrap() == "vid")
+        })
+        .collect();
+    db.execute_batch("BEGIN IMMEDIATE; PRAGMA defer_foreign_keys=ON")
+        .unwrap();
+    for (from, to) in [
+        (original_vid, -1),
+        (edited_vid, original_vid),
+        (-1, edited_vid),
+    ] {
+        for table in &tables {
+            db.execute(
+                &format!("UPDATE \"{table}\" SET vid=?1 WHERE vid=?2"),
+                [to, from],
+            )
+            .unwrap();
+        }
+    }
+    db.execute_batch("COMMIT").unwrap();
+    let violations: i64 = db
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(violations, 0);
+    drop(db);
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    assert_eq!(
+        store
+            .architecture_fingerprints_for_tests(None)
+            .unwrap()
+            .documents[&key],
+        edited
+    );
+    assert_eq!(
+        store
+            .architecture_fingerprints_for_tests(Some(pin))
+            .unwrap()
+            .documents[&key],
+        first
+    );
+    fs::write(root.path().join("src/high.rs"), "pub fn upper() {}\n").unwrap();
+    publish_current(&store, root.path());
+    assert_eq!(
+        store
+            .architecture_fingerprints_for_tests(None)
+            .unwrap()
+            .documents[&key],
+        first
+    );
+}
+
+#[test]
+fn architecture_incremental_coverage() {
+    let (state, root, store, _) = fixture();
+    let baseline = store.architecture_fingerprints_for_tests(None).unwrap();
+    let key = baseline
+        .documents
+        .keys()
+        .find(|key| key.path == "src/high.rs")
+        .unwrap()
+        .clone();
+    let first = baseline.documents[&key].clone();
+    drop(store);
+    for (assignments, requested, selected, status, diagnostic) in [
+        ("coverage_requested=0", false, true, "complete", None),
+        (
+            "coverage_requested=1,coverage_selected=0",
+            true,
+            false,
+            "complete",
+            None,
+        ),
+        (
+            "coverage_selected=1,coverage_state='partial',coverage_diagnostic='one'",
+            true,
+            true,
+            "partial",
+            Some("one"),
+        ),
+        (
+            "coverage_diagnostic='two'",
+            true,
+            true,
+            "partial",
+            Some("two"),
+        ),
+        (
+            "coverage_state='failed',coverage_diagnostic='two'",
+            true,
+            true,
+            "failed",
+            Some("two"),
+        ),
+        (
+            "coverage_state='unsupported'",
+            true,
+            true,
+            "unsupported",
+            Some("two"),
+        ),
+        (
+            "coverage_state='omitted'",
+            true,
+            true,
+            "omitted",
+            Some("two"),
+        ),
+        (
+            "coverage_state='notRequested'",
+            true,
+            true,
+            "notRequested",
+            Some("two"),
+        ),
+        (
+            "coverage_state='complete',coverage_diagnostic=NULL",
+            true,
+            true,
+            "complete",
+            None,
+        ),
+    ] {
+        let db = rusqlite::Connection::open(index_path(state.path())).unwrap();
+        db.execute(
+            &format!("UPDATE revision_documents SET {assignments} WHERE path='src/high.rs'"),
+            [],
+        )
+        .unwrap();
+        drop(db);
+        let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+        let current = store.architecture_fingerprints_for_tests(None).unwrap();
+        let mut expected = first.clone();
+        expected.native.coverage_requested = requested;
+        expected.native.coverage_selected = selected;
+        expected.native.coverage_state = status.into();
+        expected.native.coverage_diagnostic = diagnostic.map(str::to_owned);
+        assert_eq!(current.documents[&key], expected, "{assignments}");
+        assert_eq!(current.producers, baseline.producers);
+        assert_eq!(current.selections, baseline.selections);
+        drop(store);
+    }
+    let db = rusqlite::Connection::open(index_path(state.path())).unwrap();
+    db.execute_batch("UPDATE revision_documents SET ordinal=ordinal+100; UPDATE revision_documents SET ordinal=102-ordinal,class_complete=1-class_complete").unwrap();
+    let stat: String = db
+        .query_row(
+            "SELECT capture_stat FROM revision_documents WHERE path='src/high.rs'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut stat: trellis::capture::CaptureStat = serde_json::from_str(&stat).unwrap();
+    stat.mtime_seconds = stat.mtime_seconds.map(|seconds| seconds + 1);
+    db.execute(
+        "UPDATE revision_documents SET capture_stat=?1 WHERE path='src/high.rs'",
+        [serde_json::to_string(&stat).unwrap()],
+    )
+    .unwrap();
+    drop(db);
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    assert_eq!(
+        store.architecture_fingerprints_for_tests(None).unwrap(),
+        baseline
+    );
+    drop(store);
+    let db = rusqlite::Connection::open(index_path(state.path())).unwrap();
+    db.execute("UPDATE graph_projections SET state='unavailable' WHERE gid IN (SELECT gid FROM revision_documents WHERE path='src/high.rs')", []).unwrap();
+    drop(db);
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let error = store.architecture_fingerprints_for_tests(None).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("incompatible_index:"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn architecture_incremental_captured_root_config_fallback() {
+    let (_state, root, store, _) = fixture();
+    assert!(
+        store
+            .architecture_reference_snapshot_for_tests()
+            .unwrap()
+            .root_tsconfig
+            .is_none()
+    );
+    fs::write(
+        root.path().join("jsconfig.json"),
+        "{\"compilerOptions\":{}}",
+    )
+    .unwrap();
+    publish_current(&store, root.path());
+    let snapshot = store.architecture_reference_snapshot_for_tests().unwrap();
+    let config = snapshot.root_tsconfig.unwrap();
+    assert_eq!(config.path, "jsconfig.json");
+    assert_eq!(config.bytes, b"{\"compilerOptions\":{}}");
+    fs::write(root.path().join("tsconfig.json"), "{}").unwrap();
+    publish_current(&store, root.path());
+    let snapshot = store.architecture_reference_snapshot_for_tests().unwrap();
+    let config = snapshot.root_tsconfig.unwrap();
+    assert_eq!(config.path, "tsconfig.json");
+    assert_eq!(config.bytes, b"{}");
+}
 #[test]
 fn captured_references_keep_stored_roles_and_call_rules_unknown_without_writes() {
     let (state, root, store, pin) = fixture();
